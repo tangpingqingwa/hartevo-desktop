@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：质量工程目标合同。** 任何完成声明必须由本仓库对应版本的 Mission Eval 与可重放证据重新证明。
 
 状态：**Target Contract**；不表示当前仓库已经实现全部组件
-Desktop 采用版本：2026-08-09-v1
+Desktop 采用版本：2026-08-09-v2
 目标：让每次代码、模型、Prompt、Skill、Capability 或 Provider 变化都能回答“它是否更好地完成了 Hartevo 用户的增长业务目标”
 
 ## 1. Harness 的主体是业务世界，不是 Prompt
@@ -25,6 +25,12 @@ Mission 目标
 ```
 
 单元测试、工具 Contract、SSE 顺序和安全测试仍是基础，但必须能归属到 Mission Checkpoint。
+
+### 1.1 PenguinHarness 的采用边界
+
+PenguinHarness 为本路线提供 Harness Candidate Lab 的工程参考：极简工具 schema、冻结 Benchmark、私有 Rubric、append-only Trace、版本快照、Evaluator/Optimizer 隔离和失败驱动候选优化。具体采用与修正见 [PenguinHarness Rust 能力引入清单](../research/PENGUIN-HARNESS-RUST-CAPABILITY-INTAKE.md)。
+
+Hartevo 不采用“模型写最终 Score”“单 Run Baseline 对比多 Run Candidate”或“Optimizer 直接改写生产 Agent”的合同。Harness 的主体仍是版本化业务世界，最终指标由 Rust Result Engine、确定性/可复算 Oracle 和受限专家 Judge 共同产生。
 
 ## 2. Desktop 初始工程缺口
 
@@ -415,6 +421,7 @@ Agent Runtime 暴露的工具是受控入口；它们应映射到 Canonical Capa
 交付：
 
 - Mission/World/Checkpoint/Result JSON Schema；
+- HarnessProfile、BenchmarkRevision、RunMatrix、CandidateBundle 与 PromotionDecision Schema；
 - `blank-brand-v1`、`conflicted-truth-v1`、`mxzone-de-market-v1`；
 - World Loader、虚拟 Clock、Domain Snapshot、Trace Collector；
 - VM-00 当前状态识别和 Operating Contract；
@@ -454,6 +461,7 @@ Agent Runtime 暴露的工具是受控入口；它们应映射到 Canonical Capa
 - 跨周虚拟时间和事件驱动；
 - 各 Mission KPI→Attribution→正常结束或下一周期；
 - Skill Draft Eval 与权限检查；
+- Harness Candidate Lab：固定 Run matrix、隔离 Optimizer/Evaluator/Target、Candidate Snapshot、晋升与回滚；
 - 多模态 Artifact Intake；
 - 分池调度、并发、8 小时 Soak、成本曲线；
 - Production Bug 自动压缩为 Replay Pack。
@@ -470,6 +478,8 @@ eval run --mission VM-01 --world mxzone-seo-established-v1 --mode local
 eval run --suite p0 --mode local-rc
 eval replay --failure <failure-id>
 eval compare --baseline <release> --candidate <commit>
+eval optimize-harness --profile <profile> --benchmark <revision> --rounds <n>
+eval promote-harness --candidate <candidate-id> --canary
 eval report --run <eval-run-id>
 ```
 
@@ -484,6 +494,7 @@ eval report --run <eval-run-id>
 - `metrics.json`：MGCR、VBOR、LCR、时序、成本、资源和返工；
 - `artifacts/`：用户可见 Work Product、页面截图和 Verification；
 - `regressions.md`：相对基线的业务改善和退化；
+- `candidate-promotion-decision.json`：候选质量、安全、成本、延迟、稳定性与晋升/回滚结论；
 - `release-handoff.md`：可直接用于发布决策的摘要。
 
 ## 17. 回归门禁
@@ -496,6 +507,7 @@ eval report --run <eval-run-id>
 - Work Product 接受率下降超过 5 个百分点：阻断；
 - p95 或单位 Mission 成本回退超过门槛且无批准解释：阻断；
 - 仅 Judge 分数变化、确定性状态不变：抽样专家复核，不自动修改 Oracle。
+- Candidate 的分数由模型写入、Baseline/Candidate Run matrix 不一致或样本不足：结果为 `INCONCLUSIVE`，禁止晋升。
 
 ## 18. 禁止的 Harness 反模式
 
@@ -506,6 +518,9 @@ eval report --run <eval-run-id>
 - 把 Draft、Plan、Provider Success 或 CRM Stage 记为业务结果；
 - 用固定九角色或固定步骤替代动态目标规划；
 - 用 LLM Judge 判定金额、租户、Consent、Effect 和 Attribution；
+- 让 Target 或 Optimizer 读取私有 Rubric、holdout Case，或修改 Fixture、Oracle、Gate；
+- 用单 Run Baseline 对比多 Run Candidate，或因 Judge 均值略高就声称自我进化成功；
+- 让模型自报 Goal complete 代替 Work Product、Receipt、Verification 和 Outcome；
 - 为通过测试静默改 Fixture 或 Oracle；
 - 生产首次发现会话、流式、审批、发布和恢复错误；
 - 用单次成功截图覆盖长期 Mission、失败路径和下一轮。
@@ -520,3 +535,4 @@ Mission Harness 达到产品级必须满足：
 4. Capability 的价值能回到具体 Mission，不再以工具数量计完成；
 5. 任何生产问题都能变成可本地重放的业务 Fixture；
 6. 生产部署只验证真实环境边界，不再承担第一次产品功能发现。
+7. Harness/Prompt/Skill/Route 的任何自动优化都经过冻结 Benchmark、隔离 Candidate、可复算 Gate、Canary 和可回滚晋升。

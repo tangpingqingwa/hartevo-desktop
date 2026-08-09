@@ -1,7 +1,7 @@
 # Hartevo Desktop Rust 与 OpenInterpreter 基座 RFC
 
 状态：**Accepted**
-版本：1.2
+版本：1.3
 日期：2026-08-09
 审查基线：`openinterpreter/openinterpreter@984acc698cd038885ecb0b82721402b01e11a5ad`
 
@@ -53,6 +53,12 @@ Hartevo Desktop 采用 Rust-first 架构：产品代码、桌面 Shell、领域�
 OpenInterpreter 是主代码与 Agent Runtime 基座，但不是 Hartevo 唯一的能力参考。Hermes Agent v0.20 在 mid-turn redirect、长期任务调度、上下文微压缩、工具自恢复、grounded citations、Artifacts、Quick Entry、智能审批、A2A、签名 webhook、语音和桌面扩展方面有值得吸收的成熟机制。
 
 Hartevo 不运行 Hermes Python Core，不采用其 Electron Desktop，也不维护第二个 Agent Loop。相关机制按照 [Hermes Agent v0.20 → Hartevo Rust 能力引入清单](../research/HERMES-AGENT-V0.20-RUST-CAPABILITY-INTAKE.md) 分级，在 Hartevo-owned Rust crates 中重构；与 OpenInterpreter 已有能力重叠时优先包装 OpenInterpreter。
+
+### 2.4 PenguinHarness 的位置
+
+PenguinHarness 是 Harness Engineering Reference。它的极简模型工具面、Human/LLM/Environment 边界、流式消息纪律、Trace、Goal loop、冻结 Benchmark、Agent State Snapshot 和评测驱动优化对低成本模型适配很有价值。
+
+Hartevo 不运行 Penguin TypeScript Core、Hono Server、React Web 或 Electron Desktop，也不引入 OmniMessage 作为第二协议。相关机制按照 [PenguinHarness → Hartevo Rust Harness Lab 能力引入清单](../research/PENGUIN-HARNESS-RUST-CAPABILITY-INTAKE.md) 进入 `hartevo-rs/eval` 与 Hartevo-owned runtime adapters。模型自报完成、模型写入最终 Score、单 Run Baseline 和直接修改生产 Harness 的做法不予采用。
 
 ## 3. 产品对象与运行时对象的边界
 
