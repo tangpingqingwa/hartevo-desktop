@@ -1,7 +1,7 @@
 # Hartevo Desktop Rust 与 OpenInterpreter 基座 RFC
 
 状态：**Accepted**
-版本：1.0
+版本：1.1
 日期：2026-08-09
 审查基线：`openinterpreter/openinterpreter@984acc698cd038885ecb0b82721402b01e11a5ad`
 
@@ -11,7 +11,7 @@ Hartevo Desktop 采用 Rust-first 架构：产品代码、桌面 Shell、领域�
 
 主技术基座采用新版 Rust OpenInterpreter。它是基于 OpenAI Codex 演进的 Rust Agent Runtime，重点解决开放模型、低成本模型、多 Provider、模型专用 Harness、Codex 协议兼容和跨平台本地执行。
 
-桌面 UI 使用 Dioxus Desktop，以 Rust/RSX 编写组件并通过 HTML/CSS 渲染。AI CSS 作为 Agent 交互组件的设计与样式参考；免费组件可在授权允许范围内移植，付费组件必须在取得相应授权后才能进入仓库。
+桌面 UI 使用 Dioxus Desktop，以 Rust/RSX 编写组件并通过 HTML/CSS 渲染。AI CSS 只作为 Agent 交互问题与公开演示的研究参考。Hartevo 不购买其 Personal 或 Enterprise license，不复制其付费源码、CSS、SVG 或高度近似实现；全部产品组件根据 Hartevo 需求独立设计并以 Rust/Dioxus 实现。
 
 这项决策是本仓库唯一有效的技术基座；被替代方案不在当前文档集中保留，避免形成双基座。
 
@@ -180,13 +180,14 @@ OpenInterpreter 的 Harness 是候选策略，不是质量承诺。每个 Provid
 
 AI CSS 当前提供 14 个 Agent UI 组件，覆盖思考状态、工具动作、文本、引用、代码、任务列表、表格和 Composer；9 个免费，其余需要一次性授权。组件提供 React、Vue、Svelte 源码和 plain CSS，没有 Tailwind 依赖。
 
-Hartevo 的采用方式是：
+Hartevo 不购买 AI CSS 许可证。采用边界是：
 
-- 学习信息密度、状态转换、动效、折叠和 CSS token 设计。
-- 将选定组件重写为 Dioxus RSX，接入真实 Rust state，不运行 React/Vue/Svelte 代码。
-- 先采用免费组件：AI Agent Input、Thinking State、Thinking + Reasoning、Orbs、Text Response、Streaming Text、Code Block、Task List、Data Table。
-- Web Search、File Diff、Image Generation、Inline Citations、Comparison Table 在取得适用授权前只做交互参考，不复制源码。
-- 即使已授权，也不得把原组件作为独立组件库转售或原样再分发。
+- 研究这些组件解决了什么交互问题，例如信息密度、状态转换、动效、折叠、引用和结果呈现。
+- 从 Hartevo 的 Mission、Task、Evidence、Effect、Receipt 和 Work Product 状态模型出发，独立完成产品设计与 Rust/Dioxus 实现。
+- AI Agent Input、Thinking State、Thinking + Reasoning、Orbs、Text Response、Streaming Text、Code Block、Task List、Data Table 可作为公开参考；若直接使用其明确免费的代码或资产，必须单独完成来源与商用条款审查。
+- Web Search、File Diff、Image Generation、Inline Citations、Comparison Table 仅允许参考公开功能说明和演示表达的交互目标，不得获取、复制或改写其付费源码、CSS、SVG。
+- 不制作与付费组件高度近似、可被视为派生复制品的实现；同类能力必须具有 Hartevo 自己的业务语义、信息架构、状态和视觉表达。
+- 改变“不购买许可证”的决策必须经过新的 RFC，不得由开发者、设计师或依赖升级隐式改变。
 - 所有组件必须重新映射 Hartevo 品牌 token、中文排版、业务状态、WCAG 2.2 AA 和 reduced motion。
 
 ## 11. 仓库与上游策略
@@ -212,7 +213,7 @@ Hartevo 的采用方式是：
 - Runtime thread 只能绑定一个 Project execution scope；跨项目复用必须显式授权。
 - 不确定的外部写入、付款和可能重复的触达禁止自动重试。
 - Harness prompt、第三方 Skill、Plugin 和 Hook 都按可执行供应链资产审查。
-- AI CSS 付费源码在授权前不得进入 Git 历史。
+- AI CSS 付费源码、CSS、SVG 及其派生复制品不得进入 Git 历史。
 
 ## 13. 首个 90 天路线
 
@@ -234,7 +235,7 @@ Hartevo 的采用方式是：
 
 - Research、Evidence、Content、CRM/Creator 的首批 typed capability。
 - Effect Broker、审批、幂等、Receipt 和 Verification。
-- AI CSS 免费组件的 Dioxus 移植与 Hartevo token 化。
+- 参考公开交互问题，独立实现 Hartevo Agent UI primitives 并完成品牌 token 化。
 - 至少两种低成本模型和一个强模型的 Mission Eval。
 
 ### 阶段 D：受控 Pilot（第 10–13 周）

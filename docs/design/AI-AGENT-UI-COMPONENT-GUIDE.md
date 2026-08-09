@@ -1,7 +1,7 @@
 # Hartevo Agent UI 组件采用规范
 
 状态：**Accepted**
-版本：1.0
+版本：1.1
 日期：2026-08-09
 
 本文规定怎样在 Rust/Dioxus Hartevo Desktop 中参考 AI CSS，而不引入第二套前端运行时、错误授权或通用 Chat UI 语义。
@@ -12,13 +12,14 @@
 - 样式使用 Hartevo-owned plain CSS 和 design tokens。
 - 不把 React、Vue 或 Svelte 源码作为运行依赖。
 - AI CSS 提供交互、状态、动效和样式参考，不提供 Hartevo 的业务信息架构。
+- Hartevo 不购买 AI CSS Personal 或 Enterprise license；所有 Hartevo Agent UI 组件均独立设计并以 Rust/Dioxus 实现。
 - 组件只渲染 Rust application state，不自行模拟 Agent 状态。
 
 ## 2. 授权边界
 
-AI CSS 当前列出 14 个组件，其中 9 个免费，其他组件需要付费授权。免费组件可用于个人和商业项目；付费授权禁止把组件原样作为竞品组件库再分发。
+AI CSS 当前列出 14 个组件，其中 9 个免费，其他组件需要付费授权。其公开条款允许免费组件用于个人和商业项目，但 Hartevo 的默认策略仍是研究组件解决的交互问题，再以自己的领域语义、状态模型、品牌系统和 Rust/Dioxus 代码独立实现。
 
-### 可先采用的免费组件
+### 可研究的免费组件
 
 - AI Agent Input
 - Thinking State
@@ -30,7 +31,7 @@ AI CSS 当前列出 14 个组件，其中 9 个免费，其他组件需要付费
 - To-do List
 - Data Table
 
-### 取得授权后才能复制源码的组件
+### 仅限公开交互研究的付费锁定组件
 
 - Web Search
 - File Diff
@@ -38,9 +39,9 @@ AI CSS 当前列出 14 个组件，其中 9 个免费，其他组件需要付费
 - Inline Citations
 - Comparison Table
 
-团队开发前建议购买适用的 Enterprise license。授权前，锁定组件只允许做视觉和交互研究，不得把其源码、CSS、SVG 或派生复制品提交到 Git。
+Hartevo 不为上述锁定组件购买许可证。团队只能参考其公开名称、功能描述、演示所表达的问题与交互目标；不得获取、复制或改写其付费源码、CSS、SVG，也不得提交高度近似、可被视为派生复制品的实现。Hartevo 应从自己的 Mission、Task、Evidence、Effect 和 Work Product 状态出发重新完成交互设计。
 
-每次引入组件都更新 `ui-component-license-manifest`：来源 URL、tier、取得日期、授权主体、改写文件和原始版本 digest。
+默认不直接引入 AI CSS 源码。若未来确需使用其明确免费且允许商用的代码或资产，必须先完成来源审查并更新 `ui-component-license-manifest`：来源 URL、免费 tier、取得日期、适用条款、落地文件和原始版本 digest。该例外不适用于任何付费锁定组件；改变“不购买许可证”的决策必须另行提出 RFC，不能由实现人员自行处理。
 
 ## 3. Hartevo 组件层级
 
@@ -193,7 +194,7 @@ provider returned 200
 4. Keyboard 与 screen reader 检查。
 5. reduced-motion snapshot。
 6. 中文、英文和长文本 fixture。
-7. License manifest entry。
+7. Provenance / license assessment；直接使用外部免费代码时必须有 manifest entry。
 8. 与 Mission / Task / Effect 状态的契约测试。
 
 ## 11. 依据
