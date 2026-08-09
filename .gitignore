@@ -1,0 +1,25 @@
+# Dependencies and builds
+node_modules/
+dist/
+build/
+out/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime and QA artifacts
+*.log
+.playwright-cli/
+output/
+coverage/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+desktop.ini

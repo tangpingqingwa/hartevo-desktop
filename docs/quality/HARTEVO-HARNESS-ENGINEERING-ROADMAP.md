@@ -1,0 +1,522 @@
+# Hartevo 垂直 Mission Harness 工程路线
+
+> **在 Hartevo Desktop 仓库中的状态：质量工程目标合同。** 任何完成声明必须由本仓库对应版本的 Mission Eval 与可重放证据重新证明。
+
+状态：**Target Contract**；不表示当前仓库已经实现全部组件
+Desktop 采用版本：2026-08-09-v1
+目标：让每次代码、模型、Prompt、Skill、Capability 或 Provider 变化都能回答“它是否更好地完成了 Hartevo 用户的增长业务目标”
+
+## 1. Harness 的主体是业务世界，不是 Prompt
+
+Hartevo Harness 必须能够运行一个有持续状态的业务世界：品牌有产品、市场、网站、历史内容、Partner、客户、订单和约束；时间会推进；用户会纠正目标；Provider 会失败；外部动作需要审批；结果会通过 Webhook 或测量返回。
+
+Harness 的最小有意义输出不是“模型回答符合预期”，而是：
+
+```text
+Mission 目标
+→ 初始项目世界
+→ 用户和系统事件
+→ Agent/Worker/Browser 执行轨迹
+→ Work Product 与领域状态变化
+→ Effect/Receipt/Verification
+→ Outcome/Attribution
+→ 下一轮决策
+→ 业务 Oracle 判定
+```
+
+单元测试、工具 Contract、SSE 顺序和安全测试仍是基础，但必须能归属到 Mission Checkpoint。
+
+## 2. Desktop 初始工程缺口
+
+Desktop 工程实现尚未开始，首个可发布版本必须补齐以下能力，不能继承其他代码库的完成度判断：
+
+| 领域 | 必须建立的 Harness 能力 |
+| --- | --- |
+| Product UI | 跨工作面 Journey Driver、可读 Work Product 验收、用户纠正和跨日连续性 |
+| Domain/API | 版本化业务 Fixture Loader、领域快照、业务不变量 Oracle |
+| Capability | Capability→Mission 覆盖账本、Provider 行为模拟、业务结果合同 |
+| Agent Runtime | 目标理解、动态 DAG、Replan、长周期连续性和 Work Product 质量 Eval |
+| Worker/Effect | 事件级故障注入、确定性时钟、跨队列 Journey 和结果回流 |
+| Browser | 可重放页面世界、Profile 所有权 Fixture、登录/验证码/崩溃脚本 |
+| CRM/Inbox/Partner | 关系生命周期、Consent、Supply Class、消息/订单/Commission 世界 |
+| Eval | Mission Manifest、World Fixture、Journey Runner、业务 Oracle、差异报告 |
+
+## 3. 目标架构
+
+```mermaid
+flowchart LR
+    M["Vertical Mission Manifest"] --> O["Mission Orchestrator"]
+    W["Versioned Business World"] --> O
+    U["User and Time Events"] --> O
+    O --> J["Journey Driver"]
+    J --> UI["Dioxus UI Driver"]
+    J --> API["Typed Domain Driver"]
+    J --> SYS["Webhook / Clock / Approval Driver"]
+    UI --> P["Hartevo Product Stack"]
+    API --> P
+    SYS --> P
+    P --> T["Unified Product Trace"]
+    P --> S["Domain State Snapshots"]
+    P --> A["User-visible Artifacts"]
+    T --> R["Mission Result Engine"]
+    S --> R
+    A --> R
+    D["Deterministic and Expert Oracles"] --> R
+    R --> G["Release Gate and Handoff"]
+    R --> F["Failure Minimizer / Replay Pack"]
+    F --> W
+```
+
+## 4. 建议目录
+
+```text
+evals/
+  missions/
+    vm-00-current-state.yaml
+    vm-01-seo-operator.yaml
+    vm-02-ai-visibility-operator.yaml
+    vm-03-site-foundation.yaml
+    vm-04-social-matrix.yaml
+    vm-05-email-acquisition.yaml
+    vm-06-partner-affiliate.yaml
+    vm-07-new-market-decision.yaml
+    vm-08-marketplace-operator.yaml
+    vm-09-b2b-pipeline.yaml
+    vm-10-inbox-handoff.yaml
+    vm-11-mission-outcome.yaml
+  worlds/
+    projects/
+    truth/
+    crm/
+    conversations/
+    partners/
+    commerce/
+    websites/
+  providers/
+    search/
+    ai-ground-truth/
+    marketplace/
+    channels/
+    partner-networks/
+    stripe/
+    email/
+  artifacts/
+    documents/
+    images/
+    feeds/
+    expected/
+  oracles/
+    deterministic/
+    recomputable/
+    rubrics/
+  variants/
+  baselines/
+  reports/
+tools/eval/
+  mission-runner/
+  world-loader/
+  provider-simulator/
+  trace-collector/
+  report-generator/
+```
+
+目录名是目标合同；创建前应与仓库现有测试脚本和构建方式对齐。
+
+## 5. Business World Fixture
+
+### 5.1 世界状态
+
+每个 Fixture 是可版本化、可重置、可复算的业务世界，至少包含：
+
+- Tenant、User、Membership、Session 和 Project；
+- Brand、Product、Audience、Market、Conversion Route；
+- 网站页面、Sitemap、Schema、CTA 和历史版本；
+- Buyer Question、Evidence、Ground Truth 和 Provider 估算；
+- Campaign、Content、Publication 和 Measurement；
+- Partner Identity、Supply Class、Program、Relationship、Link/Coupon；
+- Person、Company、Opportunity、Consent、Task、Note；
+- Inbox、Contact、Conversation、Message、Assignment、Handoff；
+- Click、Lead、Order、Refund、Commission、Payout 和 Attribution；
+- Run、Task、Approval、Effect、Receipt、Verification、Cost 和 Event；
+- 时间、预算、权限、连接器状态和故障计划。
+
+### 5.2 来源与可信度
+
+Fixture 事实需要模拟真实 Hartevo Truth Graph：
+
+```yaml
+factId: fact_product_compatibility_01
+subject: product:mxzone-filter-a
+predicate: compatible_with
+value: shark-nv360
+source:
+  type: tenant_document
+  artifact: product-manual.pdf
+  locator: page:12
+observedAt: 2026-06-01T00:00:00Z
+validFrom: 2026-06-01T00:00:00Z
+confidence: 1.0
+status: confirmed
+supersedes: null
+```
+
+冲突 Fixture 同时包含营销页面声称、产品手册、用户确认和过期 CRM 记录，使系统必须做证据分级，而不是只测试读取成功。
+
+### 5.3 可复算商业事件
+
+订单、退款、佣金和归因不能是自由文本。Fixture 必须提供可独立计算的期望结果：
+
+```yaml
+order:
+  id: order-1001
+  amountMinor: 12999
+  currency: EUR
+  occurredAt: 2026-07-10T10:00:00Z
+touches: [citation-01, publication-02, partner-click-03]
+refunds:
+  - amountMinor: 3000
+    occurredAt: 2026-07-20T10:00:00Z
+program:
+  attributionWindowDays: 30
+  commissionBps: 1200
+expected:
+  netRevenueMinor: 9999
+  commissionMinor: 1200
+```
+
+## 6. Mission Manifest 与 Checkpoint
+
+Manifest 以 `HARTEVO-EVAL-SCENARIO-CATALOG.md` 的业务 Mission 为准。Runner 需要支持：
+
+- 初始世界和用户 Persona；
+- 业务目标、硬约束和允许的 Effect；
+- 多轮用户输入、附件、审批、人工接管和系统事件；
+- 虚拟时间推进到小时、天、周或退款窗口；
+- Checkpoint 的前置条件、用户可见状态和完成标准；
+- 必须/允许/禁止 Capability 类别；
+- Work Product、领域状态和 Outcome Oracle；
+- 成本、时限、人工交互和 Provider 调用预算；
+- 故障、恢复和替代路径。
+
+Runner 还必须理解 `operatingContract`：
+
+- `mode`：一次决策、一次建设、Campaign、持续经营或持续关系；
+- `cadence`：即时、每日、每周、每月或事件触发；
+- `autonomy`：自动读取、自动出 Draft、预批准动作和逐次审批边界；
+- `targetMetrics`：该 Mission 自己的成功指标；
+- `stopConditions`：用户暂停、预算耗尽、连接失效、目标达成或活动到期；
+- `completionPolicy`：正常结束还是进入下一周期。
+
+Harness 必须断言 Hartevo 只执行实现当前目标所需的能力子图。SEO Mission 不应因为系统拥有 Partner/CRM 能力就自动打开它们；一次市场决策也不应被强制变成长期 Campaign。
+
+Checkpoint 示例：
+
+```yaml
+id: vm02.evidence-ready
+after: [vm02.context-confirmed]
+expect:
+  userVisibleStage: Building the German market evidence baseline
+  workProducts: [market-evidence-pack, buyer-question-map]
+  domainState:
+    audiences: {min: 1, market: DE}
+    evidence: {min: 8, provenanceCoverage: 1.0}
+  capabilities:
+    requiredAny: [research.discover, visibility.scan]
+    forbidden: [publication.publish, partner.engage, domain.purchase]
+  decision:
+    separates: [confirmed_fact, provider_estimate, agent_inference, unknown]
+```
+
+## 7. Journey Driver
+
+### 7.1 三种入口同一业务状态
+
+Journey Driver 必须能组合：
+
+1. **Dioxus UI Driver**：模拟用户从登录、项目选择、总调度、任务、渠道、CRM、达人、连接与设置操作；
+2. **Domain/API Driver**：适用于 Webhook、Partner Signup、Credential Claim 和确定性系统事件；
+3. **Time/Operator Driver**：推进时间、批准/拒绝、人工接管、重启组件、恢复连接器。
+
+同一 Mission 可以从总调度开始、在任务或业务工作面查看 Work Product、在 CRM 审批跟进、由 Webhook 接收回复，再回到总调度复盘。Harness 不应把每个工作面当成独立产品。
+
+### 7.2 用户行为不是固定 Prompt
+
+Driver 必须支持：
+
+- 用户中途改变市场、受众、预算、时限和禁用渠道；
+- 指代已有 Work Product 或“第二个方案”；
+- 上传文件、纠正事实、要求遗忘；
+- 离线后返回、跨设备/Session 继续；
+- 只批准部分内容或部分 Partner；
+- 对建议提出反问、拒绝或要求依据；
+- 等待数天后接收搜索、AI、CRM、订单和退款事件。
+
+## 8. Provider Simulator
+
+Simulator 不只返回 HTTP 状态码，而要模拟业务语义。
+
+| Provider World | 必须支持的行为 |
+| --- | --- |
+| Search/DataForSEO | 有结果、空结果、估算、市场/语言差异、429、异步任务、过期结果 |
+| AI Ground Truth | 问题/模型/回答/引用、登录状态、页面变化、人工接管、结果不稳定 |
+| Marketplace/Sorftime | 商品、销量估算、评论、Listing、不同市场和币种、字段缺失 |
+| Site/GitHub | 页面版本、PR、测试、Merge/Deploy、Provider Success 但 URL 不可用 |
+| Channel/Browser | API 发布、网页登录、验证码、Session 过期、重复提交、可见性验证 |
+| Partner Network | 认证权限、官方库存、关系状态、申请、Link、Transaction、Webhook |
+| CRM/Email | Consent、发送、Bounce、Reply、Unsubscribe、乱序线程和人工接管 |
+| Stripe | Checkout、Portal、成功/取消、重复 Webhook、退款和 Credits |
+| Commerce/Attribution | Click、Lead、Order、Refund、Commission、Payout、重复和乱序 |
+
+每个 Effect Provider 必须能模拟“外部已经执行，但客户端超时且 Receipt 未持久化”，以验证 `uncertain` 和独立核查。
+
+## 9. Product Trace
+
+### 9.1 用户目标级事件
+
+在现有事件信封基础上，Harness 需要能观察或推导：
+
+```text
+mission.started
+goal.confirmed / changed
+project.context.loaded
+fact.candidate_found / confirmed / conflicted / invalidated
+evidence.collection_started / ready
+decision.proposed / accepted / rejected
+plan.created / revised
+work_product.created / revised / accepted
+approval.requested / decided
+effect.proposed / executed / uncertain / verified
+relationship.changed
+message.received / sent / handed_off
+outcome.observed
+attribution.calculated / disputed
+next_loop.proposed / accepted
+mission.partial / completed / failed
+```
+
+这些事件是可审计的产品摘要，不是 Chain-of-Thought。
+
+### 9.2 必备关联字段
+
+- `missionId`、`scenarioVersion`、`worldVersion`、`checkpointId`；
+- `tenantIdHash`、`projectId`、`conversationId`、`runId`、`taskId`；
+- `workProductId`、`approvalId`、`effectId`、`receiptId`、`verificationId`；
+- `personId`、`companyId`、`partnerId`、`campaignId`、`publicationId`、`orderId` 的用途隔离引用；
+- `capability`、`effectClass`、`provider`、`model`、`skillDigest`、`schemaDigest`；
+- `sequence`、单调时间偏移、Queue/Execution/Persist/Render 时长；
+- Input/Output Digest，不复制 Secret、Prompt 原文或 PII；
+- Token、Provider Cost、Browser Time 和外部金额；
+- `failureClass`、`responsibility`、`recoveryAction`。
+
+### 9.3 用户可见步骤 Oracle
+
+Trace Collector 同时检查：
+
+- 第一条具体过程是否在相关正文之前；
+- 相同 Step ID 是否原位更新；
+- 是否长期重复“Working with project evidence”；
+- 等输入、等审批、排队、人工接管和 Provider 故障是否说明下一步；
+- 终态后是否仍出现正文或正在执行事件；
+- OpenInterpreter、MCP、私有 Tool Name、Thread/Harness ID、Migration ID、Secret 是否泄漏给用户。
+
+## 10. Oracle Stack
+
+### 10.1 确定性 Oracle
+
+- Tenant、Project、User、Profile 和 Credential Ownership；
+- Schema、状态机、版本、乐观锁和删除围栏；
+- Approval、Idempotency、Effect、Receipt、Verification 和 Audit；
+- Supply Class、Consent、人工接管和消息方向；
+- 金额、币种、订单、退款、Commission、Payout；
+- Webhook 验签、重复、乱序和 Provider→Project 路由；
+- URL/PR/Publication 是否真实存在；
+- Conversation/Run 连续性和事件顺序；
+- 禁止 Capability、预算和用户硬约束。
+
+### 10.2 可复算 Oracle
+
+- 关键词/排名/趋势公式和时间窗；
+- Evidence 覆盖、冲突和去重；
+- Partner/CRM 实体解析与评分；
+- DAG 合法性、依赖、关键路径和 Replan 差异；
+- Attribution、漏斗、Revenue、Refund 和 Commission；
+- 成本、延迟、队列、公平性和容量。
+
+### 10.3 专家与 Judge
+
+仅用于：
+
+- 市场决策是否合理；
+- Buyer Question 和内容是否对真实用户有价值；
+- Evidence Pack 是否足以支持决策；
+- Partner/Opportunity 排序理由是否可信；
+- Work Product 是否可被业务用户采用；
+- 下一轮 Continue/Stop/Scale/Test 建议是否适当。
+
+Judge 必须与至少 200 个双人专家样本校准；确定性 Oracle 冲突时以确定性 Oracle 为准。被测 Agent 不能评价自己的成功。
+
+## 11. Capability Coverage Harness
+
+版本声明支持的每个 Capability 都必须通过三层证据：
+
+1. **Contract**：输入、输出、Effect Class、权限、成本、超时和失败；
+2. **Mission Use**：在正确业务 Checkpoint 被选择，并产生有增量价值的状态/产物；
+3. **Outcome Link**：若声称影响业务结果，能够连接到 Verification、Outcome 或 Attribution。
+
+Harness 生成如下账本：
+
+```json
+{
+  "capability": "ground_truth.measure",
+  "contract": "PASS",
+  "missions": ["VM-02", "VM-11"],
+  "providerModes": ["simulator", "controlled-browser"],
+  "businessOutputs": ["ground-truth-run", "recommendation-evidence"],
+  "lastEvidenceLevel": "E3",
+  "gaps": ["real-provider sample below E4 threshold"]
+}
+```
+
+Agent Runtime 暴露的工具是受控入口；它们应映射到 Canonical Capability 和领域命令。Harness 不以“模型叫对了某个私有工具名”为用户价值，而以领域结果判断。
+
+## 12. Failure Minimizer 与 Replay Pack
+
+每个失败自动产出：
+
+- 最小 World State；
+- 最少用户轮次和系统事件；
+- Provider/Fault 脚本；
+- 关键 Trace；
+- 领域状态 Before/After；
+- 用户可见截图/Artifact；
+- 失败 Oracle、责任边界和复现命令；
+- 关联 Issue/Commit 和修复后的永久回归 ID。
+
+最小化不得删掉导致错误的业务上下文。例如 Partner 自动触达错误若依赖 Supply Class，就不能压缩成没有 Partner Identity 的通用 Tool Test。
+
+## 13. 本地执行层级
+
+| 层级 | 内容 | 目的 |
+| --- | --- | --- |
+| L0 | Manifest/World/Schema 校验、确定性 Oracle、静态安全 | 测试资产本身可信 |
+| L1 | Domain/Capability/Planner/Memory/Effect 组件测试 | 局部合同正确 |
+| L2 | Domain/SQLite/Worker/OpenInterpreter/Browser Simulator 集成 | Checkpoint 状态和故障恢复 |
+| L3 | Dioxus 跨工作面 Mission Journey | 用户可以完成目标、审阅产物和恢复 |
+| L4 | 本地 Release Candidate：P0 Mission、并发、Soak、差异报告 | 发布前完整证据 |
+| Controlled Provider | 真实模型、搜索、浏览器、渠道、Partner、Stripe 的低量对照 | 只验证本地不能复制的边界 |
+| Production | 健康、网络、配置和最小 Canary | 不承担普通逻辑调试 |
+
+执行顺序固定为先本地、再受控 Provider、最后最小生产 Canary；具体命令以仓库脚本为准。
+
+## 14. 分阶段实施
+
+### H0：Mission Foundation
+
+交付：
+
+- Mission/World/Checkpoint/Result JSON Schema；
+- `blank-brand-v1`、`conflicted-truth-v1`、`mxzone-de-market-v1`；
+- World Loader、虚拟 Clock、Domain Snapshot、Trace Collector；
+- VM-00 当前状态识别和 Operating Contract；
+- VM-01 SEO Operator 的最小 Baseline→Work Queue→Review Journey；
+- 统一 JSON/Markdown 报告。
+
+退出条件：同一 Commit 连跑三次状态和 Digest 一致；失败可一键重放。
+
+### H1：Core Growth Operators
+
+交付：
+
+- VM-01 SEO、VM-02 AI Visibility、VM-03 Site、VM-04 Social；
+- Search、GSC/Analytics、GT、Channel、Site/GitHub Simulator；
+- Truth/Evidence/Decision/Work Product Oracle；
+- Dioxus 总调度↔业务工作面跨入口 Journey；
+- 用户中途改 KPI、频率、自主级别、预算和渠道的 Replan。
+
+退出条件：系统能交付可审阅的业务决策和产物，不把通用回答算成功。
+
+### H2：Acquisition and Relationship Operators
+
+交付：
+
+- VM-05 Email、VM-06 Partner、VM-09 B2B Pipeline、VM-10 Inbox；
+- Partner/CRM/Email/Commerce/Stripe Simulator；
+- Approval、Uncertain、Receipt、Verification、Consent、Handoff、Refund 和 Payout Oracle；
+- Playwright 跨路由 Journey 和人工接管测试。
+
+退出条件：所有 External Effect 安全不变量通过，关系和经济状态可复算。
+
+### H3：Decision、Marketplace 与 Mission Outcomes
+
+交付：
+
+- VM-07 新市场决策、VM-08 Marketplace、VM-11 各经营目标 Outcome；
+- 跨周虚拟时间和事件驱动；
+- 各 Mission KPI→Attribution→正常结束或下一周期；
+- Skill Draft Eval 与权限检查；
+- 多模态 Artifact Intake；
+- 分池调度、并发、8 小时 Soak、成本曲线；
+- Production Bug 自动压缩为 Replay Pack。
+
+退出条件：本地可以证明 Hartevo 既能正确完成一次性决策，也能按用户选择持续经营 SEO、AI、社媒、邮件和 Partner，而不是把所有用户塞进同一个大循环。
+
+## 15. 一键命令目标合同
+
+建议最终提供稳定入口，名称可按仓库规范调整：
+
+```text
+eval validate-assets
+eval run --mission VM-01 --world mxzone-seo-established-v1 --mode local
+eval run --suite p0 --mode local-rc
+eval replay --failure <failure-id>
+eval compare --baseline <release> --candidate <commit>
+eval report --run <eval-run-id>
+```
+
+命令必须失败关闭：工作区/Commit 不匹配、World 不可重置、样本不足、必需 Gate 缺失、零容忍失败时不能输出 `passed=true`。
+
+## 16. 报告产物
+
+- `mission-summary.json`：十二条 Mission 的状态、成熟度和失败 Checkpoint；
+- `mission-results.jsonl`：每次变体的输入摘要、世界版本、结果和 Trace；
+- `capability-ledger.json`：Capability→Mission→Provider→证据等级；
+- `business-state-diff.json`：领域状态 Before/After；
+- `metrics.json`：MGCR、VBOR、LCR、时序、成本、资源和返工；
+- `artifacts/`：用户可见 Work Product、页面截图和 Verification；
+- `regressions.md`：相对基线的业务改善和退化；
+- `release-handoff.md`：可直接用于发布决策的摘要。
+
+## 17. 回归门禁
+
+- 任一零容忍失败：立即阻断；
+- P0 Mission 从 PASS 变 FAIL/NOT_IMPLEMENTED：阻断；
+- MGCR、VBOR 或 LCR 下降超过 2 个百分点：阻断并人工复核；
+- 高影响事实/金额/Consent/Attribution 错误：阻断；
+- 新版本产生更多 Narrative-only Completion 或 False Complete：阻断；
+- Work Product 接受率下降超过 5 个百分点：阻断；
+- p95 或单位 Mission 成本回退超过门槛且无批准解释：阻断；
+- 仅 Judge 分数变化、确定性状态不变：抽样专家复核，不自动修改 Oracle。
+
+## 18. 禁止的 Harness 反模式
+
+- 以 `hello`、标准命令句或一次 Tool Call 代表产品质量；
+- 按 INT/TOL/MEM/PERF 分类堆数量，却没有完整业务 Mission；
+- 只检查 Agent 是否调用工具，不检查领域状态和用户产物；
+- 只测 GEO 分数，不测 SEO→GDO、Conversion、Partner、CRM 和 Attribution；
+- 把 Draft、Plan、Provider Success 或 CRM Stage 记为业务结果；
+- 用固定九角色或固定步骤替代动态目标规划；
+- 用 LLM Judge 判定金额、租户、Consent、Effect 和 Attribution；
+- 为通过测试静默改 Fixture 或 Oracle；
+- 生产首次发现会话、流式、审批、发布和恢复错误；
+- 用单次成功截图覆盖长期 Mission、失败路径和下一轮。
+
+## 19. 路线图完成定义
+
+Mission Harness 达到产品级必须满足：
+
+1. 十二条垂直 Mission 均有可执行合同；声明为当前支持的 Mission 可在本地版本化业务世界中运行；
+2. 总调度、任务、业务工作面、Worker、Browser 和 Provider 能组成同一个 Journey；
+3. 结果由 Work Product、领域状态、Receipt、Verification、Outcome 和 Attribution 共同判断；
+4. Capability 的价值能回到具体 Mission，不再以工具数量计完成；
+5. 任何生产问题都能变成可本地重放的业务 Fixture；
+6. 生产部署只验证真实环境边界，不再承担第一次产品功能发现。

@@ -1,0 +1,39 @@
+# Hartevo Desktop 事实源规则
+
+本文定义本仓库内部的文档权威关系，防止后续再次出现多个版本互相冲突。
+
+## 1. 当前事实源
+
+| 问题 | 权威文件 |
+| --- | --- |
+| 产品为谁服务、解决什么问题 | `/PRODUCT.md` |
+| 为什么采用 Rust/OpenInterpreter、产品线怎样启动 | `/docs/product/HARTEVO-DESKTOP-RUST-OPENINTERPRETER-RFC.md` |
+| 用户怎样操作、界面怎样响应 | `/docs/product/HARTEVO-DESKTOP-INTERACTION-SPEC.md` 与 `/prototype/index.html` |
+| 组件怎样协作、谁拥有事实和权限 | `/docs/architecture/HARTEVO-DESKTOP-ARCHITECTURE.md` |
+| Agent UI 组件怎样实现与授权 | `/docs/design/AI-AGENT-UI-COMPONENT-GUIDE.md` |
+| 怎样判定完成与允许发布 | `/docs/quality/` 下的四份质量合同 |
+
+## 2. 冲突处理
+
+1. 实际代码和可重放测试证据优先于完成声明。
+2. 原型负责视觉与交互细节，交互规格负责行为语义；两者不一致时必须在同一个变更中修正，不能长期并存。
+3. 架构文档负责组件所有权与安全边界，RFC 负责重大决策及其理由；实现不得静默改变两者。
+4. Quality 文档定义目标和 Gate，不证明某个版本已经通过。通过结果必须绑定 Commit、环境、场景版本和证据位置。
+5. 本仓库之外的旧文档只能作为来源或历史证据，不能直接覆盖本仓库当前事实。
+
+## 3. 文档状态
+
+本仓库只使用三种状态：
+
+- **Current**：当前实现与产品决策必须遵守。
+- **Accepted**：已经决策，等待或正在实现。
+- **Target Contract**：目标与验收合同，不代表已经实现。
+
+历史文档不进入主分支。需要保留时放入独立 Archive Release，不与 Current 文档混排。
+
+## 4. 更新要求
+
+- 产品层级、默认导航、自然语言入口、外部动作边界或数据所有权变化，必须同时更新交互规格、架构和相应 Eval。
+- 上游 OpenInterpreter 基线变化，必须更新 RFC，记录 release、commit、license、App Server schema digest、Harness 行为和迁移影响。
+- 每个 Release Candidate 必须生成独立的 Eval 结果，不修改质量合同来适配失败实现。
+- 文档中的“已完成”“已连接”“已验证”必须链接到对应的代码或测试证据。
