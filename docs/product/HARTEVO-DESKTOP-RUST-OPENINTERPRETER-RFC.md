@@ -1,7 +1,7 @@
 # Hartevo Desktop Rust 与 OpenInterpreter 基座 RFC
 
 状态：**Accepted**
-版本：1.1
+版本：1.2
 日期：2026-08-09
 审查基线：`openinterpreter/openinterpreter@984acc698cd038885ecb0b82721402b01e11a5ad`
 
@@ -47,6 +47,12 @@ Hartevo Desktop 采用 Rust-first 架构：产品代码、桌面 Shell、领域�
 4. **开放模型优化主要针对 coding。** “接近 Codex”必须用 Hartevo Mission Eval 重新证明，不能从代码任务表现外推到增长经营。
 5. **上游很大且变化快。** 直接在 `codex-core` 堆叠业务逻辑会快速失去上游同步能力。
 6. **App Server 的一部分字段仍是 experimental。** Hartevo 必须固定 schema digest，并在升级前跑契约测试。
+
+### 2.3 Hermes Agent 的位置
+
+OpenInterpreter 是主代码与 Agent Runtime 基座，但不是 Hartevo 唯一的能力参考。Hermes Agent v0.20 在 mid-turn redirect、长期任务调度、上下文微压缩、工具自恢复、grounded citations、Artifacts、Quick Entry、智能审批、A2A、签名 webhook、语音和桌面扩展方面有值得吸收的成熟机制。
+
+Hartevo 不运行 Hermes Python Core，不采用其 Electron Desktop，也不维护第二个 Agent Loop。相关机制按照 [Hermes Agent v0.20 → Hartevo Rust 能力引入清单](../research/HERMES-AGENT-V0.20-RUST-CAPABILITY-INTAKE.md) 分级，在 Hartevo-owned Rust crates 中重构；与 OpenInterpreter 已有能力重叠时优先包装 OpenInterpreter。
 
 ## 3. 产品对象与运行时对象的边界
 

@@ -8,6 +8,7 @@
 | --- | --- |
 | 产品为谁服务、解决什么问题 | `/PRODUCT.md` |
 | 为什么采用 Rust/OpenInterpreter、产品线怎样启动 | `/docs/product/HARTEVO-DESKTOP-RUST-OPENINTERPRETER-RFC.md` |
+| Hermes 的哪些能力需要用 Rust 重构、哪些不能照搬 | `/docs/research/HERMES-AGENT-V0.20-RUST-CAPABILITY-INTAKE.md` |
 | 用户怎样操作、界面怎样响应 | `/docs/product/HARTEVO-DESKTOP-INTERACTION-SPEC.md` 与 `/prototype/index.html` |
 | 组件怎样协作、谁拥有事实和权限 | `/docs/architecture/HARTEVO-DESKTOP-ARCHITECTURE.md` |
 | Agent UI 组件怎样实现与授权 | `/docs/design/AI-AGENT-UI-COMPONENT-GUIDE.md` |
@@ -35,5 +36,6 @@
 
 - 产品层级、默认导航、自然语言入口、外部动作边界或数据所有权变化，必须同时更新交互规格、架构和相应 Eval。
 - 上游 OpenInterpreter 基线变化，必须更新 RFC，记录 release、commit、license、App Server schema digest、Harness 行为和迁移影响。
+- 引入新的 Hermes-inspired 能力时，必须先更新 Hermes 能力引入清单，记录固定版本、Rust owner、与 OpenInterpreter 的重叠、许可证路径和 Hartevo Eval 场景。
 - 每个 Release Candidate 必须生成独立的 Eval 结果，不修改质量合同来适配失败实现。
 - 文档中的“已完成”“已连接”“已验证”必须链接到对应的代码或测试证据。
