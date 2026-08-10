@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：产品验收场景合同。** 场景定义可以继承，历史实现状态不能继承；Desktop 每个 Release Candidate 必须产生自己的执行结果与证据。
 
 状态：**Target Contract**；实际完成度必须由 Harness 报告证明
-Desktop 采用版本：2026-08-10-v3
+Desktop 采用版本：2026-08-10-v4
 依据：本仓库产品、交互与架构合同
 
 ## 1. 正确的测试主体
@@ -45,6 +45,7 @@ Mission 可以是：
 id: VM-01
 version: 1
 title: Continuous SEO growth operator
+datasetPartition: vertical-dev
 persona: owner_with_existing_website
 fixture: mxzone-seo-established-v1
 businessGoal:
@@ -445,7 +446,13 @@ P0 本地使用 Fixture 和 Simulator，不依赖生产凭据或真实外部写�
 - 每个重大生产问题压缩为 Mission Checkpoint 或横切 Fixture。
 - 不只围绕 MXZONE；覆盖 DTC、B2B、Marketplace、本地服务、不同市场和语言。
 - 一次性与持续经营 Mission 分开评估。
-- Prompt/Skill/模型调优集与盲测集隔离。
+- 数据分为 `generic-public`、`vertical-dev`、`vertical-holdout`、`fresh-shadow` 和 `production-replay`；每个 Case 只能属于一个固定 partition revision。
+- Prompt/Skill/模型/Harness 调优只能读取 `generic-public` 与 `vertical-dev`；`vertical-holdout` 和 `fresh-shadow` 的 Prompt、World delta、Rubric、Oracle、gold artifact 与失败 Trace 对 Target/Optimizer 均不可见。
+- `fresh-shadow` 在 Candidate 冻结后由领域专家或新生产 Replay 编写；同一 Candidate 不得根据其结果继续修改后再重复声称样本外通过。
+- 每个 P0 Mission Family 在对外声称能力提升前，目标至少覆盖 20 个开发组合、10 个私有 Holdout 组合和 5 个冻结后新鲜组合；不足时标记 `INSUFFICIENT_OOS_EVIDENCE`。
+- Holdout 访问必须使用隔离 Evaluator 身份、一次性 Run grant、有界输出和审计；泄漏后立即废弃对应 Benchmark revision。
+- 公开 SWE-bench、Terminal-Bench 等只进入 Generic Benchmark Registry；其题目、答案或 verifier 不得重新包装成 Hartevo 私有 Holdout。
+- Dataset manifest 保存来源、许可证、作者/生成方式、时间范围、污染 canary、已知坏题、环境 digest、scorer 和修订历史。
 - 安全、金额、Consent 和状态不交给 LLM Judge。
 - 业务事实变化时升级 Fixture 版本，不为让新实现通过而静默改 Oracle。
 
@@ -456,5 +463,6 @@ P0 本地使用 Fixture 和 Simulator，不依赖生产凭据或真实外部写�
 1. 十二条 Mission 均有机器 Manifest、版本化 Fixture 和适用的 Business Oracle；
 2. Hartevo 能从用户现状直接进入目标，不强制固定 Onboarding 或六层流水线；
 3. SEO、AI 可见性、无网站建站、社媒、邮件、Partner 六类核心经营目标有持续 Loop；
-4. Capability、UI、Runtime、Worker、Browser 和 Provider Trace 能回到具体 Mission/Checkpoint；
-5. 报告能回答 Hartevo 正在替用户经营什么、依据是什么、执行了什么、指标如何变化、何时暂停或进入下一周期。
+4. 通用公开基准、垂直开发集、私有 Holdout 与冻结后新鲜集有独立版本、权限、污染记录和样本外报告；
+5. Capability、UI、Runtime、Worker、Browser 和 Provider Trace 能回到具体 Mission/Checkpoint；
+6. 报告能回答 Hartevo 正在替用户经营什么、依据是什么、执行了什么、指标如何变化、何时暂停或进入下一周期。

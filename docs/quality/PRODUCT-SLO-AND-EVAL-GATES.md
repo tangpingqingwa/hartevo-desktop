@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：发布质量下限。** 数值门槛和 Gate 顺序作为首版合同；若工程实现需要调整，必须通过新的 RFC 修改，不能在发布时临时跳过。
 
 状态：**Target Contract**；不表示当前生产已经达到所有门槛
-Desktop 采用版本：2026-08-10-v3
+Desktop 采用版本：2026-08-10-v4
 适用范围：Rust/Dioxus Desktop、Hartevo Domain Kernel、Effect Broker、OpenInterpreter Runtime、Browser Runtime、SQLite/Cloud Storage、Connector 和 Provider 边界
 
 ## 1. 发布必须证明什么
@@ -68,6 +68,7 @@ G0 Identity and project truth
 → G4 Attribution and next loop
 → G5 UX, performance and continuity
 → G6 Reliability, security, capacity and cost
+→ G7 Benchmark integrity and out-of-sample generalization
 → Controlled Provider Canary
 ```
 
@@ -348,7 +349,7 @@ Run、Effect、Outbox 和 Verification 的 Lease 到期后必须进入确定性�
 - 新版本单位 Mission 成本回退 >20% 时阻断，除非质量收益获批且仍在硬预算内；
 - 流式优化不得产生无界事件和数据库写放大。
 
-## 12. 样本与比较合同
+## 12. G7：Benchmark 完整性与样本外泛化
 
 - 确定性状态、Effect、安全、金额和事件测试必须逻辑上 100% 通过，不依赖统计概率。
 - 每个 P0 Mission 的确定性核心至少运行 10 个 World/Variant 组合；关键竞态连续重复运行。
@@ -356,6 +357,17 @@ Run、Effect、Outbox 和 Verification 的 Lease 到期后必须进入确定性�
 - 开放式业务质量集必须覆盖多个行业、市场、语言和项目成熟度，不能只对 MXZONE 调优。
 - 真实付费 Provider Canary 使用最小有意义样本并报告原始数据；只有样本足够才用统计分位数做门禁。
 - 每份结果绑定 Commit、镜像、模型、Prompt、Skill、MCP/Capability Schema、Mission、World 和 Judge 版本。
+
+Harness/Prompt/Skill/Route Candidate 还必须满足：
+
+- Formal Baseline 与 Candidate 使用完全相同的模型、Provider route、effort、预算、环境、重试策略、scorer 和运行次数；
+- 公开通用 Benchmark、垂直开发集、私有 Holdout 和冻结后 Fresh Shadow 分开报告，不混成一个总分；
+- Target/Optimizer 对 V1/V2 Prompt、Rubric、Oracle、gold artifact 和失败 Trace 的读取次数必须为 `0`；一旦泄漏，Benchmark revision 立即作废；
+- 只在开发集提升而 Holdout/Fresh 不提升时，结论为 `BENCHMARK_OVERFIT`，禁止通用晋升；
+- 只对一个模型有效时只能晋升为 model-specific Harness Profile，不宣传为通用 Harness 增益；
+- 至少报告 paired difference、重复次数、无效 Run、失败 Run、成本和适用置信区间；样本不足为 `INCONCLUSIVE`；
+- Generic Benchmark 回归不能由垂直分数掩盖，垂直业务失败也不能由 SWE-bench/Terminal-Bench 高分掩盖；
+- Public leaderboard 数字必须带 model、provider、harness、version、budget、dataset revision 与 source，不能只展示品牌名和百分比。
 
 不得删除慢样本、只保留重试成功、把降级答案记为完整成功，或把 Provider 失败从用户可见成功率中消失。
 
@@ -404,12 +416,17 @@ Canary 仅验证：
 
 ```json
 {
-  "schemaVersion": "2.0.0",
+  "schemaVersion": "2.1.0",
   "passed": false,
   "releaseCommit": "<40-char-sha>",
   "imageDigests": {},
   "environment": "local-rc|controlled-provider|production",
-  "missionCatalogVersion": "desktop-2026-08-10-v3",
+  "missionCatalogVersion": "desktop-2026-08-10-v4",
+  "genericBenchmarkRegistryVersion": "<version>",
+  "datasetPartitionRevision": "<version>",
+  "contaminationAuditDigest": "<digest>",
+  "benchmarkMatrix": {},
+  "oosGeneralization": {},
   "worldVersions": {},
   "capabilitySchemaDigest": "<digest>",
   "modelAndPrompt": {},
@@ -468,4 +485,5 @@ SLO 失败必须生成 Owner、缓解措施和本地 Replay Fixture，只写“�
 5. 性能、连续性、恢复、容量和成本满足已声明 SLO；
 6. 真实 Provider Canary 只验证环境边界且结果符合授权范围；
 7. 相比上一生产版本没有通过技术指标掩盖业务体验或目标完成度回退；
-8. 用户能明确知道 Hartevo 为其业务做了什么、依据是什么、哪些动作真实发生、产生了什么结果，以及下一步是什么。
+8. Harness/Prompt/Skill/Route 改动通过私有 Holdout 与冻结后 Fresh Shadow，没有 Benchmark 泄漏或样本内过拟合；
+9. 用户能明确知道 Hartevo 为其业务做了什么、依据是什么、哪些动作真实发生、产生了什么结果，以及下一步是什么。

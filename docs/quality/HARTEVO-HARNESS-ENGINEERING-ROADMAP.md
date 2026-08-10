@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：质量工程目标合同。** 任何完成声明必须由本仓库对应版本的 Mission Eval 与可重放证据重新证明。
 
 状态：**Target Contract**；不表示当前仓库已经实现全部组件
-Desktop 采用版本：2026-08-10-v3
+Desktop 采用版本：2026-08-10-v4
 目标：让每次代码、模型、Prompt、Skill、Capability 或 Provider 变化都能回答“它是否更好地完成了 Hartevo 用户的增长业务目标”
 
 ## 1. Harness 的主体是业务世界，不是 Prompt
@@ -79,10 +79,113 @@ flowchart LR
     F --> W
 ```
 
+### 3.1 Benchmark Stack：通用基准是地基，不是产品终点
+
+Hartevo 使用同一套可追溯 Runner 连接公开通用 Benchmark 与自有垂直 Mission，但两者回答不同问题：
+
+| 层 | 数据可见性 | 回答的问题 | 能否单独放行产品 |
+| --- | --- | --- | --- |
+| G0 Runtime Contract | 公开 | Tool schema、sandbox、patch、terminal、stream、resume 是否正确 | 否 |
+| G1 Public Generic | 公开 | Hartevo Runtime/Harness 在主流 Agent 工作负载中是否有基本竞争力 | 否，只用于生态比较与通用回归 |
+| V0 Vertical Development | 开发者、Target 与 Optimizer 可见 | 怎样改善 Hartevo 的十二类 Mission 和已知失败 | 否，属于样本内优化 |
+| V1 Private Holdout | 只对隔离 Evaluator 可见 | Candidate 是否泛化到未见行业、市场、表达和失败组合 | 是，Candidate 必经 Gate |
+| V2 Fresh Rolling Shadow | 冻结后新编写，Target/Optimizer 不可见 | 数据分布变化、Benchmark 污染和长期过拟合是否已经发生 | 是，发布与季度能力声明必经 Gate |
+| V3 Controlled Provider / Production Replay | 最小授权范围 | 本地无法复制的真实 Provider、账号和网络边界 | 只能补充，不能替代 V1/V2 |
+
+首批 G1 Registry：
+
+| Benchmark | Hartevo 用途 | 采用边界 |
+| --- | --- | --- |
+| Terminal-Bench 2.1 | terminal、长命令、环境配置、重试、循环检测、进程生命周期与任务恢复 | 固定 task/repository/container 版本；公开题可用于诊断，不能作为唯一晋升集 |
+| SWE-bench family | patch、测试、代码仓库理解和修改闭环；用于站点、Connector、Recipe 与 Rust 工程能力 | 每个变体单独 pin；Verified 只保留兼容趋势，优先引入可复现的更新/Live split；不把公开榜单分数当成垂直业务能力 |
+
+后续引入 OS、浏览器、研究、Office 或 MCP 类公开基准时，必须先进入 `GenericBenchmarkRegistry`，记录来源、许可证、版本、环境 digest、公开/隐藏状态、污染风险、已知坏题、评分器和 Harness adapter。公开数据集的题目、答案或 verifier 不得被复制进 V1/V2 后再声称为私有样本外测试。
+
+Terminal-Bench 2.1 本身说明了为什么必须版本化：它修正了 2.0 中 89 题里的 28 题，问题包含外部依赖漂移、资源不匹配和任务/测试错配。Benchmark 分数是 `model + harness + provider route + environment + budget + dataset revision + scorer` 的联合结果，不是模型或 Harness 的单一属性。
+
+### 3.2 Cline / Kimi K3 案例应怎样解读
+
+Cline 公开文章报告了同一 Terminal-Bench 2.1 上的以下过程：stock Cline + Kimi K3 经 OpenRouter 为 `69/89 = 77.5%`；合并 Candidate 为 `77/89 = 86.5%`；确认 Run 为 `79/89 = 88.8%`。改动包括限流重试、output-aware loop detection、异步存活修复和避免 `pkill` 自杀，且文章说明没有修改 verifier、按 task name 分流或膨胀 timeout。这证明 Benchmark 驱动可以发现真实的 Harness 可靠性问题。
+
+但这篇公开报告没有给出独立样本外测试；诊断、修改和确认仍围绕 TB2.1。Moonshot 同时报告 Kimi K3 + Kimi Code 在 TB2.1 为 `88.3%`。两者 Provider route、Harness、成本、运行配置与实验过程并不完全一致，不能用 `88.8 vs 88.3` 证明 Cline 普遍优于 Kimi Code。更谨慎的结论是：优化后的 Cline 把 Kimi K3 从明显低于其专用 Harness 的位置提升到同一成绩区间，而是否能迁移到新任务分布仍需 OOS 证明。
+
+Hartevo 因此禁止以下宣传捷径：
+
+- 只报告 Candidate 在被反复查看的公开 Benchmark 上的最高分；
+- 把不同 Provider、模型参数、Harness、预算、重试和环境的分数直接相减；
+- 用“通用修复看起来合理”替代新任务分布验证；
+- 把一次 confirmation run 称为稳定泛化；
+- 把模型专用 Harness 追平后的成绩全部归因于自我改进系统。
+
+### 3.3 模型、Harness 与泛化增益拆解
+
+每次比较定义完整配置：
+
+```text
+Score = S(model, provider_route, harness, effort, budget,
+          benchmark_revision, environment_digest, scorer, repetitions)
+```
+
+同一 Candidate 至少报告：
+
+| 指标 | 定义 |
+| --- | --- |
+| `DevGain` | 同模型、Provider、预算和环境下，Candidate 与 Baseline 在 V0 的配对差 |
+| `HoldoutGain` | Candidate 与 Baseline 在 V1 的配对差；Target/Optimizer 从未读取样本或失败 Trace |
+| `FreshGain` | Candidate 与 Baseline 在冻结后新编写 V2 的配对差 |
+| `CrossModelTransfer` | 至少两个模型家族上是否保持非负，并明确 model-specific 例外 |
+| `GenericTransfer` | G1 中 terminal/patch/recovery 等通用能力是否改善且无主流回归 |
+| `VerticalMissionGain` | MGCR、VBOR、LCR、Work Product 接受率与零容忍不变量的变化 |
+| `EfficiencyGain` | 每个完成 Mission 的 Token、成本、时长、重试和人工分钟变化 |
+
+模型原生/专用 Harness（例如 Kimi K3 + Kimi Code）是外部参考线，不自动成为 Hartevo Formal Baseline。Formal Baseline 必须与 Candidate 使用相同模型、Provider route、effort、预算、环境和运行次数；否则只显示并排结果，不计算 `HarnessGain`。
+
+若 Candidate 只对一个模型有效，允许以 `model-specific Harness Profile` 晋升，但不能宣称为通用 Harness 改进。若 V0 提升而 V1/V2 无提升，结论是 `BENCHMARK_OVERFIT`；若样本量不足或置信区间无法区分，结论是 `INCONCLUSIVE`，不能用最高单次分数替代。
+
+### 3.4 Hartevo Vertical Benchmark 的构造方式
+
+Hartevo 借鉴公开 Agent Benchmark 的工程结构，不复制其考试答案：固定环境、机器可读任务、受控工具、有限预算、最终 Artifact、确定性 Verifier、完整 Trace 和可复现实验。垂直层在此基础上增加业务世界、身份/权限、时间、用户修正、Provider 事件、外部 Effect 和 Outcome。
+
+每个垂直 Case 至少包含：
+
+```text
+Case Manifest
+├─ Mission goal / KPI / stop condition
+├─ Project and business-world snapshot
+├─ user, clock, provider and fault event script
+├─ allowed capabilities / data / effect scope
+├─ token, cost, time, retry and concurrency budget
+├─ expected work products and state transitions
+├─ private deterministic/recomputable oracle
+├─ contamination canary and provenance
+└─ failure taxonomy / replay contract
+```
+
+十二条 Mission 的公开开发集可以放在仓库中；V1 private holdout 的 Prompt、World delta、Rubric、Oracle 和 gold artifact 不进入产品仓库、Target Context、Optimizer Trace 或普通 CI log。V2 每季度由领域专家和生产 Replay 重新补充，冻结后才允许运行 Candidate。
+
+在对外声称 Harness 或模型能力提升前，每个 P0 Mission Family 目标至少覆盖 `20` 个 V0 组合、`10` 个 V1 组合和 `5` 个冻结后 V2 组合；不足时可以继续工程开发，但报告必须标记 `INSUFFICIENT_OOS_EVIDENCE`。
+
+### 3.5 Candidate 晋升合同
+
+Candidate 必须在完全配对的 Run Matrix 中与 Baseline 比较：相同模型、Provider route、effort、环境、预算、并发、重试策略和重复次数。晋升同时满足：
+
+1. V0 改善可解释到 Trace、状态或可靠性机制，而不是只看总分；
+2. V1 没有 P0 Mission、零容忍、安全、Effect 或事实回归，并出现可重复的净改善；
+3. V2 不出现 `BENCHMARK_OVERFIT`，新行业、市场、语言和表达保持稳定；
+4. 至少两个模型家族非负，否则只晋升为明确的 model-specific profile；
+5. G1 没有 terminal、patch、recovery、cost 或 latency 的未批准重大退化；
+6. 使用 paired bootstrap / McNemar 等适用统计方法报告区间；样本不足时保持 `INCONCLUSIVE`；
+7. 单位 Mission 成本、耗时、重试和人工审核符合 Release Gate；
+8. Evaluator、Optimizer 与 Target 身份、Context、网络和存储隔离，且访问审计为零泄漏。
+
 ## 4. 建议目录
 
 ```text
 evals/
+  benchmarks/
+    generic/               # pinned public benchmark adapters; not product gates
+    vertical-dev/          # V0 repository-visible Hartevo cases
+    manifests/             # V1/V2 metadata only; private content stored separately
   missions/
     vm-00-current-state.yaml
     vm-01-seo-operator.yaml
@@ -123,6 +226,7 @@ evals/
     rubrics/
   variants/
   baselines/
+  benchmark-registry/
   reports/
 tools/eval/
   mission-runner/
@@ -433,6 +537,8 @@ Agent Runtime 暴露的工具是受控入口；它们应映射到 Canonical Capa
 
 - Mission/World/Checkpoint/Result JSON Schema；
 - HarnessProfile、BenchmarkRevision、RunMatrix、CandidateBundle 与 PromotionDecision Schema；
+- GenericBenchmarkRegistry、DatasetPartition、ContaminationRecord 与 OOS Report Schema；
+- Terminal-Bench 2.1 与一个 pin 后的 SWE-bench family adapter；
 - `blank-brand-v1`、`conflicted-truth-v1`、`mxzone-de-market-v1`；
 - World Loader、虚拟 Clock、Domain Snapshot、Trace Collector；
 - VM-00 当前状态识别和 Operating Contract；
@@ -487,6 +593,8 @@ Agent Runtime 暴露的工具是受控入口；它们应映射到 Canonical Capa
 eval validate-assets
 eval run --mission VM-01 --world mxzone-seo-established-v1 --mode local
 eval run --suite p0 --mode local-rc
+eval run --benchmark terminal-bench-2.1 --profile <profile>
+eval run --partition vertical-holdout --candidate <candidate-id>
 eval replay --failure <failure-id>
 eval compare --baseline <release> --candidate <commit>
 eval optimize-harness --profile <profile> --benchmark <revision> --rounds <n>
@@ -506,6 +614,8 @@ eval report --run <eval-run-id>
 - `artifacts/`：用户可见 Work Product、页面截图和 Verification；
 - `regressions.md`：相对基线的业务改善和退化；
 - `candidate-promotion-decision.json`：候选质量、安全、成本、延迟、稳定性与晋升/回滚结论；
+- `benchmark-matrix.json`：model/provider/harness/budget/environment/dataset/scorer 的完整配对结果；
+- `oos-generalization.json`：DevGain、HoldoutGain、FreshGain、CrossModelTransfer 与污染审计；
 - `release-handoff.md`：可直接用于发布决策的摘要。
 
 ## 17. 回归门禁
@@ -519,6 +629,8 @@ eval report --run <eval-run-id>
 - p95 或单位 Mission 成本回退超过门槛且无批准解释：阻断；
 - 仅 Judge 分数变化、确定性状态不变：抽样专家复核，不自动修改 Oracle。
 - Candidate 的分数由模型写入、Baseline/Candidate Run matrix 不一致或样本不足：结果为 `INCONCLUSIVE`，禁止晋升。
+- Candidate 只在 V0/公开 Benchmark 提升而 V1/V2 不提升：结果为 `BENCHMARK_OVERFIT`，禁止通用晋升。
+- V1/V2 Prompt、Rubric、Oracle、gold artifact 或失败 Trace 被 Target/Optimizer 读取：该 Benchmark revision 作废并轮换。
 
 ## 18. 禁止的 Harness 反模式
 
@@ -531,6 +643,9 @@ eval report --run <eval-run-id>
 - 用 LLM Judge 判定金额、租户、Consent、Effect 和 Attribution；
 - 让 Target 或 Optimizer 读取私有 Rubric、holdout Case，或修改 Fixture、Oracle、Gate；
 - 用单 Run Baseline 对比多 Run Candidate，或因 Judge 均值略高就声称自我进化成功；
+- 在同一公开题集上反复 hill climb 后，把 confirmation run 当成样本外泛化；
+- 直接比较不同 Provider route、effort、预算、重试、环境或 scorer 的总分并归因于 Harness；
+- 只公布 best-of-N，不公布失败 Run、无效 Run、重复次数、成本和置信区间；
 - 让模型自报 Goal complete 代替 Work Product、Receipt、Verification 和 Outcome；
 - 为通过测试静默改 Fixture 或 Oracle；
 - 生产首次发现会话、流式、审批、发布和恢复错误；
@@ -547,3 +662,12 @@ Mission Harness 达到产品级必须满足：
 5. 任何生产问题都能变成可本地重放的业务 Fixture；
 6. 生产部署只验证真实环境边界，不再承担第一次产品功能发现。
 7. Harness/Prompt/Skill/Route 的任何自动优化都经过冻结 Benchmark、隔离 Candidate、可复算 Gate、Canary 和可回滚晋升。
+8. 通用公开 Benchmark、垂直开发集、私有 Holdout 和滚动新鲜集均有独立版本、访问边界、污染记录与配对报告。
+
+## 20. 公开基准与案例依据
+
+- [Terminal-Bench 2.1 发布说明](https://www.tbench.ai/news/terminal-bench-2-1)
+- [Cline：Recursive Self Improvement for Coding Agents](https://cline.bot/blog/recursive-self-improvement-for-coding-agents)
+- [Kimi K3 官方评测与 Harness 说明（固定提交）](https://github.com/MoonshotAI/Kimi-K3/tree/3cb39dfd32e51c3328e2e4b4af21341247d06c43)
+- [SWE-bench Verified 与 Bash-only 对照](https://www.swebench.com/verified.html)
+- [OpenAI：SWE-bench Verified 的污染与评分问题](https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/)

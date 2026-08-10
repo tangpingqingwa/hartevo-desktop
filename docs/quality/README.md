@@ -33,4 +33,5 @@ Product SLO and Eval Gates
 - 环境缺失报告 `BLOCKED_ENV`，能力不存在报告 `NOT_IMPLEMENTED`，不能用 `SKIP` 隐藏。
 - 外部动作场景必须检查 Scope、Consent、Approval、Idempotency、Receipt 与 Verification。
 - 长任务场景必须检查 Context Capsule 隔离、压缩不变量、Worker authority、分支回流、Runtime-independent resume 和成本归因。
+- 公开通用 Benchmark 只证明基础竞争力；Harness 晋升必须同时通过 Hartevo 垂直开发集、私有 Holdout 和 Candidate 冻结后的 Fresh Shadow。
 - 失败必须生成可重放的最小 Replay Pack，进入下一次回归。

@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：完成度口径。** 本仓库在 Harness 可运行后生成按 Commit 固定的 Scorecard。
 
 状态：**Target Contract**；分数只能由版本化 Eval 证据生成
-Desktop 采用版本：2026-08-10-v3
+Desktop 采用版本：2026-08-10-v4
 适用范围：Rust/Dioxus Desktop、Hartevo Domain Kernel、Effect Broker、OpenInterpreter Runtime、Browser Runtime、SQLite/Cloud Storage、Connector 和 Provider 边界
 
 ## 1. 完成度回答的不是“写了多少代码”
@@ -226,6 +226,22 @@ SEO→AEO→GEO→GAO→GMO→GDO 是 Hartevo 可选择的能力坐标，不是�
 
 首 Token 很快但过程重复、结果错误或等待很久不算体验成熟。高并发 HTTP RPS 也不能代替“成功 Mission/小时”。
 
+### 12.1 Harness 泛化与 Benchmark 指标
+
+公开 SWE-bench、Terminal-Bench 等成绩单独展示，不进入 Hartevo Business Mission 总分。Harness 改进必须在相同模型、Provider route、effort、预算、环境、重试、数据 revision 和运行次数下做配对比较：
+
+| 指标 | 定义 | 晋升要求 |
+| --- | --- | --- |
+| Generic Benchmark Compatibility | 固定公开通用集上的 terminal/patch/recovery 基础能力 | 无未批准重大回归 |
+| DevGain | Candidate 相对 Baseline 在可见垂直开发集的变化 | 用于诊断，不单独证明泛化 |
+| HoldoutGain | Candidate 在不可见私有垂直集的配对变化 | P0/零容忍无回归，且改善可重复 |
+| FreshGain | Candidate 冻结后在新行业、市场、表达与故障组合的变化 | 不得出现 `BENCHMARK_OVERFIT` |
+| CrossModelTransfer | 同一 Candidate 在至少两个模型家族的变化 | 通用 Profile 应非负；否则标为 model-specific |
+| OOS Generalization Gap | `DevGain - min(HoldoutGain, FreshGain)` | 持续扩大时阻断并调查过拟合 |
+| Harness Efficiency Gain | 完成 Mission 的 Token、成本、时长、重试和人工分钟变化 | 遵守成本与延迟 Gate |
+
+只报告 best-of-N、把不同 Harness/Provider/预算成绩直接相减、或用一次 confirmation run 代替样本外测试，均不产生完成度分数。样本不足时结论是 `INCONCLUSIVE`，不是“基本有效”。
+
 ## 13. Capability Coverage Ledger
 
 每个 Canonical Capability 必须在报告中连接到业务目标，而不是只有单元测试：
@@ -269,6 +285,7 @@ Capability 只有在至少一个 Mission 中达到 E3，才算“业务集成”
 - Effect、Receipt、Verification 和 Attribution 证据；
 - MGCR、VBOR、LCR、返工、成本和时间；
 - 相对上一生产版本的改善/退化；
+- 公开通用 Benchmark 矩阵、Formal Baseline、Dev/Holdout/Fresh 配对增益、Cross-model transfer、置信区间与污染审计；
 - `NOT_IMPLEMENTED`、`BLOCKED_ENV` 和真实 Provider 阻塞；
 - Commit、镜像、模型、Prompt、Skill、Schema、Fixture 和 Judge 版本。
 

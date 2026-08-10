@@ -1,7 +1,7 @@
 # Hartevo Desktop Rust 与 OpenInterpreter 基座 RFC
 
 状态：**Accepted**
-版本：1.5
+版本：1.6
 日期：2026-08-10
 审查基线：`openinterpreter/openinterpreter@984acc698cd038885ecb0b82721402b01e11a5ad`
 
@@ -195,7 +195,7 @@ Hartevo 提供面向用户的预设，例如“快速整理”“平衡执行”
 
 ## 9. 低成本模型验证策略
 
-OpenInterpreter 的 Harness 是候选策略，不是质量承诺。每个 Provider/Model/Harness 组合必须在 Hartevo Mission Catalog 上得到版本化结果：
+OpenInterpreter 的 Harness 是候选策略，不是质量承诺。每个 Provider/Model/Harness 组合先运行 pin 后的 Terminal-Bench、SWE-bench family 等公开通用 Benchmark，证明 terminal、patch、工具、恢复与生态基础竞争力；再在 Hartevo Mission Catalog 上得到版本化垂直结果：
 
 - Goal / Constraint 保真率。
 - Tool selection 与参数正确率。
@@ -205,7 +205,7 @@ OpenInterpreter 的 Harness 是候选策略，不是质量承诺。每个 Provid
 - Receipt / Verification / Outcome 完整度。
 - 首 Token、总时长、Token、Provider 成本和人工返工。
 
-同一模型至少比较 `native`、推荐 Harness 和 Hartevo Growth Harness。只有在质量、成本和安全同时达到 Gate 时，才进入默认模型列表。
+同一模型至少比较 `native`、推荐 Harness 和 Hartevo Growth Harness。Formal Baseline 与 Candidate 必须固定相同 Provider route、effort、预算、环境、重试和运行次数；公开通用集、垂直开发集、私有 Holdout 与 Candidate 冻结后的 Fresh Shadow 分开报告。只有样本外质量、成本和安全同时达到 Gate 时，才进入默认模型列表。公开榜单高分不能替代 Hartevo Business Mission 证据。
 
 ## 10. AI CSS 采用边界
 

@@ -43,5 +43,6 @@
 - 引入新的 PenguinHarness-inspired 机制时，必须固定来源版本，并证明它没有创建第二 Agent Loop、第二 wire protocol、模型自评分或可改写 Gate 的自我优化通道。
 - 引入新的 Ego Lite-inspired 机制时，必须固定公开代码 commit，区分 MIT helper 与闭源浏览器边界，并证明 Profile、Cookie、Browser Workspace、控制租约和外部 Effect 不会跨 Project 或绕过审批。
 - 引入新的 Prime Agent-inspired 机制时，必须固定稳定 Release 与代码审查 commit，并证明它没有创建第二 Agent Runtime、执行模型生成的任意 Python、把 Session/Kernel 当成 Mission 事实源、让 child 扩大权限，或让 Continual Harness 绕过 Candidate Eval 与签名晋升。
+- Generic Benchmark Registry、垂直 Dataset partition、私有 Holdout 或 Fresh Shadow 合同变化，必须同步升级四份 Quality 文档版本；公开榜单成绩不能覆盖垂直 Mission 失败，开发集提升不能表述为样本外泛化。
 - 每个 Release Candidate 必须生成独立的 Eval 结果，不修改质量合同来适配失败实现。
 - 文档中的“已完成”“已连接”“已验证”必须链接到对应的代码或测试证据。

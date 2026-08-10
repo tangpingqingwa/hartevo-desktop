@@ -72,10 +72,11 @@ hartevo-desktop/
 
 ## 下一阶段
 
-下一步应在本仓库补齐三个实现合同，然后开始首个垂直切片：
+下一步应在本仓库补齐四个实现合同，然后开始首个垂直切片：
 
 1. OpenInterpreter bootstrap、完整来源历史与 App Server schema pin。
 2. `hartevo-rs` Workspace、Domain Contract 与 Runtime Adapter 协议。
-3. 将 Hermes v0.20 R0、PenguinHarness Candidate Lab、Ego Lite-inspired Browser Workspace 和 Prime Agent-inspired Context Fabric 合同写入 MVP Implementation Backlog、Dioxus Shell 与首批 Mission Harness。
+3. Generic Benchmark Registry、Terminal-Bench/SWE-bench adapter、垂直开发集、私有 Holdout 与 Fresh Shadow 的隔离存储和 Runner。
+4. 将 Hermes v0.20 R0、PenguinHarness Candidate Lab、Ego Lite-inspired Browser Workspace 和 Prime Agent-inspired Context Fabric 合同写入 MVP Implementation Backlog、Dioxus Shell 与首批 Mission Harness。
 
 首个可运行切片应完成：自然语言目标 → Mission 编译 → 研究与 Work Product → 外部动作审批 → Receipt / Verification → Outcome，而不是先完成大量空模块。
