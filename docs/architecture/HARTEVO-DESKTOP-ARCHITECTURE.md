@@ -1,7 +1,7 @@
 # Hartevo Desktop 当前架构合同
 
 状态：**Accepted**
-版本：2.1
+版本：2.2
 日期：2026-08-10
 
 本文定义 Rust Hartevo Desktop 的组件所有权、进程边界、数据流和安全不变量。产品行为以交互规格与 v12 原型为准；上游采用理由以 Rust/OpenInterpreter RFC 为准。
@@ -58,6 +58,7 @@ User / Organization
 │                                                             │
 │  UI State ─ Application Service ─ Domain Kernel             │
 │                       │              │                       │
+│                 Context Fabric       │                       │
 │                       │              ├─ SQLite / Event Log   │
 │                       │              ├─ Effect Broker        │
 │                       │              └─ Sync Projection      │
@@ -200,6 +201,25 @@ OpenInterpreter 不拥有 Project、Mission、Consent、Effect 或 Outcome。
 
 不确定的外部写入、付款或可能重复触达不能自动重试。
 
+### 4.10 Context Fabric 与 Worker Registry
+
+Context Fabric 是 Hartevo-owned Rust application/storage 组件，负责把长周期 Mission 的上下文从单一模型窗口外置为可持久化、可压缩、可分支和可恢复的状态：
+
+- `ContextWorkspace`：绑定 Project、Mission、runtime generation、Context Budget 和数据策略。
+- `WorkingSet`：保存 typed value、Evidence / Work Product reference、查询快照、TTL 和 provenance。
+- `ContinuationLedger`：保存 Goal、KPI、Constraint、Decision、用户纠正、Task、Blocker、Pending Effect 和下一步。
+- `ContextCapsule`：只向一个 Worker 投影完成局部任务必需的事实、约束、能力、预算和 return contract。
+- `ContextBranch`：记录 fork 原因、parent、scope、status、merge / abandon policy 与 lineage。
+- `WorkerRegistry`：保存 worker identity、lease、generation、runtime mapping、usage 和 result status。
+- `ContextCheckpoint`：保存恢复所需的领域 revision、open work、Effect 状态和 stream cursor。
+- `CompactionRecord`：append-only 保存 source range、结构化摘要、不可丢失不变量、provenance coverage、模型和配置。
+
+Context Fabric 不拥有 Project Truth、Consent、Approval、Effect、Receipt、Verification 或 Outcome。它引用 Domain Kernel 的版本化对象，模型窗口、LLM 摘要、Runtime Thread、Session JSONL、Python variable 或 child result 都不能直接覆盖领域事实。
+
+Worker Graph 属于一个 Mission 的执行投影：Task 可以映射为不同模型、Provider、OpenInterpreter Thread、Browser 或 Connector Worker；用户仍只看到 Mission、任务、证据、产物和等待状态。child 的 Project、Mission、Capability、数据、Secret 和 Effect authority 必须是 parent authority 与当前 Mission Scope 的严格子集。
+
+Prime Agent-inspired goal、heartbeat、schedule、message 和 retained worker 与 Hermes-inspired 长期调度统一实现；Continual Harness 只生成 Penguin-inspired `HarnessCandidateState`，不能直接修改 active Harness、权限、Rubric、Oracle 或 Release Gate。完整采用边界见 [Prime Agent → Hartevo Rust Context Fabric 能力引入清单](../research/PRIME-AGENT-RUST-CONTEXT-FABRIC-INTAKE.md)。
+
 ## 5. Runtime 与 Domain 双层审批
 
 ```text
@@ -260,12 +280,13 @@ Hartevo 保存的是用户可理解的 preset 与底层版本化配置，不把�
 1. 用户在项目总调度输入目标或修正方向。
 2. Application Service 调用 Domain Kernel 建立或更新 Mission Contract。
 3. Domain Kernel 生成当前 Project Context、Capability Scope 和待执行 Task。
-4. Runtime Adapter 创建或恢复 OpenInterpreter Thread，注入有界上下文和动态工具。
-5. Runtime stream 持续转为 Live Work；任务与工作面自动同步。
-6. 研究和草稿直接形成 Evidence / Work Product 候选。
-7. 外部动作先成为 Pending Effect，由 Effect Broker 检查 Scope、Consent、Policy、Approval 和幂等。
-8. Connector 或 Browser 执行后写入 Receipt；Verifier 独立验证。
-9. Outcome 和 Attribution 回流 Truth Graph，生成 Continue、Stop、Scale 或 Test 决策。
+4. Context Fabric 建立或恢复 `ContextWorkspace`，从 Continuation Ledger、Working Set 和 Project Truth 组装有界 Context Capsule。
+5. Runtime Adapter 创建或恢复 OpenInterpreter Thread；并行任务通过 Worker Registry 获得独立 lease、generation、budget 和 Capsule。
+6. Runtime stream 持续转为 Live Work；Worker 结果、任务与工作面自动同步并保留 lineage。
+7. 研究和草稿直接形成 Evidence / Work Product 候选；压缩只生成 append-only record，不覆盖 typed invariant。
+8. 外部动作先成为 Pending Effect，由 Effect Broker 检查 Scope、Consent、Policy、Approval 和幂等。
+9. Connector 或 Browser 执行后写入 Receipt；Verifier 独立验证。
+10. Outcome 和 Attribution 回流 Truth Graph，生成 Continue、Stop、Scale 或 Test 决策。
 
 连接缺失只阻塞依赖该连接的 Task，不阻塞研究、草稿和其他可执行工作。
 
@@ -277,6 +298,8 @@ Hartevo 保存的是用户可理解的 preset 与底层版本化配置，不把�
 - 未知状态的外部 Effect进入 `verification_required`，不得盲目重放。
 - Thread resume 失败时可以创建新 runtime generation，但必须保留 Mission continuity。
 - 模型切换创建新的可审计 runtime config，不改写既有证据来源。
+- Context Workspace、Continuation Ledger、Worker Registry 和 Compaction Record 先于 Runtime 恢复；不可恢复的临时 Working Set 项必须显式列为缺口并重算，不能静默假装存在。
+- 旧 generation Worker、过期 lease 或分支回流不能覆盖新状态；其结果只能进入冲突审阅或被拒绝。
 
 ## 10. 安全不变量
 
@@ -288,6 +311,10 @@ Hartevo 保存的是用户可理解的 preset 与底层版本化配置，不把�
 - Provider accepted 不等于发布、送达或付款完成。
 - 所有外部 Effect 必须可审计、唯一执行并独立验证。
 - Harness、Skill、Plugin、Hook 和 MCP server 都是供应链执行资产，必须有来源、版本、权限和信任状态。
+- 模型生成的任意 Python、Node、shell program 和不可信 pickle/dill 不进入默认 Context 或 Capability 执行路径。
+- Compaction 不得丢失 Goal、Constraint、用户纠正、Evidence lineage、Consent、Approval、Pending Effect、Stop Condition 或 Work Product version。
+- Worker / Subagent authority 不能超过 parent 与 Mission Scope，且不能跨 Project 静默传递上下文。
+- Harness 自我改进只产生 Candidate；生产版本必须经过冻结 Benchmark、确定性 Oracle、安全回归、签名晋升和回滚合同。
 - UI 不展示私有 chain-of-thought；只展示可公开的 reasoning summary、证据和操作理由。
 
 ## 11. 版本合同
@@ -303,6 +330,8 @@ Hartevo 保存的是用户可理解的 preset 与底层版本化配置，不把�
 - `provider_catalog_version`
 - `harness_catalog_version`
 - `mission_catalog_version`
+- `context_fabric_schema_version`
+- `compaction_policy_version`
 - `ui_component_license_manifest_digest`
 
 上游升级必须通过 Runtime Adapter contract test、Mission smoke test、安全回归和 UI event snapshot。

@@ -1,7 +1,7 @@
 # Hartevo Desktop Rust 与 OpenInterpreter 基座 RFC
 
 状态：**Accepted**
-版本：1.4
+版本：1.5
 日期：2026-08-10
 审查基线：`openinterpreter/openinterpreter@984acc698cd038885ecb0b82721402b01e11a5ad`
 
@@ -66,6 +66,12 @@ Ego Lite 是 Browser Workspace / Human Handoff Reference。它的 Agent 专属�
 
 Hartevo 不运行 Ego Lite 的 TypeScript/Node helper，也不依赖其闭源、当前 macOS-only 的浏览器应用。相关机制按照 [Ego Lite → Hartevo Rust Browser Workspace 能力引入清单](../research/EGO-LITE-RUST-BROWSER-WORKSPACE-INTAKE.md) 在 Rust `browser-adapter` 中独立实现。默认迁移个人 Chrome Profile、执行任意 Node/页面脚本、无租约接管，以及利用浏览器身份绕过 Effect Broker 的做法不予采用。
 
+### 2.6 Prime Agent 的位置
+
+Prime Agent 是 Context Fabric / Long-Horizon Runtime Reference。它把模型当前窗口、持久工作状态、Context Branch、retained subagent、daemon-backed Session、自动压缩、目标、调度和 Continual Harness 组合起来，证明“长上下文”可以来自外置状态与可恢复 Worker Graph，而不只是扩大单次 Prompt。
+
+Hartevo 不运行 Prime Agent 的 TypeScript/Node Core、daemon、TUI、Python/IPython kernel 或 executable Python skills，也不维护第二个 Agent Runtime。相关机制按照 [Prime Agent → Hartevo Rust Context Fabric 能力引入清单](../research/PRIME-AGENT-RUST-CONTEXT-FABRIC-INTAKE.md) 在 Hartevo-owned Rust `application`、`storage`、`runtime-adapter` 与 `eval` 中实现。模型生成代码继承用户权限、best-effort pickle/dill snapshot、Session 等同于 Mission、child 越权和生产 Harness 直接自改写的做法不予采用。
+
 ## 3. 产品对象与运行时对象的边界
 
 | Hartevo 对象 | OpenInterpreter 对象 | 约束 |
@@ -88,6 +94,7 @@ Hartevo 不运行 Ego Lite 的 TypeScript/Node helper，也不依赖其闭源、
 | Desktop UI | Rust + Dioxus Desktop 0.7.x + RSX + plain CSS | 保持 Rust UI；兼容 HTML/CSS 设计资产；跨平台打包与系统访问；上游为 MIT/Apache-2.0 双许可 |
 | Desktop state | Rust signals + typed application state | Project、Mission 和运行时流式状态不经过 JS bridge |
 | Domain Kernel | 独立 Rust crates | 领域事实不进入 OpenInterpreter 私有 core |
+| Context Fabric | Rust typed working set + continuation ledger + worker graph | 长任务状态外置、可压缩、可分支、可恢复；模型窗口不是事实源 |
 | Local storage | SQLite + typed migrations | 本地优先、事务、可重放事件、离线项目 |
 | Optional cloud | Hartevo Cloud API + encrypted sync adapter | 创建项目不隐含上传 |
 | Agent Runtime | Pinned OpenInterpreter App Server | 开放模型 Harness、Codex 协议、工具、Skills、MCP、沙箱 |
@@ -111,6 +118,7 @@ Slint、Iced 或 WGPU/Skia 可以避免 WebView，但会失去 AI CSS 的可移�
 Hartevo Desktop (Rust + Dioxus)
 ├─ Hartevo Domain Kernel
 ├─ Project / Mission Store
+├─ Context Fabric / Worker Registry
 ├─ Effect Broker
 ├─ Runtime Supervisor
 │   └─ OpenInterpreter App Server (Rust child, stdio JSON-RPC)
@@ -122,6 +130,7 @@ Hartevo Desktop (Rust + Dioxus)
 - Desktop 进程拥有用户体验和 Hartevo 领域状态。
 - OpenInterpreter child 拥有模型请求、Agent loop、工具执行、local sandbox 和 runtime thread。
 - Runtime 只能看到当前 Project 明确授予的 workspace roots 和动态工具。
+- Context Fabric 只向每个 Runtime / Worker 投影最小 Context Capsule；child authority 永远是 parent 与 Mission Scope 的子集。
 - Effect Broker 独占外部写入能力；模型不能直接拿到社媒、邮件、CRM、广告或付款凭据。
 - Browser/Computer Adapter 独占登录 Profile 和人工接管状态。
 - Browser Workspace 是 Mission 执行资源，不是第二会话；用户接管后旧控制租约立即失效。
@@ -136,6 +145,7 @@ hartevo-rs/
   desktop/                 # Dioxus Desktop entrypoint
   ui/                      # Hartevo components and design tokens
   application/             # commands, queries, orchestrator projections
+    context-fabric/         # working set, capsules, branches, worker registry
   domain/                  # Project, Mission, Truth, CRM, Partner, Outcome
   storage/                 # SQLite, migrations, event log
   protocol/                # Hartevo-owned DTO and event schema
@@ -169,6 +179,7 @@ OpenInterpreter 源码保留在清晰的 upstream zone。首版通过协议组�
 | Dioxus Desktop Shell | Add | 当前冻结交互的 Rust 实现 |
 | Mission Harness | Add | 证明低成本模型在增长任务上的真实能力 |
 | Browser Workspace / Control Lease / Semantic Snapshot | Add | 在 Rust Browser Host 中实现 Project/Profile/Mission 隔离、人机接管和可验证自动化 |
+| Context Fabric / Worker Graph / Compaction Record | Add | 在 Rust Application/Storage 中实现长上下文、分支执行、压缩与恢复；不引入 Prime Agent runtime |
 
 ## 8. 模型、推理强度与速度
 
@@ -296,3 +307,6 @@ Hartevo 不购买 AI CSS 许可证。采用边界是：
 - [AI CSS pricing and usage terms](https://www.aicss.dev/pricing)
 - [Ego Lite repository](https://github.com/citrolabs/ego-lite)
 - [Ego Lite review commit](https://github.com/citrolabs/ego-lite/tree/c46a439e7fbad90ad33dbea6c6af329b6009809f)
+- [Prime Agent repository](https://github.com/PrimeIntellect-ai/prime-agent)
+- [Prime Agent v0.7.1](https://github.com/PrimeIntellect-ai/prime-agent/releases/tag/v0.7.1)
+- [Prime Agent review commit](https://github.com/PrimeIntellect-ai/prime-agent/tree/a18809e00ea30638584d87b3afea7285a9d7296c)

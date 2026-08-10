@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：完成度口径。** 本仓库在 Harness 可运行后生成按 Commit 固定的 Scorecard。
 
 状态：**Target Contract**；分数只能由版本化 Eval 证据生成
-Desktop 采用版本：2026-08-10-v2
+Desktop 采用版本：2026-08-10-v3
 适用范围：Rust/Dioxus Desktop、Hartevo Domain Kernel、Effect Broker、OpenInterpreter Runtime、Browser Runtime、SQLite/Cloud Storage、Connector 和 Provider 边界
 
 ## 1. 完成度回答的不是“写了多少代码”
@@ -201,8 +201,13 @@ SEO→AEO→GEO→GAO→GMO→GDO 是 Hartevo 可选择的能力坐标，不是�
 | Duplicate Step Cards | 同一工具/阶段重复展示 | ≤ 1% |
 | Internal Runtime Leakage | OpenInterpreter/MCP/内部 Thread、Harness 或迁移 ID 等用户不可理解术语 | 0 |
 | Constraint Retention | 市场、预算、受众、语言、禁用渠道和审批策略全程保持 | ≥ 99% |
+| Compaction Invariant Retention | Goal、纠正、Evidence lineage、Consent、Approval、Pending Effect、Stop Condition 和产物版本在压缩后保持 | 100% |
+| Context Capsule Isolation | Worker 只获得局部任务所需 Project/Mission 数据、能力和预算 | 100% |
+| Worker Authority Escalation | child / retained worker 超过 parent 或 Mission Scope | 0 |
+| Branch Merge Integrity | 分支回流不造成重复 Effect、事实静默覆盖或产物版本倒退 | 100% |
+| Runtime-independent Resume | 跨模型、Provider、Runtime generation、Desktop restart 和 compaction 恢复同一 Mission | ≥ 99.5% |
 | Failure Recovery | 失败后已有结果可见、输入可继续、责任和下一步明确 | ≥ 99% |
-| Cross-project Session/Memory Leakage | 0 |
+| Cross-project Session/Memory Leakage | 任一 Context、Memory 或 Runtime Session 跨项目进入当前 Mission | 0 |
 
 总调度和业务工作面是同一 Mission 的不同视图，不是两套业务状态。相同 Mission 在任一入口开始、查看或继续时必须共享 Project、Task、Approval、Work Product 和结果事实。
 

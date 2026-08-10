@@ -32,4 +32,5 @@ Product SLO and Eval Gates
 - 历史 Hartevo 得分不能继承给 Desktop。
 - 环境缺失报告 `BLOCKED_ENV`，能力不存在报告 `NOT_IMPLEMENTED`，不能用 `SKIP` 隐藏。
 - 外部动作场景必须检查 Scope、Consent、Approval、Idempotency、Receipt 与 Verification。
+- 长任务场景必须检查 Context Capsule 隔离、压缩不变量、Worker authority、分支回流、Runtime-independent resume 和成本归因。
 - 失败必须生成可重放的最小 Replay Pack，进入下一次回归。

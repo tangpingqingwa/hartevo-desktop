@@ -11,6 +11,7 @@
 | Hermes 的哪些能力需要用 Rust 重构、哪些不能照搬 | `/docs/research/HERMES-AGENT-V0.20-RUST-CAPABILITY-INTAKE.md` |
 | PenguinHarness 的哪些 Harness/Eval 机制需要重构 | `/docs/research/PENGUIN-HARNESS-RUST-CAPABILITY-INTAKE.md` 与 `/docs/quality/HARTEVO-HARNESS-ENGINEERING-ROADMAP.md` |
 | Ego Lite 的哪些 Browser Workspace、人机接管与语义自动化机制需要重构 | `/docs/research/EGO-LITE-RUST-BROWSER-WORKSPACE-INTAKE.md` 与 `/docs/architecture/HARTEVO-DESKTOP-ARCHITECTURE.md` |
+| Prime Agent 的哪些长上下文、持久工作集与 Worker Graph 机制需要重构 | `/docs/research/PRIME-AGENT-RUST-CONTEXT-FABRIC-INTAKE.md` 与 `/docs/architecture/HARTEVO-DESKTOP-ARCHITECTURE.md` |
 | 用户怎样操作、界面怎样响应 | `/docs/product/HARTEVO-DESKTOP-INTERACTION-SPEC.md` 与 `/prototype/index.html` |
 | 组件怎样协作、谁拥有事实和权限 | `/docs/architecture/HARTEVO-DESKTOP-ARCHITECTURE.md` |
 | Agent UI 组件怎样实现与授权 | `/docs/design/AI-AGENT-UI-COMPONENT-GUIDE.md` |
@@ -41,5 +42,6 @@
 - 引入新的 Hermes-inspired 能力时，必须先更新 Hermes 能力引入清单，记录固定版本、Rust owner、与 OpenInterpreter 的重叠、许可证路径和 Hartevo Eval 场景。
 - 引入新的 PenguinHarness-inspired 机制时，必须固定来源版本，并证明它没有创建第二 Agent Loop、第二 wire protocol、模型自评分或可改写 Gate 的自我优化通道。
 - 引入新的 Ego Lite-inspired 机制时，必须固定公开代码 commit，区分 MIT helper 与闭源浏览器边界，并证明 Profile、Cookie、Browser Workspace、控制租约和外部 Effect 不会跨 Project 或绕过审批。
+- 引入新的 Prime Agent-inspired 机制时，必须固定稳定 Release 与代码审查 commit，并证明它没有创建第二 Agent Runtime、执行模型生成的任意 Python、把 Session/Kernel 当成 Mission 事实源、让 child 扩大权限，或让 Continual Harness 绕过 Candidate Eval 与签名晋升。
 - 每个 Release Candidate 必须生成独立的 Eval 结果，不修改质量合同来适配失败实现。
 - 文档中的“已完成”“已连接”“已验证”必须链接到对应的代码或测试证据。

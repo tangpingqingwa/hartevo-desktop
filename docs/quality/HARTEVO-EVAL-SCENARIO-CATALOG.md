@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：产品验收场景合同。** 场景定义可以继承，历史实现状态不能继承；Desktop 每个 Release Candidate 必须产生自己的执行结果与证据。
 
 状态：**Target Contract**；实际完成度必须由 Harness 报告证明
-Desktop 采用版本：2026-08-10-v2
+Desktop 采用版本：2026-08-10-v3
 依据：本仓库产品、交互与架构合同
 
 ## 1. 正确的测试主体
@@ -359,7 +359,7 @@ Fixture 必须有确定性时间轴、Provider 返回、金额、实体关系和
 
 | 套件 | 核心断言 |
 | --- | --- |
-| `CTX-*` | 正确 Tenant/Project/User/Market/Time Scope；从现状继续 |
+| `CTX-*` | 正确 Tenant/Project/User/Market/Time Scope；从现状继续；压缩前后不变量与证据 lineage 不丢失 |
 | `INT-*` | 识别 Goal、KPI、Operating Mode、Cadence、Autonomy 和 Stop Condition |
 | `TRUTH-*` | 来源、版本、冲突、时效、纠正、删除和敏感信息策略 |
 | `PLAN-*` | 只规划所需能力子图；依赖、Replan、预算和部分完成正确 |
@@ -369,9 +369,10 @@ Fixture 必须有确定性时间轴、Provider 返回、金额、实体关系和
 | `REL-*` | Partner/CRM/Inbox 身份、Consent、关系状态和人工接管 |
 | `ATTR-*` | Mission KPI、事件、金额、币种、退款、Commission 和未归因 |
 | `MEM-*` | Conversation 连续、事实版本、跨项目隔离和删除后不可召回 |
+| `WRK-*` | Context Capsule 最小化、child authority 子集、Worker generation/lease、分支回流和成本归因 |
 | `UX-*` | 具体过程先于正文、持续进度、建议连接的理由和错误恢复 |
 | `SAFE-*` | 跨租户、Prompt Injection、Secret/PII、非法触达、CAPTCHA |
-| `REC-*` | Runtime/Worker/Browser/Postgres 重启、SSE、Lease、Dead Letter |
+| `REC-*` | Runtime/Worker/Browser/Postgres 重启、模型/Provider 切换、compaction、SSE、Lease、Dead Letter |
 | `PERF-*` | 交互不被长期 Operator 阻塞、流式连续、资源/成本有界 |
 
 ## 10. Business Oracle

@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：发布质量下限。** 数值门槛和 Gate 顺序作为首版合同；若工程实现需要调整，必须通过新的 RFC 修改，不能在发布时临时跳过。
 
 状态：**Target Contract**；不表示当前生产已经达到所有门槛
-Desktop 采用版本：2026-08-10-v2
+Desktop 采用版本：2026-08-10-v3
 适用范围：Rust/Dioxus Desktop、Hartevo Domain Kernel、Effect Broker、OpenInterpreter Runtime、Browser Runtime、SQLite/Cloud Storage、Connector 和 Provider 边界
 
 ## 1. 发布必须证明什么
@@ -278,6 +278,21 @@ D1/W1/L1 在运行期间任意 5 秒窗口内必须有具体进度、正文 Delt
 - 任务标题来自真实业务目标，不长期显示未命名；
 - 总调度与业务工作面中同一 Mission 的 Project/Runtime 映射稳定。
 
+### 10.5 Context Fabric 连续性
+
+| 指标 | Release Gate |
+| --- | ---: |
+| Compaction 后 Goal / Constraint / 用户纠正 / Evidence lineage / Pending Effect / Stop Condition 丢失 | 0 |
+| Context Capsule 跨 Tenant / Project / Mission 泄漏 | 0 |
+| child / retained worker authority 超过 parent 与 Mission Scope | 0 |
+| 旧 Worker generation 或过期 lease 覆盖当前状态 | 0 |
+| Branch merge 导致重复 Effect、事实静默覆盖或 Work Product version 倒退 | 0 |
+| 跨模型、Provider、Runtime crash、Desktop restart 与 compaction 恢复同一 Mission | ≥ 99.5% |
+| Context、Worker usage 与 Provider cost 可复算 | 100% |
+| Continual Harness Candidate 未经冻结 Benchmark 与签名晋升直接上线 | 0 |
+
+长上下文不以单次 Prompt Token 上限证明。Release 必须同时提交原始轨迹、Compaction Record、Continuation Ledger、Context Capsule、Worker Graph、恢复事件和业务 Oracle 结果。
+
 ## 11. G6：可靠性、恢复、安全、容量与成本
 
 ### 11.1 可靠性与恢复
@@ -288,6 +303,7 @@ D1/W1/L1 在运行期间任意 5 秒窗口内必须有具体进度、正文 Delt
 | F0/Q1 平台内部成功率 | ≥ 99.5% |
 | 用户可见成功率（含 Provider） | ≥ 99.0%，按 Provider 拆分 |
 | 已持久化 Mission/Run 重启后恢复 | ≥ 99.5% |
+| 已持久化 Context Workspace / Worker Graph 重启后恢复 | ≥ 99.5% |
 | 流事件无正文丢失、重复和错序 | ≥ 99.9% |
 | 重复/乱序 Webhook 业务正确率 | 100% |
 | Lease 导致重复外部效果 | 0 |
@@ -393,7 +409,7 @@ Canary 仅验证：
   "releaseCommit": "<40-char-sha>",
   "imageDigests": {},
   "environment": "local-rc|controlled-provider|production",
-  "missionCatalogVersion": "desktop-2026-08-10-v2",
+  "missionCatalogVersion": "desktop-2026-08-10-v3",
   "worldVersions": {},
   "capabilitySchemaDigest": "<digest>",
   "modelAndPrompt": {},

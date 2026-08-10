@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：质量工程目标合同。** 任何完成声明必须由本仓库对应版本的 Mission Eval 与可重放证据重新证明。
 
 状态：**Target Contract**；不表示当前仓库已经实现全部组件
-Desktop 采用版本：2026-08-10-v2
+Desktop 采用版本：2026-08-10-v3
 目标：让每次代码、模型、Prompt、Skill、Capability 或 Provider 变化都能回答“它是否更好地完成了 Hartevo 用户的增长业务目标”
 
 ## 1. Harness 的主体是业务世界，不是 Prompt
@@ -32,6 +32,12 @@ PenguinHarness 为本路线提供 Harness Candidate Lab 的工程参考：极简
 
 Hartevo 不采用“模型写最终 Score”“单 Run Baseline 对比多 Run Candidate”或“Optimizer 直接改写生产 Agent”的合同。Harness 的主体仍是版本化业务世界，最终指标由 Rust Result Engine、确定性/可复算 Oracle 和受限专家 Judge 共同产生。
 
+### 1.2 Prime Agent 的采用边界
+
+Prime Agent 为本路线提供 Context Fabric 的工程参考：外置 Working Set、Context Branch、retained worker、daemon detach / reattach、append-only Session Tree、自动压缩和 Continual Harness。具体采用与修正见 [Prime Agent Rust Context Fabric 引入清单](../research/PRIME-AGENT-RUST-CONTEXT-FABRIC-INTAKE.md)。
+
+Hartevo 不运行 Prime Agent daemon、IPython 或 executable Python skill，也不把 Session、kernel namespace 或 LLM summary 当作业务事实。其 Continual Harness 只能生成 Candidate，并进入 Penguin-inspired frozen Benchmark、Evaluator 隔离、Promotion 和 rollback；不能直接改写生产 Harness、权限、Oracle 或 Gate。
+
 ## 2. Desktop 初始工程缺口
 
 Desktop 工程实现尚未开始，首个可发布版本必须补齐以下能力，不能继承其他代码库的完成度判断：
@@ -41,7 +47,7 @@ Desktop 工程实现尚未开始，首个可发布版本必须补齐以下能力
 | Product UI | 跨工作面 Journey Driver、可读 Work Product 验收、用户纠正和跨日连续性 |
 | Domain/API | 版本化业务 Fixture Loader、领域快照、业务不变量 Oracle |
 | Capability | Capability→Mission 覆盖账本、Provider 行为模拟、业务结果合同 |
-| Agent Runtime | 目标理解、动态 DAG、Replan、长周期连续性和 Work Product 质量 Eval |
+| Agent Runtime | 目标理解、动态 DAG、Replan、Context Capsule、Worker Graph、压缩不变量、长周期连续性和 Work Product 质量 Eval |
 | Worker/Effect | 事件级故障注入、确定性时钟、跨队列 Journey 和结果回流 |
 | Browser | 可重放页面世界、Profile 所有权 Fixture、登录/验证码/崩溃脚本 |
 | CRM/Inbox/Partner | 关系生命周期、Consent、Supply Class、消息/订单/Commission 世界 |
@@ -337,6 +343,9 @@ Trace Collector 同时检查：
 - Webhook 验签、重复、乱序和 Provider→Project 路由；
 - URL/PR/Publication 是否真实存在；
 - Conversation/Run 连续性和事件顺序；
+- Context Capsule 的 Project/Mission 隔离、child authority 子集、Worker lease/generation 和预算归因；
+- Compaction 前后的 Goal、Constraint、用户纠正、Evidence lineage、Pending Effect、Stop Condition 与 Work Product version；
+- Context Branch merge 不产生重复 Effect、静默事实覆盖或产物版本倒退；
 - 禁止 Capability、预算和用户硬约束。
 
 ### 10.2 可复算 Oracle
@@ -399,6 +408,8 @@ Agent Runtime 暴露的工具是受控入口；它们应映射到 Canonical Capa
 - 关联 Issue/Commit 和修复后的永久回归 ID。
 
 最小化不得删掉导致错误的业务上下文。例如 Partner 自动触达错误若依赖 Supply Class，就不能压缩成没有 Partner Identity 的通用 Tool Test。
+
+长上下文失败的 Replay Pack 还必须包含压缩前 source range、`CompactionRecord`、Continuation Ledger revision、Context Capsule、Worker Graph、lease/generation、模型/Provider/Runtime 配置和回流消息。只有摘要文本而没有 typed invariant diff 的失败不能关闭。
 
 ## 13. 本地执行层级
 
