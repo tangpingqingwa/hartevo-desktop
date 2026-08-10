@@ -1,8 +1,8 @@
 # Hartevo Desktop Rust 与 OpenInterpreter 基座 RFC
 
 状态：**Accepted**
-版本：1.3
-日期：2026-08-09
+版本：1.4
+日期：2026-08-10
 审查基线：`openinterpreter/openinterpreter@984acc698cd038885ecb0b82721402b01e11a5ad`
 
 ## 1. 决策
@@ -60,6 +60,12 @@ PenguinHarness 是 Harness Engineering Reference。它的极简模型工具面�
 
 Hartevo 不运行 Penguin TypeScript Core、Hono Server、React Web 或 Electron Desktop，也不引入 OmniMessage 作为第二协议。相关机制按照 [PenguinHarness → Hartevo Rust Harness Lab 能力引入清单](../research/PENGUIN-HARNESS-RUST-CAPABILITY-INTAKE.md) 进入 `hartevo-rs/eval` 与 Hartevo-owned runtime adapters。模型自报完成、模型写入最终 Score、单 Run Baseline 和直接修改生产 Harness 的做法不予采用。
 
+### 2.5 Ego Lite 的位置
+
+Ego Lite 是 Browser Workspace / Human Handoff Reference。它的 Agent 专属浏览空间、登录状态复用、语义快照、稳定定位、批量浏览器动作、站点经验包，以及用户随时接管且 Agent 硬停止的机制，对 Hartevo 的渠道、社媒、CRM、达人和联盟执行很有价值。
+
+Hartevo 不运行 Ego Lite 的 TypeScript/Node helper，也不依赖其闭源、当前 macOS-only 的浏览器应用。相关机制按照 [Ego Lite → Hartevo Rust Browser Workspace 能力引入清单](../research/EGO-LITE-RUST-BROWSER-WORKSPACE-INTAKE.md) 在 Rust `browser-adapter` 中独立实现。默认迁移个人 Chrome Profile、执行任意 Node/页面脚本、无租约接管，以及利用浏览器身份绕过 Effect Broker 的做法不予采用。
+
 ## 3. 产品对象与运行时对象的边界
 
 | Hartevo 对象 | OpenInterpreter 对象 | 约束 |
@@ -88,7 +94,7 @@ Hartevo 不运行 Penguin TypeScript Core、Hono Server、React Web 或 Electron
 | Runtime transport | child process + stdio JSON-RPC v2 | 本地、无监听端口、崩溃隔离、可升级、边界清晰 |
 | Credentials | OS keyring，通过 Rust keyring adapter | Secret 不进入项目、Prompt、日志或 UI state |
 | Effect execution | Rust Effect Broker + typed provider workers | 幂等、审批、回执、验证和重试策略 |
-| Browser work | 受控 Browser/Computer adapter | Profile、人工接管、验证码和登录状态独立治理 |
+| Browser work | Rust Browser Host + 受控 Browser/Computer adapter | Project-bound Profile、Mission Workspace、独占控制租约、语义/视觉自动化与验证 |
 | Eval | Rust Mission Harness + provider simulators | 同一类型和状态机可用于产品与验收 |
 
 ### 4.1 为什么不是 Tauri + React
@@ -118,6 +124,7 @@ Hartevo Desktop (Rust + Dioxus)
 - Runtime 只能看到当前 Project 明确授予的 workspace roots 和动态工具。
 - Effect Broker 独占外部写入能力；模型不能直接拿到社媒、邮件、CRM、广告或付款凭据。
 - Browser/Computer Adapter 独占登录 Profile 和人工接管状态。
+- Browser Workspace 是 Mission 执行资源，不是第二会话；用户接管后旧控制租约立即失效。
 - 不在本地开放未认证 WebSocket；首版只使用 stdio。远程 Worker 必须经过独立身份、TLS 和租约设计。
 
 ## 6. Hartevo-owned Rust Workspace
@@ -161,6 +168,7 @@ OpenInterpreter 源码保留在清晰的 upstream zone。首版通过协议组�
 | Effect Broker / Verification | Add | 外部业务副作用治理 |
 | Dioxus Desktop Shell | Add | 当前冻结交互的 Rust 实现 |
 | Mission Harness | Add | 证明低成本模型在增长任务上的真实能力 |
+| Browser Workspace / Control Lease / Semantic Snapshot | Add | 在 Rust Browser Host 中实现 Project/Profile/Mission 隔离、人机接管和可验证自动化 |
 
 ## 8. 模型、推理强度与速度
 
@@ -223,7 +231,9 @@ Hartevo 不购买 AI CSS 许可证。采用边界是：
 - Provider tool result 不等于业务成功，必须有独立 Receipt 与 Verification。
 - Secret、Cookie、OAuth refresh token 和 API key 不进入 Prompt、项目文件、同步包或普通日志。
 - Runtime thread 只能绑定一个 Project execution scope；跨项目复用必须显式授权。
+- Browser Profile、Cookie、Workspace、Snapshot 和下载目录不得跨 Project 静默复用；用户接管后 Agent 不得继续排队动作。
 - 不确定的外部写入、付款和可能重复的触达禁止自动重试。
+- 页面 JavaScript、raw CDP、browser-authenticated fetch 和站点 Recipe 不得绕过 Effect Broker。
 - Harness prompt、第三方 Skill、Plugin 和 Hook 都按可执行供应链资产审查。
 - AI CSS 付费源码、CSS、SVG 及其派生复制品不得进入 Git 历史。
 
@@ -247,6 +257,7 @@ Hartevo 不购买 AI CSS 许可证。采用边界是：
 
 - Research、Evidence、Content、CRM/Creator 的首批 typed capability。
 - Effect Broker、审批、幂等、Receipt 和 Verification。
+- Rust Browser Workspace、managed profile、控制租约、语义 snapshot 与一个低风险渠道闭环。
 - 参考公开交互问题，独立实现 Hartevo Agent UI primitives 并完成品牌 token 化。
 - 至少两种低成本模型和一个强模型的 Mission Eval。
 
@@ -283,3 +294,5 @@ Hartevo 不购买 AI CSS 许可证。采用边界是：
 - [Dioxus v0.7.10](https://github.com/DioxusLabs/dioxus/releases/tag/v0.7.10)
 - [AI CSS component index](https://www.aicss.dev/llms.txt)
 - [AI CSS pricing and usage terms](https://www.aicss.dev/pricing)
+- [Ego Lite repository](https://github.com/citrolabs/ego-lite)
+- [Ego Lite review commit](https://github.com/citrolabs/ego-lite/tree/c46a439e7fbad90ad33dbea6c6af329b6009809f)

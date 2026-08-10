@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：产品验收场景合同。** 场景定义可以继承，历史实现状态不能继承；Desktop 每个 Release Candidate 必须产生自己的执行结果与证据。
 
 状态：**Target Contract**；实际完成度必须由 Harness 报告证明
-Desktop 采用版本：2026-08-09-v1
+Desktop 采用版本：2026-08-10-v2
 依据：本仓库产品、交互与架构合同
 
 ## 1. 正确的测试主体
@@ -211,7 +211,7 @@ Fixture 必须有确定性时间轴、Provider 返回、金额、实体关系和
 
 1. 根据目标受众、市场、内容能力和业务目标推荐渠道优先级，而不是把所有平台都列出来。
 2. 逐个平台解释连接价值、所需权限、人工登录和内容职责。
-3. Connector/Profile 真实验证后才显示可运营；验证码时请求人工接管。
+3. Connector/Profile 真实验证后才显示可运营；验证码时请求人工接管。接管提交后旧 Browser Lease 的点击、键盘、上传和请求全部硬停止；用户明确交还后从同一 Mission 与 Workspace 恢复。
 4. 建立渠道原生 Content Pillar、Calendar、格式、频率和 CTA。
 5. 自动产出 Draft 和素材需求；按预批准规则或逐项审批发布。
 6. 回复/互动只在平台政策、Consent 和用户授权内执行。
@@ -397,6 +397,7 @@ Mission 至少按适用范围选择：
 - 用户中途改 KPI、市场、预算、自主级别、频率和禁用渠道；
 - Connector 未授权、权限不足、过期和重新授权；
 - 冷/热 Session、断线、Runtime/Worker/Browser 重启；
+- 用户在 Browser action 排队或执行边界主动接管，随后选择继续或结束；
 - Provider 空结果、429、401/403、5xx、超时、重复和乱序；
 - 有审批、预批准、拒绝、额度不足和 `uncertain`；
 - GPT/DeepSeek 路由变化但业务合同稳定；

@@ -14,11 +14,12 @@ Hartevo Desktop 是面向增长负责人、品牌经营者和代理团队的 Age
 2. [Rust 与 OpenInterpreter 基座 RFC](./docs/product/HARTEVO-DESKTOP-RUST-OPENINTERPRETER-RFC.md)：对上游的技术审查、采用边界、Rust 栈、仓库策略和实施路线。
 3. [Hermes v0.20 Rust 能力引入清单](./docs/research/HERMES-AGENT-V0.20-RUST-CAPABILITY-INTAKE.md)：哪些 Hermes 前沿机制应由 Hartevo 用 Rust 重构，哪些不能照搬。
 4. [PenguinHarness Rust Harness Lab 引入清单](./docs/research/PENGUIN-HARNESS-RUST-CAPABILITY-INTAKE.md)：怎样吸收其极简工具面、Trace、Benchmark 与自我改进闭环，并修正不适合业务 Agent 的部分。
-5. [Desktop 交互规格](./docs/product/HARTEVO-DESKTOP-INTERACTION-SPEC.md)：当前冻结的产品层级、信息架构和完整交互。
-6. [Desktop 当前架构](./docs/architecture/HARTEVO-DESKTOP-ARCHITECTURE.md)：组件所有权、数据流、本地与云边界、安全不变量。
-7. [Agent UI 组件采用规范](./docs/design/AI-AGENT-UI-COMPONENT-GUIDE.md)：如何在 Dioxus 中参考 AI CSS，并处理授权、状态语义和可访问性。
-8. [质量与 Eval 入口](./docs/quality/README.md)：怎样证明 Mission 真正完成，而不只是界面或工具存在。
-9. [可交互原型](./prototype/index.html)：当前产品行为的最终视觉和交互参考。
+5. [Ego Lite Rust Browser Workspace 引入清单](./docs/research/EGO-LITE-RUST-BROWSER-WORKSPACE-INTAKE.md)：怎样吸收 Agent 专属浏览空间、登录复用、语义快照和人机接管，并修正闭源内核、任意脚本与 Profile 越界风险。
+6. [Desktop 交互规格](./docs/product/HARTEVO-DESKTOP-INTERACTION-SPEC.md)：当前冻结的产品层级、信息架构和完整交互。
+7. [Desktop 当前架构](./docs/architecture/HARTEVO-DESKTOP-ARCHITECTURE.md)：组件所有权、数据流、本地与云边界、安全不变量。
+8. [Agent UI 组件采用规范](./docs/design/AI-AGENT-UI-COMPONENT-GUIDE.md)：如何在 Dioxus 中参考 AI CSS，并处理授权、状态语义和可访问性。
+9. [质量与 Eval 入口](./docs/quality/README.md)：怎样证明 Mission 真正完成，而不只是界面或工具存在。
+10. [可交互原型](./prototype/index.html)：当前产品行为的最终视觉和交互参考。
 
 ## 当前冻结的产品决策
 
@@ -47,6 +48,7 @@ hartevo-desktop/
     design/
       AI-AGENT-UI-COMPONENT-GUIDE.md
     research/
+      EGO-LITE-RUST-BROWSER-WORKSPACE-INTAKE.md
       HERMES-AGENT-V0.20-RUST-CAPABILITY-INTAKE.md
       PENGUIN-HARNESS-RUST-CAPABILITY-INTAKE.md
     quality/
@@ -71,6 +73,6 @@ hartevo-desktop/
 
 1. OpenInterpreter bootstrap、完整来源历史与 App Server schema pin。
 2. `hartevo-rs` Workspace、Domain Contract 与 Runtime Adapter 协议。
-3. 将 Hermes v0.20 R0 机制和 PenguinHarness Candidate Lab 合同写入 MVP Implementation Backlog、Dioxus Shell 与首批 Mission Harness。
+3. 将 Hermes v0.20 R0、PenguinHarness Candidate Lab 和 Ego Lite-inspired Browser Workspace 合同写入 MVP Implementation Backlog、Dioxus Shell 与首批 Mission Harness。
 
 首个可运行切片应完成：自然语言目标 → Mission 编译 → 研究与 Work Product → 外部动作审批 → Receipt / Verification → Outcome，而不是先完成大量空模块。

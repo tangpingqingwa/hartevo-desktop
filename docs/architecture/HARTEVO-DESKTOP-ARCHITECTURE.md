@@ -1,8 +1,8 @@
 # Hartevo Desktop 当前架构合同
 
 状态：**Accepted**
-版本：2.0
-日期：2026-08-09
+版本：2.1
+日期：2026-08-10
 
 本文定义 Rust Hartevo Desktop 的组件所有权、进程边界、数据流和安全不变量。产品行为以交互规格与 v12 原型为准；上游采用理由以 Rust/OpenInterpreter RFC 为准。
 
@@ -176,12 +176,18 @@ OpenInterpreter 不拥有 Project、Mission、Consent、Effect 或 Outcome。
 
 负责：
 
-- 登录 Profile、Cookie 和浏览器身份隔离。
-- CDP/浏览器自动化、截图和可见结果验证。
-- CAPTCHA、MFA 和人工接管状态。
-- 页面级写入前的目标、账号和范围复核。
+- `BrowserProfile`：绑定 Tenant、Project、账号身份与 OS keyring credential reference；默认使用 Project-bound managed profile，不默认控制用户主浏览器 Profile。
+- `BrowserWorkspace`：绑定 Project、Mission、Profile 与标签集合；恢复同一 Mission 时优先复用原 Workspace，不生成新的业务会话。
+- `BrowserControlLease`：`agent_controlled`、`user_controlled`、`paused`、`completed` 与 `closed` 状态；每次交接递增 generation。
+- `SemanticSnapshot`：通过 AX/DOM/iframe 信息生成脱敏语义视图、短期 element ref 与稳定 locator 候选。
+- `BrowserActionBatch`：执行可中断的 observe、resolve、act、wait、verify typed action，不运行模型生成的任意 Node.js。
+- `BrowserRecipePackage`：按域名、账号、UI 版本、Scope、Effect class 和签名管理可复用站点经验。
+- 截图、可见 readback、下载、上传、CAPTCHA、MFA 和人工接管。
+- 页面级动作前复核目标域名、账号、Project、Mission、Scope、Snapshot generation 与 Control Lease。
 
-人工接管期间，Agent 不得并发操作同一对象。
+人工接管提交后，Browser Host 必须拒绝旧 lease 中所有未开始的点击、键盘、上传、页面脚本与 browser fetch；Agent 只能在用户明确“交还 Hartevo 继续”后通过 compare-and-swap 获得新 lease。只查看 Agent 页面不会隐式接管。
+
+潜在外部写入即使通过页面 JavaScript、raw CDP、浏览器身份 fetch 或 Recipe 发起，也必须先建立 Pending Effect，经 Effect Broker 执行。Browser tool success 只产生 `BrowserReceipt` 候选，仍需独立 Verification。
 
 ### 4.9 Connector Workers
 

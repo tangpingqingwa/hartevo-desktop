@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：发布质量下限。** 数值门槛和 Gate 顺序作为首版合同；若工程实现需要调整，必须通过新的 RFC 修改，不能在发布时临时跳过。
 
 状态：**Target Contract**；不表示当前生产已经达到所有门槛
-Desktop 采用版本：2026-08-09-v1
+Desktop 采用版本：2026-08-10-v2
 适用范围：Rust/Dioxus Desktop、Hartevo Domain Kernel、Effect Broker、OpenInterpreter Runtime、Browser Runtime、SQLite/Cloud Storage、Connector 和 Provider 边界
 
 ## 1. 发布必须证明什么
@@ -51,7 +51,7 @@ Hartevo 的 Release Candidate 不仅要“服务健康、首 Token 快、工具�
 | R1 Relationship Journey | Partner、CRM、Inbox、人工接管 | Consent、身份、消息顺序、关系状态和连续性 |
 | O1 Outcome/Attribution | Lead、Order、Refund、Commission、Payout | 事件完整、金额/币种、身份链和可复算结果 |
 | L1 Long Growth Loop | 跨周测量、复盘、Next Loop、Skill Draft | 持续进度、重启恢复、Outcome→Next Decision |
-| B1 Browser/GT | 登录 AI 引擎、渠道后台、人工接管 | Profile 隔离、排队、TTL、崩溃恢复 |
+| B1 Browser/GT | 登录 AI 引擎、渠道后台、人工接管 | Profile/Project 隔离、Workspace 生命周期、独占控制租约、接管硬停止、Snapshot/Locator 正确性、崩溃恢复 |
 | J1 Deterministic Background | Webhook、Sync、Outbox、Verification、Schedule | Lease、吞吐、乱序、Dead Letter 和公平性 |
 
 不得用 `hello` 的性能代表 D1/L1，也不得用 HTTP RPS 代替成功 Mission/小时。
@@ -291,6 +291,7 @@ D1/W1/L1 在运行期间任意 5 秒窗口内必须有具体进度、正文 Delt
 | 流事件无正文丢失、重复和错序 | ≥ 99.9% |
 | 重复/乱序 Webhook 业务正确率 | 100% |
 | Lease 导致重复外部效果 | 0 |
+| 用户接管提交后旧 Browser Lease 成功执行动作 | 0 |
 | Dead Letter 可解释且重放重新过策略 | 100% |
 
 Run、Effect、Outbox 和 Verification 的 Lease 到期后必须进入确定性接管；Runtime 重启不得静默创建新的逻辑 Mission；SSE 用序列恢复；资源饱和用类型化退压而不是 OOM 或无限等待。
@@ -301,6 +302,7 @@ Run、Effect、Outbox 和 Verification 的 Lease 到期后必须进入确定性�
 - 未授权 Capability 或 Subagent 范围扩大；
 - Secret、Token、Cookie、PII、Provider Header、私有推理进入日志/SSE/Work Product；
 - Browser Profile 所有权错误、路径穿越或 CAPTCHA 绕过；
+- 用户接管后 Agent 继续操作，或 raw CDP、页面脚本、browser fetch、Recipe 绕过 Effect Broker；
 - 附件/网页/工具结果中的 Prompt Injection 改变权限；
 - 删除/导出/支付/联系对象越过授权范围。
 
@@ -391,7 +393,7 @@ Canary 仅验证：
   "releaseCommit": "<40-char-sha>",
   "imageDigests": {},
   "environment": "local-rc|controlled-provider|production",
-  "missionCatalogVersion": "desktop-2026-08-09-v1",
+  "missionCatalogVersion": "desktop-2026-08-10-v2",
   "worldVersions": {},
   "capabilitySchemaDigest": "<digest>",
   "modelAndPrompt": {},

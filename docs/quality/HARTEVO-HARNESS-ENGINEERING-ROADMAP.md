@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：质量工程目标合同。** 任何完成声明必须由本仓库对应版本的 Mission Eval 与可重放证据重新证明。
 
 状态：**Target Contract**；不表示当前仓库已经实现全部组件
-Desktop 采用版本：2026-08-09-v2
+Desktop 采用版本：2026-08-10-v2
 目标：让每次代码、模型、Prompt、Skill、Capability 或 Provider 变化都能回答“它是否更好地完成了 Hartevo 用户的增长业务目标”
 
 ## 1. Harness 的主体是业务世界，不是 Prompt

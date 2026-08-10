@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：完成度口径。** 本仓库在 Harness 可运行后生成按 Commit 固定的 Scorecard。
 
 状态：**Target Contract**；分数只能由版本化 Eval 证据生成
-Desktop 采用版本：2026-08-09-v1
+Desktop 采用版本：2026-08-10-v2
 适用范围：Rust/Dioxus Desktop、Hartevo Domain Kernel、Effect Broker、OpenInterpreter Runtime、Browser Runtime、SQLite/Cloud Storage、Connector 和 Provider 边界
 
 ## 1. 完成度回答的不是“写了多少代码”
