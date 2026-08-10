@@ -7,6 +7,7 @@
 | 问题 | 权威文件 |
 | --- | --- |
 | 产品为谁服务、解决什么问题 | `/PRODUCT.md` |
+| 新 Mac 怎样准备环境、克隆仓库和完成首个 Bootstrap PR | `/DEVELOPMENT.md` |
 | 为什么采用 Rust/OpenInterpreter、产品线怎样启动 | `/docs/product/HARTEVO-DESKTOP-RUST-OPENINTERPRETER-RFC.md` |
 | Hermes 的哪些能力需要用 Rust 重构、哪些不能照搬 | `/docs/research/HERMES-AGENT-V0.20-RUST-CAPABILITY-INTAKE.md` |
 | PenguinHarness 的哪些 Harness/Eval 机制需要重构 | `/docs/research/PENGUIN-HARNESS-RUST-CAPABILITY-INTAKE.md` 与 `/docs/quality/HARTEVO-HARNESS-ENGINEERING-ROADMAP.md` |
