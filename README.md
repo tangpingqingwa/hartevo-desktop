@@ -34,6 +34,7 @@ Hartevo Desktop 是面向增长负责人、品牌经营者和代理团队的 Age
 - 连接成功不等于允许执行；外部动作仍受 Scope、Consent、Approval 与 Effect Policy 控制。
 - Provider 返回成功不等于业务成功；必须保留 Receipt、Verification 和 Outcome。
 - 长上下文不是无限 Prompt；Context Fabric 用持久工作集、Continuation Ledger、Context Capsule 和可恢复 Worker Graph 保持 Mission 连续。
+- 遇到艰难技术瓶颈时，从用户目标、领域不变量与真实边界重新推导；允许重构抽象和创新架构，不把上游实现或当前框架习惯误当成不可改变的约束。
 
 ## 仓库结构
 

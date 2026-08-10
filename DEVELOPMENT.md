@@ -118,7 +118,23 @@ Python 这里只是可选的静态原型预览手段，不是 Hartevo 产品运�
 - Hermes、PenguinHarness、Ego Lite 和 Prime Agent 只按各自 Intake 文档吸收机制，不复制其运行时或绕过 Hartevo 权限边界；
 - AI CSS 只用于研究交互问题；不得复制付费源码、CSS、SVG 或高度近似实现。
 
-## 5. 首个分支：Bootstrap R0
+## 5. 艰难问题与第一性原理
+
+> 遇到艰难险阻，不要受限；从第一性原理出发，解决难关，创新架构。
+
+这里的“不受限”是指不受既有实现、上游习惯、框架默认路径和历史偶然选择束缚。遇到关键难题时，不能只堆超时、重试、兼容分支或临时胶水，也不能因为某个开源基座没有提供能力就降低 Hartevo 的产品目标。按以下顺序处理：
+
+1. 重新写出用户最终要达成的结果，以及不能破坏的领域、安全和权限不变量；
+2. 用最小可复现 Case、Trace、性能数据或协议记录描述真实失败，不凭印象争论；
+3. 区分硬约束与假设：操作系统、协议、物理资源和已验证法规是约束；上游目录、当前抽象、流行做法和“以前一直这样”只是候选方案；
+4. 同时比较修复现有实现、替换抽象、拆分进程/状态所有权、重写 Rust 组件和设计新架构，而不是只优化眼前代码；
+5. 在隔离分支做最小 Spike，用 Mission 完成度、安全、恢复、延迟、成本和可维护性共同评估；
+6. 把结论写入 RFC/架构文档，保留被否决方案、迁移与回滚路径，并把故障固化为永久 Contract Test 或 Eval Fixture；
+7. 如果证据证明当前子系统违反第一性原则或无法达到产品合同，应主动重构边界，不能因沉没成本继续堆补丁。
+
+以下边界不可用“创新”绕过：用户 Consent 与 Approval、Effect Broker、安全与隐私、许可证和来源历史、跨项目隔离、确定性业务状态、私有 Benchmark 隔离及 Release Gate。真正的创新必须扩大产品能力，同时让权限、证据和失败恢复更加清晰。
+
+## 6. 首个分支：Bootstrap R0
 
 从同步后的 `main` 创建独立分支：
 
@@ -137,7 +153,7 @@ Bootstrap R0 只负责建立可重复工程地基，不实现大量业务模块�
 7. 本地配置示例与 Secret 规则；真实 Token、Cookie、OAuth refresh token 和签名证书不得进入 Git；
 8. 更新本文件，把下节目标命令改成实际已验证命令并记录 Apple Silicon/Intel 验证状态。
 
-### 5.1 OpenInterpreter intake 的第一步
+### 6.1 OpenInterpreter intake 的第一步
 
 只添加和核验上游，不在命令行临时复制源码快照：
 
@@ -150,7 +166,7 @@ git tag -l rust-v0.0.34
 
 审查基线是提交 `984acc698cd038885ecb0b82721402b01e11a5ad`，公开稳定参考是 `rust-v0.0.34`。二者不自动等价于最终 R0 pin；PR 必须先比较 App Server schema、Harness 行为、安全测试和 macOS 构建。具体采用保留完整历史的 subtree、vendor zone 或其他可审计方式，应在 Bootstrap PR 中显式说明；禁止无来源复制和 `--squash` 后丢失升级依据。
 
-## 6. Bootstrap R0 合并后的目标命令
+## 7. Bootstrap R0 合并后的目标命令
 
 以下命令是首个工程 PR 必须使其成立的验收合同：
 
@@ -171,7 +187,7 @@ cargo run -p codex-app-server -- generate-json-schema --out <schema-dir>
 
 最终路径和 workspace 参数以 Bootstrap PR 实际导入结构为准。合并前必须由 CI 和一台干净 macOS 机器复跑，不能只在开发者已有环境中成功。
 
-## 7. 分支与提交纪律
+## 8. 分支与提交纪律
 
 - `main` 始终保持可克隆、文档无冲突和已声明命令可复现；
 - 上游升级使用 `upstream-intake/<date>-<sha>`，不直接在 `main` 拉取；
@@ -179,7 +195,7 @@ cargo run -p codex-app-server -- generate-json-schema --out <schema-dir>
 - 不提交 `.env`、账号数据库、浏览器 Profile、下载文件、Eval 私有 Holdout 或生产 Replay 原文；
 - 每个“完成”声明必须链接代码、测试、Commit 和可重放证据；Target Contract 本身不是完成证明。
 
-## 8. 官方依据
+## 9. 官方依据
 
 - [Apple：安装 Command Line Tools](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools)
 - [GitHub CLI 安装说明](https://cli.github.com/manual/installation)

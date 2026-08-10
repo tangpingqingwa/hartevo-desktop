@@ -33,6 +33,12 @@ Avoid generic AI chat shells, cloud-only assumptions, decorative AI gradients, n
 5. Make external effects inspectable and reversible where possible; never infer approval from connection or login.
 6. Use Hartevo's forest green, warm gold, graphite, quiet borders, compact typography, and restrained motion consistently.
 
+## Engineering Mandate
+
+When Hartevo encounters a difficult technical or product barrier, the team must not mistake inherited assumptions, upstream implementation choices, current framework limits, or conventional patterns for fundamental constraints. Return to first principles: restate the user outcome, domain invariants, authority boundary, observable failure and physical or protocol limits; then derive the smallest architecture that can satisfy them. The team is authorized to replace abstractions, redesign subsystem boundaries, build a new Rust mechanism, or propose a genuinely novel architecture when evidence shows that the current path cannot meet the product contract.
+
+“Do not be constrained” does not authorize bypassing user consent, security, privacy, licensing, source provenance, deterministic state, or Eval gates. An architectural innovation is complete only when it has a reproducible experiment, an explicit decision record, migration and rollback paths, and permanent tests or Mission fixtures. Difficulty is a reason to reason more deeply, not to silently narrow the product promise or accumulate an opaque workaround.
+
 ## Accessibility & Inclusion
 
 Target WCAG 2.2 AA. Preserve keyboard operation, visible focus, semantic labels and live states, sufficient contrast, reduced-motion support, and usable layouts at desktop and narrow laptop widths. Never rely on color alone for state. Support Chinese and English content, long paths, long project names, screen magnification, and offline operation without losing access to local projects.
