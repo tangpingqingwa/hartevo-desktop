@@ -13,6 +13,7 @@ use thiserror::Error;
 mod evidence;
 mod mission_contract;
 mod provider_closure;
+mod route_graph;
 
 pub use evidence::{
     EvidenceLevel, MissionEvidenceRecord, MissionEvidenceStatus, ReleaseEvidence, ReleaseStage,
@@ -26,6 +27,18 @@ pub use provider_closure::{
     EffectReadbackRouteContract, EffectReadbackStage, EffectReadbackTerminalCondition,
     ProductClaimAuthority, ProviderClaimAuthority, RouteClaimAuthority,
     expanded_execution_stage_count, validate_provider_route_closure,
+};
+use route_graph::ROUTE_GRAPH_CONTRACT_JSON;
+pub use route_graph::{
+    CompletionEvidenceReusePolicy, EXPECTED_ROUTE_GRAPH_COUNT, EXPECTED_ROUTE_GRAPH_NODE_COUNT,
+    EXPECTED_ROUTE_GRAPH_NORMAL_EDGE_COUNT, EXPECTED_ROUTE_GRAPH_REDIRECT_EDGE_COUNT,
+    EXPECTED_ROUTE_GRAPH_TERMINAL_COUNT, EffectReplayPolicy, MissionRouteGraph,
+    PreservedArtifactsPolicy, RouteCondition, RouteGraphContract, RouteGraphNode,
+    RouteGraphRedirect, RouteGraphRuntimeAuthority, RouteGraphTerminal,
+    RouteGraphTerminalDisposition, RouteGraphTerminalKind, RouteGraphTransition,
+    RouteGraphTransitionTarget, RouteGraphTransitionTargetKind, RouteNodeCompletionGate,
+    RouteNodeCompletionGateKind, route_graph_node_count, route_graph_normal_edge_count,
+    route_graph_redirect_edge_count, route_graph_terminal_count, validate_route_graph_closure,
 };
 
 const MISSION_CATALOG_JSON: &str = include_str!("../../../contracts/missions/catalog.v1.json");
@@ -225,6 +238,7 @@ pub struct CatalogSnapshot {
     pub schema_version: String,
     pub mission_catalog_version: String,
     pub effect_readback_route_contract_version: String,
+    pub route_graph_contract_version: String,
     pub application_handler_registry_version: String,
     pub capability_catalog_version: String,
     pub provider_catalog_version: String,
@@ -242,6 +256,11 @@ pub struct CatalogSummary {
     pub mission_count: usize,
     pub checkpoint_route_count: usize,
     pub executable_stage_count: usize,
+    pub route_graph_count: usize,
+    pub route_graph_node_count: usize,
+    pub route_graph_normal_edge_count: usize,
+    pub route_graph_redirect_edge_count: usize,
+    pub route_graph_terminal_count: usize,
     pub application_route_count: usize,
     pub implemented_application_handler_count: usize,
     pub not_implemented_application_route_count: usize,
@@ -318,6 +337,7 @@ pub struct CrossCuttingCaseManifest {
 pub struct Catalog {
     pub missions: MissionCatalog,
     pub effect_readback_routes: EffectReadbackRouteContract,
+    pub route_graphs: RouteGraphContract,
     pub application_handlers: ApplicationHandlerRegistry,
     pub capabilities: CapabilityCatalog,
     pub providers: ProviderCatalog,
@@ -332,6 +352,10 @@ impl Catalog {
             effect_readback_routes: parse_contract(
                 "effect/readback route contract",
                 EFFECT_READBACK_ROUTE_CONTRACT_JSON,
+            )?,
+            route_graphs: parse_contract(
+                "Mission route graph contract",
+                ROUTE_GRAPH_CONTRACT_JSON,
             )?,
             application_handlers: parse_contract(
                 "application handler registry",
@@ -389,6 +413,14 @@ impl Catalog {
             &self.capabilities,
             &self.providers,
             &self.effect_readback_routes,
+        ) {
+            violations.append(&mut contract_violations);
+        }
+        if let Err(mut contract_violations) = validate_route_graph_closure(
+            &self.missions,
+            &self.capabilities,
+            &self.effect_readback_routes,
+            &self.route_graphs,
         ) {
             violations.append(&mut contract_violations);
         }
@@ -936,11 +968,21 @@ impl Catalog {
             .sum();
         let executable_stage_count =
             expanded_execution_stage_count(&self.missions, &self.effect_readback_routes);
+        let route_graph_count = self.route_graphs.graphs.len();
+        let route_graph_node_count = route_graph_node_count(&self.route_graphs);
+        let route_graph_normal_edge_count = route_graph_normal_edge_count(&self.route_graphs);
+        let route_graph_redirect_edge_count = route_graph_redirect_edge_count(&self.route_graphs);
+        let route_graph_terminal_count = route_graph_terminal_count(&self.route_graphs);
         let implemented_application_handler_count = self.application_handlers.handlers.len();
         let summary = CatalogSummary {
             mission_count: self.missions.missions.len(),
             checkpoint_route_count,
             executable_stage_count,
+            route_graph_count,
+            route_graph_node_count,
+            route_graph_normal_edge_count,
+            route_graph_redirect_edge_count,
+            route_graph_terminal_count,
             application_route_count,
             implemented_application_handler_count,
             not_implemented_application_route_count: application_route_count
@@ -960,6 +1002,7 @@ impl Catalog {
         let digest_input = serde_json::to_vec(&(
             &self.missions,
             &self.effect_readback_routes,
+            &self.route_graphs,
             &self.application_handlers,
             &self.capabilities,
             &self.providers,
@@ -970,12 +1013,13 @@ impl Catalog {
         ))?;
 
         Ok(CatalogSnapshot {
-            schema_version: "hartevo-catalog-snapshot/v3".into(),
+            schema_version: "hartevo-catalog-snapshot/v4".into(),
             mission_catalog_version: self.missions.catalog_version.clone(),
             effect_readback_route_contract_version: self
                 .effect_readback_routes
                 .contract_version
                 .clone(),
+            route_graph_contract_version: self.route_graphs.contract_version.clone(),
             application_handler_registry_version: self
                 .application_handlers
                 .registry_version
@@ -1200,6 +1244,12 @@ impl Catalog {
         let summary = &snapshot.summary;
         require(
             violations,
+            snapshot.schema_version == "hartevo-catalog-snapshot/v4"
+                && snapshot.route_graph_contract_version == "desktop-2026-08-12-ct02-v1",
+            "Catalog Snapshot v4 must exactly bind the Mission route graph companion contract",
+        );
+        require(
+            violations,
             summary.implemented_application_handler_count == snapshot.application_handlers.len()
                 && summary.application_route_count
                     == summary.implemented_application_handler_count
@@ -1211,6 +1261,16 @@ impl Catalog {
             summary.checkpoint_route_count == EXPECTED_CHECKPOINT_ROUTE_COUNT
                 && summary.executable_stage_count == EXPECTED_EXECUTABLE_STAGE_COUNT,
             "Catalog snapshot must expose exactly 123 checkpoint routes and 124 executable stages",
+        );
+        require(
+            violations,
+            summary.route_graph_count == EXPECTED_ROUTE_GRAPH_COUNT
+                && summary.route_graph_node_count == EXPECTED_ROUTE_GRAPH_NODE_COUNT
+                && summary.route_graph_normal_edge_count == EXPECTED_ROUTE_GRAPH_NORMAL_EDGE_COUNT
+                && summary.route_graph_redirect_edge_count
+                    == EXPECTED_ROUTE_GRAPH_REDIRECT_EDGE_COUNT
+                && summary.route_graph_terminal_count == EXPECTED_ROUTE_GRAPH_TERMINAL_COUNT,
+            "Catalog Snapshot v4 must freeze 12 graphs, 123 nodes, 124 normal edges, one bounded redirect and 12 terminals",
         );
         require(
             violations,

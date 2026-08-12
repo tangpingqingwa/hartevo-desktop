@@ -75,7 +75,7 @@ fn snapshot_freezes_checkpoint_routes_separately_from_executable_stages() {
     let catalog = Catalog::load().expect("valid production Catalog");
     let snapshot = catalog.snapshot().expect("valid Catalog snapshot");
 
-    assert_eq!(snapshot.schema_version, "hartevo-catalog-snapshot/v3");
+    assert_eq!(snapshot.schema_version, "hartevo-catalog-snapshot/v4");
     assert_eq!(
         snapshot.effect_readback_route_contract_version,
         "desktop-2026-08-12-ct00b-v1"
