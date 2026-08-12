@@ -1,5 +1,14 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod runtime_text_subscription;
+
+pub use runtime_text_subscription::{
+    CatalogMissionExecutionHandle, CatalogMissionExecutionStart,
+    RUNTIME_TEXT_SUBSCRIPTION_MAX_PAGE_SIZE, RuntimeTextSubscriptionBatch,
+    RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionDelta, RuntimeTextSubscriptionError,
+    RuntimeTextSubscriptionPage, RuntimeTextSubscriptionTurn,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -20176,6 +20185,8 @@ pub enum ApplicationError {
     Runtime(#[from] AdapterError),
     #[error(transparent)]
     RuntimeTurn(#[from] RuntimeTurnError),
+    #[error(transparent)]
+    RuntimeTextSubscription(#[from] RuntimeTextSubscriptionError),
     #[error(transparent)]
     Browser(#[from] BrowserError),
     #[error(
