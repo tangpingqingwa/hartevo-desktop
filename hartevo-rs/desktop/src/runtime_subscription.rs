@@ -15,10 +15,14 @@ use hartevo_domain_kernel::{MissionId, ProjectId, RuntimeTurnStatus};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::data_plane::DesktopRuntimeCancellation;
+use crate::data_plane::{
+    DesktopRuntimeCancellation, DesktopRuntimeProgressEvent, DesktopRuntimeTextItemProjection,
+    DesktopRuntimeTextStreamProjection,
+};
 
 const SHA256_HEX_LENGTH: usize = 64;
 const DIGEST_LABEL_LENGTH: usize = 8;
+pub(crate) const DESKTOP_RUNTIME_SUBSCRIPTION_PAGE_SIZE: usize = 64;
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct DesktopOpaqueDigest(String);
@@ -1316,6 +1320,13 @@ impl DesktopRuntimeCoordinatorControl {
     pub(crate) fn is_stop_requested(&self) -> bool {
         self.cancellation.is_requested()
     }
+
+    /// Borrows the exact cancellation authority while the matching background
+    /// command is executing. The authority itself remains non-Clone at this
+    /// Desktop orchestration boundary.
+    pub(crate) fn cancellation(&self) -> &DesktopRuntimeCancellation {
+        &self.cancellation
+    }
 }
 
 impl fmt::Debug for DesktopRuntimeCoordinatorControl {
@@ -1342,6 +1353,10 @@ pub(crate) struct DesktopRuntimeCommandSlot {
 }
 
 impl DesktopRuntimeCommandSlot {
+    const fn has_active_command(&self) -> bool {
+        self.active.is_some()
+    }
+
     pub(crate) fn install(
         &mut self,
         handle: DesktopRuntimeCommandHandle,
@@ -1370,6 +1385,16 @@ impl DesktopRuntimeCommandSlot {
             })
     }
 
+    fn progress_since(
+        &self,
+        identity: &DesktopRuntimeCommandIdentity,
+        sequence: u64,
+    ) -> Option<Vec<DesktopRuntimeProgressEvent>> {
+        self.active.as_ref().and_then(|handle| {
+            (handle.identity == *identity).then(|| handle.cancellation.progress_since(sequence))
+        })
+    }
+
     /// Clears only the command whose exact identity completed. A stale async
     /// completion cannot remove a newer command for the same Mission.
     pub(crate) fn finish_exact(&mut self, identity: &DesktopRuntimeCommandIdentity) -> bool {
@@ -1384,6 +1409,877 @@ impl DesktopRuntimeCommandSlot {
             false
         }
     }
+}
+
+/// Result of reconciling the current Desktop selection with an exact retained
+/// Application handle. `Untracked` falls back to the older read-only Mission
+/// projection; it never fabricates a subscription handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DesktopRuntimeSelectionChange {
+    Untracked,
+    Unchanged,
+    Selected(DesktopRuntimeSelection),
+}
+
+/// Exact producer inputs for one durable pull. Both the Application handle and
+/// cursor are retained byte-for-byte; Desktop only adds a checked selection
+/// epoch and never reconstructs or signs either value.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct DesktopRuntimePullRequest {
+    scope: DesktopRuntimeSubscriptionScope,
+    epoch: DesktopRuntimeSubscriptionEpoch,
+    handle: CatalogMissionExecutionHandle,
+    cursor: Option<DesktopRuntimeViewportCursor>,
+}
+
+impl DesktopRuntimePullRequest {
+    pub(crate) fn handle(&self) -> &CatalogMissionExecutionHandle {
+        &self.handle
+    }
+
+    pub(crate) fn producer_cursor(&self) -> Option<&RuntimeTextSubscriptionCursor> {
+        self.cursor
+            .as_ref()
+            .map(DesktopRuntimeViewportCursor::producer)
+    }
+
+    pub(crate) fn into_delivery(
+        self,
+        batch: RuntimeTextSubscriptionBatch,
+    ) -> Result<DesktopRuntimeDelivery, RuntimeSubscriptionError> {
+        DesktopRuntimeDelivery::from_application(self.scope, self.epoch, batch)
+    }
+}
+
+impl fmt::Debug for DesktopRuntimePullRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopRuntimePullRequest")
+            .field("scope", &self.scope)
+            .field("epoch", &self.epoch)
+            .field("handle", &self.handle)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesktopRuntimePaintStreamTransport {
+    Open,
+    CaughtUp,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+enum DesktopRuntimePaintContent {
+    Empty,
+    AwaitingTurn,
+    Stream {
+        projection: DesktopRuntimeTextStreamProjection,
+        transport: DesktopRuntimePaintStreamTransport,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesktopRuntimePaintVisibility {
+    Following,
+    PausedSeen,
+    PausedUnseen,
+}
+
+impl DesktopRuntimePaintVisibility {
+    fn from_viewport(viewport: &DesktopRuntimeViewportState) -> Option<Self> {
+        match (viewport.follow_mode, viewport.visibility) {
+            (DesktopRuntimeFollowMode::FollowLatest, DesktopRuntimeVisibility::Seen) => {
+                Some(Self::Following)
+            }
+            (DesktopRuntimeFollowMode::Paused, DesktopRuntimeVisibility::Seen) => {
+                Some(Self::PausedSeen)
+            }
+            (DesktopRuntimeFollowMode::Paused, DesktopRuntimeVisibility::Unseen) => {
+                Some(Self::PausedUnseen)
+            }
+            (DesktopRuntimeFollowMode::FollowLatest, DesktopRuntimeVisibility::Unseen) => None,
+        }
+    }
+
+    const fn follow_latest(self) -> bool {
+        matches!(self, Self::Following)
+    }
+
+    const fn has_unseen(self) -> bool {
+        matches!(self, Self::PausedUnseen)
+    }
+}
+
+/// Ephemeral render projection derived from the reducer. It may be cloned by
+/// Dioxus while painting, but is never stored as a second application signal;
+/// the reducer viewport remains the sole long-lived private-text owner. Typed
+/// content and visibility states make contradictory boolean combinations
+/// unrepresentable.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct DesktopRuntimeExecutionPaintView {
+    content: DesktopRuntimePaintContent,
+    visibility: DesktopRuntimePaintVisibility,
+}
+
+impl DesktopRuntimeExecutionPaintView {
+    pub(crate) fn stream(&self) -> Option<&DesktopRuntimeTextStreamProjection> {
+        match &self.content {
+            DesktopRuntimePaintContent::Stream { projection, .. } => Some(projection),
+            DesktopRuntimePaintContent::Empty | DesktopRuntimePaintContent::AwaitingTurn => None,
+        }
+    }
+
+    pub(crate) const fn awaiting_turn(&self) -> bool {
+        matches!(&self.content, DesktopRuntimePaintContent::AwaitingTurn)
+    }
+
+    pub(crate) const fn follow_latest(&self) -> bool {
+        self.visibility.follow_latest()
+    }
+
+    pub(crate) const fn has_unseen(&self) -> bool {
+        self.visibility.has_unseen()
+    }
+
+    pub(crate) const fn transport_caught_up(&self) -> bool {
+        matches!(
+            &self.content,
+            DesktopRuntimePaintContent::Stream {
+                transport: DesktopRuntimePaintStreamTransport::CaughtUp,
+                ..
+            }
+        )
+    }
+}
+
+impl fmt::Debug for DesktopRuntimeExecutionPaintView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopRuntimeExecutionPaintView")
+            .field("has_stream", &self.stream().is_some())
+            .field(
+                "delta_count",
+                &self.stream().map_or(0, |stream| stream.delta_count),
+            )
+            .field(
+                "item_count",
+                &self.stream().map_or(0, |stream| stream.items.len()),
+            )
+            .field("awaiting_turn", &self.awaiting_turn())
+            .field("follow_latest", &self.follow_latest())
+            .field("has_unseen", &self.has_unseen())
+            .field("transport_caught_up", &self.transport_caught_up())
+            .finish()
+    }
+}
+
+/// Content-free receipt that phase one has entered the reducer. This is not a
+/// render acknowledgement and deliberately carries no Runtime authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DesktopRuntimePaintCommit {
+    selection: DesktopRuntimeSelection,
+    identity: DesktopRuntimeCommandIdentity,
+    prepared_sequence: u64,
+}
+
+impl DesktopRuntimePaintCommit {
+    pub(crate) fn selection(&self) -> &DesktopRuntimeSelection {
+        &self.selection
+    }
+}
+
+/// Token produced only after a post-render Dioxus effect acknowledges the
+/// exact phase-one paint receipt. Runtime execution owns the non-Clone
+/// coordinator endpoint carried by this token.
+pub(crate) struct DesktopRuntimeExecutionLaunch {
+    selection: DesktopRuntimeSelection,
+    identity: DesktopRuntimeCommandIdentity,
+    coordinator: DesktopRuntimeCoordinatorControl,
+    prepared_sequence: u64,
+    render_ack_sequence: u64,
+}
+
+impl DesktopRuntimeExecutionLaunch {
+    pub(crate) fn selection(&self) -> &DesktopRuntimeSelection {
+        &self.selection
+    }
+
+    pub(crate) fn identity(&self) -> &DesktopRuntimeCommandIdentity {
+        &self.identity
+    }
+
+    pub(crate) const fn prepared_sequence(&self) -> u64 {
+        self.prepared_sequence
+    }
+
+    pub(crate) const fn render_ack_sequence(&self) -> u64 {
+        self.render_ack_sequence
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        DesktopRuntimeSelection,
+        DesktopRuntimeCommandIdentity,
+        DesktopRuntimeCoordinatorControl,
+        u64,
+        u64,
+    ) {
+        (
+            self.selection,
+            self.identity,
+            self.coordinator,
+            self.prepared_sequence,
+            self.render_ack_sequence,
+        )
+    }
+}
+
+impl fmt::Debug for DesktopRuntimeExecutionLaunch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopRuntimeExecutionLaunch")
+            .field("selection", &self.selection)
+            .field("identity", &self.identity)
+            .field("prepared_sequence", &self.prepared_sequence)
+            .field("render_ack_sequence", &self.render_ack_sequence)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DesktopRuntimeAcceptedCompletion {
+    render_ack_sequence: u64,
+    runtime_completion_sequence: u64,
+}
+
+impl DesktopRuntimeAcceptedCompletion {
+    pub(crate) const fn render_ack_sequence(self) -> u64 {
+        self.render_ack_sequence
+    }
+
+    pub(crate) const fn runtime_completion_sequence(self) -> u64 {
+        self.runtime_completion_sequence
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DesktopRuntimeCompletionDisposition {
+    Accepted(DesktopRuntimeAcceptedCompletion),
+    IgnoredStale,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DesktopRuntimePollDisposition {
+    Stale,
+    PullNow,
+    WaitForRuntime,
+    WaitAfterRuntime,
+    AwaitingWithoutRuntime,
+    ReadyToFinalize,
+    Complete,
+}
+
+#[derive(Debug)]
+struct DesktopRuntimeActivePaint {
+    identity: DesktopRuntimeCommandIdentity,
+    selection: DesktopRuntimeSelection,
+    prepared_sequence: u64,
+    render_ack_sequence: Option<u64>,
+    coordinator: Option<DesktopRuntimeCoordinatorControl>,
+    runtime_returned: bool,
+    post_return_delivery_observed: bool,
+}
+
+/// Single Desktop owner for exact Application handles, subscription viewports,
+/// scoped stop authority, and execution/paint ordering. It owns no Mission or
+/// Runtime completion authority; those remain in the durable snapshot/ledger.
+#[derive(Default)]
+pub(crate) struct DesktopRuntimeExecutionPaintState {
+    reducer: DesktopRuntimeSubscriptionReducer,
+    handles: BTreeMap<DesktopRuntimeSubscriptionScope, CatalogMissionExecutionHandle>,
+    command_slot: DesktopRuntimeCommandSlot,
+    active_paint: Option<DesktopRuntimeActivePaint>,
+    visible_scope: Option<DesktopRuntimeSubscriptionScope>,
+    transition_sequence: u64,
+}
+
+impl DesktopRuntimeExecutionPaintState {
+    pub(crate) fn commit_catalog_start(
+        &mut self,
+        handle: CatalogMissionExecutionHandle,
+    ) -> Result<DesktopRuntimePaintCommit, RuntimeSubscriptionError> {
+        if self.command_slot.has_active_command() {
+            return Err(RuntimeSubscriptionError::CommandAlreadyActive);
+        }
+        let prepared_sequence = self
+            .transition_sequence
+            .checked_add(1)
+            .ok_or(RuntimeSubscriptionError::SequenceOverflow)?;
+        let scope = DesktopRuntimeSubscriptionScope::from_handle(&handle)?;
+        let selection = self
+            .reducer
+            .select_scope(Some(scope.clone()))?
+            .ok_or(RuntimeSubscriptionError::ScopeNotSelected)?;
+        let awaiting = DesktopRuntimeDelivery::AwaitingTurn {
+            scope: scope.clone(),
+            epoch: selection.epoch,
+        };
+        if self.reducer.apply_delivery(&awaiting)? != DesktopRuntimeReducerEffect::AwaitingTurn {
+            return Err(RuntimeSubscriptionError::InvalidViewportState);
+        }
+        let command_digest = execution_command_digest(&handle, selection.epoch);
+        let (command, coordinator) =
+            DesktopRuntimeCommandHandle::pair(scope.clone(), command_digest)?;
+        let identity = command.identity();
+        self.command_slot.install(command)?;
+        self.handles.insert(scope.clone(), handle);
+        self.visible_scope = Some(scope);
+        self.active_paint = Some(DesktopRuntimeActivePaint {
+            identity: identity.clone(),
+            selection: selection.clone(),
+            prepared_sequence,
+            render_ack_sequence: None,
+            coordinator: Some(coordinator),
+            runtime_returned: false,
+            post_return_delivery_observed: false,
+        });
+        self.transition_sequence = prepared_sequence;
+        Ok(DesktopRuntimePaintCommit {
+            selection,
+            identity,
+            prepared_sequence,
+        })
+    }
+
+    pub(crate) fn pending_paint_commit(&self) -> Option<DesktopRuntimePaintCommit> {
+        let active = self.active_paint.as_ref()?;
+        (active.render_ack_sequence.is_none() && active.coordinator.is_some()).then(|| {
+            DesktopRuntimePaintCommit {
+                selection: active.selection.clone(),
+                identity: active.identity.clone(),
+                prepared_sequence: active.prepared_sequence,
+            }
+        })
+    }
+
+    /// Consumes the exact phase-one receipt from a post-render Dioxus effect.
+    /// Calling this before that lifecycle point is a caller error: the state
+    /// machine intentionally exposes no Runtime control through `commit`.
+    pub(crate) fn acknowledge_rendered_paint(
+        &mut self,
+        commit: &DesktopRuntimePaintCommit,
+    ) -> Result<DesktopRuntimeExecutionLaunch, RuntimeSubscriptionError> {
+        let render_ack_sequence = self
+            .transition_sequence
+            .checked_add(1)
+            .ok_or(RuntimeSubscriptionError::SequenceOverflow)?;
+        let active = self
+            .active_paint
+            .as_ref()
+            .ok_or(RuntimeSubscriptionError::PaintAcknowledgementMismatch)?;
+        if active.identity != commit.identity
+            || active.selection != commit.selection
+            || active.prepared_sequence != commit.prepared_sequence
+            || self.reducer.selected.as_ref()
+                != Some(&(commit.selection.scope.clone(), commit.selection.epoch))
+        {
+            return Err(RuntimeSubscriptionError::PaintAcknowledgementMismatch);
+        }
+        if active.render_ack_sequence.is_some() || active.coordinator.is_none() {
+            return Err(RuntimeSubscriptionError::PaintAlreadyAcknowledged);
+        }
+        let viewport = self
+            .reducer
+            .viewport(&commit.selection.scope)
+            .ok_or(RuntimeSubscriptionError::ViewportMissing)?;
+        if viewport.projection().is_some()
+            || !matches!(
+                viewport.transport_state,
+                DesktopRuntimeTransportState::AwaitingTurn
+            )
+        {
+            return Err(RuntimeSubscriptionError::PaintAcknowledgementMismatch);
+        }
+        if active
+            .coordinator
+            .as_ref()
+            .is_some_and(DesktopRuntimeCoordinatorControl::is_stop_requested)
+        {
+            let identity = active.identity.clone();
+            self.command_slot.finish_exact(&identity);
+            self.active_paint = None;
+            return Err(RuntimeSubscriptionError::PaintStoppedBeforeRuntime);
+        }
+        let active = self
+            .active_paint
+            .as_mut()
+            .ok_or(RuntimeSubscriptionError::PaintAcknowledgementMismatch)?;
+        let coordinator = active
+            .coordinator
+            .take()
+            .ok_or(RuntimeSubscriptionError::PaintAlreadyAcknowledged)?;
+        active.render_ack_sequence = Some(render_ack_sequence);
+        self.transition_sequence = render_ack_sequence;
+        Ok(DesktopRuntimeExecutionLaunch {
+            selection: commit.selection.clone(),
+            identity: commit.identity.clone(),
+            coordinator,
+            prepared_sequence: commit.prepared_sequence,
+            render_ack_sequence,
+        })
+    }
+
+    pub(crate) fn reconcile_selection(
+        &mut self,
+        selected: Option<(&ProjectId, &MissionId)>,
+    ) -> Result<DesktopRuntimeSelectionChange, RuntimeSubscriptionError> {
+        self.abandon_unacknowledged_paint_if_scope_changed(selected);
+        let Some((project_id, mission_id)) = selected else {
+            self.visible_scope = None;
+            if self.active_paint.is_none() && self.reducer.selected.is_some() {
+                self.reducer.select_scope(None)?;
+            }
+            return Ok(DesktopRuntimeSelectionChange::Untracked);
+        };
+        let scope = self
+            .handles
+            .keys()
+            .find(|scope| scope.project_id() == project_id && scope.mission_id() == mission_id)
+            .cloned();
+        let Some(scope) = scope else {
+            self.visible_scope = None;
+            if self.active_paint.is_none() && self.reducer.selected.is_some() {
+                self.reducer.select_scope(None)?;
+            }
+            return Ok(DesktopRuntimeSelectionChange::Untracked);
+        };
+        let was_visible = self.visible_scope.as_ref() == Some(&scope);
+        self.visible_scope = Some(scope.clone());
+
+        if let Some(active_scope) = self
+            .active_paint
+            .as_ref()
+            .map(|active| active.selection.scope.clone())
+        {
+            if active_scope != scope {
+                return Ok(if was_visible {
+                    DesktopRuntimeSelectionChange::Unchanged
+                } else {
+                    DesktopRuntimeSelectionChange::Untracked
+                });
+            }
+            let transport_is_exact =
+                self.reducer
+                    .selected
+                    .as_ref()
+                    .is_some_and(|(selected_scope, selected_epoch)| {
+                        selected_scope == &scope
+                            && self
+                                .active_paint
+                                .as_ref()
+                                .is_some_and(|active| active.selection.epoch == *selected_epoch)
+                    });
+            if was_visible && transport_is_exact {
+                return Ok(DesktopRuntimeSelectionChange::Unchanged);
+            }
+            let selection = self
+                .reducer
+                .select_scope(Some(scope))?
+                .ok_or(RuntimeSubscriptionError::ScopeNotSelected)?;
+            let active = self
+                .active_paint
+                .as_mut()
+                .ok_or(RuntimeSubscriptionError::CommandIdentityMismatch)?;
+            active.selection = selection.clone();
+            return Ok(DesktopRuntimeSelectionChange::Selected(selection));
+        }
+
+        if was_visible
+            && self
+                .reducer
+                .selected
+                .as_ref()
+                .is_some_and(|(selected_scope, _)| selected_scope == &scope)
+        {
+            return Ok(DesktopRuntimeSelectionChange::Unchanged);
+        }
+        let selection = self
+            .reducer
+            .select_scope(Some(scope))?
+            .ok_or(RuntimeSubscriptionError::ScopeNotSelected)?;
+        Ok(DesktopRuntimeSelectionChange::Selected(selection))
+    }
+
+    fn abandon_unacknowledged_paint_if_scope_changed(
+        &mut self,
+        selected: Option<(&ProjectId, &MissionId)>,
+    ) {
+        let identity = self.active_paint.as_ref().and_then(|active| {
+            let same_scope = selected.is_some_and(|(project_id, mission_id)| {
+                active.selection.scope.project_id() == project_id
+                    && active.selection.scope.mission_id() == mission_id
+            });
+            (active.render_ack_sequence.is_none() && !same_scope).then(|| active.identity.clone())
+        });
+        if let Some(identity) = identity {
+            self.command_slot.finish_exact(&identity);
+            self.active_paint = None;
+        }
+    }
+
+    pub(crate) fn pull_request(
+        &self,
+        selection: &DesktopRuntimeSelection,
+    ) -> Option<DesktopRuntimePullRequest> {
+        if self.reducer.selected.as_ref() != Some(&(selection.scope.clone(), selection.epoch)) {
+            return None;
+        }
+        let handle = self.handles.get(&selection.scope)?.clone();
+        let cursor = self.reducer.viewport(&selection.scope)?.cursor();
+        Some(DesktopRuntimePullRequest {
+            scope: selection.scope.clone(),
+            epoch: selection.epoch,
+            handle,
+            cursor,
+        })
+    }
+
+    pub(crate) fn apply_delivery(
+        &mut self,
+        delivery: &DesktopRuntimeDelivery,
+    ) -> Result<DesktopRuntimeReducerEffect, RuntimeSubscriptionError> {
+        let effect = self.reducer.apply_delivery(delivery)?;
+        if effect != DesktopRuntimeReducerEffect::IgnoredStale
+            && self.active_paint.as_ref().is_some_and(|active| {
+                active.runtime_returned && active.selection.scope == *delivery.scope()
+            })
+            && let Some(active) = self.active_paint.as_mut()
+        {
+            active.post_return_delivery_observed = true;
+        }
+        Ok(effect)
+    }
+
+    pub(crate) fn set_follow_latest(
+        &mut self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        follow_latest: bool,
+    ) -> Result<bool, RuntimeSubscriptionError> {
+        let Some(scope) = self.selected_scope_for(project_id, mission_id).cloned() else {
+            return Ok(false);
+        };
+        self.reducer.set_follow_latest(&scope, follow_latest)?;
+        Ok(true)
+    }
+
+    pub(crate) fn paint_view(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Option<DesktopRuntimeExecutionPaintView> {
+        let scope = self.selected_scope_for(project_id, mission_id)?;
+        let viewport = self.reducer.viewport(scope)?;
+        let handle = self.handles.get(scope)?;
+        let stream = viewport.projection().map(|projection| {
+            let items = projection
+                .items()
+                .iter()
+                .map(|item| DesktopRuntimeTextItemProjection {
+                    item_id_digest: item.item_identity_digest.as_str().to_owned(),
+                    text: item.text.clone(),
+                    delta_count: item.delta_count,
+                    last_stream_sequence: item.last_stream_sequence,
+                    cumulative_byte_count: item.cumulative_byte_count,
+                    observed_at: item.observed_at,
+                })
+                .collect::<Vec<_>>();
+            let updated_at = items
+                .iter()
+                .map(|item| item.observed_at)
+                .max()
+                .unwrap_or_else(|| handle.mission_created_at());
+            DesktopRuntimeTextStreamProjection {
+                project_id: scope.project_id().clone(),
+                mission_id: scope.mission_id().clone(),
+                worker_generation: projection.turn.worker_generation,
+                turn_revision: projection.turn.turn_revision,
+                turn_status: projection.turn.turn_status,
+                last_evidence_sequence: projection.turn.consumed_evidence_sequence,
+                delta_count: projection.delta_count(),
+                items,
+                updated_at,
+            }
+        });
+        let content = match stream {
+            Some(projection) => DesktopRuntimePaintContent::Stream {
+                projection,
+                transport: if viewport.transport_caught_up() {
+                    DesktopRuntimePaintStreamTransport::CaughtUp
+                } else {
+                    DesktopRuntimePaintStreamTransport::Open
+                },
+            },
+            None if self.command_slot.stop_available_for(scope) => {
+                DesktopRuntimePaintContent::AwaitingTurn
+            }
+            None => DesktopRuntimePaintContent::Empty,
+        };
+        Some(DesktopRuntimeExecutionPaintView {
+            content,
+            visibility: DesktopRuntimePaintVisibility::from_viewport(viewport)?,
+        })
+    }
+
+    pub(crate) fn viewport_controls(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Option<(bool, bool)> {
+        let scope = self.selected_scope_for(project_id, mission_id)?;
+        let viewport = self.reducer.viewport(scope)?;
+        Some((viewport.follow_latest(), viewport.has_unseen()))
+    }
+
+    pub(crate) fn mark_runtime_returned(
+        &mut self,
+        identity: &DesktopRuntimeCommandIdentity,
+    ) -> Result<bool, RuntimeSubscriptionError> {
+        let Some(active) = self.active_paint.as_mut() else {
+            return Ok(false);
+        };
+        if active.identity != *identity {
+            return Ok(false);
+        }
+        if active.render_ack_sequence.is_none() || active.coordinator.is_some() {
+            return Err(RuntimeSubscriptionError::RuntimeStartedBeforePaint);
+        }
+        if active.runtime_returned {
+            return Ok(false);
+        }
+        active.runtime_returned = true;
+        active.post_return_delivery_observed = false;
+        Ok(true)
+    }
+
+    pub(crate) fn poll_disposition(
+        &self,
+        selection: &DesktopRuntimeSelection,
+    ) -> DesktopRuntimePollDisposition {
+        if self.reducer.selected.as_ref() != Some(&(selection.scope.clone(), selection.epoch)) {
+            return DesktopRuntimePollDisposition::Stale;
+        }
+        let Some(viewport) = self.reducer.viewport(&selection.scope) else {
+            return DesktopRuntimePollDisposition::Stale;
+        };
+        let active = self
+            .active_paint
+            .as_ref()
+            .filter(|active| active.selection.scope == selection.scope);
+        if viewport.transport_caught_up() {
+            match active {
+                Some(active) if !active.runtime_returned => {
+                    DesktopRuntimePollDisposition::WaitForRuntime
+                }
+                Some(active)
+                    if active.post_return_delivery_observed
+                        && viewport
+                            .projection()
+                            .is_some_and(|projection| projection.turn_status().is_terminal()) =>
+                {
+                    DesktopRuntimePollDisposition::ReadyToFinalize
+                }
+                Some(_) => DesktopRuntimePollDisposition::WaitAfterRuntime,
+                None => DesktopRuntimePollDisposition::Complete,
+            }
+        } else if viewport.has_more() || viewport.projection().is_some() {
+            DesktopRuntimePollDisposition::PullNow
+        } else {
+            match active {
+                Some(active) if !active.runtime_returned => {
+                    DesktopRuntimePollDisposition::WaitForRuntime
+                }
+                Some(active) if active.post_return_delivery_observed => {
+                    DesktopRuntimePollDisposition::ReadyToFinalize
+                }
+                Some(_) => DesktopRuntimePollDisposition::WaitAfterRuntime,
+                None => DesktopRuntimePollDisposition::AwaitingWithoutRuntime,
+            }
+        }
+    }
+
+    pub(crate) fn completion_ready(&self, identity: &DesktopRuntimeCommandIdentity) -> bool {
+        let Some(active) = self
+            .active_paint
+            .as_ref()
+            .filter(|active| active.identity == *identity)
+        else {
+            return false;
+        };
+        if !active.runtime_returned {
+            return false;
+        }
+        self.poll_disposition(&active.selection) == DesktopRuntimePollDisposition::ReadyToFinalize
+    }
+
+    pub(crate) fn current_selection_for_command(
+        &self,
+        identity: &DesktopRuntimeCommandIdentity,
+    ) -> Option<DesktopRuntimeSelection> {
+        let active = self
+            .active_paint
+            .as_ref()
+            .filter(|active| active.identity == *identity)?;
+        (self.reducer.selected.as_ref()
+            == Some(&(active.selection.scope.clone(), active.selection.epoch)))
+        .then(|| active.selection.clone())
+    }
+
+    pub(crate) fn selection_is_visible(&self, selection: &DesktopRuntimeSelection) -> bool {
+        self.visible_scope.as_ref() == Some(&selection.scope)
+            && self.reducer.selected.as_ref() == Some(&(selection.scope.clone(), selection.epoch))
+    }
+
+    /// Releases a failed transport coordinator without treating it as Runtime
+    /// or Mission completion. Durable text already in the reducer is retained.
+    pub(crate) fn abort_runtime_transport(
+        &mut self,
+        identity: &DesktopRuntimeCommandIdentity,
+    ) -> Result<bool, RuntimeSubscriptionError> {
+        let Some(active) = self
+            .active_paint
+            .as_ref()
+            .filter(|active| active.identity == *identity)
+        else {
+            return Ok(false);
+        };
+        if active.render_ack_sequence.is_none() {
+            return Err(RuntimeSubscriptionError::RuntimeStartedBeforePaint);
+        }
+        let abort_sequence = self
+            .transition_sequence
+            .checked_add(1)
+            .ok_or(RuntimeSubscriptionError::SequenceOverflow)?;
+        if !self.command_slot.finish_exact(identity) {
+            return Ok(false);
+        }
+        self.active_paint = None;
+        self.transition_sequence = abort_sequence;
+        Ok(true)
+    }
+
+    pub(crate) fn stop_available_for_selection(
+        &self,
+        selected: Option<(&ProjectId, &MissionId)>,
+    ) -> bool {
+        selected
+            .and_then(|(project_id, mission_id)| self.selected_scope_for(project_id, mission_id))
+            .is_some_and(|scope| self.command_slot.stop_available_for(scope))
+    }
+
+    pub(crate) fn request_stop_for_selection(
+        &self,
+        selected: Option<(&ProjectId, &MissionId)>,
+    ) -> DesktopRuntimeStopDisposition {
+        let scope = selected
+            .and_then(|(project_id, mission_id)| self.selected_scope_for(project_id, mission_id));
+        self.command_slot.request_stop_for(scope)
+    }
+
+    pub(crate) fn progress_since(
+        &self,
+        identity: &DesktopRuntimeCommandIdentity,
+        sequence: u64,
+    ) -> Option<Vec<DesktopRuntimeProgressEvent>> {
+        self.command_slot.progress_since(identity, sequence)
+    }
+
+    pub(crate) fn finish_runtime(
+        &mut self,
+        identity: &DesktopRuntimeCommandIdentity,
+        selection: &DesktopRuntimeSelection,
+    ) -> Result<DesktopRuntimeCompletionDisposition, RuntimeSubscriptionError> {
+        let Some(active) = self.active_paint.as_ref() else {
+            return Ok(DesktopRuntimeCompletionDisposition::IgnoredStale);
+        };
+        if active.identity != *identity || active.selection != *selection {
+            return Ok(DesktopRuntimeCompletionDisposition::IgnoredStale);
+        }
+        if active.render_ack_sequence.is_none()
+            || !active.runtime_returned
+            || !self.completion_ready(identity)
+        {
+            return Err(RuntimeSubscriptionError::RuntimeCompletionBeforeTransportReady);
+        }
+        let completion_sequence = self
+            .transition_sequence
+            .checked_add(1)
+            .ok_or(RuntimeSubscriptionError::SequenceOverflow)?;
+        let render_ack_sequence = active
+            .render_ack_sequence
+            .ok_or(RuntimeSubscriptionError::RuntimeStartedBeforePaint)?;
+        let selected_is_exact = self.visible_scope.as_ref() == Some(&selection.scope)
+            && self.reducer.selected.as_ref() == Some(&(selection.scope.clone(), selection.epoch));
+        if !self.command_slot.finish_exact(identity) {
+            return Ok(DesktopRuntimeCompletionDisposition::IgnoredStale);
+        }
+        self.active_paint = None;
+        self.transition_sequence = completion_sequence;
+        if selected_is_exact {
+            Ok(DesktopRuntimeCompletionDisposition::Accepted(
+                DesktopRuntimeAcceptedCompletion {
+                    render_ack_sequence,
+                    runtime_completion_sequence: completion_sequence,
+                },
+            ))
+        } else {
+            Ok(DesktopRuntimeCompletionDisposition::IgnoredStale)
+        }
+    }
+
+    fn selected_scope_for(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Option<&DesktopRuntimeSubscriptionScope> {
+        let visible = self
+            .visible_scope
+            .as_ref()
+            .filter(|scope| scope.project_id() == project_id && scope.mission_id() == mission_id)?;
+        self.reducer
+            .selected
+            .as_ref()
+            .map(|(scope, _)| scope)
+            .filter(|scope| *scope == visible)
+    }
+}
+
+impl fmt::Debug for DesktopRuntimeExecutionPaintState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopRuntimeExecutionPaintState")
+            .field("retained_handle_count", &self.handles.len())
+            .field("reducer", &self.reducer)
+            .field("command_active", &self.command_slot.has_active_command())
+            .field("has_visible_scope", &self.visible_scope.is_some())
+            .field("active_paint", &self.active_paint)
+            .field("transition_sequence", &self.transition_sequence)
+            .finish()
+    }
+}
+
+fn execution_command_digest(
+    handle: &CatalogMissionExecutionHandle,
+    epoch: DesktopRuntimeSubscriptionEpoch,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hartevo.desktop.runtime-command/v1\0");
+    hasher.update(handle.handle_digest().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(epoch.get().to_be_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -1438,6 +2334,20 @@ pub(crate) enum RuntimeSubscriptionError {
     TurnHistoryDisappeared,
     #[error("a Runtime command is already active")]
     CommandAlreadyActive,
+    #[error("the active Runtime command no longer matches its exact transport identity")]
+    CommandIdentityMismatch,
+    #[error("render acknowledgement does not match the prepared Mission paint")]
+    PaintAcknowledgementMismatch,
+    #[error("the prepared Mission paint was already acknowledged")]
+    PaintAlreadyAcknowledged,
+    #[error("the prepared Mission paint was stopped before Runtime launch")]
+    PaintStoppedBeforeRuntime,
+    #[error("Runtime execution cannot start before the exact render acknowledgement")]
+    RuntimeStartedBeforePaint,
+    #[error("the Runtime coordinator lost its exact command state")]
+    RuntimeCoordinatorStateMismatch,
+    #[error("Runtime completion arrived before final durable transport evidence")]
+    RuntimeCompletionBeforeTransportReady,
 }
 
 #[cfg(test)]
@@ -1485,6 +2395,26 @@ mod tests {
             digest(digest_character),
         )
         .expect("canonical scope")
+    }
+
+    fn catalog_handle(
+        project: &str,
+        mission: &str,
+        digest_character: char,
+    ) -> CatalogMissionExecutionHandle {
+        serde_json::from_value(json!({
+            "tenantId": "tenant-desktop-runtime-paint",
+            "projectId": project,
+            "missionId": mission,
+            "manifestId": "VM-07",
+            "manifestVersion": 1,
+            "catalogDigest": digest('9'),
+            "conversationId": format!("mission-conversation:{mission}"),
+            "missionCreatedAt": "2026-08-13T09:00:00Z",
+            "contractDigest": digest('8'),
+            "handleDigest": digest(digest_character),
+        }))
+        .expect("catalog execution handle fixture")
     }
 
     fn turn_value(
@@ -1654,6 +2584,15 @@ mod tests {
         )
     }
 
+    fn reset_running_final_hello() -> RuntimeTextSubscriptionBatch {
+        RuntimeBatchFixture {
+            source_last_sequence: Some(1),
+            cursor_after_sequence: Some(1),
+            ..RuntimeBatchFixture::running()
+        }
+        .page("reset", &[delta_value(1, 1, 'd', "Hello ", 6)], false)
+    }
+
     fn append_page_two(cursor_character: char) -> RuntimeTextSubscriptionBatch {
         RuntimeBatchFixture {
             source_last_sequence: Some(2),
@@ -1662,6 +2601,90 @@ mod tests {
             ..RuntimeBatchFixture::running()
         }
         .page("append", &[delta_value(2, 2, 'd', "world", 11)], false)
+    }
+
+    fn acknowledged_execution_state(
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> (
+        DesktopRuntimeExecutionPaintState,
+        CatalogMissionExecutionHandle,
+        DesktopRuntimeSelection,
+        DesktopRuntimeCommandIdentity,
+    ) {
+        let handle = catalog_handle(project_id.as_str(), mission_id.as_str(), 'a');
+        let mut state = DesktopRuntimeExecutionPaintState::default();
+        let commit = state
+            .commit_catalog_start(handle.clone())
+            .expect("prepare first paint");
+        let launch = state
+            .acknowledge_rendered_paint(&commit)
+            .expect("ack rendered paint");
+        let selection = launch.selection().clone();
+        let identity = launch.identity().clone();
+        (state, handle, selection, identity)
+    }
+
+    fn awaiting_turn_batch(handle: &CatalogMissionExecutionHandle) -> RuntimeTextSubscriptionBatch {
+        serde_json::from_value(json!({
+            "kind": "awaiting_turn",
+            "handle_digest": handle.handle_digest(),
+        }))
+        .expect("awaiting batch")
+    }
+
+    fn apply_terminal_two_delta_turn(
+        state: &mut DesktopRuntimeExecutionPaintState,
+        selection: &DesktopRuntimeSelection,
+        status: RuntimeTurnStatus,
+        revision: u64,
+        cursor_character: char,
+    ) {
+        let terminal_reset = RuntimeBatchFixture {
+            revision,
+            status,
+            source_last_sequence: Some(2),
+            cursor_after_sequence: Some(2),
+            cursor_character,
+            ..RuntimeBatchFixture::running()
+        }
+        .page(
+            "reset",
+            &[
+                delta_value(1, 1, 'd', "Hello ", 6),
+                delta_value(2, 2, 'd', "world", 11),
+            ],
+            false,
+        );
+        let terminal_reset = state
+            .pull_request(selection)
+            .expect("terminal reset pull")
+            .into_delivery(terminal_reset)
+            .expect("terminal Reset");
+        state
+            .apply_delivery(&terminal_reset)
+            .expect("apply terminal Reset");
+        assert_eq!(
+            state.poll_disposition(selection),
+            DesktopRuntimePollDisposition::PullNow
+        );
+        let terminal_ack = RuntimeBatchFixture {
+            revision,
+            status,
+            source_last_sequence: Some(2),
+            cursor_after_sequence: Some(2),
+            cursor_character,
+            ..RuntimeBatchFixture::running()
+        }
+        .caught_up();
+        let terminal_ack = state
+            .pull_request(selection)
+            .expect("terminal ack pull")
+            .into_delivery(terminal_ack)
+            .expect("terminal CaughtUp");
+        state
+            .apply_delivery(&terminal_ack)
+            .expect("apply terminal acknowledgement");
     }
 
     #[test]
@@ -2488,6 +3511,514 @@ mod tests {
 
         let debug = format!("{identity_two:?}");
         assert!(!debug.contains(&digest('d')));
+    }
+
+    #[test]
+    fn execution_launch_requires_exact_post_render_ack_before_runtime_return() {
+        let project_id = ProjectId::from("project-paint");
+        let mission_id = MissionId::from("mission-paint");
+        let handle = catalog_handle(project_id.as_str(), mission_id.as_str(), 'a');
+        let exact_handle_digest = handle.handle_digest().to_owned();
+        let mut state = DesktopRuntimeExecutionPaintState::default();
+
+        let commit = state
+            .commit_catalog_start(handle.clone())
+            .expect("prepare durable first paint");
+        assert_eq!(state.pending_paint_commit(), Some(commit.clone()));
+        let view = state
+            .paint_view(&project_id, &mission_id)
+            .expect("selected paint view");
+        assert!(view.awaiting_turn());
+        assert!(view.stream().is_none());
+        assert!(view.follow_latest());
+        assert!(!view.has_unseen());
+        assert!(!view.transport_caught_up());
+        assert!(state.stop_available_for_selection(Some((&project_id, &mission_id))));
+        assert_eq!(
+            state.mark_runtime_returned(&commit.identity),
+            Err(RuntimeSubscriptionError::RuntimeStartedBeforePaint)
+        );
+
+        let pull = state
+            .pull_request(commit.selection())
+            .expect("exact pull after paint");
+        assert_eq!(pull.handle(), &handle);
+        assert_eq!(pull.handle().handle_digest(), exact_handle_digest);
+        assert!(pull.producer_cursor().is_none());
+        assert_eq!(
+            state.poll_disposition(commit.selection()),
+            DesktopRuntimePollDisposition::WaitForRuntime
+        );
+
+        let launch = state
+            .acknowledge_rendered_paint(&commit)
+            .expect("post-render acknowledgement");
+        assert!(launch.render_ack_sequence() > launch.prepared_sequence());
+        assert!(matches!(
+            state.acknowledge_rendered_paint(&commit),
+            Err(RuntimeSubscriptionError::PaintAlreadyAcknowledged)
+        ));
+        let selection = launch.selection().clone();
+        let identity = launch.identity().clone();
+        let render_ack_sequence = launch.render_ack_sequence();
+        assert!(
+            state
+                .mark_runtime_returned(&identity)
+                .expect("record Runtime return")
+        );
+        let awaiting_batch: RuntimeTextSubscriptionBatch = serde_json::from_value(json!({
+            "kind": "awaiting_turn",
+            "handle_digest": exact_handle_digest,
+        }))
+        .expect("awaiting batch");
+        let final_pull = state
+            .pull_request(&selection)
+            .expect("final read-only pull")
+            .into_delivery(awaiting_batch)
+            .expect("awaiting delivery");
+        assert_eq!(
+            state
+                .apply_delivery(&final_pull)
+                .expect("observe final pull"),
+            DesktopRuntimeReducerEffect::Duplicate
+        );
+        assert_eq!(
+            state.poll_disposition(&selection),
+            DesktopRuntimePollDisposition::ReadyToFinalize
+        );
+        let completion = state
+            .finish_runtime(&identity, &selection)
+            .expect("fenced completion");
+        let DesktopRuntimeCompletionDisposition::Accepted(completion) = completion else {
+            panic!("exact selected completion must be accepted");
+        };
+        assert_eq!(completion.render_ack_sequence(), render_ack_sequence);
+        assert!(completion.runtime_completion_sequence() > render_ack_sequence);
+        assert!(
+            !state
+                .paint_view(&project_id, &mission_id)
+                .expect("retained paint view")
+                .awaiting_turn()
+        );
+        assert!(state.pull_request(&selection).is_some());
+        assert!(!state.stop_available_for_selection(Some((&project_id, &mission_id))));
+    }
+
+    #[test]
+    fn execution_paint_typed_states_map_getters_and_reject_invalid_visibility() {
+        let empty_following = DesktopRuntimeExecutionPaintView {
+            content: DesktopRuntimePaintContent::Empty,
+            visibility: DesktopRuntimePaintVisibility::Following,
+        };
+        assert!(empty_following.stream().is_none());
+        assert!(!empty_following.awaiting_turn());
+        assert!(empty_following.follow_latest());
+        assert!(!empty_following.has_unseen());
+        assert!(!empty_following.transport_caught_up());
+
+        let awaiting_paused = DesktopRuntimeExecutionPaintView {
+            content: DesktopRuntimePaintContent::AwaitingTurn,
+            visibility: DesktopRuntimePaintVisibility::PausedSeen,
+        };
+        assert!(awaiting_paused.awaiting_turn());
+        assert!(!awaiting_paused.follow_latest());
+        assert!(!awaiting_paused.has_unseen());
+
+        let paused_unseen = DesktopRuntimeExecutionPaintView {
+            content: DesktopRuntimePaintContent::Empty,
+            visibility: DesktopRuntimePaintVisibility::PausedUnseen,
+        };
+        assert!(!paused_unseen.follow_latest());
+        assert!(paused_unseen.has_unseen());
+
+        let invalid_source = DesktopRuntimeViewportState {
+            scope: scope(
+                "project-invalid-visibility",
+                "mission-invalid-visibility",
+                'a',
+            ),
+            follow_mode: DesktopRuntimeFollowMode::FollowLatest,
+            visibility: DesktopRuntimeVisibility::Unseen,
+            cursor: None,
+            projection: None,
+            transport_state: DesktopRuntimeTransportState::AwaitingTurn,
+            last_delivery_fingerprint: None,
+        };
+        assert_eq!(
+            DesktopRuntimePaintVisibility::from_viewport(&invalid_source),
+            None
+        );
+    }
+
+    #[test]
+    fn execution_paint_view_reselect_fences_stale_epoch_completion_and_stop() {
+        let project_id = ProjectId::from("project-reselect");
+        let mission_id = MissionId::from("mission-reselect");
+        let (mut state, handle, stale_selection, stale_identity) =
+            acknowledged_execution_state(&project_id, &mission_id);
+        let stale_pull = state
+            .pull_request(&stale_selection)
+            .expect("initial command transport pull");
+
+        assert_eq!(
+            state
+                .reconcile_selection(None)
+                .expect("leave selected Mission"),
+            DesktopRuntimeSelectionChange::Untracked
+        );
+        assert_eq!(
+            state.current_selection_for_command(&stale_identity),
+            Some(stale_selection.clone())
+        );
+        assert!(state.pull_request(&stale_selection).is_some());
+        assert_eq!(
+            state.request_stop_for_selection(None),
+            DesktopRuntimeStopDisposition::ScopeMismatch
+        );
+        let reselected = state
+            .reconcile_selection(Some((&project_id, &mission_id)))
+            .expect("reselect retained handle");
+        let DesktopRuntimeSelectionChange::Selected(reselected) = reselected else {
+            panic!("retained exact handle must produce a new selection epoch");
+        };
+        assert!(reselected.epoch > stale_selection.epoch);
+        assert_eq!(
+            state.current_selection_for_command(&stale_identity),
+            Some(reselected.clone())
+        );
+        let stale_delivery = stale_pull
+            .into_delivery(awaiting_turn_batch(&handle))
+            .expect("stale delivery");
+        assert_eq!(
+            state
+                .apply_delivery(&stale_delivery)
+                .expect("old epoch is ignored"),
+            DesktopRuntimeReducerEffect::IgnoredStale
+        );
+        assert_eq!(
+            state
+                .finish_runtime(&stale_identity, &stale_selection)
+                .expect("old epoch completion is ignored"),
+            DesktopRuntimeCompletionDisposition::IgnoredStale
+        );
+        assert!(state.command_slot.has_active_command());
+        assert!(state.active_paint.is_some());
+        let reselected_pull = state
+            .pull_request(&reselected)
+            .expect("same-process reselected exact pull");
+        assert_eq!(reselected_pull.handle(), &handle);
+        assert!(
+            state
+                .mark_runtime_returned(&stale_identity)
+                .expect("record stale Runtime return")
+        );
+        let delivery = reselected_pull
+            .into_delivery(awaiting_turn_batch(&handle))
+            .expect("reselected delivery");
+        state
+            .apply_delivery(&delivery)
+            .expect("final reselected pull");
+        assert!(state.completion_ready(&stale_identity));
+        assert!(matches!(
+            state
+                .finish_runtime(&stale_identity, &reselected)
+                .expect("real caller completes current transport selection"),
+            DesktopRuntimeCompletionDisposition::Accepted(_)
+        ));
+        assert!(
+            state
+                .current_selection_for_command(&stale_identity)
+                .is_none()
+        );
+        assert!(!state.command_slot.has_active_command());
+        assert!(state.active_paint.is_none());
+        assert_eq!(
+            state
+                .apply_delivery(&stale_delivery)
+                .expect("old epoch remains stale after completion"),
+            DesktopRuntimeReducerEffect::IgnoredStale
+        );
+        assert_eq!(
+            state.poll_disposition(&reselected),
+            DesktopRuntimePollDisposition::AwaitingWithoutRuntime
+        );
+    }
+
+    #[test]
+    fn offscreen_selection_keeps_exact_transport_until_final_pull_without_ui_acceptance() {
+        let project_id = ProjectId::from("project-offscreen");
+        let mission_id = MissionId::from("mission-offscreen");
+        let (mut state, handle, command_selection, command_identity) =
+            acknowledged_execution_state(&project_id, &mission_id);
+        let other_project = ProjectId::from("project-other");
+        let other_mission = MissionId::from("mission-other");
+
+        assert_eq!(
+            state
+                .reconcile_selection(None)
+                .expect("deselect active Mission"),
+            DesktopRuntimeSelectionChange::Untracked
+        );
+        assert_eq!(
+            state.current_selection_for_command(&command_identity),
+            Some(command_selection.clone())
+        );
+        assert!(!state.selection_is_visible(&command_selection));
+        assert_eq!(
+            state
+                .reconcile_selection(Some((&other_project, &other_mission)))
+                .expect("select unrelated scope"),
+            DesktopRuntimeSelectionChange::Untracked
+        );
+        assert!(state.paint_view(&project_id, &mission_id).is_none());
+        assert_eq!(
+            state.current_selection_for_command(&command_identity),
+            Some(command_selection.clone())
+        );
+        assert!(
+            state
+                .mark_runtime_returned(&command_identity)
+                .expect("record Runtime return")
+        );
+        assert!(!state.completion_ready(&command_identity));
+
+        let final_pull = state
+            .pull_request(&command_selection)
+            .expect("offscreen exact command pull")
+            .into_delivery(awaiting_turn_batch(&handle))
+            .expect("offscreen delivery");
+        assert_eq!(
+            state
+                .apply_delivery(&final_pull)
+                .expect("observe offscreen final pull"),
+            DesktopRuntimeReducerEffect::Duplicate
+        );
+        assert!(state.completion_ready(&command_identity));
+        assert_eq!(
+            state
+                .finish_runtime(&command_identity, &command_selection)
+                .expect("release offscreen command after durable evidence"),
+            DesktopRuntimeCompletionDisposition::IgnoredStale
+        );
+        assert!(
+            state
+                .current_selection_for_command(&command_identity)
+                .is_none()
+        );
+        assert!(!state.command_slot.has_active_command());
+        assert!(state.active_paint.is_none());
+        assert!(state.paint_view(&project_id, &mission_id).is_none());
+    }
+
+    #[test]
+    fn execution_paint_stream_is_ephemeral_and_debug_redacts_private_text() {
+        let project_id = ProjectId::from("project-stream");
+        let mission_id = MissionId::from("mission-stream");
+        let private = "private execution-time paint body";
+        let handle = catalog_handle(project_id.as_str(), mission_id.as_str(), 'a');
+        let mut state = DesktopRuntimeExecutionPaintState::default();
+        let commit = state
+            .commit_catalog_start(handle)
+            .expect("prepare first paint");
+        let launch = state
+            .acknowledge_rendered_paint(&commit)
+            .expect("ack rendered paint");
+        let batch = RuntimeBatchFixture {
+            source_last_sequence: Some(1),
+            cursor_after_sequence: Some(1),
+            ..RuntimeBatchFixture::running()
+        }
+        .page(
+            "reset",
+            &[delta_value(
+                1,
+                1,
+                'd',
+                private,
+                u64::try_from(private.len()).expect("private length"),
+            )],
+            false,
+        );
+        let delivery = state
+            .pull_request(launch.selection())
+            .expect("pull request")
+            .into_delivery(batch)
+            .expect("integrity checked delivery");
+        state.apply_delivery(&delivery).expect("apply Reset");
+
+        let view = state
+            .paint_view(&project_id, &mission_id)
+            .expect("render view");
+        let stream = view.stream().expect("stream projection");
+        assert_eq!(stream.items[0].text, private);
+        assert_eq!(stream.delta_count, 1);
+        let debug = format!("{state:?} {view:?}");
+        assert!(!debug.contains(private));
+        assert!(!debug.contains(&digest('a')));
+        assert!(!debug.contains(&digest('d')));
+    }
+
+    #[test]
+    fn running_caught_up_waits_for_late_delta_and_terminal_ack() {
+        let project_id = ProjectId::from("project-late-delta");
+        let mission_id = MissionId::from("mission-late-delta");
+        let (mut state, _handle, selection, identity) =
+            acknowledged_execution_state(&project_id, &mission_id);
+
+        let reset = state
+            .pull_request(&selection)
+            .expect("initial pull")
+            .into_delivery(reset_running_final_hello())
+            .expect("running Reset");
+        state.apply_delivery(&reset).expect("apply running Reset");
+        let running_caught_up = state
+            .pull_request(&selection)
+            .expect("running ack pull")
+            .into_delivery(
+                RuntimeBatchFixture {
+                    source_last_sequence: Some(1),
+                    cursor_after_sequence: Some(1),
+                    ..RuntimeBatchFixture::running()
+                }
+                .caught_up(),
+            )
+            .expect("running CaughtUp");
+        state
+            .apply_delivery(&running_caught_up)
+            .expect("apply running CaughtUp");
+        let caught_up_view = state
+            .paint_view(&project_id, &mission_id)
+            .expect("caught-up stream paint view");
+        assert!(caught_up_view.stream().is_some());
+        assert!(caught_up_view.transport_caught_up());
+        assert_eq!(
+            state.poll_disposition(&selection),
+            DesktopRuntimePollDisposition::WaitForRuntime
+        );
+
+        let late_append = state
+            .pull_request(&selection)
+            .expect("late delta pull")
+            .into_delivery(append_page_two('d'))
+            .expect("late Append");
+        state
+            .apply_delivery(&late_append)
+            .expect("apply late delta");
+        assert!(
+            !state
+                .paint_view(&project_id, &mission_id)
+                .expect("reopened stream paint view")
+                .transport_caught_up()
+        );
+        assert_eq!(
+            state.poll_disposition(&selection),
+            DesktopRuntimePollDisposition::PullNow
+        );
+        assert!(
+            state
+                .mark_runtime_returned(&identity)
+                .expect("record Runtime completion")
+        );
+        apply_terminal_two_delta_turn(&mut state, &selection, RuntimeTurnStatus::Completed, 5, 'e');
+        assert_eq!(
+            state.poll_disposition(&selection),
+            DesktopRuntimePollDisposition::ReadyToFinalize
+        );
+        assert!(state.completion_ready(&identity));
+    }
+
+    #[test]
+    fn runtime_return_before_first_pull_requires_terminal_reset_and_caught_up() {
+        let project_id = ProjectId::from("project-fast-runtime");
+        let mission_id = MissionId::from("mission-fast-runtime");
+        let (mut state, _handle, selection, identity) =
+            acknowledged_execution_state(&project_id, &mission_id);
+        assert!(
+            state
+                .mark_runtime_returned(&identity)
+                .expect("record fast Runtime return")
+        );
+        assert_eq!(
+            state.poll_disposition(&selection),
+            DesktopRuntimePollDisposition::WaitAfterRuntime
+        );
+
+        let terminal_reset = RuntimeBatchFixture {
+            revision: 2,
+            status: RuntimeTurnStatus::Completed,
+            source_last_sequence: Some(1),
+            cursor_after_sequence: Some(1),
+            ..RuntimeBatchFixture::running()
+        }
+        .page("reset", &[delta_value(1, 1, 'd', "done", 4)], false);
+        let delivery = state
+            .pull_request(&selection)
+            .expect("first post-return pull")
+            .into_delivery(terminal_reset)
+            .expect("terminal Reset");
+        state
+            .apply_delivery(&delivery)
+            .expect("apply terminal Reset");
+        assert!(!state.completion_ready(&identity));
+        let terminal_ack = state
+            .pull_request(&selection)
+            .expect("terminal acknowledgement pull")
+            .into_delivery(
+                RuntimeBatchFixture {
+                    revision: 2,
+                    status: RuntimeTurnStatus::Completed,
+                    source_last_sequence: Some(1),
+                    cursor_after_sequence: Some(1),
+                    ..RuntimeBatchFixture::running()
+                }
+                .caught_up(),
+            )
+            .expect("terminal CaughtUp");
+        state
+            .apply_delivery(&terminal_ack)
+            .expect("apply terminal acknowledgement");
+        assert!(state.completion_ready(&identity));
+    }
+
+    #[test]
+    fn stale_or_stopped_render_ack_never_produces_runtime_authority() {
+        let project_id = ProjectId::from("project-ack-fence");
+        let mission_id = MissionId::from("mission-ack-fence");
+        let mut stale = DesktopRuntimeExecutionPaintState::default();
+        let stale_commit = stale
+            .commit_catalog_start(catalog_handle(
+                project_id.as_str(),
+                mission_id.as_str(),
+                'a',
+            ))
+            .expect("prepare stale paint");
+        stale
+            .reconcile_selection(None)
+            .expect("selection changed before render ack");
+        assert!(matches!(
+            stale.acknowledge_rendered_paint(&stale_commit),
+            Err(RuntimeSubscriptionError::PaintAcknowledgementMismatch)
+        ));
+        assert!(stale.pending_paint_commit().is_none());
+
+        let mut stopped = DesktopRuntimeExecutionPaintState::default();
+        let stopped_commit = stopped
+            .commit_catalog_start(catalog_handle(
+                project_id.as_str(),
+                mission_id.as_str(),
+                'b',
+            ))
+            .expect("prepare stopped paint");
+        assert_eq!(
+            stopped.request_stop_for_selection(Some((&project_id, &mission_id))),
+            DesktopRuntimeStopDisposition::Requested
+        );
+        assert!(matches!(
+            stopped.acknowledge_rendered_paint(&stopped_commit),
+            Err(RuntimeSubscriptionError::PaintStoppedBeforeRuntime)
+        ));
+        assert!(stopped.pending_paint_commit().is_none());
+        assert!(!stopped.stop_available_for_selection(Some((&project_id, &mission_id))));
     }
 
     #[test]
