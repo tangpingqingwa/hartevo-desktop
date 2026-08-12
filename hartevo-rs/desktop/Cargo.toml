@@ -1,0 +1,40 @@
+[package]
+name = "hartevo-desktop"
+description = "Dioxus desktop shell for Hartevo's Mission workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+dioxus.workspace = true
+hartevo-application = { path = "../application" }
+hartevo-catalog = { path = "../catalog" }
+hartevo-context-fabric = { path = "../context-fabric" }
+hartevo-domain-kernel = { path = "../domain-kernel" }
+hartevo-runtime-adapter = { path = "../runtime-adapter" }
+hartevo-storage = { path = "../storage" }
+hex.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
+[features]
+default = ["desktop"]
+desktop = ["dioxus/desktop"]
+bundle = []
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hartevo-desktop"
+path = "src/main.rs"

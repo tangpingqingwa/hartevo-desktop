@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：发布质量下限。** 数值门槛和 Gate 顺序作为首版合同；若工程实现需要调整，必须通过新的 RFC 修改，不能在发布时临时跳过。
 
 状态：**Target Contract**；不表示当前生产已经达到所有门槛
-Desktop 采用版本：2026-08-10-v4
+Desktop 采用版本：2026-08-11-v5
 适用范围：Rust/Dioxus Desktop、Hartevo Domain Kernel、Effect Broker、OpenInterpreter Runtime、Browser Runtime、SQLite/Cloud Storage、Connector 和 Provider 边界
 
 ## 1. 发布必须证明什么
@@ -46,9 +46,9 @@ Hartevo 的 Release Candidate 不仅要“服务健康、首 Token 快、工具�
 | F0 Foundation | 登录、项目选择、账户用量、Connector、空状态 | 首次可用、身份连续、幂等和错误可恢复 |
 | Q1 Quick Project Question | 当前状态、下一步、证据解释 | 首过程、首正文、事实正确、不过度调用 |
 | D1 Decision Mission | 新市场、AI 推荐、GDO、Marketplace 机会 | Time-to-Decision-ready-Evidence、决策质量、约束保持 |
-| W1 Work Product Mission | Site、Content、PR、Partner Shortlist、CRM Plan | Time-to-Reviewable-Artifact、采用率、可追溯性 |
+| W1 Work Product Mission | Site、Content、PR、Partner Shortlist、Creator Deliverable、CRM Plan | Time-to-Reviewable-Artifact、采用率、可追溯性 |
 | E1 Approved Effect | 发布、邀约、邮件、域名购买、Checkout | Approval、Idempotency、Receipt、Verification |
-| R1 Relationship Journey | Partner、CRM、Inbox、人工接管 | Consent、身份、消息顺序、关系状态和连续性 |
+| R1 Relationship Journey | Partner、Creator Task、CRM、Inbox、人工接管 | Consent、身份、合同版本、交付 Review、消息顺序、关系状态和连续性 |
 | O1 Outcome/Attribution | Lead、Order、Refund、Commission、Payout | 事件完整、金额/币种、身份链和可复算结果 |
 | L1 Long Growth Loop | 跨周测量、复盘、Next Loop、Skill Draft | 持续进度、重启恢复、Outcome→Next Decision |
 | B1 Browser/GT | 登录 AI 引擎、渠道后台、人工接管 | Profile/Project 隔离、Workspace 生命周期、独占控制租约、接管硬停止、Snapshot/Locator 正确性、崩溃恢复 |
@@ -112,7 +112,7 @@ G0 Identity and project truth
 - VM-03 无网站→Preview→Approval→Verified Site；
 - VM-04 Social Connection→Native Draft→Approved Publish→Engagement Review；
 - VM-05 Consent-safe Email→Receipt→Reply/Handoff；
-- VM-06 Brand Readiness→Partner Supply→Program/Tracking/Commission；
+- VM-06 Brand Readiness→Partner Supply→Program/Tracking/Commission，以及 Campaign/Relationship→Verified Invitation/Listing→Application→User Award→Funding Reservation→Task/Bounty→真实 Deliverable→Review→Verified Payout→Rights Entitlement；
 - VM-11 各经营目标的 KPI、一次性终态和持续周期终态；
 - 所有零容忍横切套件。
 
@@ -144,6 +144,7 @@ VM-07 新市场决策、VM-08 Marketplace、VM-09 B2B Pipeline、VM-10 Inbox 必
 - Content Brief、Draft、Claims Manifest；
 - Site Preview、Diff 或 PR；
 - Partner Shortlist、Program、Opportunity、Tracking Link；
+- Creator Task/Bounty Contract、Deliverable、Review、Dispute 和 Payout Receipt；
 - CRM Next Best Action、Follow-up Draft、Conversation Summary；
 - Attribution/Commission/Payout Reconciliation；
 - Next-loop Review。
@@ -192,6 +193,9 @@ Policy
 
 - Supply Class 必须区分官方授权、Hartevo Opt-in、租户私域和公开候选；
 - Public Candidate 不得自动触达；
+- Creator Task 在接受后修改目标、金额、期限、验收或使用权时必须重新由双方接受；
+- Deliverable 必须具有可访问 revision/digest、文件安全结果和使用权声明；用户接受前不得付款；
+- Review 绑定的 Deliverable digest 被替换后，原付款审批立即失效；
 - Consent/Opt-out/频次/退订违反为 0；
 - Person、Company、Partner、Contact 的错误合并率必须低于 1%，高风险样本必须人工确认；
 - Webhook 重复/乱序不得产生重复 Message、Activity 或业务执行；
@@ -208,6 +212,8 @@ Policy
 | 无法归因事件保留为 Unattributed | 100% |
 | Refund 不改写原订单且重算正确 | 100% |
 | Commission/Payout 可复算匹配 | 100% |
+| Creator Task/Acceptance/Deliverable/Review/Payout 身份链完整 | 100% |
+| Creator 未经接受、重复或错误金额/币种付款 | 0 |
 | 无订单/收入事件却声称 Revenue | 0 |
 | 无因果设计却声称某动作导致增长 | 0 |
 
@@ -416,32 +422,37 @@ Canary 仅验证：
 
 ```json
 {
-  "schemaVersion": "2.1.0",
+  "schemaVersion": "2.2.0",
   "passed": false,
   "releaseCommit": "<40-char-sha>",
-  "imageDigests": {},
-  "environment": "local-rc|controlled-provider|production",
-  "missionCatalogVersion": "desktop-2026-08-10-v4",
-  "genericBenchmarkRegistryVersion": "<version>",
+  "environment": "wave-zero-contract-baseline|local-rc|controlled-provider|production",
+  "requestedStage": "engineering_foundation",
+  "missionCatalogVersion": "desktop-2026-08-12-v10",
+  "applicationHandlerRegistryVersion": "desktop-2026-08-12-v1",
+  "applicationRouteCount": 52,
+  "implementedApplicationHandlerCount": 1,
+  "notImplementedApplicationRouteCount": 51,
+  "capabilityCatalogVersion": "<version>",
+  "providerCatalogVersion": "<version>",
   "datasetPartitionRevision": "<version>",
-  "contaminationAuditDigest": "<digest>",
-  "benchmarkMatrix": {},
-  "oosGeneralization": {},
-  "worldVersions": {},
-  "capabilitySchemaDigest": "<digest>",
-  "modelAndPrompt": {},
+  "catalogDigest": "<64-char-sha256>",
+  "contaminationAuditDigest": null,
+  "traceabilityComplete": true,
   "missionResults": {},
-  "sixLayerCoverage": {},
-  "workProducts": {},
-  "effects": {},
-  "attribution": {},
-  "quality": {"mgcr": 0, "vbor": 0, "lcr": 0},
-  "experience": {},
-  "reliability": {},
+  "quality": {
+    "mgcr": null,
+    "vbor": null,
+    "lcr": null,
+    "workProductAdoption": null,
+    "judgeCalibratedSamples": 0,
+    "longitudinalTenants": 0,
+    "longitudinalVerticals": 0,
+    "longitudinalMarkets": 0,
+    "longitudinalDays": 0
+  },
   "safetyInvariants": {},
-  "capacity": {},
-  "cost": {},
   "notImplemented": [],
+  "blockedEnv": [],
   "failures": [],
   "startedAt": "<rfc3339>",
   "completedAt": "<rfc3339>"

@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：完成度口径。** 本仓库在 Harness 可运行后生成按 Commit 固定的 Scorecard。
 
 状态：**Target Contract**；分数只能由版本化 Eval 证据生成
-Desktop 采用版本：2026-08-10-v4
+Desktop 采用版本：2026-08-11-v5
 适用范围：Rust/Dioxus Desktop、Hartevo Domain Kernel、Effect Broker、OpenInterpreter Runtime、Browser Runtime、SQLite/Cloud Storage、Connector 和 Provider 边界
 
 ## 1. 完成度回答的不是“写了多少代码”
@@ -105,7 +105,7 @@ LCR 只适用于 `continuous_operator`、`continuous_relationship` 和声明需�
 | VM-03 无网站建站 | Verified Site、Conversion Route Readiness、Time-to-First-Lead-Ready | Claims、PR/Test、Receipt/Verification、Tracking | 已生成页面、Provider Success |
 | VM-04 Social Matrix | Verified Connections、Native Publication、Useful Engagement、Referral | 渠道选择理由、内容原生度、发布真实性、人工登录边界 | 连接数量、发帖数量、机械群发 |
 | VM-05 Email Acquisition | Delivered、Reply、Qualified Lead、Meeting、Opt-out Compliance | Consent、Sequence、Message Receipt、Reply/Handoff | 生成邮件数量、发送成功当获客成功 |
-| VM-06 Partner/Affiliate | Brand Readiness、Verified Supply、Activation、Attributed Orders、Commission | Supply Class、Consent、Program/Link、订单/Payout | 公开候选总数、虚假 10 万+ |
+| VM-06 Partner/Affiliate/Creator Work | Brand Readiness、Verified Supply、Activation、Accepted Deliverable、Attributed Orders、Commission/Payout | Supply Class、Consent、Task/Bounty Contract、Deliverable digest、User Review、Program/Link、订单/付款 | 公开候选总数、生成一份文件、Review 前付款、虚假 10 万+ |
 | VM-07 新市场决策 | Decision-ready Evidence、Go/No-go Acceptance | 市场/产品/预算一致性、估算边界、Replan | 强行进入所有增长模块 |
 | VM-08 Marketplace | Opportunity Precision、Listing Fix Adoption、Return/Conversion Change | 第一方/估算区分、评论/退货覆盖、事实一致性 | 第三方销量估算、泛化文案 |
 | VM-09 B2B Pipeline/GDO | Accepted Next Best Action、Qualified Progress、Win/Loss Evidence | Consent、Buying Committee、Decision Evidence、Currency | Pipeline 金额当收入 |
@@ -178,6 +178,13 @@ SEO→AEO→GEO→GAO→GMO→GDO 是 Hartevo 可选择的能力坐标，不是�
 | Message Duplicate/Loss | 0 |
 | Human Handoff Control Violation | 0 |
 | Opportunity Priority Expert Agreement | ≥ 85% |
+| Creator Task Contract/Acceptance Version Match | 100% |
+| Creator Deliverable 安全、权利与 Digest Coverage | 100% |
+| 未经用户接受的 Creator Payout | 0 |
+| Review 后 Deliverable 被替换仍付款 | 0 |
+| Funding Reservation 被错误声明为法定 Escrow | 0 |
+| 未经独立验证付款即授予合同使用权 | 0 |
+| Creator Payout Duplicate/Amount/Currency Error | 0 |
 
 ### 10.3 Attribution 与经济事实
 
@@ -253,7 +260,7 @@ SEO→AEO→GEO→GAO→GMO→GDO 是 Hartevo 可选择的能力坐标，不是�
 | Content/Site | `content.draft`、`site.build`、`publication.prepare`、`source.pull_request` | 从 Evidence 到可审阅产物和安全变更 |
 | Publication/Community | `publication.publish`、`community.reply` | 经审批发布并独立验证 |
 | CRM/Conversation | `crm.record`、`crm.follow_up`、`conversation.reply` | 关系事实、Consent 和消息结果回流 |
-| Partner | `partner.engage`、`operations.command` | 供给分类、Program、邀约和追踪进入闭环 |
+| Partner/Creator Work | `partner.engage`、`creator.task.publish`、`deliverable.upload`、`settlement.payout` | 供给分类、Program、邀约、任务悬赏、真实交付、Review、追踪和付款进入闭环 |
 | Integration/Browser | `integration.verify`、`integration.manage`、`browser.session` | 真实连接状态、租户 Profile 和人工接管 |
 | Domain | `domain.search`、`domain.purchase` | 可查与可购买分离，金额和所有权可验证 |
 | Automation | `automation.configure` | Trigger 不扩大权限，结果进入下一轮 |

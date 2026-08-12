@@ -43,7 +43,7 @@ Hartevo Desktop 采用 Rust-first 架构：产品代码、桌面 Shell、领域�
 
 1. **它是 coding-agent runtime，不是增长业务内核。** 核心对象仍是 cwd、workspace root、thread、turn、tool item 和文件/命令执行。
 2. **TUI 不是目标 Desktop。** 仓库没有可直接换皮为 Hartevo 的成熟增长业务 GUI；`desktop_app` 代码只是安装/打开既有桌面应用的辅助逻辑。
-3. **本地审批不等于业务审批。** 命令和文件审批不能覆盖发邮件、发布社媒、广告花费、CRM 写入、联盟付款和重复触达风险。
+3. **本地审批不等于业务审批。** 命令和文件审批不能覆盖发邮件、发布社媒、广告花费、CRM 写入、Creator Task/Deliverable 接受、联盟/达人付款和重复触达风险。
 4. **开放模型优化主要针对 coding。** “接近 Codex”必须用 Hartevo Mission Eval 重新证明，不能从代码任务表现外推到增长经营。
 5. **上游很大且变化快。** 直接在 `codex-core` 堆叠业务逻辑会快速失去上游同步能力。
 6. **App Server 的一部分字段仍是 experimental。** Hartevo 必须固定 schema digest，并在升级前跑契约测试。

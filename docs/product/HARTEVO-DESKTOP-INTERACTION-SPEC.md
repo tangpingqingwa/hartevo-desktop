@@ -1,7 +1,7 @@
 # Hartevo Desktop：Growth Operations 交互规格
 
 状态：**Current**
-版本：Desktop v12 冻结交互基线
+版本：Desktop v13 当前交互基线
 范围：渠道、社媒、邮件与 CRM、达人发现与建联、联盟营销，以及这些业务依赖的外部连接、权限、审批和验证。
 
 ## 1. 产品原则
@@ -11,6 +11,17 @@
 3. 连接成功不等于允许执行。读取、发布、触达、邀请、合同、预算和付款分别受策略与审批控制。
 4. 公开发现、租户私域、Hartevo Opt-in 与官方网络是不同供给事实，不混写、不虚构。
 5. 每次外部动作都保留 Effect、Provider Receipt、Verification 与 Outcome，失败或不确定时冻结并核验。
+
+### 1.0 本地首次启动与个人项目 Recovery Kit
+
+- 首次启动只展示显式“初始化本地加密数据层”；用户操作前不创建 SQLCipher 文件或 OS Vault credential，也不连接 Provider。
+- 初始化后 Project/Mission/Keyring 状态只来自 Application projection。空状态不能加载 demo 项目、假 Receipt、假 Verification 或假 Completed。
+- 创建个人项目先输入项目名称与首个自然语言 Mission 目标，再生成一次性 Recovery Kit。Kit 只在当前 UI 中显示，产品不提供“稍后查看”；用户确认已完整离线保存后才能创建 `PersonalE2ee` Keyring、项目目录与首个持久 Mission。
+- Hartevo、SQLCipher、日志、Trace、Release Evidence 和 OS Vault 均不得保存 Recovery Kit；OS Vault 只保存设备 wrapping key。用户作废并重生成时，旧 UI state 必须清零。
+- 项目已创建但 Keyring 未完成时，重启后明确显示 `RECOVERY_REQUIRED`/`NotProvisioned`，允许粘贴此前保存的 Kit 完成一次 provisioning；不得静默生成替代 key、删除项目或伪装 Ready。
+- 已配置项目只有在 exact Project/Device Context session 成功后才能显示 WorkProduct preview 或创建新 Mission；通用 inventory 只显示元数据与 WorkProduct 数量。设备 wrapping secret 丢失、设备撤销或 active key 不可用时保留项目导航，但正文/preview 必须为空，并显示 `RECOVERY_REQUIRED` 或相应完整性错误。
+- `RECOVERY_REQUIRED` 为个人项目提供用户自持 Recovery Kit 的 Device Attachment：先校验项目、当前 keyring revision、唯一 Recovery recipient 与 Kit，再通过持久 Saga 原子写入 distinct successor Device wrapping secret/envelope；错误 Kit 零副作用，旧 envelope 不覆盖，成功重开 Context 后才恢复预览与写入。整机丢失导致安装 SQLCipher key 同时缺失、团队/多 Recovery recipient、历史 key 补齐和跨设备数据库恢复不在该入口能力内，必须显示相应边界。
+- 数据库存在但安装 key 缺失/不匹配时显示 `BLOCKED_ENV` 并失败关闭；恢复产品流尚未实现时，不允许初始化覆盖旧数据库。
 
 ### 1.1 用户、宣发项目与 Mission
 
@@ -24,19 +35,23 @@
 
 “新建宣发项目”不要求填写传统配置表。用户先用自然语言说明市场、产品、目标和限制，Hartevo 再建立独立 Truth Graph、Mission 记忆、连接范围、审批策略与成果空间。账户、团队和全局设置仍从用户级入口管理。
 
-### 1.2 唯一总调度会话
+### 1.2 项目总调度与持久 Mission 会话
 
-Hartevo 每个宣发项目只有一个持续存在的 **总调度会话**。它负责目标理解、Mission 编译、进度说明、方向调整、审批和结果复盘。连接中心、渠道、CRM、达人与联盟是同一 Mission 的结构化工作面，不拥有各自独立的会话，也不要求用户在模块之间手工传递上下文。
+Hartevo 每个宣发项目有一个持续存在的 **项目总调度会话**，同时每条 Mission 有自己的持久会话。两者是同一 Domain State 的不同 Conversation View，不是不同 Agent、不同 Truth Graph 或不同权限系统。
 
-- 主入口：左侧“总调度”是持续交互入口。会话区明确展示当前 Mission 正在协调的工作面，以及每个工作面的实时状态。
-- 主输入：完整自然语言输入、模型、推理强度与速度只出现在总调度。用户在这里连续描述目标、改变方向、设置停止条件或要求转人工。
-- 工作面：进入模块后只展示结构化状态与专业操作，不再重复放置完整输入框。底部共享状态条说明当前工作面属于哪个 Mission、哪些状态已经同步，并提供“回到总调度继续”。
-- 上下文回流：模块里的“创建渠道 Mission”“创建建联 Mission”等按钮不会在模块内新开会话，而是携带当前对象、筛选条件和工作面状态返回总调度，预填为下一条指令。
-- 自动同步：所有工作面订阅同一份 Mission State、Truth Graph、Effect Ledger 和 Approval Policy。任何进度、连接、回执、失败与人工接管状态都会自动回写，不需要用户刷新或逐个查看。
-- 自动回到任务：为某条指令完成必要连接后，产品自动回到原总调度会话并恢复 Mission；用户不需要重新输入目标。
-- 快捷入口：在任意工作面按 `Ctrl / Cmd + K` 会回到总调度并聚焦主输入，而不是在当前模块生成另一个输入框。
+- 项目总调度：负责理解新目标、选择/创建 Mission、跨 Mission 优先级、当前经营状态和跨目标复盘；它不复制 Mission 事实或执行状态。
+- Mission 会话：围绕一条 Operating Contract 持续讨论、执行、暂停、审批、Review、恢复和复盘；跨 Runtime、Desktop 重启和入口切换保持同一个 Mission ID。
+- 主输入：总调度和当前 Mission 都可使用完整自然语言输入；在 Mission 内输入默认只修改当前合同或局部分支，不静默创建新 Mission。
+- 工作面：渠道、CRM、达人、Creator Deliverable、连接和 Outcome 页面不拥有独立业务会话；它们可以打开绑定对象的 Mission 会话侧栏，写入同一个 Mission Stream。
+- 路由：模块里的“创建渠道 Mission”“创建 Creator Task”等动作先携带当前对象和筛选条件交给总调度；创建后进入新 Mission 会话。已有 Mission 的对象动作直接回到原 Mission。
+- 自动同步：总调度、Mission 会话和所有工作面订阅同一份 Project Truth、Mission State、Effect Ledger、Approval Policy 和 Outcome Ledger。
+- 自动回到任务：完成连接、人工登录、Deliverable 上传或审批后，产品恢复原 Mission 会话和 Checkpoint；用户不需要重新输入目标。
+- Human Checkpoint：只有当前 route 明确为 `human + human_confirmation + running` 时，输入区才切换为精确确认。界面必须显示稳定 Checkpoint ID、Oracle 集和 required WorkProduct；需要 WorkProduct 时逐项选择真实可审阅产物，缺产物则显示阻塞，不得空确认。
+- 提交 Human Checkpoint 时，用户陈述、所选 WorkProduct、Mission/Checkpoint/Conversation revision 和 route digest 形成同一个确认边界；修改任何一项都不是原审批的重放。成功后同一事务完成当前 Checkpoint 并启动 exact 下一 route，失败不允许留下“消息已写但 Mission 未推进”或相反的半状态。
+- Human confirmation 不调用 Runtime、不产生 Provider Effect；下一 route 若为 Runtime，只显示已经就绪，必须由后续独立调度执行。通用“完成 Checkpoint”按钮或模型输出不能绕过这个入口。
+- 快捷入口：`Ctrl / Cmd + K` 打开 Project Quick Entry；用户可选择提交给总调度或当前 Mission，UI 明确显示目标，不靠隐式路由猜测。
 
-项目首页的“描述新任务”和各业务工作面的动作按钮都是总调度的上下文入口。它们可以预填指令，但会话、审批、记忆和成果始终归属于同一 Mission Thread。切换宣发项目时，总调度、工作面状态和未提交输入必须一起切换，禁止跨项目静默继承。
+项目首页和业务工作面的动作按钮都是带上下文的入口。切换项目时，总调度、Mission 会话列表、工作面状态和未提交输入必须一起切换，禁止跨项目静默继承。
 
 ## 2. 一级信息架构
 
@@ -44,7 +59,7 @@ Hartevo 每个宣发项目只有一个持续存在的 **总调度会话**。它�
 
 - 渠道运营：渠道选择、内容日历、发布队列、成效与回执。
 - 关系与 CRM：Consent、联系人、邮件序列、Inbox、人工接管、商机阶段。
-- 达人与联盟：供给网络、达人发现、建联管线、Program、归因、佣金和付款。
+- 达人与联盟：供给网络、达人发现、建联管线、Program、用户任务/悬赏、真实交付 Review、归因、佣金和付款。
 
 ### 能力层：系统与连接
 
@@ -81,6 +96,8 @@ Hartevo 每个宣发项目只有一个持续存在的 **总调度会话**。它�
 - 策略允许：满足既定对象、预算、频率和内容边界的重复动作。
 - 必须确认：首次发布、首次邮件、批量触达、达人邀请、合同、预算变更、佣金和付款。
 - 禁止自动重试：付款、不确定的外部写入、可能重复发送或重复发布的动作。
+
+本地 Runtime 恢复与业务 Effect 重试必须分开显示。只有 Running Mission 的 `Prepared|Failed` recovery 或 `Failed|Interrupted` Turn 可以出现“重试本地 Runtime”；active、`Uncertain` 或 `Completed` Turn 不显示可执行重放。恢复始终复用同一 Mission，耗尽 generation 必须先撤销旧 Worker authority，再创建 successor generation。恢复成功只产生可审阅草稿，不能显示 Provider Receipt、Verification 或 Mission Completed。
 
 ### 3.4 连接流程
 
@@ -164,24 +181,46 @@ Hartevo 每个宣发项目只有一个持续存在的 **总调度会话**。它�
 
 ### 6.3 建联管线
 
-标准流程：
+Affiliate 标准流程：
 
 `发现/导入 → 去重 → 来源与权限验证 → 评分 → 合格 → 审批 → 邀请/申请/谈判 → 条款 → Link/Coupon/Brief/Sample → 激活 → 发布验证 → 归因 → 佣金 → 付款审批 → 培育`
 
 - `permission_unknown` 候选停留在研究区。
 - 可建联对象才允许生成 Outreach Pack。
 - 每次外发都保留对象、模板版本、审批和 Provider Receipt。
+- Creator Hiring 的合法入口只有两种：经独立 readback 验证的定向邀请，或经独立 readback 验证的公开 Task/Bounty Listing；不能从搜索结果、Agent 推荐或未发送草稿直接生成应聘。
+- 联系许可不是一次性快照。即使邀请已获用户批准，执行前也要重新读取当前 Partner permission；期间撤回时必须在 Provider 调用前失败关闭。
 
 ### 6.4 Partner Program
 
 - 管理市场、商品、佣金模型、Cookie Window、退款规则、币种、条款、素材和终止条件。
 - Program、Partner、Link/Coupon、Order/Action、Commission、Payout 保持可追溯关系。
 
-### 6.5 归因与佣金
+### 6.5 Creator Hiring、Task、悬赏与交付 Review
+
+用户可以先定义需求和悬赏，再从允许联系的候选中定向邀请，或向已验证供给范围发布 Listing；系统不得要求用户预先指定一个达人，也不得把 Agent 推荐直接当成雇佣：
+
+1. 用户填写目标、私有说明、公开摘要、参考资产、交付格式、截止时间、验收标准、允许修改次数、使用权/披露要求、金额和币种，形成固定 `CreatorHiringOffer` digest；
+2. 用户逐个选择候选并预览定向邀请，或预览公开 Listing；邀请/发布分别形成精确 Effect，绑定 Provider、账号、受众/供给范围、Offer digest、金额、市场、截止时间和有效期；
+3. Provider Receipt 之后必须独立 readback，只有已验证邀请或 Listing 才能接收 Application。公开搜索候选没有 Contact Permission 时只能研究；联系许可在审批后撤回会阻止尚未执行的邀请；
+4. 每份 Application 绑定 Creator Identity、来源邀请/Listing、原 Offer digest、提案、承诺交付时间和提交时间。达人不能通过应聘修改用户已冻结的金额或要求；Offer 变化会关闭旧申请并创建新 revision；
+5. 用户比较申请并显式执行 `选中并雇佣`、`暂不选择` 或 `取消悬赏`。Award 绑定唯一 Application、Creator/Partner、Offer digest 和选择证据；未获选申请进入可审计终态；
+6. 只有持久化 Award 能创建正式 Task/Bounty Contract。Creator 接受的 Task revision 被锁定，任何实质修改需要双方重新接受；
+7. 用户在 Creator 接受前完成可验证的资金准备；产品只显示 Provider 实际提供的 `reservation`、`prefunded` 或 `payment_ready` 语义，没有相应法律与 Provider 合同时绝不显示“托管/escrow”；
+8. Creator 上传 Deliverable 后先显示扫描、格式、digest、来源和使用权状态；未通过时不向用户提供“可接受”入口；
+9. 用户可以逐里程碑 `接受并准备付款`、`请求修改`、`拒绝并说明` 或 `发起争议`；Review 始终绑定固定 Deliverable revision/digest；
+10. Review 前用户对安全交付物拥有预览/下载的评估访问权，但不能把它冒充合同使用权；接受后显示 `accepted_awaiting_verified_payout`，只有精确 Payout 经独立 Verification 后才显示 `contract_usage_granted`；
+11. 接受只产生精确 Payout Effect，用户仍能看到对象、金额、币种、交付物和 Provider；Provider 结果不确定时只允许用无执行权的 reconciliation lease 查 Receipt。找到 Receipt 后必须独立 Verification，并把 Mission、Creator Payout 和 `contract_usage_granted` 原子投影；查不到、确认未执行或 Dead Letter 都不能自动再次付款；
+12. 不提供默认选中、默认接受或自动付款。若未来引入超时接受，必须单独 RFC、法务审查和显式 opt-in。
+
+交付详情页必须让用户直接预览/下载真实成果、对比 revision、查看验收标准、权利声明、Review 历史、评估访问/合同使用权状态和付款状态，不能只展示 Agent 总结。Creator Work 可以按一次性 `campaign` 完成，也可以作为 `continuous_relationship` 周期经营；一次悬赏不得被强制延长为持续运营。这里的“雇佣”指版本化服务/创作合同，产品不得在未经法务与适用合同确认时将达人表述为租户或 Hartevo 的雇员。
+
+### 6.6 归因、佣金与 Creator Payout
 
 - 订单、退款、币种和归因窗口独立复算。
 - 付款审批只创建精确金额的 Payout Effect；Provider 完成后再次验证。
-- 不确定付款禁止自动重试，进入人工复核。
+- 不确定付款禁止自动重试；允许按冻结 policy 有界执行只读查账，ReceiptFound 后独立验证，NotExecuted 要求新的精确 Payout Effect/Approval，持续不确定进入 Dead Letter 和人工复核。
+- Creator Payout 在 Task Acceptance、Deliverable、User Review、KYC、资金和金额/币种全部匹配后才可执行；Dispute/Refund 保留为独立事件。
 
 ## 7. 跨模块交互闭环
 
@@ -204,12 +243,14 @@ Hartevo 每个宣发项目只有一个持续存在的 **总调度会话**。它�
 
 1. 候选进入供给分类与真实性检查。
 2. 满足联系许可后进入建联管线。
-3. 条款确认后生成 Program 关系、Link/Coupon 和 Brief。
-4. 发布验证、归因、佣金和付款沿同一关系链回流。
+3. 用户冻结 Hiring Offer，并选择已验证定向邀请或已验证公开悬赏 Listing。
+4. 达人从该合法来源提交 Application；用户显式比较并 Award 一名申请人。
+5. Award 生成正式 Task；达人接受、上传真实 Deliverable，用户绑定固定 revision Review。
+6. Affiliate 发布验证/归因/佣金与 Creator Review/Payout 沿同一 Partner/Identity 关系链回流。
 
 ## 8. 已覆盖的原型状态
 
-- 唯一总调度入口、共享 Mission Thread 与四工作面实时状态
+- 项目总调度、持久 Mission 会话、共享 Domain State 与四工作面实时状态
 - 工作面动作携带上下文返回总调度，不创建割裂会话
 - 必要连接完成后自动恢复原 Mission
 - 连接中心总览、全部连接、权限策略、活动日志
@@ -217,7 +258,7 @@ Hartevo 每个宣发项目只有一个持续存在的 **总调度会话**。它�
 - 任务线程内的按需连接建议
 - 渠道计划、内容日历、发布队列、效果
 - CRM Pipeline、Inbox、邮件序列、联系人
-- 达人供给网络、发现、详情、建联管线、Program、归因与佣金
+- 达人供给网络、发现、详情、动态许可建联、Hiring Offer/Listing/Invitation/Application/Award、Task、Deliverable Review、Program、归因与佣金
 - 详情抽屉、审批、重新授权、人工接管与完成回执
 - 1600×1000 与 1366×900 桌面宽度
 

@@ -1,0 +1,154 @@
+//! Hartevo's deterministic business state.
+//!
+//! Runtime threads, model output, and provider responses are projections into this
+//! kernel. They are never accepted as business truth without a domain command.
+
+mod connection;
+mod context;
+mod context_collaboration;
+mod context_foundation;
+mod creator_hiring;
+mod creator_work;
+mod deletion;
+mod identity;
+mod ids;
+mod key_management;
+mod mission;
+mod mission_conversation;
+mod mission_schedule;
+mod money;
+mod outcome;
+mod project;
+mod relationship;
+mod runtime_process;
+mod runtime_recovery;
+mod runtime_turn;
+mod truth;
+mod work_product;
+
+pub use context::{
+    ContextBranch, ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleStatus,
+    ContextDataClass, ContextDataPolicy, ContextError, ContextFactGrant, ContextInputRefs,
+    ContextMergePolicy, ContextReturnContract, ContextReturnReceipt, ContextWorkspace, WorkerLease,
+    WorkerLeaseStatus, validate_context_branch_lineage,
+};
+pub use context_collaboration::{
+    ContextBranchMerge, ContextBranchMergeDisposition, ContextWorkerMessage,
+    ContextWorkerMessageKind, ContextWorkerMessageStatus, WorkerHandle, WorkerHandleStatus,
+    WorkerMailbox, WorkerUsage,
+};
+pub use context_foundation::{
+    ContextCheckpoint, ContextCompactionRecord, ContextEffectInvariant, ContextEvidenceInvariant,
+    ContextFoundationSnapshot, ContextInvariantBlock, ContextItemAvailability,
+    ContextTaskInvariant, ContextTruthInvariant, ContextWorkProductInvariant, ContextWorkingItem,
+    ContextWorkingItemKind, ContextWorkingSet, ContinuationEntry, ContinuationEntryInput,
+    ContinuationEntryKind, ContinuationLedger,
+};
+pub use deletion::{
+    DeletionError, DeletionPropagationReceipt, DeletionPropagationStatus, DeletionReason,
+    DeletionRecord, DeletionRetentionMode, DeletionSurface, DeletionSurfaceState,
+    DeletionTombstone,
+};
+pub use identity::{
+    Company, ConsentPurpose, ConsentRecord, ConsentRequirement, ConsentStatus, ContactChannel,
+    ContactPermission, ContactPoint, ConversationIdentitySnapshot, CreatorIdentitySnapshot,
+    ExternalIdentity, IdentityError, IdentityLink, IdentityLinkDecision, IdentityLinkStatus,
+    IdentitySubject, LegalBasis, Partner, PartnerSupplyClass, Person,
+};
+pub use ids::{
+    AccountId, ActorId, ApprovalId, AttributionId, BrowserActionBatchId, BrowserControlLeaseId,
+    BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId, BrowserRecipeId, BrowserSnapshotId,
+    BrowserTabId, BrowserWorkspaceId, CampaignId, CommissionId, CompanyId, ConnectionId,
+    ConsentRecordId, ContextAssemblyId, ContextBranchId, ContextBranchMergeId, ContextCapsuleId,
+    ContextCheckpointId, ContextCompactionRecordId, ContextContinuationLedgerId,
+    ContextWorkerMailboxId, ContextWorkerMessageId, ContextWorkingSetId, ContextWorkspaceId,
+    ConversationId, CreatorApplicationId, CreatorHiringId, CreatorId, CreatorMilestoneId,
+    CreatorTaskId, DeletionId, DeletionReceiptId, DeliverableId, DeviceAttachmentId,
+    DeviceHandoffId, DeviceId, EffectId, EvidenceId, ExecutionAttemptId, FactId, IdentityLinkId,
+    KeyEnvelopeId, MemberId, MessageId, MissionConversationId, MissionConversationMessageId,
+    MissionId, MissionScheduleId, OpportunityId, OrderId, OutcomeEventId, PartnerId, PayoutId,
+    PersonId, ProjectId, ReceiptId, RefundId, ReviewId, RuntimeRecoveryAttemptId,
+    RuntimeTurnAttemptId, TaskId, TenantId, VerificationId, WorkProductId, WorkerId, WorkerLeaseId,
+};
+pub use key_management::{
+    DeviceAttachment, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffCiphertext,
+    DeviceHandoffClaim, DeviceHandoffConsumption, DeviceHandoffContext, DeviceHandoffGrant,
+    DeviceHandoffRevocation, DeviceKeyAgreementAlgorithm, DevicePublicKeyRegistration, KeyEnvelope,
+    KeyManagementError, KeyRecipient, KeyWrapAlgorithm, ProjectEncryptionMode, ProjectKeyring,
+    ProjectKeyringBootstrap, WrappedKeyCiphertext,
+};
+pub use mission::{
+    Approval, ApprovalDecision, ApprovalPolicy, AutonomyLevel, Cadence, CadenceTriggerKind,
+    ConsentState, Constraint, ConversationEffectGuard, CreatorContactEffectGuard,
+    DurableProviderState, Effect, EffectClass, EffectRisk, EffectSpec, EffectStatus, Evidence,
+    EvidenceStatus, KpiContract, MetricValue, Mission, MissionBlock, MissionCheckpoint,
+    MissionCheckpointApplicationEvidence, MissionCheckpointCompletion,
+    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointOracleSource,
+    MissionCheckpointRoute, MissionCheckpointStatus, MissionContract, MissionDefinition,
+    MissionError, MissionStage, MissionTerminalDisposition, OperatingContract,
+    OperatingContractError, OperatingMode, Outcome, OutcomeDecision, Receipt, Task, TaskStatus,
+    Verification, VerificationStatus, WorkProduct, WorkProductStatus,
+};
+pub use mission_conversation::{
+    MissionConversation, MissionConversationError, MissionConversationMessage,
+    MissionConversationMessageKind, MissionConversationRole,
+};
+pub use mission_schedule::{
+    MissionSchedule, MissionScheduleError, MissionScheduleFailure, MissionScheduleFailureClass,
+    MissionScheduleLease, MissionScheduleSignal, MissionScheduleStatus,
+};
+pub use money::{CurrencyCode, FxQuote, Money, MoneyError};
+pub use outcome::{
+    AttributionModel, AttributionRecord, CommissionRecord, CommissionStatus, OutcomeEvent,
+    OutcomeEventKind, OutcomeLedger, OutcomeLedgerError, OutcomeOrder, OutcomeRefund,
+    OutcomeSourceVerification, OutcomeVerificationMethod, Touchpoint,
+};
+pub use project::{Project, ProjectDataCell, ProjectError, StorageMode};
+pub use relationship::{
+    AutomatedReplyAuthorization, BuyingCommitteeMember, BuyingCommitteeRole, Campaign,
+    CampaignRecipient, CampaignRecipientState, CampaignSendAuthorization, CampaignStatus,
+    Conversation, ConversationContentRisk, ConversationControl, ConversationMessage,
+    ConversationState, InboundIngest, InboundMessageInput, MessageDelivery, MessageDirection,
+    MessagingGateway, Opportunity, OpportunityStage, PreparedAutomaticReply, RelationshipError,
+    StageTransition, SuppressionReason, WebhookAttestation,
+};
+pub use runtime_process::{
+    RuntimeProcessClaim, RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition,
+    RuntimeProcessCleanupEvidence, RuntimeProcessIdentity,
+};
+pub use runtime_recovery::{
+    RuntimeRecoveryAttempt, RuntimeRecoveryFailure, RuntimeRecoveryFailureClass,
+    RuntimeRecoveryStatus, RuntimeResumeStrategy,
+};
+pub use runtime_turn::{
+    RuntimeTurnAttempt, RuntimeTurnError, RuntimeTurnEvidence, RuntimeTurnEvidenceKind,
+    RuntimeTurnFailure, RuntimeTurnFailureClass, RuntimeTurnObservedKind,
+    RuntimeTurnPrivateMessage, RuntimeTurnRestartDisposition, RuntimeTurnScope, RuntimeTurnStatus,
+};
+pub use truth::{
+    TruthCandidate, TruthError, TruthFact, TruthRevisionLink, TruthSource, TruthStatus, TruthValue,
+};
+pub use work_product::{
+    WorkProductDependencies, WorkProductManifest, WorkProductManifestError, WorkProductPreview,
+};
+
+/// Domain schema recorded with every build and persisted snapshot.
+pub const DOMAIN_SCHEMA_VERSION: &str = "hartevo-domain/v1";
+pub use connection::{
+    Connection, ConnectionError, ConnectionProbe, ConnectionSnapshot, ConnectionStatus,
+    ProbeOutcome,
+};
+pub use creator_hiring::{
+    CreatorApplication, CreatorApplicationInput, CreatorApplicationOrigin,
+    CreatorApplicationStatus, CreatorCandidate, CreatorCandidateStatus, CreatorExternalProof,
+    CreatorHiring, CreatorHiringAward, CreatorHiringError, CreatorHiringSpec, CreatorHiringStatus,
+    CreatorInvitation, CreatorListingPublication,
+};
+pub use creator_work::{
+    AcceptanceCheck, CreatorAcceptance, CreatorDeliverable, CreatorDeliverableInput,
+    CreatorEligibility, CreatorMilestone, CreatorMilestoneSpec, CreatorMilestoneStatus,
+    CreatorPayoutConfirmation, CreatorPayoutRecord, CreatorTask, CreatorTaskSpec,
+    CreatorTaskStatus, CreatorWorkError, DeliverableAssessment, DeliverableEntitlementStatus,
+    DeliverableReview, DeliverableReviewInput, DeliverableStatus, FundingReservation,
+    PayoutAuthorization, ReviewDecision, RightsAttestation, UsageRights,
+};

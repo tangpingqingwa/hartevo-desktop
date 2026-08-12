@@ -1,0 +1,33 @@
+[package]
+name = "hartevo-application"
+description = "Mission commands, orchestration, and shared work-surface projections"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+hartevo-browser-adapter = { path = "../browser-adapter" }
+hartevo-catalog = { path = "../catalog" }
+hartevo-domain-kernel = { path = "../domain-kernel" }
+hartevo-context-fabric = { path = "../context-fabric" }
+hartevo-cloud-storage = { path = "../cloud-storage" }
+hartevo-effect-broker = { path = "../effect-broker" }
+hartevo-runtime-adapter = { path = "../runtime-adapter" }
+hartevo-storage = { path = "../storage" }
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio-postgres.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+ring.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

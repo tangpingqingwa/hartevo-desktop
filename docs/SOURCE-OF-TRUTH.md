@@ -17,6 +17,15 @@
 | 组件怎样协作、谁拥有事实和权限 | `/docs/architecture/HARTEVO-DESKTOP-ARCHITECTURE.md` |
 | Agent UI 组件怎样实现与授权 | `/docs/design/AI-AGENT-UI-COMPONENT-GUIDE.md` |
 | 怎样判定完成与允许发布 | `/docs/quality/` 下的四份质量合同 |
+| 十二条 Mission 的机器合同 | `/contracts/missions/catalog.v1.json`，由 `hartevo-catalog` 校验 |
+| Application route 是否真正有生产 handler | `/contracts/application-handlers/catalog.v1.json`；缺席即 `NOT_IMPLEMENTED`，注册项必须同时存在于当前二进制 |
+| Capability 与 Provider 当前状态 | `/contracts/capabilities/catalog.v1.json`、`/contracts/providers/catalog.v1.json` |
+| 420+180 数据集结构与私有隔离 | `/contracts/datasets/registry.v1.json` 与 `/docs/quality/DATASET-REGISTRY-AND-ISOLATION.md` |
+| 从本地到 E5 的验证顺序 | `/docs/quality/DEVELOPMENT-VALIDATION-LADDER.md` |
+| 当前 checkpoint 内容实际运行过什么、哪些环境被阻塞 | `/docs/quality/CURRENT-WORKTREE-EVIDENCE.md`；它不能把 Release baseline 改为通过 |
+| 安全、隐私和 Creator 交付/付款威胁 | `/docs/security/HARTEVO-THREAT-MODEL.md` |
+| 部署、DR、观测和签名更新 | `/docs/operations/DEPLOYMENT-DR-AND-UPDATES.md` |
+| Release 是否通过 | `hartevo-eval` 按 `/contracts/release-evidence/schema.v2.2.json` 生成的证据；必须包含 Application handler 覆盖与缺口 |
 
 ## 2. 冲突处理
 
@@ -25,6 +34,7 @@
 3. 架构文档负责组件所有权与安全边界，RFC 负责重大决策及其理由；实现不得静默改变两者。
 4. Quality 文档定义目标和 Gate，不证明某个版本已经通过。通过结果必须绑定 Commit、环境、场景版本和证据位置。
 5. 本仓库之外的旧文档只能作为来源或历史证据，不能直接覆盖本仓库当前事实。
+6. 机器 Catalog 负责 ID、映射、数量和版本；产品文档负责语义。两者不一致时 CI 必须失败，不能选择对实现更有利的一份。
 
 ## 3. 文档状态
 
@@ -47,3 +57,4 @@
 - Generic Benchmark Registry、垂直 Dataset partition、私有 Holdout 或 Fresh Shadow 合同变化，必须同步升级四份 Quality 文档版本；公开榜单成绩不能覆盖垂直 Mission 失败，开发集提升不能表述为样本外泛化。
 - 每个 Release Candidate 必须生成独立的 Eval 结果，不修改质量合同来适配失败实现。
 - 文档中的“已完成”“已连接”“已验证”必须链接到对应的代码或测试证据。
+- Creator Hiring/Listing/Application/Award、Task/Bounty、Funding Reservation、Deliverable、Review、Entitlement、Dispute 或 Payout 合同变化必须同时更新 VM-06 Manifest、交互规格、Threat Model、Provider Matrix、Dataset Case 和 Effect/Settlement Oracle。

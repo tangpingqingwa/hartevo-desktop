@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly repository="https://github.com/openinterpreter/openinterpreter.git"
+readonly release="rust-v0.0.34"
+readonly commit="52a31019714294add53cafbc5268e1467b471263"
+readonly schema_root="https://raw.githubusercontent.com/openinterpreter/openinterpreter/${commit}/codex-rs/app-server-protocol/schema/json"
+readonly expected_schema="f5d28066430a14cb5f7b98545fbff3683734ea6112a1e9944bf7f268afe9e896"
+readonly expected_server_requests="fc063273c71e6310f5a4c1449a607364fcd11b8bf4c998d71fb780016df7b3ad"
+readonly expected_server_notifications="322148beced81b06eafa74011a91ace9c3ef2bad9757d3e0e6c72369c52251fb"
+readonly expected_checksums="1d9ef8a8fac6449c1ecfab293a18e15c777f2bbd41418dcc76434b697beae267"
+readonly expected_artifact_catalog="dca01e63fe94a3961fc5d1ba847f642d23429717322e527f83bf5e596e608061"
+readonly expected_vendored_license="c95bae1d1ce0235ecccd3560b772ec1efb97f348a79f0fbe0a634f0c2ccefe2c"
+readonly expected_vendored_notice="d5e4d363cea80898cbefcc6bfb3d5af833ef22c5a99dc074ec28bf64115cf280"
+readonly workspace_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/hartevo-openinterpreter.XXXXXX")"
+trap 'rm -rf "${work_dir}"' EXIT
+
+curl --fail --location --silent --show-error \
+  "${schema_root}/codex_app_server_protocol.v2.schemas.json" \
+  --output "${work_dir}/app-server-v2.json"
+curl --fail --location --silent --show-error \
+  "${schema_root}/ServerRequest.json" \
+  --output "${work_dir}/server-requests.json"
+curl --fail --location --silent --show-error \
+  "${schema_root}/ServerNotification.json" \
+  --output "${work_dir}/server-notifications.json"
+curl --fail --location --silent --show-error \
+  "https://github.com/openinterpreter/openinterpreter/releases/download/${release}/codex-package_SHA256SUMS" \
+  --output "${work_dir}/SHA256SUMS"
+
+check_digest() {
+  local path="$1"
+  local expected="$2"
+  local label="$3"
+  local actual
+  actual="$(shasum -a 256 "${path}" | awk '{print $1}')"
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "OpenInterpreter ${label} drift: expected ${expected}, got ${actual}" >&2
+    exit 1
+  fi
+}
+
+check_digest "${work_dir}/app-server-v2.json" "${expected_schema}" "App Server schema"
+check_digest "${work_dir}/server-requests.json" "${expected_server_requests}" "server-request schema"
+check_digest "${work_dir}/server-notifications.json" "${expected_server_notifications}" "server-notification schema"
+check_digest "${work_dir}/SHA256SUMS" "${expected_checksums}" "release checksum manifest"
+check_digest "${workspace_root}/third_party/openinterpreter/ARTIFACTS.json" "${expected_artifact_catalog}" "local artifact catalog"
+check_digest "${workspace_root}/third_party/openinterpreter/LICENSE" "${expected_vendored_license}" "vendored license"
+check_digest "${workspace_root}/third_party/openinterpreter/NOTICE" "${expected_vendored_notice}" "vendored notice"
+
+peeled_commit="$(git ls-remote "${repository}" "refs/tags/${release}^{}" | awk '{print $1}')"
+if [[ "${peeled_commit}" != "${commit}" ]]; then
+  echo "OpenInterpreter release tag drift: expected ${commit}, got ${peeled_commit:-missing}" >&2
+  exit 1
+fi
+
+for method in item/commandExecution/requestApproval item/fileChange/requestApproval; do
+  if ! jq -e --arg method "${method}" \
+    '[.. | objects | .method? | .enum? // empty | .[]?] | any(. == $method)' \
+    "${work_dir}/server-requests.json" >/dev/null; then
+    echo "OpenInterpreter server-request method missing: ${method}" >&2
+    exit 1
+  fi
+done
+
+artifact_count="$(jq '.artifacts | length' "${workspace_root}/third_party/openinterpreter/ARTIFACTS.json")"
+if [[ "${artifact_count}" != "6" ]]; then
+  echo "OpenInterpreter artifact matrix must contain exactly six pinned release assets" >&2
+  exit 1
+fi
+while IFS=$'\t' read -r archive digest; do
+  if ! grep -Fqx "${digest}  ${archive}" "${work_dir}/SHA256SUMS"; then
+    echo "OpenInterpreter artifact checksum missing from upstream manifest: ${archive}" >&2
+    exit 1
+  fi
+done < <(jq -r '.artifacts[] | [.archive, .archiveSha256] | @tsv' \
+  "${workspace_root}/third_party/openinterpreter/ARTIFACTS.json")
+
+for method in thread/started turn/started item/started item/completed turn/completed; do
+  if ! jq -e --arg method "${method}" \
+    '[.. | objects | .method? | .enum? // empty | .[]?] | any(. == $method)' \
+    "${work_dir}/server-notifications.json" >/dev/null; then
+    echo "OpenInterpreter server-notification method missing: ${method}" >&2
+    exit 1
+  fi
+done
+
+echo "OpenInterpreter ${release} source, wire methods, schemas, and release checksums verified at ${commit}"

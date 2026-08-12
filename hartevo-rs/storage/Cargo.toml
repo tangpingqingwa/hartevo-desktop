@@ -1,0 +1,42 @@
+[package]
+name = "hartevo-storage"
+description = "Project-scoped SQLite snapshots and append-only event log"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+hartevo-domain-kernel = { path = "../domain-kernel" }
+hartevo-browser-adapter = { path = "../browser-adapter" }
+hartevo-context-fabric = { path = "../context-fabric" }
+hartevo-effect-broker = { path = "../effect-broker" }
+hex.workspace = true
+keyring-core.workspace = true
+ring.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "=1.0.2", features = ["keychain", "protected"] }
+security-framework = "=3.7.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "=1.1.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store = "=1.0.0"
+
+[dev-dependencies]
+proptest.workspace = true
+rust_decimal.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

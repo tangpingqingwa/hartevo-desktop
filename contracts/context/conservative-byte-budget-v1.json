@@ -1,0 +1,12 @@
+{
+  "schema": "hartevo.context-token-budget/v1",
+  "algorithm": "utf8_byte_upper_bound",
+  "exactModelTokenizer": false,
+  "assurance": "development_safety_fallback",
+  "count": "one budget unit per UTF-8 byte plus the separately frozen request overhead",
+  "limitations": [
+    "This is not provider model-revision proof.",
+    "It may reject context that an exact model tokenizer would accept.",
+    "It must never be reported as an exact tokenizer or GA evidence."
+  ]
+}

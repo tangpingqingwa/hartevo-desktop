@@ -1,0 +1,22 @@
+{
+  "schema": "hartevo.openinterpreter-contract/v1",
+  "stableMethods": [
+    "initialize",
+    "thread/start",
+    "thread/resume",
+    "turn/start",
+    "turn/interrupt"
+  ],
+  "stableServerRequests": [
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval"
+  ],
+  "stableNotifications": [
+    "thread/started",
+    "turn/started",
+    "item/started",
+    "item/completed",
+    "turn/completed"
+  ],
+  "experimentalApi": false
+}

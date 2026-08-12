@@ -1,23 +1,31 @@
 # Dependencies and builds
+/target/
+**/target/
+/dist/
+/build/
+/out/
 node_modules/
-dist/
-build/
-out/
 
 # Local configuration and secrets
 .env
 .env.*
 !.env.example
+!/config/hartevo.example.toml
 *.pem
 *.key
 *.p12
 *.pfx
+*.mobileprovision
 
 # Runtime and QA artifacts
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 *.log
 .playwright-cli/
-output/
+/output/
 coverage/
+**/.hartevo/
 
 # Operating-system files
 .DS_Store

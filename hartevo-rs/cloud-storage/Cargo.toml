@@ -1,0 +1,23 @@
+[package]
+name = "hartevo-cloud-storage"
+description = "US/EU Cell PostgreSQL storage, encrypted sync, and durable outbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+hartevo-domain-kernel = { path = "../domain-kernel" }
+hartevo-effect-broker = { path = "../effect-broker" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio-postgres.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

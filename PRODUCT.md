@@ -8,11 +8,11 @@ product
 
 ## Users
 
-Hartevo Desktop serves founders, growth teams, agencies, cross-border operators, and creator or affiliate teams that need one durable work entrance for market research, channel operations, CRM, email, creator discovery, outreach, distribution, and conversion. They think in business goals and constraints, not modules, and expect to direct the system in natural language while retaining control over approvals, data, and external actions.
+Hartevo Desktop serves founders, growth teams, agencies, cross-border operators, and creator or affiliate teams that need one durable work entrance for market research, channel operations, CRM, email, creator discovery, permission-safe outreach, verified task/bounty listings and invitations, creator applications, user-controlled hiring awards, funding readiness, real deliverable review, verified payment, contracted usage rights, distribution, and conversion. They think in business goals and constraints, not modules, and expect to direct the system in natural language while retaining control over approvals, data, creator selection, deliverables, money, rights, and external actions.
 
 ## Product Purpose
 
-Hartevo is an agent-native growth operating system. A user owns multiple promotional projects; each project owns its Missions, Truth Graph, memory, files, connection scopes, consent, approval policies, work products, and execution receipts. Hartevo continuously coordinates tasks through one project-level dispatcher and makes specialist work surfaces share the same Mission state. Success means the user can state an outcome once, let Hartevo research and prepare work across channels, and intervene only where judgment, authorization, or new context is needed.
+Hartevo is an agent-native growth operating system. A user owns multiple promotional projects; each project owns its Missions, Truth Graph, memory, files, connection scopes, consent, approval policies, work products, creator hiring offers/applications/awards, funding reservations, creator deliverables, Reviews, usage entitlements, and execution receipts. Hartevo continuously coordinates tasks through one project-level dispatcher, gives each Mission a persistent conversation, and makes specialist work surfaces share the same Domain state. Success means the user can state an outcome once, let Hartevo research and prepare work across channels, and intervene where judgment, authorization, creator selection, deliverable acceptance, payment, rights, or new context is needed. A single creator bounty may end as a `campaign`; a durable creator portfolio may operate as a `continuous_relationship`.
 
 Desktop is local-first. A project can live in an existing local folder, a newly created local folder, a cloud workspace, or a local workspace with optional encrypted synchronization. Cloud storage is never implied by project creation. Credentials live in the operating-system vault; external writes remain governed by explicit scopes and approval policy.
 
@@ -26,7 +26,7 @@ Avoid generic AI chat shells, cloud-only assumptions, decorative AI gradients, n
 
 ## Design Principles
 
-1. Keep one persistent natural-language command relationship with the project dispatcher; work surfaces are synchronized views, not separate agents.
+1. Keep one persistent project dispatcher and one persistent conversation per Mission; both are synchronized views of the same Domain state, not separate agents or truth sources.
 2. Make tasks and Missions the primary work objects while preserving the user → project → task hierarchy.
 3. Put the next useful action beside the evidence or state that justifies it.
 4. Show local path, storage mode, synchronization, permission scope, consent, and execution status explicitly.

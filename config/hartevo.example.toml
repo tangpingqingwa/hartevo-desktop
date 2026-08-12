@@ -1,0 +1,16 @@
+# Copy project-safe preferences only. Never place credentials in this file.
+[runtime]
+app_server_program = "/absolute/path/to/verified/openinterpreter/bin/interpreter"
+app_server_args = ["app-server", "--stdio"]
+openinterpreter_home = "/absolute/path/to/hartevo/project-scoped/runtime-state"
+schema_digest = "sha256:f5d28066430a14cb5f7b98545fbff3683734ea6112a1e9944bf7f268afe9e896"
+release = "rust-v0.0.34"
+tag_commit = "52a31019714294add53cafbc5268e1467b471263"
+
+[project]
+storage_mode = "local_existing"
+workspace_roots = ["/absolute/path/to/a/project"]
+
+[credentials]
+# Values are opaque references resolved by the OS keyring adapter.
+provider_token_ref = "keyring://hartevo/<project-id>/<provider>"

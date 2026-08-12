@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "hartevo-application-handler-registry/v1",
+  "registryVersion": "desktop-2026-08-12-v1",
+  "handlers": [
+    {
+      "handlerId": "vm11.event_ingest/v1",
+      "missionId": "VM-11",
+      "missionVersion": 3,
+      "checkpointId": "event_ingest",
+      "capabilityId": "outcome.ingest",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": ["mission_contract", "mission_checkpoint", "outcome_ledger"],
+      "oracleIds": ["goal", "truth", "operating_state", "outcome"],
+      "implementationCrate": "hartevo-application"
+    }
+  ]
+}

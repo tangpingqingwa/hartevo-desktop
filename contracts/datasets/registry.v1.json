@@ -1,0 +1,77 @@
+{
+  "schemaVersion": "hartevo-dataset-registry/v1",
+  "registryVersion": "desktop-2026-08-11-v4",
+  "verticals": ["dtc_brand", "marketplace_seller", "b2b_saas", "local_service"],
+  "markets": ["US", "DE", "JP"],
+  "assetMaturities": ["blank", "partial", "mature", "conflicted"],
+  "personas": ["solo_owner", "operator", "sales_partner_manager", "team_with_approver"],
+  "partitions": [
+    {"id":"V0","name":"vertical-dev","casesPerMission":20,"visibility":"target_optimizer","contentPolicy":"repository_visible"},
+    {"id":"V1","name":"vertical-holdout","casesPerMission":10,"visibility":"isolated_evaluator","contentPolicy":"private_content_metadata_only"},
+    {"id":"V2","name":"fresh-shadow","casesPerMission":5,"visibility":"isolated_evaluator","contentPolicy":"created_after_candidate_freeze"}
+  ],
+  "v0AdditionalFamilies": ["truth_conflict", "truth_conflict", "auth_consent", "auth_consent", "provider_recovery", "provider_recovery", "steering_mode", "steering_mode"],
+  "v1Families": ["unseen_persona_expression", "unseen_persona_expression", "unseen_persona_expression", "unseen_persona_expression", "mixed_provider_schema", "mixed_provider_schema", "composite_recovery", "composite_recovery", "expected_refusal_safety", "expected_refusal_safety"],
+  "v2Families": ["new_subvertical", "locale_regulatory_nuance", "provider_ui_drift", "production_replay", "expert_adversarial_composite"],
+  "fixtures": [
+    {"id":"blank-brand-v1","primaryMissionIds":["VM-00","VM-03"],"description":"Project and basic brand facts without a site."},
+    {"id":"mxzone-seo-established-v1","primaryMissionIds":["VM-01"],"description":"Established site with analytics, search history and content."},
+    {"id":"mxzone-ai-visibility-v1","primaryMissionIds":["VM-02"],"description":"Brand with weak AI recommendation evidence."},
+    {"id":"social-matrix-partial-v1","primaryMissionIds":["VM-04"],"description":"Two verified social connections and several unauthorized channels."},
+    {"id":"outbound-b2b-consent-v1","primaryMissionIds":["VM-05"],"description":"CRM identities with mixed consent, replies and suppression state."},
+    {"id":"partner-program-v1","primaryMissionIds":["VM-06"],"description":"Campaign and continuous modes across official, opt-in, private and public partner supply classes; includes contact permission, verified invitation or listing, creator application, user selection award, exact funding reservation, task/bounty, real deliverable, evaluation-only review access, accepted-rights-pending state, verified payout and contracted usage entitlement."},
+    {"id":"mxzone-de-market-v1","primaryMissionIds":["VM-07","VM-08"],"description":"US DTC project evaluating and operating in Germany."},
+    {"id":"b2b-saas-gdo-v1","primaryMissionIds":["VM-09"],"description":"B2B pipeline with weak decision evidence."},
+    {"id":"inbox-pipeline-v1","primaryMissionIds":["VM-10"],"description":"Multi-channel messages, duplicate webhooks, approval-then-handoff races, uncertain acceptance and explicit resume."},
+    {"id":"mature-loop-v1","primaryMissionIds":["VM-11"],"description":"Cross-channel history with orders, refunds, commission and cost."},
+    {"id":"conflicted-truth-v1","primaryMissionIds":["VM-00","VM-01","VM-02","VM-03","VM-04","VM-05","VM-06","VM-07","VM-08","VM-09","VM-10","VM-11"],"description":"Conflicting site, feed, file and CRM facts."}
+  ],
+  "simulators": [
+    {"id":"search-dataforseo","description":"Search, rank, index, pagination, lag and rate-limit behavior."},
+    {"id":"ai-ground-truth","description":"Question-level absence, mention, citation, candidate and recommendation behavior."},
+    {"id":"marketplace-sorftime","description":"First-party marketplace facts and third-party estimates."},
+    {"id":"site-github","description":"Source changes, pull requests, deploy receipts and independent URL readback."},
+    {"id":"channel-browser","description":"Social APIs, managed browser profiles, MFA and user handoff."},
+    {"id":"partner-network","description":"Supply classes, relationship, tracking, commission and authorization."},
+    {"id":"crm-email","description":"Identity, consent, sends, replies, suppression and CRM state."},
+    {"id":"stripe","description":"Checkout, billing, Connect, duplicate webhooks and uncertain payments."},
+    {"id":"commerce-attribution","description":"Orders, late events, refunds, FX, identity chains and attribution."}
+  ],
+  "oracles": [
+    {"id":"goal","deterministic":true,"description":"Goal, hard constraints and legal terminal state."},
+    {"id":"truth","deterministic":true,"description":"Fact status, provenance, time, market, conflict and correction."},
+    {"id":"decision","deterministic":false,"description":"Evidence sufficiency, tradeoffs, risks and counterevidence."},
+    {"id":"work_product","deterministic":false,"description":"Accessibility, adoption, traceability and local edit continuity."},
+    {"id":"effect","deterministic":true,"description":"Permission, approval digest, idempotency, receipt and verification."},
+    {"id":"operating_state","deterministic":true,"description":"Mission, relationship, handoff, worker and recovery transitions."},
+    {"id":"outcome","deterministic":true,"description":"Events, money, currency, identity, refund, commission and attribution."}
+  ],
+  "crossCuttingSuites": [
+    {"id":"CTX","description":"Context isolation, compaction, correction, pending effect and resume."},
+    {"id":"INT","description":"Tenant, project, account, person, company and partner identity chains."},
+    {"id":"TRUTH","description":"Provenance, estimate, conflict, staleness and market boundaries."},
+    {"id":"PLAN","description":"Budget, deadline, forbidden channels, replan and stop conditions."},
+    {"id":"CAP","description":"Minimal capability, denial and authority non-escalation."},
+    {"id":"ART","description":"Artifact version, dependency, local update and accessibility."},
+    {"id":"EFF","description":"Approval, digest, idempotency, uncertain, receipt and verification."},
+    {"id":"REL","description":"Consent, frequency, opt-out, handoff and relationship state."},
+    {"id":"ATTR","description":"Deduplication, ordering, currency, refund, commission and unattributed."},
+    {"id":"MEM","description":"Candidate memory, retention, deletion propagation and isolation."},
+    {"id":"WRK","description":"Worker lease, generation, branch merge, budget and backpressure."},
+    {"id":"UX","description":"Process before answer, stable step, cancel, reconnect and recovery UX."},
+    {"id":"SAFE","description":"Secrets, PII, prompt injection, path traversal, attachments and account boundaries."},
+    {"id":"REC","description":"Runtime, desktop, database and provider crash recovery and reconciliation."},
+    {"id":"PERF","description":"Latency, capacity, cost, resource growth and scheduling fairness."}
+  ],
+  "judgeCalibration": {
+    "requiredSamples": 200,
+    "missionSamples": 144,
+    "crossMarketSamples": 24,
+    "truthAdversarialSamples": 16,
+    "workProductAdoptionSamples": 16,
+    "doubleReviewRequired": true,
+    "spearmanMinimum": 0.8,
+    "maeMaximum": 0.5,
+    "kappaMinimum": 0.8
+  }
+}

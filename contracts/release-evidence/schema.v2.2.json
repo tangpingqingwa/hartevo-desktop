@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/release-evidence/2.2.0",
+  "title": "Hartevo Release Evidence",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "passed",
+    "releaseCommit",
+    "environment",
+    "requestedStage",
+    "missionCatalogVersion",
+    "applicationHandlerRegistryVersion",
+    "applicationRouteCount",
+    "implementedApplicationHandlerCount",
+    "notImplementedApplicationRouteCount",
+    "capabilityCatalogVersion",
+    "providerCatalogVersion",
+    "datasetPartitionRevision",
+    "catalogDigest",
+    "traceabilityComplete",
+    "missionResults",
+    "quality",
+    "safetyInvariants",
+    "notImplemented",
+    "blockedEnv",
+    "failures",
+    "startedAt",
+    "completedAt"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "2.2.0"},
+    "passed": {"type": "boolean"},
+    "releaseCommit": {"type": "string", "minLength": 1},
+    "environment": {"type": "string", "minLength": 1},
+    "requestedStage": {"enum": ["engineering_foundation", "internal_alpha", "controlled_beta", "general_availability", "mature_e5"]},
+    "missionCatalogVersion": {"type": "string", "minLength": 1},
+    "applicationHandlerRegistryVersion": {"type": "string", "minLength": 1},
+    "applicationRouteCount": {"type": "integer", "minimum": 0},
+    "implementedApplicationHandlerCount": {"type": "integer", "minimum": 0},
+    "notImplementedApplicationRouteCount": {"type": "integer", "minimum": 0},
+    "capabilityCatalogVersion": {"type": "string", "minLength": 1},
+    "providerCatalogVersion": {"type": "string", "minLength": 1},
+    "datasetPartitionRevision": {"type": "string", "minLength": 1},
+    "catalogDigest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "contaminationAuditDigest": {"type": ["string", "null"]},
+    "traceabilityComplete": {"type": "boolean"},
+    "missionResults": {
+      "type": "object",
+      "minProperties": 12,
+      "maxProperties": 12,
+      "patternProperties": {
+        "^VM-(0[0-9]|1[01])$": {"$ref": "#/$defs/missionEvidence"}
+      },
+      "additionalProperties": false
+    },
+    "quality": {"$ref": "#/$defs/qualityEvidence"},
+    "safetyInvariants": {"type": "object", "additionalProperties": {"type": "boolean"}},
+    "notImplemented": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "blockedEnv": {"type": "array", "items": {"type": "string"}},
+    "failures": {"type": "array", "items": {"type": "string"}},
+    "startedAt": {"type": "string", "format": "date-time"},
+    "completedAt": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "missionEvidence": {
+      "type": "object",
+      "required": ["missionId", "evidenceLevel", "status", "configuredV0Cases", "configuredV1Cases", "configuredV2Cases", "configuredCrossCuttingCases", "failures"],
+      "properties": {
+        "missionId": {"type": "string"},
+        "evidenceLevel": {"enum": ["E0", "E1", "E2", "E3", "E4", "E5"]},
+        "status": {"enum": ["not_implemented", "blocked_env", "fail", "partial", "expected_refusal", "pass"]},
+        "configuredV0Cases": {"const": 20},
+        "configuredV1Cases": {"const": 10},
+        "configuredV2Cases": {"const": 5},
+        "executedV0Cases": {"type": "integer", "minimum": 0},
+        "passedV0Cases": {"type": "integer", "minimum": 0},
+        "executedV1Cases": {"type": "integer", "minimum": 0},
+        "passedV1Cases": {"type": "integer", "minimum": 0},
+        "executedV2Cases": {"type": "integer", "minimum": 0},
+        "passedV2Cases": {"type": "integer", "minimum": 0},
+        "configuredCrossCuttingCases": {"type": "integer", "minimum": 15},
+        "passedCrossCuttingCases": {"type": "integer", "minimum": 0},
+        "providerCanaryScenarios": {"type": "integer", "minimum": 0},
+        "tenantProjectEvidence": {"type": "integer", "minimum": 0},
+        "observationDays": {"type": "integer", "minimum": 0},
+        "failures": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "qualityEvidence": {
+      "type": "object",
+      "required": ["mgcr", "vbor", "lcr", "workProductAdoption", "judgeCalibratedSamples", "longitudinalTenants", "longitudinalVerticals", "longitudinalMarkets", "longitudinalDays"],
+      "properties": {
+        "mgcr": {"type": ["number", "null"]},
+        "vbor": {"type": ["number", "null"]},
+        "lcr": {"type": ["number", "null"]},
+        "workProductAdoption": {"type": ["number", "null"]},
+        "judgeCalibratedSamples": {"type": "integer", "minimum": 0},
+        "longitudinalTenants": {"type": "integer", "minimum": 0},
+        "longitudinalVerticals": {"type": "integer", "minimum": 0},
+        "longitudinalMarkets": {"type": "integer", "minimum": 0},
+        "longitudinalDays": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

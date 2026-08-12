@@ -154,9 +154,9 @@ Task Space 的 create/reuse/handoff/takeover/complete/keep/close 对桌面产品
 | Multi-step heredoc | `browser-adapter/action-batch` | 改为可中断、带租约与策略检查的 typed batch | B1 |
 | Playwright-style locator ergonomics | `browser-adapter/locator` | 吸收语义，不复制 TypeScript facade | B1 |
 | Semantic / Visual / CDP fallback | `application/browser-router` | 记录降级理由、探针与 Verification | B1 |
-| Site learnings | `browser-adapter/recipe-registry` | 版本化、签名、权限化 Recipe 与候选晋升 | B2 |
+| Site learnings | `browser-adapter/recipe-registry` | Candidate/Production 双签名、V1/V2 晋升 gate、CAS activation、派发时重验和 project-local SQLCipher v34 恢复已达 E2；生产 root-key lifecycle、Cell/跨设备同步与真实 Provider Recipe 待完成 | B2（基础） |
 | Screenshot/screencast | `browser-adapter/observer` | 本地生成、敏感区域脱敏、按 Project retention 保存 | B2 |
-| Downloads/uploads | `browser-adapter/file-broker` | 文件隔离、类型/大小/路径检查、恶意内容扫描 | B2 |
+| Downloads/uploads | `browser-adapter/file-broker` | 文件隔离、类型/大小/路径检查、恶意内容扫描；durable grant/claim 与 exact leased Grant 到 `<input type=file>` 的本地选择已实现，选择后仍保持 `Leased`；生产扫描、Provider submit/readback/Verification 未完成 | B2（窄切片） |
 | Parallel spaces | `application/browser-scheduler` | 跨 Profile 有界并行；同 Profile 写操作串行 | B2 |
 | Visible handoff | `ui/live-work` + `ui/workpad` | 在原 Mission 显示控制权、账号、标签和继续动作 | B2 |
 
@@ -266,6 +266,8 @@ Browser Workspace 不新增一级导航，也不产生割裂对话：
 - 定义 Workspace、Profile、Lease、Action、Snapshot、Recipe 和 typed error schema。
 - 建立 Fake Browser Host，覆盖接管、过期 ref、账号不符、Prompt Injection 和崩溃恢复。
 - 将 Browser Effect 与现有 Effect Broker、Receipt 和 Verification 对齐。
+
+当前证据（2026-08-11）：B0 的 Workspace/Profile/lease/error/action/snapshot、确定性 Fake Host、Effect-bound 写动作、SQLCipher v32 投影和 Application takeover/continue/restart/reconciliation 已实现。B1a 已增加 canonical executable/private profile binding、OS lock、清洗环境、无 TCP debug port 的 Unix Chromium pipe、有界 NUL frame/stderr 与窄 CDP allowlist。生产导航只接受 canonical exact-origin HTTPS policy；页面脚本预先禁用，HTTP(S) request 逐项经过 Fetch+lease+origin fence，完成绑定 exact frame/loader lifecycle、最终 URL readback、document generation 和 digest-only Receipt。AX 观察前后核对 frame/loader/URL；stable locator 是一小时、不可序列化的 in-memory capability，绑定 Workspace/Tab/Identity/Origin/Policy 与 canonical accessible role/name，零匹配/歧义/Prompt Injection 均失败关闭。AX 暴露不等于 viewport visibility，真实 ref 保持 `visible=false`。B1b 已提供单动作、exact Effect-bound semantic click；B1c 增加只面向空白、可编辑、非密码字段的 `DOM.focus`/focused-AX/`Input.insertText`/AX digest readback，cleartext 不进入 Action、Debug 或 Receipt。窄 B2 进一步把 exact leased File Grant、staged blob 二次校验、`accept` 检查和 `<input type=file>` 的 `DOM.setFileInputFiles`/AX selection digest 绑定；Grant 在选择后仍为 `Leased`。所有 executor 在输入前重验 locator/DOM/geometry/hit-test/frame/URL/lease，输入开始后的失败均为 `uncertain`，成功 evidence 固定 `business_verified=false`。两个默认 ignored 的 macOS Chrome smoke 证明 Host health、test-only loopback 同源导航/AX、内嵌脚本不执行、locator 跨 document 重解析/歧义拒绝、跨 origin redirect 不派发 HTTP 请求、真实空白 email 输入、本地 text file 选择、一次审批 click 的真实同源表单提交/有界 readback，以及 Application takeover→重开→显式 continue；测试专用 mock keychain 必须显式启用且生产默认不使用。schema v33 File Broker 已部分进入 B2：Project root/symlink/type/size/scanner evidence、exact lease/payload/claim、只读 staging、跨进程 lock、SQLCipher CAS/Event/Outbox、重启 orphan/terminal 清理与 single-use consume 均有本地 E2。Signed Recipe 基础也已进入 B2：Candidate/Production 双 Ed25519 key purpose、V1/V2/安全/污染/回滚 Promotion gate、immutable version、CAS activation、selector/policy/action/Effect binding 与恢复后 active-release/revocation 重验均通过 Fake Host；schema v34 进一步将 Trust Key、Candidate、Release、Activation、Head 保存为 project-local SQLCipher 状态，并由迁移备份、重启、head rollback/projection tamper、陈旧 CAS、key revocation 与 Application→Fake Host→Effect Journey 证明失败关闭。普通 Executor 对 Recipe Batch 默认拒绝。四类可外发动作在每次执行前重验 live lease，旧 generation 永不恢复；Host 只产生本地 Receipt 候选，不产生 Provider submit 或独立 Verification。Fetch fence 不保证零 speculative DNS/TCP。生产 root-key lifecycle、Cell/跨设备 Recipe 同步、首个真实 Provider Recipe 和 Chromium Recipe smoke 仍未实现；active-script/authenticated navigation、真实 Profile Cookie、登录/MFA、通用键盘、非空字段替换、密码输入、跨动作恢复、截图、生产 scanner、Provider upload/readback/独立 Verification、Windows 实机与 Dioxus Browser UI 均未覆盖，因此 Browser 整体仍只计组件 E2。
 
 ### B1：Rust Browser Host
 

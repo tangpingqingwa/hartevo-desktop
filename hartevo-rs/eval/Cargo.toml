@@ -1,0 +1,24 @@
+[package]
+name = "hartevo-eval"
+description = "Deterministic Mission vertical-slice runner and release evidence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+hartevo-application = { path = "../application" }
+hartevo-catalog = { path = "../catalog" }
+hartevo-domain-kernel = { path = "../domain-kernel" }
+hartevo-effect-broker = { path = "../effect-broker" }
+hartevo-storage = { path = "../storage" }
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

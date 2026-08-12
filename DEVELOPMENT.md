@@ -2,17 +2,32 @@
 
 - 状态：**Current（工程交接入口）**
 - 适用：从一台全新 macOS 机器接手 Hartevo Desktop，并完成首个 Bootstrap R0 PR
-- 最后审查：2026-08-10
+- 最后审查：2026-08-12
+
+当前 revision 的命令结果、真实 OpenInterpreter/Chrome smoke 与宿主环境阻塞统一见 [Current Worktree Evidence](./docs/quality/CURRENT-WORKTREE-EVIDENCE.md)。旧数字快照不得覆盖该证据文件或机器生成的 Release Evidence。
 
 ## 1. 先确认仓库所处阶段
 
-远程仓库当前已经包含产品、交互、架构、上游能力引入和质量合同，以及可直接打开的交互原型；工程代码尚未开始。当前根目录没有 `Cargo.toml`、`rust-toolchain.toml`、`Dioxus.toml` 或可执行的 `hartevo eval`。
+仓库现在包含产品与质量合同、冻结原型、可编译的 Bootstrap R0 Rust workspace，以及 Wave 0 机器 Catalog。首个受控垂直切片 VS-01 已能从自然语言 Mission 合同运行到 Evidence、Work Product、Approval、Effect、Receipt、Verification 与 Outcome，并输出确定性 Eval 报告。
 
-因此：
+当前边界：
 
-- 现在可以在新 Mac 上克隆仓库、阅读唯一事实源、打开原型并创建 Bootstrap 分支；
-- 现在不能执行 `cargo run`、`dx serve` 或 Eval Runner；
-- 下文标记为“Bootstrap R0 合并后”的命令是首个工程 PR 的验收目标，不是假定它们已经存在。
+- SQLCipher 当前为 schema v44：v35 local wrapping-reference Registry 只保存完整 `SecretReference` 与 immutable envelope binding，不保存 wrapping/content key；v36～v42 依次保存 MissionDefinition/Checkpoint DAG、MissionConversation、exact Runtime private message、Process Claim/cleanup、Mission Schedule、`expired` 终态与 Checkpoint Capability/executor；v43 增加 route Oracle/completion policy，v44 增加受约束的 user `checkpoint_confirmation`。完整 Runtime/Scheduler token 与 launch path 只在 SQLCipher 密文 record 或进程内 zeroizing buffer，Event/Outbox/Debug/Desktop 仅含 digest、状态和计数。Application-owned Context CAS session 以 Project+Device 从 Registry→OS Secret Store→Envelope AEAD 装配 active/历史 key，临时 key 由 `SecretBytes`/`KeyMaterial`/session drop 清零，调用者不接触裸密钥。metadata inventory 清空 Mission 标题、目标、Conversation 正文、Outcome 与 preview，只有 exact Device session 才生成可读投影。重启、轮换、历史 key 缺失降级、active key 缺失、错设备、撤销、route partial migration 和投影篡改已有 E2 回归；真实双设备 UI、Windows Credential Manager、整机丢失/历史 key handoff、CAS 删除/重加密/扫描仍未完成；
+- `cargo`、`dx build`、`dx serve` 与 Eval Runner 已可执行；
+- VM-00～VM-11、48 Capability、39 Provider、420 Mission Case metadata 和 180 横切 Case 已由 `hartevo-catalog` 双向校验；它们当前只证明 E1；
+- OpenInterpreter `rust-v0.0.34` 的 commit、schema、checksum 和稳定 stdio 方法已冻结；真实二进制在两个独立测试中证明隔离 home、无凭据失败关闭，以及 Application 持久失败而不伪造完成。v39 对 pinned Runtime 为每个 durable Claim 创建唯一 launch 副本，启动时以 PID+start epoch+executable/runtime digest 和私有 token/路径标记精确回收；无法检查时保持 `Blocked`，不按 PID 猜杀。真实子进程回归覆盖 coordinator handle 丢失、后代优先回收、Recovery attempt 推进和 Claim-cleanup/Recovery-update 提交间隙，两个真实 OpenInterpreter smoke 也在该路径上通过且无 launch residue。Fake Runtime 继续证明成功 stream、local approval、interrupt 与协议恢复；同 Mission coordinator 还证明 generation retry/retirement/replacement、bound-thread resume、私有 draft 原子采用，以及无 Recovery/Prepared Recovery/Attached Recovery 三类 pre-Turn steering 撤权。Runtime Adapter 的 Windows x64/ARM64 条件编译已分别通过；macOS 主机上的全工作区 Windows 交叉构建仍被 Windows C SDK/Windows Perl+OpenSSL 工具链阻断。正式模型 artifact/model-revision、credentialed success、provider switch、外部 process-kill/断电、Windows 实机和完整 Mission continuity 未完成。
+- 仓库尚未携带或构建真实 `codex-app-server` 二进制，VS-01 使用受控 Provider Simulator，不连接生产账号、不产生真实外部写入；
+- Browser B0/B1a/B1b/B1c/B2-narrow 已具备 Project/Mission-bound Workspace、CAS handoff、真实 Chrome pipe/AX、exact-origin navigation、stable locator、Effect-bound click/空白非密码 text/local file selection 和 Application takeover/restart/continue；真实 Chrome smoke 使用显式 `MacOsMockForTest`/`--use-mock-keychain`，不会读取或重建用户 Chrome 钥匙串，也不构成生产 Keychain 证据。当前 OS Secret Store 生产路径优先 Data Protection Keychain 并在 release 缺 entitlement 时失败关闭；本机无有效 signing identity，protected backend 返回 missing entitlement，legacy login Keychain 也不可写，因此初始化保持 `BLOCKED_ENV`。Windows Credential Manager、authenticated browser、密码/替换/raw keyboard、生产 scanner、真实 Provider upload/readback/Verification 和 Dioxus Browser UI 未完成。
+- Signed Browser Recipe 的 project-local E2 已实现：Candidate/Production 两类 Ed25519 key、V1/V2+安全+污染+回滚 Promotion gate、immutable Registry、单调版本与 CAS activation、selector/policy/action/Effect exact binding，以及恢复后派发时的 active release、revocation、Resolution 和 Effect 重验。schema v34 以 SQLCipher 保存 Trust Key/Candidate/Release/Activation/Head，Event/Outbox 只含 digest；迁移备份、重启、head rollback、projection tamper、陈旧 CAS、key revocation 与 Application→Fake Host→Effect Journey 均有证据。普通 Executor 遇到 Recipe Batch 默认拒绝。Cell/跨设备同步、生产 root-key provisioning/rotation、真实 Provider Recipe 与真实 Chromium Recipe smoke 未完成。
+- US/EU Cell PostgreSQL 加密同步、RLS、CAS 和 durable Outbox 已有实现与 CI L2 replay；本机没有隔离 PostgreSQL 时明确报告 `BLOCKED_ENV`，不能用 schema 静态测试冒充实机通过。
+- 本地 SQLCipher schema v33 在 v32 Browser Profile/Workspace/Tab/Control Transition 上新增 `BrowserFileGrant`。File Broker 只接受 canonical Project root 内的非 symlink 文件，验证大小、魔数/主动内容、scanner clean evidence、exact lease/payload/claim，并把私有 staged blob 绑定 durable OS lock；Unix 使用 `O_NOFOLLOW`。Grant 的准备、claim、terminal 与 Event/Outbox 由 SQLCipher CAS 原子提交，完整 record 留在密文列，规范化与审计面不含源路径、文件名、正文或原始 claim ID。重启恢复 Prepared/Leased，清除 crash orphan 和 terminal residue；缺失/篡改只进入 reconciliation，Leased 不自动重放。`FileUploadHandle::validate_for` 在真实 Host 选择文件前后重算 staged digest 并核对 Grant/Claim/Workspace/Lease；`DOM.setFileInputFiles` 成功与 AX selection 变化仍只产生 Browser Receipt，不完成 Grant、不删除 blob。当前 scanner 仅为测试替身，Windows reparse-point 强化、真实 Provider submit/upload/readback 仍未完成。既有 Assembler/Runtime/Browser Workspace 的 durable intent、`Uncertain` 零重放、content-free evidence 和故障回滚边界保持不变。
+- Desktop 不再维护 demo store：启动只在用户显式操作后生成安装 SQLCipher key，并从 OS Secret Store→SQLCipher→Application inventory 重建 Project/Mission；已有数据库缺失/替换 key 或 data-root symlink 均失败关闭。个人项目先显示一次性 zeroizing Recovery Kit，用户确认离线保存后才创建 Personal E2EE Keyring 与首个持久 Mission；Kit 不写入数据库或 OS Vault。中断后的 `NotProvisioned` 项目有显式恢复入口。通用 inventory 只读取 WorkProduct 元数据；exact Project/Device Context session 成功后才装配带已校验 Manifest preview 的投影，设备 secret 丢失时保留数量但清空 preview、阻断新 Mission 并显示 `RECOVERY_REQUIRED`。Dioxus 的恢复卡用用户自持 Kit 建立 distinct successor Device envelope，错误 Kit 不改 Keyring/SecretStore，Context 重开成功后才恢复 preview 与写入。当前证据是 data-plane/Application/Dioxus 编译与确定性重启 E2；原生窗口 AX/视觉、任意 encrypted CAS 正文/file/query 浏览与编辑、整机/跨设备恢复和完整 Mission L3 仍未证明。
+- 本地 durable Mission Scheduler 与 Checkpoint route 已进入 E2：连续 Outcome+Schedule、signed inbound Conversation+event signal、Schedule+Mission cycle start、expiry/dead-letter+Mission terminal 均为 SQLCipher 原子事务；interval/event/hybrid cadence、anchor、exact n→n+1 DAG reset、owner/token digest、generation、heartbeat、五次失败预算与 stale lease 均失败关闭。Catalog v10 的 123 个 Checkpoint 逐一绑定 Capability、`application|runtime|effect_broker|human` executor、Oracle 子集与 completion policy；Task/Checkpoint/Event/Outbox 同事务推进，legacy route 只能审计且不能完成。Application 会把下一个 `Ready` Checkpoint 与 exact Task 原子推进到 Running 并返回 revision-fenced dispatch proof；Human route 只能通过双 revision CAS 的原子确认命令。Application Handler Registry 当前只注册 `vm11.event_ingest/v1`，以 Outcome Ledger revision fence 物化结构化 Oracle proof；其余 51 条 route 明确 `NOT_IMPLEMENTED`，旧 Catalog digest 明确 `BLOCKED_CATALOG_REVISION`，两者都不运行 Runtime。Desktop 重开先做 Runtime reconciliation，再幂等关闭合同到期 Schedule。它尚未提供 OS wake/sleep-resume、Cell leader/多 Worker、公平调度、其余 51 条 Application handler、Effect Broker/Browser handler、其余 Human Checkpoint、redirect 或 Mission E3 原生 UI。
+- 当前 revision 的全工作区门禁为 **466 passed、0 failed、4 ignored**；四个默认忽略的真实环境测试（2 个 OpenInterpreter、2 个 Chrome）必须逐个显式运行并单独记录。严格 Clippy、OpenInterpreter schema/checksum、Catalog/Asset/VS-01 replay 与当前 Dioxus bundle 通过；Catalog Snapshot v2 digest 为 `577735c04b4c4858ea6c461cb6bd7d9896a7274f922c85a53418e1843aaeec3f`，Release Evidence 2.2 baseline 仍为 `passed: false`，并报告 `1/52 Application handlers implemented`。Catalog Conversation、Runtime draft、process Claim、Checkpoint Oracle/policy、Human/Application handler、dispatch proof 与 future-cycle Schedule 状态贯穿同一 Mission；成功只产生可审阅草稿或来源校验后的 Checkpoint proof，Mission 不会被模型自报完成，Effect 为 0。Cell live gate、显式 native Keychain smoke 与原生窗口复验若缺环境则保持 `BLOCKED_ENV`。
+- 团队/个人 keyring 已覆盖成员、设备、Recovery 与短期 Worker envelope、撤销/轮换、exact attachment Saga 和 X25519 claim-first handoff；私钥只进入 OS Secret Store，远端 Claim 前禁止解密。当前 macOS Data Protection Keychain 因缺 codesigning entitlement 为 `BLOCKED_ENV`，legacy login Keychain 也不可写；不得把测试内存后端或 Chrome mock-keychain 当作生产凭据证据。Control Plane HTTP/OIDC、真实双设备 UI、整机恢复、Windows Credential Manager 与完整跨平台矩阵仍未完成。
+- L1 的 `proptest`/`loom` 继续覆盖 Keyring、同步、Effect、Truth/Identity/Relationship、CreatorWork/Outcome、Context/Runtime 与 Outbox。Browser 默认门禁包含 48 个 adapter 测试，真实 Chrome smoke 单独显式运行；Runtime 另覆盖 coordinator restart、full-record/projection/evidence 校验、startup gate、同 generation 重试、耗尽 generation 原子退役、successor generation、`thread/resume` 与 replay suppression。跨平台浏览器并发、Windows 实机、authenticated flow、生产 scanner/Recipe keys、真实 Provider upload/readback/Verification 与 Mission E3 仍未完成。
+- VM-05/09/10 共用的 Conversation、Campaign、Buying Committee 与 Opportunity 已有规范化 SQLCipher 投影和 Application replay；回复 Effect 绑定 exact gateway/provider/connection/account/person/content/Consent/control generation，人工接管或暂停在同一事务取消待发 Effect，`uncertain` 写入被冻结且不会自动重放。Conversation 的全部控制/终态修订已进入 Team E2EE outbound→authenticated inbound replay，伪造 readback、伪造独立 Verification 和本地控制分叉都会失败关闭。这仍是 E2，不是 Dioxus E3 或真实 Gmail/Outlook E4。
+- VM-06 已有规范化 Creator Hiring/Task/Deliverable/Review/Payout 投影和 Application replay：公开候选只能研究；邀请必须重读当前联系许可；应聘必须来自已独立验证的邀请或悬赏发布；用户 Award 锁定申请、Offer digest 和选择证据；后续 Task 与付款不能伪造或绕过该 Award。Manifest v2 同时支持一次性 `campaign` 与长期 `continuous_relationship`，显式加入 Funding Reservation 和 Deliverable Entitlement；安全交付物先是 `evaluation_only`，接受后等待独立验证付款，只有匹配 digest 的已验证 Payout 才产生 `contract_usage_granted`，且 reservation 不得冒充法定 escrow。Payout `uncertain` 由无执行权的只读 reconciliation 查账，ReceiptFound 经独立 Verification 后把 Mission、Payout、使用权和审计事件原子 CAS；精确重放不增加付款记录。这仍是 E2，不是双边 Creator UI E3、真实网络/Stripe Connect E4 或 E5 经营证据。
 
 不要从旧目录、聊天附件或其他 Hartevo 仓库复制历史代码。当前远程仓库是 Desktop 产品线唯一工程起点。
 
@@ -72,9 +87,12 @@ rustup toolchain install 1.95.0 --component clippy --component rustfmt --compone
 
 ```bash
 cargo install dioxus-cli --version 0.7.10 --locked
+rustup toolchain install nightly --profile minimal
 dx --version
 dx doctor
 ```
+
+应用与所有 Hartevo crates 仍由仓库固定的稳定 Rust `1.95.0` 编译。Dioxus CLI 0.7.10 会用 nightly 的 Cargo unit graph 发现构建单元，因此 desktop bundle/serve 需要可用的最小 nightly 工具链；nightly 不进入产品运行时依赖。若本机从源码安装 CLI 时缺少 OpenSSL/libgit2，请安装相应开发库，或使用启用 vendored OpenSSL/libgit2 的同版本 CLI 构建。
 
 ## 3. 克隆后的完整性检查
 
@@ -134,7 +152,7 @@ Python 这里只是可选的静态原型预览手段，不是 Hartevo 产品运�
 
 以下边界不可用“创新”绕过：用户 Consent 与 Approval、Effect Broker、安全与隐私、许可证和来源历史、跨项目隔离、确定性业务状态、私有 Benchmark 隔离及 Release Gate。真正的创新必须扩大产品能力，同时让权限、证据和失败恢复更加清晰。
 
-## 6. 首个分支：Bootstrap R0
+## 6. Bootstrap R0 实现范围
 
 从同步后的 `main` 创建独立分支：
 
@@ -142,16 +160,18 @@ Python 这里只是可选的静态原型预览手段，不是 Hartevo 产品运�
 git switch -c bootstrap/macos-r0
 ```
 
-Bootstrap R0 只负责建立可重复工程地基，不实现大量业务模块。它至少交付：
+当前 `bootstrap/macos-r0` 分支已经交付：
 
 1. 根目录 `rust-toolchain.toml`、Cargo workspace、`Cargo.lock`、格式化与 lint 策略；
 2. 独立的 `hartevo-rs/` workspace/zone，以及最小 `desktop`、`domain-kernel`、`runtime-adapter`、`effect-broker` crate；
-3. Dioxus Desktop Shell、Hartevo 品牌 token、原型主框架和一个无网络的启动 smoke test；
-4. OpenInterpreter 上游 remote、来源 manifest、Apache-2.0 `LICENSE`/`NOTICE`、固定 release/commit 和可审计历史；
+3. Dioxus Desktop Shell、Hartevo 品牌 token、Application-owned Project/Mission inventory、显式 SQLCipher 初始化、用户自持 Recovery Kit 个人项目 onboarding，以及诚实的 `NOT_IMPLEMENTED`/`BLOCKED_ENV` 状态；
+4. OpenInterpreter 来源 manifest、Apache-2.0 `LICENSE`/`NOTICE`、固定 release/commit 与 schema digest；
 5. App Server stable schema snapshot、digest、initialize/stream/interrupt/approval/resume 契约测试；实验 API 必须单独标注，不能混入稳定协议；
-6. macOS CI：format、clippy、unit test、schema drift 和 Desktop smoke；
+6. macOS CI：format、clippy、unit test、schema drift、Desktop smoke 与 VS-01 replay；
 7. 本地配置示例与 Secret 规则；真实 Token、Cookie、OAuth refresh token 和签名证书不得进入 Git；
-8. 更新本文件，把下节目标命令改成实际已验证命令并记录 Apple Silicon/Intel 验证状态。
+8. SQLite 项目快照、append-only Mission event log、跨项目隔离，以及确定性 VS-01 Eval 报告。
+
+真实 OpenInterpreter 源码/二进制并未复制进本仓库；当前采用可审计来源 manifest + 固定 schema + 协议组合。引入真实 App Server 时必须保留上游历史或使用可审计 vendor zone，并单独补充进程级集成测试。
 
 ### 6.1 OpenInterpreter intake 的第一步
 
@@ -166,26 +186,42 @@ git tag -l rust-v0.0.34
 
 审查基线是提交 `984acc698cd038885ecb0b82721402b01e11a5ad`，公开稳定参考是 `rust-v0.0.34`。二者不自动等价于最终 R0 pin；PR 必须先比较 App Server schema、Harness 行为、安全测试和 macOS 构建。具体采用保留完整历史的 subtree、vendor zone 或其他可审计方式，应在 Bootstrap PR 中显式说明；禁止无来源复制和 `--squash` 后丢失升级依据。
 
-## 7. Bootstrap R0 合并后的目标命令
+## 7. 当前验收命令
 
-以下命令是首个工程 PR 必须使其成立的验收合同：
+以下命令已在 2026-08-10 的 Apple Silicon macOS 环境验证：
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+cargo test -p hartevo-cloud-storage --locked -- --nocapture
+bash scripts/check-openinterpreter-schema.sh
+cargo run -p hartevo-eval --locked -- catalog validate
+cargo run -p hartevo-eval --locked -- catalog export --output target/eval/catalog-v1.json
+cargo run -p hartevo-eval --locked -- evidence baseline --commit "$(git rev-parse HEAD)" --output target/eval/release-baseline.json
+cargo run -p hartevo-eval --locked -- run --mission VS-01 --output target/eval/vs-01.json
 dx doctor
-dx serve --desktop
+dx build --package hartevo-desktop
+dx serve --package hartevo-desktop
 ```
 
-OpenInterpreter zone 的最小协议验证目标为：
+OpenInterpreter 边界的当前验证命令为：
 
 ```bash
-cargo run -p codex-app-server -- --stdio
-cargo run -p codex-app-server -- generate-json-schema --out <schema-dir>
+cargo test -p hartevo-runtime-adapter
+bash scripts/check-openinterpreter-schema.sh
 ```
 
-最终路径和 workspace 参数以 Bootstrap PR 实际导入结构为准。合并前必须由 CI 和一台干净 macOS 机器复跑，不能只在开发者已有环境中成功。
+Browser 真实环境 smoke 默认保持 `ignored`，必须显式指定受审查的 Chrome 可执行文件；macOS 用例只在 headless 测试模式加入 Chromium 官方测试开关 `--use-mock-keychain`，不读取、创建或重置用户 Chrome 钥匙串：
+
+```bash
+HARTEVO_TEST_CHROME_BINARY="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" cargo test -p hartevo-browser-adapter --locked real_chromium_pipe_health_and_ax_smoke -- --ignored
+HARTEVO_TEST_CHROME_BINARY="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" cargo test -p hartevo-application --locked real_chromium_application_handoff_and_restart_smoke -- --ignored
+```
+
+第一条命令还证明受管理私有 Profile 上 test-only loopback 的 script-disabled exact-origin 导航、同源 AX readback、document generation 更新、stable locator 跨页面重解析和歧义拒绝、跨 origin redirect 在 HTTP request dispatch 前失败关闭，以及精确 Effect-bound semantic text input、File Broker→file-input selection、semantic click 的 DOM/viewport/hit-test/focus/AX readback、真实同源表单提交、单次使用和异步 readback；第二条证明 Application takeover/restart/continue。两者都覆盖进程组清理。它们不证明 active-script/authenticated navigation、真实账号登录、Cookie 迁移、密码/替换/raw keyboard、真实 Provider 文件提交、零 speculative DNS/TCP、生产写入或独立在线 Verification。实现使用 Chromium 官方的 [`Page.navigate`/frame/lifecycle`](https://chromedevtools.github.io/devtools-protocol/tot/Page/)、[`Accessibility.getFullAXTree`](https://chromedevtools.github.io/devtools-protocol/tot/Accessibility/)、[`DOM.focus`/geometry/hit-test/`setFileInputFiles`](https://chromedevtools.github.io/devtools-protocol/tot/DOM/)、[`Input.insertText`/`dispatchMouseEvent`](https://chromedevtools.github.io/devtools-protocol/tot/Input/) 与 [`Emulation.setScriptExecutionDisabled`](https://chromedevtools.github.io/devtools-protocol/tot/Emulation/) 合同。
+
+`cargo run -p codex-app-server` 当前不是有效命令，因为真实上游 binary 尚未进入 workspace。已验证环境为 Apple Silicon `aarch64-apple-darwin`、Rust `1.95.0`、Dioxus CLI `0.7.10`；Intel macOS、Windows、Linux、签名与公证尚未验证。合并前仍必须由 CI 和一台干净 macOS 机器复跑，不能只依赖开发者已有环境。
 
 ## 8. 分支与提交纪律
 
@@ -204,3 +240,4 @@ cargo run -p codex-app-server -- generate-json-schema --out <schema-dir>
 - [Dioxus v0.7.10](https://github.com/DioxusLabs/dioxus/releases/tag/v0.7.10)
 - [OpenInterpreter Rust v0.0.34](https://github.com/openinterpreter/openinterpreter/releases/tag/rust-v0.0.34)
 - [固定 OpenInterpreter 审查提交](https://github.com/openinterpreter/openinterpreter/tree/984acc698cd038885ecb0b82721402b01e11a5ad)
+- [Chromium：`--use-mock-keychain` 仅供测试、防止阻塞式钥匙串对话框](https://chromium.googlesource.com/chromium/chromium/+/master/chrome/common/chrome_switches.cc)

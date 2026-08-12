@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：质量工程目标合同。** 任何完成声明必须由本仓库对应版本的 Mission Eval 与可重放证据重新证明。
 
 状态：**Target Contract**；不表示当前仓库已经实现全部组件
-Desktop 采用版本：2026-08-10-v4
+Desktop 采用版本：2026-08-11-v5
 目标：让每次代码、模型、Prompt、Skill、Capability 或 Provider 变化都能回答“它是否更好地完成了 Hartevo 用户的增长业务目标”
 
 ## 1. Harness 的主体是业务世界，不是 Prompt
@@ -249,7 +249,7 @@ tools/eval/
 - 网站页面、Sitemap、Schema、CTA 和历史版本；
 - Buyer Question、Evidence、Ground Truth 和 Provider 估算；
 - Campaign、Content、Publication 和 Measurement；
-- Partner Identity、Supply Class、Program、Relationship、Link/Coupon；
+- Partner Identity、Supply Class、Program、Relationship、Link/Coupon，以及 Creator Task/Bounty、Acceptance、Deliverable revision/digest、Review、Dispute；
 - Person、Company、Opportunity、Consent、Task、Note；
 - Inbox、Contact、Conversation、Message、Assignment、Handoff；
 - Click、Lead、Order、Refund、Commission、Payout 和 Attribution；
@@ -378,7 +378,7 @@ Simulator 不只返回 HTTP 状态码，而要模拟业务语义。
 | Marketplace/Sorftime | 商品、销量估算、评论、Listing、不同市场和币种、字段缺失 |
 | Site/GitHub | 页面版本、PR、测试、Merge/Deploy、Provider Success 但 URL 不可用 |
 | Channel/Browser | API 发布、网页登录、验证码、Session 过期、重复提交、可见性验证 |
-| Partner Network | 认证权限、官方库存、关系状态、申请、Link、Transaction、Webhook |
+| Partner Network | 认证权限、官方库存、关系状态、申请、Link、Transaction、Webhook；Hartevo Opt-in Creator 的 Task/Bounty、接受、交付、Review 与 Payout eligibility |
 | CRM/Email | Consent、发送、Bounce、Reply、Unsubscribe、乱序线程和人工接管 |
 | Stripe | Checkout、Portal、成功/取消、重复 Webhook、退款和 Credits |
 | Commerce/Attribution | Click、Lead、Order、Refund、Commission、Payout、重复和乱序 |
@@ -404,6 +404,9 @@ approval.requested / decided
 effect.proposed / executed / uncertain / verified
 relationship.changed
 message.received / sent / handed_off
+creator.hiring_published / application_received / awarded
+creator.task_funded / accepted / deliverable_uploaded / reviewed
+creator.payout_verified / entitlement_granted / disputed
 outcome.observed
 attribution.calculated / disputed
 next_loop.proposed / accepted
@@ -444,6 +447,7 @@ Trace Collector 同时检查：
 - Approval、Idempotency、Effect、Receipt、Verification 和 Audit；
 - Supply Class、Consent、人工接管和消息方向；
 - 金额、币种、订单、退款、Commission、Payout；
+- Creator Task 合同版本、Deliverable digest/安全/使用权、User Review、Dispute 与接受前禁付；
 - Webhook 验签、重复、乱序和 Provider→Project 路由；
 - URL/PR/Publication 是否真实存在；
 - Conversation/Run 连续性和事件顺序；
@@ -511,7 +515,7 @@ Agent Runtime 暴露的工具是受控入口；它们应映射到 Canonical Capa
 - 失败 Oracle、责任边界和复现命令；
 - 关联 Issue/Commit 和修复后的永久回归 ID。
 
-最小化不得删掉导致错误的业务上下文。例如 Partner 自动触达错误若依赖 Supply Class，就不能压缩成没有 Partner Identity 的通用 Tool Test。
+最小化不得删掉导致错误的业务上下文。例如 Partner 自动触达错误若依赖 Supply Class，就不能压缩成没有 Partner Identity 的通用 Tool Test；Creator 付款错误若依赖 Task revision、Deliverable digest 或 User Review，也不能最小化掉这些合同事实。
 
 长上下文失败的 Replay Pack 还必须包含压缩前 source range、`CompactionRecord`、Continuation Ledger revision、Context Capsule、Worker Graph、lease/generation、模型/Provider/Runtime 配置和回流消息。只有摘要文本而没有 typed invariant diff 的失败不能关闭。
 
@@ -563,9 +567,9 @@ Agent Runtime 暴露的工具是受控入口；它们应映射到 Canonical Capa
 
 交付：
 
-- VM-05 Email、VM-06 Partner、VM-09 B2B Pipeline、VM-10 Inbox；
+- VM-05 Email、VM-06 Partner/Affiliate/Creator Work、VM-09 B2B Pipeline、VM-10 Inbox；
 - Partner/CRM/Email/Commerce/Stripe Simulator；
-- Approval、Uncertain、Receipt、Verification、Consent、Handoff、Refund 和 Payout Oracle；
+- Approval、Uncertain、Receipt、Verification、Consent、Handoff、Funding Reservation、真实 Deliverable、Review、Rights Entitlement、Refund 和 Payout Oracle；
 - Playwright 跨路由 Journey 和人工接管测试。
 
 退出条件：所有 External Effect 安全不变量通过，关系和经济状态可复算。

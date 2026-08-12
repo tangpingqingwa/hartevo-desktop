@@ -1,0 +1,11 @@
+[application]
+name = "Hartevo Desktop"
+sub_package = "hartevo-desktop"
+asset_dir = "hartevo-rs/desktop/assets"
+
+[web.app]
+title = "Hartevo Desktop"
+
+[bundle]
+identifier = "team.hartevo.desktop"
+publisher = "Hartevo"

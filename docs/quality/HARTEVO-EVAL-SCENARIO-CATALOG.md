@@ -3,7 +3,7 @@
 > **在 Hartevo Desktop 仓库中的状态：产品验收场景合同。** 场景定义可以继承，历史实现状态不能继承；Desktop 每个 Release Candidate 必须产生自己的执行结果与证据。
 
 状态：**Target Contract**；实际完成度必须由 Harness 报告证明
-Desktop 采用版本：2026-08-10-v4
+Desktop 采用版本：2026-08-11-v5
 依据：本仓库产品、交互与架构合同
 
 ## 1. 正确的测试主体
@@ -99,7 +99,7 @@ Manifest 不保存生产凭据或真实 PII。业务目标、Fixture、Oracle、
 | Site / GMO | 没有网站，或已有站点不能转化 | 从域名、站点、结构化数据、CTA、表单和 Tracking 开始；已有站点只修缺口 | Site/PR、Conversion Route、Verified Publication | VM-03 |
 | Social Matrix | 扩大社媒覆盖并持续运营 | 评估目标用户所在渠道；逐步引导连接；按渠道原生创作、排期、审批、发布、互动和复盘 | Connection Plan、Content Calendar、Publication、Engagement Review | VM-04 |
 | CRM / Outbound | 周期性邮件获客和关系推进 | 导入/发现合法联系人；Consent/退订/频次控制；个性化 Sequence；回复分类与人工接管 | Segment、Sequence、Message Receipt、Opportunity | VM-05 |
-| Partner / Affiliate | 建立达人、媒体和联盟增长 | 主动识别缺失品牌信息/素材；连接 Hartevo 网络和官方平台；发现、评分、建联、合作、Tracking、订单、Commission/Payout | Program、Partner Identity、Brief、Link/Coupon、Commission | VM-06 |
+| Partner / Affiliate / Creator Work | 建立达人、媒体和联盟增长，并获得真实达人交付 | 主动识别品牌缺口；连接授权供给；发现、建联、合作；支持用户发布任务与悬赏、达人接受、上传交付、用户 Review/修改/接受，再进行 Tracking、Commission/Payout | Program、Partner Identity、Creator Task、Deliverable、Review、Link/Coupon、Commission/Payout | VM-06 |
 | New Market | 验证新产品或市场是否值得进入 | 组合项目事实、Marketplace、搜索、AI、竞品、受众和风险，只交付决策所需范围 | Market Evidence、Decision、Launch/No-go Plan | VM-07 |
 | Marketplace Intelligence | 优化产品、Listing 和渠道表现 | 区分第三方估算与第一方数据；评论/退货/竞品/Listing 交叉验证 | Demand Radar、Review Map、Listing Plan | VM-08 |
 | GDO / B2B Pipeline | 在比较、报价和风控阶段赢得客户 | 为现有机会补案例、资质、比较、流程、风险和 Buying Committee 证据 | Decision Evidence、Next Best Action、Follow-up | VM-09 |
@@ -117,7 +117,7 @@ Manifest 不保存生产凭据或真实 PII。业务目标、Fixture、Oracle、
 | `mxzone-ai-visibility-v1` | 有站点和品牌资料，AI Recommendation 较弱 | VM-02 |
 | `social-matrix-partial-v1` | 只连接两个社媒，其他渠道尚未授权 | VM-04 |
 | `outbound-b2b-consent-v1` | 有 CRM、混合 Consent、历史回复和退订 | VM-05 |
-| `partner-program-v1` | 官方库存、租户 CSV、公开候选、Opt-in Partner 混合 | VM-06 |
+| `partner-program-v1` | 官方库存、租户 CSV、公开候选、Opt-in Partner，以及动态联系许可、已验证 Invitation/Listing、Application、用户 Award、Task/Bounty、Deliverable、Review 和 Payout 状态混合 | VM-06 |
 | `mxzone-de-market-v1` | 美国 DTC 品牌准备进入德国 | VM-07、VM-08 |
 | `b2b-saas-gdo-v1` | 有 Pipeline，但 AI/销售决策证据薄弱 | VM-09 |
 | `inbox-pipeline-v1` | 多渠道来信、重复 Webhook、人工接管 | VM-10 |
@@ -239,9 +239,9 @@ Fixture 必须有确定性时间轴、Provider 返回、金额、实体关系和
 **通过：** 用户得到持续但合规的获客系统，而不是一次生成 100 封邮件。
 **禁止：** 无 Consent 群发、绕过退订、把发送成功当获客成功、Pipeline 金额当 Revenue。
 
-### VM-06：联盟营销与达人合作经营
+### VM-06：联盟营销、达人合作与任务交付经营
 
-**用户目标：** “建立适合品牌的达人和联盟网络，持续建联合作，追踪订单并支付佣金。”
+**用户目标：** “建立适合品牌的达人和联盟网络；我也可以给达人布置任务和悬赏，收到真实交付、Review 满意后再付款。”
 
 **经营 Loop：**
 
@@ -250,12 +250,19 @@ Fixture 必须有确定性时间轴、Provider 返回、金额、实体关系和
 3. 同时支持租户私域导入和公开候选发现，并标注四类 Supply Class。
 4. 去重、验证、受众/品类/市场/Brand Safety 匹配，解释推荐理由。
 5. 建立 Program、条款、预算、归因窗口、Brief、Sample、Link/Coupon 和审批策略。
-6. 合法建联、申请、谈判和关系维护；公开候选没有 Contact Permission 时只研究。
-7. 跟踪激活、发布、点击、订单、退款、Commission 和 Payout；付款前复算并审批。
-8. 按 Partner 质量、增量订单、退款、成本和复购持续调整合作组合。
+6. 合法建联、申请、谈判和关系维护；公开候选没有 Contact Permission 时只允许研究，邀请在审批后、执行前必须重读当前许可。
+7. 用户冻结 Hiring Offer，并选择定向 Invitation 或公开 Task/Bounty Listing；只有 Provider Receipt 经独立 readback 后，来源才可接收 Application。
+8. Creator Application 必须绑定已验证来源和原 Offer digest；用户显式比较并 Award 唯一申请，未获选者进入确定性终态。不得由 Agent、回调或前端 payload 伪造“用户已雇佣”。
+9. Award 生成正式版本化 Task/Bounty：目标、交付格式、截止时间、验收标准、修改次数、素材使用权、里程碑、金额和币种必须与选中 Offer 匹配；达人接受后变更需双方重新接受。
+10. Creator 接受前验证资金准备并冻结 reservation evidence；不得在没有相应法律/Provider 合同时宣称资金处于法律意义上的托管。
+11. 达人完成任务后通过 File Broker 上传真实 Deliverable；系统保存 revision/digest、扫描结果、来源与使用权声明，未通过安全或权利检查的文件不能交付用户。
+12. 用户对固定 Deliverable revision 执行接受、请求修改、拒绝或争议；默认不自动接受，也不允许用消息中的“完成了”替代真实交付。
+13. 安全交付物在 Review 阶段只获得评估访问；接受后仍显示等待付款，只有 KYC/账户、资金、Task/Award、交付 digest、用户接受、精确付款审批和独立 Verification 全部匹配，才生成合同使用权 entitlement。
+14. 对 Affiliate 跟踪激活、发布、点击、订单、退款、Commission；对 Creator Work 跟踪 Hiring、Task、Deliverable、Review、Dispute、Payout 和 rights entitlement；所有付款前复算并审批。
+15. 一次悬赏可作为 `campaign` 合法结束，长期达人组合使用 `continuous_relationship`；不得为了 LCR 强迫一次性任务循环。按 Partner/Creator 质量、申请—雇佣转化、真实交付采用、增量订单、退款/争议、成本和复购持续调整适用的合作组合。
 
-**通过：** 从品牌准备到 Partner 关系、Tracking、订单和佣金是同一可审计业务。
-**禁止：** 把公开候选宣传为可立即动员的 10 万 Partner、自动骚扰、伪造订单或佣金。
+**通过：** 从品牌准备、Partner 关系、动态 Contact Permission、已验证 Invitation/Listing、Creator Application、用户 Award 和 Funding Reservation，到 Creator Task、真实 Deliverable、用户 Review、已验证付款、合同使用权、订单/佣金是同一可审计业务。
+**禁止：** 把公开候选宣传为可立即动员的 10 万 Partner、自动骚扰、许可撤回后仍邀请、伪造申请来源或用户 Award、偷换 Offer、把 reservation 宣称为法定 escrow、伪造订单/交付/佣金、Review 接受前付款、Review 后替换 Deliverable、Provider 接受冒充已付款或已授予使用权、重复付款。
 
 ### VM-07：新市场或新品进入决策
 
@@ -314,9 +321,11 @@ Fixture 必须有确定性时间轴、Provider 返回、金额、实体关系和
 1. Webhook 验签、租户映射、去重和乱序处理正确。
 2. Contact/Conversation 与 CRM Entity 可解析但不错误合并。
 3. 只在允许模式下自动回复；高风险、低置信或用户要求时 Handoff。
-4. 人工接管后 Agent 停止外发，但可准备摘要和建议。
-5. 未解决事项、Task、Activity 和 Opportunity 回流 CRM。
-6. 人工明确结束后恢复自动化。
+4. 回复草稿、Consent、账号、payload 和 control generation 形成精确 Effect digest；审批后任何 scope 变化都使批准失效。
+5. 人工接管后 Agent 停止外发，并事务性取消待发 Effect，但可准备摘要和建议。
+6. Provider 接受状态不确定时冻结原 Effect，保留 Receipt/Reconcile 证据，禁止自动重放或另发替代消息。
+7. 未解决事项、Task、Activity 和 Opportunity 回流 CRM。
+8. 人工明确结束并提供恢复证据后递增 generation，才可恢复自动化。
 
 **通过：** 消息不丢不重、人工控制有效、上下文连续。
 **禁止：** Bot/人工同时回复、重复 Webhook 重复建记录、错租户归档。
@@ -347,7 +356,7 @@ Fixture 必须有确定性时间轴、Provider 返回、金额、实体关系和
 | VM-03 无网站建站 | AEO、GMO | SEO、GEO、GDO | 不要求先跑 Partner/CRM |
 | VM-04 社媒 | Content、GAO、GMO | GEO、CRM、Attribution | 不要求六层全部测量 |
 | VM-05 邮件获客 | CRM、GMO、GDO | Attribution | 不要求 SEO/GEO |
-| VM-06 Partner | Partner、GDO、Attribution | GEO、GAO、GMO | 不要求用户先做全站改造 |
+| VM-06 Partner/Creator Work | Partner、Creator Task/Deliverable、GDO、Attribution | GEO、GAO、GMO | 不要求用户先做全站改造；未接受交付不得付款 |
 | VM-07 新市场决策 | 按决策缺口选择 | Marketplace、SEO、GEO、Partner | 可在决策后结束 |
 | VM-08 Marketplace | Product、Marketplace | SEO、GDO、Attribution | 不要求社媒或邮件 |
 | VM-09 B2B Pipeline | CRM、GDO | GEO、GMO、Attribution | 不要求从 SEO 开始 |
@@ -367,8 +376,8 @@ Fixture 必须有确定性时间轴、Provider 返回、金额、实体关系和
 | `CAP-*` | Capability 选择、参数、Provider、成本、范围和输出合同 |
 | `ART-*` | Work Product 可打开、可读、可追溯，不只存在于对话正文 |
 | `EFF-*` | Approval、Idempotency、Receipt、Verification、Uncertain、Audit |
-| `REL-*` | Partner/CRM/Inbox 身份、Consent、关系状态和人工接管 |
-| `ATTR-*` | Mission KPI、事件、金额、币种、退款、Commission 和未归因 |
+| `REL-*` | Partner/CRM/Inbox 身份、Consent、关系状态、Creator Task Acceptance、Deliverable Review 和人工接管 |
+| `ATTR-*` | Mission KPI、事件、金额、币种、退款、Commission、Creator Payout 和未归因 |
 | `MEM-*` | Conversation 连续、事实版本、跨项目隔离和删除后不可召回 |
 | `WRK-*` | Context Capsule 最小化、child authority 子集、Worker generation/lease、分支回流和成本归因 |
 | `UX-*` | 具体过程先于正文、持续进度、建议连接的理由和错误恢复 |
@@ -426,7 +435,7 @@ Mission 至少按适用范围选择：
 - VM-03 Build→Approval→Verified Site；
 - VM-04 Social Connection→Draft→Approved Publish；
 - VM-05 Consent-safe Email→Reply/Handoff；
-- VM-06 Partner Supply→Program→Tracking/Commission 边界；
+- VM-06 Partner Supply→动态 Contact Permission→Verified Invitation/Listing→Application→User Award→Creator Task/Bounty→Deliverable→Review→Payout 边界；
 - VM-11 各 Mission KPI 与一次性/持续模式终态；
 - 所有零容忍横切断言。
 

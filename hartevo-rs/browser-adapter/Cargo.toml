@@ -1,0 +1,31 @@
+[package]
+name = "hartevo-browser-adapter"
+description = "Project-scoped browser workspace, control lease, and typed host boundary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+command-group.workspace = true
+crossbeam-channel.workspace = true
+hartevo-domain-kernel = { path = "../domain-kernel" }
+hartevo-effect-broker = { path = "../effect-broker" }
+hex.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+command-fds.workspace = true
+libc.workspace = true
+os_pipe.workspace = true
+
+[lints]
+workspace = true

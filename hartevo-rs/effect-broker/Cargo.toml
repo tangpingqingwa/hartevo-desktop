@@ -1,0 +1,21 @@
+[package]
+name = "hartevo-effect-broker"
+description = "Approval, idempotency, receipts, and verification for Hartevo effects"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+hartevo-domain-kernel = { path = "../domain-kernel" }
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+loom.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
