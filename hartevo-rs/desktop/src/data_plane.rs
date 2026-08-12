@@ -83,6 +83,68 @@ pub struct DesktopSnapshot {
     pub product_evidence: ProductEvidenceProjection,
 }
 
+/// One assistant text item reconstructed from the encrypted, integrity-checked
+/// Runtime delta ledger. The raw Runtime item identifier never crosses this
+/// boundary; only its digest is exposed so Dioxus can keep stable paragraph
+/// identity while a stream grows.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopRuntimeTextItemProjection {
+    pub item_id_digest: String,
+    pub text: String,
+    pub delta_count: usize,
+    pub last_stream_sequence: u64,
+    pub cumulative_byte_count: u64,
+    pub observed_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for DesktopRuntimeTextItemProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopRuntimeTextItemProjection")
+            .field("item_id_digest", &self.item_id_digest)
+            .field("text_byte_count", &self.text.len())
+            .field("delta_count", &self.delta_count)
+            .field("last_stream_sequence", &self.last_stream_sequence)
+            .field("cumulative_byte_count", &self.cumulative_byte_count)
+            .field("observed_at", &self.observed_at)
+            .finish()
+    }
+}
+
+/// Context-gated private text for the newest Runtime turn of one exact
+/// Project/Mission. This is deliberately separate from `DesktopSnapshot`: an
+/// inventory refresh must never hydrate private text for every project, and a
+/// locked Device context must continue to expose metadata only.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopRuntimeTextStreamProjection {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub worker_generation: u64,
+    pub turn_revision: u64,
+    pub turn_status: RuntimeTurnStatus,
+    pub last_evidence_sequence: Option<u64>,
+    pub delta_count: usize,
+    pub items: Vec<DesktopRuntimeTextItemProjection>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for DesktopRuntimeTextStreamProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopRuntimeTextStreamProjection")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("worker_generation", &self.worker_generation)
+            .field("turn_revision", &self.turn_revision)
+            .field("turn_status", &self.turn_status)
+            .field("last_evidence_sequence", &self.last_evidence_sequence)
+            .field("delta_count", &self.delta_count)
+            .field("item_count", &self.items.len())
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DesktopMissionRuntimeOutcome {
     CheckpointRouted {
@@ -514,6 +576,83 @@ impl DesktopDataPlane {
             Err(SecretStoreError::SecretNotFound) => Err(DesktopDataError::MissingDatabaseKey),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Reads the newest persisted assistant-text stream for one exact Mission.
+    ///
+    /// This query intentionally does not run startup reconciliation or mutate
+    /// Mission/Runtime state. It first proves that the current Device can open
+    /// the encrypted Project Context, then reads the latest turn and its
+    /// integrity-checked delta chain. A caller that only has inventory access
+    /// receives the same recovery/blocked error as every other private-content
+    /// path rather than an empty string that could be mistaken for a valid
+    /// response.
+    pub fn runtime_text_stream_with(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DesktopRuntimeTextStreamProjection>, DesktopDataError> {
+        self.revalidate_database_entry()?;
+        let database_secret = secret_store
+            .get(&self.database_key_reference)
+            .map_err(|error| {
+                if matches!(error, SecretStoreError::SecretNotFound) {
+                    DesktopDataError::MissingDatabaseKey
+                } else {
+                    error.into()
+                }
+            })?;
+        let service = self.open_read_application_from_secret(&database_secret)?;
+        self.require_project_context_access(&service, secret_store, project_id, now)?;
+        let Some(attempt) = service.latest_runtime_turn_for_mission(project_id, mission_id)? else {
+            return Ok(None);
+        };
+        let deltas = service.runtime_turn_private_text_deltas(project_id, &attempt.id)?;
+        let mut item_indexes = BTreeMap::<String, usize>::new();
+        let mut items = Vec::<DesktopRuntimeTextItemProjection>::new();
+        for delta in &deltas {
+            if let Some(index) = item_indexes.get(&delta.item_id_digest).copied() {
+                let item = &mut items[index];
+                item.text.push_str(&delta.delta);
+                item.delta_count = item.delta_count.saturating_add(1);
+                item.last_stream_sequence = delta.stream_sequence;
+                item.cumulative_byte_count = delta.cumulative_byte_count;
+                item.observed_at = delta.observed_at;
+            } else {
+                item_indexes.insert(delta.item_id_digest.clone(), items.len());
+                items.push(DesktopRuntimeTextItemProjection {
+                    item_id_digest: delta.item_id_digest.clone(),
+                    text: delta.delta.clone(),
+                    delta_count: 1,
+                    last_stream_sequence: delta.stream_sequence,
+                    cumulative_byte_count: delta.cumulative_byte_count,
+                    observed_at: delta.observed_at,
+                });
+            }
+        }
+        Ok(Some(DesktopRuntimeTextStreamProjection {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            worker_generation: attempt.scope.worker_generation,
+            turn_revision: attempt.revision,
+            turn_status: attempt.status,
+            last_evidence_sequence: deltas.last().map(|delta| delta.evidence_sequence),
+            delta_count: deltas.len(),
+            items,
+            updated_at: attempt.updated_at,
+        }))
+    }
+
+    pub fn runtime_text_stream_os(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DesktopRuntimeTextStreamProjection>, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.runtime_text_stream_with(&secret_store, project_id, mission_id, now)
     }
 
     /// Creates the installation SQLCipher key only after an explicit Desktop
@@ -2392,6 +2531,15 @@ impl DesktopDataPlane {
         Ok((service, reconciliation))
     }
 
+    fn open_read_application_from_secret(
+        &self,
+        secret: &hartevo_storage::SecretBytes,
+    ) -> Result<ApplicationService, DesktopDataError> {
+        let database_key = DatabaseKey::from_secret(secret)?;
+        let store = ProjectStore::open(&self.database_path, &database_key)?;
+        Ok(ApplicationService::new(store))
+    }
+
     fn revalidate_database_entry(&self) -> Result<(), DesktopDataError> {
         reject_symlink(&self.data_root)?;
         reject_symlink(&self.database_path)
@@ -2808,7 +2956,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn runtime_fixture_completion_messages() -> [String; 4] {
+    fn runtime_fixture_completion_messages() -> [String; 6] {
         let thread_id = "desktop-fixture-thread";
         let turn_id = "desktop-fixture-turn";
         [
@@ -2821,8 +2969,30 @@ mod tests {
                     "item": {
                         "id": "desktop-fixture-item",
                         "type": "agentMessage",
-                        "text": "transient streaming text must not be adopted",
+                        "text": "",
                     },
+                },
+            })
+            .to_string(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "itemId": "desktop-fixture-item",
+                    "delta": "Reviewable local runtime ",
+                },
+            })
+            .to_string(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "itemId": "desktop-fixture-item",
+                    "delta": "draft; no external effect occurred.",
                 },
             })
             .to_string(),
@@ -2883,6 +3053,8 @@ mod tests {
         ] = runtime_fixture_start_messages(&project_root, &runtime_home);
         let [
             item_started,
+            first_delta,
+            second_delta,
             approval_request,
             item_completed,
             turn_completed,
@@ -2902,10 +3074,12 @@ printf '%s\n' "$3"
 printf '%s\n' "$4"
 printf '%s\n' "$5"
 printf '%s\n' "$6"
-IFS= read -r decision
-case "$decision" in *'"id":"desktop-fixture-local-approval"'*'"decision":"decline"'*) ;; *) exit 34 ;; esac
 printf '%s\n' "$7"
 printf '%s\n' "$8"
+IFS= read -r decision
+case "$decision" in *'"id":"desktop-fixture-local-approval"'*'"decision":"decline"'*) ;; *) exit 34 ;; esac
+printf '%s\n' "$9"
+printf '%s\n' "${10}"
 sleep 30"#
                 .into(),
             "hartevo-desktop-runtime-fixture".into(),
@@ -2914,6 +3088,8 @@ sleep 30"#
             turn_started,
             turn_response,
             item_started,
+            first_delta,
+            second_delta,
             approval_request,
             item_completed,
             turn_completed,
@@ -4717,6 +4893,137 @@ sleep 30"#;
                 .expect("unchanged events"),
             events_before_replay
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the read-only Desktop boundary is proved end-to-end across exact scope, diagnostics, restart, and lost-device Context gating"
+    )]
+    fn runtime_text_stream_query_is_context_gated_redacted_and_restart_stable() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let submission = plane
+            .start_catalog_mission_and_run_with(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-04".into(),
+                    mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
+                    title: Some("Persisted stream query".into()),
+                    goal: "Render only the authorized private Runtime stream".into(),
+                    market: "DE".into(),
+                    language: "de-DE".into(),
+                    audience: "owner".into(),
+                    timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 0,
+                    currency: "EUR".into(),
+                },
+                Some(completed_runtime_fixture_source()),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("completed Runtime stream fixture");
+        let expected_text = "Reviewable local runtime draft; no external effect occurred.";
+        let projected = plane
+            .runtime_text_stream_with(
+                &secrets,
+                &project_id,
+                &submission.mission_id,
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("authorized stream query")
+            .expect("latest Runtime turn");
+        assert_eq!(projected.project_id, project_id);
+        assert_eq!(projected.mission_id, submission.mission_id);
+        assert_eq!(projected.turn_status, RuntimeTurnStatus::Completed);
+        assert_eq!(projected.delta_count, 2);
+        assert_eq!(projected.items.len(), 1);
+        assert_eq!(projected.items[0].text, expected_text);
+        assert_eq!(projected.items[0].delta_count, 2);
+        assert_eq!(projected.items[0].last_stream_sequence, 2);
+        assert_eq!(
+            projected.items[0].cumulative_byte_count,
+            u64::try_from(expected_text.len()).expect("fixture length")
+        );
+        assert!(projected.last_evidence_sequence.is_some());
+        assert!(!format!("{projected:?}").contains(expected_text));
+        assert!(!format!("{:?}", projected.items[0]).contains(expected_text));
+
+        let replayed = plane
+            .runtime_text_stream_with(
+                &secrets,
+                &project_id,
+                &submission.mission_id,
+                observed_at() + Duration::minutes(4),
+            )
+            .expect("restart-equivalent stream read")
+            .expect("persisted stream");
+        assert_eq!(replayed, projected);
+        assert!(
+            plane
+                .runtime_text_stream_with(
+                    &secrets,
+                    &project_id,
+                    &MissionId::from("mission-outside-exact-scope"),
+                    observed_at() + Duration::minutes(4),
+                )
+                .expect("scoped empty query")
+                .is_none()
+        );
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at())
+            .expect("application");
+        let project = service
+            .desktop_inventory()
+            .expect("inventory")
+            .projects
+            .into_iter()
+            .find(|project| project.project_id == project_id)
+            .expect("project");
+        let keyring = service.load_project_keyring(&project_id).expect("keyring");
+        let device_reference = keyring
+            .envelopes
+            .iter()
+            .filter(|envelope| {
+                envelope.key_version == keyring.active_key_version
+                    && envelope.is_available(observed_at() + Duration::minutes(5))
+            })
+            .find_map(|envelope| {
+                let KeyRecipient::Device(device_id) = &envelope.recipient else {
+                    return None;
+                };
+                let recipient = KeyRecipient::Device(device_id.clone());
+                let reference = SecretReference {
+                    tenant_id: project.tenant_id.clone(),
+                    project_id: project_id.clone(),
+                    provider: "os-native".into(),
+                    account_scope: recipient.stable_scope(),
+                    purpose: format!("project_wrapping_key:{}", envelope.id),
+                    version: envelope.key_version,
+                };
+                secrets.get(&reference).ok().map(|_| reference)
+            })
+            .expect("active local Device wrapping secret");
+        drop(service);
+        secrets
+            .delete(&device_reference)
+            .expect("simulate a lost Device wrapping key");
+        assert!(matches!(
+            plane.runtime_text_stream_with(
+                &secrets,
+                &project_id,
+                &submission.mission_id,
+                observed_at() + Duration::minutes(5),
+            ),
+            Err(DesktopDataError::ProjectContextRecoveryRequired(id)) if id == project_id
+        ));
     }
 
     #[cfg(unix)]

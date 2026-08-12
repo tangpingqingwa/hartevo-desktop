@@ -4491,6 +4491,331 @@ body.resizing-workpad {
   }
 }
 
+/* --------------------------------------------------------------------------
+ * Persisted Mission Conversation. Unlike the fixture-only selectors above,
+ * every visible body here comes from the context-gated SQLCipher projection.
+ * ----------------------------------------------------------------------- */
+
+.persisted-mission-thread {
+  position: relative;
+  padding: 30px 34px 168px;
+  overscroll-behavior: contain;
+  scroll-behavior: smooth;
+}
+
+.persisted-user-row {
+  display: flex;
+  width: min(760px, 100%);
+  margin: 0 auto 30px;
+  justify-content: flex-end;
+}
+
+.persisted-user-message {
+  max-width: 78%;
+  padding: 10px 12px 8px;
+  border-radius: 10px 10px 3px 10px;
+  color: #303136;
+  background: #f0f0f1;
+  font-size: 12px;
+  line-height: 1.58;
+  overflow-wrap: anywhere;
+}
+
+.persisted-user-message p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.persisted-user-message p + p { margin-top: 8px; }
+
+.persisted-user-message footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+  color: #929398;
+  font-size: 8px;
+}
+
+.persisted-user-message footer time { margin-left: auto; }
+
+.persisted-assistant-turn {
+  width: min(760px, 100%);
+  margin: 0 auto 30px;
+}
+
+.persisted-assistant-turn .assistant-byline img,
+.persisted-state-turn .assistant-byline img {
+  width: 23px;
+  height: 23px;
+  object-fit: contain;
+}
+
+.persisted-assistant-copy,
+.runtime-stream-copy {
+  color: #38393d;
+  font-size: 12.5px;
+  line-height: 1.68;
+  overflow-wrap: anywhere;
+}
+
+.persisted-assistant-copy p,
+.runtime-stream-item p {
+  margin: 0 0 9px;
+  white-space: pre-wrap;
+}
+
+.conversation-empty .assistant-copy {
+  color: #77787d;
+  font-size: 11.5px;
+}
+
+.persisted-system-notice,
+.runtime-stream-error {
+  display: grid;
+  width: min(700px, calc(100% - 60px));
+  min-height: 42px;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  margin: 0 auto 24px;
+  padding: 8px 10px;
+  border-left: 2px solid #c7c8cc;
+  color: #6f7075;
+  background: #f7f7f8;
+}
+
+.persisted-system-notice span,
+.runtime-stream-error span {
+  display: grid;
+  gap: 3px;
+}
+
+.persisted-system-notice strong,
+.runtime-stream-error strong { font-size: 9.5px; }
+
+.persisted-system-notice small,
+.runtime-stream-error small {
+  font-size: 9.5px;
+  line-height: 1.5;
+}
+
+.runtime-stream-error {
+  border-left-color: var(--red);
+  color: #955046;
+  background: var(--red-soft);
+}
+
+.runtime-stream-item + .runtime-stream-item {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid #eeeeef;
+}
+
+.runtime-stream-waiting {
+  color: #898a8f;
+  font-size: 11.5px;
+}
+
+.runtime-stream-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  margin-left: 2px;
+  border-radius: 1px;
+  vertical-align: -0.12em;
+  background: #4d4e53;
+  animation: fixture-caret 780ms steps(1, end) infinite;
+}
+
+.runtime-stream-receipt {
+  display: flex;
+  min-height: 26px;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0 0 31px;
+  color: #85868b;
+  font-size: 8.5px;
+}
+
+.runtime-stream-receipt em {
+  margin-left: auto;
+  color: #999a9f;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 7.5px;
+  font-style: normal;
+}
+
+.runtime-stream-turn.is-streaming .assistant-byline time { color: var(--gold-strong); }
+
+.persisted-state-turn {
+  width: min(760px, 100%);
+  margin: 0 auto;
+  padding: 18px 14px 14px;
+}
+
+.persisted-state-turn .mission-contract,
+.persisted-state-turn .live-work,
+.persisted-state-turn .connection-readiness {
+  width: calc(100% - 31px);
+  margin-left: 31px;
+}
+
+.mission-follow-latest {
+  position: sticky;
+  bottom: 122px;
+  z-index: 4;
+  display: flex;
+  width: fit-content;
+  min-height: 31px;
+  align-items: center;
+  gap: 6px;
+  margin: 14px auto 0;
+  padding: 0 11px;
+  border: 1px solid #d7d8dc;
+  border-radius: 999px;
+  color: #55565b;
+  background: rgb(255 255 255 / 94%);
+  box-shadow: 0 4px 14px rgb(29 29 31 / 10%);
+  font-size: 10px;
+  backdrop-filter: blur(10px);
+}
+
+.mission-follow-latest:hover { color: #303136; background: #fff; }
+.mission-follow-latest > span { color: var(--gold-strong); font-weight: 650; }
+.mission-follow-latest.has-unseen { border-color: #d7bd89; }
+
+.persisted-state-details {
+  width: min(760px, 100%);
+  margin: 10px auto 0;
+  border-top: 1px solid #eeeeef;
+}
+
+.persisted-state-details > summary {
+  display: grid;
+  min-height: 46px;
+  grid-template-columns: 20px minmax(0, 1fr) auto 14px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  color: #66676c;
+  cursor: pointer;
+  list-style: none;
+}
+
+.persisted-state-details > summary::-webkit-details-marker { display: none; }
+.persisted-state-details > summary span { display: grid; gap: 2px; }
+.persisted-state-details > summary strong { color: #48494e; font-size: 10.5px; }
+.persisted-state-details > summary small { color: #929398; font-size: 8.5px; }
+.persisted-state-details > summary em { color: #999a9f; font-size: 8.5px; font-style: normal; }
+.persisted-state-details > summary > svg:last-child { transition: transform 150ms var(--ease); }
+.persisted-state-details[open] > summary > svg:last-child { transform: rotate(180deg); }
+.persisted-state-details[open] { border: 1px solid #e3e3e5; border-radius: 10px; background: #fafafb; }
+.persisted-state-details[open] > summary { border-bottom: 1px solid #e8e8ea; }
+
+/* While a turn is live, the composer stays a compact control surface. The
+   durable response and process history remain in the Conversation itself. */
+.composer-zone.runtime-active textarea {
+  min-height: 42px;
+  max-height: 42px;
+  padding-block: 8px;
+  overflow: hidden;
+}
+
+.composer-zone.runtime-active .live-operation-strip {
+  min-height: 40px;
+  margin-top: 5px;
+  padding-block: 4px;
+}
+
+.composer-zone.runtime-active .live-operation-strip > span small { display: none; }
+
+.composer-zone.runtime-active .live-operation-events {
+  display: block;
+  margin-top: 0;
+}
+
+.composer-zone.runtime-active .live-operation-events > div { display: none; }
+
+.composer-zone.runtime-active .live-operation-events > div:last-child {
+  display: grid;
+  min-height: 22px;
+}
+
+@media (max-width: 900px) {
+  .persisted-mission-thread { padding-inline: 22px; }
+  .persisted-state-turn .mission-contract,
+  .persisted-state-turn .live-work,
+  .persisted-state-turn .connection-readiness {
+    width: 100%;
+    margin-left: 0;
+  }
+  .runtime-stream-receipt { margin-left: 0; }
+  .persisted-state-details > summary em { display: none; }
+  .persisted-state-details > summary { grid-template-columns: 20px minmax(0, 1fr) 14px; }
+}
+
+/* At 200% desktop zoom a 1024×768 window exposes roughly a 512×384 CSS
+   viewport. Keep the live transcript readable instead of letting the active
+   composer become a second full-height work surface. */
+@media (max-height: 520px) {
+  .persisted-mission-thread { padding-bottom: 104px; }
+
+  .composer-zone.runtime-active {
+    bottom: 4px;
+    margin-bottom: 4px;
+  }
+
+  .composer-zone.runtime-active .composer-context {
+    display: flex;
+    min-height: 24px;
+    align-items: center;
+    padding: 3px 6px 0;
+    overflow: hidden;
+  }
+
+  .composer-zone.runtime-active .composer-context > span,
+  .composer-zone.runtime-active .composer-context-actions {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .composer-zone.runtime-active .composer-context-actions {
+    margin-left: auto;
+  }
+
+  .composer-zone.runtime-active .live-operation-strip {
+    min-height: 32px;
+    margin: 3px 5px 0;
+    padding: 2px 5px;
+  }
+
+  .composer-zone.runtime-active .live-operation-events { display: none; }
+
+  .composer-zone.runtime-active textarea {
+    min-height: 28px;
+    max-height: 28px;
+    padding: 4px 6px;
+    line-height: 20px;
+  }
+
+  .composer-zone.runtime-active > footer {
+    min-height: 38px;
+    padding: 3px 4px;
+  }
+
+  .composer-zone.runtime-active .runtime-pickers > .honesty-chip:last-child {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .persisted-mission-thread { scroll-behavior: auto; }
+  .runtime-stream-caret { animation: none !important; }
+}
+
 .prototype-composer-attachments {
   display: flex;
   min-height: 74px;
