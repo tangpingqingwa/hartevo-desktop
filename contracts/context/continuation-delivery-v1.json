@@ -1,0 +1,20 @@
+{
+  "schema": "hartevo.context-continuation-delivery/v1",
+  "continuationEntryLifetime": "non_expiring",
+  "absentKindPolicy": "no_synthetic_reference",
+  "deliveryByKind": {
+    "decision": "required_when_present",
+    "blocker": "required_when_present",
+    "next_action": "required_when_present",
+    "user_correction": "required_when_present",
+    "checkpoint_transition": "required_when_present",
+    "approval_pending": "required_when_present",
+    "effect_uncertain": "required_when_present",
+    "human_handoff": "required_when_present"
+  },
+  "genericRequiredReferenceDisposition": {
+    "missing": "blocked_missing_required",
+    "expired": "blocked_missing_required",
+    "budgetOverflow": "blocked_budget"
+  }
+}

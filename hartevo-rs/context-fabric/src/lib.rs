@@ -11,7 +11,7 @@ pub use model_tokenizer::{
     ConservativeByteBudgetTokenizer, PinnedModelTokenizer, PinnedTokenizerSpec,
 };
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use chrono::{DateTime, Utc};
@@ -30,6 +30,115 @@ const MAX_PROMPT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PROMPT_TOKENS: u64 = 4 * 1024 * 1024;
 const MAX_OPTIONAL_FRAMES: u32 = 512;
 const MAX_GAP_RECORDS: u32 = 1_024;
+const CONTINUATION_DELIVERY_SCHEMA: &str = "hartevo.context-continuation-delivery/v1";
+const CONTINUATION_DELIVERY_CONTRACT_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../contracts/context/continuation-delivery-v1.json"
+));
+const CONTINUATION_ENTRY_KINDS: [ContinuationEntryKind; 8] = [
+    ContinuationEntryKind::Decision,
+    ContinuationEntryKind::Blocker,
+    ContinuationEntryKind::NextAction,
+    ContinuationEntryKind::UserCorrection,
+    ContinuationEntryKind::CheckpointTransition,
+    ContinuationEntryKind::ApprovalPending,
+    ContinuationEntryKind::EffectUncertain,
+    ContinuationEntryKind::HumanHandoff,
+];
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ContinuationEntryLifetime {
+    NonExpiring,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum AbsentContinuationKindPolicy {
+    NoSyntheticReference,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ContinuationDeliveryRequirement {
+    RequiredWhenPresent,
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum RequiredReferenceDisposition {
+    BlockedMissingRequired,
+    BlockedBudget,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GenericRequiredReferenceDisposition {
+    missing: RequiredReferenceDisposition,
+    expired: RequiredReferenceDisposition,
+    budget_overflow: RequiredReferenceDisposition,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContinuationDeliveryPolicy {
+    schema: String,
+    continuation_entry_lifetime: ContinuationEntryLifetime,
+    absent_kind_policy: AbsentContinuationKindPolicy,
+    delivery_by_kind: BTreeMap<ContinuationEntryKind, ContinuationDeliveryRequirement>,
+    generic_required_reference_disposition: GenericRequiredReferenceDisposition,
+}
+
+impl ContinuationDeliveryPolicy {
+    fn load() -> Result<Self, ContextAssemblyError> {
+        let policy: Self = serde_json::from_slice(CONTINUATION_DELIVERY_CONTRACT_BYTES)
+            .map_err(|_| ContextAssemblyError::InvalidContinuationDeliveryPolicy)?;
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    fn validate(&self) -> Result<(), ContextAssemblyError> {
+        let expected_kinds = CONTINUATION_ENTRY_KINDS
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let actual_kinds = self
+            .delivery_by_kind
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let disposition = &self.generic_required_reference_disposition;
+        if self.schema != CONTINUATION_DELIVERY_SCHEMA
+            || self.continuation_entry_lifetime != ContinuationEntryLifetime::NonExpiring
+            || self.absent_kind_policy != AbsentContinuationKindPolicy::NoSyntheticReference
+            || actual_kinds != expected_kinds
+            || self.delivery_by_kind.values().any(|requirement| {
+                *requirement != ContinuationDeliveryRequirement::RequiredWhenPresent
+            })
+            || disposition.missing != RequiredReferenceDisposition::BlockedMissingRequired
+            || disposition.expired != RequiredReferenceDisposition::BlockedMissingRequired
+            || disposition.budget_overflow != RequiredReferenceDisposition::BlockedBudget
+        {
+            return Err(ContextAssemblyError::InvalidContinuationDeliveryPolicy);
+        }
+        Ok(())
+    }
+
+    fn requirement_for(
+        &self,
+        kind: ContinuationEntryKind,
+    ) -> Result<ContextFrameRequirement, ContextAssemblyError> {
+        match self.delivery_by_kind.get(&kind) {
+            Some(ContinuationDeliveryRequirement::RequiredWhenPresent) => {
+                Ok(ContextFrameRequirement::Required)
+            }
+            Some(ContinuationDeliveryRequirement::Unsupported) | None => {
+                Err(ContextAssemblyError::InvalidContinuationDeliveryPolicy)
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -622,7 +731,7 @@ impl ContextAssembler {
 
         let checkpoint_digest = request.foundation.checkpoint.digest()?;
         let mut selected = mandatory_inline_frames(request, tokenizer)?;
-        let (required_references, optional_references) = material_references(request);
+        let (required_references, optional_references) = material_references(request)?;
         let input_digest = assembly_input_digest(
             request,
             &checkpoint_digest,
@@ -968,7 +1077,8 @@ fn mandatory_inline_frames(
 )]
 fn material_references(
     request: &ContextAssemblyRequest<'_>,
-) -> (Vec<ContextMaterialReference>, Vec<ContextMaterialReference>) {
+) -> Result<(Vec<ContextMaterialReference>, Vec<ContextMaterialReference>), ContextAssemblyError> {
+    let continuation_delivery = ContinuationDeliveryPolicy::load()?;
     let mut required = vec![ContextMaterialReference {
         source: ContextFrameSource::CompactionSummary,
         source_id: request.foundation.compaction.id.to_string(),
@@ -982,19 +1092,7 @@ fn material_references(
     let mut optional = Vec::new();
 
     for entry in &request.foundation.continuation_ledger.entries {
-        let requirement = if matches!(
-            entry.kind,
-            ContinuationEntryKind::Decision
-                | ContinuationEntryKind::Blocker
-                | ContinuationEntryKind::UserCorrection
-                | ContinuationEntryKind::ApprovalPending
-                | ContinuationEntryKind::EffectUncertain
-                | ContinuationEntryKind::HumanHandoff
-        ) {
-            ContextFrameRequirement::Required
-        } else {
-            ContextFrameRequirement::Optional
-        };
+        let requirement = continuation_delivery.requirement_for(entry.kind)?;
         let reference = ContextMaterialReference {
             source: ContextFrameSource::Continuation,
             source_id: format!("{}:{}", entry.sequence, entry.subject_id),
@@ -1070,7 +1168,7 @@ fn material_references(
             .cmp(&left.source)
             .then_with(|| right.source_id.cmp(&left.source_id))
     });
-    (required, optional)
+    Ok((required, optional))
 }
 
 fn inline_frame(
@@ -1449,6 +1547,8 @@ pub enum ContextAssemblyError {
     Json(#[from] serde_json::Error),
     #[error("context assembly policy is invalid or exceeds the worker token budget")]
     InvalidPolicy,
+    #[error("embedded continuation delivery policy is invalid or incomplete")]
+    InvalidContinuationDeliveryPolicy,
     #[error("context assembly scope, generation, branch, lease, or capsule is inconsistent")]
     ScopeMismatch,
     #[error("context checkpoint does not match the current working set, continuation, or mission")]
@@ -1502,7 +1602,30 @@ mod tests {
     const DECISION_TEXT: &str = "PRIVATE-DECISION::Germany evidence is incomplete";
     const REQUIRED_ITEM_TEXT: &str = "PRIVATE-EFFECT::approval remains pending";
     const NEXT_ACTION_TEXT: &str = "PRIVATE-NEXT-ACTION::collect counterevidence";
+    const CHECKPOINT_TRANSITION_TEXT: &str =
+        "PRIVATE-CHECKPOINT-TRANSITION::resume after checkpoint";
     const ASSEMBLY_AT_SECONDS: i64 = 10;
+
+    #[derive(Clone, Copy)]
+    struct FixtureContinuation {
+        kind: ContinuationEntryKind,
+        subject_id: &'static str,
+        storage_ref: &'static str,
+        text: &'static str,
+    }
+
+    const NEXT_ACTION_CONTINUATION: FixtureContinuation = FixtureContinuation {
+        kind: ContinuationEntryKind::NextAction,
+        subject_id: "next-action",
+        storage_ref: "cas://next-action-context",
+        text: NEXT_ACTION_TEXT,
+    };
+    const CHECKPOINT_TRANSITION_CONTINUATION: FixtureContinuation = FixtureContinuation {
+        kind: ContinuationEntryKind::CheckpointTransition,
+        subject_id: "checkpoint-transition",
+        storage_ref: "cas://checkpoint-transition-context",
+        text: CHECKPOINT_TRANSITION_TEXT,
+    };
 
     fn at() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 11, 12, 0, 0)
@@ -1645,11 +1768,19 @@ mod tests {
         expired_at_assembly.then(|| at() + Duration::seconds(6))
     }
 
+    fn fixture(required_expired: bool, optional_expired: bool) -> AssemblyFixture {
+        fixture_with_continuation(required_expired, optional_expired, NEXT_ACTION_CONTINUATION)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the test fixture constructs one fully valid Mission-to-Checkpoint-to-Capsule authority closure"
     )]
-    fn fixture(required_expired: bool, optional_expired: bool) -> AssemblyFixture {
+    fn fixture_with_continuation(
+        required_expired: bool,
+        optional_expired: bool,
+        fixture_continuation: FixtureContinuation,
+    ) -> AssemblyFixture {
         let contract = MissionContract {
             version: 1,
             mode: OperatingMode::BuildOnce,
@@ -1807,17 +1938,17 @@ mod tests {
         continuation
             .append(
                 hartevo_domain_kernel::ContinuationEntryInput {
-                    kind: ContinuationEntryKind::NextAction,
-                    subject_id: "next-action".into(),
-                    payload_ref: "cas://next-action-context".into(),
-                    payload_digest: sha(NEXT_ACTION_TEXT),
+                    kind: fixture_continuation.kind,
+                    subject_id: fixture_continuation.subject_id.into(),
+                    payload_ref: fixture_continuation.storage_ref.into(),
+                    payload_digest: sha(fixture_continuation.text),
                     evidence_ids: BTreeSet::new(),
                 },
                 &workspace,
                 &mission,
                 at() + Duration::seconds(2),
             )
-            .expect("next-action continuation");
+            .expect("required continuation");
         let compaction = ContextCompactionRecord::create(
             ContextCompactionRecordId::from("compaction-context-assembly"),
             &workspace,
@@ -1899,16 +2030,19 @@ mod tests {
         capsule
             .claim(workspace.generation, at() + Duration::seconds(5))
             .expect("capsule claim");
-        let materials = BTreeMap::from([
+        let mut materials = BTreeMap::from([
             ("cas://summary-context".into(), SUMMARY_TEXT.into()),
             ("cas://decision-context".into(), DECISION_TEXT.into()),
             (
                 "cas://pending-effect-context".into(),
                 REQUIRED_ITEM_TEXT.into(),
             ),
-            ("cas://next-action-context".into(), NEXT_ACTION_TEXT.into()),
             ("cas://conversation-tail-context".into(), optional_text),
         ]);
+        materials.insert(
+            fixture_continuation.storage_ref.into(),
+            fixture_continuation.text.into(),
+        );
         AssemblyFixture {
             mission,
             foundation,
@@ -1917,6 +2051,63 @@ mod tests {
             capsule,
             resolver: MapResolver { materials },
         }
+    }
+
+    #[test]
+    fn continuation_delivery_contract_is_total_required_when_present_and_non_synthesizing() {
+        let policy = ContinuationDeliveryPolicy::load().expect("valid embedded delivery contract");
+        assert_eq!(
+            policy.continuation_entry_lifetime,
+            ContinuationEntryLifetime::NonExpiring
+        );
+        assert_eq!(
+            policy.absent_kind_policy,
+            AbsentContinuationKindPolicy::NoSyntheticReference
+        );
+        assert_eq!(
+            policy.delivery_by_kind.len(),
+            CONTINUATION_ENTRY_KINDS.len()
+        );
+        for kind in CONTINUATION_ENTRY_KINDS {
+            assert_eq!(
+                policy.requirement_for(kind).expect("known kind"),
+                ContextFrameRequirement::Required
+            );
+        }
+        for kind in CONTINUATION_ENTRY_KINDS {
+            let mut unsupported = ContinuationDeliveryPolicy::load().expect("valid policy");
+            unsupported
+                .delivery_by_kind
+                .insert(kind, ContinuationDeliveryRequirement::Unsupported);
+            assert!(matches!(
+                unsupported.validate(),
+                Err(ContextAssemblyError::InvalidContinuationDeliveryPolicy)
+            ));
+            assert!(matches!(
+                unsupported.requirement_for(kind),
+                Err(ContextAssemblyError::InvalidContinuationDeliveryPolicy)
+            ));
+        }
+
+        let fixture = fixture(false, false);
+        let request = fixture.request(roomy_policy());
+        let (required, optional) = material_references(&request).expect("material projection");
+        let required_continuations = required
+            .iter()
+            .filter(|reference| reference.source == ContextFrameSource::Continuation)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            required_continuations.len(),
+            fixture.foundation.continuation_ledger.entries.len()
+        );
+        assert!(required_continuations.iter().all(|reference| {
+            reference.requirement == ContextFrameRequirement::Required && !reference.expired
+        }));
+        assert!(
+            optional
+                .iter()
+                .all(|reference| reference.source != ContextFrameSource::Continuation)
+        );
     }
 
     #[test]
@@ -2093,7 +2284,63 @@ mod tests {
     }
 
     #[test]
+    fn present_next_action_and_checkpoint_transition_missing_material_blocks() {
+        for continuation in [NEXT_ACTION_CONTINUATION, CHECKPOINT_TRANSITION_CONTINUATION] {
+            let fixture = fixture_with_continuation(false, false, continuation);
+            let mut missing = fixture.resolver.clone();
+            missing.materials.remove(continuation.storage_ref);
+            let blocked = ContextAssembler::assemble(
+                &fixture.request(roomy_policy()),
+                &missing,
+                &ByteTokenizer,
+            )
+            .expect("missing required continuation becomes an explicit block");
+            assert_eq!(
+                blocked.manifest.status,
+                ContextAssemblyStatus::BlockedMissingRequired
+            );
+            assert!(blocked.envelope.is_none());
+            assert!(blocked.manifest.gaps.iter().any(|gap| {
+                gap.source == ContextFrameSource::Continuation
+                    && gap.expected_digest == sha(continuation.text)
+                    && gap.requirement == ContextFrameRequirement::Required
+                    && gap.reason == ContextGapReason::Missing
+            }));
+            let manifest_json = serde_json::to_string(&blocked.manifest).expect("manifest");
+            assert!(!manifest_json.contains(continuation.text));
+            assert!(!format!("{blocked:?}").contains(continuation.text));
+        }
+    }
+
+    #[test]
     fn expiry_distinguishes_required_block_from_optional_gap() {
+        let generic_required_reference = ContextMaterialReference {
+            source: ContextFrameSource::WorkingItem,
+            source_id: "generic-expired-required".into(),
+            storage_ref: "cas://generic-expired-required".into(),
+            expected_digest: sha("generic expired material"),
+            declared_max_bytes: None,
+            classification: ContextDataClass::Business,
+            requirement: ContextFrameRequirement::Required,
+            expired: true,
+        };
+        let direct_resolution = resolve_frame(
+            &generic_required_reference,
+            &MapResolver {
+                materials: BTreeMap::new(),
+            },
+            &ByteTokenizer,
+        )
+        .expect("generic expiry resolves without loading material");
+        assert!(matches!(
+            direct_resolution,
+            Resolution::Gap(ContextGap {
+                requirement: ContextFrameRequirement::Required,
+                reason: ContextGapReason::Expired,
+                ..
+            })
+        ));
+
         let required_expired = fixture(true, false);
         let blocked = ContextAssembler::assemble(
             &required_expired.request(roomy_policy()),
@@ -2133,9 +2380,6 @@ mod tests {
         without_optional
             .materials
             .remove("cas://conversation-tail-context");
-        without_optional
-            .materials
-            .remove("cas://next-action-context");
         let baseline = ContextAssembler::assemble(
             &fixture.request(roomy_policy()),
             &without_optional,
@@ -2160,24 +2404,32 @@ mod tests {
                 && gap.reason == ContextGapReason::BudgetOmitted
         }));
 
-        let mut impossible = roomy_policy();
-        impossible.max_prompt_tokens = 10;
-        impossible.max_prompt_bytes = 10;
-        let blocked = ContextAssembler::assemble(
-            &fixture.request(impossible),
-            &fixture.resolver,
-            &ByteTokenizer,
-        )
-        .expect("mandatory overflow is durable evidence, not a partial prompt");
-        assert_eq!(
-            blocked.manifest.status,
-            ContextAssemblyStatus::BlockedBudget
-        );
-        assert!(blocked.envelope.is_none());
-        assert!(blocked.manifest.gaps.iter().any(|gap| {
-            gap.requirement == ContextFrameRequirement::Required
-                && gap.reason == ContextGapReason::BudgetOmitted
-        }));
+        for continuation in [NEXT_ACTION_CONTINUATION, CHECKPOINT_TRANSITION_CONTINUATION] {
+            let fixture = fixture_with_continuation(false, false, continuation);
+            let mut impossible = roomy_policy();
+            impossible.max_prompt_tokens = 10;
+            impossible.max_prompt_bytes = 10;
+            let blocked = ContextAssembler::assemble(
+                &fixture.request(impossible),
+                &fixture.resolver,
+                &ByteTokenizer,
+            )
+            .expect("mandatory overflow is durable evidence, not a partial prompt");
+            assert_eq!(
+                blocked.manifest.status,
+                ContextAssemblyStatus::BlockedBudget
+            );
+            assert!(blocked.envelope.is_none());
+            assert!(blocked.manifest.frames.iter().any(|frame| {
+                frame.source == ContextFrameSource::Continuation
+                    && frame.requirement == ContextFrameRequirement::Required
+                    && frame.content_digest == sha(continuation.text)
+            }));
+            assert!(blocked.manifest.gaps.iter().any(|gap| {
+                gap.requirement == ContextFrameRequirement::Required
+                    && gap.reason == ContextGapReason::BudgetOmitted
+            }));
+        }
     }
 
     #[test]
