@@ -930,6 +930,65 @@ impl FileBroker {
         })
     }
 
+    /// Convenience transition for an in-memory or otherwise externally
+    /// coordinated broker. Durable callers must persist the grant returned by
+    /// `plan_revoke_grant` before calling `commit_terminal_transition`, so a
+    /// crash can reconcile the terminal record before deleting staged bytes.
+    pub fn revoke_grant(
+        &mut self,
+        grant_id: &BrowserFileGrantId,
+        expected_revision: u64,
+        revocation_evidence_digest: String,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserFileGrant, BrowserError> {
+        let plan =
+            self.plan_revoke_grant(grant_id, expected_revision, revocation_evidence_digest, now)?;
+        self.commit_terminal_transition(plan)
+    }
+
+    pub fn plan_revoke_grant(
+        &self,
+        grant_id: &BrowserFileGrantId,
+        expected_revision: u64,
+        revocation_evidence_digest: String,
+        now: DateTime<Utc>,
+    ) -> Result<FileTerminalPlan, BrowserError> {
+        let grant = self
+            .grants
+            .get(grant_id)
+            .ok_or(BrowserError::InvalidFileGrant)?;
+        grant.validate()?;
+        if grant.revision != expected_revision
+            || !matches!(
+                grant.state,
+                BrowserFileGrantState::Prepared | BrowserFileGrantState::Leased
+            )
+            || now < grant.updated_at
+        {
+            return Err(BrowserError::FileGrantUnavailable);
+        }
+        if !is_sha256(&revocation_evidence_digest) {
+            return Err(BrowserError::InvalidFileGrant);
+        }
+        let mut next = grant.clone();
+        next.state = BrowserFileGrantState::Revoked;
+        next.terminal_evidence_digest = Some(revocation_evidence_digest);
+        next.updated_at = now;
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        next.validate()?;
+        if !next.is_valid_successor_of(grant)? {
+            return Err(BrowserError::InvalidFileGrant);
+        }
+        Ok(FileTerminalPlan {
+            previous: grant.clone(),
+            next,
+            staged_path: self.staged_paths.get(grant_id).cloned(),
+        })
+    }
+
     pub fn expire_grant(
         &mut self,
         grant_id: &BrowserFileGrantId,
@@ -983,6 +1042,14 @@ impl FileBroker {
         &mut self,
         plan: FileTerminalPlan,
     ) -> Result<BrowserFileGrant, BrowserError> {
+        self.commit_terminal_transition_with(plan, |path| fs::remove_file(path))
+    }
+
+    fn commit_terminal_transition_with(
+        &mut self,
+        plan: FileTerminalPlan,
+        remove_staged_file: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<BrowserFileGrant, BrowserError> {
         let current = self
             .grants
             .get(&plan.next.id)
@@ -1004,7 +1071,7 @@ impl FileBroker {
             verify_staged_file(path, &plan.next.content_digest, plan.next.byte_count)?;
         }
         if let Some(path) = &plan.staged_path {
-            fs::remove_file(path)?;
+            remove_staged_file(path)?;
         }
         self.staged_paths.remove(&plan.next.id);
         self.grants.insert(plan.next.id.clone(), plan.next.clone());
@@ -1651,6 +1718,34 @@ mod tests {
         }
     }
 
+    fn prepare_json_grant(
+        broker: &mut FileBroker,
+        project: &Project,
+        workspace: &BrowserWorkspace,
+        project_root: &Path,
+        grant_id: BrowserFileGrantId,
+    ) -> BrowserFileGrant {
+        let source = project_root.join(format!(
+            "deliverable-{}.json",
+            &digest(grant_id.as_str().as_bytes())[..16]
+        ));
+        fs::write(&source, br#"{"status":"ready"}"#).expect("source file");
+        broker
+            .prepare_upload(
+                grant_id,
+                project,
+                workspace,
+                &workspace.agent_lease_proof(now()).expect("proof"),
+                &source,
+                BrowserFileType::Json,
+                sha('4'),
+                now() + Duration::minutes(10),
+                now(),
+                &mut CleanScanner,
+            )
+            .expect("prepare JSON grant")
+    }
+
     #[test]
     fn exact_clean_file_grant_claim_and_completion_is_single_use_and_redacted() {
         let temp = TempDir::new().expect("temp dir");
@@ -1747,6 +1842,271 @@ mod tests {
             .expect("commit terminal after persistence boundary");
         assert_eq!(completed.state, BrowserFileGrantState::Consumed);
         assert!(!claim.staged_path().exists());
+    }
+
+    #[test]
+    fn prepared_revoke_plan_is_exact_and_deletes_only_after_commit() {
+        let temp = TempDir::new().expect("temp dir");
+        let (project, workspace, project_root, mut broker) = fixture(&temp);
+        let grant_id = BrowserFileGrantId::from("grant-revoke-prepared");
+        let prepared = prepare_json_grant(
+            &mut broker,
+            &project,
+            &workspace,
+            &project_root,
+            grant_id.clone(),
+        );
+        let staged_path = broker
+            .staged_paths
+            .get(&grant_id)
+            .expect("staged path")
+            .clone();
+        let evidence = sha('5');
+        assert!(matches!(
+            broker.plan_revoke_grant(&grant_id, 9, evidence.clone(), now()),
+            Err(BrowserError::FileGrantUnavailable)
+        ));
+        assert!(matches!(
+            broker.plan_revoke_grant(&grant_id, prepared.revision, "not-a-digest".into(), now()),
+            Err(BrowserError::InvalidFileGrant)
+        ));
+        assert!(matches!(
+            broker.plan_revoke_grant(
+                &grant_id,
+                prepared.revision,
+                evidence.clone(),
+                now() - Duration::seconds(1),
+            ),
+            Err(BrowserError::FileGrantUnavailable)
+        ));
+
+        let plan = broker
+            .plan_revoke_grant(&grant_id, prepared.revision, evidence.clone(), now())
+            .expect("plan prepared grant revocation");
+        assert_eq!(plan.grant().state, BrowserFileGrantState::Revoked);
+        assert_eq!(plan.grant().revision, prepared.revision + 1);
+        assert_eq!(
+            plan.grant().terminal_evidence_digest.as_deref(),
+            Some(evidence.as_str())
+        );
+        assert!(
+            plan.grant()
+                .is_valid_successor_of(&prepared)
+                .expect("revoked successor")
+        );
+        assert_eq!(broker.grant(&grant_id), Some(&prepared));
+        assert!(
+            staged_path.exists(),
+            "planning must not delete staged bytes"
+        );
+
+        let revoked = broker
+            .commit_terminal_transition(plan)
+            .expect("commit only after the durable boundary");
+        assert_eq!(revoked.state, BrowserFileGrantState::Revoked);
+        assert_eq!(broker.grant(&grant_id), Some(&revoked));
+        assert!(!staged_path.exists());
+        assert!(matches!(
+            broker.plan_revoke_grant(&grant_id, revoked.revision, sha('6'), now()),
+            Err(BrowserError::FileGrantUnavailable)
+        ));
+    }
+
+    #[test]
+    fn leased_grant_revoke_preserves_claim_and_terminal_states_never_reopen() {
+        let leased_temp = TempDir::new().expect("leased temp dir");
+        let (project, workspace, project_root, mut broker) = fixture(&leased_temp);
+        let grant_id = BrowserFileGrantId::from("grant-revoke-leased");
+        let prepared = prepare_json_grant(
+            &mut broker,
+            &project,
+            &workspace,
+            &project_root,
+            grant_id.clone(),
+        );
+        let claim_id = BrowserFileClaimId::from("claim-revoke-leased");
+        let handle = broker
+            .claim_upload(
+                &grant_id,
+                claim_id.clone(),
+                &workspace,
+                &workspace.agent_lease_proof(now()).expect("proof"),
+                &prepared.upload_payload_digest,
+                prepared.revision,
+                now(),
+            )
+            .expect("lease grant");
+        let leased = broker.grant(&grant_id).expect("leased grant").clone();
+        let staged_path = handle.staged_path().to_path_buf();
+        let revoked = broker
+            .revoke_grant(&grant_id, leased.revision, sha('5'), now())
+            .expect("revoke leased grant");
+        assert_eq!(revoked.state, BrowserFileGrantState::Revoked);
+        assert_eq!(revoked.claim_id.as_ref(), Some(&claim_id));
+        assert!(!staged_path.exists());
+        assert!(matches!(
+            broker.revoke_grant(&grant_id, revoked.revision, sha('6'), now()),
+            Err(BrowserError::FileGrantUnavailable)
+        ));
+
+        let consumed_temp = TempDir::new().expect("consumed temp dir");
+        let (project, workspace, project_root, mut broker) = fixture(&consumed_temp);
+        let grant_id = BrowserFileGrantId::from("grant-revoke-consumed");
+        let prepared = prepare_json_grant(
+            &mut broker,
+            &project,
+            &workspace,
+            &project_root,
+            grant_id.clone(),
+        );
+        let claim_id = BrowserFileClaimId::from("claim-revoke-consumed");
+        broker
+            .claim_upload(
+                &grant_id,
+                claim_id.clone(),
+                &workspace,
+                &workspace.agent_lease_proof(now()).expect("proof"),
+                &prepared.upload_payload_digest,
+                prepared.revision,
+                now(),
+            )
+            .expect("lease consumed fixture");
+        let consumed = broker
+            .complete_upload(
+                &grant_id,
+                &claim_id,
+                &workspace,
+                &workspace.agent_lease_proof(now()).expect("proof"),
+                2,
+                sha('5'),
+                now(),
+            )
+            .expect("consume grant");
+        assert!(matches!(
+            broker.plan_revoke_grant(&grant_id, consumed.revision, sha('6'), now()),
+            Err(BrowserError::FileGrantUnavailable)
+        ));
+
+        let expired_temp = TempDir::new().expect("expired temp dir");
+        let (project, workspace, project_root, mut broker) = fixture(&expired_temp);
+        let grant_id = BrowserFileGrantId::from("grant-revoke-expired");
+        let prepared = prepare_json_grant(
+            &mut broker,
+            &project,
+            &workspace,
+            &project_root,
+            grant_id.clone(),
+        );
+        let expired = broker
+            .expire_grant(&grant_id, prepared.revision, prepared.expires_at)
+            .expect("expire grant");
+        assert!(matches!(
+            broker.plan_revoke_grant(&grant_id, expired.revision, sha('6'), expired.updated_at),
+            Err(BrowserError::FileGrantUnavailable)
+        ));
+    }
+
+    #[test]
+    fn revoke_deletes_a_mutated_staged_blob_instead_of_reauthorizing_it() {
+        let temp = TempDir::new().expect("temp dir");
+        let (project, workspace, project_root, mut broker) = fixture(&temp);
+        let grant_id = BrowserFileGrantId::from("grant-revoke-mutated");
+        let prepared = prepare_json_grant(
+            &mut broker,
+            &project,
+            &workspace,
+            &project_root,
+            grant_id.clone(),
+        );
+        let staged_path = broker
+            .staged_paths
+            .get(&grant_id)
+            .expect("staged path")
+            .clone();
+        let plan = broker
+            .plan_revoke_grant(&grant_id, prepared.revision, sha('5'), now())
+            .expect("plan revoke before mutation");
+        #[cfg(unix)]
+        fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600))
+            .expect("make staged fixture writable");
+        #[cfg(not(unix))]
+        {
+            let mut permissions = fs::metadata(&staged_path)
+                .expect("staged metadata")
+                .permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&staged_path, permissions).expect("make staged fixture writable");
+        }
+        fs::write(&staged_path, b"mutated-after-revoke-plan").expect("mutate staged fixture");
+        let revoked = broker
+            .commit_terminal_transition(plan)
+            .expect("revocation deletes changed staged bytes");
+        assert_eq!(revoked.state, BrowserFileGrantState::Revoked);
+        assert!(!staged_path.exists());
+    }
+
+    #[test]
+    fn durable_revoke_delete_failure_is_reconciled_from_the_terminal_record() {
+        let temp = TempDir::new().expect("temp dir");
+        let (project, workspace, project_root, ephemeral) = fixture(&temp);
+        drop(ephemeral);
+        let durable_root = temp.path().join("durable-revoke-broker");
+        fs::create_dir(&durable_root).expect("durable broker root");
+        #[cfg(unix)]
+        fs::set_permissions(&durable_root, fs::Permissions::from_mode(0o700))
+            .expect("private durable root");
+        let (mut broker, initial) =
+            FileBroker::open_durable(&durable_root, &project.tenant_id, &project.id, [])
+                .expect("open durable broker");
+        assert!(initial.is_healthy());
+        let grant_id = BrowserFileGrantId::from("grant-durable-revoke-failure");
+        let prepared = prepare_json_grant(
+            &mut broker,
+            &project,
+            &workspace,
+            &project_root,
+            grant_id.clone(),
+        );
+        let staged_path = broker
+            .staged_paths
+            .get(&grant_id)
+            .expect("staged path")
+            .clone();
+        let plan = broker
+            .plan_revoke_grant(&grant_id, prepared.revision, sha('5'), now())
+            .expect("plan durable revocation");
+        let persisted_revoked = plan.grant().clone();
+        let error = broker
+            .commit_terminal_transition_with(plan, |path| {
+                assert_eq!(path, staged_path.as_path());
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected staged delete failure",
+                ))
+            })
+            .expect_err("delete failure requires restart reconciliation");
+        assert!(matches!(
+            error,
+            BrowserError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(broker.grant(&grant_id), Some(&prepared));
+        assert!(staged_path.exists());
+        drop(broker);
+
+        let (restored, reconciliation) = FileBroker::open_durable(
+            &durable_root,
+            &project.tenant_id,
+            &project.id,
+            [persisted_revoked.clone()],
+        )
+        .expect("reconcile persisted revocation after delete failure");
+        assert_eq!(reconciliation.restored_active_grants, 0);
+        assert_eq!(reconciliation.restored_terminal_grants, 1);
+        assert_eq!(reconciliation.removed_terminal_files, 1);
+        assert!(reconciliation.is_healthy());
+        assert!(!staged_path.exists());
+        assert_eq!(restored.grant(&grant_id), Some(&persisted_revoked));
     }
 
     #[cfg(unix)]
