@@ -1,7 +1,21 @@
 //! The only path from a proposed Hartevo business effect to a provider.
 
+pub mod approval_authority;
 pub mod provider_auth;
 pub mod provider_contract;
+
+pub use approval_authority::{
+    ApprovalAuthority, ApprovalAuthorityError, ApprovalAuthorityKind, ApprovalRecordAuthorization,
+    ApprovalRequest, HUMAN_OPERATION_AUTHORITY_CONTRACT_VERSION,
+    HUMAN_OPERATION_AUTHORITY_SCHEMA_VERSION, HumanActorAuthorization, HumanActorSession,
+    HumanApprovalIssuanceEvidence, HumanApprovalRequestEvidence, HumanAssuranceLevel,
+    HumanAuthorityIssuerIdentity, HumanAuthoritySubject, HumanEvidenceWindow,
+    HumanOperationDecision, HumanOperationKind, HumanSessionIdentity, HumanStepUpIntent,
+    HumanStepUpIntentIdentity, HumanStepUpMethod, PROVIDER_APPROVAL_AUTHORITY_CONTRACT_JSON,
+    PROVIDER_APPROVAL_AUTHORITY_CONTRACT_VERSION, PROVIDER_APPROVAL_AUTHORITY_SCHEMA_VERSION,
+    ProviderApprovalAuthorityPolicy, ProviderApprovalEvidence, ProviderEffectApprovalContext,
+    RequestBoundStepUpAssertion,
+};
 
 pub use provider_auth::{
     AuthSession, ConnectedAuthority, ConnectedAuthorization, CredentialLease,
