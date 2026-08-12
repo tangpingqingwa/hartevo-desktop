@@ -1,6 +1,14 @@
 //! The only path from a proposed Hartevo business effect to a provider.
 
+pub mod provider_auth;
 pub mod provider_contract;
+
+pub use provider_auth::{
+    AuthSession, ConnectedAuthority, ConnectedAuthorization, CredentialLease,
+    PROVIDER_AUTH_PROBE_CONTRACT_JSON, PROVIDER_AUTH_PROBE_CONTRACT_VERSION,
+    PROVIDER_AUTH_PROBE_SCHEMA_VERSION, ProbeObservation, ProbeResult, ProbeStatus,
+    ProviderAuthProbeError, ProviderAuthProbePolicy, ProviderAuthScope, SecretReference,
+};
 
 pub use provider_contract::{
     PROVIDER_ADAPTER_BASELINE_REGISTRY_VERSION, PROVIDER_ADAPTER_CONTRACT_JSON,
