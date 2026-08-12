@@ -1411,6 +1411,14 @@ mod tests {
     }
 
     fn connect(store: &mut ProjectStore, project_id: &ProjectId) -> Connection {
+        connect_at(store, project_id, now())
+    }
+
+    fn connect_at(
+        store: &mut ProjectStore,
+        project_id: &ProjectId,
+        base: DateTime<Utc>,
+    ) -> Connection {
         let mut connection = Connection::register(
             ConnectionId::from("connection-1"),
             TenantId::from("tenant-auth"),
@@ -1419,7 +1427,7 @@ mod tests {
             AccountId::from("account-1"),
             "external-account-1",
             ["publish.write".into()],
-            now(),
+            base,
         )
         .expect("connection");
         store
@@ -1427,17 +1435,17 @@ mod tests {
                 &connection,
                 "connection.registered",
                 &serde_json::json!({}),
-                now(),
+                base,
             )
             .expect("create connection");
-        connection.begin_probe(now()).expect("begin probe");
+        connection.begin_probe(base).expect("begin probe");
         store
             .update_connection(
                 &connection,
                 1,
                 "connection.probe_started",
                 &serde_json::json!({}),
-                now(),
+                base,
             )
             .expect("persist probing");
         connection
@@ -1446,12 +1454,12 @@ mod tests {
                     outcome: ProbeOutcome::Successful,
                     observed_external_account_id: "external-account-1".into(),
                     granted_scopes: BTreeSet::from(["publish.write".into()]),
-                    probed_at: now(),
-                    valid_until: now() + Duration::hours(4),
-                    credential_expires_at: now() + Duration::hours(4),
+                    probed_at: base,
+                    valid_until: base + Duration::hours(4),
+                    credential_expires_at: base + Duration::hours(4),
                     evidence_digest: "a".repeat(64),
                 },
-                now(),
+                base,
             )
             .expect("apply probe");
         store
@@ -1460,7 +1468,7 @@ mod tests {
                 2,
                 "connection.probed",
                 &serde_json::json!({}),
-                now(),
+                base,
             )
             .expect("persist connected");
         connection
@@ -1508,6 +1516,15 @@ mod tests {
         consent_record_id: Option<ConsentRecordId>,
         consent_requirement: Option<ConsentRequirement>,
     ) -> (Mission, EffectId) {
+        mission_with_effect_at(project_id, now(), consent_record_id, consent_requirement)
+    }
+
+    fn mission_with_effect_at(
+        project_id: &ProjectId,
+        base: DateTime<Utc>,
+        consent_record_id: Option<ConsentRecordId>,
+        consent_requirement: Option<ConsentRequirement>,
+    ) -> (Mission, EffectId) {
         let mut mission = Mission::compile(
             TenantId::from("tenant-auth"),
             MissionId::from("mission-auth"),
@@ -1516,12 +1533,12 @@ mod tests {
             MissionContract::bootstrap(
                 "Publish only with current authorization",
                 ["channel.publish".into()],
-                now(),
+                base,
             ),
-            now(),
+            base,
         )
         .expect("mission");
-        mission.start_research([], now()).expect("research");
+        mission.start_research([], base).expect("research");
         let consent = if consent_record_id.is_some() {
             ConsentState::Confirmed
         } else {
@@ -1556,9 +1573,9 @@ mod tests {
                     amount: hartevo_domain_kernel::Money::zero(
                         CurrencyCode::parse("USD").expect("USD"),
                     ),
-                    expires_at: now() + Duration::hours(1),
+                    expires_at: base + Duration::hours(1),
                 },
-                now(),
+                base,
             )
             .expect("effect");
         (mission, effect_id)
@@ -1617,6 +1634,155 @@ mod tests {
                 receipt_id: receipt.id.clone(),
             }
         }
+    }
+
+    struct FactTimedExecutor {
+        calls: usize,
+        accepted_at: DateTime<Utc>,
+    }
+
+    impl EffectExecutor for FactTimedExecutor {
+        fn execute(&mut self, effect: &Effect) -> Result<Receipt, ProviderFailure> {
+            self.calls += 1;
+            Ok(Receipt {
+                id: ReceiptId::from("receipt-live-authority"),
+                provider: effect.provider.clone(),
+                external_id: "external-live-authority".into(),
+                accepted_at: self.accepted_at,
+                request_digest: effect.approval_digest(),
+                response_digest: "c".repeat(64),
+            })
+        }
+    }
+
+    struct FactTimedVerifier {
+        calls: usize,
+        observed_at: DateTime<Utc>,
+    }
+
+    impl EffectVerifier for FactTimedVerifier {
+        fn verify(&mut self, _effect: &Effect, receipt: &Receipt) -> Verification {
+            self.calls += 1;
+            Verification {
+                id: VerificationId::from("verification-live-authority"),
+                status: VerificationStatus::Confirmed,
+                verifier: "fixture-live-readback".into(),
+                independent: true,
+                observed_at: self.observed_at,
+                evidence_digest: "d".repeat(64),
+                receipt_id: receipt.id.clone(),
+            }
+        }
+    }
+
+    struct LiveAuthorizationFixture {
+        store: ProjectStore,
+        connection: Connection,
+        mission: Mission,
+        effect_id: EffectId,
+        broker: EffectBroker,
+    }
+
+    fn live_authorization_fixture(
+        base: DateTime<Utc>,
+        approval_at: DateTime<Utc>,
+    ) -> LiveAuthorizationFixture {
+        let (mut store, project_id) = setup_store();
+        let connection = connect_at(&mut store, &project_id, base);
+        let (mut mission, effect_id) = mission_with_effect_at(&project_id, base, None, None);
+        let broker = broker().with_lease_for(Duration::minutes(30));
+        broker
+            .approve(
+                &mut mission,
+                &effect_id,
+                ActorId::from("user-1"),
+                &store,
+                approval_at,
+            )
+            .expect("live authority approval");
+        store
+            .save_mission(&mission)
+            .expect("persist live approved mission");
+        LiveAuthorizationFixture {
+            store,
+            connection,
+            mission,
+            effect_id,
+            broker,
+        }
+    }
+
+    fn assert_lease_is_strictly_inside_effect_window(
+        mission: &Mission,
+        effect_id: &EffectId,
+        lease_expires_at: DateTime<Utc>,
+    ) {
+        let effect = mission.effect(effect_id).expect("live effect");
+        let approval = effect.approval.as_ref().expect("live approval");
+        assert!(lease_expires_at < approval.valid_until);
+        assert!(lease_expires_at < effect.expires_at);
+    }
+
+    fn record_live_durable_receipt(
+        fixture: &mut LiveAuthorizationFixture,
+        initial_entry: DateTime<Utc>,
+    ) -> (Receipt, DateTime<Utc>) {
+        let effect = fixture
+            .mission
+            .effect(&fixture.effect_id)
+            .expect("effect")
+            .clone();
+        let initial_lease_expires_at = initial_entry
+            .checked_add_signed(Duration::minutes(30))
+            .expect("bounded initial recovery lease");
+        assert_lease_is_strictly_inside_effect_window(
+            &fixture.mission,
+            &fixture.effect_id,
+            initial_lease_expires_at,
+        );
+        let context = effect_policy()
+            .execution_claim_context(
+                &effect,
+                fixture
+                    .store
+                    .authorize(&effect, initial_entry)
+                    .expect("authorized dispatch evidence"),
+            )
+            .expect("claim context");
+        let LedgerClaim::Acquired {
+            lease,
+            receipt: None,
+            execution_started_at,
+        } = fixture
+            .store
+            .claim(
+                &effect,
+                Some(&context),
+                "crash-before-mission-projection",
+                initial_entry,
+                initial_lease_expires_at,
+            )
+            .expect("initial execution claim")
+        else {
+            panic!("initial execution claim must be acquired")
+        };
+        let receipt = Receipt {
+            id: ReceiptId::from("receipt-crash-recovery"),
+            provider: effect.provider.clone(),
+            external_id: "external-crash-recovery".into(),
+            accepted_at: initial_entry,
+            request_digest: effect.approval_digest(),
+            response_digest: "9".repeat(64),
+        };
+        assert!(receipt.accepted_at >= execution_started_at);
+        let receipt_operation_at = Utc::now();
+        assert!(receipt.accepted_at <= receipt_operation_at);
+        assert!(receipt_operation_at < lease.expires_at);
+        fixture
+            .store
+            .record_receipt(&effect, &lease, &receipt, receipt_operation_at)
+            .expect("receipt committed before simulated crash");
+        (receipt, receipt_operation_at)
     }
 
     #[test]
@@ -1763,132 +1929,146 @@ mod tests {
 
     #[test]
     fn unchanged_permission_revision_passes_the_transactional_claim_fence() {
-        let (mut store, project_id) = setup_store();
-        connect(&mut store, &project_id);
-        let (mut mission, effect_id) = mission_with_effect(&project_id, None, None);
-        let mut broker = broker();
-        broker
-            .approve(
-                &mut mission,
-                &effect_id,
-                ActorId::from("user-1"),
-                &store,
-                now() + Duration::minutes(1),
-            )
-            .expect("approval");
-        store
-            .save_mission(&mission)
-            .expect("persist approved mission");
-        let mut executor = CountingExecutor::default();
-        let mut verifier = ConfirmingVerifier;
+        let entry_at = Utc::now();
+        let base = entry_at
+            .checked_sub_signed(Duration::minutes(5))
+            .expect("bounded live fixture base");
+        let approval_at = entry_at
+            .checked_sub_signed(Duration::minutes(1))
+            .expect("bounded live approval time");
+        let receipt_fact = entry_at
+            .checked_sub_signed(Duration::seconds(2))
+            .expect("bounded receipt fact time");
+        let verification_fact = entry_at
+            .checked_sub_signed(Duration::seconds(1))
+            .expect("bounded verification fact time");
+        let mut fixture = live_authorization_fixture(base, approval_at);
+        let lease_expires_at = entry_at
+            .checked_add_signed(Duration::minutes(30))
+            .expect("bounded live lease");
+        assert_lease_is_strictly_inside_effect_window(
+            &fixture.mission,
+            &fixture.effect_id,
+            lease_expires_at,
+        );
+        let mut executor = FactTimedExecutor {
+            calls: 0,
+            accepted_at: receipt_fact,
+        };
+        let mut verifier = FactTimedVerifier {
+            calls: 0,
+            observed_at: verification_fact,
+        };
 
-        let result = broker
-            .execute_and_verify(
-                &mut mission,
-                &effect_id,
-                &mut store,
+        let bound = fixture
+            .broker
+            .execute_and_verify_authority_bound(
+                &mut fixture.mission,
+                &fixture.effect_id,
+                &mut fixture.store,
                 &mut executor,
                 &mut verifier,
-                now() + Duration::minutes(2),
+                entry_at,
             )
             .expect("unchanged revision remains authorized at durable claim");
+        let (result, authority) = bound.into_parts();
+        let provider = authority.provider().expect("provider authority");
+        let verification = authority.verification().expect("verification authority");
 
         assert_eq!(
             result.disposition,
             hartevo_effect_broker::ExecutionDisposition::Executed
         );
-        assert_eq!(executor.calls, 1);
+        assert_eq!((executor.calls, verifier.calls), (1, 1));
+        assert_eq!(provider.sequence(), 1);
+        assert!(provider.operation_at() >= entry_at);
+        assert!(provider.operation_at() > receipt_fact);
+        assert_eq!(verification.sequence(), 2);
+        assert!(verification.operation_at() >= provider.operation_at());
+        assert!(verification.operation_at() > verification_fact);
     }
 
     #[test]
     fn durable_receipt_recovers_after_connection_revocation_without_a_second_provider_write() {
-        let (mut store, project_id) = setup_store();
-        let mut connection = connect(&mut store, &project_id);
-        let (mut mission, effect_id) = mission_with_effect(&project_id, None, None);
-        let mut broker = broker();
-        broker
-            .approve(
-                &mut mission,
-                &effect_id,
-                ActorId::from("user-1"),
-                &store,
-                now() + Duration::minutes(1),
-            )
-            .expect("approval");
-        store
-            .save_mission(&mission)
-            .expect("persist approved mission");
-        let effect = mission.effect(&effect_id).expect("effect").clone();
-        let context = effect_policy()
-            .execution_claim_context(
-                &effect,
-                store
-                    .authorize(&effect, now() + Duration::minutes(1))
-                    .expect("authorized dispatch evidence"),
-            )
-            .expect("claim context");
-        let LedgerClaim::Acquired {
-            lease,
-            receipt: None,
-            ..
-        } = store
-            .claim(
-                &effect,
-                Some(&context),
-                "crash-before-mission-projection",
-                now() + Duration::minutes(1),
-                now() + Duration::minutes(3),
-            )
-            .expect("initial execution claim")
-        else {
-            panic!("initial execution claim must be acquired")
-        };
-        let receipt = Receipt {
-            id: ReceiptId::from("receipt-crash-recovery"),
-            provider: effect.provider.clone(),
-            external_id: "external-crash-recovery".into(),
-            accepted_at: now() + Duration::minutes(2),
-            request_digest: effect.approval_digest(),
-            response_digest: "9".repeat(64),
-        };
-        store
-            .record_receipt(&effect, &lease, &receipt, now() + Duration::minutes(2))
-            .expect("receipt committed before simulated crash");
+        let window_entry = Utc::now();
+        let base = window_entry
+            .checked_sub_signed(Duration::minutes(5))
+            .expect("bounded recovery fixture base");
+        let approval_at = window_entry
+            .checked_sub_signed(Duration::minutes(1))
+            .expect("bounded recovery approval time");
+        let mut fixture = live_authorization_fixture(base, approval_at);
+        let initial_entry = Utc::now();
+        let (receipt, receipt_operation_at) =
+            record_live_durable_receipt(&mut fixture, initial_entry);
 
-        connection
-            .revoke(now() + Duration::minutes(3))
+        let revoke_at = Utc::now();
+        assert!(receipt_operation_at <= revoke_at);
+        fixture
+            .connection
+            .revoke(revoke_at)
             .expect("revoke after provider dispatch");
-        store
+        fixture
+            .store
             .update_connection(
-                &connection,
+                &fixture.connection,
                 3,
                 "connection.revoked",
                 &serde_json::json!({}),
-                now() + Duration::minutes(3),
+                revoke_at,
             )
             .expect("persist revocation");
-        let mut executor = CountingExecutor::default();
-        let mut verifier = ConfirmingVerifier;
+        let verification_fact = receipt.accepted_at;
+        let recovery_entry = Utc::now();
+        assert_eq!(verification_fact, receipt.accepted_at);
+        assert!(verification_fact < recovery_entry);
+        let recovery_lease_expires_at = recovery_entry
+            .checked_add_signed(Duration::minutes(30))
+            .expect("bounded resumed recovery lease");
+        assert_lease_is_strictly_inside_effect_window(
+            &fixture.mission,
+            &fixture.effect_id,
+            recovery_lease_expires_at,
+        );
+        let mut executor = FactTimedExecutor {
+            calls: 0,
+            accepted_at: receipt.accepted_at,
+        };
+        let mut verifier = FactTimedVerifier {
+            calls: 0,
+            observed_at: verification_fact,
+        };
 
-        let result = broker
-            .execute_and_verify(
-                &mut mission,
-                &effect_id,
-                &mut store,
+        let bound = fixture
+            .broker
+            .execute_and_verify_authority_bound(
+                &mut fixture.mission,
+                &fixture.effect_id,
+                &mut fixture.store,
                 &mut executor,
                 &mut verifier,
-                now() + Duration::minutes(4),
+                recovery_entry,
             )
             .expect("resume verification from durable receipt");
+        let (result, authority) = bound.into_parts();
+        let verification = authority.verification().expect("recovery authority");
 
         assert_eq!(
             result.disposition,
             hartevo_effect_broker::ExecutionDisposition::ReusedIdempotentReceipt
         );
         assert_eq!(result.receipt, receipt);
-        assert_eq!(executor.calls, 0);
+        assert_eq!((executor.calls, verifier.calls), (0, 1));
+        assert!(authority.provider().is_none());
+        assert_eq!(verification.sequence(), 1);
+        assert!(verification.operation_at() >= recovery_entry);
+        assert!(verification.operation_at() > verification_fact);
         assert_eq!(
-            mission.effect(&effect_id).expect("effect").status,
+            fixture
+                .mission
+                .effect(&fixture.effect_id)
+                .expect("effect")
+                .status,
             EffectStatus::Verified
         );
     }
