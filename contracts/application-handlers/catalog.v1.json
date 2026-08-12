@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-application-handler-registry/v1",
-  "registryVersion": "desktop-2026-08-12-v7",
+  "registryVersion": "desktop-2026-08-12-v8",
   "handlers": [
     {
       "handlerId": "vm11.event_ingest/v2",
@@ -117,6 +117,26 @@
         "outcome_review": ["outcome"]
       },
       "oracleIds": ["decision", "operating_state", "outcome"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm11.next-contract-or-valid-terminal/v1",
+      "missionId": "VM-11",
+      "missionVersion": 3,
+      "checkpointId": "next_contract_or_valid_terminal",
+      "capabilityId": "automation.schedule",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": [
+        "mission_checkpoint",
+        "parent_mission_contract",
+        "outcome_review_decision"
+      ],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "parent_mission_contract": ["goal"],
+        "outcome_review_decision": ["outcome"]
+      },
+      "oracleIds": ["goal", "operating_state", "outcome"],
       "implementationCrate": "hartevo-application"
     }
   ]

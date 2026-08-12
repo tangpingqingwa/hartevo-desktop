@@ -65,17 +65,18 @@ use hartevo_domain_kernel::{
     OutcomeDecision, OutcomeEvent, OutcomeIdentityChainProjection, OutcomeLedger,
     OutcomeLedgerError, OutcomeNormalizationProjection, OutcomeReviewActionGate,
     OutcomeReviewCausalStatus, OutcomeReviewCaveat, OutcomeReviewDecision, OutcomeReviewLoopPolicy,
-    OutcomeReviewProjection, OutcomeReviewRoiStatus, OutcomeSettlementProjection, Partner,
-    PartnerId, PayoutAuthorization, PayoutId, Person, PersonId, PreparedAutomaticReply, Project,
-    ProjectDataCell, ProjectEncryptionMode, ProjectError, ProjectId, ProjectKeyring,
-    ProjectKeyringBootstrap, ReceiptId, RelationshipError, ReviewDecision, ReviewId,
-    RuntimeProcessClaim, RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition,
-    RuntimeProcessIdentity, RuntimeRecoveryAttempt, RuntimeRecoveryAttemptId,
-    RuntimeRecoveryFailureClass, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt,
-    RuntimeTurnAttemptId, RuntimeTurnError, RuntimeTurnFailureClass, RuntimeTurnObservedKind,
-    RuntimeTurnPrivateMessage, RuntimeTurnPrivateTextDelta, RuntimeTurnRestartDisposition,
-    RuntimeTurnScope, RuntimeTurnStatus, StorageMode, SuppressionReason, Task, TaskId, TaskStatus,
-    TenantId, TruthError, TruthFact, VerificationStatus, WebhookAttestation, WorkProduct,
+    OutcomeReviewNextContractIntent, OutcomeReviewNextContractResolution, OutcomeReviewProjection,
+    OutcomeReviewRoiStatus, OutcomeSettlementProjection, Partner, PartnerId, PayoutAuthorization,
+    PayoutId, Person, PersonId, PreparedAutomaticReply, Project, ProjectDataCell,
+    ProjectEncryptionMode, ProjectError, ProjectId, ProjectKeyring, ProjectKeyringBootstrap,
+    ReceiptId, RelationshipError, ReviewDecision, ReviewId, RuntimeProcessClaim,
+    RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition, RuntimeProcessIdentity,
+    RuntimeRecoveryAttempt, RuntimeRecoveryAttemptId, RuntimeRecoveryFailureClass,
+    RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt, RuntimeTurnAttemptId,
+    RuntimeTurnError, RuntimeTurnFailureClass, RuntimeTurnObservedKind, RuntimeTurnPrivateMessage,
+    RuntimeTurnPrivateTextDelta, RuntimeTurnRestartDisposition, RuntimeTurnScope,
+    RuntimeTurnStatus, StorageMode, SuppressionReason, Task, TaskId, TaskStatus, TenantId,
+    TruthError, TruthFact, VerificationStatus, WebhookAttestation, WorkProduct,
     WorkProductDependencies, WorkProductId, WorkProductManifest, WorkProductManifestError,
     WorkProductPreview, WorkProductStatus, WorkerHandle, WorkerHandleStatus, WorkerId, WorkerLease,
     WorkerLeaseId, WorkerLeaseStatus, WorkerMailbox, validate_context_branch_lineage,
@@ -262,6 +263,62 @@ pub struct ExecuteApplicationMissionCheckpoint {
     pub checkpoint_id: String,
     pub expected_mission_revision: u64,
     pub expected_checkpoint_revision: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolveVm11NextContractOrValidTerminal {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub expected_mission_revision: u64,
+    pub expected_checkpoint_revision: u64,
+    pub expected_decision_digest: String,
+    pub expected_parent_mission_revision: u64,
+    pub expected_parent_contract_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Vm11NextContractOrValidTerminalResult {
+    Resolved {
+        mission: Box<Mission>,
+        resolution: Box<OutcomeReviewNextContractResolution>,
+        next_dispatch: Option<MissionCheckpointDispatch>,
+        replayed: bool,
+    },
+    WaitingUser {
+        mission: Box<Mission>,
+        intent: OutcomeReviewNextContractIntent,
+        code: String,
+        replayed: bool,
+    },
+}
+
+struct Vm11NextContractResolutionContext {
+    mission: Mission,
+    review: OutcomeReviewProjection,
+    decision: OutcomeReviewDecision,
+    parent_mission: Mission,
+    source_contract_digest: String,
+    decision_digest: String,
+}
+
+struct ValidatedVm11NextContractCommand(ResolveVm11NextContractOrValidTerminal);
+
+impl ValidatedVm11NextContractCommand {
+    fn new(command: ResolveVm11NextContractOrValidTerminal) -> Result<Self, ApplicationError> {
+        if !is_sha256_text(&command.expected_decision_digest)
+            || !is_sha256_text(&command.expected_parent_contract_digest)
+            || command.expected_mission_revision == 0
+            || command.expected_checkpoint_revision == 0
+            || command.expected_parent_mission_revision == 0
+        {
+            return Err(ApplicationError::Vm11NextContractCommandMismatch);
+        }
+        Ok(Self(command))
+    }
+
+    const fn command(&self) -> &ResolveVm11NextContractOrValidTerminal {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2297,6 +2354,8 @@ const VM11_ATTRIBUTION_AND_UNATTRIBUTED_HANDLER_ID: &str = "vm11.attribution-and
 const VM11_REFUND_COMMISSION_PAYOUT_RECALC_HANDLER_ID: &str =
     "vm11.refund-commission-payout-recalc/v1";
 const VM11_OUTCOME_REVIEW_HANDLER_ID: &str = "vm11.outcome-review/v1";
+const VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID: &str =
+    "vm11.next-contract-or-valid-terminal/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompiledApplicationCheckpointHandler {
@@ -2307,6 +2366,7 @@ enum CompiledApplicationCheckpointHandler {
     AttributionAndUnattributed,
     RefundCommissionPayoutRecalc,
     OutcomeReview,
+    NextContractOrValidTerminal,
 }
 
 impl CompiledApplicationCheckpointHandler {
@@ -2319,6 +2379,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::AttributionAndUnattributed => VM11_ATTRIBUTION_AND_UNATTRIBUTED_HANDLER_ID,
             Self::RefundCommissionPayoutRecalc => VM11_REFUND_COMMISSION_PAYOUT_RECALC_HANDLER_ID,
             Self::OutcomeReview => VM11_OUTCOME_REVIEW_HANDLER_ID,
+            Self::NextContractOrValidTerminal => VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID,
         }
     }
 
@@ -2331,6 +2392,7 @@ impl CompiledApplicationCheckpointHandler {
             Self::AttributionAndUnattributed => "outcome_attribution",
             Self::RefundCommissionPayoutRecalc => "outcome_settlement",
             Self::OutcomeReview => "outcome_review",
+            Self::NextContractOrValidTerminal => "outcome_review_decision",
         }
     }
 }
@@ -2595,7 +2657,34 @@ fn compiled_application_checkpoint_handler(
             Some(CompiledApplicationCheckpointHandler::RefundCommissionPayoutRecalc)
         }
         VM11_OUTCOME_REVIEW_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::OutcomeReview),
+        VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::NextContractOrValidTerminal)
+        }
         _ => None,
+    }
+}
+
+fn vm11_next_contract_authorization_code(
+    intent: OutcomeReviewNextContractIntent,
+) -> Option<&'static str> {
+    match intent {
+        OutcomeReviewNextContractIntent::ScaleWithRevisedContract => {
+            Some("revised_contract_authorization_required")
+        }
+        OutcomeReviewNextContractIntent::TestWithNewExperiment => {
+            Some("experiment_contract_authorization_required")
+        }
+        OutcomeReviewNextContractIntent::ValidTerminal
+        | OutcomeReviewNextContractIntent::ContinueCurrentContract => None,
+    }
+}
+
+fn next_contract_intent_name(intent: OutcomeReviewNextContractIntent) -> &'static str {
+    match intent {
+        OutcomeReviewNextContractIntent::ValidTerminal => "valid_terminal",
+        OutcomeReviewNextContractIntent::ContinueCurrentContract => "continue_current_contract",
+        OutcomeReviewNextContractIntent::ScaleWithRevisedContract => "scale_with_revised_contract",
+        OutcomeReviewNextContractIntent::TestWithNewExperiment => "test_with_new_experiment",
     }
 }
 
@@ -3700,6 +3789,276 @@ fn vm11_outcome_review_application_evidence(
         ]),
         observed_at: now,
     })
+}
+
+fn vm11_next_contract_or_valid_terminal_application_evidence(
+    mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ResolveVm11NextContractOrValidTerminal,
+    parent_mission: &Mission,
+    resolution: &OutcomeReviewNextContractResolution,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    if parent_mission.id != resolution.source_mission_id
+        || parent_mission.revision != resolution.source_mission_revision
+        || resolution.source_contract_digest != command.expected_parent_contract_digest
+        || resolution.decision_digest != command.expected_decision_digest
+    {
+        return Err(ApplicationError::Vm11NextContractCommandMismatch);
+    }
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "parent_mission_contract".into(),
+                source_id: parent_mission.id.to_string(),
+                source_revision: parent_mission.revision,
+                projection_digest: resolution.source_contract_digest.clone(),
+                oracle_ids: BTreeSet::from(["goal".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "outcome_review_decision".into(),
+                source_id: resolution.decision_source_id(),
+                source_revision: resolution.cycle,
+                projection_digest: resolution.decision_digest.clone(),
+                oracle_ids: BTreeSet::from(["outcome".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
+fn validate_vm11_next_contract_dispatch(
+    mission: &Mission,
+    command: &ResolveVm11NextContractOrValidTerminal,
+) -> Result<(), ApplicationError> {
+    let dispatch = current_checkpoint_dispatch_projection(mission)?
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    if dispatch.checkpoint_id != "next_contract_or_valid_terminal"
+        || dispatch.executor != MissionCheckpointExecutor::Application
+        || dispatch.application_handler_status
+            != Some(ApplicationCheckpointHandlerStatus::Implemented)
+        || dispatch.application_handler_id.as_deref()
+            != Some(VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID)
+        || dispatch.mission_revision != command.expected_mission_revision
+        || dispatch.checkpoint_revision != command.expected_checkpoint_revision
+    {
+        return Err(ApplicationError::Vm11NextContractCommandMismatch);
+    }
+    Ok(())
+}
+
+fn complete_vm11_next_contract_resolution_in_memory(
+    context: &mut Vm11NextContractResolutionContext,
+    command: &ResolveVm11NextContractOrValidTerminal,
+    resolution: &OutcomeReviewNextContractResolution,
+    now: DateTime<Utc>,
+) -> Result<(String, Option<StartedCatalogCheckpoint>), ApplicationError> {
+    context
+        .mission
+        .begin_checkpoint_verification("next_contract_or_valid_terminal", now)?;
+    let route = context
+        .mission
+        .definition
+        .as_ref()
+        .and_then(|definition| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
+        })
+        .and_then(|checkpoint| checkpoint.route.clone())
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let application_evidence = vm11_next_contract_or_valid_terminal_application_evidence(
+        &context.mission,
+        &route,
+        command,
+        &context.parent_mission,
+        resolution,
+        now,
+    )?;
+    validate_application_evidence_against_registry(&application_evidence)?;
+    let completion_evidence_digest = application_evidence.digest();
+    context.mission.complete_vm11_next_contract_resolution(
+        resolution,
+        MissionCheckpointCompletion {
+            oracle_ids: route.oracle_ids,
+            work_product_ids: BTreeSet::new(),
+            effect_ids: BTreeSet::new(),
+            application_evidence: Some(application_evidence),
+            evidence_digest: completion_evidence_digest.clone(),
+            verified_at: now,
+        },
+    )?;
+    let next_started = if resolution.next_contract_intent
+        == OutcomeReviewNextContractIntent::ContinueCurrentContract
+    {
+        start_ready_catalog_checkpoint_in_memory(&mut context.mission, now)?
+    } else {
+        None
+    };
+    Ok((completion_evidence_digest, next_started))
+}
+
+fn vm11_next_contract_resolution_event_payload(
+    mission: &Mission,
+    resolution: &OutcomeReviewNextContractResolution,
+    completion_evidence_digest: &str,
+) -> Result<serde_json::Value, ApplicationError> {
+    Ok(serde_json::json!({
+        "missionId": mission.id,
+        "checkpointId": "next_contract_or_valid_terminal",
+        "handlerId": VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID,
+        "cycle": resolution.cycle,
+        "action": resolution.action,
+        "intent": resolution.next_contract_intent,
+        "decisionDigest": resolution.decision_digest,
+        "parentMissionId": resolution.source_mission_id,
+        "parentMissionRevision": resolution.source_mission_revision,
+        "parentContractDigest": resolution.source_contract_digest,
+        "continuedContractDigest": resolution.continued_contract_digest,
+        "terminalDisposition": resolution.terminal_disposition,
+        "resolutionDigest": resolution.digest()?,
+        "completionEvidenceDigest": completion_evidence_digest,
+        "externalEffectExecuted": false,
+    }))
+}
+
+fn vm11_next_contract_resolution_events(
+    mission: &Mission,
+    resolution: &OutcomeReviewNextContractResolution,
+    completion_evidence_digest: &str,
+    next_started: Option<StartedCatalogCheckpoint>,
+    now: DateTime<Utc>,
+) -> Result<Vec<PendingEvent>, ApplicationError> {
+    let mut events = vec![PendingEvent::new(
+        "mission.next_contract_or_valid_terminal_resolved",
+        vm11_next_contract_resolution_event_payload(
+            mission,
+            resolution,
+            completion_evidence_digest,
+        )?,
+        now,
+    )];
+    if let Some((checkpoint_id, checkpoint_revision, capability_id, executor, task_id, cycle)) =
+        next_started
+    {
+        events.push(PendingEvent::new(
+            "mission.checkpoint_started",
+            serde_json::json!({
+                "missionId": mission.id,
+                "checkpointId": checkpoint_id,
+                "checkpointRevision": checkpoint_revision,
+                "capabilityId": capability_id,
+                "executor": executor,
+                "cycle": cycle,
+                "taskId": task_id,
+            }),
+            now,
+        ));
+    }
+    Ok(events)
+}
+
+fn vm11_next_contract_authorization_event_payload(
+    context: &Vm11NextContractResolutionContext,
+    command: &ResolveVm11NextContractOrValidTerminal,
+    code: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "missionId": context.mission.id,
+        "checkpointId": "next_contract_or_valid_terminal",
+        "handlerId": VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "decisionDigest": context.decision_digest,
+        "action": context.decision.action,
+        "intent": next_contract_intent_name(context.decision.next_contract_intent),
+        "parentMissionId": context.parent_mission.id,
+        "parentMissionRevision": context.parent_mission.revision,
+        "parentContractDigest": context.source_contract_digest,
+        "code": code,
+        "resolutionCreated": false,
+        "externalEffectExecuted": false,
+    })
+}
+
+fn validate_vm11_next_contract_resolution_time(
+    context: &Vm11NextContractResolutionContext,
+    now: DateTime<Utc>,
+) -> Result<(), ApplicationError> {
+    if now < context.decision.decided_at
+        || now < context.review.observed_at
+        || now < context.parent_mission.updated_at
+        || now < context.mission.updated_at
+    {
+        return Err(OutcomeLedgerError::OutcomeReviewResolutionTimeInvalid.into());
+    }
+    Ok(())
+}
+
+fn vm11_next_contract_authorization_error_code(error: &OutcomeLedgerError) -> &'static str {
+    match error {
+        OutcomeLedgerError::OutcomeReviewRevisedContractAuthorizationRequired => {
+            "revised_contract_authorization_required"
+        }
+        OutcomeLedgerError::OutcomeReviewExperimentContractAuthorizationRequired => {
+            "experiment_contract_authorization_required"
+        }
+        _ => unreachable!("authorization alternatives are exhaustive"),
+    }
 }
 
 /// Fails closed if compiled code materializes a different source graph than
@@ -7937,6 +8296,9 @@ impl ApplicationService {
         if let Some(replay_handler) =
             compiled_handler_for_checkpoint(&mission, &command.checkpoint_id)?
         {
+            if replay_handler == CompiledApplicationCheckpointHandler::NextContractOrValidTerminal {
+                return Err(ApplicationError::Vm11NextContractRouteSpecificCommandRequired);
+            }
             if let Some(replay) = completed_application_checkpoint_replay(
                 &mission,
                 &command,
@@ -8923,6 +9285,9 @@ impl ApplicationService {
                     now,
                 )?
             }
+            CompiledApplicationCheckpointHandler::NextContractOrValidTerminal => {
+                unreachable!("route-specific handler returned before the generic VM-11 pipeline")
+            }
         };
         validate_application_evidence_against_registry(&application_evidence)?;
         let evidence_digest = application_evidence.digest();
@@ -9083,6 +9448,9 @@ impl ApplicationService {
                     "observedAt": projection.observed_at,
                     "parentMissionRevision": projection.source_mission_revision,
                 })
+            }
+            CompiledApplicationCheckpointHandler::NextContractOrValidTerminal => {
+                unreachable!("route-specific handler returned before the generic VM-11 pipeline")
             }
         };
         let mut events = vec![PendingEvent::new(
@@ -9618,6 +9986,274 @@ impl ApplicationService {
             message,
             decision,
             next_dispatch,
+            replayed: false,
+        })
+    }
+
+    /// Resolves VM-11's exact post-review route without allowing a generic
+    /// Application completion or a caller-supplied replacement contract.
+    /// Stop produces the typed terminal; Continue reuses only the still-current
+    /// frozen parent contract. Scale/Test wait for a separate Human approval
+    /// that binds the complete revised contract digest.
+    pub fn resolve_vm11_next_contract_or_valid_terminal(
+        &mut self,
+        command: ResolveVm11NextContractOrValidTerminal,
+        now: DateTime<Utc>,
+    ) -> Result<Vm11NextContractOrValidTerminalResult, ApplicationError> {
+        let validated_command = ValidatedVm11NextContractCommand::new(command)?;
+        let command = validated_command.command();
+        let context = self.load_vm11_next_contract_resolution_context(command)?;
+        if let Some(replayed) = self.replay_vm11_completed_resolution(&context, command)? {
+            return Ok(replayed);
+        }
+        if let Some(replayed) = self.replay_vm11_waiting_resolution(&context, command)? {
+            return Ok(replayed);
+        }
+        validate_vm11_next_contract_dispatch(&context.mission, command)?;
+
+        match OutcomeReviewNextContractResolution::resolve(
+            &context.mission,
+            &context.parent_mission,
+            &context.review,
+            &context.decision,
+            now,
+        ) {
+            Ok(resolution) => {
+                self.persist_vm11_next_contract_resolution(context, command, resolution, now)
+            }
+            Err(
+                error @ (OutcomeLedgerError::OutcomeReviewRevisedContractAuthorizationRequired
+                | OutcomeLedgerError::OutcomeReviewExperimentContractAuthorizationRequired),
+            ) => self.wait_vm11_next_contract_authorization(context, command, &error, now),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn load_vm11_next_contract_resolution_context(
+        &self,
+        command: &ResolveVm11NextContractOrValidTerminal,
+    ) -> Result<Vm11NextContractResolutionContext, ApplicationError> {
+        let mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        let review = self
+            .store
+            .load_vm11_outcome_review(&command.project_id, &command.mission_id)?;
+        let decision = self
+            .store
+            .load_vm11_outcome_review_decision(&command.project_id, &command.mission_id)?;
+        let parent_mission = self
+            .store
+            .load_mission(&command.project_id, &decision.source_mission_id)?;
+        let source_contract_digest = OutcomeReviewNextContractResolution::validate_frozen_sources(
+            &mission,
+            &parent_mission,
+            &review,
+            &decision,
+        )?;
+        let decision_digest = decision.digest()?;
+        if command.expected_decision_digest != decision_digest
+            || command.expected_parent_mission_revision != parent_mission.revision
+            || command.expected_parent_contract_digest != source_contract_digest
+        {
+            return Err(ApplicationError::Vm11NextContractCommandMismatch);
+        }
+
+        Ok(Vm11NextContractResolutionContext {
+            mission,
+            review,
+            decision,
+            parent_mission,
+            source_contract_digest,
+            decision_digest,
+        })
+    }
+
+    fn replay_vm11_completed_resolution(
+        &self,
+        context: &Vm11NextContractResolutionContext,
+        command: &ResolveVm11NextContractOrValidTerminal,
+    ) -> Result<Option<Vm11NextContractOrValidTerminalResult>, ApplicationError> {
+        let mission = &context.mission;
+        let persisted_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref());
+        let Some(completion) = persisted_completion else {
+            return Ok(None);
+        };
+        let evidence = completion
+            .application_evidence
+            .as_ref()
+            .ok_or(ApplicationError::Vm11NextContractReplayMismatch)?;
+        if evidence.handler_id != VM11_NEXT_CONTRACT_OR_VALID_TERMINAL_HANDLER_ID
+            || evidence.dispatch_mission_revision != command.expected_mission_revision
+            || evidence.dispatch_checkpoint_revision != command.expected_checkpoint_revision
+        {
+            return Err(ApplicationError::Vm11NextContractReplayMismatch);
+        }
+        let resolution = OutcomeReviewNextContractResolution::reconstruct_persisted(
+            mission,
+            &context.parent_mission,
+            &context.review,
+            &context.decision,
+            completion.verified_at,
+        )?;
+        let expected_resolution_event = vm11_next_contract_resolution_event_payload(
+            mission,
+            &resolution,
+            &completion.evidence_digest,
+        )?;
+        if !self
+            .store
+            .events_for_mission(&command.project_id, &command.mission_id)?
+            .into_iter()
+            .any(|event| {
+                event.event_type == "mission.next_contract_or_valid_terminal_resolved"
+                    && event.payload == expected_resolution_event
+            })
+        {
+            return Err(ApplicationError::Vm11NextContractReplayMismatch);
+        }
+        Ok(Some(Vm11NextContractOrValidTerminalResult::Resolved {
+            next_dispatch: current_checkpoint_dispatch_projection(mission)?,
+            mission: Box::new(mission.clone()),
+            resolution: Box::new(resolution),
+            replayed: true,
+        }))
+    }
+
+    fn replay_vm11_waiting_resolution(
+        &self,
+        context: &Vm11NextContractResolutionContext,
+        command: &ResolveVm11NextContractOrValidTerminal,
+    ) -> Result<Option<Vm11NextContractOrValidTerminalResult>, ApplicationError> {
+        if context.mission.stage != MissionStage::WaitingUser {
+            return Ok(None);
+        }
+        let expected_code =
+            vm11_next_contract_authorization_code(context.decision.next_contract_intent)
+                .ok_or(ApplicationError::Vm11NextContractReplayMismatch)?;
+        let expected_wait_event =
+            vm11_next_contract_authorization_event_payload(context, command, expected_code);
+        self.store
+            .events_for_mission(&command.project_id, &command.mission_id)?
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.event_type == "mission.next_contract_authorization_required"
+                    && event.payload == expected_wait_event
+            })
+            .ok_or(ApplicationError::Vm11NextContractReplayMismatch)?;
+        if context
+            .mission
+            .block
+            .as_ref()
+            .is_none_or(|block| block.code != expected_code)
+        {
+            return Err(ApplicationError::Vm11NextContractReplayMismatch);
+        }
+        Ok(Some(Vm11NextContractOrValidTerminalResult::WaitingUser {
+            mission: Box::new(context.mission.clone()),
+            intent: context.decision.next_contract_intent,
+            code: expected_code.into(),
+            replayed: true,
+        }))
+    }
+
+    fn persist_vm11_next_contract_resolution(
+        &mut self,
+        mut context: Vm11NextContractResolutionContext,
+        command: &ResolveVm11NextContractOrValidTerminal,
+        resolution: OutcomeReviewNextContractResolution,
+        now: DateTime<Utc>,
+    ) -> Result<Vm11NextContractOrValidTerminalResult, ApplicationError> {
+        let expected_mission_revision = context.mission.revision;
+        let (completion_evidence_digest, next_started) =
+            complete_vm11_next_contract_resolution_in_memory(
+                &mut context,
+                command,
+                &resolution,
+                now,
+            )?;
+        resolution.validate_persisted(
+            &context.mission,
+            &context.parent_mission,
+            &context.review,
+            &context.decision,
+        )?;
+        let events = vm11_next_contract_resolution_events(
+            &context.mission,
+            &resolution,
+            &completion_evidence_digest,
+            next_started,
+            now,
+        )?;
+        self.store
+            .complete_vm11_next_contract_or_valid_terminal_atomic(
+                &context.mission,
+                expected_mission_revision,
+                &context.parent_mission,
+                command.expected_parent_mission_revision,
+                &context.review,
+                &context.decision,
+                &resolution,
+                &events,
+            )?;
+        Ok(Vm11NextContractOrValidTerminalResult::Resolved {
+            next_dispatch: current_checkpoint_dispatch_projection(&context.mission)?,
+            mission: Box::new(context.mission),
+            resolution: Box::new(resolution),
+            replayed: false,
+        })
+    }
+
+    fn wait_vm11_next_contract_authorization(
+        &mut self,
+        mut context: Vm11NextContractResolutionContext,
+        command: &ResolveVm11NextContractOrValidTerminal,
+        error: &OutcomeLedgerError,
+        now: DateTime<Utc>,
+    ) -> Result<Vm11NextContractOrValidTerminalResult, ApplicationError> {
+        validate_vm11_next_contract_resolution_time(&context, now)?;
+        let code = vm11_next_contract_authorization_error_code(error);
+        let expected_mission_revision = context.mission.revision;
+        context.mission.block_checkpoint(
+            "next_contract_or_valid_terminal",
+            &hartevo_domain_kernel::MissionBlock {
+                code: code.into(),
+                detail: "The Human outcome action did not approve an exact replacement Operating Contract digest; budget, KPI, validity, experiment scope, and capabilities remain unchanged until a separate approval is recorded."
+                    .into(),
+                recoverable: true,
+                observed_at: now,
+            },
+            MissionStage::WaitingUser,
+        )?;
+        let event = PendingEvent::new(
+            "mission.next_contract_authorization_required",
+            vm11_next_contract_authorization_event_payload(&context, command, code),
+            now,
+        );
+        self.store.wait_vm11_next_contract_authorization_atomic(
+            &context.mission,
+            expected_mission_revision,
+            &context.parent_mission,
+            command.expected_parent_mission_revision,
+            &context.review,
+            &context.decision,
+            code,
+            &[event],
+        )?;
+        Ok(Vm11NextContractOrValidTerminalResult::WaitingUser {
+            mission: Box::new(context.mission),
+            intent: context.decision.next_contract_intent,
+            code: code.into(),
             replayed: false,
         })
     }
@@ -19724,6 +20360,14 @@ pub enum ApplicationError {
     StructuredOutcomeDecisionReviewMismatch,
     #[error("the structured VM-11 outcome decision replay does not match persisted evidence")]
     StructuredOutcomeDecisionReplayMismatch,
+    #[error("VM-11 next_contract_or_valid_terminal requires its route-specific resolution command")]
+    Vm11NextContractRouteSpecificCommandRequired,
+    #[error(
+        "the VM-11 next-contract command no longer matches the exact Mission, decision, or parent contract"
+    )]
+    Vm11NextContractCommandMismatch,
+    #[error("the VM-11 next-contract replay does not match its append-once durable evidence")]
+    Vm11NextContractReplayMismatch,
     #[error(
         "Catalog Mission route, mode, market, language, audience, timezone, or budget is invalid"
     )]
@@ -20001,6 +20645,47 @@ mod tests {
             }
             step += 1;
         }
+    }
+
+    fn advance_vm11_application_routes_to_human_decision(
+        service: &mut ApplicationService,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        started_at: DateTime<Utc>,
+    ) -> MissionCheckpointDispatch {
+        for step in 0_i64..10 {
+            let dispatch = service
+                .dispatch_current_mission_checkpoint(
+                    project_id,
+                    mission_id,
+                    started_at + Duration::seconds(step),
+                )
+                .expect("VM-11 dispatch");
+            if dispatch.executor == MissionCheckpointExecutor::Human {
+                assert_eq!(dispatch.checkpoint_id, "continue_stop_scale_test");
+                return dispatch;
+            }
+            let execution = service
+                .execute_application_mission_checkpoint(
+                    ExecuteApplicationMissionCheckpoint {
+                        project_id: project_id.clone(),
+                        mission_id: mission_id.clone(),
+                        checkpoint_id: dispatch.checkpoint_id,
+                        expected_mission_revision: dispatch.mission_revision,
+                        expected_checkpoint_revision: dispatch.checkpoint_revision,
+                    },
+                    started_at + Duration::seconds(step),
+                )
+                .expect("source-fenced VM-11 Application route");
+            assert!(matches!(
+                execution,
+                ApplicationMissionCheckpointExecution::Completed {
+                    replayed: false,
+                    ..
+                }
+            ));
+        }
+        panic!("VM-11 did not reach its Human decision within the manifest bound")
     }
 
     /// Builds real Domain evidence for a Catalog Checkpoint while keeping Provider
@@ -22581,6 +23266,833 @@ mod tests {
         assert!(matches!(
             service.decide_vm11_outcome_review(swapped_decision, now() + Duration::seconds(36),),
             Err(ApplicationError::StructuredOutcomeDecisionReplayMismatch)
+        ));
+        let next_contract_dispatch = decided
+            .next_dispatch
+            .clone()
+            .expect("typed next-contract route");
+        let mut generic_terminal = decided.mission.clone();
+        assert_eq!(
+            generic_terminal.terminate(
+                MissionTerminalDisposition::Completed,
+                now() + Duration::seconds(36),
+            ),
+            Err(MissionError::Vm11ValidTerminalResolutionRequired)
+        );
+        assert_eq!(generic_terminal, decided.mission);
+        assert!(matches!(
+            service.execute_application_mission_checkpoint(
+                ExecuteApplicationMissionCheckpoint {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    checkpoint_id: next_contract_dispatch.checkpoint_id.clone(),
+                    expected_mission_revision: next_contract_dispatch.mission_revision,
+                    expected_checkpoint_revision: next_contract_dispatch.checkpoint_revision,
+                },
+                now() + Duration::seconds(36),
+            ),
+            Err(ApplicationError::Vm11NextContractRouteSpecificCommandRequired)
+        ));
+        let resolution_command = ResolveVm11NextContractOrValidTerminal {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            expected_mission_revision: next_contract_dispatch.mission_revision,
+            expected_checkpoint_revision: next_contract_dispatch.checkpoint_revision,
+            expected_decision_digest: decided.decision.digest().expect("decision digest"),
+            expected_parent_mission_revision: current_parent.revision,
+            expected_parent_contract_digest: recomputed_review.source_contract_digest.clone(),
+        };
+        let resolved = service
+            .resolve_vm11_next_contract_or_valid_terminal(
+                resolution_command.clone(),
+                now() + Duration::seconds(36),
+            )
+            .expect("typed Stop terminal");
+        let Vm11NextContractOrValidTerminalResult::Resolved {
+            mission: terminal_mission,
+            resolution,
+            next_dispatch,
+            replayed,
+        } = resolved
+        else {
+            panic!("Stop must resolve to the typed terminal")
+        };
+        assert!(!replayed);
+        assert!(next_dispatch.is_none());
+        assert_eq!(
+            (
+                terminal_mission.stage,
+                resolution.action.clone(),
+                resolution.next_contract_intent,
+                resolution.continued_contract_digest.as_deref(),
+                resolution.terminal_disposition,
+                terminal_mission.effects.len(),
+            ),
+            (
+                MissionStage::Completed,
+                OutcomeDecision::Stop,
+                OutcomeReviewNextContractIntent::ValidTerminal,
+                None,
+                Some(MissionTerminalDisposition::Completed),
+                0,
+            )
+        );
+        let terminal_definition = terminal_mission
+            .definition
+            .as_ref()
+            .expect("terminal definition");
+        assert_eq!(
+            terminal_definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == "candidate_learning")
+                .map(|checkpoint| checkpoint.status),
+            Some(MissionCheckpointStatus::Skipped)
+        );
+        let terminal_completion = terminal_definition
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("append-once terminal completion");
+        assert_eq!(
+            terminal_completion
+                .application_evidence
+                .as_ref()
+                .expect("route-specific evidence")
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "mission_checkpoint",
+                "outcome_review_decision",
+                "parent_mission_contract",
+            ])
+        );
+        let event_count_after_resolution = service
+            .mission_events(&project_id, &mission_id)
+            .expect("resolution events")
+            .len();
+        let expected_resolution = resolution.clone();
+        let replayed_resolution = service
+            .resolve_vm11_next_contract_or_valid_terminal(
+                resolution_command.clone(),
+                now() + Duration::seconds(37),
+            )
+            .expect("exact terminal replay");
+        let Vm11NextContractOrValidTerminalResult::Resolved {
+            resolution: exact_replay,
+            replayed: true,
+            ..
+        } = replayed_resolution
+        else {
+            panic!("exact terminal replay must not append another result")
+        };
+        assert_eq!(exact_replay, expected_resolution);
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged terminal replay events")
+                .len(),
+            event_count_after_resolution
+        );
+        let mut swapped_resolution = resolution_command;
+        swapped_resolution.expected_parent_contract_digest = "f".repeat(64);
+        assert!(matches!(
+            service.resolve_vm11_next_contract_or_valid_terminal(
+                swapped_resolution,
+                now() + Duration::seconds(38),
+            ),
+            Err(ApplicationError::Vm11NextContractCommandMismatch)
+        ));
+
+        let experiment_mission_id = MissionId::from("vm11-experiment-authorization-mission");
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: experiment_mission_id.clone(),
+                    first_task_id: TaskId::from("vm11-experiment-event-ingest-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-11".into(),
+                    mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: Some(parent_mission_id.clone()),
+                    title: Some("Explicit experiment authorization".into()),
+                    goal: "Do not create an experiment contract without exact Human authority"
+                        .into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: current_parent.contract.kpis.clone(),
+                    budget: current_parent.contract.budget.clone(),
+                },
+                now() + Duration::seconds(39),
+            )
+            .expect("second VM-11 Mission");
+        let experiment_decision_dispatch = advance_vm11_application_routes_to_human_decision(
+            &mut service,
+            &project_id,
+            &experiment_mission_id,
+            now() + Duration::seconds(40),
+        );
+        let experiment_review = service
+            .store
+            .load_vm11_outcome_review(&project_id, &experiment_mission_id)
+            .expect("experiment review");
+        let experiment_mission = service
+            .load_mission(&project_id, &experiment_mission_id)
+            .expect("experiment decision Mission");
+        let experiment_conversation = service
+            .mission_conversation(&project_id, &experiment_mission_id)
+            .expect("experiment decision Conversation");
+        let experiment_review_completion_digest = experiment_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "outcome_review")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .map(|completion| completion.evidence_digest.clone())
+            .expect("experiment review completion");
+        let experiment_decision = service
+            .decide_vm11_outcome_review(
+                DecideVm11OutcomeReview {
+                    project_id: project_id.clone(),
+                    mission_id: experiment_mission_id.clone(),
+                    action: OutcomeDecision::Test,
+                    decided_by: ActorId::from("vm11-human-reviewer"),
+                    message_id: MissionConversationMessageId::from(
+                        "vm11-experiment-decision-message",
+                    ),
+                    rationale: "Test only after a separately reviewed experiment contract.".into(),
+                    idempotency_key: "vm11-experiment-decision:cycle-1".into(),
+                    expected_review_projection_digest: experiment_review
+                        .digest()
+                        .expect("experiment review digest"),
+                    expected_review_completion_digest: experiment_review_completion_digest,
+                    expected_mission_revision: experiment_decision_dispatch.mission_revision,
+                    expected_checkpoint_revision: experiment_decision_dispatch.checkpoint_revision,
+                    expected_conversation_revision: experiment_conversation.revision,
+                },
+                now() + Duration::seconds(51),
+            )
+            .expect("structured Test decision");
+        let experiment_route = experiment_decision
+            .next_dispatch
+            .expect("experiment next-contract route");
+        let experiment_resolution_command = ResolveVm11NextContractOrValidTerminal {
+            project_id: project_id.clone(),
+            mission_id: experiment_mission_id.clone(),
+            expected_mission_revision: experiment_route.mission_revision,
+            expected_checkpoint_revision: experiment_route.checkpoint_revision,
+            expected_decision_digest: experiment_decision
+                .decision
+                .digest()
+                .expect("experiment decision digest"),
+            expected_parent_mission_revision: current_parent.revision,
+            expected_parent_contract_digest: experiment_review.source_contract_digest.clone(),
+        };
+        let contract_before_wait = service
+            .load_mission(&project_id, &experiment_mission_id)
+            .expect("pre-wait Mission")
+            .contract;
+        let waiting = service
+            .resolve_vm11_next_contract_or_valid_terminal(
+                experiment_resolution_command.clone(),
+                now() + Duration::seconds(52),
+            )
+            .expect("Test waits for exact experiment contract authority");
+        let Vm11NextContractOrValidTerminalResult::WaitingUser {
+            mission: waiting_mission,
+            intent,
+            code,
+            replayed,
+        } = waiting
+        else {
+            panic!("Test cannot create a replacement contract from an action alone")
+        };
+        assert_eq!(
+            (
+                waiting_mission.stage,
+                intent,
+                code.as_str(),
+                replayed,
+                &waiting_mission.contract,
+                waiting_mission.effects.len(),
+            ),
+            (
+                MissionStage::WaitingUser,
+                OutcomeReviewNextContractIntent::TestWithNewExperiment,
+                "experiment_contract_authorization_required",
+                false,
+                &contract_before_wait,
+                0,
+            )
+        );
+        let waiting_checkpoint = waiting_mission
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("waiting current route");
+        assert_eq!(
+            (
+                waiting_checkpoint.id.as_str(),
+                waiting_checkpoint.status,
+                waiting_checkpoint.completion.is_none(),
+            ),
+            (
+                "next_contract_or_valid_terminal",
+                MissionCheckpointStatus::WaitingUser,
+                true,
+            )
+        );
+        let experiment_event_count = service
+            .mission_events(&project_id, &experiment_mission_id)
+            .expect("experiment events")
+            .len();
+        assert!(matches!(
+            service
+                .resolve_vm11_next_contract_or_valid_terminal(
+                    experiment_resolution_command.clone(),
+                    now() + Duration::seconds(53),
+                )
+                .expect("exact authorization wait replay"),
+            Vm11NextContractOrValidTerminalResult::WaitingUser {
+                replayed: true,
+                intent: OutcomeReviewNextContractIntent::TestWithNewExperiment,
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &experiment_mission_id)
+                .expect("unchanged wait replay events")
+                .len(),
+            experiment_event_count
+        );
+        let mut swapped_experiment = experiment_resolution_command;
+        swapped_experiment.expected_decision_digest = "e".repeat(64);
+        assert!(matches!(
+            service.resolve_vm11_next_contract_or_valid_terminal(
+                swapped_experiment,
+                now() + Duration::seconds(54),
+            ),
+            Err(ApplicationError::Vm11NextContractCommandMismatch)
+        ));
+        assert_eq!(
+            service
+                .load_mission(&project_id, &parent_mission_id)
+                .expect("parent remains immutable"),
+            current_parent
+        );
+
+        let continuous_parent_id = MissionId::from("vm11-continuous-parent");
+        let continuous_parent = service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: continuous_parent_id.clone(),
+                    first_task_id: TaskId::from("vm11-continuous-parent-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-01".into(),
+                    mode: OperatingMode::ContinuousOperator,
+                    parent_mission_id: None,
+                    title: Some("Continuous parent".into()),
+                    goal: "Continue only the exact frozen operating contract".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
+                },
+                now() + Duration::seconds(55),
+            )
+            .expect("continuous parent Mission");
+        service
+            .ingest_outcome_event(
+                OutcomeEvent {
+                    id: OutcomeEventId::from("vm11-continuous-lead-event"),
+                    tenant_id: tenant_id.clone(),
+                    project_id: project_id.clone(),
+                    mission_id: continuous_parent_id.clone(),
+                    kind: OutcomeEventKind::LeadQualified,
+                    provider: "user-review".into(),
+                    connection_id: None,
+                    account_id: None,
+                    source_event_id: "continuous-lead-event".into(),
+                    identity_link_id: Some(identity_link_id),
+                    opportunity_id: None,
+                    campaign_id: None,
+                    order_id: None,
+                    refund_id: None,
+                    commission_id: None,
+                    payout_id: None,
+                    partner_id: None,
+                    amount: None,
+                    occurred_at: now() + Duration::seconds(56),
+                    received_at: now() + Duration::seconds(56),
+                    evidence_digest: "6".repeat(64),
+                    raw_payload_digest: "7".repeat(64),
+                    source_verification: Some(OutcomeSourceVerification {
+                        method: OutcomeVerificationMethod::UserConfirmed,
+                        verifier: "project-owner".into(),
+                        independent: false,
+                        verified_at: now() + Duration::seconds(56),
+                        evidence_digest: "8".repeat(64),
+                    }),
+                },
+                now() + Duration::seconds(56),
+            )
+            .expect("continuous parent outcome");
+        service
+            .ingest_outcome_event(
+                OutcomeEvent {
+                    id: OutcomeEventId::from("vm11-continuous-order-event"),
+                    tenant_id: tenant_id.clone(),
+                    project_id: project_id.clone(),
+                    mission_id: continuous_parent_id.clone(),
+                    kind: OutcomeEventKind::OrderPlaced,
+                    provider: "user-review".into(),
+                    connection_id: Some(ConnectionId::from("vm11-commerce-connection")),
+                    account_id: Some(AccountId::from("project-owner")),
+                    source_event_id: "continuous-order-event".into(),
+                    identity_link_id: Some(IdentityLinkId::from("vm11-qualified-person-link")),
+                    opportunity_id: None,
+                    campaign_id: None,
+                    order_id: Some(OrderId::from("vm11-continuous-order")),
+                    refund_id: None,
+                    commission_id: None,
+                    payout_id: None,
+                    partner_id: None,
+                    amount: Some(Money::new(1_000, CurrencyCode::parse("USD").expect("USD"))),
+                    occurred_at: now() + Duration::seconds(57),
+                    received_at: now() + Duration::seconds(57),
+                    evidence_digest: "9".repeat(64),
+                    raw_payload_digest: "a".repeat(64),
+                    source_verification: Some(OutcomeSourceVerification {
+                        method: OutcomeVerificationMethod::SignedWebhook,
+                        verifier: "commerce-webhook".into(),
+                        independent: true,
+                        verified_at: now() + Duration::seconds(57),
+                        evidence_digest: "b".repeat(64),
+                    }),
+                },
+                now() + Duration::seconds(57),
+            )
+            .expect("continuous parent order");
+        service
+            .record_attribution(
+                AttributionRecord {
+                    id: AttributionId::from("vm11-continuous-last-non-direct"),
+                    tenant_id: tenant_id.clone(),
+                    project_id: project_id.clone(),
+                    order_id: OrderId::from("vm11-continuous-order"),
+                    model: AttributionModel::LastNonDirect,
+                    touchpoint: Some(Touchpoint {
+                        mission_id: continuous_parent_id.clone(),
+                        source: "source-verified-continuous-readback".into(),
+                        effect_id: None,
+                        traffic_class: Some(AttributionTrafficClass::NonDirect),
+                        provider_identity_digest: None,
+                        verified_link_or_coupon_digest: None,
+                        occurred_at: now() + Duration::seconds(56),
+                        received_at: Some(now() + Duration::seconds(57)),
+                        evidence_digest: "c".repeat(64),
+                        source_verification: Some(OutcomeSourceVerification {
+                            method: OutcomeVerificationMethod::IndependentReadback,
+                            verifier: "analytics-readback".into(),
+                            independent: true,
+                            verified_at: now() + Duration::seconds(57),
+                            evidence_digest: "c".repeat(64),
+                        }),
+                    }),
+                    window_started_at: continuous_parent.contract.valid_from,
+                    window_ended_at: now() + Duration::days(30),
+                    confidence: "0.8".parse().expect("continuous confidence"),
+                    causal_claim: false,
+                    rationale:
+                        "Operational continuous last-non-direct view; correlation is not causality"
+                            .into(),
+                    evidence_digest: "d".repeat(64),
+                    recorded_at: now() + Duration::seconds(58),
+                },
+                now() + Duration::seconds(58),
+            )
+            .expect("continuous source-verified attribution");
+        let continuous_vm11_id = MissionId::from("vm11-continue-resolution-mission");
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: continuous_vm11_id.clone(),
+                    first_task_id: TaskId::from("vm11-continue-event-ingest-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-11".into(),
+                    mode: continuous_parent.contract.mode.clone(),
+                    parent_mission_id: Some(continuous_parent_id.clone()),
+                    title: Some("Continue exact parent".into()),
+                    goal: "Reuse, but never extend, the frozen continuous contract".into(),
+                    market: continuous_parent.contract.market.clone(),
+                    language: continuous_parent.contract.language.clone(),
+                    audience: continuous_parent.contract.audience.clone(),
+                    timezone: continuous_parent.contract.timezone.clone(),
+                    kpis: continuous_parent.contract.kpis.clone(),
+                    budget: continuous_parent.contract.budget.clone(),
+                },
+                now() + Duration::seconds(58),
+            )
+            .expect("continuous VM-11 Mission");
+        let continue_decision_dispatch = advance_vm11_application_routes_to_human_decision(
+            &mut service,
+            &project_id,
+            &continuous_vm11_id,
+            now() + Duration::seconds(59),
+        );
+        let continue_review = service
+            .store
+            .load_vm11_outcome_review(&project_id, &continuous_vm11_id)
+            .expect("continuous review");
+        assert_eq!(
+            continue_review.loop_policy,
+            OutcomeReviewLoopPolicy::Eligible
+        );
+        let continue_decision_mission = service
+            .load_mission(&project_id, &continuous_vm11_id)
+            .expect("continuous decision Mission");
+        let continue_conversation = service
+            .mission_conversation(&project_id, &continuous_vm11_id)
+            .expect("continuous decision Conversation");
+        let continue_review_completion_digest = continue_decision_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "outcome_review")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .map(|completion| completion.evidence_digest.clone())
+            .expect("continuous review completion");
+        let continue_decision = service
+            .decide_vm11_outcome_review(
+                DecideVm11OutcomeReview {
+                    project_id: project_id.clone(),
+                    mission_id: continuous_vm11_id.clone(),
+                    action: OutcomeDecision::Continue,
+                    decided_by: ActorId::from("vm11-human-reviewer"),
+                    message_id: MissionConversationMessageId::from(
+                        "vm11-continue-decision-message",
+                    ),
+                    rationale: "Continue the same bounded contract without extending authority."
+                        .into(),
+                    idempotency_key: "vm11-continue-decision:cycle-1".into(),
+                    expected_review_projection_digest: continue_review
+                        .digest()
+                        .expect("continuous review digest"),
+                    expected_review_completion_digest: continue_review_completion_digest,
+                    expected_mission_revision: continue_decision_dispatch.mission_revision,
+                    expected_checkpoint_revision: continue_decision_dispatch.checkpoint_revision,
+                    expected_conversation_revision: continue_conversation.revision,
+                },
+                now() + Duration::seconds(70),
+            )
+            .expect("structured Continue decision");
+        let continue_route = continue_decision
+            .next_dispatch
+            .expect("continue next-contract route");
+        let continue_resolution_command = ResolveVm11NextContractOrValidTerminal {
+            project_id: project_id.clone(),
+            mission_id: continuous_vm11_id.clone(),
+            expected_mission_revision: continue_route.mission_revision,
+            expected_checkpoint_revision: continue_route.checkpoint_revision,
+            expected_decision_digest: continue_decision
+                .decision
+                .digest()
+                .expect("Continue decision digest"),
+            expected_parent_mission_revision: continuous_parent.revision,
+            expected_parent_contract_digest: continue_review.source_contract_digest.clone(),
+        };
+        let continued = service
+            .resolve_vm11_next_contract_or_valid_terminal(
+                continue_resolution_command.clone(),
+                now() + Duration::seconds(71),
+            )
+            .expect("reuse exact continuous contract");
+        let Vm11NextContractOrValidTerminalResult::Resolved {
+            mission: continued_mission,
+            resolution: continue_resolution,
+            next_dispatch: candidate_dispatch,
+            replayed: false,
+        } = continued
+        else {
+            panic!("Continue must resolve to candidate_learning, not a terminal")
+        };
+        assert_eq!(
+            (
+                continued_mission.stage,
+                &continued_mission.contract,
+                continue_resolution.action,
+                continue_resolution.next_contract_intent,
+                continue_resolution.continued_contract_digest.as_deref(),
+                continue_resolution.terminal_disposition,
+                continued_mission.effects.len(),
+            ),
+            (
+                MissionStage::Running,
+                &continue_decision_mission.contract,
+                OutcomeDecision::Continue,
+                OutcomeReviewNextContractIntent::ContinueCurrentContract,
+                Some(continue_review.source_contract_digest.as_str()),
+                None,
+                0,
+            )
+        );
+        assert_eq!(
+            candidate_dispatch.as_ref().map(|dispatch| (
+                dispatch.checkpoint_id.as_str(),
+                dispatch.capability_id.as_str(),
+                dispatch.executor,
+                dispatch.state,
+                dispatch.application_handler_status,
+            )),
+            Some((
+                "candidate_learning",
+                "candidate.propose",
+                MissionCheckpointExecutor::Application,
+                MissionCheckpointDispatchState::Ready,
+                Some(ApplicationCheckpointHandlerStatus::NotImplemented),
+            ))
+        );
+        let continue_event_count = service
+            .mission_events(&project_id, &continuous_vm11_id)
+            .expect("Continue events")
+            .len();
+        assert!(matches!(
+            service
+                .resolve_vm11_next_contract_or_valid_terminal(
+                    continue_resolution_command,
+                    now() + Duration::seconds(72),
+                )
+                .expect("exact Continue replay"),
+            Vm11NextContractOrValidTerminalResult::Resolved {
+                replayed: true,
+                next_dispatch: Some(MissionCheckpointDispatch {
+                    state: MissionCheckpointDispatchState::Ready,
+                    application_handler_status: Some(
+                        ApplicationCheckpointHandlerStatus::NotImplemented
+                    ),
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &continuous_vm11_id)
+                .expect("unchanged Continue replay events")
+                .len(),
+            continue_event_count
+        );
+
+        let scale_vm11_id = MissionId::from("vm11-scale-authorization-mission");
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: scale_vm11_id.clone(),
+                    first_task_id: TaskId::from("vm11-scale-event-ingest-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-11".into(),
+                    mode: continuous_parent.contract.mode.clone(),
+                    parent_mission_id: Some(continuous_parent_id.clone()),
+                    title: Some("Scale only after revised-contract authorization".into()),
+                    goal: "Do not infer revised budget, KPI, validity, or authority from Scale"
+                        .into(),
+                    market: continuous_parent.contract.market.clone(),
+                    language: continuous_parent.contract.language.clone(),
+                    audience: continuous_parent.contract.audience.clone(),
+                    timezone: continuous_parent.contract.timezone.clone(),
+                    kpis: continuous_parent.contract.kpis.clone(),
+                    budget: continuous_parent.contract.budget.clone(),
+                },
+                now() + Duration::seconds(73),
+            )
+            .expect("scale authorization VM-11 Mission");
+        let scale_decision_dispatch = advance_vm11_application_routes_to_human_decision(
+            &mut service,
+            &project_id,
+            &scale_vm11_id,
+            now() + Duration::seconds(74),
+        );
+        let scale_review = service
+            .store
+            .load_vm11_outcome_review(&project_id, &scale_vm11_id)
+            .expect("scale-ready review");
+        assert_eq!(
+            (
+                scale_review.loop_policy,
+                scale_review.scale_evidence_status,
+                scale_review.decision_gate(OutcomeDecision::Scale).status,
+            ),
+            (
+                OutcomeReviewLoopPolicy::Eligible,
+                hartevo_domain_kernel::OutcomeReviewGateStatus::Satisfied,
+                hartevo_domain_kernel::OutcomeReviewDecisionGateStatus::Available,
+            )
+        );
+        let scale_decision_mission = service
+            .load_mission(&project_id, &scale_vm11_id)
+            .expect("scale decision Mission");
+        let scale_conversation = service
+            .mission_conversation(&project_id, &scale_vm11_id)
+            .expect("scale decision Conversation");
+        let scale_review_completion_digest = scale_decision_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "outcome_review")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .map(|completion| completion.evidence_digest.clone())
+            .expect("scale review completion");
+        let scale_decision = service
+            .decide_vm11_outcome_review(
+                DecideVm11OutcomeReview {
+                    project_id: project_id.clone(),
+                    mission_id: scale_vm11_id.clone(),
+                    action: OutcomeDecision::Scale,
+                    decided_by: ActorId::from("vm11-human-reviewer"),
+                    message_id: MissionConversationMessageId::from("vm11-scale-decision-message"),
+                    rationale:
+                        "Scale only after a separate approval binds the full revised contract."
+                            .into(),
+                    idempotency_key: "vm11-scale-decision:cycle-1".into(),
+                    expected_review_projection_digest: scale_review
+                        .digest()
+                        .expect("scale review digest"),
+                    expected_review_completion_digest: scale_review_completion_digest,
+                    expected_mission_revision: scale_decision_dispatch.mission_revision,
+                    expected_checkpoint_revision: scale_decision_dispatch.checkpoint_revision,
+                    expected_conversation_revision: scale_conversation.revision,
+                },
+                now() + Duration::seconds(85),
+            )
+            .expect("structured Scale decision");
+        assert_eq!(
+            (
+                scale_decision.decision.action.clone(),
+                scale_decision.decision.next_contract_intent,
+            ),
+            (
+                OutcomeDecision::Scale,
+                OutcomeReviewNextContractIntent::ScaleWithRevisedContract,
+            )
+        );
+        let scale_route = scale_decision
+            .next_dispatch
+            .expect("scale next-contract route");
+        let scale_resolution_command = ResolveVm11NextContractOrValidTerminal {
+            project_id: project_id.clone(),
+            mission_id: scale_vm11_id.clone(),
+            expected_mission_revision: scale_route.mission_revision,
+            expected_checkpoint_revision: scale_route.checkpoint_revision,
+            expected_decision_digest: scale_decision
+                .decision
+                .digest()
+                .expect("Scale decision digest"),
+            expected_parent_mission_revision: continuous_parent.revision,
+            expected_parent_contract_digest: scale_review.source_contract_digest.clone(),
+        };
+        let scale_contract_before_wait = service
+            .load_mission(&project_id, &scale_vm11_id)
+            .expect("pre-Scale-wait Mission")
+            .contract;
+        let scale_waiting = service
+            .resolve_vm11_next_contract_or_valid_terminal(
+                scale_resolution_command.clone(),
+                now() + Duration::seconds(86),
+            )
+            .expect("Scale waits for exact revised contract authority");
+        let Vm11NextContractOrValidTerminalResult::WaitingUser {
+            mission: scale_waiting_mission,
+            intent: scale_intent,
+            code: scale_code,
+            replayed: false,
+        } = scale_waiting
+        else {
+            panic!("Scale cannot synthesize a revised contract from outcome evidence")
+        };
+        assert_eq!(
+            (
+                scale_waiting_mission.stage,
+                scale_intent,
+                scale_code.as_str(),
+                &scale_waiting_mission.contract,
+                scale_waiting_mission.effects.len(),
+            ),
+            (
+                MissionStage::WaitingUser,
+                OutcomeReviewNextContractIntent::ScaleWithRevisedContract,
+                "revised_contract_authorization_required",
+                &scale_contract_before_wait,
+                0,
+            )
+        );
+        let scale_waiting_checkpoint = scale_waiting_mission
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("Scale waiting current route");
+        assert_eq!(
+            (
+                scale_waiting_checkpoint.id.as_str(),
+                scale_waiting_checkpoint.status,
+                scale_waiting_checkpoint.completion.is_none(),
+            ),
+            (
+                "next_contract_or_valid_terminal",
+                MissionCheckpointStatus::WaitingUser,
+                true,
+            )
+        );
+        let scale_event_count = service
+            .mission_events(&project_id, &scale_vm11_id)
+            .expect("Scale wait events")
+            .len();
+        assert!(matches!(
+            service
+                .resolve_vm11_next_contract_or_valid_terminal(
+                    scale_resolution_command.clone(),
+                    now() + Duration::seconds(87),
+                )
+                .expect("exact Scale authorization wait replay"),
+            Vm11NextContractOrValidTerminalResult::WaitingUser {
+                replayed: true,
+                intent: OutcomeReviewNextContractIntent::ScaleWithRevisedContract,
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &scale_vm11_id)
+                .expect("unchanged Scale wait replay events")
+                .len(),
+            scale_event_count
+        );
+        let mut swapped_scale_source = scale_resolution_command;
+        swapped_scale_source.expected_parent_mission_revision = continuous_parent.revision + 1;
+        assert!(matches!(
+            service.resolve_vm11_next_contract_or_valid_terminal(
+                swapped_scale_source,
+                now() + Duration::seconds(88),
+            ),
+            Err(ApplicationError::Vm11NextContractCommandMismatch)
         ));
         let visible_events = serde_json::to_string(
             &service

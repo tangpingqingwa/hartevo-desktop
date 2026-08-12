@@ -13,10 +13,10 @@ use crate::{
     CompanyId, ConnectionId, ConnectionSnapshot, CurrencyCode, Effect, EffectId, EffectStatus,
     IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject, KpiContract, KpiDirection,
     Mission, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointStatus,
-    MissionConversationId, MissionConversationMessageId, MissionId, Money, OperatingMode,
-    Opportunity, OpportunityId, OrderId, OutcomeDecision, OutcomeEventId, Partner, PartnerId,
-    PartnerSupplyClass, PayoutId, Person, PersonId, ProjectId, RefundId, TenantId,
-    VerificationStatus,
+    MissionConversationId, MissionConversationMessageId, MissionId, MissionStage,
+    MissionTerminalDisposition, Money, OperatingMode, Opportunity, OpportunityId, OrderId,
+    OutcomeDecision, OutcomeEventId, Partner, PartnerId, PartnerSupplyClass, PayoutId, Person,
+    PersonId, ProjectId, RefundId, TenantId, VerificationStatus,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -830,6 +830,34 @@ pub struct OutcomeReviewDecision {
     pub decided_at: DateTime<Utc>,
 }
 
+/// Deterministic, content-free output of VM-11
+/// `next_contract_or_valid_terminal`.
+///
+/// The durable authority is the append-once Application Checkpoint completion
+/// plus the immutable Human decision. This projection is reconstructed from
+/// those records instead of adding an unversioned side channel to normalized
+/// Mission storage. Continue may only reuse the exact frozen parent contract;
+/// Stop may only produce the typed Completed terminal. Scale and Test require
+/// a separate Human approval that binds the complete revised contract digest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeReviewNextContractResolution {
+    pub schema_version: u32,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub cycle: u64,
+    pub decision_digest: String,
+    pub action: OutcomeDecision,
+    pub next_contract_intent: OutcomeReviewNextContractIntent,
+    pub source_mission_id: MissionId,
+    pub source_mission_revision: u64,
+    pub source_contract_digest: String,
+    pub continued_contract_digest: Option<String>,
+    pub terminal_disposition: Option<MissionTerminalDisposition>,
+    pub resolved_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug)]
 struct SettlementAccumulator {
     partner_id: PartnerId,
@@ -1172,6 +1200,391 @@ impl OutcomeReviewDecision {
             return Err(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch);
         }
         Ok(())
+    }
+}
+
+impl OutcomeReviewNextContractResolution {
+    pub const SCHEMA_VERSION: u32 = 1;
+    pub const HANDLER_ID: &'static str = "vm11.next-contract-or-valid-terminal/v1";
+
+    pub fn validate_frozen_sources(
+        mission: &Mission,
+        parent_mission: &Mission,
+        review: &OutcomeReviewProjection,
+        decision: &OutcomeReviewDecision,
+    ) -> Result<String, OutcomeLedgerError> {
+        validate_next_contract_resolution_sources(mission, parent_mission, review, decision)
+    }
+
+    /// Resolves only the two actions whose complete authority already exists
+    /// in the frozen Human decision. Scale and Test intentionally fail closed:
+    /// the decision selected an intent, but did not approve a replacement
+    /// budget, KPI set, experiment scope, validity window, or capability set.
+    pub fn resolve(
+        mission: &Mission,
+        parent_mission: &Mission,
+        review: &OutcomeReviewProjection,
+        decision: &OutcomeReviewDecision,
+        resolved_at: DateTime<Utc>,
+    ) -> Result<Self, OutcomeLedgerError> {
+        let source_contract_digest =
+            validate_next_contract_resolution_sources(mission, parent_mission, review, decision)?;
+        let (definition, checkpoint) = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .current_checkpoint()
+                    .map(|checkpoint| (definition, checkpoint))
+            })
+            .ok_or(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch)?;
+        let route = checkpoint
+            .route
+            .as_ref()
+            .ok_or(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch)?;
+        if definition.manifest_id != "VM-11"
+            || definition.cycle != decision.cycle
+            || mission.stage != MissionStage::Running
+            || mission.block.is_some()
+            || checkpoint.id != "next_contract_or_valid_terminal"
+            || checkpoint.status != MissionCheckpointStatus::Running
+            || checkpoint.completion.is_some()
+            || route.executor != MissionCheckpointExecutor::Application
+            || route.completion_policy
+                != Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+            || route.capability_id != "automation.schedule"
+            || route.oracle_ids
+                != BTreeSet::from(["goal".into(), "operating_state".into(), "outcome".into()])
+        {
+            return Err(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch);
+        }
+        if resolved_at < decision.decided_at
+            || resolved_at < review.observed_at
+            || resolved_at < parent_mission.updated_at
+            || resolved_at < mission.updated_at
+        {
+            return Err(OutcomeLedgerError::OutcomeReviewResolutionTimeInvalid);
+        }
+
+        let (continued_contract_digest, terminal_disposition) =
+            match (decision.action.clone(), decision.next_contract_intent) {
+                (OutcomeDecision::Stop, OutcomeReviewNextContractIntent::ValidTerminal) => {
+                    (None, Some(MissionTerminalDisposition::Completed))
+                }
+                (
+                    OutcomeDecision::Continue,
+                    OutcomeReviewNextContractIntent::ContinueCurrentContract,
+                ) => {
+                    parent_mission
+                        .contract
+                        .validate(resolved_at)
+                        .map_err(|_| OutcomeLedgerError::OutcomeReviewCurrentContractUnavailable)?;
+                    (Some(source_contract_digest.clone()), None)
+                }
+                (
+                    OutcomeDecision::Scale,
+                    OutcomeReviewNextContractIntent::ScaleWithRevisedContract,
+                ) => {
+                    return Err(
+                        OutcomeLedgerError::OutcomeReviewRevisedContractAuthorizationRequired,
+                    );
+                }
+                (OutcomeDecision::Test, OutcomeReviewNextContractIntent::TestWithNewExperiment) => {
+                    return Err(
+                        OutcomeLedgerError::OutcomeReviewExperimentContractAuthorizationRequired,
+                    );
+                }
+                _ => return Err(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch),
+            };
+
+        Ok(Self {
+            schema_version: Self::SCHEMA_VERSION,
+            tenant_id: mission.tenant_id.clone(),
+            project_id: mission.project_id.clone(),
+            mission_id: mission.id.clone(),
+            cycle: decision.cycle,
+            decision_digest: decision.digest()?,
+            action: decision.action.clone(),
+            next_contract_intent: decision.next_contract_intent,
+            source_mission_id: parent_mission.id.clone(),
+            source_mission_revision: parent_mission.revision,
+            source_contract_digest,
+            continued_contract_digest,
+            terminal_disposition,
+            resolved_at,
+        })
+    }
+
+    /// Reconstructs the typed output from the append-once Checkpoint evidence
+    /// and immutable Human decision. No serialized resolution side channel is
+    /// trusted during replay.
+    pub fn reconstruct_persisted(
+        mission: &Mission,
+        parent_mission: &Mission,
+        review: &OutcomeReviewProjection,
+        decision: &OutcomeReviewDecision,
+        resolved_at: DateTime<Utc>,
+    ) -> Result<Self, OutcomeLedgerError> {
+        let source_contract_digest =
+            validate_next_contract_resolution_sources(mission, parent_mission, review, decision)?;
+        if resolved_at < decision.decided_at
+            || resolved_at < review.observed_at
+            || resolved_at < parent_mission.updated_at
+            || resolved_at < mission.updated_at
+        {
+            return Err(OutcomeLedgerError::OutcomeReviewResolutionTimeInvalid);
+        }
+        let (continued_contract_digest, terminal_disposition) =
+            match (decision.action.clone(), decision.next_contract_intent) {
+                (OutcomeDecision::Stop, OutcomeReviewNextContractIntent::ValidTerminal) => {
+                    (None, Some(MissionTerminalDisposition::Completed))
+                }
+                (
+                    OutcomeDecision::Continue,
+                    OutcomeReviewNextContractIntent::ContinueCurrentContract,
+                ) => {
+                    parent_mission
+                        .contract
+                        .validate(resolved_at)
+                        .map_err(|_| OutcomeLedgerError::OutcomeReviewCurrentContractUnavailable)?;
+                    (Some(source_contract_digest.clone()), None)
+                }
+                (
+                    OutcomeDecision::Scale,
+                    OutcomeReviewNextContractIntent::ScaleWithRevisedContract,
+                ) => {
+                    return Err(
+                        OutcomeLedgerError::OutcomeReviewRevisedContractAuthorizationRequired,
+                    );
+                }
+                (OutcomeDecision::Test, OutcomeReviewNextContractIntent::TestWithNewExperiment) => {
+                    return Err(
+                        OutcomeLedgerError::OutcomeReviewExperimentContractAuthorizationRequired,
+                    );
+                }
+                _ => return Err(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch),
+            };
+        let resolution = Self {
+            schema_version: Self::SCHEMA_VERSION,
+            tenant_id: mission.tenant_id.clone(),
+            project_id: mission.project_id.clone(),
+            mission_id: mission.id.clone(),
+            cycle: decision.cycle,
+            decision_digest: decision.digest()?,
+            action: decision.action.clone(),
+            next_contract_intent: decision.next_contract_intent,
+            source_mission_id: parent_mission.id.clone(),
+            source_mission_revision: parent_mission.revision,
+            source_contract_digest,
+            continued_contract_digest,
+            terminal_disposition,
+            resolved_at,
+        };
+        resolution.validate_persisted(mission, parent_mission, review, decision)?;
+        Ok(resolution)
+    }
+
+    pub fn digest(&self) -> Result<String, OutcomeLedgerError> {
+        canonical_json_digest(self)
+    }
+
+    pub fn decision_source_id(&self) -> String {
+        format!(
+            "{}:cycle:{}:{}:{}",
+            self.mission_id,
+            self.cycle,
+            outcome_decision_name(&self.action),
+            next_contract_intent_name(self.next_contract_intent)
+        )
+    }
+
+    /// Revalidates the reconstructed resolution against normalized Mission
+    /// state. This is called inside the SQLCipher transaction before the
+    /// append-once Checkpoint completion becomes durable.
+    pub fn validate_persisted(
+        &self,
+        mission: &Mission,
+        parent_mission: &Mission,
+        review: &OutcomeReviewProjection,
+        decision: &OutcomeReviewDecision,
+    ) -> Result<(), OutcomeLedgerError> {
+        let source_contract_digest =
+            validate_next_contract_resolution_sources(mission, parent_mission, review, decision)?;
+        let definition = mission
+            .definition
+            .as_ref()
+            .ok_or(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch)?;
+        let checkpoint = definition
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
+            .ok_or(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch)?;
+        let completion = checkpoint
+            .completion
+            .as_ref()
+            .ok_or(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch)?;
+        let evidence = completion
+            .application_evidence
+            .as_ref()
+            .ok_or(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch)?;
+        let parent_source = evidence
+            .sources
+            .iter()
+            .find(|source| source.source_kind == "parent_mission_contract")
+            .ok_or(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch)?;
+        let decision_source = evidence
+            .sources
+            .iter()
+            .find(|source| source.source_kind == "outcome_review_decision")
+            .ok_or(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch)?;
+        let checkpoint_source = evidence
+            .sources
+            .iter()
+            .find(|source| source.source_kind == "mission_checkpoint")
+            .ok_or(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch)?;
+        let expected_sources = BTreeSet::from([
+            "mission_checkpoint",
+            "outcome_review_decision",
+            "parent_mission_contract",
+        ]);
+        if self.schema_version != Self::SCHEMA_VERSION
+            || self.tenant_id != mission.tenant_id
+            || self.project_id != mission.project_id
+            || self.mission_id != mission.id
+            || self.cycle != decision.cycle
+            || self.decision_digest != decision.digest()?
+            || self.action != decision.action
+            || self.next_contract_intent != decision.next_contract_intent
+            || self.source_mission_id != parent_mission.id
+            || self.source_mission_revision != parent_mission.revision
+            || self.source_contract_digest != source_contract_digest
+            || self.resolved_at < decision.decided_at
+            || self.resolved_at < review.observed_at
+            || self.resolved_at < parent_mission.updated_at
+            || self.resolved_at < mission.updated_at
+            || definition.manifest_id != "VM-11"
+            || definition.cycle != self.cycle
+            || checkpoint.status != MissionCheckpointStatus::Completed
+            || evidence.handler_id != Self::HANDLER_ID
+            || evidence.observed_at != self.resolved_at
+            || completion.verified_at != self.resolved_at
+            || completion.evidence_digest != evidence.digest()
+            || evidence
+                .sources
+                .iter()
+                .map(|source| source.source_kind.as_str())
+                .collect::<BTreeSet<_>>()
+                != expected_sources
+            || parent_source.source_id != parent_mission.id.as_str()
+            || parent_source.source_revision != parent_mission.revision
+            || parent_source.projection_digest != source_contract_digest
+            || decision_source.source_id != self.decision_source_id()
+            || decision_source.source_revision != decision.cycle
+            || decision_source.projection_digest != self.decision_digest
+            || checkpoint_source.source_id != format!("{}:{}", mission.id, checkpoint.id)
+            || checkpoint_source.source_revision != evidence.dispatch_checkpoint_revision
+        {
+            return Err(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch);
+        }
+
+        validate_persisted_next_contract_closure(
+            self,
+            mission,
+            parent_mission,
+            &source_contract_digest,
+        )
+    }
+}
+
+fn validate_persisted_next_contract_closure(
+    resolution: &OutcomeReviewNextContractResolution,
+    mission: &Mission,
+    parent_mission: &Mission,
+    source_contract_digest: &str,
+) -> Result<(), OutcomeLedgerError> {
+    let candidate = mission
+        .definition
+        .as_ref()
+        .and_then(|definition| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|candidate| candidate.id == "candidate_learning")
+        })
+        .ok_or(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch)?;
+    match (resolution.action.clone(), resolution.next_contract_intent) {
+        (OutcomeDecision::Stop, OutcomeReviewNextContractIntent::ValidTerminal)
+            if resolution.continued_contract_digest.is_none()
+                && resolution.terminal_disposition
+                    == Some(MissionTerminalDisposition::Completed)
+                && mission.stage == MissionStage::Completed
+                && candidate.status == MissionCheckpointStatus::Skipped => {}
+        (OutcomeDecision::Continue, OutcomeReviewNextContractIntent::ContinueCurrentContract)
+            if resolution.continued_contract_digest.as_deref() == Some(source_contract_digest)
+                && resolution.terminal_disposition.is_none()
+                && candidate.status != MissionCheckpointStatus::Skipped
+                && !mission.stage.is_terminal() =>
+        {
+            parent_mission
+                .contract
+                .validate(resolution.resolved_at)
+                .map_err(|_| OutcomeLedgerError::OutcomeReviewCurrentContractUnavailable)?;
+        }
+        _ => return Err(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch),
+    }
+    Ok(())
+}
+
+fn validate_next_contract_resolution_sources(
+    mission: &Mission,
+    parent_mission: &Mission,
+    review: &OutcomeReviewProjection,
+    decision: &OutcomeReviewDecision,
+) -> Result<String, OutcomeLedgerError> {
+    decision.validate_persisted(mission, review)?;
+    let source_contract_digest = mission_kpi_contract_source_digest(parent_mission)?;
+    if mission.tenant_id != parent_mission.tenant_id
+        || mission.project_id != parent_mission.project_id
+        || mission.id == parent_mission.id
+        || mission.contract.parent_mission_id.as_ref() != Some(&parent_mission.id)
+        || parent_mission.contract.parent_mission_id.is_some()
+        || parent_mission
+            .definition
+            .as_ref()
+            .is_none_or(|definition| definition.manifest_id == "VM-11")
+        || parent_mission.id != review.source_mission_id
+        || parent_mission.id != decision.source_mission_id
+        || parent_mission.revision != review.source_mission_revision
+        || parent_mission.revision != decision.source_mission_revision
+        || review.source_contract_digest != source_contract_digest
+        || mission.contract.mode != parent_mission.contract.mode
+        || mission.contract.market != parent_mission.contract.market
+        || mission.contract.language != parent_mission.contract.language
+        || mission.contract.audience != parent_mission.contract.audience
+        || mission.contract.timezone != parent_mission.contract.timezone
+        || mission.contract.budget != parent_mission.contract.budget
+        || mission.contract.kpis != parent_mission.contract.kpis
+    {
+        return Err(OutcomeLedgerError::OutcomeReviewNextContractSourceMismatch);
+    }
+    Ok(source_contract_digest)
+}
+
+fn outcome_decision_name(action: &OutcomeDecision) -> &'static str {
+    match action {
+        OutcomeDecision::Continue => "continue",
+        OutcomeDecision::Stop => "stop",
+        OutcomeDecision::Scale => "scale",
+        OutcomeDecision::Test => "test",
+    }
+}
+
+fn next_contract_intent_name(intent: OutcomeReviewNextContractIntent) -> &'static str {
+    match intent {
+        OutcomeReviewNextContractIntent::ValidTerminal => "valid_terminal",
+        OutcomeReviewNextContractIntent::ContinueCurrentContract => "continue_current_contract",
+        OutcomeReviewNextContractIntent::ScaleWithRevisedContract => "scale_with_revised_contract",
+        OutcomeReviewNextContractIntent::TestWithNewExperiment => "test_with_new_experiment",
     }
 }
 
@@ -4163,6 +4576,18 @@ pub enum OutcomeLedgerError {
     OutcomeReviewDecisionActionForbidden,
     #[error("Scale is forbidden until every deterministic scale-evidence gate is satisfied")]
     OutcomeReviewDecisionScaleBlocked,
+    #[error(
+        "the next-contract resolution is detached from its exact VM-11 decision, parent contract, or Checkpoint"
+    )]
+    OutcomeReviewNextContractSourceMismatch,
+    #[error("the current frozen parent contract is expired or otherwise unavailable")]
+    OutcomeReviewCurrentContractUnavailable,
+    #[error("Scale requires a separately approved exact revised Operating Contract")]
+    OutcomeReviewRevisedContractAuthorizationRequired,
+    #[error("Test requires a separately approved exact experiment Operating Contract")]
+    OutcomeReviewExperimentContractAuthorizationRequired,
+    #[error("the next-contract resolution time precedes its frozen decision or source")]
+    OutcomeReviewResolutionTimeInvalid,
     #[error("an outcome Oracle projection could not be canonically serialized")]
     ProjectionSerialization,
     #[error("decimal commission arithmetic overflowed minor units")]

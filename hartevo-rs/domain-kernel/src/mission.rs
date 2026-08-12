@@ -8,8 +8,9 @@ use thiserror::Error;
 
 use crate::{
     AccountId, ActorId, ApprovalId, ConnectionId, ConsentRecordId, ConsentRequirement,
-    ConversationId, CreatorHiringId, CreatorId, EffectId, EvidenceId, MissionId, Money, PartnerId,
-    ProjectId, ReceiptId, TaskId, TenantId, VerificationId, WorkProductId,
+    ConversationId, CreatorHiringId, CreatorId, EffectId, EvidenceId, MissionId, Money,
+    OutcomeReviewNextContractIntent, OutcomeReviewNextContractResolution, PartnerId, ProjectId,
+    ReceiptId, TaskId, TenantId, VerificationId, WorkProductId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1973,6 +1974,22 @@ impl Mission {
         checkpoint_id: &str,
         completion: MissionCheckpointCompletion,
     ) -> Result<(), MissionError> {
+        if checkpoint_id == "next_contract_or_valid_terminal"
+            && self
+                .definition
+                .as_ref()
+                .is_some_and(|definition| definition.manifest_id == "VM-11")
+        {
+            return Err(MissionError::Vm11NextContractResolutionRequired);
+        }
+        self.complete_checkpoint_validated(checkpoint_id, completion)
+    }
+
+    fn complete_checkpoint_validated(
+        &mut self,
+        checkpoint_id: &str,
+        completion: MissionCheckpointCompletion,
+    ) -> Result<(), MissionError> {
         self.require_stage(&[MissionStage::Verifying])?;
         let checkpoint_route =
             self.validated_checkpoint_completion_route(checkpoint_id, &completion)?;
@@ -2038,6 +2055,20 @@ impl Mission {
             self.stage = MissionStage::Verifying;
         }
         self.touch(verified_at);
+        Ok(())
+    }
+
+    /// Applies the route-specific VM-11 resolution. The typed resolution is
+    /// durably represented by the append-once Application completion and its
+    /// immutable decision/parent sources; no caller-supplied completion digest
+    /// can authorize the terminal shortcut.
+    pub fn complete_vm11_next_contract_resolution(
+        &mut self,
+        resolution: &OutcomeReviewNextContractResolution,
+        completion: MissionCheckpointCompletion,
+    ) -> Result<(), MissionError> {
+        validate_vm11_next_contract_completion_sources(self, resolution, &completion)?;
+        *self = resolved_vm11_next_contract_mission(self, resolution, completion)?;
         Ok(())
     }
 
@@ -2774,6 +2805,15 @@ impl Mission {
         if self.stage.is_terminal() {
             return Err(MissionError::AlreadyTerminal);
         }
+        if disposition == MissionTerminalDisposition::Completed
+            && self
+                .definition
+                .as_ref()
+                .is_some_and(|definition| definition.manifest_id == "VM-11")
+            && !vm11_valid_terminal_is_typed(self)
+        {
+            return Err(MissionError::Vm11ValidTerminalResolutionRequired);
+        }
         self.ensure_touchable()?;
         self.stage = match disposition {
             MissionTerminalDisposition::Completed => MissionStage::Completed,
@@ -2834,6 +2874,189 @@ impl Mission {
         self.updated_at = now;
         self.revision += 1;
     }
+}
+
+fn validate_vm11_next_contract_completion_sources(
+    mission: &Mission,
+    resolution: &OutcomeReviewNextContractResolution,
+    completion: &MissionCheckpointCompletion,
+) -> Result<(), MissionError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(MissionError::MissionDefinitionRequired)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
+        .ok_or_else(|| {
+            MissionError::MissionCheckpointNotFound("next_contract_or_valid_terminal".into())
+        })?;
+    let evidence = completion.application_evidence.as_ref().ok_or_else(|| {
+        MissionError::InvalidCheckpointCompletion("next_contract_or_valid_terminal".into())
+    })?;
+    let parent_source = evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "parent_mission_contract");
+    let decision_source = evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "outcome_review_decision");
+    let checkpoint_source = evidence
+        .sources
+        .iter()
+        .find(|source| source.source_kind == "mission_checkpoint");
+    let source_kinds = evidence
+        .sources
+        .iter()
+        .map(|source| source.source_kind.as_str())
+        .collect::<BTreeSet<_>>();
+    if definition.manifest_id != "VM-11"
+        || definition.cycle != resolution.cycle
+        || checkpoint.status != MissionCheckpointStatus::Verifying
+        || resolution.tenant_id != mission.tenant_id
+        || resolution.project_id != mission.project_id
+        || resolution.mission_id != mission.id
+        || resolution.resolved_at != completion.verified_at
+        || evidence.handler_id != OutcomeReviewNextContractResolution::HANDLER_ID
+        || evidence.observed_at != resolution.resolved_at
+        || source_kinds
+            != BTreeSet::from([
+                "mission_checkpoint",
+                "outcome_review_decision",
+                "parent_mission_contract",
+            ])
+        || checkpoint_source.is_none_or(|source| {
+            source.source_id != format!("{}:{}", mission.id, checkpoint.id)
+                || source.oracle_ids != BTreeSet::from(["operating_state".into()])
+        })
+        || parent_source.is_none_or(|source| {
+            source.source_id != resolution.source_mission_id.as_str()
+                || source.source_revision != resolution.source_mission_revision
+                || source.projection_digest != resolution.source_contract_digest
+                || source.oracle_ids != BTreeSet::from(["goal".into()])
+        })
+        || decision_source.is_none_or(|source| {
+            source.source_id != resolution.decision_source_id()
+                || source.source_revision != resolution.cycle
+                || source.projection_digest != resolution.decision_digest
+                || source.oracle_ids != BTreeSet::from(["outcome".into()])
+        })
+    {
+        return Err(MissionError::InvalidCheckpointCompletion(
+            "next_contract_or_valid_terminal".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolved_vm11_next_contract_mission(
+    mission: &Mission,
+    resolution: &OutcomeReviewNextContractResolution,
+    completion: MissionCheckpointCompletion,
+) -> Result<Mission, MissionError> {
+    let mut resolved = mission.clone();
+    resolved.complete_checkpoint_validated("next_contract_or_valid_terminal", completion)?;
+    if resolution.next_contract_intent == OutcomeReviewNextContractIntent::ValidTerminal {
+        validate_vm11_stop_resolution(resolution)?;
+        skip_vm11_candidate_learning(&mut resolved)?;
+        resolved.terminate(
+            MissionTerminalDisposition::Completed,
+            resolution.resolved_at,
+        )?;
+    } else {
+        validate_vm11_continue_resolution(resolution)?;
+    }
+    Ok(resolved)
+}
+
+fn validate_vm11_stop_resolution(
+    resolution: &OutcomeReviewNextContractResolution,
+) -> Result<(), MissionError> {
+    if resolution.action != OutcomeDecision::Stop
+        || resolution.terminal_disposition != Some(MissionTerminalDisposition::Completed)
+        || resolution.continued_contract_digest.is_some()
+    {
+        return Err(MissionError::Vm11ValidTerminalResolutionRequired);
+    }
+    Ok(())
+}
+
+fn validate_vm11_continue_resolution(
+    resolution: &OutcomeReviewNextContractResolution,
+) -> Result<(), MissionError> {
+    if resolution.action != OutcomeDecision::Continue
+        || resolution.next_contract_intent
+            != OutcomeReviewNextContractIntent::ContinueCurrentContract
+        || resolution.continued_contract_digest.as_deref()
+            != Some(resolution.source_contract_digest.as_str())
+        || resolution.terminal_disposition.is_some()
+    {
+        return Err(MissionError::InvalidCheckpointCompletion(
+            "next_contract_or_valid_terminal".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn skip_vm11_candidate_learning(mission: &mut Mission) -> Result<(), MissionError> {
+    let definition = mission
+        .definition
+        .as_mut()
+        .ok_or(MissionError::MissionDefinitionRequired)?;
+    let candidate = definition
+        .checkpoints
+        .iter_mut()
+        .find(|checkpoint| checkpoint.id == "candidate_learning")
+        .ok_or_else(|| MissionError::MissionCheckpointNotFound("candidate_learning".into()))?;
+    if candidate.status != MissionCheckpointStatus::Ready
+        || candidate.completion.is_some()
+        || candidate.block.is_some()
+    {
+        return Err(MissionError::Vm11ValidTerminalResolutionRequired);
+    }
+    candidate.status = MissionCheckpointStatus::Skipped;
+    candidate.revision = candidate
+        .revision
+        .checked_add(1)
+        .ok_or(MissionError::RevisionOverflow)?;
+    Ok(())
+}
+
+fn vm11_valid_terminal_is_typed(mission: &Mission) -> bool {
+    let Some(definition) = &mission.definition else {
+        return false;
+    };
+    let Some(checkpoint) = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
+    else {
+        return false;
+    };
+    let Some(candidate) = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == "candidate_learning")
+    else {
+        return false;
+    };
+    let Some(evidence) = checkpoint
+        .completion
+        .as_ref()
+        .and_then(|completion| completion.application_evidence.as_ref())
+    else {
+        return false;
+    };
+    checkpoint.status == MissionCheckpointStatus::Completed
+        && candidate.status == MissionCheckpointStatus::Skipped
+        && evidence.handler_id == OutcomeReviewNextContractResolution::HANDLER_ID
+        && evidence.sources.iter().any(|source| {
+            source.source_kind == "outcome_review_decision"
+                && source.source_id.ends_with(":stop:valid_terminal")
+                && source.oracle_ids == BTreeSet::from(["outcome".into()])
+        })
 }
 
 fn next_stage_after_outcome(
@@ -3119,6 +3342,12 @@ pub enum MissionError {
     BlockNotRecoverable,
     #[error("mission already has a terminal business disposition")]
     AlreadyTerminal,
+    #[error("VM-11 Completed requires the typed next_contract_or_valid_terminal Stop resolution")]
+    Vm11ValidTerminalResolutionRequired,
+    #[error(
+        "VM-11 next_contract_or_valid_terminal completion requires its typed route-specific resolution"
+    )]
+    Vm11NextContractResolutionRequired,
     #[error("mission revision overflow")]
     RevisionOverflow,
 }

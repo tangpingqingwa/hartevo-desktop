@@ -10,7 +10,8 @@ use std::collections::BTreeSet;
 
 use hartevo_domain_kernel::{
     Mission, MissionCheckpointStatus, MissionConversation, MissionConversationMessageKind,
-    MissionConversationRole, MissionId, OutcomeReviewDecision, OutcomeReviewProjection, ProjectId,
+    MissionConversationRole, MissionId, MissionStage, OutcomeReviewDecision,
+    OutcomeReviewNextContractResolution, OutcomeReviewProjection, ProjectId,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -19,7 +20,7 @@ use crate::aggregate::{
     append_events, application_source_name, ensure_project_scope, require_application_source_fence,
 };
 use crate::mission_conversation_store::{to_sql_u64, update_mission_conversation_append};
-use crate::normalized::update_mission_normalized_cas;
+use crate::normalized::{load_mission_normalized, update_mission_normalized_cas};
 use crate::{ProjectStore, StorageError};
 
 impl ProjectStore {
@@ -262,6 +263,207 @@ impl ProjectStore {
             state_revision: mission.revision,
         })
     }
+
+    /// Commits the route-specific next-contract resolution, Mission
+    /// Checkpoint completion, optional typed Stop terminal, Event, and Outbox
+    /// behind one Mission CAS and one exact parent-Mission read fence.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the resolution boundary keeps VM-11 CAS, immutable review/decision, parent contract fence, typed output, events, and outbox explicit"
+    )]
+    pub fn complete_vm11_next_contract_or_valid_terminal_atomic(
+        &mut self,
+        mission: &Mission,
+        expected_mission_revision: u64,
+        parent_mission: &Mission,
+        expected_parent_mission_revision: u64,
+        review: &OutcomeReviewProjection,
+        decision: &OutcomeReviewDecision,
+        resolution: &OutcomeReviewNextContractResolution,
+        events: &[PendingEvent],
+    ) -> Result<AtomicMutation, StorageError> {
+        if mission.revision <= expected_mission_revision
+            || parent_mission.revision != expected_parent_mission_revision
+        {
+            return Err(StorageError::OptimisticConflict {
+                aggregate: format!("mission:{}", mission.id),
+                expected_revision: expected_mission_revision,
+            });
+        }
+        if events.is_empty() {
+            return Err(StorageError::EmptyAtomicEventSet);
+        }
+        resolution.validate_persisted(mission, parent_mission, review, decision)?;
+
+        let transaction = self.connection.transaction()?;
+        ensure_project_scope(
+            &transaction,
+            mission.tenant_id.as_str(),
+            mission.project_id.as_str(),
+        )?;
+        require_vm11_review_decision_and_parent(
+            &transaction,
+            mission,
+            parent_mission,
+            review,
+            decision,
+            expected_parent_mission_revision,
+        )?;
+        update_mission_normalized_cas(&transaction, mission, expected_mission_revision)?;
+        let (event_sequences, outbox_sequences) = append_events(
+            &transaction,
+            mission.tenant_id.as_str(),
+            mission.project_id.as_str(),
+            Some(mission.id.as_str()),
+            "mission",
+            mission.id.as_str(),
+            events,
+        )?;
+        transaction.commit()?;
+        Ok(AtomicMutation {
+            event_sequences,
+            outbox_sequences,
+            state_revision: mission.revision,
+        })
+    }
+
+    /// Persists the honest Scale/Test waiting boundary without creating a
+    /// resolution or replacement contract. Exact replay is handled from this
+    /// durable block/event; a changed decision or parent source cannot reuse it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the waiting boundary binds Mission CAS, immutable decision/review, parent contract fence, and replay event"
+    )]
+    pub fn wait_vm11_next_contract_authorization_atomic(
+        &mut self,
+        mission: &Mission,
+        expected_mission_revision: u64,
+        parent_mission: &Mission,
+        expected_parent_mission_revision: u64,
+        review: &OutcomeReviewProjection,
+        decision: &OutcomeReviewDecision,
+        expected_code: &str,
+        events: &[PendingEvent],
+    ) -> Result<AtomicMutation, StorageError> {
+        let checkpoint = mission
+            .definition
+            .as_ref()
+            .filter(|definition| definition.manifest_id == "VM-11")
+            .and_then(|definition| definition.current_checkpoint())
+            .ok_or_else(|| {
+                StorageError::DomainDecode(
+                    "VM-11 next-contract authorization Checkpoint is unavailable".into(),
+                )
+            })?;
+        if mission.revision <= expected_mission_revision
+            || parent_mission.revision != expected_parent_mission_revision
+            || mission.stage != MissionStage::WaitingUser
+            || checkpoint.id != "next_contract_or_valid_terminal"
+            || checkpoint.status != MissionCheckpointStatus::WaitingUser
+            || checkpoint.completion.is_some()
+            || mission.block.as_ref().is_none_or(|block| {
+                block.code != expected_code || block.observed_at < decision.decided_at
+            })
+            || events.is_empty()
+        {
+            return Err(StorageError::DomainDecode(
+                "VM-11 next-contract authorization wait is inconsistent".into(),
+            ));
+        }
+        OutcomeReviewNextContractResolution::validate_frozen_sources(
+            mission,
+            parent_mission,
+            review,
+            decision,
+        )?;
+
+        let transaction = self.connection.transaction()?;
+        ensure_project_scope(
+            &transaction,
+            mission.tenant_id.as_str(),
+            mission.project_id.as_str(),
+        )?;
+        require_vm11_review_decision_and_parent(
+            &transaction,
+            mission,
+            parent_mission,
+            review,
+            decision,
+            expected_parent_mission_revision,
+        )?;
+        update_mission_normalized_cas(&transaction, mission, expected_mission_revision)?;
+        let (event_sequences, outbox_sequences) = append_events(
+            &transaction,
+            mission.tenant_id.as_str(),
+            mission.project_id.as_str(),
+            Some(mission.id.as_str()),
+            "mission",
+            mission.id.as_str(),
+            events,
+        )?;
+        transaction.commit()?;
+        Ok(AtomicMutation {
+            event_sequences,
+            outbox_sequences,
+            state_revision: mission.revision,
+        })
+    }
+}
+
+fn require_vm11_review_decision_and_parent(
+    transaction: &Transaction<'_>,
+    mission: &Mission,
+    parent_mission: &Mission,
+    review: &OutcomeReviewProjection,
+    decision: &OutcomeReviewDecision,
+    expected_parent_mission_revision: u64,
+) -> Result<(), StorageError> {
+    let stored_review = load_outcome_review_record(
+        transaction,
+        &mission.project_id,
+        &mission.id,
+        decision.cycle,
+    )?
+    .ok_or_else(|| StorageError::ScopedRecordNotFound {
+        kind: "VM-11 outcome review",
+        project_id: mission.project_id.clone(),
+        id: format!("{}:cycle:{}", mission.id, decision.cycle),
+    })?;
+    let stored_decision = load_outcome_review_decision_record(
+        transaction,
+        &mission.project_id,
+        &mission.id,
+        decision.cycle,
+    )?
+    .ok_or_else(|| StorageError::ScopedRecordNotFound {
+        kind: "VM-11 outcome review decision",
+        project_id: mission.project_id.clone(),
+        id: format!("{}:cycle:{}", mission.id, decision.cycle),
+    })?;
+    let stored_parent =
+        load_mission_normalized(transaction, &mission.project_id, &parent_mission.id)?.ok_or_else(
+            || StorageError::MissionNotFound {
+                project_id: mission.project_id.clone(),
+                mission_id: parent_mission.id.clone(),
+            },
+        )?;
+    if stored_review != *review
+        || stored_decision != *decision
+        || stored_parent != *parent_mission
+        || stored_parent.revision != expected_parent_mission_revision
+    {
+        return Err(StorageError::ImmutableRecordMismatch {
+            kind: "VM-11 next-contract source",
+            id: mission.id.to_string(),
+        });
+    }
+    OutcomeReviewNextContractResolution::validate_frozen_sources(
+        mission,
+        &stored_parent,
+        &stored_review,
+        &stored_decision,
+    )?;
+    Ok(())
 }
 
 struct CompletedReviewBinding {
@@ -696,8 +898,8 @@ mod tests {
 
     use chrono::{DateTime, Duration, TimeZone, Utc};
     use hartevo_domain_kernel::{
-        ActorId, CurrencyCode, MissionCheckpointApplicationEvidence, MissionCheckpointCompletion,
-        MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
+        ActorId, CurrencyCode, KpiContract, KpiDirection, MissionCheckpointApplicationEvidence,
+        MissionCheckpointCompletion, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
         MissionCheckpointOracleSource, MissionCheckpointRoute, MissionContract,
         MissionConversationId, MissionConversationMessageId, MissionDefinition, Money,
         OperatingMode, OutcomeDecision, OutcomeLedger, OutcomeReviewCausalStatus,
@@ -728,20 +930,56 @@ mod tests {
         MissionConversation,
         OutcomeReviewProjection,
     ) {
-        let parent = Mission::compile(
+        let usd = CurrencyCode::parse("USD").expect("USD");
+        let kpis = BTreeMap::from([(
+            "lead_qualified_count".into(),
+            KpiContract {
+                baseline: None,
+                target: rust_decimal::Decimal::ONE,
+                unit: "count".into(),
+                direction: KpiDirection::AtLeast,
+            },
+        )]);
+        let parent_oracles =
+            BTreeSet::from(["goal".into(), "decision".into(), "operating_state".into()]);
+        let parent_definition = MissionDefinition::from_routed_linear_manifest(
+            "VM-07",
+            3,
+            "8".repeat(64),
+            OperatingMode::OneOffDecision,
+            ["decision.evaluate".into()],
+            ["next_decision".into()],
+            parent_oracles.clone(),
+            [(
+                "product_market_budget_constraints".into(),
+                MissionCheckpointRoute::contracted(
+                    "decision.evaluate",
+                    MissionCheckpointExecutor::Application,
+                    parent_oracles,
+                    MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                )
+                .expect("parent route"),
+            )],
+        )
+        .expect("parent definition");
+        let mut parent_contract = MissionContract::bootstrap(
+            "Review one verified business outcome",
+            ["decision.evaluate".into()],
+            now(),
+        );
+        parent_contract.mode = OperatingMode::OneOffDecision;
+        parent_contract.kpis = kpis.clone();
+        parent_contract.budget = Money::new(500, usd.clone());
+        let parent = Mission::compile_catalog(
             tenant_id.clone(),
             MissionId::from("outcome-review-parent"),
             project_id.clone(),
             "Parent Mission",
-            MissionContract::bootstrap(
-                "Review one verified business outcome",
-                ["decision.evaluate".into()],
-                now(),
-            ),
+            parent_contract,
+            parent_definition,
             now(),
         )
         .expect("parent Mission");
-        let usd = CurrencyCode::parse("USD").expect("USD");
         let review = OutcomeReviewProjection {
             schema_version: OutcomeReviewProjection::SCHEMA_VERSION,
             tenant_id: tenant_id.clone(),
@@ -784,7 +1022,15 @@ mod tests {
                 OutcomeReviewCaveat::ImplicitLoopForbidden,
             ]),
             economics: BTreeMap::new(),
-            source_contract_digest: "1".repeat(64),
+            source_contract_digest: sha256(
+                &serde_json::to_vec(&serde_json::json!({
+                    "schemaVersion": "hartevo-mission-kpi-contract-source/v1",
+                    "missionId": parent.id,
+                    "missionRevision": parent.revision,
+                    "contract": parent.contract,
+                }))
+                .expect("parent source"),
+            ),
             normalization_digest: "2".repeat(64),
             identity_chain_digest: "3".repeat(64),
             kpi_projection_digest: "4".repeat(64),
@@ -803,14 +1049,31 @@ mod tests {
             "operating_state".into(),
             "outcome".into(),
         ]);
+        let next_contract_oracles =
+            BTreeSet::from(["goal".into(), "operating_state".into(), "outcome".into()]);
+        let candidate_oracles = BTreeSet::from([
+            "decision".into(),
+            "work_product".into(),
+            "operating_state".into(),
+        ]);
+        let definition_oracles = review_oracles
+            .union(&decision_oracles)
+            .cloned()
+            .chain(next_contract_oracles.iter().cloned())
+            .chain(candidate_oracles.iter().cloned())
+            .collect::<BTreeSet<_>>();
         let definition = MissionDefinition::from_routed_linear_manifest(
             "VM-11",
             3,
             "8".repeat(64),
             OperatingMode::OneOffDecision,
-            ["decision.evaluate".into()],
+            [
+                "decision.evaluate".into(),
+                "automation.schedule".into(),
+                "candidate.propose".into(),
+            ],
             ["next_decision".into()],
-            decision_oracles.clone(),
+            definition_oracles,
             [
                 (
                     "outcome_review".into(),
@@ -832,16 +1095,46 @@ mod tests {
                     )
                     .expect("decision route"),
                 ),
+                (
+                    "next_contract_or_valid_terminal".into(),
+                    MissionCheckpointRoute::contracted(
+                        "automation.schedule",
+                        MissionCheckpointExecutor::Application,
+                        next_contract_oracles,
+                        MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                    )
+                    .expect("next-contract route"),
+                ),
+                (
+                    "candidate_learning".into(),
+                    MissionCheckpointRoute::contracted(
+                        "candidate.propose",
+                        MissionCheckpointExecutor::Application,
+                        candidate_oracles,
+                        MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                    )
+                    .expect("candidate route"),
+                ),
             ],
         )
         .expect("VM-11 definition");
         let mut contract = MissionContract::bootstrap(
             "Choose one explicit action from the frozen outcome review",
-            ["decision.evaluate".into()],
+            [
+                "decision.evaluate".into(),
+                "automation.schedule".into(),
+                "candidate.propose".into(),
+            ],
             now(),
         );
         contract.mode = OperatingMode::OneOffDecision;
         contract.parent_mission_id = Some(parent.id.clone());
+        contract.market = parent.contract.market.clone();
+        contract.language = parent.contract.language.clone();
+        contract.audience = parent.contract.audience.clone();
+        contract.timezone = parent.contract.timezone.clone();
+        contract.kpis = parent.contract.kpis.clone();
+        contract.budget = parent.contract.budget.clone();
         let mut mission = Mission::compile_catalog(
             tenant_id.clone(),
             MissionId::from("vm11-outcome-review-decision"),
@@ -1338,6 +1631,337 @@ mod tests {
                     .get::<_, i64>(0))
                 .expect("outbox remains unchanged"),
             before_outbox_count
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the route-specific rollback proof keeps frozen Human authority, parent fencing, typed Stop, candidate skip, Mission CAS, Event and Outbox in one auditable transaction"
+    )]
+    fn next_contract_stop_is_atomic_parent_fenced_and_rolls_back_event_failure() {
+        let mut store = ProjectStore::in_memory().expect("store");
+        let tenant_id = TenantId::from("tenant-next-contract-rollback");
+        let project_id = ProjectId::from("project-next-contract-rollback");
+        let project = Project::create_local(
+            tenant_id.clone(),
+            project_id.clone(),
+            "Next-contract rollback",
+            "",
+            "/tmp/hartevo-next-contract-rollback",
+            StorageMode::LocalExisting,
+        )
+        .expect("project");
+        store.save_project(&project).expect("project");
+        let (parent, mut mission, mut conversation, review) =
+            decision_fixture(&tenant_id, &project_id);
+        store.save_mission(&parent).expect("parent Mission");
+        let ledger = OutcomeLedger::new(tenant_id.clone(), project_id.clone()).expect("ledger");
+        store
+            .create_outcome_ledger(
+                &ledger,
+                "outcome.ledger_started",
+                &serde_json::json!({"projectId": project_id}),
+                now(),
+            )
+            .expect("Outcome Ledger");
+        store
+            .create_catalog_mission_with_conversation_atomic(
+                &mission,
+                &conversation,
+                &[PendingEvent::new(
+                    "mission.catalog_bound",
+                    serde_json::json!({"missionId": mission.id}),
+                    now(),
+                )],
+            )
+            .expect("Mission and Conversation");
+        let source_fences = [ApplicationSourceRevisionFence::present(
+            ApplicationSourceKind::Mission,
+            parent.id.to_string(),
+            parent.revision,
+        )];
+        let binding = validate_completed_review_binding(&mission, &review).expect("review binding");
+        {
+            let transaction = store.connection.transaction().expect("transaction");
+            insert_outcome_review(&transaction, &mission, &review, &binding, &source_fences)
+                .expect("persist frozen review");
+            transaction.commit().expect("review transaction");
+        }
+
+        let expected_human_mission_revision = mission.revision;
+        let expected_conversation_revision = conversation.revision;
+        let decided_at = review.observed_at + Duration::minutes(1);
+        let (message, appended) = conversation
+            .append_user_message(
+                MissionConversationMessageId::from("vm11-next-contract-stop-message"),
+                MissionConversationMessageKind::CheckpointConfirmation,
+                "Stop at the reviewed one-off terminal.",
+                "vm11-next-contract-stop:v1",
+                &mission,
+                decided_at,
+            )
+            .expect("append private Stop rationale");
+        assert!(appended);
+        let review_checkpoint = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "outcome_review")
+            })
+            .expect("review checkpoint");
+        let decision = OutcomeReviewDecision::decide(
+            &mission,
+            &review,
+            review_checkpoint.revision,
+            review_checkpoint
+                .completion
+                .as_ref()
+                .expect("review completion")
+                .evidence_digest
+                .clone(),
+            OutcomeDecision::Stop,
+            ActorId::from("project-owner"),
+            conversation.id.clone(),
+            conversation.revision,
+            message.id.clone(),
+            message.sequence,
+            message.content_digest.clone(),
+            sha256(message.idempotency_key.as_bytes()),
+            decided_at,
+        )
+        .expect("structured Stop");
+        mission
+            .begin_checkpoint_verification("continue_stop_scale_test", decided_at)
+            .expect("verify decision");
+        mission
+            .complete_checkpoint(
+                "continue_stop_scale_test",
+                MissionCheckpointCompletion {
+                    oracle_ids: BTreeSet::from([
+                        "goal".into(),
+                        "decision".into(),
+                        "operating_state".into(),
+                        "outcome".into(),
+                    ]),
+                    work_product_ids: BTreeSet::new(),
+                    effect_ids: BTreeSet::new(),
+                    application_evidence: None,
+                    evidence_digest: decision.digest().expect("decision digest"),
+                    verified_at: decided_at,
+                },
+            )
+            .expect("complete decision");
+        mission
+            .begin_checkpoint_with_task(
+                "next_contract_or_valid_terminal",
+                Task {
+                    id: TaskId::from("vm11-next-contract-task"),
+                    title: "Resolve the exact decision".into(),
+                    status: TaskStatus::Running,
+                    capability: "automation.schedule".into(),
+                },
+                decided_at,
+            )
+            .expect("start next-contract route");
+        store
+            .complete_vm11_outcome_review_decision_atomic(
+                &mission,
+                expected_human_mission_revision,
+                &conversation,
+                expected_conversation_revision,
+                &review,
+                &decision,
+                &[PendingEvent::new(
+                    "mission.outcome_review_decided",
+                    serde_json::json!({
+                        "missionId": mission.id,
+                        "action": decision.action,
+                        "decisionDigest": decision.digest().expect("decision digest"),
+                    }),
+                    decided_at,
+                )],
+            )
+            .expect("persist structured decision");
+
+        let dispatch_mission_revision = mission.revision;
+        let dispatch_checkpoint_revision = mission
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .map(|checkpoint| checkpoint.revision)
+            .expect("next-contract checkpoint");
+        let resolved_at = decided_at + Duration::minutes(1);
+        let resolution = OutcomeReviewNextContractResolution::resolve(
+            &mission,
+            &parent,
+            &review,
+            &decision,
+            resolved_at,
+        )
+        .expect("typed Stop resolution");
+        let expected_resolution_mission_revision = mission.revision;
+        mission
+            .begin_checkpoint_verification("next_contract_or_valid_terminal", resolved_at)
+            .expect("verify next-contract route");
+        let definition = mission.definition.as_ref().expect("definition");
+        let checkpoint = definition
+            .current_checkpoint()
+            .expect("next-contract checkpoint");
+        let route = checkpoint.route.as_ref().expect("next-contract route");
+        let evidence = MissionCheckpointApplicationEvidence {
+            schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+            handler_id: OutcomeReviewNextContractResolution::HANDLER_ID.into(),
+            tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
+            mission_id: mission.id.clone(),
+            manifest_id: definition.manifest_id.clone(),
+            manifest_version: definition.manifest_version,
+            catalog_digest: definition.catalog_digest.clone(),
+            cycle: definition.cycle,
+            checkpoint_id: checkpoint.id.clone(),
+            dispatch_mission_revision,
+            dispatch_checkpoint_revision,
+            verification_mission_revision: mission.revision,
+            verification_checkpoint_revision: checkpoint.revision,
+            capability_id: route.capability_id.clone(),
+            executor: route.executor,
+            completion_policy: route.completion_policy.expect("completion policy"),
+            sources: BTreeSet::from([
+                MissionCheckpointOracleSource {
+                    source_kind: "mission_checkpoint".into(),
+                    source_id: format!("{}:{}", mission.id, checkpoint.id),
+                    source_revision: dispatch_checkpoint_revision,
+                    projection_digest: "a".repeat(64),
+                    oracle_ids: BTreeSet::from(["operating_state".into()]),
+                },
+                MissionCheckpointOracleSource {
+                    source_kind: "parent_mission_contract".into(),
+                    source_id: parent.id.to_string(),
+                    source_revision: parent.revision,
+                    projection_digest: resolution.source_contract_digest.clone(),
+                    oracle_ids: BTreeSet::from(["goal".into()]),
+                },
+                MissionCheckpointOracleSource {
+                    source_kind: "outcome_review_decision".into(),
+                    source_id: resolution.decision_source_id(),
+                    source_revision: resolution.cycle,
+                    projection_digest: resolution.decision_digest.clone(),
+                    oracle_ids: BTreeSet::from(["outcome".into()]),
+                },
+            ]),
+            observed_at: resolved_at,
+        };
+        mission
+            .complete_vm11_next_contract_resolution(
+                &resolution,
+                MissionCheckpointCompletion {
+                    oracle_ids: route.oracle_ids.clone(),
+                    work_product_ids: BTreeSet::new(),
+                    effect_ids: BTreeSet::new(),
+                    application_evidence: Some(evidence.clone()),
+                    evidence_digest: evidence.digest(),
+                    verified_at: resolved_at,
+                },
+            )
+            .expect("apply typed Stop");
+        resolution
+            .validate_persisted(&mission, &parent, &review, &decision)
+            .expect("persisted typed Stop");
+        let resolution_event = PendingEvent::new(
+            "mission.next_contract_or_valid_terminal_resolved",
+            serde_json::json!({
+                "missionId": mission.id,
+                "resolutionDigest": resolution.digest().expect("resolution digest"),
+            }),
+            resolved_at,
+        );
+        let before_mission = store
+            .load_mission(&project_id, &mission.id)
+            .expect("pre-resolution Mission");
+        let before_events = store
+            .events_for_mission(&project_id, &mission.id)
+            .expect("pre-resolution events");
+        let before_outbox_count = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM outbox_messages", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("pre-resolution outbox");
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER inject_vm11_next_contract_event_failure
+                 BEFORE INSERT ON domain_events
+                 WHEN NEW.event_type = 'mission.next_contract_or_valid_terminal_resolved'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected VM-11 next-contract event failure');
+                 END;",
+            )
+            .expect("failure trigger");
+        assert!(matches!(
+            store.complete_vm11_next_contract_or_valid_terminal_atomic(
+                &mission,
+                expected_resolution_mission_revision,
+                &parent,
+                parent.revision,
+                &review,
+                &decision,
+                &resolution,
+                std::slice::from_ref(&resolution_event),
+            ),
+            Err(StorageError::Sql(_))
+        ));
+        assert_eq!(
+            store
+                .load_mission(&project_id, &mission.id)
+                .expect("Mission rollback"),
+            before_mission
+        );
+        assert_eq!(
+            store
+                .events_for_mission(&project_id, &mission.id)
+                .expect("Event rollback"),
+            before_events
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM outbox_messages", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("Outbox rollback"),
+            before_outbox_count
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER inject_vm11_next_contract_event_failure;")
+            .expect("drop failure trigger");
+        let mutation = store
+            .complete_vm11_next_contract_or_valid_terminal_atomic(
+                &mission,
+                expected_resolution_mission_revision,
+                &parent,
+                parent.revision,
+                &review,
+                &decision,
+                &resolution,
+                &[resolution_event],
+            )
+            .expect("atomic typed Stop");
+        assert_eq!(
+            (
+                mutation.event_sequences.len(),
+                mutation.outbox_sequences.len(),
+                store
+                    .load_mission(&project_id, &mission.id)
+                    .expect("terminal Mission")
+                    .stage,
+            ),
+            (1, 1, MissionStage::Completed)
         );
     }
 }
