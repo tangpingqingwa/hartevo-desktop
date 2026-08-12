@@ -47,7 +47,9 @@ pub use key_bootstrap_store::{
     KeyBootstrapPrepareOutcome, LocalKeyBootstrapOperation,
 };
 pub use keyring_store::{DeviceAttachmentPrepareOutcome, ProjectKeySecretReference};
-pub use outbox::{OutboxMessage, OutboxStatus};
+pub use outbox::{
+    OutboxAcknowledgeTimes, OutboxMessage, OutboxRelease, OutboxReleaseTimes, OutboxStatus,
+};
 pub use registration_store::{
     LocalProjectCloudRegistration, LocalProjectCloudRegistrationPrepareOutcome,
     ProjectCloudRegistrationStatus,
@@ -9042,7 +9044,7 @@ mod tests {
                             sequence,
                             owner,
                             before.lease_generation,
-                            cursor,
+                            OutboxAcknowledgeTimes::new(cursor, cursor)?,
                         )
                     }
                     3 => {
@@ -9054,16 +9056,29 @@ mod tests {
                         let (owner, generation) = stale
                             .cloned()
                             .unwrap_or_else(|| ("stale-worker".into(), 0));
-                        store.acknowledge_outbox(sequence, &owner, generation, cursor)
+                        store.acknowledge_outbox(
+                            sequence,
+                            &owner,
+                            generation,
+                            OutboxAcknowledgeTimes::new(cursor, cursor)?,
+                        )
                     }
                     4 => {
                         let owner = before.lease_owner.as_deref().unwrap_or("no-current-owner");
+                        let times = OutboxReleaseTimes::new(
+                            cursor + Duration::seconds(1),
+                            cursor,
+                        )?;
+                        let release = if dead_letter {
+                            OutboxRelease::DeadLetter(times)
+                        } else {
+                            OutboxRelease::Requeue(times)
+                        };
                         store.release_outbox(
                             sequence,
                             owner,
                             before.lease_generation,
-                            cursor + Duration::seconds(1),
-                            dead_letter,
+                            release,
                         )
                     }
                     _ => {
@@ -9075,12 +9090,20 @@ mod tests {
                         let (owner, generation) = stale
                             .cloned()
                             .unwrap_or_else(|| ("stale-worker".into(), 0));
+                        let times = OutboxReleaseTimes::new(
+                            cursor + Duration::seconds(1),
+                            cursor,
+                        )?;
+                        let release = if dead_letter {
+                            OutboxRelease::DeadLetter(times)
+                        } else {
+                            OutboxRelease::Requeue(times)
+                        };
                         store.release_outbox(
                             sequence,
                             &owner,
                             generation,
-                            cursor + Duration::seconds(1),
-                            dead_letter,
+                            release,
                         )
                     }
                 };
@@ -9128,6 +9151,217 @@ mod tests {
         }
     }
 
+    fn claimed_outbox_for_completion(lease_for: Duration) -> (ProjectStore, OutboxMessage) {
+        let mut store = ProjectStore::in_memory().expect("store");
+        let project = project(
+            "project-outbox-completion",
+            "/tmp/project-outbox-completion",
+        );
+        let mission = mission("project-outbox-completion", "mission-outbox-completion");
+        store.save_project(&project).expect("project");
+        store.save_mission(&mission).expect("mission");
+        store
+            .connection
+            .execute(
+                "INSERT INTO outbox_messages
+                   (tenant_id, project_id, mission_id, aggregate_type, aggregate_id,
+                    event_type, payload_json, available_at, created_at)
+                 VALUES (?1, ?2, ?3, 'mission', ?3, 'completion.event', '{}', ?4, ?4)",
+                params![
+                    project.tenant_id.as_str(),
+                    project.id.as_str(),
+                    mission.id.as_str(),
+                    now().to_rfc3339(),
+                ],
+            )
+            .expect("outbox seed");
+        let message = store
+            .claim_outbox("worker-a", now(), lease_for, 1)
+            .expect("claim")
+            .remove(0);
+        (store, message)
+    }
+
+    #[derive(Clone, Copy)]
+    enum CompletionExpectation {
+        Success,
+        LeaseLost,
+        InvalidTimeOrder,
+    }
+
+    #[test]
+    fn outbox_acknowledgement_time_fence_is_strict_and_ordered() {
+        for (case, published_offset, operation_offset, expected) in [
+            ("ack_before_expiry", 1, 1, CompletionExpectation::Success),
+            (
+                "ack_backfilled_at_expiry",
+                0,
+                10,
+                CompletionExpectation::LeaseLost,
+            ),
+            ("ack_after_expiry", 0, 11, CompletionExpectation::LeaseLost),
+            (
+                "ack_fact_after_operation",
+                2,
+                1,
+                CompletionExpectation::InvalidTimeOrder,
+            ),
+        ] {
+            let (mut store, message) = claimed_outbox_for_completion(Duration::seconds(10));
+            let before = store.outbox_message(message.sequence).expect("before ack");
+            let published_at = now() + Duration::seconds(published_offset);
+            let operation_at = now() + Duration::seconds(operation_offset);
+            let times = if matches!(expected, CompletionExpectation::InvalidTimeOrder) {
+                assert!(matches!(
+                    OutboxAcknowledgeTimes::new(published_at, operation_at),
+                    Err(StorageError::DomainDecode(_))
+                ));
+                let mut tampered = OutboxAcknowledgeTimes::new(operation_at, operation_at)
+                    .expect("valid acknowledgement times");
+                tampered.published_at = published_at;
+                tampered
+            } else {
+                OutboxAcknowledgeTimes::new(published_at, operation_at)
+                    .expect("valid acknowledgement times")
+            };
+            let result = store.acknowledge_outbox(
+                message.sequence,
+                "worker-a",
+                message.lease_generation,
+                times,
+            );
+            match expected {
+                CompletionExpectation::Success => {
+                    assert!(result.is_ok(), "{case}: {result:?}");
+                    assert_eq!(
+                        store
+                            .outbox_message(message.sequence)
+                            .expect("after ack")
+                            .status,
+                        OutboxStatus::Published,
+                        "{case}",
+                    );
+                }
+                CompletionExpectation::LeaseLost => {
+                    assert!(
+                        matches!(&result, Err(StorageError::OutboxLeaseLost { .. })),
+                        "{case}: {result:?}",
+                    );
+                    assert_eq!(
+                        store.outbox_message(message.sequence).expect("after ack"),
+                        before,
+                        "{case}",
+                    );
+                }
+                CompletionExpectation::InvalidTimeOrder => {
+                    assert!(
+                        matches!(&result, Err(StorageError::DomainDecode(_))),
+                        "{case}: {result:?}",
+                    );
+                    assert_eq!(
+                        store.outbox_message(message.sequence).expect("after ack"),
+                        before,
+                        "{case}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn outbox_release_time_fence_is_strict_and_ordered() {
+        for (case, available_offset, operation_offset, expected) in [
+            (
+                "release_before_expiry",
+                2,
+                1,
+                CompletionExpectation::Success,
+            ),
+            (
+                "release_at_expiry",
+                10,
+                10,
+                CompletionExpectation::LeaseLost,
+            ),
+            (
+                "release_after_expiry",
+                11,
+                11,
+                CompletionExpectation::LeaseLost,
+            ),
+            (
+                "release_schedule_before_operation",
+                0,
+                1,
+                CompletionExpectation::InvalidTimeOrder,
+            ),
+        ] {
+            let (mut store, message) = claimed_outbox_for_completion(Duration::seconds(10));
+            let before = store
+                .outbox_message(message.sequence)
+                .expect("before release");
+            let available_at = now() + Duration::seconds(available_offset);
+            let operation_at = now() + Duration::seconds(operation_offset);
+            let times = if matches!(expected, CompletionExpectation::InvalidTimeOrder) {
+                assert!(matches!(
+                    OutboxReleaseTimes::new(available_at, operation_at),
+                    Err(StorageError::DomainDecode(_))
+                ));
+                let mut tampered = OutboxReleaseTimes::new(operation_at, operation_at)
+                    .expect("valid release times");
+                tampered.available_at = available_at;
+                tampered
+            } else {
+                OutboxReleaseTimes::new(available_at, operation_at).expect("valid release times")
+            };
+            let result = store.release_outbox(
+                message.sequence,
+                "worker-a",
+                message.lease_generation,
+                OutboxRelease::Requeue(times),
+            );
+            match expected {
+                CompletionExpectation::Success => {
+                    assert!(result.is_ok(), "{case}: {result:?}");
+                    assert_eq!(
+                        store
+                            .outbox_message(message.sequence)
+                            .expect("after release")
+                            .status,
+                        OutboxStatus::Pending,
+                        "{case}",
+                    );
+                }
+                CompletionExpectation::LeaseLost => {
+                    assert!(
+                        matches!(&result, Err(StorageError::OutboxLeaseLost { .. })),
+                        "{case}: {result:?}",
+                    );
+                    assert_eq!(
+                        store
+                            .outbox_message(message.sequence)
+                            .expect("after release"),
+                        before,
+                        "{case}",
+                    );
+                }
+                CompletionExpectation::InvalidTimeOrder => {
+                    assert!(
+                        matches!(&result, Err(StorageError::DomainDecode(_))),
+                        "{case}: {result:?}",
+                    );
+                    assert_eq!(
+                        store
+                            .outbox_message(message.sequence)
+                            .expect("after release"),
+                        before,
+                        "{case}",
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn expired_outbox_generation_cannot_ack_after_another_worker_reclaims() {
         let mut store = ProjectStore::in_memory().expect("store");
@@ -9169,7 +9403,11 @@ mod tests {
                 first.sequence,
                 "worker-a",
                 first.lease_generation,
-                now() + Duration::seconds(3)
+                OutboxAcknowledgeTimes::new(
+                    now() + Duration::seconds(3),
+                    now() + Duration::seconds(3),
+                )
+                .expect("valid acknowledgement times")
             ),
             Err(StorageError::OutboxLeaseLost { .. })
         ));
@@ -9178,7 +9416,11 @@ mod tests {
                 second.sequence,
                 "worker-b",
                 second.lease_generation,
-                now() + Duration::seconds(3),
+                OutboxAcknowledgeTimes::new(
+                    now() + Duration::seconds(3),
+                    now() + Duration::seconds(3),
+                )
+                .expect("valid acknowledgement times"),
             )
             .expect("current generation ack");
         assert_eq!(

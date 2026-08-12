@@ -48,6 +48,18 @@ const CLAIM_OUTBOX_SQL: &str = "WITH candidates AS (
                message.status, message.attempts, message.available_at,
                message.lease_owner, message.lease_generation,
                message.lease_expires_at, message.created_at, message.published_at";
+const ACKNOWLEDGE_OUTBOX_SQL: &str = "UPDATE hartevo_cell.outbox_messages
+     SET status = 'published', published_at = $6,
+         lease_owner = NULL, lease_expires_at = NULL
+     WHERE cell = $1 AND tenant_id = $2 AND sequence = $3
+       AND status = 'leased' AND lease_owner = $4
+       AND lease_generation = $5 AND lease_expires_at > $7";
+const RELEASE_OUTBOX_SQL: &str = "UPDATE hartevo_cell.outbox_messages
+     SET status = $6, available_at = $7,
+         lease_owner = NULL, lease_expires_at = NULL
+     WHERE cell = $1 AND tenant_id = $2 AND sequence = $3
+       AND status = 'leased' AND lease_owner = $4
+       AND lease_generation = $5 AND lease_expires_at > $8";
 
 pub const POSTGRES_L2_URL_ENV: &str = "HARTEVO_TEST_POSTGRES_URL";
 
@@ -304,9 +316,70 @@ pub struct CloudOutboxMessage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutboxAcknowledgeTimes {
+    pub published_at: DateTime<Utc>,
+    pub operation_at: DateTime<Utc>,
+}
+
+impl OutboxAcknowledgeTimes {
+    pub fn new(
+        published_at: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
+    ) -> Result<Self, CloudStorageError> {
+        let times = Self {
+            published_at,
+            operation_at,
+        };
+        times.validate()?;
+        Ok(times)
+    }
+
+    pub fn validate(&self) -> Result<(), CloudStorageError> {
+        if self.published_at > self.operation_at {
+            Err(CloudStorageError::InvalidOutboxClaim)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutboxReleaseTimes {
+    pub available_at: DateTime<Utc>,
+    pub operation_at: DateTime<Utc>,
+}
+
+impl OutboxReleaseTimes {
+    pub fn new(
+        available_at: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
+    ) -> Result<Self, CloudStorageError> {
+        let times = Self {
+            available_at,
+            operation_at,
+        };
+        times.validate()?;
+        Ok(times)
+    }
+
+    pub fn validate(&self) -> Result<(), CloudStorageError> {
+        if self.available_at < self.operation_at {
+            Err(CloudStorageError::InvalidOutboxClaim)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutboxRelease {
-    Requeue,
-    DeadLetter,
+    Requeue(OutboxReleaseTimes),
+    DeadLetter(OutboxReleaseTimes),
+}
+
+enum OutboxCompletion {
+    Acknowledge(OutboxAcknowledgeTimes),
+    Release(OutboxRelease),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1484,7 +1557,7 @@ impl PostgresCellStore {
         sequence: i64,
         owner: &str,
         generation: u64,
-        published_at: DateTime<Utc>,
+        times: OutboxAcknowledgeTimes,
     ) -> Result<(), CloudStorageError> {
         self.finish_outbox_lease(
             client,
@@ -1492,13 +1565,11 @@ impl PostgresCellStore {
             sequence,
             owner,
             generation,
-            published_at,
-            None,
+            OutboxCompletion::Acknowledge(times),
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn release_outbox(
         &self,
         client: &mut Client,
@@ -1506,7 +1577,6 @@ impl PostgresCellStore {
         sequence: i64,
         owner: &str,
         generation: u64,
-        available_at: DateTime<Utc>,
         release: OutboxRelease,
     ) -> Result<(), CloudStorageError> {
         self.finish_outbox_lease(
@@ -1515,13 +1585,11 @@ impl PostgresCellStore {
             sequence,
             owner,
             generation,
-            available_at,
-            Some(release),
+            OutboxCompletion::Release(release),
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn finish_outbox_lease(
         &self,
         client: &mut Client,
@@ -1529,50 +1597,46 @@ impl PostgresCellStore {
         sequence: i64,
         owner: &str,
         generation: u64,
-        at: DateTime<Utc>,
-        release: Option<OutboxRelease>,
+        completion: OutboxCompletion,
     ) -> Result<(), CloudStorageError> {
         scope.validate(self.cell)?;
         if sequence <= 0 || owner.trim().is_empty() || generation == 0 {
             return Err(CloudStorageError::InvalidOutboxClaim);
         }
+        match &completion {
+            OutboxCompletion::Acknowledge(times) => times.validate()?,
+            OutboxCompletion::Release(
+                OutboxRelease::Requeue(times) | OutboxRelease::DeadLetter(times),
+            ) => times.validate()?,
+        }
         let transaction = client.transaction().await?;
         set_scope(&transaction, scope).await?;
         ensure_database_cell(&transaction, self.cell).await?;
-        let updated = match release {
-            None => {
+        let updated = match completion {
+            OutboxCompletion::Acknowledge(times) => {
                 transaction
                     .execute(
-                        "UPDATE hartevo_cell.outbox_messages
-                         SET status = 'published', published_at = $6,
-                             lease_owner = NULL, lease_expires_at = NULL
-                         WHERE cell = $1 AND tenant_id = $2 AND sequence = $3
-                           AND status = 'leased' AND lease_owner = $4
-                           AND lease_generation = $5",
+                        ACKNOWLEDGE_OUTBOX_SQL,
                         &[
                             &scope.cell.as_str(),
                             &scope.tenant_id.as_str(),
                             &sequence,
                             &owner,
                             &to_sql_u64(generation)?,
-                            &at,
+                            &times.published_at,
+                            &times.operation_at,
                         ],
                     )
                     .await?
             }
-            Some(release) => {
-                let status = match release {
-                    OutboxRelease::Requeue => "pending",
-                    OutboxRelease::DeadLetter => "dead_letter",
+            OutboxCompletion::Release(release) => {
+                let (status, times) = match release {
+                    OutboxRelease::Requeue(times) => ("pending", times),
+                    OutboxRelease::DeadLetter(times) => ("dead_letter", times),
                 };
                 transaction
                     .execute(
-                        "UPDATE hartevo_cell.outbox_messages
-                         SET status = $6, available_at = $7,
-                             lease_owner = NULL, lease_expires_at = NULL
-                         WHERE cell = $1 AND tenant_id = $2 AND sequence = $3
-                           AND status = 'leased' AND lease_owner = $4
-                           AND lease_generation = $5",
+                        RELEASE_OUTBOX_SQL,
                         &[
                             &scope.cell.as_str(),
                             &scope.tenant_id.as_str(),
@@ -1580,7 +1644,8 @@ impl PostgresCellStore {
                             &owner,
                             &to_sql_u64(generation)?,
                             &status,
-                            &at,
+                            &times.available_at,
+                            &times.operation_at,
                         ],
                     )
                     .await?
@@ -2759,6 +2824,50 @@ mod tests {
         assert!(!SCHEMA.contains("plaintext"));
         assert!(CLAIM_OUTBOX_SQL.contains("FOR UPDATE SKIP LOCKED"));
         assert!(CLAIM_OUTBOX_SQL.contains("lease_generation = message.lease_generation + 1"));
+        assert!(ACKNOWLEDGE_OUTBOX_SQL.contains("lease_expires_at > $7"));
+        assert!(!ACKNOWLEDGE_OUTBOX_SQL.contains("lease_expires_at >= $7"));
+        assert!(RELEASE_OUTBOX_SQL.contains("lease_expires_at > $8"));
+        assert!(!RELEASE_OUTBOX_SQL.contains("lease_expires_at >= $8"));
+    }
+
+    #[test]
+    fn outbox_completion_time_order_is_explicit_for_ack_and_release() {
+        for (case, completion_offset, operation_offset, is_release, valid) in [
+            ("ack_same_time", 1, 1, false, true),
+            ("ack_backfilled_fact", 0, 1, false, true),
+            ("ack_fact_after_operation", 2, 1, false, false),
+            ("release_same_time", 1, 1, true, true),
+            ("release_scheduled_future", 2, 1, true, true),
+            ("release_schedule_before_operation", 0, 1, true, false),
+        ] {
+            let completion_at = now() + Duration::seconds(completion_offset);
+            let operation_at = now() + Duration::seconds(operation_offset);
+            let constructor_valid = if is_release {
+                OutboxReleaseTimes::new(completion_at, operation_at).is_ok()
+            } else {
+                OutboxAcknowledgeTimes::new(completion_at, operation_at).is_ok()
+            };
+            assert_eq!(constructor_valid, valid, "{case}");
+            if !valid {
+                if is_release {
+                    let mut tampered = OutboxReleaseTimes::new(operation_at, operation_at)
+                        .expect("valid release times");
+                    tampered.available_at = completion_at;
+                    assert!(matches!(
+                        tampered.validate(),
+                        Err(CloudStorageError::InvalidOutboxClaim)
+                    ));
+                } else {
+                    let mut tampered = OutboxAcknowledgeTimes::new(operation_at, operation_at)
+                        .expect("valid acknowledgement times");
+                    tampered.published_at = completion_at;
+                    assert!(matches!(
+                        tampered.validate(),
+                        Err(CloudStorageError::InvalidOutboxClaim)
+                    ));
+                }
+            }
+        }
     }
 
     #[test]
@@ -3246,6 +3355,71 @@ mod tests {
             .expect("first lease")
             .pop()
             .expect("outbox message");
+        let mut invalid_ack_times =
+            OutboxAcknowledgeTimes::new(now(), now()).expect("valid acknowledgement times");
+        invalid_ack_times.published_at = now() + Duration::seconds(1);
+        assert!(matches!(
+            store
+                .acknowledge_outbox(
+                    &mut client,
+                    &primary_scope,
+                    first_lease.sequence,
+                    "worker-old",
+                    first_lease.lease_generation,
+                    invalid_ack_times,
+                )
+                .await,
+            Err(CloudStorageError::InvalidOutboxClaim)
+        ));
+        let mut invalid_release_times =
+            OutboxReleaseTimes::new(now(), now()).expect("valid release times");
+        invalid_release_times.available_at = now() - Duration::seconds(1);
+        assert!(matches!(
+            store
+                .release_outbox(
+                    &mut client,
+                    &primary_scope,
+                    first_lease.sequence,
+                    "worker-old",
+                    first_lease.lease_generation,
+                    OutboxRelease::Requeue(invalid_release_times),
+                )
+                .await,
+            Err(CloudStorageError::InvalidOutboxClaim)
+        ));
+        assert!(matches!(
+            store
+                .acknowledge_outbox(
+                    &mut client,
+                    &primary_scope,
+                    first_lease.sequence,
+                    "worker-old",
+                    first_lease.lease_generation,
+                    OutboxAcknowledgeTimes::new(now(), now() + Duration::minutes(1))
+                        .expect("valid acknowledgement times"),
+                )
+                .await,
+            Err(CloudStorageError::OutboxLeaseLost { .. })
+        ));
+        assert!(matches!(
+            store
+                .release_outbox(
+                    &mut client,
+                    &primary_scope,
+                    first_lease.sequence,
+                    "worker-old",
+                    first_lease.lease_generation,
+                    OutboxRelease::Requeue(
+                        OutboxReleaseTimes::new(
+                            now() + Duration::minutes(1),
+                            now() + Duration::minutes(1),
+                        )
+                        .expect("valid release times"),
+                    ),
+                )
+                .await,
+            Err(CloudStorageError::OutboxLeaseLost { .. })
+        ));
         let replacement_lease = store
             .claim_outbox(
                 &mut client,
@@ -3269,7 +3443,11 @@ mod tests {
                     first_lease.sequence,
                     "worker-old",
                     first_lease.lease_generation,
-                    now() + Duration::minutes(2),
+                    OutboxAcknowledgeTimes::new(
+                        now() + Duration::minutes(1),
+                        now() + Duration::minutes(2),
+                    )
+                    .expect("valid acknowledgement times"),
                 )
                 .await,
             Err(CloudStorageError::OutboxLeaseLost { .. })
@@ -3281,10 +3459,78 @@ mod tests {
                 replacement_lease.sequence,
                 "worker-new",
                 replacement_lease.lease_generation,
-                now() + Duration::minutes(2),
+                OutboxAcknowledgeTimes::new(
+                    now() + Duration::minutes(1),
+                    now() + Duration::minutes(2),
+                )
+                .expect("valid acknowledgement times"),
             )
             .await
             .expect("current generation acknowledges");
+        let release_lease = store
+            .claim_outbox(
+                &mut client,
+                &primary_scope,
+                "release-old",
+                now() + Duration::minutes(2),
+                Duration::minutes(1),
+                1,
+            )
+            .await
+            .expect("release lease")
+            .pop()
+            .expect("second outbox message");
+        assert!(matches!(
+            store
+                .release_outbox(
+                    &mut client,
+                    &primary_scope,
+                    release_lease.sequence,
+                    "release-old",
+                    release_lease.lease_generation,
+                    OutboxRelease::Requeue(
+                        OutboxReleaseTimes::new(
+                            now() + Duration::minutes(3),
+                            now() + Duration::minutes(3),
+                        )
+                        .expect("valid release times"),
+                    ),
+                )
+                .await,
+            Err(CloudStorageError::OutboxLeaseLost { .. })
+        ));
+        let replacement_release_lease = store
+            .claim_outbox(
+                &mut client,
+                &primary_scope,
+                "release-new",
+                now() + Duration::minutes(3),
+                Duration::minutes(1),
+                1,
+            )
+            .await
+            .expect("expired release lease takeover")
+            .pop()
+            .expect("reclaimed release message");
+        assert_eq!(replacement_release_lease.sequence, release_lease.sequence);
+        assert!(replacement_release_lease.lease_generation > release_lease.lease_generation);
+        store
+            .release_outbox(
+                &mut client,
+                &primary_scope,
+                replacement_release_lease.sequence,
+                "release-new",
+                replacement_release_lease.lease_generation,
+                OutboxRelease::Requeue(
+                    OutboxReleaseTimes::new(
+                        now() + Duration::minutes(3) + Duration::seconds(1),
+                        now() + Duration::minutes(3),
+                    )
+                    .expect("valid release times"),
+                ),
+            )
+            .await
+            .expect("current generation releases");
         assert!(
             store
                 .claim_outbox(

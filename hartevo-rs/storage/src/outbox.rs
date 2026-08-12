@@ -36,6 +36,72 @@ pub struct OutboxMessage {
     pub published_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutboxAcknowledgeTimes {
+    pub published_at: DateTime<Utc>,
+    pub operation_at: DateTime<Utc>,
+}
+
+impl OutboxAcknowledgeTimes {
+    pub fn new(
+        published_at: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
+    ) -> Result<Self, StorageError> {
+        let times = Self {
+            published_at,
+            operation_at,
+        };
+        times.validate()?;
+        Ok(times)
+    }
+
+    pub fn validate(&self) -> Result<(), StorageError> {
+        if self.published_at > self.operation_at {
+            Err(StorageError::DomainDecode(
+                "outbox acknowledgement requires published_at <= operation_at".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutboxReleaseTimes {
+    pub available_at: DateTime<Utc>,
+    pub operation_at: DateTime<Utc>,
+}
+
+impl OutboxReleaseTimes {
+    pub fn new(
+        available_at: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
+    ) -> Result<Self, StorageError> {
+        let times = Self {
+            available_at,
+            operation_at,
+        };
+        times.validate()?;
+        Ok(times)
+    }
+
+    pub fn validate(&self) -> Result<(), StorageError> {
+        if self.available_at < self.operation_at {
+            Err(StorageError::DomainDecode(
+                "outbox release requires available_at >= operation_at".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutboxRelease {
+    Requeue(OutboxReleaseTimes),
+    DeadLetter(OutboxReleaseTimes),
+}
+
 impl ProjectStore {
     pub fn claim_outbox(
         &mut self,
@@ -89,50 +155,53 @@ impl ProjectStore {
         sequence: i64,
         owner: &str,
         generation: u64,
-        published_at: DateTime<Utc>,
+        times: OutboxAcknowledgeTimes,
     ) -> Result<(), StorageError> {
+        times.validate()?;
         let updated = self.connection.execute(
             "UPDATE outbox_messages SET
                status = 'published', published_at = ?4,
                lease_owner = NULL, lease_expires_at = NULL
              WHERE sequence = ?1 AND status = 'leased'
-               AND lease_owner = ?2 AND lease_generation = ?3",
+               AND lease_owner = ?2 AND lease_generation = ?3
+               AND lease_expires_at > ?5",
             params![
                 sequence,
                 owner,
                 to_sql_generation(generation)?,
-                published_at.to_rfc3339(),
+                times.published_at.to_rfc3339(),
+                times.operation_at.to_rfc3339(),
             ],
         )?;
         require_lease(updated, sequence, owner, generation)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn release_outbox(
         &mut self,
         sequence: i64,
         owner: &str,
         generation: u64,
-        available_at: DateTime<Utc>,
-        dead_letter: bool,
+        release: OutboxRelease,
     ) -> Result<(), StorageError> {
-        let status = if dead_letter {
-            "dead_letter"
-        } else {
-            "pending"
+        let (status, times) = match release {
+            OutboxRelease::Requeue(times) => ("pending", times),
+            OutboxRelease::DeadLetter(times) => ("dead_letter", times),
         };
+        times.validate()?;
         let updated = self.connection.execute(
             "UPDATE outbox_messages SET
                status = ?4, available_at = ?5,
                lease_owner = NULL, lease_expires_at = NULL
              WHERE sequence = ?1 AND status = 'leased'
-               AND lease_owner = ?2 AND lease_generation = ?3",
+               AND lease_owner = ?2 AND lease_generation = ?3
+               AND lease_expires_at > ?6",
             params![
                 sequence,
                 owner,
                 to_sql_generation(generation)?,
                 status,
-                available_at.to_rfc3339(),
+                times.available_at.to_rfc3339(),
+                times.operation_at.to_rfc3339(),
             ],
         )?;
         require_lease(updated, sequence, owner, generation)
