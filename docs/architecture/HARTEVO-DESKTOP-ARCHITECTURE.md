@@ -178,8 +178,8 @@ US/EU Cell 使用独立 PostgreSQL 数据库和 `hartevo-cloud-storage`：
 当前冻结的 App Server v2 子集只映射：
 
 - client request：`initialize`、`thread/start`、`thread/resume`、`turn/start`、`turn/interrupt`；
-- server request：`commandExecution/requestApproval`、`fileChange/requestApproval`；
-- notification：`thread/started`、`turn/started`、`item/started`、`item/completed`、`turn/completed`。
+- server request：`item/commandExecution/requestApproval`、`item/fileChange/requestApproval`；
+- notification：`thread/started`、`turn/started`、`item/started`、`item/agentMessage/delta`、`item/completed`、`turn/completed`。
 
 未在固定 schema 中的 thread read/archive、turn steer、Provider/Model/Harness 配置、MCP/Skill/Plugin/Hook 与更细 item 类型当前均不是已实现声明；新增方法必须先更新冻结合同和 digest，再通过 adapter contract test。
 
