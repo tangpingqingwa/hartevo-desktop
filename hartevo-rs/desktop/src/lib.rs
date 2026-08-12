@@ -633,12 +633,58 @@ impl DesktopUiModel {
     }
 }
 
+struct ScopedRuntimeRenderProjection<'a> {
+    stream: Option<&'a DesktopRuntimeTextStreamProjection>,
+    error: Option<&'a UiFailure>,
+}
+
+fn runtime_text_scope_from_projection(
+    projection: Option<&DesktopRuntimeTextStreamProjection>,
+) -> Option<(ProjectId, MissionId)> {
+    projection.map(|stream| (stream.project_id.clone(), stream.mission_id.clone()))
+}
+
+fn scoped_runtime_render_projection<'a>(
+    selected_scope: Option<(&ProjectId, &MissionId)>,
+    runtime_text_scope: Option<(&ProjectId, &MissionId)>,
+    selected_paint_stream: Option<&'a DesktopRuntimeTextStreamProjection>,
+    fallback_stream: Option<&'a DesktopRuntimeTextStreamProjection>,
+    runtime_text_error: Option<&'a UiFailure>,
+) -> ScopedRuntimeRenderProjection<'a> {
+    let Some((selected_project_id, selected_mission_id)) = selected_scope else {
+        return ScopedRuntimeRenderProjection {
+            stream: None,
+            error: None,
+        };
+    };
+    let scope_matches = runtime_text_scope.is_some_and(|(project_id, mission_id)| {
+        project_id == selected_project_id && mission_id == selected_mission_id
+    });
+    let scoped_fallback = if scope_matches {
+        fallback_stream.filter(|stream| {
+            stream.project_id == *selected_project_id && stream.mission_id == *selected_mission_id
+        })
+    } else {
+        None
+    };
+    ScopedRuntimeRenderProjection {
+        stream: selected_paint_stream.or(scoped_fallback),
+        error: if scope_matches {
+            runtime_text_error
+        } else {
+            None
+        },
+    }
+}
+
 #[component]
 pub fn App() -> Element {
     let desktop_context = dioxus::desktop::use_window();
     let visual_zoom = active_visual_zoom();
     let visual_fixture_mode = active_visual_fixture_id().is_some();
     let initial_visual_runtime_text_stream = active_visual_runtime_text_stream();
+    let initial_runtime_text_scope =
+        runtime_text_scope_from_projection(initial_visual_runtime_text_stream.as_ref());
     let visual_persisted_stream_fixture = initial_visual_runtime_text_stream.is_some();
     let visual_streaming_fixture = visual_fixture_mode
         && matches!(
@@ -694,7 +740,7 @@ pub fn App() -> Element {
         }
     });
     let mut runtime_execution_paint = use_signal(DesktopRuntimeExecutionPaintState::default);
-    let mut runtime_text_scope = use_signal(|| None::<(ProjectId, MissionId)>);
+    let mut runtime_text_scope = use_signal(move || initial_runtime_text_scope);
     let mut runtime_text_stream = use_signal(move || initial_visual_runtime_text_stream);
     let mut runtime_text_error = use_signal(|| None::<UiFailure>);
     let mut runtime_follow_latest = use_signal(|| true);
@@ -906,19 +952,33 @@ pub fn App() -> Element {
     let workpad_visible =
         workpad_open() && current_surface == Surface::Orchestrator && mission.is_some();
     let runtime_busy = mission_submitting() || runtime_retrying();
-    let selected_runtime_execution_paint =
-        project
-            .as_ref()
-            .zip(mission.as_ref())
-            .and_then(|(project, mission)| {
-                runtime_execution_paint
-                    .read()
-                    .paint_view(&project.project_id, &mission.mission_id)
-            });
-    let rendered_runtime_text_stream = selected_runtime_execution_paint
+    let selected_runtime_scope = project
         .as_ref()
-        .and_then(|paint| paint.stream().cloned())
-        .or_else(|| runtime_text_stream.read().clone());
+        .zip(mission.as_ref())
+        .map(|(project, mission)| (&project.project_id, &mission.mission_id));
+    let selected_runtime_execution_paint =
+        selected_runtime_scope.and_then(|(project_id, mission_id)| {
+            runtime_execution_paint
+                .read()
+                .paint_view(project_id, mission_id)
+        });
+    let (rendered_runtime_text_stream, rendered_runtime_text_error) = {
+        let fallback_scope = runtime_text_scope.read();
+        let fallback_stream = runtime_text_stream.read();
+        let fallback_error = runtime_text_error.read();
+        let projection = scoped_runtime_render_projection(
+            selected_runtime_scope,
+            fallback_scope
+                .as_ref()
+                .map(|(project_id, mission_id)| (project_id, mission_id)),
+            selected_runtime_execution_paint
+                .as_ref()
+                .and_then(DesktopRuntimeExecutionPaintView::stream),
+            fallback_stream.as_ref(),
+            fallback_error.as_ref(),
+        );
+        (projection.stream.cloned(), projection.error.cloned())
+    };
     let runtime_waiting_for_turn = selected_runtime_execution_paint
         .as_ref()
         .is_some_and(DesktopRuntimeExecutionPaintView::awaiting_turn);
@@ -1766,7 +1826,7 @@ pub fn App() -> Element {
                                 runtime_activity: runtime_activity.clone(),
                                 runtime_text_stream: rendered_runtime_text_stream.clone(),
                                 runtime_waiting_for_turn,
-                                runtime_text_error: runtime_text_error.read().clone(),
+                                runtime_text_error: rendered_runtime_text_error.clone(),
                                 runtime_busy,
                                 runtime_stream_is_fixture: visual_persisted_stream_fixture,
                                 runtime_follow_latest: rendered_runtime_follow_latest,
@@ -8204,6 +8264,210 @@ mod tests {
 
     fn execution_digest(character: char) -> String {
         character.to_string().repeat(64)
+    }
+
+    fn scoped_render_stream(
+        project_id: &str,
+        mission_id: &str,
+        private_text: &str,
+    ) -> DesktopRuntimeTextStreamProjection {
+        let observed_at = "2026-08-13T10:00:00Z"
+            .parse()
+            .expect("fixed render-scope timestamp");
+        DesktopRuntimeTextStreamProjection {
+            project_id: ProjectId::from(project_id),
+            mission_id: MissionId::from(mission_id),
+            worker_generation: 1,
+            turn_revision: 1,
+            turn_status: RuntimeTurnStatus::Running,
+            last_evidence_sequence: Some(1),
+            delta_count: 1,
+            items: vec![data_plane::DesktopRuntimeTextItemProjection {
+                item_id_digest: execution_digest('4'),
+                text: private_text.to_owned(),
+                delta_count: 1,
+                last_stream_sequence: 1,
+                cumulative_byte_count: u64::try_from(private_text.len())
+                    .expect("private text length fits u64"),
+                observed_at,
+            }],
+            updated_at: observed_at,
+        }
+    }
+
+    fn scoped_render_error() -> UiFailure {
+        UiFailure {
+            code: "RUNTIME_STREAM_QUERY_FAILED".into(),
+            message: "private scoped Runtime error detail".into(),
+        }
+    }
+
+    #[test]
+    fn initial_runtime_projection_derives_exact_scope_without_fixture_bypass() {
+        let stream = scoped_render_stream(
+            "project-initial-scope",
+            "mission-initial-scope",
+            "private initial Runtime text",
+        );
+        let derived = runtime_text_scope_from_projection(Some(&stream));
+        assert!(derived.as_ref().is_some_and(|(project_id, mission_id)| {
+            project_id == &stream.project_id && mission_id == &stream.mission_id
+        }));
+        assert!(runtime_text_scope_from_projection(None).is_none());
+
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn scoped_runtime_render_projection")
+            .expect("production render gate");
+        let end = source[start..]
+            .find("\n#[component]\npub fn App")
+            .map(|offset| start + offset)
+            .expect("render gate source boundary");
+        assert!(!source[start..end].contains("visual_fixture"));
+    }
+
+    #[test]
+    fn runtime_render_scope_gate_allows_only_exact_fallback_and_scoped_error() {
+        let project_id = ProjectId::from("project-exact-render");
+        let mission_id = MissionId::from("mission-exact-render");
+        let stream = scoped_render_stream(
+            project_id.as_str(),
+            mission_id.as_str(),
+            "private exact Runtime text",
+        );
+        let error = scoped_render_error();
+        let render = scoped_runtime_render_projection(
+            Some((&project_id, &mission_id)),
+            Some((&project_id, &mission_id)),
+            None,
+            Some(&stream),
+            Some(&error),
+        );
+        assert!(render.stream.is_some());
+        assert!(render.error.is_some());
+        assert!(render.stream.is_some_and(|visible| {
+            visible.project_id == stream.project_id
+                && visible.mission_id == stream.mission_id
+                && visible.worker_generation == stream.worker_generation
+                && visible.delta_count == stream.delta_count
+        }));
+    }
+
+    #[test]
+    fn runtime_render_scope_gate_hides_missing_same_project_and_cross_project_selection() {
+        let source_project = ProjectId::from("project-source-render");
+        let source_mission = MissionId::from("mission-source-render");
+        let stream = scoped_render_stream(
+            source_project.as_str(),
+            source_mission.as_str(),
+            "private stale Runtime text",
+        );
+        let error = scoped_render_error();
+        let other_mission = MissionId::from("mission-other-render");
+        let other_project = ProjectId::from("project-other-render");
+
+        for selected_scope in [
+            None,
+            Some((&source_project, &other_mission)),
+            Some((&other_project, &source_mission)),
+        ] {
+            let render = scoped_runtime_render_projection(
+                selected_scope,
+                Some((&source_project, &source_mission)),
+                None,
+                Some(&stream),
+                Some(&error),
+            );
+            assert!(render.stream.is_none());
+            assert!(render.error.is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_render_scope_gate_rejects_projection_identity_drift_but_keeps_scoped_error() {
+        let project_id = ProjectId::from("project-drift-render");
+        let mission_id = MissionId::from("mission-drift-render");
+        let error = scoped_render_error();
+        let project_drift = scoped_render_stream(
+            "project-drifted-render",
+            mission_id.as_str(),
+            "private project-drift Runtime text",
+        );
+        let mission_drift = scoped_render_stream(
+            project_id.as_str(),
+            "mission-drifted-render",
+            "private mission-drift Runtime text",
+        );
+
+        for stream in [&project_drift, &mission_drift] {
+            let render = scoped_runtime_render_projection(
+                Some((&project_id, &mission_id)),
+                Some((&project_id, &mission_id)),
+                None,
+                Some(stream),
+                Some(&error),
+            );
+            assert!(render.stream.is_none());
+            assert!(render.error.is_some());
+        }
+    }
+
+    #[test]
+    fn runtime_render_scope_gate_requires_scope_recovery_when_returning_to_old_mission() {
+        let old_project = ProjectId::from("project-return-render");
+        let old_mission = MissionId::from("mission-return-render");
+        let current_mission = MissionId::from("mission-current-render");
+        let old_stream = scoped_render_stream(
+            old_project.as_str(),
+            old_mission.as_str(),
+            "private retained Runtime text",
+        );
+        let error = scoped_render_error();
+        let render = scoped_runtime_render_projection(
+            Some((&old_project, &old_mission)),
+            Some((&old_project, &current_mission)),
+            None,
+            Some(&old_stream),
+            Some(&error),
+        );
+        assert!(render.stream.is_none());
+        assert!(render.error.is_none());
+    }
+
+    #[test]
+    fn runtime_render_scope_gate_prioritizes_exact_selected_paint_projection() {
+        let selected_project = ProjectId::from("project-paint-render");
+        let selected_mission = MissionId::from("mission-paint-render");
+        let stale_project = ProjectId::from("project-stale-render");
+        let paint_stream = scoped_render_stream(
+            selected_project.as_str(),
+            selected_mission.as_str(),
+            "private exact paint text",
+        );
+        let mut stale_fallback = scoped_render_stream(
+            stale_project.as_str(),
+            selected_mission.as_str(),
+            "private stale fallback text",
+        );
+        stale_fallback.worker_generation = 2;
+        stale_fallback.delta_count = 2;
+        let stale_error = scoped_render_error();
+        let render = scoped_runtime_render_projection(
+            Some((&selected_project, &selected_mission)),
+            Some((&stale_project, &selected_mission)),
+            Some(&paint_stream),
+            Some(&stale_fallback),
+            Some(&stale_error),
+        );
+        assert!(render.stream.is_some_and(|visible| {
+            visible.project_id == paint_stream.project_id
+                && visible.mission_id == paint_stream.mission_id
+                && visible.worker_generation == paint_stream.worker_generation
+                && visible.delta_count == paint_stream.delta_count
+                && visible.worker_generation != stale_fallback.worker_generation
+                && visible.delta_count != stale_fallback.delta_count
+        }));
+        assert!(render.error.is_none());
     }
 
     fn execution_paint_handle() -> hartevo_application::CatalogMissionExecutionHandle {
