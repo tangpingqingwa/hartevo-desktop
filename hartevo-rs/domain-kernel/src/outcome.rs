@@ -9,11 +9,13 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    AccountId, ApprovalDecision, AttributionId, CampaignId, CommissionId, Company, CompanyId,
-    ConnectionId, ConnectionSnapshot, CurrencyCode, Effect, EffectId, EffectStatus, IdentityLink,
-    IdentityLinkId, IdentityLinkStatus, IdentitySubject, KpiContract, KpiDirection, Mission,
-    MissionId, Money, OperatingMode, Opportunity, OpportunityId, OrderId, OutcomeEventId, Partner,
-    PartnerId, PartnerSupplyClass, PayoutId, Person, PersonId, ProjectId, RefundId, TenantId,
+    AccountId, ActorId, ApprovalDecision, AttributionId, CampaignId, CommissionId, Company,
+    CompanyId, ConnectionId, ConnectionSnapshot, CurrencyCode, Effect, EffectId, EffectStatus,
+    IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject, KpiContract, KpiDirection,
+    Mission, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointStatus,
+    MissionConversationId, MissionConversationMessageId, MissionId, Money, OperatingMode,
+    Opportunity, OpportunityId, OrderId, OutcomeDecision, OutcomeEventId, Partner, PartnerId,
+    PartnerSupplyClass, PayoutId, Person, PersonId, ProjectId, RefundId, TenantId,
     VerificationStatus,
 };
 
@@ -759,6 +761,75 @@ pub struct OutcomeReviewProjection {
     pub effect_cost_source_digest: String,
 }
 
+/// The contract disposition implied by one explicit Human outcome decision.
+/// It is deliberately derived from the action rather than supplied by the UI:
+/// a Stop cannot retain scheduling authority, and Scale/Test can never silently
+/// reuse the old contract as if its budget and experiment scope were unchanged.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeReviewNextContractIntent {
+    ValidTerminal,
+    ContinueCurrentContract,
+    ScaleWithRevisedContract,
+    TestWithNewExperiment,
+}
+
+/// Deterministic availability of one explicit outcome-review action. The UI
+/// renders this projection, while `OutcomeReviewDecision::decide` enforces the
+/// same status again at the Domain authority boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeReviewDecisionGateStatus {
+    Available,
+    BlockedLoopPolicy,
+    BlockedScaleEvidence,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeReviewActionGate {
+    pub action: OutcomeDecision,
+    pub next_contract_intent: OutcomeReviewNextContractIntent,
+    pub status: OutcomeReviewDecisionGateStatus,
+}
+
+/// Content-free, replayable Human decision for VM-11
+/// `continue_stop_scale_test`.
+///
+/// The private rationale stays in the encrypted Mission Conversation. This
+/// record binds its digest, the exact frozen `outcome_review`, actor, action,
+/// idempotency intent, and the Mission/Checkpoint CAS observed by the user.
+/// It does not schedule a cycle, mutate the parent Mission, or execute an
+/// external Effect; the following Application Checkpoint owns the legal next
+/// contract or terminal transition.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeReviewDecision {
+    pub schema_version: u32,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub cycle: u64,
+    pub dispatch_mission_revision: u64,
+    pub dispatch_checkpoint_revision: u64,
+    pub source_review_checkpoint_revision: u64,
+    pub source_review_completion_digest: String,
+    pub source_review_projection_digest: String,
+    pub source_mission_id: MissionId,
+    pub source_mission_revision: u64,
+    pub source_ledger_revision: u64,
+    pub action: OutcomeDecision,
+    pub next_contract_intent: OutcomeReviewNextContractIntent,
+    pub decided_by: ActorId,
+    pub conversation_id: MissionConversationId,
+    pub conversation_revision: u64,
+    pub message_id: MissionConversationMessageId,
+    pub message_sequence: u64,
+    pub rationale_digest: String,
+    pub idempotency_key_digest: String,
+    pub decided_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug)]
 struct SettlementAccumulator {
     partner_id: PartnerId,
@@ -869,6 +940,270 @@ impl OutcomeReviewProjection {
 
     pub fn digest(&self) -> Result<String, OutcomeLedgerError> {
         canonical_json_digest(self)
+    }
+
+    /// Returns the complete, user-visible gate for one action without making a
+    /// recommendation. Stop and Test are always explicit choices; Continue
+    /// requires a loop-eligible parent contract, while Scale additionally
+    /// requires all frozen scale evidence gates to be satisfied.
+    pub fn decision_gate(&self, action: OutcomeDecision) -> OutcomeReviewActionGate {
+        let next_contract_intent = decision_contract_intent(&action);
+        let status = match action {
+            OutcomeDecision::Continue | OutcomeDecision::Scale
+                if self.loop_policy != OutcomeReviewLoopPolicy::Eligible =>
+            {
+                OutcomeReviewDecisionGateStatus::BlockedLoopPolicy
+            }
+            OutcomeDecision::Scale
+                if self.scale_evidence_status != OutcomeReviewGateStatus::Satisfied =>
+            {
+                OutcomeReviewDecisionGateStatus::BlockedScaleEvidence
+            }
+            OutcomeDecision::Continue
+            | OutcomeDecision::Stop
+            | OutcomeDecision::Scale
+            | OutcomeDecision::Test => OutcomeReviewDecisionGateStatus::Available,
+        };
+        OutcomeReviewActionGate {
+            action,
+            next_contract_intent,
+            status,
+        }
+    }
+}
+
+impl OutcomeReviewDecision {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the Human decision constructor binds every frozen review, CAS, actor, rationale, and replay dimension at one authority boundary"
+    )]
+    pub fn decide(
+        mission: &Mission,
+        review: &OutcomeReviewProjection,
+        source_review_checkpoint_revision: u64,
+        source_review_completion_digest: impl Into<String>,
+        action: OutcomeDecision,
+        decided_by: ActorId,
+        conversation_id: MissionConversationId,
+        conversation_revision: u64,
+        message_id: MissionConversationMessageId,
+        message_sequence: u64,
+        rationale_digest: impl Into<String>,
+        idempotency_key_digest: impl Into<String>,
+        decided_at: DateTime<Utc>,
+    ) -> Result<Self, OutcomeLedgerError> {
+        let source_review_completion_digest = source_review_completion_digest.into();
+        let rationale_digest = rationale_digest.into();
+        let idempotency_key_digest = idempotency_key_digest.into();
+        let (definition, checkpoint) = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .current_checkpoint()
+                    .map(|checkpoint| (definition, checkpoint))
+            })
+            .ok_or(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch)?;
+        let route = checkpoint
+            .route
+            .as_ref()
+            .ok_or(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch)?;
+        if definition.manifest_id != "VM-11"
+            || definition.cycle == 0
+            || checkpoint.id != "continue_stop_scale_test"
+            || checkpoint.status != MissionCheckpointStatus::Running
+            || route.executor != MissionCheckpointExecutor::Human
+            || route.completion_policy != Some(MissionCheckpointCompletionPolicy::HumanConfirmation)
+            || route.capability_id != "decision.evaluate"
+            || mission.revision == 0
+            || checkpoint.revision == 0
+        {
+            return Err(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch);
+        }
+        let next_contract_intent = decision_contract_intent(&action);
+        let decision = Self {
+            schema_version: Self::SCHEMA_VERSION,
+            tenant_id: mission.tenant_id.clone(),
+            project_id: mission.project_id.clone(),
+            mission_id: mission.id.clone(),
+            cycle: definition.cycle,
+            dispatch_mission_revision: mission.revision,
+            dispatch_checkpoint_revision: checkpoint.revision,
+            source_review_checkpoint_revision,
+            source_review_completion_digest,
+            source_review_projection_digest: review.digest()?,
+            source_mission_id: review.source_mission_id.clone(),
+            source_mission_revision: review.source_mission_revision,
+            source_ledger_revision: review.source_ledger_revision,
+            action,
+            next_contract_intent,
+            decided_by,
+            conversation_id,
+            conversation_revision,
+            message_id,
+            message_sequence,
+            rationale_digest,
+            idempotency_key_digest,
+            decided_at,
+        };
+        decision.validate_source(mission, review, false)?;
+        Ok(decision)
+    }
+
+    pub fn digest(&self) -> Result<String, OutcomeLedgerError> {
+        canonical_json_digest(self)
+    }
+
+    /// Validates a record after the Human Checkpoint has completed and the
+    /// next route may already be Running. This is used on every SQLCipher read
+    /// so a projection/decision row cannot be detached from Mission authority.
+    pub fn validate_persisted(
+        &self,
+        mission: &Mission,
+        review: &OutcomeReviewProjection,
+    ) -> Result<(), OutcomeLedgerError> {
+        self.validate_source(mission, review, true)
+    }
+
+    fn validate_source(
+        &self,
+        mission: &Mission,
+        review: &OutcomeReviewProjection,
+        require_completed_decision: bool,
+    ) -> Result<(), OutcomeLedgerError> {
+        let definition = mission
+            .definition
+            .as_ref()
+            .ok_or(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch)?;
+        let review_checkpoint = definition
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.id == "outcome_review")
+            .ok_or(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch)?;
+        let review_completion = review_checkpoint
+            .completion
+            .as_ref()
+            .ok_or(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch)?;
+        let review_source = review_completion
+            .application_evidence
+            .as_ref()
+            .and_then(|evidence| {
+                evidence
+                    .sources
+                    .iter()
+                    .find(|source| source.source_kind == "outcome_review")
+            })
+            .ok_or(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch)?;
+        let decision_checkpoint = definition
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.id == "continue_stop_scale_test")
+            .ok_or(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch)?;
+        let decision_route = decision_checkpoint
+            .route
+            .as_ref()
+            .ok_or(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch)?;
+        let projection_digest = review.digest()?;
+        if self.schema_version != Self::SCHEMA_VERSION
+            || definition.manifest_id != "VM-11"
+            || self.tenant_id != mission.tenant_id
+            || self.project_id != mission.project_id
+            || self.mission_id != mission.id
+            || self.cycle != definition.cycle
+            || self.dispatch_mission_revision == 0
+            || self.dispatch_checkpoint_revision == 0
+            || self.source_review_checkpoint_revision != review_checkpoint.revision
+            || self.source_review_completion_digest != review_completion.evidence_digest
+            || self.source_review_projection_digest != projection_digest
+            || review_source.projection_digest != projection_digest
+            || review_source.source_revision != review.source_ledger_revision
+            || review_checkpoint.status != MissionCheckpointStatus::Completed
+            || decision_checkpoint.revision <= self.dispatch_checkpoint_revision
+                && require_completed_decision
+            || decision_route.executor != MissionCheckpointExecutor::Human
+            || decision_route.completion_policy
+                != Some(MissionCheckpointCompletionPolicy::HumanConfirmation)
+            || decision_route.capability_id != "decision.evaluate"
+            || mission.contract.parent_mission_id.as_ref() != Some(&review.source_mission_id)
+            || review.tenant_id != mission.tenant_id
+            || review.project_id != mission.project_id
+            || self.source_mission_id != review.source_mission_id
+            || self.source_mission_revision != review.source_mission_revision
+            || self.source_ledger_revision != review.source_ledger_revision
+            || review.source_mission_revision == 0
+            || review.source_ledger_revision == 0
+            || !is_sha256(&review.source_contract_digest)
+            || !is_sha256(&self.source_review_completion_digest)
+            || !is_sha256(&self.source_review_projection_digest)
+            || !is_sha256(&self.rationale_digest)
+            || !is_sha256(&self.idempotency_key_digest)
+            || self.decided_by.as_str().trim().is_empty()
+            || self.conversation_id.as_str().trim().is_empty()
+            || self.conversation_revision == 0
+            || self.message_id.as_str().trim().is_empty()
+            || self.message_sequence == 0
+            || self.message_sequence > self.conversation_revision
+            || self.decided_at < review.observed_at
+        {
+            return Err(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch);
+        }
+        validate_outcome_review_action(review, &self.action, self.next_contract_intent)?;
+        if require_completed_decision {
+            let completion = decision_checkpoint
+                .completion
+                .as_ref()
+                .ok_or(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch)?;
+            if decision_checkpoint.status != MissionCheckpointStatus::Completed
+                || completion.evidence_digest != self.digest()?
+                || completion.application_evidence.is_some()
+                || !completion.work_product_ids.is_empty()
+                || !completion.effect_ids.is_empty()
+                || completion.oracle_ids != decision_route.oracle_ids
+            {
+                return Err(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch);
+            }
+        } else if mission.revision != self.dispatch_mission_revision
+            || decision_checkpoint.revision != self.dispatch_checkpoint_revision
+            || decision_checkpoint.status != MissionCheckpointStatus::Running
+            || decision_checkpoint.completion.is_some()
+        {
+            return Err(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn decision_contract_intent(action: &OutcomeDecision) -> OutcomeReviewNextContractIntent {
+    match action {
+        OutcomeDecision::Stop => OutcomeReviewNextContractIntent::ValidTerminal,
+        OutcomeDecision::Continue => OutcomeReviewNextContractIntent::ContinueCurrentContract,
+        OutcomeDecision::Scale => OutcomeReviewNextContractIntent::ScaleWithRevisedContract,
+        OutcomeDecision::Test => OutcomeReviewNextContractIntent::TestWithNewExperiment,
+    }
+}
+
+fn validate_outcome_review_action(
+    review: &OutcomeReviewProjection,
+    action: &OutcomeDecision,
+    intent: OutcomeReviewNextContractIntent,
+) -> Result<(), OutcomeLedgerError> {
+    if intent != decision_contract_intent(action) {
+        return Err(OutcomeLedgerError::OutcomeReviewDecisionActionForbidden);
+    }
+    match (action, review.decision_gate(action.clone()).status) {
+        (_, OutcomeReviewDecisionGateStatus::Available) => Ok(()),
+        (
+            OutcomeDecision::Scale,
+            OutcomeReviewDecisionGateStatus::BlockedLoopPolicy
+            | OutcomeReviewDecisionGateStatus::BlockedScaleEvidence,
+        ) => Err(OutcomeLedgerError::OutcomeReviewDecisionScaleBlocked),
+        (
+            OutcomeDecision::Continue | OutcomeDecision::Stop | OutcomeDecision::Test,
+            OutcomeReviewDecisionGateStatus::BlockedLoopPolicy
+            | OutcomeReviewDecisionGateStatus::BlockedScaleEvidence,
+        ) => Err(OutcomeLedgerError::OutcomeReviewDecisionActionForbidden),
     }
 }
 
@@ -3822,6 +4157,12 @@ pub enum OutcomeLedgerError {
     OutcomeReviewEffectStateMismatch,
     #[error("outcome review money uses inconsistent currency or overflows minor units")]
     OutcomeReviewMoneyMismatch,
+    #[error("the Human outcome decision is detached from its exact VM-11 review or CAS")]
+    OutcomeReviewDecisionSourceMismatch,
+    #[error("the selected outcome action is forbidden by the frozen Mission mode or contract")]
+    OutcomeReviewDecisionActionForbidden,
+    #[error("Scale is forbidden until every deterministic scale-evidence gate is satisfied")]
+    OutcomeReviewDecisionScaleBlocked,
     #[error("an outcome Oracle projection could not be canonically serialized")]
     ProjectionSerialization,
     #[error("decimal commission arithmetic overflowed minor units")]
@@ -4048,10 +4389,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActorId, Approval, ApprovalDecision, ApprovalId, Connection, ConnectionProbe, ConsentState,
-        ContactPermission, CurrencyCode, EffectClass, EffectRisk, ExternalIdentity,
-        IdentitySubject, MissionContract, PartnerSupplyClass, ProbeOutcome, Receipt, ReceiptId,
-        Verification, VerificationId,
+        ActorId, Approval, ApprovalDecision, ApprovalId, Cadence, CadenceTriggerKind, Connection,
+        ConnectionProbe, ConsentState, ContactPermission, CurrencyCode, EffectClass, EffectRisk,
+        ExternalIdentity, IdentitySubject, MissionCheckpointApplicationEvidence,
+        MissionCheckpointCompletion, MissionCheckpointOracleSource, MissionCheckpointRoute,
+        MissionContract, MissionDefinition, PartnerSupplyClass, ProbeOutcome, Receipt, ReceiptId,
+        Task, TaskId, TaskStatus, Verification, VerificationId,
     };
 
     fn now() -> DateTime<Utc> {
@@ -4150,6 +4493,178 @@ mod tests {
             )
             .expect("successful probe");
         (connection.snapshot(), person, link)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the test fixture constructs the exact routed Application/Human review boundary and its completion evidence"
+    )]
+    fn vm11_decision_mission(review: &OutcomeReviewProjection, mode: OperatingMode) -> Mission {
+        let mut contract = MissionContract::bootstrap(
+            "Choose one explicit action from the frozen outcome review",
+            ["decision.evaluate".into()],
+            now(),
+        );
+        contract.mode = mode.clone();
+        contract.parent_mission_id = Some(review.source_mission_id.clone());
+        if matches!(
+            mode,
+            OperatingMode::ContinuousOperator | OperatingMode::ContinuousRelationship
+        ) {
+            contract.cadence = Some(Cadence {
+                interval_seconds: 7 * 24 * 60 * 60,
+                anchor_at: now(),
+                trigger: CadenceTriggerKind::Interval,
+                event_topics: BTreeSet::new(),
+            });
+        }
+        let review_oracles = BTreeSet::from([
+            "decision".into(),
+            "operating_state".into(),
+            "outcome".into(),
+        ]);
+        let decision_oracles = BTreeSet::from([
+            "goal".into(),
+            "decision".into(),
+            "operating_state".into(),
+            "outcome".into(),
+        ]);
+        let definition = MissionDefinition::from_routed_linear_manifest(
+            "VM-11",
+            3,
+            "8".repeat(64),
+            mode,
+            ["decision.evaluate".into()],
+            ["next_decision".into()],
+            decision_oracles.clone(),
+            [
+                (
+                    "outcome_review".into(),
+                    MissionCheckpointRoute::contracted(
+                        "decision.evaluate",
+                        MissionCheckpointExecutor::Application,
+                        review_oracles.clone(),
+                        MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                    )
+                    .expect("review route"),
+                ),
+                (
+                    "continue_stop_scale_test".into(),
+                    MissionCheckpointRoute::contracted(
+                        "decision.evaluate",
+                        MissionCheckpointExecutor::Human,
+                        decision_oracles,
+                        MissionCheckpointCompletionPolicy::HumanConfirmation,
+                    )
+                    .expect("decision route"),
+                ),
+            ],
+        )
+        .expect("VM-11 decision definition");
+        let mut mission = Mission::compile_catalog(
+            review.tenant_id.clone(),
+            MissionId::from("vm11-decision-mission"),
+            review.project_id.clone(),
+            "VM-11 decision",
+            contract,
+            definition,
+            now(),
+        )
+        .expect("VM-11 Mission");
+        mission
+            .start_research(
+                [Task {
+                    id: TaskId::from("vm11-review-task"),
+                    title: "Freeze outcome review".into(),
+                    status: TaskStatus::Running,
+                    capability: "decision.evaluate".into(),
+                }],
+                now(),
+            )
+            .expect("start review");
+        let dispatch_mission_revision = mission.revision;
+        let dispatch_checkpoint_revision = mission
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .map(|checkpoint| checkpoint.revision)
+            .expect("review checkpoint");
+        mission
+            .begin_checkpoint_verification("outcome_review", review.observed_at)
+            .expect("verify review");
+        let definition = mission.definition.as_ref().expect("definition");
+        let checkpoint = definition.current_checkpoint().expect("review checkpoint");
+        let route = checkpoint.route.as_ref().expect("review route");
+        let evidence = MissionCheckpointApplicationEvidence {
+            schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+            handler_id: "vm11.outcome-review/v1".into(),
+            tenant_id: mission.tenant_id.clone(),
+            project_id: mission.project_id.clone(),
+            mission_id: mission.id.clone(),
+            manifest_id: definition.manifest_id.clone(),
+            manifest_version: definition.manifest_version,
+            catalog_digest: definition.catalog_digest.clone(),
+            cycle: definition.cycle,
+            checkpoint_id: checkpoint.id.clone(),
+            dispatch_mission_revision,
+            dispatch_checkpoint_revision,
+            verification_mission_revision: mission.revision,
+            verification_checkpoint_revision: checkpoint.revision,
+            capability_id: route.capability_id.clone(),
+            executor: route.executor,
+            completion_policy: route.completion_policy.expect("policy"),
+            sources: BTreeSet::from([
+                MissionCheckpointOracleSource {
+                    source_kind: "mission_checkpoint".into(),
+                    source_id: format!("{}:outcome_review", mission.id),
+                    source_revision: dispatch_checkpoint_revision,
+                    projection_digest: "9".repeat(64),
+                    oracle_ids: BTreeSet::from(["operating_state".into()]),
+                },
+                MissionCheckpointOracleSource {
+                    source_kind: "parent_mission_review".into(),
+                    source_id: review.source_mission_id.to_string(),
+                    source_revision: review.source_mission_revision,
+                    projection_digest: "a".repeat(64),
+                    oracle_ids: BTreeSet::from(["decision".into()]),
+                },
+                MissionCheckpointOracleSource {
+                    source_kind: "outcome_review".into(),
+                    source_id: review.project_id.to_string(),
+                    source_revision: review.source_ledger_revision,
+                    projection_digest: review.digest().expect("review digest"),
+                    oracle_ids: BTreeSet::from(["outcome".into()]),
+                },
+            ]),
+            observed_at: review.observed_at,
+        };
+        let evidence_digest = evidence.digest();
+        mission
+            .complete_checkpoint(
+                "outcome_review",
+                MissionCheckpointCompletion {
+                    oracle_ids: review_oracles,
+                    work_product_ids: BTreeSet::new(),
+                    effect_ids: BTreeSet::new(),
+                    application_evidence: Some(evidence),
+                    evidence_digest,
+                    verified_at: review.observed_at,
+                },
+            )
+            .expect("complete review");
+        mission
+            .begin_checkpoint_with_task(
+                "continue_stop_scale_test",
+                Task {
+                    id: TaskId::from("vm11-decision-task"),
+                    title: "Choose Continue, Stop, Scale, or Test".into(),
+                    status: TaskStatus::Running,
+                    capability: "decision.evaluate".into(),
+                },
+                review.observed_at + Duration::seconds(1),
+            )
+            .expect("start Human decision");
+        mission
     }
 
     fn verified_attribution_support_mission(
@@ -5677,6 +6192,260 @@ mod tests {
                 observed_at,
             ),
             Err(OutcomeLedgerError::OutcomeReviewEffectStateMismatch)
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the regression proves every action gate, mode boundary, scale gate, and persisted completion binding together"
+    )]
+    fn outcome_review_decision_is_structured_mode_gated_scale_gated_and_completion_bound() {
+        let parent = Mission::compile(
+            TenantId::from("tenant-1"),
+            MissionId::from("mission-11"),
+            ProjectId::from("project-1"),
+            "Parent",
+            MissionContract::bootstrap(
+                "Provide one reviewed business outcome",
+                ["decision.evaluate".into()],
+                now(),
+            ),
+            now(),
+        )
+        .expect("parent");
+        let usd = CurrencyCode::parse("USD").expect("USD");
+        let review = OutcomeReviewProjection {
+            schema_version: OutcomeReviewProjection::SCHEMA_VERSION,
+            tenant_id: parent.tenant_id.clone(),
+            project_id: parent.project_id.clone(),
+            source_mission_id: parent.id.clone(),
+            source_mission_revision: parent.revision,
+            source_ledger_revision: 1,
+            window_started_at: now(),
+            outcome_window_ended_at: now() + Duration::minutes(1),
+            observed_at: now() + Duration::minutes(2),
+            measurement_count: 1,
+            target_met_count: 0,
+            target_gap_count: 1,
+            order_count: 1,
+            attributed_order_count: 0,
+            unattributed_order_count: 1,
+            settlement_group_count: 1,
+            paid_or_no_payment_due_group_count: 0,
+            outstanding_settlement_group_count: 1,
+            verified_effect_count: 0,
+            pending_effect_count: 0,
+            unresolved_cost_effect_count: 0,
+            cross_currency_cost_effect_count: 0,
+            budget: Money::new(500, usd.clone()),
+            budget_currency_verified_cost: Money::zero(usd.clone()),
+            budget_remaining: Money::new(500, usd.clone()),
+            budget_overrun: Money::zero(usd.clone()),
+            kpi_status: OutcomeReviewGateStatus::Blocked,
+            attribution_status: OutcomeReviewGateStatus::Blocked,
+            settlement_status: OutcomeReviewGateStatus::Blocked,
+            cost_status: OutcomeReviewGateStatus::Satisfied,
+            budget_status: OutcomeReviewGateStatus::Satisfied,
+            scale_evidence_status: OutcomeReviewGateStatus::Blocked,
+            loop_policy: OutcomeReviewLoopPolicy::Forbidden,
+            causal_status: OutcomeReviewCausalStatus::NotClaimed,
+            roi_status: OutcomeReviewRoiStatus::NotCalculated,
+            caveats: BTreeSet::from([
+                OutcomeReviewCaveat::KpiTargetGap,
+                OutcomeReviewCaveat::UnattributedOrders,
+                OutcomeReviewCaveat::OutstandingSettlement,
+                OutcomeReviewCaveat::ImplicitLoopForbidden,
+            ]),
+            economics: BTreeMap::new(),
+            source_contract_digest: "b".repeat(64),
+            normalization_digest: "c".repeat(64),
+            identity_chain_digest: "d".repeat(64),
+            kpi_projection_digest: "e".repeat(64),
+            attribution_projection_digest: "f".repeat(64),
+            settlement_projection_digest: "1".repeat(64),
+            effect_cost_source_digest: "2".repeat(64),
+        };
+        let mission = vm11_decision_mission(&review, OperatingMode::BuildOnce);
+        assert_eq!(
+            review.decision_gate(OutcomeDecision::Stop),
+            OutcomeReviewActionGate {
+                action: OutcomeDecision::Stop,
+                next_contract_intent: OutcomeReviewNextContractIntent::ValidTerminal,
+                status: OutcomeReviewDecisionGateStatus::Available,
+            }
+        );
+        assert_eq!(
+            review.decision_gate(OutcomeDecision::Continue).status,
+            OutcomeReviewDecisionGateStatus::BlockedLoopPolicy
+        );
+        assert_eq!(
+            review.decision_gate(OutcomeDecision::Scale).status,
+            OutcomeReviewDecisionGateStatus::BlockedLoopPolicy
+        );
+        assert_eq!(
+            review.decision_gate(OutcomeDecision::Test).status,
+            OutcomeReviewDecisionGateStatus::Available
+        );
+        let review_checkpoint = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "outcome_review")
+            })
+            .expect("review checkpoint");
+        let review_completion_digest = review_checkpoint
+            .completion
+            .as_ref()
+            .expect("review completion")
+            .evidence_digest
+            .clone();
+        let decide = |mission: &Mission, review: &OutcomeReviewProjection, action| {
+            OutcomeReviewDecision::decide(
+                mission,
+                review,
+                review_checkpoint.revision,
+                review_completion_digest.clone(),
+                action,
+                ActorId::from("user-reviewer"),
+                MissionConversationId::from("vm11-decision-conversation"),
+                2,
+                MissionConversationMessageId::from("vm11-decision-message"),
+                2,
+                "3".repeat(64),
+                "4".repeat(64),
+                review.observed_at + Duration::minutes(1),
+            )
+        };
+        let stop = decide(&mission, &review, OutcomeDecision::Stop).expect("explicit Stop");
+        assert_eq!(
+            stop.next_contract_intent,
+            OutcomeReviewNextContractIntent::ValidTerminal
+        );
+        assert_eq!(
+            decide(&mission, &review, OutcomeDecision::Continue),
+            Err(OutcomeLedgerError::OutcomeReviewDecisionActionForbidden)
+        );
+        assert_eq!(
+            decide(&mission, &review, OutcomeDecision::Scale),
+            Err(OutcomeLedgerError::OutcomeReviewDecisionScaleBlocked)
+        );
+        assert_eq!(
+            decide(&mission, &review, OutcomeDecision::Test)
+                .expect("one-off can explicitly request a new experiment")
+                .next_contract_intent,
+            OutcomeReviewNextContractIntent::TestWithNewExperiment
+        );
+
+        let mut eligible_review = review.clone();
+        eligible_review.loop_policy = OutcomeReviewLoopPolicy::Eligible;
+        eligible_review
+            .caveats
+            .remove(&OutcomeReviewCaveat::ImplicitLoopForbidden);
+        assert_eq!(
+            eligible_review
+                .decision_gate(OutcomeDecision::Continue)
+                .status,
+            OutcomeReviewDecisionGateStatus::Available
+        );
+        assert_eq!(
+            eligible_review.decision_gate(OutcomeDecision::Scale).status,
+            OutcomeReviewDecisionGateStatus::BlockedScaleEvidence
+        );
+        let eligible_mission =
+            vm11_decision_mission(&eligible_review, OperatingMode::ContinuousOperator);
+        let eligible_review_checkpoint = eligible_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "outcome_review")
+            })
+            .expect("eligible review checkpoint");
+        let continued = OutcomeReviewDecision::decide(
+            &eligible_mission,
+            &eligible_review,
+            eligible_review_checkpoint.revision,
+            eligible_review_checkpoint
+                .completion
+                .as_ref()
+                .expect("eligible review completion")
+                .evidence_digest
+                .clone(),
+            OutcomeDecision::Continue,
+            ActorId::from("user-reviewer"),
+            MissionConversationId::from("vm11-decision-conversation"),
+            2,
+            MissionConversationMessageId::from("vm11-decision-message"),
+            2,
+            "5".repeat(64),
+            "6".repeat(64),
+            eligible_review.observed_at + Duration::minutes(1),
+        )
+        .expect("continuous Continue");
+        assert_eq!(
+            continued.next_contract_intent,
+            OutcomeReviewNextContractIntent::ContinueCurrentContract
+        );
+        assert_eq!(
+            OutcomeReviewDecision::decide(
+                &eligible_mission,
+                &eligible_review,
+                eligible_review_checkpoint.revision,
+                eligible_review_checkpoint
+                    .completion
+                    .as_ref()
+                    .expect("eligible review completion")
+                    .evidence_digest
+                    .clone(),
+                OutcomeDecision::Scale,
+                ActorId::from("user-reviewer"),
+                MissionConversationId::from("vm11-decision-conversation"),
+                2,
+                MissionConversationMessageId::from("vm11-decision-message"),
+                2,
+                "5".repeat(64),
+                "7".repeat(64),
+                eligible_review.observed_at + Duration::minutes(1),
+            ),
+            Err(OutcomeLedgerError::OutcomeReviewDecisionScaleBlocked)
+        );
+
+        let mut completed = mission;
+        completed
+            .begin_checkpoint_verification("continue_stop_scale_test", stop.decided_at)
+            .expect("begin structured decision verification");
+        completed
+            .complete_checkpoint(
+                "continue_stop_scale_test",
+                MissionCheckpointCompletion {
+                    oracle_ids: BTreeSet::from([
+                        "goal".into(),
+                        "decision".into(),
+                        "operating_state".into(),
+                        "outcome".into(),
+                    ]),
+                    work_product_ids: BTreeSet::new(),
+                    effect_ids: BTreeSet::new(),
+                    application_evidence: None,
+                    evidence_digest: stop.digest().expect("decision digest"),
+                    verified_at: stop.decided_at,
+                },
+            )
+            .expect("complete structured decision");
+        stop.validate_persisted(&completed, &review)
+            .expect("persisted decision remains completion-bound");
+        let mut swapped = stop;
+        swapped.action = OutcomeDecision::Test;
+        swapped.next_contract_intent = OutcomeReviewNextContractIntent::TestWithNewExperiment;
+        assert_eq!(
+            swapped.validate_persisted(&completed, &review),
+            Err(OutcomeLedgerError::OutcomeReviewDecisionSourceMismatch)
         );
     }
 

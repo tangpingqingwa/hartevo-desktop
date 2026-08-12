@@ -51,9 +51,9 @@ pub enum ApplicationSourceKind {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ApplicationSourceRevisionFence {
-    kind: ApplicationSourceKind,
-    id: String,
-    expected_revision: Option<u64>,
+    pub(crate) kind: ApplicationSourceKind,
+    pub(crate) id: String,
+    pub(crate) expected_revision: Option<u64>,
 }
 
 impl ApplicationSourceRevisionFence {
@@ -354,7 +354,7 @@ impl ProjectStore {
     }
 }
 
-fn require_application_source_fence(
+pub(crate) fn require_application_source_fence(
     transaction: &Transaction<'_>,
     tenant_id: &str,
     project_id: &str,
@@ -413,7 +413,7 @@ fn require_application_source_fence(
     Ok(())
 }
 
-const fn application_source_name(kind: ApplicationSourceKind) -> &'static str {
+pub(crate) const fn application_source_name(kind: ApplicationSourceKind) -> &'static str {
     match kind {
         ApplicationSourceKind::Mission => "mission",
         ApplicationSourceKind::Connection => "connection",
@@ -425,7 +425,7 @@ const fn application_source_name(kind: ApplicationSourceKind) -> &'static str {
     }
 }
 
-fn ensure_project_scope(
+pub(crate) fn ensure_project_scope(
     transaction: &Transaction<'_>,
     tenant_id: &str,
     project_id: &str,

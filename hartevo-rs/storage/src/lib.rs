@@ -22,6 +22,7 @@ mod mission_conversation_store;
 mod mission_schedule_store;
 mod normalized;
 mod outbox;
+mod outcome_review_store;
 mod outcome_store;
 mod registration_store;
 mod relationship_store;
@@ -77,7 +78,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 44;
+pub const STORAGE_SCHEMA_VERSION: i64 = 45;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -3980,6 +3981,95 @@ impl ProjectStore {
             record_migration(&transaction, 44)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 45 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS vm11_outcome_reviews (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   cycle INTEGER NOT NULL CHECK (cycle > 0),
+                   source_mission_id TEXT NOT NULL CHECK (length(trim(source_mission_id)) > 0),
+                   source_mission_revision INTEGER NOT NULL CHECK (source_mission_revision > 0),
+                   source_ledger_revision INTEGER NOT NULL CHECK (source_ledger_revision > 0),
+                   source_review_checkpoint_revision INTEGER NOT NULL CHECK (
+                     source_review_checkpoint_revision > 0
+                   ),
+                   source_review_completion_digest TEXT NOT NULL CHECK (
+                     length(source_review_completion_digest) = 64
+                   ),
+                   projection_digest TEXT NOT NULL CHECK (length(projection_digest) = 64),
+                   observed_at TEXT NOT NULL,
+                   projection_json TEXT NOT NULL CHECK (length(trim(projection_json)) > 2),
+                   PRIMARY KEY (project_id, mission_id, cycle),
+                   FOREIGN KEY (mission_id, project_id)
+                     REFERENCES missions(id, project_id) ON DELETE CASCADE,
+                   FOREIGN KEY (source_mission_id, project_id)
+                     REFERENCES missions(id, project_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS vm11_outcome_review_source_fences (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   cycle INTEGER NOT NULL CHECK (cycle > 0),
+                   source_kind TEXT NOT NULL CHECK (source_kind IN (
+                     'mission', 'connection', 'identity_link', 'person',
+                     'company', 'partner', 'opportunity'
+                   )),
+                   source_id TEXT NOT NULL CHECK (length(trim(source_id)) > 0),
+                   expected_revision INTEGER CHECK (expected_revision > 0),
+                   PRIMARY KEY (project_id, mission_id, cycle, source_kind, source_id),
+                   FOREIGN KEY (project_id, mission_id, cycle)
+                     REFERENCES vm11_outcome_reviews(project_id, mission_id, cycle)
+                     ON DELETE CASCADE
+                 );
+                 CREATE TABLE IF NOT EXISTS vm11_outcome_review_decisions (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   cycle INTEGER NOT NULL CHECK (cycle > 0),
+                   action TEXT NOT NULL CHECK (action IN ('continue', 'stop', 'scale', 'test')),
+                   next_contract_intent TEXT NOT NULL CHECK (next_contract_intent IN (
+                     'valid_terminal', 'continue_current_contract',
+                     'scale_with_revised_contract', 'test_with_new_experiment'
+                   )),
+                   source_review_projection_digest TEXT NOT NULL CHECK (
+                     length(source_review_projection_digest) = 64
+                   ),
+                   source_review_completion_digest TEXT NOT NULL CHECK (
+                     length(source_review_completion_digest) = 64
+                   ),
+                   source_mission_id TEXT NOT NULL CHECK (length(trim(source_mission_id)) > 0),
+                   source_mission_revision INTEGER NOT NULL CHECK (source_mission_revision > 0),
+                   source_ledger_revision INTEGER NOT NULL CHECK (source_ledger_revision > 0),
+                   decided_by TEXT NOT NULL CHECK (length(trim(decided_by)) > 0),
+                   conversation_id TEXT NOT NULL CHECK (length(trim(conversation_id)) > 0),
+                   conversation_revision INTEGER NOT NULL CHECK (conversation_revision > 0),
+                   message_id TEXT NOT NULL CHECK (length(trim(message_id)) > 0),
+                   message_sequence INTEGER NOT NULL CHECK (message_sequence > 0),
+                   rationale_digest TEXT NOT NULL CHECK (length(rationale_digest) = 64),
+                   idempotency_key_digest TEXT NOT NULL CHECK (
+                     length(idempotency_key_digest) = 64
+                   ),
+                   decision_digest TEXT NOT NULL CHECK (length(decision_digest) = 64),
+                   decided_at TEXT NOT NULL,
+                   decision_json TEXT NOT NULL CHECK (length(trim(decision_json)) > 2),
+                   PRIMARY KEY (project_id, mission_id, cycle),
+                   UNIQUE (project_id, idempotency_key_digest),
+                   FOREIGN KEY (project_id, mission_id, cycle)
+                     REFERENCES vm11_outcome_reviews(project_id, mission_id, cycle)
+                     ON DELETE CASCADE,
+                   FOREIGN KEY (project_id, conversation_id, message_id)
+                     REFERENCES mission_conversation_messages(project_id, conversation_id, id)
+                 );
+                 CREATE INDEX IF NOT EXISTS vm11_outcome_review_source_idx
+                   ON vm11_outcome_review_source_fences(
+                     tenant_id, project_id, mission_id, cycle, source_kind, source_id
+                   );",
+            )?;
+            record_migration(&transaction, 45)?;
+            transaction.commit()?;
+        }
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
@@ -4196,6 +4286,8 @@ pub enum StorageError {
     MissionSchedule(#[from] hartevo_domain_kernel::MissionScheduleError),
     #[error(transparent)]
     Mission(#[from] hartevo_domain_kernel::MissionError),
+    #[error(transparent)]
+    Outcome(#[from] hartevo_domain_kernel::OutcomeLedgerError),
     #[error(transparent)]
     KeyManagement(#[from] hartevo_domain_kernel::KeyManagementError),
     #[error(transparent)]

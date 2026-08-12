@@ -11,8 +11,10 @@ use hartevo_domain_kernel::{
     CadenceTriggerKind, KpiContract, KpiDirection, MissionCheckpointCompletionPolicy,
     MissionCheckpointExecutor, MissionCheckpointStatus, MissionConversationMessageId,
     MissionConversationMessageKind, MissionConversationRole, MissionId, MissionScheduleStatus,
-    MissionStage, OperatingMode, ProjectEncryptionMode, ProjectId, RuntimeProcessClaimStatus,
-    RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode, WorkProductId, WorkProductStatus,
+    MissionStage, Money, OperatingMode, OutcomeDecision, OutcomeReviewCaveat,
+    OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus, ProjectEncryptionMode, ProjectId,
+    RuntimeProcessClaimStatus, RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode,
+    WorkProductId, WorkProductStatus,
 };
 use rust_decimal::Decimal;
 use zeroize::Zeroizing;
@@ -23,8 +25,8 @@ mod runtime_plane;
 use data_plane::{
     DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane,
     DesktopHumanCheckpointConfirmationRequest, DesktopLoadState, DesktopMissionContinuationRequest,
-    DesktopSnapshot, ProductEvidenceProjection, ProjectContextAccessProjection,
-    ProjectContextAccessStatus, RecoveryKitDraft,
+    DesktopSnapshot, DesktopVm11OutcomeDecisionRequest, ProductEvidenceProjection,
+    ProjectContextAccessProjection, ProjectContextAccessStatus, RecoveryKitDraft,
 };
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -120,6 +122,10 @@ impl UiFailure {
                 code: "WAITING_USER".into(),
                 message: "Human Checkpoint 确认必须绑定当前 Mission/Checkpoint revision、持久 Conversation、非空确认和稳定幂等键；未写入部分状态。".into(),
             },
+            DesktopDataError::InvalidVm11OutcomeDecision => Self {
+                code: "WAITING_USER".into(),
+                message: "VM-11 决策必须选择一个当前可用的结构化动作，填写私密理由，并绑定冻结 Review 与当前 CAS revision；未写入部分状态。".into(),
+            },
             DesktopDataError::InvalidRecoveryKey => Self {
                 code: "WAITING_USER".into(),
                 message: "Recovery Kit 必须是此前导出的 64 位十六进制密钥；Hartevo 不会代替用户保存或猜测恢复密钥。".into(),
@@ -145,6 +151,21 @@ impl UiFailure {
             }) => Self {
                 code: "BLOCKED_ENV".into(),
                 message: "此前认领的本机 Runtime 进程无法被精确检查或终止。Hartevo 不会按 PID 猜测清理，也不会启动第二个 Runtime；请保留现场并进入支持恢复流程。".into(),
+            },
+            DesktopDataError::Application(
+                ApplicationError::StructuredOutcomeDecisionRequired
+                | ApplicationError::StructuredOutcomeDecisionCommandMismatch,
+            ) => Self {
+                code: "WAITING_USER".into(),
+                message: "该 VM-11 Checkpoint 不接受自由文本冒充决策；请选择 Continue、Stop、Scale 或 Test，并填写理由。".into(),
+            },
+            DesktopDataError::Application(
+                ApplicationError::StructuredOutcomeDecisionUnavailable
+                | ApplicationError::StructuredOutcomeDecisionReviewMismatch
+                | ApplicationError::StructuredOutcomeDecisionReplayMismatch,
+            ) => Self {
+                code: "STALE_DECISION".into(),
+                message: "冻结 Outcome Review 或 Mission/Conversation revision 已变化；请刷新后重新审阅，旧决策未被写入或重放。".into(),
             },
             DesktopDataError::Storage(_)
             | DesktopDataError::Application(_)
@@ -370,6 +391,7 @@ pub fn App() -> Element {
     let mut mission_submitting = use_signal(|| false);
     let mut runtime_retrying = use_signal(|| false);
     let mut human_work_product_selection = use_signal(BTreeSet::<WorkProductId>::new);
+    let mut vm11_outcome_action = use_signal(|| None::<(MissionId, OutcomeDecision)>);
     let mut workpad_open = use_signal(|| true);
     let view = model.read().clone();
     let current_surface = surface();
@@ -543,6 +565,31 @@ pub fn App() -> Element {
             .current_checkpoint_oracle_ids
             .contains("work_product")
     });
+    let vm11_outcome_decision_active = human_route_active
+        && mission.as_ref().is_some_and(|mission| {
+            mission.manifest_id.as_deref() == Some("VM-11")
+                && mission.current_checkpoint_id.as_deref() == Some("continue_stop_scale_test")
+        });
+    let vm11_outcome_review = mission
+        .as_ref()
+        .and_then(|mission| mission.vm11_outcome_review.clone());
+    let selected_vm11_action =
+        vm11_outcome_action
+            .read()
+            .as_ref()
+            .and_then(|(selected_mission_id, action)| {
+                mission
+                    .as_ref()
+                    .filter(|mission| mission.mission_id == *selected_mission_id)
+                    .map(|_| action.clone())
+            });
+    let selected_vm11_action_available = selected_vm11_action.as_ref().is_some_and(|action| {
+        vm11_outcome_review.as_ref().is_some_and(|projection| {
+            projection.action_gates.iter().any(|gate| {
+                gate.action == *action && gate.status == OutcomeReviewDecisionGateStatus::Available
+            })
+        })
+    });
     let available_human_work_product_ids = mission.as_ref().map_or_else(BTreeSet::new, |mission| {
         mission
             .work_products
@@ -559,8 +606,13 @@ pub fn App() -> Element {
     let can_edit_human_confirmation =
         project_can_start_mission && human_route_active && !runtime_busy;
     let can_submit_human_confirmation = can_edit_human_confirmation
+        && !vm11_outcome_decision_active
         && !draft.read().trim().is_empty()
         && (!human_requires_work_product || !selected_human_work_product_ids.is_empty());
+    let can_submit_vm11_outcome_decision = can_edit_human_confirmation
+        && vm11_outcome_decision_active
+        && selected_vm11_action_available
+        && !draft.read().trim().is_empty();
     let can_execute_application_route =
         project_can_start_mission && application_route_active && !runtime_busy;
     let can_edit_continuation = project_can_start_mission
@@ -955,43 +1007,116 @@ pub fn App() -> Element {
                                 }
                                 if human_route_active {
                                     section { class: "human-checkpoint-confirmation", aria_label: "Human Checkpoint 精确确认",
-                                        strong { "需要你的精确确认" }
-                                        span {
-                                            "Checkpoint {human_checkpoint_id_label} · Oracle {human_oracle_label}"
-                                        }
-                                        if human_requires_work_product {
-                                            if mission.as_ref().is_none_or(|mission| mission.work_products.is_empty()) {
-                                                em { "BLOCKED：此确认必须绑定真实 WorkProduct，但当前解锁投影中没有可审阅产物。不会空确认。" }
-                                            } else if let Some(current_mission) = &mission {
-                                                div { class: "human-work-product-list",
-                                                    for product in current_mission.work_products.clone() {
+                                        if vm11_outcome_decision_active {
+                                            strong { "选择下一步：Continue / Stop / Scale / Test" }
+                                            span {
+                                                "Checkpoint {human_checkpoint_id_label} · Oracle {human_oracle_label}"
+                                            }
+                                            if let Some(projection) = &vm11_outcome_review {
+                                                div { class: "outcome-review-gates",
+                                                    span { "KPI · {outcome_review_gate_label(projection.review.kpi_status)}" }
+                                                    span { "归因 · {outcome_review_gate_label(projection.review.attribution_status)}" }
+                                                    span { "结算 · {outcome_review_gate_label(projection.review.settlement_status)}" }
+                                                    span { "成本 · {outcome_review_gate_label(projection.review.cost_status)}" }
+                                                    span { "预算 · {outcome_review_gate_label(projection.review.budget_status)}" }
+                                                    span { "Scale evidence · {outcome_review_gate_label(projection.review.scale_evidence_status)}" }
+                                                }
+                                                div { class: "outcome-review-summary",
+                                                    span { "KPI {projection.review.target_met_count} 达标 / {projection.review.target_gap_count} 未达标" }
+                                                    span { "订单 {projection.review.order_count} · 已归因 {projection.review.attributed_order_count} · 未归因 {projection.review.unattributed_order_count}" }
+                                                    span { "结算组 {projection.review.settlement_group_count} · 未结 {projection.review.outstanding_settlement_group_count}" }
+                                                    span { "已验证 Effect {projection.review.verified_effect_count} · Pending {projection.review.pending_effect_count}" }
+                                                    span { "预算 {money_label(&projection.review.budget)} · 剩余 {money_label(&projection.review.budget_remaining)} · 超支 {money_label(&projection.review.budget_overrun)}" }
+                                                }
+                                                if !projection.review.economics.is_empty() {
+                                                    div { class: "outcome-review-economics",
+                                                        for economics in projection.review.economics.values() {
+                                                            span {
+                                                                "{economics.currency}：净收入 {money_label(&economics.net_revenue)} · 已付佣金 {money_label(&economics.commission_paid)} · 待付 {money_label(&economics.commission_outstanding)} · 已验证支出 {money_label(&economics.verified_effect_outflow)}"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if !projection.review.caveats.is_empty() {
+                                                    div { class: "outcome-review-caveats",
+                                                        strong { "限制与不确定性" }
+                                                        for caveat in projection.review.caveats.iter() {
+                                                            span { "{outcome_review_caveat_label(*caveat)}" }
+                                                        }
+                                                    }
+                                                }
+                                                div { class: "outcome-review-actions", role: "group", aria_label: "选择 VM-11 Outcome 决策",
+                                                    for gate in projection.action_gates.clone() {
                                                         {
-                                                            let work_product_id = product.work_product_id.clone();
-                                                            let checked = selected_human_work_product_ids.contains(&work_product_id);
+                                                            let action = gate.action.clone();
+                                                            let action_for_selection = action.clone();
+                                                            let selected = selected_vm11_action.as_ref() == Some(&action);
+                                                            let available = gate.status == OutcomeReviewDecisionGateStatus::Available;
+                                                            let mission_id = mission.as_ref().map(|mission| mission.mission_id.clone());
                                                             rsx! {
-                                                                label { class: "human-work-product-option",
-                                                                    input {
-                                                                        r#type: "checkbox",
-                                                                        checked,
-                                                                        disabled: !can_edit_human_confirmation,
-                                                                        onchange: move |event| {
-                                                                            let mut selected = human_work_product_selection.write();
-                                                                            if event.checked() {
-                                                                                selected.insert(work_product_id.clone());
-                                                                            } else {
-                                                                                selected.remove(&work_product_id);
-                                                                            }
-                                                                        },
-                                                                    }
-                                                                    span { strong { "{product.title}" } small { "{product.work_product_id} · revision {product.work_product_revision}" } }
+                                                                button {
+                                                                    class: if selected { "outcome-action selected" } else { "outcome-action" },
+                                                                    disabled: !can_edit_human_confirmation || !available || mission_id.is_none(),
+                                                                    aria_pressed: selected,
+                                                                    aria_label: "选择 {outcome_decision_label(&action)}",
+                                                                    onclick: move |_| {
+                                                                        if let Some(mission_id) = mission_id.clone() {
+                                                                            vm11_outcome_action.set(Some((mission_id, action_for_selection.clone())));
+                                                                        }
+                                                                    },
+                                                                    strong { "{outcome_decision_label(&action)}" }
+                                                                    small { "{outcome_decision_gate_label(gate.status)}" }
                                                                 }
                                                             }
                                                         }
                                                     }
                                                 }
+                                                small { "决策会绑定此冻结 Review 的 projection/completion digest、当前 Mission/Checkpoint/Conversation revision 与私密理由；修改任一输入都会拒绝旧提交。" }
+                                            } else {
+                                                div { class: "catalog-route-note application-handler-boundary", role: "status",
+                                                    span { class: "honesty-badge", "BLOCKED_DATA" }
+                                                    span { "outcome_review 已标记完成，但当前 SQLCipher 数据库没有可验证的冻结 Review。不会退化为自由文本确认。" }
+                                                }
                                             }
                                         } else {
-                                            small { "该 Checkpoint 不声明 WorkProduct Oracle；确认只绑定下面的用户陈述、Mission/Checkpoint revision 与 Catalog route digest。" }
+                                            strong { "需要你的精确确认" }
+                                            span {
+                                                "Checkpoint {human_checkpoint_id_label} · Oracle {human_oracle_label}"
+                                            }
+                                            if human_requires_work_product {
+                                                if mission.as_ref().is_none_or(|mission| mission.work_products.is_empty()) {
+                                                    em { "BLOCKED：此确认必须绑定真实 WorkProduct，但当前解锁投影中没有可审阅产物。不会空确认。" }
+                                                } else if let Some(current_mission) = &mission {
+                                                    div { class: "human-work-product-list",
+                                                        for product in current_mission.work_products.clone() {
+                                                            {
+                                                                let work_product_id = product.work_product_id.clone();
+                                                                let checked = selected_human_work_product_ids.contains(&work_product_id);
+                                                                rsx! {
+                                                                    label { class: "human-work-product-option",
+                                                                        input {
+                                                                            r#type: "checkbox",
+                                                                            checked,
+                                                                            disabled: !can_edit_human_confirmation,
+                                                                            onchange: move |event| {
+                                                                                let mut selected = human_work_product_selection.write();
+                                                                                if event.checked() {
+                                                                                    selected.insert(work_product_id.clone());
+                                                                                } else {
+                                                                                    selected.remove(&work_product_id);
+                                                                                }
+                                                                            },
+                                                                        }
+                                                                        span { strong { "{product.title}" } small { "{product.work_product_id} · revision {product.work_product_revision}" } }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                small { "该 Checkpoint 不声明 WorkProduct Oracle；确认只绑定下面的用户陈述、Mission/Checkpoint revision 与 Catalog route digest。" }
+                                            }
                                         }
                                     }
                                 }
@@ -1000,7 +1125,7 @@ pub fn App() -> Element {
                                     disabled: !can_write_composer,
                                     aria_label: "Operating Contract 目标、约束与停止条件",
                                     placeholder: if mission.is_some() {
-                                        if human_route_active { "写下你对当前 Checkpoint 的明确确认；这段内容会私密写入 Mission Conversation…" } else if can_edit_continuation { "继续当前 Mission，或写明纠正与新约束…" } else { "当前 Mission 状态不接受续写，或它是 legacy bootstrap" }
+                                        if vm11_outcome_decision_active { "写下选择该动作的理由、风险与停止条件；正文只进入加密 Mission Conversation…" } else if human_route_active { "写下你对当前 Checkpoint 的明确确认；这段内容会私密写入 Mission Conversation…" } else if can_edit_continuation { "继续当前 Mission，或写明纠正与新约束…" } else { "当前 Mission 状态不接受续写，或它是 legacy bootstrap" }
                                     } else if project_can_start_mission {
                                         "写明目标、硬约束、非目标与停止条件…"
                                     } else {
@@ -1120,76 +1245,162 @@ pub fn App() -> Element {
                                         }
                                         if mission.is_some() {
                                             if human_route_active {
-                                                button {
-                                                    class: "send-button",
-                                                    disabled: !can_submit_human_confirmation,
-                                                    aria_label: "确认当前 Human Checkpoint 并原子进入下一路由",
-                                                    onclick: move |_| {
-                                                        let selection = {
-                                                            let model = model.read();
-                                                            model.selected_project_id.clone().zip(
-                                                                model.current_mission().and_then(|mission| {
-                                                                    Some((
-                                                                        mission.mission_id.clone(),
-                                                                        mission.current_checkpoint_id.clone()?,
-                                                                        mission.revision,
-                                                                        mission.current_checkpoint_revision?,
-                                                                        mission.conversation_revision?,
-                                                                    ))
-                                                                }),
-                                                            )
-                                                        };
-                                                        let Some((project_id, (mission_id, checkpoint_id, expected_mission_revision, expected_checkpoint_revision, expected_conversation_revision))) = selection else {
-                                                            model.write().notice = Some(UiFailure {
-                                                                code: "WAITING_USER".into(),
-                                                                message: "当前 Human Checkpoint revision 或持久 Conversation 不完整；未写入确认。".into(),
-                                                            });
-                                                            return;
-                                                        };
-                                                        let message_id = MissionConversationMessageId::new();
-                                                        let request = DesktopHumanCheckpointConfirmationRequest {
-                                                            project_id,
-                                                            mission_id,
-                                                            checkpoint_id,
-                                                            message_id: message_id.clone(),
-                                                            body: draft(),
-                                                            idempotency_key: format!("desktop-human-confirmation:{}", message_id.as_str()),
-                                                            work_product_ids: selected_human_work_product_ids.clone(),
-                                                            expected_mission_revision,
-                                                            expected_checkpoint_revision,
-                                                            expected_conversation_revision,
-                                                        };
-                                                        mission_submitting.set(true);
-                                                        spawn(async move {
-                                                            let result = tokio::task::spawn_blocking(move || {
-                                                                DesktopDataPlane::discover().and_then(|plane| {
-                                                                    plane.confirm_human_mission_checkpoint_os(request, Utc::now())
+                                                if vm11_outcome_decision_active {
+                                                    button {
+                                                        class: "send-button",
+                                                        disabled: !can_submit_vm11_outcome_decision,
+                                                        aria_label: "提交结构化 VM-11 Outcome 决策并原子进入下一路由",
+                                                        onclick: move |_| {
+                                                            let selection = {
+                                                                let model = model.read();
+                                                                model.selected_project_id.clone().zip(
+                                                                    model.current_mission().and_then(|mission| {
+                                                                        let review = mission.vm11_outcome_review.as_ref()?;
+                                                                        let action = vm11_outcome_action
+                                                                            .read()
+                                                                            .as_ref()
+                                                                            .filter(|(mission_id, _)| *mission_id == mission.mission_id)
+                                                                            .map(|(_, action)| action.clone())?;
+                                                                        Some((
+                                                                            mission.mission_id.clone(),
+                                                                            action,
+                                                                            review.review_projection_digest.clone(),
+                                                                            review.review_completion_digest.clone(),
+                                                                            mission.revision,
+                                                                            mission.current_checkpoint_revision?,
+                                                                            mission.conversation_revision?,
+                                                                        ))
+                                                                    }),
+                                                                )
+                                                            };
+                                                            let Some((project_id, (mission_id, action, expected_review_projection_digest, expected_review_completion_digest, expected_mission_revision, expected_checkpoint_revision, expected_conversation_revision))) = selection else {
+                                                                model.write().notice = Some(UiFailure {
+                                                                    code: "BLOCKED_DATA".into(),
+                                                                    message: "冻结 Review、结构化动作或当前 CAS revision 不完整；未写入决策。".into(),
+                                                                });
+                                                                return;
+                                                            };
+                                                            let message_id = MissionConversationMessageId::new();
+                                                            let request = DesktopVm11OutcomeDecisionRequest {
+                                                                project_id,
+                                                                mission_id,
+                                                                action,
+                                                                message_id: message_id.clone(),
+                                                                rationale: draft(),
+                                                                idempotency_key: format!("desktop-vm11-outcome-decision:{}", message_id.as_str()),
+                                                                expected_review_projection_digest,
+                                                                expected_review_completion_digest,
+                                                                expected_mission_revision,
+                                                                expected_checkpoint_revision,
+                                                                expected_conversation_revision,
+                                                            };
+                                                            mission_submitting.set(true);
+                                                            spawn(async move {
+                                                                let result = tokio::task::spawn_blocking(move || {
+                                                                    DesktopDataPlane::discover().and_then(|plane| {
+                                                                        plane.decide_vm11_outcome_review_os(request, Utc::now())
+                                                                    })
                                                                 })
-                                                            })
-                                                            .await;
-                                                            match result {
-                                                                Ok(Ok(snapshot)) => {
-                                                                    model.write().set_ready(snapshot, false);
-                                                                    draft.set(String::new());
-                                                                    human_work_product_selection.write().clear();
+                                                                .await;
+                                                                match result {
+                                                                    Ok(Ok(snapshot)) => {
+                                                                        model.write().set_ready(snapshot, false);
+                                                                        draft.set(String::new());
+                                                                        vm11_outcome_action.set(None);
+                                                                    }
+                                                                    Ok(Err(error)) => model.write().set_notice(&error),
+                                                                    Err(_) => {
+                                                                        model.write().notice = Some(UiFailure {
+                                                                            code: "VM11_OUTCOME_DECISION_COORDINATOR_FAILED".into(),
+                                                                            message: "结构化 Outcome 决策协调异常结束；Review 来源 fence、Mission/Conversation 双 CAS 与事务回滚仍然生效。".into(),
+                                                                        });
+                                                                    }
                                                                 }
-                                                                Ok(Err(error)) => model.write().set_notice(&error),
-                                                                Err(_) => {
-                                                                    model.write().notice = Some(UiFailure {
-                                                                        code: "HUMAN_CONFIRMATION_COORDINATOR_FAILED".into(),
-                                                                        message: "Human Checkpoint 原子协调异常结束；Mission 与 Conversation 使用双 CAS，不会留下半完成确认。".into(),
-                                                                    });
+                                                                mission_submitting.set(false);
+                                                            });
+                                                        },
+                                                        if mission_submitting() {
+                                                            "正在绑定 Review 并原子交接…"
+                                                        } else if selected_vm11_action.is_none() {
+                                                            "先选择 Continue / Stop / Scale / Test"
+                                                        } else if !selected_vm11_action_available {
+                                                            "所选动作被冻结证据阻断"
+                                                        } else {
+                                                            "提交结构化决策"
+                                                        }
+                                                    }
+                                                } else {
+                                                    button {
+                                                        class: "send-button",
+                                                        disabled: !can_submit_human_confirmation,
+                                                        aria_label: "确认当前 Human Checkpoint 并原子进入下一路由",
+                                                        onclick: move |_| {
+                                                            let selection = {
+                                                                let model = model.read();
+                                                                model.selected_project_id.clone().zip(
+                                                                    model.current_mission().and_then(|mission| {
+                                                                        Some((
+                                                                            mission.mission_id.clone(),
+                                                                            mission.current_checkpoint_id.clone()?,
+                                                                            mission.revision,
+                                                                            mission.current_checkpoint_revision?,
+                                                                            mission.conversation_revision?,
+                                                                        ))
+                                                                    }),
+                                                                )
+                                                            };
+                                                            let Some((project_id, (mission_id, checkpoint_id, expected_mission_revision, expected_checkpoint_revision, expected_conversation_revision))) = selection else {
+                                                                model.write().notice = Some(UiFailure {
+                                                                    code: "WAITING_USER".into(),
+                                                                    message: "当前 Human Checkpoint revision 或持久 Conversation 不完整；未写入确认。".into(),
+                                                                });
+                                                                return;
+                                                            };
+                                                            let message_id = MissionConversationMessageId::new();
+                                                            let request = DesktopHumanCheckpointConfirmationRequest {
+                                                                project_id,
+                                                                mission_id,
+                                                                checkpoint_id,
+                                                                message_id: message_id.clone(),
+                                                                body: draft(),
+                                                                idempotency_key: format!("desktop-human-confirmation:{}", message_id.as_str()),
+                                                                work_product_ids: selected_human_work_product_ids.clone(),
+                                                                expected_mission_revision,
+                                                                expected_checkpoint_revision,
+                                                                expected_conversation_revision,
+                                                            };
+                                                            mission_submitting.set(true);
+                                                            spawn(async move {
+                                                                let result = tokio::task::spawn_blocking(move || {
+                                                                    DesktopDataPlane::discover().and_then(|plane| {
+                                                                        plane.confirm_human_mission_checkpoint_os(request, Utc::now())
+                                                                    })
+                                                                })
+                                                                .await;
+                                                                match result {
+                                                                    Ok(Ok(snapshot)) => {
+                                                                        model.write().set_ready(snapshot, false);
+                                                                        draft.set(String::new());
+                                                                        human_work_product_selection.write().clear();
+                                                                    }
+                                                                    Ok(Err(error)) => model.write().set_notice(&error),
+                                                                    Err(_) => {
+                                                                        model.write().notice = Some(UiFailure {
+                                                                            code: "HUMAN_CONFIRMATION_COORDINATOR_FAILED".into(),
+                                                                            message: "Human Checkpoint 原子协调异常结束；Mission 与 Conversation 使用双 CAS，不会留下半完成确认。".into(),
+                                                                        });
+                                                                    }
                                                                 }
-                                                            }
-                                                            mission_submitting.set(false);
-                                                        });
-                                                    },
-                                                    if mission_submitting() {
-                                                        "正在原子确认与交接…"
-                                                    } else if human_requires_work_product && selected_human_work_product_ids.is_empty() {
-                                                        "先选择真实 WorkProduct"
-                                                    } else {
-                                                        "确认当前 Checkpoint"
+                                                                mission_submitting.set(false);
+                                                            });
+                                                        },
+                                                        if mission_submitting() {
+                                                            "正在原子确认与交接…"
+                                                        } else if human_requires_work_product && selected_human_work_product_ids.is_empty() {
+                                                            "先选择真实 WorkProduct"
+                                                        } else {
+                                                            "确认当前 Checkpoint"
+                                                        }
                                                     }
                                                 }
                                             } else {
@@ -2367,6 +2578,47 @@ fn mission_conversation_kind_label(kind: MissionConversationMessageKind) -> &'st
         MissionConversationMessageKind::RuntimeDraft => "RUNTIME_DRAFT",
         MissionConversationMessageKind::SystemNotice => "SYSTEM_NOTICE",
     }
+}
+
+const fn outcome_review_gate_label(status: OutcomeReviewGateStatus) -> &'static str {
+    match status {
+        OutcomeReviewGateStatus::Satisfied => "SATISFIED",
+        OutcomeReviewGateStatus::Blocked => "BLOCKED",
+    }
+}
+
+const fn outcome_decision_label(action: &OutcomeDecision) -> &'static str {
+    match action {
+        OutcomeDecision::Continue => "Continue",
+        OutcomeDecision::Stop => "Stop",
+        OutcomeDecision::Scale => "Scale",
+        OutcomeDecision::Test => "Test",
+    }
+}
+
+const fn outcome_decision_gate_label(status: OutcomeReviewDecisionGateStatus) -> &'static str {
+    match status {
+        OutcomeReviewDecisionGateStatus::Available => "可选择",
+        OutcomeReviewDecisionGateStatus::BlockedLoopPolicy => "当前合同禁止隐式循环",
+        OutcomeReviewDecisionGateStatus::BlockedScaleEvidence => "Scale 证据不足",
+    }
+}
+
+const fn outcome_review_caveat_label(caveat: OutcomeReviewCaveat) -> &'static str {
+    match caveat {
+        OutcomeReviewCaveat::KpiTargetGap => "存在 KPI 目标缺口",
+        OutcomeReviewCaveat::UnattributedOrders => "存在未归因订单",
+        OutcomeReviewCaveat::OutstandingSettlement => "存在未结算义务",
+        OutcomeReviewCaveat::PendingEffect => "存在 Pending Effect",
+        OutcomeReviewCaveat::UnresolvedEffectCost => "存在未解析 Effect 成本",
+        OutcomeReviewCaveat::BudgetExceeded => "预算已超支",
+        OutcomeReviewCaveat::CrossCurrencyCostWithoutFx => "跨币种成本缺少已验证 FX",
+        OutcomeReviewCaveat::ImplicitLoopForbidden => "当前 Operating Contract 禁止隐式循环",
+    }
+}
+
+fn money_label(money: &Money) -> String {
+    format!("{} {} minor", money.amount_minor, money.currency)
 }
 
 fn runtime_availability_label(status: DesktopRuntimeAvailabilityStatus) -> &'static str {

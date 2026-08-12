@@ -10,15 +10,15 @@ use chrono::{DateTime, Duration, Utc};
 use hartevo_application::{
     AdoptRuntimeTurnDraft, AppendMissionConversationMessage, ApplicationError,
     ApplicationMissionCheckpointExecution, ApplicationService, ConfirmHumanMissionCheckpoint,
-    CreateProject, DesktopInventoryProjection, DesktopUnlockedProjectProjection,
-    DispatchContextRuntimeTurn, EnsureFailedLocalMissionRuntimeGenerationRetired,
-    ExecuteApplicationMissionCheckpoint, FenceOrphanedContextRuntimeTurn,
-    InterruptContextRuntimeTurn, KeyAdministrationAuthorization, MissionCheckpointDispatchState,
-    MissionRuntimeProjection, ObserveContextRuntimeTurn, PrepareLocalMissionRuntimeContext,
-    ProjectContextMaterialSession, ProjectEncryptionReadiness, ProvisionProjectEncryption,
-    RecoverContextWorkerRuntime, RecoverPersonalProjectDevice, ResearchPacket,
-    RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime, RuntimeTurnDispatchDisposition,
-    StartCatalogMission, StartMission,
+    CreateProject, DecideVm11OutcomeReview, DesktopInventoryProjection,
+    DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
+    EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
+    FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn, KeyAdministrationAuthorization,
+    MissionCheckpointDispatchState, MissionRuntimeProjection, ObserveContextRuntimeTurn,
+    PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
+    ProvisionProjectEncryption, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
+    ResearchPacket, RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime,
+    RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission,
 };
 use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
@@ -28,9 +28,9 @@ use hartevo_domain_kernel::{
     ActorId, CurrencyCode, DeviceId, KeyManagementError, KeyRecipient, KpiContract,
     MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionConversationMessageId,
     MissionConversationMessageKind, MissionConversationRole, MissionId, MissionStage, Money,
-    OperatingMode, ProjectEncryptionMode, ProjectId, ProjectKeyring, RuntimeRecoveryStatus,
-    RuntimeResumeStrategy, RuntimeTurnAttemptId, RuntimeTurnStatus, StorageMode, TaskId, TenantId,
-    WorkProductId, WorkerHandleStatus,
+    OperatingMode, OutcomeDecision, ProjectEncryptionMode, ProjectId, ProjectKeyring,
+    RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId, RuntimeTurnStatus,
+    StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
 };
 use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand};
 use hartevo_storage::{
@@ -164,6 +164,52 @@ pub struct DesktopHumanCheckpointConfirmationRequest {
     pub expected_mission_revision: u64,
     pub expected_checkpoint_revision: u64,
     pub expected_conversation_revision: u64,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopVm11OutcomeDecisionRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub action: OutcomeDecision,
+    pub message_id: MissionConversationMessageId,
+    pub rationale: String,
+    pub idempotency_key: String,
+    pub expected_review_projection_digest: String,
+    pub expected_review_completion_digest: String,
+    pub expected_mission_revision: u64,
+    pub expected_checkpoint_revision: u64,
+    pub expected_conversation_revision: u64,
+}
+
+impl fmt::Debug for DesktopVm11OutcomeDecisionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopVm11OutcomeDecisionRequest")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("action", &self.action)
+            .field("message_id", &self.message_id)
+            .field("rationale", &"[REDACTED]")
+            .field("idempotency_key", &"[REDACTED]")
+            .field(
+                "expected_review_projection_digest",
+                &self.expected_review_projection_digest,
+            )
+            .field(
+                "expected_review_completion_digest",
+                &self.expected_review_completion_digest,
+            )
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .field(
+                "expected_checkpoint_revision",
+                &self.expected_checkpoint_revision,
+            )
+            .field(
+                "expected_conversation_revision",
+                &self.expected_conversation_revision,
+            )
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -751,6 +797,65 @@ impl DesktopDataPlane {
                 body: request.body,
                 idempotency_key: request.idempotency_key,
                 work_product_ids: request.work_product_ids,
+                expected_mission_revision: request.expected_mission_revision,
+                expected_checkpoint_revision: request.expected_checkpoint_revision,
+                expected_conversation_revision: request.expected_conversation_revision,
+            },
+            now,
+        )?;
+        let product_evidence = load_product_evidence(now)?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
+            now,
+        )
+    }
+
+    /// Persists VM-11's exact Continue/Stop/Scale/Test choice without Runtime
+    /// or Provider execution. The SQLCipher transaction binds the frozen
+    /// review, private rationale message, Mission/Conversation CAS and next
+    /// Application route before this refreshed projection is returned.
+    pub fn decide_vm11_outcome_review_os(
+        &self,
+        request: DesktopVm11OutcomeDecisionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.decide_vm11_outcome_review_with(&secret_store, request, now)
+    }
+
+    pub fn decide_vm11_outcome_review_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopVm11OutcomeDecisionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if request.rationale.trim().is_empty()
+            || request.idempotency_key.trim().is_empty()
+            || request.expected_review_projection_digest.len() != 64
+            || request.expected_review_completion_digest.len() != 64
+        {
+            return Err(DesktopDataError::InvalidVm11OutcomeDecision);
+        }
+        let project_id = request.project_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        service.decide_vm11_outcome_review(
+            DecideVm11OutcomeReview {
+                project_id,
+                mission_id: request.mission_id,
+                action: request.action,
+                decided_by: ActorId::from_stable(format!(
+                    "desktop-local-operator:{}",
+                    self.device_id
+                )),
+                message_id: request.message_id,
+                rationale: request.rationale,
+                idempotency_key: request.idempotency_key,
+                expected_review_projection_digest: request.expected_review_projection_digest,
+                expected_review_completion_digest: request.expected_review_completion_digest,
                 expected_mission_revision: request.expected_mission_revision,
                 expected_checkpoint_revision: request.expected_checkpoint_revision,
                 expected_conversation_revision: request.expected_conversation_revision,
@@ -2202,6 +2307,10 @@ pub enum DesktopDataError {
         "Human Checkpoint confirmation requires an exact Checkpoint, message, and idempotency key"
     )]
     InvalidHumanCheckpointConfirmation,
+    #[error(
+        "VM-11 outcome decision requires a typed action, private rationale, actor, and exact frozen review digests"
+    )]
+    InvalidVm11OutcomeDecision,
     #[error("project name cannot be empty")]
     EmptyProjectName,
     #[error("recovery key must be exactly 32 bytes encoded as 64 hexadecimal characters")]
@@ -3438,11 +3547,156 @@ sleep 30"#;
                 None,
             )
         );
+        let review_decision_projection = reviewed_projection
+            .vm11_outcome_review
+            .as_ref()
+            .expect("frozen outcome review is projected for Human decision");
+        assert_eq!(review_decision_projection.review.order_count, 1);
+        assert_eq!(review_decision_projection.review.attributed_order_count, 0);
+        assert_eq!(
+            review_decision_projection.review.unattributed_order_count,
+            1
+        );
+        assert_eq!(review_decision_projection.decision, None);
+        assert_eq!(review_decision_projection.action_gates.len(), 4);
+        assert_eq!(
+            review_decision_projection
+                .action_gates
+                .iter()
+                .find(|gate| gate.action == OutcomeDecision::Stop)
+                .map(|gate| gate.status),
+            Some(hartevo_domain_kernel::OutcomeReviewDecisionGateStatus::Available)
+        );
+        assert_eq!(
+            review_decision_projection
+                .action_gates
+                .iter()
+                .find(|gate| gate.action == OutcomeDecision::Scale)
+                .map(|gate| gate.status),
+            Some(hartevo_domain_kernel::OutcomeReviewDecisionGateStatus::BlockedLoopPolicy)
+        );
+
+        let generic_message_id = MissionConversationMessageId::new();
+        assert!(matches!(
+            plane.confirm_human_mission_checkpoint_with(
+                &secrets,
+                DesktopHumanCheckpointConfirmationRequest {
+                    project_id: project_id.clone(),
+                    mission_id: started.mission_id.clone(),
+                    checkpoint_id: "continue_stop_scale_test".into(),
+                    message_id: generic_message_id.clone(),
+                    body: "stop".into(),
+                    idempotency_key: format!(
+                        "desktop-generic-vm11-decision:{}",
+                        generic_message_id.as_str()
+                    ),
+                    work_product_ids: BTreeSet::new(),
+                    expected_mission_revision: reviewed_projection.revision,
+                    expected_checkpoint_revision: reviewed_projection
+                        .current_checkpoint_revision
+                        .expect("decision Checkpoint revision"),
+                    expected_conversation_revision: reviewed_projection
+                        .conversation_revision
+                        .expect("decision Conversation revision"),
+                },
+                observed_at() + Duration::minutes(13),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::StructuredOutcomeDecisionRequired
+            ))
+        ));
+
+        let decision_message_id = MissionConversationMessageId::new();
+        let decision_request = DesktopVm11OutcomeDecisionRequest {
+            project_id: project_id.clone(),
+            mission_id: started.mission_id.clone(),
+            action: OutcomeDecision::Stop,
+            message_id: decision_message_id.clone(),
+            rationale: "Stop: the one-off parent contract forbids an implicit loop; retain the frozen outcome evidence".into(),
+            idempotency_key: format!(
+                "desktop-vm11-outcome-decision:{}",
+                decision_message_id.as_str()
+            ),
+            expected_review_projection_digest: review_decision_projection
+                .review_projection_digest
+                .clone(),
+            expected_review_completion_digest: review_decision_projection
+                .review_completion_digest
+                .clone(),
+            expected_mission_revision: reviewed_projection.revision,
+            expected_checkpoint_revision: reviewed_projection
+                .current_checkpoint_revision
+                .expect("decision Checkpoint revision"),
+            expected_conversation_revision: reviewed_projection
+                .conversation_revision
+                .expect("decision Conversation revision"),
+        };
+        let decided = plane
+            .decide_vm11_outcome_review_with(
+                &secrets,
+                decision_request.clone(),
+                observed_at() + Duration::minutes(13),
+            )
+            .expect("structured Stop decision");
+        let decided_projection = decided.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("decided VM-11 projection");
+        assert_eq!(decided_projection.completed_checkpoint_count, 8);
+        assert_eq!(
+            decided_projection.current_checkpoint_id.as_deref(),
+            Some("next_contract_or_valid_terminal")
+        );
+        assert_eq!(
+            decided_projection.current_checkpoint_executor,
+            Some(MissionCheckpointExecutor::Application)
+        );
+        assert_eq!(
+            decided_projection.current_checkpoint_application_handler_status,
+            Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented)
+        );
+        let persisted_decision = decided_projection
+            .vm11_outcome_review
+            .as_ref()
+            .and_then(|projection| projection.decision.as_ref())
+            .expect("structured decision projection");
+        assert_eq!(persisted_decision.action, OutcomeDecision::Stop);
+        assert_eq!(persisted_decision.message_id, decision_message_id);
+        assert!(
+            persisted_decision
+                .decided_by
+                .as_str()
+                .starts_with("desktop-local-operator:desktop-device:")
+        );
+        assert!(decided.runtime_activity.iter().all(|activity| {
+            activity.mission_id != started.mission_id
+                || (activity.process_claim_status.is_none()
+                    && activity.recovery_status.is_none()
+                    && activity.turn_status.is_none())
+        }));
+        let replayed = plane
+            .decide_vm11_outcome_review_with(
+                &secrets,
+                decision_request,
+                observed_at() + Duration::minutes(14),
+            )
+            .expect("exact structured decision replay");
+        let replayed_projection = replayed.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("replayed VM-11 projection");
+        assert_eq!(replayed_projection.revision, decided_projection.revision);
+        assert_eq!(
+            replayed_projection.conversation_revision,
+            decided_projection.conversation_revision
+        );
         let database_secret = secrets
             .get(plane.database_key_reference())
             .expect("database secret");
         let (service, _) = plane
-            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(13))
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(15))
             .expect("reopen completed Application route");
         let mission = service
             .load_mission(&project_id, &started.mission_id)
@@ -3574,6 +3828,30 @@ sleep 30"#;
             Some("vm11.outcome-review/v1")
         );
         assert_eq!(mission.effects.len(), 0);
+        let decision = service
+            .desktop_inventory()
+            .expect("reopened Desktop inventory")
+            .projects
+            .into_iter()
+            .find(|project| project.project_id == project_id)
+            .and_then(|project| {
+                project
+                    .missions
+                    .into_iter()
+                    .find(|mission| mission.mission_id == started.mission_id)
+            })
+            .and_then(|mission| mission.vm11_outcome_review)
+            .and_then(|projection| projection.decision)
+            .expect("durable structured outcome decision");
+        assert_eq!(decision.action, OutcomeDecision::Stop);
+        let event_json = serde_json::to_string(
+            &service
+                .mission_events(&project_id, &started.mission_id)
+                .expect("content-free VM-11 events"),
+        )
+        .expect("VM-11 event JSON");
+        assert!(event_json.contains("mission.outcome_review_decided"));
+        assert!(!event_json.contains("one-off parent contract"));
     }
 
     #[test]

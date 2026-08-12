@@ -103,12 +103,13 @@ pub use outcome::{
     CommissionStatus, MissionKpiMeasurement, MissionKpiObservedValue, MissionKpiProjection,
     OrderAttributionView, OrderSettlementView, OutcomeAttributionProjection, OutcomeEvent,
     OutcomeEventKind, OutcomeIdentityChainProjection, OutcomeLedger, OutcomeLedgerError,
-    OutcomeNormalizationProjection, OutcomeOrder, OutcomeRefund, OutcomeReviewCausalStatus,
-    OutcomeReviewCaveat, OutcomeReviewGateStatus, OutcomeReviewLoopPolicy, OutcomeReviewMoneyView,
-    OutcomeReviewProjection, OutcomeReviewRoiStatus, OutcomeSettlementProjection,
-    OutcomeSourceVerification, OutcomeVerificationMethod, PartnerSettlementView,
-    SettlementCommissionBasis, SettlementGroupStatus, Touchpoint,
-    attribution_effect_provider_identity_digest,
+    OutcomeNormalizationProjection, OutcomeOrder, OutcomeRefund, OutcomeReviewActionGate,
+    OutcomeReviewCausalStatus, OutcomeReviewCaveat, OutcomeReviewDecision,
+    OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus, OutcomeReviewLoopPolicy,
+    OutcomeReviewMoneyView, OutcomeReviewNextContractIntent, OutcomeReviewProjection,
+    OutcomeReviewRoiStatus, OutcomeSettlementProjection, OutcomeSourceVerification,
+    OutcomeVerificationMethod, PartnerSettlementView, SettlementCommissionBasis,
+    SettlementGroupStatus, Touchpoint, attribution_effect_provider_identity_digest,
 };
 pub use project::{Project, ProjectDataCell, ProjectError, StorageMode};
 pub use relationship::{

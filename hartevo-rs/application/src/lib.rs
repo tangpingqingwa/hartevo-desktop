@@ -63,18 +63,18 @@ use hartevo_domain_kernel::{
     MissionScheduleStatus, MissionStage, MissionTerminalDisposition, Money, OperatingMode,
     Opportunity, OpportunityId, OpportunityStage, OrderId, Outcome, OutcomeAttributionProjection,
     OutcomeDecision, OutcomeEvent, OutcomeIdentityChainProjection, OutcomeLedger,
-    OutcomeLedgerError, OutcomeNormalizationProjection, OutcomeReviewCausalStatus,
-    OutcomeReviewCaveat, OutcomeReviewLoopPolicy, OutcomeReviewProjection, OutcomeReviewRoiStatus,
-    OutcomeSettlementProjection, Partner, PartnerId, PayoutAuthorization, PayoutId, Person,
-    PersonId, PreparedAutomaticReply, Project, ProjectDataCell, ProjectEncryptionMode,
-    ProjectError, ProjectId, ProjectKeyring, ProjectKeyringBootstrap, ReceiptId, RelationshipError,
-    ReviewDecision, ReviewId, RuntimeProcessClaim, RuntimeProcessClaimStatus,
-    RuntimeProcessCleanupDisposition, RuntimeProcessIdentity, RuntimeRecoveryAttempt,
-    RuntimeRecoveryAttemptId, RuntimeRecoveryFailureClass, RuntimeRecoveryStatus,
-    RuntimeResumeStrategy, RuntimeTurnAttempt, RuntimeTurnAttemptId, RuntimeTurnError,
-    RuntimeTurnFailureClass, RuntimeTurnObservedKind, RuntimeTurnPrivateMessage,
-    RuntimeTurnRestartDisposition, RuntimeTurnScope, RuntimeTurnStatus, StorageMode,
-    SuppressionReason, Task, TaskId, TaskStatus, TenantId, TruthError, TruthFact,
+    OutcomeLedgerError, OutcomeNormalizationProjection, OutcomeReviewActionGate,
+    OutcomeReviewCausalStatus, OutcomeReviewCaveat, OutcomeReviewDecision, OutcomeReviewLoopPolicy,
+    OutcomeReviewProjection, OutcomeReviewRoiStatus, OutcomeSettlementProjection, Partner,
+    PartnerId, PayoutAuthorization, PayoutId, Person, PersonId, PreparedAutomaticReply, Project,
+    ProjectDataCell, ProjectEncryptionMode, ProjectError, ProjectId, ProjectKeyring,
+    ProjectKeyringBootstrap, ReceiptId, RelationshipError, ReviewDecision, ReviewId,
+    RuntimeProcessClaim, RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition,
+    RuntimeProcessIdentity, RuntimeRecoveryAttempt, RuntimeRecoveryAttemptId,
+    RuntimeRecoveryFailureClass, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt,
+    RuntimeTurnAttemptId, RuntimeTurnError, RuntimeTurnFailureClass, RuntimeTurnObservedKind,
+    RuntimeTurnPrivateMessage, RuntimeTurnRestartDisposition, RuntimeTurnScope, RuntimeTurnStatus,
+    StorageMode, SuppressionReason, Task, TaskId, TaskStatus, TenantId, TruthError, TruthFact,
     VerificationStatus, WebhookAttestation, WorkProduct, WorkProductDependencies, WorkProductId,
     WorkProductManifest, WorkProductManifestError, WorkProductPreview, WorkProductStatus,
     WorkerHandle, WorkerHandleStatus, WorkerId, WorkerLease, WorkerLeaseId, WorkerLeaseStatus,
@@ -192,6 +192,67 @@ pub struct HumanMissionCheckpointConfirmation {
     pub completed_checkpoint_id: String,
     pub completion_evidence_digest: String,
     pub next_dispatch: Option<MissionCheckpointDispatch>,
+}
+
+#[derive(Clone)]
+pub struct DecideVm11OutcomeReview {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub action: OutcomeDecision,
+    pub decided_by: ActorId,
+    pub message_id: MissionConversationMessageId,
+    pub rationale: String,
+    pub idempotency_key: String,
+    pub expected_review_projection_digest: String,
+    pub expected_review_completion_digest: String,
+    pub expected_mission_revision: u64,
+    pub expected_checkpoint_revision: u64,
+    pub expected_conversation_revision: u64,
+}
+
+impl fmt::Debug for DecideVm11OutcomeReview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecideVm11OutcomeReview")
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("action", &self.action)
+            .field("decided_by", &self.decided_by)
+            .field("message_id", &self.message_id)
+            .field("rationale_digest", &sha256(self.rationale.as_bytes()))
+            .field(
+                "idempotency_key_digest",
+                &sha256(self.idempotency_key.as_bytes()),
+            )
+            .field(
+                "expected_review_projection_digest",
+                &self.expected_review_projection_digest,
+            )
+            .field(
+                "expected_review_completion_digest",
+                &self.expected_review_completion_digest,
+            )
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .field(
+                "expected_checkpoint_revision",
+                &self.expected_checkpoint_revision,
+            )
+            .field(
+                "expected_conversation_revision",
+                &self.expected_conversation_revision,
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vm11OutcomeReviewDecisionResult {
+    pub mission: Mission,
+    pub conversation: MissionConversation,
+    pub message: MissionConversationMessage,
+    pub decision: OutcomeReviewDecision,
+    pub next_dispatch: Option<MissionCheckpointDispatch>,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -3709,6 +3770,22 @@ fn validate_application_evidence_against_registry(
     Ok(())
 }
 
+fn is_vm11_structured_outcome_decision_checkpoint(mission: &Mission, checkpoint_id: &str) -> bool {
+    checkpoint_id == "continue_stop_scale_test"
+        && mission.definition.as_ref().is_some_and(|definition| {
+            definition.manifest_id == "VM-11"
+                && definition.checkpoints.iter().any(|checkpoint| {
+                    checkpoint.id == checkpoint_id
+                        && checkpoint.route.as_ref().is_some_and(|route| {
+                            route.executor == MissionCheckpointExecutor::Human
+                                && route.completion_policy
+                                    == Some(MissionCheckpointCompletionPolicy::HumanConfirmation)
+                                && route.capability_id == "decision.evaluate"
+                        })
+                })
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn persist_application_checkpoint_block(
     store: &mut ProjectStore,
@@ -3806,6 +3883,21 @@ pub struct MissionProjection {
     pub pending_approval_count: usize,
     pub verified_effect_count: usize,
     pub outcome_summary: Option<String>,
+    #[serde(default)]
+    pub vm11_outcome_review: Option<Vm11OutcomeReviewDecisionProjection>,
+}
+
+/// Exact decision material shown by Desktop for VM-11. The review and both
+/// digests are read back from SQLCipher; callers cannot reconstruct them from
+/// prose or substitute a newer ledger snapshot when submitting the decision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Vm11OutcomeReviewDecisionProjection {
+    pub review: OutcomeReviewProjection,
+    pub review_projection_digest: String,
+    pub review_completion_digest: String,
+    pub action_gates: Vec<OutcomeReviewActionGate>,
+    pub decision: Option<OutcomeReviewDecision>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -9025,14 +9117,30 @@ impl ApplicationService {
                 now,
             ));
         }
-        self.store
-            .update_mission_atomic_with_application_source_fences(
-                &mission,
-                expected_mission_revision,
-                Some(outcome_ledger.revision),
-                &application_source_fences,
-                &events,
-            )?;
+        if compiled_handler == CompiledApplicationCheckpointHandler::OutcomeReview {
+            self.store
+                .complete_vm11_outcome_review_application_checkpoint_atomic(
+                    &mission,
+                    expected_mission_revision,
+                    outcome_ledger.revision,
+                    &application_source_fences,
+                    outcome_review.as_ref().ok_or(
+                        ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                            handler_id: handler_id.into(),
+                        },
+                    )?,
+                    &events,
+                )?;
+        } else {
+            self.store
+                .update_mission_atomic_with_application_source_fences(
+                    &mission,
+                    expected_mission_revision,
+                    Some(outcome_ledger.revision),
+                    &application_source_fences,
+                    &events,
+                )?;
+        }
         Ok(ApplicationMissionCheckpointExecution::Completed {
             completed_checkpoint_id: command.checkpoint_id,
             completion_evidence_digest: evidence_digest,
@@ -9222,6 +9330,296 @@ impl ApplicationService {
         Ok(mission)
     }
 
+    /// Completes only VM-11's structured `continue_stop_scale_test` route.
+    /// Generic free-text Human confirmation is explicitly rejected for this
+    /// Checkpoint so the following Application handler can consume one typed,
+    /// source-fenced action instead of parsing prose or trusting UI state.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the structured decision boundary keeps replay, exact review projection, parent/source CAS, private rationale, typed action gates, completion, and next-route handoff visible together"
+    )]
+    pub fn decide_vm11_outcome_review(
+        &mut self,
+        command: DecideVm11OutcomeReview,
+        now: DateTime<Utc>,
+    ) -> Result<Vm11OutcomeReviewDecisionResult, ApplicationError> {
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        let mut conversation = self
+            .store
+            .load_mission_conversation(&command.project_id, &command.mission_id)?;
+        let normalized_rationale = command.rationale.trim();
+        let normalized_idempotency_key = command.idempotency_key.trim();
+        let rationale_digest = sha256(normalized_rationale.as_bytes());
+        let idempotency_key_digest = sha256(normalized_idempotency_key.as_bytes());
+        if normalized_rationale.is_empty()
+            || normalized_idempotency_key.is_empty()
+            || command.decided_by.as_str().trim().is_empty()
+            || !is_sha256_text(&command.expected_review_projection_digest)
+            || !is_sha256_text(&command.expected_review_completion_digest)
+        {
+            return Err(ApplicationError::StructuredOutcomeDecisionCommandMismatch);
+        }
+
+        match self
+            .store
+            .load_vm11_outcome_review_decision(&command.project_id, &command.mission_id)
+        {
+            Ok(decision) => {
+                let message = conversation
+                    .messages
+                    .iter()
+                    .find(|message| message.id == decision.message_id)
+                    .cloned()
+                    .ok_or(ApplicationError::StructuredOutcomeDecisionReplayMismatch)?;
+                if decision.action != command.action
+                    || decision.decided_by != command.decided_by
+                    || decision.message_id != command.message_id
+                    || decision.rationale_digest != rationale_digest
+                    || decision.idempotency_key_digest != idempotency_key_digest
+                    || decision.source_review_projection_digest
+                        != command.expected_review_projection_digest
+                    || decision.source_review_completion_digest
+                        != command.expected_review_completion_digest
+                    || decision.dispatch_mission_revision != command.expected_mission_revision
+                    || decision.dispatch_checkpoint_revision != command.expected_checkpoint_revision
+                    || decision.conversation_revision.checked_sub(1)
+                        != Some(command.expected_conversation_revision)
+                    || message.body != normalized_rationale
+                    || message.idempotency_key != normalized_idempotency_key
+                {
+                    return Err(ApplicationError::StructuredOutcomeDecisionReplayMismatch);
+                }
+                return Ok(Vm11OutcomeReviewDecisionResult {
+                    next_dispatch: current_checkpoint_dispatch_projection(&mission)?,
+                    mission,
+                    conversation,
+                    message,
+                    decision,
+                    replayed: true,
+                });
+            }
+            Err(StorageError::ScopedRecordNotFound {
+                kind: "VM-11 outcome review decision",
+                ..
+            }) => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        if mission.revision != command.expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: command.expected_mission_revision,
+                actual: mission.revision,
+            });
+        }
+        if conversation.revision != command.expected_conversation_revision {
+            return Err(ApplicationError::MissionConversationRevisionMismatch {
+                expected: command.expected_conversation_revision,
+                actual: conversation.revision,
+            });
+        }
+        let (cycle, checkpoint_revision, route) = mission
+            .definition
+            .as_ref()
+            .filter(|definition| definition.manifest_id == "VM-11")
+            .and_then(|definition| {
+                definition.current_checkpoint().and_then(|checkpoint| {
+                    checkpoint.route.as_ref().map(|route| {
+                        (
+                            definition.cycle,
+                            checkpoint.id.clone(),
+                            checkpoint.status,
+                            checkpoint.revision,
+                            route.clone(),
+                        )
+                    })
+                })
+            })
+            .and_then(|(cycle, id, status, revision, route)| {
+                (id == "continue_stop_scale_test" && status == MissionCheckpointStatus::Running)
+                    .then_some((cycle, revision, route))
+            })
+            .ok_or(ApplicationError::StructuredOutcomeDecisionUnavailable)?;
+        if checkpoint_revision != command.expected_checkpoint_revision {
+            return Err(ApplicationError::MissionCheckpointRevisionMismatch {
+                checkpoint_id: "continue_stop_scale_test".into(),
+                expected: command.expected_checkpoint_revision,
+                actual: checkpoint_revision,
+            });
+        }
+        if !route.is_contracted()
+            || route.executor != MissionCheckpointExecutor::Human
+            || route.completion_policy != Some(MissionCheckpointCompletionPolicy::HumanConfirmation)
+            || route.capability_id != "decision.evaluate"
+            || route.oracle_ids
+                != BTreeSet::from([
+                    "goal".into(),
+                    "decision".into(),
+                    "operating_state".into(),
+                    "outcome".into(),
+                ])
+        {
+            return Err(ApplicationError::StructuredOutcomeDecisionUnavailable);
+        }
+        let review = self
+            .store
+            .load_vm11_outcome_review(&command.project_id, &command.mission_id)?;
+        let review_projection_digest = review.digest()?;
+        let (source_review_checkpoint_revision, source_review_completion_digest) = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "outcome_review")
+            })
+            .and_then(|checkpoint| {
+                checkpoint
+                    .completion
+                    .as_ref()
+                    .map(|completion| (checkpoint.revision, completion.evidence_digest.clone()))
+            })
+            .ok_or(ApplicationError::StructuredOutcomeDecisionUnavailable)?;
+        if review_projection_digest != command.expected_review_projection_digest
+            || source_review_completion_digest != command.expected_review_completion_digest
+        {
+            return Err(ApplicationError::StructuredOutcomeDecisionReviewMismatch);
+        }
+
+        let expected_mission_revision = mission.revision;
+        let expected_conversation_revision = conversation.revision;
+        let (message, appended) = conversation.append_user_message(
+            command.message_id,
+            MissionConversationMessageKind::CheckpointConfirmation,
+            command.rationale,
+            command.idempotency_key,
+            &mission,
+            now,
+        )?;
+        if !appended {
+            return Err(ApplicationError::StructuredOutcomeDecisionReplayMismatch);
+        }
+        let decision = OutcomeReviewDecision::decide(
+            &mission,
+            &review,
+            source_review_checkpoint_revision,
+            source_review_completion_digest,
+            command.action,
+            command.decided_by,
+            conversation.id.clone(),
+            conversation.revision,
+            message.id.clone(),
+            message.sequence,
+            message.content_digest.clone(),
+            idempotency_key_digest,
+            now,
+        )?;
+        let decision_digest = decision.digest()?;
+        mission.begin_checkpoint_verification("continue_stop_scale_test", now)?;
+        mission.complete_checkpoint(
+            "continue_stop_scale_test",
+            MissionCheckpointCompletion {
+                oracle_ids: route.oracle_ids.clone(),
+                work_product_ids: BTreeSet::new(),
+                effect_ids: BTreeSet::new(),
+                application_evidence: None,
+                evidence_digest: decision_digest.clone(),
+                verified_at: now,
+            },
+        )?;
+        let completed_checkpoint_revision = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "continue_stop_scale_test")
+            })
+            .map(|checkpoint| checkpoint.revision)
+            .ok_or(ApplicationError::StructuredOutcomeDecisionUnavailable)?;
+        let next_started = start_ready_catalog_checkpoint_in_memory(&mut mission, now)?;
+        decision.validate_persisted(&mission, &review)?;
+        let next_dispatch = current_checkpoint_dispatch_projection(&mission)?;
+        let mut events = vec![
+            PendingEvent::new(
+                "mission.outcome_review_decided",
+                serde_json::json!({
+                    "missionId": mission.id,
+                    "cycle": cycle,
+                    "checkpointId": "continue_stop_scale_test",
+                    "checkpointRevision": completed_checkpoint_revision,
+                    "action": decision.action,
+                    "nextContractIntent": decision.next_contract_intent,
+                    "decidedByDigest": sha256(decision.decided_by.as_str().as_bytes()),
+                    "conversationId": decision.conversation_id,
+                    "conversationRevision": decision.conversation_revision,
+                    "messageId": decision.message_id,
+                    "messageSequence": decision.message_sequence,
+                    "rationaleDigest": decision.rationale_digest,
+                    "sourceReviewProjectionDigest": decision.source_review_projection_digest,
+                    "sourceReviewCompletionDigest": decision.source_review_completion_digest,
+                    "decisionDigest": decision_digest,
+                    "externalEffectExecuted": false,
+                }),
+                now,
+            ),
+            PendingEvent::new(
+                "mission.checkpoint_completed",
+                serde_json::json!({
+                    "missionId": mission.id,
+                    "checkpointId": "continue_stop_scale_test",
+                    "checkpointRevision": completed_checkpoint_revision,
+                    "capabilityId": route.capability_id,
+                    "executor": route.executor,
+                    "cycle": cycle,
+                    "oracleIds": route.oracle_ids,
+                    "evidenceDigest": decision_digest,
+                    "workProductCount": 0,
+                    "effectCount": 0,
+                    "nextCheckpointId": next_dispatch.as_ref().map(|dispatch| &dispatch.checkpoint_id),
+                }),
+                now,
+            ),
+        ];
+        if let Some((checkpoint_id, revision, capability_id, executor, task_id, next_cycle)) =
+            next_started
+        {
+            events.push(PendingEvent::new(
+                "mission.checkpoint_started",
+                serde_json::json!({
+                    "missionId": mission.id,
+                    "checkpointId": checkpoint_id,
+                    "checkpointRevision": revision,
+                    "capabilityId": capability_id,
+                    "executor": executor,
+                    "cycle": next_cycle,
+                    "taskId": task_id,
+                }),
+                now,
+            ));
+        }
+        self.store.complete_vm11_outcome_review_decision_atomic(
+            &mission,
+            expected_mission_revision,
+            &conversation,
+            expected_conversation_revision,
+            &review,
+            &decision,
+            &events,
+        )?;
+        Ok(Vm11OutcomeReviewDecisionResult {
+            mission,
+            conversation,
+            message,
+            decision,
+            next_dispatch,
+            replayed: false,
+        })
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the Human Checkpoint boundary binds replay, dual revisions, exact WorkProducts, confirmation evidence, completion, and next-route handoff in one transaction"
@@ -9237,6 +9635,9 @@ impl ApplicationService {
         let mut conversation = self
             .store
             .load_mission_conversation(&command.project_id, &command.mission_id)?;
+        if is_vm11_structured_outcome_decision_checkpoint(&mission, &command.checkpoint_id) {
+            return Err(ApplicationError::StructuredOutcomeDecisionRequired);
+        }
         let normalized_body = command.body.trim();
 
         if let Some(existing) = conversation
@@ -15997,6 +16398,7 @@ fn mission_projection(
             .filter(|checkpoint| checkpoint.status == MissionCheckpointStatus::Completed)
             .count()
     });
+    let vm11_outcome_review = vm11_outcome_review_decision_projection(store, &mission)?;
     let title = if include_work_product_previews {
         mission.title
     } else {
@@ -16058,7 +16460,66 @@ fn mission_projection(
             .filter(|effect| effect.status == hartevo_domain_kernel::EffectStatus::Verified)
             .count(),
         outcome_summary,
+        vm11_outcome_review,
     })
+}
+
+fn vm11_outcome_review_decision_projection(
+    store: &ProjectStore,
+    mission: &Mission,
+) -> Result<Option<Vm11OutcomeReviewDecisionProjection>, ApplicationError> {
+    let Some(review_completion_digest) = mission.definition.as_ref().and_then(|definition| {
+        (definition.manifest_id == "VM-11").then(|| {
+            definition
+                .checkpoints
+                .iter()
+                .find(|checkpoint| {
+                    checkpoint.id == "outcome_review"
+                        && checkpoint.status == MissionCheckpointStatus::Completed
+                })
+                .and_then(|checkpoint| {
+                    checkpoint
+                        .completion
+                        .as_ref()
+                        .map(|completion| completion.evidence_digest.clone())
+                })
+        })?
+    }) else {
+        return Ok(None);
+    };
+    let review = match store.load_vm11_outcome_review(&mission.project_id, &mission.id) {
+        Ok(review) => review,
+        Err(StorageError::ScopedRecordNotFound {
+            kind: "VM-11 outcome review",
+            ..
+        }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let review_projection_digest = review.digest()?;
+    let action_gates = [
+        OutcomeDecision::Continue,
+        OutcomeDecision::Stop,
+        OutcomeDecision::Scale,
+        OutcomeDecision::Test,
+    ]
+    .into_iter()
+    .map(|action| review.decision_gate(action))
+    .collect();
+    let decision = match store.load_vm11_outcome_review_decision(&mission.project_id, &mission.id) {
+        Ok(decision) => Some(decision),
+        Err(StorageError::ScopedRecordNotFound {
+            kind: "VM-11 outcome review decision",
+            ..
+        }) => None,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(Vm11OutcomeReviewDecisionProjection {
+        review,
+        review_projection_digest,
+        review_completion_digest,
+        action_gates,
+        decision,
+    }))
 }
 
 fn mission_schedule_projection(schedule: MissionSchedule) -> MissionScheduleProjection {
@@ -19172,6 +19633,18 @@ pub enum ApplicationError {
     #[error("Human Checkpoint confirmation does not bind the exact required WorkProducts")]
     HumanCheckpointWorkProductMismatch,
     #[error(
+        "VM-11 continue_stop_scale_test requires a structured Continue/Stop/Scale/Test command"
+    )]
+    StructuredOutcomeDecisionRequired,
+    #[error("the current Mission is not at its structured VM-11 outcome decision route")]
+    StructuredOutcomeDecisionUnavailable,
+    #[error("the structured VM-11 outcome decision command is incomplete or malformed")]
+    StructuredOutcomeDecisionCommandMismatch,
+    #[error("the structured VM-11 outcome decision no longer matches the frozen review")]
+    StructuredOutcomeDecisionReviewMismatch,
+    #[error("the structured VM-11 outcome decision replay does not match persisted evidence")]
+    StructuredOutcomeDecisionReplayMismatch,
+    #[error(
         "Catalog Mission route, mode, market, language, audience, timezone, or budget is invalid"
     )]
     InvalidCatalogMissionInput,
@@ -21796,7 +22269,7 @@ mod tests {
             ),
             (
                 VM11_OUTCOME_REVIEW_HANDLER_ID,
-                review_evidence_digest,
+                review_evidence_digest.clone(),
                 BTreeSet::from([
                     "mission_checkpoint",
                     "outcome_review",
@@ -21910,6 +22383,125 @@ mod tests {
                 .len(),
             event_count_after_review
         );
+        let decision_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Human decision Mission");
+        let decision_checkpoint = decision_mission
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("Human decision Checkpoint");
+        assert_eq!(decision_checkpoint.id, "continue_stop_scale_test");
+        let decision_conversation = service
+            .mission_conversation(&project_id, &mission_id)
+            .expect("decision Conversation");
+        assert!(matches!(
+            service.confirm_human_mission_checkpoint(
+                ConfirmHumanMissionCheckpoint {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    checkpoint_id: decision_checkpoint.id.clone(),
+                    message_id: MissionConversationMessageId::from("forbidden-generic-decision"),
+                    body: "Stop after the frozen review".into(),
+                    idempotency_key: "forbidden-generic-decision".into(),
+                    work_product_ids: BTreeSet::new(),
+                    expected_mission_revision: decision_mission.revision,
+                    expected_checkpoint_revision: decision_checkpoint.revision,
+                    expected_conversation_revision: decision_conversation.revision,
+                },
+                now() + Duration::seconds(34),
+            ),
+            Err(ApplicationError::StructuredOutcomeDecisionRequired)
+        ));
+        let decision_command = DecideVm11OutcomeReview {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            action: OutcomeDecision::Stop,
+            decided_by: ActorId::from("vm11-human-reviewer"),
+            message_id: MissionConversationMessageId::from("vm11-stop-decision-message"),
+            rationale: "Stop: the one-off parent Mission has reached a valid reviewed terminal."
+                .into(),
+            idempotency_key: "vm11-outcome-decision:cycle-1".into(),
+            expected_review_projection_digest: recomputed_review
+                .digest()
+                .expect("review projection digest"),
+            expected_review_completion_digest: review_evidence_digest.clone(),
+            expected_mission_revision: decision_mission.revision,
+            expected_checkpoint_revision: decision_checkpoint.revision,
+            expected_conversation_revision: decision_conversation.revision,
+        };
+        let mut forbidden_scale = decision_command.clone();
+        forbidden_scale.action = OutcomeDecision::Scale;
+        assert!(matches!(
+            service.decide_vm11_outcome_review(forbidden_scale, now() + Duration::seconds(34),),
+            Err(ApplicationError::Outcome(
+                OutcomeLedgerError::OutcomeReviewDecisionScaleBlocked
+            ))
+        ));
+        assert_eq!(
+            service
+                .mission_conversation(&project_id, &mission_id)
+                .expect("failed Scale leaves Conversation unchanged")
+                .revision,
+            decision_conversation.revision
+        );
+        let decided = service
+            .decide_vm11_outcome_review(decision_command.clone(), now() + Duration::seconds(34))
+            .expect("structured Stop decision");
+        assert!(!decided.replayed);
+        assert_eq!(decided.decision.action, OutcomeDecision::Stop);
+        assert_eq!(
+            decided.decision.next_contract_intent,
+            hartevo_domain_kernel::OutcomeReviewNextContractIntent::ValidTerminal
+        );
+        assert_eq!(
+            decided.next_dispatch.as_ref().map(|dispatch| (
+                dispatch.checkpoint_id.as_str(),
+                dispatch.executor,
+                dispatch.capability_id.as_str(),
+            )),
+            Some((
+                "next_contract_or_valid_terminal",
+                MissionCheckpointExecutor::Application,
+                "automation.schedule",
+            ))
+        );
+        assert_eq!(
+            service
+                .store
+                .load_vm11_outcome_review(&project_id, &mission_id)
+                .expect("immutable review projection"),
+            recomputed_review
+        );
+        assert_eq!(
+            service
+                .store
+                .load_vm11_outcome_review_decision(&project_id, &mission_id)
+                .expect("immutable structured decision"),
+            decided.decision
+        );
+        let event_count_after_decision = service
+            .mission_events(&project_id, &mission_id)
+            .expect("decision events")
+            .len();
+        let replayed_decision = service
+            .decide_vm11_outcome_review(decision_command.clone(), now() + Duration::seconds(35))
+            .expect("exact structured decision replay");
+        assert!(replayed_decision.replayed);
+        assert_eq!(replayed_decision.decision, decided.decision);
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("decision replay events")
+                .len(),
+            event_count_after_decision
+        );
+        let mut swapped_decision = decision_command;
+        swapped_decision.action = OutcomeDecision::Test;
+        assert!(matches!(
+            service.decide_vm11_outcome_review(swapped_decision, now() + Duration::seconds(36),),
+            Err(ApplicationError::StructuredOutcomeDecisionReplayMismatch)
+        ));
         let visible_events = serde_json::to_string(
             &service
                 .mission_events(&project_id, &mission_id)
@@ -21926,6 +22518,7 @@ mod tests {
         assert!(!visible_events.contains("PRIVATE-PROVIDER-EVENT-ID"));
         assert!(!visible_events.contains("PRIVATE-REFUND-PROVIDER-ID"));
         assert!(!visible_events.contains("PRIVATE-PAYOUT-PROVIDER-ID"));
+        assert!(!visible_events.contains("one-off parent Mission"));
     }
 
     #[test]
