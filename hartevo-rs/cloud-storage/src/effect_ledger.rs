@@ -236,7 +236,7 @@ impl PostgresCellStore {
         effect: &Effect,
         lease: &ExecutionLease,
         receipt: &Receipt,
-        now: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
     ) -> Result<(), CloudStorageError> {
         let scope = effect_scope(*self, effect)?;
         let transaction = client.transaction().await?;
@@ -244,7 +244,15 @@ impl PostgresCellStore {
         ensure_database_cell(&transaction, self.cell()).await?;
         lock_project(&transaction, &scope, &effect.project_id).await?;
         ensure_team_project(&transaction, &scope, &effect.project_id, false).await?;
-        require_current_effect_lease(&transaction, &scope, effect, lease, &["executing"]).await?;
+        require_current_effect_lease(
+            &transaction,
+            &scope,
+            effect,
+            lease,
+            &["executing"],
+            operation_at,
+        )
+        .await?;
         let execution_started_at =
             initial_execution_started_at(&transaction, &scope, effect).await?;
         validate_durable_receipt(effect, receipt, execution_started_at)?;
@@ -252,10 +260,11 @@ impl PostgresCellStore {
         let attempt_updated = transaction
             .execute(
                 "UPDATE hartevo_cell.effect_execution_attempts
-                 SET status = 'receipt_recorded', receipt_json = $8, updated_at = $9
+                 SET status = 'receipt_recorded', receipt_json = $10, updated_at = $11
                  WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
                    AND attempt_id = $4 AND effect_id = $5 AND generation = $6
-                   AND lease_owner = $7 AND status = 'executing'",
+                   AND lease_owner = $7 AND lease_expires_at = $8
+                   AND lease_expires_at > $9 AND status = 'executing'",
                 &[
                     &scope.cell.as_str(),
                     &scope.tenant_id.as_str(),
@@ -264,8 +273,10 @@ impl PostgresCellStore {
                     &effect.id.as_str(),
                     &to_sql_u64(lease.generation)?,
                     &lease.owner,
+                    &lease.expires_at,
+                    &operation_at,
                     &receipt_json,
-                    &now,
+                    &operation_at,
                 ],
             )
             .await?;
@@ -283,7 +294,7 @@ impl PostgresCellStore {
                     &effect.idempotency_key,
                     &effect.approval_digest(),
                     &receipt_json,
-                    &now,
+                    &operation_at,
                 ],
             )
             .await?;
@@ -300,7 +311,7 @@ impl PostgresCellStore {
         effect: &Effect,
         lease: &ExecutionLease,
         verification: &Verification,
-        now: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
     ) -> Result<(), CloudStorageError> {
         let scope = effect_scope(*self, effect)?;
         let transaction = client.transaction().await?;
@@ -314,6 +325,7 @@ impl PostgresCellStore {
             effect,
             lease,
             &["receipt_recorded", "verifying"],
+            operation_at,
         )
         .await?;
         let record = load_effect_record(&transaction, &scope, effect)
@@ -334,11 +346,13 @@ impl PostgresCellStore {
         let attempt_updated = transaction
             .execute(
                 "UPDATE hartevo_cell.effect_execution_attempts
-                 SET status = $8, verification_json = $9, failure_class = $10,
-                     updated_at = $11
+                 SET status = $10, verification_json = $11, failure_class = $12,
+                     updated_at = $13
                  WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
                    AND attempt_id = $4 AND effect_id = $5 AND generation = $6
-                   AND lease_owner = $7 AND status IN ('receipt_recorded', 'verifying')",
+                   AND lease_owner = $7 AND lease_expires_at = $8
+                   AND lease_expires_at > $9
+                   AND status IN ('receipt_recorded', 'verifying')",
                 &[
                     &scope.cell.as_str(),
                     &scope.tenant_id.as_str(),
@@ -347,10 +361,12 @@ impl PostgresCellStore {
                     &effect.id.as_str(),
                     &to_sql_u64(lease.generation)?,
                     &lease.owner,
+                    &lease.expires_at,
+                    &operation_at,
                     &status,
                     &verification_json,
                     &failure_class,
-                    &now,
+                    &operation_at,
                 ],
             )
             .await?;
@@ -371,7 +387,7 @@ impl PostgresCellStore {
                     &status,
                     &verification_json,
                     &failure_class,
-                    &now,
+                    &operation_at,
                 ],
             )
             .await?;
@@ -388,9 +404,10 @@ impl PostgresCellStore {
         effect: &Effect,
         lease: &ExecutionLease,
         reason: &str,
-        now: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
     ) -> Result<(), CloudStorageError> {
-        finish_effect_without_receipt(self, client, effect, lease, "failed", reason, now).await
+        finish_effect_without_receipt(self, client, effect, lease, "failed", reason, operation_at)
+            .await
     }
 
     pub async fn record_effect_uncertain(
@@ -399,9 +416,18 @@ impl PostgresCellStore {
         effect: &Effect,
         lease: &ExecutionLease,
         reason: &str,
-        now: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
     ) -> Result<(), CloudStorageError> {
-        finish_effect_without_receipt(self, client, effect, lease, "uncertain", reason, now).await
+        finish_effect_without_receipt(
+            self,
+            client,
+            effect,
+            lease,
+            "uncertain",
+            reason,
+            operation_at,
+        )
+        .await
     }
 }
 
@@ -2242,13 +2268,14 @@ async fn insert_effect_attempt(
         "cell-attempt:{}:{attempt_no}:{generation}",
         request.effect.id
     ));
-    transaction
-        .execute(
+    let row = transaction
+        .query_one(
             "INSERT INTO hartevo_cell.effect_execution_attempts
                (attempt_id, cell, tenant_id, project_id, mission_id, effect_id,
                 attempt_no, generation, status, lease_owner, lease_expires_at,
                 request_digest, receipt_json, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
+             RETURNING lease_expires_at",
             &[
                 &attempt_id.as_str(),
                 &request.scope.cell.as_str(),
@@ -2267,11 +2294,12 @@ async fn insert_effect_attempt(
             ],
         )
         .await?;
+    let stored_expires_at = row.get(0);
     Ok(ExecutionLease {
         attempt_id,
         owner: request.owner.into(),
         generation,
-        expires_at: request.lease_expires_at,
+        expires_at: stored_expires_at,
     })
 }
 
@@ -2466,10 +2494,11 @@ async fn require_current_effect_lease(
     effect: &Effect,
     lease: &ExecutionLease,
     allowed_statuses: &[&str],
+    operation_at: DateTime<Utc>,
 ) -> Result<(), CloudStorageError> {
     let row = transaction
         .query_opt(
-            "SELECT attempt_id, lease_owner, generation, status
+            "SELECT attempt_id, lease_owner, generation, status, lease_expires_at
              FROM hartevo_cell.effect_execution_attempts
              WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND effect_id = $4
              ORDER BY generation DESC LIMIT 1 FOR UPDATE",
@@ -2482,10 +2511,13 @@ async fn require_current_effect_lease(
         )
         .await?
         .ok_or(CloudStorageError::EffectLeaseLost)?;
+    let stored_expires_at = row.get::<_, DateTime<Utc>>(4);
     if row.get::<_, String>(0) != lease.attempt_id.as_str()
         || row.get::<_, String>(1) != lease.owner
         || from_sql_u64(row.get(2), "effect lease generation")? != lease.generation
         || !allowed_statuses.contains(&row.get::<_, String>(3).as_str())
+        || stored_expires_at != lease.expires_at
+        || stored_expires_at <= operation_at
     {
         return Err(CloudStorageError::EffectLeaseLost);
     }
@@ -2499,7 +2531,7 @@ async fn finish_effect_without_receipt(
     lease: &ExecutionLease,
     status: &str,
     reason: &str,
-    now: DateTime<Utc>,
+    operation_at: DateTime<Utc>,
 ) -> Result<(), CloudStorageError> {
     if !matches!(status, "failed" | "uncertain") || reason.trim().is_empty() {
         return Err(CloudStorageError::StoredValueInvalid(
@@ -2512,14 +2544,23 @@ async fn finish_effect_without_receipt(
     ensure_database_cell(&transaction, store.cell()).await?;
     lock_project(&transaction, &scope, &effect.project_id).await?;
     ensure_team_project(&transaction, &scope, &effect.project_id, false).await?;
-    require_current_effect_lease(&transaction, &scope, effect, lease, &["executing"]).await?;
+    require_current_effect_lease(
+        &transaction,
+        &scope,
+        effect,
+        lease,
+        &["executing"],
+        operation_at,
+    )
+    .await?;
     let attempt_updated = transaction
         .execute(
             "UPDATE hartevo_cell.effect_execution_attempts
-             SET status = $8, failure_class = $9, updated_at = $10
+             SET status = $10, failure_class = $11, updated_at = $12
              WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
                AND attempt_id = $4 AND effect_id = $5 AND generation = $6
-               AND lease_owner = $7 AND status = 'executing'",
+               AND lease_owner = $7 AND lease_expires_at = $8
+               AND lease_expires_at > $9 AND status = 'executing'",
             &[
                 &scope.cell.as_str(),
                 &scope.tenant_id.as_str(),
@@ -2528,9 +2569,11 @@ async fn finish_effect_without_receipt(
                 &effect.id.as_str(),
                 &to_sql_u64(lease.generation)?,
                 &lease.owner,
+                &lease.expires_at,
+                &operation_at,
                 &status,
                 &reason,
-                &now,
+                &operation_at,
             ],
         )
         .await?;
@@ -2549,7 +2592,7 @@ async fn finish_effect_without_receipt(
                 &effect.approval_digest(),
                 &status,
                 &reason,
-                &now,
+                &operation_at,
             ],
         )
         .await?;
@@ -3242,6 +3285,134 @@ mod tests {
         execution_started_at: DateTime<Utc>,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum RemoteEffectCompletionPath {
+        Receipt,
+        Verification,
+        Failed,
+        Uncertain,
+    }
+
+    impl RemoteEffectCompletionPath {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Receipt => "receipt",
+                Self::Verification => "verification",
+                Self::Failed => "failed",
+                Self::Uncertain => "uncertain",
+            }
+        }
+
+        const fn completed_status(self) -> &'static str {
+            match self {
+                Self::Receipt => "receipt_recorded",
+                Self::Verification => "verified",
+                Self::Failed => "failed",
+                Self::Uncertain => "uncertain",
+            }
+        }
+
+        const fn matrix_index(self) -> i64 {
+            match self {
+                Self::Receipt => 0,
+                Self::Verification => 1,
+                Self::Failed => 2,
+                Self::Uncertain => 3,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RemoteEffectLeaseFenceCase {
+        Before,
+        Equality,
+        After,
+        TamperedExpiry,
+    }
+
+    impl RemoteEffectLeaseFenceCase {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Before => "before",
+                Self::Equality => "equality",
+                Self::After => "after",
+                Self::TamperedExpiry => "tampered_expiry",
+            }
+        }
+
+        const fn expects_success(self) -> bool {
+            matches!(self, Self::Before)
+        }
+
+        const fn matrix_index(self) -> i64 {
+            match self {
+                Self::Before => 0,
+                Self::Equality => 1,
+                Self::After => 2,
+                Self::TamperedExpiry => 3,
+            }
+        }
+
+        fn operation_at(self, expires_at: DateTime<Utc>) -> DateTime<Utc> {
+            match self {
+                Self::Before | Self::TamperedExpiry => expires_at - Duration::seconds(1),
+                Self::Equality => expires_at,
+                Self::After => expires_at + Duration::seconds(1),
+            }
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct RemoteEffectAttemptCompletionSnapshot {
+        attempt_id: String,
+        cell: String,
+        tenant_id: String,
+        project_id: String,
+        mission_id: String,
+        effect_id: String,
+        attempt_no: i64,
+        generation: i64,
+        status: String,
+        lease_owner: String,
+        lease_expires_at: DateTime<Utc>,
+        request_digest: String,
+        receipt_json: Option<serde_json::Value>,
+        verification_json: Option<serde_json::Value>,
+        failure_class: Option<String>,
+        created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct RemoteEffectIdempotencyCompletionSnapshot {
+        cell: String,
+        tenant_id: String,
+        project_id: String,
+        mission_id: String,
+        idempotency_key: String,
+        effect_id: String,
+        approval_digest: String,
+        status: String,
+        receipt_json: Option<serde_json::Value>,
+        verification_json: Option<serde_json::Value>,
+        terminal_reason: Option<String>,
+        created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct RemoteEffectCompletionSnapshot {
+        attempts: Vec<RemoteEffectAttemptCompletionSnapshot>,
+        idempotency: RemoteEffectIdempotencyCompletionSnapshot,
+    }
+
+    struct RemoteEffectCompletionFixture {
+        effect: Effect,
+        lease: ExecutionLease,
+        receipt: Receipt,
+        verification: Verification,
+    }
+
     async fn connect_test_client(
         database_url: &str,
     ) -> (tokio_postgres::Client, TestConnectionTask) {
@@ -3269,6 +3440,113 @@ mod tests {
             .await
             .expect("PostgreSQL connection task")
             .expect("PostgreSQL connection clean shutdown");
+    }
+
+    async fn remote_effect_attempt_completion_snapshot(
+        inspection: &Transaction<'_>,
+        scope: &CellScope,
+        effect: &Effect,
+    ) -> Vec<RemoteEffectAttemptCompletionSnapshot> {
+        inspection
+            .query(
+                "SELECT attempt_id, cell, tenant_id, project_id, mission_id, effect_id,
+                        attempt_no, generation, status, lease_owner, lease_expires_at,
+                        request_digest, receipt_json, verification_json, failure_class,
+                        created_at, updated_at
+                 FROM hartevo_cell.effect_execution_attempts
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND effect_id = $4
+                 ORDER BY generation ASC",
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &effect.project_id.as_str(),
+                    &effect.id.as_str(),
+                ],
+            )
+            .await
+            .expect("completion attempt snapshot")
+            .into_iter()
+            .map(|row| RemoteEffectAttemptCompletionSnapshot {
+                attempt_id: row.get(0),
+                cell: row.get(1),
+                tenant_id: row.get(2),
+                project_id: row.get(3),
+                mission_id: row.get(4),
+                effect_id: row.get(5),
+                attempt_no: row.get(6),
+                generation: row.get(7),
+                status: row.get(8),
+                lease_owner: row.get(9),
+                lease_expires_at: row.get(10),
+                request_digest: row.get(11),
+                receipt_json: row.get(12),
+                verification_json: row.get(13),
+                failure_class: row.get(14),
+                created_at: row.get(15),
+                updated_at: row.get(16),
+            })
+            .collect()
+    }
+
+    async fn remote_effect_idempotency_completion_snapshot(
+        inspection: &Transaction<'_>,
+        scope: &CellScope,
+        effect: &Effect,
+    ) -> RemoteEffectIdempotencyCompletionSnapshot {
+        let row = inspection
+            .query_one(
+                "SELECT cell, tenant_id, project_id, mission_id, idempotency_key, effect_id,
+                        approval_digest, status, receipt_json, verification_json,
+                        terminal_reason, created_at, updated_at
+                 FROM hartevo_cell.effect_idempotency
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                   AND idempotency_key = $4",
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &effect.project_id.as_str(),
+                    &effect.idempotency_key,
+                ],
+            )
+            .await
+            .expect("completion idempotency snapshot");
+        RemoteEffectIdempotencyCompletionSnapshot {
+            cell: row.get(0),
+            tenant_id: row.get(1),
+            project_id: row.get(2),
+            mission_id: row.get(3),
+            idempotency_key: row.get(4),
+            effect_id: row.get(5),
+            approval_digest: row.get(6),
+            status: row.get(7),
+            receipt_json: row.get(8),
+            verification_json: row.get(9),
+            terminal_reason: row.get(10),
+            created_at: row.get(11),
+            updated_at: row.get(12),
+        }
+    }
+
+    async fn remote_effect_completion_snapshot(
+        client: &mut tokio_postgres::Client,
+        scope: &CellScope,
+        effect: &Effect,
+    ) -> RemoteEffectCompletionSnapshot {
+        let inspection = client.transaction().await.expect("completion inspection");
+        set_scope(&inspection, scope)
+            .await
+            .expect("completion inspection scope");
+        let attempts = remote_effect_attempt_completion_snapshot(&inspection, scope, effect).await;
+        let idempotency =
+            remote_effect_idempotency_completion_snapshot(&inspection, scope, effect).await;
+        inspection
+            .commit()
+            .await
+            .expect("completion inspection commit");
+        RemoteEffectCompletionSnapshot {
+            attempts,
+            idempotency,
+        }
     }
 
     async fn claim_remote_effect(
@@ -3309,6 +3587,205 @@ mod tests {
             effect,
             lease,
             execution_started_at,
+        }
+    }
+
+    async fn remote_effect_completion_fixture(
+        client: &mut tokio_postgres::Client,
+        store: &PostgresCellStore,
+        scope: &CellScope,
+        project_id: &ProjectId,
+        path: RemoteEffectCompletionPath,
+        case: RemoteEffectLeaseFenceCase,
+        claim_at: DateTime<Utc>,
+    ) -> RemoteEffectCompletionFixture {
+        let tag = format!("completion-{}-{}", path.label(), case.label());
+        let claimed = claim_remote_effect(client, store, scope, project_id, &tag, claim_at).await;
+        let receipt = scenario_receipt(&claimed.effect, &tag, claim_at + Duration::seconds(1));
+        let lease = if matches!(path, RemoteEffectCompletionPath::Verification) {
+            store
+                .record_effect_receipt(
+                    client,
+                    &claimed.effect,
+                    &claimed.lease,
+                    &receipt,
+                    claim_at + Duration::seconds(1),
+                )
+                .await
+                .expect("valid remote receipt before verification lease");
+            let LedgerClaim::Acquired {
+                lease,
+                receipt: Some(reused),
+                ..
+            } = store
+                .claim_effect(
+                    client,
+                    &claimed.effect,
+                    None,
+                    "completion-verification-worker",
+                    claim_at + Duration::seconds(2),
+                    claim_at + Duration::seconds(32),
+                )
+                .await
+                .expect("remote completion verification claim")
+            else {
+                panic!("expected remote completion verification lease")
+            };
+            assert_eq!(reused, receipt);
+            lease
+        } else {
+            claimed.lease
+        };
+        let verification = Verification {
+            id: VerificationId::from_stable(format!("verification-{tag}")),
+            status: VerificationStatus::Confirmed,
+            verifier: "remote-independent-completion-readback".into(),
+            independent: true,
+            observed_at: claim_at + Duration::seconds(3),
+            evidence_digest: "c".repeat(64),
+            receipt_id: receipt.id.clone(),
+        };
+        RemoteEffectCompletionFixture {
+            effect: claimed.effect,
+            lease,
+            receipt,
+            verification,
+        }
+    }
+
+    async fn complete_remote_effect(
+        client: &mut tokio_postgres::Client,
+        store: &PostgresCellStore,
+        fixture: &RemoteEffectCompletionFixture,
+        path: RemoteEffectCompletionPath,
+        lease: &ExecutionLease,
+        operation_at: DateTime<Utc>,
+    ) -> Result<(), CloudStorageError> {
+        match path {
+            RemoteEffectCompletionPath::Receipt => {
+                store
+                    .record_effect_receipt(
+                        client,
+                        &fixture.effect,
+                        lease,
+                        &fixture.receipt,
+                        operation_at,
+                    )
+                    .await
+            }
+            RemoteEffectCompletionPath::Verification => {
+                store
+                    .record_effect_verification(
+                        client,
+                        &fixture.effect,
+                        lease,
+                        &fixture.verification,
+                        operation_at,
+                    )
+                    .await
+            }
+            RemoteEffectCompletionPath::Failed => {
+                store
+                    .record_effect_failed(
+                        client,
+                        &fixture.effect,
+                        lease,
+                        "remote provider rejected completion fixture",
+                        operation_at,
+                    )
+                    .await
+            }
+            RemoteEffectCompletionPath::Uncertain => {
+                store
+                    .record_effect_uncertain(
+                        client,
+                        &fixture.effect,
+                        lease,
+                        "remote provider completion fixture is uncertain",
+                        operation_at,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn assert_remote_effect_completion_fences(
+        client: &mut tokio_postgres::Client,
+        store: &PostgresCellStore,
+        scope: &CellScope,
+        project_id: &ProjectId,
+    ) {
+        for path in [
+            RemoteEffectCompletionPath::Receipt,
+            RemoteEffectCompletionPath::Verification,
+            RemoteEffectCompletionPath::Failed,
+            RemoteEffectCompletionPath::Uncertain,
+        ] {
+            for case in [
+                RemoteEffectLeaseFenceCase::Before,
+                RemoteEffectLeaseFenceCase::Equality,
+                RemoteEffectLeaseFenceCase::After,
+                RemoteEffectLeaseFenceCase::TamperedExpiry,
+            ] {
+                let scenario_index = path.matrix_index() * 4 + case.matrix_index();
+                let claim_at = now()
+                    + Duration::seconds(1 + scenario_index * 61)
+                    + Duration::nanoseconds(123_456_789);
+                let fixture = remote_effect_completion_fixture(
+                    client, store, scope, project_id, path, case, claim_at,
+                )
+                .await;
+                let operation_at = case.operation_at(fixture.lease.expires_at);
+                let mut presented_lease = fixture.lease.clone();
+                if matches!(case, RemoteEffectLeaseFenceCase::TamperedExpiry) {
+                    presented_lease.expires_at += Duration::seconds(1);
+                }
+                let before =
+                    remote_effect_completion_snapshot(client, scope, &fixture.effect).await;
+                assert_eq!(
+                    before
+                        .attempts
+                        .last()
+                        .expect("remote leased attempt")
+                        .lease_expires_at,
+                    fixture.lease.expires_at,
+                    "{path:?}/{case:?}: returned lease expiry must equal the stored value",
+                );
+                let result = complete_remote_effect(
+                    client,
+                    store,
+                    &fixture,
+                    path,
+                    &presented_lease,
+                    operation_at,
+                )
+                .await;
+                let after = remote_effect_completion_snapshot(client, scope, &fixture.effect).await;
+                if case.expects_success() {
+                    assert!(result.is_ok(), "{path:?}/{case:?}: {result:?}");
+                    assert_ne!(after, before, "{path:?}/{case:?}");
+                    assert_eq!(
+                        after
+                            .attempts
+                            .last()
+                            .expect("remote completed attempt")
+                            .status,
+                        path.completed_status(),
+                        "{path:?}/{case:?}",
+                    );
+                    assert_eq!(
+                        after.idempotency.status,
+                        path.completed_status(),
+                        "{path:?}/{case:?}",
+                    );
+                } else {
+                    assert!(
+                        matches!(&result, Err(CloudStorageError::EffectLeaseLost)),
+                        "{path:?}/{case:?}: {result:?}",
+                    );
+                    assert_eq!(after, before, "{path:?}/{case:?}");
+                }
+            }
         }
     }
 
@@ -3643,6 +4120,32 @@ mod tests {
                 .await,
             before
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_effect_completion_expiry_fence_reports_blocked_or_executes_matrix() {
+        let Some(database_url) = std::env::var_os(POSTGRES_L2_URL_ENV) else {
+            eprintln!(
+                "BLOCKED_ENV: {POSTGRES_L2_URL_ENV} is absent; PostgreSQL Effect completion before/equality/after/tampered-expiry matrix did not execute"
+            );
+            return;
+        };
+        let database_url = database_url
+            .into_string()
+            .expect("PostgreSQL test URL must be valid Unicode");
+        let (mut client, connection_task) = connect_test_client(&database_url).await;
+        let store = PostgresCellStore::new(DataCell::Us);
+        let (scope, project_id) = prepare_remote_project(&mut client, &store).await;
+        let (_, _, evidence) = approved_remote_effect(
+            &scope.tenant_id,
+            &project_id,
+            "mission-completion-fence",
+            "effect-completion-fence",
+            "idempotency-completion-fence",
+        );
+        publish_active_fixture_fence(&mut client, &store, &scope, &project_id, &evidence).await;
+        assert_remote_effect_completion_fences(&mut client, &store, &scope, &project_id).await;
+        close_test_client(client, connection_task).await;
     }
 
     #[tokio::test]
