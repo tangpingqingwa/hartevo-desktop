@@ -30,6 +30,7 @@ use zeroize::Zeroizing;
 
 pub mod data_plane;
 mod runtime_plane;
+mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
 mod visual_fixture;
 
