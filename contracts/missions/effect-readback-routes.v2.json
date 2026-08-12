@@ -1,0 +1,111 @@
+{
+  "schemaVersion": "hartevo-effect-readback-route-contract/v2",
+  "contractVersion": "desktop-2026-08-12-ct00b-v1",
+  "evidenceLevel": "E1",
+  "claimAuthority": {
+    "adapterRegistered": false,
+    "provider": {
+      "execution": false,
+      "receipt": false
+    },
+    "product": {
+      "businessVerification": false,
+      "e4": false
+    }
+  },
+  "flows": [
+    {
+      "id": "vm08.listing-write-account-readback/v2",
+      "missionId": "VM-08",
+      "missionVersion": 4,
+      "parentCheckpointId": "listing_write_readback",
+      "parentCompletionPolicy": "effect_readback_v2",
+      "stages": [
+        {
+          "id": "vm08.listing-write.effect/v1",
+          "ordinal": 1,
+          "role": "write_effect",
+          "capabilityId": "marketplace.write",
+          "executor": "effect_broker",
+          "effectClass": "external_write",
+          "providerId": "amazon-sp-api",
+          "operation": "execute",
+          "evidenceClass": "receipt_candidate",
+          "terminalContribution": "receipt_candidate_only",
+          "bindingFields": [
+            "seller_account_id",
+            "marketplace_id",
+            "sku_or_asin",
+            "locale",
+            "canonical_field_diff",
+            "idempotency_key",
+            "approval_scope"
+          ],
+          "correlationSourceStageId": null,
+          "independentReadPathRequired": false,
+          "readOnlyCredentialRequired": false,
+          "executionLeaseForbidden": false,
+          "comparison": null
+        },
+        {
+          "id": "vm08.listing-write.account-readback/v1",
+          "ordinal": 2,
+          "role": "independent_account_readback",
+          "capabilityId": "marketplace.read",
+          "executor": "runtime",
+          "effectClass": "read",
+          "providerId": "amazon-sp-api",
+          "operation": "read",
+          "evidenceClass": "read_observation",
+          "terminalContribution": "verification_required",
+          "bindingFields": [
+            "receipt_candidate_digest",
+            "seller_account_id",
+            "marketplace_id",
+            "sku_or_asin",
+            "locale",
+            "canonical_field_diff"
+          ],
+          "correlationSourceStageId": "vm08.listing-write.effect/v1",
+          "independentReadPathRequired": true,
+          "readOnlyCredentialRequired": true,
+          "executionLeaseForbidden": true,
+          "comparison": "canonical_target_field_diff"
+        }
+      ],
+      "corroboration": [
+        {
+          "providerId": "sorftime",
+          "capabilityId": "marketplace.read",
+          "authority": "estimate_only",
+          "requiredForCompletion": false,
+          "mayConfirmWrite": false
+        },
+        {
+          "providerId": "browser-workspace",
+          "capabilityId": "publication.verify",
+          "authority": "public_view_only",
+          "requiredForCompletion": false,
+          "mayConfirmWrite": false
+        }
+      ],
+      "terminalCondition": {
+        "success": "verification_bound_to_receipt_and_canonical_target_diff",
+        "receiptCandidateAloneCompletes": false,
+        "corroborationAloneCompletes": false,
+        "onMissingOrMismatch": "inconclusive_fail_closed"
+      },
+      "failClosedOn": [
+        "missing_receipt_correlation",
+        "seller_account_mismatch",
+        "marketplace_mismatch",
+        "sku_or_asin_mismatch",
+        "locale_mismatch",
+        "canonical_field_diff_mismatch",
+        "readback_not_independent",
+        "readback_credential_not_read_only",
+        "corroboration_conflict"
+      ]
+    }
+  ]
+}

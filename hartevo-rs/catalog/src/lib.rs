@@ -12,12 +12,20 @@ use thiserror::Error;
 
 mod evidence;
 mod mission_contract;
+mod provider_closure;
 
 pub use evidence::{
     EvidenceLevel, MissionEvidenceRecord, MissionEvidenceStatus, ReleaseEvidence, ReleaseStage,
 };
 pub use mission_contract::{
     EXPECTED_CAPABILITY_COUNT, EXPECTED_CHECKPOINT_ROUTE_COUNT, validate_mission_contract_closure,
+};
+use provider_closure::EFFECT_READBACK_ROUTE_CONTRACT_JSON;
+pub use provider_closure::{
+    CorroborationBinding, EXPECTED_EXECUTABLE_STAGE_COUNT, EffectReadbackFlow,
+    EffectReadbackRouteContract, EffectReadbackStage, EffectReadbackTerminalCondition,
+    ProductClaimAuthority, ProviderClaimAuthority, RouteClaimAuthority,
+    expanded_execution_stage_count, validate_provider_route_closure,
 };
 
 const MISSION_CATALOG_JSON: &str = include_str!("../../../contracts/missions/catalog.v1.json");
@@ -216,6 +224,7 @@ pub struct JudgeCalibrationContract {
 pub struct CatalogSnapshot {
     pub schema_version: String,
     pub mission_catalog_version: String,
+    pub effect_readback_route_contract_version: String,
     pub application_handler_registry_version: String,
     pub capability_catalog_version: String,
     pub provider_catalog_version: String,
@@ -231,6 +240,8 @@ pub struct CatalogSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct CatalogSummary {
     pub mission_count: usize,
+    pub checkpoint_route_count: usize,
+    pub executable_stage_count: usize,
     pub application_route_count: usize,
     pub implemented_application_handler_count: usize,
     pub not_implemented_application_route_count: usize,
@@ -306,6 +317,7 @@ pub struct CrossCuttingCaseManifest {
 #[derive(Clone, Debug)]
 pub struct Catalog {
     pub missions: MissionCatalog,
+    pub effect_readback_routes: EffectReadbackRouteContract,
     pub application_handlers: ApplicationHandlerRegistry,
     pub capabilities: CapabilityCatalog,
     pub providers: ProviderCatalog,
@@ -317,6 +329,10 @@ impl Catalog {
     pub fn load() -> Result<Self, CatalogError> {
         let catalog = Self {
             missions: parse_contract("mission catalog", MISSION_CATALOG_JSON)?,
+            effect_readback_routes: parse_contract(
+                "effect/readback route contract",
+                EFFECT_READBACK_ROUTE_CONTRACT_JSON,
+            )?,
             application_handlers: parse_contract(
                 "application handler registry",
                 APPLICATION_HANDLER_REGISTRY_JSON,
@@ -366,6 +382,14 @@ impl Catalog {
         if let Err(mut contract_violations) =
             validate_mission_contract_closure(&self.missions, &self.capabilities)
         {
+            violations.append(&mut contract_violations);
+        }
+        if let Err(mut contract_violations) = validate_provider_route_closure(
+            &self.missions,
+            &self.capabilities,
+            &self.providers,
+            &self.effect_readback_routes,
+        ) {
             violations.append(&mut contract_violations);
         }
         self.validate_mission_contracts(&mut violations);
@@ -625,7 +649,7 @@ impl Catalog {
                 (route.executor.as_str(), route.completion_policy.as_str()),
                 ("application", "deterministic_evidence")
                     | ("runtime", "work_product")
-                    | ("effect_broker", "verified_effect")
+                    | ("effect_broker", "verified_effect" | "effect_readback_v2")
                     | ("human", "human_confirmation")
             ),
             format!(
@@ -904,9 +928,19 @@ impl Catalog {
             .flat_map(|mission| &mission.checkpoint_routes)
             .filter(|route| route.executor == "application")
             .count();
+        let checkpoint_route_count = self
+            .missions
+            .missions
+            .iter()
+            .map(|mission| mission.checkpoint_routes.len())
+            .sum();
+        let executable_stage_count =
+            expanded_execution_stage_count(&self.missions, &self.effect_readback_routes);
         let implemented_application_handler_count = self.application_handlers.handlers.len();
         let summary = CatalogSummary {
             mission_count: self.missions.missions.len(),
+            checkpoint_route_count,
+            executable_stage_count,
             application_route_count,
             implemented_application_handler_count,
             not_implemented_application_route_count: application_route_count
@@ -925,6 +959,7 @@ impl Catalog {
         };
         let digest_input = serde_json::to_vec(&(
             &self.missions,
+            &self.effect_readback_routes,
             &self.application_handlers,
             &self.capabilities,
             &self.providers,
@@ -935,8 +970,12 @@ impl Catalog {
         ))?;
 
         Ok(CatalogSnapshot {
-            schema_version: "hartevo-catalog-snapshot/v2".into(),
+            schema_version: "hartevo-catalog-snapshot/v3".into(),
             mission_catalog_version: self.missions.catalog_version.clone(),
+            effect_readback_route_contract_version: self
+                .effect_readback_routes
+                .contract_version
+                .clone(),
             application_handler_registry_version: self
                 .application_handlers
                 .registry_version
@@ -1166,6 +1205,12 @@ impl Catalog {
                     == summary.implemented_application_handler_count
                         + summary.not_implemented_application_route_count,
             "Application handler summary must expose implemented and NOT_IMPLEMENTED route coverage exactly",
+        );
+        require(
+            violations,
+            summary.checkpoint_route_count == EXPECTED_CHECKPOINT_ROUTE_COUNT
+                && summary.executable_stage_count == EXPECTED_EXECUTABLE_STAGE_COUNT,
+            "Catalog snapshot must expose exactly 123 checkpoint routes and 124 executable stages",
         );
         require(
             violations,
