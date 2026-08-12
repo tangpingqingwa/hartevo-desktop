@@ -1,0 +1,187 @@
+{
+  "schema": "hartevo.dioxus-build-contract/v1",
+  "cli": {
+    "binary": "dx",
+    "package": "dioxus-cli",
+    "version": "0.7.10",
+    "versionExtraction": "first-semver-token"
+  },
+  "host": {
+    "os": "Darwin",
+    "architectures": [
+      "arm64"
+    ]
+  },
+  "gate": {
+    "script": "scripts/check-dioxus-toolchain.sh",
+    "buildMode": "build",
+    "verifyReceiptMode": "verify-receipt",
+    "selfTestMode": "self-test"
+  },
+  "build": {
+    "workingDirectory": ".",
+    "package": "hartevo-desktop",
+    "command": [
+      "dx",
+      "build",
+      "--package",
+      "hartevo-desktop",
+      "--features",
+      "bundle",
+      "--locked"
+    ],
+    "profile": "debug",
+    "defaultFeatures": [
+      "desktop"
+    ],
+    "requestedFeatures": [
+      "bundle"
+    ],
+    "allFeatures": false,
+    "noDefaultFeatures": false
+  },
+  "provenanceInputs": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "Dioxus.toml",
+    "hartevo-rs/desktop/Cargo.toml",
+    "rust-toolchain.toml"
+  ],
+  "sourceAssertions": [
+    {
+      "path": "Cargo.toml",
+      "line": "dioxus = { version = \"=0.7.10\", default-features = false, features = [\"launch\", \"lib\"] }"
+    },
+    {
+      "path": "hartevo-rs/desktop/Cargo.toml",
+      "line": "default = [\"desktop\"]"
+    },
+    {
+      "path": "hartevo-rs/desktop/Cargo.toml",
+      "line": "bundle = []"
+    },
+    {
+      "path": "Dioxus.toml",
+      "line": "sub_package = \"hartevo-desktop\""
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "line": "channel = \"1.95.0\""
+    }
+  ],
+  "artifact": {
+    "type": "macos-app-directory",
+    "path": "target/dx/hartevo-desktop/debug/macos/HartevoDesktop.app",
+    "requiredEntries": [
+      {
+        "path": "Contents/Info.plist",
+        "type": "regular-file",
+        "nonEmpty": true,
+        "executable": false
+      },
+      {
+        "path": "Contents/MacOS/hartevo-desktop",
+        "type": "regular-file",
+        "nonEmpty": true,
+        "executable": true
+      },
+      {
+        "path": "Contents/Resources",
+        "type": "directory",
+        "nonEmpty": true
+      }
+    ],
+    "digest": {
+      "algorithm": "sha256-tree-manifest-v1",
+      "selection": [
+        "regular-file"
+      ],
+      "pathEncoding": "lowercase-hex-of-relative-path-bytes",
+      "recordFormat": "F<TAB>pathHex<TAB>payloadSha256<TAB>payloadByteCount<LF>",
+      "ordering": "LC_ALL=C-sort-complete-record",
+      "regularFilePayload": "raw-file-bytes",
+      "pathComponents": "symbolic-links-rejected",
+      "symbolicLinks": "rejected",
+      "specialFileTypes": "rejected",
+      "directories": "excluded",
+      "extendedAttributes": "excluded",
+      "fileModes": "excluded-except-required-entry-assertions",
+      "readPasses": 2
+    }
+  },
+  "receipt": {
+    "schema": "hartevo.dioxus-build-provenance/v1",
+    "statusValues": {
+      "pass": "PASS",
+      "testOnly": "TEST_ONLY",
+      "blockedEnvironment": "BLOCKED_ENV",
+      "failure": "FAIL"
+    },
+    "passCode": "DIOXUS_BUNDLE_VERIFIED",
+    "testOnlyCode": "DIOXUS_BUNDLE_FIXTURE_VERIFIED",
+    "evidenceClasses": {
+      "build": "REAL_DX_BUILD",
+      "fixture": "TEST_FIXTURE"
+    },
+    "blockedEnvironmentCodes": [
+      "BLOCKED_ENV_DX_MISSING",
+      "BLOCKED_ENV_GATE_DEPENDENCY_MISSING",
+      "BLOCKED_ENV_UNSUPPORTED_HOST"
+    ],
+    "failureCodes": [
+      "ARTIFACT_DIGEST_FAILED",
+      "ARTIFACT_DIGEST_UNSTABLE",
+      "ARTIFACT_ENTRY_MISMATCH",
+      "ARTIFACT_MISSING",
+      "ARTIFACT_TYPE_MISMATCH",
+      "ARTIFACT_UNSUPPORTED_ENTRY",
+      "CONTRACT_INVALID",
+      "DX_BUILD_FAILED",
+      "DX_BINARY_CHANGED",
+      "DX_VERSION_MISMATCH",
+      "DX_VERSION_UNREADABLE",
+      "INTERNAL_GATE_ERROR",
+      "INVALID_ARGUMENT",
+      "RECEIPT_INVALID",
+      "RECEIPT_PROVENANCE_MISMATCH",
+      "SOURCE_ASSERTION_FAILED"
+    ],
+    "passFields": [
+      "artifactByteCount",
+      "artifactDigest",
+      "artifactDigestAlgorithm",
+      "artifactFileCount",
+      "artifactPath",
+      "artifactType",
+      "buildCommand",
+      "cliBinarySha256",
+      "cliVersion",
+      "cliVersionOutputSha256",
+      "code",
+      "contractSha256",
+      "defaultFeatures",
+      "evidenceClass",
+      "gateSha256",
+      "hostArch",
+      "hostOs",
+      "inputDigests",
+      "package",
+      "profile",
+      "requestedFeatures",
+      "schema",
+      "sourceCommit",
+      "sourceDirty",
+      "status",
+      "testMode"
+    ],
+    "problemFields": [
+      "code",
+      "contractSha256",
+      "hostArch",
+      "hostOs",
+      "message",
+      "schema",
+      "status"
+    ]
+  }
+}
