@@ -1,0 +1,2940 @@
+{
+  "schemaVersion": "hartevo-mission-route-graph-contract/v2",
+  "contractVersion": "desktop-2026-08-12-ct02-v1",
+  "evidenceLevel": "E1",
+  "runtimeAuthority": {
+    "branchExecution": false,
+    "redirectExecution": false,
+    "optionalSkipExecution": false,
+    "terminalExecution": false
+  },
+  "graphs": [
+    {
+      "id": "vm00.route-graph/v2",
+      "missionId": "VM-00",
+      "missionVersion": 3,
+      "entryCheckpointId": "identity.resolve",
+      "nodes": [
+        {
+          "checkpointId": "identity.resolve",
+          "dependsOn": [],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "project_inventory",
+          "dependsOn": [
+            "identity.resolve"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "encryption_workspace_ready",
+          "dependsOn": [
+            "project_inventory"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "entitlement_and_wallet",
+          "dependsOn": [
+            "encryption_workspace_ready"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "connection_probe",
+          "dependsOn": [
+            "entitlement_and_wallet"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "goal_selected",
+          "dependsOn": [
+            "connection_probe"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "operating_contract_compiled",
+          "dependsOn": [
+            "goal_selected"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "mission_handoff",
+          "dependsOn": [
+            "operating_contract_compiled"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        }
+      ],
+      "transitions": [
+        {
+          "id": "vm00.identity.resolve.to.project_inventory/v2",
+          "sourceCheckpointId": "identity.resolve",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "project_inventory",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm00.project_inventory.to.encryption_workspace_ready/v2",
+          "sourceCheckpointId": "project_inventory",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "encryption_workspace_ready",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm00.encryption_workspace_ready.to.entitlement_and_wallet/v2",
+          "sourceCheckpointId": "encryption_workspace_ready",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "entitlement_and_wallet",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm00.entitlement_and_wallet.to.connection_probe/v2",
+          "sourceCheckpointId": "entitlement_and_wallet",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "connection_probe",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm00.connection_probe.to.goal_selected/v2",
+          "sourceCheckpointId": "connection_probe",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "goal_selected",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm00.goal_selected.to.operating_contract_compiled/v2",
+          "sourceCheckpointId": "goal_selected",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "operating_contract_compiled",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm00.operating_contract_compiled.to.mission_handoff/v2",
+          "sourceCheckpointId": "operating_contract_compiled",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "mission_handoff",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm00.mission_handoff.to.valid-terminal/v2",
+          "sourceCheckpointId": "mission_handoff",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm00.valid-terminal/v2"
+          }
+        }
+      ],
+      "redirects": [],
+      "terminals": [
+        {
+          "id": "vm00.valid-terminal/v2",
+          "kind": "valid_mission_terminal",
+          "missionDisposition": null
+        }
+      ]
+    },
+    {
+      "id": "vm01.route-graph/v2",
+      "missionId": "VM-01",
+      "missionVersion": 3,
+      "entryCheckpointId": "scope_locked",
+      "nodes": [
+        {
+          "checkpointId": "scope_locked",
+          "dependsOn": [],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "analytics_and_search_baseline",
+          "dependsOn": [
+            "scope_locked"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "opportunity_prioritized",
+          "dependsOn": [
+            "analytics_and_search_baseline"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "work_queue",
+          "dependsOn": [
+            "opportunity_prioritized"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "brief_or_patch_ready",
+          "dependsOn": [
+            "work_queue"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "selective_approval",
+          "dependsOn": [
+            "brief_or_patch_ready"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "publication_or_submission",
+          "dependsOn": [
+            "selective_approval"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "url_link_readback",
+          "dependsOn": [
+            "publication_or_submission"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "ranking_traffic_review",
+          "dependsOn": [
+            "url_link_readback"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "next_cycle",
+          "dependsOn": [
+            "ranking_traffic_review"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        }
+      ],
+      "transitions": [
+        {
+          "id": "vm01.scope_locked.to.analytics_and_search_baseline/v2",
+          "sourceCheckpointId": "scope_locked",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "analytics_and_search_baseline",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm01.analytics_and_search_baseline.to.opportunity_prioritized/v2",
+          "sourceCheckpointId": "analytics_and_search_baseline",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "opportunity_prioritized",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm01.opportunity_prioritized.to.work_queue/v2",
+          "sourceCheckpointId": "opportunity_prioritized",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "work_queue",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm01.work_queue.to.brief_or_patch_ready/v2",
+          "sourceCheckpointId": "work_queue",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "brief_or_patch_ready",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm01.brief_or_patch_ready.to.selective_approval/v2",
+          "sourceCheckpointId": "brief_or_patch_ready",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "selective_approval",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm01.selective_approval.to.publication_or_submission/v2",
+          "sourceCheckpointId": "selective_approval",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "publication_or_submission",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm01.publication_or_submission.to.url_link_readback/v2",
+          "sourceCheckpointId": "publication_or_submission",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "url_link_readback",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm01.url_link_readback.to.ranking_traffic_review/v2",
+          "sourceCheckpointId": "url_link_readback",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "ranking_traffic_review",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm01.ranking_traffic_review.to.next_cycle/v2",
+          "sourceCheckpointId": "ranking_traffic_review",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "next_cycle",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm01.next_cycle.to.valid-terminal/v2",
+          "sourceCheckpointId": "next_cycle",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm01.valid-terminal/v2"
+          }
+        }
+      ],
+      "redirects": [],
+      "terminals": [
+        {
+          "id": "vm01.valid-terminal/v2",
+          "kind": "valid_mission_terminal",
+          "missionDisposition": null
+        }
+      ]
+    },
+    {
+      "id": "vm02.route-graph/v2",
+      "missionId": "VM-02",
+      "missionVersion": 3,
+      "entryCheckpointId": "buyer_questions_frozen",
+      "nodes": [
+        {
+          "checkpointId": "buyer_questions_frozen",
+          "dependsOn": [],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "gt_baseline",
+          "dependsOn": [
+            "buyer_questions_frozen"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "mention_citation_recommendation_classified",
+          "dependsOn": [
+            "gt_baseline"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "evidence_gap",
+          "dependsOn": [
+            "mention_citation_recommendation_classified"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "intervention_plan",
+          "dependsOn": [
+            "evidence_gap"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "channel_approval",
+          "dependsOn": [
+            "intervention_plan"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "publication_verified",
+          "dependsOn": [
+            "channel_approval"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "same_set_remeasurement",
+          "dependsOn": [
+            "publication_verified"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "trend_review",
+          "dependsOn": [
+            "same_set_remeasurement"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        }
+      ],
+      "transitions": [
+        {
+          "id": "vm02.buyer_questions_frozen.to.gt_baseline/v2",
+          "sourceCheckpointId": "buyer_questions_frozen",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "gt_baseline",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm02.gt_baseline.to.mention_citation_recommendation_classified/v2",
+          "sourceCheckpointId": "gt_baseline",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "mention_citation_recommendation_classified",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm02.mention_citation_recommendation_classified.to.evidence_gap/v2",
+          "sourceCheckpointId": "mention_citation_recommendation_classified",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "evidence_gap",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm02.evidence_gap.to.intervention_plan/v2",
+          "sourceCheckpointId": "evidence_gap",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "intervention_plan",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm02.intervention_plan.to.channel_approval/v2",
+          "sourceCheckpointId": "intervention_plan",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "channel_approval",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm02.channel_approval.to.publication_verified/v2",
+          "sourceCheckpointId": "channel_approval",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "publication_verified",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm02.publication_verified.to.same_set_remeasurement/v2",
+          "sourceCheckpointId": "publication_verified",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "same_set_remeasurement",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm02.same_set_remeasurement.to.trend_review/v2",
+          "sourceCheckpointId": "same_set_remeasurement",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "trend_review",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm02.trend_review.to.valid-terminal/v2",
+          "sourceCheckpointId": "trend_review",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm02.valid-terminal/v2"
+          }
+        }
+      ],
+      "redirects": [],
+      "terminals": [
+        {
+          "id": "vm02.valid-terminal/v2",
+          "kind": "valid_mission_terminal",
+          "missionDisposition": null
+        }
+      ]
+    },
+    {
+      "id": "vm03.route-graph/v2",
+      "missionId": "VM-03",
+      "missionVersion": 3,
+      "entryCheckpointId": "minimum_truth_ready",
+      "nodes": [
+        {
+          "checkpointId": "minimum_truth_ready",
+          "dependsOn": [],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "domain_search_and_quote",
+          "dependsOn": [
+            "minimum_truth_ready"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "domain_purchase_approval",
+          "dependsOn": [
+            "domain_search_and_quote"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "site_spec_and_claims",
+          "dependsOn": [
+            "domain_purchase_approval"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "sandbox_build",
+          "dependsOn": [
+            "site_spec_and_claims"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "quality_gate",
+          "dependsOn": [
+            "sandbox_build"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "preview_revision",
+          "dependsOn": [
+            "quality_gate"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "deploy_approval",
+          "dependsOn": [
+            "preview_revision"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "online_verification",
+          "dependsOn": [
+            "deploy_approval"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "analytics_form_lead_ready",
+          "dependsOn": [
+            "online_verification"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        }
+      ],
+      "transitions": [
+        {
+          "id": "vm03.minimum_truth_ready.to.domain_search_and_quote/v2",
+          "sourceCheckpointId": "minimum_truth_ready",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "domain_search_and_quote",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm03.domain_search_and_quote.to.domain_purchase_approval/v2",
+          "sourceCheckpointId": "domain_search_and_quote",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "domain_purchase_approval",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm03.domain_purchase_approval.to.site_spec_and_claims/v2",
+          "sourceCheckpointId": "domain_purchase_approval",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "site_spec_and_claims",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm03.site_spec_and_claims.to.sandbox_build/v2",
+          "sourceCheckpointId": "site_spec_and_claims",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "sandbox_build",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm03.sandbox_build.to.quality_gate/v2",
+          "sourceCheckpointId": "sandbox_build",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "quality_gate",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm03.quality_gate.to.preview_revision/v2",
+          "sourceCheckpointId": "quality_gate",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "preview_revision",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm03.preview_revision.to.deploy_approval/v2",
+          "sourceCheckpointId": "preview_revision",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "deploy_approval",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm03.deploy_approval.to.online_verification/v2",
+          "sourceCheckpointId": "deploy_approval",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "online_verification",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm03.online_verification.to.analytics_form_lead_ready/v2",
+          "sourceCheckpointId": "online_verification",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "analytics_form_lead_ready",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm03.analytics_form_lead_ready.to.valid-terminal/v2",
+          "sourceCheckpointId": "analytics_form_lead_ready",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm03.valid-terminal/v2"
+          }
+        }
+      ],
+      "redirects": [],
+      "terminals": [
+        {
+          "id": "vm03.valid-terminal/v2",
+          "kind": "valid_mission_terminal",
+          "missionDisposition": null
+        }
+      ]
+    },
+    {
+      "id": "vm04.route-graph/v2",
+      "missionId": "VM-04",
+      "missionVersion": 3,
+      "entryCheckpointId": "audience_channel_fit",
+      "nodes": [
+        {
+          "checkpointId": "audience_channel_fit",
+          "dependsOn": [],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "account_scope_probe",
+          "dependsOn": [
+            "audience_channel_fit"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "pillar_calendar",
+          "dependsOn": [
+            "account_scope_probe"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "native_variants_and_assets",
+          "dependsOn": [
+            "pillar_calendar"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "selective_approval",
+          "dependsOn": [
+            "native_variants_and_assets"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "schedule_or_publish",
+          "dependsOn": [
+            "selective_approval"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "provider_readback",
+          "dependsOn": [
+            "schedule_or_publish"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "engagement_and_referral_review",
+          "dependsOn": [
+            "provider_readback"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "channel_rebalance",
+          "dependsOn": [
+            "engagement_and_referral_review"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        }
+      ],
+      "transitions": [
+        {
+          "id": "vm04.audience_channel_fit.to.account_scope_probe/v2",
+          "sourceCheckpointId": "audience_channel_fit",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "account_scope_probe",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm04.account_scope_probe.to.pillar_calendar/v2",
+          "sourceCheckpointId": "account_scope_probe",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "pillar_calendar",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm04.pillar_calendar.to.native_variants_and_assets/v2",
+          "sourceCheckpointId": "pillar_calendar",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "native_variants_and_assets",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm04.native_variants_and_assets.to.selective_approval/v2",
+          "sourceCheckpointId": "native_variants_and_assets",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "selective_approval",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm04.selective_approval.to.schedule_or_publish/v2",
+          "sourceCheckpointId": "selective_approval",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "schedule_or_publish",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm04.schedule_or_publish.to.provider_readback/v2",
+          "sourceCheckpointId": "schedule_or_publish",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "provider_readback",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm04.provider_readback.to.engagement_and_referral_review/v2",
+          "sourceCheckpointId": "provider_readback",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "engagement_and_referral_review",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm04.engagement_and_referral_review.to.channel_rebalance/v2",
+          "sourceCheckpointId": "engagement_and_referral_review",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "channel_rebalance",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm04.channel_rebalance.to.valid-terminal/v2",
+          "sourceCheckpointId": "channel_rebalance",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm04.valid-terminal/v2"
+          }
+        }
+      ],
+      "redirects": [],
+      "terminals": [
+        {
+          "id": "vm04.valid-terminal/v2",
+          "kind": "valid_mission_terminal",
+          "missionDisposition": null
+        }
+      ]
+    },
+    {
+      "id": "vm05.route-graph/v2",
+      "missionId": "VM-05",
+      "missionVersion": 3,
+      "entryCheckpointId": "icp_and_legal_basis",
+      "nodes": [
+        {
+          "checkpointId": "icp_and_legal_basis",
+          "dependsOn": [],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "source_identity_consent",
+          "dependsOn": [
+            "icp_and_legal_basis"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "dedupe_and_suppression",
+          "dependsOn": [
+            "source_identity_consent"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "segment_sequence_frequency",
+          "dependsOn": [
+            "dedupe_and_suppression"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "personalized_drafts",
+          "dependsOn": [
+            "segment_sequence_frequency"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "selective_approval",
+          "dependsOn": [
+            "personalized_drafts"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "send_receipt",
+          "dependsOn": [
+            "selective_approval"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "reply_bounce_unsubscribe_ingest",
+          "dependsOn": [
+            "send_receipt"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "classification_handoff_crm",
+          "dependsOn": [
+            "reply_bounce_unsubscribe_ingest"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "cycle_review",
+          "dependsOn": [
+            "classification_handoff_crm"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        }
+      ],
+      "transitions": [
+        {
+          "id": "vm05.icp_and_legal_basis.to.source_identity_consent/v2",
+          "sourceCheckpointId": "icp_and_legal_basis",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "source_identity_consent",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm05.source_identity_consent.to.dedupe_and_suppression/v2",
+          "sourceCheckpointId": "source_identity_consent",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "dedupe_and_suppression",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm05.dedupe_and_suppression.to.segment_sequence_frequency/v2",
+          "sourceCheckpointId": "dedupe_and_suppression",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "segment_sequence_frequency",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm05.segment_sequence_frequency.to.personalized_drafts/v2",
+          "sourceCheckpointId": "segment_sequence_frequency",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "personalized_drafts",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm05.personalized_drafts.to.selective_approval/v2",
+          "sourceCheckpointId": "personalized_drafts",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "selective_approval",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm05.selective_approval.to.send_receipt/v2",
+          "sourceCheckpointId": "selective_approval",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "send_receipt",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm05.send_receipt.to.reply_bounce_unsubscribe_ingest/v2",
+          "sourceCheckpointId": "send_receipt",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "reply_bounce_unsubscribe_ingest",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm05.reply_bounce_unsubscribe_ingest.to.classification_handoff_crm/v2",
+          "sourceCheckpointId": "reply_bounce_unsubscribe_ingest",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "classification_handoff_crm",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm05.classification_handoff_crm.to.cycle_review/v2",
+          "sourceCheckpointId": "classification_handoff_crm",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "cycle_review",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm05.cycle_review.to.valid-terminal/v2",
+          "sourceCheckpointId": "cycle_review",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm05.valid-terminal/v2"
+          }
+        }
+      ],
+      "redirects": [],
+      "terminals": [
+        {
+          "id": "vm05.valid-terminal/v2",
+          "kind": "valid_mission_terminal",
+          "missionDisposition": null
+        }
+      ]
+    },
+    {
+      "id": "vm06.route-graph/v2",
+      "missionId": "VM-06",
+      "missionVersion": 4,
+      "entryCheckpointId": "brand_readiness",
+      "nodes": [
+        {
+          "checkpointId": "brand_readiness",
+          "dependsOn": [],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "provider_probe_and_supply_class",
+          "dependsOn": [
+            "brand_readiness"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "identity_dedupe_fit",
+          "dependsOn": [
+            "provider_probe_and_supply_class"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "program_terms_budget",
+          "dependsOn": [
+            "identity_dedupe_fit"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "contact_permission",
+          "dependsOn": [
+            "program_terms_budget"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "creator_hiring_offer_frozen",
+          "dependsOn": [
+            "contact_permission"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "verified_invitation_or_listing",
+          "dependsOn": [
+            "creator_hiring_offer_frozen"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "creator_application",
+          "dependsOn": [
+            "verified_invitation_or_listing"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "user_selection_and_award",
+          "dependsOn": [
+            "creator_application"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "creator_task_and_bounty",
+          "dependsOn": [
+            "user_selection_and_award"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "funding_readiness_and_reservation",
+          "dependsOn": [
+            "creator_task_and_bounty"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "creator_acceptance",
+          "dependsOn": [
+            "funding_readiness_and_reservation"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "link_coupon_or_work_activation",
+          "dependsOn": [
+            "creator_acceptance"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "publication_or_deliverable_upload",
+          "dependsOn": [
+            "link_coupon_or_work_activation"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "deliverable_safety_and_rights",
+          "dependsOn": [
+            "publication_or_deliverable_upload"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "user_review_revision_or_acceptance",
+          "dependsOn": [
+            "deliverable_safety_and_rights"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "orders_refunds_or_payout_eligibility",
+          "dependsOn": [
+            "user_review_revision_or_acceptance"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "refund_commission_recalc",
+          "dependsOn": [
+            "orders_refunds_or_payout_eligibility"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "payout_approval_reconciliation",
+          "dependsOn": [
+            "refund_commission_recalc"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "deliverable_entitlement_and_verified_settlement",
+          "dependsOn": [
+            "payout_approval_reconciliation"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "portfolio_review",
+          "dependsOn": [
+            "deliverable_entitlement_and_verified_settlement"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        }
+      ],
+      "transitions": [
+        {
+          "id": "vm06.brand_readiness.to.provider_probe_and_supply_class/v2",
+          "sourceCheckpointId": "brand_readiness",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "provider_probe_and_supply_class",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.provider_probe_and_supply_class.to.identity_dedupe_fit/v2",
+          "sourceCheckpointId": "provider_probe_and_supply_class",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "identity_dedupe_fit",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.identity_dedupe_fit.to.program_terms_budget/v2",
+          "sourceCheckpointId": "identity_dedupe_fit",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "program_terms_budget",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.program_terms_budget.to.contact_permission/v2",
+          "sourceCheckpointId": "program_terms_budget",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "contact_permission",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.contact_permission.to.creator_hiring_offer_frozen/v2",
+          "sourceCheckpointId": "contact_permission",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "creator_hiring_offer_frozen",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.creator_hiring_offer_frozen.to.verified_invitation_or_listing/v2",
+          "sourceCheckpointId": "creator_hiring_offer_frozen",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "verified_invitation_or_listing",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.verified_invitation_or_listing.to.creator_application/v2",
+          "sourceCheckpointId": "verified_invitation_or_listing",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "creator_application",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.creator_application.to.user_selection_and_award/v2",
+          "sourceCheckpointId": "creator_application",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "user_selection_and_award",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.user_selection_and_award.to.creator_task_and_bounty/v2",
+          "sourceCheckpointId": "user_selection_and_award",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "creator_task_and_bounty",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.creator_task_and_bounty.to.funding_readiness_and_reservation/v2",
+          "sourceCheckpointId": "creator_task_and_bounty",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "funding_readiness_and_reservation",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.funding_readiness_and_reservation.to.creator_acceptance/v2",
+          "sourceCheckpointId": "funding_readiness_and_reservation",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "creator_acceptance",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.creator_acceptance.to.link_coupon_or_work_activation/v2",
+          "sourceCheckpointId": "creator_acceptance",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "link_coupon_or_work_activation",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.link_coupon_or_work_activation.to.publication_or_deliverable_upload/v2",
+          "sourceCheckpointId": "link_coupon_or_work_activation",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "publication_or_deliverable_upload",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.publication_or_deliverable_upload.to.deliverable_safety_and_rights/v2",
+          "sourceCheckpointId": "publication_or_deliverable_upload",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "deliverable_safety_and_rights",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.deliverable_safety_and_rights.to.user_review_revision_or_acceptance/v2",
+          "sourceCheckpointId": "deliverable_safety_and_rights",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "user_review_revision_or_acceptance",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.user_review_revision_or_acceptance.to.orders_refunds_or_payout_eligibility/v2",
+          "sourceCheckpointId": "user_review_revision_or_acceptance",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "orders_refunds_or_payout_eligibility",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.orders_refunds_or_payout_eligibility.to.refund_commission_recalc/v2",
+          "sourceCheckpointId": "orders_refunds_or_payout_eligibility",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "refund_commission_recalc",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.refund_commission_recalc.to.payout_approval_reconciliation/v2",
+          "sourceCheckpointId": "refund_commission_recalc",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "payout_approval_reconciliation",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.payout_approval_reconciliation.to.deliverable_entitlement_and_verified_settlement/v2",
+          "sourceCheckpointId": "payout_approval_reconciliation",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "deliverable_entitlement_and_verified_settlement",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.deliverable_entitlement_and_verified_settlement.to.portfolio_review/v2",
+          "sourceCheckpointId": "deliverable_entitlement_and_verified_settlement",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "portfolio_review",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm06.portfolio_review.to.valid-terminal/v2",
+          "sourceCheckpointId": "portfolio_review",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm06.valid-terminal/v2"
+          }
+        }
+      ],
+      "redirects": [],
+      "terminals": [
+        {
+          "id": "vm06.valid-terminal/v2",
+          "kind": "valid_mission_terminal",
+          "missionDisposition": null
+        }
+      ]
+    },
+    {
+      "id": "vm07.route-graph/v2",
+      "missionId": "VM-07",
+      "missionVersion": 3,
+      "entryCheckpointId": "product_market_budget_constraints",
+      "nodes": [
+        {
+          "checkpointId": "product_market_budget_constraints",
+          "dependsOn": [],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "evidence_plan",
+          "dependsOn": [
+            "product_market_budget_constraints"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "scoped_collection",
+          "dependsOn": [
+            "evidence_plan"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "confirmed_estimated_inferred_unknown_conflict",
+          "dependsOn": [
+            "scoped_collection"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "scenarios_risks_counterevidence",
+          "dependsOn": [
+            "confirmed_estimated_inferred_unknown_conflict"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "go_no_go_need_more_evidence",
+          "dependsOn": [
+            "scenarios_risks_counterevidence"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "prioritized_experiments",
+          "dependsOn": [
+            "go_no_go_need_more_evidence"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "replan_or_terminal",
+          "dependsOn": [
+            "prioritized_experiments"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        }
+      ],
+      "transitions": [
+        {
+          "id": "vm07.product_market_budget_constraints.to.evidence_plan/v2",
+          "sourceCheckpointId": "product_market_budget_constraints",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "evidence_plan",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm07.evidence_plan.to.scoped_collection/v2",
+          "sourceCheckpointId": "evidence_plan",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "scoped_collection",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm07.scoped_collection.to.confirmed_estimated_inferred_unknown_conflict/v2",
+          "sourceCheckpointId": "scoped_collection",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "confirmed_estimated_inferred_unknown_conflict",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm07.confirmed_estimated_inferred_unknown_conflict.to.scenarios_risks_counterevidence/v2",
+          "sourceCheckpointId": "confirmed_estimated_inferred_unknown_conflict",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "scenarios_risks_counterevidence",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm07.scenarios_risks_counterevidence.to.go_no_go_need_more_evidence/v2",
+          "sourceCheckpointId": "scenarios_risks_counterevidence",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "go_no_go_need_more_evidence",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm07.go_no_go_need_more_evidence.to.prioritized_experiments/v2",
+          "sourceCheckpointId": "go_no_go_need_more_evidence",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "prioritized_experiments",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm07.prioritized_experiments.to.replan_or_terminal/v2",
+          "sourceCheckpointId": "prioritized_experiments",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "replan_or_terminal",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm07.replan_or_terminal.to.valid-terminal/v2",
+          "sourceCheckpointId": "replan_or_terminal",
+          "condition": "vm07_replan_resolution.valid_terminal",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm07.valid-terminal/v2"
+          }
+        }
+      ],
+      "redirects": [
+        {
+          "id": "vm07.replan_or_terminal.redirect.go_no_go_need_more_evidence/v2",
+          "sourceCheckpointId": "replan_or_terminal",
+          "condition": "vm07_replan_resolution.replan",
+          "targetCheckpointId": "go_no_go_need_more_evidence",
+          "resetRegionCheckpointIds": [
+            "go_no_go_need_more_evidence",
+            "prioritized_experiments",
+            "replan_or_terminal"
+          ],
+          "maxTraversalsPerCycle": 1,
+          "effectReplayPolicy": "forbidden",
+          "preserveCompletedArtifacts": "audit_only",
+          "completionEvidenceReusePolicy": "forbidden"
+        }
+      ],
+      "terminals": [
+        {
+          "id": "vm07.valid-terminal/v2",
+          "kind": "valid_mission_terminal",
+          "missionDisposition": null
+        }
+      ]
+    },
+    {
+      "id": "vm08.route-graph/v2",
+      "missionId": "VM-08",
+      "missionVersion": 4,
+      "entryCheckpointId": "seller_account_market_identity",
+      "nodes": [
+        {
+          "checkpointId": "seller_account_market_identity",
+          "dependsOn": [],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "sku_asin_currency_normalization",
+          "dependsOn": [
+            "seller_account_market_identity"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "first_party_vs_estimate",
+          "dependsOn": [
+            "sku_asin_currency_normalization"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "demand_review_return_competitor_clusters",
+          "dependsOn": [
+            "first_party_vs_estimate"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "opportunity_queue",
+          "dependsOn": [
+            "demand_review_return_competitor_clusters"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "listing_evidence_fix_pack",
+          "dependsOn": [
+            "opportunity_queue"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "selective_approval",
+          "dependsOn": [
+            "listing_evidence_fix_pack"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "listing_write_readback",
+          "dependsOn": [
+            "selective_approval"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "effect_readback_v2_terminal_verification",
+            "flowId": "vm08.listing-write-account-readback/v2"
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "conversion_return_rank_profit_review",
+          "dependsOn": [
+            "listing_write_readback"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        }
+      ],
+      "transitions": [
+        {
+          "id": "vm08.seller_account_market_identity.to.sku_asin_currency_normalization/v2",
+          "sourceCheckpointId": "seller_account_market_identity",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "sku_asin_currency_normalization",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm08.sku_asin_currency_normalization.to.first_party_vs_estimate/v2",
+          "sourceCheckpointId": "sku_asin_currency_normalization",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "first_party_vs_estimate",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm08.first_party_vs_estimate.to.demand_review_return_competitor_clusters/v2",
+          "sourceCheckpointId": "first_party_vs_estimate",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "demand_review_return_competitor_clusters",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm08.demand_review_return_competitor_clusters.to.opportunity_queue/v2",
+          "sourceCheckpointId": "demand_review_return_competitor_clusters",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "opportunity_queue",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm08.opportunity_queue.to.listing_evidence_fix_pack/v2",
+          "sourceCheckpointId": "opportunity_queue",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "listing_evidence_fix_pack",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm08.listing_evidence_fix_pack.to.selective_approval/v2",
+          "sourceCheckpointId": "listing_evidence_fix_pack",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "selective_approval",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm08.selective_approval.to.listing_write_readback/v2",
+          "sourceCheckpointId": "selective_approval",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "listing_write_readback",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm08.listing_write_readback.to.conversion_return_rank_profit_review/v2",
+          "sourceCheckpointId": "listing_write_readback",
+          "condition": "effect_readback_v2.terminal_verification_satisfied",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "conversion_return_rank_profit_review",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm08.conversion_return_rank_profit_review.to.valid-terminal/v2",
+          "sourceCheckpointId": "conversion_return_rank_profit_review",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm08.valid-terminal/v2"
+          }
+        }
+      ],
+      "redirects": [],
+      "terminals": [
+        {
+          "id": "vm08.valid-terminal/v2",
+          "kind": "valid_mission_terminal",
+          "missionDisposition": null
+        }
+      ]
+    },
+    {
+      "id": "vm09.route-graph/v2",
+      "missionId": "VM-09",
+      "missionVersion": 3,
+      "entryCheckpointId": "crm_scope",
+      "nodes": [
+        {
+          "checkpointId": "crm_scope",
+          "dependsOn": [],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "entity_and_buying_committee",
+          "dependsOn": [
+            "crm_scope"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "stage_activity_objection_deadline_priority",
+          "dependsOn": [
+            "entity_and_buying_committee"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "evidence_gap",
+          "dependsOn": [
+            "stage_activity_objection_deadline_priority"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "case_comparison_security_implementation_roi_pack",
+          "dependsOn": [
+            "evidence_gap"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "next_best_action_and_draft",
+          "dependsOn": [
+            "case_comparison_security_implementation_roi_pack"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "consent_approval_send",
+          "dependsOn": [
+            "next_best_action_and_draft"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "reply_meeting",
+          "dependsOn": [
+            "consent_approval_send"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "stage_and_win_loss_review",
+          "dependsOn": [
+            "reply_meeting"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        }
+      ],
+      "transitions": [
+        {
+          "id": "vm09.crm_scope.to.entity_and_buying_committee/v2",
+          "sourceCheckpointId": "crm_scope",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "entity_and_buying_committee",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm09.entity_and_buying_committee.to.stage_activity_objection_deadline_priority/v2",
+          "sourceCheckpointId": "entity_and_buying_committee",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "stage_activity_objection_deadline_priority",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm09.stage_activity_objection_deadline_priority.to.evidence_gap/v2",
+          "sourceCheckpointId": "stage_activity_objection_deadline_priority",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "evidence_gap",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm09.evidence_gap.to.case_comparison_security_implementation_roi_pack/v2",
+          "sourceCheckpointId": "evidence_gap",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "case_comparison_security_implementation_roi_pack",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm09.case_comparison_security_implementation_roi_pack.to.next_best_action_and_draft/v2",
+          "sourceCheckpointId": "case_comparison_security_implementation_roi_pack",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "next_best_action_and_draft",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm09.next_best_action_and_draft.to.consent_approval_send/v2",
+          "sourceCheckpointId": "next_best_action_and_draft",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "consent_approval_send",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm09.consent_approval_send.to.reply_meeting/v2",
+          "sourceCheckpointId": "consent_approval_send",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "reply_meeting",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm09.reply_meeting.to.stage_and_win_loss_review/v2",
+          "sourceCheckpointId": "reply_meeting",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "stage_and_win_loss_review",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm09.stage_and_win_loss_review.to.valid-terminal/v2",
+          "sourceCheckpointId": "stage_and_win_loss_review",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm09.valid-terminal/v2"
+          }
+        }
+      ],
+      "redirects": [],
+      "terminals": [
+        {
+          "id": "vm09.valid-terminal/v2",
+          "kind": "valid_mission_terminal",
+          "missionDisposition": null
+        }
+      ]
+    },
+    {
+      "id": "vm10.route-graph/v2",
+      "missionId": "VM-10",
+      "missionVersion": 3,
+      "entryCheckpointId": "webhook_signature_and_tenant_route",
+      "nodes": [
+        {
+          "checkpointId": "webhook_signature_and_tenant_route",
+          "dependsOn": [],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "dedupe_order_replay",
+          "dependsOn": [
+            "webhook_signature_and_tenant_route"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "identity_conversation_resolution",
+          "dependsOn": [
+            "dedupe_order_replay"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "intent_risk_confidence",
+          "dependsOn": [
+            "identity_conversation_resolution"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "policy_auto_draft_handoff",
+          "dependsOn": [
+            "intent_risk_confidence"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "reply_effect_or_handoff",
+          "dependsOn": [
+            "policy_auto_draft_handoff"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "human_control_lock",
+          "dependsOn": [
+            "reply_effect_or_handoff"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "summary_assignment_task_crm",
+          "dependsOn": [
+            "human_control_lock"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "explicit_resume",
+          "dependsOn": [
+            "summary_assignment_task_crm"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "reconciliation",
+          "dependsOn": [
+            "explicit_resume"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        }
+      ],
+      "transitions": [
+        {
+          "id": "vm10.webhook_signature_and_tenant_route.to.dedupe_order_replay/v2",
+          "sourceCheckpointId": "webhook_signature_and_tenant_route",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "dedupe_order_replay",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm10.dedupe_order_replay.to.identity_conversation_resolution/v2",
+          "sourceCheckpointId": "dedupe_order_replay",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "identity_conversation_resolution",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm10.identity_conversation_resolution.to.intent_risk_confidence/v2",
+          "sourceCheckpointId": "identity_conversation_resolution",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "intent_risk_confidence",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm10.intent_risk_confidence.to.policy_auto_draft_handoff/v2",
+          "sourceCheckpointId": "intent_risk_confidence",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "policy_auto_draft_handoff",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm10.policy_auto_draft_handoff.to.reply_effect_or_handoff/v2",
+          "sourceCheckpointId": "policy_auto_draft_handoff",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "reply_effect_or_handoff",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm10.reply_effect_or_handoff.to.human_control_lock/v2",
+          "sourceCheckpointId": "reply_effect_or_handoff",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "human_control_lock",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm10.human_control_lock.to.summary_assignment_task_crm/v2",
+          "sourceCheckpointId": "human_control_lock",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "summary_assignment_task_crm",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm10.summary_assignment_task_crm.to.explicit_resume/v2",
+          "sourceCheckpointId": "summary_assignment_task_crm",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "explicit_resume",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm10.explicit_resume.to.reconciliation/v2",
+          "sourceCheckpointId": "explicit_resume",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "reconciliation",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm10.reconciliation.to.valid-terminal/v2",
+          "sourceCheckpointId": "reconciliation",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm10.valid-terminal/v2"
+          }
+        }
+      ],
+      "redirects": [],
+      "terminals": [
+        {
+          "id": "vm10.valid-terminal/v2",
+          "kind": "valid_mission_terminal",
+          "missionDisposition": null
+        }
+      ]
+    },
+    {
+      "id": "vm11.route-graph/v2",
+      "missionId": "VM-11",
+      "missionVersion": 3,
+      "entryCheckpointId": "event_ingest",
+      "nodes": [
+        {
+          "checkpointId": "event_ingest",
+          "dependsOn": [],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "normalize_dedupe_order",
+          "dependsOn": [
+            "event_ingest"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "identity_chain",
+          "dependsOn": [
+            "normalize_dedupe_order"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "mission_specific_kpi",
+          "dependsOn": [
+            "identity_chain"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "attribution_and_unattributed",
+          "dependsOn": [
+            "mission_specific_kpi"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "refund_commission_payout_recalc",
+          "dependsOn": [
+            "attribution_and_unattributed"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "outcome_review",
+          "dependsOn": [
+            "refund_commission_payout_recalc"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "continue_stop_scale_test",
+          "dependsOn": [
+            "outcome_review"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "next_contract_or_valid_terminal",
+          "dependsOn": [
+            "continue_stop_scale_test"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": [
+            "outcome_review_next_contract_resolution.scale_with_revised_contract_waiting_user",
+            "outcome_review_next_contract_resolution.test_with_new_experiment_waiting_user"
+          ]
+        },
+        {
+          "checkpointId": "candidate_learning",
+          "dependsOn": [
+            "next_contract_or_valid_terminal"
+          ],
+          "optional": true,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        }
+      ],
+      "transitions": [
+        {
+          "id": "vm11.event_ingest.to.normalize_dedupe_order/v2",
+          "sourceCheckpointId": "event_ingest",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "normalize_dedupe_order",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm11.normalize_dedupe_order.to.identity_chain/v2",
+          "sourceCheckpointId": "normalize_dedupe_order",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "identity_chain",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm11.identity_chain.to.mission_specific_kpi/v2",
+          "sourceCheckpointId": "identity_chain",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "mission_specific_kpi",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm11.mission_specific_kpi.to.attribution_and_unattributed/v2",
+          "sourceCheckpointId": "mission_specific_kpi",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "attribution_and_unattributed",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm11.attribution_and_unattributed.to.refund_commission_payout_recalc/v2",
+          "sourceCheckpointId": "attribution_and_unattributed",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "refund_commission_payout_recalc",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm11.refund_commission_payout_recalc.to.outcome_review/v2",
+          "sourceCheckpointId": "refund_commission_payout_recalc",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "outcome_review",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm11.outcome_review.to.continue_stop_scale_test/v2",
+          "sourceCheckpointId": "outcome_review",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "continue_stop_scale_test",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm11.continue_stop_scale_test.to.next_contract_or_valid_terminal/v2",
+          "sourceCheckpointId": "continue_stop_scale_test",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "next_contract_or_valid_terminal",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm11.next_contract_or_valid_terminal.to.candidate_learning/v2",
+          "sourceCheckpointId": "next_contract_or_valid_terminal",
+          "condition": "outcome_review_next_contract_resolution.continue_current_contract",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "candidate_learning",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm11.candidate_learning.to.valid-terminal/v2",
+          "sourceCheckpointId": "candidate_learning",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm11.valid-terminal/v2"
+          }
+        },
+        {
+          "id": "vm11.next_contract_or_valid_terminal.to.valid-terminal.stop/v2",
+          "sourceCheckpointId": "next_contract_or_valid_terminal",
+          "condition": "outcome_review_next_contract_resolution.stop_valid_terminal",
+          "target": {
+            "kind": "terminal",
+            "checkpointId": null,
+            "terminalId": "vm11.valid-terminal/v2"
+          }
+        }
+      ],
+      "redirects": [],
+      "terminals": [
+        {
+          "id": "vm11.valid-terminal/v2",
+          "kind": "valid_mission_terminal",
+          "missionDisposition": "completed"
+        }
+      ]
+    }
+  ]
+}
