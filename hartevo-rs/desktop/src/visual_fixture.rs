@@ -28,18 +28,21 @@ const SURFACE_ENV: &str = "HARTEVO_DESKTOP_UI_SURFACE";
 const PROTOTYPE_SCENARIO_ID: &str = "prototype-baseline-v1";
 const PROTOTYPE_SCENARIO: &str = include_str!("../fixtures/prototype-baseline.v1.json");
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VisualFixtureDefinition {
     scenario_id: String,
     source: String,
     disclosure: String,
     project: VisualProject,
+    #[serde(default)]
+    related_projects: Vec<VisualProject>,
     missions: Vec<VisualMission>,
     catalog: Vec<(String, String, String)>,
+    presentation: VisualPresentation,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VisualProject {
     project_id: String,
@@ -49,7 +52,7 @@ struct VisualProject {
     workspace_root_count: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VisualMission {
     mission_id: String,
@@ -63,6 +66,120 @@ struct VisualMission {
     cycle: u64,
     pending_approvals: usize,
     work_products: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VisualPresentation {
+    pub(super) notifications: Vec<VisualNotification>,
+    pub(super) conversation: VisualConversation,
+    pub(super) approval: VisualApproval,
+    pub(super) outcome: VisualOutcome,
+    pub(super) workpad: VisualWorkpad,
+    pub(super) pages: Vec<VisualPage>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VisualNotification {
+    pub(super) mark: String,
+    pub(super) title: String,
+    pub(super) context: String,
+    pub(super) time: String,
+    pub(super) kind: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VisualConversation {
+    pub(super) user_prompt: String,
+    pub(super) assistant_intro: String,
+    pub(super) goal: String,
+    pub(super) automatic: String,
+    pub(super) approval: String,
+    pub(super) progress: Vec<VisualProgress>,
+    pub(super) capability_summary: String,
+    pub(super) connection_title: String,
+    pub(super) connection_detail: String,
+    pub(super) artifact_title: String,
+    pub(super) artifact_meta: String,
+    pub(super) decision: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VisualProgress {
+    pub(super) title: String,
+    pub(super) detail: String,
+    pub(super) capability: String,
+    pub(super) state: String,
+    pub(super) time: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VisualApproval {
+    pub(super) user_prompt: String,
+    pub(super) assistant_intro: String,
+    pub(super) effects: Vec<VisualRow>,
+    pub(super) facts: Vec<VisualRow>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VisualOutcome {
+    pub(super) intro: String,
+    pub(super) metrics: Vec<VisualMetric>,
+    pub(super) rows: Vec<VisualRow>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VisualWorkpad {
+    pub(super) tabs: Vec<String>,
+    pub(super) eyebrow: String,
+    pub(super) title: String,
+    pub(super) meta: String,
+    pub(super) conclusion: String,
+    pub(super) phases: Vec<String>,
+    pub(super) candidates: Vec<VisualRow>,
+    pub(super) sources: Vec<VisualRow>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VisualPage {
+    pub(super) id: String,
+    pub(super) stats: Vec<VisualMetric>,
+    pub(super) tabs: Vec<VisualPageTab>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VisualMetric {
+    pub(super) value: String,
+    pub(super) label: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VisualPageTab {
+    pub(super) id: String,
+    pub(super) label: String,
+    pub(super) kind: String,
+    pub(super) headline: String,
+    pub(super) subline: String,
+    pub(super) columns: Vec<String>,
+    pub(super) rows: Vec<VisualRow>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VisualRow {
+    pub(super) title: String,
+    pub(super) detail: String,
+    pub(super) meta: String,
+    pub(super) state: String,
 }
 
 pub(super) fn load_from_environment() -> Option<DesktopUiModel> {
@@ -83,12 +200,17 @@ pub(super) fn load_from_environment() -> Option<DesktopUiModel> {
         .collect::<Vec<_>>();
     let selected_mission_id = selected_fixture_mission_id(&missions);
     let project = fixture_project_projection(project_id.clone(), definition.project, missions);
+    let mut projects = vec![project];
+    projects.extend(definition.related_projects.into_iter().map(|related| {
+        let related_id = ProjectId::from(related.project_id.as_str());
+        fixture_project_projection(related_id, related, Vec::new())
+    }));
     let evidence = fixture_evidence_projection(
         &definition.scenario_id,
         &definition.source,
         definition.catalog,
     );
-    let snapshot = fixture_snapshot(project_id.clone(), project, evidence);
+    let snapshot = fixture_snapshot(project_id.clone(), projects, evidence);
 
     Some(DesktopUiModel {
         backend: DesktopBackendState::Ready(Box::new(snapshot)),
@@ -98,12 +220,33 @@ pub(super) fn load_from_environment() -> Option<DesktopUiModel> {
     })
 }
 
+pub(super) fn presentation() -> Option<VisualPresentation> {
+    active_id()?;
+    let definition: VisualFixtureDefinition = serde_json::from_str(PROTOTYPE_SCENARIO)
+        .expect("checked-in prototype visual fixture must deserialize");
+    Some(definition.presentation)
+}
+
+pub(super) fn page(page_id: &str) -> Option<VisualPage> {
+    presentation()?
+        .pages
+        .into_iter()
+        .find(|page| page.id == page_id)
+}
+
 fn selected_fixture_mission_id(missions: &[MissionProjection]) -> Option<MissionId> {
-    let selected_manifest_id = match initial_surface() {
-        Some(Surface::ChannelOperations) => Some("VM-04"),
-        Some(Surface::Relationships) => Some("VM-05"),
-        Some(Surface::Outcomes) => Some("VM-01"),
-        _ => None,
+    let requested_surface = requested_surface_id();
+    let selected_manifest_id = match requested_surface.as_deref() {
+        Some(
+            "mission-conversation" | "mission-streaming" | "mission-workpad" | "mission-inspector",
+        ) => Some("VM-07"),
+        Some("mission-approval" | "mission-outcome") => Some("VM-03"),
+        _ => match initial_surface() {
+            Some(Surface::ChannelOperations) => Some("VM-04"),
+            Some(Surface::Relationships) => Some("VM-05"),
+            Some(Surface::Outcomes) => Some("VM-01"),
+            _ => None,
+        },
     };
     selected_manifest_id.and_then(|manifest_id| {
         missions
@@ -163,13 +306,11 @@ fn fixture_evidence_projection(
 
 fn fixture_snapshot(
     project_id: ProjectId,
-    project: DesktopProjectProjection,
+    projects: Vec<DesktopProjectProjection>,
     evidence: ProductEvidenceProjection,
 ) -> DesktopSnapshot {
     DesktopSnapshot {
-        inventory: DesktopInventoryProjection {
-            projects: vec![project],
-        },
+        inventory: DesktopInventoryProjection { projects },
         context_access: vec![ProjectContextAccessProjection {
             project_id,
             status: ProjectContextAccessStatus::Ready {
@@ -207,10 +348,28 @@ pub(super) fn active_id() -> Option<String> {
         .filter(|value| value == PROTOTYPE_SCENARIO_ID)
 }
 
+pub(super) fn active_surface_variant() -> Option<String> {
+    active_id()?;
+    requested_surface_id()
+}
+
+fn requested_surface_id() -> Option<String> {
+    env::var(SURFACE_ENV).ok()
+}
+
 pub(super) fn initial_surface() -> Option<Surface> {
     active_id()?;
     Some(match env::var(SURFACE_ENV).ok().as_deref() {
-        None | Some("orchestrator") => Surface::Orchestrator,
+        None
+        | Some(
+            "orchestrator"
+            | "mission-conversation"
+            | "mission-streaming"
+            | "mission-workpad"
+            | "mission-inspector"
+            | "mission-approval"
+            | "mission-outcome",
+        ) => Surface::Orchestrator,
         Some("current") => Surface::Current,
         Some("missions") => Surface::Missions,
         Some("channels") => Surface::ChannelOperations,
@@ -318,5 +477,29 @@ mod tests {
         assert_eq!(fixture.disclosure, "VISUAL_FIXTURE");
         assert_eq!(fixture.catalog.len(), 12);
         assert_eq!(fixture.missions.len(), 7);
+        assert_eq!(fixture.related_projects.len(), 3);
+        assert_eq!(fixture.presentation.pages.len(), 5);
+        assert_eq!(fixture.presentation.notifications.len(), 4);
+        let creator_work = fixture
+            .presentation
+            .pages
+            .iter()
+            .find(|page| page.id == "partners")
+            .and_then(|page| page.tabs.iter().find(|tab| tab.id == "work"))
+            .expect("creator work lifecycle fixture");
+        assert_eq!(creator_work.kind, "workflow");
+        assert_eq!(creator_work.rows.len(), 6);
+        assert!(creator_work.rows[0].detail.contains("Reward $300 USD"));
+        assert!(creator_work.rows[3].title.contains("Deliverable Upload"));
+        assert!(creator_work.rows[4].title.contains("Review / Revision"));
+        assert!(creator_work.rows[5].title.contains("Payout Verification"));
+        assert!(
+            fixture
+                .presentation
+                .outcome
+                .rows
+                .iter()
+                .all(|row| { !row.state.contains("verified") && !row.state.contains("已付款") })
+        );
     }
 }

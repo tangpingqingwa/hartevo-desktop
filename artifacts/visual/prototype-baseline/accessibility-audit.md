@@ -5,6 +5,12 @@ This report audits native macOS accessibility snapshots from the real Dioxus Des
 | Surface | AX lines | named controls | Result |
 |---|---:|---:|---|
 | `orchestrator` | 101 | 35 | PASS |
+| `mission-conversation` | 117 | 46 | PASS |
+| `mission-streaming` | 133 | 46 | PASS |
+| `mission-workpad` | 177 | 59 | PASS |
+| `mission-inspector` | 162 | 56 | PASS |
+| `mission-approval` | 98 | 45 | PASS |
+| `mission-outcome` | 88 | 42 | PASS |
 | `current` | 120 | 28 | PASS |
 | `missions` | 105 | 39 | PASS |
 | `channels` | 82 | 32 | PASS |

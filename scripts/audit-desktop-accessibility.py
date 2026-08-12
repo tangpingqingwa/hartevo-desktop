@@ -20,6 +20,12 @@ REPORT_PATH = (
 
 REQUIRED_SURFACES = (
     "orchestrator",
+    "mission-conversation",
+    "mission-streaming",
+    "mission-workpad",
+    "mission-inspector",
+    "mission-approval",
+    "mission-outcome",
     "current",
     "missions",
     "channels",
@@ -94,6 +100,44 @@ def main() -> None:
     ):
         if expected not in settings_text:
             failures.append(f"settings: missing accessible name {expected}")
+
+    mission_expectations = {
+        "mission-conversation": (
+            "Mission Conversation",
+            "Operating Contract 目标、约束与停止条件",
+            "添加附件或上下文",
+        ),
+        "mission-streaming": (
+            "Runtime 事件流",
+            "停止 Runtime 交互结构样例",
+            "VISUAL_FIXTURE",
+        ),
+        "mission-workpad": (
+            "调整 Mission 会话与工作台宽度",
+            "任务工作台",
+            "工作产物标签",
+        ),
+        "mission-inspector": (
+            "运行检查器",
+            "MISSION INSPECTOR",
+            "Browser Workspace",
+        ),
+        "mission-approval": (
+            "等待审批",
+            "修改样例",
+            "不创建 ApprovalGrant / EffectIntent",
+        ),
+        "mission-outcome": (
+            "未执行",
+            "ProviderReceipt",
+            "下一步",
+        ),
+    }
+    for surface, expectations in mission_expectations.items():
+        surface_text = (AX_ROOT / f"{surface}.txt").read_text(encoding="utf-8")
+        for expected in expectations:
+            if expected not in surface_text:
+                failures.append(f"{surface}: missing accessible contract {expected}")
 
     css = CSS_PATH.read_text(encoding="utf-8")
     for contract in (

@@ -17,6 +17,12 @@ RESPONSIVE_ROOT = ARTIFACT_ROOT / "responsive"
 
 SURFACES = (
     "orchestrator",
+    "mission-conversation",
+    "mission-streaming",
+    "mission-workpad",
+    "mission-inspector",
+    "mission-approval",
+    "mission-outcome",
     "current",
     "missions",
     "channels",
@@ -31,6 +37,11 @@ SURFACES = (
 
 COMPARABLE_SURFACES = (
     "orchestrator",
+    "mission-conversation",
+    "mission-streaming",
+    "mission-workpad",
+    "mission-approval",
+    "mission-outcome",
     "channels",
     "relationships",
     "partners",
@@ -75,6 +86,20 @@ def implementation_path(surface: str) -> Path:
     return SURFACE_ROOT / f"{surface}-macos-content.png"
 
 
+def reference_path(surface: str, width: int, height: int) -> Path:
+    candidates = (
+        REFERENCE_ROOT / f"{surface}-prototype-{width}x{height}.png",
+        REFERENCE_ROOT / f"{surface}-prototype-{width}x{height}.jpg",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"missing same-viewport source reference for {surface}: "
+        + ", ".join(str(candidate) for candidate in candidates)
+    )
+
+
 def content_viewport() -> tuple[int, int]:
     with Image.open(implementation_path("orchestrator")) as source:
         return source.size
@@ -102,12 +127,9 @@ def compose_comparisons() -> None:
     comparison_rows: list[Image.Image] = []
 
     for surface in COMPARABLE_SURFACES:
-        reference_path = (
-            REFERENCE_ROOT
-            / f"{surface}-prototype-{content_width}x{content_height}.jpg"
-        )
+        source_reference_path = reference_path(surface, content_width, content_height)
         surface_implementation_path = implementation_path(surface)
-        with Image.open(reference_path) as reference, Image.open(
+        with Image.open(source_reference_path) as reference, Image.open(
             surface_implementation_path
         ) as implementation:
             full_reference = captioned(

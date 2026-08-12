@@ -5,10 +5,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{
-    Bell, Blocks, BotMessageSquare, BriefcaseBusiness, CalendarDays, ChartNoAxesCombined, Check,
-    ChevronDown, ContactRound, FileCheck, FileText, FolderKanban, Handshake, House, Inbox,
-    LayoutDashboard, ListChecks, Mail, MessageSquareText, PanelRightOpen, PlugZap, Plus, RefreshCw,
-    Search, Settings, ShieldCheck, Sparkles, Target, UsersRound, WalletCards, Workflow, X,
+    ArrowUp, Bell, Blocks, BotMessageSquare, BriefcaseBusiness, CalendarDays, ChartNoAxesCombined,
+    Check, ChevronDown, ContactRound, Ellipsis, FileCheck, FileText, FolderKanban, Handshake,
+    House, Inbox, LayoutDashboard, ListChecks, Mail, MessageSquareText, PanelRightOpen, Pin,
+    PlugZap, Plus, RefreshCw, Search, Settings, ShieldCheck, Sparkles, Square, Target, UsersRound,
+    WalletCards, Workflow, X,
 };
 use hartevo_application::{
     ApplicationCheckpointHandlerStatus, ApplicationError, DesktopProjectProjection,
@@ -32,6 +33,7 @@ mod visual_fixture;
 use data_plane::{
     DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane,
     DesktopHumanCheckpointConfirmationRequest, DesktopLoadState, DesktopMissionContinuationRequest,
+    DesktopRuntimeCancellation, DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase,
     DesktopSnapshot, ProductEvidenceProjection, ProjectContextAccessProjection,
     ProjectContextAccessStatus, RecoveryKitDraft,
 };
@@ -39,6 +41,11 @@ pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjecti
 
 static MAIN_CSS: Asset = asset!("/assets/main.css");
 static PROTOTYPE_CSS: Asset = asset!("/assets/prototype.css");
+#[allow(
+    dead_code,
+    reason = "bundled source asset is used by the visual fixture surface"
+)]
+static PROTOTYPE_TREND_SVG: Asset = asset!("/assets/prototype-demand-trend.svg");
 static BRAND_MARK_DATA_URL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "data:image/png;base64,{}",
@@ -63,6 +70,7 @@ pub enum Surface {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiIconName {
+    ArrowUp,
     Bell,
     Blocks,
     Bot,
@@ -72,6 +80,7 @@ enum UiIconName {
     Check,
     ChevronDown,
     Contact,
+    Ellipsis,
     FileCheck,
     FileText,
     Folder,
@@ -83,6 +92,7 @@ enum UiIconName {
     Mail,
     Message,
     Panel,
+    Pin,
     Plug,
     Plus,
     Refresh,
@@ -90,6 +100,7 @@ enum UiIconName {
     Settings,
     Shield,
     Sparkles,
+    Square,
     Target,
     Users,
     Wallet,
@@ -113,6 +124,12 @@ enum ActiveOverlay {
     GlobalSearch,
     Notifications,
     ProjectSwitcher,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SearchTarget {
+    Project(ProjectId),
+    Mission(ProjectId, MissionId),
 }
 
 impl ActiveOverlay {
@@ -221,6 +238,7 @@ const CREATOR_WORK_STAGES: [&str; 12] = [
 #[component]
 fn UiIcon(name: UiIconName, #[props(default = 16)] size: u32) -> Element {
     match name {
+        UiIconName::ArrowUp => rsx! { ArrowUp { size } },
         UiIconName::Bell => rsx! { Bell { size } },
         UiIconName::Blocks => rsx! { Blocks { size } },
         UiIconName::Bot => rsx! { BotMessageSquare { size } },
@@ -230,6 +248,7 @@ fn UiIcon(name: UiIconName, #[props(default = 16)] size: u32) -> Element {
         UiIconName::Check => rsx! { Check { size } },
         UiIconName::ChevronDown => rsx! { ChevronDown { size } },
         UiIconName::Contact => rsx! { ContactRound { size } },
+        UiIconName::Ellipsis => rsx! { Ellipsis { size } },
         UiIconName::FileCheck => rsx! { FileCheck { size } },
         UiIconName::FileText => rsx! { FileText { size } },
         UiIconName::Folder => rsx! { FolderKanban { size } },
@@ -241,6 +260,7 @@ fn UiIcon(name: UiIconName, #[props(default = 16)] size: u32) -> Element {
         UiIconName::Mail => rsx! { Mail { size } },
         UiIconName::Message => rsx! { MessageSquareText { size } },
         UiIconName::Panel => rsx! { PanelRightOpen { size } },
+        UiIconName::Pin => rsx! { Pin { size } },
         UiIconName::Plug => rsx! { PlugZap { size } },
         UiIconName::Plus => rsx! { Plus { size } },
         UiIconName::Refresh => rsx! { RefreshCw { size } },
@@ -248,6 +268,7 @@ fn UiIcon(name: UiIconName, #[props(default = 16)] size: u32) -> Element {
         UiIconName::Settings => rsx! { Settings { size } },
         UiIconName::Shield => rsx! { ShieldCheck { size } },
         UiIconName::Sparkles => rsx! { Sparkles { size } },
+        UiIconName::Square => rsx! { Square { size } },
         UiIconName::Target => rsx! { Target { size } },
         UiIconName::Users => rsx! { UsersRound { size } },
         UiIconName::Wallet => rsx! { WalletCards { size } },
@@ -574,6 +595,8 @@ impl DesktopUiModel {
 pub fn App() -> Element {
     let desktop_context = dioxus::desktop::use_window();
     let visual_zoom = active_visual_zoom();
+    let visual_streaming_fixture = active_visual_fixture_id().is_some()
+        && active_visual_surface_variant().as_deref() == Some("mission-streaming");
     use_effect(move || desktop_context.set_zoom_level(visual_zoom));
     let mut surface = use_signal(initial_surface);
     let mut model = use_signal(DesktopUiModel::load);
@@ -587,12 +610,47 @@ pub fn App() -> Element {
     let mut catalog_currency = use_signal(|| "USD".to_owned());
     let mut catalog_budget_minor = use_signal(|| "0".to_owned());
     let mut catalog_contract_expanded = use_signal(|| false);
-    let mut mission_submitting = use_signal(|| false);
+    let mut mission_submitting = use_signal(move || visual_streaming_fixture);
     let mut runtime_retrying = use_signal(|| false);
+    let mut runtime_cancellation =
+        use_signal(move || visual_streaming_fixture.then(DesktopRuntimeCancellation::default));
+    let mut runtime_stop_requested = use_signal(|| false);
+    let mut runtime_progress = use_signal(move || {
+        if visual_streaming_fixture {
+            vec![
+                DesktopRuntimeProgressEvent {
+                    sequence: 1,
+                    phase: DesktopRuntimeProgressPhase::Preparing,
+                },
+                DesktopRuntimeProgressEvent {
+                    sequence: 2,
+                    phase: DesktopRuntimeProgressPhase::Dispatched,
+                },
+                DesktopRuntimeProgressEvent {
+                    sequence: 3,
+                    phase: DesktopRuntimeProgressPhase::TurnStarted,
+                },
+                DesktopRuntimeProgressEvent {
+                    sequence: 4,
+                    phase: DesktopRuntimeProgressPhase::ItemStarted,
+                },
+            ]
+        } else {
+            Vec::new()
+        }
+    });
+    let mut composer_expanded = use_signal(|| false);
+    let mut composer_guidance_dismissed = use_signal(|| false);
     let mut human_work_product_selection = use_signal(BTreeSet::<WorkProductId>::new);
-    let mut workpad_open = use_signal(|| true);
+    let mut workpad_open = use_signal(initial_workpad_open);
     let mut global_search_query = use_signal(String::new);
     let mut active_overlay = use_signal(ActiveOverlay::default);
+    let mut composer_tool_menu = use_signal(|| false);
+    let mut runtime_profile_open = use_signal(|| false);
+    let mut fixture_attachment_visible = use_signal(|| false);
+    let mut mission_menu_id = use_signal(|| None::<MissionId>);
+    let mut current_object_menu = use_signal(|| false);
+    let mut current_object_pinned = use_signal(|| false);
     let mut surface_before_settings = use_signal(|| Surface::Orchestrator);
     let view = model.read().clone();
     let current_surface = surface();
@@ -612,6 +670,7 @@ pub fn App() -> Element {
     let workpad_visible =
         workpad_open() && current_surface == Surface::Orchestrator && mission.is_some();
     let runtime_busy = mission_submitting() || runtime_retrying();
+    let runtime_stop_available = runtime_cancellation.read().is_some();
     let project_can_start_mission = view.can_start_mission();
     let evidence = view.product_evidence().cloned();
     let project_storage_status = project
@@ -690,6 +749,32 @@ pub fn App() -> Element {
             && mission.current_checkpoint_application_handler_status
                 == Some(ApplicationCheckpointHandlerStatus::CatalogRevisionMismatch)
     });
+    let runtime_progress_events = runtime_progress.read().clone();
+    let recent_runtime_progress = runtime_progress_events
+        .iter()
+        .rev()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    let active_operation_label = runtime_progress_events.last().map_or_else(
+        || {
+            if runtime_retrying() {
+                "正在安全恢复本地 Runtime"
+            } else if application_route_active {
+                "正在运行确定性 Application Checkpoint"
+            } else if human_route_active {
+                "正在原子确认 Human Checkpoint"
+            } else if mission.is_some() {
+                "正在续写同一 Mission"
+            } else {
+                "正在固化 Operating Contract 与首个 Checkpoint"
+            }
+        },
+        |event| desktop_runtime_progress_display_label(event.phase, visual_streaming_fixture),
+    );
     let application_route_boundary_code = if application_route_catalog_mismatch {
         "BLOCKED_CATALOG_REVISION"
     } else {
@@ -788,6 +873,80 @@ pub fn App() -> Element {
     let can_retry_runtime = runtime_retry_needed && runtime_environment_ready && !runtime_busy;
     let keyboard_has_project = project.is_some();
     let visual_fixture_id = active_visual_fixture_id();
+    let visual_fixture_active = visual_fixture_id.is_some();
+    let current_object_deep_link = mission.as_ref().map_or_else(
+        || {
+            project.as_ref().map_or_else(
+                || "hartevo://dispatcher".to_owned(),
+                |project| format!("hartevo://project/{}", project.project_id),
+            )
+        },
+        |mission| format!("hartevo://mission/{}", mission.mission_id),
+    );
+    let notification_count = active_visual_notification_count();
+    let visual_surface_variant = active_visual_surface_variant();
+    let (composer_guidance_title, composer_guidance_action) =
+        match visual_surface_variant.as_deref() {
+            Some("mission-approval") => (
+                "外部动作仍在等待确认；你也可以直接修改预算、渠道或停止条件",
+                "修改计划",
+            ),
+            Some("mission-outcome") => (
+                "结果区只是结构预览；你可以返回审批或写下下一步判断",
+                "写下下一步",
+            ),
+            _ if mission.is_some() => (
+                "继续说，随时调整当前 Mission 的范围、优先级或停止条件",
+                "调整方向",
+            ),
+            _ => (
+                "你可以随时创建、暂停或重排多个任务，不需要先选择功能模块",
+                "描述任务",
+            ),
+        };
+    let composer_guidance_visible = !composer_guidance_dismissed()
+        && !composer_expanded()
+        && !runtime_busy
+        && visual_surface_variant.as_deref() != Some("mission-streaming");
+    let running_missions = project.as_ref().map_or_else(Vec::new, |project| {
+        project
+            .missions
+            .iter()
+            .filter(|mission| {
+                !matches!(
+                    mission.stage,
+                    MissionStage::Scheduled
+                        | MissionStage::Completed
+                        | MissionStage::Cancelled
+                        | MissionStage::Failed
+                )
+            })
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let scheduled_missions = project.as_ref().map_or_else(Vec::new, |project| {
+        project
+            .missions
+            .iter()
+            .filter(|mission| mission.stage == MissionStage::Scheduled)
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let waiting_count = project.as_ref().map_or(0, |project| {
+        project
+            .missions
+            .iter()
+            .filter(|mission| {
+                matches!(
+                    mission.stage,
+                    MissionStage::WaitingUser | MissionStage::WaitingApproval
+                )
+            })
+            .count()
+    });
+    let mission_count = project.as_ref().map_or(0, |project| project.missions.len());
 
     rsx! {
         document::Title { "Hartevo Desktop" }
@@ -799,7 +958,34 @@ pub fn App() -> Element {
             onkeydown: move |event| {
                 match app_shortcut(&event.key(), event.modifiers()) {
                     Some(AppShortcut::DismissOverlays) => {
+                        let focus_target = if current_object_menu() {
+                            Some("current-object-menu-trigger".to_owned())
+                        } else if composer_tool_menu() {
+                            Some("composer-tool-trigger".to_owned())
+                        } else if runtime_profile_open() {
+                            Some("runtime-profile-trigger".to_owned())
+                        } else if let Some(mission_id) = mission_menu_id.read().clone() {
+                            Some(format!("mission-menu-trigger-{}", mission_id.as_str()))
+                        } else {
+                            match active_overlay() {
+                                ActiveOverlay::GlobalSearch => Some("global-search-trigger".to_owned()),
+                                ActiveOverlay::Notifications => Some("notification-center-trigger".to_owned()),
+                                ActiveOverlay::ProjectSwitcher => Some("project-switcher-trigger".to_owned()),
+                                ActiveOverlay::None => None,
+                            }
+                        };
                         active_overlay.set(ActiveOverlay::None);
+                        composer_tool_menu.set(false);
+                        runtime_profile_open.set(false);
+                        mission_menu_id.set(None);
+                        current_object_menu.set(false);
+                        composer_expanded.set(false);
+                        let _ = dioxus::document::eval(
+                            "document.getElementById('mission-composer-input')?.blur()",
+                        );
+                        if let Some(focus_target) = focus_target {
+                            restore_ui_focus(&focus_target);
+                        }
                         if current_surface == Surface::Settings {
                             surface.set(surface_before_settings());
                         }
@@ -807,6 +993,7 @@ pub fn App() -> Element {
                     Some(AppShortcut::GlobalSearch) => {
                         event.prevent_default();
                         active_overlay.set(ActiveOverlay::GlobalSearch);
+                        restore_ui_focus("global-search-input");
                     }
                     Some(AppShortcut::NewTask) => {
                         event.prevent_default();
@@ -814,6 +1001,10 @@ pub fn App() -> Element {
                             model.write().select_dispatcher();
                             surface.set(Surface::Orchestrator);
                             catalog_contract_expanded.set(true);
+                            composer_expanded.set(true);
+                            let _ = dioxus::document::eval(
+                                "requestAnimationFrame(() => document.getElementById('mission-composer-input')?.focus())",
+                            );
                         }
                     }
                     Some(AppShortcut::ProjectDispatcher) => {
@@ -822,6 +1013,10 @@ pub fn App() -> Element {
                             model.write().select_dispatcher();
                             active_overlay.set(ActiveOverlay::None);
                             surface.set(Surface::Orchestrator);
+                            composer_expanded.set(true);
+                            let _ = dioxus::document::eval(
+                                "requestAnimationFrame(() => document.getElementById('mission-composer-input')?.focus())",
+                            );
                         }
                     }
                     Some(AppShortcut::Settings) => {
@@ -840,24 +1035,34 @@ pub fn App() -> Element {
                     strong { class: "brand-name", "Hartevo" }
                     div { class: "brand-global-actions",
                         button {
+                            id: "global-search-trigger",
                             class: if active_overlay() == ActiveOverlay::GlobalSearch { "brand-action active" } else { "brand-action" },
                             aria_label: "搜索所有项目与任务",
                             title: "搜索所有项目与任务",
                             onclick: move |_| {
                                 active_overlay.set(ActiveOverlay::GlobalSearch);
+                                restore_ui_focus("global-search-input");
                             },
                             UiIcon { name: UiIconName::Search, size: 15 }
                         }
                         button {
+                            id: "notification-center-trigger",
                             class: if active_overlay() == ActiveOverlay::Notifications { "brand-action active" } else { "brand-action" },
                             aria_label: "查看全部项目通知",
                             title: "全部项目通知",
                             aria_expanded: active_overlay() == ActiveOverlay::Notifications,
                             onclick: move |_| {
-                                active_overlay.set(active_overlay().toggle(ActiveOverlay::Notifications));
+                                let next = active_overlay().toggle(ActiveOverlay::Notifications);
+                                active_overlay.set(next);
+                                if next == ActiveOverlay::Notifications {
+                                    restore_ui_focus("notification-center-close");
+                                }
                             },
                             UiIcon { name: UiIconName::Bell, size: 15 }
-                            span { class: "notification-badge quiet", "0" }
+                            span {
+                                class: if notification_count == 0 { "notification-badge quiet" } else { "notification-badge" },
+                                "{notification_count}"
+                            }
                         }
                     }
                 }
@@ -869,11 +1074,83 @@ pub fn App() -> Element {
                     }
                     div { class: "mission-actions",
                         button {
-                            class: "icon-button",
-                            aria_label: "重新读取持久状态",
-                            title: "重新读取持久状态",
-                            onclick: move |_| model.set(DesktopUiModel::load()),
-                            UiIcon { name: UiIconName::Refresh, size: 14 }
+                            id: "current-object-pin-trigger",
+                            class: if current_object_pinned() { "icon-button active" } else { "icon-button" },
+                            disabled: !visual_fixture_active,
+                            aria_label: if current_object_pinned() { "取消置顶当前对象" } else { "置顶当前对象" },
+                            aria_pressed: current_object_pinned(),
+                            title: if visual_fixture_active { "切换视觉夹具中的置顶表现" } else { "NOT_IMPLEMENTED · 等待 UI Preference Application Service" },
+                            onclick: move |_| current_object_pinned.set(!current_object_pinned()),
+                            UiIcon { name: UiIconName::Pin, size: 14 }
+                        }
+                        button {
+                            id: "current-object-menu-trigger",
+                            class: if current_object_menu() { "icon-button active" } else { "icon-button" },
+                            aria_label: "当前对象操作",
+                            aria_haspopup: "menu",
+                            aria_expanded: current_object_menu(),
+                            onclick: move |_| current_object_menu.set(!current_object_menu()),
+                            UiIcon { name: UiIconName::Ellipsis, size: 15 }
+                        }
+                        if current_object_menu() {
+                            button {
+                                class: "current-object-menu-dismiss",
+                                aria_label: "关闭当前对象操作",
+                                onclick: move |_| {
+                                    current_object_menu.set(false);
+                                    restore_ui_focus("current-object-menu-trigger");
+                                },
+                            }
+                            section {
+                                class: "current-object-menu",
+                                role: "menu",
+                                aria_label: "当前对象操作",
+                                onkeydown: move |event| {
+                                    if event.key() == Key::Escape {
+                                        event.stop_propagation();
+                                        current_object_menu.set(false);
+                                        restore_ui_focus("current-object-menu-trigger");
+                                    }
+                                },
+                                button {
+                                    id: "current-object-menu-first",
+                                    autofocus: true,
+                                    role: "menuitem",
+                                    onclick: move |_| {
+                                        model.set(DesktopUiModel::load());
+                                        current_object_menu.set(false);
+                                    },
+                                    UiIcon { name: UiIconName::Refresh, size: 13 }
+                                    "重新读取持久状态"
+                                }
+                                button {
+                                    role: "menuitem",
+                                    onclick: move |_| {
+                                        let script = format!(
+                                            "navigator.clipboard?.writeText({current_object_deep_link:?}).catch(() => undefined)"
+                                        );
+                                        let _ = dioxus::document::eval(&script);
+                                        current_object_menu.set(false);
+                                    },
+                                    UiIcon { name: UiIconName::FileCheck, size: 13 }
+                                    "复制 Deep Link"
+                                }
+                                button {
+                                    role: "menuitem",
+                                    disabled: true,
+                                    title: "NOT_IMPLEMENTED · 等待 Mission metadata Application command",
+                                    UiIcon { name: UiIconName::FileText, size: 13 }
+                                    "编辑名称与说明"
+                                }
+                                button {
+                                    class: "danger",
+                                    role: "menuitem",
+                                    disabled: true,
+                                    title: "NOT_IMPLEMENTED · 等待可恢复归档命令",
+                                    UiIcon { name: UiIconName::X, size: 13 }
+                                    "归档当前对象"
+                                }
+                            }
                         }
                     }
                 }
@@ -909,73 +1186,123 @@ pub fn App() -> Element {
                         kbd { "⌘ N" }
                     }
                 }
-                nav { class: "primary-nav", aria_label: "项目工作面",
+                nav { class: "primary-nav prototype-primary-nav", aria_label: "项目工作面",
                     div { class: "nav-label", "工作" }
+                    NavButton { label: "总调度", meta: "运行中", icon: UiIconName::Sparkles, active: current_surface == Surface::Orchestrator && view.selected_mission_id.is_none(), onclick: move |_| { model.write().select_dispatcher(); surface.set(Surface::Orchestrator); } }
                     NavButton { label: "当前状态", meta: "Project", icon: UiIconName::Home, active: current_surface == Surface::Current, onclick: move |_| surface.set(Surface::Current) }
-                    NavButton { label: "总调度", meta: "同一会话", icon: UiIconName::Sparkles, active: current_surface == Surface::Orchestrator, onclick: move |_| surface.set(Surface::Orchestrator) }
-                    NavButton { label: "全部任务", meta: "Mission", icon: UiIconName::List, active: current_surface == Surface::Missions, onclick: move |_| surface.set(Surface::Missions) }
+                    NavButton { label: "全部任务", meta: "{mission_count}", icon: UiIconName::List, active: current_surface == Surface::Missions, onclick: move |_| surface.set(Surface::Missions) }
+                    NavButton { label: "待确认", meta: "{waiting_count}", icon: UiIconName::Shield, active: false, onclick: move |_| surface.set(Surface::Missions) }
+
+                    if !running_missions.is_empty() {
+                        div { class: "nav-label mission-group-label", span { "任务 · 进行中" } em { "{running_missions.len()}" } }
+                        for item in running_missions.clone() {
+                            {
+                                let mission_id = item.mission_id.clone();
+                                let selected = current_surface == Surface::Orchestrator
+                                    && view.selected_mission_id.as_ref() == Some(&mission_id);
+                                rsx! {
+                                    MissionNavRow {
+                                        mission: item,
+                                        active: selected,
+                                        menu_open: mission_menu_id.read().as_ref() == Some(&mission_id),
+                                        onclick: move |_| {
+                                            mission_menu_id.set(None);
+                                            model.write().select_mission(mission_id.clone());
+                                            surface.set(Surface::Orchestrator);
+                                        },
+                                        on_menu: move |target_id| {
+                                            mission_menu_id.set(
+                                                if mission_menu_id.read().as_ref() == Some(&target_id) {
+                                                    None
+                                                } else {
+                                                    Some(target_id)
+                                                },
+                                            );
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !scheduled_missions.is_empty() {
+                        div { class: "nav-label mission-group-label", span { "自动任务" } em { "持续运行" } }
+                        for item in scheduled_missions.clone() {
+                            {
+                                let mission_id = item.mission_id.clone();
+                                let selected = current_surface == Surface::Orchestrator
+                                    && view.selected_mission_id.as_ref() == Some(&mission_id);
+                                rsx! {
+                                    MissionNavRow {
+                                        mission: item,
+                                        active: selected,
+                                        menu_open: mission_menu_id.read().as_ref() == Some(&mission_id),
+                                        onclick: move |_| {
+                                            mission_menu_id.set(None);
+                                            model.write().select_mission(mission_id.clone());
+                                            surface.set(Surface::Orchestrator);
+                                        },
+                                        on_menu: move |target_id| {
+                                            mission_menu_id.set(
+                                                if mission_menu_id.read().as_ref() == Some(&target_id) {
+                                                    None
+                                                } else {
+                                                    Some(target_id)
+                                                },
+                                            );
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    div { class: "nav-label", "成果与工作面" }
                     NavButton { label: "成果与循环", meta: "Outcome", icon: UiIconName::Chart, active: current_surface == Surface::Outcomes, onclick: move |_| surface.set(Surface::Outcomes) }
-                    div { class: "nav-label", "增长运营" }
                     NavButton { label: "渠道运营", meta: "Channel", icon: UiIconName::Mail, active: current_surface == Surface::ChannelOperations, onclick: move |_| surface.set(Surface::ChannelOperations) }
-                    NavButton { label: "关系与 CRM", meta: "未接入", icon: UiIconName::Contact, active: current_surface == Surface::Relationships, onclick: move |_| surface.set(Surface::Relationships) }
-                    NavButton { label: "达人与联盟", meta: "未接入", icon: UiIconName::Handshake, active: current_surface == Surface::Partners, onclick: move |_| surface.set(Surface::Partners) }
-                    div { class: "nav-label", "系统与连接" }
+                    NavButton { label: "关系与 CRM", meta: "CRM", icon: UiIconName::Contact, active: current_surface == Surface::Relationships, onclick: move |_| surface.set(Surface::Relationships) }
+                    NavButton { label: "达人与联盟", meta: "Partner", icon: UiIconName::Handshake, active: current_surface == Surface::Partners, onclick: move |_| surface.set(Surface::Partners) }
                     NavButton { label: "连接中心", meta: "Probe", icon: UiIconName::Plug, active: current_surface == Surface::Connections, onclick: move |_| surface.set(Surface::Connections) }
                     NavButton { label: "能力与证据", meta: "E0–E5", icon: UiIconName::Blocks, active: current_surface == Surface::CapabilityEvidence, onclick: move |_| surface.set(Surface::CapabilityEvidence) }
                 }
 
-                if let DesktopBackendState::Ready(snapshot) = &view.backend {
-                    section { class: "project-rail", aria_label: "宣发项目",
-                        header { span { "宣发项目" } em { "{snapshot.inventory.projects.len()}" } }
-                        for item in snapshot.inventory.projects.clone() {
-                            {
-                                let project_id = item.project_id.clone();
-                                let selected = view.selected_project_id.as_ref() == Some(&project_id);
-                                rsx! {
-                                    button { class: if selected { "project-row active" } else { "project-row" },
-                                        onclick: move |_| model.write().select_project(&project_id),
-                                        span { class: "workspace-mark", "{item.name.chars().next().unwrap_or('项')}" }
-                                        span { strong { "{item.name}" } small { "revision {item.revision} · {encryption_short_label(&item.encryption)}" } }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    section { class: "mission-rail", aria_label: "持久任务",
-                        header { span { "持久 Mission" } em { "{project.as_ref().map_or(0, |item| item.missions.len())}" } }
-                        if let Some(selected_project) = &project {
-                            button {
-                                class: if view.selected_mission_id.is_none() { "mission-row dispatcher active" } else { "mission-row dispatcher" },
-                                onclick: move |_| model.write().select_dispatcher(),
-                                span { class: "status-dot" }
-                                span { strong { "项目总调度" } small { "显式选择 VM-00～VM-11" } }
-                                em { "CATALOG" }
-                            }
-                            for item in selected_project.missions.clone() {
-                                {
-                                    let mission_id = item.mission_id.clone();
-                                    let selected = view.selected_mission_id.as_ref() == Some(&mission_id);
-                                    rsx! {
-                                        button { class: if selected { "mission-row active" } else { "mission-row" },
-                                            onclick: move |_| model.write().select_mission(mission_id.clone()),
-                                            span { class: "status-dot live" }
-                                            span { strong { "{item.title}" } small { "{mission_stage_label(&item.stage)}" } }
-                                            em { "{item.revision}" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
                 footer { class: "workspace-switcher",
                     if active_overlay() == ActiveOverlay::ProjectSwitcher {
-                        section { class: "project-switcher", aria_label: "宣发项目切换器",
+                        button {
+                            class: "project-switcher-dismiss",
+                            aria_label: "关闭宣发项目切换器",
+                            onclick: move |_| {
+                                active_overlay.set(ActiveOverlay::None);
+                                restore_ui_focus("project-switcher-trigger");
+                            },
+                        }
+                        section {
+                            class: "project-switcher",
+                            role: "dialog",
+                            aria_modal: "true",
+                            aria_label: "宣发项目切换器",
+                            tabindex: "-1",
+                            onkeydown: move |event| match event.key() {
+                                Key::Escape => {
+                                    event.stop_propagation();
+                                    active_overlay.set(ActiveOverlay::None);
+                                    restore_ui_focus("project-switcher-trigger");
+                                }
+                                Key::Tab => {
+                                    event.prevent_default();
+                                    cycle_dialog_focus(
+                                        ".project-switcher",
+                                        event.modifiers().contains(Modifiers::SHIFT),
+                                    );
+                                }
+                                _ => {}
+                            },
                             header { class: "project-switcher-head",
                                 span { class: "user-avatar", "本" }
                                 span { strong { "本机工作区" } small { "Local-first · 项目严格隔离" } }
                                 button {
+                                    id: "project-switcher-initial",
+                                    autofocus: true,
                                     class: "icon-button",
                                     aria_label: "打开设置",
                                     onclick: move |_| {
@@ -1037,11 +1364,16 @@ pub fn App() -> Element {
                         }
                     }
                     button {
+                        id: "project-switcher-trigger",
                         class: "workspace-button",
                         aria_haspopup: "true",
                         aria_expanded: active_overlay() == ActiveOverlay::ProjectSwitcher,
                         onclick: move |_| {
-                            active_overlay.set(active_overlay().toggle(ActiveOverlay::ProjectSwitcher));
+                            let next = active_overlay().toggle(ActiveOverlay::ProjectSwitcher);
+                            active_overlay.set(next);
+                            if next == ActiveOverlay::ProjectSwitcher {
+                                restore_ui_focus("project-switcher-initial");
+                            }
                         },
                         img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
                         span { strong { "{project_name}" } small { b { "{project_storage_status}" } } }
@@ -1093,6 +1425,7 @@ pub fn App() -> Element {
                                 on_ready: move |snapshot| model.write().set_ready(snapshot, true),
                                 on_error: move |error| model.write().set_notice(&error),
                                 on_select_mission: move |mission_id| model.write().select_mission(mission_id),
+                                on_open_workpad: move |()| workpad_open.set(true),
                             }
                         } else if current_surface == Surface::Current {
                             CurrentSurface { project: project.clone(), context_access: context_access.clone() }
@@ -1122,7 +1455,47 @@ pub fn App() -> Element {
                         }
 
                         if current_surface == Surface::Orchestrator {
-                            section { class: "composer-zone",
+                            section {
+                                class: if composer_expanded()
+                                    || fixture_attachment_visible()
+                                    || catalog_contract_expanded()
+                                    || runtime_busy
+                                    || human_route_active
+                                    || application_route_active
+                                    || application_route_not_implemented
+                                    || application_route_catalog_mismatch
+                                    || runtime_retry_needed
+                                {
+                                    if fixture_attachment_visible() { "composer-zone is-expanded has-attachments" } else { "composer-zone is-expanded" }
+                                } else {
+                                    "composer-zone"
+                                },
+                                if composer_guidance_visible {
+                                    section { class: "mission-intent-guidance", aria_live: "polite",
+                                        i { img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" } }
+                                        span {
+                                            strong { "{composer_guidance_title}" }
+                                            small { "{project_name} · ⌘K 随时聚焦同一 Mission" }
+                                        }
+                                        button {
+                                            class: "mission-intent-guidance-action",
+                                            onclick: move |_| {
+                                                composer_expanded.set(true);
+                                                let _ = dioxus::document::eval(
+                                                    "requestAnimationFrame(() => document.getElementById('mission-composer-input')?.focus())",
+                                                );
+                                            },
+                                            "{composer_guidance_action}"
+                                        }
+                                        button {
+                                            class: "mission-intent-guidance-dismiss",
+                                            aria_label: "暂时收起建议",
+                                            title: "暂时收起建议",
+                                            onclick: move |_| composer_guidance_dismissed.set(true),
+                                            UiIcon { name: UiIconName::X, size: 13 }
+                                        }
+                                    }
+                                }
                                 div { class: "composer-context",
                                     span { "{project_name} · {composer_target}" }
                                     div { class: "composer-context-actions",
@@ -1131,12 +1504,68 @@ pub fn App() -> Element {
                                         }
                                         if mission.is_none() {
                                             button {
+                                                id: "operating-contract-trigger",
                                                 class: if catalog_contract_expanded() { "contract-toggle active" } else { "contract-toggle" },
                                                 aria_expanded: catalog_contract_expanded(),
                                                 aria_controls: "operating-contract-fields",
                                                 onclick: move |_| catalog_contract_expanded.set(!catalog_contract_expanded()),
                                                 span { "Operating Contract" }
                                                 UiIcon { name: UiIconName::ChevronDown, size: 12 }
+                                            }
+                                        }
+                                    }
+                                }
+                                if runtime_busy {
+                                    div {
+                                        class: if runtime_stop_requested() { "live-operation-strip stop-requested" } else { "live-operation-strip" },
+                                        role: "status",
+                                        aria_live: "polite",
+                                        i { UiIcon { name: UiIconName::Refresh, size: 13 } }
+                                        span {
+                                            strong { "{active_operation_label}" }
+                                            small {
+                                                if visual_streaming_fixture && runtime_stop_requested() {
+                                                    "VISUAL_FIXTURE · 已触发 Stop 控件状态；未发送真实 Interrupt，也没有 Provider Effect。"
+                                                } else if visual_streaming_fixture {
+                                                    "VISUAL_FIXTURE · 仅验证事件流、跟随状态与 Stop 交互；不构成 Runtime 或 Provider 执行证据。"
+                                                } else if runtime_stop_requested() {
+                                                    "停止请求已交给 exact Runtime attempt；等待 Interrupt receipt 或 UNCERTAIN reconciliation。"
+                                                } else if runtime_stop_available {
+                                                    "过程会持续写入持久 Runtime ledger；可以安全请求停止。"
+                                                } else {
+                                                    "此步骤由 Application 事务协调；不会用隐藏动画代替取消。"
+                                                }
+                                            }
+                                        }
+                                        if runtime_stop_available {
+                                            em {
+                                                if runtime_stop_requested() { "等待中断" } else { "可安全停止" }
+                                            }
+                                        } else {
+                                            em { "事务提交中" }
+                                        }
+                                        if !recent_runtime_progress.is_empty() {
+                                            div { class: "live-operation-events", aria_label: "Runtime 事件流",
+                                                for event in recent_runtime_progress.clone() {
+                                                    div { class: desktop_runtime_progress_class(event.phase),
+                                                        i {}
+                                                        span { "{desktop_runtime_progress_display_label(event.phase, visual_streaming_fixture)}" }
+                                                        em { "#{event.sequence}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if visual_fixture_id.is_some() && fixture_attachment_visible() {
+                                    div { class: "prototype-composer-attachments", aria_label: "附件结构样例",
+                                        article {
+                                            img { src: PROTOTYPE_TREND_SVG, alt: "需求趋势工作产物结构样例" }
+                                            span { strong { "需求趋势样例.svg" } small { "VISUAL_FIXTURE · 不会上传" } }
+                                            button {
+                                                aria_label: "移除附件结构样例",
+                                                onclick: move |_| fixture_attachment_visible.set(false),
+                                                UiIcon { name: UiIconName::X, size: 13 }
                                             }
                                         }
                                     }
@@ -1314,6 +1743,7 @@ pub fn App() -> Element {
                                     }
                                 }
                                 textarea {
+                                    id: "mission-composer-input",
                                     value: "{draft}",
                                     disabled: !can_write_composer,
                                     aria_label: "Operating Contract 目标、约束与停止条件",
@@ -1324,11 +1754,98 @@ pub fn App() -> Element {
                                     } else {
                                         "项目加密与 Context 就绪后才能创建 Mission"
                                     },
-                                    oninput: move |event| draft.set(event.value()),
+                                    onfocus: move |_| composer_expanded.set(true),
+                                    oninput: move |event| {
+                                        draft.set(event.value());
+                                        let _ = dioxus::document::eval(
+                                            "const input = document.getElementById('mission-composer-input'); if (input) { input.style.height = 'auto'; input.style.height = `${Math.min(input.scrollHeight, 160)}px`; }",
+                                        );
+                                    },
+                                    onkeydown: move |event| {
+                                        if composer_should_submit(
+                                            &event.key(),
+                                            event.modifiers(),
+                                            event.data.is_composing(),
+                                        ) {
+                                            event.prevent_default();
+                                            let _ = dioxus::document::eval(
+                                                "document.getElementById('mission-composer-send')?.click()",
+                                            );
+                                        }
+                                    },
                                 }
                                 footer {
+                                    div { class: "composer-tool-cluster",
+                                        div { class: "composer-tool-anchor",
+                                            button {
+                                                id: "composer-tool-trigger",
+                                                class: if composer_tool_menu() { "composer-icon-tool active" } else { "composer-icon-tool" },
+                                                aria_label: "添加附件或上下文",
+                                                aria_expanded: composer_tool_menu(),
+                                                onclick: move |_| {
+                                                    composer_expanded.set(true);
+                                                    composer_tool_menu.set(!composer_tool_menu());
+                                                    runtime_profile_open.set(false);
+                                                },
+                                                UiIcon { name: UiIconName::Plus, size: 16 }
+                                            }
+                                            if composer_tool_menu() {
+                                                section { class: "composer-tool-menu", role: "menu", aria_label: "添加到 Mission",
+                                                    header { strong { "添加到 Mission" } small { "不扩大 Capability" } }
+                                                    button {
+                                                        role: "menuitem",
+                                                        disabled: visual_fixture_id.is_none(),
+                                                        onclick: move |_| {
+                                                            fixture_attachment_visible.set(true);
+                                                            composer_expanded.set(true);
+                                                            composer_tool_menu.set(false);
+                                                        },
+                                                        UiIcon { name: UiIconName::FileText, size: 14 }
+                                                        span { strong { "工作产物结构样例" } small { "仅视觉 fixture；不读取本机文件" } }
+                                                    }
+                                                    button { role: "menuitem", disabled: true,
+                                                        UiIcon { name: UiIconName::Folder, size: 14 }
+                                                        span { strong { "选择本机文件" } small { "NOT_IMPLEMENTED · File Broker 未接线" } }
+                                                    }
+                                                    button { role: "menuitem", disabled: true,
+                                                        UiIcon { name: UiIconName::Blocks, size: 14 }
+                                                        span { strong { "引用 Project Truth" } small { "NOT_IMPLEMENTED · 等待 Truth Picker" } }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        button {
+                                            class: "composer-icon-tool",
+                                            disabled: true,
+                                            aria_label: "语音输入未实现",
+                                            title: "BLOCKED_ENV · 麦克风与本地转写尚未接线",
+                                            UiIcon { name: UiIconName::Bot, size: 15 }
+                                        }
+                                    }
                                     div { class: "runtime-pickers",
-                                        span { class: "honesty-chip", "{runtime_chip}" }
+                                        div { class: "runtime-profile-anchor",
+                                            button {
+                                                id: "runtime-profile-trigger",
+                                                class: "runtime-profile-toggle honesty-chip",
+                                                aria_expanded: runtime_profile_open(),
+                                                onclick: move |_| {
+                                                    composer_expanded.set(true);
+                                                    runtime_profile_open.set(!runtime_profile_open());
+                                                    composer_tool_menu.set(false);
+                                                },
+                                                span { "{runtime_chip}" }
+                                                UiIcon { name: UiIconName::ChevronDown, size: 11 }
+                                            }
+                                            if runtime_profile_open() {
+                                                section { class: "runtime-profile-menu", role: "dialog", aria_label: "Runtime 与权限边界",
+                                                    header { strong { "Runtime Profile" } small { "模型 × Mission 最小能力" } }
+                                                    div { span { "执行环境" } b { "{runtime_chip}" } }
+                                                    div { span { "Provider route" } b { "{provider_chip}" } }
+                                                    div { span { "外部 Effect" } b { "必须独立审批" } }
+                                                    footer { "切换模型不能扩大 Capability、Consent 或账号范围。" }
+                                                }
+                                            }
+                                        }
                                         span { class: "honesty-chip", "{provider_chip}" }
                                         if runtime_projection.as_ref().is_some_and(|runtime| !runtime.exact_tokenizer_evidence) {
                                             span { class: "honesty-chip", "Tokenizer · DEV_FALLBACK" }
@@ -1400,13 +1917,24 @@ pub fn App() -> Element {
                                                         )
                                                     };
                                                     let Some((project_id, mission_id)) = selection else { return; };
+                                                    let cancellation = DesktopRuntimeCancellation::default();
+                                                    runtime_cancellation.set(Some(cancellation.clone()));
+                                                    runtime_stop_requested.set(false);
+                                                    runtime_progress.set(Vec::new());
                                                     runtime_retrying.set(true);
+                                                    begin_runtime_progress_monitor(
+                                                        cancellation.clone(),
+                                                        runtime_progress,
+                                                        mission_submitting,
+                                                        runtime_retrying,
+                                                    );
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
                                                             DesktopDataPlane::discover().and_then(|plane| {
-                                                                plane.resume_mission_runtime_os(
+                                                                plane.resume_mission_runtime_cancellable_os(
                                                                     &project_id,
                                                                     &mission_id,
+                                                                    &cancellation,
                                                                     Utc::now(),
                                                                 )
                                                             })
@@ -1424,6 +1952,8 @@ pub fn App() -> Element {
                                                                 });
                                                             }
                                                         }
+                                                        runtime_cancellation.set(None);
+                                                        runtime_stop_requested.set(false);
                                                         runtime_retrying.set(false);
                                                     });
                                                 },
@@ -1436,9 +1966,11 @@ pub fn App() -> Element {
                                                 }
                                             }
                                         }
+                                        if !(runtime_busy && runtime_stop_available) {
                                         if mission.is_some() {
                                             if human_route_active {
                                                 button {
+                                                    id: "mission-composer-send",
                                                     class: "send-button",
                                                     disabled: !can_submit_human_confirmation,
                                                     aria_label: "确认当前 Human Checkpoint 并原子进入下一路由",
@@ -1512,6 +2044,7 @@ pub fn App() -> Element {
                                                 }
                                             } else {
                                             button { class: "send-button", disabled: !can_submit_continuation,
+                                                id: "mission-composer-send",
                                                 aria_label: "续写当前持久 Mission Conversation",
                                                 onclick: move |_| {
                                                     let selection = {
@@ -1541,11 +2074,25 @@ pub fn App() -> Element {
                                                         body: draft(),
                                                         expected_conversation_revision: expected_revision,
                                                     };
+                                                    let cancellation = DesktopRuntimeCancellation::default();
+                                                    runtime_cancellation.set(Some(cancellation.clone()));
+                                                    runtime_stop_requested.set(false);
+                                                    runtime_progress.set(Vec::new());
                                                     mission_submitting.set(true);
+                                                    begin_runtime_progress_monitor(
+                                                        cancellation.clone(),
+                                                        runtime_progress,
+                                                        mission_submitting,
+                                                        runtime_retrying,
+                                                    );
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
                                                             DesktopDataPlane::discover().and_then(|plane| {
-                                                                plane.continue_mission_and_run_os(request, Utc::now())
+                                                                plane.continue_mission_and_run_cancellable_os(
+                                                                    request,
+                                                                    &cancellation,
+                                                                    Utc::now(),
+                                                                )
                                                             })
                                                         })
                                                         .await;
@@ -1562,14 +2109,17 @@ pub fn App() -> Element {
                                                                 });
                                                             }
                                                         }
+                                                        runtime_cancellation.set(None);
+                                                        runtime_stop_requested.set(false);
                                                         mission_submitting.set(false);
                                                     });
                                                 },
-                                                if mission_submitting() { "正在续写同一 Mission…" } else { "继续当前 Mission" }
+                                                UiIcon { name: UiIconName::ArrowUp, size: 15 }
                                             }
                                             }
                                         } else {
                                             button { class: "send-button", disabled: !can_submit_catalog,
+                                                id: "mission-composer-send",
                                                 aria_label: "提交 Catalog-bound 持久 Mission",
                                                 onclick: move |_| {
                                                     let project_id = model.read().selected_project_id.clone();
@@ -1604,11 +2154,25 @@ pub fn App() -> Element {
                                                         budget_minor,
                                                         currency,
                                                     };
+                                                    let cancellation = DesktopRuntimeCancellation::default();
+                                                    runtime_cancellation.set(Some(cancellation.clone()));
+                                                    runtime_stop_requested.set(false);
+                                                    runtime_progress.set(Vec::new());
                                                     mission_submitting.set(true);
+                                                    begin_runtime_progress_monitor(
+                                                        cancellation.clone(),
+                                                        runtime_progress,
+                                                        mission_submitting,
+                                                        runtime_retrying,
+                                                    );
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
                                                             DesktopDataPlane::discover().and_then(|plane| {
-                                                                plane.start_catalog_mission_and_run_os(request, Utc::now())
+                                                                plane.start_catalog_mission_and_run_cancellable_os(
+                                                                    request,
+                                                                    &cancellation,
+                                                                    Utc::now(),
+                                                                )
                                                             })
                                                         })
                                                         .await;
@@ -1627,6 +2191,8 @@ pub fn App() -> Element {
                                                                 });
                                                             }
                                                         }
+                                                        runtime_cancellation.set(None);
+                                                        runtime_stop_requested.set(false);
                                                         mission_submitting.set(false);
                                                     });
                                                 },
@@ -1639,6 +2205,25 @@ pub fn App() -> Element {
                                                 }
                                             }
                                         }
+                                        }
+                                        if runtime_busy && runtime_stop_available {
+                                            button {
+                                                id: "mission-composer-stop",
+                                                class: "send-button stream-stop-button",
+                                                disabled: runtime_stop_requested(),
+                                                aria_label: if visual_streaming_fixture { "停止 Runtime 交互结构样例" } else if runtime_stop_requested() { "正在等待 Runtime 停止回执" } else { "停止当前 Runtime turn" },
+                                                title: if visual_streaming_fixture { "VISUAL_FIXTURE · 仅切换 Stop 交互状态，不发送真实 interrupt" } else { "停止 exact Runtime attempt；保留已持久化的正文、事件与 Mission 边界" },
+                                                onclick: move |_| {
+                                                    request_desktop_runtime_stop(
+                                                        runtime_cancellation.read().clone(),
+                                                        runtime_stop_requested,
+                                                        runtime_progress,
+                                                        visual_streaming_fixture,
+                                                    );
+                                                },
+                                                UiIcon { name: UiIconName::Square, size: 12 }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1646,7 +2231,47 @@ pub fn App() -> Element {
                     }
 
                     if workpad_visible {
-                        Workpad { mission: mission.clone(), context_access: context_access.clone() }
+                        button {
+                            class: "workpad-compact-backdrop",
+                            aria_label: "收起任务工作台",
+                            onclick: move |_| workpad_open.set(false),
+                        }
+                        div {
+                            id: "workpad-resize-handle",
+                            class: "workpad-resize-handle",
+                            role: "separator",
+                            tabindex: "0",
+                            aria_orientation: "vertical",
+                            aria_valuemin: "440",
+                            aria_valuemax: "650",
+                            aria_valuenow: "500",
+                            aria_valuetext: "500px Mission 会话宽度",
+                            aria_label: "调整 Mission 会话与工作台宽度",
+                            onpointerdown: move |event| {
+                                begin_workpad_resize(event.data.client_coordinates().x);
+                            },
+                            onkeydown: move |event| match event.key() {
+                                Key::ArrowLeft => {
+                                    event.prevent_default();
+                                    nudge_workpad_width(-24);
+                                }
+                                Key::ArrowRight => {
+                                    event.prevent_default();
+                                    nudge_workpad_width(24);
+                                }
+                                Key::Home => {
+                                    event.prevent_default();
+                                    set_workpad_width(440);
+                                }
+                                _ => {}
+                            },
+                            i {}
+                        }
+                        Workpad {
+                            mission: mission.clone(),
+                            context_access: context_access.clone(),
+                            on_close: move |()| workpad_open.set(false),
+                        }
                     }
                 }
             }
@@ -1655,7 +2280,10 @@ pub fn App() -> Element {
                     backend: view.backend.clone(),
                     query: global_search_query(),
                     on_query: move |value| global_search_query.set(value),
-                    on_close: move |()| active_overlay.set(ActiveOverlay::None),
+                    on_close: move |()| {
+                        active_overlay.set(ActiveOverlay::None);
+                        restore_ui_focus("global-search-trigger");
+                    },
                     on_project: move |project_id| {
                         model.write().select_project(&project_id);
                         active_overlay.set(ActiveOverlay::None);
@@ -1671,7 +2299,10 @@ pub fn App() -> Element {
             }
             if active_overlay() == ActiveOverlay::Notifications {
                 NotificationsPanel {
-                    on_close: move |()| active_overlay.set(ActiveOverlay::None),
+                    on_close: move |()| {
+                        active_overlay.set(ActiveOverlay::None);
+                        restore_ui_focus("notification-center-trigger");
+                    },
                     on_settings: move |()| {
                         active_overlay.set(ActiveOverlay::None);
                         surface_before_settings.set(current_surface);
@@ -1685,8 +2316,8 @@ pub fn App() -> Element {
 
 #[component]
 fn NavButton(
-    label: &'static str,
-    meta: &'static str,
+    #[props(into)] label: String,
+    #[props(into)] meta: String,
     icon: UiIconName,
     active: bool,
     onclick: EventHandler<MouseEvent>,
@@ -1701,6 +2332,89 @@ fn NavButton(
 }
 
 #[component]
+fn MissionNavRow(
+    mission: MissionProjection,
+    active: bool,
+    menu_open: bool,
+    onclick: EventHandler<MouseEvent>,
+    on_menu: EventHandler<MissionId>,
+) -> Element {
+    let dot = dispatcher_stage_dot(&mission.stage);
+    let stage = mission_stage_label(&mission.stage);
+    let cadence = if mission.stage == MissionStage::Scheduled {
+        "持续运行".to_owned()
+    } else if mission.current_checkpoint_id.is_some() {
+        format!(
+            "{}/{} 步 · {}",
+            mission.completed_checkpoint_count, mission.checkpoint_count, stage
+        )
+    } else {
+        stage.to_owned()
+    };
+    let trigger_mission_id = mission.mission_id.clone();
+    let escape_mission_id = mission.mission_id.clone();
+    let trigger_id = format!("mission-menu-trigger-{}", mission.mission_id.as_str());
+    let escape_trigger_id = trigger_id.clone();
+    let deep_link = format!("hartevo://mission/{}", mission.mission_id);
+    rsx! {
+        div {
+            class: if active { "prototype-mission-nav-row active" } else { "prototype-mission-nav-row" },
+            button {
+                class: "prototype-mission-nav-main",
+                aria_current: active,
+                onclick,
+                i { class: "{dot}" }
+                span {
+                    strong { "{mission.title}" }
+                    small { "{cadence}" }
+                }
+                em { "{mission.revision}" }
+            }
+            button {
+                id: "{trigger_id}",
+                class: if menu_open { "prototype-mission-menu-trigger active" } else { "prototype-mission-menu-trigger" },
+                aria_label: "{mission.title} 操作",
+                aria_haspopup: "menu",
+                aria_expanded: menu_open,
+                onclick: move |event| {
+                    event.stop_propagation();
+                    on_menu.call(trigger_mission_id.clone());
+                },
+                UiIcon { name: UiIconName::Ellipsis, size: 14 }
+            }
+            if menu_open {
+                section {
+                    class: "prototype-mission-object-menu",
+                    role: "menu",
+                    aria_label: "{mission.title} 操作",
+                    onkeydown: move |event| {
+                        if event.key() == Key::Escape {
+                            event.stop_propagation();
+                            on_menu.call(escape_mission_id.clone());
+                            restore_ui_focus(&escape_trigger_id);
+                        }
+                    },
+                    button { autofocus: true, role: "menuitem", onclick, UiIcon { name: UiIconName::Message, size: 13 } "在会话中打开" }
+                    button {
+                        role: "menuitem",
+                        onclick: move |_| {
+                            let script = format!(
+                                "navigator.clipboard?.writeText({deep_link:?}).catch(() => undefined)"
+                            );
+                            let _ = dioxus::document::eval(&script);
+                        },
+                        UiIcon { name: UiIconName::FileCheck, size: 13 }
+                        "复制 Deep Link"
+                    }
+                    button { role: "menuitem", disabled: true, title: "NOT_IMPLEMENTED · 需要 Mission rename Application command", UiIcon { name: UiIconName::FileText, size: 13 } "重命名" }
+                    button { class: "danger", role: "menuitem", disabled: true, title: "NOT_IMPLEMENTED · 需要可恢复归档命令", UiIcon { name: UiIconName::X, size: 13 } "归档任务" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn GlobalSearchOverlay(
     backend: DesktopBackendState,
     query: String,
@@ -1709,6 +2423,7 @@ fn GlobalSearchOverlay(
     on_project: EventHandler<ProjectId>,
     on_mission: EventHandler<(ProjectId, MissionId)>,
 ) -> Element {
+    let mut selected_index = use_signal(|| 0_usize);
     let normalized = query.trim().to_lowercase();
     let mut project_results = Vec::new();
     let mut mission_results = Vec::new();
@@ -1736,6 +2451,20 @@ fn GlobalSearchOverlay(
         }
     }
     let result_count = project_results.len() + mission_results.len();
+    let mut targets = project_results
+        .iter()
+        .map(|project| SearchTarget::Project(project.project_id.clone()))
+        .collect::<Vec<_>>();
+    targets.extend(mission_results.iter().map(|(project_id, _, mission)| {
+        SearchTarget::Mission(project_id.clone(), mission.mission_id.clone())
+    }));
+    let active_index = if result_count == 0 {
+        0
+    } else {
+        selected_index().min(result_count.saturating_sub(1))
+    };
+    let active_target = targets.get(active_index).cloned();
+    let project_result_count = project_results.len();
     rsx! {
         button { class: "overlay-backdrop search-backdrop", aria_label: "关闭全局搜索", onclick: move |_| on_close.call(()) }
         section {
@@ -1744,18 +2473,48 @@ fn GlobalSearchOverlay(
             aria_modal: "true",
             aria_label: "搜索所有项目与任务",
             onkeydown: move |event| {
-                if event.key() == Key::Escape {
-                    on_close.call(());
+                match event.key() {
+                    Key::Escape => on_close.call(()),
+                    Key::ArrowDown if result_count > 0 => {
+                        event.prevent_default();
+                        selected_index.set((active_index + 1).min(result_count - 1));
+                    }
+                    Key::ArrowUp if result_count > 0 => {
+                        event.prevent_default();
+                        selected_index.set(active_index.saturating_sub(1));
+                    }
+                    Key::Enter => {
+                        event.prevent_default();
+                        match active_target.clone() {
+                            Some(SearchTarget::Project(project_id)) => on_project.call(project_id),
+                            Some(SearchTarget::Mission(project_id, mission_id)) => {
+                                on_mission.call((project_id, mission_id));
+                            }
+                            None => {}
+                        }
+                    }
+                    Key::Tab => {
+                        event.prevent_default();
+                        cycle_dialog_focus(
+                            ".global-search",
+                            event.modifiers().contains(Modifiers::SHIFT),
+                        );
+                    }
+                    _ => {}
                 }
             },
             header {
                 UiIcon { name: UiIconName::Search, size: 18 }
                 input {
+                    id: "global-search-input",
                     autofocus: true,
                     value: "{query}",
                     aria_label: "搜索 Project 或 Mission",
                     placeholder: "搜索项目、Mission 与状态…",
-                    oninput: move |event| on_query.call(event.value()),
+                    oninput: move |event| {
+                        selected_index.set(0);
+                        on_query.call(event.value());
+                    },
                 }
                 kbd { "Esc" }
             }
@@ -1765,11 +2524,13 @@ fn GlobalSearchOverlay(
                 } else {
                     if !project_results.is_empty() {
                         h2 { "项目" }
-                        for project in project_results {
+                        for (index, project) in project_results.into_iter().enumerate() {
                             {
                                 let project_id = project.project_id.clone();
                                 rsx! {
-                                    button { class: "search-result", onclick: move |_| on_project.call(project_id.clone()),
+                                    button {
+                                        class: if active_index == index { "search-result active" } else { "search-result" },
+                                        onclick: move |_| on_project.call(project_id.clone()),
                                         i { class: "project-mark", "{project_initials(&project.name)}" }
                                         span { strong { "{project.name}" } small { "Project revision {project.revision} · {encryption_short_label(&project.encryption)}" } }
                                         em { "当前状态" }
@@ -1780,11 +2541,13 @@ fn GlobalSearchOverlay(
                     }
                     if !mission_results.is_empty() {
                         h2 { "Mission" }
-                        for (project_id, project_name, mission) in mission_results {
+                        for (index, (project_id, project_name, mission)) in mission_results.into_iter().enumerate() {
                             {
                                 let mission_id = mission.mission_id.clone();
                                 rsx! {
-                                    button { class: "search-result", onclick: move |_| on_mission.call((project_id.clone(), mission_id.clone())),
+                                    button {
+                                        class: if active_index == project_result_count + index { "search-result active" } else { "search-result" },
+                                        onclick: move |_| on_mission.call((project_id.clone(), mission_id.clone())),
                                         i { class: "mission-result-mark", UiIcon { name: UiIconName::Target, size: 14 } }
                                         span { strong { "{mission.title}" } small { "{project_name} · {mission_stage_label(&mission.stage)} · revision {mission.revision}" } }
                                         em { "打开会话" }
@@ -1802,13 +2565,39 @@ fn GlobalSearchOverlay(
 
 #[component]
 fn NotificationsPanel(on_close: EventHandler<()>, on_settings: EventHandler<()>) -> Element {
+    #[cfg(feature = "visual-fixtures")]
+    if let Some(presentation) = visual_fixture::presentation() {
+        return rsx! {
+            PrototypeNotificationsPanel {
+                notifications: presentation.notifications,
+                on_close,
+                on_settings,
+            }
+        };
+    }
     rsx! {
         button { class: "overlay-dismiss", aria_label: "关闭通知", onclick: move |_| on_close.call(()) }
-        section { class: "notification-center", role: "dialog", aria_label: "全部项目通知",
+        section {
+            class: "notification-center",
+            role: "dialog",
+            aria_modal: "true",
+            aria_label: "全部项目通知",
+            tabindex: "-1",
+            onkeydown: move |event| match event.key() {
+                Key::Escape => on_close.call(()),
+                Key::Tab => {
+                    event.prevent_default();
+                    cycle_dialog_focus(
+                        ".notification-center",
+                        event.modifiers().contains(Modifiers::SHIFT),
+                    );
+                }
+                _ => {}
+            },
             header { class: "notification-head",
                 strong { "通知" }
                 span { "所有宣发项目" }
-                button { onclick: move |_| on_close.call(()), UiIcon { name: UiIconName::X, size: 14 } }
+                button { id: "notification-center-close", autofocus: true, aria_label: "关闭通知", onclick: move |_| on_close.call(()), UiIcon { name: UiIconName::X, size: 14 } }
             }
             nav { class: "notification-tabs", aria_label: "筛选通知",
                 button { class: "active", "全部" }
@@ -1824,6 +2613,834 @@ fn NotificationsPanel(on_close: EventHandler<()>, on_settings: EventHandler<()>)
             footer { class: "notification-footer",
                 span { "通知按项目隔离，用户级聚合" }
                 button { onclick: move |_| on_settings.call(()), "通知设置" }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "visual-fixtures")]
+#[component]
+fn PrototypeNotificationsPanel(
+    notifications: Vec<visual_fixture::VisualNotification>,
+    on_close: EventHandler<()>,
+    on_settings: EventHandler<()>,
+) -> Element {
+    let mut active_tab = use_signal(|| "all".to_owned());
+    let mut read_all = use_signal(|| false);
+    let visible = notifications
+        .iter()
+        .filter(|notification| {
+            active_tab() == "all"
+                || (active_tab() == "attention" && notification.kind == "需要你")
+                || (active_tab() == "activity" && notification.kind == "运行动态")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let attention_count = notifications
+        .iter()
+        .filter(|notification| notification.kind == "需要你")
+        .count();
+    rsx! {
+        button { class: "overlay-dismiss", aria_label: "关闭通知", onclick: move |_| on_close.call(()) }
+        section {
+            class: "notification-center fixture-notifications",
+            role: "dialog",
+            aria_modal: "true",
+            aria_label: "全部项目通知",
+            tabindex: "-1",
+            onkeydown: move |event| match event.key() {
+                Key::Escape => on_close.call(()),
+                Key::Tab => {
+                    event.prevent_default();
+                    cycle_dialog_focus(
+                        ".notification-center.fixture-notifications",
+                        event.modifiers().contains(Modifiers::SHIFT),
+                    );
+                }
+                _ => {}
+            },
+            header { class: "notification-head",
+                strong { "通知" }
+                span { "所有宣发项目" }
+                button { class: "notification-read-all", onclick: move |_| read_all.set(true), if read_all() { "已全部标记" } else { "全部已读" } }
+                button { id: "notification-center-close", autofocus: true, aria_label: "关闭通知", onclick: move |_| on_close.call(()), UiIcon { name: UiIconName::X, size: 14 } }
+            }
+            div { class: "fixture-notification-disclosure", "VISUAL_FIXTURE · 结构样例，不是持久 Notification Projection" }
+            nav { class: "notification-tabs", aria_label: "筛选通知",
+                button { class: if active_tab() == "all" { "active" } else { "" }, onclick: move |_| active_tab.set("all".into()), "全部" }
+                button { class: if active_tab() == "attention" { "active" } else { "" }, onclick: move |_| active_tab.set("attention".into()), "需要你 {attention_count}" }
+                button { class: if active_tab() == "activity" { "active" } else { "" }, onclick: move |_| active_tab.set("activity".into()), "运行动态" }
+            }
+            div { class: "fixture-notification-list",
+                for item in visible {
+                    button { class: if read_all() { "fixture-notification-row read" } else { "fixture-notification-row" },
+                        i { "{item.mark}" }
+                        span { strong { "{item.title}" } small { "{item.context}" } time { "{item.time}" } }
+                        em { "{item.kind}" }
+                    }
+                }
+            }
+            footer { class: "notification-footer",
+                span { "通知按项目隔离，用户级聚合" }
+                button { onclick: move |_| on_settings.call(()), "通知设置" }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "visual-fixtures")]
+#[component]
+fn PrototypeMissionJourney(
+    mission: MissionProjection,
+    conversation: visual_fixture::VisualConversation,
+    approval: visual_fixture::VisualApproval,
+    outcome: visual_fixture::VisualOutcome,
+    on_open_workpad: EventHandler<()>,
+) -> Element {
+    let fixture_variant = active_visual_surface_variant();
+    let frozen_stream_frame = fixture_variant.as_deref() == Some("mission-streaming");
+    let initial_outcome = fixture_variant.as_deref() == Some("mission-outcome");
+    let mut capability_open = use_signal(|| false);
+    let mut preview_outcome = use_signal(move || initial_outcome);
+    let mut progress_open = use_signal(|| false);
+    let mut approval_facts_open = use_signal(|| false);
+    let mut approval_edit_open = use_signal(|| false);
+    let mut approval_deferred = use_signal(|| false);
+    let mut approval_digest_revision = use_signal(|| 1_u32);
+    let mut approval_budget = use_signal(|| "140000".to_owned());
+    let mut stream_interrupted = use_signal(|| false);
+    let intro_source = conversation.assistant_intro.clone();
+    let intro_initial = if frozen_stream_frame {
+        intro_source.chars().take(56).collect::<String>()
+    } else {
+        intro_source.clone()
+    };
+    let progress_total = conversation.progress.len();
+    let mut streamed_intro = use_signal(move || intro_initial);
+    let initial_progress = if frozen_stream_frame {
+        progress_total.min(3)
+    } else {
+        progress_total
+    };
+    let mut visible_progress = use_signal(move || initial_progress);
+    let mut stream_running = use_signal(move || frozen_stream_frame);
+    let mut stream_generation = use_signal(|| 0_u64);
+    let approval_view = mission.stage == MissionStage::WaitingApproval;
+
+    if preview_outcome() {
+        return rsx! {
+            div { class: "surface-scroll prototype-thread",
+                article { class: "assistant-turn prototype-turn fixture-outcome-turn",
+                    header { class: "assistant-byline",
+                        img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                        strong { "Hartevo" }
+                        time { "结构预览" }
+                    }
+                    div { class: "fixture-disclosure-banner", role: "status",
+                        strong { "VISUAL_FIXTURE · 未执行" }
+                        span { "此状态只验证结果区交互与布局；没有 ProviderReceipt、Verification、OutcomeEvent 或支出。" }
+                    }
+                    div { class: "assistant-copy", p { "{outcome.intro}" } }
+                    section { class: "fixture-outcome-metrics", aria_label: "结果结构样例",
+                        for metric in outcome.metrics.clone() {
+                            div { strong { "{metric.value}" } small { "{metric.label}" } }
+                        }
+                    }
+                    div { class: "fixture-receipt-stack",
+                        for row in outcome.rows.clone() {
+                            div { class: "fixture-receipt-row",
+                                i { UiIcon { name: UiIconName::Shield, size: 13 } }
+                                span { strong { "{row.title}" } small { "{row.detail}" } }
+                                em { "{row.meta}" }
+                                b { class: "fixture-state neutral", "{row.state}" }
+                            }
+                        }
+                    }
+                    div { class: "prototype-next-loop",
+                        span { strong { "下一步仍由用户决定" } small { "Continue / Stop / Scale / Test；不会因为预览结果而推进 Mission。" } }
+                        button { onclick: move |_| preview_outcome.set(false), "返回审批结构" }
+                    }
+                }
+            }
+        };
+    }
+
+    if approval_view {
+        return rsx! {
+            div { class: "surface-scroll prototype-thread",
+                div { class: "prototype-user-row",
+                    div { class: "prototype-user-message", "{approval.user_prompt}" time { "10:26" } }
+                }
+                article { class: "assistant-turn prototype-turn",
+                    header { class: "assistant-byline",
+                        img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                        strong { "Hartevo" }
+                        time { "10:28" }
+                    }
+                    div { class: "assistant-copy",
+                        p { "{approval.assistant_intro}" }
+                        p { "你可以直接修改预算、渠道、受众或时间；任何字段变化都会生成新的完整 digest。" }
+                    }
+                    if approval_deferred() {
+                        div { class: "fixture-approval-notice", role: "status",
+                            strong { "已保留在等待确认" }
+                            span { "仅改变本页视觉夹具状态；未创建 ApprovalGrant，也未执行 Effect。" }
+                        }
+                    }
+                    section { class: "prototype-approval-panel", aria_label: "精确审批结构样例",
+                        header {
+                            i { UiIcon { name: UiIconName::Shield, size: 14 } }
+                            strong { "审阅 4 个外部动作结构" }
+                            span { "Effect Broker · VISUAL_FIXTURE" }
+                        }
+                        div { class: "prototype-effect-list",
+                            for (index, effect) in approval.effects.clone().into_iter().enumerate() {
+                                div { class: "prototype-effect-row",
+                                    i { "{index + 1}" }
+                                    span { strong { "{effect.title}" } small { "{effect.detail}" } }
+                                    b { "{effect.state}" }
+                                }
+                            }
+                        }
+                        if approval_edit_open() {
+                            section { class: "fixture-approval-editor", aria_label: "修改审批结构样例",
+                                header { strong { "修改会使旧 digest 失效" } span { "SAMPLE revision {approval_digest_revision}" } }
+                                label { span { "预算（minor units）" } input {
+                                    value: "{approval_budget}",
+                                    inputmode: "numeric",
+                                    aria_label: "视觉夹具预算 minor units",
+                                    oninput: move |event| approval_budget.set(event.value()),
+                                } }
+                                label { span { "渠道" } select { aria_label: "视觉夹具渠道", option { "Meta Ads · US" } option { "TikTok Ads · US" } } }
+                                footer {
+                                    span { "VISUAL_FIXTURE · 不写入 Domain" }
+                                    button {
+                                        class: "surface-button primary",
+                                        onclick: move |_| {
+                                            approval_digest_revision.set(approval_digest_revision().saturating_add(1));
+                                            approval_edit_open.set(false);
+                                        },
+                                        "生成新结构 digest"
+                                    }
+                                }
+                            }
+                        }
+                        if approval_facts_open() {
+                            div { class: "prototype-approval-facts",
+                                for fact in approval.facts.clone() {
+                                    div { span { "{fact.title}" } strong { "{fact.detail}" } small { "{fact.state}" } }
+                                }
+                            }
+                        }
+                        footer { class: "prototype-approval-actions",
+                            button {
+                                class: "surface-button primary",
+                                onclick: move |_| preview_outcome.set(true),
+                                "预览批准后结构"
+                            }
+                            button { class: "surface-button", onclick: move |_| approval_edit_open.set(!approval_edit_open()), "修改样例" }
+                            button { class: "surface-button", onclick: move |_| approval_deferred.set(true), "稍后处理" }
+                            button { class: "approval-digest-toggle", aria_expanded: approval_facts_open(), onclick: move |_| approval_facts_open.set(!approval_facts_open()), "完整 digest" }
+                            span { "SAMPLE r{approval_digest_revision} · 不创建 ApprovalGrant / EffectIntent" }
+                        }
+                    }
+                }
+            }
+        };
+    }
+
+    rsx! {
+        div { class: "surface-scroll prototype-thread",
+            div { class: "prototype-user-row",
+                div { class: "prototype-user-message", "{conversation.user_prompt}" time { "10:21" } }
+            }
+                article { class: "assistant-turn prototype-turn",
+                    header { class: "assistant-byline",
+                        img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                        strong { "Hartevo" }
+                        time { "10:21" }
+                        button {
+                            class: "fixture-stream-replay",
+                            disabled: stream_running(),
+                            aria_label: "重播视觉夹具的流式响应",
+                            onclick: move |_| {
+                                let next_generation = stream_generation().saturating_add(1);
+                                stream_generation.set(next_generation);
+                                streamed_intro.set(String::new());
+                                visible_progress.set(0);
+                                stream_running.set(true);
+                                stream_interrupted.set(false);
+                                let full_intro = intro_source.clone();
+                                spawn(async move {
+                                    let mut rendered = String::new();
+                                    let characters = full_intro.chars().collect::<Vec<_>>();
+                                    for chunk in characters.chunks(3) {
+                                        if stream_generation() != next_generation {
+                                            return;
+                                        }
+                                        rendered.extend(chunk.iter());
+                                        streamed_intro.set(rendered.clone());
+                                        let _ = dioxus::document::eval(
+                                            "(() => { const thread = document.querySelector('.prototype-thread'); if (!thread) return; const nearBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80; if (nearBottom) thread.scrollTo({top: thread.scrollHeight, behavior: 'smooth'}); })();",
+                                        );
+                                        tokio::time::sleep(std::time::Duration::from_millis(34)).await;
+                                    }
+                                    for count in 1..=progress_total {
+                                        if stream_generation() != next_generation {
+                                            return;
+                                        }
+                                        visible_progress.set(count);
+                                        tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+                                    }
+                                    stream_running.set(false);
+                                    stream_interrupted.set(false);
+                                });
+                            },
+                            UiIcon { name: UiIconName::Refresh, size: 12 }
+                            if frozen_stream_frame { "流式取证帧" } else { "重播流式轨迹" }
+                        }
+                    }
+                    div { class: "assistant-copy fixture-stream-copy", aria_live: "polite", aria_busy: stream_running(),
+                        p {
+                            "{streamed_intro}"
+                            if stream_running() { i { class: "fixture-stream-caret", aria_hidden: "true" } }
+                        }
+                    }
+                section { class: "prototype-mission-contract", aria_label: "系统理解的任务边界",
+                    header {
+                        UiIcon { name: UiIconName::FileText, size: 14 }
+                        strong { "已编译为 Hartevo Mission" }
+                        span { "你可以直接用自然语言修改" }
+                    }
+                    div { class: "prototype-contract-grid",
+                        div { small { "目标" } strong { "{conversation.goal}" } }
+                        div { small { "自动执行" } strong { "{conversation.automatic}" } }
+                        div { small { "必须确认" } strong { "{conversation.approval}" } }
+                    }
+                }
+                section { class: "mission-activity-stream", aria_label: "Mission 流式活动",
+                    header {
+                        strong { "运行轨迹" }
+                        span { "事件来自冻结视觉夹具 · 不构成 Runtime/Provider 证据" }
+                    }
+                    for item in conversation.progress.clone().into_iter().take(visible_progress()) {
+                        div { class: "mission-activity-row",
+                            i { class: if item.state == "live" { "mission-activity-icon live" } else { "mission-activity-icon done" },
+                                if item.state == "live" { span {} } else { UiIcon { name: UiIconName::Check, size: 10 } }
+                            }
+                            span { class: "mission-activity-copy",
+                                strong { "{item.title}" }
+                                small { "{item.detail}" }
+                                em { "{item.capability}" }
+                            }
+                            time { "{item.time}" }
+                        }
+                    }
+                    button {
+                        class: "mission-activity-group-toggle",
+                        aria_expanded: capability_open(),
+                        onclick: move |_| capability_open.set(!capability_open()),
+                        UiIcon { name: UiIconName::Workflow, size: 14 }
+                        span { strong { "本次任务的能力与运行事件" } small { "{conversation.capability_summary}" } }
+                        UiIcon { name: UiIconName::ChevronDown, size: 13 }
+                    }
+                    if capability_open() {
+                        div { class: "mission-activity-details",
+                            span { strong { "Skill" } small { "Opportunity Validation · Candidate" } }
+                            span { strong { "Provider route" } small { "Simulator only · no live account" } }
+                            span { strong { "Worker generation" } small { "Fixture g1 · no process started" } }
+                            span { strong { "Effect boundary" } small { "0 intents · 0 receipts · 0 verifications" } }
+                        }
+                    }
+                    if frozen_stream_frame || stream_running() || stream_interrupted() {
+                        div { class: "compaction-event-row",
+                            UiIcon { name: UiIconName::FileCheck, size: 14 }
+                            span { strong { "上下文压缩记录结构" } small { "Truth correction、Pending Effect 与审批边界保持；fixture 未执行压缩。" } }
+                            em { "CTX · SAMPLE" }
+                        }
+                    }
+                }
+                div { class: "prototype-connection-suggestion",
+                    i { "+" }
+                    span { strong { "{conversation.connection_title}" } small { "{conversation.connection_detail}" } }
+                    button { "查看连接建议" }
+                }
+                button { class: "prototype-artifact-attachment", onclick: move |_| on_open_workpad.call(()),
+                    i { UiIcon { name: UiIconName::FileText, size: 17 } }
+                    span { strong { "{conversation.artifact_title}" } small { "{conversation.artifact_meta}" } }
+                    em { "在工作台打开" }
+                }
+                section { class: "prototype-decision-summary",
+                    h3 { "结论" }
+                    p { "{conversation.decision}" }
+                }
+                button {
+                    class: if progress_open() { "mission-progress-pill open" } else { "mission-progress-pill" },
+                    aria_label: "打开 Checkpoint 进度",
+                    aria_expanded: progress_open(),
+                    onclick: move |_| progress_open.set(!progress_open()),
+                    i { class: "live" }
+                    strong { "第 {mission.completed_checkpoint_count + 1} / {mission.checkpoint_count} 步" }
+                    span { "· revision {mission.revision} · 0 外部 Effect" }
+                    UiIcon { name: UiIconName::ChevronDown, size: 12 }
+                }
+                if progress_open() {
+                    section { class: "mission-progress-popover", aria_label: "Checkpoint 进度结构",
+                        header { strong { "Mission Checkpoints" } span { "VISUAL_FIXTURE" } }
+                        div { i { class: "done" } span { strong { "约束与证据计划" } small { "已冻结 · 无外部动作" } } em { "1" } }
+                        div { i { class: "live" } span { strong { "采集与冲突核验" } small { "当前结构样例" } } em { "2" } }
+                        div { i {} span { strong { "决策与反证" } small { "等待前序 Oracle" } } em { "3" } }
+                        footer { "纠正只使依赖分支失效；不会清空无关 Work Product。" }
+                    }
+                }
+                if stream_running() {
+                    div { class: "fixture-stream-controls", role: "status",
+                        button {
+                            class: "fixture-follow-latest",
+                            onclick: move |_| {
+                                let _ = dioxus::document::eval(
+                                    "document.querySelector('.prototype-thread')?.scrollTo({top: document.querySelector('.prototype-thread').scrollHeight, behavior: 'smooth'});",
+                                );
+                            },
+                            "回到最新"
+                        }
+                        button {
+                            class: "fixture-stop-stream",
+                            onclick: move |_| {
+                                stream_generation.set(stream_generation().saturating_add(1));
+                                stream_running.set(false);
+                                stream_interrupted.set(true);
+                            },
+                            span { aria_hidden: "true" }
+                            "停止重播"
+                        }
+                    }
+                } else if stream_interrupted() {
+                    div { class: "fixture-stream-interrupted", role: "status",
+                        span { aria_hidden: "true" }
+                        strong { "已停止重播" }
+                        small { "当前正文、活动与 Mission 边界保持；没有回滚或外部 Effect。" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "visual-fixtures")]
+fn fixture_state_tone(value: &str) -> &'static str {
+    if value.contains("BLOCKED") || value.contains("重新授权") || value.contains("安全阻塞")
+    {
+        "error"
+    } else if value.contains("等待") || value.contains("需") || value.contains("审批") {
+        "warning"
+    } else if value.contains("可研究") || value.contains("可选") || value.contains("采用") {
+        "success"
+    } else {
+        "neutral"
+    }
+}
+
+#[cfg(feature = "visual-fixtures")]
+#[component]
+fn PrototypeOperationsSurface(
+    page: visual_fixture::VisualPage,
+    #[props(into)] title: String,
+    #[props(into)] description: String,
+    #[props(into)] eyebrow: String,
+) -> Element {
+    let initial_tab = page
+        .tabs
+        .first()
+        .map(|tab| tab.id.clone())
+        .unwrap_or_default();
+    let mut active_tab = use_signal(move || initial_tab);
+    let mut selected_row = use_signal(|| None::<visual_fixture::VisualRow>);
+    let mut strategy_open = use_signal(|| false);
+    let mut split_index = use_signal(|| 0_usize);
+    let mut connection_flow_open = use_signal(|| false);
+    let mut connection_flow_step = use_signal(|| 1_u8);
+    let is_connections = page.id == "connections";
+    let selected = page
+        .tabs
+        .iter()
+        .find(|tab| tab.id == active_tab())
+        .cloned()
+        .or_else(|| page.tabs.first().cloned());
+    let Some(selected) = selected else {
+        return rsx! { EmptyState { code: "EMPTY", title: "视觉夹具缺少页面状态", detail: "Fixture schema 未提供可渲染 tab。" } };
+    };
+    let column_count = selected.columns.len().max(1);
+    let grid_style = format!("grid-template-columns: repeat({column_count}, minmax(0, 1fr));");
+    let suggested_row = selected.rows.first().cloned();
+    let split_row = selected.rows.get(split_index()).cloned();
+    let split_title = split_row
+        .as_ref()
+        .map_or("Conversation sample", |row| row.title.as_str());
+    let split_detail = split_row
+        .as_ref()
+        .map_or("No selected fixture conversation", |row| {
+            row.detail.as_str()
+        });
+
+    rsx! {
+        div { class: "surface-scroll business-surface prototype-operations-surface",
+            div { class: "prototype-growth-topbar",
+                strong { "北美增长项目" }
+                nav { aria_label: "增长运营模块",
+                    span { "连接" }
+                    span { "渠道" }
+                    span { "关系" }
+                    span { "达人与联盟" }
+                }
+                em { i {} "共享总调度状态 · 视觉夹具" }
+            }
+            header { class: "surface-head prototype-surface-head",
+                div { class: "surface-head-copy",
+                    span { class: "surface-eyebrow", "{eyebrow}" }
+                    h1 { "{title}" }
+                    p { "{description}" }
+                }
+                div { class: "surface-head-actions",
+                    button { class: "surface-button", onclick: move |_| strategy_open.set(true), "页面策略" }
+                    button {
+                        class: "surface-button primary",
+                        onclick: move |_| {
+                            if is_connections {
+                                connection_flow_step.set(1);
+                                connection_flow_open.set(true);
+                            } else {
+                                selected_row.set(suggested_row.clone());
+                            }
+                        },
+                        if is_connections { "连接服务" } else { "建议下一步" }
+                    }
+                }
+            }
+            nav { class: "surface-tabs prototype-surface-tabs", aria_label: "{title} 视图",
+                for tab in page.tabs.clone() {
+                    {
+                        let tab_id = tab.id.clone();
+                        rsx! {
+                            button {
+                                class: if active_tab() == tab.id { "active" } else { "" },
+                                onclick: move |_| active_tab.set(tab_id.clone()),
+                                "{tab.label}"
+                            }
+                        }
+                    }
+                }
+            }
+            section { class: "prototype-readiness-strip",
+                div { class: "prototype-readiness-intro",
+                    span { class: "readiness-mark", UiIcon { name: UiIconName::Sparkles, size: 17 } }
+                    span { strong { "结构样例，不构成业务状态" } small { "数据来自 prototype-baseline-v1；真实页面仍只读取 Application Projection。" } }
+                }
+                for metric in page.stats.clone() {
+                    div { class: "readiness-stat", b { "{metric.value}" } small { "{metric.label}" } }
+                }
+            }
+            section { class: "prototype-operation-section",
+                header { h2 { "{selected.headline}" } p { "{selected.subline}" } span { "VISUAL_FIXTURE" } }
+                if selected.kind == "ranked" {
+                    div { class: "prototype-ranked-layout",
+                        main { class: "prototype-ranked-list",
+                            for (index, row) in selected.rows.clone().into_iter().enumerate() {
+                                div { class: "prototype-ranked-row",
+                                    i { "{index + 1}" }
+                                    span { strong { "{row.title}" } small { "{row.detail}" } }
+                                    em { "{row.meta}" }
+                                    b { class: "fixture-state {fixture_state_tone(&row.state)}", "{row.state}" }
+                                    button {
+                                        aria_label: "打开 {row.title}",
+                                        onclick: {
+                                            let row = row.clone();
+                                            move |_| selected_row.set(Some(row.clone()))
+                                        },
+                                        "打开"
+                                    }
+                                }
+                            }
+                        }
+                        aside { class: "prototype-operation-aside",
+                            UiIcon { name: UiIconName::Shield, size: 17 }
+                            strong { "能力不会因页面样例自动启用" }
+                            p { "连接、Consent、Contact Permission、审批、Receipt 与 Verification 仍由真实 Domain 状态决定。" }
+                            button { onclick: move |_| strategy_open.set(true), "查看动作边界" }
+                        }
+                    }
+                } else if selected.kind == "calendar" {
+                    div { class: "prototype-calendar",
+                        div { class: "prototype-calendar-head", style: "{grid_style}",
+                            for column in selected.columns.clone() { strong { "{column}" } }
+                        }
+                        for row in selected.rows.clone() {
+                            div { class: "prototype-calendar-row",
+                                span { strong { "{row.title}" } small { "{row.detail}" } }
+                                div { class: "prototype-calendar-lane", span { "{row.meta}" } }
+                                b { class: "fixture-state {fixture_state_tone(&row.state)}", "{row.state}" }
+                            }
+                        }
+                    }
+                } else if selected.kind == "split" {
+                    div { class: "prototype-split-view",
+                        nav { aria_label: "会话样例",
+                            for (index, row) in selected.rows.clone().into_iter().enumerate() {
+                                button {
+                                    class: if split_index() == index { "active" } else { "" },
+                                    onclick: move |_| split_index.set(index),
+                                    span { strong { "{row.title}" } small { "{row.detail}" } }
+                                    em { "{row.meta}" }
+                                    b { "{row.state}" }
+                                }
+                            }
+                        }
+                        article {
+                            span { class: "surface-eyebrow", "HUMAN HANDOFF · SAMPLE" }
+                            h3 { "{split_title}" }
+                            p { "{split_detail}" }
+                            div { class: "prototype-handoff-card",
+                                UiIcon { name: UiIconName::Bot, size: 16 }
+                                span { strong { "人工接管锁结构" } small { "旧 Worker generation 不得继续外发；fixture 没有发送消息。" } }
+                                b { "HANDOFF" }
+                            }
+                            button {
+                                class: "surface-button primary",
+                                onclick: {
+                                    let row = split_row.clone();
+                                    move |_| selected_row.set(row.clone())
+                                },
+                                "查看回复草稿"
+                            }
+                        }
+                    }
+                } else if selected.kind == "kanban" {
+                    div { class: "prototype-kanban",
+                        for (index, column) in selected.columns.clone().into_iter().enumerate() {
+                            div { class: "prototype-kanban-column",
+                                header { strong { "{column}" } span { "1" } }
+                                if let Some(row) = selected.rows.get(index) {
+                                    button {
+                                        class: "prototype-kanban-card",
+                                        onclick: {
+                                            let row = row.clone();
+                                            move |_| selected_row.set(Some(row.clone()))
+                                        },
+                                        strong { "{row.title}" }
+                                        p { "{row.detail}" }
+                                        small { "{row.meta}" }
+                                        b { class: "fixture-state {fixture_state_tone(&row.state)}", "{row.state}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if selected.kind == "workflow" {
+                    div { class: "prototype-workflow-layout",
+                        main { class: "prototype-workflow-list",
+                            for (index, row) in selected.rows.clone().into_iter().enumerate() {
+                                button {
+                                    class: "prototype-workflow-row",
+                                    onclick: {
+                                        let row = row.clone();
+                                        move |_| selected_row.set(Some(row.clone()))
+                                    },
+                                    i { "{index + 1}" }
+                                    span { strong { "{row.title}" } small { "{row.detail}" } }
+                                    em { "{row.meta}" }
+                                    b { class: "fixture-state {fixture_state_tone(&row.state)}", "{row.state}" }
+                                }
+                            }
+                        }
+                        aside { class: "prototype-review-panel",
+                            span { class: "surface-eyebrow", "DELIVERABLE REVIEW" }
+                            h3 { "交付、Review、Rights 与付款分离" }
+                            p { "真实 Deliverable digest、用户接受、权益记录和精确 Payout 审批必须齐全。Provider 接受不等于已付款。" }
+                            div { strong { "$300.00 USD" } small { "Reward fixture · 0 payout effects" } }
+                            button { class: "surface-button", onclick: move |_| strategy_open.set(true), "查看合同边界" }
+                        }
+                    }
+                } else {
+                    div { class: "prototype-data-table",
+                        if !selected.columns.is_empty() {
+                            div { class: "prototype-data-head", style: "{grid_style}",
+                                for column in selected.columns.clone() { strong { "{column}" } }
+                            }
+                        }
+                        for row in selected.rows.clone() {
+                            div { class: "prototype-data-row",
+                                span { strong { "{row.title}" } small { "{row.detail}" } }
+                                em { "{row.meta}" }
+                                b { class: "fixture-state {fixture_state_tone(&row.state)}", "{row.state}" }
+                                button {
+                                    onclick: {
+                                        let row = row.clone();
+                                        move |_| selected_row.set(Some(row.clone()))
+                                    },
+                                    "查看"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(row) = selected_row() {
+                button { class: "prototype-drawer-backdrop", aria_label: "关闭详情", onclick: move |_| selected_row.set(None) }
+                aside {
+                    class: "prototype-detail-drawer",
+                    role: "dialog",
+                    aria_modal: "true",
+                    aria_label: "{row.title} 详情",
+                    tabindex: "-1",
+                    onkeydown: move |event| match event.key() {
+                        Key::Escape => selected_row.set(None),
+                        Key::Tab => {
+                            event.prevent_default();
+                            cycle_dialog_focus(
+                                ".prototype-detail-drawer",
+                                event.modifiers().contains(Modifiers::SHIFT),
+                            );
+                        }
+                        _ => {}
+                    },
+                    header {
+                        span { class: "surface-eyebrow", "{page.id.to_uppercase()} · VISUAL_FIXTURE" }
+                        button { autofocus: true, aria_label: "关闭详情", onclick: move |_| selected_row.set(None), UiIcon { name: UiIconName::X, size: 15 } }
+                    }
+                    section {
+                        h2 { "{row.title}" }
+                        p { "{row.detail}" }
+                        div { class: "prototype-detail-state",
+                            span { "当前结构状态" }
+                            b { class: "fixture-state {fixture_state_tone(&row.state)}", "{row.state}" }
+                        }
+                        dl {
+                            div { dt { "范围" } dd { "{row.meta}" } }
+                            div { dt { "外部动作" } dd { "0 EffectIntent" } }
+                            div { dt { "业务证据" } dd { "0 Receipt · 0 Verification" } }
+                            div { dt { "数据来源" } dd { "prototype-baseline-v1" } }
+                        }
+                        article { class: "prototype-detail-note",
+                            UiIcon { name: UiIconName::Shield, size: 15 }
+                            span { strong { "这是可操作结构，不是业务成功" } small { "真实按钮必须由 Application Service 提供精确命令；当前只允许关闭、切换与审阅结构。" } }
+                        }
+                    }
+                    footer {
+                        button { class: "surface-button", onclick: move |_| selected_row.set(None), "返回列表" }
+                        button { class: "surface-button primary", disabled: true, "NOT_IMPLEMENTED" }
+                    }
+                }
+            }
+            if strategy_open() {
+                button { class: "prototype-drawer-backdrop", aria_label: "关闭页面策略", onclick: move |_| strategy_open.set(false) }
+                aside {
+                    class: "prototype-detail-drawer strategy",
+                    role: "dialog",
+                    aria_modal: "true",
+                    aria_label: "页面策略与动作边界",
+                    tabindex: "-1",
+                    onkeydown: move |event| match event.key() {
+                        Key::Escape => strategy_open.set(false),
+                        Key::Tab => {
+                            event.prevent_default();
+                            cycle_dialog_focus(
+                                ".prototype-detail-drawer.strategy",
+                                event.modifiers().contains(Modifiers::SHIFT),
+                            );
+                        }
+                        _ => {}
+                    },
+                    header {
+                        span { class: "surface-eyebrow", "PAGE POLICY · HONEST BOUNDARY" }
+                        button { autofocus: true, aria_label: "关闭页面策略", onclick: move |_| strategy_open.set(false), UiIcon { name: UiIconName::X, size: 15 } }
+                    }
+                    section {
+                        h2 { "{title}如何读取与改变状态" }
+                        p { "页面、Tab、筛选和抽屉只是同一 Project / Mission Domain 的投影视图；它们不能自己生成成功状态。" }
+                        ol { class: "prototype-policy-steps",
+                            li { strong { "1 · Read" } span { "从 Application Projection 读取项目、账号与业务对象。" } }
+                            li { strong { "2 · Prepare" } span { "草稿保持本地，变更先形成精确 diff 与 digest。" } }
+                            li { strong { "3 · Approve" } span { "对象、受众、素材、金额、时间、账号任一变化都会使批准失效。" } }
+                            li { strong { "4 · Verify" } span { "Provider 接受之后仍需独立 readback；uncertain 永不自动重放。" } }
+                        }
+                        div { class: "fixture-disclosure-banner",
+                            strong { "VISUAL_FIXTURE" }
+                            span { "当前页面没有 Connection、Consent、Receipt、Verification 或 E3 证据。" }
+                        }
+                    }
+                    footer { button { class: "surface-button primary", onclick: move |_| strategy_open.set(false), "知道了" } }
+                }
+            }
+            if connection_flow_open() {
+                button { class: "prototype-modal-backdrop", aria_label: "关闭连接向导", onclick: move |_| connection_flow_open.set(false) }
+                section {
+                    class: "prototype-connection-modal",
+                    role: "dialog",
+                    aria_modal: "true",
+                    aria_label: "连接服务流程结构",
+                    tabindex: "-1",
+                    onkeydown: move |event| match event.key() {
+                        Key::Escape => connection_flow_open.set(false),
+                        Key::Tab => {
+                            event.prevent_default();
+                            cycle_dialog_focus(
+                                ".prototype-connection-modal",
+                                event.modifiers().contains(Modifiers::SHIFT),
+                            );
+                        }
+                        _ => {}
+                    },
+                    header {
+                        span { strong { "连接服务" } small { "Step {connection_flow_step} of 4 · VISUAL_FIXTURE" } }
+                        button { autofocus: true, aria_label: "关闭连接向导", onclick: move |_| connection_flow_open.set(false), UiIcon { name: UiIconName::X, size: 15 } }
+                    }
+                    div { class: "prototype-flow-progress",
+                        for step in 1_u8..=4 {
+                            i { class: if step <= connection_flow_step() { "active" } else { "" } }
+                        }
+                    }
+                    main {
+                        if connection_flow_step() == 1 {
+                            span { class: "surface-eyebrow", "SELECT PROVIDER" }
+                            h2 { "选择当前 Mission 真正需要的服务" }
+                            p { "连接不会自动启用写入；每项 Capability 仍需独立 Policy 和审批。" }
+                            div { class: "prototype-provider-grid",
+                                button { class: "selected", UiIcon { name: UiIconName::Chart, size: 17 } strong { "Google Analytics" } small { "Read-only measurement" } }
+                                button { UiIcon { name: UiIconName::Mail, size: 17 } strong { "Gmail" } small { "Read + send boundaries" } }
+                                button { UiIcon { name: UiIconName::Contact, size: 17 } strong { "HubSpot" } small { "CRM identity" } }
+                                button { UiIcon { name: UiIconName::Wallet, size: 17 } strong { "Stripe" } small { "Billing / settlement" } }
+                            }
+                        } else if connection_flow_step() == 2 {
+                            span { class: "surface-eyebrow", "ACCOUNT & SCOPE" }
+                            h2 { "确认账号身份与最小 Scope" }
+                            p { "实际 OAuth 必须显示 Provider、账号和 scopes；当前环境没有打开授权页面。" }
+                            div { class: "prototype-auth-scope",
+                                strong { "analytics.readonly" }
+                                small { "只读 Measurement；不允许管理账号或修改数据。" }
+                                b { "BLOCKED_ENV" }
+                            }
+                        } else if connection_flow_step() == 3 {
+                            span { class: "surface-eyebrow", "PROBE" }
+                            h2 { "实时验证连接与目标账号" }
+                            p { "只有实时 Probe 成功才能显示 Connected。fixture 不会生成绿色成功状态。" }
+                            div { class: "prototype-probe-state", UiIcon { name: UiIconName::Shield, size: 18 } strong { "等待真实 OAuth 环境" } small { "No token · no account identity · no scopes" } b { "BLOCKED_ENV" } }
+                        } else {
+                            span { class: "surface-eyebrow", "MISSION BINDING" }
+                            h2 { "绑定项目与允许的 Capability" }
+                            p { "连接只绑定当前 Tenant / Project / Provider / Account；不会跨项目复用正文或凭据。" }
+                            div { class: "fixture-disclosure-banner", strong { "未连接" } span { "向导结构已覆盖；真实回调、Probe、撤销和重授权仍为 BLOCKED_ENV。" } }
+                        }
+                    }
+                    footer {
+                        button { class: "surface-button", disabled: connection_flow_step() == 1, onclick: move |_| connection_flow_step.set(connection_flow_step().saturating_sub(1).max(1)), "上一步" }
+                        span { "不会启动 OAuth 或写入 Secret Store" }
+                        if connection_flow_step() < 4 {
+                            button { class: "surface-button primary", onclick: move |_| connection_flow_step.set(connection_flow_step().saturating_add(1).min(4)), "下一步" }
+                        } else {
+                            button { class: "surface-button primary", onclick: move |_| connection_flow_open.set(false), "完成结构审阅" }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2025,6 +3642,7 @@ fn OrchestratorSurface(
     on_ready: EventHandler<DesktopSnapshot>,
     on_error: EventHandler<DesktopDataError>,
     on_select_mission: EventHandler<MissionId>,
+    on_open_workpad: EventHandler<()>,
 ) -> Element {
     match backend {
         DesktopBackendState::Uninitialized(evidence) => rsx! {
@@ -2109,6 +3727,18 @@ fn OrchestratorSurface(
                     }
                 };
             };
+            #[cfg(feature = "visual-fixtures")]
+            if let Some(presentation) = visual_fixture::presentation() {
+                return rsx! {
+                    PrototypeMissionJourney {
+                        mission,
+                        conversation: presentation.conversation,
+                        approval: presentation.approval,
+                        outcome: presentation.outcome,
+                        on_open_workpad,
+                    }
+                };
+            }
             let route_label = mission.manifest_id.as_ref().map_or_else(
                 || "LEGACY_BOOTSTRAP · 未绑定 Catalog".to_owned(),
                 |manifest_id| {
@@ -2494,6 +4124,7 @@ fn MissionStateCard(
                 }
             }
             if let Some(activity) = &runtime_activity {
+                RuntimeProjectionTimeline { activity: activity.clone() }
                 div { class: "evidence-summary runtime-summary",
                     span { strong { "{process_claim_label}" } small { "OS process claim" } }
                     span { strong { "{recovery_label}" } small { "Runtime recovery" } }
@@ -2531,6 +4162,79 @@ fn MissionStateCard(
                 div { class: "boundary-note", "Outcome：{outcome}" }
             } else {
                 div { class: "boundary-note", "当前状态仅由 Application projection 决定；未接入的下一步保持 NOT_IMPLEMENTED。" }
+            }
+        }
+    }
+}
+
+#[component]
+fn RuntimeProjectionTimeline(activity: MissionRuntimeProjection) -> Element {
+    let process = activity
+        .process_claim_status
+        .map(runtime_process_claim_status_label);
+    let recovery = activity.recovery_status.map(runtime_recovery_status_label);
+    let turn = activity.turn_status.map(runtime_turn_status_label);
+    let process_active = matches!(
+        activity.process_claim_status,
+        Some(RuntimeProcessClaimStatus::Prepared | RuntimeProcessClaimStatus::Spawned)
+    );
+    let recovery_active = matches!(
+        activity.recovery_status,
+        Some(
+            RuntimeRecoveryStatus::Prepared
+                | RuntimeRecoveryStatus::Spawned
+                | RuntimeRecoveryStatus::ThreadBound
+                | RuntimeRecoveryStatus::Attached
+        )
+    );
+    let turn_active = activity
+        .turn_status
+        .is_some_and(RuntimeTurnStatus::is_active);
+    rsx! {
+        section {
+            class: if activity.requires_reconciliation { "runtime-projection-timeline uncertain" } else { "runtime-projection-timeline" },
+            aria_label: "持久 Runtime 活动",
+            aria_live: "polite",
+            header {
+                span { strong { "Runtime 活动" } small { "来自持久 Application Projection" } }
+                if activity.requires_reconciliation {
+                    b { "UNCERTAIN · 禁止自动重放" }
+                } else {
+                    em { "{activity.turn_evidence_count} evidence" }
+                }
+            }
+            div { class: "runtime-projection-events",
+                if let Some(process) = process {
+                    div { class: if process_active { "runtime-projection-event live" } else { "runtime-projection-event done" },
+                        i { if process_active { span {} } else { UiIcon { name: UiIconName::Check, size: 10 } } }
+                        span { strong { "OS process claim" } small { "{process} · 仅代表本机执行权，不是业务完成" } }
+                    }
+                }
+                if let Some(recovery) = recovery {
+                    div { class: if recovery_active { "runtime-projection-event live" } else { "runtime-projection-event done" },
+                        i { if recovery_active { span {} } else { UiIcon { name: UiIconName::Check, size: 10 } } }
+                        span { strong { "Runtime recovery" } small { "{recovery} · generation 与 thread binding 由账本 fencing" } }
+                    }
+                }
+                if let Some(turn) = turn {
+                    div { class: if turn_active { "runtime-projection-event live" } else if activity.requires_reconciliation { "runtime-projection-event uncertain" } else { "runtime-projection-event done" },
+                        i {
+                            if turn_active { span {} } else if activity.requires_reconciliation { "?" } else { UiIcon { name: UiIconName::Check, size: 10 } }
+                        }
+                        span { strong { "Runtime turn" } small { "{turn} · 模型终态不能直接完成 Mission" } }
+                    }
+                }
+                div { class: "runtime-projection-event ledger",
+                    i { UiIcon { name: UiIconName::FileCheck, size: 10 } }
+                    span {
+                        strong { "持久事件账本" }
+                        small { "{activity.turn_evidence_count} turn evidence · {activity.process_cleanup_attempt_count} cleanup · {activity.recovery_failure_count + activity.turn_failure_count} failures" }
+                    }
+                }
+            }
+            details {
+                summary { "查看安全边界" UiIcon { name: UiIconName::ChevronDown, size: 12 } }
+                p { "当前列表只显示已经进入 SQLCipher/Application Projection 的状态；未持久化的 token、私有推理和正文不会作为遥测事件显示。停止/中断必须由精确 Runtime attempt 命令完成，页面不会只隐藏动画。" }
             }
         }
     }
@@ -2787,6 +4491,17 @@ fn ChannelSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
 ) -> Element {
+    #[cfg(feature = "visual-fixtures")]
+    if let Some(page) = visual_fixture::page("channels") {
+        return rsx! {
+            PrototypeOperationsSurface {
+                page,
+                title: "渠道运营",
+                description: "根据受众、市场、内容能力与目标选择值得经营的渠道；每个平台保留独立素材、节奏、审批和结果。",
+                eyebrow: "CHANNELS · GROWTH OPERATIONS",
+            }
+        };
+    }
     let mut active_tab = use_signal(|| "plan");
     let Some(project) = project else {
         return rsx! { EmptyState { code: "NOT_IMPLEMENTED", title: "没有渠道上下文", detail: "先完成安全项目创建；渠道页不会使用 demo store。" } };
@@ -2873,6 +4588,17 @@ fn RelationshipsSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
 ) -> Element {
+    #[cfg(feature = "visual-fixtures")]
+    if let Some(page) = visual_fixture::page("relationships") {
+        return rsx! {
+            PrototypeOperationsSurface {
+                page,
+                title: "关系与 CRM",
+                description: "联系人、公司、邮件、会话与机会共享同一条关系记录；公开发现不会自动获得触达许可。",
+                eyebrow: "RELATIONSHIPS · CRM",
+            }
+        };
+    }
     let mut active_tab = use_signal(|| "pipeline");
     let Some(project) = project else {
         return rsx! { EmptyState { code: "EMPTY", title: "没有关系项目范围", detail: "Identity、Consent、Conversation 和 Opportunity 必须绑定明确项目。" } };
@@ -2944,6 +4670,17 @@ fn PartnersSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
 ) -> Element {
+    #[cfg(feature = "visual-fixtures")]
+    if let Some(page) = visual_fixture::page("partners") {
+        return rsx! {
+            PrototypeOperationsSurface {
+                page,
+                title: "达人与联盟",
+                description: "从身份与许可开始，覆盖建联、雇佣、悬赏任务、真实交付、Review、权益接受与付款。",
+                eyebrow: "PARTNERS · CREATOR WORK",
+            }
+        };
+    }
     let mut active_tab = use_signal(|| "supply");
     let Some(project) = project else {
         return rsx! { EmptyState { code: "EMPTY", title: "没有 Partner 项目范围", detail: "Creator、Partner、任务、交付与付款必须绑定 Tenant/Project。" } };
@@ -3022,6 +4759,17 @@ fn OutcomesSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
 ) -> Element {
+    #[cfg(feature = "visual-fixtures")]
+    if let Some(page) = visual_fixture::page("outcomes") {
+        return rsx! {
+            PrototypeOperationsSurface {
+                page,
+                title: "成果与下一循环",
+                description: "原始事件、身份链、退款与归因不被页面覆盖；相关性不会被描述为因果。",
+                eyebrow: "OUTCOMES · ATTRIBUTION",
+            }
+        };
+    }
     let Some(project) = project else {
         return rsx! { EmptyState { code: "EMPTY", title: "没有 Outcome 项目范围", detail: "Outcome、Attribution、Refund 与 Payout 必须绑定明确项目。" } };
     };
@@ -3275,6 +5023,17 @@ fn ConnectionsSurface(
     project: Option<DesktopProjectProjection>,
     context_access: Option<ProjectContextAccessProjection>,
 ) -> Element {
+    #[cfg(feature = "visual-fixtures")]
+    if let Some(page) = visual_fixture::page("connections") {
+        return rsx! {
+            PrototypeOperationsSurface {
+                page,
+                title: "连接中心",
+                description: "管理 Hartevo 为当前项目读取、发布、发送和同步所需的账号；连接不自动放宽权限。",
+                eyebrow: "CONNECTIONS · CAPABILITY AVAILABILITY",
+            }
+        };
+    }
     let mut active_tab = use_signal(|| "overview");
     let mut flow_open = use_signal(|| false);
     let mut flow_step = use_signal(|| 1_u8);
@@ -3421,11 +5180,197 @@ fn CapabilityEvidenceSurface(evidence: ProductEvidenceProjection) -> Element {
     }
 }
 
+#[cfg(feature = "visual-fixtures")]
+#[component]
+fn PrototypeWorkpad(
+    mission: MissionProjection,
+    workpad: visual_fixture::VisualWorkpad,
+    on_close: EventHandler<()>,
+) -> Element {
+    let initial_tab = if active_visual_surface_variant().as_deref() == Some("mission-inspector") {
+        "运行检查器".to_owned()
+    } else {
+        workpad.tabs.first().cloned().unwrap_or_default()
+    };
+    let mut active_tab = use_signal(move || initial_tab);
+    let mut expanded_candidate = use_signal(|| None::<usize>);
+    let mut selected_source = use_signal(|| None::<visual_fixture::VisualRow>);
+    let mut action_notice = use_signal(|| None::<String>);
+    let inspector_active = active_tab() == "运行检查器";
+    rsx! {
+        aside { class: "workpad prototype-workpad", aria_label: "任务工作台",
+            header { class: "prototype-workpad-header",
+                nav { class: "prototype-workpad-tabs", aria_label: "工作产物标签",
+                    for tab in workpad.tabs.clone() {
+                        {
+                            let tab_id = tab.clone();
+                            rsx! {
+                                button { class: if active_tab() == tab { "active" } else { "" }, onclick: move |_| active_tab.set(tab_id.clone()),
+                                    UiIcon { name: UiIconName::FileText, size: 13 }
+                                    span { "{tab}" }
+                                }
+                            }
+                        }
+                    }
+                    button { class: if inspector_active { "active inspector" } else { "inspector" }, onclick: move |_| active_tab.set("运行检查器".into()),
+                        UiIcon { name: UiIconName::Workflow, size: 13 }
+                        span { "运行检查器" }
+                    }
+                }
+                div { class: "prototype-workpad-actions",
+                    button { aria_label: "评论", onclick: move |_| action_notice.set(Some("NOT_IMPLEMENTED · 评论服务尚未接线；未写入任何内容。".into())), UiIcon { name: UiIconName::Message, size: 14 } }
+                    button { aria_label: "导出", onclick: move |_| action_notice.set(Some("NOT_IMPLEMENTED · 导出签名与敏感字段清洗尚未接线。".into())), UiIcon { name: UiIconName::FileCheck, size: 14 } }
+                    button { aria_label: "收起工作台", onclick: move |_| on_close.call(()), UiIcon { name: UiIconName::Panel, size: 14 } }
+                }
+            }
+            if let Some(notice) = action_notice() {
+                div { class: "prototype-workpad-notice", role: "status",
+                    span { "{notice}" }
+                    button { aria_label: "关闭提示", onclick: move |_| action_notice.set(None), UiIcon { name: UiIconName::X, size: 12 } }
+                }
+            }
+            if inspector_active {
+                div { class: "prototype-inspector-body",
+                    header {
+                        span { class: "document-kicker", "MISSION INSPECTOR · VISUAL_FIXTURE" }
+                        h2 { "运行环境与证据" }
+                        p { "所有分区来自同一 Mission projection；fixture 不会创建 Worker、Browser、Effect 或 Provider 连接。" }
+                    }
+                    section { class: "inspector-summary-grid",
+                        div { strong { "+{mission.completed_checkpoint_count}" } small { "Checkpoint transitions" } }
+                        div { strong { "{mission.work_product_count}" } small { "Work Products" } }
+                        div { strong { "0" } small { "External Effects" } }
+                    }
+                    details { open: true, class: "inspector-section",
+                        summary { UiIcon { name: UiIconName::Workflow, size: 14 } strong { "Checkpoint 与工作树" } span { "{mission.completed_checkpoint_count}/{mission.checkpoint_count}" } }
+                        div { class: "inspector-list",
+                            span { i { class: "done" } strong { "scoped_collection" } small { "completed fixture transition" } }
+                            span { i { class: "live" } strong { "evidence_plan" } small { "current structural sample" } }
+                            span { i {} strong { "decision" } small { "pending" } }
+                        }
+                    }
+                    details { open: true, class: "inspector-section",
+                        summary { UiIcon { name: UiIconName::Bot, size: 14 } strong { "Worker 与后台运行" } span { "0 active" } }
+                        div { class: "inspector-empty-row", "BLOCKED_ENV · 没有启动 Runtime 子进程或 Worker lease" }
+                    }
+                    details { class: "inspector-section",
+                        summary { UiIcon { name: UiIconName::Layout, size: 14 } strong { "Browser Workspace" } span { "未创建" } }
+                        div { class: "inspector-empty-row", "人工接管锁、Browser lease 与 stable locator 将在真实 projection 中显示。" }
+                    }
+                    details { open: true, class: "inspector-section",
+                        summary { UiIcon { name: UiIconName::FileCheck, size: 14 } strong { "来源" } span { "3 fixture" } }
+                        div { class: "inspector-source-list",
+                            for source in workpad.sources.clone() {
+                                button { UiIcon { name: UiIconName::FileText, size: 13 } span { strong { "{source.title}" } small { "{source.detail}" } } em { "{source.state}" } }
+                            }
+                        }
+                    }
+                }
+            } else {
+                div { class: "workpad-body prototype-document",
+                    header { class: "prototype-document-title",
+                        span { class: "document-kicker", "{workpad.eyebrow}" }
+                        h2 { "{workpad.title}" }
+                        p { "{workpad.meta}" }
+                        div { class: "prototype-document-chips",
+                            span { "revision {mission.revision}" }
+                            span { "0 ProviderReceipt" }
+                            span { "0 Verification" }
+                        }
+                    }
+                    section { class: "prototype-loop-strip", aria_label: "增长循环",
+                        for (index, phase) in workpad.phases.clone().into_iter().enumerate() {
+                            span { i { "{index + 1}" } strong { "{phase}" } }
+                        }
+                    }
+                    section { class: "prototype-doc-section executive",
+                        header { h3 { "结论" } span { "结构样例" } }
+                        p { "{workpad.conclusion}" }
+                        div { class: "prototype-evidence-line",
+                            span { i {} "需求趋势样例 +34%" }
+                            span { i {} "讨论量样例 2.1×" }
+                            span { i { class: "gold" } "竞争密度待验证" }
+                        }
+                    }
+                    section { class: "prototype-doc-section",
+                        header { h3 { "需求趋势" } span { "过去 12 个月 · 标准化结构" } }
+                        div { class: "prototype-trend-layout",
+                            div { class: "prototype-chart",
+                                header { strong { "搜索与社交需求" } span { i { class: "gold" } "可调哑铃" } span { i { class: "green" } "折叠划船机" } }
+                                img { src: PROTOTYPE_TREND_SVG, alt: "美国健身器材需求趋势视觉夹具" }
+                            }
+                            aside { span { i {} "验证窗口结构" } strong { "需求在样例中增长，真实结论仍需 Provider Evidence" } p { "先验证空间效率与快速换重两个购买理由，不在第一轮扩大主张。" } }
+                        }
+                    }
+                    section { class: "prototype-doc-section",
+                        header { h3 { "候选方向" } span { "综合需求、利润与风险" } }
+                        div { class: "prototype-opportunity-list",
+                            for (index, row) in workpad.candidates.clone().into_iter().enumerate() {
+                                div {
+                                    class: if expanded_candidate() == Some(index) { "prototype-opportunity-item open" } else { "prototype-opportunity-item" },
+                                    button {
+                                        class: "prototype-opportunity-row",
+                                        aria_expanded: expanded_candidate() == Some(index),
+                                        onclick: move |_| {
+                                            expanded_candidate.set(
+                                                if expanded_candidate() == Some(index) { None } else { Some(index) },
+                                            );
+                                        },
+                                        i { "{index + 1}" }
+                                        span { strong { "{row.title}" } small { "{row.detail}" } }
+                                        em { strong { "{row.meta}" } small { "{row.state}" } }
+                                        UiIcon { name: UiIconName::ChevronDown, size: 13 }
+                                    }
+                                    if expanded_candidate() == Some(index) {
+                                        div { class: "prototype-opportunity-detail",
+                                            span { strong { "验证假设" } small { "需求、利润、交付可行性与反证必须分别记录。" } }
+                                            span { strong { "允许动作" } small { "只允许生成 Research/Decision Work Product；0 外部 Effect。" } }
+                                            button { onclick: move |_| action_notice.set(Some("VISUAL_FIXTURE · 已定位到候选结构；没有改变 Project Truth。".into())), "在 Mission 中定位" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    section { class: "prototype-doc-section",
+                        header { h3 { "来源与边界" } span { "provenance" } }
+                        div { class: "prototype-source-list",
+                            for source in workpad.sources.clone() {
+                                button {
+                                    onclick: {
+                                        let source = source.clone();
+                                        move |_| selected_source.set(Some(source.clone()))
+                                    },
+                                    UiIcon { name: UiIconName::FileText, size: 13 }
+                                    span { strong { "{source.title}" } small { "{source.detail}" } }
+                                    em { "{source.meta} · {source.state}" }
+                                }
+                            }
+                        }
+                        if let Some(source) = selected_source() {
+                            div { class: "prototype-source-detail", role: "status",
+                                span { strong { "{source.title}" } small { "{source.detail}" } }
+                                b { "VISUAL_FIXTURE · {source.state}" }
+                                button { aria_label: "关闭来源详情", onclick: move |_| selected_source.set(None), UiIcon { name: UiIconName::X, size: 12 } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn Workpad(
     mission: Option<MissionProjection>,
     context_access: Option<ProjectContextAccessProjection>,
+    on_close: EventHandler<()>,
 ) -> Element {
+    #[cfg(feature = "visual-fixtures")]
+    if let (Some(mission), Some(presentation)) = (mission.clone(), visual_fixture::presentation()) {
+        return rsx! { PrototypeWorkpad { mission, workpad: presentation.workpad, on_close } };
+    }
     let context_is_open = context_access.as_ref().is_some_and(|access| {
         matches!(
             access.status,
@@ -3434,7 +5379,10 @@ fn Workpad(
     });
     rsx! {
         aside { class: "workpad", aria_label: "任务工作台",
-            header { span { strong { "工作产物" } small { "Application projection" } } }
+            header {
+                span { strong { "工作产物" } small { "Application projection" } }
+                button { class: "icon-button", aria_label: "收起工作台", onclick: move |_| on_close.call(()), UiIcon { name: UiIconName::Panel, size: 14 } }
+            }
             div { class: "workpad-body",
                 if !context_is_open {
                     div { class: "document-kicker", "CONTEXT LOCKED" }
@@ -3530,6 +5478,38 @@ fn active_visual_fixture_id() -> Option<String> {
     }
 }
 
+fn active_visual_surface_variant() -> Option<String> {
+    #[cfg(feature = "visual-fixtures")]
+    {
+        visual_fixture::active_surface_variant()
+    }
+    #[cfg(not(feature = "visual-fixtures"))]
+    {
+        None
+    }
+}
+
+fn initial_workpad_open() -> bool {
+    #[cfg(feature = "visual-fixtures")]
+    if active_visual_fixture_id().is_some() {
+        return matches!(
+            active_visual_surface_variant().as_deref(),
+            Some("mission-workpad" | "mission-inspector")
+        );
+    }
+    true
+}
+
+#[cfg(feature = "visual-fixtures")]
+fn active_visual_notification_count() -> usize {
+    visual_fixture::presentation().map_or(0, |presentation| presentation.notifications.len())
+}
+
+#[cfg(not(feature = "visual-fixtures"))]
+const fn active_visual_notification_count() -> usize {
+    0
+}
+
 fn active_visual_zoom() -> f64 {
     #[cfg(feature = "visual-fixtures")]
     {
@@ -3538,6 +5518,108 @@ fn active_visual_zoom() -> f64 {
         }
     }
     1.0
+}
+
+fn begin_runtime_progress_monitor(
+    control: DesktopRuntimeCancellation,
+    mut progress: Signal<Vec<DesktopRuntimeProgressEvent>>,
+    submitting: Signal<bool>,
+    retrying: Signal<bool>,
+) {
+    spawn(async move {
+        let mut cursor = 0_u64;
+        loop {
+            let events = control.progress_since(cursor);
+            let terminal = events.iter().any(|event| event.phase.is_terminal());
+            if let Some(last) = events.last() {
+                cursor = last.sequence;
+                let mut projection = progress.write();
+                projection.extend(events);
+                if projection.len() > 32 {
+                    let overflow = projection.len() - 32;
+                    projection.drain(0..overflow);
+                }
+            }
+            if terminal || (!*submitting.read() && !*retrying.read()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        }
+    });
+}
+
+fn request_desktop_runtime_stop(
+    control: Option<DesktopRuntimeCancellation>,
+    mut stop_requested: Signal<bool>,
+    mut progress: Signal<Vec<DesktopRuntimeProgressEvent>>,
+    visual_streaming_fixture: bool,
+) {
+    let Some(control) = control else {
+        return;
+    };
+    control.request();
+    stop_requested.set(true);
+    if visual_streaming_fixture {
+        let mut projection = progress.write();
+        if projection
+            .iter()
+            .any(|event| event.phase == DesktopRuntimeProgressPhase::StopRequested)
+        {
+            return;
+        }
+        let sequence = projection
+            .last()
+            .map_or(1, |event| event.sequence.saturating_add(1));
+        projection.push(DesktopRuntimeProgressEvent {
+            sequence,
+            phase: DesktopRuntimeProgressPhase::StopRequested,
+        });
+    }
+}
+
+const fn desktop_runtime_progress_label(phase: DesktopRuntimeProgressPhase) -> &'static str {
+    match phase {
+        DesktopRuntimeProgressPhase::Preparing => "正在准备加密 Context 与 Runtime authority",
+        DesktopRuntimeProgressPhase::Dispatched => "exact Runtime turn 已派发",
+        DesktopRuntimeProgressPhase::TurnStarted => "Runtime 已确认开始",
+        DesktopRuntimeProgressPhase::ItemStarted => "正在处理下一项 Runtime 工作",
+        DesktopRuntimeProgressPhase::ItemCompleted => "Runtime 工作项已完成",
+        DesktopRuntimeProgressPhase::LocalActionDeclined => "本地写入请求已按默认策略拒绝",
+        DesktopRuntimeProgressPhase::StopRequested => "停止请求已交给协调器",
+        DesktopRuntimeProgressPhase::InterruptSent => "fenced interrupt 已发送",
+        DesktopRuntimeProgressPhase::Completed => "Runtime turn 已完成，正在采纳最终产物",
+        DesktopRuntimeProgressPhase::Interrupted => "Runtime 已确认中断",
+        DesktopRuntimeProgressPhase::Failed => "Runtime 已返回失败终态",
+        DesktopRuntimeProgressPhase::Uncertain => "Runtime 结果不确定，等待 reconcile",
+    }
+}
+
+const fn desktop_runtime_progress_display_label(
+    phase: DesktopRuntimeProgressPhase,
+    visual_streaming_fixture: bool,
+) -> &'static str {
+    if visual_streaming_fixture && matches!(phase, DesktopRuntimeProgressPhase::StopRequested) {
+        "VISUAL_FIXTURE · Stop 控件状态已触发"
+    } else {
+        desktop_runtime_progress_label(phase)
+    }
+}
+
+const fn desktop_runtime_progress_class(phase: DesktopRuntimeProgressPhase) -> &'static str {
+    match phase {
+        DesktopRuntimeProgressPhase::Completed | DesktopRuntimeProgressPhase::Interrupted => {
+            "terminal"
+        }
+        DesktopRuntimeProgressPhase::Failed | DesktopRuntimeProgressPhase::Uncertain => "danger",
+        DesktopRuntimeProgressPhase::StopRequested
+        | DesktopRuntimeProgressPhase::InterruptSent
+        | DesktopRuntimeProgressPhase::LocalActionDeclined => "attention",
+        DesktopRuntimeProgressPhase::Preparing
+        | DesktopRuntimeProgressPhase::Dispatched
+        | DesktopRuntimeProgressPhase::TurnStarted
+        | DesktopRuntimeProgressPhase::ItemStarted
+        | DesktopRuntimeProgressPhase::ItemCompleted => "active",
+    }
 }
 
 fn initial_surface() -> Surface {
@@ -3569,6 +5651,100 @@ fn app_shortcut(key: &Key, modifiers: Modifiers) -> Option<AppShortcut> {
     } else {
         None
     }
+}
+
+fn composer_should_submit(key: &Key, modifiers: Modifiers, is_composing: bool) -> bool {
+    *key == Key::Enter && !modifiers.contains(Modifiers::SHIFT) && !is_composing
+}
+
+fn cycle_dialog_focus(selector: &str, reverse: bool) {
+    let direction = if reverse { "-1" } else { "1" };
+    let script = format!(
+        r#"
+        (() => {{
+          const root = document.querySelector({selector:?});
+          if (!root) return;
+          const nodes = [...root.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+          if (!nodes.length) return;
+          const current = nodes.indexOf(document.activeElement);
+          const next = current < 0
+            ? ({direction} < 0 ? nodes.length - 1 : 0)
+            : (current + {direction} + nodes.length) % nodes.length;
+          nodes[next].focus();
+        }})()
+        "#
+    );
+    let _ = dioxus::document::eval(&script);
+}
+
+fn restore_ui_focus(element_id: &str) {
+    let script =
+        format!("requestAnimationFrame(() => document.getElementById({element_id:?})?.focus())");
+    let _ = dioxus::document::eval(&script);
+}
+
+fn begin_workpad_resize(start_x: f64) {
+    let script = format!(
+        r"
+        (() => {{
+          const root = document.documentElement;
+          const style = getComputedStyle(root);
+          const startWidth = parseFloat(style.getPropertyValue('--chat-w')) || 500;
+          const sideWidth = parseFloat(style.getPropertyValue('--side-w')) || 238;
+          const maxWidth = Math.max(440, window.innerWidth - sideWidth - 360);
+          const handle = document.getElementById('workpad-resize-handle');
+          const updateWidth = (width) => {{
+            const rounded = Math.round(width);
+            root.style.setProperty('--chat-w', `${{rounded}}px`);
+            handle?.setAttribute('aria-valuenow', String(rounded));
+            handle?.setAttribute('aria-valuetext', `${{rounded}}px Mission 会话宽度`);
+          }};
+          document.body.classList.add('resizing-workpad');
+          const move = (event) => {{
+            const width = Math.max(440, Math.min(maxWidth, startWidth + event.clientX - {start_x}));
+            updateWidth(width);
+          }};
+          const finish = () => {{
+            document.body.classList.remove('resizing-workpad');
+            window.removeEventListener('pointermove', move);
+            window.removeEventListener('pointerup', finish);
+            window.removeEventListener('pointercancel', finish);
+          }};
+          window.addEventListener('pointermove', move);
+          window.addEventListener('pointerup', finish, {{ once: true }});
+          window.addEventListener('pointercancel', finish, {{ once: true }});
+        }})()
+        "
+    );
+    let _ = dioxus::document::eval(&script);
+}
+
+fn nudge_workpad_width(delta: i32) {
+    let script = format!(
+        r"
+        (() => {{
+          const root = document.documentElement;
+          const style = getComputedStyle(root);
+          const current = parseFloat(style.getPropertyValue('--chat-w')) || 500;
+          const sideWidth = parseFloat(style.getPropertyValue('--side-w')) || 238;
+          const maxWidth = Math.max(440, window.innerWidth - sideWidth - 360);
+          const width = Math.round(Math.max(440, Math.min(maxWidth, current + {delta})));
+          root.style.setProperty('--chat-w', `${{width}}px`);
+          const handle = document.getElementById('workpad-resize-handle');
+          handle?.setAttribute('aria-valuenow', String(width));
+          handle?.setAttribute('aria-valuetext', `${{width}}px Mission 会话宽度`);
+        }})()
+        "
+    );
+    let _ = dioxus::document::eval(&script);
+}
+
+fn set_workpad_width(width: i32) {
+    let width = width.max(440);
+    let script = format!(
+        "document.documentElement.style.setProperty('--chat-w', '{width}px'); const handle = document.getElementById('workpad-resize-handle'); handle?.setAttribute('aria-valuenow', '{width}'); handle?.setAttribute('aria-valuetext', '{width}px Mission 会话宽度')"
+    );
+    let _ = dioxus::document::eval(&script);
 }
 
 fn dispatcher_stage_dot(stage: &MissionStage) -> &'static str {
@@ -4049,6 +6225,40 @@ mod tests {
             ActiveOverlay::Notifications.toggle(ActiveOverlay::Notifications),
             ActiveOverlay::None
         );
+        assert!(composer_should_submit(
+            &Key::Enter,
+            Modifiers::empty(),
+            false
+        ));
+        assert!(!composer_should_submit(
+            &Key::Enter,
+            Modifiers::SHIFT,
+            false
+        ));
+        assert!(!composer_should_submit(
+            &Key::Enter,
+            Modifiers::empty(),
+            true
+        ));
+        assert!(!composer_should_submit(
+            &Key::Character("a".into()),
+            Modifiers::empty(),
+            false
+        ));
+        assert_eq!(
+            desktop_runtime_progress_display_label(
+                DesktopRuntimeProgressPhase::StopRequested,
+                true,
+            ),
+            "VISUAL_FIXTURE · Stop 控件状态已触发"
+        );
+        assert_eq!(
+            desktop_runtime_progress_display_label(
+                DesktopRuntimeProgressPhase::StopRequested,
+                false,
+            ),
+            "停止请求已交给协调器"
+        );
     }
 
     #[test]
@@ -4078,6 +6288,50 @@ mod tests {
         }
         assert!(!css.contains("linear-gradient"));
         assert!(!css.contains("radial-gradient"));
+    }
+
+    #[test]
+    fn chat_first_interaction_contract_is_structural_and_truthful() {
+        let source = include_str!("lib.rs");
+        let css = include_str!("../assets/prototype.css");
+        for contract in [
+            "重播流式轨迹",
+            "停止重播",
+            "回到最新",
+            "上下文压缩记录结构",
+            "Mission Checkpoints",
+            "Runtime Profile",
+            "工作产物结构样例",
+            "No token · no account identity · no scopes",
+            "mission-composer-stop",
+            "event.data.is_composing()",
+            "continue_mission_and_run_cancellable_os",
+        ] {
+            assert!(
+                source.contains(contract),
+                "missing interaction contract {contract}"
+            );
+        }
+        for selector in [
+            ".fixture-stream-caret",
+            ".mission-progress-popover",
+            ".prototype-composer-attachments",
+            ".composer-tool-menu",
+            ".runtime-profile-menu",
+            ".composer-zone:not(.is-expanded)",
+            ".stream-stop-button",
+            ".prototype-detail-drawer",
+            ".prototype-connection-modal",
+            ".search-result.active",
+        ] {
+            assert!(
+                css.contains(selector),
+                "missing interaction selector {selector}"
+            );
+        }
+        assert!(css.contains(".prototype-thread .assistant-copy { font-size: 12.5px"));
+        assert!(source.contains("0 EffectIntent"));
+        assert!(source.contains("0 Receipt · 0 Verification"));
     }
 
     #[test]

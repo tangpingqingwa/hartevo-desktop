@@ -1,0 +1,133 @@
+Window: "Hartevo Desktop", App: HartevoAxBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text Hartevo
+				6 button 搜索所有项目与任务
+				7 button (collapsed) 查看全部项目通知, Help: 全部项目通知, Secondary Actions: Expand
+				8 text 美国健身器材机会研究
+				9 text 运行中
+				10 toggle button 置顶当前对象, Help: 切换视觉夹具中的置顶表现, Value: off
+				11 pop up button 当前对象操作
+				12 text 美国健身器材机会研究
+				13 toggle button 打开任务工作台, Value: off
+				14 container 项目与任务导航
+					15 button 在当前项目描述新任务
+					16 container 项目工作面
+						17 text 工作
+						18 button 总调度 运行中
+						19 button 当前状态 Project
+						20 button 全部任务 7
+						21 button 待确认 2
+						22 text 任务 · 进行中
+						23 text 4
+						24 button 美国健身器材机会研究 3/9 步 · 运行中 1
+						25 pop up button 美国健身器材机会研究 操作
+						26 button Q3 促销策略与节奏 2/9 步 · 运行中 1
+						27 pop up button Q3 促销策略与节奏 操作
+						28 button 新品着陆页文案 6/10 步 · 等待审批 1
+						29 pop up button 新品着陆页文案 操作
+						30 button 德国经销商邮件序列 0/10 步 · 等待用户 1
+						31 pop up button 德国经销商邮件序列 操作
+						32 text 自动任务
+						33 text 持续运行
+						34 button AI 推荐与引用监测 持续运行 1
+						35 pop up button AI 推荐与引用监测 操作
+						36 button 竞品价格与评论变化 持续运行 1
+						37 pop up button 竞品价格与评论变化 操作
+						38 button SEO 周度增长循环 持续运行 1
+						39 pop up button SEO 周度增长循环 操作
+						40 text 成果与工作面
+						41 button 成果与循环 Outcome
+						42 button 渠道运营 Channel
+						43 button 关系与 CRM CRM
+						44 button 达人与联盟 Partner
+						45 button 连接中心 Probe
+						46 button 能力与证据 E0–E5
+					47 container
+						48 pop up button 北美增长项目 本地 E2EE 同步
+						49 text 路径只用于本机数据层，不进入日志或 Release Evidence
+				50 container
+					51 text Mission Conversation
+					52 text 可以随时改变方向；不会扩大 Capability VISUAL_FIXTURE · prototype-baseline-v1
+					53 button 工作台
+				54 text 帮我分析美国健身器材品类机会，找出三个值得测试的产品。未经我批准，不要发布或花钱。
+				55 text 10:21
+				56 container 结论
+					57 container
+						58 text Hartevo 10:21
+						59 button (disabled) 重播视觉夹具的流式响应
+					60 text 我会先核对需求、竞争、利润空间与合规风险，再给出 3 个可以实际验证的方向。任何发布或支出都会先征求你确认。
+					61 container 系统理解的任务边界
+						62 container
+							63 text 已编译为 Hartevo Mission 你可以直接用自然语言修改
+						64 text 目标
+						65 text 找出 3 个可验证的品类机会
+						66 text 自动执行
+						67 text 研究、核验、生成草稿
+						68 text 必须确认
+						69 text 发布、支出、外部写入
+					70 container Mission 流式活动
+						71 container
+							72 text 运行轨迹 事件来自冻结视觉夹具 · 不构成 Runtime/Provider 证据
+						73 text 已载入 16 个冻结来源样例
+						74 text Search、Marketplace、社区与行业报告 · 视觉夹具
+						75 text DataForSEO Simulator · 只读
+						76 text 10:22
+						77 text 正在比较需求与竞争
+						78 text 统一数据口径，去重证据，标记数据时效
+						79 text Marketplace Intelligence · Candidate
+						80 text 10:24
+						81 text 机会报告结构已生成
+						82 text 3 个候选方向，16 条可追溯样例证据
+						83 text Evidence Oracle · Fixture
+						84 text 10:26
+						85 button (collapsed) 本次任务的能力与运行事件 1 Skill · 1 Plugin · 2 MCP · 3 Connectors, Secondary Actions: Expand
+						86 text 上下文压缩记录结构
+						87 text Truth correction、Pending Effect 与审批边界保持；fixture 未执行压缩。
+						88 text CTX · SAMPLE
+					89 text +
+					90 text 下一阶段建议连接 Meta 与邮件域
+					91 text 当前研究不受影响；只有进入投放或关系经营时才需要真实授权与 Probe。
+					92 button 查看连接建议
+					93 button 美国健身器材机会研究 研究报告 · 16 个冻结样例来源 在工作台打开
+					94 heading 结论, Value: 3
+						95 text 结论
+					96 text 可调哑铃的需求、利润空间和验证成本最均衡。折叠划船机适合作为第二梯队；髋外展训练器增长快，但需要先核查专利与供应链。
+					97 button (collapsed) 打开 Checkpoint 进度, Secondary Actions: Expand
+					98 container
+						99 button 回到最新
+						100 button 停止重播
+				101 text 北美增长项目 · 当前 Mission 持久会话
+				102 text 同一 Mission · Capability 不扩大
+				103 container
+					104 text 正在处理下一项 Runtime 工作 VISUAL_FIXTURE · 仅验证事件流、跟随状态与 Stop 交互；不构成 Runtime 或 Provider 执行证据。 可安全停止
+					105 container Runtime 事件流
+						106 text 正在准备加密 Context 与 Runtime authority
+						107 text #1
+						108 text exact Runtime turn 已派发
+						109 text #2
+						110 text Runtime 已确认开始
+						111 text #3
+						112 text 正在处理下一项 Runtime 工作
+						113 text #4
+				114 text Mission Conversation revision 1
+				115 text 消息会写入同一 Mission Stream；不会另建 Mission，也不会修改 Operating Contract 权限。
+				116 text entry area (disabled, settable, string) Operating Contract 目标、约束与停止条件, Placeholder: 当前 Mission 状态不接受续写，或它是 legacy bootstrap
+					117 text 当前 Mission 状态不接受续写，或它是 legacy bootstrap
+				118 container
+					119 button (collapsed) 添加附件或上下文, Secondary Actions: Expand
+					120 button (disabled) 语音输入未实现, Help: BLOCKED_ENV · 麦克风与本地转写尚未接线
+					121 button (collapsed) Runtime · NOT_CONFIGURED, Secondary Actions: Expand
+					122 text Provider · 未配置 · 无业务 Receipt Tokenizer · DEV_FALLBACK
+					123 button 停止 Runtime 交互结构样例, Help: VISUAL_FIXTURE · 仅切换 Stop 交互状态，不发送真实 interrupt
+	124 close button
+	125 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	126 minimize button
+	127 text Hartevo Desktop
+128 menu bar
+	129 HartevoAxBaseline
+	130 Edit
+	131 Help

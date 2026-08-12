@@ -1,12 +1,18 @@
 surface	status	artifact
-orchestrator	BLOCKED_ENV_SCREEN_CAPTURE	orchestrator-macos-content.png (preserved)
-current	BLOCKED_ENV_SCREEN_CAPTURE	current-macos-content.png (preserved)
-missions	BLOCKED_ENV_SCREEN_CAPTURE	missions-macos-content.png (preserved)
-channels	BLOCKED_ENV_SCREEN_CAPTURE	channels-macos-content.png (preserved)
-relationships	BLOCKED_ENV_SCREEN_CAPTURE	relationships-macos-content.png (preserved)
-partners	BLOCKED_ENV_SCREEN_CAPTURE	partners-macos-content.png (preserved)
-connections	BLOCKED_ENV_SCREEN_CAPTURE	connections-macos-content.png (preserved)
-outcomes	BLOCKED_ENV_SCREEN_CAPTURE	outcomes-macos-content.png (preserved)
-capability-evidence	BLOCKED_ENV_SCREEN_CAPTURE	capability-evidence-macos-content.png (preserved)
-settings	BLOCKED_ENV_SCREEN_CAPTURE	settings-macos-content.png (preserved)
-state-coverage	BLOCKED_ENV_SCREEN_CAPTURE	state-coverage-macos-content.png (preserved)
+orchestrator	PASS	orchestrator-macos-content.png
+mission-conversation	PASS	mission-conversation-macos-content.png
+mission-streaming	PASS	mission-streaming-macos-content.png
+mission-workpad	PASS	mission-workpad-macos-content.png
+mission-inspector	PASS	mission-inspector-macos-content.png
+mission-approval	PASS	mission-approval-macos-content.png
+mission-outcome	PASS	mission-outcome-macos-content.png
+current	PASS	current-macos-content.png
+missions	PASS	missions-macos-content.png
+channels	PASS	channels-macos-content.png
+relationships	PASS	relationships-macos-content.png
+partners	PASS	partners-macos-content.png
+connections	PASS	connections-macos-content.png
+outcomes	PASS	outcomes-macos-content.png
+capability-evidence	PASS	capability-evidence-macos-content.png
+settings	PASS	settings-macos-content.png
+state-coverage	PASS	state-coverage-macos-content.png

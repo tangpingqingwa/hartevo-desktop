@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 180" role="img" aria-labelledby="title desc">
+  <title id="title">美国健身器材需求趋势视觉夹具</title>
+  <desc id="desc">从冻结原型提取的两条标准化趋势线，只用于视觉回归，不构成真实市场数据。</desc>
+  <style>
+    .grid{fill:none;stroke:#eeeeef;stroke-width:1}.axis{fill:#929398;font:9px Geist,"SF Pro Text","Segoe UI",sans-serif}.gold{fill:none;stroke:#c8932f;stroke-width:2.3;stroke-linecap:round}.green{fill:none;stroke:#237a50;stroke-width:2.3;stroke-linecap:round}.point{fill:#c8932f;stroke:#fff;stroke-width:2}
+  </style>
+  <path class="grid" d="M38 20H506M38 62H506M38 104H506M38 146H506"/>
+  <text class="axis" x="11" y="23">100</text><text class="axis" x="18" y="65">75</text><text class="axis" x="18" y="107">50</text><text class="axis" x="18" y="149">25</text>
+  <path class="gold" d="M38 133 C74 122 102 108 138 111 S197 90 235 77 S297 68 336 55 S395 44 433 41 S473 50 506 31"/>
+  <path class="green" d="M38 148 C78 138 105 129 140 134 S199 120 236 115 S298 97 338 102 S398 85 435 90 S477 76 506 80"/>
+  <circle class="point" cx="506" cy="31" r="4"/>
+  <text class="axis" x="35" y="171">2025-06</text><text class="axis" x="153" y="171">2025-09</text><text class="axis" x="274" y="171">2025-12</text><text class="axis" x="395" y="171">2026-03</text><text class="axis" x="476" y="171">2026-05</text>
+</svg>

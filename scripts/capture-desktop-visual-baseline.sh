@@ -28,6 +28,12 @@ swiftc "$repo_root/scripts/crop-image.swift" -o "$crop_tool"
 
 surfaces=(
   orchestrator
+  mission-conversation
+  mission-streaming
+  mission-workpad
+  mission-inspector
+  mission-approval
+  mission-outcome
   current
   missions
   channels

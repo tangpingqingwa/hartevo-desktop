@@ -1,9 +1,13 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
@@ -122,6 +126,94 @@ pub struct DesktopMissionSubmission {
     pub snapshot: DesktopSnapshot,
     pub mission_id: MissionId,
     pub runtime_outcome: DesktopMissionRuntimeOutcome,
+}
+
+/// Cooperative UI-to-coordinator stop request for one bounded local Runtime
+/// turn. Requesting stop never hides the task or kills a process by PID; the
+/// coordinator converts it into the version-fenced Runtime interrupt command
+/// while it still owns the exact managed process and turn attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesktopRuntimeProgressPhase {
+    Preparing,
+    Dispatched,
+    TurnStarted,
+    ItemStarted,
+    ItemCompleted,
+    LocalActionDeclined,
+    StopRequested,
+    InterruptSent,
+    Completed,
+    Interrupted,
+    Failed,
+    Uncertain,
+}
+
+impl DesktopRuntimeProgressPhase {
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Interrupted | Self::Failed | Self::Uncertain
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopRuntimeProgressEvent {
+    pub sequence: u64,
+    pub phase: DesktopRuntimeProgressPhase,
+}
+
+#[derive(Debug, Default)]
+struct DesktopRuntimeProgressFeed {
+    next_sequence: u64,
+    events: VecDeque<DesktopRuntimeProgressEvent>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DesktopRuntimeCancellation {
+    requested: Arc<AtomicBool>,
+    progress: Arc<Mutex<DesktopRuntimeProgressFeed>>,
+}
+
+impl DesktopRuntimeCancellation {
+    pub fn request(&self) {
+        if !self.requested.swap(true, Ordering::AcqRel) {
+            self.record_progress(DesktopRuntimeProgressPhase::StopRequested);
+        }
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    pub fn progress_since(&self, sequence: u64) -> Vec<DesktopRuntimeProgressEvent> {
+        self.progress
+            .lock()
+            .map(|feed| {
+                feed.events
+                    .iter()
+                    .filter(|event| event.sequence > sequence)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn record_progress(&self, phase: DesktopRuntimeProgressPhase) {
+        let Ok(mut feed) = self.progress.lock() else {
+            return;
+        };
+        if phase.is_terminal() && feed.events.iter().any(|event| event.phase.is_terminal()) {
+            return;
+        }
+        feed.next_sequence = feed.next_sequence.saturating_add(1);
+        let sequence = feed.next_sequence;
+        feed.events
+            .push_back(DesktopRuntimeProgressEvent { sequence, phase });
+        while feed.events.len() > 128 {
+            feed.events.pop_front();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -519,12 +611,51 @@ impl DesktopDataPlane {
         )
     }
 
+    pub fn start_catalog_mission_and_run_cancellable_os(
+        &self,
+        request: DesktopCatalogMissionRequest,
+        cancellation: &DesktopRuntimeCancellation,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        let runtime = discover_runtime();
+        self.start_catalog_mission_and_run_with_cancellation(
+            &secret_store,
+            request,
+            runtime
+                .configuration
+                .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
+            runtime.projection.status,
+            Some(cancellation),
+            now,
+        )
+    }
+
     fn start_catalog_mission_and_run_with(
         &self,
         secret_store: &impl SecretStore,
         request: DesktopCatalogMissionRequest,
         runtime: Option<DesktopRuntimeSource>,
         availability: DesktopRuntimeAvailabilityStatus,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        self.start_catalog_mission_and_run_with_cancellation(
+            secret_store,
+            request,
+            runtime,
+            availability,
+            None,
+            now,
+        )
+    }
+
+    fn start_catalog_mission_and_run_with_cancellation(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopCatalogMissionRequest,
+        runtime: Option<DesktopRuntimeSource>,
+        availability: DesktopRuntimeAvailabilityStatus,
+        cancellation: Option<&DesktopRuntimeCancellation>,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         if request.goal.trim().is_empty()
@@ -560,7 +691,7 @@ impl DesktopDataPlane {
             },
             now,
         )?;
-        self.run_existing_mission_runtime_with(
+        self.run_existing_mission_runtime_with_cancellation(
             &mut service,
             secret_store,
             runtime_reconciliation,
@@ -569,6 +700,7 @@ impl DesktopDataPlane {
             mission.id,
             runtime,
             availability,
+            cancellation,
             now,
         )
     }
@@ -635,6 +767,28 @@ impl DesktopDataPlane {
         )
     }
 
+    pub fn resume_mission_runtime_cancellable_os(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        cancellation: &DesktopRuntimeCancellation,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        let runtime = discover_runtime();
+        self.resume_mission_runtime_with_cancellation(
+            &secret_store,
+            project_id,
+            mission_id,
+            runtime
+                .configuration
+                .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
+            runtime.projection.status,
+            Some(cancellation),
+            now,
+        )
+    }
+
     /// Runs only the current registered Application Checkpoint handler. The
     /// call deliberately supplies no Runtime source; if the route changed
     /// concurrently, dispatch returns the newly fenced route without starting
@@ -674,6 +828,26 @@ impl DesktopDataPlane {
                 .configuration
                 .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
             runtime.projection.status,
+            now,
+        )
+    }
+
+    pub fn continue_mission_and_run_cancellable_os(
+        &self,
+        request: DesktopMissionContinuationRequest,
+        cancellation: &DesktopRuntimeCancellation,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        let runtime = discover_runtime();
+        self.continue_mission_and_run_with_cancellation(
+            &secret_store,
+            request,
+            runtime
+                .configuration
+                .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
+            runtime.projection.status,
+            Some(cancellation),
             now,
         )
     }
@@ -739,6 +913,25 @@ impl DesktopDataPlane {
         availability: DesktopRuntimeAvailabilityStatus,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        self.continue_mission_and_run_with_cancellation(
+            secret_store,
+            request,
+            runtime,
+            availability,
+            None,
+            now,
+        )
+    }
+
+    fn continue_mission_and_run_with_cancellation(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopMissionContinuationRequest,
+        runtime: Option<DesktopRuntimeSource>,
+        availability: DesktopRuntimeAvailabilityStatus,
+        cancellation: Option<&DesktopRuntimeCancellation>,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         if request.body.trim().is_empty() || request.idempotency_key.trim().is_empty() {
             return Err(DesktopDataError::InvalidMissionContinuation);
         }
@@ -758,7 +951,7 @@ impl DesktopDataPlane {
             },
             now,
         )?;
-        self.run_existing_mission_runtime_with(
+        self.run_existing_mission_runtime_with_cancellation(
             &mut service,
             secret_store,
             runtime_reconciliation,
@@ -767,6 +960,7 @@ impl DesktopDataPlane {
             mission_id,
             runtime,
             availability,
+            cancellation,
             now,
         )
     }
@@ -780,6 +974,28 @@ impl DesktopDataPlane {
         availability: DesktopRuntimeAvailabilityStatus,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        self.resume_mission_runtime_with_cancellation(
+            secret_store,
+            project_id,
+            mission_id,
+            runtime,
+            availability,
+            None,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resume_mission_runtime_with_cancellation(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        runtime: Option<DesktopRuntimeSource>,
+        availability: DesktopRuntimeAvailabilityStatus,
+        cancellation: Option<&DesktopRuntimeCancellation>,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
         let (mut service, runtime_reconciliation, context_session) =
             self.open_ready_runtime_project(secret_store, project_id, now)?;
         let mission = service.load_mission(project_id, mission_id)?;
@@ -789,7 +1005,7 @@ impl DesktopDataPlane {
         {
             return Err(ApplicationError::LocalRuntimeMissionNotSchedulable.into());
         }
-        self.run_existing_mission_runtime_with(
+        self.run_existing_mission_runtime_with_cancellation(
             &mut service,
             secret_store,
             runtime_reconciliation,
@@ -798,6 +1014,7 @@ impl DesktopDataPlane {
             mission.id,
             runtime,
             availability,
+            cancellation,
             now,
         )
     }
@@ -858,6 +1075,41 @@ impl DesktopDataPlane {
         availability: DesktopRuntimeAvailabilityStatus,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        self.run_existing_mission_runtime_with_cancellation(
+            service,
+            secret_store,
+            runtime_reconciliation,
+            context_session,
+            project_id,
+            mission_id,
+            runtime,
+            availability,
+            None,
+            now,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the cancellable Desktop Runtime Journey keeps the exact managed process and turn attempt inside one coordinator so a UI stop request becomes a fenced Runtime interrupt rather than a cosmetic task abort"
+    )]
+    fn run_existing_mission_runtime_with_cancellation(
+        &self,
+        service: &mut ApplicationService,
+        secret_store: &impl SecretStore,
+        runtime_reconciliation: RuntimeTurnStartupReconciliation,
+        context_session: &ProjectContextMaterialSession,
+        project_id: &ProjectId,
+        mission_id: MissionId,
+        runtime: Option<DesktopRuntimeSource>,
+        availability: DesktopRuntimeAvailabilityStatus,
+        cancellation: Option<&DesktopRuntimeCancellation>,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        if let Some(control) = cancellation {
+            control.record_progress(DesktopRuntimeProgressPhase::Preparing);
+        }
         let mut mission = service.load_mission(project_id, &mission_id)?;
         if mission.project_id != *project_id {
             return Err(ApplicationError::LocalRuntimeMissionNotSchedulable.into());
@@ -1277,9 +1529,39 @@ impl DesktopDataPlane {
             );
         }
 
+        if let Some(control) = cancellation {
+            control.record_progress(DesktopRuntimeProgressPhase::Dispatched);
+        }
+
         let mut attempt = dispatch.attempt;
         let mut consecutive_timeouts = 0_u32;
+        let mut cooperative_interrupt_sent = false;
         for _ in 0..128 {
+            if !cooperative_interrupt_sent
+                && cancellation.is_some_and(DesktopRuntimeCancellation::is_requested)
+                && matches!(
+                    attempt.status,
+                    RuntimeTurnStatus::Running | RuntimeTurnStatus::WaitingLocalApproval
+                )
+            {
+                logical_millis += 1;
+                attempt = service.interrupt_context_runtime_turn(
+                    &mut managed,
+                    &InterruptContextRuntimeTurn {
+                        project_id: project_id.clone(),
+                        id: turn_id.clone(),
+                        expected_revision: attempt.revision,
+                        response_timeout: StdDuration::from_secs(5),
+                    },
+                    now + Duration::milliseconds(logical_millis),
+                )?;
+                cooperative_interrupt_sent = true;
+                consecutive_timeouts = 0;
+                if let Some(control) = cancellation {
+                    control.record_progress(DesktopRuntimeProgressPhase::InterruptSent);
+                }
+                continue;
+            }
             logical_millis += 1;
             let observation = service.observe_context_runtime_turn(
                 &mut managed,
@@ -1292,7 +1574,30 @@ impl DesktopDataPlane {
                 now + Duration::milliseconds(logical_millis),
             )?;
             attempt = observation.attempt;
+            if let Some(control) = cancellation {
+                let phase = match &observation.kind {
+                    hartevo_application::ContextRuntimeTurnObservationKind::Event(
+                        MappedTurnEventKind::TurnStarted,
+                    ) => Some(DesktopRuntimeProgressPhase::TurnStarted),
+                    hartevo_application::ContextRuntimeTurnObservationKind::Event(
+                        MappedTurnEventKind::ItemStarted,
+                    ) => Some(DesktopRuntimeProgressPhase::ItemStarted),
+                    hartevo_application::ContextRuntimeTurnObservationKind::Event(
+                        MappedTurnEventKind::ItemCompleted,
+                    ) => Some(DesktopRuntimeProgressPhase::ItemCompleted),
+                    hartevo_application::ContextRuntimeTurnObservationKind::Uncertain => {
+                        Some(DesktopRuntimeProgressPhase::Uncertain)
+                    }
+                    _ => None,
+                };
+                if let Some(phase) = phase {
+                    control.record_progress(phase);
+                }
+            }
             if let Some(request) = observation.local_approval_request {
+                if let Some(control) = cancellation {
+                    control.record_progress(DesktopRuntimeProgressPhase::LocalActionDeclined);
+                }
                 logical_millis += 1;
                 attempt = service.respond_context_runtime_local_approval(
                     &mut managed,
@@ -1324,6 +1629,9 @@ impl DesktopDataPlane {
                 break;
             }
             if consecutive_timeouts >= 5 {
+                if attempt.status == RuntimeTurnStatus::InterruptRequested {
+                    break;
+                }
                 logical_millis += 1;
                 attempt = service.interrupt_context_runtime_turn(
                     &mut managed,
@@ -1415,6 +1723,21 @@ impl DesktopDataPlane {
             | RuntimeTurnStatus::InterruptRequested
             | RuntimeTurnStatus::Uncertain => DesktopMissionRuntimeOutcome::Uncertain,
         };
+        if let Some(control) = cancellation {
+            let phase = match attempt.status {
+                RuntimeTurnStatus::Completed => DesktopRuntimeProgressPhase::Completed,
+                RuntimeTurnStatus::Interrupted => DesktopRuntimeProgressPhase::Interrupted,
+                RuntimeTurnStatus::Failed => DesktopRuntimeProgressPhase::Failed,
+                RuntimeTurnStatus::Prepared
+                | RuntimeTurnStatus::Dispatching
+                | RuntimeTurnStatus::Running
+                | RuntimeTurnStatus::WaitingLocalApproval
+                | RuntimeTurnStatus::ApprovalResponding
+                | RuntimeTurnStatus::InterruptRequested
+                | RuntimeTurnStatus::Uncertain => DesktopRuntimeProgressPhase::Uncertain,
+            };
+            control.record_progress(phase);
+        }
         self.finish_mission_submission(
             service,
             secret_store,
@@ -2419,6 +2742,77 @@ sleep 30"#
             provider: "fixture-provider".into(),
             model: "fixture-model".into(),
             command_builder: Box::new(completed_runtime_fixture_command),
+        }
+    }
+
+    #[cfg(unix)]
+    fn interruptible_runtime_fixture_command(
+        project_root: &Path,
+        runtime_home: &Path,
+    ) -> RuntimeCommand {
+        let project_root = project_root
+            .canonicalize()
+            .expect("canonical fixture project root");
+        let runtime_home = runtime_home
+            .canonicalize()
+            .expect("canonical fixture runtime home");
+        let [
+            initialize_response,
+            thread_response,
+            turn_started,
+            turn_response,
+        ] = runtime_fixture_start_messages(&project_root, &runtime_home);
+        let turn_interrupted = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {
+                "threadId": "desktop-fixture-thread",
+                "turn": {"id": "desktop-fixture-turn", "status": "interrupted"},
+            },
+        })
+        .to_string();
+        let mut command = RuntimeCommand::new(PathBuf::from("/bin/sh"), &project_root);
+        command.args = vec![
+            "-c".into(),
+            r#"IFS= read -r initialize
+case "$initialize" in *'"method":"initialize"'*) ;; *) exit 51 ;; esac
+printf '%s\n' "$1"
+IFS= read -r thread
+case "$thread" in *'"method":"thread/start"'*) ;; *) exit 52 ;; esac
+printf '%s\n' "$2"
+IFS= read -r turn
+case "$turn" in *'"method":"turn/start"'*) ;; *) exit 53 ;; esac
+printf '%s\n' "$3"
+printf '%s\n' "$4"
+IFS= read -r interrupt
+case "$interrupt" in *'"method":"turn/interrupt"'*) ;; *) exit 54 ;; esac
+interrupt_id="$(printf '%s\n' "$interrupt" | /usr/bin/sed -E 's/.*"id":([^,}]+).*/\1/')"
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$interrupt_id"
+printf '%s\n' "$5"
+sleep 30"#
+                .into(),
+            "hartevo-desktop-interrupt-runtime-fixture".into(),
+            initialize_response,
+            thread_response,
+            turn_started,
+            turn_response,
+            turn_interrupted,
+        ];
+        command.environment.insert(
+            "INTERPRETER_HOME".into(),
+            runtime_home.to_string_lossy().into_owned(),
+        );
+        command.openinterpreter_home = Some(runtime_home);
+        command.shutdown_grace = StdDuration::from_millis(50);
+        command
+    }
+
+    #[cfg(unix)]
+    fn interruptible_runtime_fixture_source() -> DesktopRuntimeSource {
+        DesktopRuntimeSource::Fixture {
+            provider: "fixture-provider".into(),
+            model: "fixture-model".into(),
+            command_builder: Box::new(interruptible_runtime_fixture_command),
         }
     }
 
@@ -3496,6 +3890,104 @@ sleep 30"#;
                 .mission_events(&project_id, &submission.mission_id)
                 .expect("unchanged events"),
             events_before_replay
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cooperative_desktop_stop_becomes_exact_runtime_interrupt() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let cancellation = DesktopRuntimeCancellation::default();
+        let observer = cancellation.clone();
+        cancellation.request();
+        assert!(observer.is_requested());
+
+        let submission = plane
+            .start_catalog_mission_and_run_with_cancellation(
+                &secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-04".into(),
+                    mode: OperatingMode::Campaign,
+                    title: Some("Interruptible social matrix turn".into()),
+                    goal: "Prepare one reviewable draft and stop when requested".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    budget_minor: 0,
+                    currency: "USD".into(),
+                },
+                Some(interruptible_runtime_fixture_source()),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                Some(&cancellation),
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("cooperative stop finishes through the managed Runtime");
+        assert_eq!(
+            submission.runtime_outcome,
+            DesktopMissionRuntimeOutcome::Interrupted
+        );
+        let progress = cancellation.progress_since(0);
+        assert!(
+            progress
+                .windows(2)
+                .all(|events| events[0].sequence < events[1].sequence)
+        );
+        let phases = progress.iter().map(|event| event.phase).collect::<Vec<_>>();
+        assert_eq!(
+            phases.first(),
+            Some(&DesktopRuntimeProgressPhase::StopRequested)
+        );
+        assert_eq!(
+            phases.last(),
+            Some(&DesktopRuntimeProgressPhase::Interrupted)
+        );
+        for required in [
+            DesktopRuntimeProgressPhase::Preparing,
+            DesktopRuntimeProgressPhase::Dispatched,
+            DesktopRuntimeProgressPhase::InterruptSent,
+        ] {
+            assert!(
+                phases.contains(&required),
+                "missing progress phase {required:?}"
+            );
+        }
+        assert!(
+            phases
+                .iter()
+                .position(|phase| *phase == DesktopRuntimeProgressPhase::InterruptSent)
+                < phases
+                    .iter()
+                    .position(|phase| *phase == DesktopRuntimeProgressPhase::Interrupted)
+        );
+        assert_eq!(
+            cancellation.progress_since(progress.last().expect("terminal progress event").sequence),
+            Vec::<DesktopRuntimeProgressEvent>::new()
+        );
+        let projected = submission.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == submission.mission_id)
+            .expect("interrupted Mission projection");
+        assert_eq!(projected.work_product_count, 0);
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(3))
+            .expect("reopen interrupted Runtime state");
+        let turn = service
+            .latest_runtime_turn_for_mission(&project_id, &submission.mission_id)
+            .expect("turn query")
+            .expect("interrupted turn");
+        assert_eq!(turn.status, RuntimeTurnStatus::Interrupted);
+        assert!(
+            service
+                .latest_runtime_turn_private_message(&project_id, &turn.id)
+                .expect("private message query")
+                .is_none()
         );
     }
 

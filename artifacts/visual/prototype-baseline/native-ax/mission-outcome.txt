@@ -1,0 +1,88 @@
+Window: "Hartevo Desktop", App: HartevoAxBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text Hartevo
+				6 button 搜索所有项目与任务
+				7 button (collapsed) 查看全部项目通知, Help: 全部项目通知, Secondary Actions: Expand
+				8 text 新品着陆页文案
+				9 text 等待审批
+				10 toggle button 置顶当前对象, Help: 切换视觉夹具中的置顶表现, Value: off
+				11 pop up button 当前对象操作
+				12 text 新品着陆页文案
+				13 toggle button 打开任务工作台, Value: off
+				14 container 项目与任务导航
+					15 button 在当前项目描述新任务
+					16 container 项目工作面
+						17 text 工作
+						18 button 总调度 运行中
+						19 button 当前状态 Project
+						20 button 全部任务 7
+						21 button 待确认 2
+						22 text 任务 · 进行中
+						23 text 4
+						24 button 美国健身器材机会研究 3/9 步 · 运行中 1
+						25 pop up button 美国健身器材机会研究 操作
+						26 button Q3 促销策略与节奏 2/9 步 · 运行中 1
+						27 pop up button Q3 促销策略与节奏 操作
+						28 button 新品着陆页文案 6/10 步 · 等待审批 1
+						29 pop up button 新品着陆页文案 操作
+						30 button 德国经销商邮件序列 0/10 步 · 等待用户 1
+						31 pop up button 德国经销商邮件序列 操作
+						32 text 自动任务
+						33 text 持续运行
+						34 button AI 推荐与引用监测 持续运行 1
+						35 pop up button AI 推荐与引用监测 操作
+						36 button 竞品价格与评论变化 持续运行 1
+						37 pop up button 竞品价格与评论变化 操作
+						38 button SEO 周度增长循环 持续运行 1
+						39 pop up button SEO 周度增长循环 操作
+						40 text 成果与工作面
+						41 button 成果与循环 Outcome
+						42 button 渠道运营 Channel
+						43 button 关系与 CRM CRM
+						44 button 达人与联盟 Partner
+						45 button 连接中心 Probe
+						46 button 能力与证据 E0–E5
+					47 container
+						48 pop up button 北美增长项目 本地 E2EE 同步
+						49 text 路径只用于本机数据层，不进入日志或 Release Evidence
+				50 container
+					51 text Mission Conversation
+					52 text 可以随时改变方向；不会扩大 Capability VISUAL_FIXTURE · prototype-baseline-v1
+					53 button 工作台
+				54 container
+					55 text Hartevo
+					56 text 结构预览
+					57 text VISUAL_FIXTURE · 未执行
+					58 text 此状态只验证结果区交互与布局；没有 ProviderReceipt、Verification、OutcomeEvent 或支出。 下面是结果区的视觉结构样例。没有真实 ProviderReceipt、Verification 或 OutcomeEvent，因此所有行保持未执行或未测量。
+					59 container 结果结构样例
+						60 text $0.00
+						61 text 真实支出
+						62 text $1,400.00
+						63 text 合同上限样例
+						64 text 0
+						65 text Verified Effects
+					66 text Provider acceptance 没有真实请求 Receipt unavailable 未执行 Public readback 没有公开对象 URL Verification unavailable 未验证 Outcome attribution 没有不可变业务事件 OutcomeEvent unavailable 未测量 下一步仍由用户决定 Continue / Stop / Scale / Test；不会因为预览结果而推进 Mission。
+					67 button 返回审批结构
+				68 container
+					69 text 结果区只是结构预览；你可以返回审批或写下下一步判断 北美增长项目 · ⌘K 随时聚焦同一 Mission
+					70 button 写下下一步
+					71 button 暂时收起建议
+				72 text entry area (settable, string) Operating Contract 目标、约束与停止条件, Placeholder: 继续当前 Mission，或写明纠正与新约束…
+					73 text 继续当前 Mission，或写明纠正与新约束…
+				74 container
+					75 button (collapsed) 添加附件或上下文, Secondary Actions: Expand
+					76 button (disabled) 语音输入未实现, Help: BLOCKED_ENV · 麦克风与本地转写尚未接线
+					77 button (collapsed) Runtime · NOT_CONFIGURED, Secondary Actions: Expand
+					78 button (disabled) 续写当前持久 Mission Conversation
+	79 close button
+	80 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	81 minimize button
+	82 text Hartevo Desktop
+83 menu bar
+	84 HartevoAxBaseline
+	85 Edit
+	86 Help
