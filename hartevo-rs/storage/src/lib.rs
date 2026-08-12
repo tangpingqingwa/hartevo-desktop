@@ -133,6 +133,50 @@ pub struct DomainEventRecord {
     pub recorded_at: DateTime<Utc>,
 }
 
+#[derive(Debug)]
+struct StoredDomainEventRow {
+    sequence: i64,
+    project_id: String,
+    mission_id: Option<String>,
+    event_type: String,
+    payload: String,
+    recorded_at: String,
+}
+
+impl StoredDomainEventRow {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            sequence: row.get(0)?,
+            project_id: row.get(1)?,
+            mission_id: row.get(2)?,
+            event_type: row.get(3)?,
+            payload: row.get(4)?,
+            recorded_at: row.get(5)?,
+        })
+    }
+
+    fn decode(self) -> Result<DomainEventRecord, StorageError> {
+        Ok(DomainEventRecord {
+            sequence: self.sequence,
+            project_id: ProjectId::from_stable(self.project_id),
+            mission_id: self.mission_id.map(MissionId::from_stable),
+            event_type: self.event_type,
+            payload: serde_json::from_str(&self.payload)?,
+            recorded_at: DateTime::parse_from_rfc3339(&self.recorded_at)?.with_timezone(&Utc),
+        })
+    }
+}
+
+fn collect_domain_event_records(
+    rows: impl Iterator<Item = rusqlite::Result<StoredDomainEventRow>>,
+) -> Result<Vec<DomainEventRecord>, StorageError> {
+    rows.map(|row| {
+        row.map_err(StorageError::from)
+            .and_then(StoredDomainEventRow::decode)
+    })
+    .collect()
+}
+
 impl ProjectStore {
     pub fn open(path: &Path, key: &DatabaseKey) -> Result<Self, StorageError> {
         let path = validated_database_path(path)?;
@@ -335,30 +379,29 @@ impl ProjectStore {
              WHERE project_id = ?1 AND mission_id = ?2
              ORDER BY sequence ASC",
         )?;
-        let rows =
-            statement.query_map(params![project_id.as_str(), mission_id.as_str()], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })?;
+        let rows = statement.query_map(
+            params![project_id.as_str(), mission_id.as_str()],
+            StoredDomainEventRow::read,
+        )?;
+        collect_domain_event_records(rows)
+    }
 
-        rows.map(|row| {
-            let (sequence, project_id, mission_id, event_type, payload, recorded_at) = row?;
-            Ok(DomainEventRecord {
-                sequence,
-                project_id: ProjectId::from_stable(project_id),
-                mission_id: mission_id.map(MissionId::from_stable),
-                event_type,
-                payload: serde_json::from_str(&payload)?,
-                recorded_at: DateTime::parse_from_rfc3339(&recorded_at)?.with_timezone(&Utc),
-            })
-        })
-        .collect()
+    /// Returns every persisted event in one project, including events that
+    /// intentionally do not belong to a Mission. Project loading is the
+    /// scope and integrity gate; this read path never repairs or reconciles.
+    pub fn events_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<DomainEventRecord>, StorageError> {
+        self.load_project(project_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, project_id, mission_id, event_type, payload_json, recorded_at
+             FROM domain_events
+             WHERE project_id = ?1
+             ORDER BY sequence ASC",
+        )?;
+        let rows = statement.query_map([project_id.as_str()], StoredDomainEventRow::read)?;
+        collect_domain_event_records(rows)
     }
 
     pub fn schema_version(&self) -> Result<i64, StorageError> {
@@ -5041,6 +5084,13 @@ mod tests {
         .expect("mission")
     }
 
+    fn outbox_row_count(store: &ProjectStore) -> i64 {
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM outbox_messages", [], |row| row.get(0))
+            .expect("outbox row count")
+    }
+
     fn catalog_mission(project_id: &str, mission_id: &str) -> Mission {
         let contract = MissionContract::bootstrap(
             "Decide whether to enter Germany",
@@ -8898,6 +8948,152 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(events[0].sequence < events[1].sequence);
         assert_eq!(events[1].event_type, "goal.confirmed");
+    }
+
+    struct ProjectEventReadFixture {
+        store: ProjectStore,
+        first: Project,
+        second: Project,
+        mission: Mission,
+        project_sequence: i64,
+        other_sequence: i64,
+        mission_sequence: i64,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ProjectEventReadState {
+        first: Project,
+        second: Project,
+        mission: Mission,
+        first_events: Vec<DomainEventRecord>,
+        second_events: Vec<DomainEventRecord>,
+        outbox_count: i64,
+    }
+
+    impl ProjectEventReadFixture {
+        fn build() -> Self {
+            let mut store = ProjectStore::in_memory().expect("store");
+            let first = project("project-event-scope-a", "/tmp/project-event-scope-a");
+            let second = Project::create_local(
+                hartevo_domain_kernel::TenantId::from("tenant-2"),
+                ProjectId::from("project-event-scope-b"),
+                "project-event-scope-b",
+                "",
+                "/tmp/project-event-scope-b",
+                StorageMode::LocalExisting,
+            )
+            .expect("second tenant project");
+            let mission = mission(first.id.as_str(), "mission-event-scope-a");
+            store.save_project(&first).expect("first project");
+            store.save_project(&second).expect("second project");
+            store.save_mission(&mission).expect("first project Mission");
+            let project_sequence = store
+                .append_event(
+                    &first.id,
+                    None,
+                    "project.authorization_changed",
+                    &serde_json::json!({"revision": 2}),
+                    now(),
+                )
+                .expect("project event");
+            let other_sequence = store
+                .append_event(
+                    &second.id,
+                    None,
+                    "project.keyring_ready",
+                    &serde_json::json!({"revision": 1}),
+                    now() + Duration::seconds(1),
+                )
+                .expect("other project event");
+            let mission_sequence = store
+                .append_event(
+                    &first.id,
+                    Some(&mission.id),
+                    "mission.started",
+                    &serde_json::json!({"revision": 1}),
+                    now() + Duration::seconds(2),
+                )
+                .expect("Mission event");
+            Self {
+                store,
+                first,
+                second,
+                mission,
+                project_sequence,
+                other_sequence,
+                mission_sequence,
+            }
+        }
+
+        fn capture(&self) -> ProjectEventReadState {
+            ProjectEventReadState {
+                first: self
+                    .store
+                    .load_project(&self.first.id)
+                    .expect("first project"),
+                second: self
+                    .store
+                    .load_project(&self.second.id)
+                    .expect("second project"),
+                mission: self
+                    .store
+                    .load_mission(&self.first.id, &self.mission.id)
+                    .expect("Mission"),
+                first_events: self
+                    .store
+                    .events_for_project(&self.first.id)
+                    .expect("all first-project events"),
+                second_events: self
+                    .store
+                    .events_for_project(&self.second.id)
+                    .expect("all second-project events"),
+                outbox_count: outbox_row_count(&self.store),
+            }
+        }
+
+        fn assert_exact_scope_and_order(&self, state: &ProjectEventReadState) {
+            assert_eq!(
+                state
+                    .first_events
+                    .iter()
+                    .map(|event| event.sequence)
+                    .collect::<Vec<_>>(),
+                vec![self.project_sequence, self.mission_sequence]
+            );
+            assert!(state.first_events[0].mission_id.is_none());
+            assert_eq!(
+                state.first_events[0].event_type,
+                "project.authorization_changed"
+            );
+            assert_eq!(
+                state.first_events[0].payload,
+                serde_json::json!({"revision": 2})
+            );
+            assert_eq!(
+                state.first_events[1].mission_id.as_ref(),
+                Some(&self.mission.id)
+            );
+            assert_eq!(state.first_events[1].event_type, "mission.started");
+            assert!(state.first_events[0].sequence < state.first_events[1].sequence);
+            assert_eq!(state.second_events.len(), 1);
+            assert_eq!(state.second_events[0].sequence, self.other_sequence);
+            assert_eq!(state.second_events[0].project_id, self.second.id);
+            assert!(state.second_events[0].mission_id.is_none());
+        }
+    }
+
+    #[test]
+    fn project_event_reads_include_unscoped_events_in_order_without_mutation() {
+        let fixture = ProjectEventReadFixture::build();
+        let before = fixture.capture();
+        fixture.assert_exact_scope_and_order(&before);
+        assert!(matches!(
+            fixture
+                .store
+                .events_for_project(&ProjectId::from("project-event-scope-missing")),
+            Err(StorageError::ProjectNotFound(_))
+        ));
+        assert_eq!(fixture.capture(), before);
     }
 
     #[test]

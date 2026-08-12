@@ -372,6 +372,10 @@ impl UiFailure {
                 code: "WAITING_USER".into(),
                 message: "Recovery Kit 必须是此前导出的 64 位十六进制密钥；Hartevo 不会代替用户保存或猜测恢复密钥。".into(),
             },
+            DesktopDataError::RuntimeSubscriptionContextMismatch => Self {
+                code: "STALE_SELECTION".into(),
+                message: "Runtime 订阅句柄与当前 Tenant / Project 上下文不一致，请重新选择后重试；未读取正文或写入状态。".into(),
+            },
             DesktopDataError::ProjectNotFound(_)
             | DesktopDataError::ProjectEncryptionAlreadyProvisioned(_) => Self {
                 code: "STALE_SELECTION".into(),
