@@ -13,16 +13,17 @@ use std::time::Duration as StdDuration;
 use chrono::{DateTime, Duration, Utc};
 use hartevo_application::{
     AdoptRuntimeTurnDraft, AppendMissionConversationMessage, ApplicationError,
-    ApplicationMissionCheckpointExecution, ApplicationService, ConfirmHumanMissionCheckpoint,
-    CreateProject, DecideVm11OutcomeReview, DesktopInventoryProjection,
-    DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
+    ApplicationMissionCheckpointExecution, ApplicationService, CatalogMissionExecutionHandle,
+    ConfirmHumanMissionCheckpoint, CreateProject, DecideVm11OutcomeReview,
+    DesktopInventoryProjection, DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
     EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
     FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn, KeyAdministrationAuthorization,
     MissionCheckpointDispatchState, MissionRuntimeProjection, ObserveContextRuntimeTurn,
     PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
     ProvisionProjectEncryption, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
     ResearchPacket, RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime,
-    RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission,
+    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTurnDispatchDisposition,
+    StartCatalogMission, StartMission,
 };
 use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
@@ -293,6 +294,27 @@ pub struct DesktopCatalogMissionRequest {
     pub kpis: BTreeMap<String, KpiContract>,
     pub budget_minor: i64,
     pub currency: String,
+}
+
+/// Result of the atomic Catalog Mission start only. A durable, content-free
+/// handle is available for later Runtime-text pulls, but no Runtime or Effect
+/// has been dispatched and the handle is not execution-start evidence.
+#[derive(Clone, PartialEq)]
+pub struct DesktopCatalogMissionExecutionStart {
+    pub snapshot: DesktopSnapshot,
+    pub handle: CatalogMissionExecutionHandle,
+}
+
+impl fmt::Debug for DesktopCatalogMissionExecutionStart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopCatalogMissionExecutionStart")
+            .field("handle", &self.handle)
+            .field("project_count", &self.snapshot.inventory.projects.len())
+            .field("runtime_dispatched", &false)
+            .field("external_effect_executed", &false)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -776,6 +798,73 @@ impl DesktopDataPlane {
         )
     }
 
+    /// Atomically creates one exact Catalog Mission and returns its durable
+    /// content-free subscription handle. This path deliberately performs no
+    /// startup reconciliation, Runtime dispatch/execution, or Effect work;
+    /// the returned snapshot may include a read-only Runtime availability
+    /// probe.
+    pub fn start_catalog_mission_execution_os(
+        &self,
+        request: DesktopCatalogMissionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopCatalogMissionExecutionStart, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.start_catalog_mission_execution_with(&secret_store, request, now)
+    }
+
+    fn start_catalog_mission_execution_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopCatalogMissionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopCatalogMissionExecutionStart, DesktopDataError> {
+        self.revalidate_database_entry()?;
+        let database_secret = self.database_secret(secret_store)?;
+        let mut service = self.open_read_application_from_secret(&database_secret)?;
+        self.require_project_context_access(&service, secret_store, &request.project_id, now)?;
+        let command = Self::catalog_mission_start_command(&service, request)?;
+        let started = service.start_catalog_mission_execution(command, now)?;
+        let handle = started.handle().clone();
+        let snapshot = self.build_snapshot(
+            &service,
+            secret_store,
+            no_runtime_turn_startup_reconciliation(),
+            load_product_evidence(now)?,
+            now,
+        )?;
+        Ok(DesktopCatalogMissionExecutionStart { snapshot, handle })
+    }
+
+    /// Pulls one integrity-checked page from the encrypted Runtime text ledger
+    /// after exact Tenant/Project/Device context authorization. The signed
+    /// Application handle and cursor are returned unchanged; this read cannot
+    /// reconcile startup state or mutate Mission, Event, Outbox, or Runtime.
+    pub fn runtime_text_subscription_os(
+        &self,
+        handle: &CatalogMissionExecutionHandle,
+        cursor: Option<&RuntimeTextSubscriptionCursor>,
+        page_size: usize,
+        now: DateTime<Utc>,
+    ) -> Result<RuntimeTextSubscriptionBatch, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.runtime_text_subscription_with(&secret_store, handle, cursor, page_size, now)
+    }
+
+    fn runtime_text_subscription_with(
+        &self,
+        secret_store: &impl SecretStore,
+        handle: &CatalogMissionExecutionHandle,
+        cursor: Option<&RuntimeTextSubscriptionCursor>,
+        page_size: usize,
+        now: DateTime<Utc>,
+    ) -> Result<RuntimeTextSubscriptionBatch, DesktopDataError> {
+        self.revalidate_database_entry()?;
+        let database_secret = self.database_secret(secret_store)?;
+        let service = self.open_read_application_from_secret(&database_secret)?;
+        self.require_runtime_subscription_context_access(&service, secret_store, handle, now)?;
+        Ok(service.read_runtime_text_subscription(handle, cursor, page_size)?)
+    }
+
     /// Starts an explicitly confirmed VM-00..VM-11 Mission from the machine
     /// Catalog and then runs at most one bounded local Runtime turn. The
     /// Catalog binding and first Checkpoint are committed before Runtime
@@ -845,6 +934,29 @@ impl DesktopDataPlane {
         cancellation: Option<&DesktopRuntimeCancellation>,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let project_id = request.project_id.clone();
+        let (mut service, runtime_reconciliation, context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let command = Self::catalog_mission_start_command(&service, request)?;
+        let mission = service.start_catalog_mission(command, now)?;
+        self.run_existing_mission_runtime_with_cancellation(
+            &mut service,
+            secret_store,
+            runtime_reconciliation,
+            &context_session,
+            &project_id,
+            mission.id,
+            runtime,
+            availability,
+            cancellation,
+            now,
+        )
+    }
+
+    fn catalog_mission_start_command(
+        service: &ApplicationService,
+        request: DesktopCatalogMissionRequest,
+    ) -> Result<StartCatalogMission, DesktopDataError> {
         let vm11 = request.manifest_id == "VM-11";
         if request.goal.trim().is_empty()
             || request.manifest_id.trim().is_empty()
@@ -859,14 +971,11 @@ impl DesktopDataPlane {
         {
             return Err(DesktopDataError::InvalidCatalogMissionContract);
         }
-        let project_id = request.project_id.clone();
-        let (mut service, runtime_reconciliation, context_session) =
-            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let project_id = request.project_id;
         let (mode, parent_mission_id, market, language, audience, timezone, kpis, budget) = if vm11
         {
             let parent_mission_id = request
                 .parent_mission_id
-                .clone()
                 .ok_or(DesktopDataError::InvalidCatalogMissionContract)?;
             let parent = service.load_mission(&project_id, &parent_mission_id)?;
             (
@@ -893,37 +1002,22 @@ impl DesktopDataPlane {
                 Money::new(request.budget_minor, currency),
             )
         };
-        let mission = service.start_catalog_mission(
-            StartCatalogMission {
-                id: MissionId::new(),
-                first_task_id: TaskId::new(),
-                project_id: project_id.clone(),
-                manifest_id: request.manifest_id,
-                mode,
-                parent_mission_id,
-                title: request.title,
-                goal: request.goal,
-                market,
-                language,
-                audience,
-                timezone,
-                kpis,
-                budget,
-            },
-            now,
-        )?;
-        self.run_existing_mission_runtime_with_cancellation(
-            &mut service,
-            secret_store,
-            runtime_reconciliation,
-            &context_session,
-            &project_id,
-            mission.id,
-            runtime,
-            availability,
-            cancellation,
-            now,
-        )
+        Ok(StartCatalogMission {
+            id: MissionId::new(),
+            first_task_id: TaskId::new(),
+            project_id,
+            manifest_id: request.manifest_id,
+            mode,
+            parent_mission_id,
+            title: request.title,
+            goal: request.goal,
+            market,
+            language,
+            audience,
+            timezone,
+            kpis,
+            budget,
+        })
     }
 
     fn start_mission_and_run_with(
@@ -2518,6 +2612,38 @@ impl DesktopDataPlane {
         }
     }
 
+    fn require_runtime_subscription_context_access(
+        &self,
+        service: &ApplicationService,
+        secret_store: &impl SecretStore,
+        handle: &CatalogMissionExecutionHandle,
+        now: DateTime<Utc>,
+    ) -> Result<(), DesktopDataError> {
+        let inventory = service.desktop_inventory()?;
+        let exact_project = inventory.projects.iter().find(|project| {
+            project.project_id == *handle.project_id() && project.tenant_id == *handle.tenant_id()
+        });
+        if exact_project.is_none() {
+            return Err(DesktopDataError::RuntimeSubscriptionContextMismatch);
+        }
+        self.require_project_context_access(service, secret_store, handle.project_id(), now)
+    }
+
+    fn database_secret(
+        &self,
+        secret_store: &impl SecretStore,
+    ) -> Result<SecretBytes, DesktopDataError> {
+        secret_store
+            .get(&self.database_key_reference)
+            .map_err(|error| {
+                if matches!(error, SecretStoreError::SecretNotFound) {
+                    DesktopDataError::MissingDatabaseKey
+                } else {
+                    error.into()
+                }
+            })
+    }
+
     fn open_application_from_secret(
         &self,
         secret: &hartevo_storage::SecretBytes,
@@ -2563,6 +2689,17 @@ impl DesktopDataPlane {
     #[cfg(test)]
     fn database_key_reference(&self) -> &SecretReference {
         &self.database_key_reference
+    }
+}
+
+fn no_runtime_turn_startup_reconciliation() -> RuntimeTurnStartupReconciliation {
+    RuntimeTurnStartupReconciliation {
+        scanned_attempts: 0,
+        failed_before_dispatch: 0,
+        frozen_uncertain: 0,
+        already_safe: 0,
+        event_sequences: Vec::new(),
+        outbox_sequences: Vec::new(),
     }
 }
 
@@ -2800,6 +2937,8 @@ pub enum DesktopDataError {
     ProjectContextBlockedEnvironment(ProjectId),
     #[error("project {0} Context key or storage integrity validation failed")]
     ProjectContextIntegrityError(ProjectId),
+    #[error("Runtime text subscription context does not match the authorized Tenant and Project")]
+    RuntimeSubscriptionContextMismatch,
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -2819,7 +2958,7 @@ mod tests {
     use chrono::Duration;
     use hartevo_application::{
         CreateProject, EvidenceInput, ProvisionProjectEncryption, ResearchPacket,
-        StartRelationshipMission,
+        RuntimeTextSubscriptionError, StartRelationshipMission,
     };
     use hartevo_domain_kernel::{
         AccountId, ActorId, Connection, ConnectionId, ConnectionProbe, ContextBranchStatus,
@@ -2832,6 +2971,11 @@ mod tests {
     };
     use hartevo_storage::MemorySecretStore;
     use rust_decimal::Decimal;
+
+    use crate::runtime_subscription::{
+        DesktopRuntimeDelivery, DesktopRuntimeReducerEffect, DesktopRuntimeSubscriptionEpoch,
+        DesktopRuntimeSubscriptionReducer, DesktopRuntimeSubscriptionScope,
+    };
 
     use super::*;
 
@@ -2910,6 +3054,363 @@ mod tests {
             .expect("ready personal project");
         let project_id = created.inventory.projects[0].project_id.clone();
         (directory, plane, secrets, project_id)
+    }
+
+    fn catalog_runtime_request(project_id: &ProjectId) -> DesktopCatalogMissionRequest {
+        DesktopCatalogMissionRequest {
+            project_id: project_id.clone(),
+            manifest_id: "VM-04".into(),
+            mode: OperatingMode::Campaign,
+            parent_mission_id: None,
+            title: Some("Durable Runtime subscription".into()),
+            goal: "Render authorized private Runtime text while execution remains bounded".into(),
+            market: "DE".into(),
+            language: "de-DE".into(),
+            audience: "owner".into(),
+            timezone: "Europe/Berlin".into(),
+            kpis: catalog_count_kpis(),
+            budget_minor: 0,
+            currency: "EUR".into(),
+        }
+    }
+
+    fn persisted_outbox_messages(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+    ) -> Vec<hartevo_storage::OutboxMessage> {
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let database_key = DatabaseKey::from_secret(&database_secret).expect("database key");
+        let store = ProjectStore::open(&plane.database_path, &database_key).expect("project store");
+        let mut sequence = 1_i64;
+        let mut messages = Vec::new();
+        loop {
+            match store.outbox_message(sequence) {
+                Ok(message) => {
+                    assert_eq!(message.sequence, sequence);
+                    messages.push(message);
+                }
+                Err(StorageError::DomainDecode(message))
+                    if message == format!("unknown outbox message {sequence}") =>
+                {
+                    return messages;
+                }
+                Err(error) => panic!("outbox inspection failed at {sequence}: {error}"),
+            }
+            sequence = sequence.checked_add(1).expect("bounded outbox fixture");
+        }
+    }
+
+    #[derive(Clone, Eq, PartialEq)]
+    struct DurableSnapshotDomainDigest {
+        row_count: usize,
+        digest: [u8; 32],
+    }
+
+    impl fmt::Debug for DurableSnapshotDomainDigest {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("DurableSnapshotDomainDigest")
+                .field("row_count", &self.row_count)
+                .field("digest", &ShortSnapshotDigest(&self.digest))
+                .finish()
+        }
+    }
+
+    #[derive(Clone, Eq, PartialEq)]
+    struct RuntimeSubscriptionDurableSnapshotDigest {
+        project: DurableSnapshotDomainDigest,
+        project_keyring: DurableSnapshotDomainDigest,
+        missions: DurableSnapshotDomainDigest,
+        conversations: DurableSnapshotDomainDigest,
+        project_events: DurableSnapshotDomainDigest,
+        outbox: DurableSnapshotDomainDigest,
+        runtime_attempts: DurableSnapshotDomainDigest,
+        private_messages: DurableSnapshotDomainDigest,
+        private_text_deltas: DurableSnapshotDomainDigest,
+        overall_digest: [u8; 32],
+    }
+
+    impl fmt::Debug for RuntimeSubscriptionDurableSnapshotDigest {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("RuntimeSubscriptionDurableSnapshotDigest")
+                .field("project", &self.project)
+                .field("project_keyring", &self.project_keyring)
+                .field("missions", &self.missions)
+                .field("conversations", &self.conversations)
+                .field("project_events", &self.project_events)
+                .field("outbox", &self.outbox)
+                .field("runtime_attempts", &self.runtime_attempts)
+                .field("private_messages", &self.private_messages)
+                .field("private_text_deltas", &self.private_text_deltas)
+                .field("overall_digest", &ShortSnapshotDigest(&self.overall_digest))
+                .finish()
+        }
+    }
+
+    struct ShortSnapshotDigest<'a>(&'a [u8; 32]);
+
+    impl fmt::Debug for ShortSnapshotDigest<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "{:02x}{:02x}{:02x}{:02x}…",
+                self.0[0], self.0[1], self.0[2], self.0[3]
+            )
+        }
+    }
+
+    fn write_canonical_snapshot_json(value: &serde_json::Value, output: &mut Vec<u8>) {
+        match value {
+            serde_json::Value::Null => output.extend_from_slice(b"null"),
+            serde_json::Value::Bool(value) => {
+                output.extend_from_slice(if *value { b"true" } else { b"false" });
+            }
+            serde_json::Value::Number(value) => {
+                output.extend_from_slice(value.to_string().as_bytes());
+            }
+            serde_json::Value::String(value) => {
+                output.extend_from_slice(
+                    serde_json::to_string(value)
+                        .expect("snapshot string must serialize")
+                        .as_bytes(),
+                );
+            }
+            serde_json::Value::Array(values) => {
+                output.push(b'[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        output.push(b',');
+                    }
+                    write_canonical_snapshot_json(value, output);
+                }
+                output.push(b']');
+            }
+            serde_json::Value::Object(values) => {
+                output.push(b'{');
+                let mut fields = values.iter().collect::<Vec<_>>();
+                fields.sort_unstable_by_key(|(name, _)| (*name).clone());
+                for (index, (name, value)) in fields.into_iter().enumerate() {
+                    if index > 0 {
+                        output.push(b',');
+                    }
+                    output.extend_from_slice(
+                        serde_json::to_string(name)
+                            .expect("snapshot field name must serialize")
+                            .as_bytes(),
+                    );
+                    output.push(b':');
+                    write_canonical_snapshot_json(value, output);
+                }
+                output.push(b'}');
+            }
+        }
+    }
+
+    fn snapshot_frame(hasher: &mut Sha256, bytes: &[u8]) {
+        let byte_count = u64::try_from(bytes.len()).expect("bounded snapshot material");
+        hasher.update(byte_count.to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    fn durable_snapshot_json_domain_digest(
+        domain: &str,
+        rows: &[serde_json::Value],
+    ) -> DurableSnapshotDomainDigest {
+        let mut canonical_rows = rows
+            .iter()
+            .map(|row| {
+                let mut encoded = Vec::new();
+                write_canonical_snapshot_json(row, &mut encoded);
+                encoded
+            })
+            .collect::<Vec<_>>();
+        canonical_rows.sort_unstable();
+
+        let mut hasher = Sha256::new();
+        snapshot_frame(
+            &mut hasher,
+            b"hartevo-runtime-subscription-durable-domain-v1",
+        );
+        snapshot_frame(&mut hasher, domain.as_bytes());
+        hasher.update(
+            u64::try_from(canonical_rows.len())
+                .expect("bounded snapshot row count")
+                .to_be_bytes(),
+        );
+        for row in &canonical_rows {
+            snapshot_frame(&mut hasher, row);
+        }
+        DurableSnapshotDomainDigest {
+            row_count: canonical_rows.len(),
+            digest: hasher.finalize().into(),
+        }
+    }
+
+    macro_rules! durable_snapshot_domain_digest {
+        ($domain:expr, $rows:expr) => {{
+            let snapshot_rows = ($rows)
+                .iter()
+                .map(|row| serde_json::to_value(row).expect("snapshot row must serialize"))
+                .collect::<Vec<_>>();
+            durable_snapshot_json_domain_digest($domain, &snapshot_rows)
+        }};
+    }
+
+    fn durable_snapshot_overall_digest(
+        domains: &[(&str, &DurableSnapshotDomainDigest)],
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        snapshot_frame(
+            &mut hasher,
+            b"hartevo-runtime-subscription-durable-snapshot-v1",
+        );
+        for (name, domain) in domains {
+            snapshot_frame(&mut hasher, name.as_bytes());
+            hasher.update(
+                u64::try_from(domain.row_count)
+                    .expect("bounded snapshot row count")
+                    .to_be_bytes(),
+            );
+            hasher.update(domain.digest);
+        }
+        hasher.finalize().into()
+    }
+
+    fn contains_full_hex_digest(value: &str) -> bool {
+        value
+            .split(|character: char| !character.is_ascii_hexdigit())
+            .any(|token| token.len() >= 64)
+    }
+
+    #[test]
+    fn durable_snapshot_digest_is_canonical_private_and_mutation_sensitive() {
+        let private_attempt_id = "runtime-attempt-private-raw-id";
+        let private_text = "private Runtime text must never enter assertion output";
+        let first = serde_json::json!({
+            "runtimeAttemptId": private_attempt_id,
+            "streamSequence": 1,
+            "privateText": private_text,
+        });
+        let second = serde_json::json!({
+            "runtimeAttemptId": private_attempt_id,
+            "streamSequence": 2,
+            "privateText": "second private increment",
+        });
+        let changed = serde_json::json!({
+            "runtimeAttemptId": private_attempt_id,
+            "streamSequence": 2,
+            "privateText": "mutated private increment",
+        });
+
+        let ordered = durable_snapshot_json_domain_digest(
+            "runtime-private-text-deltas",
+            &[first.clone(), second.clone()],
+        );
+        let reordered = durable_snapshot_json_domain_digest(
+            "runtime-private-text-deltas",
+            &[second, first.clone()],
+        );
+        let mutated =
+            durable_snapshot_json_domain_digest("runtime-private-text-deltas", &[first, changed]);
+        assert_eq!(ordered, reordered);
+        assert_ne!(ordered, mutated);
+        assert_ne!(
+            durable_snapshot_overall_digest(&[("runtime-private-text-deltas", &ordered)]),
+            durable_snapshot_overall_digest(&[("runtime-private-text-deltas", &mutated)])
+        );
+
+        let debug = format!("{ordered:?}");
+        assert!(!debug.contains(private_attempt_id));
+        assert!(!debug.contains(private_text));
+        assert!(!contains_full_hex_digest(&debug));
+    }
+
+    fn runtime_subscription_durable_snapshot(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+    ) -> RuntimeSubscriptionDurableSnapshotDigest {
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let database_key = DatabaseKey::from_secret(&database_secret).expect("database key");
+        let store = ProjectStore::open(&plane.database_path, &database_key).expect("project store");
+        let project = store.load_project(project_id).expect("snapshot Project");
+        let keyring = store
+            .load_project_keyring(project_id)
+            .expect("snapshot Project keyring");
+        let missions = store.list_missions(project_id).expect("snapshot Missions");
+        let project_events = store
+            .events_for_project(project_id)
+            .expect("snapshot all Project events");
+        let mut conversations = Vec::new();
+        for mission in &missions {
+            match store.load_mission_conversation(project_id, &mission.id) {
+                Ok(conversation) => conversations.push(conversation),
+                Err(StorageError::ScopedRecordNotFound {
+                    kind: "mission conversation",
+                    ..
+                }) => {}
+                Err(error) => panic!("snapshot Conversation failed: {error}"),
+            }
+        }
+        let outbox = persisted_outbox_messages(plane, secrets);
+        let attempts = store
+            .list_runtime_turn_attempts(project_id)
+            .expect("snapshot all Runtime attempts");
+        let mut private_messages = Vec::new();
+        let mut private_text_deltas = Vec::new();
+        for attempt in &attempts {
+            private_messages.extend(
+                store
+                    .load_runtime_turn_private_messages(project_id, &attempt.id)
+                    .unwrap_or_else(|_| panic!("snapshot Runtime private-message read failed")),
+            );
+            private_text_deltas.extend(
+                store
+                    .load_runtime_turn_private_text_deltas(project_id, &attempt.id)
+                    .unwrap_or_else(|_| panic!("snapshot Runtime private-delta read failed")),
+            );
+        }
+
+        let project = durable_snapshot_domain_digest!("project", std::slice::from_ref(&project));
+        let project_keyring =
+            durable_snapshot_domain_digest!("project-keyring", std::slice::from_ref(&keyring));
+        let missions = durable_snapshot_domain_digest!("missions", &missions);
+        let conversations = durable_snapshot_domain_digest!("conversations", &conversations);
+        let project_events = durable_snapshot_domain_digest!("project-events", &project_events);
+        let outbox = durable_snapshot_domain_digest!("outbox", &outbox);
+        let runtime_attempts = durable_snapshot_domain_digest!("runtime-attempts", &attempts);
+        let private_messages =
+            durable_snapshot_domain_digest!("runtime-private-messages", &private_messages);
+        let private_text_deltas =
+            durable_snapshot_domain_digest!("runtime-private-text-deltas", &private_text_deltas);
+        let overall_digest = durable_snapshot_overall_digest(&[
+            ("project", &project),
+            ("project-keyring", &project_keyring),
+            ("missions", &missions),
+            ("conversations", &conversations),
+            ("project-events", &project_events),
+            ("outbox", &outbox),
+            ("runtime-attempts", &runtime_attempts),
+            ("runtime-private-messages", &private_messages),
+            ("runtime-private-text-deltas", &private_text_deltas),
+        ]);
+        RuntimeSubscriptionDurableSnapshotDigest {
+            project,
+            project_keyring,
+            missions,
+            conversations,
+            project_events,
+            outbox,
+            runtime_attempts,
+            private_messages,
+            private_text_deltas,
+            overall_digest,
+        }
     }
 
     #[cfg(unix)]
@@ -4772,6 +5273,593 @@ sleep 30"#;
     }
 
     #[cfg(unix)]
+    struct CatalogStartOnlyReadInvariants<'a> {
+        plane: &'a DesktopDataPlane,
+        secrets: &'a MemorySecretStore,
+        project_id: &'a ProjectId,
+        handle: &'a CatalogMissionExecutionHandle,
+        durable_before_reads: RuntimeSubscriptionDurableSnapshotDigest,
+        outbox_before_reads: Vec<hartevo_storage::OutboxMessage>,
+    }
+
+    #[cfg(unix)]
+    impl CatalogStartOnlyReadInvariants<'_> {
+        fn assert_durable_state_unchanged(&self) {
+            let after =
+                runtime_subscription_durable_snapshot(self.plane, self.secrets, self.project_id);
+            assert_eq!(&after, &self.durable_before_reads);
+            assert_eq!(
+                persisted_outbox_messages(self.plane, self.secrets).as_slice(),
+                self.outbox_before_reads.as_slice()
+            );
+        }
+
+        fn assert_awaiting_and_page_limits_are_read_only(&self) {
+            let awaiting = self
+                .plane
+                .runtime_text_subscription_with(
+                    self.secrets,
+                    self.handle,
+                    None,
+                    64,
+                    observed_at() + Duration::minutes(3),
+                )
+                .expect("awaiting Runtime turn");
+            assert!(matches!(
+                awaiting,
+                RuntimeTextSubscriptionBatch::AwaitingTurn { .. }
+            ));
+            self.assert_durable_state_unchanged();
+
+            for invalid_page_size in [0, 65] {
+                assert!(matches!(
+                    self.plane.runtime_text_subscription_with(
+                        self.secrets,
+                        self.handle,
+                        None,
+                        invalid_page_size,
+                        observed_at() + Duration::minutes(3),
+                    ),
+                    Err(DesktopDataError::Application(
+                        ApplicationError::RuntimeTextSubscription(
+                            RuntimeTextSubscriptionError::InvalidPageSize
+                        )
+                    ))
+                ));
+                self.assert_durable_state_unchanged();
+            }
+        }
+
+        fn assert_handle_tamper_is_read_only(&self) {
+            let mut tampered_handle_json =
+                serde_json::to_value(self.handle).expect("serialized execution handle");
+            tampered_handle_json["contractDigest"] = serde_json::json!("0".repeat(64));
+            let tampered_handle: CatalogMissionExecutionHandle =
+                serde_json::from_value(tampered_handle_json).expect("tampered handle envelope");
+            assert!(matches!(
+                self.plane.runtime_text_subscription_with(
+                    self.secrets,
+                    &tampered_handle,
+                    None,
+                    64,
+                    observed_at() + Duration::minutes(3),
+                ),
+                Err(DesktopDataError::Application(
+                    ApplicationError::RuntimeTextSubscription(
+                        RuntimeTextSubscriptionError::MissionHandleMismatch
+                    )
+                ))
+            ));
+            self.assert_durable_state_unchanged();
+        }
+
+        fn assert_tenant_and_project_mismatch_are_read_only(&self) {
+            for (field, value) in [
+                ("tenantId", "tenant-outside-exact-context"),
+                ("projectId", "project-outside-exact-context"),
+            ] {
+                let mut wrong_context_json =
+                    serde_json::to_value(self.handle).expect("serialized execution handle");
+                wrong_context_json[field] = serde_json::json!(value);
+                let wrong_context_handle: CatalogMissionExecutionHandle =
+                    serde_json::from_value(wrong_context_json)
+                        .expect("tampered context handle envelope");
+                assert!(matches!(
+                    self.plane.runtime_text_subscription_with(
+                        self.secrets,
+                        &wrong_context_handle,
+                        None,
+                        64,
+                        observed_at() + Duration::minutes(3),
+                    ),
+                    Err(DesktopDataError::RuntimeSubscriptionContextMismatch)
+                ));
+                self.assert_durable_state_unchanged();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_catalog_start_only_contract<'a>(
+        plane: &'a DesktopDataPlane,
+        secrets: &'a MemorySecretStore,
+        project_id: &'a ProjectId,
+        started: &'a DesktopCatalogMissionExecutionStart,
+        private_goal: &str,
+        baseline_outbox: &[hartevo_storage::OutboxMessage],
+    ) -> CatalogStartOnlyReadInvariants<'a> {
+        assert_eq!(started.handle.project_id(), project_id);
+        assert_eq!(started.handle.manifest_id(), "VM-04");
+        assert_eq!(
+            started.snapshot.runtime_reconciliation,
+            no_runtime_turn_startup_reconciliation()
+        );
+        let debug = format!("{started:?}");
+        assert!(!debug.contains(private_goal));
+        assert!(!debug.contains(started.handle.handle_digest()));
+        assert!(debug.contains("runtime_dispatched: false"));
+
+        let durable_before_reads =
+            runtime_subscription_durable_snapshot(plane, secrets, project_id);
+        let durable_debug = format!("{durable_before_reads:?}");
+        assert!(!durable_debug.contains(private_goal));
+        assert!(!durable_debug.contains(project_id.as_str()));
+        assert!(!durable_debug.contains(started.handle.mission_id().as_str()));
+        assert!(!contains_full_hex_digest(&durable_debug));
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let service = plane
+            .open_read_application_from_secret(&database_secret)
+            .expect("read-only Application");
+        let mission = service
+            .load_mission(project_id, started.handle.mission_id())
+            .expect("started Mission");
+        assert_eq!(
+            service
+                .mission_execution_handle(project_id, started.handle.mission_id())
+                .expect("reopened durable execution handle"),
+            started.handle
+        );
+        let events = service
+            .mission_events(project_id, started.handle.mission_id())
+            .expect("Mission events");
+        assert_eq!(events.len(), 3);
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.event_type.contains("runtime"))
+        );
+        assert!(mission.effects.is_empty());
+        assert!(
+            service
+                .latest_runtime_turn_for_mission(project_id, started.handle.mission_id())
+                .expect("Runtime turn query")
+                .is_none()
+        );
+        let outbox_before_reads = persisted_outbox_messages(plane, secrets);
+        assert_eq!(
+            outbox_before_reads.len(),
+            baseline_outbox.len() + events.len()
+        );
+        assert_eq!(
+            &outbox_before_reads[..baseline_outbox.len()],
+            baseline_outbox
+        );
+
+        CatalogStartOnlyReadInvariants {
+            plane,
+            secrets,
+            project_id,
+            handle: &started.handle,
+            durable_before_reads,
+            outbox_before_reads,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_start_only_returns_handle_without_runtime_and_pull_is_read_only() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let baseline_outbox = persisted_outbox_messages(&plane, &secrets);
+        let private_goal = catalog_runtime_request(&project_id).goal;
+        let started = plane
+            .start_catalog_mission_execution_with(
+                &secrets,
+                catalog_runtime_request(&project_id),
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("atomic Catalog Mission start");
+        let invariants = assert_catalog_start_only_contract(
+            &plane,
+            &secrets,
+            &project_id,
+            &started,
+            &private_goal,
+            &baseline_outbox,
+        );
+        invariants.assert_durable_state_unchanged();
+        invariants.assert_awaiting_and_page_limits_are_read_only();
+        invariants.assert_handle_tamper_is_read_only();
+        invariants.assert_tenant_and_project_mismatch_are_read_only();
+    }
+
+    #[cfg(unix)]
+    struct RuntimeSubscriptionSqlcipherJourney<'a> {
+        plane: &'a DesktopDataPlane,
+        secrets: &'a MemorySecretStore,
+        project_id: &'a ProjectId,
+        handle: CatalogMissionExecutionHandle,
+        scope: DesktopRuntimeSubscriptionScope,
+        epoch: DesktopRuntimeSubscriptionEpoch,
+        reducer: DesktopRuntimeSubscriptionReducer,
+        durable_before_pulls: RuntimeSubscriptionDurableSnapshotDigest,
+    }
+
+    #[cfg(unix)]
+    impl<'a> RuntimeSubscriptionSqlcipherJourney<'a> {
+        fn prepare(
+            plane: &'a DesktopDataPlane,
+            secrets: &'a MemorySecretStore,
+            project_id: &'a ProjectId,
+            handle: CatalogMissionExecutionHandle,
+        ) -> Self {
+            let runtime_submission = plane
+                .resume_mission_runtime_with(
+                    secrets,
+                    project_id,
+                    handle.mission_id(),
+                    Some(completed_runtime_fixture_source()),
+                    DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                    observed_at() + Duration::minutes(3),
+                )
+                .expect("bounded Runtime completion fixture");
+            assert_eq!(runtime_submission.mission_id, *handle.mission_id());
+            let durable_before_pulls =
+                runtime_subscription_durable_snapshot(plane, secrets, project_id);
+            let scope = DesktopRuntimeSubscriptionScope::from_handle(&handle)
+                .expect("Desktop subscription scope");
+            let mut reducer = DesktopRuntimeSubscriptionReducer::default();
+            let epoch = reducer
+                .select_scope(Some(scope.clone()))
+                .expect("select scope")
+                .expect("selection")
+                .epoch;
+            RuntimeSubscriptionSqlcipherJourney {
+                plane,
+                secrets,
+                project_id,
+                handle,
+                scope,
+                epoch,
+                reducer,
+                durable_before_pulls,
+            }
+        }
+
+        fn assert_durable_unchanged(&self) {
+            assert_eq!(
+                runtime_subscription_durable_snapshot(self.plane, self.secrets, self.project_id,),
+                self.durable_before_pulls
+            );
+        }
+
+        fn assert_snapshot_privacy_and_project_event_coverage(&self) {
+            let database_secret = self
+                .secrets
+                .get(self.plane.database_key_reference())
+                .expect("database secret");
+            let service = self
+                .plane
+                .open_read_application_from_secret(&database_secret)
+                .expect("read-only Application");
+            let runtime = service
+                .latest_runtime_turn_for_mission(self.project_id, self.handle.mission_id())
+                .expect("Runtime before pulls")
+                .expect("completed Runtime attempt");
+            let deltas = service
+                .runtime_turn_private_text_deltas(self.project_id, &runtime.id)
+                .expect("private deltas before pulls");
+            let debug = format!("{:?}", self.durable_before_pulls);
+            assert!(!debug.contains("project.created"));
+            assert!(!debug.contains("project_keyring.provisioned"));
+            assert!(!debug.contains(runtime.id.as_str()));
+            if let Some(runtime_turn_id) = &runtime.runtime_turn_id {
+                assert!(!debug.contains(runtime_turn_id));
+            }
+            for delta in &deltas {
+                assert!(!debug.contains(&delta.delta));
+                assert!(!debug.contains(&delta.item_id_digest));
+                assert!(!debug.contains(&delta.delta_digest));
+                assert!(!debug.contains(&delta.chain_digest));
+                assert!(!debug.contains(&delta.event_digest));
+            }
+            assert!(!contains_full_hex_digest(&debug));
+
+            let database_key =
+                DatabaseKey::from_secret(&database_secret).expect("database key for event proof");
+            let events = ProjectStore::open(&self.plane.database_path, &database_key)
+                .expect("project store for event proof")
+                .events_for_project(self.project_id)
+                .expect("all Project events for digest proof");
+            assert!(events.iter().any(|event| {
+                event.mission_id.is_none() && event.event_type == "project.created"
+            }));
+            assert!(events.iter().any(|event| {
+                event.mission_id.is_none() && event.event_type == "project_keyring.provisioned"
+            }));
+            assert_eq!(
+                durable_snapshot_domain_digest!("project-events", &events),
+                self.durable_before_pulls.project_events
+            );
+            assert_eq!(
+                self.durable_before_pulls.project_events.row_count,
+                events.len()
+            );
+
+            let mut mutation = events
+                .iter()
+                .map(|event| serde_json::to_value(event).expect("Project event must serialize"))
+                .collect::<Vec<_>>();
+            let project_created = mutation
+                .iter_mut()
+                .find(|event| {
+                    event.get("eventType").and_then(serde_json::Value::as_str)
+                        == Some("project.created")
+                })
+                .expect("real project.created event");
+            project_created["payload"] = serde_json::json!({"mutatedForDigestProof": true});
+            assert_ne!(
+                durable_snapshot_json_domain_digest("project-events", &mutation),
+                self.durable_before_pulls.project_events
+            );
+        }
+
+        fn pull_and_apply_reset(&mut self) -> RuntimeTextSubscriptionCursor {
+            let batch = self
+                .plane
+                .runtime_text_subscription_with(
+                    self.secrets,
+                    &self.handle,
+                    None,
+                    1,
+                    observed_at() + Duration::minutes(4),
+                )
+                .expect("first durable page");
+            let cursor = match &batch {
+                RuntimeTextSubscriptionBatch::Reset { page } => {
+                    assert!(page.has_more());
+                    page.next_cursor().clone()
+                }
+                other => panic!("expected Reset, got {other:?}"),
+            };
+            let delivery =
+                DesktopRuntimeDelivery::from_application(self.scope.clone(), self.epoch, batch)
+                    .expect("Desktop Reset");
+            assert!(matches!(
+                self.reducer.apply_delivery(&delivery).expect("apply Reset"),
+                DesktopRuntimeReducerEffect::Reset { .. }
+            ));
+            assert_eq!(
+                self.reducer
+                    .viewport(&self.scope)
+                    .expect("viewport")
+                    .cursor()
+                    .expect("exact cursor")
+                    .producer(),
+                &cursor
+            );
+            self.assert_durable_unchanged();
+            cursor
+        }
+
+        fn pull_and_apply_append(
+            &mut self,
+            reset_cursor: &RuntimeTextSubscriptionCursor,
+        ) -> RuntimeTextSubscriptionCursor {
+            let batch = self
+                .plane
+                .runtime_text_subscription_with(
+                    self.secrets,
+                    &self.handle,
+                    Some(reset_cursor),
+                    1,
+                    observed_at() + Duration::minutes(4),
+                )
+                .expect("second durable page");
+            let cursor = match &batch {
+                RuntimeTextSubscriptionBatch::Append { page } => {
+                    assert!(!page.has_more());
+                    page.next_cursor().clone()
+                }
+                other => panic!("expected Append, got {other:?}"),
+            };
+            let mut tampered = serde_json::to_value(&cursor).expect("serialized signed cursor");
+            tampered["cursorDigest"] = serde_json::json!("0".repeat(64));
+            let tampered =
+                serde_json::from_value(tampered).expect("tampered signed cursor envelope");
+            assert!(matches!(
+                self.plane.runtime_text_subscription_with(
+                    self.secrets,
+                    &self.handle,
+                    Some(&tampered),
+                    1,
+                    observed_at() + Duration::minutes(4),
+                ),
+                Err(DesktopDataError::Application(
+                    ApplicationError::RuntimeTextSubscription(
+                        RuntimeTextSubscriptionError::CursorMismatch
+                    )
+                ))
+            ));
+            self.assert_durable_unchanged();
+
+            let delivery =
+                DesktopRuntimeDelivery::from_application(self.scope.clone(), self.epoch, batch)
+                    .expect("Desktop Append");
+            self.reducer
+                .apply_delivery(&delivery)
+                .expect("apply Append");
+            let viewport = self
+                .reducer
+                .viewport(&self.scope)
+                .expect("appended viewport");
+            assert_eq!(
+                viewport.projection().expect("projection").items()[0].text(),
+                "Reviewable local runtime draft; no external effect occurred."
+            );
+            assert_eq!(
+                viewport.cursor().expect("append cursor").producer(),
+                &cursor
+            );
+            self.assert_durable_unchanged();
+            cursor
+        }
+
+        fn acknowledge_caught_up(&mut self, cursor: &RuntimeTextSubscriptionCursor) {
+            let batch = self
+                .plane
+                .runtime_text_subscription_with(
+                    self.secrets,
+                    &self.handle,
+                    Some(cursor),
+                    1,
+                    observed_at() + Duration::minutes(4),
+                )
+                .expect("caught-up acknowledgement");
+            let delivery =
+                DesktopRuntimeDelivery::from_application(self.scope.clone(), self.epoch, batch)
+                    .expect("Desktop CaughtUp");
+            assert_eq!(
+                self.reducer
+                    .apply_delivery(&delivery)
+                    .expect("apply CaughtUp"),
+                DesktopRuntimeReducerEffect::CaughtUp
+            );
+            let viewport = self
+                .reducer
+                .viewport(&self.scope)
+                .expect("caught-up viewport");
+            assert!(viewport.transport_caught_up());
+            assert_eq!(
+                viewport.projection().expect("projection").items()[0].text(),
+                "Reviewable local runtime draft; no external effect occurred."
+            );
+            assert_eq!(
+                viewport.cursor().expect("unchanged cursor").producer(),
+                cursor
+            );
+            self.assert_durable_unchanged();
+        }
+
+        fn reselect_and_reopen(&mut self, cursor: &RuntimeTextSubscriptionCursor) {
+            self.reducer.select_scope(None).expect("clear selection");
+            let reselected = self
+                .reducer
+                .select_scope(Some(self.scope.clone()))
+                .expect("reselect scope")
+                .expect("reselection");
+            assert_eq!(
+                reselected
+                    .cursor
+                    .as_ref()
+                    .expect("reselected cursor")
+                    .producer(),
+                cursor
+            );
+            let batch =
+                self.plane
+                    .runtime_text_subscription_with(
+                        self.secrets,
+                        &self.handle,
+                        reselected.cursor.as_ref().map(
+                            crate::runtime_subscription::DesktopRuntimeViewportCursor::producer,
+                        ),
+                        64,
+                        observed_at() + Duration::minutes(5),
+                    )
+                    .expect("reselected durable read");
+            self.reducer
+                .apply_delivery(
+                    &DesktopRuntimeDelivery::from_application(
+                        self.scope.clone(),
+                        reselected.epoch,
+                        batch,
+                    )
+                    .expect("reselected delivery"),
+                )
+                .expect("apply reselected delivery");
+            self.assert_durable_unchanged();
+
+            let reopened = DesktopDataPlane::at_data_root(self.plane.data_root.clone())
+                .expect("reopened Desktop data plane");
+            let batch = reopened
+                .runtime_text_subscription_with(
+                    self.secrets,
+                    &self.handle,
+                    None,
+                    64,
+                    observed_at() + Duration::minutes(6),
+                )
+                .expect("restart hydration from SQLCipher");
+            let mut restarted = DesktopRuntimeSubscriptionReducer::default();
+            let selection = restarted
+                .select_scope(Some(self.scope.clone()))
+                .expect("restart select")
+                .expect("restart selection");
+            restarted
+                .apply_delivery(
+                    &DesktopRuntimeDelivery::from_application(
+                        self.scope.clone(),
+                        selection.epoch,
+                        batch,
+                    )
+                    .expect("restart Reset"),
+                )
+                .expect("apply restart Reset");
+            assert_eq!(
+                restarted
+                    .viewport(&self.scope)
+                    .expect("restart viewport")
+                    .projection()
+                    .expect("restart projection")
+                    .items()[0]
+                    .text(),
+                "Reviewable local runtime draft; no external effect occurred."
+            );
+            assert_eq!(
+                runtime_subscription_durable_snapshot(&reopened, self.secrets, self.project_id,),
+                self.durable_before_pulls
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_subscription_reducer_reuses_application_cursor_across_reselect_and_reopen() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let started = plane
+            .start_catalog_mission_execution_with(
+                &secrets,
+                catalog_runtime_request(&project_id),
+                observed_at() + Duration::minutes(2),
+            )
+            .expect("atomic Catalog Mission start");
+        let mut journey = RuntimeSubscriptionSqlcipherJourney::prepare(
+            &plane,
+            &secrets,
+            &project_id,
+            started.handle,
+        );
+        journey.assert_snapshot_privacy_and_project_event_coverage();
+        let reset_cursor = journey.pull_and_apply_reset();
+        let append_cursor = journey.pull_and_apply_append(&reset_cursor);
+        journey.acknowledge_caught_up(&append_cursor);
+        journey.reselect_and_reopen(&append_cursor);
+    }
+
+    #[cfg(unix)]
     #[test]
     #[allow(
         clippy::too_many_lines,
@@ -4998,6 +6086,9 @@ sleep 30"#;
             .into_iter()
             .find(|project| project.project_id == project_id)
             .expect("project");
+        let execution_handle = service
+            .mission_execution_handle(&project_id, &submission.mission_id)
+            .expect("durable execution handle");
         let keyring = service.load_project_keyring(&project_id).expect("keyring");
         let device_reference = keyring
             .envelopes
@@ -5022,6 +6113,8 @@ sleep 30"#;
                 secrets.get(&reference).ok().map(|_| reference)
             })
             .expect("active local Device wrapping secret");
+        let durable_before_context_failure =
+            runtime_subscription_durable_snapshot(&plane, &secrets, &project_id);
         drop(service);
         secrets
             .delete(&device_reference)
@@ -5035,6 +6128,20 @@ sleep 30"#;
             ),
             Err(DesktopDataError::ProjectContextRecoveryRequired(id)) if id == project_id
         ));
+        assert!(matches!(
+            plane.runtime_text_subscription_with(
+                &secrets,
+                &execution_handle,
+                None,
+                64,
+                observed_at() + Duration::minutes(5),
+            ),
+            Err(DesktopDataError::ProjectContextRecoveryRequired(id)) if id == project_id
+        ));
+        assert_eq!(
+            runtime_subscription_durable_snapshot(&plane, &secrets, &project_id,),
+            durable_before_context_failure
+        );
     }
 
     #[cfg(unix)]
