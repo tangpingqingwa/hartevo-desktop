@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "hartevo-provider-auth-probe-contract/v1",
+  "contractVersion": "provider-auth-probe-e1/v1",
+  "secretMaterial": "opaque_reference_only",
+  "connectedAuthority": "connection_state_only",
+  "adapterRegistrySchemaVersion": "hartevo-provider-adapter-contract/v1",
+  "registryBinding": {
+    "capabilityId": "connection.probe",
+    "operation": "probe",
+    "evidenceClass": "probe_observation"
+  },
+  "registryPolicy": {
+    "source": "provider_adapter_registry",
+    "emptyRegistryBehavior": "deny_connected"
+  },
+  "freshness": {
+    "credentialLeaseMaxTtlSeconds": 900,
+    "authSessionMaxTtlSeconds": 600,
+    "probeMaxTtlSeconds": 120,
+    "clockSkewSeconds": 0
+  },
+  "connectedProbeStatuses": [
+    "reachable"
+  ],
+  "connectedProvenanceClasses": [
+    "production_provider"
+  ],
+  "forbiddenAuthorities": [
+    "runtime_local_approval",
+    "provider_execution",
+    "provider_receipt",
+    "business_verification",
+    "e4"
+  ]
+}
