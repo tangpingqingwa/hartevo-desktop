@@ -2334,26 +2334,32 @@ fn sha1_compress(state: &mut [u32; 5], block: &[u8]) {
             (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
                 .rotate_left(1);
     }
-    let [mut a, mut b, mut c, mut d, mut e] = *state;
+    let [
+        mut working_a,
+        mut working_b,
+        mut working_c,
+        mut working_d,
+        mut working_e,
+    ] = *state;
     for (index, word) in words.into_iter().enumerate() {
-        let (function, constant) = sha1_round(index, b, c, d);
-        let next = a
+        let (function, constant) = sha1_round(index, working_b, working_c, working_d);
+        let next = working_a
             .rotate_left(5)
             .wrapping_add(function)
-            .wrapping_add(e)
+            .wrapping_add(working_e)
             .wrapping_add(constant)
             .wrapping_add(word);
-        e = d;
-        d = c;
-        c = b.rotate_left(30);
-        b = a;
-        a = next;
+        working_e = working_d;
+        working_d = working_c;
+        working_c = working_b.rotate_left(30);
+        working_b = working_a;
+        working_a = next;
     }
-    state[0] = state[0].wrapping_add(a);
-    state[1] = state[1].wrapping_add(b);
-    state[2] = state[2].wrapping_add(c);
-    state[3] = state[3].wrapping_add(d);
-    state[4] = state[4].wrapping_add(e);
+    state[0] = state[0].wrapping_add(working_a);
+    state[1] = state[1].wrapping_add(working_b);
+    state[2] = state[2].wrapping_add(working_c);
+    state[3] = state[3].wrapping_add(working_d);
+    state[4] = state[4].wrapping_add(working_e);
 }
 
 fn sha1_round(index: usize, b: u32, c: u32, d: u32) -> (u32, u32) {
