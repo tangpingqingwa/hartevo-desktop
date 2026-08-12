@@ -123,7 +123,8 @@ pub use runtime_recovery::{
 pub use runtime_turn::{
     RuntimeTurnAttempt, RuntimeTurnError, RuntimeTurnEvidence, RuntimeTurnEvidenceKind,
     RuntimeTurnFailure, RuntimeTurnFailureClass, RuntimeTurnObservedKind,
-    RuntimeTurnPrivateMessage, RuntimeTurnRestartDisposition, RuntimeTurnScope, RuntimeTurnStatus,
+    RuntimeTurnPrivateMessage, RuntimeTurnPrivateTextDelta, RuntimeTurnRestartDisposition,
+    RuntimeTurnScope, RuntimeTurnStatus,
 };
 pub use truth::{
     TruthCandidate, TruthError, TruthFact, TruthRevisionLink, TruthSource, TruthStatus, TruthValue,

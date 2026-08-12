@@ -14,6 +14,8 @@ use crate::{
 const MAX_TURN_EVIDENCE: usize = 4096;
 const MAX_TURN_FAILURES: usize = 32;
 const MAX_PRIVATE_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const LEGACY_AGENT_MESSAGE_ITEM_DIGEST: &str =
+    "b907287bacf5470d3b3c410ae6e7934f19ee7e0640b289fc41922a441bb88d5b";
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,6 +173,7 @@ pub enum RuntimeTurnEvidenceKind {
     DispatchAccepted,
     TurnStarted,
     ItemStarted,
+    AgentMessageDelta,
     ItemCompleted,
     Diagnostic,
     LocalApprovalRequested,
@@ -188,6 +191,7 @@ pub enum RuntimeTurnEvidenceKind {
 pub enum RuntimeTurnObservedKind {
     TurnStarted,
     ItemStarted,
+    AgentMessageDelta,
     ItemCompleted,
     Diagnostic,
     Completed,
@@ -228,6 +232,7 @@ pub struct RuntimeTurnPrivateMessage {
     pub runtime_turn_attempt_id: RuntimeTurnAttemptId,
     pub evidence_sequence: u64,
     pub worker_generation: u64,
+    pub item_id_digest: String,
     pub body: String,
     pub body_digest: String,
     pub event_digest: String,
@@ -244,6 +249,7 @@ impl fmt::Debug for RuntimeTurnPrivateMessage {
             .field("runtime_turn_attempt_id", &self.runtime_turn_attempt_id)
             .field("evidence_sequence", &self.evidence_sequence)
             .field("worker_generation", &self.worker_generation)
+            .field("item_id_digest", &self.item_id_digest)
             .field("body_digest", &self.body_digest)
             .field("event_digest", &self.event_digest)
             .field("observed_at", &self.observed_at)
@@ -254,6 +260,14 @@ impl fmt::Debug for RuntimeTurnPrivateMessage {
 impl RuntimeTurnPrivateMessage {
     pub fn capture(
         attempt: &RuntimeTurnAttempt,
+        body: impl Into<String>,
+    ) -> Result<Self, RuntimeTurnError> {
+        Self::capture_for_item(attempt, LEGACY_AGENT_MESSAGE_ITEM_DIGEST.to_owned(), body)
+    }
+
+    pub fn capture_for_item(
+        attempt: &RuntimeTurnAttempt,
+        item_id_digest: String,
         body: impl Into<String>,
     ) -> Result<Self, RuntimeTurnError> {
         let body = body.into();
@@ -268,6 +282,7 @@ impl RuntimeTurnPrivateMessage {
             runtime_turn_attempt_id: attempt.id.clone(),
             evidence_sequence: evidence.sequence,
             worker_generation: attempt.scope.worker_generation,
+            item_id_digest,
             body_digest: sha256(body.as_bytes()),
             body,
             event_digest: evidence.evidence_digest.clone(),
@@ -288,6 +303,8 @@ impl RuntimeTurnPrivateMessage {
             || self.mission_id != attempt.scope.mission_id
             || self.runtime_turn_attempt_id != attempt.id
             || self.worker_generation != attempt.scope.worker_generation
+            || evidence.kind != RuntimeTurnEvidenceKind::ItemCompleted
+            || !is_digest(&self.item_id_digest)
             || self.body.trim().is_empty()
             || self.body.len() > MAX_PRIVATE_MESSAGE_BYTES
             || self.body_digest != sha256(self.body.as_bytes())
@@ -295,6 +312,179 @@ impl RuntimeTurnPrivateMessage {
             || self.observed_at != evidence.observed_at
         {
             return Err(RuntimeTurnError::InvalidPrivateMessage);
+        }
+        Ok(())
+    }
+}
+
+/// One encrypted assistant text increment, bound to the exact public evidence
+/// transition that observed it. `chain_digest` makes omission, reordering, or
+/// cross-item splicing detectable when a partial stream is replayed after a
+/// coordinator or Desktop restart.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeTurnPrivateTextDelta {
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub runtime_turn_attempt_id: RuntimeTurnAttemptId,
+    pub evidence_sequence: u64,
+    pub stream_sequence: u64,
+    pub worker_generation: u64,
+    pub item_id_digest: String,
+    pub delta: String,
+    pub delta_digest: String,
+    pub cumulative_byte_count: u64,
+    pub chain_digest: String,
+    pub event_digest: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for RuntimeTurnPrivateTextDelta {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeTurnPrivateTextDelta")
+            .field("tenant_id", &self.tenant_id)
+            .field("project_id", &self.project_id)
+            .field("mission_id", &self.mission_id)
+            .field("runtime_turn_attempt_id", &self.runtime_turn_attempt_id)
+            .field("evidence_sequence", &self.evidence_sequence)
+            .field("stream_sequence", &self.stream_sequence)
+            .field("worker_generation", &self.worker_generation)
+            .field("item_id_digest", &self.item_id_digest)
+            .field("delta_digest", &self.delta_digest)
+            .field("cumulative_byte_count", &self.cumulative_byte_count)
+            .field("chain_digest", &self.chain_digest)
+            .field("event_digest", &self.event_digest)
+            .field("observed_at", &self.observed_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeTurnPrivateTextDelta {
+    pub fn capture(
+        attempt: &RuntimeTurnAttempt,
+        item_id_digest: String,
+        delta: impl Into<String>,
+        previous: Option<&Self>,
+    ) -> Result<Self, RuntimeTurnError> {
+        let delta = delta.into();
+        let evidence = attempt
+            .evidence
+            .last()
+            .ok_or(RuntimeTurnError::InvalidPrivateTextDelta)?;
+        let delta_byte_count =
+            u64::try_from(delta.len()).map_err(|_| RuntimeTurnError::InvalidPrivateTextDelta)?;
+        let (stream_sequence, previous_chain_digest, previous_byte_count) =
+            if let Some(previous) = previous {
+                (
+                    previous
+                        .stream_sequence
+                        .checked_add(1)
+                        .ok_or(RuntimeTurnError::RevisionOverflow)?,
+                    previous.chain_digest.as_str(),
+                    previous.cumulative_byte_count,
+                )
+            } else {
+                (1, "runtime-text-stream-v1", 0)
+            };
+        let cumulative_byte_count = previous_byte_count
+            .checked_add(delta_byte_count)
+            .ok_or(RuntimeTurnError::InvalidPrivateTextDelta)?;
+        let delta_digest = sha256(delta.as_bytes());
+        let chain_digest = private_text_delta_chain_digest(
+            previous_chain_digest,
+            &item_id_digest,
+            stream_sequence,
+            cumulative_byte_count,
+            &delta_digest,
+            evidence.sequence,
+        );
+        let record = Self {
+            tenant_id: attempt.scope.tenant_id.clone(),
+            project_id: attempt.scope.project_id.clone(),
+            mission_id: attempt.scope.mission_id.clone(),
+            runtime_turn_attempt_id: attempt.id.clone(),
+            evidence_sequence: evidence.sequence,
+            stream_sequence,
+            worker_generation: attempt.scope.worker_generation,
+            item_id_digest,
+            delta,
+            delta_digest,
+            cumulative_byte_count,
+            chain_digest,
+            event_digest: evidence.evidence_digest.clone(),
+            observed_at: evidence.observed_at,
+        };
+        record.validate_for(attempt, previous)?;
+        Ok(record)
+    }
+
+    pub fn validate_for(
+        &self,
+        attempt: &RuntimeTurnAttempt,
+        previous: Option<&Self>,
+    ) -> Result<(), RuntimeTurnError> {
+        let evidence = attempt
+            .evidence
+            .iter()
+            .find(|evidence| evidence.sequence == self.evidence_sequence)
+            .ok_or(RuntimeTurnError::InvalidPrivateTextDelta)?;
+        let delta_byte_count = u64::try_from(self.delta.len())
+            .map_err(|_| RuntimeTurnError::InvalidPrivateTextDelta)?;
+        let (expected_sequence, previous_chain_digest, previous_byte_count) =
+            if let Some(previous) = previous {
+                if previous.tenant_id != self.tenant_id
+                    || previous.project_id != self.project_id
+                    || previous.mission_id != self.mission_id
+                    || previous.runtime_turn_attempt_id != self.runtime_turn_attempt_id
+                    || previous.worker_generation != self.worker_generation
+                    || previous.item_id_digest != self.item_id_digest
+                    || previous.evidence_sequence >= self.evidence_sequence
+                {
+                    return Err(RuntimeTurnError::InvalidPrivateTextDelta);
+                }
+                (
+                    previous
+                        .stream_sequence
+                        .checked_add(1)
+                        .ok_or(RuntimeTurnError::RevisionOverflow)?,
+                    previous.chain_digest.as_str(),
+                    previous.cumulative_byte_count,
+                )
+            } else {
+                (1, "runtime-text-stream-v1", 0)
+            };
+        let expected_cumulative = previous_byte_count
+            .checked_add(delta_byte_count)
+            .ok_or(RuntimeTurnError::InvalidPrivateTextDelta)?;
+        let expected_chain = private_text_delta_chain_digest(
+            previous_chain_digest,
+            &self.item_id_digest,
+            self.stream_sequence,
+            self.cumulative_byte_count,
+            &self.delta_digest,
+            self.evidence_sequence,
+        );
+        if self.tenant_id != attempt.scope.tenant_id
+            || self.project_id != attempt.scope.project_id
+            || self.mission_id != attempt.scope.mission_id
+            || self.runtime_turn_attempt_id != attempt.id
+            || self.worker_generation != attempt.scope.worker_generation
+            || evidence.kind != RuntimeTurnEvidenceKind::AgentMessageDelta
+            || self.stream_sequence != expected_sequence
+            || self.delta.is_empty()
+            || self.delta.len() > MAX_PRIVATE_MESSAGE_BYTES
+            || !is_digest(&self.item_id_digest)
+            || self.delta_digest != sha256(self.delta.as_bytes())
+            || self.cumulative_byte_count != expected_cumulative
+            || self.cumulative_byte_count
+                > u64::try_from(MAX_PRIVATE_MESSAGE_BYTES).unwrap_or(u64::MAX)
+            || self.chain_digest != expected_chain
+            || self.event_digest != evidence.evidence_digest
+            || self.observed_at != evidence.observed_at
+        {
+            return Err(RuntimeTurnError::InvalidPrivateTextDelta);
         }
         Ok(())
     }
@@ -482,6 +672,9 @@ impl RuntimeTurnAttempt {
         let evidence_kind = match kind {
             RuntimeTurnObservedKind::TurnStarted => RuntimeTurnEvidenceKind::TurnStarted,
             RuntimeTurnObservedKind::ItemStarted => RuntimeTurnEvidenceKind::ItemStarted,
+            RuntimeTurnObservedKind::AgentMessageDelta => {
+                RuntimeTurnEvidenceKind::AgentMessageDelta
+            }
             RuntimeTurnObservedKind::ItemCompleted => RuntimeTurnEvidenceKind::ItemCompleted,
             RuntimeTurnObservedKind::Diagnostic => RuntimeTurnEvidenceKind::Diagnostic,
             RuntimeTurnObservedKind::Completed => {
@@ -907,6 +1100,7 @@ fn valid_status_transition(
                     | RuntimeTurnStatus::Uncertain,
                 RuntimeTurnEvidenceKind::TurnStarted
                     | RuntimeTurnEvidenceKind::ItemStarted
+                    | RuntimeTurnEvidenceKind::AgentMessageDelta
                     | RuntimeTurnEvidenceKind::ItemCompleted
                     | RuntimeTurnEvidenceKind::Diagnostic
             )
@@ -940,6 +1134,22 @@ fn is_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn private_text_delta_chain_digest(
+    previous_chain_digest: &str,
+    item_id_digest: &str,
+    stream_sequence: u64,
+    cumulative_byte_count: u64,
+    delta_digest: &str,
+    evidence_sequence: u64,
+) -> String {
+    sha256(
+        format!(
+            "{previous_chain_digest}:{item_id_digest}:{stream_sequence}:{cumulative_byte_count}:{delta_digest}:{evidence_sequence}"
+        )
+        .as_bytes(),
+    )
+}
+
 fn sha256(bytes: &[u8]) -> String {
     hex_digest(Sha256::digest(bytes).as_slice())
 }
@@ -967,6 +1177,8 @@ pub enum RuntimeTurnError {
     InvalidEvidence,
     #[error("runtime turn private message is invalid")]
     InvalidPrivateMessage,
+    #[error("runtime turn private text delta is invalid")]
+    InvalidPrivateTextDelta,
     #[error("runtime turn attempt is internally inconsistent")]
     InvalidAttempt,
     #[error("runtime turn transition is not permitted")]
@@ -1225,6 +1437,71 @@ mod tests {
         assert_eq!(
             forged.validate_for(&attempt),
             Err(RuntimeTurnError::InvalidPrivateMessage)
+        );
+    }
+
+    #[test]
+    fn private_text_delta_chain_rejects_reordering_splicing_and_content_tamper() {
+        let now = Utc::now();
+        let mut attempt = RuntimeTurnAttempt::prepare(
+            RuntimeTurnAttemptId::from("turn-attempt-private-delta"),
+            scope(),
+            now,
+        )
+        .expect("prepare");
+        attempt.begin_dispatch(now).expect("dispatch");
+        attempt
+            .accept_dispatch(
+                "runtime-turn-private-delta".into(),
+                digest("request"),
+                digest("response"),
+                now + Duration::milliseconds(1),
+            )
+            .expect("accept");
+        let item_id_digest = digest("assistant-item");
+        attempt
+            .observe(
+                RuntimeTurnObservedKind::AgentMessageDelta,
+                digest("delta-event-1"),
+                now + Duration::milliseconds(2),
+            )
+            .expect("first delta event");
+        let first = RuntimeTurnPrivateTextDelta::capture(
+            &attempt,
+            item_id_digest.clone(),
+            "PRIVATE-",
+            None,
+        )
+        .expect("first delta");
+        attempt
+            .observe(
+                RuntimeTurnObservedKind::AgentMessageDelta,
+                digest("delta-event-2"),
+                now + Duration::milliseconds(3),
+            )
+            .expect("second delta event");
+        let second =
+            RuntimeTurnPrivateTextDelta::capture(&attempt, item_id_digest, "STREAM", Some(&first))
+                .expect("second delta");
+        assert_eq!(second.stream_sequence, 2);
+        assert_eq!(second.cumulative_byte_count, 14);
+        assert!(!format!("{first:?}{second:?}").contains("PRIVATE-STREAM"));
+
+        let mut tampered = second.clone();
+        tampered.delta.push('!');
+        assert_eq!(
+            tampered.validate_for(&attempt, Some(&first)),
+            Err(RuntimeTurnError::InvalidPrivateTextDelta)
+        );
+        assert_eq!(
+            second.validate_for(&attempt, None),
+            Err(RuntimeTurnError::InvalidPrivateTextDelta)
+        );
+        let mut cross_item = first.clone();
+        cross_item.item_id_digest = digest("different-item");
+        assert_eq!(
+            second.validate_for(&attempt, Some(&cross_item)),
+            Err(RuntimeTurnError::InvalidPrivateTextDelta)
         );
     }
 

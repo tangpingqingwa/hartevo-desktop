@@ -502,6 +502,7 @@ pub enum RuntimeEventKind {
     ThreadStarted,
     TurnStarted,
     ItemStarted,
+    AgentMessageDelta,
     ItemCompleted,
     TurnCompleted,
     LocalApprovalRequested,
@@ -514,6 +515,7 @@ impl RuntimeEventKind {
             "thread/started" => Self::ThreadStarted,
             "turn/started" => Self::TurnStarted,
             "item/started" => Self::ItemStarted,
+            "item/agentMessage/delta" => Self::AgentMessageDelta,
             "item/completed" => Self::ItemCompleted,
             "turn/completed" => Self::TurnCompleted,
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
@@ -565,6 +567,7 @@ impl fmt::Debug for RuntimeLocalApprovalRequest {
 pub enum MappedTurnEventKind {
     TurnStarted,
     ItemStarted,
+    AgentMessageDelta,
     ItemCompleted,
     TurnCompleted(RuntimeTurnCompletionStatus),
     LocalApprovalRequested(RuntimeLocalApprovalKind),
@@ -575,12 +578,13 @@ pub enum MappedTurnEventKind {
 #[derive(Clone, PartialEq)]
 pub struct RuntimeAgentMessage {
     text: Zeroizing<String>,
+    pub item_id_digest: String,
     pub content_digest: String,
     pub byte_count: u64,
 }
 
 impl RuntimeAgentMessage {
-    fn new(text: &str) -> Result<Option<Self>, AdapterError> {
+    fn new(item_id: &str, text: &str) -> Result<Option<Self>, AdapterError> {
         if text.is_empty() {
             return Ok(None);
         }
@@ -592,6 +596,7 @@ impl RuntimeAgentMessage {
         }
         Ok(Some(Self {
             text: Zeroizing::new(text.to_owned()),
+            item_id_digest: digest_hex(item_id.as_bytes()),
             content_digest: digest_hex(text.as_bytes()),
             byte_count: u64::try_from(text.len()).map_err(|_| {
                 AdapterError::AgentMessageTooLarge {
@@ -611,6 +616,60 @@ impl fmt::Debug for RuntimeAgentMessage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RuntimeAgentMessage")
+            .field("item_id_digest", &self.item_id_digest)
+            .field("content_digest", &self.content_digest)
+            .field("byte_count", &self.byte_count)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One content-bearing assistant text increment from the pinned App Server v2
+/// protocol. The text is deliberately transient and zeroized; only its
+/// digests may enter content-free evidence and diagnostics.
+#[derive(Clone, PartialEq)]
+pub struct RuntimeAgentMessageDelta {
+    text: Zeroizing<String>,
+    pub item_id_digest: String,
+    pub content_digest: String,
+    pub byte_count: u64,
+}
+
+impl RuntimeAgentMessageDelta {
+    fn new(item_id: &str, text: &str) -> Result<Self, AdapterError> {
+        if item_id.is_empty() || text.is_empty() {
+            return Err(AdapterError::InvalidTurnNotification {
+                notification_digest: digest_hex(format!("{item_id}:{}", text.len()).as_bytes()),
+            });
+        }
+        if text.len() > MAX_AGENT_MESSAGE_BYTES {
+            return Err(AdapterError::AgentMessageTooLarge {
+                byte_count: text.len(),
+                maximum: MAX_AGENT_MESSAGE_BYTES,
+            });
+        }
+        Ok(Self {
+            text: Zeroizing::new(text.to_owned()),
+            item_id_digest: digest_hex(item_id.as_bytes()),
+            content_digest: digest_hex(text.as_bytes()),
+            byte_count: u64::try_from(text.len()).map_err(|_| {
+                AdapterError::AgentMessageTooLarge {
+                    byte_count: text.len(),
+                    maximum: MAX_AGENT_MESSAGE_BYTES,
+                }
+            })?,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.text.as_str()
+    }
+}
+
+impl fmt::Debug for RuntimeAgentMessageDelta {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeAgentMessageDelta")
+            .field("item_id_digest", &self.item_id_digest)
             .field("content_digest", &self.content_digest)
             .field("byte_count", &self.byte_count)
             .finish_non_exhaustive()
@@ -622,6 +681,9 @@ pub struct MappedTurnEvent {
     pub kind: MappedTurnEventKind,
     pub event_digest: String,
     pub approval_request: Option<RuntimeLocalApprovalRequest>,
+    /// Incremental user-facing assistant text. It is transient, zeroized on
+    /// drop, and omitted from content-free evidence.
+    pub agent_message_delta: Option<RuntimeAgentMessageDelta>,
     /// Completed user-facing agent output only. It is transient, zeroized on
     /// drop, and omitted from persistent Runtime evidence.
     pub agent_message: Option<RuntimeAgentMessage>,
@@ -634,6 +696,7 @@ impl fmt::Debug for MappedTurnEvent {
             .field("kind", &self.kind)
             .field("event_digest", &self.event_digest)
             .field("approval_request", &self.approval_request)
+            .field("agent_message_delta", &self.agent_message_delta)
             .field("agent_message", &self.agent_message)
             .finish()
     }
@@ -1659,6 +1722,10 @@ impl StdioRuntime {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one protocol boundary maps every scoped turn notification, private text carrier, approval request, and terminal failure without leaking content"
+    )]
     pub fn next_mapped_turn_event(
         &mut self,
         mapping: &RuntimeMapping,
@@ -1688,12 +1755,14 @@ impl StdioRuntime {
                         kind: approval_kind,
                         request_digest,
                     }),
+                    agent_message_delta: None,
                     agent_message: None,
                 })
             }
             RuntimeEvent::Notification { kind, notification } => {
                 let event_digest = digest_hex(&serde_json::to_vec(&notification)?);
                 let mut agent_message = None;
+                let mut agent_message_delta = None;
                 let mapped_kind = match kind {
                     RuntimeEventKind::TurnStarted => {
                         self.validate_turn_scope_fields(mapping, &notification.params, true)?;
@@ -1703,6 +1772,18 @@ impl StdioRuntime {
                     RuntimeEventKind::ItemStarted => {
                         self.validate_turn_scope_fields(mapping, &notification.params, false)?;
                         MappedTurnEventKind::ItemStarted
+                    }
+                    RuntimeEventKind::AgentMessageDelta => {
+                        self.validate_turn_scope_fields(mapping, &notification.params, false)?;
+                        agent_message_delta =
+                            Some(match parse_agent_message_delta(&notification.params) {
+                                Ok(delta) => delta,
+                                Err(_) => {
+                                    return self
+                                        .turn_protocol_violation("invalid_agent_message_delta");
+                                }
+                            });
+                        MappedTurnEventKind::AgentMessageDelta
                     }
                     RuntimeEventKind::ItemCompleted => {
                         self.validate_turn_scope_fields(mapping, &notification.params, false)?;
@@ -1731,6 +1812,7 @@ impl StdioRuntime {
                     kind: mapped_kind,
                     event_digest,
                     approval_request: None,
+                    agent_message_delta,
                     agent_message,
                 })
             }
@@ -1738,12 +1820,14 @@ impl StdioRuntime {
                 kind: MappedTurnEventKind::Diagnostic,
                 event_digest: digest_hex(format!("{diagnostic:?}").as_bytes()),
                 approval_request: None,
+                agent_message_delta: None,
                 agent_message: None,
             }),
             RuntimeEvent::StderrClosed => Ok(MappedTurnEvent {
                 kind: MappedTurnEventKind::Diagnostic,
                 event_digest: digest_hex(b"runtime-stderr-closed"),
                 approval_request: None,
+                agent_message_delta: None,
                 agent_message: None,
             }),
             RuntimeEvent::ProtocolViolation(diagnostic) => Err(AdapterError::ProtocolViolation {
@@ -2288,12 +2372,32 @@ fn completed_agent_message(params: &Value) -> Result<Option<RuntimeAgentMessage>
     if item_type != "agentMessage" {
         return Ok(None);
     }
+    let item_id = item.get("id").and_then(Value::as_str).ok_or_else(|| {
+        AdapterError::InvalidTurnNotification {
+            notification_digest: json_digest(item),
+        }
+    })?;
     let text = item.get("text").and_then(Value::as_str).ok_or_else(|| {
         AdapterError::InvalidTurnNotification {
             notification_digest: json_digest(item),
         }
     })?;
-    RuntimeAgentMessage::new(text)
+    RuntimeAgentMessage::new(item_id, text)
+}
+
+fn parse_agent_message_delta(params: &Value) -> Result<RuntimeAgentMessageDelta, AdapterError> {
+    let item_id = params
+        .get("itemId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AdapterError::InvalidTurnNotification {
+            notification_digest: json_digest(params),
+        })?;
+    let delta = params.get("delta").and_then(Value::as_str).ok_or_else(|| {
+        AdapterError::InvalidTurnNotification {
+            notification_digest: json_digest(params),
+        }
+    })?;
+    RuntimeAgentMessageDelta::new(item_id, delta)
 }
 
 impl Drop for StdioRuntime {
@@ -3542,6 +3646,10 @@ mod tests {
             RuntimeEventKind::ItemCompleted
         );
         assert_eq!(
+            RuntimeEventKind::from_method("item/agentMessage/delta"),
+            RuntimeEventKind::AgentMessageDelta
+        );
+        assert_eq!(
             RuntimeEventKind::from_method("future/event"),
             RuntimeEventKind::Unknown("future/event".into())
         );
@@ -4179,6 +4287,8 @@ case "$turn" in *'"clientUserMessageId":"application-turn-private"'*'runtime-con
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"runtime-thread-private","turn":{"id":"runtime-turn-private","status":"inProgress"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"turn":{"id":"runtime-turn-private","status":"inProgress"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"runtime-thread-private","turnId":"runtime-turn-private","item":{"id":"private-item","type":"agentMessage","text":"private-stream"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"runtime-thread-private","turnId":"runtime-turn-private","itemId":"private-item","delta":"private-"}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"runtime-thread-private","turnId":"runtime-turn-private","itemId":"private-item","delta":"result"}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"runtime-thread-private","turnId":"runtime-turn-private","item":{"id":"private-item","type":"agentMessage","text":"private-result"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"runtime-thread-private","turn":{"id":"runtime-turn-private","status":"completed","items":[]}}}'
 sleep 20"#;
@@ -4216,6 +4326,8 @@ sleep 20"#;
         let expected = [
             MappedTurnEventKind::TurnStarted,
             MappedTurnEventKind::ItemStarted,
+            MappedTurnEventKind::AgentMessageDelta,
+            MappedTurnEventKind::AgentMessageDelta,
             MappedTurnEventKind::ItemCompleted,
             MappedTurnEventKind::TurnCompleted(RuntimeTurnCompletionStatus::Completed),
         ];
@@ -4229,8 +4341,20 @@ sleep 20"#;
                 let message = event.agent_message.as_ref().expect("transient result");
                 assert_eq!(message.as_str(), "private-result");
                 assert_eq!(message.byte_count, 14);
+                assert_eq!(message.item_id_digest, digest_hex(b"private-item"));
                 assert_eq!(message.content_digest, digest_hex(b"private-result"));
+                assert!(event.agent_message_delta.is_none());
+            } else if event.kind == MappedTurnEventKind::AgentMessageDelta {
+                let delta = event
+                    .agent_message_delta
+                    .as_ref()
+                    .expect("transient text delta");
+                assert_eq!(delta.item_id_digest, digest_hex(b"private-item"));
+                assert!(!delta.as_str().is_empty());
+                assert_eq!(delta.content_digest, digest_hex(delta.as_str().as_bytes()));
+                assert!(event.agent_message.is_none());
             } else {
+                assert!(event.agent_message_delta.is_none());
                 assert!(event.agent_message.is_none());
             }
             let debug = format!("{event:?}");

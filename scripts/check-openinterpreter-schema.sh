@@ -10,8 +10,8 @@ readonly expected_server_requests="fc063273c71e6310f5a4c1449a607364fcd11b8bf4c99
 readonly expected_server_notifications="322148beced81b06eafa74011a91ace9c3ef2bad9757d3e0e6c72369c52251fb"
 readonly expected_checksums="1d9ef8a8fac6449c1ecfab293a18e15c777f2bbd41418dcc76434b697beae267"
 readonly expected_artifact_catalog="dca01e63fe94a3961fc5d1ba847f642d23429717322e527f83bf5e596e608061"
-readonly expected_vendored_license="c95bae1d1ce0235ecccd3560b772ec1efb97f348a79f0fbe0a634f0c2ccefe2c"
-readonly expected_vendored_notice="d5e4d363cea80898cbefcc6bfb3d5af833ef22c5a99dc074ec28bf64115cf280"
+readonly expected_vendored_license="c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+readonly expected_vendored_notice="2918fe8efde0c31b0b0d9fdb2a70d3f029b46b7b70f4231da4937203e8c128eb"
 readonly workspace_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/hartevo-openinterpreter.XXXXXX")"
@@ -78,7 +78,7 @@ while IFS=$'\t' read -r archive digest; do
 done < <(jq -r '.artifacts[] | [.archive, .archiveSha256] | @tsv' \
   "${workspace_root}/third_party/openinterpreter/ARTIFACTS.json")
 
-for method in thread/started turn/started item/started item/completed turn/completed; do
+for method in thread/started turn/started item/started item/agentMessage/delta item/completed turn/completed; do
   if ! jq -e --arg method "${method}" \
     '[.. | objects | .method? | .enum? // empty | .[]?] | any(. == $method)' \
     "${work_dir}/server-notifications.json" >/dev/null; then

@@ -75,7 +75,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 44;
+pub const STORAGE_SCHEMA_VERSION: i64 = 45;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -3976,6 +3976,126 @@ impl ProjectStore {
                    );",
             )?;
             record_migration(&transaction, 44)?;
+            transaction.commit()?;
+        }
+        // Provisional v45 on `codex/interaction-baseline`. Integration owns
+        // Outcome/Human-decision v45, so this exact migration must be
+        // renumbered to v46 and remain after that migration when merged.
+        if current_schema_version(&self.connection)? < 45 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                "DROP INDEX IF EXISTS runtime_turn_private_message_scope_idx;
+                 ALTER TABLE runtime_turn_private_messages
+                   RENAME TO runtime_turn_private_messages_v45;
+                 ALTER TABLE runtime_turn_evidence RENAME TO runtime_turn_evidence_v45;
+                 CREATE TABLE runtime_turn_evidence (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   runtime_turn_attempt_id TEXT NOT NULL,
+                   sequence INTEGER NOT NULL CHECK (sequence > 0),
+                   evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
+                     'prepared', 'dispatch_started', 'dispatch_accepted', 'turn_started',
+                     'item_started', 'agent_message_delta', 'item_completed', 'diagnostic',
+                     'local_approval_requested', 'local_approval_response_started',
+                     'local_approval_response_sent', 'interrupt_requested',
+                     'interrupt_accepted', 'completed', 'interrupted', 'failed', 'uncertain'
+                   )),
+                   evidence_digest TEXT NOT NULL CHECK (length(evidence_digest) = 64),
+                   resulting_status TEXT NOT NULL CHECK (resulting_status IN (
+                     'prepared', 'dispatching', 'running', 'waiting_local_approval',
+                     'approval_responding', 'interrupt_requested', 'completed',
+                     'interrupted', 'failed', 'uncertain'
+                   )),
+                   observed_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id, runtime_turn_attempt_id, sequence),
+                   FOREIGN KEY (project_id, runtime_turn_attempt_id)
+                     REFERENCES runtime_turn_attempts(project_id, id) ON DELETE CASCADE
+                 );
+                 INSERT INTO runtime_turn_evidence (
+                   tenant_id, project_id, runtime_turn_attempt_id, sequence,
+                   evidence_kind, evidence_digest, resulting_status, observed_at
+                 )
+                 SELECT tenant_id, project_id, runtime_turn_attempt_id, sequence,
+                   evidence_kind, evidence_digest, resulting_status, observed_at
+                 FROM runtime_turn_evidence_v45;
+                 CREATE TABLE runtime_turn_private_messages (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   runtime_turn_attempt_id TEXT NOT NULL,
+                   evidence_sequence INTEGER NOT NULL CHECK (evidence_sequence > 0),
+                   worker_generation INTEGER NOT NULL CHECK (worker_generation > 0),
+                   item_id_digest TEXT NOT NULL CHECK (length(item_id_digest) = 64),
+                   body TEXT NOT NULL CHECK (
+                     length(trim(body)) > 0 AND length(body) <= 4194304
+                   ),
+                   body_digest TEXT NOT NULL CHECK (length(body_digest) = 64),
+                   event_digest TEXT NOT NULL CHECK (length(event_digest) = 64),
+                   observed_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id, runtime_turn_attempt_id, evidence_sequence),
+                   FOREIGN KEY (mission_id, project_id)
+                     REFERENCES missions(id, project_id) ON DELETE CASCADE,
+                   FOREIGN KEY (
+                     project_id, runtime_turn_attempt_id, evidence_sequence
+                   ) REFERENCES runtime_turn_evidence(
+                     project_id, runtime_turn_attempt_id, sequence
+                   ) ON DELETE CASCADE
+                 );
+                 INSERT INTO runtime_turn_private_messages (
+                   tenant_id, project_id, mission_id, runtime_turn_attempt_id,
+                   evidence_sequence, worker_generation, item_id_digest, body,
+                   body_digest, event_digest, observed_at
+                 )
+                 SELECT tenant_id, project_id, mission_id, runtime_turn_attempt_id,
+                   evidence_sequence, worker_generation,
+                   'b907287bacf5470d3b3c410ae6e7934f19ee7e0640b289fc41922a441bb88d5b',
+                   body, body_digest, event_digest, observed_at
+                 FROM runtime_turn_private_messages_v45;
+                 CREATE INDEX runtime_turn_private_message_scope_idx
+                   ON runtime_turn_private_messages(
+                     tenant_id, project_id, mission_id, worker_generation,
+                     runtime_turn_attempt_id, evidence_sequence
+                   );
+                 DROP TABLE runtime_turn_private_messages_v45;
+                 DROP TABLE runtime_turn_evidence_v45;
+                 CREATE TABLE runtime_turn_private_text_deltas (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   runtime_turn_attempt_id TEXT NOT NULL,
+                   evidence_sequence INTEGER NOT NULL CHECK (evidence_sequence > 0),
+                   stream_sequence INTEGER NOT NULL CHECK (stream_sequence > 0),
+                   worker_generation INTEGER NOT NULL CHECK (worker_generation > 0),
+                   item_id_digest TEXT NOT NULL CHECK (length(item_id_digest) = 64),
+                   delta TEXT NOT NULL CHECK (
+                     length(delta) > 0 AND length(delta) <= 4194304
+                   ),
+                   delta_digest TEXT NOT NULL CHECK (length(delta_digest) = 64),
+                   cumulative_byte_count INTEGER NOT NULL CHECK (
+                     cumulative_byte_count > 0 AND cumulative_byte_count <= 4194304
+                   ),
+                   chain_digest TEXT NOT NULL CHECK (length(chain_digest) = 64),
+                   event_digest TEXT NOT NULL CHECK (length(event_digest) = 64),
+                   observed_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id, runtime_turn_attempt_id, evidence_sequence),
+                   UNIQUE (
+                     project_id, runtime_turn_attempt_id, item_id_digest, stream_sequence
+                   ),
+                   FOREIGN KEY (mission_id, project_id)
+                     REFERENCES missions(id, project_id) ON DELETE CASCADE,
+                   FOREIGN KEY (
+                     project_id, runtime_turn_attempt_id, evidence_sequence
+                   ) REFERENCES runtime_turn_evidence(
+                     project_id, runtime_turn_attempt_id, sequence
+                   ) ON DELETE CASCADE
+                 );
+                 CREATE INDEX runtime_turn_private_text_delta_scope_idx
+                   ON runtime_turn_private_text_deltas(
+                     tenant_id, project_id, mission_id, worker_generation,
+                     runtime_turn_attempt_id, item_id_digest, stream_sequence
+                   );",
+            )?;
+            record_migration(&transaction, 45)?;
             transaction.commit()?;
         }
         self.backfill_normalized_state()?;
