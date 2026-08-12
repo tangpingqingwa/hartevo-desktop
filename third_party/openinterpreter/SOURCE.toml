@@ -16,9 +16,9 @@ experimental_api = false
 
 [integrity]
 upstream_license_sha256 = "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc"
-vendored_license_sha256 = "c95bae1d1ce0235ecccd3560b772ec1efb97f348a79f0fbe0a634f0c2ccefe2c"
+vendored_license_sha256 = "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc"
 upstream_notice_sha256 = "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915"
-vendored_notice_sha256 = "d5e4d363cea80898cbefcc6bfb3d5af833ef22c5a99dc074ec28bf64115cf280"
+vendored_notice_sha256 = "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915"
 release_checksum_manifest_sha256 = "1d9ef8a8fac6449c1ecfab293a18e15c777f2bbd41418dcc76434b697beae267"
 artifact_manifest = "ARTIFACTS.json"
 artifact_manifest_sha256 = "dca01e63fe94a3961fc5d1ba847f642d23429717322e527f83bf5e596e608061"

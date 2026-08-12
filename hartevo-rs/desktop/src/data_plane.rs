@@ -2756,9 +2756,9 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the Desktop data-plane Journey proves Application dispatch, honest empty-ledger blocking, source-verified recovery, atomic next-route handoff, and zero Runtime construction"
+        reason = "the Desktop data-plane Journey proves three deterministic Application handlers, honest empty-ledger blocking, source-verified recovery, atomic next-route handoff, and zero Runtime construction"
     )]
-    fn vm11_application_checkpoint_blocks_then_recovers_without_constructing_runtime() {
+    fn vm11_application_handlers_recover_and_advance_without_constructing_runtime() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
         let started = plane
             .start_catalog_mission_and_run_with(
@@ -2961,17 +2961,117 @@ sleep 30"#;
                     .as_deref(),
             ),
             (
-                Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented),
-                None,
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                Some("vm11.normalize-dedupe-order/v1"),
             )
         );
-        let unsupported_revision = projected.revision;
         assert!(resumed.snapshot.runtime_activity.iter().all(|activity| {
             activity.mission_id != started.mission_id
                 || (activity.process_claim_status.is_none()
                     && activity.recovery_status.is_none()
                     && activity.turn_status.is_none())
         }));
+        let normalized = plane
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("normalization Application route must not construct Runtime")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(5),
+            )
+            .expect("normalize Outcome Ledger without Runtime");
+        assert_eq!(
+            normalized.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "identity_chain".into(),
+                capability_id: "attribution.compute".into(),
+                executor: MissionCheckpointExecutor::Application,
+                oracle_ids: BTreeSet::from([
+                    "decision".into(),
+                    "operating_state".into(),
+                    "outcome".into(),
+                    "truth".into(),
+                ]),
+                completion_policy: MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
+        let normalized_projection = normalized.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("normalized VM-11 projection");
+        assert_eq!(normalized_projection.completed_checkpoint_count, 2);
+        assert_eq!(
+            (
+                normalized_projection.current_checkpoint_application_handler_status,
+                normalized_projection
+                    .current_checkpoint_application_handler_id
+                    .as_deref(),
+            ),
+            (
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                Some("vm11.identity-chain/v1"),
+            )
+        );
+        let identified = plane
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("identity-chain Application route must not construct Runtime")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(6),
+            )
+            .expect("resolve identity chain without Runtime");
+        assert_eq!(
+            identified.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "mission_specific_kpi".into(),
+                capability_id: "attribution.compute".into(),
+                executor: MissionCheckpointExecutor::Application,
+                oracle_ids: BTreeSet::from([
+                    "decision".into(),
+                    "operating_state".into(),
+                    "outcome".into(),
+                    "truth".into(),
+                ]),
+                completion_policy: MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
+        let identified_projection = identified.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("identity-resolved VM-11 projection");
+        assert_eq!(identified_projection.completed_checkpoint_count, 3);
+        assert_eq!(
+            (
+                identified_projection.current_checkpoint_application_handler_status,
+                identified_projection
+                    .current_checkpoint_application_handler_id
+                    .as_deref(),
+            ),
+            (
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented),
+                None,
+            )
+        );
+        let unsupported_revision = identified_projection.revision;
         let unsupported = plane
             .resume_mission_runtime_with(
                 &secrets,
@@ -2985,14 +3085,14 @@ sleep 30"#;
                     }),
                 }),
                 DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
-                observed_at() + Duration::minutes(5),
+                observed_at() + Duration::minutes(7),
             )
             .expect("honest unsupported Application route");
         assert_eq!(
             unsupported.runtime_outcome,
             DesktopMissionRuntimeOutcome::ApplicationCheckpointNotImplemented {
-                checkpoint_id: "normalize_dedupe_order".into(),
-                capability_id: "outcome.ingest".into(),
+                checkpoint_id: "mission_specific_kpi".into(),
+                capability_id: "attribution.compute".into(),
             }
         );
         assert_eq!(
@@ -3008,7 +3108,7 @@ sleep 30"#;
             .get(plane.database_key_reference())
             .expect("database secret");
         let (service, _) = plane
-            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(6))
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(8))
             .expect("reopen completed Application route");
         let mission = service
             .load_mission(&project_id, &started.mission_id)
@@ -3029,7 +3129,43 @@ sleep 30"#;
                 .application_evidence
                 .as_ref()
                 .map(|evidence| evidence.handler_id.as_str()),
-            Some("vm11.event_ingest/v1")
+            Some("vm11.event_ingest/v2")
+        );
+        let normalization_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "normalize_dedupe_order")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable normalization completion");
+        assert_eq!(
+            normalization_completion
+                .application_evidence
+                .as_ref()
+                .map(|evidence| evidence.handler_id.as_str()),
+            Some("vm11.normalize-dedupe-order/v1")
+        );
+        let identity_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "identity_chain")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable identity-chain completion");
+        assert_eq!(
+            identity_completion
+                .application_evidence
+                .as_ref()
+                .map(|evidence| evidence.handler_id.as_str()),
+            Some("vm11.identity-chain/v1")
         );
         assert_eq!(mission.effects.len(), 0);
     }

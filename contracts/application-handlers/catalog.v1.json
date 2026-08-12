@@ -1,16 +1,52 @@
 {
   "schemaVersion": "hartevo-application-handler-registry/v1",
-  "registryVersion": "desktop-2026-08-12-v1",
+  "registryVersion": "desktop-2026-08-12-v3",
   "handlers": [
     {
-      "handlerId": "vm11.event_ingest/v1",
+      "handlerId": "vm11.event_ingest/v2",
       "missionId": "VM-11",
       "missionVersion": 3,
       "checkpointId": "event_ingest",
       "capabilityId": "outcome.ingest",
       "completionPolicy": "deterministic_evidence",
       "sourceKinds": ["mission_contract", "mission_checkpoint", "outcome_ledger"],
+      "sourceOracleBindings": {
+        "mission_contract": ["goal"],
+        "mission_checkpoint": ["operating_state"],
+        "outcome_ledger": ["truth", "outcome"]
+      },
       "oracleIds": ["goal", "truth", "operating_state", "outcome"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm11.normalize-dedupe-order/v1",
+      "missionId": "VM-11",
+      "missionVersion": 3,
+      "checkpointId": "normalize_dedupe_order",
+      "capabilityId": "outcome.ingest",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": ["mission_checkpoint", "outcome_normalization"],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "outcome_normalization": ["truth", "outcome"]
+      },
+      "oracleIds": ["truth", "operating_state", "outcome"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm11.identity-chain/v1",
+      "missionId": "VM-11",
+      "missionVersion": 3,
+      "checkpointId": "identity_chain",
+      "capabilityId": "attribution.compute",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": ["mission_checkpoint", "outcome_normalization", "outcome_identity_chain"],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "outcome_normalization": ["outcome"],
+        "outcome_identity_chain": ["truth", "decision"]
+      },
+      "oracleIds": ["truth", "decision", "operating_state", "outcome"],
       "implementationCrate": "hartevo-application"
     }
   ]

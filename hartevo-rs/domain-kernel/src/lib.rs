@@ -100,8 +100,9 @@ pub use mission_schedule::{
 pub use money::{CurrencyCode, FxQuote, Money, MoneyError};
 pub use outcome::{
     AttributionModel, AttributionRecord, CommissionRecord, CommissionStatus, OutcomeEvent,
-    OutcomeEventKind, OutcomeLedger, OutcomeLedgerError, OutcomeOrder, OutcomeRefund,
-    OutcomeSourceVerification, OutcomeVerificationMethod, Touchpoint,
+    OutcomeEventKind, OutcomeIdentityChainProjection, OutcomeLedger, OutcomeLedgerError,
+    OutcomeNormalizationProjection, OutcomeOrder, OutcomeRefund, OutcomeSourceVerification,
+    OutcomeVerificationMethod, Touchpoint,
 };
 pub use project::{Project, ProjectDataCell, ProjectError, StorageMode};
 pub use relationship::{

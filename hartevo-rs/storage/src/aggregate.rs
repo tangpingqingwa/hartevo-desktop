@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use hartevo_domain_kernel::{Mission, Project};
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -31,6 +33,60 @@ pub struct AtomicMutation {
     pub event_sequences: Vec<i64>,
     pub outbox_sequences: Vec<i64>,
     pub state_revision: u64,
+}
+
+/// A typed, project-scoped read fence for an Application Checkpoint source.
+/// `None` fences a required absence, allowing a missing-record block to race
+/// safely with sync or recovery inserting that record.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ApplicationSourceKind {
+    Connection,
+    IdentityLink,
+    Person,
+    Company,
+    Partner,
+    Opportunity,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ApplicationSourceRevisionFence {
+    kind: ApplicationSourceKind,
+    id: String,
+    expected_revision: Option<u64>,
+}
+
+impl ApplicationSourceRevisionFence {
+    pub fn present(
+        kind: ApplicationSourceKind,
+        id: impl Into<String>,
+        expected_revision: u64,
+    ) -> Self {
+        Self {
+            kind,
+            id: id.into(),
+            expected_revision: Some(expected_revision),
+        }
+    }
+
+    pub fn absent(kind: ApplicationSourceKind, id: impl Into<String>) -> Self {
+        Self {
+            kind,
+            id: id.into(),
+            expected_revision: None,
+        }
+    }
+
+    pub const fn kind(&self) -> ApplicationSourceKind {
+        self.kind
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub const fn expected_revision(&self) -> Option<u64> {
+        self.expected_revision
+    }
 }
 
 impl ProjectStore {
@@ -197,6 +253,27 @@ impl ProjectStore {
         expected_outcome_ledger_revision: Option<u64>,
         events: &[PendingEvent],
     ) -> Result<AtomicMutation, StorageError> {
+        self.update_mission_atomic_with_application_source_fences(
+            mission,
+            expected_mission_revision,
+            expected_outcome_ledger_revision,
+            &[],
+            events,
+        )
+    }
+
+    /// Extends the Outcome Ledger fence with the exact Connection/Identity/
+    /// Relationship revisions inspected by a deterministic Application
+    /// handler. Every fence and the Mission CAS is evaluated in the same SQL
+    /// transaction as its Event/Outbox append.
+    pub fn update_mission_atomic_with_application_source_fences(
+        &mut self,
+        mission: &Mission,
+        expected_mission_revision: u64,
+        expected_outcome_ledger_revision: Option<u64>,
+        source_fences: &[ApplicationSourceRevisionFence],
+        events: &[PendingEvent],
+    ) -> Result<AtomicMutation, StorageError> {
         if mission.revision <= expected_mission_revision {
             return Err(StorageError::UnexpectedNewerRevision {
                 expected_revision: expected_mission_revision,
@@ -205,6 +282,19 @@ impl ProjectStore {
         }
         if events.is_empty() {
             return Err(StorageError::EmptyAtomicEventSet);
+        }
+        let mut unique_fences = BTreeSet::new();
+        for fence in source_fences {
+            if fence.id.trim().is_empty()
+                || fence
+                    .expected_revision
+                    .is_some_and(|revision| revision == 0)
+                || !unique_fences.insert((fence.kind, fence.id.as_str()))
+            {
+                return Err(StorageError::DomainDecode(
+                    "application source fences must be non-empty, non-zero and unique".into(),
+                ));
+            }
         }
         let expected_source_revision = expected_outcome_ledger_revision
             .map(|revision| {
@@ -236,6 +326,14 @@ impl ProjectStore {
                 expected_revision: expected_outcome_ledger_revision.unwrap_or(0),
             });
         }
+        for fence in source_fences {
+            require_application_source_fence(
+                &transaction,
+                mission.tenant_id.as_str(),
+                mission.project_id.as_str(),
+                fence,
+            )?;
+        }
         update_mission_normalized_cas(&transaction, mission, expected_mission_revision)?;
         let (event_sequences, outbox_sequences) = append_events(
             &transaction,
@@ -252,6 +350,73 @@ impl ProjectStore {
             outbox_sequences,
             state_revision: mission.revision,
         })
+    }
+}
+
+fn require_application_source_fence(
+    transaction: &Transaction<'_>,
+    tenant_id: &str,
+    project_id: &str,
+    fence: &ApplicationSourceRevisionFence,
+) -> Result<(), StorageError> {
+    let query = match fence.kind {
+        ApplicationSourceKind::Connection => {
+            "SELECT tenant_id, revision FROM connections WHERE project_id = ?1 AND id = ?2"
+        }
+        ApplicationSourceKind::IdentityLink => {
+            "SELECT tenant_id, revision FROM identity_links WHERE project_id = ?1 AND id = ?2"
+        }
+        ApplicationSourceKind::Person => {
+            "SELECT tenant_id, revision FROM people WHERE project_id = ?1 AND id = ?2"
+        }
+        ApplicationSourceKind::Company => {
+            "SELECT tenant_id, revision FROM companies WHERE project_id = ?1 AND id = ?2"
+        }
+        ApplicationSourceKind::Partner => {
+            "SELECT tenant_id, revision FROM partners WHERE project_id = ?1 AND id = ?2"
+        }
+        ApplicationSourceKind::Opportunity => {
+            "SELECT tenant_id, revision FROM opportunities WHERE project_id = ?1 AND id = ?2"
+        }
+    };
+    let stored = transaction
+        .query_row(query, params![project_id, fence.id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .optional()?;
+    if stored
+        .as_ref()
+        .is_some_and(|(stored_tenant, _)| stored_tenant != tenant_id)
+    {
+        return Err(StorageError::TenantScopeMismatch);
+    }
+    let stored_revision = stored
+        .map(|(_, revision)| {
+            u64::try_from(revision).map_err(|_| {
+                StorageError::DomainDecode(format!(
+                    "invalid {} source revision {revision}",
+                    application_source_name(fence.kind)
+                ))
+            })
+        })
+        .transpose()?;
+    if stored_revision != fence.expected_revision {
+        return Err(StorageError::OptimisticConflict {
+            aggregate: format!("{}_source_fence", application_source_name(fence.kind)),
+            expected_revision: fence.expected_revision.unwrap_or(0),
+        });
+    }
+    Ok(())
+}
+
+const fn application_source_name(kind: ApplicationSourceKind) -> &'static str {
+    match kind {
+        ApplicationSourceKind::Connection => "connection",
+        ApplicationSourceKind::IdentityLink => "identity_link",
+        ApplicationSourceKind::Person => "person",
+        ApplicationSourceKind::Company => "company",
+        ApplicationSourceKind::Partner => "partner",
+        ApplicationSourceKind::Opportunity => "opportunity",
     }
 }
 
@@ -332,7 +497,8 @@ pub(crate) fn append_events(
 mod tests {
     use chrono::TimeZone;
     use hartevo_domain_kernel::{
-        MissionContract, MissionId, ProjectId, StorageMode, Task, TaskId, TaskStatus, TenantId,
+        Company, CompanyId, MissionContract, MissionId, ProjectId, StorageMode, Task, TaskId,
+        TaskStatus, TenantId,
     };
 
     use super::*;
@@ -459,5 +625,176 @@ mod tests {
             .map(|event| event.event_type)
             .collect::<Vec<_>>();
         assert_eq!(event_types, vec!["mission.started", "mission.updated"]);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ordered SQL transaction regression proves both absence and present-revision races roll back before the current source succeeds"
+    )]
+    fn application_source_revisions_and_absence_are_fenced_in_the_mission_transaction() {
+        let mut store = ProjectStore::in_memory().expect("store");
+        let project = project();
+        store
+            .create_project_atomic(
+                &project,
+                &[PendingEvent::new(
+                    "project.created",
+                    serde_json::json!({}),
+                    now(),
+                )],
+            )
+            .expect("project");
+        let mut mission = Mission::compile(
+            project.tenant_id.clone(),
+            MissionId::from("mission-source-fence"),
+            project.id.clone(),
+            "Source-fenced mission",
+            MissionContract::bootstrap("Fence sources", ["research.read".into()], now()),
+            now(),
+        )
+        .expect("mission");
+        mission
+            .start_research(
+                [Task {
+                    id: TaskId::from("source-fence-task"),
+                    title: "Fence".into(),
+                    status: TaskStatus::Running,
+                    capability: "research.read".into(),
+                }],
+                now(),
+            )
+            .expect("start");
+        store
+            .create_mission_atomic(
+                &mission,
+                &[PendingEvent::new(
+                    "mission.started",
+                    serde_json::json!({}),
+                    now(),
+                )],
+            )
+            .expect("mission");
+        let mut company = Company::create(
+            CompanyId::from("source-fence-company"),
+            project.tenant_id.clone(),
+            project.id.clone(),
+            "Fence Company",
+            "US",
+        )
+        .expect("company");
+        store
+            .create_company(&company, "company.created", &serde_json::json!({}), now())
+            .expect("persist company");
+
+        let mut candidate = mission.clone();
+        candidate.revision += 1;
+        let event_count = store
+            .events_for_mission(&project.id, &mission.id)
+            .expect("events")
+            .len();
+        assert!(matches!(
+            store.update_mission_atomic_with_application_source_fences(
+                &candidate,
+                mission.revision,
+                None,
+                &[ApplicationSourceRevisionFence::absent(
+                    ApplicationSourceKind::Company,
+                    company.id.to_string(),
+                )],
+                &[PendingEvent::new(
+                    "test.absence_race_must_rollback",
+                    serde_json::json!({}),
+                    now(),
+                )],
+            ),
+            Err(StorageError::OptimisticConflict {
+                aggregate,
+                expected_revision: 0,
+            }) if aggregate == "company_source_fence"
+        ));
+        assert_eq!(
+            store
+                .events_for_mission(&project.id, &mission.id)
+                .expect("events after absence conflict")
+                .len(),
+            event_count
+        );
+
+        company.legal_name = "Fence Company Revised".into();
+        company.revision = 2;
+        store
+            .update_company(
+                &company,
+                1,
+                "company.updated",
+                &serde_json::json!({}),
+                now(),
+            )
+            .expect("update company");
+        assert!(matches!(
+            store.update_mission_atomic_with_application_source_fences(
+                &candidate,
+                mission.revision,
+                None,
+                &[ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Company,
+                    company.id.to_string(),
+                    1,
+                )],
+                &[PendingEvent::new(
+                    "test.stale_source_must_rollback",
+                    serde_json::json!({}),
+                    now(),
+                )],
+            ),
+            Err(StorageError::OptimisticConflict {
+                aggregate,
+                expected_revision: 1,
+            }) if aggregate == "company_source_fence"
+        ));
+        assert_eq!(
+            store
+                .load_mission(&project.id, &mission.id)
+                .expect("unchanged mission"),
+            mission
+        );
+        assert_eq!(
+            store
+                .events_for_mission(&project.id, &mission.id)
+                .expect("events after stale conflict")
+                .len(),
+            event_count
+        );
+        store
+            .update_mission_atomic_with_application_source_fences(
+                &candidate,
+                mission.revision,
+                None,
+                &[ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Company,
+                    company.id.to_string(),
+                    2,
+                )],
+                &[PendingEvent::new(
+                    "mission.source_fence_verified",
+                    serde_json::json!({}),
+                    now(),
+                )],
+            )
+            .expect("current source revision and Mission commit atomically");
+        assert_eq!(
+            store
+                .load_mission(&project.id, &mission.id)
+                .expect("updated mission"),
+            candidate
+        );
+        assert_eq!(
+            store
+                .events_for_mission(&project.id, &mission.id)
+                .expect("events after successful fence")
+                .len(),
+            event_count + 1
+        );
     }
 }

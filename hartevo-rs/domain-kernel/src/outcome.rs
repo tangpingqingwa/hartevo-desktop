@@ -9,9 +9,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    AccountId, AttributionId, CampaignId, CommissionId, ConnectionId, IdentityLinkId, MissionId,
-    Money, OpportunityId, OrderId, OutcomeEventId, PartnerId, PayoutId, ProjectId, RefundId,
-    TenantId,
+    AccountId, AttributionId, CampaignId, CommissionId, Company, CompanyId, ConnectionId,
+    ConnectionSnapshot, IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject,
+    MissionId, Money, Opportunity, OpportunityId, OrderId, OutcomeEventId, Partner, PartnerId,
+    PayoutId, Person, PersonId, ProjectId, RefundId, TenantId,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -336,6 +337,108 @@ pub struct OutcomeLedger {
     pub revision: u64,
 }
 
+/// Content-free, deterministically recomputable proof that one exact Outcome
+/// Ledger revision has a complete source-verification chain, contains no
+/// duplicate provider/event identities, and can be projected into one stable
+/// event/order/refund ordering. Raw provider identifiers and payloads stay in
+/// the ledger; Mission evidence retains only this projection's digest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeNormalizationProjection {
+    pub schema_version: u32,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub source_ledger_revision: u64,
+    pub event_count: u64,
+    pub unique_event_id_count: u64,
+    pub unique_provider_source_count: u64,
+    pub order_count: u64,
+    pub refund_count: u64,
+    /// Number of append positions that differ from the canonical ordering by
+    /// occurred time, receive time, provider source and stable event id.
+    pub observed_reorder_count: u64,
+    pub canonical_event_digest: String,
+    pub order_refund_projection_digest: String,
+}
+
+/// Content-free proof that every normalized OutcomeEvent resolves through the
+/// exact project-scoped identity support closure inspected by the VM-11
+/// `identity_chain` Checkpoint. The source digest binds the immutable Outcome
+/// projection plus every referenced Connection, IdentityLink, Person,
+/// Company, Partner and Opportunity revision; none of those records are
+/// copied into Mission evidence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeIdentityChainProjection {
+    pub schema_version: u32,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub source_ledger_revision: u64,
+    pub event_count: u64,
+    pub identity_covered_event_count: u64,
+    pub direct_identity_event_count: u64,
+    pub inherited_order_identity_event_count: u64,
+    pub external_account_match_count: u64,
+    pub connection_count: u64,
+    pub identity_link_count: u64,
+    pub person_count: u64,
+    pub company_count: u64,
+    pub partner_count: u64,
+    pub opportunity_count: u64,
+    pub source_support_digest: String,
+}
+
+impl OutcomeNormalizationProjection {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn digest(&self) -> String {
+        let mut digest = Sha256::new();
+        hash_projection_field(&mut digest, "hartevo-outcome-normalization/v1");
+        hash_projection_field(&mut digest, &self.schema_version.to_string());
+        hash_projection_field(&mut digest, self.tenant_id.as_str());
+        hash_projection_field(&mut digest, self.project_id.as_str());
+        hash_projection_field(&mut digest, &self.source_ledger_revision.to_string());
+        hash_projection_field(&mut digest, &self.event_count.to_string());
+        hash_projection_field(&mut digest, &self.unique_event_id_count.to_string());
+        hash_projection_field(&mut digest, &self.unique_provider_source_count.to_string());
+        hash_projection_field(&mut digest, &self.order_count.to_string());
+        hash_projection_field(&mut digest, &self.refund_count.to_string());
+        hash_projection_field(&mut digest, &self.observed_reorder_count.to_string());
+        hash_projection_field(&mut digest, &self.canonical_event_digest);
+        hash_projection_field(&mut digest, &self.order_refund_projection_digest);
+        format!("{:x}", digest.finalize())
+    }
+}
+
+impl OutcomeIdentityChainProjection {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn digest(&self) -> String {
+        let mut digest = Sha256::new();
+        hash_projection_field(&mut digest, "hartevo-outcome-identity-chain/v1");
+        hash_projection_field(&mut digest, &self.schema_version.to_string());
+        hash_projection_field(&mut digest, self.tenant_id.as_str());
+        hash_projection_field(&mut digest, self.project_id.as_str());
+        hash_projection_field(&mut digest, &self.source_ledger_revision.to_string());
+        hash_projection_field(&mut digest, &self.event_count.to_string());
+        hash_projection_field(&mut digest, &self.identity_covered_event_count.to_string());
+        hash_projection_field(&mut digest, &self.direct_identity_event_count.to_string());
+        hash_projection_field(
+            &mut digest,
+            &self.inherited_order_identity_event_count.to_string(),
+        );
+        hash_projection_field(&mut digest, &self.external_account_match_count.to_string());
+        hash_projection_field(&mut digest, &self.connection_count.to_string());
+        hash_projection_field(&mut digest, &self.identity_link_count.to_string());
+        hash_projection_field(&mut digest, &self.person_count.to_string());
+        hash_projection_field(&mut digest, &self.company_count.to_string());
+        hash_projection_field(&mut digest, &self.partner_count.to_string());
+        hash_projection_field(&mut digest, &self.opportunity_count.to_string());
+        hash_projection_field(&mut digest, &self.source_support_digest);
+        format!("{:x}", digest.finalize())
+    }
+}
+
 impl OutcomeLedger {
     pub fn new(tenant_id: TenantId, project_id: ProjectId) -> Result<Self, OutcomeLedgerError> {
         if tenant_id.as_str().trim().is_empty() || project_id.as_str().trim().is_empty() {
@@ -457,6 +560,439 @@ impl OutcomeLedger {
             && self.refunds.is_empty()
             && self.attributions.is_empty()
             && self.commissions.is_empty())
+    }
+
+    /// Builds the VM-11 normalize/dedupe/order Oracle from the full immutable
+    /// source. Unlike `validate`, which intentionally keeps pre-v17 snapshots
+    /// readable for migration and reconciliation, this boundary requires every
+    /// event to satisfy the current source-verification contract.
+    pub fn verified_normalization_projection(
+        &self,
+    ) -> Result<OutcomeNormalizationProjection, OutcomeLedgerError> {
+        self.validate()?;
+        for event in &self.events {
+            event.validate()?;
+        }
+
+        let event_count = u64::try_from(self.events.len())
+            .map_err(|_| OutcomeLedgerError::ProjectionCountOverflow)?;
+        let unique_event_ids = self
+            .events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let unique_provider_sources = self
+            .events
+            .iter()
+            .map(|event| (event.provider.as_str(), event.source_event_id.as_str()))
+            .collect::<BTreeSet<_>>();
+        let unique_event_id_count = u64::try_from(unique_event_ids.len())
+            .map_err(|_| OutcomeLedgerError::ProjectionCountOverflow)?;
+        let unique_provider_source_count = u64::try_from(unique_provider_sources.len())
+            .map_err(|_| OutcomeLedgerError::ProjectionCountOverflow)?;
+        if unique_event_id_count != event_count || unique_provider_source_count != event_count {
+            return Err(OutcomeLedgerError::DuplicateEvent);
+        }
+
+        let mut canonical_events = self.events.iter().collect::<Vec<_>>();
+        canonical_events.sort_by(|left, right| {
+            (
+                left.occurred_at,
+                left.received_at,
+                left.provider.as_str(),
+                left.source_event_id.as_str(),
+                left.id.as_str(),
+            )
+                .cmp(&(
+                    right.occurred_at,
+                    right.received_at,
+                    right.provider.as_str(),
+                    right.source_event_id.as_str(),
+                    right.id.as_str(),
+                ))
+        });
+        let observed_reorder_count = u64::try_from(
+            self.events
+                .iter()
+                .zip(&canonical_events)
+                .filter(|(observed, canonical)| observed.id != canonical.id)
+                .count(),
+        )
+        .map_err(|_| OutcomeLedgerError::ProjectionCountOverflow)?;
+
+        let canonical_event_digest = canonical_outcome_event_digest(&canonical_events, event_count);
+        let order_refund_projection_digest =
+            canonical_order_refund_digest(&self.orders, &self.refunds);
+
+        Ok(OutcomeNormalizationProjection {
+            schema_version: OutcomeNormalizationProjection::SCHEMA_VERSION,
+            tenant_id: self.tenant_id.clone(),
+            project_id: self.project_id.clone(),
+            source_ledger_revision: self.revision,
+            event_count,
+            unique_event_id_count,
+            unique_provider_source_count,
+            order_count: u64::try_from(self.orders.len())
+                .map_err(|_| OutcomeLedgerError::ProjectionCountOverflow)?,
+            refund_count: u64::try_from(self.refunds.len())
+                .map_err(|_| OutcomeLedgerError::ProjectionCountOverflow)?,
+            observed_reorder_count,
+            canonical_event_digest,
+            order_refund_projection_digest,
+        })
+    }
+
+    /// Resolves the normalized ledger through one exact identity support
+    /// closure. Callers must supply neither a partial graph nor unrelated
+    /// records: exact closure equality is part of the Oracle so a convenient
+    /// project-wide dump cannot accidentally mask a broken reference.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the identity Oracle deliberately validates every supported identity path and its exact transitive closure"
+    )]
+    pub fn verified_identity_chain_projection(
+        &self,
+        connections: &[ConnectionSnapshot],
+        identity_links: &[IdentityLink],
+        people: &[Person],
+        companies: &[Company],
+        partners: &[Partner],
+        opportunities: &[Opportunity],
+    ) -> Result<OutcomeIdentityChainProjection, OutcomeLedgerError> {
+        let normalization = self.verified_normalization_projection()?;
+        let connection_map = connections
+            .iter()
+            .map(|item| (item.id.clone(), item))
+            .collect::<BTreeMap<_, _>>();
+        let identity_map = identity_links
+            .iter()
+            .map(|item| (item.id.clone(), item))
+            .collect::<BTreeMap<_, _>>();
+        let person_map = people
+            .iter()
+            .map(|item| (item.id.clone(), item))
+            .collect::<BTreeMap<_, _>>();
+        let company_map = companies
+            .iter()
+            .map(|item| (item.id.clone(), item))
+            .collect::<BTreeMap<_, _>>();
+        let partner_map = partners
+            .iter()
+            .map(|item| (item.id.clone(), item))
+            .collect::<BTreeMap<_, _>>();
+        let opportunity_map = opportunities
+            .iter()
+            .map(|item| (item.id.clone(), item))
+            .collect::<BTreeMap<_, _>>();
+        if connection_map.len() != connections.len()
+            || identity_map.len() != identity_links.len()
+            || person_map.len() != people.len()
+            || company_map.len() != companies.len()
+            || partner_map.len() != partners.len()
+            || opportunity_map.len() != opportunities.len()
+        {
+            return Err(OutcomeLedgerError::IdentityChainSupportClosureMismatch);
+        }
+
+        let in_scope = |tenant_id: &TenantId, project_id: &ProjectId| {
+            tenant_id == &self.tenant_id && project_id == &self.project_id
+        };
+        for connection in connections {
+            connection
+                .validate()
+                .map_err(|_| OutcomeLedgerError::IdentityRelationshipMismatch)?;
+            if !in_scope(&connection.tenant_id, &connection.project_id) {
+                return Err(OutcomeLedgerError::IdentityRelationshipMismatch);
+            }
+        }
+        for link in identity_links {
+            link.validate()
+                .map_err(|_| OutcomeLedgerError::IdentityRelationshipMismatch)?;
+            if !in_scope(&link.tenant_id, &link.project_id) {
+                return Err(OutcomeLedgerError::IdentityRelationshipMismatch);
+            }
+            if link.status != IdentityLinkStatus::Confirmed {
+                return Err(OutcomeLedgerError::IdentityLinkUnconfirmed);
+            }
+        }
+        for person in people {
+            person
+                .validate()
+                .map_err(|_| OutcomeLedgerError::IdentityRelationshipMismatch)?;
+            if !in_scope(&person.tenant_id, &person.project_id) {
+                return Err(OutcomeLedgerError::IdentityRelationshipMismatch);
+            }
+        }
+        for company in companies {
+            company
+                .validate()
+                .map_err(|_| OutcomeLedgerError::IdentityRelationshipMismatch)?;
+            if !in_scope(&company.tenant_id, &company.project_id) {
+                return Err(OutcomeLedgerError::IdentityRelationshipMismatch);
+            }
+        }
+        for partner in partners {
+            partner
+                .validate()
+                .map_err(|_| OutcomeLedgerError::IdentityRelationshipMismatch)?;
+            if !in_scope(&partner.tenant_id, &partner.project_id) {
+                return Err(OutcomeLedgerError::IdentityRelationshipMismatch);
+            }
+        }
+        for opportunity in opportunities {
+            opportunity
+                .validate()
+                .map_err(|_| OutcomeLedgerError::IdentityRelationshipMismatch)?;
+            if !in_scope(&opportunity.tenant_id, &opportunity.project_id) {
+                return Err(OutcomeLedgerError::IdentityRelationshipMismatch);
+            }
+        }
+
+        let mut expected_connections = BTreeSet::new();
+        let mut expected_identities = BTreeSet::new();
+        let mut expected_opportunities = BTreeSet::new();
+        let mut expected_partners = self
+            .commissions
+            .iter()
+            .map(|record| record.partner_id.clone())
+            .collect::<BTreeSet<_>>();
+        let directly_linked_orders = self
+            .events
+            .iter()
+            .filter(|event| event.kind == OutcomeEventKind::OrderPlaced)
+            .map(|event| {
+                if event.identity_link_id.is_none() {
+                    return Err(OutcomeLedgerError::IdentityChainCoverageMismatch);
+                }
+                event
+                    .order_id
+                    .clone()
+                    .ok_or(OutcomeLedgerError::IdentityChainCoverageMismatch)
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let mut direct_identity_event_count = 0_u64;
+        let mut inherited_order_identity_event_count = 0_u64;
+        let mut external_account_match_count = 0_u64;
+        let mut identity_covered_event_count = 0_u64;
+
+        for event in &self.events {
+            if let Some(connection_id) = &event.connection_id {
+                expected_connections.insert(connection_id.clone());
+                let connection = connection_map
+                    .get(connection_id)
+                    .ok_or(OutcomeLedgerError::IdentityChainSupportClosureMismatch)?;
+                if connection.provider != event.provider
+                    || Some(&connection.account_id) != event.account_id.as_ref()
+                {
+                    return Err(OutcomeLedgerError::IdentityProviderAccountMismatch);
+                }
+            }
+            if let Some(link_id) = &event.identity_link_id {
+                expected_identities.insert(link_id.clone());
+                let link = identity_map
+                    .get(link_id)
+                    .ok_or(OutcomeLedgerError::IdentityChainSupportClosureMismatch)?;
+                if let Some(account_id) = &event.account_id {
+                    if !link.confirms_external_identity(&event.provider, account_id) {
+                        return Err(OutcomeLedgerError::IdentityProviderAccountMismatch);
+                    }
+                    external_account_match_count = external_account_match_count
+                        .checked_add(1)
+                        .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                }
+                direct_identity_event_count = direct_identity_event_count
+                    .checked_add(1)
+                    .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+            }
+            if let Some(opportunity_id) = &event.opportunity_id {
+                expected_opportunities.insert(opportunity_id.clone());
+            }
+            if let Some(partner_id) = &event.partner_id {
+                expected_partners.insert(partner_id.clone());
+            }
+
+            let covered = match event.kind {
+                OutcomeEventKind::LeadQualified
+                | OutcomeEventKind::MeetingBooked
+                | OutcomeEventKind::OrderPlaced => event.identity_link_id.is_some(),
+                OutcomeEventKind::RefundIssued | OutcomeEventKind::CommissionAccrued => {
+                    let inherited = event
+                        .order_id
+                        .as_ref()
+                        .is_some_and(|order_id| directly_linked_orders.contains(order_id));
+                    if inherited {
+                        inherited_order_identity_event_count = inherited_order_identity_event_count
+                            .checked_add(1)
+                            .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                    }
+                    inherited
+                        && (event.kind != OutcomeEventKind::CommissionAccrued
+                            || event.partner_id.is_some())
+                }
+                OutcomeEventKind::OpportunityStageChanged => event.opportunity_id.is_some(),
+                OutcomeEventKind::PayoutCompleted => event.partner_id.is_some(),
+            };
+            if !covered {
+                return Err(OutcomeLedgerError::IdentityChainCoverageMismatch);
+            }
+            identity_covered_event_count = identity_covered_event_count
+                .checked_add(1)
+                .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+        }
+
+        if expected_connections != connection_map.keys().cloned().collect()
+            || expected_identities != identity_map.keys().cloned().collect()
+            || expected_opportunities != opportunity_map.keys().cloned().collect()
+        {
+            return Err(OutcomeLedgerError::IdentityChainSupportClosureMismatch);
+        }
+
+        let mut expected_people = BTreeSet::<PersonId>::new();
+        let mut expected_companies = BTreeSet::<CompanyId>::new();
+        for link in identity_links {
+            match &link.subject {
+                IdentitySubject::Person(id) => {
+                    expected_people.insert(id.clone());
+                }
+                IdentitySubject::Company(id) => {
+                    expected_companies.insert(id.clone());
+                }
+                IdentitySubject::Partner(id) => {
+                    expected_partners.insert(id.clone());
+                }
+            }
+        }
+        for opportunity in opportunities {
+            expected_companies.insert(opportunity.company_id.clone());
+            expected_people.extend(
+                opportunity
+                    .buying_committee
+                    .iter()
+                    .map(|member| member.person_id.clone()),
+            );
+        }
+        if expected_partners != partner_map.keys().cloned().collect() {
+            return Err(OutcomeLedgerError::IdentityChainSupportClosureMismatch);
+        }
+        for partner in partners {
+            if let Some(person_id) = &partner.person_id {
+                expected_people.insert(person_id.clone());
+            }
+            if let Some(company_id) = &partner.company_id {
+                expected_companies.insert(company_id.clone());
+            }
+        }
+        if expected_people != person_map.keys().cloned().collect() {
+            return Err(OutcomeLedgerError::IdentityChainSupportClosureMismatch);
+        }
+        for person in people {
+            if let Some(company_id) = &person.company_id {
+                expected_companies.insert(company_id.clone());
+            }
+        }
+        if expected_companies != company_map.keys().cloned().collect() {
+            return Err(OutcomeLedgerError::IdentityChainSupportClosureMismatch);
+        }
+
+        for link in identity_links {
+            let subject_exists = match &link.subject {
+                IdentitySubject::Person(id) => person_map.contains_key(id),
+                IdentitySubject::Company(id) => company_map.contains_key(id),
+                IdentitySubject::Partner(id) => partner_map.contains_key(id),
+            };
+            if !subject_exists {
+                return Err(OutcomeLedgerError::IdentityRelationshipMismatch);
+            }
+        }
+        for person in people {
+            if person
+                .company_id
+                .as_ref()
+                .is_some_and(|id| !company_map.contains_key(id))
+            {
+                return Err(OutcomeLedgerError::IdentityRelationshipMismatch);
+            }
+        }
+        for partner in partners {
+            let person = partner
+                .person_id
+                .as_ref()
+                .map(|id| {
+                    person_map
+                        .get(id)
+                        .copied()
+                        .ok_or(OutcomeLedgerError::IdentityRelationshipMismatch)
+                })
+                .transpose()?;
+            if partner
+                .company_id
+                .as_ref()
+                .is_some_and(|id| !company_map.contains_key(id))
+                || matches!(
+                    (
+                        partner.company_id.as_ref(),
+                        person.and_then(|person| person.company_id.as_ref())
+                    ),
+                    (Some(partner_company), Some(person_company))
+                        if partner_company != person_company
+                )
+            {
+                return Err(OutcomeLedgerError::IdentityRelationshipMismatch);
+            }
+        }
+        for opportunity in opportunities {
+            if !company_map.contains_key(&opportunity.company_id)
+                || opportunity
+                    .buying_committee
+                    .iter()
+                    .any(|member| !person_map.contains_key(&member.person_id))
+            {
+                return Err(OutcomeLedgerError::IdentityRelationshipMismatch);
+            }
+        }
+
+        let event_count = u64::try_from(self.events.len())
+            .map_err(|_| OutcomeLedgerError::ProjectionCountOverflow)?;
+        if identity_covered_event_count != event_count {
+            return Err(OutcomeLedgerError::IdentityChainCoverageMismatch);
+        }
+        let source_support = serde_json::json!({
+            "schemaVersion": "hartevo-outcome-identity-support/v1",
+            "normalizationDigest": normalization.digest(),
+            "connections": connection_map.values().copied().collect::<Vec<_>>(),
+            "identityLinks": identity_map.values().copied().collect::<Vec<_>>(),
+            "people": person_map.values().copied().collect::<Vec<_>>(),
+            "companies": company_map.values().copied().collect::<Vec<_>>(),
+            "partners": partner_map.values().copied().collect::<Vec<_>>(),
+            "opportunities": opportunity_map.values().copied().collect::<Vec<_>>(),
+        });
+        let source_support_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&source_support)
+                    .map_err(|_| OutcomeLedgerError::ProjectionSerialization)?
+            )
+        );
+
+        Ok(OutcomeIdentityChainProjection {
+            schema_version: OutcomeIdentityChainProjection::SCHEMA_VERSION,
+            tenant_id: self.tenant_id.clone(),
+            project_id: self.project_id.clone(),
+            source_ledger_revision: self.revision,
+            event_count,
+            identity_covered_event_count,
+            direct_identity_event_count,
+            inherited_order_identity_event_count,
+            external_account_match_count,
+            connection_count: projection_count(connections.len())?,
+            identity_link_count: projection_count(identity_links.len())?,
+            person_count: projection_count(people.len())?,
+            company_count: projection_count(companies.len())?,
+            partner_count: projection_count(partners.len())?,
+            opportunity_count: projection_count(opportunities.len())?,
+            source_support_digest,
+        })
     }
 
     /// Proves that the snapshot is exactly one legal append/recalculation
@@ -893,6 +1429,20 @@ pub enum OutcomeLedgerError {
     EventProjectionMismatch,
     #[error("outcome projection revision mismatch: expected {expected}, found {actual}")]
     ProjectionRevisionMismatch { expected: u64, actual: u64 },
+    #[error("outcome normalization projection count overflow")]
+    ProjectionCountOverflow,
+    #[error("outcome identity support is not the exact referenced closure")]
+    IdentityChainSupportClosureMismatch,
+    #[error("an outcome identity link is not currently confirmed")]
+    IdentityLinkUnconfirmed,
+    #[error("an outcome provider/account does not match its connection or identity link")]
+    IdentityProviderAccountMismatch,
+    #[error("an outcome identity subject or relationship is inconsistent")]
+    IdentityRelationshipMismatch,
+    #[error("an outcome event has no direct or inherited identity path")]
+    IdentityChainCoverageMismatch,
+    #[error("an outcome Oracle projection could not be canonically serialized")]
+    ProjectionSerialization,
     #[error("decimal commission arithmetic overflowed minor units")]
     ArithmeticOverflow,
     #[error("outcome ledger revision overflow")]
@@ -936,13 +1486,149 @@ fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn projection_count(count: usize) -> Result<u64, OutcomeLedgerError> {
+    u64::try_from(count).map_err(|_| OutcomeLedgerError::ProjectionCountOverflow)
+}
+
+fn hash_projection_field(digest: &mut Sha256, value: &str) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value.as_bytes());
+}
+
+fn hash_optional_projection_field(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash_projection_field(digest, "some");
+            hash_projection_field(digest, value);
+        }
+        None => hash_projection_field(digest, "none"),
+    }
+}
+
+fn canonical_outcome_event_digest(events: &[&OutcomeEvent], event_count: u64) -> String {
+    let mut digest = Sha256::new();
+    hash_projection_field(&mut digest, "hartevo-outcome-canonical-events/v1");
+    hash_projection_field(&mut digest, &event_count.to_string());
+    for event in events {
+        hash_outcome_event(&mut digest, event);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn canonical_order_refund_digest(orders: &[OutcomeOrder], refunds: &[OutcomeRefund]) -> String {
+    let mut canonical_orders = orders.iter().collect::<Vec<_>>();
+    canonical_orders.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut canonical_refunds = refunds.iter().collect::<Vec<_>>();
+    canonical_refunds
+        .sort_by(|left, right| (&left.order_id, &left.id).cmp(&(&right.order_id, &right.id)));
+    let mut digest = Sha256::new();
+    hash_projection_field(&mut digest, "hartevo-outcome-order-refund-projection/v1");
+    hash_projection_field(&mut digest, &canonical_orders.len().to_string());
+    for order in canonical_orders {
+        hash_projection_field(&mut digest, order.id.as_str());
+        hash_projection_field(&mut digest, order.source_event_id.as_str());
+        hash_projection_field(&mut digest, &order.original_amount.amount_minor.to_string());
+        hash_projection_field(&mut digest, order.original_amount.currency.as_str());
+        hash_projection_field(&mut digest, &order.occurred_at.to_rfc3339());
+    }
+    hash_projection_field(&mut digest, &canonical_refunds.len().to_string());
+    for refund in canonical_refunds {
+        hash_projection_field(&mut digest, refund.id.as_str());
+        hash_projection_field(&mut digest, refund.order_id.as_str());
+        hash_projection_field(&mut digest, refund.source_event_id.as_str());
+        hash_projection_field(&mut digest, &refund.amount.amount_minor.to_string());
+        hash_projection_field(&mut digest, refund.amount.currency.as_str());
+        hash_projection_field(&mut digest, &refund.occurred_at.to_rfc3339());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the canonical event proof deliberately binds every immutable identity, money, timestamp and source-verification field"
+)]
+fn hash_outcome_event(digest: &mut Sha256, event: &OutcomeEvent) {
+    hash_projection_field(digest, event.id.as_str());
+    hash_projection_field(digest, event.tenant_id.as_str());
+    hash_projection_field(digest, event.project_id.as_str());
+    hash_projection_field(digest, event.mission_id.as_str());
+    hash_projection_field(
+        digest,
+        match event.kind {
+            OutcomeEventKind::LeadQualified => "lead_qualified",
+            OutcomeEventKind::MeetingBooked => "meeting_booked",
+            OutcomeEventKind::OpportunityStageChanged => "opportunity_stage_changed",
+            OutcomeEventKind::OrderPlaced => "order_placed",
+            OutcomeEventKind::RefundIssued => "refund_issued",
+            OutcomeEventKind::CommissionAccrued => "commission_accrued",
+            OutcomeEventKind::PayoutCompleted => "payout_completed",
+        },
+    );
+    hash_projection_field(digest, &event.provider);
+    hash_optional_projection_field(
+        digest,
+        event.connection_id.as_ref().map(ConnectionId::as_str),
+    );
+    hash_optional_projection_field(digest, event.account_id.as_ref().map(AccountId::as_str));
+    hash_projection_field(digest, &event.source_event_id);
+    hash_optional_projection_field(
+        digest,
+        event.identity_link_id.as_ref().map(IdentityLinkId::as_str),
+    );
+    hash_optional_projection_field(
+        digest,
+        event.opportunity_id.as_ref().map(OpportunityId::as_str),
+    );
+    hash_optional_projection_field(digest, event.campaign_id.as_ref().map(CampaignId::as_str));
+    hash_optional_projection_field(digest, event.order_id.as_ref().map(OrderId::as_str));
+    hash_optional_projection_field(digest, event.refund_id.as_ref().map(RefundId::as_str));
+    hash_optional_projection_field(
+        digest,
+        event.commission_id.as_ref().map(CommissionId::as_str),
+    );
+    hash_optional_projection_field(digest, event.payout_id.as_ref().map(PayoutId::as_str));
+    hash_optional_projection_field(digest, event.partner_id.as_ref().map(PartnerId::as_str));
+    if let Some(amount) = &event.amount {
+        hash_projection_field(digest, "some");
+        hash_projection_field(digest, &amount.amount_minor.to_string());
+        hash_projection_field(digest, amount.currency.as_str());
+    } else {
+        hash_projection_field(digest, "none");
+    }
+    hash_projection_field(digest, &event.occurred_at.to_rfc3339());
+    hash_projection_field(digest, &event.received_at.to_rfc3339());
+    hash_projection_field(digest, &event.evidence_digest);
+    hash_projection_field(digest, &event.raw_payload_digest);
+    if let Some(verification) = &event.source_verification {
+        hash_projection_field(digest, "some");
+        hash_projection_field(
+            digest,
+            match verification.method {
+                OutcomeVerificationMethod::SignedWebhook => "signed_webhook",
+                OutcomeVerificationMethod::IndependentReadback => "independent_readback",
+                OutcomeVerificationMethod::UserConfirmed => "user_confirmed",
+                OutcomeVerificationMethod::InternalDerived => "internal_derived",
+            },
+        );
+        hash_projection_field(digest, &verification.verifier);
+        hash_projection_field(digest, &verification.independent.to_string());
+        hash_projection_field(digest, &verification.verified_at.to_rfc3339());
+        hash_projection_field(digest, &verification.evidence_digest);
+    } else {
+        hash_projection_field(digest, "none");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone};
     use proptest::prelude::*;
 
     use super::*;
-    use crate::CurrencyCode;
+    use crate::{
+        ActorId, Connection, ConnectionProbe, ContactPermission, CurrencyCode, ExternalIdentity,
+        IdentitySubject, PartnerSupplyClass, ProbeOutcome,
+    };
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 10, 8, 0, 0)
@@ -983,6 +1669,63 @@ mod tests {
                 evidence_digest: "c".repeat(64),
             }),
         }
+    }
+
+    fn confirmed_identity_support() -> (ConnectionSnapshot, Person, IdentityLink) {
+        let person = Person::create(
+            PersonId::from("person-1"),
+            TenantId::from("tenant-1"),
+            ProjectId::from("project-1"),
+            "Verified buyer",
+            None,
+            vec![],
+        )
+        .expect("person");
+        let mut link = IdentityLink::propose(
+            IdentityLinkId::from("identity-1"),
+            TenantId::from("tenant-1"),
+            ProjectId::from("project-1"),
+            IdentitySubject::Person(person.id.clone()),
+            [ExternalIdentity {
+                provider: "commerce-fixture".into(),
+                account_id: AccountId::from("account-1"),
+                external_subject_digest: "d".repeat(64),
+                encrypted_subject_ref: "ciphertext://buyer-1".into(),
+                evidence_digest: "e".repeat(64),
+            }],
+            Decimal::ONE,
+        )
+        .expect("identity link");
+        link.confirm(ActorId::from("identity-reviewer"), "f".repeat(64), now())
+            .expect("confirmed identity link");
+
+        let mut connection = Connection::register(
+            ConnectionId::from("connection-1"),
+            TenantId::from("tenant-1"),
+            ProjectId::from("project-1"),
+            "commerce-fixture",
+            AccountId::from("account-1"),
+            "external-account-1",
+            ["orders.read".into()],
+            now(),
+        )
+        .expect("connection");
+        connection.begin_probe(now()).expect("begin probe");
+        connection
+            .apply_probe(
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "external-account-1".into(),
+                    granted_scopes: BTreeSet::from(["orders.read".into()]),
+                    probed_at: now(),
+                    valid_until: now() + Duration::hours(1),
+                    credential_expires_at: now() + Duration::hours(2),
+                    evidence_digest: "1".repeat(64),
+                },
+                now(),
+            )
+            .expect("successful probe");
+        (connection.snapshot(), person, link)
     }
 
     #[test]
@@ -1029,6 +1772,279 @@ mod tests {
         assert_eq!(
             order.validate(),
             Err(OutcomeLedgerError::UnverifiedOutcomeSource)
+        );
+    }
+
+    #[test]
+    fn verified_normalization_is_canonical_and_rejects_legacy_unverified_sources() {
+        let mut later = event(OutcomeEventKind::LeadQualified, "later", None);
+        later.order_id = None;
+        later.occurred_at = now() + Duration::minutes(2);
+        later.received_at = now() + Duration::minutes(3);
+        later
+            .source_verification
+            .as_mut()
+            .expect("source verification")
+            .verified_at = later.received_at;
+        let mut earlier = event(OutcomeEventKind::LeadQualified, "earlier", None);
+        earlier.order_id = None;
+        earlier.occurred_at = now() + Duration::minutes(1);
+        earlier.received_at = now() + Duration::minutes(4);
+        earlier
+            .source_verification
+            .as_mut()
+            .expect("source verification")
+            .verified_at = earlier.received_at;
+
+        let mut observed_out_of_order =
+            OutcomeLedger::new(TenantId::from("tenant-1"), ProjectId::from("project-1"))
+                .expect("ledger");
+        observed_out_of_order
+            .ingest(later.clone())
+            .expect("later event first");
+        observed_out_of_order
+            .ingest(earlier.clone())
+            .expect("earlier event arrives later");
+        let projection = observed_out_of_order
+            .verified_normalization_projection()
+            .expect("strict normalization");
+        assert_eq!(
+            (
+                projection.event_count,
+                projection.unique_event_id_count,
+                projection.unique_provider_source_count,
+                projection.observed_reorder_count,
+                projection.order_count,
+                projection.refund_count,
+            ),
+            (2, 2, 2, 2, 0, 0)
+        );
+        assert!(is_sha256(&projection.digest()));
+
+        let mut canonical_observation =
+            OutcomeLedger::new(TenantId::from("tenant-1"), ProjectId::from("project-1"))
+                .expect("ledger");
+        canonical_observation
+            .ingest(earlier)
+            .expect("earlier event first");
+        canonical_observation
+            .ingest(later)
+            .expect("later event second");
+        let canonical_projection = canonical_observation
+            .verified_normalization_projection()
+            .expect("canonical normalization");
+        assert_eq!(canonical_projection.observed_reorder_count, 0);
+        assert_eq!(
+            projection.canonical_event_digest,
+            canonical_projection.canonical_event_digest
+        );
+        assert_eq!(
+            projection.order_refund_projection_digest,
+            canonical_projection.order_refund_projection_digest
+        );
+
+        let mut legacy_readable = canonical_observation;
+        legacy_readable.events[0].source_verification = None;
+        assert!(legacy_readable.validate().is_ok());
+        assert_eq!(
+            legacy_readable.verified_normalization_projection(),
+            Err(OutcomeLedgerError::UnverifiedOutcomeSource)
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ordered Oracle regression compares success, identity conflict, provider mismatch, exact closure rejection and deterministic recomputation"
+    )]
+    fn identity_chain_oracle_requires_exact_confirmed_provider_scoped_support() {
+        let (connection, person, link) = confirmed_identity_support();
+        let mut ledger =
+            OutcomeLedger::new(TenantId::from("tenant-1"), ProjectId::from("project-1"))
+                .expect("ledger");
+        ledger
+            .ingest(event(
+                OutcomeEventKind::OrderPlaced,
+                "identity-order",
+                Some(10_000),
+            ))
+            .expect("order");
+        let mut refund = event(
+            OutcomeEventKind::RefundIssued,
+            "identity-refund",
+            Some(1_000),
+        );
+        refund.identity_link_id = None;
+        refund.refund_id = Some(RefundId::from("refund-1"));
+        refund.occurred_at = now() + Duration::minutes(2);
+        refund.received_at = now() + Duration::minutes(3);
+        refund
+            .source_verification
+            .as_mut()
+            .expect("verification")
+            .verified_at = refund.received_at;
+        ledger.ingest(refund).expect("refund");
+
+        let projection = ledger
+            .verified_identity_chain_projection(
+                std::slice::from_ref(&connection),
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                &[],
+                &[],
+            )
+            .expect("verified identity closure");
+        assert_eq!(
+            (
+                projection.event_count,
+                projection.identity_covered_event_count,
+                projection.direct_identity_event_count,
+                projection.inherited_order_identity_event_count,
+                projection.external_account_match_count,
+                projection.connection_count,
+                projection.identity_link_count,
+                projection.person_count,
+            ),
+            (2, 2, 1, 1, 1, 1, 1, 1)
+        );
+        assert!(is_sha256(&projection.source_support_digest));
+        assert!(is_sha256(&projection.digest()));
+        assert_eq!(
+            projection,
+            ledger
+                .verified_identity_chain_projection(
+                    std::slice::from_ref(&connection),
+                    std::slice::from_ref(&link),
+                    std::slice::from_ref(&person),
+                    &[],
+                    &[],
+                    &[],
+                )
+                .expect("deterministic recomputation")
+        );
+
+        let partner = Partner::create(
+            PartnerId::from("partner-1"),
+            TenantId::from("tenant-1"),
+            ProjectId::from("project-1"),
+            None,
+            None,
+            "Verified partner",
+            PartnerSupplyClass::TenantPrivate,
+            ContactPermission::TenantOwnedRelationship,
+            Some("6".repeat(64)),
+        )
+        .expect("partner");
+        let mut out_of_order_commission =
+            OutcomeLedger::new(TenantId::from("tenant-1"), ProjectId::from("project-1"))
+                .expect("ledger");
+        let mut commission_event = event(
+            OutcomeEventKind::CommissionAccrued,
+            "commission-before-order",
+            Some(500),
+        );
+        commission_event.identity_link_id = None;
+        commission_event.commission_id = Some(CommissionId::from("commission-event-1"));
+        commission_event.partner_id = Some(partner.id.clone());
+        out_of_order_commission
+            .ingest(commission_event)
+            .expect("commission can arrive before order callback");
+        out_of_order_commission
+            .ingest(event(
+                OutcomeEventKind::OrderPlaced,
+                "late-order-callback",
+                Some(10_000),
+            ))
+            .expect("late order callback");
+        let out_of_order_projection = out_of_order_commission
+            .verified_identity_chain_projection(
+                std::slice::from_ref(&connection),
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                &[partner],
+                &[],
+            )
+            .expect("order-insensitive identity inheritance");
+        assert_eq!(
+            (
+                out_of_order_projection.event_count,
+                out_of_order_projection.identity_covered_event_count,
+                out_of_order_projection.direct_identity_event_count,
+                out_of_order_projection.inherited_order_identity_event_count,
+            ),
+            (2, 2, 1, 1)
+        );
+
+        let mut conflicted = link.clone();
+        conflicted
+            .mark_conflicted(
+                ActorId::from("identity-reviewer"),
+                "2".repeat(64),
+                now() + Duration::minutes(4),
+            )
+            .expect("conflict transition");
+        assert_eq!(
+            ledger.verified_identity_chain_projection(
+                std::slice::from_ref(&connection),
+                &[conflicted],
+                std::slice::from_ref(&person),
+                &[],
+                &[],
+                &[],
+            ),
+            Err(OutcomeLedgerError::IdentityLinkUnconfirmed)
+        );
+
+        let mut wrong_provider_link = IdentityLink::propose(
+            link.id.clone(),
+            link.tenant_id.clone(),
+            link.project_id.clone(),
+            link.subject.clone(),
+            [ExternalIdentity {
+                provider: "wrong-provider".into(),
+                account_id: AccountId::from("account-1"),
+                external_subject_digest: "3".repeat(64),
+                encrypted_subject_ref: "ciphertext://wrong-provider".into(),
+                evidence_digest: "4".repeat(64),
+            }],
+            Decimal::ONE,
+        )
+        .expect("wrong provider link");
+        wrong_provider_link
+            .confirm(ActorId::from("identity-reviewer"), "5".repeat(64), now())
+            .expect("confirmed wrong provider fixture");
+        assert_eq!(
+            ledger.verified_identity_chain_projection(
+                std::slice::from_ref(&connection),
+                &[wrong_provider_link],
+                std::slice::from_ref(&person),
+                &[],
+                &[],
+                &[],
+            ),
+            Err(OutcomeLedgerError::IdentityProviderAccountMismatch)
+        );
+
+        let unrelated_company = Company::create(
+            CompanyId::from("unrelated-company"),
+            TenantId::from("tenant-1"),
+            ProjectId::from("project-1"),
+            "Unrelated Company",
+            "US",
+        )
+        .expect("unrelated company");
+        assert_eq!(
+            ledger.verified_identity_chain_projection(
+                &[connection],
+                &[link],
+                &[person],
+                &[unrelated_company],
+                &[],
+                &[],
+            ),
+            Err(OutcomeLedgerError::IdentityChainSupportClosureMismatch)
         );
     }
 

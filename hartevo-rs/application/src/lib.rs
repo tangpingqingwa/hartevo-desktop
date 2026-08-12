@@ -29,11 +29,11 @@ use hartevo_domain_kernel::{
     AutomatedReplyAuthorization, AutonomyLevel, BrowserControlLeaseId, BrowserFileClaimId,
     BrowserFileGrantId, BrowserProfileId, BrowserRecipeId, BrowserTabId, BrowserWorkspaceId,
     Cadence, CadenceTriggerKind, Campaign, CampaignId, CampaignSendAuthorization, CommissionId,
-    CommissionRecord, Company, Connection, ConnectionError, ConnectionId, ConnectionProbe,
-    ConnectionSnapshot, ConsentPurpose, ConsentRecord, ConsentRecordId, ConsentRequirement,
-    ConsentState, Constraint, ContextAssemblyId, ContextBranch, ContextBranchId,
-    ContextBranchMerge, ContextBranchMergeId, ContextBranchStatus, ContextBudget, ContextCapsule,
-    ContextCapsuleId, ContextCapsuleStatus, ContextCheckpoint, ContextCheckpointId,
+    CommissionRecord, Company, CompanyId, Connection, ConnectionError, ConnectionId,
+    ConnectionProbe, ConnectionSnapshot, ConsentPurpose, ConsentRecord, ConsentRecordId,
+    ConsentRequirement, ConsentState, Constraint, ContextAssemblyId, ContextBranch,
+    ContextBranchId, ContextBranchMerge, ContextBranchMergeId, ContextBranchStatus, ContextBudget,
+    ContextCapsule, ContextCapsuleId, ContextCapsuleStatus, ContextCheckpoint, ContextCheckpointId,
     ContextCompactionRecord, ContextCompactionRecordId, ContextContinuationLedgerId,
     ContextDataPolicy, ContextError, ContextFactGrant, ContextFoundationSnapshot, ContextInputRefs,
     ContextMergePolicy, ContextReturnContract, ContextReturnReceipt, ContextWorkerMailboxId,
@@ -61,10 +61,11 @@ use hartevo_domain_kernel::{
     MissionConversationRole, MissionDefinition, MissionError, MissionId, MissionSchedule,
     MissionScheduleError, MissionScheduleFailureClass, MissionScheduleId, MissionScheduleStatus,
     MissionStage, MissionTerminalDisposition, Money, OperatingMode, Opportunity, OpportunityId,
-    OpportunityStage, OrderId, Outcome, OutcomeDecision, OutcomeEvent, OutcomeLedger,
-    OutcomeLedgerError, Partner, PartnerId, PayoutAuthorization, PayoutId, Person, PersonId,
-    PreparedAutomaticReply, Project, ProjectDataCell, ProjectEncryptionMode, ProjectError,
-    ProjectId, ProjectKeyring, ProjectKeyringBootstrap, ReceiptId, RelationshipError,
+    OpportunityStage, OrderId, Outcome, OutcomeDecision, OutcomeEvent,
+    OutcomeIdentityChainProjection, OutcomeLedger, OutcomeLedgerError,
+    OutcomeNormalizationProjection, Partner, PartnerId, PayoutAuthorization, PayoutId, Person,
+    PersonId, PreparedAutomaticReply, Project, ProjectDataCell, ProjectEncryptionMode,
+    ProjectError, ProjectId, ProjectKeyring, ProjectKeyringBootstrap, ReceiptId, RelationshipError,
     ReviewDecision, ReviewId, RuntimeProcessClaim, RuntimeProcessClaimStatus,
     RuntimeProcessCleanupDisposition, RuntimeProcessIdentity, RuntimeRecoveryAttempt,
     RuntimeRecoveryAttemptId, RuntimeRecoveryFailureClass, RuntimeRecoveryStatus,
@@ -87,9 +88,10 @@ use hartevo_runtime_adapter::{
     cleanup_runtime_process, generate_runtime_launch_token, prepare_runtime_launch,
 };
 use hartevo_storage::{
-    BrowserRecipeRuntimeState, ContentCrypto, ContentEncryptionContext, ContextMaterialDescriptor,
-    ContextMaterialStoreError, ContextQuerySnapshot, DeviceKeyAgreementCrypto, DomainEventRecord,
-    EncryptedContent, EnvelopeContext, EnvelopeCrypto, KeyBootstrapCell, KeyBootstrapOperationKind,
+    ApplicationSourceKind, ApplicationSourceRevisionFence, BrowserRecipeRuntimeState,
+    ContentCrypto, ContentEncryptionContext, ContextMaterialDescriptor, ContextMaterialStoreError,
+    ContextQuerySnapshot, DeviceKeyAgreementCrypto, DomainEventRecord, EncryptedContent,
+    EnvelopeContext, EnvelopeCrypto, KeyBootstrapCell, KeyBootstrapOperationKind,
     KeyBootstrapOperationStatus, KeyMaterial, LocalEncryptedContextMaterialStore,
     LocalInboundSyncEnvelope, LocalInboundSyncObject, LocalInboundSyncStageDisposition,
     LocalInboundSyncStageOutcome, LocalKeyBootstrapOperation, LocalProjectCloudRegistration,
@@ -2220,18 +2222,262 @@ pub struct MissionCheckpointDispatch {
     pub state: MissionCheckpointDispatchState,
 }
 
-const VM11_EVENT_INGEST_HANDLER_ID: &str = "vm11.event_ingest/v1";
+const VM11_EVENT_INGEST_HANDLER_ID: &str = "vm11.event_ingest/v2";
+const VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID: &str = "vm11.normalize-dedupe-order/v1";
+const VM11_IDENTITY_CHAIN_HANDLER_ID: &str = "vm11.identity-chain/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompiledApplicationCheckpointHandler {
-    Vm11EventIngest,
+    EventIngest,
+    NormalizeDedupeOrder,
+    IdentityChain,
+}
+
+impl CompiledApplicationCheckpointHandler {
+    fn handler_id(self) -> &'static str {
+        match self {
+            Self::EventIngest => VM11_EVENT_INGEST_HANDLER_ID,
+            Self::NormalizeDedupeOrder => VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID,
+            Self::IdentityChain => VM11_IDENTITY_CHAIN_HANDLER_ID,
+        }
+    }
+
+    fn outcome_source_kind(self) -> &'static str {
+        match self {
+            Self::EventIngest => "outcome_ledger",
+            Self::NormalizeDedupeOrder => "outcome_normalization",
+            Self::IdentityChain => "outcome_identity_chain",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OutcomeIdentityChainSupport {
+    connections: Vec<ConnectionSnapshot>,
+    identity_links: Vec<IdentityLink>,
+    people: Vec<Person>,
+    companies: Vec<Company>,
+    partners: Vec<Partner>,
+    opportunities: Vec<Opportunity>,
+}
+
+impl OutcomeIdentityChainSupport {
+    fn revision_fences(&self) -> Vec<ApplicationSourceRevisionFence> {
+        self.connections
+            .iter()
+            .map(|item| {
+                ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Connection,
+                    item.id.to_string(),
+                    item.revision,
+                )
+            })
+            .chain(self.identity_links.iter().map(|item| {
+                ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::IdentityLink,
+                    item.id.to_string(),
+                    item.revision,
+                )
+            }))
+            .chain(self.people.iter().map(|item| {
+                ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Person,
+                    item.id.to_string(),
+                    item.revision,
+                )
+            }))
+            .chain(self.companies.iter().map(|item| {
+                ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Company,
+                    item.id.to_string(),
+                    item.revision,
+                )
+            }))
+            .chain(self.partners.iter().map(|item| {
+                ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Partner,
+                    item.id.to_string(),
+                    item.revision,
+                )
+            }))
+            .chain(self.opportunities.iter().map(|item| {
+                ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Opportunity,
+                    item.id.to_string(),
+                    item.revision,
+                )
+            }))
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+enum OutcomeIdentityChainSupportLoadError {
+    Missing {
+        kind: ApplicationSourceKind,
+        id: String,
+    },
+    Storage(StorageError),
+}
+
+fn required_identity_support_record<T>(
+    result: Result<T, StorageError>,
+    kind: ApplicationSourceKind,
+    id: &str,
+) -> Result<T, OutcomeIdentityChainSupportLoadError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(StorageError::ScopedRecordNotFound { .. }) => {
+            Err(OutcomeIdentityChainSupportLoadError::Missing {
+                kind,
+                id: id.into(),
+            })
+        }
+        Err(error) => Err(OutcomeIdentityChainSupportLoadError::Storage(error)),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the loader follows the complete transitive identity closure and performs no project-wide convenience reads"
+)]
+fn load_outcome_identity_chain_support(
+    store: &ProjectStore,
+    ledger: &OutcomeLedger,
+) -> Result<OutcomeIdentityChainSupport, OutcomeIdentityChainSupportLoadError> {
+    let connection_ids = ledger
+        .events
+        .iter()
+        .filter_map(|event| event.connection_id.clone())
+        .collect::<BTreeSet<_>>();
+    let identity_link_ids = ledger
+        .events
+        .iter()
+        .filter_map(|event| event.identity_link_id.clone())
+        .collect::<BTreeSet<_>>();
+    let opportunity_ids = ledger
+        .events
+        .iter()
+        .filter_map(|event| event.opportunity_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut partner_ids = ledger
+        .events
+        .iter()
+        .filter_map(|event| event.partner_id.clone())
+        .chain(
+            ledger
+                .commissions
+                .iter()
+                .map(|commission| commission.partner_id.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+
+    let mut connections = Vec::with_capacity(connection_ids.len());
+    for id in connection_ids {
+        let connection = required_identity_support_record(
+            store.load_connection(&ledger.project_id, &id),
+            ApplicationSourceKind::Connection,
+            id.as_str(),
+        )?;
+        connections.push(connection.snapshot());
+    }
+    let mut identity_links = Vec::with_capacity(identity_link_ids.len());
+    let mut person_ids = BTreeSet::<PersonId>::new();
+    let mut company_ids = BTreeSet::<CompanyId>::new();
+    for id in identity_link_ids {
+        let link = required_identity_support_record(
+            store.load_identity_link(&ledger.project_id, &id),
+            ApplicationSourceKind::IdentityLink,
+            id.as_str(),
+        )?;
+        match &link.subject {
+            IdentitySubject::Person(id) => {
+                person_ids.insert(id.clone());
+            }
+            IdentitySubject::Company(id) => {
+                company_ids.insert(id.clone());
+            }
+            IdentitySubject::Partner(id) => {
+                partner_ids.insert(id.clone());
+            }
+        }
+        identity_links.push(link);
+    }
+
+    let mut opportunities = Vec::with_capacity(opportunity_ids.len());
+    for id in opportunity_ids {
+        let opportunity = required_identity_support_record(
+            store.load_opportunity(&ledger.project_id, &id),
+            ApplicationSourceKind::Opportunity,
+            id.as_str(),
+        )?;
+        company_ids.insert(opportunity.company_id.clone());
+        person_ids.extend(
+            opportunity
+                .buying_committee
+                .iter()
+                .map(|member| member.person_id.clone()),
+        );
+        opportunities.push(opportunity);
+    }
+
+    let mut partners = Vec::with_capacity(partner_ids.len());
+    for id in partner_ids {
+        let partner = required_identity_support_record(
+            store.load_partner(&ledger.project_id, &id),
+            ApplicationSourceKind::Partner,
+            id.as_str(),
+        )?;
+        if let Some(person_id) = &partner.person_id {
+            person_ids.insert(person_id.clone());
+        }
+        if let Some(company_id) = &partner.company_id {
+            company_ids.insert(company_id.clone());
+        }
+        partners.push(partner);
+    }
+
+    let mut people = Vec::with_capacity(person_ids.len());
+    for id in person_ids {
+        let person = required_identity_support_record(
+            store.load_person(&ledger.project_id, &id),
+            ApplicationSourceKind::Person,
+            id.as_str(),
+        )?;
+        if let Some(company_id) = &person.company_id {
+            company_ids.insert(company_id.clone());
+        }
+        people.push(person);
+    }
+
+    let mut companies = Vec::with_capacity(company_ids.len());
+    for id in company_ids {
+        companies.push(required_identity_support_record(
+            store.load_company(&ledger.project_id, &id),
+            ApplicationSourceKind::Company,
+            id.as_str(),
+        )?);
+    }
+
+    Ok(OutcomeIdentityChainSupport {
+        connections,
+        identity_links,
+        people,
+        companies,
+        partners,
+        opportunities,
+    })
 }
 
 fn compiled_application_checkpoint_handler(
     handler_id: &str,
 ) -> Option<CompiledApplicationCheckpointHandler> {
     match handler_id {
-        VM11_EVENT_INGEST_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::Vm11EventIngest),
+        VM11_EVENT_INGEST_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::EventIngest),
+        VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::NormalizeDedupeOrder)
+        }
+        VM11_IDENTITY_CHAIN_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::IdentityChain),
         _ => None,
     }
 }
@@ -2273,6 +2519,50 @@ fn application_checkpoint_handler_projection(
         Some(ApplicationCheckpointHandlerStatus::Implemented),
         Some(handler.handler_id.clone()),
     ))
+}
+
+fn compiled_handler_for_checkpoint(
+    mission: &Mission,
+    checkpoint_id: &str,
+) -> Result<Option<CompiledApplicationCheckpointHandler>, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let route = checkpoint
+        .route
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    if route.executor != MissionCheckpointExecutor::Application {
+        return Err(ApplicationError::ApplicationCheckpointExecutorMismatch {
+            executor: route.executor,
+        });
+    }
+    let (status, handler_id) =
+        application_checkpoint_handler_projection(definition, checkpoint_id, route)?;
+    match (status, handler_id) {
+        (Some(ApplicationCheckpointHandlerStatus::Implemented), Some(handler_id)) => {
+            compiled_application_checkpoint_handler(&handler_id)
+                .map(Some)
+                .ok_or(
+                    ApplicationError::ApplicationCheckpointHandlerRegistryMismatch { handler_id },
+                )
+        }
+        (Some(ApplicationCheckpointHandlerStatus::NotImplemented), None) => Ok(None),
+        (Some(ApplicationCheckpointHandlerStatus::CatalogRevisionMismatch), None) => {
+            Err(ApplicationError::ApplicationCheckpointCatalogRevisionMismatch)
+        }
+        (_, handler_id) => Err(
+            ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                handler_id: handler_id.unwrap_or_else(|| "missing-registered-handler-id".into()),
+            },
+        ),
+    }
 }
 
 fn current_checkpoint_dispatch_projection(
@@ -2377,6 +2667,8 @@ fn start_ready_catalog_checkpoint_in_memory(
 fn completed_application_checkpoint_replay(
     mission: &Mission,
     command: &ExecuteApplicationMissionCheckpoint,
+    handler_id: &str,
+    outcome_source_kind: &str,
 ) -> Result<Option<ApplicationMissionCheckpointExecution>, ApplicationError> {
     let Some(completion) = mission
         .definition
@@ -2394,7 +2686,7 @@ fn completed_application_checkpoint_replay(
     let Some(evidence) = completion.application_evidence.as_ref() else {
         return Err(ApplicationError::ApplicationCheckpointReplayMismatch);
     };
-    if evidence.handler_id != VM11_EVENT_INGEST_HANDLER_ID
+    if evidence.handler_id != handler_id
         || evidence.dispatch_mission_revision != command.expected_mission_revision
         || evidence.dispatch_checkpoint_revision != command.expected_checkpoint_revision
         || evidence.checkpoint_id != command.checkpoint_id
@@ -2404,7 +2696,7 @@ fn completed_application_checkpoint_replay(
     let outcome_ledger_revision = evidence
         .sources
         .iter()
-        .find(|source| source.source_kind == "outcome_ledger")
+        .find(|source| source.source_kind == outcome_source_kind)
         .map(|source| source.source_revision)
         .ok_or(ApplicationError::ApplicationCheckpointReplayMismatch)?;
     Ok(Some(ApplicationMissionCheckpointExecution::Completed {
@@ -2420,6 +2712,7 @@ fn blocked_application_checkpoint_replay(
     store: &ProjectStore,
     mission: &Mission,
     command: &ExecuteApplicationMissionCheckpoint,
+    handler_id: &str,
 ) -> Result<Option<ApplicationMissionCheckpointExecution>, ApplicationError> {
     if mission.stage != MissionStage::Blocked {
         return Ok(None);
@@ -2434,7 +2727,7 @@ fn blocked_application_checkpoint_replay(
                     .payload
                     .get("handlerId")
                     .and_then(serde_json::Value::as_str)
-                    == Some(VM11_EVENT_INGEST_HANDLER_ID)
+                    == Some(handler_id)
                 && event
                     .payload
                     .get("checkpointId")
@@ -2495,30 +2788,13 @@ fn vm11_event_ingest_application_evidence(
         .find(|checkpoint| checkpoint.id == command.checkpoint_id)
         .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
     let contract_digest = canonical_sha256(&serde_json::to_value(&mission.contract)?)?;
+    // The canonical value is transient and only its digest is persisted. Bind
+    // every structured identity, amount, relationship and source-verification
+    // field instead of assuming the provider payload digest covers a parsed
+    // projection supplied by a different boundary.
     let outcome_projection_digest = canonical_sha256(&serde_json::json!({
-        "schemaVersion": "hartevo-vm11-event-ingest-source/v1",
-        "tenantId": ledger.tenant_id,
-        "projectId": ledger.project_id,
-        "ledgerRevision": ledger.revision,
-        "events": ledger.events.iter().map(|event| serde_json::json!({
-            "eventId": event.id,
-            "missionId": event.mission_id,
-            "kind": event.kind,
-            "provider": event.provider,
-            "connectionId": event.connection_id,
-            "accountId": event.account_id,
-            "occurredAt": event.occurred_at,
-            "receivedAt": event.received_at,
-            "evidenceDigest": event.evidence_digest,
-            "rawPayloadDigest": event.raw_payload_digest,
-            "sourceVerification": event.source_verification.as_ref().map(|verification| serde_json::json!({
-                "method": verification.method,
-                "verifier": verification.verifier,
-                "independent": verification.independent,
-                "verifiedAt": verification.verified_at,
-                "evidenceDigest": verification.evidence_digest,
-            })),
-        })).collect::<Vec<_>>(),
+        "schemaVersion": "hartevo-vm11-event-ingest-source/v2",
+        "ledger": ledger,
     }))?;
     let operating_state_digest = canonical_sha256(&serde_json::json!({
         "schemaVersion": "hartevo-application-checkpoint-state/v1",
@@ -2583,6 +2859,303 @@ fn vm11_event_ingest_application_evidence(
             .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
         sources,
         observed_at: now,
+    })
+}
+
+fn vm11_normalize_dedupe_order_application_evidence(
+    mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    normalization: &OutcomeNormalizationProjection,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    if normalization.tenant_id != mission.tenant_id
+        || normalization.project_id != mission.project_id
+        || normalization.source_ledger_revision == 0
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "outcome_normalization".into(),
+                source_id: normalization.project_id.to_string(),
+                source_revision: normalization.source_ledger_revision,
+                projection_digest: normalization.digest(),
+                oracle_ids: BTreeSet::from(["outcome".into(), "truth".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
+fn vm11_identity_chain_application_evidence(
+    mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    normalization: &OutcomeNormalizationProjection,
+    identity_chain: &OutcomeIdentityChainProjection,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    if normalization.tenant_id != mission.tenant_id
+        || normalization.project_id != mission.project_id
+        || identity_chain.tenant_id != mission.tenant_id
+        || identity_chain.project_id != mission.project_id
+        || normalization.source_ledger_revision != identity_chain.source_ledger_revision
+        || normalization.event_count != identity_chain.event_count
+        || identity_chain.event_count != identity_chain.identity_covered_event_count
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM11_IDENTITY_CHAIN_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "outcome_normalization".into(),
+                source_id: normalization.project_id.to_string(),
+                source_revision: normalization.source_ledger_revision,
+                projection_digest: normalization.digest(),
+                oracle_ids: BTreeSet::from(["outcome".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "outcome_identity_chain".into(),
+                source_id: identity_chain.project_id.to_string(),
+                source_revision: identity_chain.source_ledger_revision,
+                projection_digest: identity_chain.digest(),
+                oracle_ids: BTreeSet::from(["decision".into(), "truth".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
+/// Fails closed if compiled code materializes a different source graph than
+/// the machine-readable production allow-list. Catalog route validation alone
+/// cannot prove that a handler used the sources it declared.
+fn validate_application_evidence_against_registry(
+    evidence: &MissionCheckpointApplicationEvidence,
+) -> Result<(), ApplicationError> {
+    let catalog = Catalog::load()?;
+    let Some(handler) = catalog
+        .application_handlers
+        .handlers
+        .iter()
+        .find(|handler| handler.handler_id == evidence.handler_id)
+    else {
+        return Err(
+            ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                handler_id: evidence.handler_id.clone(),
+            },
+        );
+    };
+    let actual_source_kinds = evidence
+        .sources
+        .iter()
+        .map(|source| source.source_kind.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_source_kinds = handler
+        .source_kinds
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let actual_source_oracle_bindings = evidence
+        .sources
+        .iter()
+        .map(|source| (source.source_kind.clone(), source.oracle_ids.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let expected_source_oracle_bindings = handler
+        .source_oracle_bindings
+        .iter()
+        .map(|(source_kind, oracle_ids)| {
+            (
+                source_kind.clone(),
+                oracle_ids.iter().cloned().collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let actual_oracles = evidence
+        .sources
+        .iter()
+        .flat_map(|source| source.oracle_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let expected_oracles = handler.oracle_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if evidence.sources.len() != expected_source_kinds.len()
+        || actual_source_kinds != expected_source_kinds
+        || actual_source_oracle_bindings != expected_source_oracle_bindings
+        || actual_oracles != expected_oracles
+        || evidence.manifest_id != handler.mission_id
+        || evidence.manifest_version != handler.mission_version
+        || evidence.capability_id != handler.capability_id
+        || evidence.checkpoint_id != handler.checkpoint_id
+        || evidence.completion_policy != MissionCheckpointCompletionPolicy::DeterministicEvidence
+        || handler.completion_policy != "deterministic_evidence"
+    {
+        return Err(
+            ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                handler_id: evidence.handler_id.clone(),
+            },
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_application_checkpoint_block(
+    store: &mut ProjectStore,
+    mission: &mut Mission,
+    command: &ExecuteApplicationMissionCheckpoint,
+    dispatch: &MissionCheckpointDispatch,
+    handler_id: &str,
+    code: &str,
+    detail: String,
+    recoverable: bool,
+    outcome_ledger_revision: u64,
+    source_fences: &[ApplicationSourceRevisionFence],
+    now: DateTime<Utc>,
+) -> Result<ApplicationMissionCheckpointExecution, ApplicationError> {
+    let expected_mission_revision = mission.revision;
+    if mission.stage == MissionStage::Blocked {
+        mission.resume(now)?;
+    }
+    let block = hartevo_domain_kernel::MissionBlock {
+        code: code.into(),
+        detail,
+        recoverable,
+        observed_at: now,
+    };
+    mission.block_checkpoint(&command.checkpoint_id, &block, MissionStage::Blocked)?;
+    store.update_mission_atomic_with_application_source_fences(
+        mission,
+        expected_mission_revision,
+        Some(outcome_ledger_revision),
+        source_fences,
+        &[PendingEvent::new(
+            "mission.application_checkpoint_blocked",
+            serde_json::json!({
+                "missionId": mission.id,
+                "checkpointId": command.checkpoint_id,
+                "capabilityId": dispatch.capability_id,
+                "handlerId": handler_id,
+                "dispatchMissionRevision": command.expected_mission_revision,
+                "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+                "code": code,
+                "recoverable": recoverable,
+                "outcomeLedgerRevision": outcome_ledger_revision,
+                "sourceFenceCount": source_fences.len(),
+            }),
+            now,
+        )],
+    )?;
+    Ok(ApplicationMissionCheckpointExecution::Blocked {
+        checkpoint_id: command.checkpoint_id.clone(),
+        code: code.into(),
+        outcome_ledger_revision,
+        replayed: false,
     })
 }
 
@@ -6635,12 +7208,12 @@ impl ApplicationService {
 
     /// Executes one exact Application-routed Checkpoint. Unsupported routes
     /// return `NotImplemented` without mutating the Mission; they are never
-    /// completed by a caller-supplied digest. VM-11 `event_ingest` is the first
-    /// production handler and is fenced to the immutable Outcome Ledger
-    /// revision inspected by the handler.
+    /// completed by a caller-supplied digest. The first VM-11 handlers require
+    /// current source verification and are fenced to the immutable Outcome
+    /// Ledger revision inspected by their deterministic projections.
     #[allow(
         clippy::too_many_lines,
-        reason = "the first Application handler keeps replay, empty-source blocking, source-fenced Oracle materialization, completion, and next-route handoff in one auditable boundary"
+        reason = "the VM-11 Application handlers keep replay, source quarantine, source-fenced Oracle materialization, completion, and next-route handoff in one auditable boundary"
     )]
     pub fn execute_application_mission_checkpoint(
         &mut self,
@@ -6650,13 +7223,25 @@ impl ApplicationService {
         let mut mission = self
             .store
             .load_mission(&command.project_id, &command.mission_id)?;
-        if let Some(replay) = completed_application_checkpoint_replay(&mission, &command)? {
-            return Ok(replay);
-        }
-        if let Some(replay) =
-            blocked_application_checkpoint_replay(&self.store, &mission, &command)?
+        if let Some(replay_handler) =
+            compiled_handler_for_checkpoint(&mission, &command.checkpoint_id)?
         {
-            return Ok(replay);
+            if let Some(replay) = completed_application_checkpoint_replay(
+                &mission,
+                &command,
+                replay_handler.handler_id(),
+                replay_handler.outcome_source_kind(),
+            )? {
+                return Ok(replay);
+            }
+            if let Some(replay) = blocked_application_checkpoint_replay(
+                &self.store,
+                &mission,
+                &command,
+                replay_handler.handler_id(),
+            )? {
+                return Ok(replay);
+            }
         }
 
         let dispatch = current_checkpoint_dispatch_projection(&mission)?
@@ -6696,9 +7281,7 @@ impl ApplicationService {
                 },
             );
         };
-        match compiled_handler {
-            CompiledApplicationCheckpointHandler::Vm11EventIngest => {}
-        }
+        let handler_id = compiled_handler.handler_id();
 
         let outcome_ledger = match self.store.load_outcome_ledger(&command.project_id) {
             Ok(ledger) => Some(ledger),
@@ -6735,11 +7318,15 @@ impl ApplicationService {
             let block = hartevo_domain_kernel::MissionBlock {
                 code: code.into(),
                 detail: if outcome_ledger.is_some() {
-                    "No verified OutcomeEvent is available; event_ingest remains blocked without inventing an outcome."
-                        .into()
+                    format!(
+                        "No verified OutcomeEvent is available; {} remains blocked without inventing an outcome.",
+                        command.checkpoint_id
+                    )
                 } else {
-                    "The project OutcomeLedger has not been initialized; event_ingest remains blocked without a substitute snapshot."
-                        .into()
+                    format!(
+                        "The project OutcomeLedger has not been initialized; {} remains blocked without a substitute snapshot.",
+                        command.checkpoint_id
+                    )
                 },
                 recoverable: true,
                 observed_at: now,
@@ -6751,7 +7338,7 @@ impl ApplicationService {
                     "missionId": mission.id,
                     "checkpointId": command.checkpoint_id,
                     "capabilityId": dispatch.capability_id,
-                    "handlerId": VM11_EVENT_INGEST_HANDLER_ID,
+                    "handlerId": handler_id,
                     "dispatchMissionRevision": command.expected_mission_revision,
                     "dispatchCheckpointRevision": command.expected_checkpoint_revision,
                     "code": code,
@@ -6775,7 +7362,137 @@ impl ApplicationService {
         }
 
         let outcome_ledger = outcome_ledger.expect("non-empty ledger checked");
-        outcome_ledger.validate()?;
+        let normalization = match outcome_ledger.verified_normalization_projection() {
+            Ok(projection) => projection,
+            Err(OutcomeLedgerError::UnverifiedOutcomeSource) => {
+                let code = "outcome_source_unverified";
+                let expected_mission_revision = mission.revision;
+                if mission.stage == MissionStage::Blocked {
+                    mission.resume(now)?;
+                }
+                let block = hartevo_domain_kernel::MissionBlock {
+                    code: code.into(),
+                    detail: format!(
+                        "{} requires every OutcomeEvent to carry current source verification; migration-readable legacy evidence cannot complete this Checkpoint.",
+                        command.checkpoint_id
+                    ),
+                    recoverable: true,
+                    observed_at: now,
+                };
+                mission.block_checkpoint(&command.checkpoint_id, &block, MissionStage::Blocked)?;
+                self.store.update_mission_atomic_with_outcome_ledger_fence(
+                    &mission,
+                    expected_mission_revision,
+                    Some(outcome_ledger.revision),
+                    &[PendingEvent::new(
+                        "mission.application_checkpoint_blocked",
+                        serde_json::json!({
+                            "missionId": mission.id,
+                            "checkpointId": command.checkpoint_id,
+                            "capabilityId": dispatch.capability_id,
+                            "handlerId": handler_id,
+                            "dispatchMissionRevision": command.expected_mission_revision,
+                            "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+                            "code": code,
+                            "recoverable": true,
+                            "outcomeLedgerRevision": outcome_ledger.revision,
+                        }),
+                        now,
+                    )],
+                )?;
+                return Ok(ApplicationMissionCheckpointExecution::Blocked {
+                    checkpoint_id: command.checkpoint_id,
+                    code: code.into(),
+                    outcome_ledger_revision: outcome_ledger.revision,
+                    replayed: false,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut application_source_fences = Vec::new();
+        let identity_chain = if compiled_handler
+            == CompiledApplicationCheckpointHandler::IdentityChain
+        {
+            let support = match load_outcome_identity_chain_support(&self.store, &outcome_ledger) {
+                Ok(support) => support,
+                Err(OutcomeIdentityChainSupportLoadError::Missing { kind, id }) => {
+                    let missing_fence = ApplicationSourceRevisionFence::absent(kind, id);
+                    return persist_application_checkpoint_block(
+                        &mut self.store,
+                        &mut mission,
+                        &command,
+                        &dispatch,
+                        handler_id,
+                        "identity_chain_support_missing",
+                        format!(
+                            "{} cannot resolve the complete project-scoped identity support closure; no substitute identity was inferred.",
+                            command.checkpoint_id
+                        ),
+                        true,
+                        outcome_ledger.revision,
+                        std::slice::from_ref(&missing_fence),
+                        now,
+                    );
+                }
+                Err(OutcomeIdentityChainSupportLoadError::Storage(error)) => {
+                    return Err(error.into());
+                }
+            };
+            application_source_fences = support.revision_fences();
+            match outcome_ledger.verified_identity_chain_projection(
+                &support.connections,
+                &support.identity_links,
+                &support.people,
+                &support.companies,
+                &support.partners,
+                &support.opportunities,
+            ) {
+                Ok(projection) => Some(projection),
+                Err(
+                    error @ (OutcomeLedgerError::IdentityLinkUnconfirmed
+                    | OutcomeLedgerError::IdentityProviderAccountMismatch
+                    | OutcomeLedgerError::IdentityRelationshipMismatch
+                    | OutcomeLedgerError::IdentityChainSupportClosureMismatch
+                    | OutcomeLedgerError::IdentityChainCoverageMismatch),
+                ) => {
+                    let (code, recoverable) = match error {
+                        OutcomeLedgerError::IdentityLinkUnconfirmed => {
+                            ("identity_link_unconfirmed", true)
+                        }
+                        OutcomeLedgerError::IdentityProviderAccountMismatch => {
+                            ("identity_provider_account_mismatch", false)
+                        }
+                        OutcomeLedgerError::IdentityRelationshipMismatch => {
+                            ("identity_relationship_inconsistent", true)
+                        }
+                        OutcomeLedgerError::IdentityChainSupportClosureMismatch
+                        | OutcomeLedgerError::IdentityChainCoverageMismatch => {
+                            ("identity_chain_broken", true)
+                        }
+                        _ => unreachable!("identity-chain error alternatives are exhaustive"),
+                    };
+                    return persist_application_checkpoint_block(
+                        &mut self.store,
+                        &mut mission,
+                        &command,
+                        &dispatch,
+                        handler_id,
+                        code,
+                        format!(
+                            "{} failed its deterministic identity-chain Oracle; Outcome identities remain unresolved and no attribution decision was fabricated.",
+                            command.checkpoint_id
+                        ),
+                        recoverable,
+                        outcome_ledger.revision,
+                        &application_source_fences,
+                        now,
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
         let expected_mission_revision = mission.revision;
         if mission.stage == MissionStage::Blocked {
             mission.resume(now)?;
@@ -6794,13 +7511,41 @@ impl ApplicationService {
             .route
             .as_ref()
             .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
-        let application_evidence = vm11_event_ingest_application_evidence(
-            &mission,
-            route,
-            &command,
-            &outcome_ledger,
-            now,
-        )?;
+        let application_evidence = match compiled_handler {
+            CompiledApplicationCheckpointHandler::EventIngest => {
+                vm11_event_ingest_application_evidence(
+                    &mission,
+                    route,
+                    &command,
+                    &outcome_ledger,
+                    now,
+                )?
+            }
+            CompiledApplicationCheckpointHandler::NormalizeDedupeOrder => {
+                vm11_normalize_dedupe_order_application_evidence(
+                    &mission,
+                    route,
+                    &command,
+                    &normalization,
+                    now,
+                )?
+            }
+            CompiledApplicationCheckpointHandler::IdentityChain => {
+                vm11_identity_chain_application_evidence(
+                    &mission,
+                    route,
+                    &command,
+                    &normalization,
+                    identity_chain.as_ref().ok_or(
+                        ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                            handler_id: handler_id.into(),
+                        },
+                    )?,
+                    now,
+                )?
+            }
+        };
+        validate_application_evidence_against_registry(&application_evidence)?;
         let evidence_digest = application_evidence.digest();
         mission.complete_checkpoint(
             &command.checkpoint_id,
@@ -6826,6 +7571,31 @@ impl ApplicationService {
             .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
         let next_started = start_ready_catalog_checkpoint_in_memory(&mut mission, now)?;
         let next_dispatch = current_checkpoint_dispatch_projection(&mission)?;
+        let source_metrics = identity_chain.as_ref().map_or_else(
+            || {
+                serde_json::json!({
+                    "eventCount": normalization.event_count,
+                    "orderCount": normalization.order_count,
+                    "refundCount": normalization.refund_count,
+                    "observedReorderCount": normalization.observed_reorder_count,
+                })
+            },
+            |projection| {
+                serde_json::json!({
+                    "eventCount": projection.event_count,
+                    "identityCoveredEventCount": projection.identity_covered_event_count,
+                    "directIdentityEventCount": projection.direct_identity_event_count,
+                    "inheritedOrderIdentityEventCount": projection.inherited_order_identity_event_count,
+                    "externalAccountMatchCount": projection.external_account_match_count,
+                    "connectionCount": projection.connection_count,
+                    "identityLinkCount": projection.identity_link_count,
+                    "personCount": projection.person_count,
+                    "companyCount": projection.company_count,
+                    "partnerCount": projection.partner_count,
+                    "opportunityCount": projection.opportunity_count,
+                })
+            },
+        );
         let mut events = vec![PendingEvent::new(
             "mission.application_checkpoint_completed",
             serde_json::json!({
@@ -6833,11 +7603,12 @@ impl ApplicationService {
                 "checkpointId": command.checkpoint_id,
                 "checkpointRevision": completed_checkpoint_revision,
                 "capabilityId": dispatch.capability_id,
-                "handlerId": VM11_EVENT_INGEST_HANDLER_ID,
+                "handlerId": handler_id,
                 "oracleIds": dispatch.oracle_ids,
-                "sourceKind": "outcome_ledger",
+                "sourceKind": compiled_handler.outcome_source_kind(),
                 "sourceRevision": outcome_ledger.revision,
-                "sourceEventCount": outcome_ledger.events.len(),
+                "sourceMetrics": source_metrics,
+                "sourceFenceCount": application_source_fences.len(),
                 "evidenceDigest": evidence_digest,
             }),
             now,
@@ -6859,12 +7630,14 @@ impl ApplicationService {
                 now,
             ));
         }
-        self.store.update_mission_atomic_with_outcome_ledger_fence(
-            &mission,
-            expected_mission_revision,
-            Some(outcome_ledger.revision),
-            &events,
-        )?;
+        self.store
+            .update_mission_atomic_with_application_source_fences(
+                &mission,
+                expected_mission_revision,
+                Some(outcome_ledger.revision),
+                &application_source_fences,
+                &events,
+            )?;
         Ok(ApplicationMissionCheckpointExecution::Completed {
             completed_checkpoint_id: command.checkpoint_id,
             completion_evidence_digest: evidence_digest,
@@ -17705,10 +18478,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the VM-11 handler Journey proves empty-source blocking, exact replay, verified source-fenced completion, next-route handoff, and unsupported-route honesty in one ordered contract"
+        reason = "the VM-11 handler Journey proves empty-source and identity-conflict recovery, exact replay, multi-source-fenced completion, next-route handoff, and unsupported-route honesty in one ordered contract"
     )]
-    fn vm11_event_ingest_application_handler_is_source_fenced_replayable_and_never_self_fabricates()
-    {
+    fn vm11_ingest_normalization_and_identity_handlers_are_source_fenced_and_replayable() {
         let workspace = tempfile::tempdir().expect("project workspace");
         let project_id = ProjectId::from("vm11-application-project");
         let mission_id = MissionId::from("vm11-application-mission");
@@ -17908,7 +18680,7 @@ mod tests {
                     connection_id: None,
                     account_id: None,
                     source_event_id: "PRIVATE-PROVIDER-EVENT-ID".into(),
-                    identity_link_id: Some(identity_link_id),
+                    identity_link_id: Some(identity_link_id.clone()),
                     opportunity_id: None,
                     campaign_id: None,
                     order_id: None,
@@ -18015,8 +18787,8 @@ mod tests {
             ),
             (
                 MissionCheckpointExecutor::Application,
-                Some(ApplicationCheckpointHandlerStatus::NotImplemented),
-                None,
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID),
             )
         );
         let completed_mission = service
@@ -18039,7 +18811,7 @@ mod tests {
             .expect("registered handler evidence");
         assert_eq!(completion.evidence_digest, completion_evidence_digest);
         assert_eq!(application_evidence.digest(), completion_evidence_digest);
-        assert_eq!(application_evidence.handler_id, "vm11.event_ingest/v1");
+        assert_eq!(application_evidence.handler_id, "vm11.event_ingest/v2");
         assert_eq!(
             application_evidence
                 .sources
@@ -18118,6 +18890,364 @@ mod tests {
                 .len(),
             event_count_after_completion
         );
+        let normalize_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: next_dispatch.checkpoint_id.clone(),
+            expected_mission_revision: next_dispatch.mission_revision,
+            expected_checkpoint_revision: next_dispatch.checkpoint_revision,
+        };
+        let normalized = service
+            .execute_application_mission_checkpoint(
+                normalize_command.clone(),
+                now() + Duration::seconds(5),
+            )
+            .expect("deterministic normalize/dedupe/order completion");
+        let ApplicationMissionCheckpointExecution::Completed {
+            completion_evidence_digest: normalization_evidence_digest,
+            outcome_ledger_revision: normalization_ledger_revision,
+            replayed: normalization_replayed,
+            next_dispatch: identity_dispatch,
+            ..
+        } = normalized
+        else {
+            panic!("normalize_dedupe_order must complete from the strict projection")
+        };
+        assert_eq!(
+            (normalization_ledger_revision, normalization_replayed),
+            (2, false)
+        );
+        let identity_dispatch = identity_dispatch.expect("identity_chain route");
+        assert_eq!(
+            (
+                identity_dispatch.checkpoint_id.as_str(),
+                identity_dispatch.executor,
+                identity_dispatch.application_handler_status,
+                identity_dispatch.application_handler_id.as_deref(),
+            ),
+            (
+                "identity_chain",
+                MissionCheckpointExecutor::Application,
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM11_IDENTITY_CHAIN_HANDLER_ID),
+            )
+        );
+        let normalized_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("normalized Mission");
+        let normalization_completion = normalized_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "normalize_dedupe_order")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("normalization completion");
+        let normalization_evidence = normalization_completion
+            .application_evidence
+            .as_ref()
+            .expect("normalization Application evidence");
+        assert_eq!(
+            (
+                normalization_evidence.handler_id.as_str(),
+                normalization_evidence.digest(),
+                normalization_evidence
+                    .sources
+                    .iter()
+                    .map(|source| source.source_kind.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID,
+                normalization_evidence_digest,
+                BTreeSet::from(["mission_checkpoint", "outcome_normalization"]),
+            )
+        );
+        let recomputed_normalization = service
+            .store
+            .load_outcome_ledger(&project_id)
+            .expect("Outcome Ledger")
+            .verified_normalization_projection()
+            .expect("strict recomputation");
+        let recomputed_normalization_digest = recomputed_normalization.digest();
+        assert_eq!(
+            normalization_evidence
+                .sources
+                .iter()
+                .find(|source| source.source_kind == "outcome_normalization")
+                .map(|source| (source.source_revision, source.projection_digest.as_str())),
+            Some((2, recomputed_normalization_digest.as_str()))
+        );
+        let mut registry_tampered = normalization_evidence.clone();
+        let mut tampered_source = registry_tampered
+            .sources
+            .pop_first()
+            .expect("normalization source");
+        tampered_source.source_kind = "undeclared_source".into();
+        registry_tampered.sources.insert(tampered_source);
+        assert!(matches!(
+            validate_application_evidence_against_registry(&registry_tampered),
+            Err(ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                handler_id,
+            }) if handler_id == VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID
+        ));
+        let mut oracle_binding_tampered = normalization_evidence.clone();
+        oracle_binding_tampered.sources = oracle_binding_tampered
+            .sources
+            .into_iter()
+            .map(|mut source| {
+                source.oracle_ids = if source.source_kind == "mission_checkpoint" {
+                    BTreeSet::from(["outcome".into(), "truth".into()])
+                } else {
+                    BTreeSet::from(["operating_state".into()])
+                };
+                source
+            })
+            .collect();
+        assert!(matches!(
+            validate_application_evidence_against_registry(&oracle_binding_tampered),
+            Err(ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                handler_id,
+            }) if handler_id == VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID
+        ));
+        let event_count_after_normalization = service
+            .mission_events(&project_id, &mission_id)
+            .expect("normalization events")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    normalize_command,
+                    now() + Duration::seconds(6),
+                )
+                .expect("exact normalization replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: true,
+                outcome_ledger_revision: 2,
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged normalization replay events")
+                .len(),
+            event_count_after_normalization
+        );
+
+        service
+            .mark_identity_link_conflicted(
+                &project_id,
+                &identity_link_id,
+                ActorId::from("identity-reviewer"),
+                "e".repeat(64),
+                now() + Duration::seconds(7),
+            )
+            .expect("inject identity conflict");
+        let conflicted_identity_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: identity_dispatch.checkpoint_id.clone(),
+            expected_mission_revision: identity_dispatch.mission_revision,
+            expected_checkpoint_revision: identity_dispatch.checkpoint_revision,
+        };
+        assert_eq!(
+            service
+                .execute_application_mission_checkpoint(
+                    conflicted_identity_command.clone(),
+                    now() + Duration::seconds(8),
+                )
+                .expect("conflicted identity blocks"),
+            ApplicationMissionCheckpointExecution::Blocked {
+                checkpoint_id: "identity_chain".into(),
+                code: "identity_link_unconfirmed".into(),
+                outcome_ledger_revision: 2,
+                replayed: false,
+            }
+        );
+        let event_count_after_identity_block = service
+            .mission_events(&project_id, &mission_id)
+            .expect("identity block events")
+            .len();
+        assert_eq!(
+            service
+                .execute_application_mission_checkpoint(
+                    conflicted_identity_command,
+                    now() + Duration::seconds(9),
+                )
+                .expect("exact identity block replay"),
+            ApplicationMissionCheckpointExecution::Blocked {
+                checkpoint_id: "identity_chain".into(),
+                code: "identity_link_unconfirmed".into(),
+                outcome_ledger_revision: 2,
+                replayed: true,
+            }
+        );
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged identity block replay")
+                .len(),
+            event_count_after_identity_block
+        );
+        service
+            .confirm_identity_link(
+                &project_id,
+                &identity_link_id,
+                ActorId::from("identity-reviewer"),
+                "f".repeat(64),
+                now() + Duration::seconds(10),
+            )
+            .expect("resolve identity conflict");
+        let recovered_identity_dispatch = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &mission_id,
+                now() + Duration::seconds(11),
+            )
+            .expect("recovered identity dispatch");
+        assert_eq!(
+            (
+                recovered_identity_dispatch.checkpoint_id.as_str(),
+                recovered_identity_dispatch.application_handler_status,
+                recovered_identity_dispatch
+                    .application_handler_id
+                    .as_deref(),
+            ),
+            (
+                "identity_chain",
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM11_IDENTITY_CHAIN_HANDLER_ID),
+            )
+        );
+        let identity_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: recovered_identity_dispatch.checkpoint_id.clone(),
+            expected_mission_revision: recovered_identity_dispatch.mission_revision,
+            expected_checkpoint_revision: recovered_identity_dispatch.checkpoint_revision,
+        };
+        let identity_completed = service
+            .execute_application_mission_checkpoint(
+                identity_command.clone(),
+                now() + Duration::seconds(12),
+            )
+            .expect("source-fenced identity-chain completion");
+        let ApplicationMissionCheckpointExecution::Completed {
+            completion_evidence_digest: identity_evidence_digest,
+            outcome_ledger_revision: identity_ledger_revision,
+            replayed: identity_replayed,
+            next_dispatch: kpi_dispatch,
+            ..
+        } = identity_completed
+        else {
+            panic!("identity_chain must complete from confirmed exact support")
+        };
+        assert_eq!((identity_ledger_revision, identity_replayed), (2, false));
+        let kpi_dispatch = kpi_dispatch.expect("mission_specific_kpi route");
+        assert_eq!(
+            (
+                kpi_dispatch.checkpoint_id.as_str(),
+                kpi_dispatch.executor,
+                kpi_dispatch.application_handler_status,
+                kpi_dispatch.application_handler_id.as_deref(),
+            ),
+            (
+                "mission_specific_kpi",
+                MissionCheckpointExecutor::Application,
+                Some(ApplicationCheckpointHandlerStatus::NotImplemented),
+                None,
+            )
+        );
+        let identity_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("identity-chain Mission");
+        let identity_evidence = identity_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "identity_chain")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .and_then(|completion| completion.application_evidence.as_ref())
+            .expect("identity-chain Application evidence");
+        assert_eq!(
+            (
+                identity_evidence.handler_id.as_str(),
+                identity_evidence.digest(),
+                identity_evidence
+                    .sources
+                    .iter()
+                    .map(|source| source.source_kind.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                VM11_IDENTITY_CHAIN_HANDLER_ID,
+                identity_evidence_digest,
+                BTreeSet::from([
+                    "mission_checkpoint",
+                    "outcome_identity_chain",
+                    "outcome_normalization",
+                ]),
+            )
+        );
+        let persisted_ledger = service
+            .store
+            .load_outcome_ledger(&project_id)
+            .expect("persisted ledger");
+        let persisted_identity_support =
+            load_outcome_identity_chain_support(&service.store, &persisted_ledger)
+                .expect("exact persisted identity closure");
+        let recomputed_identity_chain = persisted_ledger
+            .verified_identity_chain_projection(
+                &persisted_identity_support.connections,
+                &persisted_identity_support.identity_links,
+                &persisted_identity_support.people,
+                &persisted_identity_support.companies,
+                &persisted_identity_support.partners,
+                &persisted_identity_support.opportunities,
+            )
+            .expect("recomputed identity Oracle");
+        let recomputed_identity_chain_digest = recomputed_identity_chain.digest();
+        assert_eq!(
+            identity_evidence
+                .sources
+                .iter()
+                .find(|source| source.source_kind == "outcome_identity_chain")
+                .map(|source| (source.source_revision, source.projection_digest.as_str())),
+            Some((2, recomputed_identity_chain_digest.as_str()))
+        );
+        let event_count_after_identity_completion = service
+            .mission_events(&project_id, &mission_id)
+            .expect("identity completion events")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    identity_command,
+                    now() + Duration::seconds(13),
+                )
+                .expect("exact identity completion replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: true,
+                outcome_ledger_revision: 2,
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged identity replay events")
+                .len(),
+            event_count_after_identity_completion
+        );
+
         let unsupported_before = service
             .load_mission(&project_id, &mission_id)
             .expect("unsupported next route before dispatch");
@@ -18127,15 +19257,15 @@ mod tests {
                     ExecuteApplicationMissionCheckpoint {
                         project_id: project_id.clone(),
                         mission_id: mission_id.clone(),
-                        checkpoint_id: next_dispatch.checkpoint_id.clone(),
-                        expected_mission_revision: next_dispatch.mission_revision,
-                        expected_checkpoint_revision: next_dispatch.checkpoint_revision,
+                        checkpoint_id: kpi_dispatch.checkpoint_id.clone(),
+                        expected_mission_revision: kpi_dispatch.mission_revision,
+                        expected_checkpoint_revision: kpi_dispatch.checkpoint_revision,
                     },
-                    now() + Duration::seconds(5),
+                    now() + Duration::seconds(14),
                 )
                 .expect("unsupported route is honest"),
             ApplicationMissionCheckpointExecution::NotImplemented {
-                dispatch: next_dispatch,
+                dispatch: kpi_dispatch,
             }
         );
         assert_eq!(
@@ -18158,6 +19288,202 @@ mod tests {
         )
         .expect("Application Checkpoint events JSON");
         assert!(!visible_events.contains("PRIVATE-PROVIDER-EVENT-ID"));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the migration quarantine regression keeps persisted legacy source construction, strict handler refusal, durable block, and replay in one ordered proof"
+    )]
+    fn vm11_application_handler_quarantines_migration_readable_unverified_outcomes() {
+        let workspace = tempfile::tempdir().expect("project workspace");
+        let tenant_id = TenantId::from("vm11-legacy-tenant");
+        let project_id = ProjectId::from("vm11-legacy-project");
+        let mission_id = MissionId::from("vm11-legacy-mission");
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: tenant_id.clone(),
+                    id: project_id.clone(),
+                    name: "Legacy Outcome quarantine".into(),
+                    description: String::new(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    storage_mode: StorageMode::LocalNew,
+                },
+                now(),
+            )
+            .expect("project");
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: mission_id.clone(),
+                    first_task_id: TaskId::from("vm11-legacy-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-11".into(),
+                    mode: OperatingMode::OneOffDecision,
+                    title: None,
+                    goal: "Never promote migration-only evidence".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
+                },
+                now(),
+            )
+            .expect("VM-11 Mission");
+        let person_id = PersonId::from("vm11-legacy-person");
+        service
+            .create_person(
+                Person::create(
+                    person_id.clone(),
+                    tenant_id.clone(),
+                    project_id.clone(),
+                    "Legacy imported person",
+                    None,
+                    vec![],
+                )
+                .expect("person"),
+                now(),
+            )
+            .expect("persist person");
+        let identity_link_id = IdentityLinkId::from("legacy-identity");
+        service
+            .create_identity_link(
+                IdentityLink::propose(
+                    identity_link_id.clone(),
+                    tenant_id.clone(),
+                    project_id.clone(),
+                    IdentitySubject::Person(person_id),
+                    [ExternalIdentity {
+                        provider: "legacy-import".into(),
+                        account_id: AccountId::from("legacy-account"),
+                        external_subject_digest: "4".repeat(64),
+                        encrypted_subject_ref: "ciphertext://legacy-person".into(),
+                        evidence_digest: "5".repeat(64),
+                    }],
+                    Decimal::ONE,
+                )
+                .expect("identity link"),
+                now(),
+            )
+            .expect("persist identity link");
+        service
+            .start_outcome_ledger(&project_id, now() + Duration::milliseconds(1))
+            .expect("empty ledger");
+        let mut legacy_ledger =
+            OutcomeLedger::new(tenant_id.clone(), project_id.clone()).expect("ledger");
+        legacy_ledger
+            .ingest(OutcomeEvent {
+                id: OutcomeEventId::from("legacy-qualified-lead"),
+                tenant_id,
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                kind: OutcomeEventKind::LeadQualified,
+                provider: "legacy-import".into(),
+                connection_id: None,
+                account_id: None,
+                source_event_id: "private-legacy-source".into(),
+                identity_link_id: Some(identity_link_id),
+                opportunity_id: None,
+                campaign_id: None,
+                order_id: None,
+                refund_id: None,
+                commission_id: None,
+                payout_id: None,
+                partner_id: None,
+                amount: None,
+                occurred_at: now(),
+                received_at: now() + Duration::seconds(1),
+                evidence_digest: "1".repeat(64),
+                raw_payload_digest: "2".repeat(64),
+                source_verification: Some(OutcomeSourceVerification {
+                    method: OutcomeVerificationMethod::UserConfirmed,
+                    verifier: "legacy-owner".into(),
+                    independent: false,
+                    verified_at: now() + Duration::seconds(1),
+                    evidence_digest: "3".repeat(64),
+                }),
+            })
+            .expect("construct once-valid event");
+        legacy_ledger.events[0].source_verification = None;
+        assert!(legacy_ledger.validate().is_ok());
+        service
+            .store
+            .update_outcome_ledger(
+                &legacy_ledger,
+                1,
+                Some(&mission_id),
+                "test.legacy_outcome_imported",
+                &serde_json::json!({"outcomeLedgerRevision": 2}),
+                now() + Duration::seconds(1),
+            )
+            .expect("persist migration-readable legacy source");
+        let dispatch = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &mission_id,
+                now() + Duration::seconds(2),
+            )
+            .expect("event_ingest dispatch");
+        let command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: dispatch.checkpoint_id,
+            expected_mission_revision: dispatch.mission_revision,
+            expected_checkpoint_revision: dispatch.checkpoint_revision,
+        };
+        assert_eq!(
+            service
+                .execute_application_mission_checkpoint(
+                    command.clone(),
+                    now() + Duration::seconds(3),
+                )
+                .expect("legacy source is a typed block"),
+            ApplicationMissionCheckpointExecution::Blocked {
+                checkpoint_id: "event_ingest".into(),
+                code: "outcome_source_unverified".into(),
+                outcome_ledger_revision: 2,
+                replayed: false,
+            }
+        );
+        let blocked = service
+            .load_mission(&project_id, &mission_id)
+            .expect("blocked Mission");
+        assert_eq!(blocked.stage, MissionStage::Blocked);
+        assert_eq!(
+            blocked
+                .definition
+                .as_ref()
+                .and_then(MissionDefinition::current_checkpoint)
+                .and_then(|checkpoint| checkpoint.completion.as_ref()),
+            None
+        );
+        let event_count = service
+            .mission_events(&project_id, &mission_id)
+            .expect("blocked audit")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    command,
+                    now() + Duration::seconds(4),
+                )
+                .expect("blocked command replay"),
+            ApplicationMissionCheckpointExecution::Blocked {
+                code,
+                replayed: true,
+                ..
+            } if code == "outcome_source_unverified"
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("no duplicate block event")
+                .len(),
+            event_count
+        );
     }
 
     #[test]

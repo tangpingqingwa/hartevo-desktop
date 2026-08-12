@@ -31,7 +31,9 @@ mod runtime_turn_store;
 mod secure_store;
 mod sync_store;
 mod work_product_store;
-pub use aggregate::{AtomicMutation, PendingEvent};
+pub use aggregate::{
+    ApplicationSourceKind, ApplicationSourceRevisionFence, AtomicMutation, PendingEvent,
+};
 pub use browser_recipe_store::BrowserRecipeRuntimeState;
 pub use context_material_store::{
     ContextMaterialDescriptor, ContextMaterialStoreError, ContextQuerySnapshot,

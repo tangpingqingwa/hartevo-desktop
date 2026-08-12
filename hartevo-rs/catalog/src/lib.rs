@@ -4,7 +4,7 @@
 //! failure traces are deliberately not compiled into this crate. Only the
 //! metadata required to prove partition shape is available to product code.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -91,6 +91,7 @@ pub struct ApplicationHandlerManifest {
     pub capability_id: String,
     pub completion_policy: String,
     pub source_kinds: Vec<String>,
+    pub source_oracle_bindings: BTreeMap<String, Vec<String>>,
     pub oracle_ids: Vec<String>,
     pub implementation_crate: String,
 }
@@ -683,8 +684,7 @@ impl Catalog {
             );
             require(
                 violations,
-                !handler.handler_id.trim().is_empty()
-                    && handler.handler_id.ends_with("/v1")
+                is_versioned_handler_id(&handler.handler_id)
                     && handler.implementation_crate == "hartevo-application"
                     && !handler.source_kinds.is_empty()
                     && handler
@@ -696,16 +696,7 @@ impl Catalog {
                     handler.handler_id
                 ),
             );
-            require_unique(
-                violations,
-                &handler.source_kinds,
-                &format!("application handler {} source kinds", handler.handler_id),
-            );
-            require_unique(
-                violations,
-                &handler.oracle_ids,
-                &format!("application handler {} oracle ids", handler.handler_id),
-            );
+            validate_application_handler_sources(handler, violations);
             if let Some(route) = route {
                 require(
                     violations,
@@ -1346,6 +1337,82 @@ fn require(violations: &mut Vec<String>, condition: bool, message: impl Into<Str
     }
 }
 
+fn is_versioned_handler_id(value: &str) -> bool {
+    value.rsplit_once("/v").is_some_and(|(name, version)| {
+        !name.trim().is_empty()
+            && version
+                .parse::<u32>()
+                .is_ok_and(|parsed| parsed > 0 && version == parsed.to_string())
+    })
+}
+
+fn validate_application_handler_sources(
+    handler: &ApplicationHandlerManifest,
+    violations: &mut Vec<String>,
+) {
+    require_unique(
+        violations,
+        &handler.source_kinds,
+        &format!("application handler {} source kinds", handler.handler_id),
+    );
+    let source_kind_set = handler
+        .source_kinds
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let source_binding_set = handler
+        .source_oracle_bindings
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    require(
+        violations,
+        source_kind_set == source_binding_set,
+        format!(
+            "application handler {} must bind every declared source kind exactly once",
+            handler.handler_id
+        ),
+    );
+    let mut bound_oracles = BTreeSet::new();
+    let mut bound_oracle_count = 0_usize;
+    for (source_kind, oracle_ids) in &handler.source_oracle_bindings {
+        require(
+            violations,
+            !source_kind.trim().is_empty()
+                && !oracle_ids.is_empty()
+                && oracle_ids.iter().all(|oracle| !oracle.trim().is_empty()),
+            format!(
+                "application handler {} source {} must bind non-empty Oracles",
+                handler.handler_id, source_kind
+            ),
+        );
+        require_unique(
+            violations,
+            oracle_ids,
+            &format!(
+                "application handler {} source {} Oracle ids",
+                handler.handler_id, source_kind
+            ),
+        );
+        bound_oracle_count = bound_oracle_count.saturating_add(oracle_ids.len());
+        bound_oracles.extend(oracle_ids.iter().cloned());
+    }
+    require_unique(
+        violations,
+        &handler.oracle_ids,
+        &format!("application handler {} oracle ids", handler.handler_id),
+    );
+    require(
+        violations,
+        bound_oracle_count == bound_oracles.len()
+            && bound_oracles == handler.oracle_ids.iter().cloned().collect::<BTreeSet<_>>(),
+        format!(
+            "application handler {} source bindings must cover its exact Oracle set",
+            handler.handler_id
+        ),
+    );
+}
+
 fn require_unique(violations: &mut Vec<String>, values: &[String], label: &str) {
     let unique: BTreeSet<&str> = values.iter().map(String::as_str).collect();
     require(
@@ -1424,13 +1491,25 @@ mod tests {
                 snapshot.summary.implemented_application_handler_count,
                 snapshot.summary.not_implemented_application_route_count,
             ),
-            (52, 1, 51)
+            (52, 3, 49)
         );
         assert_eq!(
             catalog
                 .application_handler("VM-11", 3, "event_ingest")
                 .map(|handler| handler.handler_id.as_str()),
-            Some("vm11.event_ingest/v1")
+            Some("vm11.event_ingest/v2")
+        );
+        assert_eq!(
+            catalog
+                .application_handler("VM-11", 3, "normalize_dedupe_order")
+                .map(|handler| handler.handler_id.as_str()),
+            Some("vm11.normalize-dedupe-order/v1")
+        );
+        assert_eq!(
+            catalog
+                .application_handler("VM-11", 3, "identity_chain")
+                .map(|handler| handler.handler_id.as_str()),
+            Some("vm11.identity-chain/v1")
         );
         assert!(catalog.mission("VM-06").is_some_and(|mission| {
             mission
@@ -1612,6 +1691,12 @@ mod tests {
         catalog.application_handlers.handlers[0]
             .oracle_ids
             .remove(0);
+        assert!(catalog.validate_contracts().is_err());
+
+        let mut catalog = Catalog::load().expect("valid catalog");
+        catalog.application_handlers.handlers[0]
+            .source_oracle_bindings
+            .remove("mission_contract");
         assert!(catalog.validate_contracts().is_err());
 
         let mut catalog = Catalog::load().expect("valid catalog");
