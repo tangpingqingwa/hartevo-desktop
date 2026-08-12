@@ -1,0 +1,105 @@
+Window: "Hartevo Desktop", App: HartevoVisualBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text Hartevo
+				6 button 搜索所有项目与任务
+				7 button (collapsed) 查看全部项目通知, Help: 全部项目通知, Secondary Actions: Expand
+				8 text 全部任务
+				9 text 等待持久 Mission
+				10 button 重新读取持久状态
+				11 text 全部任务
+				12 toggle button 打开任务工作台, Value: off
+				13 container 项目与任务导航
+					14 button 在当前项目描述新任务
+					15 container 项目工作面
+						16 text 工作
+						17 button 当前状态 Project
+						18 button 总调度 同一会话
+						19 button 全部任务 Mission
+						20 button 成果与循环 Outcome
+						21 text 增长运营
+						22 button 渠道运营 Channel
+						23 button 关系与 CRM 未接入
+						24 button 达人与联盟 未接入
+						25 text 系统与连接
+						26 button 连接中心 Probe
+						27 button 能力与证据 E0–E5
+					28 container 宣发项目
+						29 container
+							30 text 宣发项目 1
+						31 button 北 北美增长项目 revision 142 · Keyring 就绪
+					32 container 持久任务
+						33 container
+							34 text 持久 Mission 7
+						35 button 项目总调度 显式选择 VM-00～VM-11 CATALOG
+						36 button 美国健身器材机会研究 运行中 1
+						37 button Q3 促销策略与节奏 运行中 1
+						38 button 新品着陆页文案 等待审批 1
+						39 button 德国经销商邮件序列 等待用户 1
+						40 button AI 推荐与引用监测 已排期 1
+						41 button 竞品价格与评论变化 已排期 1
+						42 button SEO 周度增长循环 已排期 1
+					43 container
+						44 pop up button 北美增长项目 本地 E2EE 同步
+						45 text 路径只用于本机数据层，不进入日志或 Release Evidence
+				46 container
+					47 text Mission Inventory
+					48 text 变化回写同一 Project / Mission Truth VISUAL_FIXTURE · prototype-baseline-v1
+					49 button 工作台
+				50 container
+					51 text MISSIONS · APPLICATION PROJECTION
+					52 heading 全部任务, Value: 1
+						53 text 全部任务
+					54 text 一次选择会继续原来的 Mission Conversation，不创建第二套页面状态。 北美增长项目 · 7 Missions
+				55 container Mission 视图
+					56 button 全部
+					57 button (disabled) 进行中
+					58 button (disabled) 自动任务
+					59 button (disabled) 历史
+				60 container
+					61 button 美国健身器材机会研究 比较美国健身器材需求、竞争与反证，不执行外部写入。
+运行中 状态
+3/9 Checkpoint
+0 待审批
+继续 →
+					62 button Q3 促销策略与节奏 在预算和审批边界内形成 Q3 渠道计划。
+运行中 状态
+2/9 Checkpoint
+0 待审批
+继续 →
+					63 button 新品着陆页文案 交付有证据约束的新品着陆页文案并等待用户选择。
+等待审批 状态
+6/10 Checkpoint
+1 待审批
+继续 →
+					64 button 德国经销商邮件序列 只对具备合法基础且未被抑制的联系人准备邮件序列。
+等待用户 状态
+0/10 Checkpoint
+0 待审批
+继续 →
+					65 button AI 推荐与引用监测 使用冻结 Question Set 做同口径复测。
+已排期 状态
+1/9 Checkpoint
+0 待审批
+继续 →
+					66 button 竞品价格与评论变化 监测真实 Marketplace 数据边界，不把估算冒充后台事实。
+已排期 状态
+3/10 Checkpoint
+0 待审批
+继续 →
+					67 button SEO 周度增长循环 按周复测排名、流量与发布 readback。
+已排期 状态
+8/10 Checkpoint
+0 待审批
+继续 →
+	68 close button
+	69 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	70 minimize button
+	71 text Hartevo Desktop
+72 menu bar
+	73 HartevoVisualBaseline
+	74 Edit
+	75 Help

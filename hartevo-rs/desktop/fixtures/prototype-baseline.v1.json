@@ -1,0 +1,119 @@
+{
+  "scenarioId": "prototype-baseline-v1",
+  "source": "prototype/index.html@v12",
+  "disclosure": "VISUAL_FIXTURE",
+  "project": {
+    "projectId": "visual-prototype-project",
+    "name": "北美增长项目",
+    "description": "持续协调项目里的所有任务、审批、自动运行与共享事实；这里不是某一个任务的会话。",
+    "revision": 142,
+    "workspaceRootCount": 1
+  },
+  "missions": [
+    {
+      "missionId": "visual-us-fitness-research",
+      "title": "美国健身器材机会研究",
+      "goal": "比较美国健身器材需求、竞争与反证，不执行外部写入。",
+      "manifestId": "VM-07",
+      "stage": "running",
+      "checkpointId": "scoped_collection",
+      "completedCheckpoints": 3,
+      "checkpointCount": 9,
+      "cycle": 1,
+      "pendingApprovals": 0,
+      "workProducts": 1
+    },
+    {
+      "missionId": "visual-q3-promotion",
+      "title": "Q3 促销策略与节奏",
+      "goal": "在预算和审批边界内形成 Q3 渠道计划。",
+      "manifestId": "VM-04",
+      "stage": "running",
+      "checkpointId": "pillar_calendar",
+      "completedCheckpoints": 2,
+      "checkpointCount": 9,
+      "cycle": 2,
+      "pendingApprovals": 0,
+      "workProducts": 1
+    },
+    {
+      "missionId": "visual-launch-copy",
+      "title": "新品着陆页文案",
+      "goal": "交付有证据约束的新品着陆页文案并等待用户选择。",
+      "manifestId": "VM-03",
+      "stage": "waiting_approval",
+      "checkpointId": "preview_revision",
+      "completedCheckpoints": 6,
+      "checkpointCount": 10,
+      "cycle": 1,
+      "pendingApprovals": 1,
+      "workProducts": 1
+    },
+    {
+      "missionId": "visual-email-sequence",
+      "title": "德国经销商邮件序列",
+      "goal": "只对具备合法基础且未被抑制的联系人准备邮件序列。",
+      "manifestId": "VM-05",
+      "stage": "waiting_user",
+      "checkpointId": "icp_and_legal_basis",
+      "completedCheckpoints": 0,
+      "checkpointCount": 10,
+      "cycle": 1,
+      "pendingApprovals": 0,
+      "workProducts": 0
+    },
+    {
+      "missionId": "visual-ai-monitor",
+      "title": "AI 推荐与引用监测",
+      "goal": "使用冻结 Question Set 做同口径复测。",
+      "manifestId": "VM-02",
+      "stage": "scheduled",
+      "checkpointId": "gt_baseline",
+      "completedCheckpoints": 1,
+      "checkpointCount": 9,
+      "cycle": 4,
+      "pendingApprovals": 0,
+      "workProducts": 1
+    },
+    {
+      "missionId": "visual-competitor-monitor",
+      "title": "竞品价格与评论变化",
+      "goal": "监测真实 Marketplace 数据边界，不把估算冒充后台事实。",
+      "manifestId": "VM-08",
+      "stage": "scheduled",
+      "checkpointId": "demand_review_return_competitor_clusters",
+      "completedCheckpoints": 3,
+      "checkpointCount": 10,
+      "cycle": 3,
+      "pendingApprovals": 0,
+      "workProducts": 1
+    },
+    {
+      "missionId": "visual-seo-cycle",
+      "title": "SEO 周度增长循环",
+      "goal": "按周复测排名、流量与发布 readback。",
+      "manifestId": "VM-01",
+      "stage": "scheduled",
+      "checkpointId": "ranking_traffic_review",
+      "completedCheckpoints": 8,
+      "checkpointCount": 10,
+      "cycle": 12,
+      "pendingApprovals": 0,
+      "workProducts": 2
+    }
+  ],
+  "catalog": [
+    ["VM-00", "Current State、Identity 与 Billing", "build_once"],
+    ["VM-01", "SEO Continuous Operator", "continuous_operator"],
+    ["VM-02", "AI Visibility Operator", "continuous_operator"],
+    ["VM-03", "First-party Growth Site", "build_once"],
+    ["VM-04", "Social Matrix", "campaign"],
+    ["VM-05", "Consent-safe Email Acquisition", "campaign"],
+    ["VM-06", "Partner / Affiliate / Creator Work", "continuous_relationship"],
+    ["VM-07", "New Market Decision", "one_off_decision"],
+    ["VM-08", "Marketplace / Listing Operator", "continuous_operator"],
+    ["VM-09", "B2B Decision Evidence 与 Pipeline", "continuous_relationship"],
+    ["VM-10", "Inbox、Bot 与 Human Handoff", "continuous_relationship"],
+    ["VM-11", "Outcome、Attribution 与 Next Loop", "continuous_operator"]
+  ]
+}

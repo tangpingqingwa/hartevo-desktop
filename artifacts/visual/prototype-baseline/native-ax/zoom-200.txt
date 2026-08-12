@@ -1,0 +1,75 @@
+Window: "Hartevo Desktop", App: HartevoVisualBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text 项目总调度
+				6 text 等待持久 Mission
+				7 button 重新读取持久状态
+				8 container 项目与任务导航
+					9 button 在当前项目描述新任务
+					10 container 项目工作面
+						11 button
+						12 button
+						13 button
+						14 button
+						15 button
+						16 button
+						17 button
+						18 button
+						19 button
+					20 pop up button
+				21 container
+					22 text Mission Conversation
+					23 text VISUAL_FIXTURE · prototype-baseline-v1
+					24 button 工作台
+				25 container 北美增长项目 · 总调度
+					26 container
+						27 heading 北美增长项目 · 总调度, Value: 1
+							28 text 北美增长项目 · 总调度
+						29 text 持续协调项目里的所有任务、审批、自动运行与共享事实；这里不是某一个任务的会话。
+					30 container 项目任务摘要
+						31 text 2
+						32 text 进行中的任务
+						33 text 2
+						34 text 等待确认
+						35 text 3
+						36 text 自动任务
+						37 text 142
+						38 text Project revision
+					39 container
+						40 heading 现在优先处理, Value: 2
+							41 text 现在优先处理
+						42 text 按状态与项目顺序投影
+					43 button 美国健身器材机会研究 运行中 · scoped_collection · cycle 1 3/9 打开
+					44 button Q3 促销策略与节奏 运行中 · pillar_calendar · cycle 2 2/9 打开
+					45 button 新品着陆页文案 等待审批 · preview_revision · cycle 1 6/10 打开
+					46 container
+						47 heading 等待你, Value: 2
+							48 text 等待你
+						49 text 只显示持久等待状态
+					50 button 新品着陆页文案 等待审批 处理
+					51 button 德国经销商邮件序列 等待用户 处理
+					52 container
+						53 text Hartevo · 刚刚 调度更新
+					54 text 任务、工作面变化与审批会汇总到同一 Project/Mission Truth；这里不会从页面样例推导 Provider 成功。
+					55 container
+						56 container 2 个 Mission 正在运行
+						57 container 2 个 Mission 等待你的明确输入
+						58 container 3 个周期任务保持排期；Provider readback 未接入时不声称已执行
+				59 text 北美增长项目 · 项目总调度 · 新建 Catalog Mission
+				60 button (collapsed) Operating Contract, Secondary Actions: Expand
+				61 text entry area (settable, string) Operating Contract 目标、约束与停止条件, Placeholder: 写明目标、硬约束、非目标与停止条件…
+					62 text 写明目标、硬约束、非目标与停止条件…
+				63 container
+					64 text Runtime · NOT_CONFIGURED Provider · 未配置 · 无业务 Receipt Tokenizer · DEV_FALLBACK
+					65 button (disabled) 提交 Catalog-bound 持久 Mission
+	66 close button
+	67 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	68 minimize button
+	69 text Hartevo Desktop
+70 menu bar
+	71 HartevoVisualBaseline
+	72 Edit
+	73 Help

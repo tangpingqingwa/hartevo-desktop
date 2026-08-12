@@ -1,0 +1,82 @@
+Window: "Hartevo Desktop", App: HartevoVisualBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text Hartevo
+				6 button 搜索所有项目与任务
+				7 button (collapsed) 查看全部项目通知, Help: 全部项目通知, Secondary Actions: Expand
+				8 text 渠道运营
+				9 text 运行中
+				10 button 重新读取持久状态
+				11 text 渠道运营
+				12 toggle button 打开任务工作台, Value: off
+				13 container 项目与任务导航
+					14 button 在当前项目描述新任务
+					15 container 项目工作面
+						16 text 工作
+						17 button 当前状态 Project
+						18 button 总调度 同一会话
+						19 button 全部任务 Mission
+						20 button 成果与循环 Outcome
+						21 text 增长运营
+						22 button 渠道运营 Channel
+						23 button 关系与 CRM 未接入
+						24 button 达人与联盟 未接入
+						25 text 系统与连接
+						26 button 连接中心 Probe
+						27 button 能力与证据 E0–E5
+					28 container 宣发项目
+						29 container
+							30 text 宣发项目 1
+						31 button 北 北美增长项目 revision 142 · Keyring 就绪
+					32 container 持久任务
+						33 container
+							34 text 持久 Mission 7
+						35 button 项目总调度 显式选择 VM-00～VM-11 CATALOG
+						36 button 美国健身器材机会研究 运行中 1
+						37 button Q3 促销策略与节奏 运行中 1
+						38 button 新品着陆页文案 等待审批 1
+						39 button 德国经销商邮件序列 等待用户 1
+						40 button AI 推荐与引用监测 已排期 1
+						41 button 竞品价格与评论变化 已排期 1
+						42 button SEO 周度增长循环 已排期 1
+					43 container
+						44 pop up button 北美增长项目 本地 E2EE 同步
+						45 text 路径只用于本机数据层，不进入日志或 Release Evidence
+				46 container
+					47 text Growth Operations
+					48 text 变化回写同一 Project / Mission Truth VISUAL_FIXTURE · prototype-baseline-v1
+					49 button 工作台
+				50 container
+					51 text CHANNELS · GROWTH OPERATIONS
+					52 heading 渠道运营, Value: 1
+						53 text 渠道运营
+					54 text 根据受众、市场、内容能力与目标选择值得经营的渠道；每个平台有独立素材、节奏、审批与结果。 北美增长项目 · Mission revision 1
+				55 container 渠道运营视图
+					56 button 计划
+					57 button 日历
+					58 button 发布队列
+					59 button 效果
+				60 text 1
+				61 text 真实工作产物
+				62 text 0
+				63 text 等待审批
+				64 text 0
+				65 text 已独立验证
+				66 text 0
+				67 text 页面生成回执
+				68 heading 渠道计划, Value: 2
+					69 text 渠道计划
+				70 text 同一 Mission · 同一 Effect Ledger
+				71 container
+					72 text Q3 促销策略与节奏 · 视觉夹具产物 1 visual_fixture · evidence 0 DRAFT
+	73 close button
+	74 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	75 minimize button
+	76 text Hartevo Desktop
+77 menu bar
+	78 HartevoVisualBaseline
+	79 Edit
+	80 Help

@@ -1,0 +1,5 @@
+case	requested_content	actual_native_window	verified_content	zoom	status
+compact	1024x768	1024x800	1024x768	100%	PASS
+baseline	1366x900	1366x871	1366x839	100%	BLOCKED_ENV_SCREEN_BOUNDS
+wide	1600x1000	1512x871	1512x839	100%	BLOCKED_ENV_SCREEN_BOUNDS
+zoom-200	1024x768	1024x800	1024x768	200%	PASS

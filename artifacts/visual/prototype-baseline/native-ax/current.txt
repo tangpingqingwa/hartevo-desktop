@@ -1,0 +1,120 @@
+Window: "Hartevo Desktop", App: HartevoVisualBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text Hartevo
+				6 button 搜索所有项目与任务
+				7 button (collapsed) 查看全部项目通知, Help: 全部项目通知, Secondary Actions: Expand
+				8 text 当前状态
+				9 text 等待持久 Mission
+				10 button 重新读取持久状态
+				11 text 当前状态
+				12 toggle button 打开任务工作台, Value: off
+				13 container 项目与任务导航
+					14 button 在当前项目描述新任务
+					15 container 项目工作面
+						16 text 工作
+						17 button 当前状态 Project
+						18 button 总调度 同一会话
+						19 button 全部任务 Mission
+						20 button 成果与循环 Outcome
+						21 text 增长运营
+						22 button 渠道运营 Channel
+						23 button 关系与 CRM 未接入
+						24 button 达人与联盟 未接入
+						25 text 系统与连接
+						26 button 连接中心 Probe
+						27 button 能力与证据 E0–E5
+					28 container 宣发项目
+						29 container
+							30 text 宣发项目 1
+						31 button 北 北美增长项目 revision 142 · Keyring 就绪
+					32 container 持久任务
+						33 container
+							34 text 持久 Mission 7
+						35 button 项目总调度 显式选择 VM-00～VM-11 CATALOG
+						36 button 美国健身器材机会研究 运行中 1
+						37 button Q3 促销策略与节奏 运行中 1
+						38 button 新品着陆页文案 等待审批 1
+						39 button 德国经销商邮件序列 等待用户 1
+						40 button AI 推荐与引用监测 已排期 1
+						41 button 竞品价格与评论变化 已排期 1
+						42 button SEO 周度增长循环 已排期 1
+					43 container
+						44 pop up button 北美增长项目 本地 E2EE 同步
+						45 text 路径只用于本机数据层，不进入日志或 Release Evidence
+				46 container
+					47 text Project Current
+					48 text 变化回写同一 Project / Mission Truth VISUAL_FIXTURE · prototype-baseline-v1
+					49 button 工作台
+				50 container
+					51 text CURRENT · PROJECT PROJECTION
+					52 heading 北美增长项目, Value: 1
+						53 text 北美增长项目
+					54 text 持续协调项目里的所有任务、审批、自动运行与共享事实；这里不是某一个任务的会话。 Project revision 142
+				55 text 当前项目边界
+				56 text 所有数字来自同一 DesktopProjectProjection；Provider 状态未接入时保持未测量。
+				57 text 7
+				58 text 持久 Mission
+				59 text 7
+				60 text 非终态
+				61 text 1
+				62 text 待审批
+				63 container
+					64 heading 这个项目正在做什么, Value: 2
+						65 text 这个项目正在做什么
+					66 text Mission 不跨项目混用
+					67 text 美国健身器材机会研究
+					68 text 运行中 · checkpoint 3/9 · revision 1
+					69 text 1 产物
+					70 text Q3 促销策略与节奏
+					71 text 运行中 · checkpoint 2/9 · revision 1
+					72 text 1 产物
+					73 text 新品着陆页文案
+					74 text 等待审批 · checkpoint 6/10 · revision 1
+					75 text 1 产物
+					76 text 德国经销商邮件序列
+					77 text 等待用户 · checkpoint 0/10 · revision 1
+					78 text 0 产物
+					79 text AI 推荐与引用监测
+					80 text 已排期 · checkpoint 1/9 · revision 1
+					81 text 1 产物
+					82 text 竞品价格与评论变化
+					83 text 已排期 · checkpoint 3/10 · revision 1
+					84 text 1 产物
+					85 text SEO 周度增长循环
+					86 text 已排期 · checkpoint 8/10 · revision 1
+					87 text 2 产物
+					88 heading 最近成果, Value: 2
+						89 text 最近成果
+					90 text Work Product manifest 投影 7 个真实 Work Product 没有持久 manifest 时不会生成示例成果。 DOMAIN
+				91 heading 项目边界, Value: 2
+					92 text 项目边界
+				93 text Project scoped
+				94 text 存储模式
+				95 text 本地 E2EE 同步
+				96 text Workspace roots
+				97 text 1
+				98 text 外部动作
+				99 text Effect Broker + 精确审批
+				100 text 数据与记忆
+				101 text Tenant / Project 隔离
+				102 text READY
+				103 text Encrypted Context 已由本机设备解锁
+				104 text Keyring revision 1 · active key v1 · readable [1]
+				105 heading 连接与运行状态, Value: 2
+					106 text 连接与运行状态
+				107 text 未伪造 Probe
+				108 text Provider Projection 尚未接入
+				109 text Current 不能从 Catalog 声明推导 Connected。实时 Probe 接线前，连接数量与健康度保持 Not Measured。
+				110 text NOT_IMPLEMENTED
+	111 close button
+	112 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	113 minimize button
+	114 text Hartevo Desktop
+115 menu bar
+	116 HartevoVisualBaseline
+	117 Edit
+	118 Help

@@ -1,0 +1,132 @@
+Window: "Hartevo Desktop", App: HartevoVisualBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text Hartevo
+				6 button 搜索所有项目与任务
+				7 button (collapsed) 查看全部项目通知, Help: 全部项目通知, Secondary Actions: Expand
+				8 text 产品状态覆盖
+				9 text 等待持久 Mission
+				10 button 重新读取持久状态
+				11 text 产品状态覆盖
+				12 toggle button 打开任务工作台, Value: off
+				13 container 项目与任务导航
+					14 button 在当前项目描述新任务
+					15 container 项目工作面
+						16 text 工作
+						17 button 当前状态 Project
+						18 button 总调度 同一会话
+						19 button 全部任务 Mission
+						20 button 成果与循环 Outcome
+						21 text 增长运营
+						22 button 渠道运营 Channel
+						23 button 关系与 CRM 未接入
+						24 button 达人与联盟 未接入
+						25 text 系统与连接
+						26 button 连接中心 Probe
+						27 button 能力与证据 E0–E5
+					28 container 宣发项目
+						29 container
+							30 text 宣发项目 1
+						31 button 北 北美增长项目 revision 142 · Keyring 就绪
+					32 container 持久任务
+						33 container
+							34 text 持久 Mission 7
+						35 button 项目总调度 显式选择 VM-00～VM-11 CATALOG
+						36 button 美国健身器材机会研究 运行中 1
+						37 button Q3 促销策略与节奏 运行中 1
+						38 button 新品着陆页文案 等待审批 1
+						39 button 德国经销商邮件序列 等待用户 1
+						40 button AI 推荐与引用监测 已排期 1
+						41 button 竞品价格与评论变化 已排期 1
+						42 button SEO 周度增长循环 已排期 1
+					43 container
+						44 pop up button 北美增长项目 本地 E2EE 同步
+						45 text 路径只用于本机数据层，不进入日志或 Release Evidence
+				46 container
+					47 text UI State Contract
+					48 text 变化回写同一 Project / Mission Truth VISUAL_FIXTURE · prototype-baseline-v1
+					49 button 工作台
+				50 container
+					51 text UI STATE CONTRACT · VISUAL_FIXTURE
+					52 heading 产品状态覆盖, Value: 1
+						53 text 产品状态覆盖
+					54 text 状态只能来自 Application / Domain 投影；此页冻结视觉、语义与恢复动作，不提升任何业务证据等级。 VISUAL_FIXTURE
+				55 container Hartevo UI 状态矩阵
+					56 container LOADING: 正在读取本地投影
+						57 text LOADING
+						58 heading 正在读取本地投影, Value: 2
+							59 text 正在读取本地投影
+						60 text 保留当前导航与操作上下文，不用空白页代替加载反馈。
+						61 button (disabled) 请稍候
+					62 container EMPTY: 还没有可显示的记录
+						63 text EMPTY
+						64 heading 还没有可显示的记录, Value: 2
+							65 text 还没有可显示的记录
+						66 text 解释缺少的是哪类持久数据，并提供不会扩大权限的下一步。
+						67 button (disabled) 返回总调度
+					68 container OFFLINE: 当前处于离线模式
+						69 text OFFLINE
+						70 heading 当前处于离线模式, Value: 2
+							71 text 当前处于离线模式
+						72 text 本地读取和草稿继续可用；Provider 写入、回调与独立验证保持暂停。
+						73 button (disabled) 查看离线边界
+					74 container ERROR: 读取失败，未改变业务状态
+						75 text ERROR
+						76 heading 读取失败，未改变业务状态, Value: 2
+							77 text 读取失败，未改变业务状态
+						78 text 错误反馈不包含 Secret、Token、Cookie、PII 或本机敏感路径。
+						79 button (disabled) 安全重试
+					80 container BLOCKED: 能力或环境阻塞
+						81 text BLOCKED
+						82 heading 能力或环境阻塞, Value: 2
+							83 text 能力或环境阻塞
+						84 text 显示精确阻塞原因与解除条件；不得把 Provider 200 OK 当作业务完成。
+						85 button (disabled) 查看解除条件
+					86 container WAITING_USER: 等待你的判断
+						87 text WAITING_USER
+						88 heading 等待你的判断, Value: 2
+							89 text 等待你的判断
+						90 text 保留 Mission、Checkpoint、草稿与已采用纠正，不清空无关分支。
+						91 button (disabled) 继续审阅
+					92 container WAITING_APPROVAL: 外部动作等待精确审批
+						93 text WAITING_APPROVAL
+						94 heading 外部动作等待精确审批, Value: 2
+							95 text 外部动作等待精确审批
+						96 text 对象、受众、素材、金额、时间或账号变化都会使旧批准失效。
+						97 button (disabled) 审阅完整 Digest
+					98 container HANDOFF: 人工已接管
+						99 text HANDOFF
+						100 heading 人工已接管, Value: 2
+							101 text 人工已接管
+						102 text 旧 Worker 与 Browser generation 被硬停止；只有人工显式结束才能恢复。
+						103 button (disabled) 保持人工控制
+					104 container SUCCESS: 独立验证已通过
+						105 text SUCCESS
+						106 heading 独立验证已通过, Value: 2
+							107 text 独立验证已通过
+						108 text 仅当业务 Oracle 与持久 Verification 明确成功时显示；视觉 fixture 不构成该证据。
+						109 button (disabled) 查看 Verification
+					110 container RECOVERY: 正在恢复安全执行代次
+						111 text RECOVERY
+						112 heading 正在恢复安全执行代次, Value: 2
+							113 text 正在恢复安全执行代次
+						114 text 先 reconcile 持久 attempt 与 provider receipt；uncertain 永不自动重放。
+						115 button (disabled) 查看恢复账本
+				116 container 多语言与长文本覆盖
+					117 text Deutsch · blockierter Zustand
+					118 text Die Verbindung wurde widerrufen; externe Aktionen bleiben gesperrt, bis die Kontoberechtigung erneut geprüft wurde.
+					119 text 日本語 · 承認待ち
+					120 text 対象アカウント、金額、配信時刻を確認するまで、外部への書き込みは実行されません。
+					121 text 超长内容
+					122 text 北美与德国及日本多市场增长项目／产品目录／2026-Q3-运营证据／一个不会因为名称、路径或说明很长就遮挡审批与恢复操作的可换行测试。
+	123 close button
+	124 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	125 minimize button
+	126 text Hartevo Desktop
+127 menu bar
+	128 HartevoVisualBaseline
+	129 Edit
+	130 Help

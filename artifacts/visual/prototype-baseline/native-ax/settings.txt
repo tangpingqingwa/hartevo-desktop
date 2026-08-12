@@ -1,0 +1,96 @@
+Window: "Hartevo Desktop", App: HartevoVisualBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text Hartevo
+				6 button 搜索所有项目与任务
+				7 button (collapsed) 查看全部项目通知, Help: 全部项目通知, Secondary Actions: Expand
+				8 text 设置
+				9 text 等待持久 Mission
+				10 button 重新读取持久状态
+				11 text 设置
+				12 toggle button 打开任务工作台, Value: off
+				13 container 项目与任务导航
+					14 button 在当前项目描述新任务
+					15 container 项目工作面
+						16 text 工作
+						17 button 当前状态 Project
+						18 button 总调度 同一会话
+						19 button 全部任务 Mission
+						20 button 成果与循环 Outcome
+						21 text 增长运营
+						22 button 渠道运营 Channel
+						23 button 关系与 CRM 未接入
+						24 button 达人与联盟 未接入
+						25 text 系统与连接
+						26 button 连接中心 Probe
+						27 button 能力与证据 E0–E5
+					28 container 宣发项目
+						29 container
+							30 text 宣发项目 1
+						31 button 北 北美增长项目 revision 142 · Keyring 就绪
+					32 container 持久任务
+						33 container
+							34 text 持久 Mission 7
+						35 button 项目总调度 显式选择 VM-00～VM-11 CATALOG
+						36 button 美国健身器材机会研究 运行中 1
+						37 button Q3 促销策略与节奏 运行中 1
+						38 button 新品着陆页文案 等待审批 1
+						39 button 德国经销商邮件序列 等待用户 1
+						40 button AI 推荐与引用监测 已排期 1
+						41 button 竞品价格与评论变化 已排期 1
+						42 button SEO 周度增长循环 已排期 1
+					43 container
+						44 pop up button 北美增长项目 本地 E2EE 同步
+						45 text 路径只用于本机数据层，不进入日志或 Release Evidence
+				46 container Hartevo 设置
+					47 container
+						48 text Hartevo 设置
+						49 button 返回工作台 Esc
+					50 text field (settable, string) 搜索设置分区, Placeholder: 搜索设置
+					51 container 设置分区
+						52 heading 应用, Value: 2
+							53 text 应用
+						54 button 常规
+						55 button 外观与语言
+						56 button 模型与运行
+						57 button 数据与存储
+						58 button 隐私与权限
+						59 button 通知
+						60 heading 组织与系统, Value: 2
+							61 text 组织与系统
+						62 button 连接与凭据
+						63 button 账户与团队
+						64 button 用量与计费
+						65 button 快捷键
+					66 text Hartevo Desktop UI baseline · prototype v12
+					67 container
+						68 heading 常规, Value: 1
+							69 text 常规
+						70 text 定义 Hartevo Desktop 启动、创建项目和自然语言调度的默认行为。尚未接入 Settings Application Service 的控件保持禁用。
+						71 heading 项目默认值, Value: 2
+							72 text 项目默认值
+						73 text 新项目默认存储方式 创建时仍会明确显示和确认，不会暗中上传。
+						74 pop up button (disabled) 新项目默认存储方式, Value: 本地文件夹（推荐）
+						75 text 默认本地项目位置 新建本地目录时使用；选择已有文件夹不会复制文件。
+						76 text field (disabled, settable, string) 默认本地项目位置, Value: 未配置
+						77 button (disabled) 浏览…
+						78 text 切换项目后 默认进入项目总调度，自动加载该项目的任务、事实和连接状态。
+						79 pop up button (disabled) 切换项目后的默认页面, Value: 进入总调度
+						80 heading 应用行为, Value: 2
+							81 text 应用行为
+						82 text 开机启动 只启动桌面壳；自动任务由各项目策略独立决定。
+						83 switch (disabled, settable, boolean) 开机启动, Value: off
+						84 text 建议下一步 根据当前 Mission、缺口和等待确认状态给出建议。
+						85 switch (disabled, settable, boolean) 建议下一步, Value: on
+						86 text NOT_IMPLEMENTED  这些值尚未持久化；视觉与键盘结构不代表设置已生效。
+	87 close button
+	88 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	89 minimize button
+	90 text Hartevo Desktop
+91 menu bar
+	92 HartevoVisualBaseline
+	93 Edit
+	94 Help

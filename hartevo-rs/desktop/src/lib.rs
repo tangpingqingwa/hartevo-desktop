@@ -1,7 +1,15 @@
 use std::collections::BTreeSet;
+use std::sync::LazyLock;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use dioxus::prelude::*;
+use dioxus_icons::lucide::{
+    Bell, Blocks, BotMessageSquare, BriefcaseBusiness, CalendarDays, ChartNoAxesCombined, Check,
+    ChevronDown, ContactRound, FileCheck, FileText, FolderKanban, Handshake, House, Inbox,
+    LayoutDashboard, ListChecks, Mail, MessageSquareText, PanelRightOpen, PlugZap, Plus, RefreshCw,
+    Search, Settings, ShieldCheck, Sparkles, Target, UsersRound, WalletCards, Workflow, X,
+};
 use hartevo_application::{
     ApplicationCheckpointHandlerStatus, ApplicationError, DesktopProjectProjection,
     MissionProjection, MissionRuntimeProjection, ProjectEncryptionReadiness,
@@ -18,6 +26,8 @@ use zeroize::Zeroizing;
 
 pub mod data_plane;
 mod runtime_plane;
+#[cfg(feature = "visual-fixtures")]
+mod visual_fixture;
 
 use data_plane::{
     DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane,
@@ -28,13 +38,222 @@ use data_plane::{
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
 static MAIN_CSS: Asset = asset!("/assets/main.css");
+static PROTOTYPE_CSS: Asset = asset!("/assets/prototype.css");
+static BRAND_MARK_DATA_URL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "data:image/png;base64,{}",
+        BASE64_STANDARD.encode(include_bytes!("../../../prototype/hartevo-logo-mark.png"))
+    )
+});
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Surface {
     Orchestrator,
+    Current,
+    Missions,
     ChannelOperations,
+    Relationships,
+    Partners,
     Connections,
+    Outcomes,
     CapabilityEvidence,
+    Settings,
+    StateCoverage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiIconName {
+    Bell,
+    Blocks,
+    Bot,
+    Briefcase,
+    Calendar,
+    Chart,
+    Check,
+    ChevronDown,
+    Contact,
+    FileCheck,
+    FileText,
+    Folder,
+    Handshake,
+    Home,
+    Inbox,
+    Layout,
+    List,
+    Mail,
+    Message,
+    Panel,
+    Plug,
+    Plus,
+    Refresh,
+    Search,
+    Settings,
+    Shield,
+    Sparkles,
+    Target,
+    Users,
+    Wallet,
+    Workflow,
+    X,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppShortcut {
+    DismissOverlays,
+    GlobalSearch,
+    NewTask,
+    ProjectDispatcher,
+    Settings,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ActiveOverlay {
+    #[default]
+    None,
+    GlobalSearch,
+    Notifications,
+    ProjectSwitcher,
+}
+
+impl ActiveOverlay {
+    fn toggle(self, target: Self) -> Self {
+        if self == target { Self::None } else { target }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UiStateContract {
+    code: &'static str,
+    title: &'static str,
+    detail: &'static str,
+    action: &'static str,
+    tone: &'static str,
+}
+
+const UI_STATE_CONTRACTS: [UiStateContract; 10] = [
+    UiStateContract {
+        code: "LOADING",
+        title: "正在读取本地投影",
+        detail: "保留当前导航与操作上下文，不用空白页代替加载反馈。",
+        action: "请稍候",
+        tone: "neutral",
+    },
+    UiStateContract {
+        code: "EMPTY",
+        title: "还没有可显示的记录",
+        detail: "解释缺少的是哪类持久数据，并提供不会扩大权限的下一步。",
+        action: "返回总调度",
+        tone: "neutral",
+    },
+    UiStateContract {
+        code: "OFFLINE",
+        title: "当前处于离线模式",
+        detail: "本地读取和草稿继续可用；Provider 写入、回调与独立验证保持暂停。",
+        action: "查看离线边界",
+        tone: "warning",
+    },
+    UiStateContract {
+        code: "ERROR",
+        title: "读取失败，未改变业务状态",
+        detail: "错误反馈不包含 Secret、Token、Cookie、PII 或本机敏感路径。",
+        action: "安全重试",
+        tone: "error",
+    },
+    UiStateContract {
+        code: "BLOCKED",
+        title: "能力或环境阻塞",
+        detail: "显示精确阻塞原因与解除条件；不得把 Provider 200 OK 当作业务完成。",
+        action: "查看解除条件",
+        tone: "warning",
+    },
+    UiStateContract {
+        code: "WAITING_USER",
+        title: "等待你的判断",
+        detail: "保留 Mission、Checkpoint、草稿与已采用纠正，不清空无关分支。",
+        action: "继续审阅",
+        tone: "warning",
+    },
+    UiStateContract {
+        code: "WAITING_APPROVAL",
+        title: "外部动作等待精确审批",
+        detail: "对象、受众、素材、金额、时间或账号变化都会使旧批准失效。",
+        action: "审阅完整 Digest",
+        tone: "warning",
+    },
+    UiStateContract {
+        code: "HANDOFF",
+        title: "人工已接管",
+        detail: "旧 Worker 与 Browser generation 被硬停止；只有人工显式结束才能恢复。",
+        action: "保持人工控制",
+        tone: "info",
+    },
+    UiStateContract {
+        code: "SUCCESS",
+        title: "独立验证已通过",
+        detail: "仅当业务 Oracle 与持久 Verification 明确成功时显示；视觉 fixture 不构成该证据。",
+        action: "查看 Verification",
+        tone: "success",
+    },
+    UiStateContract {
+        code: "RECOVERY",
+        title: "正在恢复安全执行代次",
+        detail: "先 reconcile 持久 attempt 与 provider receipt；uncertain 永不自动重放。",
+        action: "查看恢复账本",
+        tone: "info",
+    },
+];
+
+const CREATOR_WORK_STAGES: [&str; 12] = [
+    "Offer / Listing",
+    "Invite / Apply",
+    "Award",
+    "Task Accepted",
+    "Funding Ready",
+    "In Progress",
+    "Deliverable Uploaded",
+    "User Review",
+    "Revision Requested",
+    "Accepted",
+    "Rights Recorded",
+    "Payout Verified",
+];
+
+#[component]
+fn UiIcon(name: UiIconName, #[props(default = 16)] size: u32) -> Element {
+    match name {
+        UiIconName::Bell => rsx! { Bell { size } },
+        UiIconName::Blocks => rsx! { Blocks { size } },
+        UiIconName::Bot => rsx! { BotMessageSquare { size } },
+        UiIconName::Briefcase => rsx! { BriefcaseBusiness { size } },
+        UiIconName::Calendar => rsx! { CalendarDays { size } },
+        UiIconName::Chart => rsx! { ChartNoAxesCombined { size } },
+        UiIconName::Check => rsx! { Check { size } },
+        UiIconName::ChevronDown => rsx! { ChevronDown { size } },
+        UiIconName::Contact => rsx! { ContactRound { size } },
+        UiIconName::FileCheck => rsx! { FileCheck { size } },
+        UiIconName::FileText => rsx! { FileText { size } },
+        UiIconName::Folder => rsx! { FolderKanban { size } },
+        UiIconName::Handshake => rsx! { Handshake { size } },
+        UiIconName::Home => rsx! { House { size } },
+        UiIconName::Inbox => rsx! { Inbox { size } },
+        UiIconName::Layout => rsx! { LayoutDashboard { size } },
+        UiIconName::List => rsx! { ListChecks { size } },
+        UiIconName::Mail => rsx! { Mail { size } },
+        UiIconName::Message => rsx! { MessageSquareText { size } },
+        UiIconName::Panel => rsx! { PanelRightOpen { size } },
+        UiIconName::Plug => rsx! { PlugZap { size } },
+        UiIconName::Plus => rsx! { Plus { size } },
+        UiIconName::Refresh => rsx! { RefreshCw { size } },
+        UiIconName::Search => rsx! { Search { size } },
+        UiIconName::Settings => rsx! { Settings { size } },
+        UiIconName::Shield => rsx! { ShieldCheck { size } },
+        UiIconName::Sparkles => rsx! { Sparkles { size } },
+        UiIconName::Target => rsx! { Target { size } },
+        UiIconName::Users => rsx! { UsersRound { size } },
+        UiIconName::Wallet => rsx! { WalletCards { size } },
+        UiIconName::Workflow => rsx! { Workflow { size } },
+        UiIconName::X => rsx! { X { size } },
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,6 +391,10 @@ struct DesktopUiModel {
 
 impl DesktopUiModel {
     fn load() -> Self {
+        #[cfg(feature = "visual-fixtures")]
+        if let Some(model) = visual_fixture::load_from_environment() {
+            return model;
+        }
         match DesktopDataPlane::discover().and_then(|plane| plane.load_os(Utc::now())) {
             Ok(DesktopLoadState::Uninitialized { product_evidence }) => Self {
                 backend: DesktopBackendState::Uninitialized(product_evidence),
@@ -349,7 +572,10 @@ impl DesktopUiModel {
 
 #[component]
 pub fn App() -> Element {
-    let mut surface = use_signal(|| Surface::Orchestrator);
+    let desktop_context = dioxus::desktop::use_window();
+    let visual_zoom = active_visual_zoom();
+    use_effect(move || desktop_context.set_zoom_level(visual_zoom));
+    let mut surface = use_signal(initial_surface);
     let mut model = use_signal(DesktopUiModel::load);
     let mut draft = use_signal(String::new);
     let mut catalog_manifest_id = use_signal(String::new);
@@ -360,10 +586,14 @@ pub fn App() -> Element {
     let mut catalog_timezone = use_signal(String::new);
     let mut catalog_currency = use_signal(|| "USD".to_owned());
     let mut catalog_budget_minor = use_signal(|| "0".to_owned());
+    let mut catalog_contract_expanded = use_signal(|| false);
     let mut mission_submitting = use_signal(|| false);
     let mut runtime_retrying = use_signal(|| false);
     let mut human_work_product_selection = use_signal(BTreeSet::<WorkProductId>::new);
     let mut workpad_open = use_signal(|| true);
+    let mut global_search_query = use_signal(String::new);
+    let mut active_overlay = use_signal(ActiveOverlay::default);
+    let mut surface_before_settings = use_signal(|| Surface::Orchestrator);
     let view = model.read().clone();
     let current_surface = surface();
     let project = view.current_project().cloned();
@@ -377,6 +607,10 @@ pub fn App() -> Element {
         .as_ref()
         .map_or_else(|| "项目总调度".to_owned(), |item| item.title.clone());
     let status = status_label(&view);
+    let surface_heading = surface_heading(current_surface, &mission_title);
+    let surface_context = surface_context_label(current_surface);
+    let workpad_visible =
+        workpad_open() && current_surface == Surface::Orchestrator && mission.is_some();
     let runtime_busy = mission_submitting() || runtime_retrying();
     let project_can_start_mission = view.can_start_mission();
     let evidence = view.product_evidence().cloned();
@@ -552,31 +786,142 @@ pub fn App() -> Element {
         )
     });
     let can_retry_runtime = runtime_retry_needed && runtime_environment_ready && !runtime_busy;
+    let keyboard_has_project = project.is_some();
+    let visual_fixture_id = active_visual_fixture_id();
 
     rsx! {
         document::Title { "Hartevo Desktop" }
         document::Stylesheet { href: MAIN_CSS }
-        div { class: "desktop-shell",
-            aside { class: "sidebar", aria_label: "项目与任务导航",
-                div { class: "brand-row",
-                    div { class: "brand-mark", aria_hidden: "true", "H" }
-                    strong { "Hartevo" }
-                    div { class: "brand-actions",
-                        button { class: "icon-button", aria_label: "重新读取持久状态", title: "重新读取持久状态",
-                            onclick: move |_| model.set(DesktopUiModel::load()),
-                            "↻"
+        document::Stylesheet { href: PROTOTYPE_CSS }
+        div {
+            class: "desktop-shell",
+            tabindex: "-1",
+            onkeydown: move |event| {
+                match app_shortcut(&event.key(), event.modifiers()) {
+                    Some(AppShortcut::DismissOverlays) => {
+                        active_overlay.set(ActiveOverlay::None);
+                        if current_surface == Surface::Settings {
+                            surface.set(surface_before_settings());
+                        }
+                    }
+                    Some(AppShortcut::GlobalSearch) => {
+                        event.prevent_default();
+                        active_overlay.set(ActiveOverlay::GlobalSearch);
+                    }
+                    Some(AppShortcut::NewTask) => {
+                        event.prevent_default();
+                        if keyboard_has_project {
+                            model.write().select_dispatcher();
+                            surface.set(Surface::Orchestrator);
+                            catalog_contract_expanded.set(true);
+                        }
+                    }
+                    Some(AppShortcut::ProjectDispatcher) => {
+                        event.prevent_default();
+                        if keyboard_has_project {
+                            model.write().select_dispatcher();
+                            active_overlay.set(ActiveOverlay::None);
+                            surface.set(Surface::Orchestrator);
+                        }
+                    }
+                    Some(AppShortcut::Settings) => {
+                        event.prevent_default();
+                        if current_surface != Surface::Settings {
+                            surface_before_settings.set(current_surface);
+                        }
+                        surface.set(Surface::Settings);
+                    }
+                    None => {}
+                }
+            },
+            header { class: "app-chrome",
+                div { class: "brand-bar",
+                    img { src: BRAND_MARK_DATA_URL.as_str(), alt: "Hartevo" }
+                    strong { class: "brand-name", "Hartevo" }
+                    div { class: "brand-global-actions",
+                        button {
+                            class: if active_overlay() == ActiveOverlay::GlobalSearch { "brand-action active" } else { "brand-action" },
+                            aria_label: "搜索所有项目与任务",
+                            title: "搜索所有项目与任务",
+                            onclick: move |_| {
+                                active_overlay.set(ActiveOverlay::GlobalSearch);
+                            },
+                            UiIcon { name: UiIconName::Search, size: 15 }
+                        }
+                        button {
+                            class: if active_overlay() == ActiveOverlay::Notifications { "brand-action active" } else { "brand-action" },
+                            aria_label: "查看全部项目通知",
+                            title: "全部项目通知",
+                            aria_expanded: active_overlay() == ActiveOverlay::Notifications,
+                            onclick: move |_| {
+                                active_overlay.set(active_overlay().toggle(ActiveOverlay::Notifications));
+                            },
+                            UiIcon { name: UiIconName::Bell, size: 15 }
+                            span { class: "notification-badge quiet", "0" }
                         }
                     }
                 }
+                div { class: "mission-bar",
+                    i { class: "mission-indicator" }
+                    div { class: "mission-copy",
+                        strong { "{surface_heading}" }
+                        span { "{status}" }
+                    }
+                    div { class: "mission-actions",
+                        button {
+                            class: "icon-button",
+                            aria_label: "重新读取持久状态",
+                            title: "重新读取持久状态",
+                            onclick: move |_| model.set(DesktopUiModel::load()),
+                            UiIcon { name: UiIconName::Refresh, size: 14 }
+                        }
+                    }
+                }
+                div { class: "document-bar",
+                    span { class: "surface-chrome",
+                        UiIcon { name: UiIconName::Layout, size: 14 }
+                        small { "{surface_context}" }
+                        strong { "{surface_heading}" }
+                    }
+                    button {
+                        class: if workpad_visible { "workpad-chrome-button active" } else { "workpad-chrome-button" },
+                        aria_label: if workpad_visible { "收起任务工作台" } else { "打开任务工作台" },
+                        aria_pressed: workpad_visible,
+                        onclick: move |_| workpad_open.set(!workpad_open()),
+                        UiIcon { name: UiIconName::Panel, size: 14 }
+                        span { "任务工作台" }
+                    }
+                }
+            }
+            aside { class: "sidebar", aria_label: "项目与任务导航",
+                div { class: "side-top",
+                    button {
+                        class: "new-task",
+                        disabled: project.is_none(),
+                        aria_label: "在当前项目描述新任务",
+                        onclick: move |_| {
+                            model.write().select_dispatcher();
+                            surface.set(Surface::Orchestrator);
+                            catalog_contract_expanded.set(true);
+                        },
+                        UiIcon { name: UiIconName::Plus, size: 15 }
+                        span { "新任务" }
+                        kbd { "⌘ N" }
+                    }
+                }
                 nav { class: "primary-nav", aria_label: "项目工作面",
-                    NavButton { label: "总调度", icon: "⌁", active: current_surface == Surface::Orchestrator, onclick: move |_| surface.set(Surface::Orchestrator) }
+                    div { class: "nav-label", "工作" }
+                    NavButton { label: "当前状态", meta: "Project", icon: UiIconName::Home, active: current_surface == Surface::Current, onclick: move |_| surface.set(Surface::Current) }
+                    NavButton { label: "总调度", meta: "同一会话", icon: UiIconName::Sparkles, active: current_surface == Surface::Orchestrator, onclick: move |_| surface.set(Surface::Orchestrator) }
+                    NavButton { label: "全部任务", meta: "Mission", icon: UiIconName::List, active: current_surface == Surface::Missions, onclick: move |_| surface.set(Surface::Missions) }
+                    NavButton { label: "成果与循环", meta: "Outcome", icon: UiIconName::Chart, active: current_surface == Surface::Outcomes, onclick: move |_| surface.set(Surface::Outcomes) }
                     div { class: "nav-label", "增长运营" }
-                    NavButton { label: "渠道运营", icon: "◫", active: current_surface == Surface::ChannelOperations, onclick: move |_| surface.set(Surface::ChannelOperations) }
-                    button { class: "nav-item blocked-nav", disabled: true, span { class: "nav-icon", "◎" } span { "关系与 CRM" } em { "NOT_IMPLEMENTED" } }
-                    button { class: "nav-item blocked-nav", disabled: true, span { class: "nav-icon", "◇" } span { "达人与联盟" } em { "NOT_IMPLEMENTED" } }
+                    NavButton { label: "渠道运营", meta: "Channel", icon: UiIconName::Mail, active: current_surface == Surface::ChannelOperations, onclick: move |_| surface.set(Surface::ChannelOperations) }
+                    NavButton { label: "关系与 CRM", meta: "未接入", icon: UiIconName::Contact, active: current_surface == Surface::Relationships, onclick: move |_| surface.set(Surface::Relationships) }
+                    NavButton { label: "达人与联盟", meta: "未接入", icon: UiIconName::Handshake, active: current_surface == Surface::Partners, onclick: move |_| surface.set(Surface::Partners) }
                     div { class: "nav-label", "系统与连接" }
-                    NavButton { label: "连接中心", icon: "⛓", active: current_surface == Surface::Connections, onclick: move |_| surface.set(Surface::Connections) }
-                    NavButton { label: "能力与证据", icon: "✦", active: current_surface == Surface::CapabilityEvidence, onclick: move |_| surface.set(Surface::CapabilityEvidence) }
+                    NavButton { label: "连接中心", meta: "Probe", icon: UiIconName::Plug, active: current_surface == Surface::Connections, onclick: move |_| surface.set(Surface::Connections) }
+                    NavButton { label: "能力与证据", meta: "E0–E5", icon: UiIconName::Blocks, active: current_surface == Surface::CapabilityEvidence, onclick: move |_| surface.set(Surface::CapabilityEvidence) }
                 }
 
                 if let DesktopBackendState::Ready(snapshot) = &view.backend {
@@ -625,27 +970,109 @@ pub fn App() -> Element {
                 }
 
                 footer { class: "workspace-switcher",
-                    div { class: "workspace-button",
-                        span { class: "workspace-mark", "{project_name.chars().next().unwrap_or('H')}" }
-                        span { strong { "{project_name}" } small { "{project_storage_status}" } }
+                    if active_overlay() == ActiveOverlay::ProjectSwitcher {
+                        section { class: "project-switcher", aria_label: "宣发项目切换器",
+                            header { class: "project-switcher-head",
+                                span { class: "user-avatar", "本" }
+                                span { strong { "本机工作区" } small { "Local-first · 项目严格隔离" } }
+                                button {
+                                    class: "icon-button",
+                                    aria_label: "打开设置",
+                                    onclick: move |_| {
+                                        active_overlay.set(ActiveOverlay::None);
+                                        surface_before_settings.set(current_surface);
+                                        surface.set(Surface::Settings);
+                                    },
+                                    UiIcon { name: UiIconName::Settings, size: 14 }
+                                }
+                            }
+                            div { class: "project-switcher-label", "宣发项目" span { "按持久 Inventory 排序" } }
+                            div { class: "project-list", role: "list", aria_label: "选择宣发项目",
+                                if let DesktopBackendState::Ready(snapshot) = &view.backend {
+                                    for item in snapshot.inventory.projects.clone() {
+                                        {
+                                            let project_id = item.project_id.clone();
+                                            let selected = view.selected_project_id.as_ref() == Some(&project_id);
+                                            rsx! {
+                                                button {
+                                                    class: if selected { "project-option active" } else { "project-option" },
+                                                    aria_current: selected,
+                                                    onclick: move |_| {
+                                                        model.write().select_project(&project_id);
+                                                        active_overlay.set(ActiveOverlay::None);
+                                                        surface.set(Surface::Current);
+                                                    },
+                                                    i { class: "project-mark", "{project_initials(&item.name)}" }
+                                                    span { strong { "{item.name}" } small { "revision {item.revision} · {encryption_short_label(&item.encryption)}" } }
+                                                    if selected { UiIcon { name: UiIconName::Check, size: 14 } }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    div { class: "project-switcher-empty", "当前没有可读取的项目 Inventory" }
+                                }
+                            }
+                            div { class: "project-switcher-actions",
+                                button {
+                                    class: "project-switcher-action",
+                                    onclick: move |_| {
+                                        active_overlay.set(ActiveOverlay::None);
+                                        surface.set(Surface::CapabilityEvidence);
+                                    },
+                                    UiIcon { name: UiIconName::Chart, size: 14 }
+                                    "查看能力与证据"
+                                }
+                                button {
+                                    class: "project-switcher-action",
+                                    onclick: move |_| {
+                                        active_overlay.set(ActiveOverlay::None);
+                                        surface_before_settings.set(current_surface);
+                                        surface.set(Surface::Settings);
+                                    },
+                                    UiIcon { name: UiIconName::Settings, size: 14 }
+                                    "设置"
+                                }
+                            }
+                        }
                     }
-                    div { class: "local-path", "路径仅在本机数据层使用，不进入日志或 Release Evidence" }
+                    button {
+                        class: "workspace-button",
+                        aria_haspopup: "true",
+                        aria_expanded: active_overlay() == ActiveOverlay::ProjectSwitcher,
+                        onclick: move |_| {
+                            active_overlay.set(active_overlay().toggle(ActiveOverlay::ProjectSwitcher));
+                        },
+                        img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                        span { strong { "{project_name}" } small { b { "{project_storage_status}" } } }
+                        UiIcon { name: UiIconName::ChevronDown, size: 14 }
+                    }
+                    div { class: "local-path", "路径只用于本机数据层，不进入日志或 Release Evidence" }
                 }
             }
 
             main { class: "workspace",
                 header { class: "workspace-header",
-                    div { class: "header-copy", small { "{project_name} / Mission" } h1 { "{mission_title}" } }
-                    div { class: "header-status", aria_live: "polite", span { class: "status-dot live" } span { "{status}" } }
+                    div { class: "conversation-state", aria_live: "polite",
+                        span { class: "status-dot live" }
+                        strong { "{surface_context}" }
+                    }
+                    span { class: "conversation-hint",
+                        if current_surface == Surface::Orchestrator { "可以随时改变方向；不会扩大 Capability" } else { "变化回写同一 Project / Mission Truth" }
+                    }
+                    if let Some(fixture_id) = &visual_fixture_id {
+                        span { class: "visual-fixture-indicator", "VISUAL_FIXTURE · {fixture_id}" }
+                    }
                     div { class: "header-actions",
-                        button { class: if workpad_open() { "quiet-button active" } else { "quiet-button" },
+                        button { class: if workpad_visible { "quiet-button active" } else { "quiet-button" },
                             onclick: move |_| workpad_open.set(!workpad_open()),
+                            UiIcon { name: UiIconName::Panel, size: 14 }
                             "工作台"
                         }
                     }
                 }
 
-                div { class: if workpad_open() { "workspace-grid workpad-visible" } else { "workspace-grid" },
+                div { class: if workpad_visible { "workspace-grid workpad-visible" } else { "workspace-grid" },
                     section { class: "main-surface",
                         if let Some(notice) = &view.notice {
                             IntegrityBanner { failure: notice.clone() }
@@ -665,11 +1092,29 @@ pub fn App() -> Element {
                                 },
                                 on_ready: move |snapshot| model.write().set_ready(snapshot, true),
                                 on_error: move |error| model.write().set_notice(&error),
+                                on_select_mission: move |mission_id| model.write().select_mission(mission_id),
                             }
+                        } else if current_surface == Surface::Current {
+                            CurrentSurface { project: project.clone(), context_access: context_access.clone() }
+                        } else if current_surface == Surface::Missions {
+                            MissionsSurface { project: project.clone(), selected_mission_id: view.selected_mission_id.clone(), on_select: move |mission_id| {
+                                model.write().select_mission(mission_id);
+                                surface.set(Surface::Orchestrator);
+                            } }
                         } else if current_surface == Surface::ChannelOperations {
                             ChannelSurface { project: project.clone(), mission: mission.clone() }
+                        } else if current_surface == Surface::Relationships {
+                            RelationshipsSurface { project: project.clone(), mission: mission.clone() }
+                        } else if current_surface == Surface::Partners {
+                            PartnersSurface { project: project.clone(), mission: mission.clone() }
                         } else if current_surface == Surface::Connections {
                             ConnectionsSurface { project: project.clone(), context_access: context_access.clone() }
+                        } else if current_surface == Surface::Outcomes {
+                            OutcomesSurface { project: project.clone(), mission: mission.clone() }
+                        } else if current_surface == Surface::Settings {
+                            SettingsSurface { runtime: runtime_projection.clone(), on_close: move |()| surface.set(surface_before_settings()) }
+                        } else if current_surface == Surface::StateCoverage {
+                            StateCoverageSurface {}
                         } else if let Some(product_evidence) = evidence.clone() {
                             CapabilityEvidenceSurface { evidence: product_evidence }
                         } else {
@@ -680,12 +1125,24 @@ pub fn App() -> Element {
                             section { class: "composer-zone",
                                 div { class: "composer-context",
                                     span { "{project_name} · {composer_target}" }
-                                    span { class: "permission-pill",
-                                        if mission.is_some() { "同一 Mission · Capability 不扩大" } else { "外部动作仍需精确审批" }
+                                    div { class: "composer-context-actions",
+                                        span { class: "permission-pill",
+                                            if mission.is_some() { "同一 Mission · Capability 不扩大" } else { "外部动作仍需精确审批" }
+                                        }
+                                        if mission.is_none() {
+                                            button {
+                                                class: if catalog_contract_expanded() { "contract-toggle active" } else { "contract-toggle" },
+                                                aria_expanded: catalog_contract_expanded(),
+                                                aria_controls: "operating-contract-fields",
+                                                onclick: move |_| catalog_contract_expanded.set(!catalog_contract_expanded()),
+                                                span { "Operating Contract" }
+                                                UiIcon { name: UiIconName::ChevronDown, size: 12 }
+                                            }
+                                        }
                                     }
                                 }
-                                if mission.is_none() {
-                                    div { class: "catalog-contract-fields",
+                                if mission.is_none() && catalog_contract_expanded() {
+                                    div { id: "operating-contract-fields", class: "catalog-contract-fields",
                                     label { class: "catalog-route-field",
                                         span { "Mission 路由" }
                                         select {
@@ -1188,9 +1645,38 @@ pub fn App() -> Element {
                         }
                     }
 
-                    if workpad_open() {
+                    if workpad_visible {
                         Workpad { mission: mission.clone(), context_access: context_access.clone() }
                     }
+                }
+            }
+            if active_overlay() == ActiveOverlay::GlobalSearch {
+                GlobalSearchOverlay {
+                    backend: view.backend.clone(),
+                    query: global_search_query(),
+                    on_query: move |value| global_search_query.set(value),
+                    on_close: move |()| active_overlay.set(ActiveOverlay::None),
+                    on_project: move |project_id| {
+                        model.write().select_project(&project_id);
+                        active_overlay.set(ActiveOverlay::None);
+                        surface.set(Surface::Current);
+                    },
+                    on_mission: move |(project_id, mission_id)| {
+                        model.write().select_project(&project_id);
+                        model.write().select_mission(mission_id);
+                        active_overlay.set(ActiveOverlay::None);
+                        surface.set(Surface::Orchestrator);
+                    },
+                }
+            }
+            if active_overlay() == ActiveOverlay::Notifications {
+                NotificationsPanel {
+                    on_close: move |()| active_overlay.set(ActiveOverlay::None),
+                    on_settings: move |()| {
+                        active_overlay.set(ActiveOverlay::None);
+                        surface_before_settings.set(current_surface);
+                        surface.set(Surface::Settings);
+                    },
                 }
             }
         }
@@ -1200,14 +1686,145 @@ pub fn App() -> Element {
 #[component]
 fn NavButton(
     label: &'static str,
-    icon: &'static str,
+    meta: &'static str,
+    icon: UiIconName,
     active: bool,
     onclick: EventHandler<MouseEvent>,
 ) -> Element {
     rsx! {
-        button { class: if active { "nav-item active" } else { "nav-item" }, onclick,
-            span { class: "nav-icon", "{icon}" }
+        button { class: if active { "nav-item active" } else { "nav-item" }, aria_current: active, onclick,
+            span { class: "nav-icon", UiIcon { name: icon, size: 15 } }
             span { "{label}" }
+            em { "{meta}" }
+        }
+    }
+}
+
+#[component]
+fn GlobalSearchOverlay(
+    backend: DesktopBackendState,
+    query: String,
+    on_query: EventHandler<String>,
+    on_close: EventHandler<()>,
+    on_project: EventHandler<ProjectId>,
+    on_mission: EventHandler<(ProjectId, MissionId)>,
+) -> Element {
+    let normalized = query.trim().to_lowercase();
+    let mut project_results = Vec::new();
+    let mut mission_results = Vec::new();
+    if let DesktopBackendState::Ready(snapshot) = backend {
+        for project in snapshot.inventory.projects {
+            if normalized.is_empty() || project.name.to_lowercase().contains(&normalized) {
+                project_results.push(project.clone());
+            }
+            for mission in project.missions {
+                if normalized.is_empty()
+                    || mission.title.to_lowercase().contains(&normalized)
+                    || mission
+                        .mission_id
+                        .to_string()
+                        .to_lowercase()
+                        .contains(&normalized)
+                {
+                    mission_results.push((
+                        project.project_id.clone(),
+                        project.name.clone(),
+                        mission,
+                    ));
+                }
+            }
+        }
+    }
+    let result_count = project_results.len() + mission_results.len();
+    rsx! {
+        button { class: "overlay-backdrop search-backdrop", aria_label: "关闭全局搜索", onclick: move |_| on_close.call(()) }
+        section {
+            class: "global-search",
+            role: "dialog",
+            aria_modal: "true",
+            aria_label: "搜索所有项目与任务",
+            onkeydown: move |event| {
+                if event.key() == Key::Escape {
+                    on_close.call(());
+                }
+            },
+            header {
+                UiIcon { name: UiIconName::Search, size: 18 }
+                input {
+                    autofocus: true,
+                    value: "{query}",
+                    aria_label: "搜索 Project 或 Mission",
+                    placeholder: "搜索项目、Mission 与状态…",
+                    oninput: move |event| on_query.call(event.value()),
+                }
+                kbd { "Esc" }
+            }
+            div { class: "global-search-results",
+                if result_count == 0 {
+                    div { class: "search-empty", span { class: "honesty-badge", "EMPTY" } p { "当前持久 Inventory 中没有匹配结果。" } }
+                } else {
+                    if !project_results.is_empty() {
+                        h2 { "项目" }
+                        for project in project_results {
+                            {
+                                let project_id = project.project_id.clone();
+                                rsx! {
+                                    button { class: "search-result", onclick: move |_| on_project.call(project_id.clone()),
+                                        i { class: "project-mark", "{project_initials(&project.name)}" }
+                                        span { strong { "{project.name}" } small { "Project revision {project.revision} · {encryption_short_label(&project.encryption)}" } }
+                                        em { "当前状态" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !mission_results.is_empty() {
+                        h2 { "Mission" }
+                        for (project_id, project_name, mission) in mission_results {
+                            {
+                                let mission_id = mission.mission_id.clone();
+                                rsx! {
+                                    button { class: "search-result", onclick: move |_| on_mission.call((project_id.clone(), mission_id.clone())),
+                                        i { class: "mission-result-mark", UiIcon { name: UiIconName::Target, size: 14 } }
+                                        span { strong { "{mission.title}" } small { "{project_name} · {mission_stage_label(&mission.stage)} · revision {mission.revision}" } }
+                                        em { "打开会话" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            footer { span { "↑ ↓ 选择" } span { "Enter 打开" } span { "结果来自持久 Application Projection" } }
+        }
+    }
+}
+
+#[component]
+fn NotificationsPanel(on_close: EventHandler<()>, on_settings: EventHandler<()>) -> Element {
+    rsx! {
+        button { class: "overlay-dismiss", aria_label: "关闭通知", onclick: move |_| on_close.call(()) }
+        section { class: "notification-center", role: "dialog", aria_label: "全部项目通知",
+            header { class: "notification-head",
+                strong { "通知" }
+                span { "所有宣发项目" }
+                button { onclick: move |_| on_close.call(()), UiIcon { name: UiIconName::X, size: 14 } }
+            }
+            nav { class: "notification-tabs", aria_label: "筛选通知",
+                button { class: "active", "全部" }
+                button { disabled: true, "需要你 0" }
+                button { disabled: true, "运行动态" }
+            }
+            div { class: "notification-empty",
+                UiIcon { name: UiIconName::Bell, size: 19 }
+                strong { "暂无持久通知" }
+                span { "Application 尚未提供跨项目 Notification Projection；这里不会复制原型中的演示提醒。" }
+                em { "NOT_IMPLEMENTED" }
+            }
+            footer { class: "notification-footer",
+                span { "通知按项目隔离，用户级聚合" }
+                button { onclick: move |_| on_settings.call(()), "通知设置" }
+            }
         }
     }
 }
@@ -1234,6 +1851,170 @@ fn EmptyState(code: &'static str, title: &'static str, detail: &'static str) -> 
 }
 
 #[component]
+fn StateContractCard(
+    code: &'static str,
+    title: &'static str,
+    detail: &'static str,
+    action: &'static str,
+    tone: &'static str,
+) -> Element {
+    rsx! {
+        article {
+            class: "state-contract-card {tone}",
+            role: if tone == "error" { "alert" } else { "status" },
+            aria_label: "{code}: {title}",
+            header { span { class: "state-contract-dot" } strong { "{code}" } }
+            h2 { "{title}" }
+            p { "{detail}" }
+            button { disabled: true, "{action}" }
+        }
+    }
+}
+
+#[component]
+fn StateCoverageSurface() -> Element {
+    rsx! {
+        div { class: "surface-scroll business-surface state-coverage-surface",
+            header { class: "surface-head",
+                div { class: "surface-head-copy",
+                    span { class: "surface-eyebrow", "UI STATE CONTRACT · VISUAL_FIXTURE" }
+                    h1 { "产品状态覆盖" }
+                    p { "状态只能来自 Application / Domain 投影；此页冻结视觉、语义与恢复动作，不提升任何业务证据等级。" }
+                }
+                span { class: "honesty-badge", "VISUAL_FIXTURE" }
+            }
+            section { class: "state-contract-grid", aria_label: "Hartevo UI 状态矩阵",
+                for state in UI_STATE_CONTRACTS {
+                    StateContractCard { code: state.code, title: state.title, detail: state.detail, action: state.action, tone: state.tone }
+                }
+            }
+            section { class: "text-stress-contract", aria_label: "多语言与长文本覆盖",
+                div { lang: "de", strong { "Deutsch · blockierter Zustand" } p { "Die Verbindung wurde widerrufen; externe Aktionen bleiben gesperrt, bis die Kontoberechtigung erneut geprüft wurde." } }
+                div { lang: "ja", strong { "日本語 · 承認待ち" } p { "対象アカウント、金額、配信時刻を確認するまで、外部への書き込みは実行されません。" } }
+                div { strong { "超长内容" } p { "北美与德国及日本多市场增长项目／产品目录／2026-Q3-运营证据／一个不会因为名称、路径或说明很长就遮挡审批与恢复操作的可换行测试。" } }
+            }
+        }
+    }
+}
+
+#[component]
+fn ProjectDispatcherSurface(
+    project: DesktopProjectProjection,
+    on_select_mission: EventHandler<MissionId>,
+) -> Element {
+    let running = project
+        .missions
+        .iter()
+        .filter(|mission| mission.stage == MissionStage::Running)
+        .count();
+    let waiting = project
+        .missions
+        .iter()
+        .filter(|mission| {
+            matches!(
+                mission.stage,
+                MissionStage::WaitingUser | MissionStage::WaitingApproval
+            )
+        })
+        .count();
+    let scheduled = project
+        .missions
+        .iter()
+        .filter(|mission| mission.stage == MissionStage::Scheduled)
+        .count();
+    let priority = project
+        .missions
+        .iter()
+        .filter(|mission| mission.stage != MissionStage::Scheduled)
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>();
+    let waiting_missions = project
+        .missions
+        .iter()
+        .filter(|mission| {
+            matches!(
+                mission.stage,
+                MissionStage::WaitingUser | MissionStage::WaitingApproval
+            )
+        })
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    rsx! {
+        article { class: "dispatcher-overview",
+            header { class: "dispatcher-hero",
+                img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                div {
+                    h1 { "{project.name} · 总调度" }
+                    p { "{project.description}" }
+                }
+                span { class: "projection-chip", "APPLICATION PROJECTION" }
+            }
+            section { class: "dispatcher-stats", aria_label: "项目任务摘要",
+                div { strong { "{running}" } small { "进行中的任务" } }
+                div { strong { "{waiting}" } small { "等待确认" } }
+                div { strong { "{scheduled}" } small { "自动任务" } }
+                div { strong { "{project.revision}" } small { "Project revision" } }
+            }
+            section { class: "dispatcher-priority",
+                header { h2 { "现在优先处理" } span { "按状态与项目顺序投影" } }
+                if priority.is_empty() {
+                    div { class: "compact-empty", span { class: "honesty-badge", "EMPTY" } p { "当前没有非排期 Mission。" } }
+                } else {
+                    for mission in priority {
+                        {
+                            let mission_id = mission.mission_id.clone();
+                            rsx! {
+                                button { class: "dispatcher-mission-row", onclick: move |_| on_select_mission.call(mission_id.clone()),
+                                    i { class: dispatcher_stage_dot(&mission.stage) }
+                                    span { strong { "{mission.title}" } small { "{dispatcher_mission_detail(&mission)}" } }
+                                    em { "{mission.completed_checkpoint_count}/{mission.checkpoint_count}" }
+                                    b { "打开" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div { class: "dispatcher-lower-grid",
+                section { class: "dispatcher-waiting",
+                    header { h2 { "等待你" } span { "只显示持久等待状态" } }
+                    if waiting_missions.is_empty() {
+                        div { class: "compact-empty", span { class: "honesty-badge", "EMPTY" } p { "没有等待用户或审批的 Mission。" } }
+                    } else {
+                        for mission in waiting_missions {
+                            {
+                                let mission_id = mission.mission_id.clone();
+                                rsx! {
+                                    button { class: "dispatcher-waiting-row", onclick: move |_| on_select_mission.call(mission_id.clone()),
+                                        i { class: dispatcher_stage_dot(&mission.stage) }
+                                        span { strong { "{mission.title}" } small { "{mission_stage_label(&mission.stage)}" } }
+                                        em { "处理" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                section { class: "dispatcher-update",
+                    header {
+                        img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                        span { strong { "Hartevo · 刚刚" } small { "调度更新" } }
+                    }
+                    p { "任务、工作面变化与审批会汇总到同一 Project/Mission Truth；这里不会从页面样例推导 Provider 成功。" }
+                    ul {
+                        li { "{running} 个 Mission 正在运行" }
+                        li { "{waiting} 个 Mission 等待你的明确输入" }
+                        li { "{scheduled} 个周期任务保持排期；Provider readback 未接入时不声称已执行" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn OrchestratorSurface(
     backend: DesktopBackendState,
     project: Option<DesktopProjectProjection>,
@@ -1243,6 +2024,7 @@ fn OrchestratorSurface(
     on_initialize: EventHandler<MouseEvent>,
     on_ready: EventHandler<DesktopSnapshot>,
     on_error: EventHandler<DesktopDataError>,
+    on_select_mission: EventHandler<MissionId>,
 ) -> Element {
     match backend {
         DesktopBackendState::Uninitialized(evidence) => rsx! {
@@ -1323,13 +2105,7 @@ fn OrchestratorSurface(
             let Some(mission) = mission else {
                 return rsx! {
                     div { class: "surface-scroll",
-                        article { class: "assistant-turn",
-                            span { class: "honesty-badge", "APPLICATION_STATE" }
-                            h2 { "{project.name}" }
-                            p { "项目 revision {project.revision} 已从 SQLCipher 经 Application Service 读取。当前没有 Mission；加密就绪后可在下方创建。" }
-                            EncryptionReadinessCard { encryption: project.encryption }
-                            ContextAccessCard { access: context_access }
-                        }
+                        ProjectDispatcherSurface { project, on_select_mission }
                     }
                 };
             };
@@ -1857,10 +2633,161 @@ fn ContextAccessCard(access: Option<ProjectContextAccessProjection>) -> Element 
 }
 
 #[component]
+fn CurrentSurface(
+    project: Option<DesktopProjectProjection>,
+    context_access: Option<ProjectContextAccessProjection>,
+) -> Element {
+    let Some(project) = project else {
+        return rsx! { EmptyState { code: "EMPTY", title: "没有当前项目", detail: "先从本机 Inventory 选择或安全创建项目；Current 不会显示跨项目样例数据。" } };
+    };
+    let mission_count = project.missions.len();
+    let active_count = project
+        .missions
+        .iter()
+        .filter(|mission| !mission.stage.is_terminal())
+        .count();
+    let work_product_count = project
+        .missions
+        .iter()
+        .map(|mission| mission.work_product_count)
+        .sum::<usize>();
+    let attention_count = project
+        .missions
+        .iter()
+        .map(|mission| mission.pending_approval_count)
+        .sum::<usize>();
+    rsx! {
+        div { class: "surface-scroll business-surface current-surface",
+            header { class: "surface-head",
+                div { class: "surface-head-copy",
+                    span { class: "surface-eyebrow", "CURRENT · PROJECT PROJECTION" }
+                    h1 { "{project.name}" }
+                    p { "{project.description}" }
+                }
+                div { class: "surface-head-actions",
+                    span { class: "sync-chip", "Project revision {project.revision}" }
+                }
+            }
+            section { class: "readiness-strip",
+                div { class: "readiness-intro",
+                    span { class: "readiness-mark", UiIcon { name: UiIconName::Folder, size: 18 } }
+                    span { strong { "当前项目边界" } small { "所有数字来自同一 DesktopProjectProjection；Provider 状态未接入时保持未测量。" } }
+                }
+                div { class: "readiness-stat", b { "{mission_count}" } small { "持久 Mission" } }
+                div { class: "readiness-stat", b { "{active_count}" } small { "非终态" } }
+                div { class: "readiness-stat", b { "{attention_count}" } small { "待审批" } }
+            }
+            div { class: "current-grid",
+                main {
+                    section { class: "surface-section",
+                        div { class: "surface-section-head", h2 { "这个项目正在做什么" } p { "Mission 不跨项目混用" } }
+                        if project.missions.is_empty() {
+                            div { class: "compact-empty", span { class: "honesty-badge", "EMPTY" } p { "尚无持久 Mission。" } }
+                        } else {
+                            div { class: "project-mission-list",
+                                for mission in project.missions.clone() {
+                                    article { class: "project-mission-row",
+                                        i { class: if mission.stage.is_terminal() { "" } else { "live" } }
+                                        span { strong { "{mission.title}" } small { "{mission_stage_label(&mission.stage)} · checkpoint {mission.completed_checkpoint_count}/{mission.checkpoint_count} · revision {mission.revision}" } }
+                                        em { "{mission.work_product_count} 产物" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    section { class: "surface-section",
+                        div { class: "surface-section-head", h2 { "最近成果" } p { "Work Product manifest 投影" } }
+                        div { class: "outcome-placeholder",
+                            UiIcon { name: UiIconName::FileCheck, size: 18 }
+                            span { strong { "{work_product_count} 个真实 Work Product" } small { "没有持久 manifest 时不会生成示例成果。" } }
+                            em { if work_product_count == 0 { "EMPTY" } else { "DOMAIN" } }
+                        }
+                    }
+                }
+                aside {
+                    section { class: "surface-section",
+                        div { class: "surface-section-head", h2 { "项目边界" } p { "Project scoped" } }
+                        div { class: "project-context-list",
+                            div { class: "project-context-row", span { "存储模式" } strong { "{project_storage_label(&project)}" } }
+                            div { class: "project-context-row", span { "Workspace roots" } strong { "{project.workspace_root_count}" } }
+                            div { class: "project-context-row", span { "外部动作" } strong { "Effect Broker + 精确审批" } }
+                            div { class: "project-context-row", span { "数据与记忆" } strong { "Tenant / Project 隔离" } }
+                        }
+                    }
+                    ContextAccessCard { access: context_access }
+                    section { class: "surface-section provider-honesty",
+                        div { class: "surface-section-head", h2 { "连接与运行状态" } p { "未伪造 Probe" } }
+                        div { class: "context-note",
+                            header { UiIcon { name: UiIconName::Plug, size: 15 } strong { "Provider Projection 尚未接入" } }
+                            p { "Current 不能从 Catalog 声明推导 Connected。实时 Probe 接线前，连接数量与健康度保持 Not Measured。" }
+                            span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn MissionsSurface(
+    project: Option<DesktopProjectProjection>,
+    selected_mission_id: Option<MissionId>,
+    on_select: EventHandler<MissionId>,
+) -> Element {
+    let Some(project) = project else {
+        return rsx! { EmptyState { code: "EMPTY", title: "没有 Mission 项目范围", detail: "选择项目后，Missions 只显示该项目的持久 Application projection。" } };
+    };
+    rsx! {
+        div { class: "surface-scroll business-surface missions-surface",
+            header { class: "surface-head",
+                div { class: "surface-head-copy",
+                    span { class: "surface-eyebrow", "MISSIONS · APPLICATION PROJECTION" }
+                    h1 { "全部任务" }
+                    p { "一次选择会继续原来的 Mission Conversation，不创建第二套页面状态。" }
+                }
+                span { class: "sync-chip", "{project.name} · {project.missions.len()} Missions" }
+            }
+            nav { class: "surface-tabs", aria_label: "Mission 视图",
+                button { class: "active", "全部" }
+                button { disabled: true, "进行中" }
+                button { disabled: true, "自动任务" }
+                button { disabled: true, "历史" }
+            }
+            section { class: "surface-section mission-table-section",
+                if project.missions.is_empty() {
+                    div { class: "compact-empty", span { class: "honesty-badge", "EMPTY" } h2 { "尚无持久 Mission" } p { "返回总调度，选择 VM-00～VM-11 并完成 Operating Contract。" } }
+                } else {
+                    div { class: "mission-table", role: "list",
+                        for mission in project.missions {
+                            {
+                                let mission_id = mission.mission_id.clone();
+                                let selected = selected_mission_id.as_ref() == Some(&mission_id);
+                                rsx! {
+                                    button { class: if selected { "mission-table-row active" } else { "mission-table-row" }, onclick: move |_| on_select.call(mission_id.clone()),
+                                        span { class: "mission-table-status", i { class: if mission.stage.is_terminal() { "" } else { "live" } } }
+                                        span { class: "mission-table-copy", strong { "{mission.title}" } small { "{mission.goal}" } }
+                                        span { strong { "{mission_stage_label(&mission.stage)}" } small { "状态" } }
+                                        span { strong { "{mission.completed_checkpoint_count}/{mission.checkpoint_count}" } small { "Checkpoint" } }
+                                        span { strong { "{mission.pending_approval_count}" } small { "待审批" } }
+                                        span { class: "mission-table-action", "继续 →" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn ChannelSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
 ) -> Element {
+    let mut active_tab = use_signal(|| "plan");
     let Some(project) = project else {
         return rsx! { EmptyState { code: "NOT_IMPLEMENTED", title: "没有渠道上下文", detail: "先完成安全项目创建；渠道页不会使用 demo store。" } };
     };
@@ -1868,23 +2795,477 @@ fn ChannelSurface(
         return rsx! { EmptyState { code: "EMPTY", title: "没有绑定 Mission", detail: "渠道工作面只投影已有 Mission，不创建独立业务状态。" } };
     };
     rsx! {
-        div { class: "surface-scroll business-surface",
-            header { class: "surface-title", div { small { "增长运营" } h2 { "渠道运营" } } span { class: "sync-chip", "{project.name} · revision {mission.revision}" } }
-            section { class: "summary-grid",
-                div { strong { "{mission.work_product_count}" } small { "真实工作产物" } }
-                div { strong { "{mission.pending_approval_count}" } small { "等待审批" } }
-                div { strong { "{mission.verified_effect_count}" } small { "已独立验证" } }
-                div { strong { "0" } small { "页面生成回执" } }
+        div { class: "surface-scroll business-surface channels-surface",
+            header { class: "surface-head",
+                div { class: "surface-head-copy",
+                    span { class: "surface-eyebrow", "CHANNELS · GROWTH OPERATIONS" }
+                    h1 { "渠道运营" }
+                    p { "根据受众、市场、内容能力与目标选择值得经营的渠道；每个平台有独立素材、节奏、审批与结果。" }
+                }
+                span { class: "sync-chip", "{project.name} · Mission revision {mission.revision}" }
             }
-            section { class: "surface-panel",
-                header { h3 { "发布队列" } span { "同一 Effect Ledger" } }
-                if mission.pending_approval_count == 0 && mission.verified_effect_count == 0 {
-                    div { class: "boundary-note", "EMPTY：当前 Mission 没有持久 Effect。Provider 连接或页面草稿不会冒充发布队列。" }
+            nav { class: "surface-tabs", aria_label: "渠道运营视图",
+                button { class: if active_tab() == "plan" { "active" } else { "" }, onclick: move |_| active_tab.set("plan"), "计划" }
+                button { class: if active_tab() == "calendar" { "active" } else { "" }, onclick: move |_| active_tab.set("calendar"), "日历" }
+                button { class: if active_tab() == "queue" { "active" } else { "" }, onclick: move |_| active_tab.set("queue"), "发布队列" }
+                button { class: if active_tab() == "performance" { "active" } else { "" }, onclick: move |_| active_tab.set("performance"), "效果" }
+            }
+            section { class: "pipeline-strip channel-strip",
+                div { class: "pipeline-stage", strong { "{mission.work_product_count}" } span { "真实工作产物" } }
+                div { class: "pipeline-stage", strong { "{mission.pending_approval_count}" } span { "等待审批" } }
+                div { class: "pipeline-stage", strong { "{mission.verified_effect_count}" } span { "已独立验证" } }
+                div { class: "pipeline-stage", strong { "0" } span { "页面生成回执" } }
+            }
+            section { class: "surface-section channel-content",
+                div { class: "surface-section-head",
+                    h2 {
+                        if active_tab() == "plan" { "渠道计划" }
+                        else if active_tab() == "calendar" { "内容日历" }
+                        else if active_tab() == "queue" { "发布队列" }
+                        else { "互动、Referral 与 Outcome" }
+                    }
+                    p { "同一 Mission · 同一 Effect Ledger" }
+                }
+                if active_tab() == "plan" {
+                    if mission.work_products.is_empty() {
+                        div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "尚无渠道 Work Product" } p { "页面不会从 Mission 标题生成演示计划；需要真实 WorkProductManifest。" } }
+                    } else {
+                        div { class: "channel-work-products",
+                            for product in mission.work_products.clone() {
+                                article { class: "channel-work-product",
+                                    UiIcon { name: UiIconName::FileText, size: 16 }
+                                    span { strong { "{product.title}" } small { "{product.work_product_type} · evidence {product.evidence_count}" } }
+                                    em { "{work_product_status_label(&product.adoption_status)}" }
+                                }
+                            }
+                        }
+                    }
+                } else if active_tab() == "calendar" {
+                    div { class: "calendar-empty",
+                        div { class: "calendar-title", UiIcon { name: UiIconName::Calendar, size: 15 } span { "本周" } }
+                        div { class: "calendar-week",
+                            for day in ["一", "二", "三", "四", "五", "六", "日"] { span { strong { "周{day}" } small { "—" } } }
+                        }
+                        div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "没有持久排期" } p { "Schedule / timezone / payload digest 接线后才会显示日历项。" } }
+                    }
+                } else if active_tab() == "queue" {
+                    if mission.pending_approval_count == 0 && mission.verified_effect_count == 0 {
+                        div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "没有持久 Effect" } p { "Provider 连接或页面草稿不会冒充发布队列。" } }
+                    } else {
+                        div { class: "policy-row", span { "等待审批" } strong { "{mission.pending_approval_count}" } em { "DOMAIN" } }
+                        div { class: "policy-row", span { "已独立验证" } strong { "{mission.verified_effect_count}" } em { "DOMAIN" } }
+                    }
                 } else {
-                    div { class: "policy-row", span { "等待审批" } strong { "{mission.pending_approval_count}" } em { "DOMAIN" } }
-                    div { class: "policy-row", span { "已验证" } strong { "{mission.verified_effect_count}" } em { "DOMAIN" } }
+                    div { class: "state-canvas compact",
+                        UiIcon { name: UiIconName::Chart, size: 22 }
+                        span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                        h3 { "尚无 Channel Outcome Projection" }
+                        p { "发帖数不会冒充有效互动、Referral、Lead 或 Revenue；Outcome Event 与 Attribution 接线前保持未测量。" }
+                    }
                 }
             }
+        }
+    }
+}
+
+#[component]
+fn RelationshipsSurface(
+    project: Option<DesktopProjectProjection>,
+    mission: Option<MissionProjection>,
+) -> Element {
+    let mut active_tab = use_signal(|| "pipeline");
+    let Some(project) = project else {
+        return rsx! { EmptyState { code: "EMPTY", title: "没有关系项目范围", detail: "Identity、Consent、Conversation 和 Opportunity 必须绑定明确项目。" } };
+    };
+    let mission_label = mission
+        .as_ref()
+        .map_or("未选择 Mission", |mission| mission.title.as_str());
+    rsx! {
+        div { class: "surface-scroll business-surface relationships-surface",
+            header { class: "surface-head",
+                div { class: "surface-head-copy",
+                    span { class: "surface-eyebrow", "RELATIONSHIPS · CRM" }
+                    h1 { "关系与 CRM" }
+                    p { "联系人、公司、邮件、会话与机会共享同一条关系记录；公开发现不会自动获得触达许可。" }
+                }
+                span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+            }
+            nav { class: "surface-tabs", aria_label: "关系与 CRM 视图",
+                button { class: if active_tab() == "pipeline" { "active" } else { "" }, onclick: move |_| active_tab.set("pipeline"), "Pipeline" }
+                button { class: if active_tab() == "inbox" { "active" } else { "" }, onclick: move |_| active_tab.set("inbox"), "Inbox" }
+                button { class: if active_tab() == "sequences" { "active" } else { "" }, onclick: move |_| active_tab.set("sequences"), "邮件序列" }
+                button { class: if active_tab() == "contacts" { "active" } else { "" }, onclick: move |_| active_tab.set("contacts"), "联系人" }
+            }
+            section { class: "readiness-strip blocked",
+                div { class: "readiness-intro",
+                    span { class: "readiness-mark", UiIcon { name: if active_tab() == "inbox" { UiIconName::Inbox } else { UiIconName::Contact }, size: 18 } }
+                    span { strong { "CRM / Inbox Projection 尚未接线" } small { "可以查看当前 Mission 边界；不能显示演示联系人、Consent、发送或回复。" } }
+                }
+                div { class: "readiness-stat", b { "0" } small { "可验证联系人" } }
+                div { class: "readiness-stat", b { "0" } small { "可合法跟进" } }
+                div { class: "readiness-stat", b { "0" } small { "开放机会" } }
+            }
+            div { class: "relationship-layout",
+                section { class: "surface-section relationship-main",
+                    div { class: "surface-section-head",
+                        h2 {
+                            if active_tab() == "pipeline" { "Pipeline" }
+                            else if active_tab() == "inbox" { "Inbox 与人工接管" }
+                            else if active_tab() == "sequences" { "Consent-safe 邮件序列" }
+                            else { "Person / Company Identity" }
+                        }
+                        p { "{project.name} · {mission_label}" }
+                    }
+                    div { class: "state-canvas",
+                        UiIcon {
+                            name: if active_tab() == "pipeline" { UiIconName::Briefcase } else if active_tab() == "inbox" { UiIconName::Message } else if active_tab() == "sequences" { UiIconName::Mail } else { UiIconName::Contact },
+                            size: 22,
+                        }
+                        span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                        h3 { "等待 Application Projection" }
+                        p { "该视图不会从页面维护第二套 CRM，也不会把公开邮箱、草稿或 Provider 200 OK 冒充 Consent、Conversation 或业务完成。" }
+                    }
+                }
+                aside { class: "surface-section relationship-policy",
+                    div { class: "surface-section-head", h2 { "关系安全边界" } p { "Contract" } }
+                    div { class: "policy-check-list",
+                        span { UiIcon { name: UiIconName::Shield, size: 14 } strong { "Identity 先解析再合并" } small { "Person / Company / Account 不跨租户猜测合并" } }
+                        span { UiIcon { name: UiIconName::Check, size: 14 } strong { "Consent 按用途与市场" } small { "公开地址不等于可触达许可" } }
+                        span { UiIcon { name: UiIconName::Bot, size: 14 } strong { "Human handoff 是 CAS 锁" } small { "人工接管后旧 Worker 禁止外发" } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn PartnersSurface(
+    project: Option<DesktopProjectProjection>,
+    mission: Option<MissionProjection>,
+) -> Element {
+    let mut active_tab = use_signal(|| "supply");
+    let Some(project) = project else {
+        return rsx! { EmptyState { code: "EMPTY", title: "没有 Partner 项目范围", detail: "Creator、Partner、任务、交付与付款必须绑定 Tenant/Project。" } };
+    };
+    let selected_mission = mission
+        .as_ref()
+        .map_or("未选择 Mission", |mission| mission.title.as_str());
+    rsx! {
+        div { class: "surface-scroll business-surface partners-surface",
+            header { class: "surface-head",
+                div { class: "surface-head-copy",
+                    span { class: "surface-eyebrow", "PARTNERS · CREATOR WORK" }
+                    h1 { "达人与联盟" }
+                    p { "从身份与许可开始，覆盖建联、雇佣、悬赏任务、真实交付、Review、权益接受与付款。" }
+                }
+                span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+            }
+            nav { class: "surface-tabs", aria_label: "达人与联盟视图",
+                button { class: if active_tab() == "supply" { "active" } else { "" }, onclick: move |_| active_tab.set("supply"), "供给" }
+                button { class: if active_tab() == "creators" { "active" } else { "" }, onclick: move |_| active_tab.set("creators"), "达人" }
+                button { class: if active_tab() == "work" { "active" } else { "" }, onclick: move |_| active_tab.set("work"), "任务与交付" }
+                button { class: if active_tab() == "programs" { "active" } else { "" }, onclick: move |_| active_tab.set("programs"), "项目" }
+                button { class: if active_tab() == "economics" { "active" } else { "" }, onclick: move |_| active_tab.set("economics"), "结算" }
+            }
+            section { class: "readiness-strip blocked",
+                div { class: "readiness-intro",
+                    span { class: "readiness-mark", UiIcon { name: UiIconName::Handshake, size: 18 } }
+                    span { strong { "Partner / Creator Projection 尚未接线" } small { "公开候选只允许研究；没有 Contact Permission 时不得自动触达。" } }
+                }
+                div { class: "readiness-stat", b { "0" } small { "已验证 Partner" } }
+                div { class: "readiness-stat", b { "0" } small { "进行中任务" } }
+                div { class: "readiness-stat", b { "0" } small { "待付款" } }
+            }
+            if active_tab() == "work" {
+                section { class: "surface-section creator-work-contract",
+                    div { class: "surface-section-head", h2 { "达人雇佣与悬赏交付合同" } p { "状态合同，不是业务完成证据" } }
+                    div { class: "creator-work-flow", aria_label: "达人工作状态合同",
+                        for (index, step) in CREATOR_WORK_STAGES.iter().enumerate() {
+                            div { class: "creator-work-step",
+                                i { "{index + 1}" }
+                                span { strong { "{step}" } small { "CONTRACT · 尚无实例" } }
+                            }
+                        }
+                    }
+                    div { class: "creator-review-boundary",
+                        UiIcon { name: UiIconName::FileCheck, size: 18 }
+                        span { strong { "交付与付款必须分离" } small { "只有真实 Deliverable digest、用户 Review/Acceptance、权益记录和精确 Payout 审批齐全，才能进入付款验证。" } }
+                        em { "NOT_IMPLEMENTED" }
+                    }
+                }
+            } else {
+                section { class: "surface-section",
+                    div { class: "surface-section-head",
+                        h2 {
+                            if active_tab() == "supply" { "四类供给边界" }
+                            else if active_tab() == "creators" { "Creator Identity 与建联许可" }
+                            else if active_tab() == "programs" { "Program / Terms / Budget" }
+                            else { "Commission / Refund / Payout" }
+                        }
+                        p { "{project.name} · {selected_mission}" }
+                    }
+                    div { class: "state-canvas",
+                        UiIcon { name: if active_tab() == "economics" { UiIconName::Wallet } else { UiIconName::Users }, size: 22 }
+                        span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                        h3 { "等待持久 Partner Aggregate" }
+                        p { "官方网络、Hartevo Opt-in、租户私域与公开候选必须明确区分；页面不会填充演示达人、订单、佣金或 Payout。" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn OutcomesSurface(
+    project: Option<DesktopProjectProjection>,
+    mission: Option<MissionProjection>,
+) -> Element {
+    let Some(project) = project else {
+        return rsx! { EmptyState { code: "EMPTY", title: "没有 Outcome 项目范围", detail: "Outcome、Attribution、Refund 与 Payout 必须绑定明确项目。" } };
+    };
+    let selected = mission.as_ref();
+    let work_products = selected.map_or(0, |mission| mission.work_product_count);
+    let verified_effects = selected.map_or(0, |mission| mission.verified_effect_count);
+    let evidence = selected.map_or(0, |mission| mission.evidence_count);
+    rsx! {
+        div { class: "surface-scroll business-surface outcomes-surface",
+            header { class: "surface-head",
+                div { class: "surface-head-copy",
+                    span { class: "surface-eyebrow", "OUTCOMES · ATTRIBUTION" }
+                    h1 { "成果与下一循环" }
+                    p { "原始事件、身份链、退款与归因不被页面覆盖；相关性不会被描述为因果。" }
+                }
+                span { class: "sync-chip", "{project.name}" }
+            }
+            section { class: "pipeline-strip",
+                div { class: "pipeline-stage", strong { "{evidence}" } span { "Evidence" } }
+                div { class: "pipeline-stage", strong { "{work_products}" } span { "Work Products" } }
+                div { class: "pipeline-stage", strong { "{verified_effects}" } span { "Verified Effects" } }
+                div { class: "pipeline-stage", strong { "0" } span { "Revenue Events" } }
+                div { class: "pipeline-stage", strong { "0" } span { "Refund Events" } }
+                div { class: "pipeline-stage", strong { "—" } span { "Attribution" } }
+            }
+            div { class: "outcome-layout",
+                section { class: "surface-section",
+                    div { class: "surface-section-head", h2 { "Outcome Ledger" } p { "不可变、可复算" } }
+                    if let Some(mission) = selected {
+                        if let Some(summary) = &mission.outcome_summary {
+                            div { class: "verified-outcome",
+                                UiIcon { name: UiIconName::Check, size: 18 }
+                                span { strong { "Domain Outcome Summary" } p { "{summary}" } }
+                                em { "DOMAIN" }
+                            }
+                        } else {
+                            div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "尚无 Outcome Review" } p { "当前 Mission 没有持久 Outcome summary；不会从 Stage 或 Provider 响应推导 Revenue。" } }
+                        }
+                    } else {
+                        div { class: "state-canvas compact", span { class: "honesty-badge", "WAITING_USER" } h3 { "选择一个 Mission" } p { "项目级汇总需要 Attribution Projection；当前先保持 Mission scoped。" } }
+                    }
+                }
+                section { class: "surface-section",
+                    div { class: "surface-section-head", h2 { "归因与下一决策" } p { "VM-11" } }
+                    div { class: "policy-check-list",
+                        span { UiIcon { name: UiIconName::Workflow, size: 14 } strong { "身份链优先" } small { "Verified link / coupon / provider identity chain" } }
+                        span { UiIcon { name: UiIconName::Chart, size: 14 } strong { "保留 Unattributed" } small { "无法确定来源时不强行分配" } }
+                        span { UiIcon { name: UiIconName::Wallet, size: 14 } strong { "退款为独立反向事件" } small { "原订单不会被覆盖" } }
+                    }
+                    span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn SettingsSurface(
+    runtime: Option<DesktopRuntimeProjection>,
+    on_close: EventHandler<()>,
+) -> Element {
+    let mut active_panel = use_signal(|| "general");
+    let mut settings_query = use_signal(String::new);
+    let runtime_status = runtime.as_ref().map_or("数据层未就绪", |runtime| {
+        runtime_availability_label(runtime.status)
+    });
+    let provider = runtime
+        .as_ref()
+        .and_then(|runtime| runtime.provider.as_deref())
+        .unwrap_or("未配置");
+    let model = runtime
+        .as_ref()
+        .and_then(|runtime| runtime.model.as_deref())
+        .unwrap_or("未配置");
+    rsx! {
+        section { class: "settings-shell", aria_label: "Hartevo 设置",
+            header { class: "settings-topbar",
+                img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                strong { "Hartevo" }
+                span { "设置" }
+                button { class: "settings-close", onclick: move |_| on_close.call(()), "返回工作台" kbd { "Esc" } }
+            }
+            aside { class: "settings-sidebar",
+                label { class: "settings-search", UiIcon { name: UiIconName::Search, size: 14 } input {
+                    value: "{settings_query}",
+                    placeholder: "搜索设置",
+                    aria_label: "搜索设置分区",
+                    oninput: move |event| settings_query.set(event.value()),
+                } }
+                nav { aria_label: "设置分区",
+                    h2 { "应用" }
+                    for (id, label) in [
+                        ("general", "常规"), ("appearance", "外观与语言"), ("models", "模型与运行"),
+                        ("storage", "数据与存储"), ("privacy", "隐私与权限"), ("notifications", "通知"),
+                    ] {
+                        if settings_query.read().trim().is_empty() || label.contains(settings_query.read().trim()) {
+                            button { class: if active_panel() == id { "active" } else { "" }, onclick: move |_| active_panel.set(id), "{label}" }
+                        }
+                    }
+                    h2 { "组织与系统" }
+                    for (id, label) in [
+                        ("connections", "连接与凭据"), ("account", "账户与团队"), ("usage", "用量与计费"),
+                        ("shortcuts", "快捷键"),
+                    ] {
+                        if settings_query.read().trim().is_empty() || label.contains(settings_query.read().trim()) {
+                            button { class: if active_panel() == id { "active" } else { "" }, onclick: move |_| active_panel.set(id), "{label}" }
+                        }
+                    }
+                }
+                div { class: "settings-version", "Hartevo Desktop" small { "UI baseline · prototype v12" } }
+            }
+            main { class: "settings-content",
+                if active_panel() == "general" {
+                    GeneralSettingsPanel {}
+                } else if active_panel() == "appearance" {
+                    SettingsPanel { title: "外观", detail: "视觉遵循冻结交互原型的 light-first 基线。",
+                        SettingsRow { title: "主题", detail: "原型基线未定义暗色主题。", value: "浅色" }
+                        SettingsRow { title: "字体", detail: "Geist → 系统 UI → 中日韩系统字体。", value: "System fallback" }
+                        SettingsRow { title: "减少动态效果", detail: "跟随系统 prefers-reduced-motion。", value: "跟随系统" }
+                    }
+                } else if active_panel() == "models" {
+                    SettingsPanel { title: "模型与 Runtime", detail: "模型选择不改变 Mission Capability、预算或审批边界。",
+                        SettingsRow { title: "Runtime", detail: "来自 DesktopRuntimeProjection。", value: runtime_status }
+                        SettingsRow { title: "Provider", detail: "没有配置时不显示可用。", value: provider }
+                        SettingsRow { title: "Model", detail: "只展示真实配置。", value: model }
+                    }
+                } else if active_panel() == "shortcuts" {
+                    SettingsPanel { title: "快捷键", detail: "核心路径支持键盘与明确焦点。",
+                        SettingsRow { title: "新建任务", detail: "回到当前项目总调度。", value: "⌘ N" }
+                        SettingsRow { title: "全局搜索", detail: "搜索持久 Project / Mission。", value: "⌘ P" }
+                        SettingsRow { title: "回到总调度", detail: "不创建新 Conversation。", value: "⌘ K" }
+                        SettingsRow { title: "打开设置", detail: "用户级设置。", value: "⌘ ," }
+                    }
+                } else {
+                    SettingsPanel { title: settings_panel_label(active_panel()), detail: "该设置分区的 Application Service 尚未接线；视觉与键盘结构已按原型实现。",
+                        SettingsRow { title: "能力状态", detail: "不会使用页面本地 store 伪造保存。", value: "NOT_IMPLEMENTED" }
+                        SettingsRow { title: "数据边界", detail: "正文、Secret、Token、Cookie 与直接 PII 不进入遥测。", value: "POLICY" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn GeneralSettingsPanel() -> Element {
+    rsx! {
+        section { class: "settings-panel",
+            header { h1 { "常规" } p { "定义 Hartevo Desktop 启动、创建项目和自然语言调度的默认行为。尚未接入 Settings Application Service 的控件保持禁用。" } }
+            section { class: "settings-section",
+                h2 { "项目默认值" }
+                div { class: "settings-group",
+                    SettingsControlRow { title: "新项目默认存储方式", detail: "创建时仍会明确显示和确认，不会暗中上传。",
+                        select { disabled: true, aria_label: "新项目默认存储方式",
+                            option { selected: true, "本地文件夹（推荐）" }
+                            option { "本地 + 加密同步" }
+                            option { "云端工作区" }
+                        }
+                    }
+                    SettingsControlRow { title: "默认本地项目位置", detail: "新建本地目录时使用；选择已有文件夹不会复制文件。",
+                        div { class: "settings-path-control",
+                            input { disabled: true, value: "未配置", aria_label: "默认本地项目位置" }
+                            button { disabled: true, "浏览…" }
+                        }
+                    }
+                    SettingsControlRow { title: "切换项目后", detail: "默认进入项目总调度，自动加载该项目的任务、事实和连接状态。",
+                        select { disabled: true, aria_label: "切换项目后的默认页面",
+                            option { selected: true, "进入总调度" }
+                            option { "恢复上次工作面" }
+                        }
+                    }
+                }
+            }
+            section { class: "settings-section",
+                h2 { "应用行为" }
+                div { class: "settings-group",
+                    SettingsSwitchRow { title: "开机启动", detail: "只启动桌面壳；自动任务由各项目策略独立决定。", enabled: false }
+                    SettingsSwitchRow { title: "建议下一步", detail: "根据当前 Mission、缺口和等待确认状态给出建议。", enabled: true }
+                }
+            }
+            p { class: "settings-boundary", span { class: "honesty-badge", "NOT_IMPLEMENTED" } " 这些值尚未持久化；视觉与键盘结构不代表设置已生效。" }
+        }
+    }
+}
+
+#[component]
+fn SettingsControlRow(
+    #[props(into)] title: String,
+    #[props(into)] detail: String,
+    children: Element,
+) -> Element {
+    rsx! {
+        div { class: "settings-control-row",
+            span { strong { "{title}" } small { "{detail}" } }
+            div { class: "settings-control", {children} }
+        }
+    }
+}
+
+#[component]
+fn SettingsSwitchRow(
+    #[props(into)] title: String,
+    #[props(into)] detail: String,
+    enabled: bool,
+) -> Element {
+    rsx! {
+        div { class: "settings-control-row",
+            span { strong { "{title}" } small { "{detail}" } }
+            button {
+                class: if enabled { "settings-switch on" } else { "settings-switch" },
+                role: "switch",
+                aria_checked: enabled,
+                aria_label: "{title}",
+                disabled: true,
+                i {}
+            }
+        }
+    }
+}
+
+#[component]
+fn SettingsPanel(
+    #[props(into)] title: String,
+    #[props(into)] detail: String,
+    children: Element,
+) -> Element {
+    rsx! {
+        section { class: "settings-panel",
+            header { h1 { "{title}" } p { "{detail}" } }
+            section { class: "settings-section", h2 { "配置" } div { class: "settings-group", {children} } }
+        }
+    }
+}
+
+#[component]
+fn SettingsRow(
+    #[props(into)] title: String,
+    #[props(into)] detail: String,
+    #[props(into)] value: String,
+) -> Element {
+    rsx! {
+        div { class: "settings-row",
+            span { strong { "{title}" } small { "{detail}" } }
+            span { class: "settings-value", "{value}" }
         }
     }
 }
@@ -1894,21 +3275,125 @@ fn ConnectionsSurface(
     project: Option<DesktopProjectProjection>,
     context_access: Option<ProjectContextAccessProjection>,
 ) -> Element {
+    let mut active_tab = use_signal(|| "overview");
+    let mut flow_open = use_signal(|| false);
+    let mut flow_step = use_signal(|| 1_u8);
     let Some(project) = project else {
         return rsx! { EmptyState { code: "EMPTY", title: "没有项目连接范围", detail: "连接必须绑定 Tenant/Project/Account；未选择项目时不会展示假连接。" } };
     };
     let revision = project.revision;
     rsx! {
-        div { class: "surface-scroll business-surface",
-            header { class: "surface-title", div { small { "系统与连接" } h2 { "连接中心" } } span { class: "sync-chip", "Project revision {revision}" } }
-            EncryptionReadinessCard { encryption: project.encryption.clone() }
-            ContextAccessCard { access: context_access }
-            section { class: "surface-panel",
-                header { h3 { "Provider Probe" } span { class: "honesty-badge", "NOT_IMPLEMENTED" } }
-                p { "当前 Desktop 数据面没有读取任何 Provider 凭据，也没有把 Catalog 中的 Provider 目标声明为 Connected。" }
-                div { class: "policy-row", span { "Connected" } strong { "0" } em { "未测量" } }
-                div { class: "policy-row", span { "外部写入" } strong { "0" } em { "未执行" } }
-                div { class: "policy-row", span { "Workspace roots" } strong { "{project.workspace_root_count}" } em { "本地" } }
+        div { class: "surface-scroll business-surface connections-surface",
+            header { class: "surface-head",
+                div { class: "surface-head-copy",
+                    span { class: "surface-eyebrow", "CONNECTIONS · CAPABILITY AVAILABILITY" }
+                    h1 { "连接中心" }
+                    p { "连接只让 Capability 变得可用；外部写入仍需策略、精确审批、Receipt 与独立 Verification。" }
+                }
+                div { class: "surface-head-actions",
+                    button { class: "surface-button", onclick: move |_| { flow_step.set(1); flow_open.set(true); }, UiIcon { name: UiIconName::Plus, size: 14 } "查看连接流程" }
+                    span { class: "sync-chip", "Project revision {revision}" }
+                }
+            }
+            nav { class: "surface-tabs", aria_label: "连接中心视图",
+                button { class: if active_tab() == "overview" { "active" } else { "" }, onclick: move |_| active_tab.set("overview"), "概览" }
+                button { class: if active_tab() == "all" { "active" } else { "" }, onclick: move |_| active_tab.set("all"), "全部连接" }
+                button { class: if active_tab() == "policies" { "active" } else { "" }, onclick: move |_| active_tab.set("policies"), "动作策略" }
+                button { class: if active_tab() == "activity" { "active" } else { "" }, onclick: move |_| active_tab.set("activity"), "活动" }
+            }
+            if active_tab() == "overview" {
+                div { class: "connections-overview-grid",
+                    main {
+                        EncryptionReadinessCard { encryption: project.encryption.clone() }
+                        ContextAccessCard { access: context_access }
+                        section { class: "surface-section",
+                            div { class: "surface-section-head", h2 { "Mission 需要的连接" } p { "Provider Probe" } }
+                            div { class: "state-canvas compact",
+                                UiIcon { name: UiIconName::Plug, size: 22 }
+                                span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                                h3 { "尚无 Connection Projection" }
+                                p { "当前 Desktop 数据面没有读取 Provider 凭据，也没有把 Catalog 中的 Provider 目标声明为 Connected。" }
+                            }
+                        }
+                    }
+                    aside { class: "surface-section",
+                        div { class: "surface-section-head", h2 { "连接原则" } p { "Zero-trust" } }
+                        div { class: "policy-check-list",
+                            span { UiIcon { name: UiIconName::Target, size: 14 } strong { "账号身份必须 Probe" } small { "错误账号或 Scope 撤销会立即阻塞" } }
+                            span { UiIcon { name: UiIconName::Shield, size: 14 } strong { "连接不扩大权限" } small { "Capability 与 Effect Policy 独立判定" } }
+                            span { UiIcon { name: UiIconName::Refresh, size: 14 } strong { "uncertain 不自动重放" } small { "先 reconcile，再显式决定" } }
+                        }
+                    }
+                }
+            } else if active_tab() == "all" {
+                section { class: "surface-section",
+                    div { class: "surface-section-head", h2 { "全部连接" } p { "Tenant / Project / Account scoped" } }
+                    div { class: "connection-table-header", span { "服务与账号" } span { "用途" } span { "Scope" } span { "状态" } span { "最近验证" } }
+                    div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "没有可展示的真实 Connection" } p { "Provider Adapter 与 Secret Store 投影接线后才会出现行。" } }
+                }
+            } else if active_tab() == "policies" {
+                section { class: "surface-section",
+                    div { class: "surface-section-head", h2 { "项目动作策略" } p { "连接提供能力，Mission 决定能否执行" } }
+                    div { class: "policy-matrix",
+                        div { class: "policy-matrix-row head", span { "Capability" } span { "读取" } span { "草稿" } span { "外部写入" } span { "金额动作" } }
+                        div { class: "policy-matrix-row", strong { "Channel" } span { "Policy checked" } span { "允许" } span { "精确审批" } span { "不适用" } }
+                        div { class: "policy-matrix-row", strong { "Email / CRM" } span { "Consent required" } span { "允许" } span { "精确审批" } span { "不适用" } }
+                        div { class: "policy-matrix-row", strong { "Partner / Creator" } span { "Permission required" } span { "允许" } span { "合同审批" } span { "Payout 审批" } }
+                    }
+                    p { class: "contract-disclaimer", "以上为 Operating Contract 的静态边界，不表示任何 Provider 已连接或 Effect 已获批准。" }
+                }
+            } else {
+                section { class: "surface-section",
+                    div { class: "surface-section-head", h2 { "连接活动" } p { "Audit projection" } }
+                    div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "暂无持久连接事件" } p { "不会复制原型中的 Twenty、X、WordPress 或 Chatwoot 演示活动。" } }
+                }
+            }
+
+            if flow_open() {
+                button { class: "overlay-backdrop", aria_label: "关闭连接流程", onclick: move |_| flow_open.set(false) }
+                section { class: "connection-flow", role: "dialog", aria_modal: "true", aria_label: "连接服务流程",
+                    header {
+                        span { strong { "连接服务" } small { "FLOW CONTRACT · 不触发 OAuth" } }
+                        button { aria_label: "关闭", onclick: move |_| flow_open.set(false), UiIcon { name: UiIconName::X, size: 15 } }
+                    }
+                    div { class: "flow-progress",
+                        for step in 1_u8..=4 {
+                            span { class: if step == flow_step() { "active" } else if step < flow_step() { "done" } else { "" }, i { "{step}" } small { if step == 1 { "用途" } else if step == 2 { "权限" } else if step == 3 { "账号" } else { "验证" } } }
+                        }
+                    }
+                    div { class: "flow-body",
+                        if flow_step() == 1 {
+                            h2 { "为什么需要连接" }
+                            p { "Hartevo 只会为当前 Mission 明确需要的 Capability 请求连接；当前没有选定 Provider，因此不会开始授权。" }
+                            div { class: "context-note", header { UiIcon { name: UiIconName::Target, size: 14 } strong { "Project scoped" } } p { "{project.name} · Connection 必须绑定 tenant/project/provider/account。" } }
+                        } else if flow_step() == 2 {
+                            h2 { "审阅最小权限" }
+                            p { "读取与写入 Scope 分开；连接成功不会自动批准发布、发送、邀请、合同或付款。" }
+                            div { class: "permission-list",
+                                span { UiIcon { name: UiIconName::Check, size: 14 } strong { "读取账号与健康状态" } em { "自动" } }
+                                span { UiIcon { name: UiIconName::Check, size: 14 } strong { "读取当前项目需要的数据" } em { "Policy" } }
+                                span { UiIcon { name: UiIconName::Shield, size: 14 } strong { "执行对外写入" } em { "需要审批" } }
+                            }
+                        } else if flow_step() == 3 {
+                            h2 { "确认真实账号" }
+                            p { "OAuth callback、state/nonce 和实时 Probe 尚未接入 Desktop；不能选择或声称账号已连接。" }
+                            div { class: "state-canvas compact", span { class: "honesty-badge", "BLOCKED_ENV" } h3 { "Provider 授权环境未配置" } }
+                        } else {
+                            h2 { "独立验证" }
+                            p { "只有实时 Probe 返回匹配的 tenant/project/provider/account 与最小 Scope，连接才能显示 Connected。" }
+                            div { class: "state-canvas compact", span { class: "honesty-badge", "NOT_IMPLEMENTED" } h3 { "尚无 Probe Receipt" } }
+                        }
+                    }
+                    footer {
+                        button { class: "surface-button", disabled: flow_step() == 1, onclick: move |_| flow_step.set(flow_step().saturating_sub(1)), "上一步" }
+                        span { "{flow_step()} / 4" }
+                        if flow_step() < 4 {
+                            button { class: "surface-button primary", onclick: move |_| flow_step.set(flow_step() + 1), "继续" }
+                        } else {
+                            button { class: "surface-button primary", onclick: move |_| flow_open.set(false), "关闭" }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1999,6 +3484,137 @@ fn work_product_status_label(status: &WorkProductStatus) -> &'static str {
         WorkProductStatus::ReadyForReview => "READY_FOR_REVIEW",
         WorkProductStatus::Accepted => "ACCEPTED",
         WorkProductStatus::Superseded => "SUPERSEDED",
+    }
+}
+
+fn surface_heading(surface: Surface, mission_title: &str) -> String {
+    match surface {
+        Surface::Orchestrator => mission_title.to_owned(),
+        Surface::Current => "当前状态".to_owned(),
+        Surface::Missions => "全部任务".to_owned(),
+        Surface::ChannelOperations => "渠道运营".to_owned(),
+        Surface::Relationships => "关系与 CRM".to_owned(),
+        Surface::Partners => "达人与联盟".to_owned(),
+        Surface::Connections => "连接中心".to_owned(),
+        Surface::Outcomes => "成果与循环".to_owned(),
+        Surface::CapabilityEvidence => "能力与证据".to_owned(),
+        Surface::Settings => "设置".to_owned(),
+        Surface::StateCoverage => "产品状态覆盖".to_owned(),
+    }
+}
+
+const fn surface_context_label(surface: Surface) -> &'static str {
+    match surface {
+        Surface::Orchestrator => "Mission Conversation",
+        Surface::Current => "Project Current",
+        Surface::Missions => "Mission Inventory",
+        Surface::ChannelOperations => "Growth Operations",
+        Surface::Relationships => "Relationships",
+        Surface::Partners => "Partner Operations",
+        Surface::Connections => "Capability Availability",
+        Surface::Outcomes => "Outcome & Attribution",
+        Surface::CapabilityEvidence => "Release Evidence",
+        Surface::Settings => "User Preferences",
+        Surface::StateCoverage => "UI State Contract",
+    }
+}
+
+fn active_visual_fixture_id() -> Option<String> {
+    #[cfg(feature = "visual-fixtures")]
+    {
+        visual_fixture::active_id()
+    }
+    #[cfg(not(feature = "visual-fixtures"))]
+    {
+        None
+    }
+}
+
+fn active_visual_zoom() -> f64 {
+    #[cfg(feature = "visual-fixtures")]
+    {
+        if std::env::var("HARTEVO_DESKTOP_UI_ZOOM").ok().as_deref() == Some("2") {
+            return 2.0;
+        }
+    }
+    1.0
+}
+
+fn initial_surface() -> Surface {
+    #[cfg(feature = "visual-fixtures")]
+    if let Some(surface) = visual_fixture::initial_surface() {
+        return surface;
+    }
+    Surface::Orchestrator
+}
+
+fn app_shortcut(key: &Key, modifiers: Modifiers) -> Option<AppShortcut> {
+    if *key == Key::Escape {
+        return Some(AppShortcut::DismissOverlays);
+    }
+    if !modifiers.intersects(Modifiers::META | Modifiers::CONTROL) {
+        return None;
+    }
+    let Key::Character(character) = key else {
+        return None;
+    };
+    if character.eq_ignore_ascii_case("p") {
+        Some(AppShortcut::GlobalSearch)
+    } else if character.eq_ignore_ascii_case("k") {
+        Some(AppShortcut::ProjectDispatcher)
+    } else if character.eq_ignore_ascii_case("n") {
+        Some(AppShortcut::NewTask)
+    } else if character == "," {
+        Some(AppShortcut::Settings)
+    } else {
+        None
+    }
+}
+
+fn dispatcher_stage_dot(stage: &MissionStage) -> &'static str {
+    match stage {
+        MissionStage::Running => "live",
+        MissionStage::WaitingUser | MissionStage::WaitingApproval => "attention",
+        MissionStage::Scheduled => "scheduled",
+        _ if stage.is_terminal() => "terminal",
+        _ => "",
+    }
+}
+
+fn dispatcher_mission_detail(mission: &MissionProjection) -> String {
+    let checkpoint = mission
+        .current_checkpoint_id
+        .as_deref()
+        .unwrap_or("unbound");
+    format!(
+        "{} · {} · cycle {}",
+        mission_stage_label(&mission.stage),
+        checkpoint,
+        mission.cycle
+    )
+}
+
+fn project_initials(name: &str) -> String {
+    let initials = name
+        .split_whitespace()
+        .filter_map(|word| word.chars().next())
+        .take(3)
+        .collect::<String>();
+    if initials.chars().count() > 1 {
+        return initials;
+    }
+    name.chars().take(2).collect()
+}
+
+fn settings_panel_label(panel: &str) -> &'static str {
+    match panel {
+        "storage" => "存储与同步",
+        "privacy" => "隐私与数据",
+        "notifications" => "通知",
+        "connections" => "连接与凭据",
+        "account" => "账户与团队",
+        "usage" => "用量",
+        _ => "设置",
     }
 }
 
@@ -2397,6 +4013,113 @@ mod tests {
         assert!(!valid_currency_shape("eur"));
         assert!(!valid_currency_shape("EU"));
         assert_eq!("9007199254740993".parse::<i64>(), Ok(9_007_199_254_740_993));
+    }
+
+    #[test]
+    fn prototype_keyboard_contract_maps_without_expanding_authority() {
+        assert_eq!(
+            app_shortcut(&Key::Character("p".into()), Modifiers::META),
+            Some(AppShortcut::GlobalSearch)
+        );
+        assert_eq!(
+            app_shortcut(&Key::Character("k".into()), Modifiers::META),
+            Some(AppShortcut::ProjectDispatcher)
+        );
+        assert_eq!(
+            app_shortcut(&Key::Character("N".into()), Modifiers::CONTROL),
+            Some(AppShortcut::NewTask)
+        );
+        assert_eq!(
+            app_shortcut(&Key::Character(",".into()), Modifiers::META),
+            Some(AppShortcut::Settings)
+        );
+        assert_eq!(
+            app_shortcut(&Key::Escape, Modifiers::empty()),
+            Some(AppShortcut::DismissOverlays)
+        );
+        assert_eq!(
+            app_shortcut(&Key::Character("k".into()), Modifiers::empty()),
+            None
+        );
+        assert_eq!(
+            ActiveOverlay::GlobalSearch.toggle(ActiveOverlay::Notifications),
+            ActiveOverlay::Notifications
+        );
+        assert_eq!(
+            ActiveOverlay::Notifications.toggle(ActiveOverlay::Notifications),
+            ActiveOverlay::None
+        );
+    }
+
+    #[test]
+    fn prototype_token_sheet_keeps_source_colors_breakpoints_and_accessibility() {
+        let css = include_str!("../assets/prototype.css");
+        for token in [
+            "--ink: #202124",
+            "--line: #e6e6e8",
+            "--sidebar: #f6f6f7",
+            "--gold: #c8932f",
+            "--green: #237a50",
+            "--red: #b5403a",
+            "--side-w: 260px",
+            "--chat-w: 550px",
+        ] {
+            assert!(css.contains(token), "missing prototype token {token}");
+        }
+        for contract in [
+            "@media (max-width: 1390px)",
+            "@media (max-width: 1120px)",
+            "@media (max-width: 900px)",
+            "@media (max-width: 680px)",
+            "@media (prefers-reduced-motion: reduce)",
+            ":focus-visible",
+        ] {
+            assert!(css.contains(contract), "missing UI contract {contract}");
+        }
+        assert!(!css.contains("linear-gradient"));
+        assert!(!css.contains("radial-gradient"));
+    }
+
+    #[test]
+    fn visual_state_contract_covers_every_required_honest_product_state() {
+        assert_eq!(
+            UI_STATE_CONTRACTS.map(|state| state.code),
+            [
+                "LOADING",
+                "EMPTY",
+                "OFFLINE",
+                "ERROR",
+                "BLOCKED",
+                "WAITING_USER",
+                "WAITING_APPROVAL",
+                "HANDOFF",
+                "SUCCESS",
+                "RECOVERY",
+            ]
+        );
+        assert!(
+            UI_STATE_CONTRACTS
+                .iter()
+                .find(|state| state.code == "SUCCESS")
+                .is_some_and(|state| state.detail.contains("Verification"))
+        );
+        assert!(
+            UI_STATE_CONTRACTS
+                .iter()
+                .find(|state| state.code == "RECOVERY")
+                .is_some_and(|state| state.detail.contains("uncertain"))
+        );
+    }
+
+    #[test]
+    fn creator_work_contract_keeps_delivery_review_rights_and_payment_in_order() {
+        assert_eq!(CREATOR_WORK_STAGES.len(), 12);
+        assert_eq!(CREATOR_WORK_STAGES[0], "Offer / Listing");
+        assert_eq!(CREATOR_WORK_STAGES[6], "Deliverable Uploaded");
+        assert_eq!(CREATOR_WORK_STAGES[7], "User Review");
+        assert_eq!(CREATOR_WORK_STAGES[9], "Accepted");
+        assert_eq!(CREATOR_WORK_STAGES[10], "Rights Recorded");
+        assert_eq!(CREATOR_WORK_STAGES[11], "Payout Verified");
     }
 
     #[test]

@@ -1,0 +1,93 @@
+Window: "Hartevo Desktop", App: HartevoVisualBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text Hartevo
+				6 button 搜索所有项目与任务
+				7 button (collapsed) 查看全部项目通知, Help: 全部项目通知, Secondary Actions: Expand
+				8 text 关系与 CRM
+				9 text 等待用户
+				10 button 重新读取持久状态
+				11 text 关系与 CRM
+				12 toggle button 打开任务工作台, Value: off
+				13 container 项目与任务导航
+					14 button 在当前项目描述新任务
+					15 container 项目工作面
+						16 text 工作
+						17 button 当前状态 Project
+						18 button 总调度 同一会话
+						19 button 全部任务 Mission
+						20 button 成果与循环 Outcome
+						21 text 增长运营
+						22 button 渠道运营 Channel
+						23 button 关系与 CRM 未接入
+						24 button 达人与联盟 未接入
+						25 text 系统与连接
+						26 button 连接中心 Probe
+						27 button 能力与证据 E0–E5
+					28 container 宣发项目
+						29 container
+							30 text 宣发项目 1
+						31 button 北 北美增长项目 revision 142 · Keyring 就绪
+					32 container 持久任务
+						33 container
+							34 text 持久 Mission 7
+						35 button 项目总调度 显式选择 VM-00～VM-11 CATALOG
+						36 button 美国健身器材机会研究 运行中 1
+						37 button Q3 促销策略与节奏 运行中 1
+						38 button 新品着陆页文案 等待审批 1
+						39 button 德国经销商邮件序列 等待用户 1
+						40 button AI 推荐与引用监测 已排期 1
+						41 button 竞品价格与评论变化 已排期 1
+						42 button SEO 周度增长循环 已排期 1
+					43 container
+						44 pop up button 北美增长项目 本地 E2EE 同步
+						45 text 路径只用于本机数据层，不进入日志或 Release Evidence
+				46 container
+					47 text Relationships
+					48 text 变化回写同一 Project / Mission Truth VISUAL_FIXTURE · prototype-baseline-v1
+					49 button 工作台
+				50 container
+					51 text RELATIONSHIPS · CRM
+					52 heading 关系与 CRM, Value: 1
+						53 text 关系与 CRM
+					54 text 联系人、公司、邮件、会话与机会共享同一条关系记录；公开发现不会自动获得触达许可。 NOT_IMPLEMENTED
+				55 container 关系与 CRM 视图
+					56 button Pipeline
+					57 button Inbox
+					58 button 邮件序列
+					59 button 联系人
+				60 text CRM / Inbox Projection 尚未接线
+				61 text 可以查看当前 Mission 边界；不能显示演示联系人、Consent、发送或回复。
+				62 text 0
+				63 text 可验证联系人
+				64 text 0
+				65 text 可合法跟进
+				66 text 0
+				67 text 开放机会
+				68 heading Pipeline, Value: 2
+					69 text Pipeline
+				70 text 北美增长项目 · 德国经销商邮件序列
+				71 text NOT_IMPLEMENTED
+				72 heading 等待 Application Projection, Value: 3
+					73 text 等待 Application Projection
+				74 text 该视图不会从页面维护第二套 CRM，也不会把公开邮箱、草稿或 Provider 200 OK 冒充 Consent、Conversation 或业务完成。
+				75 heading 关系安全边界, Value: 2
+					76 text 关系安全边界
+				77 text Contract
+				78 text Identity 先解析再合并
+				79 text Person / Company / Account 不跨租户猜测合并
+				80 text Consent 按用途与市场
+				81 text 公开地址不等于可触达许可
+				82 text Human handoff 是 CAS 锁
+				83 text 人工接管后旧 Worker 禁止外发
+	84 close button
+	85 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	86 minimize button
+	87 text Hartevo Desktop
+88 menu bar
+	89 HartevoVisualBaseline
+	90 Edit
+	91 Help
