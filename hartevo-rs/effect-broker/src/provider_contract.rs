@@ -16,8 +16,16 @@ pub const PROVIDER_ADAPTER_BASELINE_REGISTRY_VERSION: &str = "desktop-2026-08-12
 pub const PROVIDER_ADAPTER_CONTRACT_JSON: &str =
     include_str!("../../../contracts/providers/adapter-contract.v1.json");
 
+const PROVIDER_ID_RULE: &str = "1..64 lowercase ASCII letters, digits, or internal hyphens";
+const CAPABILITY_ID_RULE: &str =
+    "2..96 lowercase dot-separated segments using letters, digits, hyphens, or underscores";
+const ADAPTER_ID_RULE: &str =
+    "2..96 lowercase dot-separated segments using letters, digits, hyphens, or underscores";
+const ADAPTER_VERSION_RULE: &str = "positive integer";
+const EVIDENCE_DIGEST_RULE: &str = "64 lowercase hexadecimal characters";
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderCapabilityKey {
     provider_id: String,
     capability_id: String,
@@ -56,7 +64,7 @@ impl ProviderCapabilityKey {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderAdapterIdentity {
     adapter_id: String,
     adapter_version: u32,
@@ -94,46 +102,269 @@ impl ProviderAdapterIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderAdapterOperation {
-    Probe,
-    BeginAuth,
-    Refresh,
-    Read,
-    PrepareEffect,
-    Execute,
-    Reconcile,
-    Verify,
-    HandleWebhook,
-    Revoke,
+macro_rules! provider_contract_enum {
+    (
+        $(#[$metadata:meta])*
+        pub enum $name:ident {
+            $($variant:ident),+ $(,)?
+        }
+    ) => {
+        $(#[$metadata])*
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderEvidenceClass {
-    ProbeObservation,
-    Authentication,
-    ReadObservation,
-    PreparedEffect,
-    ReceiptCandidate,
-    ReconciliationObservation,
-    VerificationObservation,
-    WebhookObservation,
-    RevocationObservation,
+provider_contract_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ProviderAdapterOperation {
+        Probe,
+        BeginAuth,
+        Refresh,
+        Read,
+        PrepareEffect,
+        Execute,
+        Reconcile,
+        Verify,
+        HandleWebhook,
+        Revoke,
+    }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+provider_contract_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ProviderEvidenceClass {
+        ProbeObservation,
+        Authentication,
+        ReadObservation,
+        PreparedEffect,
+        ReceiptCandidate,
+        ReconciliationObservation,
+        VerificationObservation,
+        WebhookObservation,
+        RevocationObservation,
+    }
+}
+
+provider_contract_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ProviderProvenanceClass {
+        Fixture,
+        ComponentHarness,
+        ControlledProvider,
+        ProductionProvider,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+enum ProviderContractEvidenceLevel {
+    #[serde(rename = "E1")]
+    E1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum ProviderProvenanceClass {
-    Fixture,
-    ComponentHarness,
-    ControlledProvider,
-    ProductionProvider,
+enum ProviderSecretMaterialPolicy {
+    Forbidden,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(transparent)]
+struct ProviderClaimGrant(bool);
+
+impl ProviderClaimGrant {
+    const fn is_denied(&self) -> bool {
+        !self.0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderClaimAuthority {
+    connected: ProviderClaimGrant,
+    provider_execution: ProviderClaimGrant,
+    provider_receipt: ProviderClaimGrant,
+    business_verification: ProviderClaimGrant,
+    e4: ProviderClaimGrant,
+}
+
+impl ProviderClaimAuthority {
+    const fn is_metadata_only(&self) -> bool {
+        self.connected.is_denied()
+            && self.provider_execution.is_denied()
+            && self.provider_receipt.is_denied()
+            && self.business_verification.is_denied()
+            && self.e4.is_denied()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderIdentifierRules {
+    provider_id: String,
+    capability_id: String,
+    adapter_id: String,
+    adapter_version: String,
+    evidence_digest: String,
+}
+
+impl ProviderIdentifierRules {
+    fn validate(&self) -> Result<(), ProviderContractError> {
+        if self.provider_id != PROVIDER_ID_RULE
+            || self.capability_id != CAPABILITY_ID_RULE
+            || self.adapter_id != ADAPTER_ID_RULE
+            || self.adapter_version != ADAPTER_VERSION_RULE
+            || self.evidence_digest != EVIDENCE_DIGEST_RULE
+        {
+            return Err(ProviderContractError::InvalidIdentifierRules);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ProviderOperationEvidenceBindings {
+    probe: ProviderEvidenceClass,
+    begin_auth: ProviderEvidenceClass,
+    refresh: ProviderEvidenceClass,
+    read: ProviderEvidenceClass,
+    prepare_effect: ProviderEvidenceClass,
+    execute: ProviderEvidenceClass,
+    reconcile: ProviderEvidenceClass,
+    verify: ProviderEvidenceClass,
+    handle_webhook: ProviderEvidenceClass,
+    revoke: ProviderEvidenceClass,
+}
+
+impl ProviderOperationEvidenceBindings {
+    const fn entries(
+        &self,
+    ) -> [(ProviderAdapterOperation, ProviderEvidenceClass); ProviderAdapterOperation::ALL.len()]
+    {
+        [
+            (ProviderAdapterOperation::Probe, self.probe),
+            (ProviderAdapterOperation::BeginAuth, self.begin_auth),
+            (ProviderAdapterOperation::Refresh, self.refresh),
+            (ProviderAdapterOperation::Read, self.read),
+            (ProviderAdapterOperation::PrepareEffect, self.prepare_effect),
+            (ProviderAdapterOperation::Execute, self.execute),
+            (ProviderAdapterOperation::Reconcile, self.reconcile),
+            (ProviderAdapterOperation::Verify, self.verify),
+            (ProviderAdapterOperation::HandleWebhook, self.handle_webhook),
+            (ProviderAdapterOperation::Revoke, self.revoke),
+        ]
+    }
+
+    fn validate(&self) -> Result<(), ProviderContractError> {
+        for (operation, evidence_class) in self.entries() {
+            if expected_evidence_class(operation) != evidence_class {
+                return Err(ProviderContractError::InvalidEvidenceBinding);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderAdapterContractDocument {
+    schema_version: String,
+    contract_version: String,
+    registry_version: String,
+    evidence_level: ProviderContractEvidenceLevel,
+    secret_material: ProviderSecretMaterialPolicy,
+    validation_authority: ProviderEvidenceAuthority,
+    claim_authority: ProviderClaimAuthority,
+    identifier_rules: ProviderIdentifierRules,
+    operations: Vec<ProviderAdapterOperation>,
+    evidence_classes: Vec<ProviderEvidenceClass>,
+    provenance_classes: Vec<ProviderProvenanceClass>,
+    operation_evidence_bindings: ProviderOperationEvidenceBindings,
+    registrations: Vec<ProviderCapabilitySupport>,
+}
+
+impl ProviderAdapterContractDocument {
+    fn into_registry(self) -> Result<ProviderAdapterRegistry, ProviderContractError> {
+        self.validate()?;
+        let registry = ProviderAdapterRegistry {
+            schema_version: self.schema_version,
+            contract_version: self.contract_version,
+            registry_version: self.registry_version,
+            registrations: self.registrations,
+        };
+        registry.validate()?;
+        Ok(registry)
+    }
+
+    fn validate(&self) -> Result<(), ProviderContractError> {
+        if self.schema_version != PROVIDER_ADAPTER_CONTRACT_SCHEMA_VERSION {
+            return Err(ProviderContractError::InvalidSchemaVersion);
+        }
+        if self.contract_version != PROVIDER_ADAPTER_CONTRACT_VERSION {
+            return Err(ProviderContractError::InvalidContractVersion);
+        }
+        if self.evidence_level != ProviderContractEvidenceLevel::E1 {
+            return Err(ProviderContractError::InvalidEvidenceLevel);
+        }
+        if self.secret_material != ProviderSecretMaterialPolicy::Forbidden {
+            return Err(ProviderContractError::InvalidSecretMaterialPolicy);
+        }
+        if self.validation_authority != ProviderEvidenceAuthority::MetadataBindingOnly {
+            return Err(ProviderContractError::InvalidValidationAuthority);
+        }
+        if !self.claim_authority.is_metadata_only() {
+            return Err(ProviderContractError::InvalidClaimAuthority);
+        }
+        self.identifier_rules.validate()?;
+        validate_exact_contract_set(
+            &self.operations,
+            ProviderAdapterOperation::ALL,
+            "operations",
+        )?;
+        validate_exact_contract_set(
+            &self.evidence_classes,
+            ProviderEvidenceClass::ALL,
+            "evidence classes",
+        )?;
+        validate_exact_contract_set(
+            &self.provenance_classes,
+            ProviderProvenanceClass::ALL,
+            "provenance classes",
+        )?;
+        let binding_entries = self.operation_evidence_bindings.entries();
+        let binding_operations = binding_entries
+            .iter()
+            .map(|(operation, _)| *operation)
+            .collect::<BTreeSet<_>>();
+        let binding_evidence = binding_entries
+            .iter()
+            .map(|(_, evidence_class)| *evidence_class)
+            .collect::<BTreeSet<_>>();
+        let declared_operations = self.operations.iter().copied().collect::<BTreeSet<_>>();
+        let declared_evidence = self
+            .evidence_classes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if binding_operations != declared_operations || binding_evidence != declared_evidence {
+            return Err(ProviderContractError::InvalidOperationEvidenceClosure);
+        }
+        self.operation_evidence_bindings.validate()?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderEvidenceSupport {
     operation: ProviderAdapterOperation,
     evidence_class: ProviderEvidenceClass,
@@ -176,11 +407,11 @@ impl ProviderEvidenceSupport {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderCapabilitySupport {
     key: ProviderCapabilityKey,
     adapter: ProviderAdapterIdentity,
-    evidence_support: BTreeSet<ProviderEvidenceSupport>,
+    evidence_support: Vec<ProviderEvidenceSupport>,
 }
 
 impl ProviderCapabilitySupport {
@@ -206,7 +437,7 @@ impl ProviderCapabilitySupport {
         &self.adapter
     }
 
-    pub const fn evidence_support(&self) -> &BTreeSet<ProviderEvidenceSupport> {
+    pub fn evidence_support(&self) -> &[ProviderEvidenceSupport] {
         &self.evidence_support
     }
 
@@ -216,6 +447,11 @@ impl ProviderCapabilitySupport {
         if self.evidence_support.is_empty() {
             return Err(ProviderContractError::EmptySupportSurface);
         }
+        if self.evidence_support.iter().collect::<BTreeSet<_>>().len()
+            != self.evidence_support.len()
+        {
+            return Err(ProviderContractError::DuplicateEvidenceSupport);
+        }
         for support in &self.evidence_support {
             support.validate()?;
         }
@@ -224,7 +460,7 @@ impl ProviderCapabilitySupport {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderCapabilityEvidenceClaim {
     contract_version: String,
     registry_version: String,
@@ -292,7 +528,7 @@ impl ProviderCapabilityEvidenceClaim {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderAdapterRegistry {
     schema_version: String,
     contract_version: String,
@@ -301,13 +537,14 @@ pub struct ProviderAdapterRegistry {
 }
 
 impl ProviderAdapterRegistry {
-    pub fn contract_baseline() -> Self {
-        Self {
-            schema_version: PROVIDER_ADAPTER_CONTRACT_SCHEMA_VERSION.into(),
-            contract_version: PROVIDER_ADAPTER_CONTRACT_VERSION.into(),
-            registry_version: PROVIDER_ADAPTER_BASELINE_REGISTRY_VERSION.into(),
-            registrations: Vec::new(),
-        }
+    pub fn contract_baseline() -> Result<Self, ProviderContractError> {
+        Self::from_contract_json(PROVIDER_ADAPTER_CONTRACT_JSON)
+    }
+
+    pub fn from_contract_json(contract_json: &str) -> Result<Self, ProviderContractError> {
+        serde_json::from_str::<ProviderAdapterContractDocument>(contract_json)
+            .map_err(|_| ProviderContractError::InvalidContractDocument)?
+            .into_registry()
     }
 
     pub fn new(
@@ -425,6 +662,24 @@ pub enum ProviderContractError {
     InvalidSchemaVersion,
     #[error("Provider adapter contract version is not supported")]
     InvalidContractVersion,
+    #[error("Provider adapter contract JSON is malformed, incomplete, duplicated, or unknown")]
+    InvalidContractDocument,
+    #[error("Provider adapter contract evidence level is not supported")]
+    InvalidEvidenceLevel,
+    #[error("Provider adapter contract secret-material policy is not supported")]
+    InvalidSecretMaterialPolicy,
+    #[error("Provider adapter contract validation authority is not supported")]
+    InvalidValidationAuthority,
+    #[error("Provider adapter contract claim authority must deny product authority")]
+    InvalidClaimAuthority,
+    #[error("Provider adapter contract identifier rules do not match the validator")]
+    InvalidIdentifierRules,
+    #[error("Provider adapter contract repeats a value in {0}")]
+    DuplicateContractValue(&'static str),
+    #[error("Provider adapter contract does not declare the exact {0} set")]
+    ContractSetMismatch(&'static str),
+    #[error("Provider adapter operation/evidence bindings are not a closed exact mapping")]
+    InvalidOperationEvidenceClosure,
     #[error("Provider adapter registry version is invalid")]
     InvalidRegistryVersion,
     #[error("Provider adapter evidence targets another registry version")]
@@ -441,6 +696,8 @@ pub enum ProviderContractError {
     InvalidEvidenceBinding,
     #[error("Provider capability support surface is empty")]
     EmptySupportSurface,
+    #[error("Provider capability support surface contains duplicate evidence metadata")]
+    DuplicateEvidenceSupport,
     #[error("Provider capability is registered more than once")]
     DuplicateCapabilityKey,
     #[error("Provider evidence digest is not canonical SHA-256")]
@@ -451,6 +708,21 @@ pub enum ProviderContractError {
     AdapterIdentityMismatch,
     #[error("Provider evidence or provenance class is outside the registered support surface")]
     UnsupportedEvidence,
+}
+
+fn validate_exact_contract_set<T: Copy + Ord>(
+    values: &[T],
+    expected: &[T],
+    label: &'static str,
+) -> Result<(), ProviderContractError> {
+    let actual = values.iter().copied().collect::<BTreeSet<_>>();
+    if actual.len() != values.len() {
+        return Err(ProviderContractError::DuplicateContractValue(label));
+    }
+    if actual != expected.iter().copied().collect::<BTreeSet<_>>() {
+        return Err(ProviderContractError::ContractSetMismatch(label));
+    }
+    Ok(())
 }
 
 const fn expected_evidence_class(operation: ProviderAdapterOperation) -> ProviderEvidenceClass {
@@ -516,6 +788,39 @@ fn is_canonical_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+
+    fn contract_value() -> Value {
+        serde_json::from_str(PROVIDER_ADAPTER_CONTRACT_JSON).expect("checked-in contract JSON")
+    }
+
+    fn parse_tampered_contract(
+        tamper: impl FnOnce(&mut Value),
+    ) -> Result<ProviderAdapterRegistry, ProviderContractError> {
+        let mut value = contract_value();
+        tamper(&mut value);
+        ProviderAdapterRegistry::from_contract_json(
+            &serde_json::to_string(&value).expect("tampered contract JSON"),
+        )
+    }
+
+    fn registration_value() -> Value {
+        json!({
+            "key": {
+                "providerId": "github",
+                "capabilityId": "publication.verify"
+            },
+            "adapter": {
+                "adapterId": "hartevo.github",
+                "adapterVersion": 1
+            },
+            "evidenceSupport": [{
+                "operation": "read",
+                "evidenceClass": "read_observation",
+                "provenanceClass": "controlled_provider"
+            }]
+        })
+    }
 
     fn key() -> ProviderCapabilityKey {
         ProviderCapabilityKey::new("github", "publication.verify").expect("key")
@@ -563,26 +868,29 @@ mod tests {
 
     #[test]
     fn checked_in_contract_is_e1_metadata_with_an_empty_registry() {
-        let baseline = ProviderAdapterRegistry::contract_baseline();
+        let baseline = ProviderAdapterRegistry::contract_baseline().expect("typed contract");
         baseline.validate().expect("baseline");
         assert!(baseline.is_empty());
+        assert_eq!(
+            baseline.schema_version,
+            PROVIDER_ADAPTER_CONTRACT_SCHEMA_VERSION
+        );
+        assert_eq!(baseline.contract_version, PROVIDER_ADAPTER_CONTRACT_VERSION);
         assert_eq!(
             baseline.authority(),
             ProviderEvidenceAuthority::MetadataBindingOnly
         );
-        assert!(PROVIDER_ADAPTER_CONTRACT_JSON.contains("\"evidenceLevel\": \"E1\""));
-        assert!(PROVIDER_ADAPTER_CONTRACT_JSON.contains("\"registrations\": []"));
-        assert!(PROVIDER_ADAPTER_CONTRACT_JSON.contains("\"connected\": false"));
-        assert!(PROVIDER_ADAPTER_CONTRACT_JSON.contains("\"e4\": false"));
     }
 
     #[test]
     fn empty_registry_fails_closed_for_all_evidence() {
-        let error = ProviderAdapterRegistry::contract_baseline()
+        let baseline = ProviderAdapterRegistry::contract_baseline().expect("typed contract");
+        let registry_version = baseline.registry_version().to_owned();
+        let error = baseline
             .validate_evidence(
                 &ProviderCapabilityEvidenceClaim::new(
                     PROVIDER_ADAPTER_CONTRACT_VERSION,
-                    PROVIDER_ADAPTER_BASELINE_REGISTRY_VERSION,
+                    registry_version,
                     key(),
                     adapter(1),
                     ProviderAdapterOperation::Read,
@@ -709,6 +1017,298 @@ mod tests {
                 std::iter::empty::<ProviderEvidenceSupport>(),
             ),
             Err(ProviderContractError::EmptySupportSurface)
+        );
+    }
+
+    #[test]
+    fn top_level_unknown_missing_and_duplicate_fields_fail_closed() {
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value
+                    .as_object_mut()
+                    .expect("contract object")
+                    .insert("unknownField".into(), json!(true));
+            }),
+            Err(ProviderContractError::InvalidContractDocument)
+        );
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value
+                    .as_object_mut()
+                    .expect("contract object")
+                    .remove("registrations");
+            }),
+            Err(ProviderContractError::InvalidContractDocument)
+        );
+
+        let duplicate_schema = PROVIDER_ADAPTER_CONTRACT_JSON.replacen(
+            "{\n",
+            "{\n  \"schemaVersion\": \"hartevo-provider-adapter-contract/v1\",\n",
+            1,
+        );
+        assert_eq!(
+            ProviderAdapterRegistry::from_contract_json(&duplicate_schema),
+            Err(ProviderContractError::InvalidContractDocument)
+        );
+    }
+
+    #[test]
+    fn schema_contract_and_authority_tamper_fail_closed() {
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["schemaVersion"] = json!("hartevo-provider-adapter-contract/v2");
+            }),
+            Err(ProviderContractError::InvalidSchemaVersion)
+        );
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["contractVersion"] = json!("provider-adapter-e1/v2");
+            }),
+            Err(ProviderContractError::InvalidContractVersion)
+        );
+        for field_and_value in [
+            ("evidenceLevel", "E4"),
+            ("secretMaterial", "allowed"),
+            ("validationAuthority", "connected"),
+        ] {
+            assert_eq!(
+                parse_tampered_contract(|value| {
+                    value[field_and_value.0] = json!(field_and_value.1);
+                }),
+                Err(ProviderContractError::InvalidContractDocument)
+            );
+        }
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["claimAuthority"]["connected"] = json!(true);
+            }),
+            Err(ProviderContractError::InvalidClaimAuthority)
+        );
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["identifierRules"]["providerId"] = json!("any string");
+            }),
+            Err(ProviderContractError::InvalidIdentifierRules)
+        );
+    }
+
+    #[test]
+    fn operation_set_duplicate_missing_and_unknown_values_fail_closed() {
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["operations"]
+                    .as_array_mut()
+                    .expect("operations")
+                    .push(json!("probe"));
+            }),
+            Err(ProviderContractError::DuplicateContractValue("operations"))
+        );
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["operations"]
+                    .as_array_mut()
+                    .expect("operations")
+                    .pop();
+            }),
+            Err(ProviderContractError::ContractSetMismatch("operations"))
+        );
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["operations"][0] = json!("unknown_operation");
+            }),
+            Err(ProviderContractError::InvalidContractDocument)
+        );
+    }
+
+    #[test]
+    fn evidence_set_duplicate_missing_and_unknown_values_fail_closed() {
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["evidenceClasses"]
+                    .as_array_mut()
+                    .expect("evidence classes")
+                    .push(json!("probe_observation"));
+            }),
+            Err(ProviderContractError::DuplicateContractValue(
+                "evidence classes"
+            ))
+        );
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["evidenceClasses"]
+                    .as_array_mut()
+                    .expect("evidence classes")
+                    .pop();
+            }),
+            Err(ProviderContractError::ContractSetMismatch(
+                "evidence classes"
+            ))
+        );
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["evidenceClasses"][0] = json!("unknown_evidence");
+            }),
+            Err(ProviderContractError::InvalidContractDocument)
+        );
+    }
+
+    #[test]
+    fn provenance_set_duplicate_missing_and_unknown_values_fail_closed() {
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["provenanceClasses"]
+                    .as_array_mut()
+                    .expect("provenance classes")
+                    .push(json!("fixture"));
+            }),
+            Err(ProviderContractError::DuplicateContractValue(
+                "provenance classes"
+            ))
+        );
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["provenanceClasses"]
+                    .as_array_mut()
+                    .expect("provenance classes")
+                    .pop();
+            }),
+            Err(ProviderContractError::ContractSetMismatch(
+                "provenance classes"
+            ))
+        );
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["provenanceClasses"][0] = json!("unknown_provenance");
+            }),
+            Err(ProviderContractError::InvalidContractDocument)
+        );
+    }
+
+    #[test]
+    fn operation_evidence_binding_closure_and_exact_mapping_fail_closed() {
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["operationEvidenceBindings"]["execute"] = json!("read_observation");
+            }),
+            Err(ProviderContractError::InvalidOperationEvidenceClosure)
+        );
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["operationEvidenceBindings"]["read"] = json!("receipt_candidate");
+                value["operationEvidenceBindings"]["execute"] = json!("read_observation");
+            }),
+            Err(ProviderContractError::InvalidEvidenceBinding)
+        );
+    }
+
+    #[test]
+    fn operation_evidence_binding_unknown_missing_and_duplicate_fields_fail_closed() {
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["operationEvidenceBindings"]
+                    .as_object_mut()
+                    .expect("bindings")
+                    .insert("unknown_operation".into(), json!("read_observation"));
+            }),
+            Err(ProviderContractError::InvalidContractDocument)
+        );
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["operationEvidenceBindings"]
+                    .as_object_mut()
+                    .expect("bindings")
+                    .remove("verify");
+            }),
+            Err(ProviderContractError::InvalidContractDocument)
+        );
+
+        let duplicate_binding = PROVIDER_ADAPTER_CONTRACT_JSON.replacen(
+            "    \"probe\": \"probe_observation\",\n",
+            concat!(
+                "    \"probe\": \"probe_observation\",\n",
+                "    \"probe\": \"probe_observation\",\n"
+            ),
+            1,
+        );
+        assert_eq!(
+            ProviderAdapterRegistry::from_contract_json(&duplicate_binding),
+            Err(ProviderContractError::InvalidContractDocument)
+        );
+    }
+
+    #[test]
+    fn registrations_are_fully_typed_and_duplicate_metadata_fails_closed() {
+        let parsed = parse_tampered_contract(|value| {
+            value["registrations"]
+                .as_array_mut()
+                .expect("registrations")
+                .push(registration_value());
+        })
+        .expect("typed E1 registration");
+        assert_eq!(parsed.registrations().len(), 1);
+        assert_eq!(
+            parsed.authority(),
+            ProviderEvidenceAuthority::MetadataBindingOnly
+        );
+
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                let registrations = value["registrations"]
+                    .as_array_mut()
+                    .expect("registrations");
+                registrations.push(registration_value());
+                registrations.push(registration_value());
+            }),
+            Err(ProviderContractError::DuplicateCapabilityKey)
+        );
+
+        let mut duplicate_support = registration_value();
+        let support = duplicate_support["evidenceSupport"][0].clone();
+        duplicate_support["evidenceSupport"]
+            .as_array_mut()
+            .expect("evidence support")
+            .push(support);
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["registrations"]
+                    .as_array_mut()
+                    .expect("registrations")
+                    .push(duplicate_support);
+            }),
+            Err(ProviderContractError::DuplicateEvidenceSupport)
+        );
+    }
+
+    #[test]
+    fn registration_unknown_and_missing_fields_fail_closed() {
+        let mut unknown = registration_value();
+        unknown["key"]
+            .as_object_mut()
+            .expect("key")
+            .insert("unknownField".into(), json!(true));
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["registrations"]
+                    .as_array_mut()
+                    .expect("registrations")
+                    .push(unknown);
+            }),
+            Err(ProviderContractError::InvalidContractDocument)
+        );
+
+        let mut missing = registration_value();
+        missing["adapter"]
+            .as_object_mut()
+            .expect("adapter")
+            .remove("adapterVersion");
+        assert_eq!(
+            parse_tampered_contract(|value| {
+                value["registrations"]
+                    .as_array_mut()
+                    .expect("registrations")
+                    .push(missing);
+            }),
+            Err(ProviderContractError::InvalidContractDocument)
         );
     }
 }
