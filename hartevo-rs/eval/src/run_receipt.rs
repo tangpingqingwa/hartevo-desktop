@@ -713,10 +713,13 @@ impl EvidenceLocator {
     fn validate_shape(&self) -> Result<()> {
         match self {
             Self::RunRelative { path } => validate_relative_locator(path),
-            Self::PrivateOpaque { handle_digest } => ensure!(
-                is_lower_hex(handle_digest, 64),
-                "private opaque handle must be a 64-hex digest"
-            ),
+            Self::PrivateOpaque { handle_digest } => {
+                ensure!(
+                    is_lower_hex(handle_digest, 64),
+                    "private opaque handle must be a 64-hex digest"
+                );
+                Ok(())
+            }
         }
     }
 
