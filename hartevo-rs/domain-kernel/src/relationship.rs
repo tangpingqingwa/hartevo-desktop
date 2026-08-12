@@ -1002,7 +1002,8 @@ impl Conversation {
         receipt_id: ReceiptId,
         provider_event_digest: impl Into<String>,
         generation: u64,
-        sent_at: DateTime<Utc>,
+        receipt_accepted_at: DateTime<Utc>,
+        projected_at: DateTime<Utc>,
     ) -> Result<(), RelationshipError> {
         if !self.authorizes_agent_effect(effect_id, generation)
             || receipt_id.as_str().trim().is_empty()
@@ -1021,15 +1022,18 @@ impl Conversation {
             return Err(RelationshipError::WebhookReplayConflict);
         }
         let message_index = self.prepared_message_index(effect_id)?;
-        let next_revision = self.prepare_bump(sent_at)?;
+        if receipt_accepted_at > projected_at {
+            return Err(RelationshipError::InvalidConversationMessage);
+        }
+        let next_revision = self.prepare_bump(projected_at)?;
         let message = &mut self.messages[message_index];
         message.delivery = MessageDelivery::Sent {
             effect_id: effect_id.clone(),
             receipt_id,
         };
         message.provider_event_digest = Some(provider_event_digest);
-        message.delivered_at = Some(sent_at);
-        self.commit_bump(next_revision, sent_at);
+        message.delivered_at = Some(receipt_accepted_at);
+        self.commit_bump(next_revision, projected_at);
         Ok(())
     }
 
@@ -1733,7 +1737,7 @@ fn replay_sent_delivery(
     next_message: &ConversationMessage,
     effect_id: &EffectId,
     receipt_id: &ReceiptId,
-    reconciled_at: DateTime<Utc>,
+    projected_at: DateTime<Utc>,
 ) -> Result<(), RelationshipError> {
     let provider_event_digest = next_message
         .provider_event_digest
@@ -1749,7 +1753,7 @@ fn replay_sent_delivery(
             provider_event_digest,
             next_message.control_generation,
             delivered_at,
-            reconciled_at,
+            projected_at,
         )
     } else {
         candidate.record_agent_reply(
@@ -1758,6 +1762,7 @@ fn replay_sent_delivery(
             provider_event_digest,
             next_message.control_generation,
             delivered_at,
+            projected_at,
         )
     }
 }
@@ -3067,6 +3072,7 @@ mod tests {
                 "9".repeat(64),
                 1,
                 now(),
+                now(),
             ),
             Err(RelationshipError::ControlLeaseLost)
         );
@@ -3218,6 +3224,97 @@ mod tests {
             dead_lettered
                 .follows_command(&initial)
                 .expect("replay dead letter")
+        );
+    }
+
+    #[test]
+    fn agent_reply_fact_and_projection_times_are_ordered_and_fail_closed() {
+        let mut prepared = conversation();
+        prepared
+            .ingest_inbound(
+                inbound(
+                    "message-agent-reply-time",
+                    'b',
+                    ConversationContentRisk::Safe,
+                ),
+                &attestation(),
+            )
+            .expect("inbound");
+        let effect_id = EffectId::from("reply-effect-time");
+        prepared
+            .prepare_automatic_reply(
+                MessageId::from("reply-time"),
+                "f".repeat(64),
+                effect_id.clone(),
+                1,
+                AutomatedReplyAuthorization::Consent(&automated_reply_consent()),
+                now(),
+            )
+            .expect("prepared reply");
+
+        let receipt_accepted_at = now() + Duration::seconds(1);
+        let projected_at = now() + Duration::seconds(2);
+        let mut reversed = prepared.clone();
+        let before_reversed = reversed.clone();
+        assert_eq!(
+            reversed.record_agent_reply(
+                &effect_id,
+                ReceiptId::from("receipt-time-reversed"),
+                "8".repeat(64),
+                1,
+                projected_at,
+                receipt_accepted_at,
+            ),
+            Err(RelationshipError::InvalidConversationMessage)
+        );
+        assert_eq!(reversed, before_reversed);
+
+        let mut aggregate_regression = prepared.clone();
+        let before_aggregate_regression = aggregate_regression.clone();
+        let message_count_before_aggregate_regression = aggregate_regression.messages.len();
+        let projected_before_aggregate = before_aggregate_regression
+            .updated_at
+            .checked_sub_signed(Duration::seconds(1))
+            .expect("stable aggregate regression fixture");
+        assert_eq!(
+            aggregate_regression.record_agent_reply(
+                &effect_id,
+                ReceiptId::from("receipt-time-aggregate-regression"),
+                "7".repeat(64),
+                1,
+                projected_before_aggregate,
+                projected_before_aggregate,
+            ),
+            Err(RelationshipError::TimestampRegression)
+        );
+        assert_eq!(aggregate_regression, before_aggregate_regression);
+        assert_eq!(
+            aggregate_regression.messages.len(),
+            message_count_before_aggregate_regression
+        );
+
+        let mut same_time = prepared;
+        same_time
+            .record_agent_reply(
+                &effect_id,
+                ReceiptId::from("receipt-time-equal"),
+                "9".repeat(64),
+                1,
+                receipt_accepted_at,
+                receipt_accepted_at,
+            )
+            .expect("equal fact and projection times remain valid");
+        let sent_message = same_time
+            .messages
+            .iter()
+            .find(|message| message.id == MessageId::from("reply-time"))
+            .expect("sent reply");
+        assert_eq!(sent_message.delivered_at, Some(receipt_accepted_at));
+        assert_eq!(same_time.updated_at, receipt_accepted_at);
+        assert!(
+            same_time
+                .follows_command(&before_reversed)
+                .expect("same-time sent reply replay")
         );
     }
 
@@ -3412,15 +3509,29 @@ mod tests {
                 },
             )
             .expect("record independent verification");
+        let projected_at = now() + Duration::seconds(6);
         let mut sent = prepared.clone();
         sent.record_agent_reply(
             &effect_id,
-            receipt.id,
+            receipt.id.clone(),
             provider_event_digest,
             prepared_reply.control_generation,
             receipt.accepted_at,
+            projected_at,
         )
         .expect("record sent reply");
+        let sent_message = sent
+            .messages
+            .iter()
+            .find(|message| message.id == MessageId::from("reply-exact"))
+            .expect("sent reply message");
+        assert_eq!(sent_message.delivered_at, Some(receipt.accepted_at));
+        assert_eq!(sent.updated_at, projected_at);
+        assert!(sent.updated_at > sent_message.delivered_at.expect("delivery fact"));
+        let sent: Conversation = serde_json::from_value(
+            serde_json::to_value(&sent).expect("serialize split-time sent reply"),
+        )
+        .expect("restore split-time sent reply");
 
         sent.validate_snapshot(
             &identity,
