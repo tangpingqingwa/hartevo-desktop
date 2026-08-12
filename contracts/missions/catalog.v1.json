@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-mission-catalog/v1",
-  "catalogVersion": "desktop-2026-08-12-v10",
+  "catalogVersion": "desktop-2026-08-12-v11",
   "missions": [
     {
       "id": "VM-00",
@@ -225,7 +225,7 @@
     },
     {
       "id": "VM-08",
-      "version": 3,
+      "version": 4,
       "title": "Marketplace and Listing Operator",
       "goal": "Continuously prioritize and verify marketplace product and listing improvements while separating first-party facts from estimates.",
       "modes": ["campaign", "continuous_operator"],
@@ -239,15 +239,15 @@
         {"checkpointId":"opportunity_queue","capabilityId":"decision.evaluate","executor":"application","oracleIds":["decision","work_product","operating_state"],"completionPolicy":"deterministic_evidence"},
         {"checkpointId":"listing_evidence_fix_pack","capabilityId":"content.draft","executor":"runtime","oracleIds":["truth","decision","work_product","operating_state"],"completionPolicy":"work_product"},
         {"checkpointId":"selective_approval","capabilityId":"marketplace.write","executor":"human","oracleIds":["decision","work_product","operating_state"],"completionPolicy":"human_confirmation"},
-        {"checkpointId":"listing_write_readback","capabilityId":"publication.verify","executor":"effect_broker","oracleIds":["truth","work_product","effect","operating_state"],"completionPolicy":"verified_effect"},
+        {"checkpointId":"listing_write_readback","capabilityId":"marketplace.write","executor":"effect_broker","oracleIds":["truth","work_product","effect","operating_state"],"completionPolicy":"effect_readback_v2"},
         {"checkpointId":"conversion_return_rank_profit_review","capabilityId":"outcome.review","executor":"application","oracleIds":["goal","decision","operating_state","outcome"],"completionPolicy":"deterministic_evidence"}
       ],
-      "requiredArtifacts": ["demand_radar", "review_return_map", "marketplace_opportunity_queue", "listing_fix_pack", "listing_update_receipt", "marketplace_review"],
-      "capabilityIds": ["marketplace.read", "research.discover", "decision.evaluate", "content.draft", "marketplace.write", "publication.verify", "attribution.compute", "outcome.review"],
+      "requiredArtifacts": ["demand_radar", "review_return_map", "marketplace_opportunity_queue", "listing_fix_pack", "listing_effect_receipt_candidate", "listing_account_readback_verification", "marketplace_review"],
+      "capabilityIds": ["marketplace.read", "research.discover", "decision.evaluate", "content.draft", "marketplace.write", "attribution.compute", "outcome.review"],
       "providerIds": ["amazon-sp-api", "sorftime"],
       "oracleIds": ["goal", "truth", "decision", "work_product", "effect", "operating_state", "outcome"],
-      "failureFamilies": ["seller_market_mismatch", "estimate_as_first_party", "missing_listing_fields", "currency_mismatch", "unsafe_compatibility_claim", "partial_update", "readback_mismatch", "mission_not_applicable"],
-      "evidenceTargets": {"e3": "listing diff, selective approval and readback replay", "e4": "Amazon SP-API and Sorftime controlled boundaries", "e5": "five projects with ninety days of opportunity-to-result evidence"}
+      "failureFamilies": ["seller_market_mismatch", "estimate_as_first_party", "missing_listing_fields", "currency_mismatch", "unsafe_compatibility_claim", "partial_update", "missing_receipt_correlation", "readback_not_independent", "readback_mismatch", "corroboration_as_confirmation", "mission_not_applicable"],
+      "evidenceTargets": {"e3": "listing diff, selective approval, ReceiptCandidate correlation and independent account-readback replay", "e4": "Amazon SP-API write/account-read boundaries with Sorftime estimate-only corroboration", "e5": "five projects with ninety days of opportunity-to-result evidence"}
     },
     {
       "id": "VM-09",
