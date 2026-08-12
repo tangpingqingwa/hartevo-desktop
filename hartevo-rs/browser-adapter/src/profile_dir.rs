@@ -1,9 +1,8 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use hartevo_domain_kernel::BrowserProfileId;
 use serde::{Deserialize, Serialize};
@@ -13,8 +12,10 @@ use crate::workspace::{digest, digest_json};
 use crate::{BrowserError, BrowserProfile, BrowserProfileSource, BrowserProfileStatus};
 
 const PROFILE_BINDING_SCHEMA_VERSION: u32 = 1;
+const PROFILE_OWNERSHIP_LOCK_SCHEMA_VERSION: u32 = 1;
+const PROFILE_OWNERSHIP_LOCK_FILE: &str = "host.lock";
+const PROFILE_OWNERSHIP_TOKEN_BYTES: u64 = 64;
 const MAX_MARKER_BYTES: u64 = 64 * 1_024;
-static PROFILE_LOCK_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct BrowserExecutableIdentity {
@@ -119,8 +120,9 @@ pub struct ManagedProfileDirectory {
     private_home_directory: PathBuf,
     private_temp_directory: PathBuf,
     binding_digest: String,
-    lock_path: PathBuf,
-    lock_digest: String,
+    // The open file owns the kernel lock. Dropping it releases ownership even
+    // when the process exits without running a custom cleanup path.
+    _ownership_lock: File,
 }
 
 impl ManagedProfileDirectory {
@@ -174,23 +176,10 @@ impl ManagedProfileDirectory {
             create_or_validate_private_directory(directory, &binding_directory)?;
         }
 
-        let lock_path = binding_directory.join("host.lock");
-        reject_symlink_if_present(&lock_path)?;
-        let lock_digest = new_lock_digest(&binding_digest)?;
-        let mut lock = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    BrowserError::ProfileInUse
-                } else {
-                    BrowserError::Io(error)
-                }
-            })?;
-        set_private_file_permissions(&lock_path)?;
-        lock.write_all(lock_digest.as_bytes())?;
-        lock.sync_all()?;
+        let ownership_lock = acquire_profile_ownership_lock(
+            &binding_directory.join(PROFILE_OWNERSHIP_LOCK_FILE),
+            &binding_digest,
+        )?;
 
         Ok(Self {
             binding_directory,
@@ -198,8 +187,7 @@ impl ManagedProfileDirectory {
             private_home_directory,
             private_temp_directory,
             binding_digest,
-            lock_path,
-            lock_digest,
+            _ownership_lock: ownership_lock,
         })
     }
 
@@ -218,13 +206,6 @@ impl ManagedProfileDirectory {
     pub fn binding_digest(&self) -> &str {
         &self.binding_digest
     }
-
-    fn release_lock(&self) {
-        let current = fs::read_to_string(&self.lock_path).ok();
-        if current.as_deref() == Some(self.lock_digest.as_str()) {
-            let _ = fs::remove_file(&self.lock_path);
-        }
-    }
 }
 
 impl fmt::Debug for ManagedProfileDirectory {
@@ -240,12 +221,6 @@ impl fmt::Debug for ManagedProfileDirectory {
     }
 }
 
-impl Drop for ManagedProfileDirectory {
-    fn drop(&mut self) {
-        self.release_lock();
-    }
-}
-
 fn profile_scope_digest(profile: &BrowserProfile) -> Result<String, BrowserError> {
     digest_json(&serde_json::json!({
         "schemaVersion": PROFILE_BINDING_SCHEMA_VERSION,
@@ -257,6 +232,100 @@ fn profile_scope_digest(profile: &BrowserProfile) -> Result<String, BrowserError
     }))
 }
 
+fn acquire_profile_ownership_lock(path: &Path, binding_digest: &str) -> Result<File, BrowserError> {
+    let existed_before_open = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(BrowserError::InvalidProfileDirectory);
+            }
+            validate_private_file_permissions(&metadata)?;
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(BrowserError::Io(error)),
+    };
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file() {
+        return Err(BrowserError::InvalidProfileDirectory);
+    }
+    if existed_before_open {
+        validate_private_file_permissions(&opened_metadata)?;
+    } else {
+        set_private_open_file_permissions(&file)?;
+    }
+
+    file.try_lock().map_err(|_| BrowserError::ProfileInUse)?;
+
+    let path_metadata = fs::symlink_metadata(path)?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(BrowserError::InvalidProfileDirectory);
+    }
+    validate_private_file_permissions(&path_metadata)?;
+    validate_same_file_identity(&opened_metadata, &path_metadata)?;
+
+    let expected_token = profile_ownership_token(binding_digest)?;
+    if file.metadata()?.len() == 0 {
+        initialize_profile_ownership_token(&mut file, path, &expected_token)?;
+    } else {
+        validate_profile_ownership_token(&mut file, &expected_token)?;
+    }
+    Ok(file)
+}
+
+fn profile_ownership_token(binding_digest: &str) -> Result<String, BrowserError> {
+    digest_json(&serde_json::json!({
+        "schemaVersion": PROFILE_OWNERSHIP_LOCK_SCHEMA_VERSION,
+        "domain": "hartevo-browser-profile-ownership-lock/v1",
+        "bindingDigest": binding_digest,
+    }))
+}
+
+fn initialize_profile_ownership_token(
+    file: &mut File,
+    path: &Path,
+    expected_token: &str,
+) -> Result<(), BrowserError> {
+    if file.metadata()?.len() != 0 {
+        return Err(BrowserError::ProfileBindingMismatch);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(expected_token.as_bytes())?;
+    file.sync_all()?;
+    validate_profile_ownership_token(file, expected_token)?;
+    sync_parent_directory(path)
+}
+
+fn validate_profile_ownership_token(
+    file: &mut File,
+    expected_token: &str,
+) -> Result<(), BrowserError> {
+    if file.metadata()?.len() != PROFILE_OWNERSHIP_TOKEN_BYTES
+        || expected_token.len()
+            != usize::try_from(PROFILE_OWNERSHIP_TOKEN_BYTES)
+                .map_err(|_| BrowserError::CounterOverflow)?
+    {
+        return Err(BrowserError::ProfileBindingMismatch);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut actual = String::new();
+    file.read_to_string(&mut actual)
+        .map_err(|_| BrowserError::ProfileBindingMismatch)?;
+    if actual != expected_token {
+        return Err(BrowserError::ProfileBindingMismatch);
+    }
+    Ok(())
+}
+
 fn ensure_exact_marker(path: &Path, expected: &ProfileBindingMarker) -> Result<(), BrowserError> {
     reject_symlink_if_present(path)?;
     match OpenOptions::new().write(true).create_new(true).open(path) {
@@ -265,13 +334,16 @@ fn ensure_exact_marker(path: &Path, expected: &ProfileBindingMarker) -> Result<(
             let encoded = serde_json::to_vec(expected)?;
             file.write_all(&encoded)?;
             file.sync_all()?;
+            validate_private_file_permissions(&file.metadata()?)?;
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let file = File::open(path)?;
-            if file.metadata()?.len() > MAX_MARKER_BYTES {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() > MAX_MARKER_BYTES {
                 return Err(BrowserError::ProfileBindingMismatch);
             }
+            validate_private_file_permissions(&metadata)?;
             let actual: ProfileBindingMarker =
                 serde_json::from_reader(file).map_err(|_| BrowserError::ProfileBindingMismatch)?;
             if &actual != expected {
@@ -313,20 +385,6 @@ fn reject_symlink_if_present(path: &Path) -> Result<(), BrowserError> {
     }
 }
 
-fn new_lock_digest(binding_digest: &str) -> Result<String, BrowserError> {
-    let ordinal = PROFILE_LOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| BrowserError::InvalidProfileDirectory)?
-        .as_nanos();
-    digest_json(&serde_json::json!({
-        "bindingDigest": binding_digest,
-        "processId": std::process::id(),
-        "ordinal": ordinal,
-        "timestampNanos": timestamp.to_string(),
-    }))
-}
-
 #[cfg(unix)]
 fn validate_executable_permissions(metadata: &fs::Metadata) -> Result<(), BrowserError> {
     use std::os::unix::fs::PermissionsExt;
@@ -359,6 +417,54 @@ fn validate_private_directory_permissions(_metadata: &fs::Metadata) -> Result<()
 }
 
 #[cfg(unix)]
+fn validate_private_file_permissions(metadata: &fs::Metadata) -> Result<(), BrowserError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        return Err(BrowserError::InvalidProfileDirectory);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_file_permissions(_metadata: &fs::Metadata) -> Result<(), BrowserError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_same_file_identity(
+    opened: &fs::Metadata,
+    path: &fs::Metadata,
+) -> Result<(), BrowserError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if opened.dev() != path.dev() || opened.ino() != path.ino() {
+        return Err(BrowserError::InvalidProfileDirectory);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_same_file_identity(
+    _opened: &fs::Metadata,
+    _path: &fs::Metadata,
+) -> Result<(), BrowserError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), BrowserError> {
+    let parent = path.parent().ok_or(BrowserError::InvalidProfileDirectory)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), BrowserError> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn set_private_directory_permissions(path: &Path) -> Result<(), BrowserError> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -379,6 +485,19 @@ fn set_private_file_permissions(path: &Path) -> Result<(), BrowserError> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn set_private_open_file_permissions(file: &File) -> Result<(), BrowserError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_open_file_permissions(_file: &File) -> Result<(), BrowserError> {
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn set_private_file_permissions(_path: &Path) -> Result<(), BrowserError> {
     Ok(())
@@ -387,6 +506,12 @@ fn set_private_file_permissions(_path: &Path) -> Result<(), BrowserError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    #[cfg(unix)]
+    use std::thread;
+    #[cfg(unix)]
+    use std::time::Duration;
 
     use chrono::{TimeZone, Utc};
     use hartevo_domain_kernel::{
@@ -397,13 +522,20 @@ mod tests {
     use super::*;
     use crate::BrowserIdentity;
 
+    #[cfg(unix)]
+    const PROFILE_LOCK_HELPER_ROOT: &str = "HARTEVO_BROWSER_PROFILE_LOCK_HELPER_ROOT";
+    #[cfg(unix)]
+    const PROFILE_LOCK_HELPER_MODE: &str = "HARTEVO_BROWSER_PROFILE_LOCK_HELPER_MODE";
+
     fn sha(byte: char) -> String {
         byte.to_string().repeat(64)
     }
 
     fn fixture(root: &Path) -> (BrowserProfile, BrowserExecutableIdentity, PathBuf) {
         let executable = root.join("managed-browser");
-        fs::write(&executable, b"managed browser test executable").expect("write executable");
+        if !executable.exists() {
+            fs::write(&executable, b"managed browser test executable").expect("write executable");
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -444,18 +576,131 @@ mod tests {
         (profile, executable_identity, executable)
     }
 
+    fn private_profiles_root(root: &Path) -> PathBuf {
+        let profiles = root.join("profiles");
+        match fs::create_dir(&profiles) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create profiles root: {error}"),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&profiles, fs::Permissions::from_mode(0o700))
+                .expect("private profiles root");
+        }
+        profiles
+    }
+
+    #[cfg(unix)]
+    struct ProfileLockChild {
+        child: Option<Child>,
+        ready_path: PathBuf,
+        release_path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl ProfileLockChild {
+        fn spawn(root: &Path, mode: &str) -> Self {
+            let ready_path = root.join(format!("profile-lock-{mode}.ready"));
+            let release_path = root.join(format!("profile-lock-{mode}.release"));
+            let child = Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("profile_lock_process_fixture")
+                .arg("--nocapture")
+                .env(PROFILE_LOCK_HELPER_ROOT, root)
+                .env(PROFILE_LOCK_HELPER_MODE, mode)
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn profile lock holder");
+            Self {
+                child: Some(child),
+                ready_path,
+                release_path,
+            }
+        }
+
+        fn wait_until_ready(&mut self) {
+            for _ in 0..1_000 {
+                if self.ready_path.exists() {
+                    return;
+                }
+                if let Some(status) = self
+                    .child
+                    .as_mut()
+                    .expect("profile lock child")
+                    .try_wait()
+                    .expect("inspect profile lock child")
+                {
+                    panic!("profile lock child exited before ready: {status}");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("profile lock child did not become ready");
+        }
+
+        fn finish_gracefully(mut self) -> ExitStatus {
+            fs::write(&self.release_path, b"release").expect("release profile lock child");
+            let mut child = self.child.take().expect("profile lock child");
+            child.wait().expect("wait for profile lock child")
+        }
+
+        fn kill_with_sigkill(mut self) -> ExitStatus {
+            let mut child = self.child.take().expect("profile lock child");
+            child.kill().expect("send SIGKILL to profile lock child");
+            child.wait().expect("wait for killed profile lock child")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProfileLockChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_lock_process_fixture() {
+        let Some(root) = std::env::var_os(PROFILE_LOCK_HELPER_ROOT).map(PathBuf::from) else {
+            return;
+        };
+        let mode = std::env::var(PROFILE_LOCK_HELPER_MODE).expect("profile lock helper mode");
+        let (profile, executable, _) = fixture(&root);
+        let profiles = private_profiles_root(&root);
+        let _lease = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
+            .expect("child acquires profile lock");
+        let ready_path = root.join(format!("profile-lock-{mode}.ready"));
+        let release_path = root.join(format!("profile-lock-{mode}.release"));
+        fs::write(ready_path, b"ready").expect("publish profile lock readiness");
+        match mode.as_str() {
+            "graceful" => {
+                for _ in 0..1_000 {
+                    if release_path.exists() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                panic!("profile lock helper was not released");
+            }
+            "sigkill" => loop {
+                thread::sleep(Duration::from_millis(100));
+            },
+            _ => panic!("unknown profile lock helper mode"),
+        }
+    }
+
     #[test]
     fn managed_profile_is_exact_private_locked_and_reusable_after_release() {
         let temp = TempDir::new().expect("temp dir");
         let (profile, executable, _) = fixture(temp.path());
-        let profiles = temp.path().join("profiles");
-        fs::create_dir(&profiles).expect("profiles root");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&profiles, fs::Permissions::from_mode(0o700))
-                .expect("private root");
-        }
+        let profiles = private_profiles_root(temp.path());
         let first = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
             .expect("first profile lease");
         let error = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
@@ -463,7 +708,12 @@ mod tests {
         assert!(matches!(error, BrowserError::ProfileInUse));
         let binding_digest = first.binding_digest().to_owned();
         let chrome_data = first.chrome_data_directory().to_path_buf();
+        let ownership_lock = first.binding_directory.join(PROFILE_OWNERSHIP_LOCK_FILE);
         drop(first);
+        assert!(
+            ownership_lock.exists(),
+            "ownership lock file must be durable"
+        );
         let reopened = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
             .expect("reopen exact profile");
         assert_eq!(reopened.binding_digest(), binding_digest);
@@ -477,14 +727,7 @@ mod tests {
     fn executable_swap_and_marker_tamper_fail_closed() {
         let temp = TempDir::new().expect("temp dir");
         let (profile, executable, executable_path) = fixture(temp.path());
-        let profiles = temp.path().join("profiles");
-        fs::create_dir(&profiles).expect("profiles root");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&profiles, fs::Permissions::from_mode(0o700))
-                .expect("private root");
-        }
+        let profiles = private_profiles_root(temp.path());
         let prepared = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
             .expect("prepare profile");
         drop(prepared);
@@ -505,14 +748,7 @@ mod tests {
 
         let second = TempDir::new().expect("second temp dir");
         let (second_profile, second_executable, _) = fixture(second.path());
-        let second_profiles = second.path().join("profiles");
-        fs::create_dir(&second_profiles).expect("second profiles root");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&second_profiles, fs::Permissions::from_mode(0o700))
-                .expect("second private root");
-        }
+        let second_profiles = private_profiles_root(second.path());
         let second_prepared =
             ManagedProfileDirectory::prepare(&second_profiles, &second_profile, &second_executable)
                 .expect("prepare second profile");
@@ -523,6 +759,129 @@ mod tests {
             ManagedProfileDirectory::prepare(&second_profiles, &second_profile, &second_executable)
                 .expect_err("marker tamper must fail");
         assert!(matches!(error, BrowserError::ProfileBindingMismatch));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn independent_process_lock_blocks_and_releases_after_normal_exit() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut child = ProfileLockChild::spawn(temp.path(), "graceful");
+        child.wait_until_ready();
+        let (profile, executable, _) = fixture(temp.path());
+        let profiles = private_profiles_root(temp.path());
+        assert!(matches!(
+            ManagedProfileDirectory::prepare(&profiles, &profile, &executable),
+            Err(BrowserError::ProfileInUse)
+        ));
+        let status = child.finish_gracefully();
+        assert!(status.success(), "profile lock child failed: {status}");
+        let reopened = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
+            .expect("kernel lock is released after normal process exit");
+        drop(reopened);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn independent_process_lock_releases_after_sigkill() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let temp = TempDir::new().expect("temp dir");
+        let mut child = ProfileLockChild::spawn(temp.path(), "sigkill");
+        child.wait_until_ready();
+        let (profile, executable, _) = fixture(temp.path());
+        let profiles = private_profiles_root(temp.path());
+        assert!(matches!(
+            ManagedProfileDirectory::prepare(&profiles, &profile, &executable),
+            Err(BrowserError::ProfileInUse)
+        ));
+        let status = child.kill_with_sigkill();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        let reopened = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
+            .expect("kernel lock is released after SIGKILL");
+        drop(reopened);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_byte_ownership_lock_initialization_residue_is_recovered() {
+        let temp = TempDir::new().expect("temp dir");
+        let (profile, executable, _) = fixture(temp.path());
+        let profiles = private_profiles_root(temp.path());
+        let prepared = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
+            .expect("prepare initialization fixture");
+        let binding_digest = prepared.binding_digest().to_owned();
+        let lock_path = prepared.binding_directory.join(PROFILE_OWNERSHIP_LOCK_FILE);
+        drop(prepared);
+
+        let residue = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&lock_path)
+            .expect("truncate ownership token before simulated crash");
+        residue.sync_all().expect("sync zero-byte residue");
+        drop(residue);
+        assert_eq!(fs::metadata(&lock_path).expect("lock metadata").len(), 0);
+
+        let recovered = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
+            .expect("recover zero-byte initialization residue under the kernel lock");
+        assert_eq!(recovered.binding_digest(), binding_digest);
+        drop(recovered);
+        assert_eq!(
+            fs::read_to_string(&lock_path).expect("recovered ownership token"),
+            profile_ownership_token(&binding_digest).expect("expected ownership token")
+        );
+        let reopened = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
+            .expect("reopen recovered ownership lock");
+        drop(reopened);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_token_symlink_and_permissions_tamper_fail_closed() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let token_temp = TempDir::new().expect("token temp dir");
+        let (profile, executable, _) = fixture(token_temp.path());
+        let profiles = private_profiles_root(token_temp.path());
+        let prepared = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
+            .expect("prepare token fixture");
+        let lock_path = prepared.binding_directory.join(PROFILE_OWNERSHIP_LOCK_FILE);
+        drop(prepared);
+        fs::write(&lock_path, "f".repeat(64)).expect("tamper ownership token");
+        assert!(matches!(
+            ManagedProfileDirectory::prepare(&profiles, &profile, &executable),
+            Err(BrowserError::ProfileBindingMismatch)
+        ));
+
+        let symlink_temp = TempDir::new().expect("symlink temp dir");
+        let (profile, executable, _) = fixture(symlink_temp.path());
+        let profiles = private_profiles_root(symlink_temp.path());
+        let prepared = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
+            .expect("prepare symlink fixture");
+        let lock_path = prepared.binding_directory.join(PROFILE_OWNERSHIP_LOCK_FILE);
+        drop(prepared);
+        fs::remove_file(&lock_path).expect("remove ownership lock");
+        let target = symlink_temp.path().join("malicious-lock-target");
+        fs::write(&target, "0".repeat(64)).expect("write symlink target");
+        symlink(target, &lock_path).expect("replace ownership lock with symlink");
+        assert!(matches!(
+            ManagedProfileDirectory::prepare(&profiles, &profile, &executable),
+            Err(BrowserError::InvalidProfileDirectory)
+        ));
+
+        let permissions_temp = TempDir::new().expect("permissions temp dir");
+        let (profile, executable, _) = fixture(permissions_temp.path());
+        let profiles = private_profiles_root(permissions_temp.path());
+        let prepared = ManagedProfileDirectory::prepare(&profiles, &profile, &executable)
+            .expect("prepare permissions fixture");
+        let lock_path = prepared.binding_directory.join(PROFILE_OWNERSHIP_LOCK_FILE);
+        drop(prepared);
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644))
+            .expect("weaken ownership lock permissions");
+        assert!(matches!(
+            ManagedProfileDirectory::prepare(&profiles, &profile, &executable),
+            Err(BrowserError::InvalidProfileDirectory)
+        ));
     }
 
     #[cfg(unix)]
