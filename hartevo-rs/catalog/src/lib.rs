@@ -11,9 +11,13 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod evidence;
+mod mission_contract;
 
 pub use evidence::{
     EvidenceLevel, MissionEvidenceRecord, MissionEvidenceStatus, ReleaseEvidence, ReleaseStage,
+};
+pub use mission_contract::{
+    EXPECTED_CAPABILITY_COUNT, EXPECTED_CHECKPOINT_ROUTE_COUNT, validate_mission_contract_closure,
 };
 
 const MISSION_CATALOG_JSON: &str = include_str!("../../../contracts/missions/catalog.v1.json");
@@ -359,6 +363,11 @@ impl Catalog {
 
     fn validate_contracts(&self) -> Result<(), CatalogError> {
         let mut violations = Vec::new();
+        if let Err(mut contract_violations) =
+            validate_mission_contract_closure(&self.missions, &self.capabilities)
+        {
+            violations.append(&mut contract_violations);
+        }
         self.validate_mission_contracts(&mut violations);
         self.validate_application_handler_registry(&mut violations);
         self.validate_capability_provider_contracts(&mut violations);
