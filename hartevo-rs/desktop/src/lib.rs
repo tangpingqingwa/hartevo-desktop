@@ -4738,6 +4738,7 @@ fn mission_checkpoint_completion_policy_label(
         MissionCheckpointCompletionPolicy::DeterministicEvidence => "DETERMINISTIC_EVIDENCE",
         MissionCheckpointCompletionPolicy::WorkProduct => "WORK_PRODUCT",
         MissionCheckpointCompletionPolicy::VerifiedEffect => "VERIFIED_EFFECT",
+        MissionCheckpointCompletionPolicy::EffectReadbackV2 => "EFFECT_READBACK_V2",
         MissionCheckpointCompletionPolicy::HumanConfirmation => "HUMAN_CONFIRMATION",
     }
 }

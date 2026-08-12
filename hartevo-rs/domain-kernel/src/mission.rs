@@ -904,6 +904,9 @@ pub enum MissionCheckpointCompletionPolicy {
     DeterministicEvidence,
     WorkProduct,
     VerifiedEffect,
+    /// Requires the versioned ReceiptCandidate plus independent account
+    /// readback proof. Generic Checkpoint completion cannot satisfy it.
+    EffectReadbackV2,
     HumanConfirmation,
 }
 
@@ -915,6 +918,7 @@ impl TryFrom<&str> for MissionCheckpointCompletionPolicy {
             "deterministic_evidence" => Ok(Self::DeterministicEvidence),
             "work_product" => Ok(Self::WorkProduct),
             "verified_effect" => Ok(Self::VerifiedEffect),
+            "effect_readback_v2" => Ok(Self::EffectReadbackV2),
             "human_confirmation" => Ok(Self::HumanConfirmation),
             _ => Err(MissionError::InvalidMissionDefinition),
         }
@@ -1003,6 +1007,7 @@ impl MissionCheckpointRoute {
                     ) | (
                         MissionCheckpointExecutor::EffectBroker,
                         MissionCheckpointCompletionPolicy::VerifiedEffect
+                            | MissionCheckpointCompletionPolicy::EffectReadbackV2
                     ) | (
                         MissionCheckpointExecutor::Human,
                         MissionCheckpointCompletionPolicy::HumanConfirmation
@@ -1381,6 +1386,10 @@ impl MissionDefinition {
                 && checkpoint.route.as_ref().is_none_or(|route| {
                     route.is_contracted()
                         && completion.oracle_ids == route.oracle_ids
+                        && !matches!(
+                            route.completion_policy,
+                            Some(MissionCheckpointCompletionPolicy::EffectReadbackV2)
+                        )
                         && valid_persisted_application_checkpoint_evidence(
                             self, checkpoint, route, completion,
                         )
@@ -1953,6 +1962,10 @@ impl Mission {
                     )
                     || route.oracle_ids.contains("work_product")
                         && completion.work_product_ids.is_empty()
+                    || matches!(
+                        route.completion_policy,
+                        Some(MissionCheckpointCompletionPolicy::EffectReadbackV2)
+                    )
                     || matches!(
                         route.completion_policy,
                         Some(MissionCheckpointCompletionPolicy::VerifiedEffect)
@@ -3389,6 +3402,7 @@ fn checkpoint_completion_policy_name(value: MissionCheckpointCompletionPolicy) -
         MissionCheckpointCompletionPolicy::DeterministicEvidence => "deterministic_evidence",
         MissionCheckpointCompletionPolicy::WorkProduct => "work_product",
         MissionCheckpointCompletionPolicy::VerifiedEffect => "verified_effect",
+        MissionCheckpointCompletionPolicy::EffectReadbackV2 => "effect_readback_v2",
         MissionCheckpointCompletionPolicy::HumanConfirmation => "human_confirmation",
     }
 }
@@ -3943,6 +3957,237 @@ mod tests {
             Some(MissionCheckpointStatus::Completed)
         );
         assert_eq!(mission.stage, MissionStage::Verifying);
+    }
+
+    fn effect_readback_mission() -> Mission {
+        let contract = MissionContract::bootstrap(
+            "Apply and independently read back one marketplace listing update",
+            ["marketplace.write".into()],
+            now(),
+        );
+        let route_oracles = BTreeSet::from(["effect".into(), "operating_state".into()]);
+        let definition = MissionDefinition::from_routed_linear_manifest(
+            "VM-08",
+            4,
+            "8".repeat(64),
+            OperatingMode::BuildOnce,
+            contract.enabled_capabilities.iter().cloned(),
+            ["listing_account_readback_verification".into()],
+            route_oracles.iter().cloned(),
+            [(
+                "listing_write_readback".into(),
+                MissionCheckpointRoute::contracted(
+                    "marketplace.write",
+                    MissionCheckpointExecutor::EffectBroker,
+                    route_oracles.clone(),
+                    MissionCheckpointCompletionPolicy::EffectReadbackV2,
+                )
+                .expect("effect/readback route"),
+            )],
+        )
+        .expect("effect/readback definition");
+        let mut mission = Mission::compile_catalog(
+            TenantId::from("tenant-effect-readback"),
+            MissionId::from("mission-effect-readback"),
+            ProjectId::from("project-effect-readback"),
+            "Marketplace effect/readback",
+            contract,
+            definition,
+            now(),
+        )
+        .expect("effect/readback Mission");
+        mission
+            .start_research(
+                [Task {
+                    id: TaskId::from("task-effect-readback"),
+                    title: "Write and independently read back listing".into(),
+                    status: TaskStatus::Running,
+                    capability: "marketplace.write".into(),
+                }],
+                now(),
+            )
+            .expect("start effect/readback Checkpoint");
+        mission
+    }
+
+    fn record_verified_effect_for_readback(mission: &mut Mission) -> EffectId {
+        let proposed_at = now() + chrono::Duration::seconds(1);
+        let effect_id = mission
+            .propose_effect(
+                EffectSpec {
+                    id: EffectId::from("effect-readback-write"),
+                    actor_id: ActorId::from("effect-readback-operator"),
+                    capability: "marketplace.write".into(),
+                    provider: "amazon-sp-api".into(),
+                    connection_id: None,
+                    account_id: None,
+                    required_scopes: BTreeSet::new(),
+                    effect_class: EffectClass::ExternalWrite,
+                    description: "Apply exact listing field update".into(),
+                    target_resource: "amazon://seller-account/listing/sku-1".into(),
+                    audience_digest: None,
+                    payload_digest: "a".repeat(64),
+                    asset_digests: BTreeSet::new(),
+                    scheduled_for: None,
+                    timezone: "UTC".into(),
+                    consent: ConsentState::NotRequired,
+                    consent_record_id: None,
+                    consent_requirement: None,
+                    conversation_guard: None,
+                    creator_contact_guard: None,
+                    policy_version: "effect-readback-policy-v1".into(),
+                    risk: EffectRisk::High,
+                    idempotency_key: "vm08:listing-write-readback:sku-1".into(),
+                    amount: Money::zero(
+                        crate::CurrencyCode::parse("USD").expect("static ISO currency"),
+                    ),
+                    expires_at: proposed_at + chrono::Duration::hours(1),
+                },
+                proposed_at,
+            )
+            .expect("propose listing write");
+        let decided_at = proposed_at + chrono::Duration::seconds(1);
+        let scope_digest = mission
+            .effect(&effect_id)
+            .expect("listing write")
+            .approval_digest();
+        let valid_until = mission
+            .approval_valid_until(&effect_id, decided_at)
+            .expect("approval window");
+        mission
+            .approve_effect(
+                &effect_id,
+                Approval {
+                    id: ApprovalId::from("approval-effect-readback"),
+                    decision: ApprovalDecision::Approved,
+                    decided_by: ActorId::from("effect-readback-approver"),
+                    decided_at,
+                    valid_until,
+                    scope_digest,
+                    permission_digest: "b".repeat(64),
+                },
+            )
+            .expect("approve listing write");
+        let execution_at = decided_at + chrono::Duration::seconds(1);
+        mission
+            .begin_effect(&effect_id, execution_at)
+            .expect("begin listing write");
+        let receipt_id = ReceiptId::from("receipt-candidate-effect-readback");
+        let request_digest = mission
+            .effect(&effect_id)
+            .expect("executing listing write")
+            .approval_digest();
+        let accepted_at = execution_at + chrono::Duration::seconds(1);
+        mission
+            .record_receipt(
+                &effect_id,
+                Receipt {
+                    id: receipt_id.clone(),
+                    provider: "amazon-sp-api".into(),
+                    external_id: "listing-update-candidate-1".into(),
+                    accepted_at,
+                    request_digest,
+                    response_digest: "c".repeat(64),
+                },
+            )
+            .expect("record ReceiptCandidate");
+        mission
+            .record_verification(
+                &effect_id,
+                Verification {
+                    id: VerificationId::from("verification-effect-readback-write"),
+                    status: VerificationStatus::Confirmed,
+                    verifier: "effect-receipt-verifier".into(),
+                    independent: true,
+                    observed_at: accepted_at + chrono::Duration::seconds(1),
+                    evidence_digest: "d".repeat(64),
+                    receipt_id,
+                },
+            )
+            .expect("verify write receipt only");
+        effect_id
+    }
+
+    #[test]
+    fn effect_readback_v2_is_typed_persistable_and_executor_scoped() {
+        assert_eq!(
+            MissionCheckpointCompletionPolicy::try_from("effect_readback_v2"),
+            Ok(MissionCheckpointCompletionPolicy::EffectReadbackV2)
+        );
+        assert_eq!(
+            serde_json::to_string(&MissionCheckpointCompletionPolicy::EffectReadbackV2)
+                .expect("serialize effect/readback policy"),
+            "\"effect_readback_v2\""
+        );
+        for executor in [
+            MissionCheckpointExecutor::Application,
+            MissionCheckpointExecutor::Runtime,
+            MissionCheckpointExecutor::Human,
+        ] {
+            assert_eq!(
+                MissionCheckpointRoute::contracted(
+                    "marketplace.write",
+                    executor,
+                    ["effect".into(), "operating_state".into()],
+                    MissionCheckpointCompletionPolicy::EffectReadbackV2,
+                ),
+                Err(MissionError::InvalidMissionDefinition)
+            );
+        }
+
+        let mission = effect_readback_mission();
+        let serialized =
+            serde_json::to_string(&mission).expect("serialize effect/readback Mission");
+        assert!(serialized.contains("\"completionPolicy\":\"effect_readback_v2\""));
+        let reopened: Mission =
+            serde_json::from_str(&serialized).expect("reopen effect/readback Mission");
+        reopened
+            .validate_checkpoint_evidence_scope()
+            .expect("uncompleted effect/readback definition remains valid");
+        assert_eq!(reopened, mission);
+    }
+
+    #[test]
+    fn effect_readback_v2_rejects_generic_and_forged_persisted_completion() {
+        let mut mission = effect_readback_mission();
+        let effect_id = record_verified_effect_for_readback(&mut mission);
+        assert_eq!(
+            mission.effect(&effect_id).expect("write effect").status,
+            EffectStatus::Verified
+        );
+        mission
+            .validate_checkpoint_evidence_scope()
+            .expect("verified Effect does not complete the effect/readback route");
+        let verified_at = now() + chrono::Duration::seconds(7);
+        let completion = MissionCheckpointCompletion {
+            oracle_ids: BTreeSet::from(["effect".into(), "operating_state".into()]),
+            work_product_ids: BTreeSet::new(),
+            effect_ids: BTreeSet::from([effect_id]),
+            application_evidence: None,
+            evidence_digest: "e".repeat(64),
+            verified_at,
+        };
+        let before_rejection = mission.clone();
+        assert_eq!(
+            mission.complete_checkpoint("listing_write_readback", completion.clone()),
+            Err(MissionError::InvalidCheckpointCompletion(
+                "listing_write_readback".into()
+            ))
+        );
+        assert_eq!(mission, before_rejection);
+
+        let checkpoint = mission
+            .definition
+            .as_mut()
+            .and_then(|definition| definition.checkpoints.first_mut())
+            .expect("effect/readback Checkpoint");
+        checkpoint.status = MissionCheckpointStatus::Completed;
+        checkpoint.completion = Some(completion);
+        checkpoint.revision += 1;
+        assert_eq!(
+            mission.validate_checkpoint_evidence_scope(),
+            Err(MissionError::InvalidMissionDefinition)
+        );
     }
 
     fn mission_with_preview_effect() -> (Mission, EffectId) {

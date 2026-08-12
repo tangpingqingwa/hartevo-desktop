@@ -80,7 +80,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 46;
+pub const STORAGE_SCHEMA_VERSION: i64 = 47;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4280,6 +4280,85 @@ impl ProjectStore {
             record_migration(&transaction, 46)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 47 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                "DROP INDEX mission_checkpoint_state_idx;
+                 ALTER TABLE mission_checkpoints RENAME TO mission_checkpoints_v47;
+                 CREATE TABLE mission_checkpoints (
+                   mission_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   id TEXT NOT NULL CHECK (length(trim(id)) > 0),
+                   ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                   depends_on_json TEXT NOT NULL,
+                   status TEXT NOT NULL CHECK (status IN (
+                     'pending', 'ready', 'running', 'blocked', 'waiting_user',
+                     'waiting_approval', 'verifying', 'completed', 'skipped'
+                   )),
+                   revision INTEGER NOT NULL CHECK (revision > 0),
+                   attempt INTEGER NOT NULL CHECK (attempt >= 0),
+                   started_at TEXT,
+                   block_json TEXT,
+                   completion_json TEXT,
+                   route_capability_id TEXT CHECK (
+                     route_capability_id IS NULL OR length(trim(route_capability_id)) > 0
+                   ),
+                   route_executor TEXT CHECK (
+                     route_executor IS NULL OR route_executor IN (
+                       'application', 'runtime', 'effect_broker', 'human'
+                     )
+                   ),
+                   route_oracle_ids_json TEXT CHECK (
+                     route_oracle_ids_json IS NULL
+                     OR length(trim(route_oracle_ids_json)) > 2
+                   ),
+                   route_completion_policy TEXT CHECK (
+                     route_completion_policy IS NULL OR route_completion_policy IN (
+                       'deterministic_evidence', 'work_product', 'verified_effect',
+                       'effect_readback_v2', 'human_confirmation'
+                     )
+                   ),
+                   PRIMARY KEY (mission_id, project_id, id),
+                   UNIQUE (mission_id, project_id, ordinal),
+                   FOREIGN KEY (mission_id, project_id)
+                     REFERENCES mission_definitions(mission_id, project_id) ON DELETE CASCADE,
+                   CHECK (
+                     (status IN ('pending', 'ready') AND attempt = 0 AND started_at IS NULL)
+                     OR (status IN (
+                       'running', 'blocked', 'waiting_user', 'waiting_approval',
+                       'verifying', 'completed'
+                     ) AND attempt > 0 AND started_at IS NOT NULL)
+                     OR status = 'skipped'
+                   ),
+                   CHECK (
+                     (status IN ('blocked', 'waiting_user', 'waiting_approval')
+                       AND block_json IS NOT NULL)
+                     OR (status NOT IN ('blocked', 'waiting_user', 'waiting_approval')
+                       AND block_json IS NULL)
+                   ),
+                   CHECK (
+                     (status = 'completed' AND completion_json IS NOT NULL)
+                     OR (status != 'completed' AND completion_json IS NULL)
+                   )
+                 );
+                 INSERT INTO mission_checkpoints (
+                   mission_id, project_id, id, ordinal, depends_on_json, status,
+                   revision, attempt, started_at, block_json, completion_json,
+                   route_capability_id, route_executor, route_oracle_ids_json,
+                   route_completion_policy
+                 )
+                 SELECT mission_id, project_id, id, ordinal, depends_on_json, status,
+                   revision, attempt, started_at, block_json, completion_json,
+                   route_capability_id, route_executor, route_oracle_ids_json,
+                   route_completion_policy
+                 FROM mission_checkpoints_v47;
+                 DROP TABLE mission_checkpoints_v47;
+                 CREATE INDEX mission_checkpoint_state_idx
+                   ON mission_checkpoints(project_id, mission_id, status, ordinal);",
+            )?;
+            record_migration(&transaction, 47)?;
+            transaction.commit()?;
+        }
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
@@ -4532,10 +4611,11 @@ mod tests {
         ConversationId, ConversationState, CurrencyCode, DeletionId, DeletionReason,
         DeletionRecord, DeletionSurface, DeletionTombstone, Effect, EffectClass, EffectId,
         EffectRisk, EffectSpec, Evidence, EvidenceId, EvidenceStatus, ExternalIdentity,
-        IdentityLink, IdentityLinkId, IdentitySubject, MessagingGateway, MissionContract,
-        MissionStage, Money, OperatingMode, Outcome, OutcomeDecision, Person, PersonId, Receipt,
-        ReceiptId, StorageMode, Verification, VerificationId, VerificationStatus, WorkProduct,
-        WorkProductId,
+        IdentityLink, IdentityLinkId, IdentitySubject, MessagingGateway,
+        MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointRoute,
+        MissionContract, MissionDefinition, MissionStage, Money, OperatingMode, Outcome,
+        OutcomeDecision, Person, PersonId, Receipt, ReceiptId, StorageMode, Verification,
+        VerificationId, VerificationStatus, WorkProduct, WorkProductId,
     };
     use hartevo_effect_broker::{
         DurableEffectLedger, EffectPolicy, EffectRateLimit, ExecutionClaimContext, LedgerClaim,
@@ -4630,7 +4710,101 @@ mod tests {
             .expect("downgrade runtime delta schema to v45");
     }
 
-    fn assert_integrated_v46_schema(connection: &Connection) {
+    fn downgrade_checkpoint_policy_schema_to_v46(connection: &Connection) {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 DROP INDEX mission_checkpoint_state_idx;
+                 ALTER TABLE mission_checkpoints
+                   RENAME TO mission_checkpoints_current_v47;
+                 CREATE TABLE mission_checkpoints (
+                   mission_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   id TEXT NOT NULL CHECK (length(trim(id)) > 0),
+                   ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                   depends_on_json TEXT NOT NULL,
+                   status TEXT NOT NULL CHECK (status IN (
+                     'pending', 'ready', 'running', 'blocked', 'waiting_user',
+                     'waiting_approval', 'verifying', 'completed', 'skipped'
+                   )),
+                   revision INTEGER NOT NULL CHECK (revision > 0),
+                   attempt INTEGER NOT NULL CHECK (attempt >= 0),
+                   started_at TEXT,
+                   block_json TEXT,
+                   completion_json TEXT,
+                   route_capability_id TEXT CHECK (
+                     route_capability_id IS NULL OR length(trim(route_capability_id)) > 0
+                   ),
+                   route_executor TEXT CHECK (
+                     route_executor IS NULL OR route_executor IN (
+                       'application', 'runtime', 'effect_broker', 'human'
+                     )
+                   ),
+                   route_oracle_ids_json TEXT CHECK (
+                     route_oracle_ids_json IS NULL
+                     OR length(trim(route_oracle_ids_json)) > 2
+                   ),
+                   route_completion_policy TEXT CHECK (
+                     route_completion_policy IS NULL OR route_completion_policy IN (
+                       'deterministic_evidence', 'work_product',
+                       'verified_effect', 'human_confirmation'
+                     )
+                   ),
+                   PRIMARY KEY (mission_id, project_id, id),
+                   UNIQUE (mission_id, project_id, ordinal),
+                   FOREIGN KEY (mission_id, project_id)
+                     REFERENCES mission_definitions(mission_id, project_id) ON DELETE CASCADE,
+                   CHECK (
+                     (status IN ('pending', 'ready') AND attempt = 0 AND started_at IS NULL)
+                     OR (status IN (
+                       'running', 'blocked', 'waiting_user', 'waiting_approval',
+                       'verifying', 'completed'
+                     ) AND attempt > 0 AND started_at IS NOT NULL)
+                     OR status = 'skipped'
+                   ),
+                   CHECK (
+                     (status IN ('blocked', 'waiting_user', 'waiting_approval')
+                       AND block_json IS NOT NULL)
+                     OR (status NOT IN ('blocked', 'waiting_user', 'waiting_approval')
+                       AND block_json IS NULL)
+                   ),
+                   CHECK (
+                     (status = 'completed' AND completion_json IS NOT NULL)
+                     OR (status != 'completed' AND completion_json IS NULL)
+                   )
+                 );
+                 INSERT INTO mission_checkpoints (
+                   mission_id, project_id, id, ordinal, depends_on_json, status,
+                   revision, attempt, started_at, block_json, completion_json,
+                   route_capability_id, route_executor, route_oracle_ids_json,
+                   route_completion_policy
+                 )
+                 SELECT mission_id, project_id, id, ordinal, depends_on_json, status,
+                   revision, attempt, started_at, block_json, completion_json,
+                   route_capability_id, route_executor, route_oracle_ids_json,
+                   route_completion_policy
+                 FROM mission_checkpoints_current_v47;
+                 DROP TABLE mission_checkpoints_current_v47;
+                 CREATE INDEX mission_checkpoint_state_idx
+                   ON mission_checkpoints(project_id, mission_id, status, ordinal);
+                 DELETE FROM schema_migrations WHERE version >= 47;
+                 COMMIT;",
+            )
+            .expect("downgrade completion-policy constraint to schema v46");
+    }
+
+    fn checkpoint_policy_table_sql(connection: &Connection) -> String {
+        connection
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'mission_checkpoints'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("mission Checkpoint table SQL")
+    }
+
+    fn assert_integrated_v45_v46_v47_schema(connection: &Connection) {
         for table in [
             "vm11_outcome_reviews",
             "vm11_outcome_review_source_fences",
@@ -4650,16 +4824,47 @@ mod tests {
                 "missing integrated migration table {table}"
             );
         }
+        for version in [45_i64, 46, 47] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                        [version],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("integrated migration row"),
+                1,
+                "migration v{version} must be recorded exactly once"
+            );
+        }
+        let checkpoint_columns = connection
+            .prepare("PRAGMA table_info(mission_checkpoints)")
+            .expect("Checkpoint table info")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("Checkpoint columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Checkpoint column names");
         assert_eq!(
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM schema_migrations WHERE version IN (45, 46)",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .expect("integrated migration rows"),
-            2
+            checkpoint_columns,
+            vec![
+                "mission_id",
+                "project_id",
+                "id",
+                "ordinal",
+                "depends_on_json",
+                "status",
+                "revision",
+                "attempt",
+                "started_at",
+                "block_json",
+                "completion_json",
+                "route_capability_id",
+                "route_executor",
+                "route_oracle_ids_json",
+                "route_completion_policy",
+            ]
         );
+        assert!(checkpoint_policy_table_sql(connection).contains("'effect_readback_v2'"));
         assert!(
             connection
                 .query_row(
@@ -4677,12 +4882,15 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the integration migration proof keeps fresh, v44, v45, backup, idempotent-ledger repair, and transactional failure rollback in one visible matrix"
+        reason = "the integration migration proof keeps fresh, v44, v45, ordered v46/v47 ledgers, backup, and transactional v46 failure rollback in one visible matrix"
     )]
-    fn migration_v46_sequences_outcome_v45_before_runtime_delta_and_rolls_back_failure() {
-        let fresh = ProjectStore::in_memory().expect("fresh v46 store");
-        assert_eq!(fresh.schema_version().expect("fresh schema"), 46);
-        assert_integrated_v46_schema(&fresh.connection);
+    fn migration_v47_sequences_outcome_v45_runtime_v46_then_policy_v47() {
+        let fresh = ProjectStore::in_memory().expect("fresh v47 store");
+        assert_eq!(
+            fresh.schema_version().expect("fresh schema"),
+            STORAGE_SCHEMA_VERSION
+        );
+        assert_integrated_v45_v46_v47_schema(&fresh.connection);
 
         let v45_directory = tempfile::tempdir().expect("v45 directory");
         let v45_path = v45_directory.path().join("integrated-v45.sqlite3");
@@ -4704,8 +4912,8 @@ mod tests {
             );
         }
         let migrated_v45 =
-            ProjectStore::open(&v45_path, &database_key()).expect("migrate v45 to v46");
-        assert_integrated_v46_schema(&migrated_v45.connection);
+            ProjectStore::open(&v45_path, &database_key()).expect("migrate v45 through v47");
+        assert_integrated_v45_v46_v47_schema(&migrated_v45.connection);
         drop(migrated_v45);
         assert_eq!(
             fs::read_dir(v45_directory.path())
@@ -4736,8 +4944,8 @@ mod tests {
             assert_eq!(store.schema_version().expect("v44 fixture"), 44);
         }
         let migrated_v44 =
-            ProjectStore::open(&v44_path, &database_key()).expect("migrate v44 through v46");
-        assert_integrated_v46_schema(&migrated_v44.connection);
+            ProjectStore::open(&v44_path, &database_key()).expect("migrate v44 through v47");
+        assert_integrated_v45_v46_v47_schema(&migrated_v44.connection);
         drop(migrated_v44);
         assert_eq!(
             fs::read_dir(v44_directory.path())
@@ -4803,8 +5011,10 @@ mod tests {
             .connection
             .execute_batch("DROP TABLE runtime_turn_evidence_v46;")
             .expect("remove injected collision");
-        rollback.migrate().expect("retry v46 after rollback");
-        assert_integrated_v46_schema(&rollback.connection);
+        rollback
+            .migrate()
+            .expect("retry v46 then v47 after rollback");
+        assert_integrated_v45_v46_v47_schema(&rollback.connection);
     }
 
     fn project(id: &str, root: &str) -> Project {
@@ -4900,6 +5110,293 @@ mod tests {
             )
             .expect("start catalog mission");
         mission
+    }
+
+    fn mission_with_all_v46_completion_policies(project_id: &str, mission_id: &str) -> Mission {
+        let capabilities = [
+            "legacy.application".into(),
+            "legacy.runtime".into(),
+            "legacy.effect".into(),
+            "legacy.human".into(),
+        ];
+        let contract = MissionContract::bootstrap(
+            "Preserve every schema v46 Checkpoint completion policy",
+            capabilities.clone(),
+            now(),
+        );
+        let definition = MissionDefinition::from_routed_linear_manifest(
+            "VM-07",
+            1,
+            "6".repeat(64),
+            OperatingMode::BuildOnce,
+            capabilities,
+            ["legacy_policy_fixture".into()],
+            [
+                "decision".into(),
+                "effect".into(),
+                "operating_state".into(),
+                "work_product".into(),
+            ],
+            [
+                (
+                    "legacy_application".into(),
+                    MissionCheckpointRoute::contracted(
+                        "legacy.application",
+                        MissionCheckpointExecutor::Application,
+                        ["operating_state".into()],
+                        MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                    )
+                    .expect("legacy Application route"),
+                ),
+                (
+                    "legacy_runtime".into(),
+                    MissionCheckpointRoute::contracted(
+                        "legacy.runtime",
+                        MissionCheckpointExecutor::Runtime,
+                        ["operating_state".into(), "work_product".into()],
+                        MissionCheckpointCompletionPolicy::WorkProduct,
+                    )
+                    .expect("legacy Runtime route"),
+                ),
+                (
+                    "legacy_effect".into(),
+                    MissionCheckpointRoute::contracted(
+                        "legacy.effect",
+                        MissionCheckpointExecutor::EffectBroker,
+                        ["effect".into(), "operating_state".into()],
+                        MissionCheckpointCompletionPolicy::VerifiedEffect,
+                    )
+                    .expect("legacy Effect route"),
+                ),
+                (
+                    "legacy_human".into(),
+                    MissionCheckpointRoute::contracted(
+                        "legacy.human",
+                        MissionCheckpointExecutor::Human,
+                        ["decision".into(), "operating_state".into()],
+                        MissionCheckpointCompletionPolicy::HumanConfirmation,
+                    )
+                    .expect("legacy Human route"),
+                ),
+            ],
+        )
+        .expect("legacy policy definition");
+        Mission::compile_catalog(
+            hartevo_domain_kernel::TenantId::from("tenant-1"),
+            MissionId::from(mission_id),
+            ProjectId::from(project_id),
+            "Schema v46 completion policies",
+            contract,
+            definition,
+            now(),
+        )
+        .expect("legacy policy Mission")
+    }
+
+    fn effect_readback_storage_mission(project_id: &str, mission_id: &str) -> Mission {
+        let contract = MissionContract::bootstrap(
+            "Persist a typed marketplace effect/readback route",
+            ["marketplace.write".into()],
+            now(),
+        );
+        let definition = MissionDefinition::from_routed_linear_manifest(
+            "VM-08",
+            4,
+            "8".repeat(64),
+            OperatingMode::BuildOnce,
+            contract.enabled_capabilities.iter().cloned(),
+            ["listing_account_readback_verification".into()],
+            ["effect".into(), "operating_state".into()],
+            [(
+                "listing_write_readback".into(),
+                MissionCheckpointRoute::contracted(
+                    "marketplace.write",
+                    MissionCheckpointExecutor::EffectBroker,
+                    ["effect".into(), "operating_state".into()],
+                    MissionCheckpointCompletionPolicy::EffectReadbackV2,
+                )
+                .expect("typed effect/readback route"),
+            )],
+        )
+        .expect("typed effect/readback definition");
+        Mission::compile_catalog(
+            hartevo_domain_kernel::TenantId::from("tenant-1"),
+            MissionId::from(mission_id),
+            ProjectId::from(project_id),
+            "Typed effect/readback persistence",
+            contract,
+            definition,
+            now(),
+        )
+        .expect("typed effect/readback Mission")
+    }
+
+    fn stored_checkpoint_policies(connection: &Connection, mission_id: &MissionId) -> Vec<String> {
+        let mut statement = connection
+            .prepare(
+                "SELECT route_completion_policy FROM mission_checkpoints
+                 WHERE mission_id = ?1 ORDER BY ordinal ASC",
+            )
+            .expect("Checkpoint policy query");
+        statement
+            .query_map([mission_id.as_str()], |row| row.get(0))
+            .expect("Checkpoint policy rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Checkpoint policies")
+    }
+
+    #[test]
+    fn migration_v47_preserves_v46_policies_and_reopens_typed_effect_readback() {
+        let directory = tempfile::tempdir().expect("migration directory");
+        let database = directory.path().join("checkpoint-policy-v46.sqlite3");
+        let project = project("project-policy-v47", "/tmp/project-policy-v47");
+        let legacy =
+            mission_with_all_v46_completion_policies(project.id.as_str(), "mission-policy-v46");
+        {
+            let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            store.save_project(&project).expect("project");
+            store.save_mission(&legacy).expect("legacy policy Mission");
+            downgrade_checkpoint_policy_schema_to_v46(&store.connection);
+            assert_eq!(store.schema_version().expect("v46 fixture"), 46);
+            assert!(!checkpoint_policy_table_sql(&store.connection).contains("effect_readback_v2"));
+            assert_eq!(
+                stored_checkpoint_policies(&store.connection, &legacy.id),
+                vec![
+                    "deterministic_evidence",
+                    "work_product",
+                    "verified_effect",
+                    "human_confirmation",
+                ]
+            );
+            assert_eq!(
+                store
+                    .load_mission(&project.id, &legacy.id)
+                    .expect("v46 legacy Mission"),
+                legacy
+            );
+        }
+
+        let mut migrated =
+            ProjectStore::open(&database, &database_key()).expect("migrate v46 to v47");
+        assert_eq!(migrated.schema_version().expect("v47 schema"), 47);
+        assert!(checkpoint_policy_table_sql(&migrated.connection).contains("effect_readback_v2"));
+        assert_eq!(
+            migrated
+                .load_mission(&project.id, &legacy.id)
+                .expect("migrated legacy Mission"),
+            legacy
+        );
+        assert_eq!(
+            stored_checkpoint_policies(&migrated.connection, &legacy.id),
+            vec![
+                "deterministic_evidence",
+                "work_product",
+                "verified_effect",
+                "human_confirmation",
+            ]
+        );
+        assert_eq!(
+            migrated
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 47",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("v47 migration row"),
+            1
+        );
+        let effect_readback =
+            effect_readback_storage_mission(project.id.as_str(), "mission-policy-v47");
+        migrated
+            .save_mission(&effect_readback)
+            .expect("persist typed effect/readback Mission");
+        drop(migrated);
+
+        let reopened = ProjectStore::open(&database, &database_key()).expect("reopen v47");
+        assert_eq!(
+            reopened
+                .load_mission(&project.id, &effect_readback.id)
+                .expect("reopen typed effect/readback Mission"),
+            effect_readback
+        );
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("migration directory entries")
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("pre-migration-v46"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn migration_v47_collision_rolls_back_table_index_data_and_ledger() {
+        let project = project(
+            "project-policy-v47-rollback",
+            "/tmp/project-policy-v47-rollback",
+        );
+        let legacy = mission_with_all_v46_completion_policies(
+            project.id.as_str(),
+            "mission-policy-v47-rollback",
+        );
+        let mut store = ProjectStore::in_memory().expect("rollback store");
+        store.save_project(&project).expect("project");
+        store.save_mission(&legacy).expect("legacy policy Mission");
+        downgrade_checkpoint_policy_schema_to_v46(&store.connection);
+        store
+            .connection
+            .execute_batch("CREATE TABLE mission_checkpoints_v47 (sentinel INTEGER NOT NULL);")
+            .expect("inject v47 table collision");
+
+        assert!(matches!(store.migrate(), Err(StorageError::Sql(_))));
+        assert_eq!(store.schema_version().expect("rolled back schema"), 46);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 47",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("failed migration ledger"),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index' AND name = 'mission_checkpoint_state_idx'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("rolled back state index"),
+            1
+        );
+        assert_eq!(
+            store
+                .load_mission(&project.id, &legacy.id)
+                .expect("legacy Mission after rollback"),
+            legacy
+        );
+
+        store
+            .connection
+            .execute_batch("DROP TABLE mission_checkpoints_v47;")
+            .expect("remove injected collision");
+        store.migrate().expect("retry v47 migration");
+        assert_eq!(store.schema_version().expect("retried schema"), 47);
+        assert_eq!(
+            store
+                .load_mission(&project.id, &legacy.id)
+                .expect("legacy Mission after retry"),
+            legacy
+        );
+        assert!(checkpoint_policy_table_sql(&store.connection).contains("effect_readback_v2"));
     }
 
     fn persist_catalog_mission_at_next_checkpoint_ready(

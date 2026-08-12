@@ -21244,7 +21244,12 @@ mod tests {
                     },
                     now(),
                 )
-                .expect("Catalog Mission");
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Catalog Mission {} failed to compile: {error:?}",
+                        manifest.id
+                    )
+                });
             let definition = mission.definition.as_ref().expect("definition");
             assert_eq!(
                 (
@@ -21297,6 +21302,61 @@ mod tests {
                     ))
                     .collect::<Vec<_>>()
             );
+            if manifest.id == "VM-08" {
+                assert_eq!(manifest.version, 4);
+                let first_checkpoint = definition
+                    .checkpoints
+                    .first()
+                    .expect("VM-08 first Checkpoint");
+                let first_route = first_checkpoint.route.as_ref().expect("VM-08 first route");
+                assert_eq!(
+                    (
+                        first_checkpoint.id.as_str(),
+                        first_checkpoint.status,
+                        first_route.capability_id.as_str(),
+                        first_route.executor,
+                        first_route.completion_policy,
+                    ),
+                    (
+                        "seller_account_market_identity",
+                        MissionCheckpointStatus::Running,
+                        "marketplace.read",
+                        MissionCheckpointExecutor::Runtime,
+                        Some(MissionCheckpointCompletionPolicy::WorkProduct),
+                    )
+                );
+                assert_eq!(
+                    mission
+                        .tasks
+                        .first()
+                        .map(|task| { (task.capability.as_str(), task.status.clone(),) }),
+                    Some(("marketplace.read", TaskStatus::Running))
+                );
+                let readback_checkpoint = definition
+                    .checkpoints
+                    .get(7)
+                    .expect("VM-08 effect/readback Checkpoint");
+                let readback_route = readback_checkpoint
+                    .route
+                    .as_ref()
+                    .expect("VM-08 effect/readback route");
+                assert_eq!(
+                    (
+                        readback_checkpoint.id.as_str(),
+                        readback_checkpoint.status,
+                        readback_route.capability_id.as_str(),
+                        readback_route.executor,
+                        readback_route.completion_policy,
+                    ),
+                    (
+                        "listing_write_readback",
+                        MissionCheckpointStatus::Pending,
+                        "marketplace.write",
+                        MissionCheckpointExecutor::EffectBroker,
+                        Some(MissionCheckpointCompletionPolicy::EffectReadbackV2),
+                    )
+                );
+            }
             assert_eq!(
                 definition
                     .current_checkpoint()
