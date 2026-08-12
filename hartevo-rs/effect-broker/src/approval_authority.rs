@@ -1775,6 +1775,9 @@ impl ProviderApprovalAuthorityPolicy {
             contract_digest: self.contract_digest.clone(),
             request_digest: request.request_digest,
             authority_digest,
+            effect_approval_digest: request.effect_approval_digest,
+            policy_digest: request.policy_digest,
+            permission_authorization_digest: request.permission_authorization_digest,
             effect_id: request.effect_id,
             mission_revision: request.mission_revision,
             approving_actor_id: request.approving_actor_id,
@@ -1854,6 +1857,9 @@ pub struct ApprovalAuthority {
     contract_digest: String,
     request_digest: String,
     authority_digest: String,
+    effect_approval_digest: String,
+    policy_digest: String,
+    permission_authorization_digest: String,
     effect_id: EffectId,
     mission_revision: u64,
     approving_actor_id: ActorId,
@@ -1885,6 +1891,9 @@ impl ApprovalAuthority {
             contract_digest: self.contract_digest,
             request_digest: self.request_digest,
             authority_digest: self.authority_digest,
+            effect_approval_digest: self.effect_approval_digest,
+            policy_digest: self.policy_digest,
+            permission_authorization_digest: self.permission_authorization_digest,
             effect_id: self.effect_id,
             mission_revision: self.mission_revision,
             approving_actor_id: self.approving_actor_id,
@@ -1926,6 +1935,17 @@ impl fmt::Debug for ApprovalAuthority {
 /// ```compile_fail
 /// use hartevo_effect_broker::ApprovalRecordAuthorization;
 ///
+/// fn record_authorization_is_not_copyable(value: ApprovalRecordAuthorization) {
+///     let first = value;
+///     let second = value;
+///     drop(first);
+///     drop(second);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use hartevo_effect_broker::ApprovalRecordAuthorization;
+///
 /// fn record_authorization_is_not_serializable(value: &ApprovalRecordAuthorization) {
 ///     let _ = serde_json::to_string(value).unwrap();
 /// }
@@ -1938,12 +1958,45 @@ impl fmt::Debug for ApprovalAuthority {
 ///     let _: ApprovalRecordAuthorization = serde_json::from_str("{}").unwrap();
 /// }
 /// ```
+///
+/// ```compile_fail
+/// use hartevo_effect_broker::ApprovalRecordAuthorization;
+///
+/// fn caller_cannot_construct_record_authorization() {
+///     let _ = ApprovalRecordAuthorization::new();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use hartevo_effect_broker::ApprovalRecordAuthorization;
+///
+/// fn caller_cannot_populate_private_record_fields() {
+///     let _ = ApprovalRecordAuthorization {
+///         authority: todo!(),
+///         contract_version: todo!(),
+///         contract_digest: todo!(),
+///         request_digest: todo!(),
+///         authority_digest: todo!(),
+///         effect_approval_digest: todo!(),
+///         policy_digest: todo!(),
+///         permission_authorization_digest: todo!(),
+///         effect_id: todo!(),
+///         mission_revision: todo!(),
+///         approving_actor_id: todo!(),
+///         operation_at: todo!(),
+///         approval_record_valid_until: todo!(),
+///     };
+/// }
+/// ```
 pub struct ApprovalRecordAuthorization {
     authority: ApprovalAuthorityKind,
     contract_version: String,
     contract_digest: String,
     request_digest: String,
     authority_digest: String,
+    effect_approval_digest: String,
+    policy_digest: String,
+    permission_authorization_digest: String,
     effect_id: EffectId,
     mission_revision: u64,
     approving_actor_id: ActorId,
@@ -1970,6 +2023,18 @@ impl ApprovalRecordAuthorization {
 
     pub fn authority_digest(&self) -> &str {
         &self.authority_digest
+    }
+
+    pub fn effect_approval_digest(&self) -> &str {
+        &self.effect_approval_digest
+    }
+
+    pub fn policy_digest(&self) -> &str {
+        &self.policy_digest
+    }
+
+    pub fn permission_authorization_digest(&self) -> &str {
+        &self.permission_authorization_digest
     }
 
     pub const fn effect_id(&self) -> &EffectId {
@@ -3113,6 +3178,106 @@ mod tests {
     }
 
     #[test]
+    fn record_writer_getters_match_the_same_validated_live_context() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+        let state = synthetic_state();
+        let effect = state.mission.effect(&state.effect_id).expect("effect");
+        let expected_effect_approval_digest = effect.approval_digest();
+        let expected_policy_digest = state.effect_policy.canonical_digest();
+        let permission_evidence_digest = state
+            .permission_evidence
+            .digest(effect)
+            .expect("permission evidence");
+        let expected_permission_authorization_digest = state
+            .effect_policy
+            .authorization_digest(&permission_evidence_digest);
+        let request = synthetic_request(&policy, &state);
+        assert_eq!(
+            request.effect_approval_digest,
+            expected_effect_approval_digest
+        );
+        assert_eq!(request.policy_digest, expected_policy_digest);
+        assert_eq!(
+            request.permission_authorization_digest,
+            expected_permission_authorization_digest
+        );
+
+        let authority = issue_synthetic(&policy, &state, request, now() + Duration::seconds(2))
+            .expect("synthetic authority");
+        let record = authority.consume_for_approval_record();
+        assert_eq!(
+            record.effect_approval_digest(),
+            expected_effect_approval_digest
+        );
+        assert_eq!(record.policy_digest(), expected_policy_digest);
+        assert_eq!(
+            record.permission_authorization_digest(),
+            expected_permission_authorization_digest
+        );
+        let debug = format!("{record:?}");
+        assert!(!debug.contains(record.effect_approval_digest()));
+        assert!(!debug.contains(record.policy_digest()));
+        assert!(!debug.contains(record.permission_authorization_digest()));
+    }
+
+    #[test]
+    fn record_writer_field_drift_changes_both_digests_and_fails_live_closure() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+        let state = synthetic_state();
+        let operation_at = now() + Duration::seconds(2);
+        let approval_policy_deadline = operation_at + Duration::seconds(60);
+        let approval_record_valid_until = approval_policy_deadline;
+        let baseline_request = synthetic_request(&policy, &state);
+        let baseline_assertion = RequestBoundStepUpAssertion::new(
+            "step-up-assertion-field-binding",
+            &baseline_request,
+            now() + Duration::seconds(1),
+            "2".repeat(64),
+        )
+        .expect("baseline assertion");
+        let baseline_request_digest = baseline_request.request_digest.clone();
+        let baseline_authority_digest = authority_digest(
+            &baseline_request,
+            &baseline_assertion,
+            operation_at,
+            approval_policy_deadline,
+            approval_record_valid_until,
+        );
+
+        for field in 0..3 {
+            let mut changed_request = synthetic_request(&policy, &state);
+            tamper_record_writer_field(&mut changed_request, field);
+            changed_request.request_digest = changed_request.canonical_digest();
+            assert_ne!(changed_request.request_digest, baseline_request_digest);
+            let changed_assertion = RequestBoundStepUpAssertion::new(
+                "step-up-assertion-field-binding",
+                &changed_request,
+                now() + Duration::seconds(1),
+                "2".repeat(64),
+            )
+            .expect("changed assertion");
+            let changed_authority_digest = authority_digest(
+                &changed_request,
+                &changed_assertion,
+                operation_at,
+                approval_policy_deadline,
+                approval_record_valid_until,
+            );
+            assert_ne!(changed_authority_digest, baseline_authority_digest);
+            assert!(matches!(
+                issue_synthetic_with_assertion(
+                    &policy,
+                    &state,
+                    changed_request,
+                    changed_assertion,
+                    operation_at,
+                ),
+                Err(ApprovalAuthorityError::RequestContextChanged)
+            ));
+        }
+    }
+
+    #[test]
     fn every_public_a3_debug_surface_is_enumerated_and_redacted() {
         let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
         let state = synthetic_state();
@@ -3184,7 +3349,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn any_single_request_field_tamper_breaks_its_original_digest(field in 0usize..18) {
+        fn any_single_request_field_tamper_breaks_its_original_digest(field in 0usize..19) {
             let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
             let state = synthetic_state();
             let mut request = synthetic_request(&policy, &state);
@@ -3202,7 +3367,7 @@ mod tests {
         }
 
         #[test]
-        fn rehashed_single_request_field_drift_hits_live_context_closure(field in 0usize..18) {
+        fn rehashed_single_request_field_drift_hits_live_context_closure(field in 0usize..19) {
             let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
             let state = synthetic_state();
             let mut request = synthetic_request(&policy, &state);
@@ -3471,7 +3636,16 @@ mod tests {
             14 => request.payload_digest = "4".repeat(64),
             15 => request.policy_digest = "5".repeat(64),
             16 => request.permission_evidence_digest = "6".repeat(64),
+            17 => request.permission_authorization_digest = "7".repeat(64),
             _ => request.provider_probe_expires_at += Duration::seconds(1),
+        }
+    }
+
+    fn tamper_record_writer_field(request: &mut ApprovalRequest, field: usize) {
+        match field {
+            0 => request.effect_approval_digest = "3".repeat(64),
+            1 => request.policy_digest = "5".repeat(64),
+            _ => request.permission_authorization_digest = "7".repeat(64),
         }
     }
 
