@@ -589,6 +589,7 @@ pub(crate) mod tests {
         let contract = MissionContract {
             version: 1,
             mode: OperatingMode::BuildOnce,
+            parent_mission_id: None,
             goal: "Return one typed finding".into(),
             non_goals: vec!["Never publish".into()],
             market: "DE".into(),

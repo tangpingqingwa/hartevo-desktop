@@ -81,8 +81,8 @@ pub use mission::{
     Approval, ApprovalDecision, ApprovalPolicy, AutonomyLevel, Cadence, CadenceTriggerKind,
     ConsentState, Constraint, ConversationEffectGuard, CreatorContactEffectGuard,
     DurableProviderState, Effect, EffectClass, EffectRisk, EffectSpec, EffectStatus, Evidence,
-    EvidenceStatus, KpiContract, MetricValue, Mission, MissionBlock, MissionCheckpoint,
-    MissionCheckpointApplicationEvidence, MissionCheckpointCompletion,
+    EvidenceStatus, KpiContract, KpiDirection, MetricValue, Mission, MissionBlock,
+    MissionCheckpoint, MissionCheckpointApplicationEvidence, MissionCheckpointCompletion,
     MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointOracleSource,
     MissionCheckpointRoute, MissionCheckpointStatus, MissionContract, MissionDefinition,
     MissionError, MissionStage, MissionTerminalDisposition, OperatingContract,
@@ -99,10 +99,12 @@ pub use mission_schedule::{
 };
 pub use money::{CurrencyCode, FxQuote, Money, MoneyError};
 pub use outcome::{
-    AttributionModel, AttributionRecord, CommissionRecord, CommissionStatus, OutcomeEvent,
-    OutcomeEventKind, OutcomeIdentityChainProjection, OutcomeLedger, OutcomeLedgerError,
+    AttributionModel, AttributionRecord, AttributionTrafficClass, CommissionRecord,
+    CommissionStatus, MissionKpiMeasurement, MissionKpiObservedValue, MissionKpiProjection,
+    OrderAttributionView, OutcomeAttributionProjection, OutcomeEvent, OutcomeEventKind,
+    OutcomeIdentityChainProjection, OutcomeLedger, OutcomeLedgerError,
     OutcomeNormalizationProjection, OutcomeOrder, OutcomeRefund, OutcomeSourceVerification,
-    OutcomeVerificationMethod, Touchpoint,
+    OutcomeVerificationMethod, Touchpoint, attribution_effect_provider_identity_digest,
 };
 pub use project::{Project, ProjectDataCell, ProjectError, StorageMode};
 pub use relationship::{

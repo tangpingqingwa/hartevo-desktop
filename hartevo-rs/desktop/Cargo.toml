@@ -16,6 +16,7 @@ hartevo-domain-kernel = { path = "../domain-kernel" }
 hartevo-runtime-adapter = { path = "../runtime-adapter" }
 hartevo-storage = { path = "../storage" }
 hex.workspace = true
+rust_decimal.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

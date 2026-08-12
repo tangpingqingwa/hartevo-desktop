@@ -40,6 +40,7 @@ pub struct AtomicMutation {
 /// safely with sync or recovery inserting that record.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ApplicationSourceKind {
+    Mission,
     Connection,
     IdentityLink,
     Person,
@@ -360,6 +361,9 @@ fn require_application_source_fence(
     fence: &ApplicationSourceRevisionFence,
 ) -> Result<(), StorageError> {
     let query = match fence.kind {
+        ApplicationSourceKind::Mission => {
+            "SELECT tenant_id, revision FROM missions WHERE project_id = ?1 AND id = ?2"
+        }
         ApplicationSourceKind::Connection => {
             "SELECT tenant_id, revision FROM connections WHERE project_id = ?1 AND id = ?2"
         }
@@ -411,6 +415,7 @@ fn require_application_source_fence(
 
 const fn application_source_name(kind: ApplicationSourceKind) -> &'static str {
     match kind {
+        ApplicationSourceKind::Mission => "mission",
         ApplicationSourceKind::Connection => "connection",
         ApplicationSourceKind::IdentityLink => "identity_link",
         ApplicationSourceKind::Person => "person",
@@ -497,8 +502,8 @@ pub(crate) fn append_events(
 mod tests {
     use chrono::TimeZone;
     use hartevo_domain_kernel::{
-        Company, CompanyId, MissionContract, MissionId, ProjectId, StorageMode, Task, TaskId,
-        TaskStatus, TenantId,
+        Company, CompanyId, MissionBlock, MissionContract, MissionId, MissionStage, ProjectId,
+        StorageMode, Task, TaskId, TaskStatus, TenantId,
     };
 
     use super::*;
@@ -766,16 +771,97 @@ mod tests {
                 .len(),
             event_count
         );
+
+        let mut parent = Mission::compile(
+            project.tenant_id.clone(),
+            MissionId::from("mission-source-fence-parent"),
+            project.id.clone(),
+            "Parent mission",
+            MissionContract::bootstrap("Parent KPI source", ["research.read".into()], now()),
+            now(),
+        )
+        .expect("parent mission");
+        parent
+            .start_research([], now())
+            .expect("start parent mission");
+        store
+            .create_mission_atomic(
+                &parent,
+                &[PendingEvent::new(
+                    "mission.parent_started",
+                    serde_json::json!({}),
+                    now(),
+                )],
+            )
+            .expect("persist parent mission");
+        let parent_previous_revision = parent.revision;
+        parent
+            .block(
+                MissionBlock {
+                    code: "fixture_parent_changed".into(),
+                    detail: "Change the parent revision before the child transaction".into(),
+                    recoverable: true,
+                    observed_at: now(),
+                },
+                MissionStage::Blocked,
+            )
+            .expect("change parent mission");
+        store
+            .update_mission_atomic(
+                &parent,
+                parent_previous_revision,
+                &[PendingEvent::new(
+                    "mission.parent_changed",
+                    serde_json::json!({}),
+                    now(),
+                )],
+            )
+            .expect("persist changed parent");
+        assert!(matches!(
+            store.update_mission_atomic_with_application_source_fences(
+                &candidate,
+                mission.revision,
+                None,
+                &[ApplicationSourceRevisionFence::present(
+                    ApplicationSourceKind::Mission,
+                    parent.id.to_string(),
+                    parent_previous_revision,
+                )],
+                &[PendingEvent::new(
+                    "test.stale_parent_must_rollback",
+                    serde_json::json!({}),
+                    now(),
+                )],
+            ),
+            Err(StorageError::OptimisticConflict {
+                aggregate,
+                expected_revision,
+            }) if aggregate == "mission_source_fence" && expected_revision == parent_previous_revision
+        ));
+        assert_eq!(
+            store
+                .events_for_mission(&project.id, &mission.id)
+                .expect("events after stale parent conflict")
+                .len(),
+            event_count
+        );
         store
             .update_mission_atomic_with_application_source_fences(
                 &candidate,
                 mission.revision,
                 None,
-                &[ApplicationSourceRevisionFence::present(
-                    ApplicationSourceKind::Company,
-                    company.id.to_string(),
-                    2,
-                )],
+                &[
+                    ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::Company,
+                        company.id.to_string(),
+                        2,
+                    ),
+                    ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::Mission,
+                        parent.id.to_string(),
+                        parent.revision,
+                    ),
+                ],
                 &[PendingEvent::new(
                     "mission.source_fence_verified",
                     serde_json::json!({}),

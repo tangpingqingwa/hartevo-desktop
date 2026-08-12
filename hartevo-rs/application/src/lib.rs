@@ -52,25 +52,25 @@ use hartevo_domain_kernel::{
     DevicePublicKeyRegistration, Effect, EffectClass, EffectId, EffectRisk, EffectSpec,
     EffectStatus, Evidence, EvidenceId, EvidenceStatus, FactId, FundingReservation, IdentityError,
     IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject, InboundIngest,
-    InboundMessageInput, KeyEnvelope, KeyEnvelopeId, KeyManagementError, KeyRecipient,
+    InboundMessageInput, KeyEnvelope, KeyEnvelopeId, KeyManagementError, KeyRecipient, KpiContract,
     MessageDelivery, MessageId, MetricValue, Mission, MissionCheckpointApplicationEvidence,
     MissionCheckpointCompletion, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
     MissionCheckpointOracleSource, MissionCheckpointRoute, MissionCheckpointStatus,
     MissionContract, MissionConversation, MissionConversationError, MissionConversationId,
     MissionConversationMessage, MissionConversationMessageId, MissionConversationMessageKind,
-    MissionConversationRole, MissionDefinition, MissionError, MissionId, MissionSchedule,
-    MissionScheduleError, MissionScheduleFailureClass, MissionScheduleId, MissionScheduleStatus,
-    MissionStage, MissionTerminalDisposition, Money, OperatingMode, Opportunity, OpportunityId,
-    OpportunityStage, OrderId, Outcome, OutcomeDecision, OutcomeEvent,
-    OutcomeIdentityChainProjection, OutcomeLedger, OutcomeLedgerError,
-    OutcomeNormalizationProjection, Partner, PartnerId, PayoutAuthorization, PayoutId, Person,
-    PersonId, PreparedAutomaticReply, Project, ProjectDataCell, ProjectEncryptionMode,
-    ProjectError, ProjectId, ProjectKeyring, ProjectKeyringBootstrap, ReceiptId, RelationshipError,
-    ReviewDecision, ReviewId, RuntimeProcessClaim, RuntimeProcessClaimStatus,
-    RuntimeProcessCleanupDisposition, RuntimeProcessIdentity, RuntimeRecoveryAttempt,
-    RuntimeRecoveryAttemptId, RuntimeRecoveryFailureClass, RuntimeRecoveryStatus,
-    RuntimeResumeStrategy, RuntimeTurnAttempt, RuntimeTurnAttemptId, RuntimeTurnError,
-    RuntimeTurnFailureClass, RuntimeTurnObservedKind, RuntimeTurnPrivateMessage,
+    MissionConversationRole, MissionDefinition, MissionError, MissionId, MissionKpiProjection,
+    MissionSchedule, MissionScheduleError, MissionScheduleFailureClass, MissionScheduleId,
+    MissionScheduleStatus, MissionStage, MissionTerminalDisposition, Money, OperatingMode,
+    Opportunity, OpportunityId, OpportunityStage, OrderId, Outcome, OutcomeAttributionProjection,
+    OutcomeDecision, OutcomeEvent, OutcomeIdentityChainProjection, OutcomeLedger,
+    OutcomeLedgerError, OutcomeNormalizationProjection, Partner, PartnerId, PayoutAuthorization,
+    PayoutId, Person, PersonId, PreparedAutomaticReply, Project, ProjectDataCell,
+    ProjectEncryptionMode, ProjectError, ProjectId, ProjectKeyring, ProjectKeyringBootstrap,
+    ReceiptId, RelationshipError, ReviewDecision, ReviewId, RuntimeProcessClaim,
+    RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition, RuntimeProcessIdentity,
+    RuntimeRecoveryAttempt, RuntimeRecoveryAttemptId, RuntimeRecoveryFailureClass,
+    RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt, RuntimeTurnAttemptId,
+    RuntimeTurnError, RuntimeTurnFailureClass, RuntimeTurnObservedKind, RuntimeTurnPrivateMessage,
     RuntimeTurnRestartDisposition, RuntimeTurnScope, RuntimeTurnStatus, StorageMode,
     SuppressionReason, Task, TaskId, TaskStatus, TenantId, TruthError, TruthFact,
     VerificationStatus, WebhookAttestation, WorkProduct, WorkProductDependencies, WorkProductId,
@@ -146,12 +146,14 @@ pub struct StartCatalogMission {
     pub project_id: ProjectId,
     pub manifest_id: String,
     pub mode: OperatingMode,
+    pub parent_mission_id: Option<MissionId>,
     pub title: Option<String>,
     pub goal: String,
     pub market: String,
     pub language: String,
     pub audience: String,
     pub timezone: String,
+    pub kpis: BTreeMap<String, KpiContract>,
     pub budget: Money,
 }
 
@@ -2225,12 +2227,16 @@ pub struct MissionCheckpointDispatch {
 const VM11_EVENT_INGEST_HANDLER_ID: &str = "vm11.event_ingest/v2";
 const VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID: &str = "vm11.normalize-dedupe-order/v1";
 const VM11_IDENTITY_CHAIN_HANDLER_ID: &str = "vm11.identity-chain/v1";
+const VM11_MISSION_SPECIFIC_KPI_HANDLER_ID: &str = "vm11.mission-specific-kpi/v1";
+const VM11_ATTRIBUTION_AND_UNATTRIBUTED_HANDLER_ID: &str = "vm11.attribution-and-unattributed/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompiledApplicationCheckpointHandler {
     EventIngest,
     NormalizeDedupeOrder,
     IdentityChain,
+    MissionSpecificKpi,
+    AttributionAndUnattributed,
 }
 
 impl CompiledApplicationCheckpointHandler {
@@ -2239,6 +2245,8 @@ impl CompiledApplicationCheckpointHandler {
             Self::EventIngest => VM11_EVENT_INGEST_HANDLER_ID,
             Self::NormalizeDedupeOrder => VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID,
             Self::IdentityChain => VM11_IDENTITY_CHAIN_HANDLER_ID,
+            Self::MissionSpecificKpi => VM11_MISSION_SPECIFIC_KPI_HANDLER_ID,
+            Self::AttributionAndUnattributed => VM11_ATTRIBUTION_AND_UNATTRIBUTED_HANDLER_ID,
         }
     }
 
@@ -2247,6 +2255,8 @@ impl CompiledApplicationCheckpointHandler {
             Self::EventIngest => "outcome_ledger",
             Self::NormalizeDedupeOrder => "outcome_normalization",
             Self::IdentityChain => "outcome_identity_chain",
+            Self::MissionSpecificKpi => "outcome_mission_kpi",
+            Self::AttributionAndUnattributed => "outcome_attribution",
         }
     }
 }
@@ -2469,6 +2479,29 @@ fn load_outcome_identity_chain_support(
     })
 }
 
+fn vm11_inherits_exact_parent_contract(mission: &Mission, parent: &Mission) -> bool {
+    let Some(mission_definition) = mission.definition.as_ref() else {
+        return false;
+    };
+    mission.tenant_id == parent.tenant_id
+        && mission.project_id == parent.project_id
+        && mission.id != parent.id
+        && mission.contract.parent_mission_id.as_ref() == Some(&parent.id)
+        && parent.definition.as_ref().is_some_and(|definition| {
+            definition.manifest_id != "VM-11"
+                && definition.catalog_digest == mission_definition.catalog_digest
+        })
+        && parent.contract.parent_mission_id.is_none()
+        && !parent.contract.kpis.is_empty()
+        && mission.contract.mode == parent.contract.mode
+        && mission.contract.market == parent.contract.market
+        && mission.contract.language == parent.contract.language
+        && mission.contract.audience == parent.contract.audience
+        && mission.contract.timezone == parent.contract.timezone
+        && mission.contract.budget == parent.contract.budget
+        && mission.contract.kpis == parent.contract.kpis
+}
+
 fn compiled_application_checkpoint_handler(
     handler_id: &str,
 ) -> Option<CompiledApplicationCheckpointHandler> {
@@ -2478,6 +2511,12 @@ fn compiled_application_checkpoint_handler(
             Some(CompiledApplicationCheckpointHandler::NormalizeDedupeOrder)
         }
         VM11_IDENTITY_CHAIN_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::IdentityChain),
+        VM11_MISSION_SPECIFIC_KPI_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::MissionSpecificKpi)
+        }
+        VM11_ATTRIBUTION_AND_UNATTRIBUTED_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::AttributionAndUnattributed)
+        }
         _ => None,
     }
 }
@@ -3028,6 +3067,200 @@ fn vm11_identity_chain_application_evidence(
                 source_revision: identity_chain.source_ledger_revision,
                 projection_digest: identity_chain.digest(),
                 oracle_ids: BTreeSet::from(["decision".into(), "truth".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
+fn vm11_mission_specific_kpi_application_evidence(
+    mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    kpi: &MissionKpiProjection,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    if kpi.tenant_id != mission.tenant_id
+        || kpi.project_id != mission.project_id
+        || mission.contract.parent_mission_id.as_ref() != Some(&kpi.source_mission_id)
+        || kpi.source_mission_revision == 0
+        || kpi.source_ledger_revision == 0
+        || kpi.measurement_count == 0
+        || usize::try_from(kpi.measurement_count).ok() != Some(kpi.measurements.len())
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM11_MISSION_SPECIFIC_KPI_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "parent_mission_contract".into(),
+                source_id: kpi.source_mission_id.to_string(),
+                source_revision: kpi.source_mission_revision,
+                projection_digest: kpi.source_contract_digest.clone(),
+                oracle_ids: BTreeSet::from(["decision".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "outcome_mission_kpi".into(),
+                source_id: kpi.project_id.to_string(),
+                source_revision: kpi.source_ledger_revision,
+                projection_digest: kpi.digest()?,
+                oracle_ids: BTreeSet::from(["outcome".into(), "truth".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
+fn vm11_attribution_and_unattributed_application_evidence(
+    mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    attribution: &OutcomeAttributionProjection,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let represented_orders = attribution
+        .verified_identity_order_count
+        .checked_add(attribution.last_non_direct_order_count)
+        .and_then(|count| count.checked_add(attribution.unattributed_order_count));
+    if attribution.tenant_id != mission.tenant_id
+        || attribution.project_id != mission.project_id
+        || mission.contract.parent_mission_id.as_ref() != Some(&attribution.source_mission_id)
+        || attribution.source_mission_revision == 0
+        || attribution.source_ledger_revision == 0
+        || attribution.causal_claim
+        || usize::try_from(attribution.order_count).ok() != Some(attribution.orders.len())
+        || represented_orders != Some(attribution.order_count)
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM11_ATTRIBUTION_AND_UNATTRIBUTED_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "outcome_normalization".into(),
+                source_id: attribution.project_id.to_string(),
+                source_revision: attribution.source_ledger_revision,
+                projection_digest: attribution.normalization_digest.clone(),
+                oracle_ids: BTreeSet::from(["truth".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "attribution_effect_support".into(),
+                source_id: attribution.source_mission_id.to_string(),
+                source_revision: attribution.source_ledger_revision,
+                projection_digest: attribution.effect_support_digest.clone(),
+                oracle_ids: BTreeSet::from(["effect".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "outcome_attribution".into(),
+                source_id: attribution.project_id.to_string(),
+                source_revision: attribution.source_ledger_revision,
+                projection_digest: attribution.digest()?,
+                oracle_ids: BTreeSet::from(["decision".into(), "outcome".into()]),
             },
         ]),
         observed_at: now,
@@ -7053,7 +7286,19 @@ impl ApplicationService {
         let manifest = catalog
             .mission(command.manifest_id.trim())
             .ok_or(ApplicationError::InvalidCatalogMissionInput)?;
-        let contract = compile_catalog_contract(&catalog, manifest, &command, now)?;
+        let parent_mission = command
+            .parent_mission_id
+            .as_ref()
+            .map(|parent_id| self.store.load_mission(&command.project_id, parent_id))
+            .transpose()?;
+        let contract = compile_catalog_contract(
+            &catalog,
+            &snapshot.digest,
+            manifest,
+            &command,
+            parent_mission.as_ref(),
+            now,
+        )?;
         let checkpoint_routes = manifest
             .checkpoint_routes
             .iter()
@@ -7410,20 +7655,32 @@ impl ApplicationService {
             Err(error) => return Err(error.into()),
         };
         let mut application_source_fences = Vec::new();
-        let identity_chain = if compiled_handler
-            == CompiledApplicationCheckpointHandler::IdentityChain
-        {
+        let identity_chain = if matches!(
+            compiled_handler,
+            CompiledApplicationCheckpointHandler::IdentityChain
+                | CompiledApplicationCheckpointHandler::MissionSpecificKpi
+                | CompiledApplicationCheckpointHandler::AttributionAndUnattributed
+        ) {
             let support = match load_outcome_identity_chain_support(&self.store, &outcome_ledger) {
                 Ok(support) => support,
                 Err(OutcomeIdentityChainSupportLoadError::Missing { kind, id }) => {
                     let missing_fence = ApplicationSourceRevisionFence::absent(kind, id);
+                    let code = match compiled_handler {
+                        CompiledApplicationCheckpointHandler::MissionSpecificKpi => {
+                            "mission_kpi_identity_support_missing"
+                        }
+                        CompiledApplicationCheckpointHandler::AttributionAndUnattributed => {
+                            "attribution_identity_support_missing"
+                        }
+                        _ => "identity_chain_support_missing",
+                    };
                     return persist_application_checkpoint_block(
                         &mut self.store,
                         &mut mission,
                         &command,
                         &dispatch,
                         handler_id,
-                        "identity_chain_support_missing",
+                        code,
                         format!(
                             "{} cannot resolve the complete project-scoped identity support closure; no substitute identity was inferred.",
                             command.checkpoint_id
@@ -7455,7 +7712,7 @@ impl ApplicationService {
                     | OutcomeLedgerError::IdentityChainSupportClosureMismatch
                     | OutcomeLedgerError::IdentityChainCoverageMismatch),
                 ) => {
-                    let (code, recoverable) = match error {
+                    let (base_code, recoverable) = match error {
                         OutcomeLedgerError::IdentityLinkUnconfirmed => {
                             ("identity_link_unconfirmed", true)
                         }
@@ -7471,6 +7728,15 @@ impl ApplicationService {
                         }
                         _ => unreachable!("identity-chain error alternatives are exhaustive"),
                     };
+                    let code = match compiled_handler {
+                        CompiledApplicationCheckpointHandler::MissionSpecificKpi => {
+                            "mission_kpi_identity_chain_changed"
+                        }
+                        CompiledApplicationCheckpointHandler::AttributionAndUnattributed => {
+                            "attribution_identity_chain_changed"
+                        }
+                        _ => base_code,
+                    };
                     return persist_application_checkpoint_block(
                         &mut self.store,
                         &mut mission,
@@ -7480,6 +7746,377 @@ impl ApplicationService {
                         code,
                         format!(
                             "{} failed its deterministic identity-chain Oracle; Outcome identities remain unresolved and no attribution decision was fabricated.",
+                            command.checkpoint_id
+                        ),
+                        recoverable,
+                        outcome_ledger.revision,
+                        &application_source_fences,
+                        now,
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        let parent_mission = if matches!(
+            compiled_handler,
+            CompiledApplicationCheckpointHandler::MissionSpecificKpi
+                | CompiledApplicationCheckpointHandler::AttributionAndUnattributed
+        ) {
+            let Some(parent_mission_id) = mission.contract.parent_mission_id.clone() else {
+                let (code, detail) = match compiled_handler {
+                    CompiledApplicationCheckpointHandler::MissionSpecificKpi => (
+                        "mission_kpi_parent_missing",
+                        "mission_specific_kpi requires an immutable parent Mission reference; no current Mission or project aggregate was substituted.",
+                    ),
+                    CompiledApplicationCheckpointHandler::AttributionAndUnattributed => (
+                        "attribution_parent_missing",
+                        "attribution_and_unattributed requires an immutable parent Mission reference; no current Mission or project aggregate was substituted.",
+                    ),
+                    _ => unreachable!("parent-bound handler alternatives are exhaustive"),
+                };
+                return persist_application_checkpoint_block(
+                    &mut self.store,
+                    &mut mission,
+                    &command,
+                    &dispatch,
+                    handler_id,
+                    code,
+                    detail.into(),
+                    false,
+                    outcome_ledger.revision,
+                    &application_source_fences,
+                    now,
+                );
+            };
+            let parent_mission = match self
+                .store
+                .load_mission(&command.project_id, &parent_mission_id)
+            {
+                Ok(parent) => parent,
+                Err(StorageError::MissionNotFound { .. }) => {
+                    let missing_parent_fence = ApplicationSourceRevisionFence::absent(
+                        ApplicationSourceKind::Mission,
+                        parent_mission_id.to_string(),
+                    );
+                    application_source_fences.push(missing_parent_fence);
+                    let (code, detail) = match compiled_handler {
+                        CompiledApplicationCheckpointHandler::MissionSpecificKpi => (
+                            "mission_kpi_parent_unavailable",
+                            "The exact parent Mission is unavailable; no sibling Mission contract was inferred.",
+                        ),
+                        CompiledApplicationCheckpointHandler::AttributionAndUnattributed => (
+                            "attribution_parent_unavailable",
+                            "The exact attribution parent Mission is unavailable; no sibling Mission contract or project aggregate was inferred.",
+                        ),
+                        _ => unreachable!("parent-bound handler alternatives are exhaustive"),
+                    };
+                    return persist_application_checkpoint_block(
+                        &mut self.store,
+                        &mut mission,
+                        &command,
+                        &dispatch,
+                        handler_id,
+                        code,
+                        detail.into(),
+                        true,
+                        outcome_ledger.revision,
+                        &application_source_fences,
+                        now,
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            };
+            application_source_fences.push(ApplicationSourceRevisionFence::present(
+                ApplicationSourceKind::Mission,
+                parent_mission.id.to_string(),
+                parent_mission.revision,
+            ));
+            if !vm11_inherits_exact_parent_contract(&mission, &parent_mission) {
+                let code = if compiled_handler
+                    == CompiledApplicationCheckpointHandler::MissionSpecificKpi
+                {
+                    "mission_kpi_parent_contract_mismatch"
+                } else {
+                    "attribution_parent_contract_mismatch"
+                };
+                return persist_application_checkpoint_block(
+                    &mut self.store,
+                    &mut mission,
+                    &command,
+                    &dispatch,
+                    handler_id,
+                    code,
+                    "The VM-11 contract no longer exactly inherits its parent Mission mode, market, locale, audience, timezone, budget and KPI set."
+                        .into(),
+                    false,
+                    outcome_ledger.revision,
+                    &application_source_fences,
+                    now,
+                );
+            }
+            Some(parent_mission)
+        } else {
+            None
+        };
+        let mission_kpi = if compiled_handler
+            == CompiledApplicationCheckpointHandler::MissionSpecificKpi
+        {
+            let current_identity_chain = identity_chain.as_ref().ok_or(
+                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                    handler_id: handler_id.into(),
+                },
+            )?;
+            let parent_mission = parent_mission.as_ref().ok_or(
+                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                    handler_id: handler_id.into(),
+                },
+            )?;
+            match outcome_ledger.verified_mission_kpi_projection(
+                parent_mission,
+                current_identity_chain,
+                now,
+            ) {
+                Ok(projection) => Some(projection),
+                Err(
+                    error @ (OutcomeLedgerError::KpiSourceEventsUnavailable
+                    | OutcomeLedgerError::UnsupportedKpiMetric
+                    | OutcomeLedgerError::KpiCurrencyMismatch
+                    | OutcomeLedgerError::InvalidKpiContract
+                    | OutcomeLedgerError::KpiMissionScopeMismatch
+                    | OutcomeLedgerError::KpiIdentityChainMismatch
+                    | OutcomeLedgerError::KpiArithmetic),
+                ) => {
+                    let (code, recoverable) = match error {
+                        OutcomeLedgerError::KpiSourceEventsUnavailable => {
+                            ("mission_kpi_outcomes_unavailable", true)
+                        }
+                        OutcomeLedgerError::UnsupportedKpiMetric => {
+                            ("mission_kpi_metric_unsupported", false)
+                        }
+                        OutcomeLedgerError::KpiCurrencyMismatch => {
+                            ("mission_kpi_currency_conflict", false)
+                        }
+                        OutcomeLedgerError::InvalidKpiContract => {
+                            ("mission_kpi_contract_invalid", false)
+                        }
+                        OutcomeLedgerError::KpiMissionScopeMismatch
+                        | OutcomeLedgerError::KpiIdentityChainMismatch => {
+                            ("mission_kpi_source_inconsistent", false)
+                        }
+                        OutcomeLedgerError::KpiArithmetic => {
+                            ("mission_kpi_arithmetic_overflow", false)
+                        }
+                        _ => unreachable!("KPI error alternatives are exhaustive"),
+                    };
+                    return persist_application_checkpoint_block(
+                        &mut self.store,
+                        &mut mission,
+                        &command,
+                        &dispatch,
+                        handler_id,
+                        code,
+                        format!(
+                            "{} failed its deterministic parent-Mission KPI Oracle; no zero value, cross-currency sum, CRM-stage revenue, or unsupported metric was fabricated.",
+                            command.checkpoint_id
+                        ),
+                        recoverable,
+                        outcome_ledger.revision,
+                        &application_source_fences,
+                        now,
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        let outcome_attribution = if compiled_handler
+            == CompiledApplicationCheckpointHandler::AttributionAndUnattributed
+        {
+            let parent_mission = parent_mission.as_ref().ok_or(
+                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                    handler_id: handler_id.into(),
+                },
+            )?;
+            let current_identity_chain = identity_chain.as_ref().ok_or(
+                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                    handler_id: handler_id.into(),
+                },
+            )?;
+            let support_mission_ids = match outcome_ledger
+                .attribution_support_mission_ids(parent_mission, now)
+            {
+                Ok(ids) => ids,
+                Err(OutcomeLedgerError::InvalidAttribution) => {
+                    return persist_application_checkpoint_block(
+                        &mut self.store,
+                        &mut mission,
+                        &command,
+                        &dispatch,
+                        handler_id,
+                        "attribution_record_invalid",
+                        "An attribution record does not have a legal model/touchpoint shape; the handler did not infer a replacement source."
+                            .into(),
+                        false,
+                        outcome_ledger.revision,
+                        &application_source_fences,
+                        now,
+                    );
+                }
+                Err(OutcomeLedgerError::AttributionSourceOrdersUnavailable) => {
+                    return persist_application_checkpoint_block(
+                        &mut self.store,
+                        &mut mission,
+                        &command,
+                        &dispatch,
+                        handler_id,
+                        "attribution_source_orders_unavailable",
+                        "The current attribution contract addresses verified orders; an empty order projection cannot complete a lead-, meeting-, or stage-only parent Mission."
+                            .into(),
+                        true,
+                        outcome_ledger.revision,
+                        &application_source_fences,
+                        now,
+                    );
+                }
+                Err(
+                    error @ (OutcomeLedgerError::AttributionMissionScopeMismatch
+                    | OutcomeLedgerError::AttributionWindowMismatch),
+                ) => {
+                    let code = if error == OutcomeLedgerError::AttributionWindowMismatch {
+                        "attribution_window_inconsistent"
+                    } else {
+                        "attribution_parent_scope_inconsistent"
+                    };
+                    return persist_application_checkpoint_block(
+                        &mut self.store,
+                        &mut mission,
+                        &command,
+                        &dispatch,
+                        handler_id,
+                        code,
+                        "The attribution source Mission or frozen observation window is inconsistent; no out-of-window touchpoint was selected."
+                            .into(),
+                        false,
+                        outcome_ledger.revision,
+                        &application_source_fences,
+                        now,
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let mut supporting_missions = Vec::with_capacity(support_mission_ids.len());
+            for support_mission_id in support_mission_ids {
+                let support_mission = if support_mission_id == parent_mission.id {
+                    parent_mission.clone()
+                } else if support_mission_id == mission.id {
+                    return persist_application_checkpoint_block(
+                        &mut self.store,
+                        &mut mission,
+                        &command,
+                        &dispatch,
+                        handler_id,
+                        "attribution_self_reference",
+                        "The VM-11 review Mission cannot act as its own attribution touchpoint source; a prior source Mission is required."
+                            .into(),
+                        false,
+                        outcome_ledger.revision,
+                        &application_source_fences,
+                        now,
+                    );
+                } else {
+                    match self
+                        .store
+                        .load_mission(&command.project_id, &support_mission_id)
+                    {
+                        Ok(support) => support,
+                        Err(StorageError::MissionNotFound { .. }) => {
+                            application_source_fences.push(ApplicationSourceRevisionFence::absent(
+                                ApplicationSourceKind::Mission,
+                                support_mission_id.to_string(),
+                            ));
+                            return persist_application_checkpoint_block(
+                                &mut self.store,
+                                &mut mission,
+                                &command,
+                                &dispatch,
+                                handler_id,
+                                "attribution_support_unavailable",
+                                "A touchpoint's exact source Mission is unavailable; no similarly named Mission or provider response was substituted."
+                                    .into(),
+                                true,
+                                outcome_ledger.revision,
+                                &application_source_fences,
+                                now,
+                            );
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                if support_mission.id != parent_mission.id {
+                    application_source_fences.push(ApplicationSourceRevisionFence::present(
+                        ApplicationSourceKind::Mission,
+                        support_mission.id.to_string(),
+                        support_mission.revision,
+                    ));
+                }
+                supporting_missions.push(support_mission);
+            }
+            match outcome_ledger.verified_attribution_projection(
+                parent_mission,
+                current_identity_chain,
+                &supporting_missions,
+                now,
+            ) {
+                Ok(projection) => Some(projection),
+                Err(
+                    error @ (OutcomeLedgerError::UnverifiedAttributionSource
+                    | OutcomeLedgerError::AttributionSupportClosureMismatch
+                    | OutcomeLedgerError::AttributionWindowMismatch
+                    | OutcomeLedgerError::AttributionEffectSupportInvalid
+                    | OutcomeLedgerError::DuplicateAttributionTouchpoint
+                    | OutcomeLedgerError::DisputedAttribution
+                    | OutcomeLedgerError::AttributionMissionScopeMismatch
+                    | OutcomeLedgerError::AttributionIdentityChainMismatch
+                    | OutcomeLedgerError::InvalidAttribution),
+                ) => {
+                    let (code, recoverable) = match error {
+                        OutcomeLedgerError::UnverifiedAttributionSource => {
+                            ("attribution_source_unverified", true)
+                        }
+                        OutcomeLedgerError::AttributionSupportClosureMismatch => {
+                            ("attribution_support_unavailable", true)
+                        }
+                        OutcomeLedgerError::AttributionWindowMismatch => {
+                            ("attribution_window_inconsistent", false)
+                        }
+                        OutcomeLedgerError::AttributionEffectSupportInvalid => {
+                            ("attribution_effect_unverified", true)
+                        }
+                        OutcomeLedgerError::DuplicateAttributionTouchpoint => {
+                            ("attribution_touchpoint_duplicate", false)
+                        }
+                        OutcomeLedgerError::DisputedAttribution => ("attribution_disputed", true),
+                        OutcomeLedgerError::AttributionMissionScopeMismatch
+                        | OutcomeLedgerError::AttributionIdentityChainMismatch => {
+                            ("attribution_source_inconsistent", false)
+                        }
+                        OutcomeLedgerError::InvalidAttribution => {
+                            ("attribution_record_invalid", false)
+                        }
+                        _ => unreachable!("attribution error alternatives are exhaustive"),
+                    };
+                    return persist_application_checkpoint_block(
+                        &mut self.store,
+                        &mut mission,
+                        &command,
+                        &dispatch,
+                        handler_id,
+                        code,
+                        format!(
+                            "{} failed its deterministic attribution Oracle; verified identity, last-non-direct, first-touch and Unattributed remain distinct, and no correlation was promoted to causality.",
                             command.checkpoint_id
                         ),
                         recoverable,
@@ -7544,6 +8181,32 @@ impl ApplicationService {
                     now,
                 )?
             }
+            CompiledApplicationCheckpointHandler::MissionSpecificKpi => {
+                vm11_mission_specific_kpi_application_evidence(
+                    &mission,
+                    route,
+                    &command,
+                    mission_kpi.as_ref().ok_or(
+                        ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                            handler_id: handler_id.into(),
+                        },
+                    )?,
+                    now,
+                )?
+            }
+            CompiledApplicationCheckpointHandler::AttributionAndUnattributed => {
+                vm11_attribution_and_unattributed_application_evidence(
+                    &mission,
+                    route,
+                    &command,
+                    outcome_attribution.as_ref().ok_or(
+                        ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                            handler_id: handler_id.into(),
+                        },
+                    )?,
+                    now,
+                )?
+            }
         };
         validate_application_evidence_against_registry(&application_evidence)?;
         let evidence_digest = application_evidence.digest();
@@ -7571,16 +8234,22 @@ impl ApplicationService {
             .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
         let next_started = start_ready_catalog_checkpoint_in_memory(&mut mission, now)?;
         let next_dispatch = current_checkpoint_dispatch_projection(&mission)?;
-        let source_metrics = identity_chain.as_ref().map_or_else(
-            || {
+        let source_metrics = match compiled_handler {
+            CompiledApplicationCheckpointHandler::EventIngest
+            | CompiledApplicationCheckpointHandler::NormalizeDedupeOrder => {
                 serde_json::json!({
                     "eventCount": normalization.event_count,
                     "orderCount": normalization.order_count,
                     "refundCount": normalization.refund_count,
                     "observedReorderCount": normalization.observed_reorder_count,
                 })
-            },
-            |projection| {
+            }
+            CompiledApplicationCheckpointHandler::IdentityChain => {
+                let projection = identity_chain.as_ref().ok_or(
+                    ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                        handler_id: handler_id.into(),
+                    },
+                )?;
                 serde_json::json!({
                     "eventCount": projection.event_count,
                     "identityCoveredEventCount": projection.identity_covered_event_count,
@@ -7594,8 +8263,46 @@ impl ApplicationService {
                     "partnerCount": projection.partner_count,
                     "opportunityCount": projection.opportunity_count,
                 })
-            },
-        );
+            }
+            CompiledApplicationCheckpointHandler::MissionSpecificKpi => {
+                let projection = mission_kpi.as_ref().ok_or(
+                    ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                        handler_id: handler_id.into(),
+                    },
+                )?;
+                serde_json::json!({
+                    "sourceEventCount": projection.source_event_count,
+                    "measurementCount": projection.measurement_count,
+                    "targetMetCount": projection.target_met_count,
+                    "windowStartedAt": projection.window_started_at,
+                    "windowEndedAt": projection.window_ended_at,
+                    "parentMissionRevision": projection.source_mission_revision,
+                })
+            }
+            CompiledApplicationCheckpointHandler::AttributionAndUnattributed => {
+                let projection = outcome_attribution.as_ref().ok_or(
+                    ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                        handler_id: handler_id.into(),
+                    },
+                )?;
+                serde_json::json!({
+                    "orderCount": projection.order_count,
+                    "sourceRecordCount": projection.source_record_count,
+                    "eligibleTouchpointCount": projection.eligible_touchpoint_count,
+                    "verifiedIdentityOrderCount": projection.verified_identity_order_count,
+                    "lastNonDirectOrderCount": projection.last_non_direct_order_count,
+                    "unattributedOrderCount": projection.unattributed_order_count,
+                    "firstTouchOrderCount": projection.first_touch_order_count,
+                    "explicitUnattributedRecordCount": projection.explicit_unattributed_record_count,
+                    "supportingMissionCount": projection.supporting_mission_count,
+                    "verifiedEffectCount": projection.verified_effect_count,
+                    "causalClaim": projection.causal_claim,
+                    "windowStartedAt": projection.window_started_at,
+                    "windowEndedAt": projection.window_ended_at,
+                    "parentMissionRevision": projection.source_mission_revision,
+                })
+            }
+        };
         let mut events = vec![PendingEvent::new(
             "mission.application_checkpoint_completed",
             serde_json::json!({
@@ -13470,7 +14177,7 @@ impl ApplicationService {
         let expected_revision = ledger.revision;
         let mission_id = event.mission_id.clone();
         let event_id = event.id.clone();
-        let kind = event.kind.clone();
+        let kind = event.kind;
         let source_event_id = event.source_event_id.clone();
         let provider = event.provider.clone();
         let is_revenue = event.is_revenue_event();
@@ -13505,7 +14212,7 @@ impl ApplicationService {
         let mission_id = attribution_mission(&ledger, &record)?;
         let attribution_id = record.id.clone();
         let order_id = record.order_id.clone();
-        let model = record.model.clone();
+        let model = record.model;
         ledger.attribute(record)?;
         self.store.update_outcome_ledger(
             &ledger,
@@ -17220,8 +17927,10 @@ pub fn compile_contract(prompt: &str, now: DateTime<Utc>) -> MissionContract {
 )]
 fn compile_catalog_contract(
     catalog: &Catalog,
+    catalog_digest: &str,
     manifest: &MissionManifest,
     command: &StartCatalogMission,
+    parent_mission: Option<&Mission>,
     now: DateTime<Utc>,
 ) -> Result<MissionContract, ApplicationError> {
     let goal = command.goal.trim();
@@ -17239,9 +17948,43 @@ fn compile_catalog_contract(
     {
         return Err(ApplicationError::InvalidCatalogMissionInput);
     }
+    if command.kpis.is_empty() {
+        return Err(ApplicationError::CatalogMissionKpiRequired);
+    }
     let mode_name = operating_mode_catalog_name(&command.mode);
     if !manifest.modes.iter().any(|mode| mode == mode_name) {
         return Err(ApplicationError::CatalogMissionModeNotAllowed);
+    }
+
+    if manifest.id == "VM-11" {
+        let parent = parent_mission.ok_or(ApplicationError::CatalogMissionParentRequired)?;
+        let parent_definition = parent
+            .definition
+            .as_ref()
+            .filter(|definition| definition.manifest_id != "VM-11")
+            .ok_or(ApplicationError::CatalogMissionParentRequired)?;
+        let parent_manifest = catalog
+            .mission(&parent_definition.manifest_id)
+            .ok_or(ApplicationError::CatalogMissionParentContractMismatch)?;
+        if parent.id == command.id
+            || command.parent_mission_id.as_ref() != Some(&parent.id)
+            || parent.project_id != command.project_id
+            || parent_definition.catalog_digest != catalog_digest
+            || parent_definition.manifest_version != parent_manifest.version
+            || parent.contract.parent_mission_id.is_some()
+            || command.mode != parent.contract.mode
+            || market != parent.contract.market
+            || language != parent.contract.language
+            || audience != parent.contract.audience
+            || timezone != parent.contract.timezone
+            || command.budget != parent.contract.budget
+            || command.kpis != parent.contract.kpis
+            || parent.contract.kpis.is_empty()
+        {
+            return Err(ApplicationError::CatalogMissionParentContractMismatch);
+        }
+    } else if command.parent_mission_id.is_some() || parent_mission.is_some() {
+        return Err(ApplicationError::CatalogMissionParentRequired);
     }
 
     let enabled_capabilities = manifest
@@ -17367,6 +18110,7 @@ fn compile_catalog_contract(
     let contract = MissionContract {
         version: 1,
         mode: command.mode.clone(),
+        parent_mission_id: command.parent_mission_id.clone(),
         goal: goal.to_owned(),
         non_goals: vec![
             "treat provider acceptance as business verification".into(),
@@ -17376,7 +18120,7 @@ fn compile_catalog_contract(
         market: market.to_owned(),
         language: language.to_owned(),
         audience: audience.to_owned(),
-        kpis: BTreeMap::new(),
+        kpis: command.kpis.clone(),
         budget: command.budget.clone(),
         timezone: timezone.to_owned(),
         cadence,
@@ -17745,6 +18489,12 @@ pub enum ApplicationError {
     InvalidCatalogMissionInput,
     #[error("the selected operating mode is not allowed by the Mission Manifest")]
     CatalogMissionModeNotAllowed,
+    #[error("every Catalog Mission requires at least one explicit KPI contract")]
+    CatalogMissionKpiRequired,
+    #[error("VM-11 requires one existing, same-project, non-VM-11 parent Mission")]
+    CatalogMissionParentRequired,
+    #[error("VM-11 inputs must exactly inherit the parent Mission operating contract")]
+    CatalogMissionParentContractMismatch,
     #[error("worker lease revision changed: expected {expected}, actual {actual}")]
     WorkerLeaseRevisionMismatch { expected: u64, actual: u64 },
     #[error("project key reference does not match the tenant, project, recipient, or key version")]
@@ -17848,14 +18598,14 @@ mod tests {
     #[cfg(unix)]
     use hartevo_context_fabric::{PinnedModelTokenizer, PinnedTokenizerSpec};
     use hartevo_domain_kernel::{
-        Approval, ApprovalDecision, ApprovalId, AttributionId, AttributionModel, CommissionStatus,
-        ContactPermission, ContextCapsuleStatus, ContextDataClass, ConversationContentRisk,
-        CreatorId, CreatorMilestoneSpec, CurrencyCode, DeletionPropagationStatus, DeletionSurface,
-        DeliverableAssessment, DeviceId, ExternalIdentity, LegalBasis, MemberId, MessagingGateway,
-        OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification, OutcomeVerificationMethod,
-        PartnerSupplyClass, ProbeOutcome, Receipt, ReceiptId, RefundId, RightsAttestation,
-        Touchpoint, TruthSource, TruthStatus, TruthValue, UsageRights, Verification,
-        VerificationId,
+        Approval, ApprovalDecision, ApprovalId, AttributionId, AttributionModel,
+        AttributionTrafficClass, CommissionStatus, ContactPermission, ContextCapsuleStatus,
+        ContextDataClass, ConversationContentRisk, CreatorId, CreatorMilestoneSpec, CurrencyCode,
+        DeletionPropagationStatus, DeletionSurface, DeliverableAssessment, DeviceId,
+        ExternalIdentity, KpiDirection, LegalBasis, MemberId, MessagingGateway, OutcomeEventId,
+        OutcomeEventKind, OutcomeSourceVerification, OutcomeVerificationMethod, PartnerSupplyClass,
+        ProbeOutcome, Receipt, ReceiptId, RefundId, RightsAttestation, Touchpoint, TruthSource,
+        TruthStatus, TruthValue, UsageRights, Verification, VerificationId,
     };
     use hartevo_effect_broker::{
         EffectPolicy, EffectRateLimit, PermissionFailure, ProviderFailure,
@@ -17869,6 +18619,52 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 8, 10, 10, 0, 0)
             .single()
             .expect("valid time")
+    }
+
+    fn catalog_count_kpis() -> BTreeMap<String, KpiContract> {
+        BTreeMap::from([(
+            "lead_qualified_count".into(),
+            KpiContract {
+                baseline: Some(Decimal::ZERO),
+                target: Decimal::ONE,
+                unit: "count".into(),
+                direction: KpiDirection::AtLeast,
+            },
+        )])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_vm11_parent(
+        service: &mut ApplicationService,
+        project_id: &ProjectId,
+        parent_id: MissionId,
+        market: &str,
+        language: &str,
+        audience: &str,
+        timezone: &str,
+        budget: Money,
+    ) -> Mission {
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: parent_id,
+                    first_task_id: TaskId::new(),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-07".into(),
+                    mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: None,
+                    title: Some("Parent decision Mission".into()),
+                    goal: "Collect the business outcomes reviewed by VM-11".into(),
+                    market: market.into(),
+                    language: language.into(),
+                    audience: audience.into(),
+                    timezone: timezone.into(),
+                    kpis: catalog_count_kpis(),
+                    budget,
+                },
+                now(),
+            )
+            .expect("VM-11 parent Mission")
     }
 
     fn complete_catalog_checkpoint_dag(
@@ -18286,6 +19082,184 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "the atomic contract test proves four independent rejection boundaries and verifies that none creates partial Mission state"
+    )]
+    fn catalog_contract_rejects_missing_kpi_missing_parent_and_vm11_inheritance_drift_atomically() {
+        let workspace = tempfile::tempdir().expect("project workspace");
+        let project_id = ProjectId::from("catalog-contract-negative-project");
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: TenantId::from("catalog-contract-negative-tenant"),
+                    id: project_id.clone(),
+                    name: "Catalog contract negatives".into(),
+                    description: String::new(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    storage_mode: StorageMode::LocalNew,
+                },
+                now(),
+            )
+            .expect("project");
+
+        let missing_kpi = service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: MissionId::from("missing-kpi-mission"),
+                    first_task_id: TaskId::from("missing-kpi-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-07".into(),
+                    mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: None,
+                    title: None,
+                    goal: "Decide only from explicit evidence".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: BTreeMap::new(),
+                    budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
+                },
+                now(),
+            )
+            .expect_err("Catalog Mission without KPI must be rejected");
+        assert!(matches!(
+            missing_kpi,
+            ApplicationError::CatalogMissionKpiRequired
+        ));
+
+        let missing_parent = service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: MissionId::from("missing-parent-vm11"),
+                    first_task_id: TaskId::from("missing-parent-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-11".into(),
+                    mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: None,
+                    title: None,
+                    goal: "Recompute one source Mission".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
+                },
+                now(),
+            )
+            .expect_err("VM-11 without parent must be rejected");
+        assert!(matches!(
+            missing_parent,
+            ApplicationError::CatalogMissionParentRequired
+        ));
+        assert!(
+            service.desktop_inventory().expect("inventory").projects[0]
+                .missions
+                .is_empty()
+        );
+
+        let parent_id = MissionId::from("contract-source-parent");
+        let parent = start_vm11_parent(
+            &mut service,
+            &project_id,
+            parent_id.clone(),
+            "US",
+            "en-US",
+            "owner",
+            "America/New_York",
+            Money::zero(CurrencyCode::parse("USD").expect("USD")),
+        );
+        let inherited_contract_drift = service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: MissionId::from("drifted-vm11"),
+                    first_task_id: TaskId::from("drifted-vm11-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-11".into(),
+                    mode: parent.contract.mode.clone(),
+                    parent_mission_id: Some(parent_id.clone()),
+                    title: None,
+                    goal: "Recompute one source Mission".into(),
+                    market: "DE".into(),
+                    language: parent.contract.language.clone(),
+                    audience: parent.contract.audience.clone(),
+                    timezone: parent.contract.timezone.clone(),
+                    kpis: parent.contract.kpis.clone(),
+                    budget: parent.contract.budget.clone(),
+                },
+                now(),
+            )
+            .expect_err("VM-11 cannot silently drift from its parent contract");
+        assert!(matches!(
+            inherited_contract_drift,
+            ApplicationError::CatalogMissionParentContractMismatch
+        ));
+
+        let mut stale_catalog_parent = service
+            .load_mission(&project_id, &parent_id)
+            .expect("parent Mission");
+        let expected_parent_revision = stale_catalog_parent.revision;
+        stale_catalog_parent
+            .definition
+            .as_mut()
+            .expect("Catalog parent definition")
+            .catalog_digest = "0".repeat(64);
+        stale_catalog_parent.revision += 1;
+        service
+            .store
+            .update_mission_atomic(
+                &stale_catalog_parent,
+                expected_parent_revision,
+                &[PendingEvent::new(
+                    "mission.catalog_revision_rebased",
+                    serde_json::json!({
+                        "missionId": parent_id,
+                        "catalogDigest": "0".repeat(64),
+                    }),
+                    now(),
+                )],
+            )
+            .expect("persist stale Catalog parent fixture");
+
+        let stale_catalog_parent = service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: MissionId::from("stale-catalog-parent-vm11"),
+                    first_task_id: TaskId::from("stale-catalog-parent-vm11-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-11".into(),
+                    mode: parent.contract.mode,
+                    parent_mission_id: Some(parent_id),
+                    title: None,
+                    goal: "Recompute one source Mission".into(),
+                    market: parent.contract.market,
+                    language: parent.contract.language,
+                    audience: parent.contract.audience,
+                    timezone: parent.contract.timezone,
+                    kpis: parent.contract.kpis,
+                    budget: parent.contract.budget,
+                },
+                now(),
+            )
+            .expect_err("VM-11 cannot inherit a parent compiled against a stale Catalog");
+        assert!(matches!(
+            stale_catalog_parent,
+            ApplicationError::CatalogMissionParentContractMismatch
+        ));
+        let missions = service
+            .desktop_inventory()
+            .expect("inventory after rejection")
+            .projects[0]
+            .missions
+            .clone();
+        assert_eq!(missions.len(), 1);
+        assert_eq!(missions[0].mission_id.as_str(), "contract-source-parent");
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "the contract test covers all twelve Catalog routes and their exact authority, checkpoint, Conversation, privacy, and event projections"
     )]
     fn all_twelve_catalog_missions_compile_exact_authority_and_content_free_events() {
@@ -18322,6 +19296,8 @@ mod tests {
                 manifest.id
             );
             let mission_id = MissionId::from_stable(format!("catalog-mission-{}", manifest.id));
+            let parent_mission_id =
+                (manifest.id == "VM-11").then(|| MissionId::from_stable("catalog-mission-VM-07"));
             let mission = service
                 .start_catalog_mission(
                     StartCatalogMission {
@@ -18330,12 +19306,14 @@ mod tests {
                         project_id: project_id.clone(),
                         manifest_id: manifest.id.clone(),
                         mode: mode.clone(),
+                        parent_mission_id,
                         title: None,
                         goal: private_goal.clone(),
                         market: "DE".into(),
                         language: "de".into(),
                         audience: "confirmed buyers".into(),
                         timezone: "Europe/Berlin".into(),
+                        kpis: catalog_count_kpis(),
                         budget: Money::zero(CurrencyCode::parse("EUR").expect("EUR")),
                     },
                     now(),
@@ -18478,9 +19456,10 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the VM-11 handler Journey proves empty-source and identity-conflict recovery, exact replay, multi-source-fenced completion, next-route handoff, and unsupported-route honesty in one ordered contract"
+        reason = "the VM-11 handler Journey proves empty-source and identity-conflict recovery, exact replay, parent-bound KPI recomputation, non-empty source-verified attribution, multi-source-fenced completion, next-route handoff, and unsupported-route honesty in one ordered contract"
     )]
-    fn vm11_ingest_normalization_and_identity_handlers_are_source_fenced_and_replayable() {
+    fn vm11_ingest_normalization_identity_kpi_and_attribution_handlers_are_source_fenced_and_replayable()
+     {
         let workspace = tempfile::tempdir().expect("project workspace");
         let project_id = ProjectId::from("vm11-application-project");
         let mission_id = MissionId::from("vm11-application-mission");
@@ -18499,6 +19478,17 @@ mod tests {
                 now(),
             )
             .expect("project");
+        let parent_mission_id = MissionId::from("vm11-parent-mission");
+        let parent = start_vm11_parent(
+            &mut service,
+            &project_id,
+            parent_mission_id.clone(),
+            "US",
+            "en-US",
+            "owner",
+            "America/New_York",
+            Money::zero(CurrencyCode::parse("USD").expect("USD")),
+        );
         service
             .start_catalog_mission(
                 StartCatalogMission {
@@ -18507,12 +19497,14 @@ mod tests {
                     project_id: project_id.clone(),
                     manifest_id: "VM-11".into(),
                     mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: Some(parent_mission_id.clone()),
                     title: Some("Verified outcome loop".into()),
                     goal: "Review only source-verified outcomes".into(),
                     market: "US".into(),
                     language: "en-US".into(),
                     audience: "owner".into(),
                     timezone: "America/New_York".into(),
+                    kpis: parent.contract.kpis.clone(),
                     budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
                 },
                 now(),
@@ -18672,9 +19664,9 @@ mod tests {
             .ingest_outcome_event(
                 OutcomeEvent {
                     id: OutcomeEventId::from("vm11-qualified-lead-event"),
-                    tenant_id,
+                    tenant_id: tenant_id.clone(),
                     project_id: project_id.clone(),
-                    mission_id: mission_id.clone(),
+                    mission_id: parent_mission_id.clone(),
                     kind: OutcomeEventKind::LeadQualified,
                     provider: "user-review".into(),
                     connection_id: None,
@@ -19158,8 +20150,8 @@ mod tests {
             (
                 "mission_specific_kpi",
                 MissionCheckpointExecutor::Application,
-                Some(ApplicationCheckpointHandlerStatus::NotImplemented),
-                None,
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM11_MISSION_SPECIFIC_KPI_HANDLER_ID),
             )
         );
         let identity_mission = service
@@ -19248,31 +20240,442 @@ mod tests {
             event_count_after_identity_completion
         );
 
-        let unsupported_before = service
+        let kpi_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: kpi_dispatch.checkpoint_id.clone(),
+            expected_mission_revision: kpi_dispatch.mission_revision,
+            expected_checkpoint_revision: kpi_dispatch.checkpoint_revision,
+        };
+        let kpi_completed = service
+            .execute_application_mission_checkpoint(
+                kpi_command.clone(),
+                now() + Duration::seconds(14),
+            )
+            .expect("parent-bound KPI completion");
+        let ApplicationMissionCheckpointExecution::Completed {
+            completion_evidence_digest: kpi_evidence_digest,
+            outcome_ledger_revision: kpi_ledger_revision,
+            replayed: kpi_replayed,
+            next_dispatch: attribution_dispatch,
+            ..
+        } = kpi_completed
+        else {
+            panic!("mission_specific_kpi must complete from the inherited contract")
+        };
+        assert_eq!((kpi_ledger_revision, kpi_replayed), (2, false));
+        let attribution_dispatch = attribution_dispatch.expect("attribution route");
+        assert_eq!(
+            (
+                attribution_dispatch.checkpoint_id.as_str(),
+                attribution_dispatch.application_handler_status,
+                attribution_dispatch.application_handler_id.as_deref(),
+            ),
+            (
+                "attribution_and_unattributed",
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM11_ATTRIBUTION_AND_UNATTRIBUTED_HANDLER_ID),
+            )
+        );
+        let kpi_mission = service
             .load_mission(&project_id, &mission_id)
-            .expect("unsupported next route before dispatch");
+            .expect("KPI Mission");
+        let kpi_evidence = kpi_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "mission_specific_kpi")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .and_then(|completion| completion.application_evidence.as_ref())
+            .expect("KPI Application evidence");
+        assert_eq!(
+            (
+                kpi_evidence.handler_id.as_str(),
+                kpi_evidence.digest(),
+                kpi_evidence
+                    .sources
+                    .iter()
+                    .map(|source| source.source_kind.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                VM11_MISSION_SPECIFIC_KPI_HANDLER_ID,
+                kpi_evidence_digest,
+                BTreeSet::from([
+                    "mission_checkpoint",
+                    "outcome_mission_kpi",
+                    "parent_mission_contract",
+                ]),
+            )
+        );
+        let persisted_parent = service
+            .load_mission(&project_id, &parent_mission_id)
+            .expect("persisted parent Mission");
+        let recomputed_kpi = persisted_ledger
+            .verified_mission_kpi_projection(
+                &persisted_parent,
+                &recomputed_identity_chain,
+                now() + Duration::seconds(14),
+            )
+            .expect("recomputed KPI Oracle");
+        let recomputed_kpi_digest = recomputed_kpi.digest().expect("KPI digest");
+        assert_eq!(
+            (
+                recomputed_kpi.measurement_count,
+                recomputed_kpi.target_met_count,
+                kpi_evidence
+                    .sources
+                    .iter()
+                    .find(|source| source.source_kind == "outcome_mission_kpi")
+                    .map(|source| (source.source_revision, source.projection_digest.as_str())),
+            ),
+            (1, 1, Some((2, recomputed_kpi_digest.as_str())))
+        );
+        let event_count_after_kpi_completion = service
+            .mission_events(&project_id, &mission_id)
+            .expect("KPI completion events")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(kpi_command, now() + Duration::seconds(15),)
+                .expect("exact KPI completion replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: true,
+                outcome_ledger_revision: 2,
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged KPI replay events")
+                .len(),
+            event_count_after_kpi_completion
+        );
+
+        let no_order_attribution_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: attribution_dispatch.checkpoint_id.clone(),
+            expected_mission_revision: attribution_dispatch.mission_revision,
+            expected_checkpoint_revision: attribution_dispatch.checkpoint_revision,
+        };
         assert_eq!(
             service
                 .execute_application_mission_checkpoint(
-                    ExecuteApplicationMissionCheckpoint {
-                        project_id: project_id.clone(),
-                        mission_id: mission_id.clone(),
-                        checkpoint_id: kpi_dispatch.checkpoint_id.clone(),
-                        expected_mission_revision: kpi_dispatch.mission_revision,
-                        expected_checkpoint_revision: kpi_dispatch.checkpoint_revision,
-                    },
-                    now() + Duration::seconds(14),
+                    no_order_attribution_command.clone(),
+                    now() + Duration::seconds(16),
                 )
-                .expect("unsupported route is honest"),
-            ApplicationMissionCheckpointExecution::NotImplemented {
-                dispatch: kpi_dispatch,
+                .expect("lead-only attribution must not false-complete"),
+            ApplicationMissionCheckpointExecution::Blocked {
+                checkpoint_id: "attribution_and_unattributed".into(),
+                code: "attribution_source_orders_unavailable".into(),
+                outcome_ledger_revision: 2,
+                replayed: false,
             }
         );
         assert_eq!(
             service
-                .load_mission(&project_id, &mission_id)
-                .expect("unsupported route unchanged"),
-            unsupported_before
+                .execute_application_mission_checkpoint(
+                    no_order_attribution_command,
+                    now() + Duration::seconds(16),
+                )
+                .expect("exact lead-only attribution block replay"),
+            ApplicationMissionCheckpointExecution::Blocked {
+                checkpoint_id: "attribution_and_unattributed".into(),
+                code: "attribution_source_orders_unavailable".into(),
+                outcome_ledger_revision: 2,
+                replayed: true,
+            }
+        );
+
+        let outcome_connection_id = ConnectionId::from("vm11-commerce-connection");
+        service
+            .register_connection(
+                Connection::register(
+                    outcome_connection_id.clone(),
+                    tenant_id.clone(),
+                    project_id.clone(),
+                    "user-review",
+                    AccountId::from("project-owner"),
+                    "project-owner-external",
+                    ["orders.read".into()],
+                    now() + Duration::seconds(15),
+                )
+                .expect("commerce connection"),
+                now() + Duration::seconds(15),
+            )
+            .expect("persist commerce connection");
+        service
+            .record_connection_probe(
+                &project_id,
+                &outcome_connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "project-owner-external".into(),
+                    granted_scopes: BTreeSet::from(["orders.read".into()]),
+                    probed_at: now() + Duration::seconds(16),
+                    valid_until: now() + Duration::days(30),
+                    credential_expires_at: now() + Duration::days(30),
+                    evidence_digest: "0".repeat(64),
+                },
+                now() + Duration::seconds(16),
+            )
+            .expect("probe commerce connection");
+        service
+            .ingest_outcome_event(
+                OutcomeEvent {
+                    id: OutcomeEventId::from("vm11-attributed-order-event"),
+                    tenant_id: tenant_id.clone(),
+                    project_id: project_id.clone(),
+                    mission_id: parent_mission_id.clone(),
+                    kind: OutcomeEventKind::OrderPlaced,
+                    provider: "user-review".into(),
+                    connection_id: Some(outcome_connection_id),
+                    account_id: Some(AccountId::from("project-owner")),
+                    source_event_id: "PRIVATE-ORDER-PROVIDER-ID".into(),
+                    identity_link_id: Some(identity_link_id.clone()),
+                    opportunity_id: None,
+                    campaign_id: None,
+                    order_id: Some(OrderId::from("vm11-attributed-order")),
+                    refund_id: None,
+                    commission_id: None,
+                    payout_id: None,
+                    partner_id: None,
+                    amount: Some(Money::new(12_500, CurrencyCode::parse("USD").expect("USD"))),
+                    occurred_at: now() + Duration::seconds(17),
+                    received_at: now() + Duration::seconds(18),
+                    evidence_digest: "1".repeat(64),
+                    raw_payload_digest: "2".repeat(64),
+                    source_verification: Some(OutcomeSourceVerification {
+                        method: OutcomeVerificationMethod::SignedWebhook,
+                        verifier: "commerce-webhook".into(),
+                        independent: true,
+                        verified_at: now() + Duration::seconds(18),
+                        evidence_digest: "3".repeat(64),
+                    }),
+                },
+                now() + Duration::seconds(18),
+            )
+            .expect("verified parent-Mission order");
+        service
+            .record_attribution(
+                AttributionRecord {
+                    id: AttributionId::from("vm11-last-non-direct"),
+                    tenant_id: tenant_id.clone(),
+                    project_id: project_id.clone(),
+                    order_id: OrderId::from("vm11-attributed-order"),
+                    model: AttributionModel::LastNonDirect,
+                    touchpoint: Some(Touchpoint {
+                        mission_id: parent_mission_id.clone(),
+                        source: "source-verified-email-readback".into(),
+                        effect_id: None,
+                        traffic_class: Some(AttributionTrafficClass::NonDirect),
+                        provider_identity_digest: None,
+                        verified_link_or_coupon_digest: None,
+                        occurred_at: now() + Duration::seconds(15),
+                        received_at: Some(now() + Duration::seconds(16)),
+                        evidence_digest: "4".repeat(64),
+                        source_verification: Some(OutcomeSourceVerification {
+                            method: OutcomeVerificationMethod::IndependentReadback,
+                            verifier: "analytics-readback".into(),
+                            independent: true,
+                            verified_at: now() + Duration::seconds(16),
+                            evidence_digest: "4".repeat(64),
+                        }),
+                    }),
+                    window_started_at: now(),
+                    window_ended_at: now() + Duration::days(30),
+                    confidence: "0.8".parse().expect("confidence"),
+                    causal_claim: false,
+                    rationale: "Operational last-non-direct view; correlation is not causality"
+                        .into(),
+                    evidence_digest: "5".repeat(64),
+                    recorded_at: now() + Duration::seconds(19),
+                },
+                now() + Duration::seconds(19),
+            )
+            .expect("source-verified attribution record");
+        let recovered_attribution_dispatch = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &mission_id,
+                now() + Duration::seconds(20),
+            )
+            .expect("attribution dispatch recovers after a verified order arrives");
+        assert_eq!(
+            (
+                recovered_attribution_dispatch.checkpoint_id.as_str(),
+                recovered_attribution_dispatch.application_handler_status,
+                recovered_attribution_dispatch
+                    .application_handler_id
+                    .as_deref(),
+            ),
+            (
+                "attribution_and_unattributed",
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM11_ATTRIBUTION_AND_UNATTRIBUTED_HANDLER_ID),
+            )
+        );
+        let attribution_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: recovered_attribution_dispatch.checkpoint_id.clone(),
+            expected_mission_revision: recovered_attribution_dispatch.mission_revision,
+            expected_checkpoint_revision: recovered_attribution_dispatch.checkpoint_revision,
+        };
+        let attribution_completed = service
+            .execute_application_mission_checkpoint(
+                attribution_command.clone(),
+                now() + Duration::seconds(20),
+            )
+            .expect("source-fenced attribution completion");
+        let ApplicationMissionCheckpointExecution::Completed {
+            completion_evidence_digest: attribution_evidence_digest,
+            outcome_ledger_revision: attribution_ledger_revision,
+            replayed: attribution_replayed,
+            next_dispatch: refund_dispatch,
+            ..
+        } = attribution_completed
+        else {
+            panic!("attribution_and_unattributed must complete from current sources")
+        };
+        assert_eq!(
+            (attribution_ledger_revision, attribution_replayed),
+            (4, false)
+        );
+        let refund_dispatch = refund_dispatch.expect("refund reconciliation route");
+        assert_eq!(
+            (
+                refund_dispatch.checkpoint_id.as_str(),
+                refund_dispatch.application_handler_status,
+                refund_dispatch.application_handler_id.as_deref(),
+            ),
+            (
+                "refund_commission_payout_recalc",
+                Some(ApplicationCheckpointHandlerStatus::NotImplemented),
+                None,
+            )
+        );
+        let attribution_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("attribution Mission");
+        let attribution_evidence = attribution_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "attribution_and_unattributed")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .and_then(|completion| completion.application_evidence.as_ref())
+            .expect("attribution Application evidence");
+        assert_eq!(
+            (
+                attribution_evidence.handler_id.as_str(),
+                attribution_evidence.digest(),
+                attribution_evidence
+                    .sources
+                    .iter()
+                    .map(|source| source.source_kind.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                VM11_ATTRIBUTION_AND_UNATTRIBUTED_HANDLER_ID,
+                attribution_evidence_digest,
+                BTreeSet::from([
+                    "attribution_effect_support",
+                    "mission_checkpoint",
+                    "outcome_attribution",
+                    "outcome_normalization",
+                ]),
+            )
+        );
+        let current_ledger = service
+            .store
+            .load_outcome_ledger(&project_id)
+            .expect("current attribution ledger");
+        let current_identity_support =
+            load_outcome_identity_chain_support(&service.store, &current_ledger)
+                .expect("current identity support");
+        let current_identity_chain = current_ledger
+            .verified_identity_chain_projection(
+                &current_identity_support.connections,
+                &current_identity_support.identity_links,
+                &current_identity_support.people,
+                &current_identity_support.companies,
+                &current_identity_support.partners,
+                &current_identity_support.opportunities,
+            )
+            .expect("current identity chain");
+        let current_parent = service
+            .load_mission(&project_id, &parent_mission_id)
+            .expect("current parent Mission");
+        let recomputed_attribution = current_ledger
+            .verified_attribution_projection(
+                &current_parent,
+                &current_identity_chain,
+                std::slice::from_ref(&current_parent),
+                now() + Duration::seconds(20),
+            )
+            .expect("recomputed attribution Oracle");
+        assert_eq!(
+            (
+                recomputed_attribution.order_count,
+                recomputed_attribution.last_non_direct_order_count,
+                recomputed_attribution.first_touch_order_count,
+                recomputed_attribution.unattributed_order_count,
+                recomputed_attribution.causal_claim,
+                attribution_evidence
+                    .sources
+                    .iter()
+                    .find(|source| source.source_kind == "outcome_attribution")
+                    .map(|source| (source.source_revision, source.projection_digest.as_str())),
+            ),
+            (
+                1,
+                1,
+                1,
+                0,
+                false,
+                Some((
+                    4,
+                    recomputed_attribution
+                        .digest()
+                        .expect("attribution digest")
+                        .as_str(),
+                )),
+            )
+        );
+        let event_count_after_attribution = service
+            .mission_events(&project_id, &mission_id)
+            .expect("attribution events")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    attribution_command,
+                    now() + Duration::seconds(21),
+                )
+                .expect("exact attribution completion replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: true,
+                outcome_ledger_revision: 4,
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged attribution replay events")
+                .len(),
+            event_count_after_attribution
         );
         let visible_events = serde_json::to_string(
             &service
@@ -19314,6 +20717,17 @@ mod tests {
                 now(),
             )
             .expect("project");
+        let parent_mission_id = MissionId::from("vm11-legacy-parent");
+        let parent = start_vm11_parent(
+            &mut service,
+            &project_id,
+            parent_mission_id.clone(),
+            "US",
+            "en-US",
+            "owner",
+            "America/New_York",
+            Money::zero(CurrencyCode::parse("USD").expect("USD")),
+        );
         service
             .start_catalog_mission(
                 StartCatalogMission {
@@ -19322,12 +20736,14 @@ mod tests {
                     project_id: project_id.clone(),
                     manifest_id: "VM-11".into(),
                     mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: Some(parent_mission_id.clone()),
                     title: None,
                     goal: "Never promote migration-only evidence".into(),
                     market: "US".into(),
                     language: "en-US".into(),
                     audience: "owner".into(),
                     timezone: "America/New_York".into(),
+                    kpis: parent.contract.kpis.clone(),
                     budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
                 },
                 now(),
@@ -19379,7 +20795,7 @@ mod tests {
                 id: OutcomeEventId::from("legacy-qualified-lead"),
                 tenant_id,
                 project_id: project_id.clone(),
-                mission_id: mission_id.clone(),
+                mission_id: parent_mission_id,
                 kind: OutcomeEventKind::LeadQualified,
                 provider: "legacy-import".into(),
                 connection_id: None,
@@ -19517,12 +20933,14 @@ mod tests {
                     project_id: project_id.clone(),
                     manifest_id: "VM-04".into(),
                     mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
                     title: Some("Social matrix".into()),
                     goal: "Route every Checkpoint to only its frozen executor".into(),
                     market: "US".into(),
                     language: "en-US".into(),
                     audience: "owner".into(),
                     timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
                     budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
                 },
                 now(),
@@ -19664,12 +21082,14 @@ mod tests {
                     project_id: project_id.clone(),
                     manifest_id: "VM-07".into(),
                     mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: None,
                     title: Some("Germany market decision".into()),
                     goal: "Decide whether Germany fits a fixed budget".into(),
                     market: "DE".into(),
                     language: "de-DE".into(),
                     audience: "owner".into(),
                     timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
                     budget: Money::zero(CurrencyCode::parse("EUR").expect("EUR")),
                 },
                 now(),
@@ -19830,12 +21250,14 @@ mod tests {
                     project_id: project_id.clone(),
                     manifest_id: "VM-07".into(),
                     mode: OperatingMode::ContinuousOperator,
+                    parent_mission_id: None,
                     title: None,
                     goal: "Do not silently convert a one-off decision into an operator".into(),
                     market: "US".into(),
                     language: "en".into(),
                     audience: "buyers".into(),
                     timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
                     budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
                 },
                 now(),
@@ -19881,12 +21303,14 @@ mod tests {
                     project_id: project_id.clone(),
                     manifest_id: "VM-10".into(),
                     mode: OperatingMode::ContinuousRelationship,
+                    parent_mission_id: None,
                     title: Some("Inbox operator".into()),
                     goal: "Process only signed inbound events".into(),
                     market: "DE".into(),
                     language: "en".into(),
                     audience: "authorized contacts".into(),
                     timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
                     budget: Money::zero(CurrencyCode::parse("EUR").expect("EUR")),
                 },
                 now(),
@@ -20417,12 +21841,14 @@ mod tests {
                     project_id: project_id.clone(),
                     manifest_id: "VM-04".into(),
                     mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
                     title: Some("Social matrix".into()),
                     goal: private_goal.into(),
                     market: "US".into(),
                     language: "en-US".into(),
                     audience: "owner".into(),
                     timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
                     budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
                 },
                 now(),
@@ -20489,12 +21915,14 @@ mod tests {
                     project_id: project_id.clone(),
                     manifest_id: "VM-00".into(),
                     mode: OperatingMode::BuildOnce,
+                    parent_mission_id: None,
                     title: Some("Current state".into()),
                     goal: "PRIVATE-VM00-GOAL::resolve locally without Runtime".into(),
                     market: "US".into(),
                     language: "en-US".into(),
                     audience: "owner".into(),
                     timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
                     budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
                 },
                 now() + Duration::milliseconds(1),
@@ -20635,12 +22063,14 @@ mod tests {
                     project_id: project_id.clone(),
                     manifest_id: "VM-04".into(),
                     mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
                     title: Some("Attached no-turn recovery".into()),
                     goal: private_goal.into(),
                     market: "US".into(),
                     language: "en-US".into(),
                     audience: "owner".into(),
                     timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
                     budget: Money::zero(CurrencyCode::parse("USD").expect("USD")),
                 },
                 now(),
@@ -23683,12 +25113,14 @@ sleep 30"#
                     project_id: project_id.clone(),
                     manifest_id: "VM-10".into(),
                     mode: OperatingMode::ContinuousRelationship,
+                    parent_mission_id: None,
                     title: Some("Inbox and human handoff".into()),
                     goal: "Reply only while the current generation is agent-controlled".into(),
                     market: "DE".into(),
                     language: "en".into(),
                     audience: "authorized contacts".into(),
                     timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
                     budget: Money::zero(CurrencyCode::parse("EUR").expect("EUR")),
                 },
                 now(),
@@ -28503,18 +29935,29 @@ sleep 30"#
                     tenant_id: tenant_id.clone(),
                     project_id: project_id.clone(),
                     order_id: OrderId::from("order-1"),
-                    model: AttributionModel::VerifiedIdentity,
+                    model: AttributionModel::LastNonDirect,
                     touchpoint: Some(Touchpoint {
                         mission_id: mission_id.clone(),
                         source: "creator_coupon".into(),
+                        effect_id: None,
+                        traffic_class: Some(AttributionTrafficClass::NonDirect),
                         provider_identity_digest: None,
                         verified_link_or_coupon_digest: Some("d".repeat(64)),
                         occurred_at: now() - Duration::hours(1),
+                        received_at: Some(now() + Duration::minutes(1)),
                         evidence_digest: "e".repeat(64),
+                        source_verification: Some(OutcomeSourceVerification {
+                            method: OutcomeVerificationMethod::IndependentReadback,
+                            verifier: "creator-attribution-readback".into(),
+                            independent: true,
+                            verified_at: now() + Duration::minutes(1),
+                            evidence_digest: "e".repeat(64),
+                        }),
                     }),
                     window_started_at: now() - Duration::days(30),
                     window_ended_at: now() + Duration::minutes(1),
                     confidence: Decimal::ONE,
+                    causal_claim: false,
                     rationale: "Verified coupon identity chain".into(),
                     evidence_digest: "f".repeat(64),
                     recorded_at: now() + Duration::minutes(2),
@@ -28676,14 +30119,25 @@ sleep 30"#
                     touchpoint: Some(Touchpoint {
                         mission_id: mission_id.clone(),
                         source: "email_followup".into(),
+                        effect_id: None,
+                        traffic_class: Some(AttributionTrafficClass::NonDirect),
                         provider_identity_digest: None,
                         verified_link_or_coupon_digest: None,
                         occurred_at: now() - Duration::hours(2),
+                        received_at: Some(now() + Duration::days(4)),
                         evidence_digest: "8".repeat(64),
+                        source_verification: Some(OutcomeSourceVerification {
+                            method: OutcomeVerificationMethod::IndependentReadback,
+                            verifier: "email-attribution-readback".into(),
+                            independent: true,
+                            verified_at: now() + Duration::days(4),
+                            evidence_digest: "8".repeat(64),
+                        }),
                     }),
                     window_started_at: now() - Duration::days(30),
                     window_ended_at: now() + Duration::days(5),
                     confidence: "0.7".parse().expect("confidence"),
+                    causal_claim: false,
                     rationale: "Operational last-non-direct view".into(),
                     evidence_digest: "9".repeat(64),
                     recorded_at: now() + Duration::days(5),
@@ -28719,14 +30173,25 @@ sleep 30"#
                     touchpoint: Some(Touchpoint {
                         mission_id,
                         source: "first_touch".into(),
+                        effect_id: None,
+                        traffic_class: Some(AttributionTrafficClass::NonDirect),
                         provider_identity_digest: None,
                         verified_link_or_coupon_digest: None,
                         occurred_at: now() - Duration::hours(3),
+                        received_at: Some(now() + Duration::days(4)),
                         evidence_digest: "a".repeat(64),
+                        source_verification: Some(OutcomeSourceVerification {
+                            method: OutcomeVerificationMethod::IndependentReadback,
+                            verifier: "first-touch-readback".into(),
+                            independent: true,
+                            verified_at: now() + Duration::days(4),
+                            evidence_digest: "a".repeat(64),
+                        }),
                     }),
                     window_started_at: now() - Duration::days(30),
                     window_ended_at: now() + Duration::days(5),
                     confidence: "0.6".parse().expect("confidence"),
+                    causal_claim: false,
                     rationale: "Local first-touch branch".into(),
                     evidence_digest: "b".repeat(64),
                     recorded_at: now() + Duration::days(5) + Duration::minutes(1),

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::Utc;
 use dioxus::prelude::*;
@@ -8,12 +8,13 @@ use hartevo_application::{
 };
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_domain_kernel::{
-    CadenceTriggerKind, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
-    MissionCheckpointStatus, MissionConversationMessageId, MissionConversationMessageKind,
-    MissionConversationRole, MissionId, MissionScheduleStatus, MissionStage, OperatingMode,
-    ProjectEncryptionMode, ProjectId, RuntimeProcessClaimStatus, RuntimeRecoveryStatus,
-    RuntimeTurnStatus, StorageMode, WorkProductId, WorkProductStatus,
+    CadenceTriggerKind, KpiContract, KpiDirection, MissionCheckpointCompletionPolicy,
+    MissionCheckpointExecutor, MissionCheckpointStatus, MissionConversationMessageId,
+    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionScheduleStatus,
+    MissionStage, OperatingMode, ProjectEncryptionMode, ProjectId, RuntimeProcessClaimStatus,
+    RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode, WorkProductId, WorkProductStatus,
 };
+use rust_decimal::Decimal;
 use zeroize::Zeroizing;
 
 pub mod data_plane;
@@ -360,6 +361,12 @@ pub fn App() -> Element {
     let mut catalog_timezone = use_signal(String::new);
     let mut catalog_currency = use_signal(|| "USD".to_owned());
     let mut catalog_budget_minor = use_signal(|| "0".to_owned());
+    let mut catalog_parent_mission_id = use_signal(String::new);
+    let mut catalog_kpi_metric = use_signal(|| "lead_qualified_count".to_owned());
+    let mut catalog_kpi_baseline = use_signal(|| "0".to_owned());
+    let mut catalog_kpi_target = use_signal(|| "1".to_owned());
+    let mut catalog_kpi_unit = use_signal(|| "count".to_owned());
+    let mut catalog_kpi_direction = use_signal(|| "at_least".to_owned());
     let mut mission_submitting = use_signal(|| false);
     let mut runtime_retrying = use_signal(|| false);
     let mut human_work_product_selection = use_signal(BTreeSet::<WorkProductId>::new);
@@ -402,6 +409,37 @@ pub fn App() -> Element {
         .map_or_else(Vec::new, |route| route.modes.clone());
     let selected_mode = catalog_mode();
     let selected_mode_is_allowed = allowed_modes.iter().any(|mode| mode == &selected_mode);
+    let vm11_selected = selected_manifest_id == "VM-11";
+    let current_catalog_digest = evidence
+        .as_ref()
+        .map(|evidence| evidence.catalog_digest.as_str());
+    let parent_mission_candidates = project.as_ref().map_or_else(Vec::new, |project| {
+        project
+            .missions
+            .iter()
+            .filter(|mission| {
+                mission
+                    .manifest_id
+                    .as_deref()
+                    .is_some_and(|manifest_id| manifest_id != "VM-11")
+                    && mission.catalog_digest.as_deref() == current_catalog_digest
+            })
+            .map(|mission| {
+                (
+                    mission.mission_id.clone(),
+                    format!(
+                        "{} · {}",
+                        mission.manifest_id.as_deref().unwrap_or("UNKNOWN"),
+                        mission.title
+                    ),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let parent_mission_id_value = catalog_parent_mission_id();
+    let selected_parent_exists = parent_mission_candidates
+        .iter()
+        .any(|(mission_id, _)| mission_id.as_str() == parent_mission_id_value);
     let market_value = catalog_market();
     let language_value = catalog_language();
     let audience_value = catalog_audience();
@@ -413,16 +451,36 @@ pub fn App() -> Element {
         .parse::<i64>()
         .ok()
         .filter(|amount| *amount >= 0);
+    let kpi_metric_value = catalog_kpi_metric();
+    let kpi_baseline_value = catalog_kpi_baseline();
+    let kpi_target_value = catalog_kpi_target();
+    let kpi_unit_value = catalog_kpi_unit();
+    let kpi_direction_value = catalog_kpi_direction();
+    let catalog_kpis = catalog_kpi_contracts(
+        &selected_manifest_id,
+        &kpi_metric_value,
+        &kpi_baseline_value,
+        &kpi_target_value,
+        &kpi_unit_value,
+        &kpi_direction_value,
+    );
+    let mission_specific_contract_ready = if vm11_selected {
+        selected_parent_exists
+    } else {
+        catalog_kpis.as_ref().is_some_and(|kpis| !kpis.is_empty())
+    };
     let catalog_contract_ready = !selected_manifest_id.is_empty()
         && selected_mode_is_allowed
         && operating_mode_from_catalog_name(&selected_mode).is_some()
         && !draft.read().trim().is_empty()
-        && !market_value.trim().is_empty()
-        && !language_value.trim().is_empty()
-        && !audience_value.trim().is_empty()
-        && !timezone_value.trim().is_empty()
-        && valid_currency_shape(&currency_value)
-        && budget_minor.is_some();
+        && mission_specific_contract_ready
+        && (vm11_selected
+            || (!market_value.trim().is_empty()
+                && !language_value.trim().is_empty()
+                && !audience_value.trim().is_empty()
+                && !timezone_value.trim().is_empty()
+                && valid_currency_shape(&currency_value)
+                && budget_minor.is_some()));
     let can_edit_catalog = project_can_start_mission && mission.is_none() && !runtime_busy;
     let can_submit_catalog = can_edit_catalog && catalog_contract_ready;
     let human_route_active = mission.as_ref().is_some_and(|mission| {
@@ -702,6 +760,7 @@ pub fn App() -> Element {
                                                     .unwrap_or_default();
                                                 catalog_manifest_id.set(manifest_id);
                                                 catalog_mode.set(first_mode);
+                                                catalog_parent_mission_id.set(String::new());
                                             },
                                             option { value: "", "选择 VM-00～VM-11…" }
                                             for route in catalog_routes.clone() {
@@ -709,11 +768,32 @@ pub fn App() -> Element {
                                             }
                                         }
                                     }
+                                    if vm11_selected {
+                                        label { class: "catalog-route-field",
+                                            span { "父 Mission（经营维度与 KPI 后端继承）" }
+                                            select {
+                                                value: "{parent_mission_id_value}",
+                                                disabled: !can_edit_catalog,
+                                                aria_label: "选择 VM-11 要复算的父 Mission",
+                                                onchange: move |event| catalog_parent_mission_id.set(event.value()),
+                                                option { value: "", "选择同项目真实父 Mission…" }
+                                                for (parent_mission_id, parent_label) in parent_mission_candidates.clone() {
+                                                    option {
+                                                        value: "{parent_mission_id.as_str()}",
+                                                        "{parent_label}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        div { class: "catalog-route-note",
+                                            span { "模式、市场、locale、受众、时区、预算与 KPI 均从所选父 Mission 当前合同重载；下方禁用值不会作为 VM-11 输入。" }
+                                        }
+                                    }
                                     label {
                                         span { "运行模式" }
                                         select {
                                             value: "{selected_mode}",
-                                            disabled: !can_edit_catalog || allowed_modes.is_empty(),
+                                            disabled: !can_edit_catalog || allowed_modes.is_empty() || vm11_selected,
                                             aria_label: "选择 Manifest 允许的运行模式",
                                             onchange: move |event| catalog_mode.set(event.value()),
                                             if allowed_modes.is_empty() {
@@ -728,7 +808,7 @@ pub fn App() -> Element {
                                         span { "市场" }
                                         input {
                                             value: "{market_value}",
-                                            disabled: !can_edit_catalog,
+                                            disabled: !can_edit_catalog || vm11_selected,
                                             autocomplete: "off",
                                             placeholder: "US / DE / JP",
                                             aria_label: "Operating Contract 市场",
@@ -739,7 +819,7 @@ pub fn App() -> Element {
                                         span { "语言 / locale" }
                                         input {
                                             value: "{language_value}",
-                                            disabled: !can_edit_catalog,
+                                            disabled: !can_edit_catalog || vm11_selected,
                                             autocomplete: "off",
                                             placeholder: "en-US / de-DE / ja-JP",
                                             aria_label: "Operating Contract 语言或 locale",
@@ -750,7 +830,7 @@ pub fn App() -> Element {
                                         span { "受众" }
                                         input {
                                             value: "{audience_value}",
-                                            disabled: !can_edit_catalog,
+                                            disabled: !can_edit_catalog || vm11_selected,
                                             autocomplete: "off",
                                             placeholder: "buyer / owner / operator",
                                             aria_label: "Operating Contract 受众",
@@ -761,7 +841,7 @@ pub fn App() -> Element {
                                         span { "时区" }
                                         input {
                                             value: "{timezone_value}",
-                                            disabled: !can_edit_catalog,
+                                            disabled: !can_edit_catalog || vm11_selected,
                                             autocomplete: "off",
                                             placeholder: "Europe/Berlin",
                                             aria_label: "Operating Contract IANA 时区",
@@ -772,7 +852,7 @@ pub fn App() -> Element {
                                         span { "币种" }
                                         input {
                                             value: "{currency_value}",
-                                            disabled: !can_edit_catalog,
+                                            disabled: !can_edit_catalog || vm11_selected,
                                             autocomplete: "off",
                                             maxlength: 3,
                                             placeholder: "USD",
@@ -784,12 +864,71 @@ pub fn App() -> Element {
                                         span { "预算（minor units）" }
                                         input {
                                             value: "{budget_minor_value}",
-                                            disabled: !can_edit_catalog,
+                                            disabled: !can_edit_catalog || vm11_selected,
                                             inputmode: "numeric",
                                             autocomplete: "off",
                                             placeholder: "0",
                                             aria_label: "Operating Contract minor-unit 预算",
                                             oninput: move |event| catalog_budget_minor.set(event.value()),
+                                        }
+                                    }
+                                    if !vm11_selected {
+                                        label {
+                                            span { "KPI metric ID" }
+                                            input {
+                                                value: "{kpi_metric_value}",
+                                                disabled: !can_edit_catalog,
+                                                autocomplete: "off",
+                                                placeholder: "lead_qualified_count",
+                                                aria_label: "Operating Contract KPI metric ID",
+                                                oninput: move |event| catalog_kpi_metric.set(event.value()),
+                                            }
+                                        }
+                                        label {
+                                            span { "KPI baseline（可留空）" }
+                                            input {
+                                                value: "{kpi_baseline_value}",
+                                                disabled: !can_edit_catalog,
+                                                inputmode: "decimal",
+                                                autocomplete: "off",
+                                                placeholder: "0",
+                                                aria_label: "Operating Contract KPI baseline",
+                                                oninput: move |event| catalog_kpi_baseline.set(event.value()),
+                                            }
+                                        }
+                                        label {
+                                            span { "KPI target" }
+                                            input {
+                                                value: "{kpi_target_value}",
+                                                disabled: !can_edit_catalog,
+                                                inputmode: "decimal",
+                                                autocomplete: "off",
+                                                placeholder: "1",
+                                                aria_label: "Operating Contract KPI target",
+                                                oninput: move |event| catalog_kpi_target.set(event.value()),
+                                            }
+                                        }
+                                        label {
+                                            span { "KPI unit" }
+                                            input {
+                                                value: "{kpi_unit_value}",
+                                                disabled: !can_edit_catalog,
+                                                autocomplete: "off",
+                                                placeholder: "count / minor_units:USD",
+                                                aria_label: "Operating Contract KPI unit",
+                                                oninput: move |event| catalog_kpi_unit.set(event.value()),
+                                            }
+                                        }
+                                        label {
+                                            span { "KPI 方向" }
+                                            select {
+                                                value: "{kpi_direction_value}",
+                                                disabled: !can_edit_catalog,
+                                                aria_label: "Operating Contract KPI direction",
+                                                onchange: move |event| catalog_kpi_direction.set(event.value()),
+                                                option { value: "at_least", "至少达到" }
+                                                option { value: "at_most", "至多不超过" }
+                                            }
                                         }
                                     }
                                     }
@@ -1124,9 +1263,24 @@ pub fn App() -> Element {
                                                     let audience = catalog_audience();
                                                     let timezone = catalog_timezone();
                                                     let currency = catalog_currency();
-                                                    let budget_minor = catalog_budget_minor().trim().parse::<i64>().ok();
-                                                    let (Some(project_id), Some(mode), Some(budget_minor)) =
-                                                        (project_id, mode, budget_minor)
+                                                    let budget_minor = if manifest_id == "VM-11" {
+                                                        Some(0)
+                                                    } else {
+                                                        catalog_budget_minor().trim().parse::<i64>().ok()
+                                                    };
+                                                    let parent_mission_id = catalog_parent_mission_id();
+                                                    let parent_mission_id = (!parent_mission_id.trim().is_empty())
+                                                        .then(|| MissionId::from(parent_mission_id.as_str()));
+                                                    let kpis = catalog_kpi_contracts(
+                                                        &manifest_id,
+                                                        &catalog_kpi_metric(),
+                                                        &catalog_kpi_baseline(),
+                                                        &catalog_kpi_target(),
+                                                        &catalog_kpi_unit(),
+                                                        &catalog_kpi_direction(),
+                                                    );
+                                                    let (Some(project_id), Some(mode), Some(budget_minor), Some(kpis)) =
+                                                        (project_id, mode, budget_minor, kpis)
                                                     else {
                                                         model.write().notice = Some(UiFailure {
                                                             code: "WAITING_USER".into(),
@@ -1138,12 +1292,14 @@ pub fn App() -> Element {
                                                         project_id,
                                                         manifest_id,
                                                         mode,
+                                                        parent_mission_id,
                                                         title: None,
                                                         goal,
                                                         market,
                                                         language,
                                                         audience,
                                                         timezone,
+                                                        kpis,
                                                         budget_minor,
                                                         currency,
                                                     };
@@ -1161,6 +1317,7 @@ pub fn App() -> Element {
                                                                 draft.set(String::new());
                                                                 catalog_manifest_id.set(String::new());
                                                                 catalog_mode.set(String::new());
+                                                                catalog_parent_mission_id.set(String::new());
                                                             }
                                                             Ok(Err(error)) => model.write().set_notice(&error),
                                                             Err(_) => {
@@ -2131,6 +2288,44 @@ fn valid_currency_shape(value: &str) -> bool {
     value.len() == 3 && value.bytes().all(|byte| byte.is_ascii_uppercase())
 }
 
+fn catalog_kpi_contracts(
+    manifest_id: &str,
+    metric_id: &str,
+    baseline: &str,
+    target: &str,
+    unit: &str,
+    direction: &str,
+) -> Option<BTreeMap<String, KpiContract>> {
+    if manifest_id == "VM-11" {
+        return Some(BTreeMap::new());
+    }
+    let metric_id = metric_id.trim();
+    let unit = unit.trim();
+    if metric_id.is_empty() || unit.is_empty() {
+        return None;
+    }
+    let baseline = if baseline.trim().is_empty() {
+        None
+    } else {
+        Some(baseline.trim().parse::<Decimal>().ok()?)
+    };
+    let target = target.trim().parse::<Decimal>().ok()?;
+    let direction = match direction {
+        "at_least" => KpiDirection::AtLeast,
+        "at_most" => KpiDirection::AtMost,
+        _ => return None,
+    };
+    Some(BTreeMap::from([(
+        metric_id.into(),
+        KpiContract {
+            baseline,
+            target,
+            unit: unit.into(),
+            direction,
+        },
+    )]))
+}
+
 fn mission_checkpoint_status_label(status: MissionCheckpointStatus) -> &'static str {
     match status {
         MissionCheckpointStatus::Pending => "PENDING",
@@ -2397,6 +2592,40 @@ mod tests {
         assert!(!valid_currency_shape("eur"));
         assert!(!valid_currency_shape("EU"));
         assert_eq!("9007199254740993".parse::<i64>(), Ok(9_007_199_254_740_993));
+        let kpis = catalog_kpi_contracts(
+            "VM-07",
+            "lead_qualified_count",
+            "0",
+            "1",
+            "count",
+            "at_least",
+        )
+        .expect("explicit KPI contract");
+        assert_eq!(
+            kpis.get("lead_qualified_count"),
+            Some(&KpiContract {
+                baseline: Some(Decimal::ZERO),
+                target: Decimal::ONE,
+                unit: "count".into(),
+                direction: KpiDirection::AtLeast,
+            })
+        );
+        assert!(catalog_kpi_contracts("VM-07", "", "0", "1", "count", "at_least").is_none());
+        assert!(
+            catalog_kpi_contracts(
+                "VM-07",
+                "lead_qualified_count",
+                "0",
+                "not-a-decimal",
+                "count",
+                "at_least",
+            )
+            .is_none()
+        );
+        assert_eq!(
+            catalog_kpi_contracts("VM-11", "", "", "", "", ""),
+            Some(BTreeMap::new())
+        );
     }
 
     #[test]

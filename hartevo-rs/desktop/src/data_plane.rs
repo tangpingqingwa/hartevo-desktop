@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -25,7 +25,7 @@ use hartevo_catalog::{
 };
 use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblyStatus};
 use hartevo_domain_kernel::{
-    ActorId, CurrencyCode, DeviceId, KeyManagementError, KeyRecipient,
+    ActorId, CurrencyCode, DeviceId, KeyManagementError, KeyRecipient, KpiContract,
     MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionConversationMessageId,
     MissionConversationMessageKind, MissionConversationRole, MissionId, MissionStage, Money,
     OperatingMode, ProjectEncryptionMode, ProjectId, ProjectKeyring, RuntimeRecoveryStatus,
@@ -129,12 +129,14 @@ pub struct DesktopCatalogMissionRequest {
     pub project_id: ProjectId,
     pub manifest_id: String,
     pub mode: OperatingMode,
+    pub parent_mission_id: Option<MissionId>,
     pub title: Option<String>,
     pub goal: String,
     pub market: String,
     pub language: String,
     pub audience: String,
     pub timezone: String,
+    pub kpis: BTreeMap<String, KpiContract>,
     pub budget_minor: i64,
     pub currency: String,
 }
@@ -527,35 +529,69 @@ impl DesktopDataPlane {
         availability: DesktopRuntimeAvailabilityStatus,
         now: DateTime<Utc>,
     ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let vm11 = request.manifest_id == "VM-11";
         if request.goal.trim().is_empty()
             || request.manifest_id.trim().is_empty()
-            || request.market.trim().is_empty()
-            || request.language.trim().is_empty()
-            || request.audience.trim().is_empty()
-            || request.timezone.trim().is_empty()
-            || request.budget_minor < 0
+            || (vm11 && request.parent_mission_id.is_none())
+            || (!vm11
+                && (request.market.trim().is_empty()
+                    || request.language.trim().is_empty()
+                    || request.audience.trim().is_empty()
+                    || request.timezone.trim().is_empty()
+                    || request.budget_minor < 0
+                    || request.kpis.is_empty()))
         {
             return Err(DesktopDataError::InvalidCatalogMissionContract);
         }
-        let currency = CurrencyCode::parse(request.currency.trim())
-            .map_err(|_| DesktopDataError::InvalidCatalogMissionContract)?;
-        let budget = Money::new(request.budget_minor, currency);
         let project_id = request.project_id.clone();
         let (mut service, runtime_reconciliation, context_session) =
             self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let (mode, parent_mission_id, market, language, audience, timezone, kpis, budget) = if vm11
+        {
+            let parent_mission_id = request
+                .parent_mission_id
+                .clone()
+                .ok_or(DesktopDataError::InvalidCatalogMissionContract)?;
+            let parent = service.load_mission(&project_id, &parent_mission_id)?;
+            (
+                parent.contract.mode.clone(),
+                Some(parent_mission_id),
+                parent.contract.market.clone(),
+                parent.contract.language.clone(),
+                parent.contract.audience.clone(),
+                parent.contract.timezone.clone(),
+                parent.contract.kpis.clone(),
+                parent.contract.budget.clone(),
+            )
+        } else {
+            let currency = CurrencyCode::parse(request.currency.trim())
+                .map_err(|_| DesktopDataError::InvalidCatalogMissionContract)?;
+            (
+                request.mode,
+                None,
+                request.market,
+                request.language,
+                request.audience,
+                request.timezone,
+                request.kpis,
+                Money::new(request.budget_minor, currency),
+            )
+        };
         let mission = service.start_catalog_mission(
             StartCatalogMission {
                 id: MissionId::new(),
                 first_task_id: TaskId::new(),
                 project_id: project_id.clone(),
                 manifest_id: request.manifest_id,
-                mode: request.mode,
+                mode,
+                parent_mission_id,
                 title: request.title,
                 goal: request.goal,
-                market: request.market,
-                language: request.language,
-                audience: request.audience,
-                timezone: request.timezone,
+                market,
+                language,
+                audience,
+                timezone,
+                kpis,
                 budget,
             },
             now,
@@ -2206,14 +2242,16 @@ mod tests {
         StartRelationshipMission,
     };
     use hartevo_domain_kernel::{
-        AccountId, ActorId, ContextBranchStatus, ContextCapsuleStatus, EvidenceId,
-        ExternalIdentity, IdentityLink, IdentityLinkId, IdentitySubject, KeyRecipient,
-        MissionCheckpointExecutor, MissionScheduleStatus, MissionStage, OutcomeDecision,
-        OutcomeEvent, OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification,
-        OutcomeVerificationMethod, Person, PersonId, ProjectEncryptionMode, StorageMode, TaskId,
-        TaskStatus, WorkProductId, WorkerLeaseStatus,
+        AccountId, ActorId, Connection, ConnectionId, ConnectionProbe, ContextBranchStatus,
+        ContextCapsuleStatus, EvidenceId, ExternalIdentity, IdentityLink, IdentityLinkId,
+        IdentitySubject, KeyRecipient, KpiDirection, MissionCheckpointExecutor,
+        MissionScheduleStatus, MissionStage, OrderId, OutcomeDecision, OutcomeEvent,
+        OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification, OutcomeVerificationMethod,
+        Person, PersonId, ProbeOutcome, ProjectEncryptionMode, StorageMode, TaskId, TaskStatus,
+        WorkProductId, WorkerLeaseStatus,
     };
     use hartevo_storage::MemorySecretStore;
+    use rust_decimal::Decimal;
 
     use super::*;
 
@@ -2221,6 +2259,50 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-08-11T10:00:00Z")
             .expect("valid fixture time")
             .with_timezone(&Utc)
+    }
+
+    fn catalog_count_kpis() -> BTreeMap<String, KpiContract> {
+        BTreeMap::from([(
+            "lead_qualified_count".into(),
+            KpiContract {
+                baseline: Some(Decimal::ZERO),
+                target: Decimal::ONE,
+                unit: "count".into(),
+                direction: KpiDirection::AtLeast,
+            },
+        )])
+    }
+
+    fn start_vm11_parent(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        now: DateTime<Utc>,
+    ) -> MissionId {
+        plane
+            .start_catalog_mission_and_run_with(
+                secrets,
+                DesktopCatalogMissionRequest {
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-07".into(),
+                    mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: None,
+                    title: Some("Outcome source mission".into()),
+                    goal: "Decide a bounded market experiment and measure its verified lead".into(),
+                    market: "US".into(),
+                    language: "en-US".into(),
+                    audience: "owner".into(),
+                    timezone: "America/New_York".into(),
+                    kpis: catalog_count_kpis(),
+                    budget_minor: 0,
+                    currency: "USD".into(),
+                },
+                None,
+                DesktopRuntimeAvailabilityStatus::NotConfigured,
+                now,
+            )
+            .expect("VM-11 source Mission")
+            .mission_id
     }
 
     fn ready_personal_fixture() -> (
@@ -2595,12 +2677,14 @@ sleep 30"#;
                     project_id: project_id.clone(),
                     manifest_id: "VM-07".into(),
                     mode: OperatingMode::BuildOnce,
+                    parent_mission_id: None,
                     title: None,
                     goal: "invalid mode must not create state".into(),
                     market: "DE".into(),
                     language: "de".into(),
                     audience: "owner".into(),
                     timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
                     budget_minor: 0,
                     currency: "EUR".into(),
                 },
@@ -2641,12 +2725,14 @@ sleep 30"#;
                     project_id: project_id.clone(),
                     manifest_id: "VM-07".into(),
                     mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: None,
                     title: Some("德国市场决策".into()),
                     goal: private_goal.into(),
                     market: "DE".into(),
                     language: "de".into(),
                     audience: "owner".into(),
                     timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
                     budget_minor: 12_500,
                     currency: "EUR".into(),
                 },
@@ -2756,10 +2842,16 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the Desktop data-plane Journey proves three deterministic Application handlers, honest empty-ledger blocking, source-verified recovery, atomic next-route handoff, and zero Runtime construction"
+        reason = "the Desktop data-plane Journey proves five deterministic Application handlers, honest empty-ledger blocking, source-verified parent KPI and attribution recovery, atomic next-route handoff, and zero Runtime construction"
     )]
     fn vm11_application_handlers_recover_and_advance_without_constructing_runtime() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let parent_mission_id = start_vm11_parent(
+            &plane,
+            &secrets,
+            &project_id,
+            observed_at() + Duration::minutes(2),
+        );
         let started = plane
             .start_catalog_mission_and_run_with(
                 &secrets,
@@ -2767,12 +2859,14 @@ sleep 30"#;
                     project_id: project_id.clone(),
                     manifest_id: "VM-11".into(),
                     mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: Some(parent_mission_id.clone()),
                     title: Some("Verified outcome review".into()),
                     goal: "Use only verified outcome events for the next decision".into(),
                     market: "US".into(),
                     language: "en-US".into(),
                     audience: "owner".into(),
                     timezone: "America/New_York".into(),
+                    kpis: BTreeMap::new(),
                     budget_minor: 0,
                     currency: "USD".into(),
                 },
@@ -2784,7 +2878,7 @@ sleep 30"#;
                     }),
                 }),
                 DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
-                observed_at() + Duration::minutes(1),
+                observed_at() + Duration::minutes(3),
             )
             .expect("VM-11 Application dispatch");
         assert_eq!(
@@ -2819,7 +2913,7 @@ sleep 30"#;
             .get(plane.database_key_reference())
             .expect("database secret");
         let (mut service, _) = plane
-            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(2))
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(4))
             .expect("reopen Application");
         let tenant_id = service
             .desktop_inventory()
@@ -2841,7 +2935,7 @@ sleep 30"#;
                     vec![],
                 )
                 .expect("person"),
-                observed_at() + Duration::minutes(2),
+                observed_at() + Duration::minutes(4),
             )
             .expect("persist person");
         let identity_link_id = IdentityLinkId::from("desktop-vm11-identity");
@@ -2862,7 +2956,7 @@ sleep 30"#;
                     "1".parse().expect("identity confidence"),
                 )
                 .expect("identity link"),
-                observed_at() + Duration::minutes(2),
+                observed_at() + Duration::minutes(4),
             )
             .expect("persist identity link");
         service
@@ -2871,25 +2965,58 @@ sleep 30"#;
                 &identity_link_id,
                 ActorId::from("project-owner"),
                 "2".repeat(64),
-                observed_at() + Duration::minutes(2),
+                observed_at() + Duration::minutes(4),
             )
             .expect("confirm identity link");
+        let outcome_connection_id = ConnectionId::from("desktop-vm11-commerce-connection");
         service
-            .start_outcome_ledger(&project_id, observed_at() + Duration::minutes(2))
+            .register_connection(
+                Connection::register(
+                    outcome_connection_id.clone(),
+                    tenant_id.clone(),
+                    project_id.clone(),
+                    "user-review",
+                    AccountId::from("project-owner"),
+                    "desktop-project-owner-external",
+                    ["orders.read".into()],
+                    observed_at() + Duration::minutes(4),
+                )
+                .expect("commerce connection"),
+                observed_at() + Duration::minutes(4),
+            )
+            .expect("persist commerce connection");
+        service
+            .record_connection_probe(
+                &project_id,
+                &outcome_connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "desktop-project-owner-external".into(),
+                    granted_scopes: BTreeSet::from(["orders.read".into()]),
+                    probed_at: observed_at() + Duration::minutes(4),
+                    valid_until: observed_at() + Duration::days(30),
+                    credential_expires_at: observed_at() + Duration::days(30),
+                    evidence_digest: "6".repeat(64),
+                },
+                observed_at() + Duration::minutes(4),
+            )
+            .expect("probe commerce connection");
+        service
+            .start_outcome_ledger(&project_id, observed_at() + Duration::minutes(4))
             .expect("Outcome Ledger");
         service
             .ingest_outcome_event(
                 OutcomeEvent {
                     id: OutcomeEventId::from("desktop-vm11-lead-event"),
-                    tenant_id,
+                    tenant_id: tenant_id.clone(),
                     project_id: project_id.clone(),
-                    mission_id: started.mission_id.clone(),
+                    mission_id: parent_mission_id.clone(),
                     kind: OutcomeEventKind::LeadQualified,
                     provider: "user-review".into(),
                     connection_id: None,
                     account_id: None,
                     source_event_id: "desktop-user-confirmation-1".into(),
-                    identity_link_id: Some(identity_link_id),
+                    identity_link_id: Some(identity_link_id.clone()),
                     opportunity_id: None,
                     campaign_id: None,
                     order_id: None,
@@ -2898,21 +3025,57 @@ sleep 30"#;
                     payout_id: None,
                     partner_id: None,
                     amount: None,
-                    occurred_at: observed_at() + Duration::minutes(2),
-                    received_at: observed_at() + Duration::minutes(3),
+                    occurred_at: observed_at() + Duration::minutes(4),
+                    received_at: observed_at() + Duration::minutes(5),
                     evidence_digest: "3".repeat(64),
                     raw_payload_digest: "4".repeat(64),
                     source_verification: Some(OutcomeSourceVerification {
                         method: OutcomeVerificationMethod::UserConfirmed,
                         verifier: "project-owner".into(),
                         independent: false,
-                        verified_at: observed_at() + Duration::minutes(3),
+                        verified_at: observed_at() + Duration::minutes(5),
                         evidence_digest: "5".repeat(64),
                     }),
                 },
-                observed_at() + Duration::minutes(3),
+                observed_at() + Duration::minutes(5),
             )
             .expect("verified OutcomeEvent");
+        service
+            .ingest_outcome_event(
+                OutcomeEvent {
+                    id: OutcomeEventId::from("desktop-vm11-order-event"),
+                    tenant_id,
+                    project_id: project_id.clone(),
+                    mission_id: parent_mission_id,
+                    kind: OutcomeEventKind::OrderPlaced,
+                    provider: "user-review".into(),
+                    connection_id: Some(outcome_connection_id),
+                    account_id: Some(AccountId::from("project-owner")),
+                    source_event_id: "desktop-signed-order-1".into(),
+                    identity_link_id: Some(identity_link_id),
+                    opportunity_id: None,
+                    campaign_id: None,
+                    order_id: Some(OrderId::from("desktop-vm11-order")),
+                    refund_id: None,
+                    commission_id: None,
+                    payout_id: None,
+                    partner_id: None,
+                    amount: Some(Money::new(9_500, CurrencyCode::parse("USD").expect("USD"))),
+                    occurred_at: observed_at() + Duration::minutes(4),
+                    received_at: observed_at() + Duration::minutes(5),
+                    evidence_digest: "7".repeat(64),
+                    raw_payload_digest: "8".repeat(64),
+                    source_verification: Some(OutcomeSourceVerification {
+                        method: OutcomeVerificationMethod::SignedWebhook,
+                        verifier: "commerce-webhook".into(),
+                        independent: true,
+                        verified_at: observed_at() + Duration::minutes(5),
+                        evidence_digest: "9".repeat(64),
+                    }),
+                },
+                observed_at() + Duration::minutes(5),
+            )
+            .expect("verified order OutcomeEvent");
         drop(service);
 
         let resumed = plane
@@ -2928,7 +3091,7 @@ sleep 30"#;
                     }),
                 }),
                 DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
-                observed_at() + Duration::minutes(4),
+                observed_at() + Duration::minutes(6),
             )
             .expect("recover VM-11 Application route");
         assert_eq!(
@@ -2984,7 +3147,7 @@ sleep 30"#;
                     }),
                 }),
                 DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
-                observed_at() + Duration::minutes(5),
+                observed_at() + Duration::minutes(7),
             )
             .expect("normalize Outcome Ledger without Runtime");
         assert_eq!(
@@ -3034,7 +3197,7 @@ sleep 30"#;
                     }),
                 }),
                 DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
-                observed_at() + Duration::minutes(6),
+                observed_at() + Duration::minutes(8),
             )
             .expect("resolve identity chain without Runtime");
         assert_eq!(
@@ -3067,11 +3230,112 @@ sleep 30"#;
                     .as_deref(),
             ),
             (
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                Some("vm11.mission-specific-kpi/v1"),
+            )
+        );
+        let measured = plane
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("KPI Application route must not construct Runtime")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(9),
+            )
+            .expect("recompute parent Mission KPI without Runtime");
+        assert_eq!(
+            measured.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "attribution_and_unattributed".into(),
+                capability_id: "attribution.compute".into(),
+                executor: MissionCheckpointExecutor::Application,
+                oracle_ids: BTreeSet::from([
+                    "decision".into(),
+                    "effect".into(),
+                    "operating_state".into(),
+                    "outcome".into(),
+                    "truth".into(),
+                ]),
+                completion_policy: MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
+        let measured_projection = measured.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("KPI-measured VM-11 projection");
+        assert_eq!(measured_projection.completed_checkpoint_count, 4);
+        assert_eq!(
+            (
+                measured_projection.current_checkpoint_application_handler_status,
+                measured_projection
+                    .current_checkpoint_application_handler_id
+                    .as_deref(),
+            ),
+            (
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                Some("vm11.attribution-and-unattributed/v1"),
+            )
+        );
+        let attributed = plane
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("attribution Application route must not construct Runtime")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(10),
+            )
+            .expect("compute attribution without Runtime");
+        assert_eq!(
+            attributed.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "refund_commission_payout_recalc".into(),
+                capability_id: "settlement.compute".into(),
+                executor: MissionCheckpointExecutor::Application,
+                oracle_ids: BTreeSet::from([
+                    "decision".into(),
+                    "operating_state".into(),
+                    "outcome".into(),
+                    "truth".into(),
+                ]),
+                completion_policy: MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
+        let attributed_projection = attributed.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("attributed VM-11 projection");
+        assert_eq!(attributed_projection.completed_checkpoint_count, 5);
+        assert_eq!(
+            (
+                attributed_projection.current_checkpoint_application_handler_status,
+                attributed_projection
+                    .current_checkpoint_application_handler_id
+                    .as_deref(),
+            ),
+            (
                 Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented),
                 None,
             )
         );
-        let unsupported_revision = identified_projection.revision;
+        let unsupported_revision = attributed_projection.revision;
         let unsupported = plane
             .resume_mission_runtime_with(
                 &secrets,
@@ -3085,14 +3349,14 @@ sleep 30"#;
                     }),
                 }),
                 DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
-                observed_at() + Duration::minutes(7),
+                observed_at() + Duration::minutes(11),
             )
             .expect("honest unsupported Application route");
         assert_eq!(
             unsupported.runtime_outcome,
             DesktopMissionRuntimeOutcome::ApplicationCheckpointNotImplemented {
-                checkpoint_id: "mission_specific_kpi".into(),
-                capability_id: "attribution.compute".into(),
+                checkpoint_id: "refund_commission_payout_recalc".into(),
+                capability_id: "settlement.compute".into(),
             }
         );
         assert_eq!(
@@ -3108,7 +3372,7 @@ sleep 30"#;
             .get(plane.database_key_reference())
             .expect("database secret");
         let (service, _) = plane
-            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(8))
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(12))
             .expect("reopen completed Application route");
         let mission = service
             .load_mission(&project_id, &started.mission_id)
@@ -3167,6 +3431,42 @@ sleep 30"#;
                 .map(|evidence| evidence.handler_id.as_str()),
             Some("vm11.identity-chain/v1")
         );
+        let kpi_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "mission_specific_kpi")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable mission-specific KPI completion");
+        assert_eq!(
+            kpi_completion
+                .application_evidence
+                .as_ref()
+                .map(|evidence| evidence.handler_id.as_str()),
+            Some("vm11.mission-specific-kpi/v1")
+        );
+        let attribution_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "attribution_and_unattributed")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable attribution completion");
+        assert_eq!(
+            attribution_completion
+                .application_evidence
+                .as_ref()
+                .map(|evidence| evidence.handler_id.as_str()),
+            Some("vm11.attribution-and-unattributed/v1")
+        );
         assert_eq!(mission.effects.len(), 0);
     }
 
@@ -3185,12 +3485,14 @@ sleep 30"#;
                     project_id: project_id.clone(),
                     manifest_id: "VM-07".into(),
                     mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: None,
                     title: Some("Germany evidence decision".into()),
                     goal: "Decide whether Germany merits a bounded evidence experiment".into(),
                     market: "DE".into(),
                     language: "de-DE".into(),
                     audience: "owner".into(),
                     timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
                     budget_minor: 25_000,
                     currency: "EUR".into(),
                 },
@@ -3363,12 +3665,14 @@ sleep 30"#;
                     project_id: project_id.clone(),
                     manifest_id: "VM-07".into(),
                     mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: None,
                     title: Some("Persistent decision".into()),
                     goal: "Compare the confirmed German market only".into(),
                     market: "DE".into(),
                     language: "de-DE".into(),
                     audience: "owner".into(),
                     timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
                     budget_minor: 0,
                     currency: "EUR".into(),
                 },
@@ -3518,12 +3822,14 @@ sleep 30"#;
                     project_id: project_id.clone(),
                     manifest_id: "VM-04".into(),
                     mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
                     title: Some("Germany social matrix draft".into()),
                     goal: private_goal.into(),
                     market: "DE".into(),
                     language: "de-DE".into(),
                     audience: "owner".into(),
                     timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
                     budget_minor: 0,
                     currency: "EUR".into(),
                 },
@@ -3650,12 +3956,14 @@ sleep 30"#;
                     project_id: project_id.clone(),
                     manifest_id: "VM-04".into(),
                     mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
                     title: Some("Failed social draft generation fencing".into()),
                     goal: "Produce one bounded market decision draft".into(),
                     market: "DE".into(),
                     language: "de-DE".into(),
                     audience: "owner".into(),
                     timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
                     budget_minor: 0,
                     currency: "EUR".into(),
                 },
@@ -3784,12 +4092,14 @@ sleep 30"#;
                     project_id: project_id.clone(),
                     manifest_id: "VM-04".into(),
                     mode: OperatingMode::Campaign,
+                    parent_mission_id: None,
                     title: Some("Pre-turn social draft recovery fencing".into()),
                     goal: "Prepare a bounded decision before steering changes".into(),
                     market: "DE".into(),
                     language: "de-DE".into(),
                     audience: "owner".into(),
                     timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
                     budget_minor: 0,
                     currency: "EUR".into(),
                 },

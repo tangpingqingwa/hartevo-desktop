@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-application-handler-registry/v1",
-  "registryVersion": "desktop-2026-08-12-v3",
+  "registryVersion": "desktop-2026-08-12-v5",
   "handlers": [
     {
       "handlerId": "vm11.event_ingest/v2",
@@ -47,6 +47,44 @@
         "outcome_identity_chain": ["truth", "decision"]
       },
       "oracleIds": ["truth", "decision", "operating_state", "outcome"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm11.mission-specific-kpi/v1",
+      "missionId": "VM-11",
+      "missionVersion": 3,
+      "checkpointId": "mission_specific_kpi",
+      "capabilityId": "attribution.compute",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": ["mission_checkpoint", "parent_mission_contract", "outcome_mission_kpi"],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "parent_mission_contract": ["decision"],
+        "outcome_mission_kpi": ["truth", "outcome"]
+      },
+      "oracleIds": ["truth", "decision", "operating_state", "outcome"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm11.attribution-and-unattributed/v1",
+      "missionId": "VM-11",
+      "missionVersion": 3,
+      "checkpointId": "attribution_and_unattributed",
+      "capabilityId": "attribution.compute",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": [
+        "mission_checkpoint",
+        "outcome_normalization",
+        "attribution_effect_support",
+        "outcome_attribution"
+      ],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "outcome_normalization": ["truth"],
+        "attribution_effect_support": ["effect"],
+        "outcome_attribution": ["decision", "outcome"]
+      },
+      "oracleIds": ["truth", "decision", "effect", "operating_state", "outcome"],
       "implementationCrate": "hartevo-application"
     }
   ]

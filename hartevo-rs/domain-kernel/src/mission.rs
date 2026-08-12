@@ -99,6 +99,16 @@ pub struct KpiContract {
     pub baseline: Option<Decimal>,
     pub target: Decimal,
     pub unit: String,
+    #[serde(default)]
+    pub direction: KpiDirection,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KpiDirection {
+    #[default]
+    AtLeast,
+    AtMost,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -114,6 +124,10 @@ pub struct ApprovalPolicy {
 pub struct OperatingContract {
     pub version: u64,
     pub mode: OperatingMode,
+    /// VM-11 binds this immutable reference to the Mission whose business
+    /// outcomes it reviews. Other Mission types must leave it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_mission_id: Option<MissionId>,
     pub goal: String,
     pub non_goals: Vec<String>,
     pub market: String,
@@ -151,6 +165,7 @@ impl OperatingContract {
         Self {
             version: 1,
             mode: OperatingMode::BuildOnce,
+            parent_mission_id: None,
             goal: goal.into(),
             non_goals: Vec::new(),
             market: "unspecified".into(),
@@ -186,6 +201,10 @@ impl OperatingContract {
 
     pub fn validate(&self, now: DateTime<Utc>) -> Result<(), OperatingContractError> {
         if self.version == 0
+            || self
+                .parent_mission_id
+                .as_ref()
+                .is_some_and(|id| id.as_str().trim().is_empty())
             || self.goal.trim().is_empty()
             || self.market.trim().is_empty()
             || self.language.trim().is_empty()

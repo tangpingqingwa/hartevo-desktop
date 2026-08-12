@@ -9,13 +9,14 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    AccountId, AttributionId, CampaignId, CommissionId, Company, CompanyId, ConnectionId,
-    ConnectionSnapshot, IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject,
+    AccountId, ApprovalDecision, AttributionId, CampaignId, CommissionId, Company, CompanyId,
+    ConnectionId, ConnectionSnapshot, CurrencyCode, Effect, EffectId, EffectStatus, IdentityLink,
+    IdentityLinkId, IdentityLinkStatus, IdentitySubject, KpiContract, KpiDirection, Mission,
     MissionId, Money, Opportunity, OpportunityId, OrderId, OutcomeEventId, Partner, PartnerId,
-    PayoutId, Person, PersonId, ProjectId, RefundId, TenantId,
+    PayoutId, Person, PersonId, ProjectId, RefundId, TenantId, VerificationStatus,
 };
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeEventKind {
     LeadQualified,
@@ -218,7 +219,7 @@ pub struct OutcomeRefund {
     pub occurred_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttributionModel {
     VerifiedIdentity,
@@ -227,15 +228,35 @@ pub enum AttributionModel {
     Unattributed,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionTrafficClass {
+    Direct,
+    NonDirect,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Touchpoint {
     pub mission_id: MissionId,
     pub source: String,
+    /// Required when `VerifiedIdentity` relies on an external action. The
+    /// VM-11 Oracle resolves this reference against the current Mission and
+    /// independently confirmed Effect rather than trusting a caller digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_id: Option<EffectId>,
+    /// Legacy rows omit this field and remain audit-readable, but cannot enter
+    /// a current deterministic attribution view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_class: Option<AttributionTrafficClass>,
     pub provider_identity_digest: Option<String>,
     pub verified_link_or_coupon_digest: Option<String>,
     pub occurred_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<DateTime<Utc>>,
     pub evidence_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_verification: Option<OutcomeSourceVerification>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -250,6 +271,10 @@ pub struct AttributionRecord {
     pub window_started_at: DateTime<Utc>,
     pub window_ended_at: DateTime<Utc>,
     pub confidence: Decimal,
+    /// Attribution views are operational correlation views, never causal
+    /// claims. The only accepted value is false.
+    #[serde(default)]
+    pub causal_claim: bool,
     pub rationale: String,
     pub evidence_digest: String,
     pub recorded_at: DateTime<Utc>,
@@ -262,6 +287,25 @@ impl AttributionRecord {
         project_id: &ProjectId,
         order: &OutcomeOrder,
     ) -> Result<(), OutcomeLedgerError> {
+        self.validate_shape(tenant_id, project_id, order, true)
+    }
+
+    fn validate_persisted(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+        order: &OutcomeOrder,
+    ) -> Result<(), OutcomeLedgerError> {
+        self.validate_shape(tenant_id, project_id, order, false)
+    }
+
+    fn validate_shape(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+        order: &OutcomeOrder,
+        require_current_source_verification: bool,
+    ) -> Result<(), OutcomeLedgerError> {
         if self.tenant_id != *tenant_id
             || self.project_id != *project_id
             || self.order_id != order.id
@@ -271,6 +315,7 @@ impl AttributionRecord {
             || self.recorded_at < order.occurred_at
             || self.confidence < Decimal::ZERO
             || self.confidence > Decimal::ONE
+            || self.causal_claim
             || self.rationale.trim().is_empty()
             || !is_sha256(&self.evidence_digest)
         {
@@ -283,15 +328,26 @@ impl AttributionRecord {
                 return Err(OutcomeLedgerError::InvalidAttribution);
             }
             AttributionModel::Unattributed => {}
-            _ => validate_touchpoint(
-                self.touchpoint
+            _ => {
+                let touchpoint = self
+                    .touchpoint
                     .as_ref()
-                    .ok_or(OutcomeLedgerError::InvalidAttribution)?,
-                order,
-                &self.model,
-                self.window_started_at,
-                self.window_ended_at,
-            )?,
+                    .ok_or(OutcomeLedgerError::InvalidAttribution)?;
+                validate_touchpoint(
+                    touchpoint,
+                    order,
+                    self.model,
+                    self.window_started_at,
+                    self.window_ended_at,
+                    self.recorded_at,
+                    require_current_source_verification,
+                )?;
+                if self.model == AttributionModel::VerifiedIdentity
+                    && self.confidence != Decimal::ONE
+                {
+                    return Err(OutcomeLedgerError::InvalidAttribution);
+                }
+            }
         }
         Ok(())
     }
@@ -336,6 +392,9 @@ pub struct OutcomeLedger {
     pub commissions: Vec<CommissionRecord>,
     pub revision: u64,
 }
+
+type SourceMissionOrderMap<'a> = BTreeMap<OrderId, (&'a OutcomeOrder, &'a OutcomeEvent)>;
+type SourceMissionOrders<'a> = (DateTime<Utc>, DateTime<Utc>, SourceMissionOrderMap<'a>);
 
 /// Content-free, deterministically recomputable proof that one exact Outcome
 /// Ledger revision has a complete source-verification chain, contains no
@@ -388,6 +447,104 @@ pub struct OutcomeIdentityChainProjection {
     pub source_support_digest: String,
 }
 
+/// Exact value observed for one parent Mission KPI. Financial values remain
+/// typed minor-unit Money; counts never pass through `f64` or an LLM judge.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum MissionKpiObservedValue {
+    Count { value: u64 },
+    Money { value: Money },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionKpiMeasurement {
+    pub metric_id: String,
+    pub source_event_count: u64,
+    pub observed: MissionKpiObservedValue,
+    pub baseline: Option<Decimal>,
+    pub target: Decimal,
+    pub unit: String,
+    pub direction: KpiDirection,
+    pub target_met: bool,
+}
+
+/// Content-free VM-11 `mission_specific_kpi` Oracle. The projection binds one
+/// immutable parent Mission contract/revision, one verified ledger revision,
+/// an explicit event-time/receive-time cutoff, and typed KPI measurements.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionKpiProjection {
+    pub schema_version: u32,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub source_mission_id: MissionId,
+    pub source_mission_revision: u64,
+    pub source_ledger_revision: u64,
+    pub window_started_at: DateTime<Utc>,
+    pub window_ended_at: DateTime<Utc>,
+    pub source_event_count: u64,
+    pub measurement_count: u64,
+    pub target_met_count: u64,
+    pub source_contract_digest: String,
+    pub source_event_digest: String,
+    pub normalization_digest: String,
+    pub identity_chain_digest: String,
+    pub measurements: BTreeMap<String, MissionKpiMeasurement>,
+}
+
+/// One deterministic operational attribution view. `primary_model` is never a
+/// causal conclusion: it is either a source-verified identity, the latest
+/// source-verified non-direct touchpoint, or an explicit Unattributed result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderAttributionView {
+    pub order_id: OrderId,
+    pub primary_model: AttributionModel,
+    pub primary_attribution_id: Option<AttributionId>,
+    pub primary_touchpoint_digest: Option<String>,
+    pub first_touch_attribution_id: Option<AttributionId>,
+    pub first_touch_digest: Option<String>,
+    pub last_non_direct_attribution_id: Option<AttributionId>,
+    pub last_non_direct_digest: Option<String>,
+    pub source_record_count: u64,
+    pub eligible_touchpoint_count: u64,
+    pub explicit_unattributed_record_count: u64,
+    pub causal_claim: bool,
+}
+
+/// Content-free, replayable VM-11 attribution Oracle. The full order map is
+/// kept in encrypted Domain state only while Application evidence persists its
+/// digest and bounded counts.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeAttributionProjection {
+    pub schema_version: u32,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub source_mission_id: MissionId,
+    pub source_mission_revision: u64,
+    pub source_ledger_revision: u64,
+    pub window_started_at: DateTime<Utc>,
+    pub window_ended_at: DateTime<Utc>,
+    pub order_count: u64,
+    pub source_record_count: u64,
+    pub eligible_touchpoint_count: u64,
+    pub verified_identity_order_count: u64,
+    pub last_non_direct_order_count: u64,
+    pub unattributed_order_count: u64,
+    pub first_touch_order_count: u64,
+    pub explicit_unattributed_record_count: u64,
+    pub supporting_mission_count: u64,
+    pub verified_effect_count: u64,
+    pub causal_claim: bool,
+    pub normalization_digest: String,
+    pub identity_chain_digest: String,
+    pub source_record_digest: String,
+    pub effect_support_digest: String,
+    pub orders: BTreeMap<OrderId, OrderAttributionView>,
+}
+
 impl OutcomeNormalizationProjection {
     pub const SCHEMA_VERSION: u32 = 1;
 
@@ -436,6 +593,26 @@ impl OutcomeIdentityChainProjection {
         hash_projection_field(&mut digest, &self.opportunity_count.to_string());
         hash_projection_field(&mut digest, &self.source_support_digest);
         format!("{:x}", digest.finalize())
+    }
+}
+
+impl MissionKpiProjection {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn digest(&self) -> Result<String, OutcomeLedgerError> {
+        let canonical =
+            serde_json::to_vec(self).map_err(|_| OutcomeLedgerError::ProjectionSerialization)?;
+        Ok(format!("{:x}", Sha256::digest(canonical)))
+    }
+}
+
+impl OutcomeAttributionProjection {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn digest(&self) -> Result<String, OutcomeLedgerError> {
+        let canonical =
+            serde_json::to_vec(self).map_err(|_| OutcomeLedgerError::ProjectionSerialization)?;
+        Ok(format!("{:x}", Sha256::digest(canonical)))
     }
 }
 
@@ -496,7 +673,7 @@ impl OutcomeLedger {
                 .iter()
                 .find(|order| order.id == attribution.order_id)
                 .ok_or(OutcomeLedgerError::UnknownOrder)?;
-            attribution.validate(&self.tenant_id, &self.project_id, order)?;
+            attribution.validate_persisted(&self.tenant_id, &self.project_id, order)?;
         }
 
         let mut commission_ids = BTreeSet::new();
@@ -995,6 +1172,532 @@ impl OutcomeLedger {
         })
     }
 
+    /// Recomputes the parent Mission's contracted KPI values from current,
+    /// source-verified Outcome events. The event window is explicit and
+    /// receive/verification timestamps are cut off at `observed_at`, so a
+    /// future callback cannot leak into an earlier replay.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the deterministic KPI Oracle keeps scope, current identity, event ownership/window, canonical ordering, contract evaluation, and all bound digests visible in one audit path"
+    )]
+    pub fn verified_mission_kpi_projection(
+        &self,
+        source_mission: &Mission,
+        identity_chain: &OutcomeIdentityChainProjection,
+        observed_at: DateTime<Utc>,
+    ) -> Result<MissionKpiProjection, OutcomeLedgerError> {
+        let normalization = self.verified_normalization_projection()?;
+        if identity_chain.tenant_id != self.tenant_id
+            || identity_chain.project_id != self.project_id
+            || identity_chain.source_ledger_revision != self.revision
+            || identity_chain.event_count != normalization.event_count
+            || identity_chain.identity_covered_event_count != normalization.event_count
+        {
+            return Err(OutcomeLedgerError::KpiIdentityChainMismatch);
+        }
+        if source_mission.tenant_id != self.tenant_id
+            || source_mission.project_id != self.project_id
+            || source_mission.revision == 0
+        {
+            return Err(OutcomeLedgerError::KpiMissionScopeMismatch);
+        }
+        source_mission
+            .contract
+            .validate(source_mission.contract.valid_from)
+            .map_err(|_| OutcomeLedgerError::InvalidKpiContract)?;
+        if source_mission.contract.kpis.is_empty()
+            || observed_at < source_mission.contract.valid_from
+        {
+            return Err(OutcomeLedgerError::InvalidKpiContract);
+        }
+        let window_started_at = source_mission.contract.valid_from;
+        let window_ended_at = observed_at.min(source_mission.contract.valid_until);
+
+        let order_missions = self
+            .events
+            .iter()
+            .filter(|event| event.kind == OutcomeEventKind::OrderPlaced)
+            .map(|event| {
+                event
+                    .order_id
+                    .clone()
+                    .map(|order_id| (order_id, event.mission_id.clone()))
+                    .ok_or(OutcomeLedgerError::EventKindShapeMismatch)
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        for event in &self.events {
+            if matches!(
+                event.kind,
+                OutcomeEventKind::RefundIssued | OutcomeEventKind::CommissionAccrued
+            ) && event
+                .order_id
+                .as_ref()
+                .is_none_or(|order_id| !order_missions.contains_key(order_id))
+            {
+                return Err(OutcomeLedgerError::UnknownOrder);
+            }
+        }
+
+        let mut scoped_events = self
+            .events
+            .iter()
+            .filter(|event| {
+                let owning_mission = match event.kind {
+                    OutcomeEventKind::RefundIssued | OutcomeEventKind::CommissionAccrued => event
+                        .order_id
+                        .as_ref()
+                        .and_then(|order_id| order_missions.get(order_id))
+                        .unwrap_or(&event.mission_id),
+                    _ => &event.mission_id,
+                };
+                owning_mission == &source_mission.id
+                    && event.occurred_at >= window_started_at
+                    && event.occurred_at <= window_ended_at
+                    && event.received_at <= observed_at
+                    && event
+                        .source_verification
+                        .as_ref()
+                        .is_some_and(|verification| verification.verified_at <= observed_at)
+            })
+            .collect::<Vec<_>>();
+        if scoped_events.is_empty() {
+            return Err(OutcomeLedgerError::KpiSourceEventsUnavailable);
+        }
+        scoped_events.sort_by(|left, right| {
+            (
+                left.occurred_at,
+                left.received_at,
+                left.provider.as_str(),
+                left.source_event_id.as_str(),
+                left.id.as_str(),
+            )
+                .cmp(&(
+                    right.occurred_at,
+                    right.received_at,
+                    right.provider.as_str(),
+                    right.source_event_id.as_str(),
+                    right.id.as_str(),
+                ))
+        });
+        let source_event_count = projection_count(scoped_events.len())?;
+        let source_event_digest =
+            canonical_outcome_event_digest(&scoped_events, source_event_count);
+
+        let mut measurements = BTreeMap::new();
+        let mut target_met_count = 0_u64;
+        for (metric_id, contract) in &source_mission.contract.kpis {
+            let measurement = mission_kpi_measurement(metric_id, contract, &scoped_events)?;
+            if measurement.target_met {
+                target_met_count = target_met_count
+                    .checked_add(1)
+                    .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+            }
+            measurements.insert(metric_id.clone(), measurement);
+        }
+        let measurement_count = projection_count(measurements.len())?;
+        let source_contract_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&serde_json::json!({
+                    "schemaVersion": "hartevo-mission-kpi-contract-source/v1",
+                    "missionId": source_mission.id,
+                    "missionRevision": source_mission.revision,
+                    "contract": source_mission.contract,
+                }))
+                .map_err(|_| OutcomeLedgerError::ProjectionSerialization)?
+            )
+        );
+        Ok(MissionKpiProjection {
+            schema_version: MissionKpiProjection::SCHEMA_VERSION,
+            tenant_id: self.tenant_id.clone(),
+            project_id: self.project_id.clone(),
+            source_mission_id: source_mission.id.clone(),
+            source_mission_revision: source_mission.revision,
+            source_ledger_revision: self.revision,
+            window_started_at,
+            window_ended_at,
+            source_event_count,
+            measurement_count,
+            target_met_count,
+            source_contract_digest,
+            source_event_digest,
+            normalization_digest: normalization.digest(),
+            identity_chain_digest: identity_chain.digest(),
+            measurements,
+        })
+    }
+
+    /// Returns the exact Mission closure referenced by source records for the
+    /// parent Mission's currently observable orders. Application loads and
+    /// revision-fences this set before asking the Oracle to decide attribution.
+    pub fn attribution_support_mission_ids(
+        &self,
+        source_mission: &Mission,
+        observed_at: DateTime<Utc>,
+    ) -> Result<BTreeSet<MissionId>, OutcomeLedgerError> {
+        self.verified_normalization_projection()?;
+        let (_, _, source_orders) = self.source_mission_orders(source_mission, observed_at)?;
+        let order_ids = source_orders.keys().cloned().collect::<BTreeSet<_>>();
+        let mut mission_ids = BTreeSet::new();
+        for record in self.attributions.iter().filter(|record| {
+            order_ids.contains(&record.order_id) && record.recorded_at <= observed_at
+        }) {
+            match record.model {
+                AttributionModel::Unattributed => {
+                    if record.touchpoint.is_some() {
+                        return Err(OutcomeLedgerError::InvalidAttribution);
+                    }
+                }
+                _ => {
+                    mission_ids.insert(
+                        record
+                            .touchpoint
+                            .as_ref()
+                            .ok_or(OutcomeLedgerError::InvalidAttribution)?
+                            .mission_id
+                            .clone(),
+                    );
+                }
+            }
+        }
+        Ok(mission_ids)
+    }
+
+    /// Computes the frozen operational attribution views for one parent
+    /// Mission. Verified link/coupon/provider identity wins; otherwise the
+    /// latest non-direct touchpoint is the primary operational view. First
+    /// touch is retained separately and missing support remains Unattributed.
+    /// No result is represented as causal.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the deterministic attribution Oracle keeps source cutoff, exact Mission/Effect support closure, dispute handling, first/last views, Unattributed preservation, and every digest in one reviewable path"
+    )]
+    pub fn verified_attribution_projection(
+        &self,
+        source_mission: &Mission,
+        identity_chain: &OutcomeIdentityChainProjection,
+        supporting_missions: &[Mission],
+        observed_at: DateTime<Utc>,
+    ) -> Result<OutcomeAttributionProjection, OutcomeLedgerError> {
+        let normalization = self.verified_normalization_projection()?;
+        if identity_chain.tenant_id != self.tenant_id
+            || identity_chain.project_id != self.project_id
+            || identity_chain.source_ledger_revision != self.revision
+            || identity_chain.event_count != normalization.event_count
+            || identity_chain.identity_covered_event_count != normalization.event_count
+        {
+            return Err(OutcomeLedgerError::AttributionIdentityChainMismatch);
+        }
+        let (window_started_at, window_ended_at, source_orders) =
+            self.source_mission_orders(source_mission, observed_at)?;
+        let expected_mission_ids =
+            self.attribution_support_mission_ids(source_mission, observed_at)?;
+        let mut mission_support = BTreeMap::new();
+        for mission in supporting_missions {
+            if mission.tenant_id != self.tenant_id
+                || mission.project_id != self.project_id
+                || mission.revision == 0
+                || mission_support
+                    .insert(mission.id.clone(), mission)
+                    .is_some()
+            {
+                return Err(OutcomeLedgerError::AttributionSupportClosureMismatch);
+            }
+            mission
+                .contract
+                .validate(mission.contract.valid_from)
+                .map_err(|_| OutcomeLedgerError::AttributionSupportClosureMismatch)?;
+        }
+        if mission_support.keys().cloned().collect::<BTreeSet<_>>() != expected_mission_ids {
+            return Err(OutcomeLedgerError::AttributionSupportClosureMismatch);
+        }
+
+        let mut order_views = BTreeMap::new();
+        let mut source_records = Vec::new();
+        let mut effect_support = BTreeMap::new();
+        let mut source_record_count = 0_u64;
+        let mut eligible_touchpoint_count = 0_u64;
+        let mut verified_identity_order_count = 0_u64;
+        let mut last_non_direct_order_count = 0_u64;
+        let mut unattributed_order_count = 0_u64;
+        let mut first_touch_order_count = 0_u64;
+        let mut explicit_unattributed_record_count = 0_u64;
+
+        for (order_id, (order, _order_event)) in &source_orders {
+            let mut records = self
+                .attributions
+                .iter()
+                .filter(|record| record.order_id == *order_id && record.recorded_at <= observed_at)
+                .collect::<Vec<_>>();
+            records.sort_by(|left, right| {
+                (left.recorded_at, left.id.as_str()).cmp(&(right.recorded_at, right.id.as_str()))
+            });
+            source_record_count = source_record_count
+                .checked_add(projection_count(records.len())?)
+                .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+            source_records.extend(records.iter().copied());
+
+            let mut eligible = Vec::new();
+            let mut explicit_unattributed = 0_u64;
+            let mut touchpoint_digests = BTreeSet::new();
+            for record in records {
+                record.validate(&self.tenant_id, &self.project_id, order)?;
+                if record.model == AttributionModel::Unattributed {
+                    explicit_unattributed = explicit_unattributed
+                        .checked_add(1)
+                        .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                    continue;
+                }
+                let touchpoint = record
+                    .touchpoint
+                    .as_ref()
+                    .ok_or(OutcomeLedgerError::InvalidAttribution)?;
+                let received_at = touchpoint
+                    .received_at
+                    .ok_or(OutcomeLedgerError::UnverifiedAttributionSource)?;
+                let verification = touchpoint
+                    .source_verification
+                    .as_ref()
+                    .ok_or(OutcomeLedgerError::UnverifiedAttributionSource)?;
+                if touchpoint.occurred_at < window_started_at
+                    || touchpoint.occurred_at > window_ended_at
+                    || received_at > observed_at
+                    || verification.verified_at > observed_at
+                {
+                    return Err(OutcomeLedgerError::AttributionWindowMismatch);
+                }
+                let support_mission = mission_support
+                    .get(&touchpoint.mission_id)
+                    .copied()
+                    .ok_or(OutcomeLedgerError::AttributionSupportClosureMismatch)?;
+                if support_mission.created_at > touchpoint.occurred_at
+                    || touchpoint.occurred_at < support_mission.contract.valid_from
+                    || touchpoint.occurred_at > support_mission.contract.valid_until
+                {
+                    return Err(OutcomeLedgerError::AttributionWindowMismatch);
+                }
+                let touchpoint_digest = attribution_touchpoint_digest(record)?;
+                if !touchpoint_digests.insert(touchpoint_digest.clone()) {
+                    return Err(OutcomeLedgerError::DuplicateAttributionTouchpoint);
+                }
+                if let Some(effect_id) = &touchpoint.effect_id {
+                    let effect = support_mission
+                        .effects
+                        .iter()
+                        .find(|effect| &effect.id == effect_id)
+                        .ok_or(OutcomeLedgerError::AttributionEffectSupportInvalid)?;
+                    let support = verified_attribution_effect_support(
+                        record,
+                        touchpoint,
+                        support_mission,
+                        effect,
+                        order,
+                        observed_at,
+                    )?;
+                    let key = (support_mission.id.clone(), effect.id.clone());
+                    if let Some(existing) = effect_support.get(&key) {
+                        if existing != &support {
+                            return Err(OutcomeLedgerError::AttributionEffectSupportInvalid);
+                        }
+                    } else {
+                        effect_support.insert(key, support);
+                    }
+                } else if record.model == AttributionModel::VerifiedIdentity {
+                    return Err(OutcomeLedgerError::AttributionEffectSupportInvalid);
+                }
+                eligible.push(EligibleAttribution {
+                    attribution_id: record.id.clone(),
+                    model: record.model,
+                    traffic_class: touchpoint
+                        .traffic_class
+                        .ok_or(OutcomeLedgerError::UnverifiedAttributionSource)?,
+                    provider_identity_digest: touchpoint.provider_identity_digest.clone(),
+                    verified_link_or_coupon_digest: touchpoint
+                        .verified_link_or_coupon_digest
+                        .clone(),
+                    occurred_at: touchpoint.occurred_at,
+                    recorded_at: record.recorded_at,
+                    touchpoint_digest,
+                });
+            }
+
+            eligible_touchpoint_count = eligible_touchpoint_count
+                .checked_add(projection_count(eligible.len())?)
+                .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+            explicit_unattributed_record_count = explicit_unattributed_record_count
+                .checked_add(explicit_unattributed)
+                .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+
+            let verified = eligible
+                .iter()
+                .filter(|candidate| candidate.model == AttributionModel::VerifiedIdentity)
+                .collect::<Vec<_>>();
+            let verified_identity_keys = verified
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.provider_identity_digest.as_deref(),
+                        candidate.verified_link_or_coupon_digest.as_deref(),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            if verified_identity_keys.len() > 1 {
+                return Err(OutcomeLedgerError::DisputedAttribution);
+            }
+            let verified_primary = unique_attribution_extreme(&verified, false)?;
+            let non_direct = eligible
+                .iter()
+                .filter(|candidate| candidate.traffic_class == AttributionTrafficClass::NonDirect)
+                .collect::<Vec<_>>();
+            let last_non_direct = unique_attribution_extreme(&non_direct, false)?;
+            let all_candidates = eligible.iter().collect::<Vec<_>>();
+            let first_touch = unique_attribution_extreme(&all_candidates, true)?;
+
+            let (primary_model, primary) = if let Some(primary) = verified_primary {
+                verified_identity_order_count = verified_identity_order_count
+                    .checked_add(1)
+                    .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                (AttributionModel::VerifiedIdentity, Some(primary))
+            } else if let Some(primary) = last_non_direct {
+                last_non_direct_order_count = last_non_direct_order_count
+                    .checked_add(1)
+                    .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                (AttributionModel::LastNonDirect, Some(primary))
+            } else {
+                unattributed_order_count = unattributed_order_count
+                    .checked_add(1)
+                    .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                (AttributionModel::Unattributed, None)
+            };
+            if first_touch.is_some() {
+                first_touch_order_count = first_touch_order_count
+                    .checked_add(1)
+                    .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+            }
+            order_views.insert(
+                order_id.clone(),
+                OrderAttributionView {
+                    order_id: order_id.clone(),
+                    primary_model,
+                    primary_attribution_id: primary
+                        .map(|candidate| candidate.attribution_id.clone()),
+                    primary_touchpoint_digest: primary
+                        .map(|candidate| candidate.touchpoint_digest.clone()),
+                    first_touch_attribution_id: first_touch
+                        .map(|candidate| candidate.attribution_id.clone()),
+                    first_touch_digest: first_touch
+                        .map(|candidate| candidate.touchpoint_digest.clone()),
+                    last_non_direct_attribution_id: last_non_direct
+                        .map(|candidate| candidate.attribution_id.clone()),
+                    last_non_direct_digest: last_non_direct
+                        .map(|candidate| candidate.touchpoint_digest.clone()),
+                    source_record_count: projection_count(
+                        self.attributions
+                            .iter()
+                            .filter(|record| {
+                                record.order_id == *order_id && record.recorded_at <= observed_at
+                            })
+                            .count(),
+                    )?,
+                    eligible_touchpoint_count: projection_count(eligible.len())?,
+                    explicit_unattributed_record_count: explicit_unattributed,
+                    causal_claim: false,
+                },
+            );
+        }
+
+        source_records.sort_by(|left, right| {
+            (left.order_id.as_str(), left.recorded_at, left.id.as_str()).cmp(&(
+                right.order_id.as_str(),
+                right.recorded_at,
+                right.id.as_str(),
+            ))
+        });
+        let source_record_digest = canonical_json_digest(&source_records)?;
+        let effect_support_digest =
+            canonical_json_digest(&effect_support.values().collect::<Vec<_>>())?;
+        Ok(OutcomeAttributionProjection {
+            schema_version: OutcomeAttributionProjection::SCHEMA_VERSION,
+            tenant_id: self.tenant_id.clone(),
+            project_id: self.project_id.clone(),
+            source_mission_id: source_mission.id.clone(),
+            source_mission_revision: source_mission.revision,
+            source_ledger_revision: self.revision,
+            window_started_at,
+            window_ended_at,
+            order_count: projection_count(order_views.len())?,
+            source_record_count,
+            eligible_touchpoint_count,
+            verified_identity_order_count,
+            last_non_direct_order_count,
+            unattributed_order_count,
+            first_touch_order_count,
+            explicit_unattributed_record_count,
+            supporting_mission_count: projection_count(expected_mission_ids.len())?,
+            verified_effect_count: projection_count(effect_support.len())?,
+            causal_claim: false,
+            normalization_digest: normalization.digest(),
+            identity_chain_digest: identity_chain.digest(),
+            source_record_digest,
+            effect_support_digest,
+            orders: order_views,
+        })
+    }
+
+    fn source_mission_orders<'a>(
+        &'a self,
+        source_mission: &Mission,
+        observed_at: DateTime<Utc>,
+    ) -> Result<SourceMissionOrders<'a>, OutcomeLedgerError> {
+        if source_mission.tenant_id != self.tenant_id
+            || source_mission.project_id != self.project_id
+            || source_mission.revision == 0
+        {
+            return Err(OutcomeLedgerError::AttributionMissionScopeMismatch);
+        }
+        source_mission
+            .contract
+            .validate(source_mission.contract.valid_from)
+            .map_err(|_| OutcomeLedgerError::AttributionMissionScopeMismatch)?;
+        if observed_at < source_mission.contract.valid_from {
+            return Err(OutcomeLedgerError::AttributionWindowMismatch);
+        }
+        let window_started_at = source_mission.contract.valid_from;
+        let window_ended_at = observed_at.min(source_mission.contract.valid_until);
+        let mut source_orders = BTreeMap::new();
+        for event in self.events.iter().filter(|event| {
+            event.kind == OutcomeEventKind::OrderPlaced
+                && event.mission_id == source_mission.id
+                && event.occurred_at >= window_started_at
+                && event.occurred_at <= window_ended_at
+                && event.received_at <= observed_at
+                && event
+                    .source_verification
+                    .as_ref()
+                    .is_some_and(|verification| verification.verified_at <= observed_at)
+        }) {
+            let order_id = event
+                .order_id
+                .as_ref()
+                .ok_or(OutcomeLedgerError::EventKindShapeMismatch)?;
+            let order = self
+                .orders
+                .iter()
+                .find(|order| order.id == *order_id && order.source_event_id == event.id)
+                .ok_or(OutcomeLedgerError::EventProjectionMismatch)?;
+            if source_orders
+                .insert(order_id.clone(), (order, event))
+                .is_some()
+            {
+                return Err(OutcomeLedgerError::DuplicateOrder);
+            }
+        }
+        if source_orders.is_empty() {
+            return Err(OutcomeLedgerError::AttributionSourceOrdersUnavailable);
+        }
+        Ok((window_started_at, window_ended_at, source_orders))
+    }
+
     /// Proves that the snapshot is exactly one legal append/recalculation
     /// command after `previous`; list replacement, reorder, or revision jumps fail.
     pub fn follows(&self, previous: &Self) -> Result<bool, OutcomeLedgerError> {
@@ -1389,6 +2092,334 @@ impl OutcomeLedger {
     }
 }
 
+#[derive(Clone)]
+struct EligibleAttribution {
+    attribution_id: AttributionId,
+    model: AttributionModel,
+    traffic_class: AttributionTrafficClass,
+    provider_identity_digest: Option<String>,
+    verified_link_or_coupon_digest: Option<String>,
+    occurred_at: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
+    touchpoint_digest: String,
+}
+
+fn unique_attribution_extreme<'a>(
+    candidates: &[&'a EligibleAttribution],
+    earliest: bool,
+) -> Result<Option<&'a EligibleAttribution>, OutcomeLedgerError> {
+    let Some(extreme_time) = candidates
+        .iter()
+        .map(|candidate| candidate.occurred_at)
+        .reduce(|left, right| {
+            if earliest {
+                left.min(right)
+            } else {
+                left.max(right)
+            }
+        })
+    else {
+        return Ok(None);
+    };
+    let tied = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.occurred_at == extreme_time)
+        .collect::<Vec<_>>();
+    if tied
+        .iter()
+        .map(|candidate| candidate.touchpoint_digest.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        > 1
+    {
+        return Err(OutcomeLedgerError::DisputedAttribution);
+    }
+    Ok(tied.into_iter().min_by(|left, right| {
+        (left.recorded_at, left.attribution_id.as_str())
+            .cmp(&(right.recorded_at, right.attribution_id.as_str()))
+    }))
+}
+
+fn attribution_touchpoint_digest(record: &AttributionRecord) -> Result<String, OutcomeLedgerError> {
+    canonical_json_digest(&serde_json::json!({
+        "schemaVersion": "hartevo-attribution-touchpoint/v1",
+        "orderId": record.order_id,
+        "touchpoint": record.touchpoint,
+    }))
+}
+
+fn canonical_json_digest(value: &impl Serialize) -> Result<String, OutcomeLedgerError> {
+    let canonical =
+        serde_json::to_vec(value).map_err(|_| OutcomeLedgerError::ProjectionSerialization)?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
+}
+
+/// Canonical provider/account/receipt identity used by a VerifiedIdentity
+/// attribution record. Raw external identifiers enter the hash but are never
+/// returned or persisted in Checkpoint evidence.
+pub fn attribution_effect_provider_identity_digest(
+    effect: &Effect,
+) -> Result<String, OutcomeLedgerError> {
+    let receipt = effect
+        .receipt
+        .as_ref()
+        .ok_or(OutcomeLedgerError::AttributionEffectSupportInvalid)?;
+    canonical_json_digest(&serde_json::json!({
+        "schemaVersion": "hartevo-attribution-effect-provider-identity/v1",
+        "tenantId": effect.tenant_id,
+        "projectId": effect.project_id,
+        "missionId": effect.mission_id,
+        "effectId": effect.id,
+        "provider": effect.provider,
+        "connectionId": effect.connection_id,
+        "accountId": effect.account_id,
+        "receiptId": receipt.id,
+        "externalId": receipt.external_id,
+        "requestDigest": receipt.request_digest,
+        "responseDigest": receipt.response_digest,
+    }))
+}
+
+fn verified_attribution_effect_support(
+    record: &AttributionRecord,
+    touchpoint: &Touchpoint,
+    support_mission: &Mission,
+    effect: &Effect,
+    order: &OutcomeOrder,
+    observed_at: DateTime<Utc>,
+) -> Result<serde_json::Value, OutcomeLedgerError> {
+    let approval = effect
+        .approval
+        .as_ref()
+        .ok_or(OutcomeLedgerError::AttributionEffectSupportInvalid)?;
+    let receipt = effect
+        .receipt
+        .as_ref()
+        .ok_or(OutcomeLedgerError::AttributionEffectSupportInvalid)?;
+    let verification = effect
+        .verification
+        .as_ref()
+        .ok_or(OutcomeLedgerError::AttributionEffectSupportInvalid)?;
+    let source_verification = touchpoint
+        .source_verification
+        .as_ref()
+        .ok_or(OutcomeLedgerError::UnverifiedAttributionSource)?;
+    if effect.tenant_id != support_mission.tenant_id
+        || effect.project_id != support_mission.project_id
+        || effect.mission_id != support_mission.id
+        || touchpoint.effect_id.as_ref() != Some(&effect.id)
+        || effect.status != EffectStatus::Verified
+        || approval.decision != ApprovalDecision::Approved
+        || approval.scope_digest != effect.approval_digest()
+        || receipt.provider != effect.provider
+        || receipt.request_digest != effect.approval_digest()
+        || receipt.accepted_at < approval.decided_at
+        || receipt.accepted_at >= effect.expires_at
+        || verification.status != VerificationStatus::Confirmed
+        || !verification.independent
+        || verification.receipt_id != receipt.id
+        || verification.observed_at < receipt.accepted_at
+        || verification.observed_at > touchpoint.occurred_at
+        || verification.observed_at > observed_at
+        || touchpoint.occurred_at > order.occurred_at
+        || record.causal_claim
+        || !matches!(
+            source_verification.method,
+            OutcomeVerificationMethod::SignedWebhook
+                | OutcomeVerificationMethod::IndependentReadback
+        )
+        || !source_verification.independent
+    {
+        return Err(OutcomeLedgerError::AttributionEffectSupportInvalid);
+    }
+    let provider_identity_digest = attribution_effect_provider_identity_digest(effect)?;
+    if touchpoint
+        .provider_identity_digest
+        .as_ref()
+        .is_some_and(|digest| digest != &provider_identity_digest)
+        || touchpoint
+            .verified_link_or_coupon_digest
+            .as_ref()
+            .is_some_and(|digest| digest != &effect.payload_digest)
+        || touchpoint.provider_identity_digest.is_none()
+            && touchpoint.verified_link_or_coupon_digest.is_none()
+    {
+        return Err(OutcomeLedgerError::AttributionEffectSupportInvalid);
+    }
+    Ok(serde_json::json!({
+        "schemaVersion": "hartevo-attribution-effect-support/v1",
+        "missionId": support_mission.id,
+        "missionRevision": support_mission.revision,
+        "effectId": effect.id,
+        "effectApprovalDigest": effect.approval_digest(),
+        "providerIdentityDigest": provider_identity_digest,
+        "payloadDigest": effect.payload_digest,
+        "receiptId": receipt.id,
+        "receiptResponseDigest": receipt.response_digest,
+        "verificationId": verification.id,
+        "verificationEvidenceDigest": verification.evidence_digest,
+        "touchpointEvidenceDigest": touchpoint.evidence_digest,
+    }))
+}
+
+#[derive(Clone, Copy)]
+enum MissionKpiMetric {
+    EventCount(OutcomeEventKind),
+    GrossRevenue,
+    RefundTotal,
+    NetRevenue,
+    CommissionAccrued,
+    PayoutCompleted,
+}
+
+fn mission_kpi_metric(metric_id: &str) -> Result<MissionKpiMetric, OutcomeLedgerError> {
+    match metric_id {
+        "lead_qualified_count" => Ok(MissionKpiMetric::EventCount(
+            OutcomeEventKind::LeadQualified,
+        )),
+        "meeting_booked_count" => Ok(MissionKpiMetric::EventCount(
+            OutcomeEventKind::MeetingBooked,
+        )),
+        "opportunity_stage_change_count" => Ok(MissionKpiMetric::EventCount(
+            OutcomeEventKind::OpportunityStageChanged,
+        )),
+        "order_count" => Ok(MissionKpiMetric::EventCount(OutcomeEventKind::OrderPlaced)),
+        "refund_count" => Ok(MissionKpiMetric::EventCount(OutcomeEventKind::RefundIssued)),
+        "commission_accrued_count" => Ok(MissionKpiMetric::EventCount(
+            OutcomeEventKind::CommissionAccrued,
+        )),
+        "payout_completed_count" => Ok(MissionKpiMetric::EventCount(
+            OutcomeEventKind::PayoutCompleted,
+        )),
+        "gross_revenue_minor" => Ok(MissionKpiMetric::GrossRevenue),
+        "refund_total_minor" => Ok(MissionKpiMetric::RefundTotal),
+        "net_revenue_minor" => Ok(MissionKpiMetric::NetRevenue),
+        "commission_accrued_minor" => Ok(MissionKpiMetric::CommissionAccrued),
+        "payout_completed_minor" => Ok(MissionKpiMetric::PayoutCompleted),
+        _ => Err(OutcomeLedgerError::UnsupportedKpiMetric),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive typed metric match keeps every supported count and minor-unit money semantic fail-closed in one reviewable function"
+)]
+fn mission_kpi_measurement(
+    metric_id: &str,
+    contract: &KpiContract,
+    events: &[&OutcomeEvent],
+) -> Result<MissionKpiMeasurement, OutcomeLedgerError> {
+    let metric = mission_kpi_metric(metric_id)?;
+    match metric {
+        MissionKpiMetric::EventCount(kind) => {
+            if contract.unit != "count"
+                || contract.target < Decimal::ZERO
+                || !contract.target.fract().is_zero()
+                || contract.target.to_u64().is_none()
+                || contract.baseline.is_some_and(|baseline| {
+                    baseline < Decimal::ZERO
+                        || !baseline.fract().is_zero()
+                        || baseline.to_u64().is_none()
+                })
+            {
+                return Err(OutcomeLedgerError::InvalidKpiContract);
+            }
+            let source_event_count =
+                projection_count(events.iter().filter(|event| event.kind == kind).count())?;
+            let observed = Decimal::from(source_event_count);
+            Ok(MissionKpiMeasurement {
+                metric_id: metric_id.into(),
+                source_event_count,
+                observed: MissionKpiObservedValue::Count {
+                    value: source_event_count,
+                },
+                baseline: contract.baseline,
+                target: contract.target,
+                unit: contract.unit.clone(),
+                direction: contract.direction,
+                target_met: kpi_target_met(observed, contract),
+            })
+        }
+        MissionKpiMetric::GrossRevenue
+        | MissionKpiMetric::RefundTotal
+        | MissionKpiMetric::NetRevenue
+        | MissionKpiMetric::CommissionAccrued
+        | MissionKpiMetric::PayoutCompleted => {
+            let currency = contract
+                .unit
+                .strip_prefix("minor_units:")
+                .ok_or(OutcomeLedgerError::InvalidKpiContract)
+                .and_then(|value| {
+                    CurrencyCode::parse(value).map_err(|_| OutcomeLedgerError::InvalidKpiContract)
+                })?;
+            if !contract.target.fract().is_zero()
+                || contract.target.to_i64().is_none()
+                || contract.baseline.is_some_and(|baseline| {
+                    !baseline.fract().is_zero() || baseline.to_i64().is_none()
+                })
+            {
+                return Err(OutcomeLedgerError::InvalidKpiContract);
+            }
+            let relevant = events
+                .iter()
+                .copied()
+                .filter(|event| match metric {
+                    MissionKpiMetric::GrossRevenue => event.kind == OutcomeEventKind::OrderPlaced,
+                    MissionKpiMetric::RefundTotal => event.kind == OutcomeEventKind::RefundIssued,
+                    MissionKpiMetric::NetRevenue => matches!(
+                        event.kind,
+                        OutcomeEventKind::OrderPlaced | OutcomeEventKind::RefundIssued
+                    ),
+                    MissionKpiMetric::CommissionAccrued => {
+                        event.kind == OutcomeEventKind::CommissionAccrued
+                    }
+                    MissionKpiMetric::PayoutCompleted => {
+                        event.kind == OutcomeEventKind::PayoutCompleted
+                    }
+                    MissionKpiMetric::EventCount(_) => false,
+                })
+                .collect::<Vec<_>>();
+            let mut amount = Money::zero(currency.clone());
+            for event in &relevant {
+                let event_amount = event
+                    .amount
+                    .as_ref()
+                    .ok_or(OutcomeLedgerError::EventKindShapeMismatch)?;
+                if event_amount.currency != currency {
+                    return Err(OutcomeLedgerError::KpiCurrencyMismatch);
+                }
+                amount = if matches!(metric, MissionKpiMetric::NetRevenue)
+                    && event.kind == OutcomeEventKind::RefundIssued
+                {
+                    amount.checked_sub(event_amount)
+                } else {
+                    amount.checked_add(event_amount)
+                }
+                .map_err(|_| OutcomeLedgerError::KpiArithmetic)?;
+            }
+            let observed = Decimal::from(amount.amount_minor);
+            Ok(MissionKpiMeasurement {
+                metric_id: metric_id.into(),
+                source_event_count: projection_count(relevant.len())?,
+                observed: MissionKpiObservedValue::Money { value: amount },
+                baseline: contract.baseline,
+                target: contract.target,
+                unit: contract.unit.clone(),
+                direction: contract.direction,
+                target_met: kpi_target_met(observed, contract),
+            })
+        }
+    }
+}
+
+fn kpi_target_met(observed: Decimal, contract: &KpiContract) -> bool {
+    match contract.direction {
+        KpiDirection::AtLeast => observed >= contract.target,
+        KpiDirection::AtMost => observed <= contract.target,
+    }
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum OutcomeLedgerError {
     #[error("outcome ledger tenant or project scope is invalid")]
@@ -1417,6 +2448,8 @@ pub enum OutcomeLedgerError {
     CurrencyOrArithmeticMismatch,
     #[error("attribution scope, window, touchpoint, confidence, or evidence is invalid")]
     InvalidAttribution,
+    #[error("attribution touchpoint source verification is missing or invalid")]
+    UnverifiedAttributionSource,
     #[error("attribution record is duplicated")]
     DuplicateAttribution,
     #[error("commission rate, terms, identity, or duplicate ID is invalid")]
@@ -1441,6 +2474,38 @@ pub enum OutcomeLedgerError {
     IdentityRelationshipMismatch,
     #[error("an outcome event has no direct or inherited identity path")]
     IdentityChainCoverageMismatch,
+    #[error("the KPI source Mission does not match the Outcome Ledger scope")]
+    KpiMissionScopeMismatch,
+    #[error("the KPI projection does not bind the current complete identity chain")]
+    KpiIdentityChainMismatch,
+    #[error("the KPI contract, window, unit, baseline, or target is invalid")]
+    InvalidKpiContract,
+    #[error("the parent Mission has no verified Outcome events in the current KPI window")]
+    KpiSourceEventsUnavailable,
+    #[error("the KPI metric is not supported by the deterministic Outcome Oracle")]
+    UnsupportedKpiMetric,
+    #[error("the KPI source contains a currency outside its exact contract unit")]
+    KpiCurrencyMismatch,
+    #[error("KPI minor-unit arithmetic overflowed")]
+    KpiArithmetic,
+    #[error("the attribution source Mission does not match the Outcome Ledger scope")]
+    AttributionMissionScopeMismatch,
+    #[error(
+        "the parent Mission has no verified orders addressable by the current attribution contract"
+    )]
+    AttributionSourceOrdersUnavailable,
+    #[error("the attribution projection does not bind the current complete identity chain")]
+    AttributionIdentityChainMismatch,
+    #[error("the attribution Mission support is not the exact referenced closure")]
+    AttributionSupportClosureMismatch,
+    #[error("attribution touchpoint or order falls outside the frozen contract/cutoff window")]
+    AttributionWindowMismatch,
+    #[error("a VerifiedIdentity attribution is not bound to one independently verified Effect")]
+    AttributionEffectSupportInvalid,
+    #[error("the same attribution touchpoint was supplied more than once")]
+    DuplicateAttributionTouchpoint,
+    #[error("multiple equally authoritative attribution candidates disagree")]
+    DisputedAttribution,
     #[error("an outcome Oracle projection could not be canonically serialized")]
     ProjectionSerialization,
     #[error("decimal commission arithmetic overflowed minor units")]
@@ -1452,10 +2517,14 @@ pub enum OutcomeLedgerError {
 fn validate_touchpoint(
     touchpoint: &Touchpoint,
     order: &OutcomeOrder,
-    model: &AttributionModel,
+    model: AttributionModel,
     window_started_at: DateTime<Utc>,
     window_ended_at: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
+    require_current_source_verification: bool,
 ) -> Result<(), OutcomeLedgerError> {
+    let received_at = touchpoint.received_at;
+    let source_verification = touchpoint.source_verification.as_ref();
     if touchpoint.mission_id.as_str().trim().is_empty()
         || touchpoint.source.trim().is_empty()
         || touchpoint.occurred_at < window_started_at
@@ -1470,12 +2539,44 @@ fn validate_touchpoint(
             .verified_link_or_coupon_digest
             .as_deref()
             .is_some_and(|digest| !is_sha256(digest))
+        || received_at.is_some_and(|received_at| {
+            received_at < touchpoint.occurred_at || received_at > recorded_at
+        })
     {
         return Err(OutcomeLedgerError::InvalidAttribution);
     }
-    if *model == AttributionModel::VerifiedIdentity
-        && touchpoint.provider_identity_digest.is_none()
-        && touchpoint.verified_link_or_coupon_digest.is_none()
+    if require_current_source_verification
+        && (touchpoint.traffic_class.is_none()
+            || received_at.is_none()
+            || source_verification.is_none())
+    {
+        return Err(OutcomeLedgerError::UnverifiedAttributionSource);
+    }
+    if let Some(verification) = source_verification {
+        let received_at = received_at.ok_or(OutcomeLedgerError::UnverifiedAttributionSource)?;
+        verification
+            .validate(received_at)
+            .map_err(|_| OutcomeLedgerError::UnverifiedAttributionSource)?;
+        if verification.verified_at > recorded_at {
+            return Err(OutcomeLedgerError::UnverifiedAttributionSource);
+        }
+        if require_current_source_verification
+            && verification.evidence_digest != touchpoint.evidence_digest
+        {
+            return Err(OutcomeLedgerError::UnverifiedAttributionSource);
+        }
+    }
+    if model == AttributionModel::VerifiedIdentity
+        && (touchpoint.provider_identity_digest.is_none()
+            && touchpoint.verified_link_or_coupon_digest.is_none()
+            || require_current_source_verification && touchpoint.effect_id.is_none())
+    {
+        return Err(OutcomeLedgerError::InvalidAttribution);
+    }
+    if model == AttributionModel::LastNonDirect
+        && (touchpoint.traffic_class == Some(AttributionTrafficClass::Direct)
+            || require_current_source_verification
+                && touchpoint.traffic_class != Some(AttributionTrafficClass::NonDirect))
     {
         return Err(OutcomeLedgerError::InvalidAttribution);
     }
@@ -1626,8 +2727,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActorId, Connection, ConnectionProbe, ContactPermission, CurrencyCode, ExternalIdentity,
-        IdentitySubject, PartnerSupplyClass, ProbeOutcome,
+        ActorId, Approval, ApprovalDecision, ApprovalId, Connection, ConnectionProbe, ConsentState,
+        ContactPermission, CurrencyCode, EffectClass, EffectRisk, ExternalIdentity,
+        IdentitySubject, MissionContract, PartnerSupplyClass, ProbeOutcome, Receipt, ReceiptId,
+        Verification, VerificationId,
     };
 
     fn now() -> DateTime<Utc> {
@@ -1726,6 +2829,95 @@ mod tests {
             )
             .expect("successful probe");
         (connection.snapshot(), person, link)
+    }
+
+    fn verified_attribution_support_mission(
+        mission_id: &str,
+        effect_id: &str,
+        payload_digest: &str,
+    ) -> Mission {
+        let mut mission = Mission::compile(
+            TenantId::from("tenant-1"),
+            MissionId::from(mission_id),
+            ProjectId::from("project-1"),
+            "Verified channel touchpoint",
+            MissionContract::bootstrap(
+                "Publish and independently verify one attribution touchpoint",
+                ["publication.publish".into()],
+                now(),
+            ),
+            now(),
+        )
+        .expect("support Mission");
+        let effect_id = EffectId::from(effect_id);
+        let mut effect = Effect {
+            id: effect_id.clone(),
+            tenant_id: mission.tenant_id.clone(),
+            project_id: mission.project_id.clone(),
+            mission_id: mission.id.clone(),
+            actor_id: ActorId::from("channel-operator"),
+            capability: "publication.publish".into(),
+            provider: "channel-fixture".into(),
+            connection_id: Some(ConnectionId::from("channel-connection")),
+            account_id: Some(AccountId::from("channel-account")),
+            required_scopes: BTreeSet::from(["publish".into()]),
+            effect_class: EffectClass::ExternalWrite,
+            description: "Publish exact verified campaign link".into(),
+            target_resource: "channel://verified-post".into(),
+            audience_digest: Some("1".repeat(64)),
+            payload_digest: payload_digest.into(),
+            asset_digests: BTreeSet::new(),
+            scheduled_for: None,
+            timezone: "UTC".into(),
+            consent: ConsentState::NotRequired,
+            consent_record_id: None,
+            consent_requirement: None,
+            conversation_guard: None,
+            creator_contact_guard: None,
+            policy_version: "policy-v1".into(),
+            risk: EffectRisk::Low,
+            idempotency_key: format!("publish-{effect_id}"),
+            amount: Money::zero(CurrencyCode::parse("USD").expect("USD")),
+            expires_at: now() + Duration::days(1),
+            status: EffectStatus::Verified,
+            approval: None,
+            receipt: None,
+            verification: None,
+        };
+        let approval_digest = effect.approval_digest();
+        let approval_id = format!("approval-{effect_id}");
+        effect.approval = Some(Approval {
+            id: ApprovalId::from(approval_id.as_str()),
+            decision: ApprovalDecision::Approved,
+            decided_by: ActorId::from("project-owner"),
+            decided_at: now() + Duration::minutes(1),
+            valid_until: now() + Duration::hours(1),
+            scope_digest: approval_digest.clone(),
+            permission_digest: "2".repeat(64),
+        });
+        let receipt_id = format!("receipt-{effect_id}");
+        let receipt_id = ReceiptId::from(receipt_id.as_str());
+        effect.receipt = Some(Receipt {
+            id: receipt_id.clone(),
+            provider: "channel-fixture".into(),
+            external_id: format!("external-{effect_id}"),
+            accepted_at: now() + Duration::minutes(2),
+            request_digest: approval_digest,
+            response_digest: "3".repeat(64),
+        });
+        let verification_id = format!("verification-{effect_id}");
+        effect.verification = Some(Verification {
+            id: VerificationId::from(verification_id.as_str()),
+            status: VerificationStatus::Confirmed,
+            verifier: "independent-channel-readback".into(),
+            independent: true,
+            observed_at: now() + Duration::minutes(3),
+            evidence_digest: "4".repeat(64),
+            receipt_id,
+        });
+        mission.effects.push(effect);
+        mission.revision = 2;
+        mission
     }
 
     #[test]
@@ -2045,6 +3237,552 @@ mod tests {
                 &[],
             ),
             Err(OutcomeLedgerError::IdentityChainSupportClosureMismatch)
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the Oracle contract test covers count, gross, refund, net, direction, currency conflict, unsupported CRM-as-revenue, deterministic digest, and parent isolation together"
+    )]
+    fn mission_kpi_oracle_binds_parent_window_direction_and_minor_unit_currency() {
+        let mut contract = MissionContract::bootstrap(
+            "Grow verified commerce outcomes",
+            ["attribution.compute".into()],
+            now(),
+        );
+        contract.kpis = BTreeMap::from([
+            (
+                "gross_revenue_minor".into(),
+                KpiContract {
+                    baseline: Some(Decimal::from(5_000)),
+                    target: Decimal::from(10_000),
+                    unit: "minor_units:USD".into(),
+                    direction: KpiDirection::AtLeast,
+                },
+            ),
+            (
+                "lead_qualified_count".into(),
+                KpiContract {
+                    baseline: Some(Decimal::ZERO),
+                    target: Decimal::ONE,
+                    unit: "count".into(),
+                    direction: KpiDirection::AtLeast,
+                },
+            ),
+            (
+                "net_revenue_minor".into(),
+                KpiContract {
+                    baseline: None,
+                    target: Decimal::from(7_500),
+                    unit: "minor_units:USD".into(),
+                    direction: KpiDirection::AtLeast,
+                },
+            ),
+            (
+                "refund_total_minor".into(),
+                KpiContract {
+                    baseline: None,
+                    target: Decimal::from(3_000),
+                    unit: "minor_units:USD".into(),
+                    direction: KpiDirection::AtMost,
+                },
+            ),
+        ]);
+        let parent = Mission::compile(
+            TenantId::from("tenant-1"),
+            MissionId::from("mission-11"),
+            ProjectId::from("project-1"),
+            "Parent growth Mission",
+            contract,
+            now(),
+        )
+        .expect("parent Mission");
+
+        let mut ledger =
+            OutcomeLedger::new(TenantId::from("tenant-1"), ProjectId::from("project-1"))
+                .expect("ledger");
+        ledger
+            .ingest(event(
+                OutcomeEventKind::OrderPlaced,
+                "kpi-order",
+                Some(10_000),
+            ))
+            .expect("order");
+        let mut lead = event(OutcomeEventKind::LeadQualified, "kpi-lead", None);
+        lead.order_id = None;
+        lead.occurred_at = now() + Duration::minutes(1);
+        lead.received_at = now() + Duration::minutes(2);
+        lead.source_verification
+            .as_mut()
+            .expect("verification")
+            .verified_at = lead.received_at;
+        ledger.ingest(lead).expect("lead");
+        let mut refund = event(OutcomeEventKind::RefundIssued, "kpi-refund", Some(2_500));
+        refund.refund_id = Some(RefundId::from("refund-1"));
+        refund.identity_link_id = None;
+        refund.occurred_at = now() + Duration::minutes(2);
+        refund.received_at = now() + Duration::minutes(3);
+        refund
+            .source_verification
+            .as_mut()
+            .expect("verification")
+            .verified_at = refund.received_at;
+        ledger.ingest(refund).expect("refund");
+
+        let (connection, person, link) = confirmed_identity_support();
+        let identity_chain = ledger
+            .verified_identity_chain_projection(
+                std::slice::from_ref(&connection),
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                &[],
+                &[],
+            )
+            .expect("current identity chain");
+
+        let projection = ledger
+            .verified_mission_kpi_projection(&parent, &identity_chain, now() + Duration::minutes(4))
+            .expect("typed KPI projection");
+        assert_eq!(
+            (
+                projection.source_mission_id.as_str(),
+                projection.source_mission_revision,
+                projection.source_ledger_revision,
+                projection.source_event_count,
+                projection.measurement_count,
+                projection.target_met_count,
+            ),
+            ("mission-11", 1, 4, 3, 4, 4)
+        );
+        assert_eq!(
+            projection
+                .measurements
+                .get("lead_qualified_count")
+                .map(|measurement| &measurement.observed),
+            Some(&MissionKpiObservedValue::Count { value: 1 })
+        );
+        assert_eq!(
+            projection
+                .measurements
+                .get("net_revenue_minor")
+                .map(|measurement| &measurement.observed),
+            Some(&MissionKpiObservedValue::Money {
+                value: Money::new(7_500, CurrencyCode::parse("USD").expect("USD")),
+            })
+        );
+        assert!(is_sha256(&projection.digest().expect("projection digest")));
+
+        let mut mixed_currency = ledger.clone();
+        let mut eur_order = event(OutcomeEventKind::OrderPlaced, "kpi-eur-order", Some(4_000));
+        eur_order.order_id = Some(OrderId::from("order-2"));
+        eur_order.amount = Some(Money::new(4_000, CurrencyCode::parse("EUR").expect("EUR")));
+        eur_order.occurred_at = now() + Duration::minutes(3);
+        eur_order.received_at = now() + Duration::minutes(4);
+        eur_order
+            .source_verification
+            .as_mut()
+            .expect("verification")
+            .verified_at = eur_order.received_at;
+        mixed_currency.ingest(eur_order).expect("EUR order");
+        let mixed_identity_chain = mixed_currency
+            .verified_identity_chain_projection(
+                std::slice::from_ref(&connection),
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                &[],
+                &[],
+            )
+            .expect("mixed-currency identity chain");
+        assert_eq!(
+            mixed_currency.verified_mission_kpi_projection(
+                &parent,
+                &mixed_identity_chain,
+                now() + Duration::minutes(5),
+            ),
+            Err(OutcomeLedgerError::KpiCurrencyMismatch)
+        );
+
+        let mut unsupported_parent = parent.clone();
+        unsupported_parent.contract.kpis = BTreeMap::from([(
+            "crm_stage_as_revenue".into(),
+            KpiContract {
+                baseline: None,
+                target: Decimal::ONE,
+                unit: "count".into(),
+                direction: KpiDirection::AtLeast,
+            },
+        )]);
+        assert_eq!(
+            ledger.verified_mission_kpi_projection(
+                &unsupported_parent,
+                &identity_chain,
+                now() + Duration::minutes(4),
+            ),
+            Err(OutcomeLedgerError::UnsupportedKpiMetric)
+        );
+
+        let mut unrelated_parent = parent;
+        unrelated_parent.id = MissionId::from("unrelated-mission");
+        assert_eq!(
+            ledger.verified_mission_kpi_projection(
+                &unrelated_parent,
+                &identity_chain,
+                now() + Duration::minutes(4),
+            ),
+            Err(OutcomeLedgerError::KpiSourceEventsUnavailable)
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the attribution Oracle test proves verified-identity priority, first/last views, synthesized and explicit Unattributed preservation, effect support, dispute refusal, legacy quarantine, exact closure, and the no-causality invariant together"
+    )]
+    fn attribution_oracle_prioritizes_verified_identity_and_preserves_unattributed_without_causality()
+     {
+        let parent = Mission::compile(
+            TenantId::from("tenant-1"),
+            MissionId::from("mission-11"),
+            ProjectId::from("project-1"),
+            "Parent commerce Mission",
+            MissionContract::bootstrap(
+                "Review verified commerce attribution",
+                ["attribution.compute".into()],
+                now(),
+            ),
+            now(),
+        )
+        .expect("parent Mission");
+        let empty_ledger =
+            OutcomeLedger::new(TenantId::from("tenant-1"), ProjectId::from("project-1"))
+                .expect("empty ledger");
+        assert_eq!(
+            empty_ledger.attribution_support_mission_ids(&parent, now() + Duration::minutes(40),),
+            Err(OutcomeLedgerError::AttributionSourceOrdersUnavailable)
+        );
+        let mut ledger =
+            OutcomeLedger::new(TenantId::from("tenant-1"), ProjectId::from("project-1"))
+                .expect("ledger");
+        for (index, minute) in [(1_i64, 10_i64), (2, 20), (3, 30)] {
+            let mut order = event(
+                OutcomeEventKind::OrderPlaced,
+                &format!("attribution-order-event-{index}"),
+                Some(index * 10_000),
+            );
+            let order_id = format!("attribution-order-{index}");
+            order.order_id = Some(OrderId::from(order_id.as_str()));
+            order.occurred_at = now() + Duration::minutes(minute);
+            order.received_at = now() + Duration::minutes(minute + 1);
+            order
+                .source_verification
+                .as_mut()
+                .expect("verification")
+                .verified_at = order.received_at;
+            ledger.ingest(order).expect("verified order");
+        }
+        let (connection, person, link) = confirmed_identity_support();
+
+        let support = verified_attribution_support_mission(
+            "channel-mission",
+            "verified-touch-effect",
+            &"5".repeat(64),
+        );
+        let effect = support.effects.first().expect("verified support Effect");
+        let provider_identity_digest =
+            attribution_effect_provider_identity_digest(effect).expect("provider identity digest");
+
+        let first_touch = AttributionRecord {
+            id: AttributionId::from("first-touch-record"),
+            tenant_id: ledger.tenant_id.clone(),
+            project_id: ledger.project_id.clone(),
+            order_id: OrderId::from("attribution-order-1"),
+            model: AttributionModel::FirstTouch,
+            touchpoint: Some(Touchpoint {
+                mission_id: support.id.clone(),
+                source: "search-readback".into(),
+                effect_id: None,
+                traffic_class: Some(AttributionTrafficClass::NonDirect),
+                provider_identity_digest: None,
+                verified_link_or_coupon_digest: None,
+                occurred_at: now() + Duration::minutes(4),
+                received_at: Some(now() + Duration::minutes(5)),
+                evidence_digest: "6".repeat(64),
+                source_verification: Some(OutcomeSourceVerification {
+                    method: OutcomeVerificationMethod::IndependentReadback,
+                    verifier: "analytics-readback".into(),
+                    independent: true,
+                    verified_at: now() + Duration::minutes(5),
+                    evidence_digest: "6".repeat(64),
+                }),
+            }),
+            window_started_at: now(),
+            window_ended_at: now() + Duration::hours(1),
+            confidence: "0.6".parse().expect("confidence"),
+            causal_claim: false,
+            rationale: "Operational first-touch view".into(),
+            evidence_digest: "7".repeat(64),
+            recorded_at: now() + Duration::minutes(12),
+        };
+        ledger.attribute(first_touch).expect("first touch");
+        let verified_identity = AttributionRecord {
+            id: AttributionId::from("verified-identity-record"),
+            tenant_id: ledger.tenant_id.clone(),
+            project_id: ledger.project_id.clone(),
+            order_id: OrderId::from("attribution-order-1"),
+            model: AttributionModel::VerifiedIdentity,
+            touchpoint: Some(Touchpoint {
+                mission_id: support.id.clone(),
+                source: "verified-campaign-link".into(),
+                effect_id: Some(effect.id.clone()),
+                traffic_class: Some(AttributionTrafficClass::NonDirect),
+                provider_identity_digest: Some(provider_identity_digest),
+                verified_link_or_coupon_digest: Some(effect.payload_digest.clone()),
+                occurred_at: now() + Duration::minutes(6),
+                received_at: Some(now() + Duration::minutes(7)),
+                evidence_digest: "8".repeat(64),
+                source_verification: Some(OutcomeSourceVerification {
+                    method: OutcomeVerificationMethod::SignedWebhook,
+                    verifier: "commerce-link-webhook".into(),
+                    independent: true,
+                    verified_at: now() + Duration::minutes(7),
+                    evidence_digest: "8".repeat(64),
+                }),
+            }),
+            window_started_at: now(),
+            window_ended_at: now() + Duration::hours(1),
+            confidence: Decimal::ONE,
+            causal_claim: false,
+            rationale: "Verified link identity, reported only as operational attribution".into(),
+            evidence_digest: "9".repeat(64),
+            recorded_at: now() + Duration::minutes(12),
+        };
+        ledger
+            .attribute(verified_identity)
+            .expect("verified identity attribution");
+        let last_non_direct = AttributionRecord {
+            id: AttributionId::from("last-non-direct-record"),
+            tenant_id: ledger.tenant_id.clone(),
+            project_id: ledger.project_id.clone(),
+            order_id: OrderId::from("attribution-order-2"),
+            model: AttributionModel::LastNonDirect,
+            touchpoint: Some(Touchpoint {
+                mission_id: parent.id.clone(),
+                source: "email-readback".into(),
+                effect_id: None,
+                traffic_class: Some(AttributionTrafficClass::NonDirect),
+                provider_identity_digest: None,
+                verified_link_or_coupon_digest: None,
+                occurred_at: now() + Duration::minutes(15),
+                received_at: Some(now() + Duration::minutes(16)),
+                evidence_digest: "a".repeat(64),
+                source_verification: Some(OutcomeSourceVerification {
+                    method: OutcomeVerificationMethod::IndependentReadback,
+                    verifier: "analytics-readback".into(),
+                    independent: true,
+                    verified_at: now() + Duration::minutes(16),
+                    evidence_digest: "a".repeat(64),
+                }),
+            }),
+            window_started_at: now(),
+            window_ended_at: now() + Duration::hours(1),
+            confidence: "0.7".parse().expect("confidence"),
+            causal_claim: false,
+            rationale: "Operational last-non-direct view".into(),
+            evidence_digest: "b".repeat(64),
+            recorded_at: now() + Duration::minutes(22),
+        };
+        ledger
+            .attribute(last_non_direct.clone())
+            .expect("last non-direct attribution");
+        ledger
+            .attribute(AttributionRecord {
+                id: AttributionId::from("explicit-unattributed-record"),
+                tenant_id: ledger.tenant_id.clone(),
+                project_id: ledger.project_id.clone(),
+                order_id: OrderId::from("attribution-order-3"),
+                model: AttributionModel::Unattributed,
+                touchpoint: None,
+                window_started_at: now(),
+                window_ended_at: now() + Duration::hours(1),
+                confidence: Decimal::ZERO,
+                causal_claim: false,
+                rationale: "No source-verified touchpoint in the contract window".into(),
+                evidence_digest: "c".repeat(64),
+                recorded_at: now() + Duration::minutes(32),
+            })
+            .expect("explicit Unattributed record");
+
+        let identity_chain = ledger
+            .verified_identity_chain_projection(
+                std::slice::from_ref(&connection),
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                &[],
+                &[],
+            )
+            .expect("current identity chain after attribution records");
+
+        let projection = ledger
+            .verified_attribution_projection(
+                &parent,
+                &identity_chain,
+                &[support.clone(), parent.clone()],
+                now() + Duration::minutes(40),
+            )
+            .expect("deterministic attribution projection");
+        assert_eq!(
+            (
+                projection.order_count,
+                projection.source_record_count,
+                projection.eligible_touchpoint_count,
+                projection.verified_identity_order_count,
+                projection.last_non_direct_order_count,
+                projection.unattributed_order_count,
+                projection.first_touch_order_count,
+                projection.explicit_unattributed_record_count,
+                projection.supporting_mission_count,
+                projection.verified_effect_count,
+                projection.causal_claim,
+            ),
+            (3, 4, 3, 1, 1, 1, 2, 1, 2, 1, false)
+        );
+        assert_eq!(
+            projection
+                .orders
+                .get(&OrderId::from("attribution-order-1"))
+                .map(|view| {
+                    (
+                        view.primary_model,
+                        view.primary_attribution_id
+                            .as_ref()
+                            .map(AttributionId::as_str),
+                        view.first_touch_attribution_id
+                            .as_ref()
+                            .map(AttributionId::as_str),
+                        view.causal_claim,
+                    )
+                }),
+            Some((
+                AttributionModel::VerifiedIdentity,
+                Some("verified-identity-record"),
+                Some("first-touch-record"),
+                false,
+            ))
+        );
+        assert_eq!(
+            projection
+                .orders
+                .get(&OrderId::from("attribution-order-3"))
+                .map(|view| view.primary_model),
+            Some(AttributionModel::Unattributed)
+        );
+        assert!(is_sha256(&projection.digest().expect("projection digest")));
+
+        assert_eq!(
+            ledger.verified_attribution_projection(
+                &parent,
+                &identity_chain,
+                std::slice::from_ref(&parent),
+                now() + Duration::minutes(40),
+            ),
+            Err(OutcomeLedgerError::AttributionSupportClosureMismatch)
+        );
+
+        let mut legacy_unverified = ledger.clone();
+        let legacy_touchpoint = legacy_unverified.attributions[0]
+            .touchpoint
+            .as_mut()
+            .expect("legacy touchpoint");
+        legacy_touchpoint.traffic_class = None;
+        legacy_touchpoint.received_at = None;
+        legacy_touchpoint.source_verification = None;
+        assert!(legacy_unverified.validate().is_ok());
+        assert_eq!(
+            legacy_unverified.verified_attribution_projection(
+                &parent,
+                &identity_chain,
+                &[support.clone(), parent.clone()],
+                now() + Duration::minutes(40),
+            ),
+            Err(OutcomeLedgerError::UnverifiedAttributionSource)
+        );
+
+        let mut disputed_ledger = ledger;
+        let second_effect_mission = verified_attribution_support_mission(
+            "channel-mission",
+            "second-verified-touch-effect",
+            &"d".repeat(64),
+        );
+        let second_effect = second_effect_mission.effects[0].clone();
+        let second_provider_identity = attribution_effect_provider_identity_digest(&second_effect)
+            .expect("second provider identity");
+        let mut disputed_support = support;
+        disputed_support.effects.push(second_effect.clone());
+        disputed_support.revision = 3;
+        disputed_ledger
+            .attribute(AttributionRecord {
+                id: AttributionId::from("disputed-verified-identity"),
+                tenant_id: disputed_ledger.tenant_id.clone(),
+                project_id: disputed_ledger.project_id.clone(),
+                order_id: OrderId::from("attribution-order-1"),
+                model: AttributionModel::VerifiedIdentity,
+                touchpoint: Some(Touchpoint {
+                    mission_id: disputed_support.id.clone(),
+                    source: "second-verified-campaign-link".into(),
+                    effect_id: Some(second_effect.id.clone()),
+                    traffic_class: Some(AttributionTrafficClass::NonDirect),
+                    provider_identity_digest: Some(second_provider_identity),
+                    verified_link_or_coupon_digest: Some(second_effect.payload_digest.clone()),
+                    occurred_at: now() + Duration::minutes(7),
+                    received_at: Some(now() + Duration::minutes(8)),
+                    evidence_digest: "e".repeat(64),
+                    source_verification: Some(OutcomeSourceVerification {
+                        method: OutcomeVerificationMethod::SignedWebhook,
+                        verifier: "second-commerce-link-webhook".into(),
+                        independent: true,
+                        verified_at: now() + Duration::minutes(8),
+                        evidence_digest: "e".repeat(64),
+                    }),
+                }),
+                window_started_at: now(),
+                window_ended_at: now() + Duration::hours(1),
+                confidence: Decimal::ONE,
+                causal_claim: false,
+                rationale: "Conflicting verified identity must not be selected".into(),
+                evidence_digest: "f".repeat(64),
+                recorded_at: now() + Duration::minutes(13),
+            })
+            .expect("second verified record is individually valid");
+        let disputed_identity_chain = disputed_ledger
+            .verified_identity_chain_projection(
+                std::slice::from_ref(&connection),
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                &[],
+                &[],
+            )
+            .expect("disputed ledger identity chain");
+        assert_eq!(
+            disputed_ledger.verified_attribution_projection(
+                &parent,
+                &disputed_identity_chain,
+                &[disputed_support, parent.clone()],
+                now() + Duration::minutes(40),
+            ),
+            Err(OutcomeLedgerError::DisputedAttribution)
+        );
+
+        let mut causal_record = last_non_direct;
+        causal_record.id = AttributionId::from("forbidden-causal-record");
+        causal_record.causal_claim = true;
+        assert_eq!(
+            disputed_ledger.attribute(causal_record),
+            Err(OutcomeLedgerError::InvalidAttribution)
         );
     }
 

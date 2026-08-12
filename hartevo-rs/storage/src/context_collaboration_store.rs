@@ -1186,6 +1186,7 @@ mod tests {
         let contract = MissionContract {
             version: 1,
             mode: OperatingMode::BuildOnce,
+            parent_mission_id: None,
             goal: "Acknowledge one bounded worker message".into(),
             non_goals: vec![],
             market: "US".into(),

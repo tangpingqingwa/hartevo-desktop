@@ -1653,6 +1653,7 @@ mod tests {
         let contract = MissionContract {
             version: 1,
             mode: OperatingMode::BuildOnce,
+            parent_mission_id: None,
             goal: "Produce one bounded market decision".into(),
             non_goals: vec!["Never publish or spend".into()],
             market: "DE".into(),
