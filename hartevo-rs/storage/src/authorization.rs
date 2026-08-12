@@ -1837,7 +1837,7 @@ mod tests {
                 Some(&context),
                 "crash-before-mission-projection",
                 now() + Duration::minutes(1),
-                now() + Duration::minutes(2),
+                now() + Duration::minutes(3),
             )
             .expect("initial execution claim")
         else {

@@ -49,24 +49,29 @@ impl DurableEffectLedger for ProjectStore {
         effect: &Effect,
         lease: &ExecutionLease,
         receipt: &Receipt,
-        now: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
     ) -> Result<(), LedgerError> {
         let transaction = self.connection.transaction().map_err(persistence)?;
-        require_current_lease(&transaction, effect, lease, &["executing"])?;
+        require_current_lease(&transaction, effect, lease, &["executing"], operation_at)?;
         let receipt_json = serde_json::to_string(receipt).map_err(persistence)?;
         let attempt_updated = transaction
             .execute(
-                "UPDATE execution_attempts SET status = 'receipt_recorded', receipt_json = ?5,
-                   updated_at = ?6
+                "UPDATE execution_attempts SET status = 'receipt_recorded', receipt_json = ?8,
+                   updated_at = ?9
                  WHERE id = ?1 AND project_id = ?2 AND effect_id = ?3
-                   AND generation = ?4 AND status = 'executing'",
+                   AND generation = ?4 AND lease_owner = ?5
+                   AND lease_expires_at = ?6 AND lease_expires_at > ?7
+                   AND status = 'executing'",
                 params![
                     lease.attempt_id.as_str(),
                     effect.project_id.as_str(),
                     effect.id.as_str(),
                     to_sql_u64(lease.generation)?,
+                    lease.owner,
+                    lease.expires_at.to_rfc3339(),
+                    operation_at.to_rfc3339(),
                     receipt_json,
-                    now.to_rfc3339(),
+                    operation_at.to_rfc3339(),
                 ],
             )
             .map_err(persistence)?;
@@ -83,7 +88,7 @@ impl DurableEffectLedger for ProjectStore {
                     effect.idempotency_key,
                     effect.approval_digest(),
                     receipt_json,
-                    now.to_rfc3339(),
+                    operation_at.to_rfc3339(),
                 ],
             )
             .map_err(persistence)?;
@@ -98,7 +103,7 @@ impl DurableEffectLedger for ProjectStore {
         effect: &Effect,
         lease: &ExecutionLease,
         verification: &Verification,
-        now: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
     ) -> Result<(), LedgerError> {
         let transaction = self.connection.transaction().map_err(persistence)?;
         require_current_lease(
@@ -106,6 +111,7 @@ impl DurableEffectLedger for ProjectStore {
             effect,
             lease,
             &["receipt_recorded", "verifying"],
+            operation_at,
         )?;
         let (status, failure_class) = match verification.status {
             VerificationStatus::Confirmed => ("verified", None),
@@ -117,19 +123,24 @@ impl DurableEffectLedger for ProjectStore {
         let verification_json = serde_json::to_string(verification).map_err(persistence)?;
         let attempt_updated = transaction
             .execute(
-                "UPDATE execution_attempts SET status = ?5, verification_json = ?6,
-                   failure_class = ?7, updated_at = ?8
+                "UPDATE execution_attempts SET status = ?8, verification_json = ?9,
+                   failure_class = ?10, updated_at = ?11
                  WHERE id = ?1 AND project_id = ?2 AND effect_id = ?3
-                   AND generation = ?4 AND status IN ('receipt_recorded', 'verifying')",
+                   AND generation = ?4 AND lease_owner = ?5
+                   AND lease_expires_at = ?6 AND lease_expires_at > ?7
+                   AND status IN ('receipt_recorded', 'verifying')",
                 params![
                     lease.attempt_id.as_str(),
                     effect.project_id.as_str(),
                     effect.id.as_str(),
                     to_sql_u64(lease.generation)?,
+                    lease.owner,
+                    lease.expires_at.to_rfc3339(),
+                    operation_at.to_rfc3339(),
                     status,
                     verification_json,
                     failure_class,
-                    now.to_rfc3339(),
+                    operation_at.to_rfc3339(),
                 ],
             )
             .map_err(persistence)?;
@@ -148,7 +159,7 @@ impl DurableEffectLedger for ProjectStore {
                     status,
                     verification_json,
                     failure_class,
-                    now.to_rfc3339(),
+                    operation_at.to_rfc3339(),
                 ],
             )
             .map_err(persistence)?;
@@ -163,9 +174,9 @@ impl DurableEffectLedger for ProjectStore {
         effect: &Effect,
         lease: &ExecutionLease,
         reason: &str,
-        now: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
     ) -> Result<(), LedgerError> {
-        finish_without_receipt(self, effect, lease, "failed", reason, now)
+        finish_without_receipt(self, effect, lease, "failed", reason, operation_at)
     }
 
     fn record_uncertain(
@@ -173,9 +184,9 @@ impl DurableEffectLedger for ProjectStore {
         effect: &Effect,
         lease: &ExecutionLease,
         reason: &str,
-        now: DateTime<Utc>,
+        operation_at: DateTime<Utc>,
     ) -> Result<(), LedgerError> {
-        finish_without_receipt(self, effect, lease, "uncertain", reason, now)
+        finish_without_receipt(self, effect, lease, "uncertain", reason, operation_at)
     }
 
     fn claim_reconciliation(
@@ -1105,10 +1116,11 @@ fn require_current_lease(
     effect: &Effect,
     lease: &ExecutionLease,
     statuses: &[&str],
+    operation_at: DateTime<Utc>,
 ) -> Result<(), LedgerError> {
     let row = transaction
         .query_row(
-            "SELECT lease_owner, generation, status FROM execution_attempts
+            "SELECT lease_owner, generation, status, lease_expires_at FROM execution_attempts
              WHERE id = ?1 AND project_id = ?2 AND effect_id = ?3
                AND generation = (
                  SELECT MAX(current.generation) FROM execution_attempts current
@@ -1124,16 +1136,20 @@ fn require_current_lease(
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()
         .map_err(persistence)?;
-    let Some((owner, generation, status)) = row else {
+    let Some((owner, generation, status, stored_expires_at)) = row else {
         return Err(LedgerError::LeaseLost);
     };
+    let stored_expires_at = parse_time(&stored_expires_at)?;
     if owner != lease.owner
         || u64::try_from(generation).ok() != Some(lease.generation)
+        || stored_expires_at != lease.expires_at
+        || stored_expires_at <= operation_at
         || !statuses.contains(&status.as_str())
     {
         return Err(LedgerError::LeaseLost);
@@ -1147,23 +1163,28 @@ fn finish_without_receipt(
     lease: &ExecutionLease,
     status: &str,
     reason: &str,
-    now: DateTime<Utc>,
+    operation_at: DateTime<Utc>,
 ) -> Result<(), LedgerError> {
     let transaction = store.connection.transaction().map_err(persistence)?;
-    require_current_lease(&transaction, effect, lease, &["executing"])?;
+    require_current_lease(&transaction, effect, lease, &["executing"], operation_at)?;
     let updated = transaction
         .execute(
-            "UPDATE execution_attempts SET status = ?5, failure_class = ?6, updated_at = ?7
+            "UPDATE execution_attempts SET status = ?8, failure_class = ?9, updated_at = ?10
              WHERE id = ?1 AND project_id = ?2 AND effect_id = ?3
-               AND generation = ?4 AND status = 'executing'",
+               AND generation = ?4 AND lease_owner = ?5
+               AND lease_expires_at = ?6 AND lease_expires_at > ?7
+               AND status = 'executing'",
             params![
                 lease.attempt_id.as_str(),
                 effect.project_id.as_str(),
                 effect.id.as_str(),
                 to_sql_u64(lease.generation)?,
+                lease.owner,
+                lease.expires_at.to_rfc3339(),
+                operation_at.to_rfc3339(),
                 status,
                 reason,
-                now.to_rfc3339(),
+                operation_at.to_rfc3339(),
             ],
         )
         .map_err(persistence)?;
@@ -1180,7 +1201,7 @@ fn finish_without_receipt(
                 effect.approval_digest(),
                 status,
                 reason,
-                now.to_rfc3339(),
+                operation_at.to_rfc3339(),
             ],
         )
         .map_err(persistence)?;

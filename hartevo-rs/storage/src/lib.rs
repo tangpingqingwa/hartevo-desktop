@@ -4618,9 +4618,9 @@ mod tests {
         VerificationId, VerificationStatus, WorkProduct, WorkProductId,
     };
     use hartevo_effect_broker::{
-        DurableEffectLedger, EffectPolicy, EffectRateLimit, ExecutionClaimContext, LedgerClaim,
-        PermissionEvidence, ReconciliationClaim, ReconciliationDisposition,
-        ReconciliationObservation, ReconciliationPolicy,
+        DurableEffectLedger, EffectPolicy, EffectRateLimit, ExecutionClaimContext, ExecutionLease,
+        LedgerClaim, LedgerError, PermissionEvidence, ReconciliationClaim,
+        ReconciliationDisposition, ReconciliationObservation, ReconciliationPolicy,
     };
     use proptest::prelude::*;
 
@@ -6203,6 +6203,310 @@ mod tests {
         effect_policy(effect)
             .execution_claim_context(effect, PermissionEvidence::default())
             .expect("valid fixture claim context")
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EffectCompletionPath {
+        Receipt,
+        Verification,
+        Failed,
+        Uncertain,
+    }
+
+    impl EffectCompletionPath {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Receipt => "receipt",
+                Self::Verification => "verification",
+                Self::Failed => "failed",
+                Self::Uncertain => "uncertain",
+            }
+        }
+
+        const fn completed_status(self) -> &'static str {
+            match self {
+                Self::Receipt => "receipt_recorded",
+                Self::Verification => "verified",
+                Self::Failed => "failed",
+                Self::Uncertain => "uncertain",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EffectLeaseFenceCase {
+        Before,
+        Equality,
+        After,
+        TamperedExpiry,
+    }
+
+    impl EffectLeaseFenceCase {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Before => "before",
+                Self::Equality => "equality",
+                Self::After => "after",
+                Self::TamperedExpiry => "tampered_expiry",
+            }
+        }
+
+        const fn expects_success(self) -> bool {
+            matches!(self, Self::Before)
+        }
+
+        fn operation_at(self, expires_at: DateTime<Utc>) -> DateTime<Utc> {
+            match self {
+                Self::Before | Self::TamperedExpiry => expires_at - Duration::seconds(1),
+                Self::Equality => expires_at,
+                Self::After => expires_at + Duration::seconds(1),
+            }
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct EffectAttemptCompletionSnapshot {
+        id: String,
+        tenant_id: String,
+        project_id: String,
+        mission_id: String,
+        effect_id: String,
+        attempt_no: i64,
+        generation: i64,
+        status: String,
+        lease_owner: String,
+        lease_expires_at: String,
+        request_digest: String,
+        receipt_json: Option<String>,
+        verification_json: Option<String>,
+        failure_class: Option<String>,
+        created_at: String,
+        updated_at: String,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct EffectIdempotencyCompletionSnapshot {
+        tenant_id: String,
+        project_id: String,
+        mission_id: String,
+        idempotency_key: String,
+        effect_id: String,
+        approval_digest: String,
+        status: String,
+        receipt_json: Option<String>,
+        verification_json: Option<String>,
+        uncertain_reason: Option<String>,
+        created_at: String,
+        updated_at: String,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct EffectCompletionSnapshot {
+        attempts: Vec<EffectAttemptCompletionSnapshot>,
+        idempotency: EffectIdempotencyCompletionSnapshot,
+    }
+
+    fn effect_completion_snapshot(
+        store: &ProjectStore,
+        effect: &Effect,
+    ) -> EffectCompletionSnapshot {
+        let mut attempts = store
+            .connection
+            .prepare(
+                "SELECT id, tenant_id, project_id, mission_id, effect_id, attempt_no,
+                        generation, status, lease_owner, lease_expires_at, request_digest,
+                        receipt_json, verification_json, failure_class, created_at, updated_at
+                 FROM execution_attempts
+                 WHERE project_id = ?1 AND effect_id = ?2
+                 ORDER BY generation ASC",
+            )
+            .expect("completion attempt snapshot query");
+        let attempts = attempts
+            .query_map(
+                params![effect.project_id.as_str(), effect.id.as_str()],
+                |row| {
+                    Ok(EffectAttemptCompletionSnapshot {
+                        id: row.get(0)?,
+                        tenant_id: row.get(1)?,
+                        project_id: row.get(2)?,
+                        mission_id: row.get(3)?,
+                        effect_id: row.get(4)?,
+                        attempt_no: row.get(5)?,
+                        generation: row.get(6)?,
+                        status: row.get(7)?,
+                        lease_owner: row.get(8)?,
+                        lease_expires_at: row.get(9)?,
+                        request_digest: row.get(10)?,
+                        receipt_json: row.get(11)?,
+                        verification_json: row.get(12)?,
+                        failure_class: row.get(13)?,
+                        created_at: row.get(14)?,
+                        updated_at: row.get(15)?,
+                    })
+                },
+            )
+            .expect("completion attempt snapshot rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("completion attempt snapshots");
+        let idempotency = store
+            .connection
+            .query_row(
+                "SELECT tenant_id, project_id, mission_id, idempotency_key, effect_id,
+                        approval_digest, status, receipt_json, verification_json,
+                        uncertain_reason, created_at, updated_at
+                 FROM effect_idempotency
+                 WHERE project_id = ?1 AND idempotency_key = ?2",
+                params![effect.project_id.as_str(), effect.idempotency_key],
+                |row| {
+                    Ok(EffectIdempotencyCompletionSnapshot {
+                        tenant_id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        mission_id: row.get(2)?,
+                        idempotency_key: row.get(3)?,
+                        effect_id: row.get(4)?,
+                        approval_digest: row.get(5)?,
+                        status: row.get(6)?,
+                        receipt_json: row.get(7)?,
+                        verification_json: row.get(8)?,
+                        uncertain_reason: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
+                    })
+                },
+            )
+            .expect("completion idempotency snapshot");
+        EffectCompletionSnapshot {
+            attempts,
+            idempotency,
+        }
+    }
+
+    struct LocalEffectCompletionFixture {
+        store: ProjectStore,
+        effect: Effect,
+        lease: ExecutionLease,
+        receipt: Receipt,
+        verification: Verification,
+    }
+
+    fn local_effect_completion_fixture(
+        path: EffectCompletionPath,
+        case: EffectLeaseFenceCase,
+    ) -> LocalEffectCompletionFixture {
+        let tag = format!("{}-{}", path.label(), case.label());
+        let project_id = format!("project-effect-completion-{tag}");
+        let mission_id = format!("mission-effect-completion-{tag}");
+        let effect_id = format!("effect-completion-{tag}");
+        let idempotency_key = format!("idempotency-completion-{tag}");
+        let mut store = ProjectStore::in_memory().expect("completion store");
+        let project = project(&project_id, &format!("/tmp/{project_id}"));
+        let (mission, effect) =
+            approved_effect_named(&project_id, &mission_id, &effect_id, &idempotency_key);
+        store.save_project(&project).expect("completion project");
+        store.save_mission(&mission).expect("completion mission");
+        let LedgerClaim::Acquired {
+            lease: execution_lease,
+            receipt: None,
+            ..
+        } = store
+            .claim(
+                &effect,
+                Some(&effect_claim_context(&effect)),
+                "completion-execution-worker",
+                now(),
+                now() + Duration::seconds(10),
+            )
+            .expect("completion execution claim")
+        else {
+            panic!("expected completion execution lease")
+        };
+        let receipt = Receipt {
+            id: ReceiptId::from_stable(format!("receipt-completion-{tag}")),
+            provider: effect.provider.clone(),
+            external_id: format!("external-completion-{tag}"),
+            accepted_at: now() + Duration::seconds(1),
+            request_digest: effect.approval_digest(),
+            response_digest: "8".repeat(64),
+        };
+        let lease = if matches!(path, EffectCompletionPath::Verification) {
+            store
+                .record_receipt(
+                    &effect,
+                    &execution_lease,
+                    &receipt,
+                    now() + Duration::seconds(1),
+                )
+                .expect("valid receipt before verification lease");
+            let LedgerClaim::Acquired {
+                lease,
+                receipt: Some(reused),
+                ..
+            } = store
+                .claim(
+                    &effect,
+                    None,
+                    "completion-verification-worker",
+                    now() + Duration::seconds(2),
+                    now() + Duration::seconds(12),
+                )
+                .expect("completion verification claim")
+            else {
+                panic!("expected completion verification lease")
+            };
+            assert_eq!(reused, receipt);
+            lease
+        } else {
+            execution_lease
+        };
+        let verification = Verification {
+            id: VerificationId::from_stable(format!("verification-completion-{tag}")),
+            status: VerificationStatus::Confirmed,
+            verifier: "independent-completion-readback".into(),
+            independent: true,
+            observed_at: now() + Duration::seconds(3),
+            evidence_digest: "9".repeat(64),
+            receipt_id: receipt.id.clone(),
+        };
+        LocalEffectCompletionFixture {
+            store,
+            effect,
+            lease,
+            receipt,
+            verification,
+        }
+    }
+
+    fn complete_local_effect(
+        fixture: &mut LocalEffectCompletionFixture,
+        path: EffectCompletionPath,
+        lease: &ExecutionLease,
+        operation_at: DateTime<Utc>,
+    ) -> Result<(), LedgerError> {
+        match path {
+            EffectCompletionPath::Receipt => {
+                fixture
+                    .store
+                    .record_receipt(&fixture.effect, lease, &fixture.receipt, operation_at)
+            }
+            EffectCompletionPath::Verification => fixture.store.record_verification(
+                &fixture.effect,
+                lease,
+                &fixture.verification,
+                operation_at,
+            ),
+            EffectCompletionPath::Failed => fixture.store.record_failed(
+                &fixture.effect,
+                lease,
+                "provider rejected completion fixture",
+                operation_at,
+            ),
+            EffectCompletionPath::Uncertain => fixture.store.record_uncertain(
+                &fixture.effect,
+                lease,
+                "provider completion fixture is uncertain",
+                operation_at,
+            ),
+        }
     }
 
     fn persist_uncertain_effect(
@@ -8614,6 +8918,67 @@ mod tests {
         let wrong_key = DatabaseKey::new([8; 32]).expect("wrong key shape");
         assert!(ProjectStore::open(&database, &wrong_key).is_err());
         assert!(ProjectStore::open(&database, &database_key()).is_ok());
+    }
+
+    #[test]
+    fn execution_completion_expiry_fence_is_strict_exact_and_atomic() {
+        for path in [
+            EffectCompletionPath::Receipt,
+            EffectCompletionPath::Verification,
+            EffectCompletionPath::Failed,
+            EffectCompletionPath::Uncertain,
+        ] {
+            for case in [
+                EffectLeaseFenceCase::Before,
+                EffectLeaseFenceCase::Equality,
+                EffectLeaseFenceCase::After,
+                EffectLeaseFenceCase::TamperedExpiry,
+            ] {
+                let mut fixture = local_effect_completion_fixture(path, case);
+                let operation_at = case.operation_at(fixture.lease.expires_at);
+                let mut presented_lease = fixture.lease.clone();
+                if matches!(case, EffectLeaseFenceCase::TamperedExpiry) {
+                    presented_lease.expires_at += Duration::seconds(1);
+                }
+                let before = effect_completion_snapshot(&fixture.store, &fixture.effect);
+                let stored_expires_at = DateTime::parse_from_rfc3339(
+                    &before
+                        .attempts
+                        .last()
+                        .expect("leased attempt")
+                        .lease_expires_at,
+                )
+                .expect("stored lease expiry")
+                .with_timezone(&Utc);
+                assert_eq!(
+                    stored_expires_at, fixture.lease.expires_at,
+                    "{path:?}/{case:?}: returned lease expiry must equal the stored value",
+                );
+                let result =
+                    complete_local_effect(&mut fixture, path, &presented_lease, operation_at);
+                let after = effect_completion_snapshot(&fixture.store, &fixture.effect);
+                if case.expects_success() {
+                    assert!(result.is_ok(), "{path:?}/{case:?}: {result:?}");
+                    assert_ne!(after, before, "{path:?}/{case:?}");
+                    assert_eq!(
+                        after.attempts.last().expect("completed attempt").status,
+                        path.completed_status(),
+                        "{path:?}/{case:?}",
+                    );
+                    assert_eq!(
+                        after.idempotency.status,
+                        path.completed_status(),
+                        "{path:?}/{case:?}",
+                    );
+                } else {
+                    assert!(
+                        matches!(&result, Err(LedgerError::LeaseLost)),
+                        "{path:?}/{case:?}: {result:?}",
+                    );
+                    assert_eq!(after, before, "{path:?}/{case:?}");
+                }
+            }
+        }
     }
 
     #[test]
