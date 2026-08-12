@@ -4355,6 +4355,11 @@ fn OrchestratorSurface(
                             }
                         }
                     }
+                    PersistedMissionProcessDensity {
+                        mission: mission.clone(),
+                        visual_fixture: runtime_stream_is_fixture,
+                        on_open_workpad,
+                    }
                     details { class: "persisted-state-details",
                         summary {
                             UiIcon { name: UiIconName::Workflow, size: 14 }
@@ -4542,6 +4547,447 @@ fn PersistedRuntimeStreamTurn(
                     }
                 }
                 em { "{runtime_turn_status_label(stream.turn_status)} · cursor {stream.last_evidence_sequence.unwrap_or_default()}" }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MissionNextBoundaryKind {
+    ApplicationNotImplemented,
+    CatalogRevisionMismatch,
+    WaitingApproval,
+    WaitingUser,
+    Blocked,
+    Verifying,
+    Scheduled,
+    CycleReviewed,
+    Completed,
+    Partial,
+    ExpectedRefusal,
+    Failed,
+    Cancelled,
+    Running,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MissionNextBoundaryCopy {
+    code: &'static str,
+    title: &'static str,
+    detail: &'static str,
+    tone: &'static str,
+}
+
+fn mission_next_boundary_kind(
+    stage: &MissionStage,
+    checkpoint_status: Option<MissionCheckpointStatus>,
+    application_handler_status: Option<ApplicationCheckpointHandlerStatus>,
+) -> MissionNextBoundaryKind {
+    // MissionStage is the persisted aggregate authority. A pending Effect count is
+    // deliberately absent from this input: another Effect cannot rewrite the
+    // current Mission or Checkpoint boundary in the UI.
+    match stage {
+        MissionStage::WaitingApproval => return MissionNextBoundaryKind::WaitingApproval,
+        MissionStage::WaitingUser => return MissionNextBoundaryKind::WaitingUser,
+        MissionStage::Blocked => return MissionNextBoundaryKind::Blocked,
+        MissionStage::Verifying => return MissionNextBoundaryKind::Verifying,
+        MissionStage::Scheduled => return MissionNextBoundaryKind::Scheduled,
+        MissionStage::CycleReviewed => return MissionNextBoundaryKind::CycleReviewed,
+        MissionStage::Completed => return MissionNextBoundaryKind::Completed,
+        MissionStage::Partial => return MissionNextBoundaryKind::Partial,
+        MissionStage::ExpectedRefusal => return MissionNextBoundaryKind::ExpectedRefusal,
+        MissionStage::Failed => return MissionNextBoundaryKind::Failed,
+        MissionStage::Cancelled => return MissionNextBoundaryKind::Cancelled,
+        MissionStage::Draft | MissionStage::Ready | MissionStage::Running => {}
+    }
+    match checkpoint_status {
+        Some(MissionCheckpointStatus::WaitingApproval) => {
+            return MissionNextBoundaryKind::WaitingApproval;
+        }
+        Some(MissionCheckpointStatus::WaitingUser) => {
+            return MissionNextBoundaryKind::WaitingUser;
+        }
+        Some(MissionCheckpointStatus::Blocked) => return MissionNextBoundaryKind::Blocked,
+        Some(MissionCheckpointStatus::Verifying) => return MissionNextBoundaryKind::Verifying,
+        Some(
+            MissionCheckpointStatus::Pending
+            | MissionCheckpointStatus::Ready
+            | MissionCheckpointStatus::Running
+            | MissionCheckpointStatus::Completed
+            | MissionCheckpointStatus::Skipped,
+        )
+        | None => {}
+    }
+    if application_handler_status
+        == Some(ApplicationCheckpointHandlerStatus::CatalogRevisionMismatch)
+    {
+        return MissionNextBoundaryKind::CatalogRevisionMismatch;
+    }
+    if application_handler_status == Some(ApplicationCheckpointHandlerStatus::NotImplemented) {
+        return MissionNextBoundaryKind::ApplicationNotImplemented;
+    }
+    if *stage == MissionStage::Running
+        || checkpoint_status == Some(MissionCheckpointStatus::Running)
+    {
+        return MissionNextBoundaryKind::Running;
+    }
+    MissionNextBoundaryKind::Ready
+}
+
+const fn mission_next_boundary_copy(kind: MissionNextBoundaryKind) -> MissionNextBoundaryCopy {
+    match kind {
+        MissionNextBoundaryKind::ApplicationNotImplemented => MissionNextBoundaryCopy {
+            code: "NOT_IMPLEMENTED",
+            title: "当前 Application 路由尚未实现",
+            detail: "Capability 与边界可见，但不会用 Runtime、页面按钮或模拟结果代替缺失 handler。",
+            tone: "blocked",
+        },
+        MissionNextBoundaryKind::CatalogRevisionMismatch => MissionNextBoundaryCopy {
+            code: "BLOCKED_CATALOG_REVISION",
+            title: "当前 Mission 与 Catalog 版本不一致",
+            detail: "必须显式迁移或重建合同；新二进制不会把能力静默授予旧 Mission。",
+            tone: "blocked",
+        },
+        MissionNextBoundaryKind::WaitingApproval => MissionNextBoundaryCopy {
+            code: "WAITING_APPROVAL",
+            title: "等待精确审批",
+            detail: "只有完整 Effect digest 的 ApprovalGrant 才能继续；页面不会替代审批或执行外部动作。",
+            tone: "attention",
+        },
+        MissionNextBoundaryKind::WaitingUser => MissionNextBoundaryCopy {
+            code: "WAITING_USER",
+            title: "等待你的判断或纠正",
+            detail: "可以在下方直接回复；纠正只使依赖分支失效，不会清空无关工作产物。",
+            tone: "attention",
+        },
+        MissionNextBoundaryKind::Blocked => MissionNextBoundaryCopy {
+            code: "BLOCKED",
+            title: "当前 Checkpoint 已阻塞",
+            detail: "阻塞状态来自 Mission Domain；恢复前不会跳过 Oracle、扩大能力或声明完成。",
+            tone: "blocked",
+        },
+        MissionNextBoundaryKind::Verifying => MissionNextBoundaryCopy {
+            code: "VERIFYING",
+            title: "正在等待独立核验",
+            detail: "Provider 接受不等于业务真实发生；只有持久 Verification 能推进当前 Mission。",
+            tone: "active",
+        },
+        MissionNextBoundaryKind::Scheduled => MissionNextBoundaryCopy {
+            code: "SCHEDULED",
+            title: "等待 durable Scheduler 触发",
+            detail: "页面不能绕过到期时间、事件条件或 lease worker 直接启动下一周期。",
+            tone: "active",
+        },
+        MissionNextBoundaryKind::CycleReviewed => MissionNextBoundaryCopy {
+            code: "CYCLE_REVIEWED",
+            title: "当前周期已完成复盘",
+            detail: "下一周期或新合同仍须由持久调度与用户决策推进；页面不会自动开始循环。",
+            tone: "settled",
+        },
+        MissionNextBoundaryKind::Completed => MissionNextBoundaryCopy {
+            code: "COMPLETED",
+            title: "Mission 已进入合法完成终态",
+            detail: "这是持久 Domain 状态；页面不会据此补造 Provider Receipt、Verification 或业务 Outcome。",
+            tone: "settled",
+        },
+        MissionNextBoundaryKind::Partial => MissionNextBoundaryCopy {
+            code: "PARTIAL",
+            title: "Mission 仅部分完成",
+            detail: "已完成部分与未满足条件必须分别保留；页面不会把 Partial 美化为完整交付。",
+            tone: "attention",
+        },
+        MissionNextBoundaryKind::ExpectedRefusal => MissionNextBoundaryCopy {
+            code: "EXPECTED_REFUSAL",
+            title: "Mission 已按边界正确拒绝",
+            detail: "该终态只证明拒绝符合合同与安全边界，不代表执行过外部 Effect。",
+            tone: "settled",
+        },
+        MissionNextBoundaryKind::Failed => MissionNextBoundaryCopy {
+            code: "FAILED",
+            title: "Mission 已失败",
+            detail: "失败原因与恢复策略须来自持久证据；页面不会自动重试或伪装成 Outcome Review。",
+            tone: "blocked",
+        },
+        MissionNextBoundaryKind::Cancelled => MissionNextBoundaryCopy {
+            code: "CANCELLED",
+            title: "Mission 已取消",
+            detail: "取消后的 Runtime、Browser 与外部 Effect 不得继续；恢复需要新的合法状态转换。",
+            tone: "neutral",
+        },
+        MissionNextBoundaryKind::Running => MissionNextBoundaryCopy {
+            code: "RUNNING",
+            title: "继续当前 Checkpoint",
+            detail: "执行权仍受当前 Capability、Executor、Oracle 与完成策略约束；Mission 不会由模型自完成。",
+            tone: "active",
+        },
+        MissionNextBoundaryKind::Ready => MissionNextBoundaryCopy {
+            code: "READY",
+            title: "等待当前合同的下一次合法转换",
+            detail: "页面只投影已持久状态；未派发的执行、产物与外部动作不会被提前绘制。",
+            tone: "neutral",
+        },
+    }
+}
+
+fn mission_checkpoint_completion_policy_label(
+    policy: MissionCheckpointCompletionPolicy,
+) -> &'static str {
+    match policy {
+        MissionCheckpointCompletionPolicy::DeterministicEvidence => "DETERMINISTIC_EVIDENCE",
+        MissionCheckpointCompletionPolicy::WorkProduct => "WORK_PRODUCT",
+        MissionCheckpointCompletionPolicy::VerifiedEffect => "VERIFIED_EFFECT",
+        MissionCheckpointCompletionPolicy::HumanConfirmation => "HUMAN_CONFIRMATION",
+    }
+}
+
+fn application_checkpoint_handler_status_label(
+    status: ApplicationCheckpointHandlerStatus,
+) -> &'static str {
+    match status {
+        ApplicationCheckpointHandlerStatus::Implemented => "IMPLEMENTED",
+        ApplicationCheckpointHandlerStatus::NotImplemented => "NOT_IMPLEMENTED",
+        ApplicationCheckpointHandlerStatus::CatalogRevisionMismatch => "BLOCKED_CATALOG_REVISION",
+    }
+}
+
+fn mission_checkpoint_process_tone(status: Option<MissionCheckpointStatus>) -> &'static str {
+    match status {
+        Some(MissionCheckpointStatus::Completed | MissionCheckpointStatus::Skipped) => "done",
+        Some(MissionCheckpointStatus::Running | MissionCheckpointStatus::Verifying) => "active",
+        Some(MissionCheckpointStatus::WaitingUser | MissionCheckpointStatus::WaitingApproval) => {
+            "attention"
+        }
+        Some(MissionCheckpointStatus::Blocked) => "blocked",
+        Some(MissionCheckpointStatus::Pending | MissionCheckpointStatus::Ready) | None => "neutral",
+    }
+}
+
+fn mission_undisclosed_checkpoint_count(
+    checkpoint_count: usize,
+    completed_checkpoint_count: usize,
+    has_current_checkpoint: bool,
+    current_checkpoint_status: Option<MissionCheckpointStatus>,
+) -> usize {
+    let completed_count = completed_checkpoint_count.min(checkpoint_count);
+    // Application's completed_checkpoint_count contains only Completed. A known
+    // Skipped (or otherwise non-completed) current checkpoint therefore still
+    // occupies one disclosed slot and must not be counted again as undisclosed.
+    let current_is_not_in_completed_count = has_current_checkpoint
+        && current_checkpoint_status != Some(MissionCheckpointStatus::Completed);
+    checkpoint_count
+        .saturating_sub(completed_count + usize::from(current_is_not_in_completed_count))
+}
+
+#[component]
+fn PersistedMissionProcessDensity(
+    mission: MissionProjection,
+    visual_fixture: bool,
+    on_open_workpad: EventHandler<()>,
+) -> Element {
+    let completed_count = mission
+        .completed_checkpoint_count
+        .min(mission.checkpoint_count);
+    let undisclosed_checkpoint_count = mission_undisclosed_checkpoint_count(
+        mission.checkpoint_count,
+        mission.completed_checkpoint_count,
+        mission.current_checkpoint_id.is_some(),
+        mission.current_checkpoint_status,
+    );
+    let checkpoint_id = mission
+        .current_checkpoint_id
+        .as_deref()
+        .unwrap_or("NO_CURRENT_CHECKPOINT");
+    let checkpoint_status = mission
+        .current_checkpoint_status
+        .map_or("UNKNOWN", mission_checkpoint_status_label);
+    let capability_id = mission
+        .current_checkpoint_capability_id
+        .as_deref()
+        .unwrap_or("ROUTE_UNBOUND");
+    let executor = mission
+        .current_checkpoint_executor
+        .map_or("UNBOUND", mission_checkpoint_executor_label);
+    let completion_policy = mission
+        .current_checkpoint_completion_policy
+        .map_or("UNBOUND", mission_checkpoint_completion_policy_label);
+    let oracle_label = if mission.current_checkpoint_oracle_ids.is_empty() {
+        "ORACLE_UNBOUND".to_owned()
+    } else {
+        mission
+            .current_checkpoint_oracle_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    let handler_label = if mission.current_checkpoint_executor
+        == Some(MissionCheckpointExecutor::Application)
+    {
+        match (
+            mission.current_checkpoint_application_handler_status,
+            mission.current_checkpoint_application_handler_id.as_deref(),
+        ) {
+            (Some(status), Some(handler_id)) => format!(
+                "{} · {handler_id}",
+                application_checkpoint_handler_status_label(status)
+            ),
+            (Some(status), None) => application_checkpoint_handler_status_label(status).to_owned(),
+            (None, _) => "HANDLER_STATUS_UNBOUND".to_owned(),
+        }
+    } else {
+        "不适用当前 Executor".to_owned()
+    };
+    let boundary_kind = mission_next_boundary_kind(
+        &mission.stage,
+        mission.current_checkpoint_status,
+        if mission.current_checkpoint_executor == Some(MissionCheckpointExecutor::Application) {
+            mission.current_checkpoint_application_handler_status
+        } else {
+            None
+        },
+    );
+    let boundary = mission_next_boundary_copy(boundary_kind);
+    let current_tone = mission_checkpoint_process_tone(mission.current_checkpoint_status);
+    let current_checkpoint_revision = mission.current_checkpoint_revision.unwrap_or_default();
+    let mission_route = mission.manifest_id.as_deref().unwrap_or("LEGACY_BOOTSTRAP");
+    let product_count = mission.work_products.len();
+    let capability_count = usize::from(mission.current_checkpoint_capability_id.is_some());
+    let completed_row_tone = if completed_count > 0 {
+        "done"
+    } else {
+        "neutral"
+    };
+    let completed_title = if completed_count > 0 {
+        format!("已完成 {completed_count} 个 Checkpoint")
+    } else {
+        "尚无完成的 Checkpoint".to_owned()
+    };
+    let projection_origin = if visual_fixture {
+        "VISUAL_FIXTURE · 未读取 SQLCipher"
+    } else {
+        "Project-local Application projection"
+    };
+
+    rsx! {
+        section { class: "persisted-process-density", aria_label: "Mission 过程与工作产物",
+            header { class: "persisted-process-head",
+                span {
+                    strong { "Mission 过程与工作产物" }
+                    small { "{mission_route} · Mission revision {mission.revision} · {projection_origin}" }
+                }
+                em { "{completed_count}/{mission.checkpoint_count} Checkpoints" }
+            }
+            div { class: "persisted-work-progress", aria_label: "Checkpoint 过程",
+                div { class: "persisted-process-row {completed_row_tone}",
+                    i {
+                        if completed_count > 0 {
+                            UiIcon { name: UiIconName::Check, size: 10 }
+                        } else {
+                            UiIcon { name: UiIconName::List, size: 10 }
+                        }
+                    }
+                    span {
+                        strong { "{completed_title}" }
+                        small { "来自持久 Mission aggregate；不等于整个 Mission 已完成。" }
+                        em { "DOMAIN · revision {mission.revision}" }
+                    }
+                    time { "{completed_count}/{mission.checkpoint_count}" }
+                }
+                div {
+                    class: "persisted-process-row current {current_tone}",
+                    aria_current: if mission.current_checkpoint_id.is_some() { "step" } else { "false" },
+                    i {
+                        if current_tone == "done" {
+                            UiIcon { name: UiIconName::Check, size: 10 }
+                        } else if current_tone == "blocked" || current_tone == "attention" {
+                            UiIcon { name: UiIconName::Shield, size: 10 }
+                        } else {
+                            span {}
+                        }
+                    }
+                    span {
+                        strong { "{checkpoint_id}" }
+                        small { "{checkpoint_status} · {capability_id}" }
+                        em { "{executor} · checkpoint revision {current_checkpoint_revision}" }
+                    }
+                    time { "当前" }
+                }
+                if undisclosed_checkpoint_count > 0 {
+                    div { class: "persisted-process-row neutral",
+                        i { UiIcon { name: UiIconName::List, size: 10 } }
+                        span {
+                            strong { "另有 {undisclosed_checkpoint_count} 个 Checkpoint 尚未展开" }
+                            small { "当前 Projection 只公开数量；不会编造名称、顺序或执行记录。" }
+                            em { "MISSION DAG · COUNT ONLY" }
+                        }
+                        time { "待后续" }
+                    }
+                }
+            }
+            details { class: "persisted-capability-stack",
+                summary {
+                    UiIcon { name: UiIconName::Blocks, size: 14 }
+                    span {
+                        strong { "当前能力与完成条件" }
+                        small { "{capability_count} Capability · {mission.current_checkpoint_oracle_ids.len()} Oracle · {executor}" }
+                    }
+                    em { "{checkpoint_status}" }
+                    UiIcon { name: UiIconName::ChevronDown, size: 12 }
+                }
+                div { class: "persisted-capability-grid",
+                    span { strong { "Capability" } small { "{capability_id}" } }
+                    span { strong { "Executor" } small { "{executor}" } }
+                    span { strong { "Completion policy" } small { "{completion_policy}" } }
+                    span { strong { "Business Oracle" } small { "{oracle_label}" } }
+                    span { strong { "Application handler" } small { "{handler_label}" } }
+                    span {
+                        strong { "Effect evidence" }
+                        small { "{mission.pending_approval_count} pending approval · {mission.verified_effect_count} verified effect" }
+                    }
+                }
+            }
+            if mission.work_products.is_empty() {
+                div { class: "persisted-work-product-empty",
+                    UiIcon { name: UiIconName::FileText, size: 14 }
+                    span {
+                        strong { "还没有持久 Work Product" }
+                        small { "Projection count {mission.work_product_count}；页面不会补一份示例报告。" }
+                    }
+                    em { "EMPTY" }
+                }
+            } else {
+                div { class: "persisted-artifact-list", aria_label: "持久工作产物 {product_count} 项",
+                    for product in mission.work_products.clone() {
+                        {
+                            let product_id = product.work_product_id.to_string();
+                            rsx! {
+                                button {
+                                    key: "{product_id}",
+                                    class: "persisted-artifact-attachment",
+                                    aria_label: "在任务工作台打开 {product.title}",
+                                    onclick: move |_| on_open_workpad.call(()),
+                                    i { UiIcon { name: UiIconName::FileText, size: 16 } }
+                                    span {
+                                        strong { "{product.title}" }
+                                        small {
+                                            "{product.work_product_type} · r{product.work_product_revision} · {product.evidence_count} evidence · {work_product_status_label(&product.adoption_status)}"
+                                        }
+                                    }
+                                    em { "在工作台打开" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            aside { class: "persisted-next-boundary {boundary.tone}", aria_label: "Mission 下一步边界",
+                i { UiIcon { name: UiIconName::Shield, size: 14 } }
+                span {
+                    strong { "{boundary.title}" }
+                    small { "{boundary.detail}" }
+                }
+                em { "{boundary.code}" }
             }
         }
     }
@@ -7293,6 +7739,177 @@ mod tests {
             );
         }
         assert!(css.contains("@media (prefers-reduced-motion: reduce)"));
+    }
+
+    #[test]
+    fn persisted_mission_process_density_is_projection_bound_and_interactive() {
+        let source = include_str!("lib.rs");
+        let css = include_str!("../assets/prototype.css");
+        for contract in [
+            "PersistedMissionProcessDensity",
+            "另有 {undisclosed_checkpoint_count} 个 Checkpoint 尚未展开",
+            "当前 Projection 只公开数量；不会编造名称、顺序或执行记录。",
+            "current_checkpoint_capability_id",
+            "current_checkpoint_oracle_ids",
+            "current_checkpoint_completion_policy",
+            "current_checkpoint_application_handler_status",
+            "在任务工作台打开 {product.title}",
+            "work_product_status_label(&product.adoption_status)",
+            "Mission 下一步边界",
+        ] {
+            assert!(
+                source.contains(contract),
+                "missing persisted process contract {contract}"
+            );
+        }
+        for selector in [
+            ".persisted-process-density",
+            ".persisted-process-row",
+            ".persisted-capability-stack",
+            ".persisted-capability-grid",
+            ".persisted-artifact-attachment",
+            ".persisted-next-boundary",
+        ] {
+            assert!(
+                css.contains(selector),
+                "missing persisted process selector {selector}"
+            );
+        }
+        assert!(css.contains("@media (max-width: 680px)"));
+        assert!(css.contains(".persisted-process-row.active > i > span { animation: none"));
+    }
+
+    #[test]
+    fn mission_process_counts_fail_closed() {
+        assert_eq!(
+            mission_undisclosed_checkpoint_count(
+                9,
+                3,
+                true,
+                Some(MissionCheckpointStatus::Running),
+            ),
+            5
+        );
+        assert_eq!(
+            mission_undisclosed_checkpoint_count(
+                9,
+                3,
+                true,
+                Some(MissionCheckpointStatus::Completed),
+            ),
+            6
+        );
+        assert_eq!(
+            mission_undisclosed_checkpoint_count(
+                9,
+                3,
+                true,
+                Some(MissionCheckpointStatus::Skipped),
+            ),
+            5
+        );
+        assert_eq!(mission_undisclosed_checkpoint_count(9, 3, false, None), 6);
+        assert_eq!(mission_undisclosed_checkpoint_count(3, 9, false, None), 0);
+    }
+
+    #[test]
+    fn mission_next_boundary_uses_persisted_authority() {
+        assert_eq!(
+            mission_next_boundary_kind(
+                &MissionStage::Running,
+                Some(MissionCheckpointStatus::Running),
+                Some(ApplicationCheckpointHandlerStatus::CatalogRevisionMismatch),
+            ),
+            MissionNextBoundaryKind::CatalogRevisionMismatch
+        );
+        assert_eq!(
+            mission_next_boundary_kind(
+                &MissionStage::Running,
+                Some(MissionCheckpointStatus::Running),
+                Some(ApplicationCheckpointHandlerStatus::NotImplemented),
+            ),
+            MissionNextBoundaryKind::ApplicationNotImplemented
+        );
+        assert_eq!(
+            mission_next_boundary_kind(
+                &MissionStage::Running,
+                Some(MissionCheckpointStatus::Running),
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+            ),
+            MissionNextBoundaryKind::Running
+        );
+
+        // A pending Effect may belong to another Checkpoint. Its count stays
+        // display-only and is intentionally outside the boundary helper's typed
+        // inputs, so these contradictory observations cannot overwrite state.
+        for (stage, checkpoint_status, pending_approval_count, expected) in [
+            (
+                MissionStage::Blocked,
+                MissionCheckpointStatus::Blocked,
+                2,
+                MissionNextBoundaryKind::Blocked,
+            ),
+            (
+                MissionStage::WaitingUser,
+                MissionCheckpointStatus::WaitingUser,
+                3,
+                MissionNextBoundaryKind::WaitingUser,
+            ),
+        ] {
+            assert!(pending_approval_count > 0);
+            assert_eq!(
+                mission_next_boundary_kind(
+                    &stage,
+                    Some(checkpoint_status),
+                    Some(ApplicationCheckpointHandlerStatus::Implemented),
+                ),
+                expected
+            );
+        }
+        assert_eq!(
+            mission_next_boundary_kind(
+                &MissionStage::Verifying,
+                Some(MissionCheckpointStatus::Verifying),
+                None,
+            ),
+            MissionNextBoundaryKind::Verifying
+        );
+        assert_eq!(
+            mission_next_boundary_kind(
+                &MissionStage::Completed,
+                Some(MissionCheckpointStatus::Completed),
+                None,
+            ),
+            MissionNextBoundaryKind::Completed
+        );
+        assert_eq!(
+            mission_next_boundary_copy(MissionNextBoundaryKind::Completed).code,
+            "COMPLETED"
+        );
+        assert_eq!(
+            mission_next_boundary_copy(MissionNextBoundaryKind::Partial).code,
+            "PARTIAL"
+        );
+        assert_eq!(
+            mission_next_boundary_copy(MissionNextBoundaryKind::ExpectedRefusal).code,
+            "EXPECTED_REFUSAL"
+        );
+        assert_eq!(
+            mission_next_boundary_copy(MissionNextBoundaryKind::Failed).code,
+            "FAILED"
+        );
+        assert_eq!(
+            mission_next_boundary_copy(MissionNextBoundaryKind::Cancelled).code,
+            "CANCELLED"
+        );
+        assert_eq!(
+            mission_next_boundary_copy(MissionNextBoundaryKind::ApplicationNotImplemented).code,
+            "NOT_IMPLEMENTED"
+        );
+        assert_eq!(
+            mission_next_boundary_copy(MissionNextBoundaryKind::CatalogRevisionMismatch).code,
+            "BLOCKED_CATALOG_REVISION"
+        );
     }
 
     #[test]
