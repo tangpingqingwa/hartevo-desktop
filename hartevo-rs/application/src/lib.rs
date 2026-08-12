@@ -91,7 +91,8 @@ use hartevo_domain_kernel::{
     WorkerLeaseId, WorkerLeaseStatus, WorkerMailbox, validate_context_branch_lineage,
 };
 use hartevo_effect_broker::{
-    BrokerError, BrokerResult, EffectBroker, EffectExecutor, EffectReconciler, EffectVerifier,
+    BrokerError, BrokerResult, EffectBroker, EffectCompletionAuthority, EffectCompletionPoint,
+    EffectExecutor, EffectReconciler, EffectVerifier,
 };
 use hartevo_runtime_adapter::{
     AdapterError, MappedTurnEventKind, ObservedRuntimeProcessIdentity, ProcessCleanupDisposition,
@@ -11855,7 +11856,7 @@ impl ApplicationService {
         }
         validate_creator_payout_effect_binding(&task, mission.effect(effect_id)?)?;
         let expected_mission_revision = mission.revision;
-        let result = match broker.reconcile_uncertain(
+        let bound_result = match broker.reconcile_uncertain_authority_bound(
             &mut mission,
             effect_id,
             &mut self.store,
@@ -11864,36 +11865,46 @@ impl ApplicationService {
             now,
         ) {
             Ok(result) => result,
-            Err(error) => {
-                if mission.revision > expected_mission_revision {
+            Err(bound_error) => {
+                let (error, authority) = bound_error.into_parts();
+                if let Some(completion) = authority.latest_accepted()
+                    && mission.revision > expected_mission_revision
+                {
                     self.persist_reconciliation_error(
                         &mission,
                         expected_mission_revision,
                         None,
                         effect_id,
                         &error,
-                        now,
+                        completion,
                     )?;
                 }
                 return Err(error.into());
             }
         };
-
-        let changed =
-            match project_verified_creator_payout(&mut task, mission.effect(effect_id)?, now) {
-                Ok(changed) => changed,
-                Err(error) => {
-                    self.persist_reconciliation_success(
-                        &mission,
-                        expected_mission_revision,
-                        None,
-                        effect_id,
-                        &result,
-                        now,
-                    )?;
-                    return Err(error);
-                }
-            };
+        let (result, authority) = bound_result.into_parts();
+        let Some(verification_completion) = authority.verification() else {
+            return Ok((mission, task, result));
+        };
+        let projection_at = verification_completion.operation_at();
+        let changed = match project_verified_creator_payout(
+            &mut task,
+            mission.effect(effect_id)?,
+            projection_at,
+        ) {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.persist_reconciliation_success(
+                    &mission,
+                    expected_mission_revision,
+                    None,
+                    effect_id,
+                    &result,
+                    &authority,
+                )?;
+                return Err(error);
+            }
+        };
         if !changed {
             self.persist_reconciliation_success(
                 &mission,
@@ -11901,33 +11912,17 @@ impl ApplicationService {
                 None,
                 effect_id,
                 &result,
-                now,
+                &authority,
             )?;
             return Ok((mission, task, result));
         }
-
-        let payout = task
-            .payouts
-            .last()
-            .ok_or(ApplicationError::CreatorPayoutEffectMismatch)?;
-        let mission_events = effect_reconciliation_events(effect_id, &result, now);
-        let task_event = PendingEvent::new(
-            "creator.payout_reconciled_verified",
-            serde_json::json!({
-                "taskId": task.id,
-                "payoutId": payout.authorization.payout_id,
-                "effectId": effect_id,
-                "receiptId": result.receipt.id,
-                "verificationId": result.verification.id,
-                "deliverableDigest": payout.authorization.deliverable_digest,
-                "amountMinor": payout.authorization.amount.amount_minor,
-                "currency": payout.authorization.amount.currency,
-                "readOnlyReconciliation": true,
-                "providerExecutionReplayed": false,
-                "usageEntitlement": "contract_usage_granted",
-            }),
-            now,
-        );
+        let mission_events = effect_reconciliation_events(effect_id, &result, &authority);
+        let task_event = creator_payout_reconciliation_event(
+            &task,
+            effect_id,
+            &result,
+            verification_completion,
+        )?;
         self.store.update_creator_task_and_mission_atomic(
             &task,
             expected_task_revision,
@@ -12555,7 +12550,7 @@ impl ApplicationService {
         let effect_before_execution = mission.effect(effect_id)?.clone();
         let already_verified = effect_before_execution.status == EffectStatus::Verified;
         let conversation_guard = effect_before_execution.conversation_guard.clone();
-        let result = match broker.execute_and_verify(
+        let bound_result = match broker.execute_and_verify_authority_bound(
             &mut mission,
             effect_id,
             &mut self.store,
@@ -12564,24 +12559,30 @@ impl ApplicationService {
             now,
         ) {
             Ok(result) => result,
-            Err(error) => {
-                if mission.revision > expected_revision {
+            Err(bound_error) => {
+                let (error, authority) = bound_error.into_parts();
+                if let Some(completion) = authority.latest_accepted()
+                    && mission.revision > expected_revision
+                {
                     self.persist_interrupted_effect(
                         &mut mission,
                         expected_revision,
                         conversation_guard.as_ref(),
                         effect_id,
-                        now,
+                        completion,
                     )?;
                 }
                 return Err(error.into());
             }
         };
-        if already_verified {
+        let (result, authority) = bound_result.into_parts();
+        if already_verified || authority.latest_accepted().is_none() {
             return Ok((mission, result));
         }
-        let execution_events = effect_execution_events(effect_id, &result, now);
-        if let Some(guard) = conversation_guard {
+        let execution_events = effect_execution_events(effect_id, &result, &authority);
+        if let (Some(guard), Some(conversation_completion)) =
+            (conversation_guard, authority.provider())
+        {
             let mut conversation = self
                 .store
                 .load_conversation(project_id, &guard.conversation_id)?;
@@ -12593,6 +12594,7 @@ impl ApplicationService {
                 provider_event_digest.clone(),
                 guard.control_generation,
                 result.receipt.accepted_at,
+                conversation_completion.operation_at(),
             )?;
             self.store.update_conversation_and_mission_atomic(
                 &conversation,
@@ -12607,8 +12609,9 @@ impl ApplicationService {
                         "receiptId": result.receipt.id,
                         "providerEventDigest": provider_event_digest,
                         "controlGeneration": guard.control_generation,
+                        "authoritySequence": conversation_completion.sequence(),
                     }),
-                    now,
+                    conversation_completion.operation_at(),
                 )],
                 &execution_events,
             )?;
@@ -12633,7 +12636,7 @@ impl ApplicationService {
         let mut mission = self.store.load_mission(project_id, mission_id)?;
         let expected_revision = mission.revision;
         let conversation_guard = mission.effect(effect_id)?.conversation_guard.clone();
-        let result = match broker.reconcile_uncertain(
+        let bound_result = match broker.reconcile_uncertain_authority_bound(
             &mut mission,
             effect_id,
             &mut self.store,
@@ -12642,27 +12645,34 @@ impl ApplicationService {
             now,
         ) {
             Ok(result) => result,
-            Err(error) => {
-                if mission.revision > expected_revision {
+            Err(bound_error) => {
+                let (error, authority) = bound_error.into_parts();
+                if let Some(completion) = authority.latest_accepted()
+                    && mission.revision > expected_revision
+                {
                     self.persist_reconciliation_error(
                         &mission,
                         expected_revision,
                         conversation_guard.as_ref(),
                         effect_id,
                         &error,
-                        now,
+                        completion,
                     )?;
                 }
                 return Err(error.into());
             }
         };
+        let (result, authority) = bound_result.into_parts();
+        if authority.latest_accepted().is_none() {
+            return Ok((mission, result));
+        }
         self.persist_reconciliation_success(
             &mission,
             expected_revision,
             conversation_guard.as_ref(),
             effect_id,
             &result,
-            now,
+            &authority,
         )?;
         Ok((mission, result))
     }
@@ -12674,14 +12684,17 @@ impl ApplicationService {
         conversation_guard: Option<&ConversationEffectGuard>,
         effect_id: &EffectId,
         result: &BrokerResult,
-        now: DateTime<Utc>,
+        authority: &EffectCompletionAuthority,
     ) -> Result<(), ApplicationError> {
-        let events = effect_reconciliation_events(effect_id, result, now);
+        let events = effect_reconciliation_events(effect_id, result, authority);
         let Some(guard) = conversation_guard else {
             self.store
                 .update_mission_atomic(mission, expected_mission_revision, &events)?;
             return Ok(());
         };
+        let reconciliation_completion = authority
+            .reconciliation()
+            .ok_or(BrokerError::InvalidAuthorityClock)?;
         let mut conversation = self
             .store
             .load_conversation(&mission.project_id, &guard.conversation_id)?;
@@ -12693,7 +12706,7 @@ impl ApplicationService {
             provider_event_digest.clone(),
             guard.control_generation,
             result.receipt.accepted_at,
-            now,
+            reconciliation_completion.operation_at(),
         )?;
         self.store.update_conversation_and_mission_atomic(
             &conversation,
@@ -12709,8 +12722,9 @@ impl ApplicationService {
                     "providerEventDigest": provider_event_digest,
                     "originalControlGeneration": guard.control_generation,
                     "readOnlyReconciliation": true,
+                    "authoritySequence": reconciliation_completion.sequence(),
                 }),
-                now,
+                reconciliation_completion.operation_at(),
             )],
             &events,
         )?;
@@ -12724,9 +12738,10 @@ impl ApplicationService {
         conversation_guard: Option<&ConversationEffectGuard>,
         effect_id: &EffectId,
         error: &BrokerError,
-        now: DateTime<Utc>,
+        completion: EffectCompletionPoint,
     ) -> Result<(), ApplicationError> {
-        let mission_event = effect_reconciliation_error_event(effect_id, error, now);
+        let now = completion.operation_at();
+        let mission_event = effect_reconciliation_error_event(effect_id, error, completion);
         let Some(guard) = conversation_guard else {
             self.store.update_mission_atomic(
                 mission,
@@ -12759,6 +12774,7 @@ impl ApplicationService {
                     "effectStatus": mission.effect(effect_id)?.status,
                     "originalControlGeneration": guard.control_generation,
                     "readOnlyReconciliation": true,
+                    "authoritySequence": completion.sequence(),
                 }),
                 now,
             )],
@@ -12773,8 +12789,9 @@ impl ApplicationService {
         expected_mission_revision: u64,
         conversation_guard: Option<&ConversationEffectGuard>,
         effect_id: &EffectId,
-        now: DateTime<Utc>,
+        completion: EffectCompletionPoint,
     ) -> Result<(), ApplicationError> {
+        let now = completion.operation_at();
         if matches!(
             mission.effect(effect_id)?.status,
             EffectStatus::Executing | EffectStatus::ReceiptRecorded
@@ -12790,6 +12807,7 @@ impl ApplicationService {
                     mission.effect(effect_id)?.status,
                     EffectStatus::VerificationRequired
                 ),
+                "authoritySequence": completion.sequence(),
             }),
             now,
         );
@@ -12818,7 +12836,7 @@ impl ApplicationService {
                 guard.control_generation,
                 receipt.map(|value| value.id.clone()),
                 provider_event_digest.clone(),
-                receipt.map_or(now, |value| value.accepted_at),
+                now,
             )?;
             "conversation.reply_uncertain"
         };
@@ -12836,6 +12854,7 @@ impl ApplicationService {
                     "receiptId": receipt.map(|value| &value.id),
                     "providerEventDigest": provider_event_digest,
                     "controlGeneration": guard.control_generation,
+                    "authoritySequence": completion.sequence(),
                 }),
                 now,
             )],
@@ -19224,37 +19243,44 @@ fn mission_stage_event(stage: &MissionStage) -> &'static str {
 fn effect_execution_events(
     effect_id: &EffectId,
     result: &BrokerResult,
-    now: DateTime<Utc>,
-) -> [PendingEvent; 2] {
-    [
-        PendingEvent::new(
+    authority: &EffectCompletionAuthority,
+) -> Vec<PendingEvent> {
+    let mut events = Vec::with_capacity(2);
+    if let Some(completion) = authority.provider() {
+        events.push(PendingEvent::new(
             "effect.executed",
             serde_json::json!({
                 "effectId": effect_id,
                 "receiptId": result.receipt.id,
                 "disposition": format!("{:?}", result.disposition),
+                "authoritySequence": completion.sequence(),
             }),
-            now,
-        ),
-        PendingEvent::new(
+            completion.operation_at(),
+        ));
+    }
+    if let Some(completion) = authority.verification() {
+        events.push(PendingEvent::new(
             "effect.verified",
             serde_json::json!({
                 "effectId": effect_id,
                 "verificationId": result.verification.id,
                 "status": result.verification.status,
+                "authoritySequence": completion.sequence(),
             }),
-            now,
-        ),
-    ]
+            completion.operation_at(),
+        ));
+    }
+    events
 }
 
 fn effect_reconciliation_events(
     effect_id: &EffectId,
     result: &BrokerResult,
-    now: DateTime<Utc>,
-) -> [PendingEvent; 2] {
-    [
-        PendingEvent::new(
+    authority: &EffectCompletionAuthority,
+) -> Vec<PendingEvent> {
+    let mut events = Vec::with_capacity(2);
+    if let Some(completion) = authority.reconciliation() {
+        events.push(PendingEvent::new(
             "effect.reconciliation_receipt_found",
             serde_json::json!({
                 "effectId": effect_id,
@@ -19262,26 +19288,61 @@ fn effect_reconciliation_events(
                 "disposition": format!("{:?}", result.disposition),
                 "readOnlyReconciliation": true,
                 "providerExecutionReplayed": false,
+                "authoritySequence": completion.sequence(),
             }),
-            now,
-        ),
-        PendingEvent::new(
+            completion.operation_at(),
+        ));
+    }
+    if let Some(completion) = authority.verification() {
+        events.push(PendingEvent::new(
             "effect.reconciliation_verified",
             serde_json::json!({
                 "effectId": effect_id,
                 "verificationId": result.verification.id,
                 "status": result.verification.status,
                 "independent": result.verification.independent,
+                "authoritySequence": completion.sequence(),
             }),
-            now,
-        ),
-    ]
+            completion.operation_at(),
+        ));
+    }
+    events
+}
+
+fn creator_payout_reconciliation_event(
+    task: &CreatorTask,
+    effect_id: &EffectId,
+    result: &BrokerResult,
+    completion: EffectCompletionPoint,
+) -> Result<PendingEvent, ApplicationError> {
+    let payout = task
+        .payouts
+        .last()
+        .ok_or(ApplicationError::CreatorPayoutEffectMismatch)?;
+    Ok(PendingEvent::new(
+        "creator.payout_reconciled_verified",
+        serde_json::json!({
+            "taskId": task.id,
+            "payoutId": payout.authorization.payout_id,
+            "effectId": effect_id,
+            "receiptId": result.receipt.id,
+            "verificationId": result.verification.id,
+            "deliverableDigest": payout.authorization.deliverable_digest,
+            "amountMinor": payout.authorization.amount.amount_minor,
+            "currency": payout.authorization.amount.currency,
+            "readOnlyReconciliation": true,
+            "providerExecutionReplayed": false,
+            "usageEntitlement": "contract_usage_granted",
+            "authoritySequence": completion.sequence(),
+        }),
+        completion.operation_at(),
+    ))
 }
 
 fn effect_reconciliation_error_event(
     effect_id: &EffectId,
     error: &BrokerError,
-    now: DateTime<Utc>,
+    completion: EffectCompletionPoint,
 ) -> PendingEvent {
     let (event_type, evidence_digest, retry_at, attempts) = match error {
         BrokerError::ProviderNotExecuted { evidence_digest } => (
@@ -19336,8 +19397,9 @@ fn effect_reconciliation_error_event(
             "attempts": attempts,
             "readOnlyReconciliation": true,
             "providerExecutionReplayed": false,
+            "authoritySequence": completion.sequence(),
         }),
-        now,
+        completion.operation_at(),
     )
 }
 
@@ -20496,12 +20558,13 @@ mod tests {
     use hartevo_domain_kernel::{
         Approval, ApprovalDecision, ApprovalId, AttributionId, AttributionModel,
         AttributionTrafficClass, CommissionStatus, ContactPermission, ContextCapsuleStatus,
-        ContextDataClass, ConversationContentRisk, CreatorId, CreatorMilestoneSpec, CurrencyCode,
-        DeletionPropagationStatus, DeletionSurface, DeliverableAssessment, DeviceId,
-        ExternalIdentity, KpiDirection, LegalBasis, MemberId, MessagingGateway, OutcomeEventId,
-        OutcomeEventKind, OutcomeSourceVerification, OutcomeVerificationMethod, PartnerSupplyClass,
-        ProbeOutcome, Receipt, ReceiptId, RefundId, RightsAttestation, Touchpoint, TruthSource,
-        TruthStatus, TruthValue, UsageRights, Verification, VerificationId,
+        ContextDataClass, ConversationContentRisk, CreatorHiringAward, CreatorId,
+        CreatorMilestoneSpec, CurrencyCode, DeletionPropagationStatus, DeletionSurface,
+        DeliverableAssessment, DeviceId, ExternalIdentity, KpiDirection, LegalBasis, MemberId,
+        MessagingGateway, OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification,
+        OutcomeVerificationMethod, PartnerSupplyClass, ProbeOutcome, Receipt, ReceiptId, RefundId,
+        RightsAttestation, Touchpoint, TruthSource, TruthStatus, TruthValue, UsageRights,
+        Verification, VerificationId,
     };
     use hartevo_effect_broker::{
         EffectPolicy, EffectRateLimit, PermissionFailure, ProviderFailure,
@@ -20515,6 +20578,119 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 8, 10, 10, 0, 0)
             .single()
             .expect("valid time")
+    }
+
+    fn outbox_for_event(
+        service: &ApplicationService,
+        event: &DomainEventRecord,
+    ) -> hartevo_storage::OutboxMessage {
+        let tenant_id = service
+            .store
+            .load_project(&event.project_id)
+            .expect("event project scope")
+            .tenant_id;
+        let payload_digest = canonical_sha256(&event.payload).expect("canonical event payload");
+        let matches = all_outbox_snapshot(service)
+            .into_iter()
+            .filter(|message| {
+                message.tenant_id == tenant_id
+                    && message.project_id == event.project_id
+                    && message.mission_id == event.mission_id
+                    && message.event_type == event.event_type
+                    && canonical_sha256(&message.payload).is_ok_and(|message_payload_digest| {
+                        message_payload_digest.as_str() == payload_digest.as_str()
+                    })
+                    && message.created_at == event.recorded_at
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "outbox event match cardinality violation: event_type={}, mission_scoped={}, candidates={}, payload_digest={}",
+            event.event_type,
+            event.mission_id.is_some(),
+            matches.len(),
+            &payload_digest[..12],
+        );
+        matches
+            .into_iter()
+            .next()
+            .expect("unique outbox event match")
+    }
+
+    fn assert_event_outbox_time(service: &ApplicationService, event: &DomainEventRecord) {
+        let outbox = outbox_for_event(service, event);
+        assert_eq!(outbox.created_at, event.recorded_at);
+    }
+
+    #[test]
+    fn outbox_event_payload_digest_is_key_order_canonical_and_value_bound() {
+        let ordered: serde_json::Value = serde_json::from_str(
+            r#"{"authoritySequence":2,"effect":{"id":"effect-fixture","status":"verified"}}"#,
+        )
+        .expect("ordered event payload");
+        let reordered: serde_json::Value = serde_json::from_str(
+            r#"{"effect":{"status":"verified","id":"effect-fixture"},"authoritySequence":2}"#,
+        )
+        .expect("reordered event payload");
+        let changed: serde_json::Value = serde_json::from_str(
+            r#"{"authoritySequence":3,"effect":{"id":"effect-fixture","status":"verified"}}"#,
+        )
+        .expect("changed event payload");
+        let ordered_digest = canonical_sha256(&ordered).expect("ordered payload digest");
+        let reordered_digest = canonical_sha256(&reordered).expect("reordered payload digest");
+        let changed_digest = canonical_sha256(&changed).expect("changed payload digest");
+
+        assert!(
+            ordered_digest.len() == 64
+                && ordered_digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "canonical event payload digest must be 64 hexadecimal characters"
+        );
+        assert!(
+            ordered_digest == reordered_digest,
+            "canonical event payload digest changed under object key reordering"
+        );
+        assert!(
+            ordered_digest != changed_digest,
+            "canonical event payload digest did not bind the field value"
+        );
+    }
+
+    fn project_mission_event_snapshot(
+        service: &ApplicationService,
+        project_id: &ProjectId,
+    ) -> Vec<DomainEventRecord> {
+        let mut events = service
+            .store
+            .list_missions(project_id)
+            .expect("project Missions for event snapshot")
+            .into_iter()
+            .flat_map(|mission| {
+                service
+                    .mission_events(project_id, &mission.id)
+                    .expect("Mission events for project snapshot")
+            })
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| event.sequence);
+        events
+    }
+
+    fn all_outbox_snapshot(service: &ApplicationService) -> Vec<hartevo_storage::OutboxMessage> {
+        let mut messages = Vec::new();
+        let mut sequence = 1_i64;
+        loop {
+            match service.store.outbox_message(sequence) {
+                Ok(message) => messages.push(message),
+                Err(StorageError::DomainDecode(message))
+                    if message == format!("unknown outbox message {sequence}") =>
+                {
+                    break;
+                }
+                Err(error) => panic!("outbox snapshot failed at sequence {sequence}: {error}"),
+            }
+            sequence = sequence.checked_add(1).expect("outbox sequence overflow");
+        }
+        messages
     }
 
     fn catalog_count_kpis() -> BTreeMap<String, KpiContract> {
@@ -20563,11 +20739,71 @@ mod tests {
             .expect("VM-11 parent Mission")
     }
 
+    #[derive(Clone, Copy)]
+    enum CatalogCheckpointFixtureTiming {
+        Staggered,
+        Exact,
+    }
+
+    impl CatalogCheckpointFixtureTiming {
+        fn step_at(self, started_at: DateTime<Utc>, step: i64) -> DateTime<Utc> {
+            match self {
+                Self::Staggered => started_at + Duration::milliseconds(step * 10),
+                Self::Exact => started_at,
+            }
+        }
+
+        fn offset(self, at: DateTime<Utc>, milliseconds: i64) -> DateTime<Utc> {
+            match self {
+                Self::Staggered => at + Duration::milliseconds(milliseconds),
+                Self::Exact => at,
+            }
+        }
+    }
+
     fn complete_catalog_checkpoint_dag(
         service: &mut ApplicationService,
         project_id: &ProjectId,
         mission_id: &MissionId,
         started_at: DateTime<Utc>,
+    ) {
+        complete_catalog_checkpoint_dag_with_timing(
+            service,
+            project_id,
+            mission_id,
+            started_at,
+            CatalogCheckpointFixtureTiming::Staggered,
+        );
+    }
+
+    fn complete_catalog_checkpoint_dag_at_exact_time(
+        service: &mut ApplicationService,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        phase_at: DateTime<Utc>,
+    ) {
+        complete_catalog_checkpoint_dag_with_timing(
+            service,
+            project_id,
+            mission_id,
+            phase_at,
+            CatalogCheckpointFixtureTiming::Exact,
+        );
+        assert_eq!(
+            service
+                .load_mission(project_id, mission_id)
+                .expect("exact-time completed Catalog Mission")
+                .updated_at,
+            phase_at
+        );
+    }
+
+    fn complete_catalog_checkpoint_dag_with_timing(
+        service: &mut ApplicationService,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        started_at: DateTime<Utc>,
+        timing: CatalogCheckpointFixtureTiming,
     ) {
         let mut step = 0_i64;
         loop {
@@ -20582,19 +20818,20 @@ mod tests {
             else {
                 break;
             };
-            let begin_at = started_at + Duration::milliseconds(step * 10);
+            let begin_at = timing.step_at(started_at, step);
             if checkpoint.status == MissionCheckpointStatus::Ready {
                 service
                     .begin_mission_checkpoint(project_id, mission_id, &checkpoint.id, begin_at)
                     .expect("begin Catalog Checkpoint");
             }
-            let completion = prepare_catalog_checkpoint_oracle_evidence(
+            let completion = prepare_catalog_checkpoint_oracle_evidence_with_timing(
                 service,
                 project_id,
                 mission_id,
                 &checkpoint.id,
                 step,
-                begin_at + Duration::milliseconds(1),
+                timing.offset(begin_at, 1),
+                timing,
             );
             if checkpoint.route.as_ref().is_some_and(|route| {
                 route.completion_policy
@@ -20703,10 +20940,6 @@ mod tests {
     /// execution out of scheduler/dispatch test setup. The fixture follows the same
     /// WorkProduct and Effect state machines and persists one auditable preparation
     /// event before the production completion command evaluates the frozen Oracles.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "this test fixture materializes each deterministic Oracle evidence type through its real Domain state machine before returning one exact completion proof"
-    )]
     fn prepare_catalog_checkpoint_oracle_evidence(
         service: &mut ApplicationService,
         project_id: &ProjectId,
@@ -20714,6 +20947,30 @@ mod tests {
         checkpoint_id: &str,
         nonce: i64,
         prepared_at: DateTime<Utc>,
+    ) -> MissionCheckpointCompletion {
+        prepare_catalog_checkpoint_oracle_evidence_with_timing(
+            service,
+            project_id,
+            mission_id,
+            checkpoint_id,
+            nonce,
+            prepared_at,
+            CatalogCheckpointFixtureTiming::Staggered,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "this test fixture materializes each deterministic Oracle evidence type through its real Domain state machine before returning one exact completion proof"
+    )]
+    fn prepare_catalog_checkpoint_oracle_evidence_with_timing(
+        service: &mut ApplicationService,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        checkpoint_id: &str,
+        nonce: i64,
+        prepared_at: DateTime<Utc>,
+        timing: CatalogCheckpointFixtureTiming,
     ) -> MissionCheckpointCompletion {
         let mut mission = service
             .load_mission(project_id, mission_id)
@@ -20784,7 +21041,7 @@ mod tests {
                         format!("Deterministic fixture artifact for {fixture_key}"),
                         [evidence_id],
                     ),
-                    prepared_at + Duration::milliseconds(1),
+                    timing.offset(prepared_at, 1),
                 )
                 .expect("record Checkpoint WorkProduct");
             work_product_ids.insert(work_product_id);
@@ -20793,7 +21050,7 @@ mod tests {
         let mut effect_ids = BTreeSet::new();
         if route.completion_policy == Some(MissionCheckpointCompletionPolicy::VerifiedEffect) {
             let effect_id = EffectId::from_stable(format!("fixture-effect-{fixture_key}"));
-            let proposed_at = prepared_at + Duration::milliseconds(2);
+            let proposed_at = timing.offset(prepared_at, 2);
             mission
                 .propose_effect(
                     EffectSpec {
@@ -20826,7 +21083,7 @@ mod tests {
                     proposed_at,
                 )
                 .expect("propose fixture Effect");
-            let decided_at = prepared_at + Duration::milliseconds(3);
+            let decided_at = timing.offset(prepared_at, 3);
             let scope_digest = mission
                 .effect(&effect_id)
                 .expect("fixture Effect")
@@ -20849,7 +21106,7 @@ mod tests {
                 )
                 .expect("approve fixture Effect");
             mission
-                .begin_effect(&effect_id, prepared_at + Duration::milliseconds(4))
+                .begin_effect(&effect_id, timing.offset(prepared_at, 4))
                 .expect("begin fixture Effect");
             let receipt_id = ReceiptId::from_stable(format!("fixture-receipt-{fixture_key}"));
             let request_digest = mission
@@ -20863,7 +21120,7 @@ mod tests {
                         id: receipt_id.clone(),
                         provider: "fixture-provider".into(),
                         external_id: format!("fixture-external-{fixture_key}"),
-                        accepted_at: prepared_at + Duration::milliseconds(5),
+                        accepted_at: timing.offset(prepared_at, 5),
                         request_digest,
                         response_digest: sha256(format!("response:{fixture_key}").as_bytes()),
                     },
@@ -20879,7 +21136,7 @@ mod tests {
                         status: VerificationStatus::Confirmed,
                         verifier: "fixture-independent-verifier".into(),
                         independent: true,
-                        observed_at: prepared_at + Duration::milliseconds(6),
+                        observed_at: timing.offset(prepared_at, 6),
                         evidence_digest: sha256(format!("verification:{fixture_key}").as_bytes()),
                         receipt_id,
                     },
@@ -20891,10 +21148,7 @@ mod tests {
             && mission.stage != MissionStage::Verifying
         {
             mission
-                .begin_checkpoint_verification(
-                    checkpoint_id,
-                    prepared_at + Duration::milliseconds(6),
-                )
+                .begin_checkpoint_verification(checkpoint_id, timing.offset(prepared_at, 6))
                 .expect("begin deterministic Checkpoint verification");
         }
 
@@ -20915,7 +21169,7 @@ mod tests {
                             "workProductCount": work_product_ids.len(),
                             "effectCount": effect_ids.len(),
                         }),
-                        prepared_at + Duration::milliseconds(6),
+                        timing.offset(prepared_at, 6),
                     )],
                 )
                 .expect("persist fixture Oracle evidence");
@@ -20927,7 +21181,7 @@ mod tests {
                             == Some(MissionCheckpointCompletionPolicy::HumanConfirmation))
             );
         }
-        let verified_at = prepared_at + Duration::milliseconds(7);
+        let verified_at = timing.offset(prepared_at, 7);
         let application_evidence = if route.executor == MissionCheckpointExecutor::Application {
             let definition = mission.definition.as_ref().expect("Catalog definition");
             let verifying_checkpoint = definition
@@ -28575,6 +28829,56 @@ sleep 30"#
         }
     }
 
+    #[derive(Debug)]
+    struct CountingRecoveryVerifier {
+        calls: usize,
+        status: VerificationStatus,
+        observed_at: DateTime<Utc>,
+    }
+
+    impl EffectVerifier for CountingRecoveryVerifier {
+        fn verify(
+            &mut self,
+            _effect: &hartevo_domain_kernel::Effect,
+            receipt: &Receipt,
+        ) -> Verification {
+            self.calls += 1;
+            Verification {
+                id: VerificationId::from("recovery-verification"),
+                status: self.status.clone(),
+                verifier: "recovery-readback".into(),
+                independent: true,
+                observed_at: self.observed_at,
+                evidence_digest: "6".repeat(64),
+                receipt_id: receipt.id.clone(),
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MismatchedReceiptVerifier {
+        calls: usize,
+    }
+
+    impl EffectVerifier for MismatchedReceiptVerifier {
+        fn verify(
+            &mut self,
+            _effect: &hartevo_domain_kernel::Effect,
+            _receipt: &Receipt,
+        ) -> Verification {
+            self.calls += 1;
+            Verification {
+                id: VerificationId::from("mismatched-recovery-verification"),
+                status: VerificationStatus::Confirmed,
+                verifier: "mismatched-recovery-readback".into(),
+                independent: true,
+                observed_at: Utc::now(),
+                evidence_digest: "5".repeat(64),
+                receipt_id: ReceiptId::from("wrong-receipt"),
+            }
+        }
+    }
+
     #[derive(Debug, Default)]
     struct UncertainRelationshipExecutor {
         calls: usize,
@@ -28654,9 +28958,10 @@ sleep 30"#
             },
             "application-reconciliation-worker",
         )
+        .with_lease_for(Duration::days(36_500))
     }
 
-    fn uncertain_preview_fixture(suffix: &str) -> UncertainPreviewFixture {
+    fn approved_preview_fixture(suffix: &str) -> UncertainPreviewFixture {
         let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
         let project_id = ProjectId::from_stable(format!("project-reconcile-{suffix}"));
         let mission_id = MissionId::from_stable(format!("mission-reconcile-{suffix}"));
@@ -28716,7 +29021,7 @@ sleep 30"#
                 now() + Duration::seconds(1),
             )
             .expect("effect");
-        let mut broker = preview_reconciliation_broker();
+        let broker = preview_reconciliation_broker();
         service
             .approve_effect(
                 &broker,
@@ -28727,23 +29032,6 @@ sleep 30"#
                 now() + Duration::seconds(2),
             )
             .expect("approval");
-        let mut executor = UncertainRelationshipExecutor::default();
-        let mut verifier = RelationshipVerifier {
-            observed_at: now() + Duration::seconds(4),
-        };
-        assert!(matches!(
-            service.execute_effect(
-                &mut broker,
-                &project_id,
-                &mission_id,
-                &effect_id,
-                &mut executor,
-                &mut verifier,
-                now() + Duration::seconds(3),
-            ),
-            Err(ApplicationError::Broker(BrokerError::ProviderUncertain(_)))
-        ));
-        assert_eq!(executor.calls, 1);
         UncertainPreviewFixture {
             service,
             broker,
@@ -28751,6 +29039,1151 @@ sleep 30"#
             mission_id,
             effect_id,
         }
+    }
+
+    fn uncertain_preview_fixture(suffix: &str) -> UncertainPreviewFixture {
+        let mut fixture = approved_preview_fixture(suffix);
+        let mut executor = UncertainRelationshipExecutor::default();
+        let mut verifier = RelationshipVerifier {
+            observed_at: now() + Duration::seconds(4),
+        };
+        assert!(matches!(
+            fixture.service.execute_effect(
+                &mut fixture.broker,
+                &fixture.project_id,
+                &fixture.mission_id,
+                &fixture.effect_id,
+                &mut executor,
+                &mut verifier,
+                now() + Duration::seconds(3),
+            ),
+            Err(ApplicationError::Broker(BrokerError::ProviderUncertain(_)))
+        ));
+        assert_eq!(executor.calls, 1);
+        fixture
+    }
+
+    struct ConversationRecoveryIds {
+        tenant_id: TenantId,
+        project_id: ProjectId,
+        mission_id: MissionId,
+        person_id: PersonId,
+        consent_id: ConsentRecordId,
+        connection_id: ConnectionId,
+        conversation_id: ConversationId,
+        effect: EffectId,
+    }
+
+    struct ConversationRecoveryFixture {
+        service: ApplicationService,
+        broker: EffectBroker,
+        ids: ConversationRecoveryIds,
+        base: DateTime<Utc>,
+    }
+
+    fn create_conversation_recovery_identity(
+        service: &mut ApplicationService,
+        ids: &ConversationRecoveryIds,
+        base: DateTime<Utc>,
+    ) {
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: ids.tenant_id.clone(),
+                    id: ids.project_id.clone(),
+                    name: "Conversation recovery".into(),
+                    description: String::new(),
+                    workspace_root: PathBuf::from("/tmp/hartevo-conversation-recovery"),
+                    storage_mode: StorageMode::LocalExisting,
+                },
+                base,
+            )
+            .expect("conversation recovery project");
+        service
+            .start_relationship_mission(
+                StartRelationshipMission {
+                    id: ids.mission_id.clone(),
+                    project_id: ids.project_id.clone(),
+                    task_id: TaskId::from_stable("conversation-recovery-task"),
+                    title: "Recover a conversation projection".into(),
+                    goal: "Fail closed when the effect ledger is ahead of Conversation".into(),
+                },
+                base,
+            )
+            .expect("relationship Mission");
+        service
+            .create_person(
+                Person::create(
+                    ids.person_id.clone(),
+                    ids.tenant_id.clone(),
+                    ids.project_id.clone(),
+                    "Recovery contact",
+                    None,
+                    vec![],
+                )
+                .expect("recovery person"),
+                base,
+            )
+            .expect("persist recovery person");
+        service
+            .grant_consent(
+                ConsentRecord::grant(
+                    ids.consent_id.clone(),
+                    ids.tenant_id.clone(),
+                    ids.project_id.clone(),
+                    ids.person_id.clone(),
+                    ConsentPurpose::AutomatedReply,
+                    hartevo_domain_kernel::ContactChannel::Email,
+                    "DE",
+                    LegalBasis::ExplicitConsent,
+                    "recovery-fixture",
+                    "1".repeat(64),
+                    base,
+                    None,
+                )
+                .expect("recovery consent"),
+                base,
+            )
+            .expect("persist recovery consent");
+    }
+
+    fn open_conversation_recovery_channel(
+        service: &mut ApplicationService,
+        ids: &ConversationRecoveryIds,
+        base: DateTime<Utc>,
+    ) {
+        service
+            .register_connection(
+                Connection::register(
+                    ids.connection_id.clone(),
+                    ids.tenant_id.clone(),
+                    ids.project_id.clone(),
+                    "gmail",
+                    AccountId::from("recovery-account"),
+                    "recovery@example.invalid",
+                    ["messages.send".into()],
+                    base,
+                )
+                .expect("recovery connection"),
+                base,
+            )
+            .expect("persist recovery connection");
+        service
+            .record_connection_probe(
+                &ids.project_id,
+                &ids.connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "recovery@example.invalid".into(),
+                    granted_scopes: BTreeSet::from(["messages.send".into()]),
+                    probed_at: base,
+                    valid_until: base + Duration::days(30),
+                    credential_expires_at: base + Duration::days(30),
+                    evidence_digest: "2".repeat(64),
+                },
+                base,
+            )
+            .expect("recovery connection probe");
+        service
+            .open_conversation(
+                Conversation::open(
+                    ids.conversation_id.clone(),
+                    ids.tenant_id.clone(),
+                    ids.project_id.clone(),
+                    Some(ids.mission_id.clone()),
+                    ids.person_id.clone(),
+                    None,
+                    MessagingGateway::Gmail,
+                    "gmail",
+                    ids.connection_id.clone(),
+                    AccountId::from("recovery-account"),
+                    "3".repeat(64),
+                    hartevo_domain_kernel::ContactChannel::Email,
+                    "DE",
+                    base,
+                )
+                .expect("recovery conversation"),
+                base,
+            )
+            .expect("persist recovery conversation");
+        let route_digest = service
+            .load_conversation(&ids.project_id, &ids.conversation_id)
+            .expect("persisted recovery conversation")
+            .route_digest;
+        service
+            .ingest_conversation_inbound(
+                &ids.project_id,
+                &ids.conversation_id,
+                InboundMessageInput {
+                    id: MessageId::from("recovery-inbound"),
+                    provider_event_digest: "4".repeat(64),
+                    content_digest: "5".repeat(64),
+                    attachment_digests: BTreeSet::new(),
+                    risk: ConversationContentRisk::Safe,
+                    classification_confidence: "0.99".parse().expect("confidence"),
+                    occurred_at: base + Duration::seconds(1),
+                },
+                &WebhookAttestation {
+                    signature_verified: true,
+                    route_digest,
+                    provider: "gmail".into(),
+                    connection_id: ids.connection_id.clone(),
+                    account_id: AccountId::from("recovery-account"),
+                    received_at: base + Duration::seconds(1),
+                },
+            )
+            .expect("recovery inbound");
+    }
+
+    fn conversation_recovery_fixture(suffix: &str) -> ConversationRecoveryFixture {
+        let base = Utc::now() - Duration::minutes(10);
+        let ids = ConversationRecoveryIds {
+            tenant_id: TenantId::from_stable(format!("tenant-conversation-{suffix}")),
+            project_id: ProjectId::from_stable(format!("project-conversation-{suffix}")),
+            mission_id: MissionId::from_stable(format!("mission-conversation-{suffix}")),
+            person_id: PersonId::from_stable(format!("person-conversation-{suffix}")),
+            consent_id: ConsentRecordId::from_stable(format!("consent-conversation-{suffix}")),
+            connection_id: ConnectionId::from_stable(format!("connection-conversation-{suffix}")),
+            conversation_id: ConversationId::from_stable(format!("conversation-recovery-{suffix}")),
+            effect: EffectId::from_stable(format!("effect-conversation-{suffix}")),
+        };
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        create_conversation_recovery_identity(&mut service, &ids, base);
+        open_conversation_recovery_channel(&mut service, &ids, base);
+        let mut command = relationship_reply_command(
+            &ids.project_id,
+            &ids.conversation_id,
+            &ids.connection_id,
+            &ids.consent_id,
+            &ids.effect,
+            "recovery-outbound",
+        );
+        command.account_id = Some(
+            service
+                .load_conversation(&ids.project_id, &ids.conversation_id)
+                .expect("persisted recovery Conversation account")
+                .account_id,
+        );
+        service
+            .prepare_conversation_reply_effect(&command, base + Duration::seconds(2))
+            .expect("prepare recovery reply");
+        let broker = relationship_policy_broker();
+        service
+            .approve_effect(
+                &broker,
+                &ids.project_id,
+                &ids.mission_id,
+                &ids.effect,
+                ActorId::from("recovery-approver"),
+                base + Duration::seconds(3),
+            )
+            .expect("approve recovery reply");
+        ConversationRecoveryFixture {
+            service,
+            broker,
+            ids,
+            base,
+        }
+    }
+
+    struct CreatorRecoveryIds {
+        tenant_id: TenantId,
+        project_id: ProjectId,
+        mission_id: MissionId,
+        task_id: CreatorTaskId,
+        milestone_id: CreatorMilestoneId,
+        deliverable_id: DeliverableId,
+        creator_id: CreatorId,
+        connection_id: ConnectionId,
+        effect: EffectId,
+    }
+
+    struct CreatorRecoveryFixture {
+        service: ApplicationService,
+        broker: EffectBroker,
+        ids: CreatorRecoveryIds,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CreatorRecoveryProjectionSnapshot {
+        mission: Mission,
+        task: CreatorTask,
+        events: Vec<DomainEventRecord>,
+        outbox: Vec<hartevo_storage::OutboxMessage>,
+    }
+
+    fn creator_recovery_projection_snapshot(
+        service: &ApplicationService,
+        ids: &CreatorRecoveryIds,
+    ) -> CreatorRecoveryProjectionSnapshot {
+        CreatorRecoveryProjectionSnapshot {
+            mission: service
+                .load_mission(&ids.project_id, &ids.mission_id)
+                .expect("creator recovery Mission snapshot"),
+            task: service
+                .load_creator_task(&ids.project_id, &ids.task_id)
+                .expect("creator recovery task snapshot"),
+            events: project_mission_event_snapshot(service, &ids.project_id),
+            outbox: all_outbox_snapshot(service),
+        }
+    }
+
+    fn creator_recovery_eligibility(
+        ids: &CreatorRecoveryIds,
+        base: DateTime<Utc>,
+    ) -> CreatorEligibility {
+        CreatorEligibility {
+            creator_id: ids.creator_id.clone(),
+            connected_account_id: AccountId::from("creator-recovery-account"),
+            connection_id: ids.connection_id.clone(),
+            kyc_verified: true,
+            payouts_enabled: true,
+            region_supported: true,
+            verified_at: base,
+            expires_at: base + Duration::days(30),
+            verification_evidence_digest: "9".repeat(64),
+        }
+    }
+
+    fn create_creator_recovery_scope(
+        service: &mut ApplicationService,
+        ids: &CreatorRecoveryIds,
+        base: DateTime<Utc>,
+    ) {
+        let usd = CurrencyCode::parse("USD").expect("USD");
+        let bounty = Money::new(5_000, usd.clone());
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: ids.tenant_id.clone(),
+                    id: ids.project_id.clone(),
+                    name: "Creator payout recovery".into(),
+                    description: String::new(),
+                    workspace_root: PathBuf::from("/tmp/hartevo-creator-recovery"),
+                    storage_mode: StorageMode::LocalExisting,
+                },
+                base,
+            )
+            .expect("creator recovery project");
+        service
+            .start_creator_work_mission(
+                StartCreatorWorkMission {
+                    id: ids.mission_id.clone(),
+                    project_id: ids.project_id.clone(),
+                    task_id: TaskId::from_stable("creator-recovery-mission-task"),
+                    title: "Creator payout recovery".into(),
+                    goal: "Fail closed when payout ledger is ahead of projections".into(),
+                    mode: OperatingMode::Campaign,
+                },
+                base,
+            )
+            .expect("creator recovery Mission");
+        let task = CreatorTask::create(
+            CreatorTaskSpec {
+                id: ids.task_id.clone(),
+                tenant_id: ids.tenant_id.clone(),
+                project_id: ids.project_id.clone(),
+                mission_id: ids.mission_id.clone(),
+                creator_id: ids.creator_id.clone(),
+                hiring_award: CreatorHiringAward {
+                    hiring_id: CreatorHiringId::from("creator-recovery-hiring"),
+                    tenant_id: ids.tenant_id.clone(),
+                    project_id: ids.project_id.clone(),
+                    mission_id: ids.mission_id.clone(),
+                    creator_id: ids.creator_id.clone(),
+                    partner_id: PartnerId::from("creator-recovery-partner"),
+                    application_id: CreatorApplicationId::from("creator-recovery-application"),
+                    offer_digest: "1".repeat(64),
+                    bounty: bounty.clone(),
+                    selected_by: ActorId::from("creator-recovery-selector"),
+                    selection_evidence_digest: "2".repeat(64),
+                    selected_at: base,
+                },
+                title: "Recovery deliverable".into(),
+                brief: "Produce one reviewed recovery fixture deliverable".into(),
+                acceptance_criteria: vec!["Matches the approved scope".into()],
+                deliverable_requirements: vec!["Includes the source manifest".into()],
+                bounty: bounty.clone(),
+                milestones: vec![CreatorMilestoneSpec {
+                    id: ids.milestone_id.clone(),
+                    title: "Reviewed delivery".into(),
+                    amount: bounty,
+                    due_at: base + Duration::days(7),
+                }],
+                revision_limit: 1,
+                usage_rights: UsageRights {
+                    license: "campaign recovery use".into(),
+                    territories: vec!["US".into()],
+                    channels: vec!["owned".into()],
+                    exclusivity: "none".into(),
+                    disclosure_required: true,
+                    source_manifest_required: true,
+                },
+                due_at: base + Duration::days(10),
+            },
+            base,
+        )
+        .expect("creator recovery task");
+        service
+            .store
+            .create_creator_task(
+                &task,
+                "creator_task.created",
+                &serde_json::json!({"taskId": task.id}),
+                base,
+            )
+            .expect("persist creator recovery task");
+    }
+
+    fn register_creator_recovery_connection(
+        service: &mut ApplicationService,
+        ids: &CreatorRecoveryIds,
+        base: DateTime<Utc>,
+    ) {
+        service
+            .register_connection(
+                Connection::register(
+                    ids.connection_id.clone(),
+                    ids.tenant_id.clone(),
+                    ids.project_id.clone(),
+                    "stripe-connect",
+                    AccountId::from("creator-recovery-account"),
+                    "creator-recovery-account",
+                    ["payout.write".into()],
+                    base,
+                )
+                .expect("creator recovery connection"),
+                base,
+            )
+            .expect("persist creator recovery connection");
+        service
+            .record_connection_probe(
+                &ids.project_id,
+                &ids.connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "creator-recovery-account".into(),
+                    granted_scopes: BTreeSet::from(["payout.write".into()]),
+                    probed_at: base,
+                    valid_until: base + Duration::days(30),
+                    credential_expires_at: base + Duration::days(30),
+                    evidence_digest: "3".repeat(64),
+                },
+                base,
+            )
+            .expect("creator recovery connection probe");
+    }
+
+    fn fund_and_accept_creator_recovery_task(
+        service: &mut ApplicationService,
+        ids: &CreatorRecoveryIds,
+        base: DateTime<Utc>,
+    ) {
+        let task = service
+            .load_creator_task(&ids.project_id, &ids.task_id)
+            .expect("draft creator recovery task");
+        service
+            .publish_creator_task(
+                PublishCreatorTask {
+                    project_id: ids.project_id.clone(),
+                    task_id: ids.task_id.clone(),
+                    reservation: FundingReservation {
+                        provider: "stripe-connect".into(),
+                        external_id: "creator-recovery-reservation".into(),
+                        connection_id: ids.connection_id.clone(),
+                        payer_account_id: AccountId::from("creator-recovery-payer"),
+                        amount: task.bounty.clone(),
+                        contract_revision: task.contract_revision,
+                        contract_digest: task.contract_digest(),
+                        reserved_at: base + Duration::minutes(1),
+                        expires_at: base + Duration::days(30),
+                        request_digest: "4".repeat(64),
+                        provider_receipt_digest: "5".repeat(64),
+                        verification_evidence_digest: "6".repeat(64),
+                    },
+                },
+                base + Duration::minutes(1),
+            )
+            .expect("fund creator recovery task");
+        let published = service
+            .load_creator_task(&ids.project_id, &ids.task_id)
+            .expect("published creator recovery task");
+        service
+            .accept_creator_task(
+                &AcceptCreatorTask {
+                    project_id: ids.project_id.clone(),
+                    task_id: ids.task_id.clone(),
+                    eligibility: creator_recovery_eligibility(ids, base),
+                    contract_digest: published.contract_digest(),
+                },
+                base + Duration::minutes(2),
+            )
+            .expect("accept creator recovery task");
+        service
+            .start_creator_work(&ids.project_id, &ids.task_id, base + Duration::minutes(3))
+            .expect("start creator recovery work");
+    }
+
+    fn submit_and_review_creator_recovery_deliverable(
+        service: &mut ApplicationService,
+        ids: &CreatorRecoveryIds,
+        base: DateTime<Utc>,
+    ) {
+        service
+            .submit_creator_deliverable(
+                SubmitCreatorDeliverable {
+                    project_id: ids.project_id.clone(),
+                    task_id: ids.task_id.clone(),
+                    deliverable: CreatorDeliverableInput {
+                        id: ids.deliverable_id.clone(),
+                        milestone_id: ids.milestone_id.clone(),
+                        artifact_uri: "cas://creator/recovery-deliverable".into(),
+                        media_type: "application/zip".into(),
+                        size_bytes: 1_024,
+                        content_digest: "7".repeat(64),
+                        uploaded_at: base + Duration::minutes(4),
+                        assessment: DeliverableAssessment {
+                            scanner: "recovery-scanner".into(),
+                            clean: true,
+                            assessed_at: base + Duration::minutes(4),
+                            evidence_digest: "8".repeat(64),
+                        },
+                        rights: RightsAttestation {
+                            ownership_or_license: "creator original".into(),
+                            source_manifest_digest: "9".repeat(64),
+                            permitted_use: "campaign recovery use".into(),
+                            verified: true,
+                        },
+                    },
+                },
+                base + Duration::minutes(4),
+            )
+            .expect("submit creator recovery deliverable");
+        service
+            .review_creator_deliverable(
+                ReviewCreatorDeliverable {
+                    project_id: ids.project_id.clone(),
+                    task_id: ids.task_id.clone(),
+                    deliverable_id: ids.deliverable_id.clone(),
+                    review_id: ReviewId::from("creator-recovery-review"),
+                    reviewer_id: ActorId::from("creator-recovery-reviewer"),
+                    decision: ReviewDecision::Accept,
+                    acceptance_checks: vec![
+                        AcceptanceCheck {
+                            requirement: "Matches the approved scope".into(),
+                            satisfied: true,
+                            evidence: "scope-check".into(),
+                        },
+                        AcceptanceCheck {
+                            requirement: "Includes the source manifest".into(),
+                            satisfied: true,
+                            evidence: "manifest-check".into(),
+                        },
+                    ],
+                    notes: "Recovery fixture accepted".into(),
+                },
+                base + Duration::minutes(5),
+            )
+            .expect("review creator recovery deliverable");
+    }
+
+    fn creator_recovery_broker() -> EffectBroker {
+        EffectBroker::new(
+            EffectPolicy {
+                version: "creator-recovery-policy-v1".into(),
+                allowed_capabilities: BTreeSet::from(["settlement.payout".into()]),
+                allowed_classes: BTreeSet::from([EffectClass::Payment]),
+                max_amounts_minor: BTreeMap::from([(
+                    CurrencyCode::parse("USD").expect("USD"),
+                    5_000,
+                )]),
+                rate_limits: vec![EffectRateLimit {
+                    rule_id: "creator-recovery-payout-per-minute".into(),
+                    provider: "stripe-connect".into(),
+                    capability: "settlement.payout".into(),
+                    max_executions: 10,
+                    window_seconds: 60,
+                }],
+            },
+            "creator-recovery-worker",
+        )
+        .with_lease_for(Duration::days(36_500))
+    }
+
+    fn enter_uncertain_creator_recovery_state(
+        service: &mut ApplicationService,
+        broker: &mut EffectBroker,
+        ids: &CreatorRecoveryIds,
+        entry_at: DateTime<Utc>,
+    ) {
+        let mut executor = UncertainPayoutExecutor::default();
+        let mut verifier = CountingRecoveryVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+            observed_at: entry_at,
+        };
+        assert!(matches!(
+            service.execute_effect(
+                broker,
+                &ids.project_id,
+                &ids.mission_id,
+                &ids.effect,
+                &mut executor,
+                &mut verifier,
+                entry_at,
+            ),
+            Err(ApplicationError::Broker(BrokerError::ProviderUncertain(_)))
+        ));
+        assert_eq!((executor.calls, verifier.calls), (1, 0));
+    }
+
+    fn creator_recovery_fixture(suffix: &str) -> CreatorRecoveryFixture {
+        let system_anchor = Utc::now();
+        let base = system_anchor
+            .checked_sub_signed(Duration::minutes(10))
+            .expect("bounded creator recovery timeline");
+        let approval_at = base
+            .checked_add_signed(Duration::minutes(7))
+            .expect("bounded creator recovery approval time");
+        let execution_entry_at = base
+            .checked_add_signed(Duration::minutes(8))
+            .expect("bounded creator recovery execution time");
+        let ids = CreatorRecoveryIds {
+            tenant_id: TenantId::from_stable(format!("tenant-creator-{suffix}")),
+            project_id: ProjectId::from_stable(format!("project-creator-{suffix}")),
+            mission_id: MissionId::from_stable(format!("mission-creator-{suffix}")),
+            task_id: CreatorTaskId::from_stable(format!("task-creator-{suffix}")),
+            milestone_id: CreatorMilestoneId::from_stable(format!("milestone-creator-{suffix}")),
+            deliverable_id: DeliverableId::from_stable(format!("deliverable-creator-{suffix}")),
+            creator_id: CreatorId::from_stable(format!("creator-{suffix}")),
+            connection_id: ConnectionId::from_stable(format!("connection-creator-{suffix}")),
+            effect: EffectId::from_stable(format!("effect-creator-{suffix}")),
+        };
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        create_creator_recovery_scope(&mut service, &ids, base);
+        register_creator_recovery_connection(&mut service, &ids, base);
+        fund_and_accept_creator_recovery_task(&mut service, &ids, base);
+        submit_and_review_creator_recovery_deliverable(&mut service, &ids, base);
+        service
+            .prepare_creator_payout(
+                &PrepareCreatorPayout {
+                    project_id: ids.project_id.clone(),
+                    task_id: ids.task_id.clone(),
+                    milestone_id: ids.milestone_id.clone(),
+                    payout_id: PayoutId::from_stable(format!("payout-creator-{suffix}")),
+                    effect_id: ids.effect.clone(),
+                    actor_id: ActorId::from("creator-recovery-actor"),
+                    eligibility: creator_recovery_eligibility(&ids, base),
+                    policy_version: "creator-recovery-policy-v1".into(),
+                    timezone: "UTC".into(),
+                    expires_in: Duration::hours(24),
+                },
+                base + Duration::minutes(6),
+            )
+            .expect("prepare creator recovery payout");
+        let mut broker = creator_recovery_broker();
+        service
+            .approve_effect(
+                &broker,
+                &ids.project_id,
+                &ids.mission_id,
+                &ids.effect,
+                ActorId::from("creator-recovery-approver"),
+                approval_at,
+            )
+            .expect("approve creator recovery payout");
+        enter_uncertain_creator_recovery_state(&mut service, &mut broker, &ids, execution_entry_at);
+        CreatorRecoveryFixture {
+            service,
+            broker,
+            ids,
+        }
+    }
+
+    #[test]
+    fn application_future_entry_and_expired_completion_write_no_projection() {
+        let mut fixture = approved_preview_fixture("authority-zero-execute");
+        let mission_before = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("approved mission snapshot");
+        let events_before = fixture
+            .service
+            .mission_events(&fixture.project_id, &fixture.mission_id)
+            .expect("approved mission events");
+        let outbox_before = all_outbox_snapshot(&fixture.service);
+        let mut executor = CountingRelationshipExecutor {
+            calls: 0,
+            accepted_at: now() + Duration::seconds(4),
+        };
+        let mut verifier = RelationshipVerifier {
+            observed_at: now() + Duration::seconds(5),
+        };
+
+        assert!(matches!(
+            fixture.service.execute_effect(
+                &mut fixture.broker,
+                &fixture.project_id,
+                &fixture.mission_id,
+                &fixture.effect_id,
+                &mut executor,
+                &mut verifier,
+                Utc::now() + Duration::hours(1),
+            ),
+            Err(ApplicationError::Broker(BrokerError::InvalidAuthorityClock))
+        ));
+        assert_eq!(executor.calls, 0);
+        assert_eq!(
+            fixture
+                .service
+                .load_mission(&fixture.project_id, &fixture.mission_id)
+                .expect("future-entry mission"),
+            mission_before
+        );
+        let events_after_future = fixture
+            .service
+            .mission_events(&fixture.project_id, &fixture.mission_id)
+            .expect("future-entry events");
+        assert_eq!(events_after_future, events_before);
+        assert_eq!(all_outbox_snapshot(&fixture.service), outbox_before);
+
+        let broker = std::mem::replace(&mut fixture.broker, preview_reconciliation_broker());
+        fixture.broker = broker.with_lease_for(Duration::nanoseconds(1));
+        assert!(matches!(
+            fixture.service.execute_effect(
+                &mut fixture.broker,
+                &fixture.project_id,
+                &fixture.mission_id,
+                &fixture.effect_id,
+                &mut executor,
+                &mut verifier,
+                now() + Duration::seconds(3),
+            ),
+            Err(ApplicationError::Broker(BrokerError::Ledger(
+                hartevo_effect_broker::LedgerError::LeaseLost
+            )))
+        ));
+        assert_eq!(executor.calls, 1);
+        assert_eq!(
+            fixture
+                .service
+                .load_mission(&fixture.project_id, &fixture.mission_id)
+                .expect("expired-completion mission"),
+            mission_before
+        );
+        let events_after_expiry = fixture
+            .service
+            .mission_events(&fixture.project_id, &fixture.mission_id)
+            .expect("expired-completion events");
+        assert_eq!(events_after_expiry, events_before);
+        assert_eq!(all_outbox_snapshot(&fixture.service), outbox_before);
+    }
+
+    #[test]
+    fn application_reconciliation_expiry_writes_no_projection() {
+        let mut fixture = uncertain_preview_fixture("authority-zero-reconcile");
+        let broker = std::mem::replace(&mut fixture.broker, preview_reconciliation_broker());
+        fixture.broker = broker.with_lease_for(Duration::nanoseconds(1));
+        let mission_before = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("uncertain mission snapshot");
+        let events_before = fixture
+            .service
+            .mission_events(&fixture.project_id, &fixture.mission_id)
+            .expect("uncertain mission events");
+        let outbox_before = all_outbox_snapshot(&fixture.service);
+        let effect = mission_before
+            .effect(&fixture.effect_id)
+            .expect("uncertain effect");
+        let mut reconciler = FixedReconciler {
+            calls: 0,
+            observation: ReconciliationObservation::ReceiptFound {
+                receipt: Receipt {
+                    id: ReceiptId::from("expired-reconciliation-receipt"),
+                    provider: effect.provider.clone(),
+                    external_id: "expired-reconciliation-external".into(),
+                    accepted_at: now() + Duration::seconds(3),
+                    request_digest: effect.approval_digest(),
+                    response_digest: "7".repeat(64),
+                },
+                evidence_digest: "8".repeat(64),
+                observed_at: now() + Duration::seconds(4),
+            },
+        };
+        let mut verifier = RelationshipVerifier {
+            observed_at: now() + Duration::seconds(5),
+        };
+
+        assert!(matches!(
+            fixture.service.reconcile_effect(
+                &mut fixture.broker,
+                &fixture.project_id,
+                &fixture.mission_id,
+                &fixture.effect_id,
+                &mut reconciler,
+                &mut verifier,
+                now() + Duration::seconds(4),
+            ),
+            Err(ApplicationError::Broker(BrokerError::Ledger(
+                hartevo_effect_broker::LedgerError::LeaseLost
+            )))
+        ));
+        assert_eq!(reconciler.calls, 1);
+        assert_eq!(
+            fixture
+                .service
+                .load_mission(&fixture.project_id, &fixture.mission_id)
+                .expect("expired reconciliation mission"),
+            mission_before
+        );
+        let events_after = fixture
+            .service
+            .mission_events(&fixture.project_id, &fixture.mission_id)
+            .expect("expired reconciliation events");
+        assert_eq!(events_after, events_before);
+        assert_eq!(all_outbox_snapshot(&fixture.service), outbox_before);
+    }
+
+    #[test]
+    fn execute_effect_crash_ahead_ledger_requires_recovery_without_projection_mutation() {
+        let mut fixture = approved_preview_fixture("crash-ahead-execute");
+        let mut crash_projection = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("stale approved Mission");
+        let mut crash_executor = CountingRelationshipExecutor {
+            calls: 0,
+            accepted_at: now() + Duration::seconds(3),
+        };
+        let mut crash_verifier = CountingRecoveryVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+            observed_at: now() + Duration::seconds(4),
+        };
+        fixture
+            .broker
+            .execute_and_verify_authority_bound(
+                &mut crash_projection,
+                &fixture.effect_id,
+                &mut fixture.service.store,
+                &mut crash_executor,
+                &mut crash_verifier,
+                now() + Duration::seconds(3),
+            )
+            .expect("ledger commits ahead of the stale Mission projection");
+        assert_eq!((crash_executor.calls, crash_verifier.calls), (1, 1));
+        assert_eq!(
+            crash_projection
+                .effect(&fixture.effect_id)
+                .expect("crash projection effect")
+                .status,
+            EffectStatus::Verified
+        );
+
+        let mission_before = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("durably stale Mission");
+        let events_before = project_mission_event_snapshot(&fixture.service, &fixture.project_id);
+        let outbox_before = all_outbox_snapshot(&fixture.service);
+        let mut forbidden_executor = CountingRelationshipExecutor {
+            calls: 0,
+            accepted_at: now() + Duration::seconds(5),
+        };
+        let mut forbidden_verifier = CountingRecoveryVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+            observed_at: now() + Duration::seconds(5),
+        };
+
+        assert!(matches!(
+            fixture.service.execute_effect(
+                &mut fixture.broker,
+                &fixture.project_id,
+                &fixture.mission_id,
+                &fixture.effect_id,
+                &mut forbidden_executor,
+                &mut forbidden_verifier,
+                now() + Duration::seconds(5),
+            ),
+            Err(ApplicationError::Broker(
+                BrokerError::DurableProjectionRecoveryRequired
+            ))
+        ));
+        assert_eq!((forbidden_executor.calls, forbidden_verifier.calls), (0, 0));
+        assert_eq!(
+            fixture
+                .service
+                .load_mission(&fixture.project_id, &fixture.mission_id)
+                .expect("Mission after recovery-required execute"),
+            mission_before
+        );
+        let events_after = project_mission_event_snapshot(&fixture.service, &fixture.project_id);
+        assert_eq!(events_after, events_before);
+        assert_eq!(all_outbox_snapshot(&fixture.service), outbox_before);
+    }
+
+    #[test]
+    fn reconcile_effect_crash_ahead_ledger_requires_recovery_without_projection_mutation() {
+        let mut fixture = uncertain_preview_fixture("crash-ahead-reconcile");
+        let mut crash_projection = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("stale uncertain Mission");
+        let mut crash_reconciler = FixedReconciler {
+            calls: 0,
+            observation: ReconciliationObservation::NotExecuted {
+                evidence_digest: "4".repeat(64),
+                observed_at: now() + Duration::seconds(4),
+            },
+        };
+        let mut unused_verifier = CountingRecoveryVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+            observed_at: now() + Duration::seconds(4),
+        };
+        let crash_error = fixture
+            .broker
+            .reconcile_uncertain_authority_bound(
+                &mut crash_projection,
+                &fixture.effect_id,
+                &mut fixture.service.store,
+                &mut crash_reconciler,
+                &mut unused_verifier,
+                now() + Duration::seconds(4),
+            )
+            .expect_err("terminal reconciliation commits ahead of Mission projection");
+        assert!(matches!(
+            crash_error.error(),
+            BrokerError::ProviderNotExecuted { .. }
+        ));
+        assert_eq!((crash_reconciler.calls, unused_verifier.calls), (1, 0));
+        assert_eq!(
+            crash_projection
+                .effect(&fixture.effect_id)
+                .expect("crash projection effect")
+                .status,
+            EffectStatus::Reconciled
+        );
+
+        let mission_before = fixture
+            .service
+            .load_mission(&fixture.project_id, &fixture.mission_id)
+            .expect("durably stale uncertain Mission");
+        let events_before = project_mission_event_snapshot(&fixture.service, &fixture.project_id);
+        let outbox_before = all_outbox_snapshot(&fixture.service);
+        let mut forbidden_reconciler = FixedReconciler {
+            calls: 0,
+            observation: ReconciliationObservation::NotExecuted {
+                evidence_digest: "5".repeat(64),
+                observed_at: now() + Duration::seconds(5),
+            },
+        };
+        let mut forbidden_verifier = CountingRecoveryVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+            observed_at: now() + Duration::seconds(5),
+        };
+
+        assert!(matches!(
+            fixture.service.reconcile_effect(
+                &mut fixture.broker,
+                &fixture.project_id,
+                &fixture.mission_id,
+                &fixture.effect_id,
+                &mut forbidden_reconciler,
+                &mut forbidden_verifier,
+                now() + Duration::seconds(5),
+            ),
+            Err(ApplicationError::Broker(
+                BrokerError::DurableProjectionRecoveryRequired
+            ))
+        ));
+        assert_eq!(
+            (forbidden_reconciler.calls, forbidden_verifier.calls),
+            (0, 0)
+        );
+        assert_eq!(
+            fixture
+                .service
+                .load_mission(&fixture.project_id, &fixture.mission_id)
+                .expect("Mission after recovery-required reconciliation"),
+            mission_before
+        );
+        let events_after = project_mission_event_snapshot(&fixture.service, &fixture.project_id);
+        assert_eq!(events_after, events_before);
+        assert_eq!(all_outbox_snapshot(&fixture.service), outbox_before);
+    }
+
+    #[test]
+    fn execute_effect_conversation_receipt_ahead_requires_recovery_without_projection_mutation() {
+        let mut fixture = conversation_recovery_fixture("receipt-ahead");
+        let mut crash_projection = fixture
+            .service
+            .load_mission(&fixture.ids.project_id, &fixture.ids.mission_id)
+            .expect("stale conversation Mission");
+        let mut crash_executor = CountingRelationshipExecutor {
+            calls: 0,
+            accepted_at: fixture.base + Duration::seconds(4),
+        };
+        let mut mismatched_verifier = MismatchedReceiptVerifier::default();
+        let crash_error = fixture
+            .broker
+            .execute_and_verify_authority_bound(
+                &mut crash_projection,
+                &fixture.ids.effect,
+                &mut fixture.service.store,
+                &mut crash_executor,
+                &mut mismatched_verifier,
+                fixture.base + Duration::seconds(4),
+            )
+            .expect_err("receipt commits before invalid verification projection");
+        assert!(matches!(
+            crash_error.error(),
+            BrokerError::Domain(MissionError::VerificationReceiptMismatch)
+        ));
+        assert!(crash_error.authority().provider().is_some());
+        assert!(crash_error.authority().verification().is_none());
+        assert_eq!((crash_executor.calls, mismatched_verifier.calls), (1, 1));
+
+        let mission_before = fixture
+            .service
+            .load_mission(&fixture.ids.project_id, &fixture.ids.mission_id)
+            .expect("durably stale conversation Mission");
+        let conversation_before = fixture
+            .service
+            .load_conversation(&fixture.ids.project_id, &fixture.ids.conversation_id)
+            .expect("conversation before recovery-required execute");
+        let events_before =
+            project_mission_event_snapshot(&fixture.service, &fixture.ids.project_id);
+        let outbox_before = all_outbox_snapshot(&fixture.service);
+        let mut forbidden_executor = CountingRelationshipExecutor {
+            calls: 0,
+            accepted_at: fixture.base + Duration::seconds(5),
+        };
+        let mut forbidden_verifier = CountingRecoveryVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+            observed_at: fixture.base + Duration::seconds(5),
+        };
+
+        assert!(matches!(
+            fixture.service.execute_effect(
+                &mut fixture.broker,
+                &fixture.ids.project_id,
+                &fixture.ids.mission_id,
+                &fixture.ids.effect,
+                &mut forbidden_executor,
+                &mut forbidden_verifier,
+                fixture.base + Duration::seconds(5),
+            ),
+            Err(ApplicationError::Broker(
+                BrokerError::DurableProjectionRecoveryRequired
+            ))
+        ));
+        assert_eq!((forbidden_executor.calls, forbidden_verifier.calls), (0, 0));
+        assert_eq!(
+            fixture
+                .service
+                .load_mission(&fixture.ids.project_id, &fixture.ids.mission_id)
+                .expect("Mission after conversation recovery-required execute"),
+            mission_before
+        );
+        assert_eq!(
+            fixture
+                .service
+                .load_conversation(&fixture.ids.project_id, &fixture.ids.conversation_id)
+                .expect("Conversation after recovery-required execute"),
+            conversation_before
+        );
+        let events_after =
+            project_mission_event_snapshot(&fixture.service, &fixture.ids.project_id);
+        assert_eq!(events_after, events_before);
+        assert_eq!(all_outbox_snapshot(&fixture.service), outbox_before);
+    }
+
+    #[test]
+    fn reconcile_creator_payout_crash_ahead_requires_recovery_without_projection_mutation() {
+        let mut fixture = creator_recovery_fixture("crash-ahead");
+        let mut crash_projection = fixture
+            .service
+            .load_mission(&fixture.ids.project_id, &fixture.ids.mission_id)
+            .expect("stale uncertain creator payout Mission");
+        let reconciliation_at = Utc::now();
+        let mut crash_reconciler = FixedReconciler {
+            calls: 0,
+            observation: ReconciliationObservation::NotExecuted {
+                evidence_digest: "a".repeat(64),
+                observed_at: reconciliation_at,
+            },
+        };
+        let mut unused_verifier = CountingRecoveryVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+            observed_at: reconciliation_at,
+        };
+        let crash_error = fixture
+            .broker
+            .reconcile_uncertain_authority_bound(
+                &mut crash_projection,
+                &fixture.ids.effect,
+                &mut fixture.service.store,
+                &mut crash_reconciler,
+                &mut unused_verifier,
+                reconciliation_at,
+            )
+            .expect_err("creator payout ledger commits ahead of Mission and task projections");
+        assert!(matches!(
+            crash_error.error(),
+            BrokerError::ProviderNotExecuted { .. }
+        ));
+        assert_eq!((crash_reconciler.calls, unused_verifier.calls), (1, 0));
+        assert_eq!(
+            crash_projection
+                .effect(&fixture.ids.effect)
+                .expect("crash-ahead payout effect")
+                .status,
+            EffectStatus::Reconciled
+        );
+
+        let projections_before =
+            creator_recovery_projection_snapshot(&fixture.service, &fixture.ids);
+        let mut forbidden_reconciler = FixedReconciler {
+            calls: 0,
+            observation: ReconciliationObservation::NotExecuted {
+                evidence_digest: "b".repeat(64),
+                observed_at: Utc::now(),
+            },
+        };
+        let mut forbidden_verifier = CountingRecoveryVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+            observed_at: Utc::now(),
+        };
+
+        assert!(matches!(
+            fixture.service.reconcile_creator_payout(
+                &mut fixture.broker,
+                &fixture.ids.project_id,
+                &fixture.ids.task_id,
+                &fixture.ids.effect,
+                &mut forbidden_reconciler,
+                &mut forbidden_verifier,
+                Utc::now(),
+            ),
+            Err(ApplicationError::Broker(
+                BrokerError::DurableProjectionRecoveryRequired
+            ))
+        ));
+        assert_eq!(
+            (forbidden_reconciler.calls, forbidden_verifier.calls),
+            (0, 0)
+        );
+        assert_eq!(
+            creator_recovery_projection_snapshot(&fixture.service, &fixture.ids),
+            projections_before
+        );
     }
 
     #[test]
@@ -28788,13 +30221,11 @@ sleep 30"#
             })) if stored == evidence_digest
         ));
         assert_eq!(reconciler.calls, 1);
+        let terminal_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("terminal mission");
         assert_eq!(
-            service
-                .load_mission(&project_id, &mission_id)
-                .expect("terminal mission")
-                .effect(&effect_id)
-                .expect("effect")
-                .status,
+            terminal_mission.effect(&effect_id).expect("effect").status,
             EffectStatus::Reconciled
         );
         let mut forbidden_replay = CountingRelationshipExecutor {
@@ -28812,17 +30243,27 @@ sleep 30"#
                 now() + Duration::seconds(5),
             ),
             Err(ApplicationError::Broker(
-                BrokerError::ProviderNotExecuted { .. }
+                BrokerError::DurableProjectionRecoveryRequired
             ))
         ));
         assert_eq!(forbidden_replay.calls, 0);
-        assert!(
-            service
-                .mission_events(&project_id, &mission_id)
-                .expect("events")
-                .iter()
-                .any(|event| event.event_type == "effect.reconciled_not_executed")
+        let events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events");
+        let reconciliation_event = events
+            .iter()
+            .find(|event| event.event_type == "effect.reconciled_not_executed")
+            .expect("reconciliation event");
+        assert_eq!(reconciliation_event.payload["authoritySequence"], 1);
+        assert_eq!(
+            terminal_mission.updated_at,
+            reconciliation_event.recorded_at
         );
+        assert_ne!(
+            reconciliation_event.recorded_at,
+            now() + Duration::seconds(4)
+        );
+        assert_event_outbox_time(&service, reconciliation_event);
     }
 
     #[test]
@@ -28880,19 +30321,20 @@ sleep 30"#
             calls: 0,
             accepted_at: now() + Duration::seconds(5),
         };
-        assert!(
-            service
-                .execute_effect(
-                    &mut broker,
-                    &project_id,
-                    &mission_id,
-                    &effect_id,
-                    &mut forbidden_replay,
-                    &mut verifier,
-                    now() + Duration::seconds(5),
-                )
-                .is_err()
-        );
+        assert!(matches!(
+            service.execute_effect(
+                &mut broker,
+                &project_id,
+                &mission_id,
+                &effect_id,
+                &mut forbidden_replay,
+                &mut verifier,
+                now() + Duration::seconds(5),
+            ),
+            Err(ApplicationError::Broker(
+                BrokerError::DurableProjectionRecoveryRequired
+            ))
+        ));
         assert_eq!(forbidden_replay.calls, 0);
         assert!(
             service
@@ -29259,11 +30701,68 @@ sleep 30"#
             )
             .expect("send and verify replacement reply");
         assert_eq!(executor.calls, 1);
-        complete_catalog_checkpoint_dag(
+        let execution_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("mission after authority-bound execution");
+        let execution_conversation = service
+            .load_conversation(&project_id, &conversation_id)
+            .expect("conversation after authority-bound execution");
+        let execution_events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("authority-bound execution events");
+        let executed_event = execution_events
+            .iter()
+            .find(|event| {
+                event.event_type == "effect.executed"
+                    && event.payload["effectId"] == second_effect_id.as_str()
+            })
+            .expect("executed event");
+        let verified_event = execution_events
+            .iter()
+            .find(|event| {
+                event.event_type == "effect.verified"
+                    && event.payload["effectId"] == second_effect_id.as_str()
+            })
+            .expect("verified event");
+        let conversation_event = execution_events
+            .iter()
+            .find(|event| {
+                event.event_type == "conversation.reply_sent"
+                    && event.payload["effectId"] == second_effect_id.as_str()
+            })
+            .expect("conversation sent event");
+        assert_eq!(executed_event.payload["authoritySequence"], 1);
+        assert_eq!(verified_event.payload["authoritySequence"], 2);
+        assert_eq!(conversation_event.payload["authoritySequence"], 1);
+        let provider_at = executed_event.recorded_at;
+        let verification_at = verified_event.recorded_at;
+        let mut phase_at = verification_at;
+        let receipt_accepted_at = execution_mission
+            .effect(&second_effect_id)
+            .expect("executed effect")
+            .receipt
+            .as_ref()
+            .expect("provider receipt")
+            .accepted_at;
+        let sent_message = execution_conversation
+            .messages
+            .iter()
+            .find(|message| message.id == MessageId::from_stable("outbound-app-2"))
+            .expect("sent conversation reply");
+        assert_eq!(sent_message.delivered_at, Some(receipt_accepted_at));
+        assert_eq!(execution_mission.updated_at, verified_event.recorded_at);
+        assert_eq!(execution_conversation.updated_at, provider_at);
+        assert_eq!(conversation_event.recorded_at, provider_at);
+        assert_ne!(receipt_accepted_at, provider_at);
+        assert!(verification_at >= provider_at);
+        assert_event_outbox_time(&service, executed_event);
+        assert_event_outbox_time(&service, verified_event);
+        assert_event_outbox_time(&service, conversation_event);
+        complete_catalog_checkpoint_dag_at_exact_time(
             &mut service,
             &project_id,
             &mission_id,
-            now() + Duration::milliseconds(9_500),
+            phase_at,
         );
         sync_conversation_revision(
             &mut service,
@@ -29274,7 +30773,7 @@ sleep 30"#
             &conversation_id,
             std::slice::from_ref(&consent_id),
             Some(6),
-            now() + Duration::minutes(2) + Duration::seconds(7),
+            phase_at,
         );
         let restored = service
             .load_conversation(&project_id, &conversation_id)
@@ -29283,6 +30782,16 @@ sleep 30"#
             &message.delivery,
             MessageDelivery::Sent { effect_id, .. } if effect_id == &second_effect_id
         )));
+        let terminal_mission_before = service
+            .load_mission(&project_id, &mission_id)
+            .expect("verified Mission before terminal replay");
+        let terminal_conversation_before = service
+            .load_conversation(&project_id, &conversation_id)
+            .expect("verified Conversation before terminal replay");
+        let terminal_events_before = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events before terminal replay");
+        let terminal_outbox_before = all_outbox_snapshot(&service);
         service
             .execute_effect(
                 &mut broker,
@@ -29291,10 +30800,27 @@ sleep 30"#
                 &second_effect_id,
                 &mut executor,
                 &mut verifier,
-                now() + Duration::seconds(12),
+                phase_at,
             )
             .expect("verified replay returns without sending again");
         assert_eq!(executor.calls, 1);
+        assert_eq!(
+            service
+                .load_mission(&project_id, &mission_id)
+                .expect("Mission after terminal replay"),
+            terminal_mission_before
+        );
+        assert_eq!(
+            service
+                .load_conversation(&project_id, &conversation_id)
+                .expect("Conversation after terminal replay"),
+            terminal_conversation_before
+        );
+        let terminal_events_after = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events after terminal replay");
+        assert_eq!(terminal_events_after, terminal_events_before);
+        assert_eq!(all_outbox_snapshot(&service), terminal_outbox_before);
         service
             .record_outcome(
                 &project_id,
@@ -29302,7 +30828,7 @@ sleep 30"#
                 "Verified reply delivered exactly once",
                 OutcomeDecision::Continue,
                 BTreeMap::new(),
-                now() + Duration::milliseconds(12_250),
+                phase_at,
             )
             .expect("review relationship cycle");
         let scheduled_projection = service
@@ -29325,7 +30851,7 @@ sleep 30"#
                     attachment_digests: BTreeSet::new(),
                     risk: ConversationContentRisk::Safe,
                     classification_confidence: "0.98".parse().expect("confidence"),
-                    occurred_at: now() + Duration::seconds(13),
+                    occurred_at: phase_at,
                 },
                 &WebhookAttestation {
                     signature_verified: true,
@@ -29333,7 +30859,7 @@ sleep 30"#
                     provider: "gmail".into(),
                     connection_id: connection_id.clone(),
                     account_id: AccountId::from("gmail-account-1"),
-                    received_at: now() + Duration::seconds(13),
+                    received_at: phase_at,
                 },
             )
             .expect("second inbound");
@@ -29355,7 +30881,7 @@ sleep 30"#
             &conversation_id,
             std::slice::from_ref(&consent_id),
             Some(7),
-            now() + Duration::minutes(2) + Duration::seconds(8),
+            phase_at,
         );
         let scheduler_owner = "desktop-scheduler-test";
         let scheduler_token = "private-scheduler-token-000000000000000000000000";
@@ -29364,7 +30890,7 @@ sleep 30"#
                 scheduler_owner,
                 scheduler_token,
                 Duration::minutes(5),
-                now() + Duration::milliseconds(13_250),
+                phase_at,
             )
             .expect("claim signalled schedule")
             .expect("due schedule");
@@ -29381,7 +30907,7 @@ sleep 30"#
                     status: TaskStatus::Running,
                     capability: "webhook.ingest".into(),
                 },
-                now() + Duration::milliseconds(13_500),
+                phase_at,
             )
             .expect("start exact claimed relationship cycle");
         let running_projection = service
@@ -29410,7 +30936,7 @@ sleep 30"#
             "outbound-app-uncertain",
         );
         service
-            .prepare_conversation_reply_effect(&uncertain_command, now() + Duration::seconds(14))
+            .prepare_conversation_reply_effect(&uncertain_command, phase_at)
             .expect("prepare uncertain reply");
         sync_conversation_revision(
             &mut service,
@@ -29421,7 +30947,7 @@ sleep 30"#
             &conversation_id,
             std::slice::from_ref(&consent_id),
             Some(8),
-            now() + Duration::minutes(2) + Duration::seconds(9),
+            phase_at,
         );
         service
             .approve_effect(
@@ -29430,7 +30956,7 @@ sleep 30"#
                 &mission_id,
                 &uncertain_effect_id,
                 ActorId::from("approver-1"),
-                now() + Duration::seconds(15),
+                phase_at,
             )
             .expect("approve uncertain reply");
         let mut uncertain_executor = UncertainRelationshipExecutor::default();
@@ -29442,11 +30968,54 @@ sleep 30"#
                 &uncertain_effect_id,
                 &mut uncertain_executor,
                 &mut verifier,
-                now() + Duration::seconds(16),
+                phase_at,
             ),
             Err(ApplicationError::Broker(BrokerError::ProviderUncertain(_)))
         ));
         assert_eq!(uncertain_executor.calls, 1);
+        let interrupted_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("authority-bound interrupted Mission");
+        let interrupted_conversation = service
+            .load_conversation(&project_id, &conversation_id)
+            .expect("authority-bound interrupted Conversation");
+        let interrupted_events = service
+            .mission_events(&project_id, &mission_id)
+            .expect("authority-bound interruption events");
+        let interrupted_effect_event = interrupted_events
+            .iter()
+            .find(|event| {
+                event.event_type == "effect.execution_interrupted"
+                    && event.payload["effectId"] == uncertain_effect_id.as_str()
+            })
+            .expect("interrupted effect event");
+        let interrupted_conversation_event = interrupted_events
+            .iter()
+            .find(|event| {
+                event.event_type == "conversation.reply_uncertain"
+                    && event.payload["effectId"] == uncertain_effect_id.as_str()
+            })
+            .expect("interrupted conversation event");
+        assert_eq!(interrupted_effect_event.payload["authoritySequence"], 1);
+        assert_eq!(
+            interrupted_conversation_event.payload["authoritySequence"],
+            1
+        );
+        assert_eq!(
+            interrupted_mission.updated_at,
+            interrupted_effect_event.recorded_at
+        );
+        assert_eq!(
+            interrupted_conversation.updated_at,
+            interrupted_effect_event.recorded_at
+        );
+        assert_eq!(
+            interrupted_conversation_event.recorded_at,
+            interrupted_effect_event.recorded_at
+        );
+        phase_at = interrupted_effect_event.recorded_at;
+        assert_event_outbox_time(&service, interrupted_effect_event);
+        assert_event_outbox_time(&service, interrupted_conversation_event);
         sync_conversation_revision(
             &mut service,
             &secrets,
@@ -29456,7 +31025,7 @@ sleep 30"#
             &conversation_id,
             std::slice::from_ref(&consent_id),
             Some(9),
-            now() + Duration::minutes(2) + Duration::seconds(10),
+            phase_at,
         );
         assert_eq!(
             service
@@ -29488,7 +31057,7 @@ sleep 30"#
                     &uncertain_effect_id,
                     &mut uncertain_executor,
                     &mut verifier,
-                    now() + Duration::seconds(17),
+                    phase_at,
                 )
                 .is_err()
         );
@@ -29506,13 +31075,66 @@ sleep 30"#
                 id: ReceiptId::from("relationship-reconciled-receipt"),
                 provider: uncertain_effect.provider.clone(),
                 external_id: "gmail-message-reconciled".into(),
-                accepted_at: now() + Duration::milliseconds(16_500),
+                accepted_at: phase_at,
                 request_digest: uncertain_effect.approval_digest(),
                 response_digest: "e".repeat(64),
             },
-            observed_at: now() + Duration::seconds(18),
+            observed_at: phase_at,
         };
-        verifier.observed_at = now() + Duration::seconds(18);
+        verifier.observed_at = phase_at;
+        let mission_before_expired_reconciliation = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission before expired reconciliation");
+        let conversation_before_expired_reconciliation = service
+            .load_conversation(&project_id, &conversation_id)
+            .expect("Conversation before expired reconciliation");
+        let events_before_expired_reconciliation = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events before expired reconciliation");
+        let outbox_before_expired_reconciliation = all_outbox_snapshot(&service);
+        broker = broker.with_lease_for(Duration::nanoseconds(1));
+        assert!(matches!(
+            service.reconcile_effect(
+                &mut broker,
+                &project_id,
+                &mission_id,
+                &uncertain_effect_id,
+                &mut reconciler,
+                &mut verifier,
+                phase_at,
+            ),
+            Err(ApplicationError::Broker(BrokerError::Ledger(
+                hartevo_effect_broker::LedgerError::LeaseLost
+            )))
+        ));
+        assert_eq!(reconciler.calls, 1);
+        assert_eq!(
+            service
+                .load_mission(&project_id, &mission_id)
+                .expect("Mission after expired reconciliation"),
+            mission_before_expired_reconciliation
+        );
+        assert_eq!(
+            service
+                .load_conversation(&project_id, &conversation_id)
+                .expect("Conversation after expired reconciliation"),
+            conversation_before_expired_reconciliation
+        );
+        let events_after_expired_reconciliation = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events after expired reconciliation");
+        assert_eq!(
+            events_after_expired_reconciliation,
+            events_before_expired_reconciliation
+        );
+        assert_eq!(
+            all_outbox_snapshot(&service),
+            outbox_before_expired_reconciliation
+        );
+        broker = broker.with_lease_for(Duration::days(36_500));
+        reconciler.calls = 0;
+        let reconciliation_entry_at = Utc::now();
+        assert!(reconciliation_entry_at >= phase_at);
         let (reconciled_mission, reconciled_result) = service
             .reconcile_effect(
                 &mut broker,
@@ -29521,7 +31143,7 @@ sleep 30"#
                 &uncertain_effect_id,
                 &mut reconciler,
                 &mut verifier,
-                now() + Duration::seconds(18),
+                reconciliation_entry_at,
             )
             .expect("read-only reconciliation finds and verifies Provider receipt");
         assert_eq!((uncertain_executor.calls, reconciler.calls), (1, 1));
@@ -29552,15 +31174,60 @@ sleep 30"#
         let reconciliation_events = service
             .mission_events(&project_id, &mission_id)
             .expect("reconciliation events");
-        assert!(reconciliation_events.iter().any(|event| {
-            event.event_type == "effect.reconciliation_receipt_found"
-                && event.payload["providerExecutionReplayed"] == false
-        }));
-        assert!(
-            reconciliation_events
-                .iter()
-                .any(|event| event.event_type == "effect.reconciliation_verified")
+        let receipt_found_event = reconciliation_events
+            .iter()
+            .find(|event| {
+                event.event_type == "effect.reconciliation_receipt_found"
+                    && event.payload["effectId"] == uncertain_effect_id.as_str()
+            })
+            .expect("receipt found event");
+        let reconciliation_verified_event = reconciliation_events
+            .iter()
+            .find(|event| {
+                event.event_type == "effect.reconciliation_verified"
+                    && event.payload["effectId"] == uncertain_effect_id.as_str()
+            })
+            .expect("reconciliation verified event");
+        let reconciled_conversation_event = reconciliation_events
+            .iter()
+            .find(|event| {
+                event.event_type == "conversation.reply_reconciled_sent"
+                    && event.payload["effectId"] == uncertain_effect_id.as_str()
+            })
+            .expect("reconciled conversation event");
+        assert_eq!(
+            receipt_found_event.payload["providerExecutionReplayed"],
+            false
         );
+        assert_eq!(receipt_found_event.payload["authoritySequence"], 1);
+        assert_eq!(
+            reconciliation_verified_event.payload["authoritySequence"],
+            2
+        );
+        assert_eq!(
+            reconciled_conversation_event.payload["authoritySequence"],
+            1
+        );
+        phase_at = reconciliation_verified_event.recorded_at;
+        assert_eq!(reconciled_mission.updated_at, phase_at);
+        let reconciled_conversation = service
+            .load_conversation(&project_id, &conversation_id)
+            .expect("authority-bound reconciled conversation");
+        assert_eq!(
+            reconciled_conversation.updated_at,
+            receipt_found_event.recorded_at
+        );
+        assert_eq!(
+            reconciled_conversation_event.recorded_at,
+            receipt_found_event.recorded_at
+        );
+        assert_ne!(
+            reconciled_conversation.updated_at,
+            reconciled_result.receipt.accepted_at
+        );
+        assert_event_outbox_time(&service, receipt_found_event);
+        assert_event_outbox_time(&service, reconciliation_verified_event);
+        assert_event_outbox_time(&service, reconciled_conversation_event);
 
         let lifecycle_conversation_id = ConversationId::from("conversation-lifecycle-app");
         service
@@ -29579,10 +31246,10 @@ sleep 30"#
                     "c".repeat(64),
                     hartevo_domain_kernel::ContactChannel::Email,
                     "DE",
-                    now() + Duration::seconds(18),
+                    phase_at,
                 )
                 .expect("lifecycle conversation"),
-                now() + Duration::seconds(18),
+                phase_at,
             )
             .expect("persist lifecycle conversation");
         sync_conversation_revision(
@@ -29594,7 +31261,7 @@ sleep 30"#
             &lifecycle_conversation_id,
             &[],
             None,
-            now() + Duration::minutes(2) + Duration::seconds(11),
+            phase_at,
         );
         let paused = service
             .pause_conversation_agent(
@@ -29602,7 +31269,7 @@ sleep 30"#
                 &lifecycle_conversation_id,
                 1,
                 &"d".repeat(64),
-                now() + Duration::seconds(19),
+                phase_at,
             )
             .expect("pause agent");
         assert_eq!(
@@ -29618,7 +31285,7 @@ sleep 30"#
             &lifecycle_conversation_id,
             &[],
             Some(1),
-            now() + Duration::minutes(2) + Duration::seconds(12),
+            phase_at,
         );
         let resumed = service
             .resume_conversation_agent(
@@ -29626,7 +31293,7 @@ sleep 30"#
                 &lifecycle_conversation_id,
                 2,
                 &"e".repeat(64),
-                now() + Duration::seconds(20),
+                phase_at,
             )
             .expect("resume paused agent");
         assert_eq!(
@@ -29642,14 +31309,14 @@ sleep 30"#
             &lifecycle_conversation_id,
             &[],
             Some(2),
-            now() + Duration::minutes(2) + Duration::seconds(13),
+            phase_at,
         );
         let resolved = service
             .resolve_conversation(
                 &project_id,
                 &lifecycle_conversation_id,
                 &"f".repeat(64),
-                now() + Duration::seconds(21),
+                phase_at,
             )
             .expect("resolve conversation");
         assert_eq!(
@@ -29665,14 +31332,14 @@ sleep 30"#
             &lifecycle_conversation_id,
             &[],
             Some(3),
-            now() + Duration::minutes(2) + Duration::seconds(14),
+            phase_at,
         );
         let closed = service
             .close_conversation(
                 &project_id,
                 &lifecycle_conversation_id,
                 &"0".repeat(64),
-                now() + Duration::seconds(22),
+                phase_at,
             )
             .expect("close resolved conversation");
         assert_eq!(
@@ -29688,7 +31355,7 @@ sleep 30"#
             &lifecycle_conversation_id,
             &[],
             Some(4),
-            now() + Duration::minutes(2) + Duration::seconds(15),
+            phase_at,
         );
         assert!(matches!(
             service.resume_conversation_agent(
@@ -29696,7 +31363,7 @@ sleep 30"#
                 &lifecycle_conversation_id,
                 closed.control.generation(),
                 &"1".repeat(64),
-                now() + Duration::seconds(23),
+                phase_at,
             ),
             Err(ApplicationError::Relationship(
                 RelationshipError::ExplicitResumeRequired
@@ -29720,10 +31387,10 @@ sleep 30"#
                     "1".repeat(64),
                     hartevo_domain_kernel::ContactChannel::Email,
                     "DE",
-                    now() + Duration::seconds(24),
+                    phase_at,
                 )
                 .expect("dead-letter conversation"),
-                now() + Duration::seconds(24),
+                phase_at,
             )
             .expect("persist dead-letter conversation");
         sync_conversation_revision(
@@ -29735,15 +31402,10 @@ sleep 30"#
             &dead_letter_id,
             &[],
             None,
-            now() + Duration::minutes(2) + Duration::seconds(16),
+            phase_at,
         );
         let dead_lettered = service
-            .dead_letter_conversation(
-                &project_id,
-                &dead_letter_id,
-                &"2".repeat(64),
-                now() + Duration::seconds(25),
-            )
+            .dead_letter_conversation(&project_id, &dead_letter_id, &"2".repeat(64), phase_at)
             .expect("dead-letter irrecoverable conversation");
         assert_eq!(
             dead_lettered.state,
@@ -29758,7 +31420,7 @@ sleep 30"#
             &dead_letter_id,
             &[],
             Some(1),
-            now() + Duration::minutes(2) + Duration::seconds(17),
+            phase_at,
         );
     }
 
@@ -29810,6 +31472,7 @@ sleep 30"#
             },
             "relationship-application-worker",
         )
+        .with_lease_for(Duration::days(36_500))
     }
 
     #[test]
@@ -30555,6 +32218,10 @@ sleep 30"#
     }
 
     fn setup_team_key_fixture() -> TeamKeyFixture {
+        setup_team_key_fixture_at(now())
+    }
+
+    fn setup_team_key_fixture_at(at: DateTime<Utc>) -> TeamKeyFixture {
         let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
         let secrets = hartevo_storage::MemorySecretStore::default();
         let tenant = TenantId::from("tenant-team-keys");
@@ -30570,7 +32237,7 @@ sleep 30"#
                     workspace_root: PathBuf::from("/tmp/hartevo-team-key-lifecycle"),
                     storage_mode: StorageMode::LocalEncryptedSync,
                 },
-                now(),
+                at,
             )
             .expect("project");
         let provisioned = service
@@ -30582,12 +32249,12 @@ sleep 30"#
                     primary_recipient: primary.clone(),
                     recovery_recipient_id: None,
                 },
-                now(),
+                at,
             )
             .expect("team keyring");
         let primary_envelope = provisioned
             .keyring
-            .active_envelope_for(&primary, now())
+            .active_envelope_for(&primary, at)
             .expect("primary envelope");
         TeamKeyFixture {
             service,
@@ -31260,13 +32927,17 @@ sleep 30"#
     }
 
     fn complete_local_project_registration(fixture: &mut TeamKeyFixture) {
+        complete_local_project_registration_at(fixture, now());
+    }
+
+    fn complete_local_project_registration_at(fixture: &mut TeamKeyFixture, at: DateTime<Utc>) {
         let command = project_registration_command(fixture, DataCell::Eu);
         fixture
             .service
             .prepare_project_cloud_registration(
                 &fixture.secrets,
                 &command,
-                now() + Duration::minutes(1),
+                at + Duration::minutes(1),
             )
             .expect("prepare local registration");
         fixture
@@ -31280,7 +32951,7 @@ sleep 30"#
                     outbox_sequence: 1,
                     duplicate: false,
                 },
-                now() + Duration::minutes(1),
+                at + Duration::minutes(1),
             )
             .expect("apply local registration");
     }
@@ -34314,7 +35985,8 @@ sleep 30"#
                 }],
             },
             "creator-withdrawal-worker",
-        );
+        )
+        .with_lease_for(Duration::days(36_500));
         service
             .approve_effect(
                 &broker,
@@ -34383,8 +36055,28 @@ sleep 30"#
         reason = "the VM-06 replay test intentionally keeps the entire user-to-creator settlement journey visible"
     )]
     fn creator_task_deliverable_review_and_verified_payment_are_one_replayable_flow() {
-        let mut fixture = setup_team_key_fixture();
-        complete_local_project_registration(&mut fixture);
+        struct CompressedDuration;
+        impl CompressedDuration {
+            fn days(value: i64) -> chrono::Duration {
+                chrono::Duration::hours(value)
+            }
+
+            fn hours(value: i64) -> chrono::Duration {
+                chrono::Duration::hours(value)
+            }
+
+            fn minutes(value: i64) -> chrono::Duration {
+                chrono::Duration::minutes(value)
+            }
+
+            fn nanoseconds(value: i64) -> chrono::Duration {
+                chrono::Duration::nanoseconds(value)
+            }
+        }
+        type Duration = CompressedDuration;
+        let now = || Utc::now() - chrono::Duration::hours(6);
+        let mut fixture = setup_team_key_fixture_at(now() - Duration::minutes(2));
+        complete_local_project_registration_at(&mut fixture, now() - Duration::minutes(1));
         let TeamKeyFixture {
             mut service,
             secrets,
@@ -34535,7 +36227,8 @@ sleep 30"#
                 }],
             },
             "creator-invitation-test-worker",
-        );
+        )
+        .with_lease_for(Duration::days(36_500));
         service
             .approve_effect(
                 &invitation_broker,
@@ -34938,7 +36631,8 @@ sleep 30"#
                 }],
             },
             "creator-payout-test-worker",
-        );
+        )
+        .with_lease_for(Duration::days(36_500));
         service
             .approve_effect(
                 &broker,
@@ -34949,10 +36643,10 @@ sleep 30"#
                 now() + Duration::days(6),
             )
             .expect("approve exact payout");
-        let executed_at = now() + Duration::days(6) + Duration::minutes(1);
+        let executed_at = Utc::now();
         let mut executor = UncertainPayoutExecutor::default();
         let mut verifier = PayoutVerifier {
-            observed_at: executed_at + Duration::minutes(2),
+            observed_at: executed_at,
         };
         assert!(matches!(
             service.execute_effect(
@@ -34979,7 +36673,7 @@ sleep 30"#
             id: ReceiptId::from("receipt-transfer-1"),
             provider: "stripe-connect".into(),
             external_id: "transfer-1".into(),
-            accepted_at: executed_at + Duration::seconds(1),
+            accepted_at: executed_at,
             request_digest: uncertain_effect.approval_digest(),
             response_digest: "d".repeat(64),
         };
@@ -34988,9 +36682,60 @@ sleep 30"#
             observation: ReconciliationObservation::ReceiptFound {
                 receipt: reconciled_receipt.clone(),
                 evidence_digest: "f".repeat(64),
-                observed_at: executed_at + Duration::minutes(1),
+                observed_at: executed_at,
             },
         };
+        let task_before_expired_completion = service
+            .load_creator_task(&project_id, &task_id)
+            .expect("creator task before expired completion");
+        let mission_before_expired_completion = service
+            .load_mission(&project_id, &mission_id)
+            .expect("creator mission before expired completion");
+        let events_before_expired_completion = service
+            .mission_events(&project_id, &mission_id)
+            .expect("creator events before expired completion");
+        let outbox_before_expired_completion = all_outbox_snapshot(&service);
+        broker = broker.with_lease_for(Duration::nanoseconds(1));
+        assert!(matches!(
+            service.reconcile_creator_payout(
+                &mut broker,
+                &project_id,
+                &task_id,
+                &effect_id,
+                &mut reconciler,
+                &mut verifier,
+                executed_at,
+            ),
+            Err(ApplicationError::Broker(BrokerError::Ledger(
+                hartevo_effect_broker::LedgerError::LeaseLost
+            )))
+        ));
+        assert_eq!(reconciler.calls, 1);
+        assert_eq!(
+            service
+                .load_creator_task(&project_id, &task_id)
+                .expect("creator task after expired completion"),
+            task_before_expired_completion
+        );
+        assert_eq!(
+            service
+                .load_mission(&project_id, &mission_id)
+                .expect("creator mission after expired completion"),
+            mission_before_expired_completion
+        );
+        let events_after_expired_completion = service
+            .mission_events(&project_id, &mission_id)
+            .expect("creator events after expired completion");
+        assert_eq!(
+            events_after_expired_completion,
+            events_before_expired_completion
+        );
+        assert_eq!(
+            all_outbox_snapshot(&service),
+            outbox_before_expired_completion
+        );
+        broker = broker.with_lease_for(Duration::days(36_500));
+        reconciler.calls = 0;
         let (reconciled_mission, paid, reconciled_result) = service
             .reconcile_creator_payout(
                 &mut broker,
@@ -34999,7 +36744,7 @@ sleep 30"#
                 &effect_id,
                 &mut reconciler,
                 &mut verifier,
-                executed_at + Duration::minutes(3),
+                Utc::now(),
             )
             .expect("read-only reconciliation verifies and atomically projects creator payout");
         assert_eq!((executor.calls, reconciler.calls), (1, 1));
@@ -35025,13 +36770,47 @@ sleep 30"#
                 .expect("paid deliverable entitlement"),
             hartevo_domain_kernel::DeliverableEntitlementStatus::ContractUsageGranted
         );
+        let authority_events = service
+            .store
+            .events_for_mission(&project_id, &mission_id)
+            .expect("creator authority events");
+        let reconciliation_event = authority_events
+            .iter()
+            .find(|event| {
+                event.event_type == "effect.reconciliation_receipt_found"
+                    && event.payload["effectId"] == effect_id.as_str()
+            })
+            .expect("creator reconciliation event");
+        let verification_event = authority_events
+            .iter()
+            .find(|event| {
+                event.event_type == "effect.reconciliation_verified"
+                    && event.payload["effectId"] == effect_id.as_str()
+            })
+            .expect("creator verification event");
+        let payout_event = authority_events
+            .iter()
+            .find(|event| event.event_type == "creator.payout_reconciled_verified")
+            .expect("creator payout event");
+        assert_eq!(reconciliation_event.payload["authoritySequence"], 1);
+        assert_eq!(verification_event.payload["authoritySequence"], 2);
+        assert_eq!(payout_event.payload["authoritySequence"], 2);
+        assert_eq!(
+            reconciled_mission.updated_at,
+            verification_event.recorded_at
+        );
+        assert_eq!(paid.updated_at, verification_event.recorded_at);
+        assert_eq!(payout_event.recorded_at, verification_event.recorded_at);
+        assert_event_outbox_time(&service, reconciliation_event);
+        assert_event_outbox_time(&service, verification_event);
+        assert_event_outbox_time(&service, payout_event);
         let paid_revision = paid.state_revision;
         let replayed_paid = service
             .record_verified_creator_payout(
                 &project_id,
                 &task_id,
                 &effect_id,
-                executed_at + Duration::minutes(4),
+                executed_at + Duration::minutes(5),
             )
             .expect("exact verified payout projection is idempotent");
         assert_eq!(replayed_paid.state_revision, paid_revision);

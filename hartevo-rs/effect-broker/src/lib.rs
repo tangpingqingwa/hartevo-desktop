@@ -575,6 +575,428 @@ pub trait EffectVerifier {
     fn verify(&mut self, effect: &Effect, receipt: &Receipt) -> Verification;
 }
 
+/// A trusted time source used only by [`EffectAuthorityClock`]. UI and Domain
+/// callers never supply a completion `DateTime` or its wall-clock anchor.
+trait EffectAuthorityTimeSource {
+    fn sample(&mut self) -> Result<DateTime<Utc>, BrokerError>;
+}
+
+struct SystemEffectAuthorityTimeSource {
+    authority_utc_anchor: DateTime<Utc>,
+    monotonic_anchor: std::time::Instant,
+}
+
+impl EffectAuthorityTimeSource for SystemEffectAuthorityTimeSource {
+    fn sample(&mut self) -> Result<DateTime<Utc>, BrokerError> {
+        let elapsed_nanos = i64::try_from(self.monotonic_anchor.elapsed().as_nanos())
+            .map_err(|_| BrokerError::InvalidAuthorityClock)?;
+        self.authority_utc_anchor
+            .checked_add_signed(chrono::Duration::nanoseconds(elapsed_nanos))
+            .ok_or(BrokerError::InvalidAuthorityClock)
+    }
+}
+
+/// Samples completion authority strictly after external Provider boundaries.
+///
+/// The source is intentionally hidden from `Debug`; it may contain a
+/// deterministic test sequence or platform clock state. Production-compatible
+/// entry points use [`Self::system`], which captures its own UTC/monotonic
+/// anchors inside the Broker. The caller's entry time is only a not-before
+/// fence for claim and business semantics.
+struct EffectAuthorityClock {
+    entry_at: DateTime<Utc>,
+    source: Box<dyn EffectAuthorityTimeSource>,
+    sample_count: u64,
+}
+
+impl std::fmt::Debug for EffectAuthorityClock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EffectAuthorityClock")
+            .field("sample_count", &self.sample_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EffectAuthorityClock {
+    fn system(entry_at: DateTime<Utc>) -> Result<Self, BrokerError> {
+        let monotonic_anchor = std::time::Instant::now();
+        let authority_system_anchor = std::time::SystemTime::now();
+        let authority_since_epoch = authority_system_anchor
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| BrokerError::InvalidAuthorityClock)?;
+        let authority_seconds = i64::try_from(authority_since_epoch.as_secs())
+            .map_err(|_| BrokerError::InvalidAuthorityClock)?;
+        let authority_utc_anchor = DateTime::<Utc>::from_timestamp(
+            authority_seconds,
+            authority_since_epoch.subsec_nanos(),
+        )
+        .ok_or(BrokerError::InvalidAuthorityClock)?;
+        if entry_at > authority_utc_anchor {
+            return Err(BrokerError::InvalidAuthorityClock);
+        }
+        Ok(Self {
+            entry_at,
+            source: Box::new(SystemEffectAuthorityTimeSource {
+                authority_utc_anchor,
+                monotonic_anchor,
+            }),
+            sample_count: 0,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_test_source(
+        entry_at: DateTime<Utc>,
+        source: impl EffectAuthorityTimeSource + 'static,
+    ) -> Self {
+        Self {
+            entry_at,
+            source: Box::new(source),
+            sample_count: 0,
+        }
+    }
+
+    #[must_use]
+    const fn entry_at(&self) -> DateTime<Utc> {
+        self.entry_at
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    const fn sample_count(&self) -> u64 {
+        self.sample_count
+    }
+
+    fn sample_post_external_call(
+        &mut self,
+        not_before: DateTime<Utc>,
+    ) -> Result<EffectAuthoritySample, BrokerError> {
+        self.sample_count = self
+            .sample_count
+            .checked_add(1)
+            .ok_or(BrokerError::InvalidAuthorityClock)?;
+        let operation_at = self.source.sample()?;
+        if operation_at < self.entry_at || operation_at < not_before {
+            return Err(BrokerError::InvalidAuthorityClock);
+        }
+        Ok(EffectAuthoritySample {
+            sequence: self.sample_count,
+            operation_at,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EffectAuthoritySample {
+    sequence: u64,
+    operation_at: DateTime<Utc>,
+}
+
+struct ReconciliationCompletionTiming<'a> {
+    clock: &'a mut EffectAuthorityClock,
+    authority: &'a mut EffectCompletionAuthority,
+    reconciliation_at: DateTime<Utc>,
+}
+
+struct ExecuteAndVerifyFlow<'a, Infrastructure, Executor, Verifier> {
+    mission: &'a mut Mission,
+    effect_id: &'a EffectId,
+    infrastructure: &'a mut Infrastructure,
+    executor: &'a mut Executor,
+    verifier: &'a mut Verifier,
+    clock: &'a mut EffectAuthorityClock,
+    authority: &'a mut EffectCompletionAuthority,
+}
+
+struct ExecutionReceiptCompletion {
+    receipt: Receipt,
+    disposition: ExecutionDisposition,
+    recovered_receipt_candidate: Option<Mission>,
+}
+
+struct ReconcileUncertainFlow<'a, Infrastructure, Reconciler, Verifier> {
+    mission: &'a mut Mission,
+    effect_id: &'a EffectId,
+    infrastructure: &'a mut Infrastructure,
+    reconciler: &'a mut Reconciler,
+    verifier: &'a mut Verifier,
+    clock: &'a mut EffectAuthorityClock,
+    authority: &'a mut EffectCompletionAuthority,
+}
+
+struct ReconciledReceiptVerification {
+    lease: ExecutionLease,
+    receipt: Receipt,
+    execution_started_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectCompletionBoundary {
+    Provider,
+    Reconciliation,
+    Verification,
+}
+
+/// Redacted completion timing accepted by the durable ledger. A sampled time
+/// is recorded here only after its corresponding completion CAS succeeds.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct EffectCompletionAuthority {
+    entry_at: DateTime<Utc>,
+    provider: Option<EffectCompletionPoint>,
+    reconciliation: Option<EffectCompletionPoint>,
+    verification: Option<EffectCompletionPoint>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct EffectCompletionPoint {
+    sequence: u64,
+    operation_at: DateTime<Utc>,
+}
+
+impl EffectCompletionPoint {
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub const fn operation_at(self) -> DateTime<Utc> {
+        self.operation_at
+    }
+}
+
+impl std::fmt::Debug for EffectCompletionPoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EffectCompletionPoint")
+            .field("sequence", &self.sequence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for EffectCompletionAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EffectCompletionAuthority")
+            .field(
+                "provider_sequence",
+                &self.provider.map(|point| point.sequence),
+            )
+            .field(
+                "reconciliation_sequence",
+                &self.reconciliation.map(|point| point.sequence),
+            )
+            .field(
+                "verification_sequence",
+                &self.verification.map(|point| point.sequence),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl EffectCompletionAuthority {
+    const fn new(entry_at: DateTime<Utc>) -> Self {
+        Self {
+            entry_at,
+            provider: None,
+            reconciliation: None,
+            verification: None,
+        }
+    }
+
+    fn accept(
+        &mut self,
+        boundary: EffectCompletionBoundary,
+        sample: EffectAuthoritySample,
+    ) -> Result<(), BrokerError> {
+        if self.latest_accepted().is_some_and(|latest| {
+            sample.sequence <= latest.sequence || sample.operation_at < latest.operation_at
+        }) {
+            return Err(BrokerError::InvalidAuthorityClock);
+        }
+        let slot = match boundary {
+            EffectCompletionBoundary::Provider => &mut self.provider,
+            EffectCompletionBoundary::Reconciliation => &mut self.reconciliation,
+            EffectCompletionBoundary::Verification => &mut self.verification,
+        };
+        if slot.is_some() {
+            return Err(BrokerError::InvalidAuthorityClock);
+        }
+        *slot = Some(EffectCompletionPoint {
+            sequence: sample.sequence,
+            operation_at: sample.operation_at,
+        });
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn provider(&self) -> Option<EffectCompletionPoint> {
+        self.provider
+    }
+
+    #[must_use]
+    pub const fn reconciliation(&self) -> Option<EffectCompletionPoint> {
+        self.reconciliation
+    }
+
+    #[must_use]
+    pub const fn verification(&self) -> Option<EffectCompletionPoint> {
+        self.verification
+    }
+
+    #[must_use]
+    pub fn latest_accepted(&self) -> Option<EffectCompletionPoint> {
+        let mut latest = self.provider;
+        for candidate in [self.reconciliation, self.verification]
+            .into_iter()
+            .flatten()
+        {
+            if latest.is_none_or(|current| candidate.sequence > current.sequence) {
+                latest = Some(candidate);
+            }
+        }
+        latest
+    }
+
+    fn sampling_floor(&self) -> DateTime<Utc> {
+        match self.latest_accepted() {
+            Some(point) => point.operation_at,
+            None => self.entry_at,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub struct AuthorityBoundBrokerResult {
+    result: BrokerResult,
+    authority: EffectCompletionAuthority,
+}
+
+impl std::fmt::Debug for AuthorityBoundBrokerResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorityBoundBrokerResult")
+            .field("disposition", &self.result.disposition)
+            .field("authority", &self.authority)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthorityBoundBrokerResult {
+    #[must_use]
+    pub const fn result(&self) -> &BrokerResult {
+        &self.result
+    }
+
+    #[must_use]
+    pub const fn authority(&self) -> &EffectCompletionAuthority {
+        &self.authority
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (BrokerResult, EffectCompletionAuthority) {
+        (self.result, self.authority)
+    }
+}
+
+#[derive(PartialEq)]
+pub struct AuthorityBoundBrokerError {
+    inner: Box<AuthorityBoundBrokerErrorInner>,
+}
+
+#[derive(PartialEq)]
+struct AuthorityBoundBrokerErrorInner {
+    error: BrokerError,
+    authority: EffectCompletionAuthority,
+}
+
+impl std::fmt::Debug for AuthorityBoundBrokerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorityBoundBrokerError")
+            .field("error_kind", &broker_error_kind(self.error()))
+            .field("authority", self.authority())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for AuthorityBoundBrokerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error().fmt(formatter)
+    }
+}
+
+impl std::error::Error for AuthorityBoundBrokerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error())
+    }
+}
+
+impl AuthorityBoundBrokerError {
+    fn new(error: BrokerError, authority: EffectCompletionAuthority) -> Self {
+        Self {
+            inner: Box::new(AuthorityBoundBrokerErrorInner { error, authority }),
+        }
+    }
+
+    #[must_use]
+    pub fn error(&self) -> &BrokerError {
+        &self.inner.error
+    }
+
+    #[must_use]
+    pub fn authority(&self) -> &EffectCompletionAuthority {
+        &self.inner.authority
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (BrokerError, EffectCompletionAuthority) {
+        let AuthorityBoundBrokerErrorInner { error, authority } = *self.inner;
+        (error, authority)
+    }
+}
+
+fn broker_error_kind(error: &BrokerError) -> &'static str {
+    match error {
+        BrokerError::Domain(_) => "domain",
+        BrokerError::Ledger(_) => "ledger",
+        BrokerError::Permission(_) => "permission",
+        BrokerError::CapabilityDenied(_) => "capability_denied",
+        BrokerError::InvalidPolicy(_) => "invalid_policy",
+        BrokerError::PolicyVersionMismatch { .. } => "policy_version_mismatch",
+        BrokerError::RateLimitRuleMissing { .. } => "rate_limit_rule_missing",
+        BrokerError::EffectClassDenied(_) => "effect_class_denied",
+        BrokerError::CostLimitExceeded { .. } => "cost_limit_exceeded",
+        BrokerError::CurrencyDenied(_) => "currency_denied",
+        BrokerError::ConsentMissing => "consent_missing",
+        BrokerError::Expired => "expired",
+        BrokerError::ApprovalExpired => "approval_expired",
+        BrokerError::NotScheduled => "not_scheduled",
+        BrokerError::ApprovalScopeChanged => "approval_scope_changed",
+        BrokerError::PermissionEvidenceChanged => "permission_evidence_changed",
+        BrokerError::InvalidLease => "invalid_lease",
+        BrokerError::InvalidAuthorityClock => "invalid_authority_clock",
+        BrokerError::ExecutionBusy => "execution_busy",
+        BrokerError::MissingDurableRecovery => "missing_durable_recovery",
+        BrokerError::DurableProjectionRecoveryRequired => "durable_projection_recovery_required",
+        BrokerError::RateLimited { .. } => "rate_limited",
+        BrokerError::NotApproved(_) => "not_approved",
+        BrokerError::ProviderRejected(_) => "provider_rejected",
+        BrokerError::ProviderUncertain(_) => "provider_uncertain",
+        BrokerError::ReconciliationNotRequired => "reconciliation_not_required",
+        BrokerError::ReconciliationBusy => "reconciliation_busy",
+        BrokerError::ReconciliationNotReady { .. } => "reconciliation_not_ready",
+        BrokerError::ReconciliationStillUncertain { .. } => "reconciliation_still_uncertain",
+        BrokerError::ProviderNotExecuted { .. } => "provider_not_executed",
+        BrokerError::ReconciliationDeadLetter { .. } => "reconciliation_dead_letter",
+        BrokerError::VerificationRejected => "verification_rejected",
+        BrokerError::VerificationInconclusive => "verification_inconclusive",
+        BrokerError::MissingReceipt => "missing_receipt",
+        BrokerError::MissingVerification => "missing_verification",
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionLease {
     pub attempt_id: ExecutionAttemptId,
@@ -853,7 +1275,6 @@ enum ResolvedLedgerClaim {
         receipt: Option<Receipt>,
         execution_started_at: DateTime<Utc>,
     },
-    Complete(BrokerResult),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1096,7 +1517,82 @@ impl EffectBroker {
         verifier: &mut impl EffectVerifier,
         now: DateTime<Utc>,
     ) -> Result<BrokerResult, BrokerError> {
-        let effect = mission.effect(effect_id)?.clone();
+        match self.execute_and_verify_authority_bound(
+            mission,
+            effect_id,
+            infrastructure,
+            executor,
+            verifier,
+            now,
+        ) {
+            Ok(bound) => Ok(bound.into_parts().0),
+            Err(bound) => Err(bound.into_parts().0),
+        }
+    }
+
+    /// Executes an effect while returning only ledger-accepted completion
+    /// authority to the Application projection layer. The caller-provided
+    /// `entry_at` remains the claim/business time; completion samples come
+    /// exclusively from a Broker-owned system clock.
+    pub fn execute_and_verify_authority_bound(
+        &mut self,
+        mission: &mut Mission,
+        effect_id: &EffectId,
+        infrastructure: &mut impl EffectInfrastructure,
+        executor: &mut impl EffectExecutor,
+        verifier: &mut impl EffectVerifier,
+        entry_at: DateTime<Utc>,
+    ) -> Result<AuthorityBoundBrokerResult, AuthorityBoundBrokerError> {
+        let authority = EffectCompletionAuthority::new(entry_at);
+        let mut clock = match EffectAuthorityClock::system(entry_at) {
+            Ok(clock) => clock,
+            Err(error) => return Err(AuthorityBoundBrokerError::new(error, authority)),
+        };
+        self.execute_and_verify_with_clock(
+            mission,
+            effect_id,
+            infrastructure,
+            executor,
+            verifier,
+            &mut clock,
+        )
+    }
+
+    fn execute_and_verify_with_clock(
+        &mut self,
+        mission: &mut Mission,
+        effect_id: &EffectId,
+        infrastructure: &mut impl EffectInfrastructure,
+        executor: &mut impl EffectExecutor,
+        verifier: &mut impl EffectVerifier,
+        clock: &mut EffectAuthorityClock,
+    ) -> Result<AuthorityBoundBrokerResult, AuthorityBoundBrokerError> {
+        let mut authority = EffectCompletionAuthority::new(clock.entry_at());
+        match self.execute_and_verify_inner(ExecuteAndVerifyFlow {
+            mission,
+            effect_id,
+            infrastructure,
+            executor,
+            verifier,
+            clock,
+            authority: &mut authority,
+        }) {
+            Ok(result) => Ok(AuthorityBoundBrokerResult { result, authority }),
+            Err(error) => Err(AuthorityBoundBrokerError::new(error, authority)),
+        }
+    }
+
+    fn execute_and_verify_inner<Infrastructure, Executor, Verifier>(
+        &mut self,
+        mut flow: ExecuteAndVerifyFlow<'_, Infrastructure, Executor, Verifier>,
+    ) -> Result<BrokerResult, BrokerError>
+    where
+        Infrastructure: EffectInfrastructure,
+        Executor: EffectExecutor,
+        Verifier: EffectVerifier,
+    {
+        let now = flow.clock.entry_at();
+        let effect = flow.mission.effect(flow.effect_id)?.clone();
         if effect.status == EffectStatus::Verified {
             return Ok(BrokerResult {
                 disposition: ExecutionDisposition::AlreadyVerified,
@@ -1118,48 +1614,147 @@ impl EffectBroker {
         ) {
             return Err(BrokerError::NotApproved(effect.status.clone()));
         }
-        let claim = self.claim_recovery_or_fresh(&effect, infrastructure, now)?;
-        let (lease, existing_receipt, execution_started_at) =
-            match Self::resolve_ledger_claim(mission, effect_id, claim)? {
-                ResolvedLedgerClaim::Acquired {
-                    lease,
-                    receipt,
-                    execution_started_at,
-                } => (lease, receipt, execution_started_at),
-                ResolvedLedgerClaim::Complete(result) => return Ok(result),
-            };
+        let claim = self.claim_recovery_or_fresh(&effect, flow.infrastructure, now)?;
+        let ResolvedLedgerClaim::Acquired {
+            lease,
+            receipt: existing_receipt,
+            execution_started_at,
+        } = Self::resolve_ledger_claim(claim)?;
 
-        let (receipt, disposition) = if let Some(receipt) = existing_receipt {
-            mission.reconcile_durable_receipt(effect_id, receipt.clone(), execution_started_at)?;
-            (receipt, ExecutionDisposition::ReusedIdempotentReceipt)
+        let receipt_completion = Self::complete_provider_execution(
+            &mut flow,
+            &effect,
+            &lease,
+            existing_receipt,
+            execution_started_at,
+            now,
+        )?;
+        Self::complete_execution_verification(flow, &effect, &lease, receipt_completion)
+    }
+
+    fn complete_provider_execution<Infrastructure, Executor, Verifier>(
+        flow: &mut ExecuteAndVerifyFlow<'_, Infrastructure, Executor, Verifier>,
+        effect: &Effect,
+        lease: &ExecutionLease,
+        existing_receipt: Option<Receipt>,
+        execution_started_at: DateTime<Utc>,
+        entry_at: DateTime<Utc>,
+    ) -> Result<ExecutionReceiptCompletion, BrokerError>
+    where
+        Infrastructure: EffectInfrastructure,
+        Executor: EffectExecutor,
+    {
+        if let Some(receipt) = existing_receipt {
+            if effect.conversation_guard.is_some() {
+                return Err(BrokerError::DurableProjectionRecoveryRequired);
+            }
+            let mut candidate = flow.mission.clone();
+            candidate.reconcile_durable_receipt(
+                flow.effect_id,
+                receipt.clone(),
+                execution_started_at,
+            )?;
+            Ok(ExecutionReceiptCompletion {
+                receipt,
+                disposition: ExecutionDisposition::ReusedIdempotentReceipt,
+                recovered_receipt_candidate: Some(candidate),
+            })
         } else {
-            mission.begin_effect(effect_id, now)?;
-            match executor.execute(&effect) {
+            flow.mission.begin_effect(flow.effect_id, entry_at)?;
+            let provider_result = flow.executor.execute(effect);
+            let provider_sample = flow
+                .clock
+                .sample_post_external_call(flow.authority.sampling_floor())?;
+            match provider_result {
                 Ok(receipt) => {
-                    let mut candidate = mission.clone();
-                    candidate.record_receipt(effect_id, receipt.clone())?;
-                    infrastructure.record_receipt(&effect, &lease, &receipt, now)?;
-                    *mission = candidate;
-                    (receipt, ExecutionDisposition::Executed)
+                    let mut candidate = flow.mission.clone();
+                    candidate.record_receipt(flow.effect_id, receipt.clone())?;
+                    flow.infrastructure.record_receipt(
+                        effect,
+                        lease,
+                        &receipt,
+                        provider_sample.operation_at,
+                    )?;
+                    flow.authority
+                        .accept(EffectCompletionBoundary::Provider, provider_sample)?;
+                    Self::bind_receipt_projection_at(&mut candidate, provider_sample.operation_at);
+                    *flow.mission = candidate;
+                    Ok(ExecutionReceiptCompletion {
+                        receipt,
+                        disposition: ExecutionDisposition::Executed,
+                        recovered_receipt_candidate: None,
+                    })
                 }
                 Err(ProviderFailure::Rejected(reason)) => {
-                    infrastructure.record_failed(&effect, &lease, &reason, now)?;
-                    mission.mark_effect_failed(effect_id, now)?;
-                    return Err(BrokerError::ProviderRejected(reason));
+                    flow.infrastructure.record_failed(
+                        effect,
+                        lease,
+                        &reason,
+                        provider_sample.operation_at,
+                    )?;
+                    flow.authority
+                        .accept(EffectCompletionBoundary::Provider, provider_sample)?;
+                    flow.mission
+                        .mark_effect_failed(flow.effect_id, provider_sample.operation_at)?;
+                    Err(BrokerError::ProviderRejected(reason))
                 }
                 Err(ProviderFailure::Uncertain(reason)) => {
-                    infrastructure.record_uncertain(&effect, &lease, &reason, now)?;
-                    mission.mark_effect_uncertain(effect_id, now)?;
-                    return Err(BrokerError::ProviderUncertain(reason));
+                    flow.infrastructure.record_uncertain(
+                        effect,
+                        lease,
+                        &reason,
+                        provider_sample.operation_at,
+                    )?;
+                    flow.authority
+                        .accept(EffectCompletionBoundary::Provider, provider_sample)?;
+                    flow.mission
+                        .mark_effect_uncertain(flow.effect_id, provider_sample.operation_at)?;
+                    Err(BrokerError::ProviderUncertain(reason))
                 }
             }
-        };
+        }
+    }
 
-        let effect_with_receipt = mission.effect(effect_id)?.clone();
+    fn complete_execution_verification<Infrastructure, Executor, Verifier>(
+        flow: ExecuteAndVerifyFlow<'_, Infrastructure, Executor, Verifier>,
+        effect: &Effect,
+        lease: &ExecutionLease,
+        completion: ExecutionReceiptCompletion,
+    ) -> Result<BrokerResult, BrokerError>
+    where
+        Infrastructure: EffectInfrastructure,
+        Verifier: EffectVerifier,
+    {
+        let ExecuteAndVerifyFlow {
+            mission,
+            effect_id,
+            infrastructure,
+            verifier,
+            clock,
+            authority,
+            executor: _,
+        } = flow;
+        let ExecutionReceiptCompletion {
+            receipt,
+            disposition,
+            recovered_receipt_candidate,
+        } = completion;
+        let mut candidate = match recovered_receipt_candidate {
+            Some(candidate) => candidate,
+            None => mission.clone(),
+        };
+        let effect_with_receipt = candidate.effect(effect_id)?.clone();
         let verification = verifier.verify(&effect_with_receipt, &receipt);
-        let mut candidate = mission.clone();
+        let verification_sample = clock.sample_post_external_call(authority.sampling_floor())?;
         candidate.record_verification(effect_id, verification.clone())?;
-        infrastructure.record_verification(&effect, &lease, &verification, now)?;
+        infrastructure.record_verification(
+            effect,
+            lease,
+            &verification,
+            verification_sample.operation_at,
+        )?;
+        authority.accept(EffectCompletionBoundary::Verification, verification_sample)?;
+        Self::bind_verification_projection_at(&mut candidate, verification_sample.operation_at);
         *mission = candidate;
         match verification.status {
             VerificationStatus::Rejected => return Err(BrokerError::VerificationRejected),
@@ -1185,11 +1780,84 @@ impl EffectBroker {
         verifier: &mut impl EffectVerifier,
         now: DateTime<Utc>,
     ) -> Result<BrokerResult, BrokerError> {
-        let effect = mission.effect(effect_id)?.clone();
+        match self.reconcile_uncertain_authority_bound(
+            mission,
+            effect_id,
+            infrastructure,
+            reconciler,
+            verifier,
+            now,
+        ) {
+            Ok(bound) => Ok(bound.into_parts().0),
+            Err(bound) => Err(bound.into_parts().0),
+        }
+    }
+
+    /// Reconciles an uncertain effect and returns the accepted completion
+    /// authority needed by the Application projection layer.
+    pub fn reconcile_uncertain_authority_bound(
+        &mut self,
+        mission: &mut Mission,
+        effect_id: &EffectId,
+        infrastructure: &mut impl EffectInfrastructure,
+        reconciler: &mut impl EffectReconciler,
+        verifier: &mut impl EffectVerifier,
+        entry_at: DateTime<Utc>,
+    ) -> Result<AuthorityBoundBrokerResult, AuthorityBoundBrokerError> {
+        let authority = EffectCompletionAuthority::new(entry_at);
+        let mut clock = match EffectAuthorityClock::system(entry_at) {
+            Ok(clock) => clock,
+            Err(error) => return Err(AuthorityBoundBrokerError::new(error, authority)),
+        };
+        self.reconcile_uncertain_with_clock(
+            mission,
+            effect_id,
+            infrastructure,
+            reconciler,
+            verifier,
+            &mut clock,
+        )
+    }
+
+    fn reconcile_uncertain_with_clock(
+        &mut self,
+        mission: &mut Mission,
+        effect_id: &EffectId,
+        infrastructure: &mut impl EffectInfrastructure,
+        reconciler: &mut impl EffectReconciler,
+        verifier: &mut impl EffectVerifier,
+        clock: &mut EffectAuthorityClock,
+    ) -> Result<AuthorityBoundBrokerResult, AuthorityBoundBrokerError> {
+        let mut authority = EffectCompletionAuthority::new(clock.entry_at());
+        match self.reconcile_uncertain_inner(ReconcileUncertainFlow {
+            mission,
+            effect_id,
+            infrastructure,
+            reconciler,
+            verifier,
+            clock,
+            authority: &mut authority,
+        }) {
+            Ok(result) => Ok(AuthorityBoundBrokerResult { result, authority }),
+            Err(error) => Err(AuthorityBoundBrokerError::new(error, authority)),
+        }
+    }
+
+    fn reconcile_uncertain_inner<Infrastructure, Reconciler, Verifier>(
+        &mut self,
+        flow: ReconcileUncertainFlow<'_, Infrastructure, Reconciler, Verifier>,
+    ) -> Result<BrokerResult, BrokerError>
+    where
+        Infrastructure: EffectInfrastructure,
+        Reconciler: EffectReconciler,
+        Verifier: EffectVerifier,
+    {
+        let now = flow.clock.entry_at();
+        let effect = flow.mission.effect(flow.effect_id)?.clone();
         if effect.status != EffectStatus::VerificationRequired {
             return Err(BrokerError::ReconciliationNotRequired);
         }
-        let claim = infrastructure.claim_reconciliation(
+        let claim = flow.infrastructure.claim_reconciliation(
             &effect,
             &self.reconciliation_policy,
             &self.worker_id,
@@ -1202,12 +1870,8 @@ impl EffectBroker {
                 execution_started_at,
             } => (lease, execution_started_at),
             ReconciliationClaim::Resolved(claim) => {
-                return match Self::resolve_ledger_claim(mission, effect_id, claim)? {
-                    ResolvedLedgerClaim::Complete(result) => Ok(result),
-                    ResolvedLedgerClaim::Acquired { .. } => {
-                        Err(BrokerError::ReconciliationNotRequired)
-                    }
-                };
+                let ResolvedLedgerClaim::Acquired { .. } = Self::resolve_ledger_claim(claim)?;
+                return Err(BrokerError::ReconciliationNotRequired);
             }
             ReconciliationClaim::NotReady { retry_at } => {
                 return Err(BrokerError::ReconciliationNotReady { retry_at });
@@ -1217,10 +1881,35 @@ impl EffectBroker {
                 return Err(BrokerError::ReconciliationNotRequired);
             }
         };
-        let observation = reconciler.reconcile(&effect);
+        let observation = flow.reconciler.reconcile(&effect);
+        let reconciliation_sample = flow
+            .clock
+            .sample_post_external_call(flow.authority.sampling_floor())?;
         observation.validate_for(&effect, execution_started_at)?;
-        let disposition =
-            infrastructure.record_reconciliation(&effect, &lease, &observation, now)?;
+        let disposition = flow.infrastructure.record_reconciliation(
+            &effect,
+            &lease,
+            &observation,
+            reconciliation_sample.operation_at,
+        )?;
+        flow.authority.accept(
+            EffectCompletionBoundary::Reconciliation,
+            reconciliation_sample,
+        )?;
+        let ReconcileUncertainFlow {
+            mission,
+            effect_id,
+            infrastructure,
+            verifier,
+            clock,
+            authority,
+            reconciler: _,
+        } = flow;
+        let mut timing = ReconciliationCompletionTiming {
+            clock,
+            authority,
+            reconciliation_at: reconciliation_sample.operation_at,
+        };
         Self::finish_reconciliation(
             mission,
             effect_id,
@@ -1228,6 +1917,7 @@ impl EffectBroker {
             infrastructure,
             verifier,
             disposition,
+            &mut timing,
         )
     }
 
@@ -1238,79 +1928,64 @@ impl EffectBroker {
         infrastructure: &mut impl EffectInfrastructure,
         verifier: &mut impl EffectVerifier,
         disposition: ReconciliationDisposition,
+        timing: &mut ReconciliationCompletionTiming<'_>,
     ) -> Result<BrokerResult, BrokerError> {
         match disposition {
             ReconciliationDisposition::ReceiptReadyForVerification {
                 lease,
                 receipt,
                 execution_started_at,
-            } => {
-                mission.reconcile_durable_receipt(
-                    effect_id,
-                    receipt.clone(),
+            } => Self::verify_reconciled_receipt(
+                mission,
+                effect_id,
+                effect,
+                infrastructure,
+                verifier,
+                ReconciledReceiptVerification {
+                    lease,
+                    receipt,
                     execution_started_at,
-                )?;
-                let effect_with_receipt = mission.effect(effect_id)?.clone();
-                let verification = verifier.verify(&effect_with_receipt, &receipt);
-                let mut candidate = mission.clone();
-                candidate.record_verification(effect_id, verification.clone())?;
-                infrastructure.record_verification(
-                    effect,
-                    &lease,
-                    &verification,
-                    verification.observed_at,
-                )?;
-                *mission = candidate;
-                match verification.status {
-                    VerificationStatus::Confirmed => Ok(BrokerResult {
-                        disposition: ExecutionDisposition::ReusedIdempotentReceipt,
-                        receipt,
-                        verification,
-                    }),
-                    VerificationStatus::Rejected => Err(BrokerError::VerificationRejected),
-                    VerificationStatus::Inconclusive => Err(BrokerError::VerificationInconclusive),
-                }
-            }
+                },
+                timing,
+            ),
             ReconciliationDisposition::ReconciledNotExecuted {
                 evidence_digest,
-                observed_at,
                 execution_started_at,
+                ..
             } => {
                 mission.reconcile_durable_provider_state(
                     effect_id,
                     DurableProviderState::ReconciledNotExecuted,
                     execution_started_at,
-                    observed_at,
+                    timing.reconciliation_at,
                 )?;
                 Err(BrokerError::ProviderNotExecuted { evidence_digest })
             }
             ReconciliationDisposition::ProviderRejected {
                 reason,
-                evidence_digest: _,
-                observed_at,
                 execution_started_at,
+                ..
             } => {
                 mission.reconcile_durable_provider_state(
                     effect_id,
                     DurableProviderState::Rejected,
                     execution_started_at,
-                    observed_at,
+                    timing.reconciliation_at,
                 )?;
                 Err(BrokerError::ProviderRejected(reason))
             }
             ReconciliationDisposition::RetryScheduled {
                 reason,
                 evidence_digest,
-                observed_at,
                 retry_at,
-                attempt_no: _,
                 execution_started_at,
+                ..
             } => {
                 mission.reconcile_durable_provider_state(
                     effect_id,
                     DurableProviderState::Uncertain,
                     execution_started_at,
-                    observed_at,
+                    timing.reconciliation_at,
                 )?;
                 Err(BrokerError::ReconciliationStillUncertain {
                     reason,
@@ -1321,21 +1996,88 @@ impl EffectBroker {
             ReconciliationDisposition::DeadLetter {
                 reason,
                 evidence_digest,
-                dead_lettered_at,
                 attempts,
                 execution_started_at,
+                ..
             } => {
                 mission.reconcile_durable_provider_state(
                     effect_id,
                     DurableProviderState::DeadLetter,
                     execution_started_at,
-                    dead_lettered_at,
+                    timing.reconciliation_at,
                 )?;
                 Err(BrokerError::ReconciliationDeadLetter {
                     reason,
                     evidence_digest,
                     attempts,
                 })
+            }
+        }
+    }
+
+    fn verify_reconciled_receipt(
+        mission: &mut Mission,
+        effect_id: &EffectId,
+        effect: &Effect,
+        infrastructure: &mut impl EffectInfrastructure,
+        verifier: &mut impl EffectVerifier,
+        input: ReconciledReceiptVerification,
+        timing: &mut ReconciliationCompletionTiming<'_>,
+    ) -> Result<BrokerResult, BrokerError> {
+        let ReconciledReceiptVerification {
+            lease,
+            receipt,
+            execution_started_at,
+        } = input;
+        mission.reconcile_durable_receipt(effect_id, receipt.clone(), execution_started_at)?;
+        Self::bind_receipt_projection_at(mission, timing.reconciliation_at);
+        let effect_with_receipt = mission.effect(effect_id)?.clone();
+        let verification = verifier.verify(&effect_with_receipt, &receipt);
+        let verification_sample = timing
+            .clock
+            .sample_post_external_call(timing.authority.sampling_floor())?;
+        let mut candidate = mission.clone();
+        candidate.record_verification(effect_id, verification.clone())?;
+        infrastructure.record_verification(
+            effect,
+            &lease,
+            &verification,
+            verification_sample.operation_at,
+        )?;
+        timing
+            .authority
+            .accept(EffectCompletionBoundary::Verification, verification_sample)?;
+        Self::bind_verification_projection_at(&mut candidate, verification_sample.operation_at);
+        *mission = candidate;
+        match verification.status {
+            VerificationStatus::Confirmed => Ok(BrokerResult {
+                disposition: ExecutionDisposition::ReusedIdempotentReceipt,
+                receipt,
+                verification,
+            }),
+            VerificationStatus::Rejected => Err(BrokerError::VerificationRejected),
+            VerificationStatus::Inconclusive => Err(BrokerError::VerificationInconclusive),
+        }
+    }
+
+    fn bind_receipt_projection_at(mission: &mut Mission, operation_at: DateTime<Utc>) {
+        mission.updated_at = operation_at;
+    }
+
+    fn bind_verification_projection_at(mission: &mut Mission, operation_at: DateTime<Utc>) {
+        Self::bind_receipt_projection_at(mission, operation_at);
+        if let Some(block) = &mut mission.block
+            && block.code == "verification_rejected"
+        {
+            block.observed_at = operation_at;
+        }
+        if let Some(definition) = &mut mission.definition {
+            for checkpoint in &mut definition.checkpoints {
+                if let Some(block) = &mut checkpoint.block
+                    && block.code == "verification_rejected"
+                {
+                    block.observed_at = operation_at;
+                }
             }
         }
     }
@@ -1365,11 +2107,7 @@ impl EffectBroker {
         )?)
     }
 
-    fn resolve_ledger_claim(
-        mission: &mut Mission,
-        effect_id: &EffectId,
-        claim: LedgerClaim,
-    ) -> Result<ResolvedLedgerClaim, BrokerError> {
+    fn resolve_ledger_claim(claim: LedgerClaim) -> Result<ResolvedLedgerClaim, BrokerError> {
         match claim {
             LedgerClaim::Acquired {
                 lease,
@@ -1380,80 +2118,12 @@ impl EffectBroker {
                 receipt,
                 execution_started_at,
             }),
-            LedgerClaim::AlreadyVerified {
-                receipt,
-                verification,
-                execution_started_at,
-            }
-            | LedgerClaim::DurableVerification {
-                receipt,
-                verification,
-                execution_started_at,
-            } => Self::resolve_verification_claim(
-                mission,
-                effect_id,
-                receipt,
-                verification,
-                execution_started_at,
-            ),
-            LedgerClaim::ProviderRejected {
-                reason,
-                execution_started_at,
-                recorded_at,
-            } => {
-                mission.reconcile_durable_provider_state(
-                    effect_id,
-                    DurableProviderState::Rejected,
-                    execution_started_at,
-                    recorded_at,
-                )?;
-                Err(BrokerError::ProviderRejected(reason))
-            }
-            LedgerClaim::Uncertain {
-                reason,
-                execution_started_at,
-                recorded_at,
-            } => {
-                mission.reconcile_durable_provider_state(
-                    effect_id,
-                    DurableProviderState::Uncertain,
-                    execution_started_at,
-                    recorded_at,
-                )?;
-                Err(BrokerError::ProviderUncertain(reason))
-            }
-            LedgerClaim::ReconciledNotExecuted {
-                evidence_digest,
-                observed_at,
-                execution_started_at,
-            } => {
-                mission.reconcile_durable_provider_state(
-                    effect_id,
-                    DurableProviderState::ReconciledNotExecuted,
-                    execution_started_at,
-                    observed_at,
-                )?;
-                Err(BrokerError::ProviderNotExecuted { evidence_digest })
-            }
-            LedgerClaim::DeadLetter {
-                reason,
-                evidence_digest,
-                dead_lettered_at,
-                attempts,
-                execution_started_at,
-            } => {
-                mission.reconcile_durable_provider_state(
-                    effect_id,
-                    DurableProviderState::DeadLetter,
-                    execution_started_at,
-                    dead_lettered_at,
-                )?;
-                Err(BrokerError::ReconciliationDeadLetter {
-                    reason,
-                    evidence_digest,
-                    attempts,
-                })
-            }
+            LedgerClaim::AlreadyVerified { .. }
+            | LedgerClaim::DurableVerification { .. }
+            | LedgerClaim::ProviderRejected { .. }
+            | LedgerClaim::Uncertain { .. }
+            | LedgerClaim::ReconciledNotExecuted { .. }
+            | LedgerClaim::DeadLetter { .. } => Err(BrokerError::DurableProjectionRecoveryRequired),
             LedgerClaim::RateLimited { retry_at } => Err(BrokerError::RateLimited { retry_at }),
             LedgerClaim::AuthorizationRequired => {
                 Err(BrokerError::Ledger(LedgerError::Persistence(
@@ -1461,26 +2131,6 @@ impl EffectBroker {
                 )))
             }
             LedgerClaim::Busy => Err(BrokerError::ExecutionBusy),
-        }
-    }
-
-    fn resolve_verification_claim(
-        mission: &mut Mission,
-        effect_id: &EffectId,
-        receipt: Receipt,
-        verification: Verification,
-        execution_started_at: DateTime<Utc>,
-    ) -> Result<ResolvedLedgerClaim, BrokerError> {
-        mission.reconcile_durable_receipt(effect_id, receipt.clone(), execution_started_at)?;
-        mission.record_verification(effect_id, verification.clone())?;
-        match verification.status {
-            VerificationStatus::Confirmed => Ok(ResolvedLedgerClaim::Complete(BrokerResult {
-                disposition: ExecutionDisposition::AlreadyVerified,
-                receipt,
-                verification,
-            })),
-            VerificationStatus::Rejected => Err(BrokerError::VerificationRejected),
-            VerificationStatus::Inconclusive => Err(BrokerError::VerificationInconclusive),
         }
     }
 
@@ -1573,10 +2223,14 @@ pub enum BrokerError {
     PermissionEvidenceChanged,
     #[error("effect execution worker or lease duration is invalid")]
     InvalidLease,
+    #[error("effect authority clock is invalid, regressed, or exhausted")]
+    InvalidAuthorityClock,
     #[error("effect execution is already leased by another current worker")]
     ExecutionBusy,
     #[error("mission requires durable effect recovery, but no matching ledger state exists")]
     MissingDurableRecovery,
+    #[error("durable effect completion requires projection recovery")]
+    DurableProjectionRecoveryRequired,
     #[error("effect execution is rate limited until {retry_at}")]
     RateLimited { retry_at: DateTime<Utc> },
     #[error("effect has not been approved; current status is {0:?}")]
@@ -1714,12 +2368,16 @@ fn effect_class_name(value: &EffectClass) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{
+        cell::Cell,
+        collections::{BTreeSet, VecDeque},
+        rc::Rc,
+    };
 
     use chrono::{Duration, TimeZone};
     use hartevo_domain_kernel::{
-        EffectRisk, EffectSpec, MissionContract, MissionId, Outcome, OutcomeDecision, ProjectId,
-        ReceiptId, VerificationId,
+        ConversationEffectGuard, EffectRisk, EffectSpec, MissionContract, MissionId, Outcome,
+        OutcomeDecision, ProjectId, ReceiptId, VerificationId,
     };
     use proptest::prelude::*;
 
@@ -1732,14 +2390,28 @@ mod tests {
     }
 
     fn proposed_mission() -> (Mission, EffectId) {
-        proposed_mission_fixture(false)
+        proposed_mission_fixture(false, None)
     }
 
     fn proposed_mission_with_connection() -> (Mission, EffectId) {
-        proposed_mission_fixture(true)
+        proposed_mission_fixture(true, None)
     }
 
-    fn proposed_mission_fixture(with_connection: bool) -> (Mission, EffectId) {
+    fn proposed_mission_with_conversation() -> (Mission, EffectId) {
+        proposed_mission_fixture(
+            false,
+            Some(ConversationEffectGuard {
+                conversation_id: ConversationId::from("conversation-1"),
+                control_generation: 1,
+                scope_digest: "7".repeat(64),
+            }),
+        )
+    }
+
+    fn proposed_mission_fixture(
+        with_connection: bool,
+        conversation_guard: Option<ConversationEffectGuard>,
+    ) -> (Mission, EffectId) {
         let mut contract = MissionContract::bootstrap(
             "Publish a reviewed preview",
             ["channel.preview".into()],
@@ -1781,7 +2453,7 @@ mod tests {
                     consent: ConsentState::NotRequired,
                     consent_record_id: None,
                     consent_requirement: None,
-                    conversation_guard: None,
+                    conversation_guard,
                     creator_contact_guard: None,
                     policy_version: "policy-v1".into(),
                     risk: EffectRisk::Low,
@@ -1832,9 +2504,37 @@ mod tests {
         reconciliation_attempts: u32,
         reconciliation_retry_at: Option<DateTime<Utc>>,
         reconciliation_terminal: Option<LedgerClaim>,
+        enforce_completion_fence: bool,
+        receipt_operation_at: Option<DateTime<Utc>>,
+        verification_operation_at: Option<DateTime<Utc>>,
+        failed_operation_at: Option<DateTime<Utc>>,
+        uncertain_operation_at: Option<DateTime<Utc>>,
+        reconciliation_operation_at: Option<DateTime<Utc>>,
     }
 
     impl TestLedger {
+        fn require_execution_completion_live(
+            &self,
+            lease: &ExecutionLease,
+            operation_at: DateTime<Utc>,
+        ) -> Result<(), LedgerError> {
+            if self.enforce_completion_fence && lease.expires_at <= operation_at {
+                return Err(LedgerError::LeaseLost);
+            }
+            Ok(())
+        }
+
+        fn require_reconciliation_completion_live(
+            &self,
+            lease: &ReconciliationLease,
+            operation_at: DateTime<Utc>,
+        ) -> Result<(), LedgerError> {
+            if self.enforce_completion_fence && lease.expires_at <= operation_at {
+                return Err(LedgerError::LeaseLost);
+            }
+            Ok(())
+        }
+
         fn record_still_uncertain(
             &mut self,
             lease: &ReconciliationLease,
@@ -1958,44 +2658,52 @@ mod tests {
         fn record_receipt(
             &mut self,
             _effect: &Effect,
-            _lease: &ExecutionLease,
+            lease: &ExecutionLease,
             receipt: &Receipt,
-            _now: DateTime<Utc>,
+            operation_at: DateTime<Utc>,
         ) -> Result<(), LedgerError> {
+            self.require_execution_completion_live(lease, operation_at)?;
             self.receipt = Some(receipt.clone());
+            self.receipt_operation_at = Some(operation_at);
             Ok(())
         }
 
         fn record_verification(
             &mut self,
             _effect: &Effect,
-            _lease: &ExecutionLease,
+            lease: &ExecutionLease,
             verification: &Verification,
-            _now: DateTime<Utc>,
+            operation_at: DateTime<Utc>,
         ) -> Result<(), LedgerError> {
+            self.require_execution_completion_live(lease, operation_at)?;
             self.verification = Some(verification.clone());
+            self.verification_operation_at = Some(operation_at);
             Ok(())
         }
 
         fn record_failed(
             &mut self,
             _effect: &Effect,
-            _lease: &ExecutionLease,
+            lease: &ExecutionLease,
             reason: &str,
-            _now: DateTime<Utc>,
+            operation_at: DateTime<Utc>,
         ) -> Result<(), LedgerError> {
+            self.require_execution_completion_live(lease, operation_at)?;
             self.rejected = Some(reason.into());
+            self.failed_operation_at = Some(operation_at);
             Ok(())
         }
 
         fn record_uncertain(
             &mut self,
             _effect: &Effect,
-            _lease: &ExecutionLease,
+            lease: &ExecutionLease,
             reason: &str,
-            _now: DateTime<Utc>,
+            operation_at: DateTime<Utc>,
         ) -> Result<(), LedgerError> {
+            self.require_execution_completion_live(lease, operation_at)?;
             self.uncertain = Some(reason.into());
+            self.uncertain_operation_at = Some(operation_at);
             Ok(())
         }
 
@@ -2057,6 +2765,7 @@ mod tests {
             observation: &ReconciliationObservation,
             now: DateTime<Utc>,
         ) -> Result<ReconciliationDisposition, LedgerError> {
+            self.require_reconciliation_completion_live(lease, now)?;
             let execution_started_at = self.execution_started_at.unwrap_or(now);
             observation.validate_for(effect, execution_started_at)?;
             if observation.observed_at() > now {
@@ -2072,6 +2781,7 @@ mod tests {
             {
                 return Err(LedgerError::LeaseLost);
             }
+            self.reconciliation_operation_at = Some(now);
             let disposition = match observation {
                 ReconciliationObservation::ReceiptFound { receipt, .. } => {
                     self.receipt = Some(receipt.clone());
@@ -2150,20 +2860,27 @@ mod tests {
                     "fixture resolver has no external authorization records".into(),
                 ));
             }
-            let fences =
-                effect
-                    .connection_id
-                    .as_ref()
-                    .map_or_else(BTreeSet::new, |connection_id| {
-                        BTreeSet::from([PermissionFence::Connection {
-                            connection_id: connection_id.clone(),
-                            revision: self.permission_revision,
-                        }])
-                    });
+            let mut fences = BTreeSet::new();
+            if let Some(connection_id) = &effect.connection_id {
+                fences.insert(PermissionFence::Connection {
+                    connection_id: connection_id.clone(),
+                    revision: self.permission_revision,
+                });
+            }
+            if let Some(guard) = &effect.conversation_guard {
+                fences.insert(PermissionFence::Conversation {
+                    conversation_id: guard.conversation_id.clone(),
+                    revision: 1,
+                    control_generation: guard.control_generation,
+                });
+            }
             Ok(PermissionEvidence {
                 connection_evidence_digest: self.permission_evidence_digest.clone(),
                 consent_evidence_digest: None,
-                conversation_evidence_digest: None,
+                conversation_evidence_digest: effect
+                    .conversation_guard
+                    .as_ref()
+                    .map(|guard| guard.scope_digest.clone()),
                 creator_contact_evidence_digest: None,
                 fences,
             })
@@ -2248,6 +2965,212 @@ mod tests {
             self.calls += 1;
             self.observation.clone()
         }
+    }
+
+    struct ScriptedAuthorityTimeSource {
+        samples: VecDeque<DateTime<Utc>>,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl EffectAuthorityTimeSource for ScriptedAuthorityTimeSource {
+        fn sample(&mut self) -> Result<DateTime<Utc>, BrokerError> {
+            self.calls.set(self.calls.get() + 1);
+            self.samples
+                .pop_front()
+                .ok_or(BrokerError::InvalidAuthorityClock)
+        }
+    }
+
+    struct ProbeExecutor {
+        sample_calls: Rc<Cell<usize>>,
+        expected_sample_calls: usize,
+        result: Result<Receipt, ProviderFailure>,
+    }
+
+    impl EffectExecutor for ProbeExecutor {
+        fn execute(&mut self, _effect: &Effect) -> Result<Receipt, ProviderFailure> {
+            assert_eq!(self.sample_calls.get(), self.expected_sample_calls);
+            self.result.clone()
+        }
+    }
+
+    struct ProbeVerifier {
+        sample_calls: Rc<Cell<usize>>,
+        expected_sample_calls: usize,
+        verification: Verification,
+    }
+
+    impl EffectVerifier for ProbeVerifier {
+        fn verify(&mut self, _effect: &Effect, _receipt: &Receipt) -> Verification {
+            assert_eq!(self.sample_calls.get(), self.expected_sample_calls);
+            self.verification.clone()
+        }
+    }
+
+    struct ProbeReconciler {
+        sample_calls: Rc<Cell<usize>>,
+        expected_sample_calls: usize,
+        observation: ReconciliationObservation,
+    }
+
+    impl EffectReconciler for ProbeReconciler {
+        fn reconcile(&mut self, _effect: &Effect) -> ReconciliationObservation {
+            assert_eq!(self.sample_calls.get(), self.expected_sample_calls);
+            self.observation.clone()
+        }
+    }
+
+    fn scripted_clock(
+        entry_at: DateTime<Utc>,
+        samples: impl IntoIterator<Item = DateTime<Utc>>,
+        calls: Rc<Cell<usize>>,
+    ) -> EffectAuthorityClock {
+        EffectAuthorityClock::from_test_source(
+            entry_at,
+            ScriptedAuthorityTimeSource {
+                samples: samples.into_iter().collect(),
+                calls,
+            },
+        )
+    }
+
+    fn approved_mission() -> (Mission, EffectId, EffectBroker, TestLedger) {
+        let (mut mission, effect_id) = proposed_mission();
+        let broker = broker();
+        let ledger = TestLedger::default();
+        broker
+            .approve(
+                &mut mission,
+                &effect_id,
+                ActorId::from("user-1"),
+                &ledger,
+                now(),
+            )
+            .expect("approval");
+        (mission, effect_id, broker, ledger)
+    }
+
+    fn durable_receipt(effect: &Effect, id: &str) -> Receipt {
+        Receipt {
+            id: ReceiptId::from_stable(id),
+            provider: effect.provider.clone(),
+            external_id: format!("external-{id}"),
+            accepted_at: now() + Duration::seconds(1),
+            request_digest: effect.approval_digest(),
+            response_digest: "a".repeat(64),
+        }
+    }
+
+    fn durable_verification(
+        receipt: &Receipt,
+        id: &str,
+        status: VerificationStatus,
+    ) -> Verification {
+        Verification {
+            id: VerificationId::from_stable(id),
+            status,
+            verifier: "durable-readback".into(),
+            independent: true,
+            observed_at: now() + Duration::seconds(2),
+            evidence_digest: "b".repeat(64),
+            receipt_id: receipt.id.clone(),
+        }
+    }
+
+    fn durable_terminal_claim(effect: &Effect, claim_index: usize, marker: &str) -> LedgerClaim {
+        let receipt = durable_receipt(effect, marker);
+        let verification = durable_verification(
+            &receipt,
+            marker,
+            if claim_index == 1 {
+                VerificationStatus::Rejected
+            } else {
+                VerificationStatus::Confirmed
+            },
+        );
+        match claim_index {
+            0 => LedgerClaim::AlreadyVerified {
+                receipt,
+                verification,
+                execution_started_at: now(),
+            },
+            1 => LedgerClaim::DurableVerification {
+                receipt,
+                verification,
+                execution_started_at: now(),
+            },
+            2 => LedgerClaim::ProviderRejected {
+                reason: marker.into(),
+                execution_started_at: now(),
+                recorded_at: now() + Duration::seconds(1),
+            },
+            3 => LedgerClaim::Uncertain {
+                reason: marker.into(),
+                execution_started_at: now(),
+                recorded_at: now() + Duration::seconds(1),
+            },
+            4 => LedgerClaim::ReconciledNotExecuted {
+                evidence_digest: marker.into(),
+                observed_at: now() + Duration::seconds(1),
+                execution_started_at: now(),
+            },
+            5 => LedgerClaim::DeadLetter {
+                reason: marker.into(),
+                evidence_digest: marker.into(),
+                dead_lettered_at: now() + Duration::seconds(1),
+                attempts: 3,
+                execution_started_at: now(),
+            },
+            _ => unreachable!("six durable terminal claim variants"),
+        }
+    }
+
+    fn assert_durable_terminal_claim_requires_recovery(claim_index: usize) {
+        let marker = "terminal-ledger-fact-must-not-leak";
+        let (mut mission, effect_id) = proposed_mission();
+        let mut broker = broker();
+        let mut ledger = TestLedger::default();
+        broker
+            .approve(
+                &mut mission,
+                &effect_id,
+                ActorId::from("user-1"),
+                &ledger,
+                now(),
+            )
+            .expect("approval");
+        let effect = mission.effect(&effect_id).expect("effect").clone();
+        ledger.reconciliation_terminal = Some(durable_terminal_claim(&effect, claim_index, marker));
+        let mission_before = mission.clone();
+        let calls = Rc::new(Cell::new(0));
+        let mut clock = scripted_clock(now(), [], Rc::clone(&calls));
+        let mut executor = CountingExecutor::default();
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+
+        let error = broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut clock,
+            )
+            .expect_err("durable terminal claim requires projection recovery");
+
+        assert_eq!(
+            error.error(),
+            &BrokerError::DurableProjectionRecoveryRequired
+        );
+        assert!(error.authority().latest_accepted().is_none());
+        assert_eq!(mission, mission_before);
+        assert_eq!((executor.calls, verifier.calls, calls.get()), (0, 0, 0));
+        assert!(!error.to_string().contains(marker));
+        assert!(!format!("{error:?}").contains(marker));
+        assert!(!format!("{error:?}").contains("2026-08-10"));
     }
 
     #[test]
@@ -2537,7 +3460,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_provider_rejection_projects_without_reauthorization_or_provider_replay() {
+    fn durable_provider_rejection_requires_projection_recovery_without_mission_mutation() {
         let (mut mission, effect_id) = proposed_mission();
         let mut broker = broker();
         let mut ledger = TestLedger {
@@ -2554,35 +3477,43 @@ mod tests {
                 now(),
             )
             .expect("approval");
+        let mission_before = mission.clone();
         let mut executor = CountingExecutor::default();
-        let mut verifier = ConfirmingVerifier;
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
 
-        let result = broker.execute_and_verify(
-            &mut mission,
-            &effect_id,
-            &mut ledger,
-            &mut executor,
-            &mut verifier,
-            now() + Duration::seconds(61),
-        );
+        let error = broker
+            .execute_and_verify_authority_bound(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                now() + Duration::seconds(61),
+            )
+            .expect_err("durable rejection needs ledger-authoritative projection recovery");
 
         assert_eq!(
-            result,
-            Err(BrokerError::ProviderRejected(
-                "durable provider validation rejection".into()
-            ))
+            error.error(),
+            &BrokerError::DurableProjectionRecoveryRequired
         );
-        assert_eq!(executor.calls, 0);
+        assert!(error.authority().latest_accepted().is_none());
+        assert_eq!((executor.calls, verifier.calls), (0, 0));
         assert_eq!(ledger.recovery_probe_calls, 1);
         assert_eq!(ledger.authorized_claim_calls, 0);
-        assert_eq!(
-            mission.effect(&effect_id).expect("effect").status,
-            EffectStatus::Failed
+        assert_eq!(mission, mission_before);
+        assert!(
+            !error
+                .to_string()
+                .contains("durable provider validation rejection")
         );
+        assert!(!format!("{error:?}").contains("durable provider validation rejection"));
     }
 
     #[test]
-    fn durable_rejected_verification_projects_exact_receipt_without_rerunning_verifier() {
+    fn durable_rejected_verification_requires_projection_recovery_without_mission_mutation() {
         let (mut mission, effect_id) = proposed_mission();
         let mut broker = broker();
         let mut ledger = TestLedger::default();
@@ -2615,37 +3546,39 @@ mod tests {
             evidence_digest: "e".repeat(64),
             receipt_id: receipt.id.clone(),
         });
+        let mission_before = mission.clone();
         let mut executor = CountingExecutor::default();
         let mut verifier = CountingVerifier {
             calls: 0,
             status: VerificationStatus::Confirmed,
         };
 
-        let result = broker.execute_and_verify(
-            &mut mission,
-            &effect_id,
-            &mut ledger,
-            &mut executor,
-            &mut verifier,
-            now() + Duration::seconds(61),
-        );
+        let error = broker
+            .execute_and_verify_authority_bound(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                now() + Duration::seconds(61),
+            )
+            .expect_err("durable verification needs projection recovery");
 
-        assert_eq!(result, Err(BrokerError::VerificationRejected));
+        assert_eq!(
+            error.error(),
+            &BrokerError::DurableProjectionRecoveryRequired
+        );
+        assert!(error.authority().latest_accepted().is_none());
         assert_eq!(executor.calls, 0);
         assert_eq!(verifier.calls, 0);
         assert_eq!(ledger.authorized_claim_calls, 0);
-        assert_eq!(
-            mission.effect(&effect_id).expect("effect").status,
-            EffectStatus::Failed
-        );
-        assert_eq!(
-            mission.effect(&effect_id).expect("effect").receipt,
-            Some(receipt)
-        );
+        assert_eq!(mission, mission_before);
+        assert!(!error.to_string().contains(receipt.id.as_str()));
+        assert!(!format!("{error:?}").contains(receipt.id.as_str()));
     }
 
     #[test]
-    fn durable_inconclusive_verification_remains_reconcilable_without_provider_replay() {
+    fn durable_inconclusive_verification_requires_projection_recovery_without_mission_mutation() {
         let (mut mission, effect_id) = proposed_mission();
         let mut broker = broker();
         let mut ledger = TestLedger::default();
@@ -2678,29 +3611,273 @@ mod tests {
             evidence_digest: "e".repeat(64),
             receipt_id: receipt.id,
         });
+        let mission_before = mission.clone();
         let mut executor = CountingExecutor::default();
         let mut verifier = CountingVerifier {
             calls: 0,
             status: VerificationStatus::Confirmed,
         };
 
-        let result = broker.execute_and_verify(
-            &mut mission,
-            &effect_id,
-            &mut ledger,
-            &mut executor,
-            &mut verifier,
-            now() + Duration::seconds(61),
-        );
+        let error = broker
+            .execute_and_verify_authority_bound(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                now() + Duration::seconds(61),
+            )
+            .expect_err("durable verification needs projection recovery");
 
-        assert_eq!(result, Err(BrokerError::VerificationInconclusive));
+        assert_eq!(
+            error.error(),
+            &BrokerError::DurableProjectionRecoveryRequired
+        );
+        assert!(error.authority().latest_accepted().is_none());
         assert_eq!(executor.calls, 0);
         assert_eq!(verifier.calls, 0);
         assert_eq!(ledger.authorized_claim_calls, 0);
+        assert_eq!(mission, mission_before);
+    }
+
+    #[test]
+    fn every_durable_terminal_claim_requires_typed_projection_recovery_before_mutation() {
+        for claim_index in 0..6 {
+            assert_durable_terminal_claim_requires_recovery(claim_index);
+        }
+    }
+
+    #[test]
+    fn existing_receipt_conversation_guard_requires_recovery_before_verifier_or_clock() {
+        let (mut mission, effect_id) = proposed_mission_with_conversation();
+        let mut broker = broker();
+        let mut ledger = TestLedger::default();
+        broker
+            .approve(
+                &mut mission,
+                &effect_id,
+                ActorId::from("user-1"),
+                &ledger,
+                now(),
+            )
+            .expect("conversation-scoped approval");
+        let effect = mission.effect(&effect_id).expect("effect").clone();
+        let receipt = durable_receipt(&effect, "conversation-recovery-receipt");
+        ledger.execution_started_at = Some(now());
+        ledger.receipt = Some(receipt.clone());
+        let mission_before = mission.clone();
+        let calls = Rc::new(Cell::new(0));
+        let mut clock = scripted_clock(now(), [], Rc::clone(&calls));
+        let mut executor = CountingExecutor::default();
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+
+        let error = broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut clock,
+            )
+            .expect_err("conversation projection lacks ledger-native provider authority");
+
         assert_eq!(
-            mission.effect(&effect_id).expect("effect").status,
-            EffectStatus::VerificationRequired
+            error.error(),
+            &BrokerError::DurableProjectionRecoveryRequired
         );
+        assert!(error.authority().latest_accepted().is_none());
+        assert_eq!(mission, mission_before);
+        assert_eq!((executor.calls, verifier.calls, calls.get()), (0, 0, 0));
+        assert_eq!(ledger.receipt, Some(receipt.clone()));
+        assert!(ledger.verification.is_none());
+        assert!(!format!("{error:?}").contains(receipt.id.as_str()));
+    }
+
+    #[test]
+    fn existing_receipt_resume_commits_only_after_verification_cas_and_authority_accept() {
+        for status in [
+            VerificationStatus::Confirmed,
+            VerificationStatus::Rejected,
+            VerificationStatus::Inconclusive,
+        ] {
+            let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
+            let effect = mission.effect(&effect_id).expect("effect").clone();
+            let receipt = durable_receipt(&effect, "resume-status-receipt");
+            ledger.execution_started_at = Some(now());
+            ledger.receipt = Some(receipt);
+            ledger.enforce_completion_fence = true;
+            let completion_at = now() + Duration::seconds(3);
+            let calls = Rc::new(Cell::new(0));
+            let mut clock = scripted_clock(now(), [completion_at], Rc::clone(&calls));
+            let mut executor = CountingExecutor::default();
+            let mut verifier = CountingVerifier {
+                calls: 0,
+                status: status.clone(),
+            };
+
+            let bound = broker.execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut clock,
+            );
+            let authority = match &status {
+                VerificationStatus::Confirmed => bound.expect("confirmed resume").authority,
+                VerificationStatus::Rejected => {
+                    let error = bound.expect_err("rejected resume");
+                    assert_eq!(error.error(), &BrokerError::VerificationRejected);
+                    *error.authority()
+                }
+                VerificationStatus::Inconclusive => {
+                    let error = bound.expect_err("inconclusive resume");
+                    assert_eq!(error.error(), &BrokerError::VerificationInconclusive);
+                    *error.authority()
+                }
+            };
+            let expected_status = match status {
+                VerificationStatus::Confirmed => EffectStatus::Verified,
+                VerificationStatus::Rejected => EffectStatus::Failed,
+                VerificationStatus::Inconclusive => EffectStatus::VerificationRequired,
+            };
+
+            assert_eq!(
+                mission.effect(&effect_id).expect("effect").status,
+                expected_status
+            );
+            assert_eq!(mission.updated_at, completion_at);
+            assert!(authority.provider().is_none());
+            assert_eq!(
+                authority.verification().expect("verification authority"),
+                EffectCompletionPoint {
+                    sequence: 1,
+                    operation_at: completion_at,
+                }
+            );
+            assert_eq!(ledger.verification_operation_at, Some(completion_at));
+            assert_eq!((executor.calls, verifier.calls, calls.get()), (0, 1, 1));
+        }
+    }
+
+    fn assert_existing_receipt_sample_failure_preserves_mission() {
+        let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
+        let effect = mission.effect(&effect_id).expect("effect").clone();
+        ledger.execution_started_at = Some(now());
+        ledger.receipt = Some(durable_receipt(&effect, "resume-sample-failure"));
+        let mission_before = mission.clone();
+        let calls = Rc::new(Cell::new(0));
+        let mut clock = scripted_clock(now(), [], Rc::clone(&calls));
+        let mut executor = CountingExecutor::default();
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+        let sample_error = broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut clock,
+            )
+            .expect_err("missing post-verifier sample");
+
+        assert_eq!(sample_error.error(), &BrokerError::InvalidAuthorityClock);
+        assert!(sample_error.authority().latest_accepted().is_none());
+        assert_eq!(mission, mission_before);
+        assert_eq!((executor.calls, verifier.calls, calls.get()), (0, 1, 1));
+        assert!(ledger.verification.is_none());
+    }
+
+    fn assert_existing_receipt_cas_failure_preserves_mission() {
+        let (mut mission, effect_id, broker, mut ledger) = approved_mission();
+        let mut broker = broker.with_lease_for(Duration::seconds(5));
+        let effect = mission.effect(&effect_id).expect("effect").clone();
+        ledger.execution_started_at = Some(now());
+        ledger.receipt = Some(durable_receipt(&effect, "resume-cas-failure"));
+        ledger.enforce_completion_fence = true;
+        let mission_before = mission.clone();
+        let calls = Rc::new(Cell::new(0));
+        let mut clock = scripted_clock(now(), [now() + Duration::seconds(5)], Rc::clone(&calls));
+        let mut executor = CountingExecutor::default();
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+        let cas_error = broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut clock,
+            )
+            .expect_err("strict lease equality rejects verification CAS");
+
+        assert_eq!(
+            cas_error.error(),
+            &BrokerError::Ledger(LedgerError::LeaseLost)
+        );
+        assert!(cas_error.authority().latest_accepted().is_none());
+        assert_eq!(mission, mission_before);
+        assert_eq!((executor.calls, verifier.calls, calls.get()), (0, 1, 1));
+        assert!(ledger.verification.is_none());
+    }
+
+    fn assert_existing_receipt_accept_failure_preserves_mission() {
+        let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
+        let effect = mission.effect(&effect_id).expect("effect").clone();
+        ledger.execution_started_at = Some(now());
+        ledger.receipt = Some(durable_receipt(&effect, "resume-accept-failure"));
+        let mission_before = mission.clone();
+        let calls = Rc::new(Cell::new(0));
+        let mut clock = scripted_clock(now(), [now() + Duration::seconds(3)], Rc::clone(&calls));
+        let mut authority = EffectCompletionAuthority::new(now());
+        authority
+            .accept(
+                EffectCompletionBoundary::Provider,
+                EffectAuthoritySample {
+                    sequence: 1,
+                    operation_at: now() + Duration::seconds(1),
+                },
+            )
+            .expect("artificial previously accepted stage");
+        let mut executor = CountingExecutor::default();
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+        let accept_error = broker
+            .execute_and_verify_inner(ExecuteAndVerifyFlow {
+                mission: &mut mission,
+                effect_id: &effect_id,
+                infrastructure: &mut ledger,
+                executor: &mut executor,
+                verifier: &mut verifier,
+                clock: &mut clock,
+                authority: &mut authority,
+            })
+            .expect_err("duplicate accepted sequence must fail closed");
+
+        assert_eq!(accept_error, BrokerError::InvalidAuthorityClock);
+        assert_eq!(mission, mission_before);
+        assert_eq!((executor.calls, verifier.calls, calls.get()), (0, 1, 1));
+        assert!(ledger.verification.is_some());
+        assert!(authority.verification().is_none());
+    }
+
+    #[test]
+    fn existing_receipt_resume_preserves_mission_on_sample_cas_and_accept_failure() {
+        assert_existing_receipt_sample_failure_preserves_mission();
+        assert_existing_receipt_cas_failure_preserves_mission();
+        assert_existing_receipt_accept_failure_preserves_mission();
     }
 
     #[test]
@@ -2767,6 +3944,7 @@ mod tests {
             &mut verifier,
             now(),
         );
+        let mission_after_first = mission.clone();
         let second = broker.execute_and_verify(
             &mut mission,
             &effect_id,
@@ -2777,12 +3955,9 @@ mod tests {
         );
 
         assert!(matches!(first, Err(BrokerError::ProviderUncertain(_))));
-        assert!(matches!(second, Err(BrokerError::ProviderUncertain(_))));
+        assert_eq!(second, Err(BrokerError::DurableProjectionRecoveryRequired));
         assert_eq!(executor.calls, 1);
-        assert_eq!(
-            mission.effect(&effect_id).expect("effect").status,
-            EffectStatus::VerificationRequired
-        );
+        assert_eq!(mission, mission_after_first);
     }
 
     #[test]
@@ -2964,6 +4139,7 @@ mod tests {
             mission.effect(&effect_id).expect("effect").status,
             EffectStatus::Reconciled
         );
+        let stale_projection_before = stale_projection.clone();
         assert_eq!(
             broker.execute_and_verify(
                 &mut stale_projection,
@@ -2973,9 +4149,152 @@ mod tests {
                 &mut verifier,
                 now() + Duration::seconds(2),
             ),
-            Err(BrokerError::ProviderNotExecuted { evidence_digest })
+            Err(BrokerError::DurableProjectionRecoveryRequired)
         );
+        assert_eq!(stale_projection, stale_projection_before);
         assert_eq!((executor.calls, reconciler.calls), (1, 1));
+    }
+
+    struct BoundedReconciliationTestFlow<'a> {
+        broker: &'a mut EffectBroker,
+        mission: &'a mut Mission,
+        effect_id: &'a EffectId,
+        ledger: &'a mut TestLedger,
+        executor: &'a mut CountingExecutor,
+        reconciler: &'a mut CountingReconciler,
+        verifier: &'a mut ConfirmingVerifier,
+    }
+
+    fn first_bounded_reconciliation_retry_at(
+        flow: &mut BoundedReconciliationTestFlow<'_>,
+        reconciliation_entry_at: DateTime<Utc>,
+        reconciliation_fact_at: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        let first = flow
+            .broker
+            .reconcile_uncertain_authority_bound(
+                flow.mission,
+                flow.effect_id,
+                flow.ledger,
+                flow.reconciler,
+                flow.verifier,
+                reconciliation_entry_at,
+            )
+            .expect_err("first reconciliation remains uncertain");
+        let (first_error, first_authority) = first.into_parts();
+        let first_reconciliation = first_authority
+            .reconciliation()
+            .expect("accepted reconciliation authority");
+        assert!(first_authority.provider().is_none());
+        assert!(first_authority.verification().is_none());
+        assert_eq!(
+            first_authority.latest_accepted(),
+            Some(first_reconciliation)
+        );
+        assert_eq!(first_reconciliation.sequence(), 1);
+        assert_ne!(first_reconciliation.operation_at(), reconciliation_entry_at);
+        assert_ne!(first_reconciliation.operation_at(), reconciliation_fact_at);
+        let expected_retry_at = first_reconciliation
+            .operation_at()
+            .checked_add_signed(Duration::seconds(10))
+            .expect("bounded retry time");
+        let BrokerError::ReconciliationStillUncertain { retry_at, .. } = first_error else {
+            panic!("expected typed uncertain reconciliation result")
+        };
+        assert_eq!(retry_at, expected_retry_at);
+        retry_at
+    }
+
+    fn assert_dead_letter_requires_projection_recovery(
+        broker: &mut EffectBroker,
+        stale_projection: &mut Mission,
+        effect_id: &EffectId,
+        ledger: &mut TestLedger,
+        executor: &mut CountingExecutor,
+        verifier: &mut ConfirmingVerifier,
+        terminal_entry_at: DateTime<Utc>,
+    ) {
+        let stale_projection_before = stale_projection.clone();
+        let terminal_calls = Rc::new(Cell::new(0));
+        let mut terminal_clock = scripted_clock(terminal_entry_at, [], Rc::clone(&terminal_calls));
+        let terminal = broker
+            .execute_and_verify_with_clock(
+                stale_projection,
+                effect_id,
+                ledger,
+                executor,
+                verifier,
+                &mut terminal_clock,
+            )
+            .expect_err("dead-letter ledger requires projection recovery");
+        assert_eq!(
+            terminal.error(),
+            &BrokerError::DurableProjectionRecoveryRequired
+        );
+        assert!(terminal.authority().latest_accepted().is_none());
+        assert_eq!(terminal_calls.get(), 0);
+        assert_eq!(*stale_projection, stale_projection_before);
+    }
+
+    fn assert_bounded_reconciliation_retries_then_dead_letters(
+        flow: &mut BoundedReconciliationTestFlow<'_>,
+        retry_at: DateTime<Utc>,
+    ) {
+        assert_eq!(
+            flow.broker.reconcile_uncertain(
+                flow.mission,
+                flow.effect_id,
+                flow.ledger,
+                flow.reconciler,
+                flow.verifier,
+                now() + Duration::seconds(2),
+            ),
+            Err(BrokerError::ReconciliationNotReady { retry_at })
+        );
+        let mut stale_projection = flow.mission.clone();
+        let retry_calls = Rc::new(Cell::new(0));
+        let mut retry_clock = scripted_clock(retry_at, [retry_at], Rc::clone(&retry_calls));
+        let dead_letter = flow
+            .broker
+            .reconcile_uncertain_with_clock(
+                flow.mission,
+                flow.effect_id,
+                flow.ledger,
+                flow.reconciler,
+                flow.verifier,
+                &mut retry_clock,
+            )
+            .expect_err("retry equality acquires and reaches the bounded dead letter");
+        assert!(matches!(
+            dead_letter.error(),
+            BrokerError::ReconciliationDeadLetter { attempts: 2, .. }
+        ));
+        assert_eq!(retry_calls.get(), 1);
+        assert_eq!(
+            dead_letter
+                .authority()
+                .reconciliation()
+                .expect("dead-letter reconciliation authority")
+                .operation_at(),
+            retry_at
+        );
+        assert_eq!(
+            flow.mission.effect(flow.effect_id).expect("effect").status,
+            EffectStatus::DeadLetter
+        );
+        let terminal_entry_at = retry_at
+            .checked_add_signed(Duration::seconds(1))
+            .expect("bounded terminal probe time");
+        assert_dead_letter_requires_projection_recovery(
+            flow.broker,
+            &mut stale_projection,
+            flow.effect_id,
+            flow.ledger,
+            flow.executor,
+            flow.verifier,
+            terminal_entry_at,
+        );
+        assert_eq!((flow.executor.calls, flow.reconciler.calls), (1, 2));
     }
 
     #[test]
@@ -3013,68 +4332,31 @@ mod tests {
                 now(),
             )
             .expect_err("first write is uncertain");
+        let reconciliation_fact_at = now() + Duration::milliseconds(500);
+        let reconciliation_entry_at = now() + Duration::seconds(1);
         let mut reconciler = CountingReconciler {
             calls: 0,
             observation: ReconciliationObservation::StillUncertain {
                 reason: "Provider lookup is still ambiguous".into(),
                 evidence_digest: "7".repeat(64),
-                observed_at: now() + Duration::seconds(1),
+                observed_at: reconciliation_fact_at,
             },
         };
-        let retry_at = now() + Duration::seconds(11);
-        assert!(matches!(
-            broker.reconcile_uncertain(
-                &mut mission,
-                &effect_id,
-                &mut ledger,
-                &mut reconciler,
-                &mut verifier,
-                now() + Duration::seconds(1),
-            ),
-            Err(BrokerError::ReconciliationStillUncertain {
-                retry_at: actual,
-                ..
-            }) if actual == retry_at
-        ));
-        assert_eq!(
-            broker.reconcile_uncertain(
-                &mut mission,
-                &effect_id,
-                &mut ledger,
-                &mut reconciler,
-                &mut verifier,
-                now() + Duration::seconds(2),
-            ),
-            Err(BrokerError::ReconciliationNotReady { retry_at })
+        let mut flow = BoundedReconciliationTestFlow {
+            broker: &mut broker,
+            mission: &mut mission,
+            effect_id: &effect_id,
+            ledger: &mut ledger,
+            executor: &mut executor,
+            reconciler: &mut reconciler,
+            verifier: &mut verifier,
+        };
+        let retry_at = first_bounded_reconciliation_retry_at(
+            &mut flow,
+            reconciliation_entry_at,
+            reconciliation_fact_at,
         );
-        let mut stale_projection = mission.clone();
-        assert!(matches!(
-            broker.reconcile_uncertain(
-                &mut mission,
-                &effect_id,
-                &mut ledger,
-                &mut reconciler,
-                &mut verifier,
-                retry_at,
-            ),
-            Err(BrokerError::ReconciliationDeadLetter { attempts: 2, .. })
-        ));
-        assert_eq!(
-            mission.effect(&effect_id).expect("effect").status,
-            EffectStatus::DeadLetter
-        );
-        assert!(matches!(
-            broker.execute_and_verify(
-                &mut stale_projection,
-                &effect_id,
-                &mut ledger,
-                &mut executor,
-                &mut verifier,
-                retry_at + Duration::seconds(1),
-            ),
-            Err(BrokerError::ReconciliationDeadLetter { attempts: 2, .. })
-        ));
-        assert_eq!((executor.calls, reconciler.calls), (1, 2));
+        assert_bounded_reconciliation_retries_then_dead_letters(&mut flow, retry_at);
     }
 
     #[test]
@@ -3121,6 +4403,610 @@ mod tests {
             mission.stage,
             hartevo_domain_kernel::MissionStage::Completed
         );
+    }
+
+    #[test]
+    fn accepted_completion_trace_orders_by_sequence_and_allows_equal_times() {
+        let entry_at = now();
+        let accepted_at = entry_at + Duration::seconds(1);
+        let mut authority = EffectCompletionAuthority::new(entry_at);
+
+        authority
+            .accept(
+                EffectCompletionBoundary::Provider,
+                EffectAuthoritySample {
+                    sequence: 1,
+                    operation_at: accepted_at,
+                },
+            )
+            .expect("first accepted completion");
+        assert_eq!(
+            authority.accept(
+                EffectCompletionBoundary::Reconciliation,
+                EffectAuthoritySample {
+                    sequence: 1,
+                    operation_at: accepted_at,
+                },
+            ),
+            Err(BrokerError::InvalidAuthorityClock)
+        );
+        assert_eq!(
+            authority.accept(
+                EffectCompletionBoundary::Reconciliation,
+                EffectAuthoritySample {
+                    sequence: 2,
+                    operation_at: entry_at,
+                },
+            ),
+            Err(BrokerError::InvalidAuthorityClock)
+        );
+        authority
+            .accept(
+                EffectCompletionBoundary::Verification,
+                EffectAuthoritySample {
+                    sequence: 2,
+                    operation_at: accepted_at,
+                },
+            )
+            .expect("equal timestamp with a later sequence is valid");
+        authority
+            .accept(
+                EffectCompletionBoundary::Reconciliation,
+                EffectAuthoritySample {
+                    sequence: 3,
+                    operation_at: accepted_at,
+                },
+            )
+            .expect("latest stage is selected by sequence, not enum priority");
+
+        assert_eq!(authority.latest_accepted(), authority.reconciliation());
+        assert_eq!(authority.latest_accepted().expect("latest").sequence(), 3);
+        let debug = format!("{authority:?}");
+        assert!(debug.contains("provider_sequence: Some(1)"));
+        assert!(debug.contains("reconciliation_sequence: Some(3)"));
+        assert!(debug.contains("verification_sequence: Some(2)"));
+        assert!(!debug.contains("2026"));
+        assert!(!format!("{:?}", authority.verification().expect("point")).contains("2026"));
+    }
+
+    #[test]
+    fn future_entry_fails_before_external_call_with_empty_authority() {
+        let (mission, effect_id) = proposed_mission();
+        let original = mission.clone();
+        let mut mission = mission;
+        let mut broker = broker();
+        let mut ledger = TestLedger::default();
+        let mut executor = CountingExecutor::default();
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+        let future_entry = Utc::now() + Duration::hours(1);
+
+        let error = broker
+            .execute_and_verify_authority_bound(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                future_entry,
+            )
+            .expect_err("caller future time must fail closed");
+
+        assert_eq!(error.error(), &BrokerError::InvalidAuthorityClock);
+        assert!(error.authority().latest_accepted().is_none());
+        assert!(!format!("{error:?}").contains(&future_entry.to_rfc3339()));
+        assert_eq!(mission, original);
+        assert_eq!((executor.calls, verifier.calls), (0, 0));
+        assert_eq!(
+            (ledger.recovery_probe_calls, ledger.authorized_claim_calls),
+            (0, 0)
+        );
+        assert!(ledger.receipt.is_none());
+        assert!(ledger.verification.is_none());
+    }
+
+    #[test]
+    fn historical_entry_cannot_anchor_post_call_system_samples() {
+        let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
+        let mut executor = CountingExecutor::default();
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+
+        let bound = broker
+            .execute_and_verify_authority_bound(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                now(),
+            )
+            .expect("test ledger permits inspection of the system authority sample");
+        let provider = bound.authority().provider().expect("provider authority");
+        let verification = bound
+            .authority()
+            .verification()
+            .expect("verification authority");
+
+        assert!(provider.operation_at() > now() + Duration::hours(1));
+        assert!(verification.operation_at() >= provider.operation_at());
+        assert_eq!(ledger.receipt_operation_at, Some(provider.operation_at()));
+        assert_eq!(
+            ledger.verification_operation_at,
+            Some(verification.operation_at())
+        );
+        assert_eq!(mission.updated_at, verification.operation_at());
+    }
+
+    #[test]
+    fn executor_and_verifier_are_sampled_once_after_each_return() {
+        let entry_at = now();
+        let provider_at = entry_at + Duration::seconds(1);
+        let verification_at = entry_at + Duration::seconds(2);
+        let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
+        ledger.enforce_completion_fence = true;
+        let calls = Rc::new(Cell::new(0));
+        let mut clock = scripted_clock(entry_at, [provider_at, verification_at], Rc::clone(&calls));
+        let effect = mission.effect(&effect_id).expect("effect").clone();
+        let receipt = Receipt {
+            id: ReceiptId::from("authority-receipt"),
+            provider: effect.provider.clone(),
+            external_id: "authority-external".into(),
+            accepted_at: entry_at,
+            request_digest: effect.approval_digest(),
+            response_digest: "a".repeat(64),
+        };
+        let mut executor = ProbeExecutor {
+            sample_calls: Rc::clone(&calls),
+            expected_sample_calls: 0,
+            result: Ok(receipt.clone()),
+        };
+        let mut verifier = ProbeVerifier {
+            sample_calls: Rc::clone(&calls),
+            expected_sample_calls: 1,
+            verification: Verification {
+                id: VerificationId::from("authority-verification"),
+                status: VerificationStatus::Confirmed,
+                verifier: "authority-readback".into(),
+                independent: true,
+                observed_at: entry_at + Duration::seconds(1),
+                evidence_digest: "b".repeat(64),
+                receipt_id: receipt.id.clone(),
+            },
+        };
+
+        let bound = broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut clock,
+            )
+            .expect("authority-bound execution");
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(clock.sample_count(), 2);
+        assert!(!format!("{clock:?}").contains("2026"));
+        assert_eq!(
+            bound.authority().provider().expect("provider").sequence(),
+            1
+        );
+        assert_eq!(
+            bound
+                .authority()
+                .verification()
+                .expect("verification")
+                .sequence(),
+            2
+        );
+        assert_eq!(ledger.receipt_operation_at, Some(provider_at));
+        assert_eq!(ledger.verification_operation_at, Some(verification_at));
+        assert_eq!(mission.updated_at, verification_at);
+        assert!(!format!("{bound:?}").contains("authority-external"));
+    }
+
+    #[test]
+    fn completion_at_lease_expiry_is_rejected_without_accepted_authority() {
+        let entry_at = now();
+        let lease_for = Duration::seconds(5);
+        let (mut mission, effect_id, broker, mut ledger) = approved_mission();
+        let mut broker = broker.with_lease_for(lease_for);
+        ledger.enforce_completion_fence = true;
+        let calls = Rc::new(Cell::new(0));
+        let mut clock = scripted_clock(entry_at, [entry_at + lease_for], Rc::clone(&calls));
+        let effect = mission.effect(&effect_id).expect("effect").clone();
+        let mut executor = ProbeExecutor {
+            sample_calls: Rc::clone(&calls),
+            expected_sample_calls: 0,
+            result: Ok(Receipt {
+                id: ReceiptId::from("expiry-receipt"),
+                provider: effect.provider.clone(),
+                external_id: "expiry-external".into(),
+                accepted_at: entry_at,
+                request_digest: effect.approval_digest(),
+                response_digest: "c".repeat(64),
+            }),
+        };
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+
+        let error = broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut clock,
+            )
+            .expect_err("strict expiry equality must lose the lease");
+
+        assert_eq!(error.error(), &BrokerError::Ledger(LedgerError::LeaseLost));
+        assert!(error.authority().latest_accepted().is_none());
+        assert_eq!(calls.get(), 1);
+        assert_eq!(verifier.calls, 0);
+        assert!(ledger.receipt.is_none());
+        assert!(ledger.receipt_operation_at.is_none());
+    }
+
+    fn assert_authority_clock_sample_overflow_fails_before_source(entry_at: DateTime<Utc>) {
+        let overflow_calls = Rc::new(Cell::new(0));
+        let mut overflow_clock = scripted_clock(entry_at, [entry_at], Rc::clone(&overflow_calls));
+        overflow_clock.sample_count = u64::MAX;
+        assert_eq!(
+            overflow_clock.sample_post_external_call(entry_at),
+            Err(BrokerError::InvalidAuthorityClock)
+        );
+        assert_eq!(overflow_calls.get(), 0);
+    }
+
+    fn assert_regressed_authority_sample_preserves_ledger(entry_at: DateTime<Utc>) {
+        let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
+        let calls = Rc::new(Cell::new(0));
+        let mut regressed_clock = scripted_clock(
+            entry_at,
+            [entry_at - Duration::nanoseconds(1)],
+            Rc::clone(&calls),
+        );
+        let effect = mission.effect(&effect_id).expect("effect").clone();
+        let receipt = Receipt {
+            id: ReceiptId::from("clock-receipt"),
+            provider: effect.provider.clone(),
+            external_id: "clock-external".into(),
+            accepted_at: entry_at,
+            request_digest: effect.approval_digest(),
+            response_digest: "d".repeat(64),
+        };
+        let mut executor = ProbeExecutor {
+            sample_calls: Rc::clone(&calls),
+            expected_sample_calls: 0,
+            result: Ok(receipt.clone()),
+        };
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+        let regression = broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut regressed_clock,
+            )
+            .expect_err("regression must fail closed");
+        assert_eq!(regression.error(), &BrokerError::InvalidAuthorityClock);
+        assert!(regression.authority().latest_accepted().is_none());
+        assert!(ledger.receipt.is_none());
+    }
+
+    #[test]
+    fn clock_regression_and_exhaustion_fail_closed_without_accepting_failed_samples() {
+        let entry_at = now();
+        assert_authority_clock_sample_overflow_fails_before_source(entry_at);
+        assert_regressed_authority_sample_preserves_ledger(entry_at);
+
+        let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
+        ledger.enforce_completion_fence = true;
+        let calls = Rc::new(Cell::new(0));
+        let mut exhausted_clock = scripted_clock(
+            entry_at,
+            [entry_at + Duration::seconds(1)],
+            Rc::clone(&calls),
+        );
+        let effect = mission.effect(&effect_id).expect("effect").clone();
+        let receipt = Receipt {
+            id: ReceiptId::from("exhausted-receipt"),
+            provider: effect.provider.clone(),
+            external_id: "exhausted-external".into(),
+            accepted_at: entry_at,
+            request_digest: effect.approval_digest(),
+            response_digest: "e".repeat(64),
+        };
+        let mut executor = ProbeExecutor {
+            sample_calls: Rc::clone(&calls),
+            expected_sample_calls: 0,
+            result: Ok(receipt.clone()),
+        };
+        let mut verifier = ProbeVerifier {
+            sample_calls: Rc::clone(&calls),
+            expected_sample_calls: 1,
+            verification: Verification {
+                id: VerificationId::from("exhausted-verification"),
+                status: VerificationStatus::Confirmed,
+                verifier: "exhausted-readback".into(),
+                independent: true,
+                observed_at: entry_at + Duration::seconds(1),
+                evidence_digest: "f".repeat(64),
+                receipt_id: receipt.id,
+            },
+        };
+        let exhaustion = broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut exhausted_clock,
+            )
+            .expect_err("missing second sample must fail closed");
+        assert_eq!(exhaustion.error(), &BrokerError::InvalidAuthorityClock);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            exhaustion.authority().latest_accepted(),
+            exhaustion.authority().provider()
+        );
+        assert_eq!(
+            exhaustion
+                .authority()
+                .provider()
+                .expect("accepted provider")
+                .operation_at(),
+            entry_at + Duration::seconds(1)
+        );
+        assert!(exhaustion.authority().verification().is_none());
+        assert!(ledger.receipt.is_some());
+        assert!(ledger.verification.is_none());
+    }
+
+    #[test]
+    fn rejected_and_uncertain_provider_returns_use_one_post_call_sample() {
+        for failure in [
+            ProviderFailure::Rejected("rejected".into()),
+            ProviderFailure::Uncertain("uncertain".into()),
+        ] {
+            let entry_at = now();
+            let completion_at = entry_at + Duration::seconds(1);
+            let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
+            ledger.enforce_completion_fence = true;
+            let calls = Rc::new(Cell::new(0));
+            let mut clock = scripted_clock(entry_at, [completion_at], Rc::clone(&calls));
+            let mut executor = ProbeExecutor {
+                sample_calls: Rc::clone(&calls),
+                expected_sample_calls: 0,
+                result: Err(failure.clone()),
+            };
+            let mut verifier = CountingVerifier {
+                calls: 0,
+                status: VerificationStatus::Confirmed,
+            };
+
+            let error = broker
+                .execute_and_verify_with_clock(
+                    &mut mission,
+                    &effect_id,
+                    &mut ledger,
+                    &mut executor,
+                    &mut verifier,
+                    &mut clock,
+                )
+                .expect_err("provider failure remains terminal for this call");
+
+            assert_eq!(calls.get(), 1);
+            assert_eq!(verifier.calls, 0);
+            assert_eq!(
+                error
+                    .authority()
+                    .provider()
+                    .expect("provider completion")
+                    .operation_at(),
+                completion_at
+            );
+            assert_eq!(mission.updated_at, completion_at);
+            match failure {
+                ProviderFailure::Rejected(_) => {
+                    assert_eq!(ledger.failed_operation_at, Some(completion_at));
+                    assert!(ledger.uncertain_operation_at.is_none());
+                }
+                ProviderFailure::Uncertain(_) => {
+                    assert_eq!(ledger.uncertain_operation_at, Some(completion_at));
+                    assert!(ledger.failed_operation_at.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reconciliation_and_verification_sample_after_their_own_external_returns() {
+        let entry_at = now();
+        let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
+        let uncertain_calls = Rc::new(Cell::new(0));
+        let mut uncertain_clock = scripted_clock(
+            entry_at,
+            [entry_at + Duration::seconds(1)],
+            Rc::clone(&uncertain_calls),
+        );
+        let mut uncertain_executor = ProbeExecutor {
+            sample_calls: Rc::clone(&uncertain_calls),
+            expected_sample_calls: 0,
+            result: Err(ProviderFailure::Uncertain("submitted".into())),
+        };
+        let mut unused_verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+        broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut uncertain_executor,
+                &mut unused_verifier,
+                &mut uncertain_clock,
+            )
+            .expect_err("uncertain provider result");
+
+        ledger.enforce_completion_fence = true;
+        let calls = Rc::new(Cell::new(0));
+        let reconciliation_at = entry_at + Duration::seconds(2);
+        let verification_at = entry_at + Duration::seconds(3);
+        let mut clock = scripted_clock(
+            entry_at,
+            [reconciliation_at, verification_at],
+            Rc::clone(&calls),
+        );
+        let effect = mission.effect(&effect_id).expect("effect").clone();
+        let receipt = Receipt {
+            id: ReceiptId::from("reconciliation-authority-receipt"),
+            provider: effect.provider.clone(),
+            external_id: "reconciliation-authority-external".into(),
+            accepted_at: entry_at + Duration::seconds(1),
+            request_digest: effect.approval_digest(),
+            response_digest: "1".repeat(64),
+        };
+        let mut reconciler = ProbeReconciler {
+            sample_calls: Rc::clone(&calls),
+            expected_sample_calls: 0,
+            observation: ReconciliationObservation::ReceiptFound {
+                receipt: receipt.clone(),
+                evidence_digest: "2".repeat(64),
+                observed_at: reconciliation_at,
+            },
+        };
+        let mut verifier = ProbeVerifier {
+            sample_calls: Rc::clone(&calls),
+            expected_sample_calls: 1,
+            verification: Verification {
+                id: VerificationId::from("reconciliation-authority-verification"),
+                status: VerificationStatus::Confirmed,
+                verifier: "reconciliation-authority-readback".into(),
+                independent: true,
+                observed_at: verification_at,
+                evidence_digest: "3".repeat(64),
+                receipt_id: receipt.id,
+            },
+        };
+
+        let bound = broker
+            .reconcile_uncertain_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut reconciler,
+                &mut verifier,
+                &mut clock,
+            )
+            .expect("reconciliation authority closure");
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            bound
+                .authority()
+                .reconciliation()
+                .expect("reconciliation")
+                .sequence(),
+            1
+        );
+        assert_eq!(
+            bound
+                .authority()
+                .verification()
+                .expect("verification")
+                .sequence(),
+            2
+        );
+        assert_eq!(ledger.reconciliation_operation_at, Some(reconciliation_at));
+        assert_eq!(ledger.verification_operation_at, Some(verification_at));
+        assert_eq!(mission.updated_at, verification_at);
+    }
+
+    #[test]
+    fn preflight_and_durable_terminal_returns_have_empty_authority() {
+        let entry_at = now();
+        let (mission, effect_id) = proposed_mission();
+        let original = mission.clone();
+        let mut mission = mission;
+        let mut broker = broker();
+        let mut ledger = TestLedger::default();
+        let calls = Rc::new(Cell::new(0));
+        let mut clock = scripted_clock(entry_at, [], Rc::clone(&calls));
+        let mut executor = CountingExecutor::default();
+        let mut verifier = CountingVerifier {
+            calls: 0,
+            status: VerificationStatus::Confirmed,
+        };
+        let preflight = broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut clock,
+            )
+            .expect_err("unapproved effect");
+        assert!(preflight.authority().latest_accepted().is_none());
+        assert_eq!(calls.get(), 0);
+        assert_eq!(mission, original);
+
+        let (mut mission, effect_id, mut broker, mut ledger) = approved_mission();
+        let calls = Rc::new(Cell::new(0));
+        let mut execution_clock = scripted_clock(
+            entry_at,
+            [
+                entry_at + Duration::seconds(1),
+                entry_at + Duration::seconds(2),
+            ],
+            Rc::clone(&calls),
+        );
+        let mut executor = CountingExecutor::default();
+        let mut verifier = ConfirmingVerifier;
+        broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut execution_clock,
+            )
+            .expect("initial verified state");
+        let verified_snapshot = mission.clone();
+        let calls = Rc::new(Cell::new(0));
+        let mut terminal_clock = scripted_clock(entry_at, [], Rc::clone(&calls));
+        let terminal = broker
+            .execute_and_verify_with_clock(
+                &mut mission,
+                &effect_id,
+                &mut ledger,
+                &mut executor,
+                &mut verifier,
+                &mut terminal_clock,
+            )
+            .expect("durable terminal return");
+        assert!(terminal.authority().latest_accepted().is_none());
+        assert_eq!(calls.get(), 0);
+        assert_eq!(mission, verified_snapshot);
     }
 
     fn persisted_claim_state() -> impl Strategy<Value = PersistedClaimState> {
