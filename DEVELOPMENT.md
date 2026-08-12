@@ -202,9 +202,14 @@ cargo run -p hartevo-eval --locked -- catalog export --output target/eval/catalo
 cargo run -p hartevo-eval --locked -- evidence baseline --commit "$(git rev-parse HEAD)" --output target/eval/release-baseline.json
 cargo run -p hartevo-eval --locked -- run --mission VS-01 --output target/eval/vs-01.json
 dx doctor
-dx build --package hartevo-desktop
+bash scripts/check-dioxus-toolchain.sh self-test
+mkdir -p target/evidence
+bash scripts/check-dioxus-toolchain.sh build > target/evidence/dioxus-build-provenance.json
+bash scripts/check-dioxus-toolchain.sh verify-receipt target/evidence/dioxus-build-provenance.json
 dx serve --package hartevo-desktop
 ```
+
+Dioxus bundle gate 以 [`contracts/toolchain/dioxus-cli-build.json`](./contracts/toolchain/dioxus-cli-build.json) 固定 CLI `0.7.10`、Desktop package、命令、feature 与 `.app` 目录结构；每次 build 对 bundle 内全部常规文件的相对路径、内容 SHA-256 和字节数生成确定性 tree digest，并输出本次 provenance receipt。`self-test` 只使用临时 fixture/fake CLI，不执行真实构建；正式 `build` 或 `verify-receipt` 遇到 CLI 缺失、版本错误、命令失败、产物漂移或 digest 回读不一致均以非零退出，`BLOCKED_ENV` receipt 也不能作为通过证据。
 
 OpenInterpreter 边界的当前验证命令为：
 
