@@ -1,0 +1,85 @@
+{
+  "schemaVersion": "hartevo-provider-approval-authority-contract/v1",
+  "contractVersion": "provider-approval-authority-e1/v1",
+  "contractDigest": "a3c22bd954a50bd4a9d9e0caa67bb0fe9a2b6ad63f571560bb42169fedd4a87d",
+  "evidenceLevel": "E1",
+  "authority": "effect_approval_record_only",
+  "secretMaterial": "opaque_reference_and_digest_only",
+  "decision": "approve",
+  "humanOperationAuthority": {
+    "schemaVersion": "hartevo-human-operation-authority-contract/v1",
+    "contractVersion": "human-operation-authority-e1/v1",
+    "contractDigest": "d067c9430e80d7b4331442a4fecee340c1c354fd2b33a11ca311ca579c48b479",
+    "operationKinds": [
+      "approve_provider_effect"
+    ],
+    "decisions": [
+      "approve"
+    ],
+    "assuranceLevels": [
+      "reauthenticated",
+      "multi_factor",
+      "hardware_bound"
+    ],
+    "stepUpMethods": [
+      "password_reauthentication",
+      "totp",
+      "webauthn",
+      "platform_biometric"
+    ],
+    "singleUseIntent": "request_bound_by_value_consume",
+    "forbiddenSerializedMaterial": [
+      "raw_token",
+      "mfa_code",
+      "biometric_sample"
+    ],
+    "issuerRegistrations": []
+  },
+  "humanOperationAuthorityReference": {
+    "schemaVersion": "hartevo-human-operation-authority-contract/v1",
+    "contractVersion": "human-operation-authority-e1/v1",
+    "contractDigest": "d067c9430e80d7b4331442a4fecee340c1c354fd2b33a11ca311ca579c48b479"
+  },
+  "providerAdapterContract": {
+    "schemaVersion": "hartevo-provider-adapter-contract/v1",
+    "contractVersion": "provider-adapter-e1/v1",
+    "registrySource": "provider_adapter_registry",
+    "emptyRegistryBehavior": "deny_approval_authority",
+    "claimAuthority": "metadata_binding_only"
+  },
+  "providerAuthProbeContract": {
+    "schemaVersion": "hartevo-provider-auth-probe-contract/v1",
+    "contractVersion": "provider-auth-probe-e1/v1",
+    "connectedAuthority": "connection_state_only",
+    "freshnessRevalidation": "same_operation_at"
+  },
+  "requiredBindings": [
+    "actor_authorization",
+    "actor_session",
+    "request_bound_step_up",
+    "mission_revision",
+    "effect_approval_digest",
+    "provider_capability_metadata",
+    "provider_auth_probe_live_chain",
+    "effect_policy",
+    "permission_evidence",
+    "all_deadlines"
+  ],
+  "deadlineSources": [
+    "approval_policy",
+    "effect_expiry",
+    "contract_expiry",
+    "actor_authorization_expiry",
+    "actor_session_expiry",
+    "step_up_expiry",
+    "provider_probe_expiry"
+  ],
+  "forbiddenAuthorities": [
+    "runtime_local_approval",
+    "connected_upgrade",
+    "provider_execution",
+    "provider_receipt",
+    "business_verification",
+    "e4"
+  ]
+}
