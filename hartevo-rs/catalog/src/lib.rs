@@ -1545,7 +1545,7 @@ mod tests {
                 snapshot.summary.implemented_application_handler_count,
                 snapshot.summary.not_implemented_application_route_count,
             ),
-            (52, 7, 45)
+            (52, 8, 44)
         );
         assert_eq!(
             catalog
@@ -1564,6 +1564,12 @@ mod tests {
                 .application_handler("VM-11", 3, "identity_chain")
                 .map(|handler| handler.handler_id.as_str()),
             Some("vm11.identity-chain/v1")
+        );
+        assert_eq!(
+            catalog
+                .application_handler("VM-11", 3, "next_contract_or_valid_terminal")
+                .map(|handler| handler.handler_id.as_str()),
+            Some("vm11.next-contract-or-valid-terminal/v1")
         );
         assert!(catalog.mission("VM-06").is_some_and(|mission| {
             mission
