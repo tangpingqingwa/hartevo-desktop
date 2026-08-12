@@ -73,20 +73,20 @@ use hartevo_domain_kernel::{
     RuntimeProcessIdentity, RuntimeRecoveryAttempt, RuntimeRecoveryAttemptId,
     RuntimeRecoveryFailureClass, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt,
     RuntimeTurnAttemptId, RuntimeTurnError, RuntimeTurnFailureClass, RuntimeTurnObservedKind,
-    RuntimeTurnPrivateMessage, RuntimeTurnRestartDisposition, RuntimeTurnScope, RuntimeTurnStatus,
-    StorageMode, SuppressionReason, Task, TaskId, TaskStatus, TenantId, TruthError, TruthFact,
-    VerificationStatus, WebhookAttestation, WorkProduct, WorkProductDependencies, WorkProductId,
-    WorkProductManifest, WorkProductManifestError, WorkProductPreview, WorkProductStatus,
-    WorkerHandle, WorkerHandleStatus, WorkerId, WorkerLease, WorkerLeaseId, WorkerLeaseStatus,
-    WorkerMailbox, validate_context_branch_lineage,
+    RuntimeTurnPrivateMessage, RuntimeTurnPrivateTextDelta, RuntimeTurnRestartDisposition,
+    RuntimeTurnScope, RuntimeTurnStatus, StorageMode, SuppressionReason, Task, TaskId, TaskStatus,
+    TenantId, TruthError, TruthFact, VerificationStatus, WebhookAttestation, WorkProduct,
+    WorkProductDependencies, WorkProductId, WorkProductManifest, WorkProductManifestError,
+    WorkProductPreview, WorkProductStatus, WorkerHandle, WorkerHandleStatus, WorkerId, WorkerLease,
+    WorkerLeaseId, WorkerLeaseStatus, WorkerMailbox, validate_context_branch_lineage,
 };
 use hartevo_effect_broker::{
     BrokerError, BrokerResult, EffectBroker, EffectExecutor, EffectReconciler, EffectVerifier,
 };
 use hartevo_runtime_adapter::{
     AdapterError, MappedTurnEventKind, ObservedRuntimeProcessIdentity, ProcessCleanupDisposition,
-    RuntimeAgentMessage, RuntimeCommand, RuntimeLocalApprovalRequest, RuntimeMapping,
-    RuntimeProcessCleanupTarget, RuntimeTurnCompletionStatus, StdioRuntime,
+    RuntimeAgentMessage, RuntimeAgentMessageDelta, RuntimeCommand, RuntimeLocalApprovalRequest,
+    RuntimeMapping, RuntimeProcessCleanupTarget, RuntimeTurnCompletionStatus, StdioRuntime,
     cleanup_runtime_process, generate_runtime_launch_token, prepare_runtime_launch,
 };
 use hartevo_storage::{
@@ -1227,6 +1227,8 @@ pub struct ContextRuntimeTurnObservation {
     pub attempt: RuntimeTurnAttempt,
     pub kind: ContextRuntimeTurnObservationKind,
     pub local_approval_request: Option<RuntimeLocalApprovalRequest>,
+    /// One durable-before-visible user-facing text increment.
+    pub agent_message_delta: Option<RuntimeAgentMessageDelta>,
     /// Completed user-facing Runtime output only. This remains transient until
     /// an Application command deliberately adopts it as a WorkProduct.
     pub agent_message: Option<RuntimeAgentMessage>,
@@ -13989,6 +13991,7 @@ impl ApplicationService {
                     attempt,
                     kind: ContextRuntimeTurnObservationKind::NoEvent,
                     local_approval_request: None,
+                    agent_message_delta: None,
                     agent_message: None,
                 });
             }
@@ -14007,13 +14010,47 @@ impl ApplicationService {
                     attempt,
                     kind: ContextRuntimeTurnObservationKind::Uncertain,
                     local_approval_request: None,
+                    agent_message_delta: None,
                     agent_message: None,
                 });
             }
         };
         let agent_message = event.agent_message;
+        let agent_message_delta = event.agent_message_delta;
         let mut approval_request = event.approval_request;
         let observed_kind = event.kind.clone();
+        let persisted_deltas = if agent_message.is_some() || agent_message_delta.is_some() {
+            self.store
+                .load_runtime_turn_private_text_deltas(&attempt.scope.project_id, &attempt.id)?
+        } else {
+            Vec::new()
+        };
+        if let Some(message) = agent_message.as_ref() {
+            let streamed_body = Zeroizing::new(
+                persisted_deltas
+                    .iter()
+                    .filter(|delta| delta.item_id_digest == message.item_id_digest)
+                    .map(|delta| delta.delta.as_str())
+                    .collect::<String>(),
+            );
+            if !streamed_body.is_empty() && streamed_body.as_str() != message.as_str() {
+                attempt.freeze_uncertain(
+                    RuntimeTurnFailureClass::Protocol,
+                    event.event_digest,
+                    now,
+                )?;
+                self.store
+                    .update_runtime_turn_attempt(&attempt, command.expected_revision)?;
+                managed.mapping.runtime_turn_id = None;
+                return Ok(ContextRuntimeTurnObservation {
+                    attempt,
+                    kind: ContextRuntimeTurnObservationKind::Uncertain,
+                    local_approval_request: None,
+                    agent_message_delta: None,
+                    agent_message: None,
+                });
+            }
+        }
         match &event.kind {
             MappedTurnEventKind::TurnStarted => attempt.observe(
                 RuntimeTurnObservedKind::TurnStarted,
@@ -14022,6 +14059,11 @@ impl ApplicationService {
             )?,
             MappedTurnEventKind::ItemStarted => attempt.observe(
                 RuntimeTurnObservedKind::ItemStarted,
+                event.event_digest.clone(),
+                now,
+            )?,
+            MappedTurnEventKind::AgentMessageDelta => attempt.observe(
+                RuntimeTurnObservedKind::AgentMessageDelta,
                 event.event_digest.clone(),
                 now,
             )?,
@@ -14065,12 +14107,39 @@ impl ApplicationService {
                 now,
             )?,
         }
+        let private_text_delta = agent_message_delta
+            .as_ref()
+            .map(|delta| {
+                let previous = persisted_deltas
+                    .iter()
+                    .rfind(|candidate| candidate.item_id_digest == delta.item_id_digest);
+                RuntimeTurnPrivateTextDelta::capture(
+                    &attempt,
+                    delta.item_id_digest.clone(),
+                    delta.as_str(),
+                    previous,
+                )
+            })
+            .transpose()?;
         let private_message = agent_message
             .as_ref()
-            .map(|message| RuntimeTurnPrivateMessage::capture(&attempt, message.as_str()))
+            .map(|message| {
+                RuntimeTurnPrivateMessage::capture_for_item(
+                    &attempt,
+                    message.item_id_digest.clone(),
+                    message.as_str(),
+                )
+            })
             .transpose()?;
         let expected_revision = command.expected_revision;
-        if let Some(message) = &private_message {
+        if let Some(delta) = &private_text_delta {
+            self.store
+                .update_runtime_turn_attempt_with_private_text_delta(
+                    &attempt,
+                    expected_revision,
+                    delta,
+                )?;
+        } else if let Some(message) = &private_message {
             self.store
                 .update_runtime_turn_attempt_with_private_message(
                     &attempt,
@@ -14088,6 +14157,7 @@ impl ApplicationService {
             attempt,
             kind: ContextRuntimeTurnObservationKind::Event(observed_kind),
             local_approval_request: approval_request,
+            agent_message_delta,
             agent_message,
         })
     }
@@ -14230,6 +14300,16 @@ impl ApplicationService {
         Ok(self
             .store
             .load_latest_runtime_turn_private_message(project_id, id)?)
+    }
+
+    pub fn runtime_turn_private_text_deltas(
+        &self,
+        project_id: &ProjectId,
+        id: &RuntimeTurnAttemptId,
+    ) -> Result<Vec<RuntimeTurnPrivateTextDelta>, ApplicationError> {
+        Ok(self
+            .store
+            .load_runtime_turn_private_text_deltas(project_id, id)?)
     }
 
     fn load_runtime_turn_at_revision(
@@ -24966,6 +25046,17 @@ mod tests {
             }
         })
         .to_string();
+        let text_delta = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": "private-runtime-item",
+                "delta": "PRIVATE-RUNTIME-STREAM"
+            }
+        })
+        .to_string();
         let approval_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": "private-runtime-approval",
@@ -25006,12 +25097,13 @@ printf '%s\n' "$3"
 printf '%s\n' "$4"
 printf '%s\n' "$5"
 printf '%s\n' "$6"
+printf '%s\n' "$7"
 IFS= read -r approval
 case "$approval" in *'"id":"private-runtime-approval"'*'"decision":"accept"'*) ;; *) exit 42 ;; esac
 IFS= read -r interrupt
 case "$interrupt" in *'"method":"turn/interrupt"'*) ;; *) exit 43 ;; esac
-printf '%s\n' "$7"
 printf '%s\n' "$8"
+printf '%s\n' "$9"
 sleep 30"#
                 .into(),
             "hartevo-fake-runtime".into(),
@@ -25020,10 +25112,113 @@ sleep 30"#
             turn_started,
             turn_response,
             item_started,
+            text_delta,
             approval_request,
             interrupt_response,
             terminal,
         ];
+        command.shutdown_grace = StdDuration::from_millis(50);
+        command
+    }
+
+    #[cfg(unix)]
+    fn completed_stream_fake_runtime_command(
+        workspace: &Path,
+        thread_id: &str,
+        turn_id: &str,
+        delta: &str,
+        completed_text: &str,
+    ) -> RuntimeCommand {
+        let canonical_workspace = workspace.canonicalize().expect("canonical workspace");
+        let frames = [
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "thread": {"id": thread_id},
+                    "cwd": canonical_workspace,
+                    "model": "fixture-model",
+                    "modelProvider": "fixture-provider",
+                    "approvalPolicy": "on-request",
+                    "approvalsReviewer": "user",
+                    "sandbox": "workspace-write"
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "turn/started",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": {"id": turn_id, "status": "inProgress"}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {"turn": {"id": turn_id, "status": "inProgress"}}
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "item/started",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": {"id": "private-stream-item", "type": "agentMessage", "text": ""}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "itemId": "private-stream-item",
+                    "delta": delta
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": {
+                        "id": "private-stream-item",
+                        "type": "agentMessage",
+                        "text": completed_text
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": {"id": turn_id, "status": "completed", "items": []}
+                }
+            }),
+        ]
+        .map(|frame| frame.to_string());
+        let mut command = RuntimeCommand::new(PathBuf::from("/bin/sh"), canonical_workspace);
+        command.args = vec![
+            "-c".into(),
+            r#"IFS= read -r _
+printf '%s\n' "$1"
+IFS= read -r _
+printf '%s\n' "$2"
+IFS= read -r _
+printf '%s\n' "$3"
+printf '%s\n' "$4"
+printf '%s\n' "$5"
+printf '%s\n' "$6"
+printf '%s\n' "$7"
+printf '%s\n' "$8"
+sleep 30"#
+                .into(),
+            "hartevo-fake-runtime".into(),
+        ];
+        command.args.extend(frames);
         command.shutdown_grace = StdDuration::from_millis(50);
         command
     }
@@ -25632,7 +25827,7 @@ sleep 30"#
             item.kind,
             ContextRuntimeTurnObservationKind::Event(MappedTurnEventKind::ItemStarted)
         );
-        let approval = fixture
+        let text_delta = fixture
             .service
             .observe_context_runtime_turn(
                 &mut managed,
@@ -25643,6 +25838,39 @@ sleep 30"#
                     event_timeout: StdDuration::from_secs(1),
                 },
                 now() + Duration::seconds(9),
+            )
+            .expect("assistant text delta");
+        assert_eq!(
+            text_delta.kind,
+            ContextRuntimeTurnObservationKind::Event(MappedTurnEventKind::AgentMessageDelta)
+        );
+        let transient_delta = text_delta
+            .agent_message_delta
+            .as_ref()
+            .expect("transient assistant text delta");
+        assert_eq!(transient_delta.as_str(), "PRIVATE-RUNTIME-STREAM");
+        assert!(!format!("{text_delta:?}").contains("PRIVATE-RUNTIME-STREAM"));
+        let durable_deltas = fixture
+            .service
+            .runtime_turn_private_text_deltas(&fixture.project_id, &turn_id)
+            .expect("durable assistant text deltas");
+        assert_eq!(durable_deltas.len(), 1);
+        assert_eq!(durable_deltas[0].delta, "PRIVATE-RUNTIME-STREAM");
+        assert_eq!(
+            durable_deltas[0].evidence_sequence,
+            text_delta.attempt.revision
+        );
+        let approval = fixture
+            .service
+            .observe_context_runtime_turn(
+                &mut managed,
+                &ObserveContextRuntimeTurn {
+                    project_id: fixture.project_id.clone(),
+                    id: turn_id.clone(),
+                    expected_revision: text_delta.attempt.revision,
+                    event_timeout: StdDuration::from_secs(1),
+                },
+                now() + Duration::seconds(10),
             )
             .expect("local approval");
         assert_eq!(
@@ -25663,7 +25891,7 @@ sleep 30"#
                     request,
                     approved: true,
                 },
-                now() + Duration::seconds(10),
+                now() + Duration::seconds(11),
             )
             .expect("approval response");
         assert_eq!(approved.status, RuntimeTurnStatus::Running);
@@ -25677,7 +25905,7 @@ sleep 30"#
                     expected_revision: approved.revision,
                     response_timeout: StdDuration::from_secs(1),
                 },
-                now() + Duration::seconds(11),
+                now() + Duration::seconds(12),
             )
             .expect("interrupt accepted");
         assert_eq!(interrupt.status, RuntimeTurnStatus::InterruptRequested);
@@ -25691,7 +25919,7 @@ sleep 30"#
                     expected_revision: interrupt.revision,
                     event_timeout: StdDuration::from_secs(1),
                 },
-                now() + Duration::seconds(12),
+                now() + Duration::seconds(13),
             )
             .expect("terminal notification");
         assert_eq!(terminal.attempt.status, RuntimeTurnStatus::Interrupted);
@@ -25721,6 +25949,184 @@ sleep 30"#
         }
         assert!(events_json.contains("runtime_turn"));
         assert!(managed.runtime.shutdown().expect("shutdown").forced);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one deterministic replay contrasts exact stream adoption with fail-closed completed-body mismatch across the same durable protocol boundary"
+    )]
+    fn completed_stream_requires_exact_delta_reassembly_before_private_message_adoption() {
+        let exact_body = "PRIVATE-EXACT-STREAM";
+        let mut exact = ready_runtime_turn_fixture(|workspace| {
+            completed_stream_fake_runtime_command(
+                workspace,
+                "private-runtime-thread-exact",
+                "private-runtime-turn-exact",
+                exact_body,
+                exact_body,
+            )
+        });
+        let exact_turn_id = RuntimeTurnAttemptId::from("turn-attempt-stream-exact");
+        let dispatch_request =
+            dispatch_command(&exact, exact_turn_id.as_str(), StdDuration::from_secs(1));
+        let dispatch = exact
+            .fixture
+            .service
+            .dispatch_context_runtime_turn(
+                &mut exact.managed,
+                dispatch_request,
+                &exact.envelope,
+                now() + Duration::seconds(6),
+            )
+            .expect("exact stream dispatch");
+        let mut revision = dispatch.attempt.revision;
+        let expected = [
+            MappedTurnEventKind::TurnStarted,
+            MappedTurnEventKind::ItemStarted,
+            MappedTurnEventKind::AgentMessageDelta,
+            MappedTurnEventKind::ItemCompleted,
+            MappedTurnEventKind::TurnCompleted(RuntimeTurnCompletionStatus::Completed),
+        ];
+        let mut terminal = None;
+        for (index, expected_kind) in expected.into_iter().enumerate() {
+            let observation = exact
+                .fixture
+                .service
+                .observe_context_runtime_turn(
+                    &mut exact.managed,
+                    &ObserveContextRuntimeTurn {
+                        project_id: exact.fixture.project_id.clone(),
+                        id: exact_turn_id.clone(),
+                        expected_revision: revision,
+                        event_timeout: StdDuration::from_secs(1),
+                    },
+                    now() + Duration::seconds(7 + i64::try_from(index).expect("bounded index")),
+                )
+                .expect("exact stream observation");
+            assert_eq!(
+                observation.kind,
+                ContextRuntimeTurnObservationKind::Event(expected_kind.clone())
+            );
+            if expected_kind == MappedTurnEventKind::AgentMessageDelta {
+                assert_eq!(
+                    observation
+                        .agent_message_delta
+                        .as_ref()
+                        .expect("exact transient delta")
+                        .as_str(),
+                    exact_body
+                );
+            }
+            if expected_kind == MappedTurnEventKind::ItemCompleted {
+                assert_eq!(
+                    observation
+                        .agent_message
+                        .as_ref()
+                        .expect("exact completed message")
+                        .as_str(),
+                    exact_body
+                );
+            }
+            revision = observation.attempt.revision;
+            terminal = Some(observation.attempt);
+        }
+        assert_eq!(
+            terminal.expect("exact terminal").status,
+            RuntimeTurnStatus::Completed
+        );
+        assert_eq!(
+            exact
+                .fixture
+                .service
+                .latest_runtime_turn_private_message(&exact.fixture.project_id, &exact_turn_id)
+                .expect("exact private message")
+                .expect("adoptable exact message")
+                .body,
+            exact_body
+        );
+        assert!(exact.managed.runtime.shutdown().expect("shutdown").forced);
+
+        let mut mismatched = ready_runtime_turn_fixture(|workspace| {
+            completed_stream_fake_runtime_command(
+                workspace,
+                "private-runtime-thread-mismatch",
+                "private-runtime-turn-mismatch",
+                "PRIVATE-STREAMED-BODY",
+                "PRIVATE-DIFFERENT-BODY",
+            )
+        });
+        let mismatch_turn_id = RuntimeTurnAttemptId::from("turn-attempt-stream-mismatch");
+        let dispatch_request = dispatch_command(
+            &mismatched,
+            mismatch_turn_id.as_str(),
+            StdDuration::from_secs(1),
+        );
+        let dispatch = mismatched
+            .fixture
+            .service
+            .dispatch_context_runtime_turn(
+                &mut mismatched.managed,
+                dispatch_request,
+                &mismatched.envelope,
+                now() + Duration::seconds(6),
+            )
+            .expect("mismatch stream dispatch");
+        let mut revision = dispatch.attempt.revision;
+        for index in 0..3 {
+            let observation = mismatched
+                .fixture
+                .service
+                .observe_context_runtime_turn(
+                    &mut mismatched.managed,
+                    &ObserveContextRuntimeTurn {
+                        project_id: mismatched.fixture.project_id.clone(),
+                        id: mismatch_turn_id.clone(),
+                        expected_revision: revision,
+                        event_timeout: StdDuration::from_secs(1),
+                    },
+                    now() + Duration::seconds(7 + index),
+                )
+                .expect("pre-mismatch stream observation");
+            revision = observation.attempt.revision;
+        }
+        let mismatch = mismatched
+            .fixture
+            .service
+            .observe_context_runtime_turn(
+                &mut mismatched.managed,
+                &ObserveContextRuntimeTurn {
+                    project_id: mismatched.fixture.project_id.clone(),
+                    id: mismatch_turn_id.clone(),
+                    expected_revision: revision,
+                    event_timeout: StdDuration::from_secs(1),
+                },
+                now() + Duration::seconds(10),
+            )
+            .expect("deterministic mismatch fence");
+        assert_eq!(mismatch.kind, ContextRuntimeTurnObservationKind::Uncertain);
+        assert_eq!(mismatch.attempt.status, RuntimeTurnStatus::Uncertain);
+        assert!(mismatched.managed.mapping.runtime_turn_id.is_none());
+        assert!(
+            mismatched
+                .fixture
+                .service
+                .latest_runtime_turn_private_message(
+                    &mismatched.fixture.project_id,
+                    &mismatch_turn_id,
+                )
+                .expect("mismatch private message query")
+                .is_none()
+        );
+        assert!(
+            mismatched
+                .managed
+                .runtime
+                .shutdown()
+                .expect("shutdown")
+                .forced
+        );
     }
 
     #[cfg(unix)]

@@ -78,7 +78,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 45;
+pub const STORAGE_SCHEMA_VERSION: i64 = 46;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4070,6 +4070,214 @@ impl ProjectStore {
             record_migration(&transaction, 45)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 46 {
+            let runtime_delta_table_exists = self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'runtime_turn_private_text_deltas'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            let runtime_delta_index_exists = self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master
+                     WHERE type = 'index'
+                       AND name = 'runtime_turn_private_text_delta_scope_idx'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            let private_message_item_id_exists = self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('runtime_turn_private_messages')
+                     WHERE name = 'item_id_digest'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            let evidence_accepts_agent_message_delta = self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'runtime_turn_evidence'
+                       AND instr(sql, 'agent_message_delta') > 0",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            let runtime_delta_schema_installed = runtime_delta_table_exists
+                && runtime_delta_index_exists
+                && private_message_item_id_exists
+                && evidence_accepts_agent_message_delta;
+            let runtime_delta_schema_absent = !runtime_delta_table_exists
+                && !runtime_delta_index_exists
+                && !private_message_item_id_exists
+                && !evidence_accepts_agent_message_delta;
+            let runtime_delta_schema_partial_empty =
+                if runtime_delta_schema_installed || runtime_delta_schema_absent {
+                    false
+                } else {
+                    let delta_count = if runtime_delta_table_exists {
+                        self.connection.query_row(
+                            "SELECT COUNT(*) FROM runtime_turn_private_text_deltas",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )?
+                    } else {
+                        0
+                    };
+                    let private_message_count = self.connection.query_row(
+                        "SELECT COUNT(*) FROM runtime_turn_private_messages",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                    let evidence_count = self.connection.query_row(
+                        "SELECT COUNT(*) FROM runtime_turn_evidence",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                    delta_count == 0 && private_message_count == 0 && evidence_count == 0
+                };
+            if !runtime_delta_schema_installed
+                && !runtime_delta_schema_absent
+                && !runtime_delta_schema_partial_empty
+            {
+                return Err(StorageError::DomainDecode(
+                    "runtime text delta schema is only partially installed".into(),
+                ));
+            }
+            let transaction = self.connection.transaction()?;
+            if runtime_delta_schema_partial_empty {
+                transaction.execute_batch(
+                    "DROP INDEX IF EXISTS runtime_turn_private_text_delta_scope_idx;
+                     DROP TABLE IF EXISTS runtime_turn_private_text_deltas;",
+                )?;
+            }
+            if runtime_delta_schema_absent || runtime_delta_schema_partial_empty {
+                transaction.execute_batch(
+                    "DROP INDEX IF EXISTS runtime_turn_private_message_scope_idx;
+                 ALTER TABLE runtime_turn_private_messages
+                   RENAME TO runtime_turn_private_messages_v46;
+                 ALTER TABLE runtime_turn_evidence RENAME TO runtime_turn_evidence_v46;
+                 CREATE TABLE runtime_turn_evidence (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   runtime_turn_attempt_id TEXT NOT NULL,
+                   sequence INTEGER NOT NULL CHECK (sequence > 0),
+                   evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
+                     'prepared', 'dispatch_started', 'dispatch_accepted', 'turn_started',
+                     'item_started', 'agent_message_delta', 'item_completed', 'diagnostic',
+                     'local_approval_requested', 'local_approval_response_started',
+                     'local_approval_response_sent', 'interrupt_requested',
+                     'interrupt_accepted', 'completed', 'interrupted', 'failed', 'uncertain'
+                   )),
+                   evidence_digest TEXT NOT NULL CHECK (length(evidence_digest) = 64),
+                   resulting_status TEXT NOT NULL CHECK (resulting_status IN (
+                     'prepared', 'dispatching', 'running', 'waiting_local_approval',
+                     'approval_responding', 'interrupt_requested', 'completed',
+                     'interrupted', 'failed', 'uncertain'
+                   )),
+                   observed_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id, runtime_turn_attempt_id, sequence),
+                   FOREIGN KEY (project_id, runtime_turn_attempt_id)
+                     REFERENCES runtime_turn_attempts(project_id, id) ON DELETE CASCADE
+                 );
+                 INSERT INTO runtime_turn_evidence (
+                   tenant_id, project_id, runtime_turn_attempt_id, sequence,
+                   evidence_kind, evidence_digest, resulting_status, observed_at
+                 )
+                 SELECT tenant_id, project_id, runtime_turn_attempt_id, sequence,
+                   evidence_kind, evidence_digest, resulting_status, observed_at
+                 FROM runtime_turn_evidence_v46;
+                 CREATE TABLE runtime_turn_private_messages (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   runtime_turn_attempt_id TEXT NOT NULL,
+                   evidence_sequence INTEGER NOT NULL CHECK (evidence_sequence > 0),
+                   worker_generation INTEGER NOT NULL CHECK (worker_generation > 0),
+                   item_id_digest TEXT NOT NULL CHECK (length(item_id_digest) = 64),
+                   body TEXT NOT NULL CHECK (
+                     length(trim(body)) > 0 AND length(body) <= 4194304
+                   ),
+                   body_digest TEXT NOT NULL CHECK (length(body_digest) = 64),
+                   event_digest TEXT NOT NULL CHECK (length(event_digest) = 64),
+                   observed_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id, runtime_turn_attempt_id, evidence_sequence),
+                   FOREIGN KEY (mission_id, project_id)
+                     REFERENCES missions(id, project_id) ON DELETE CASCADE,
+                   FOREIGN KEY (
+                     project_id, runtime_turn_attempt_id, evidence_sequence
+                   ) REFERENCES runtime_turn_evidence(
+                     project_id, runtime_turn_attempt_id, sequence
+                   ) ON DELETE CASCADE
+                 );
+                 INSERT INTO runtime_turn_private_messages (
+                   tenant_id, project_id, mission_id, runtime_turn_attempt_id,
+                   evidence_sequence, worker_generation, item_id_digest, body,
+                   body_digest, event_digest, observed_at
+                 )
+                 SELECT tenant_id, project_id, mission_id, runtime_turn_attempt_id,
+                   evidence_sequence, worker_generation,
+                   'b907287bacf5470d3b3c410ae6e7934f19ee7e0640b289fc41922a441bb88d5b',
+                   body, body_digest, event_digest, observed_at
+                 FROM runtime_turn_private_messages_v46;
+                 CREATE INDEX runtime_turn_private_message_scope_idx
+                   ON runtime_turn_private_messages(
+                     tenant_id, project_id, mission_id, worker_generation,
+                     runtime_turn_attempt_id, evidence_sequence
+                   );
+                 DROP TABLE runtime_turn_private_messages_v46;
+                 DROP TABLE runtime_turn_evidence_v46;
+                 CREATE TABLE runtime_turn_private_text_deltas (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   runtime_turn_attempt_id TEXT NOT NULL,
+                   evidence_sequence INTEGER NOT NULL CHECK (evidence_sequence > 0),
+                   stream_sequence INTEGER NOT NULL CHECK (stream_sequence > 0),
+                   worker_generation INTEGER NOT NULL CHECK (worker_generation > 0),
+                   item_id_digest TEXT NOT NULL CHECK (length(item_id_digest) = 64),
+                   delta TEXT NOT NULL CHECK (
+                     length(delta) > 0 AND length(delta) <= 4194304
+                   ),
+                   delta_digest TEXT NOT NULL CHECK (length(delta_digest) = 64),
+                   cumulative_byte_count INTEGER NOT NULL CHECK (
+                     cumulative_byte_count > 0 AND cumulative_byte_count <= 4194304
+                   ),
+                   chain_digest TEXT NOT NULL CHECK (length(chain_digest) = 64),
+                   event_digest TEXT NOT NULL CHECK (length(event_digest) = 64),
+                   observed_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id, runtime_turn_attempt_id, evidence_sequence),
+                   UNIQUE (
+                     project_id, runtime_turn_attempt_id, item_id_digest, stream_sequence
+                   ),
+                   FOREIGN KEY (mission_id, project_id)
+                     REFERENCES missions(id, project_id) ON DELETE CASCADE,
+                   FOREIGN KEY (
+                     project_id, runtime_turn_attempt_id, evidence_sequence
+                   ) REFERENCES runtime_turn_evidence(
+                     project_id, runtime_turn_attempt_id, sequence
+                   ) ON DELETE CASCADE
+                 );
+                 CREATE INDEX runtime_turn_private_text_delta_scope_idx
+                   ON runtime_turn_private_text_deltas(
+                     tenant_id, project_id, mission_id, worker_generation,
+                     runtime_turn_attempt_id, item_id_digest, stream_sequence
+                   );",
+                )?;
+            }
+            record_migration(&transaction, 46)?;
+            transaction.commit()?;
+        }
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
@@ -4344,6 +4552,257 @@ mod tests {
 
     fn database_key() -> DatabaseKey {
         DatabaseKey::new([7; 32]).expect("database key")
+    }
+
+    fn downgrade_runtime_delta_schema_to_v45(connection: &Connection) {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 DROP INDEX IF EXISTS runtime_turn_private_text_delta_scope_idx;
+                 DROP TABLE runtime_turn_private_text_deltas;
+                 DROP INDEX IF EXISTS runtime_turn_private_message_scope_idx;
+                 DROP TABLE runtime_turn_private_messages;
+                 ALTER TABLE runtime_turn_evidence
+                   RENAME TO runtime_turn_evidence_current_v46;
+                 CREATE TABLE runtime_turn_evidence (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   runtime_turn_attempt_id TEXT NOT NULL,
+                   sequence INTEGER NOT NULL CHECK (sequence > 0),
+                   evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
+                     'prepared', 'dispatch_started', 'dispatch_accepted', 'turn_started',
+                     'item_started', 'item_completed', 'diagnostic',
+                     'local_approval_requested', 'local_approval_response_started',
+                     'local_approval_response_sent', 'interrupt_requested',
+                     'interrupt_accepted', 'completed', 'interrupted', 'failed', 'uncertain'
+                   )),
+                   evidence_digest TEXT NOT NULL CHECK (length(evidence_digest) = 64),
+                   resulting_status TEXT NOT NULL CHECK (resulting_status IN (
+                     'prepared', 'dispatching', 'running', 'waiting_local_approval',
+                     'approval_responding', 'interrupt_requested', 'completed',
+                     'interrupted', 'failed', 'uncertain'
+                   )),
+                   observed_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id, runtime_turn_attempt_id, sequence),
+                   FOREIGN KEY (project_id, runtime_turn_attempt_id)
+                     REFERENCES runtime_turn_attempts(project_id, id) ON DELETE CASCADE
+                 );
+                 INSERT INTO runtime_turn_evidence (
+                   tenant_id, project_id, runtime_turn_attempt_id, sequence,
+                   evidence_kind, evidence_digest, resulting_status, observed_at
+                 )
+                 SELECT tenant_id, project_id, runtime_turn_attempt_id, sequence,
+                   evidence_kind, evidence_digest, resulting_status, observed_at
+                 FROM runtime_turn_evidence_current_v46;
+                 DROP TABLE runtime_turn_evidence_current_v46;
+                 CREATE TABLE runtime_turn_private_messages (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   runtime_turn_attempt_id TEXT NOT NULL,
+                   evidence_sequence INTEGER NOT NULL CHECK (evidence_sequence > 0),
+                   worker_generation INTEGER NOT NULL CHECK (worker_generation > 0),
+                   body TEXT NOT NULL CHECK (
+                     length(trim(body)) > 0 AND length(body) <= 4194304
+                   ),
+                   body_digest TEXT NOT NULL CHECK (length(body_digest) = 64),
+                   event_digest TEXT NOT NULL CHECK (length(event_digest) = 64),
+                   observed_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id, runtime_turn_attempt_id, evidence_sequence),
+                   FOREIGN KEY (mission_id, project_id)
+                     REFERENCES missions(id, project_id) ON DELETE CASCADE,
+                   FOREIGN KEY (
+                     project_id, runtime_turn_attempt_id, evidence_sequence
+                   ) REFERENCES runtime_turn_evidence(
+                     project_id, runtime_turn_attempt_id, sequence
+                   ) ON DELETE CASCADE
+                 );
+                 CREATE INDEX runtime_turn_private_message_scope_idx
+                   ON runtime_turn_private_messages(
+                     tenant_id, project_id, mission_id, worker_generation,
+                     runtime_turn_attempt_id, evidence_sequence
+                   );
+                 DELETE FROM schema_migrations WHERE version >= 46;
+                 COMMIT;",
+            )
+            .expect("downgrade runtime delta schema to v45");
+    }
+
+    fn assert_integrated_v46_schema(connection: &Connection) {
+        for table in [
+            "vm11_outcome_reviews",
+            "vm11_outcome_review_source_fences",
+            "vm11_outcome_review_decisions",
+            "runtime_turn_private_text_deltas",
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master
+                         WHERE type = 'table' AND name = ?1",
+                        [table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("integrated table count"),
+                1,
+                "missing integrated migration table {table}"
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version IN (45, 46)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("integrated migration rows"),
+            2
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('runtime_turn_private_messages')
+                     WHERE name = 'item_id_digest'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .expect("private message schema")
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the integration migration proof keeps fresh, v44, v45, backup, idempotent-ledger repair, and transactional failure rollback in one visible matrix"
+    )]
+    fn migration_v46_sequences_outcome_v45_before_runtime_delta_and_rolls_back_failure() {
+        let fresh = ProjectStore::in_memory().expect("fresh v46 store");
+        assert_eq!(fresh.schema_version().expect("fresh schema"), 46);
+        assert_integrated_v46_schema(&fresh.connection);
+
+        let v45_directory = tempfile::tempdir().expect("v45 directory");
+        let v45_path = v45_directory.path().join("integrated-v45.sqlite3");
+        {
+            let store = ProjectStore::open(&v45_path, &database_key()).expect("current file");
+            downgrade_runtime_delta_schema_to_v45(&store.connection);
+            assert_eq!(store.schema_version().expect("v45 fixture"), 45);
+            assert_eq!(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master
+                         WHERE type = 'table' AND name = 'vm11_outcome_reviews'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("v45 outcome table"),
+                1
+            );
+        }
+        let migrated_v45 =
+            ProjectStore::open(&v45_path, &database_key()).expect("migrate v45 to v46");
+        assert_integrated_v46_schema(&migrated_v45.connection);
+        drop(migrated_v45);
+        assert_eq!(
+            fs::read_dir(v45_directory.path())
+                .expect("v45 directory entries")
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("pre-migration-v45"))
+                .count(),
+            1
+        );
+
+        let v44_directory = tempfile::tempdir().expect("v44 directory");
+        let v44_path = v44_directory.path().join("integrated-v44.sqlite3");
+        {
+            let store = ProjectStore::open(&v44_path, &database_key()).expect("current file");
+            downgrade_runtime_delta_schema_to_v45(&store.connection);
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE vm11_outcome_review_decisions;
+                     DROP TABLE vm11_outcome_review_source_fences;
+                     DROP TABLE vm11_outcome_reviews;
+                     DELETE FROM schema_migrations WHERE version >= 45;",
+                )
+                .expect("construct integrated v44 fixture");
+            assert_eq!(store.schema_version().expect("v44 fixture"), 44);
+        }
+        let migrated_v44 =
+            ProjectStore::open(&v44_path, &database_key()).expect("migrate v44 through v46");
+        assert_integrated_v46_schema(&migrated_v44.connection);
+        drop(migrated_v44);
+        assert_eq!(
+            fs::read_dir(v44_directory.path())
+                .expect("v44 directory entries")
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("pre-migration-v44"))
+                .count(),
+            1
+        );
+
+        let mut rollback = ProjectStore::in_memory().expect("rollback store");
+        downgrade_runtime_delta_schema_to_v45(&rollback.connection);
+        rollback
+            .connection
+            .execute_batch(
+                "CREATE TABLE runtime_turn_evidence_v46 (
+                   sentinel INTEGER NOT NULL
+                 );",
+            )
+            .expect("inject rename collision");
+        assert!(matches!(rollback.migrate(), Err(StorageError::Sql(_))));
+        assert_eq!(rollback.schema_version().expect("rolled back schema"), 45);
+        assert_eq!(
+            rollback
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'runtime_turn_private_messages'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("v45 private message table survives"),
+            1
+        );
+        assert!(
+            rollback
+                .connection
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('runtime_turn_private_messages')
+                     WHERE name = 'item_id_digest'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .expect("rolled back private message schema")
+                .is_none()
+        );
+        assert_eq!(
+            rollback
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 46",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("no failed migration ledger"),
+            0
+        );
+        rollback
+            .connection
+            .execute_batch("DROP TABLE runtime_turn_evidence_v46;")
+            .expect("remove injected collision");
+        rollback.migrate().expect("retry v46 after rollback");
+        assert_integrated_v46_schema(&rollback.connection);
     }
 
     fn project(id: &str, root: &str) -> Project {

@@ -1,0 +1,93 @@
+Window: "Hartevo Desktop", App: HartevoVisualBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text Hartevo
+				6 button 搜索所有项目与任务
+				7 button (collapsed) 查看全部项目通知, Help: 全部项目通知, Secondary Actions: Expand
+				8 text 成果与循环
+				9 text 已排期
+				10 button 重新读取持久状态
+				11 text 成果与循环
+				12 toggle button 打开任务工作台, Value: off
+				13 container 项目与任务导航
+					14 button 在当前项目描述新任务
+					15 container 项目工作面
+						16 text 工作
+						17 button 当前状态 Project
+						18 button 总调度 同一会话
+						19 button 全部任务 Mission
+						20 button 成果与循环 Outcome
+						21 text 增长运营
+						22 button 渠道运营 Channel
+						23 button 关系与 CRM 未接入
+						24 button 达人与联盟 未接入
+						25 text 系统与连接
+						26 button 连接中心 Probe
+						27 button 能力与证据 E0–E5
+					28 container 宣发项目
+						29 container
+							30 text 宣发项目 1
+						31 button 北 北美增长项目 revision 142 · Keyring 就绪
+					32 container 持久任务
+						33 container
+							34 text 持久 Mission 7
+						35 button 项目总调度 显式选择 VM-00～VM-11 CATALOG
+						36 button 美国健身器材机会研究 运行中 1
+						37 button Q3 促销策略与节奏 运行中 1
+						38 button 新品着陆页文案 等待审批 1
+						39 button 德国经销商邮件序列 等待用户 1
+						40 button AI 推荐与引用监测 已排期 1
+						41 button 竞品价格与评论变化 已排期 1
+						42 button SEO 周度增长循环 已排期 1
+					43 container
+						44 pop up button 北美增长项目 本地 E2EE 同步
+						45 text 路径只用于本机数据层，不进入日志或 Release Evidence
+				46 container
+					47 text Outcome & Attribution
+					48 text 变化回写同一 Project / Mission Truth VISUAL_FIXTURE · prototype-baseline-v1
+					49 button 工作台
+				50 container
+					51 text OUTCOMES · ATTRIBUTION
+					52 heading 成果与下一循环, Value: 1
+						53 text 成果与下一循环
+					54 text 原始事件、身份链、退款与归因不被页面覆盖；相关性不会被描述为因果。 北美增长项目
+				55 text 0
+				56 text Evidence
+				57 text 2
+				58 text Work Products
+				59 text 0
+				60 text Verified Effects
+				61 text 0
+				62 text Revenue Events
+				63 text 0
+				64 text Refund Events
+				65 text —
+				66 text Attribution
+				67 heading Outcome Ledger, Value: 2
+					68 text Outcome Ledger
+				69 text 不可变、可复算
+				70 text EMPTY
+				71 heading 尚无 Outcome Review, Value: 3
+					72 text 尚无 Outcome Review
+				73 text 当前 Mission 没有持久 Outcome summary；不会从 Stage 或 Provider 响应推导 Revenue。
+				74 heading 归因与下一决策, Value: 2
+					75 text 归因与下一决策
+				76 text VM-11
+				77 text 身份链优先
+				78 text Verified link / coupon / provider identity chain
+				79 text 保留 Unattributed
+				80 text 无法确定来源时不强行分配
+				81 text 退款为独立反向事件
+				82 text 原订单不会被覆盖
+				83 text NOT_IMPLEMENTED
+	84 close button
+	85 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	86 minimize button
+	87 text Hartevo Desktop
+88 menu bar
+	89 HartevoVisualBaseline
+	90 Edit
+	91 Help

@@ -110,7 +110,7 @@ while IFS=$'\t' read -r archive digest; do
 done < <(jq -r '.artifacts[] | [.archive, .archiveSha256] | @tsv' \
   "${workspace_root}/third_party/openinterpreter/ARTIFACTS.json")
 
-for method in thread/started turn/started item/started item/completed turn/completed; do
+for method in thread/started turn/started item/started item/agentMessage/delta item/completed turn/completed; do
   if ! jq -e --arg method "${method}" \
     '[.. | objects | .method? | .enum? // empty | .[]?] | any(. == $method)' \
     "${work_dir}/server-notifications.json" >/dev/null; then

@@ -1,0 +1,348 @@
+{
+  "scenarioId": "prototype-baseline-v1",
+  "source": "prototype/index.html@v12",
+  "disclosure": "VISUAL_FIXTURE",
+  "project": {
+    "projectId": "visual-prototype-project",
+    "name": "北美增长项目",
+    "description": "持续协调项目里的所有任务、审批、自动运行与共享事实；这里不是某一个任务的会话。",
+    "revision": 142,
+    "workspaceRootCount": 1
+  },
+  "relatedProjects": [
+    {
+      "projectId": "visual-japan-launch",
+      "name": "日本站新品增长",
+      "description": "Amazon JP · 家居收纳产品线",
+      "revision": 96,
+      "workspaceRootCount": 1
+    },
+    {
+      "projectId": "visual-dtc-growth",
+      "name": "DTC 独立站增长",
+      "description": "内容、邮件与再营销",
+      "revision": 74,
+      "workspaceRootCount": 1
+    },
+    {
+      "projectId": "visual-brand-engine",
+      "name": "品牌内容引擎",
+      "description": "社媒矩阵与长期内容资产",
+      "revision": 58,
+      "workspaceRootCount": 1
+    }
+  ],
+  "missions": [
+    {
+      "missionId": "visual-us-fitness-research",
+      "title": "美国健身器材机会研究",
+      "goal": "比较美国健身器材需求、竞争与反证，不执行外部写入。",
+      "manifestId": "VM-07",
+      "stage": "running",
+      "checkpointId": "scoped_collection",
+      "completedCheckpoints": 3,
+      "checkpointCount": 9,
+      "cycle": 1,
+      "pendingApprovals": 0,
+      "workProducts": 1
+    },
+    {
+      "missionId": "visual-q3-promotion",
+      "title": "Q3 促销策略与节奏",
+      "goal": "在预算和审批边界内形成 Q3 渠道计划。",
+      "manifestId": "VM-04",
+      "stage": "running",
+      "checkpointId": "pillar_calendar",
+      "completedCheckpoints": 2,
+      "checkpointCount": 9,
+      "cycle": 2,
+      "pendingApprovals": 0,
+      "workProducts": 1
+    },
+    {
+      "missionId": "visual-launch-copy",
+      "title": "新品着陆页文案",
+      "goal": "交付有证据约束的新品着陆页文案并等待用户选择。",
+      "manifestId": "VM-03",
+      "stage": "waiting_approval",
+      "checkpointId": "preview_revision",
+      "completedCheckpoints": 6,
+      "checkpointCount": 10,
+      "cycle": 1,
+      "pendingApprovals": 1,
+      "workProducts": 1
+    },
+    {
+      "missionId": "visual-email-sequence",
+      "title": "德国经销商邮件序列",
+      "goal": "只对具备合法基础且未被抑制的联系人准备邮件序列。",
+      "manifestId": "VM-05",
+      "stage": "waiting_user",
+      "checkpointId": "icp_and_legal_basis",
+      "completedCheckpoints": 0,
+      "checkpointCount": 10,
+      "cycle": 1,
+      "pendingApprovals": 0,
+      "workProducts": 0
+    },
+    {
+      "missionId": "visual-ai-monitor",
+      "title": "AI 推荐与引用监测",
+      "goal": "使用冻结 Question Set 做同口径复测。",
+      "manifestId": "VM-02",
+      "stage": "scheduled",
+      "checkpointId": "gt_baseline",
+      "completedCheckpoints": 1,
+      "checkpointCount": 9,
+      "cycle": 4,
+      "pendingApprovals": 0,
+      "workProducts": 1
+    },
+    {
+      "missionId": "visual-competitor-monitor",
+      "title": "竞品价格与评论变化",
+      "goal": "监测真实 Marketplace 数据边界，不把估算冒充后台事实。",
+      "manifestId": "VM-08",
+      "stage": "scheduled",
+      "checkpointId": "demand_review_return_competitor_clusters",
+      "completedCheckpoints": 3,
+      "checkpointCount": 10,
+      "cycle": 3,
+      "pendingApprovals": 0,
+      "workProducts": 1
+    },
+    {
+      "missionId": "visual-seo-cycle",
+      "title": "SEO 周度增长循环",
+      "goal": "按周复测排名、流量与发布 readback。",
+      "manifestId": "VM-01",
+      "stage": "scheduled",
+      "checkpointId": "ranking_traffic_review",
+      "completedCheckpoints": 8,
+      "checkpointCount": 10,
+      "cycle": 12,
+      "pendingApprovals": 0,
+      "workProducts": 2
+    }
+  ],
+  "catalog": [
+    ["VM-00", "Current State、Identity 与 Billing", "build_once"],
+    ["VM-01", "SEO Continuous Operator", "continuous_operator"],
+    ["VM-02", "AI Visibility Operator", "continuous_operator"],
+    ["VM-03", "First-party Growth Site", "build_once"],
+    ["VM-04", "Social Matrix", "campaign"],
+    ["VM-05", "Consent-safe Email Acquisition", "campaign"],
+    ["VM-06", "Partner / Affiliate / Creator Work", "continuous_relationship"],
+    ["VM-07", "New Market Decision", "one_off_decision"],
+    ["VM-08", "Marketplace / Listing Operator", "continuous_operator"],
+    ["VM-09", "B2B Decision Evidence 与 Pipeline", "continuous_relationship"],
+    ["VM-10", "Inbox、Bot 与 Human Handoff", "continuous_relationship"],
+    ["VM-11", "Outcome、Attribution 与 Next Loop", "continuous_operator"]
+  ],
+  "presentation": {
+    "notifications": [
+      {"mark":"JP","title":"寄样范围等待你确认","context":"日本站新品增长 · 日本达人样品计划","time":"2 分钟前","kind":"需要你"},
+      {"mark":"DTC","title":"再营销预算变更等待审批","context":"DTC 独立站增长 · Meta 再营销预算调整","time":"18 分钟前","kind":"需要你"},
+      {"mark":"NA","title":"机会研究已生成 3 个候选方向","context":"北美增长项目 · 美国健身器材机会研究","time":"36 分钟前","kind":"运行动态"},
+      {"mark":"BC","title":"AI 推荐与引用监测周期样例已更新","context":"品牌内容引擎 · 视觉夹具，不构成真实运行回执","time":"今天 09:04","kind":"运行动态"}
+    ],
+    "conversation": {
+      "userPrompt":"帮我分析美国健身器材品类机会，找出三个值得测试的产品。未经我批准，不要发布或花钱。",
+      "assistantIntro":"我会先核对需求、竞争、利润空间与合规风险，再给出 3 个可以实际验证的方向。任何发布或支出都会先征求你确认。",
+      "goal":"找出 3 个可验证的品类机会",
+      "automatic":"研究、核验、生成草稿",
+      "approval":"发布、支出、外部写入",
+      "progress":[
+        {"title":"已载入 16 个冻结来源样例","detail":"Search、Marketplace、社区与行业报告 · 视觉夹具","capability":"DataForSEO Simulator · 只读","state":"done","time":"10:22"},
+        {"title":"正在比较需求与竞争","detail":"统一数据口径，去重证据，标记数据时效","capability":"Marketplace Intelligence · Candidate","state":"live","time":"10:24"},
+        {"title":"机会报告结构已生成","detail":"3 个候选方向，16 条可追溯样例证据","capability":"Evidence Oracle · Fixture","state":"done","time":"10:26"}
+      ],
+      "capabilitySummary":"1 Skill · 1 Plugin · 2 MCP · 3 Connectors",
+      "connectionTitle":"下一阶段建议连接 Meta 与邮件域",
+      "connectionDetail":"当前研究不受影响；只有进入投放或关系经营时才需要真实授权与 Probe。",
+      "artifactTitle":"美国健身器材机会研究",
+      "artifactMeta":"研究报告 · 16 个冻结样例来源",
+      "decision":"可调哑铃的需求、利润空间和验证成本最均衡。折叠划船机适合作为第二梯队；髋外展训练器增长快，但需要先核查专利与供应链。"
+    },
+    "approval": {
+      "userPrompt":"先按可调哑铃做一个小规模测试方案，预算不要超过一万元。",
+      "assistantIntro":"验证计划结构已经准备好。视觉夹具没有创建广告、上传素材或产生支出；任何真实对象都会重新生成精确 digest 并等待审批。",
+      "effects":[
+        {"title":"创建测试广告系列","detail":"Meta Ads · US · Draft → Active","meta":"对象 1","state":"外部写入"},
+        {"title":"上传并绑定素材","detail":"3 个变体 · fixture asset digests","meta":"对象 2","state":"外部写入"},
+        {"title":"设置样例受众与排期","detail":"US/Eastern · 7 天","meta":"对象 3","state":"外部写入"},
+        {"title":"设置预算上限","detail":"$1,400.00 USD · fixture only","meta":"对象 4","state":"金额动作"}
+      ],
+      "facts":[
+        {"title":"账号","detail":"Meta Business fixture","meta":"未 Probe","state":"BLOCKED_ENV"},
+        {"title":"受众","detail":"US · 25–44 · Home fitness","meta":"digest field","state":"样例"},
+        {"title":"计划时间","detail":"2026-08-14 10:00 US/Eastern","meta":"digest field","state":"样例"},
+        {"title":"预算","detail":"140000 minor units · USD","meta":"digest field","state":"样例"}
+      ]
+    },
+    "outcome": {
+      "intro":"下面是结果区的视觉结构样例。没有真实 ProviderReceipt、Verification 或 OutcomeEvent，因此所有行保持未执行或未测量。",
+      "metrics":[{"value":"$0.00","label":"真实支出"},{"value":"$1,400.00","label":"合同上限样例"},{"value":"0","label":"Verified Effects"}],
+      "rows":[
+        {"title":"Provider acceptance","detail":"没有真实请求","meta":"Receipt unavailable","state":"未执行"},
+        {"title":"Public readback","detail":"没有公开对象 URL","meta":"Verification unavailable","state":"未验证"},
+        {"title":"Outcome attribution","detail":"没有不可变业务事件","meta":"OutcomeEvent unavailable","state":"未测量"}
+      ]
+    },
+    "workpad": {
+      "tabs":["机会报告","7 天验证计划","验证结果"],
+      "eyebrow":"OPPORTUNITY REPORT · VISUAL_FIXTURE",
+      "title":"美国健身器材机会研究",
+      "meta":"revision 1 · 16 个样例来源 · 不构成真实 Provider Evidence",
+      "conclusion":"可调哑铃在需求强度、竞争缺口、毛利空间和低量验证成本之间最均衡，建议作为首个实验方向。",
+      "phases":["Measure","Fix","Distribute","Verify"],
+      "candidates":[
+        {"title":"可调哑铃","detail":"需求稳定 · 评论缺口清晰 · 验证成本可控","meta":"Priority 01","state":"建议测试"},
+        {"title":"折叠划船机","detail":"空间效率主张明确 · 物流成本需要二次核验","meta":"Priority 02","state":"保留"},
+        {"title":"髋外展训练器","detail":"增长较快 · 专利和供应链风险仍未知","meta":"Priority 03","state":"先核验"}
+      ],
+      "sources":[
+        {"title":"Search demand snapshot","detail":"US · English · frozen 2026-08-05","meta":"Simulator","state":"样例"},
+        {"title":"Marketplace review clusters","detail":"first-party / estimate 已分开标记","meta":"Sorftime fixture","state":"样例"},
+        {"title":"Community objection evidence","detail":"来源、时间与主张链可追溯","meta":"Replay world","state":"样例"}
+      ]
+    },
+    "pages":[
+      {
+        "id":"channels",
+        "stats":[{"value":"3","label":"优先渠道"},{"value":"1","label":"需要真实连接"},{"value":"4","label":"本周样例节奏"}],
+        "tabs":[
+          {"id":"overview","label":"总览","kind":"ranked","headline":"按受众与目标排序","subline":"不是为了覆盖渠道而机械群发","columns":[],"rows":[
+            {"title":"Meta · Instagram","detail":"视觉叙事与再营销适配；预算、受众与素材逐项批准","meta":"Fit 92","state":"BLOCKED_ENV"},
+            {"title":"YouTube","detail":"评测与产品教育适配；先完成可复用长视频素材","meta":"Fit 86","state":"计划样例"},
+            {"title":"Email","detail":"只对具备 Consent/合法基础的关系运行","meta":"Fit 78","state":"需连接"},
+            {"title":"X","detail":"账号授权已过期时保留草稿并停止外发","meta":"Fit 61","state":"需重新授权"}
+          ]},
+          {"id":"calendar","label":"内容日历","kind":"calendar","headline":"本周内容节奏","subline":"US/Eastern · 视觉夹具，不产生排期 Effect","columns":["渠道","周一","周二","周三","周四","周五"],"rows":[
+            {"title":"Instagram","detail":"产品教育","meta":"·  教程  ·  复盘","state":"样例"},
+            {"title":"YouTube","detail":"短评测","meta":"·  ·  长视频  ·","state":"样例"},
+            {"title":"Email","detail":"Consent segment","meta":"·  草稿  ·  ·","state":"未投递"},
+            {"title":"X","detail":"暂停","meta":"·  ·  ·  ·","state":"BLOCKED_ENV"}
+          ]},
+          {"id":"queue","label":"发布队列","kind":"table","headline":"发布与审批队列","subline":"所有行均为结构样例，未创建 Provider Effect","columns":["对象","渠道","计划","审批","状态"],"rows":[
+            {"title":"可调哑铃：空间效率","detail":"Instagram · asset-fixture-01","meta":"周三 10:00","state":"等待样例审批"},
+            {"title":"7 天训练指南","detail":"YouTube · asset-fixture-02","meta":"周四 18:30","state":"草稿"},
+            {"title":"验证结果摘要","detail":"Email · consent-fixture","meta":"周五 09:00","state":"BLOCKED_ENV"}
+          ]},
+          {"id":"performance","label":"效果","kind":"table","headline":"互动、Referral 与 Outcome","subline":"不以发帖数或 Provider 接受冒充业务结果","columns":["渠道","采用","有效互动","Referral","Outcome"],"rows":[
+            {"title":"Instagram","detail":"内容样例采用 3/4","meta":"Not measured","state":"未测量"},
+            {"title":"YouTube","detail":"内容样例采用 1/2","meta":"Not measured","state":"未测量"},
+            {"title":"Email","detail":"Consent segment 未执行","meta":"0 Effect","state":"未测量"}
+          ]}
+        ]
+      },
+      {
+        "id":"relationships",
+        "stats":[{"value":"146","label":"关系样例"},{"value":"42","label":"可跟进样例"},{"value":"9","label":"开放机会样例"}],
+        "tabs":[
+          {"id":"pipeline","label":"Pipeline","kind":"table","headline":"关系与机会 Pipeline","subline":"样例身份与 Consent，不进入真实 CRM","columns":["Person / Company","Stage","Consent","最近活动","下一步"],"rows":[
+            {"title":"Jamie Lee · Northstar Fitness","detail":"Buying committee · 3 studios","meta":"Proposal","state":"Follow-up granted"},
+            {"title":"Nora Chen · Formline","detail":"Security review · 2 stakeholders","meta":"Evidence","state":"Human review"},
+            {"title":"Alex Morgan · Move Lab","detail":"Pricing requested · inbound","meta":"Qualified","state":"Consent verified"}
+          ]},
+          {"id":"inbox","label":"Inbox","kind":"split","headline":"Inbox 与 Human Handoff","subline":"人工接管是 CAS 锁，旧 Worker 不得外发","columns":[],"rows":[
+            {"title":"Jamie Lee","detail":"Can you confirm inventory and delivery timing?","meta":"2 分钟前","state":"人工接管"},
+            {"title":"Nora Chen","detail":"Security questionnaire attached","meta":"18 分钟前","state":"需审阅"},
+            {"title":"Alex Morgan","detail":"Thanks — please send the revised quote","meta":"昨天","state":"草稿样例"}
+          ]},
+          {"id":"sequences","label":"邮件序列","kind":"table","headline":"Consent-safe 邮件序列","subline":"公开邮箱不自动等于 Consent","columns":["序列","Segment","频次","状态","回流"],"rows":[
+            {"title":"Qualified inbound follow-up","detail":"12 contacts · purpose bound","meta":"3 touches / 14d","state":"草稿样例"},
+            {"title":"Distributor evidence pack","detail":"8 contacts · legitimate basis review","meta":"2 touches / 10d","state":"等待法务样例"}
+          ]},
+          {"id":"contacts","label":"联系人","kind":"table","headline":"Person / Company Identity","subline":"所有数据均为去标识视觉夹具","columns":["姓名","公司","来源","Consent","Owner"],"rows":[
+            {"title":"Jamie Lee","detail":"Northstar Fitness · Website inquiry","meta":"Verified inbound","state":"Shanika"},
+            {"title":"Nora Chen","detail":"Formline · Event opt-in","meta":"Purpose bound","state":"Sales"},
+            {"title":"Alex Morgan","detail":"Move Lab · Referral","meta":"Follow-up granted","state":"Shanika"}
+          ]}
+        ]
+      },
+      {
+        "id":"partners",
+        "stats":[{"value":"0","label":"官方网络实例"},{"value":"18","label":"Opt-in 样例"},{"value":"24","label":"租户私域样例"},{"value":"1,284","label":"公开研究样例"}],
+        "tabs":[
+          {"id":"overview","label":"总览","kind":"ranked","headline":"推荐供给与许可边界","subline":"公开候选没有 Contact Permission 时只允许研究","columns":[],"rows":[
+            {"title":"Maya Torres · Garage Strength","detail":"Hartevo Verified Opt-in · YouTube + Website","meta":"Fit 94","state":"可研究/建联样例"},
+            {"title":"Home Gym Atlas","detail":"Tenant private import · Permission needs review","meta":"Fit 88","state":"等待许可"},
+            {"title":"CompactLift Lab","detail":"Public web discovery · Contact Permission unknown","meta":"Fit 82","state":"仅研究"}
+          ]},
+          {"id":"discovery","label":"达人发现","kind":"table","headline":"Creator Identity 与真实性","subline":"粉丝数不是联系人许可","columns":["达人","市场","供给类别","匹配","允许动作"],"rows":[
+            {"title":"Maya Torres","detail":"US · Home fitness","meta":"Verified Opt-in","state":"研究/邀请样例"},
+            {"title":"Home Gym Atlas","detail":"US · Reviews","meta":"Tenant private","state":"需许可复核"},
+            {"title":"CompactLift Lab","detail":"CA · Short video","meta":"Public candidate","state":"Research only"}
+          ]},
+          {"id":"pipeline","label":"建联管线","kind":"kanban","headline":"建联与合作管线","subline":"状态迁移必须来自 Application Service","columns":["候选","已许可","已回复","条款","已激活"],"rows":[
+            {"title":"CompactLift Lab","detail":"公开研究","meta":"候选","state":"仅研究"},
+            {"title":"Maya Torres","detail":"Opt-in verified","meta":"已许可","state":"邀请样例"},
+            {"title":"Jordan Fit","detail":"询问 Sample + CPS","meta":"已回复","state":"人工处理"},
+            {"title":"Garage Strength","detail":"12% CPS · 30d window","meta":"条款","state":"待确认"},
+            {"title":"Move Better","detail":"Link/Coupon structure","meta":"已激活","state":"样例"}
+          ]},
+          {"id":"program","label":"Program","kind":"table","headline":"Program / Terms / Budget","subline":"条款修改使旧审批失效","columns":["Program","Model","Window","Budget","状态"],"rows":[
+            {"title":"US Home Fitness Launch","detail":"Sample + 12% CPS","meta":"30 days · USD","state":"草稿样例"},
+            {"title":"Creator Test Bounty","detail":"$300 fixed reward + rights review","meta":"7 days · USD","state":"等待精确审批"}
+          ]},
+          {"id":"economics","label":"归因与佣金","kind":"table","headline":"Commission / Refund / Payout","subline":"订单、退款和付款状态分离","columns":["Partner","Gross","Refund","Eligible","Payout"],"rows":[
+            {"title":"Maya Torres","detail":"$3,420.00","meta":"-$320.00 · $3,100.00 eligible","state":"$372.00 样例·未付款"},
+            {"title":"Move Better","detail":"$1,180.00","meta":"$0 refund · $1,180.00 eligible","state":"待复核样例"}
+          ]},
+          {"id":"work","label":"任务与交付","kind":"workflow","headline":"达人雇佣、悬赏与真实交付","subline":"付款只能发生在交付 Review、接受、权益和精确审批之后","columns":[],"rows":[
+            {"title":"任务发布与悬赏","detail":"7 天可调哑铃真实使用短视频 · Reward $300 USD","meta":"Offer revision 3","state":"等待精确审批"},
+            {"title":"邀请 / 申请 / Award","detail":"Maya Torres · Contact Permission verified fixture","meta":"Award digest fixture","state":"未执行"},
+            {"title":"任务接受与 Funding","detail":"范围、截止期、修改次数、权利与付款条件冻结","meta":"Milestone 1/1","state":"BLOCKED_ENV"},
+            {"title":"进度与 Deliverable Upload","detail":"MP4 + transcript + usage notes · File Broker 扫描","meta":"deliverable digest pending","state":"未上传"},
+            {"title":"用户 Review / Revision","detail":"逐时间码评论、接受或请求一次返修","meta":"review revision pending","state":"等待交付"},
+            {"title":"Rights / Payout Verification","detail":"接受交付后记录权利；创建精确 Payout Effect 并独立核验","meta":"$300.00 USD","state":"未付款"}
+          ]}
+        ]
+      },
+      {
+        "id":"connections",
+        "stats":[{"value":"0","label":"真实 Probe 可用"},{"value":"3","label":"建议连接样例"},{"value":"1","label":"授权阻塞样例"}],
+        "tabs":[
+          {"id":"overview","label":"总览","kind":"ranked","headline":"这个项目接下来需要什么","subline":"按 Mission 价值排序，不要求一次连完","columns":[],"rows":[
+            {"title":"Meta Business","detail":"验证受众和素材；预算变更仍需精确确认","meta":"下一阶段需要","state":"BLOCKED_ENV"},
+            {"title":"Resend 邮件域","detail":"用于具备 Consent 的投递、回复和退订回流","meta":"关系经营需要","state":"BLOCKED_ENV"},
+            {"title":"Awin Advertiser","detail":"同步官方网络供给与交易，权限以实时 Probe 为准","meta":"联盟计划需要","state":"BLOCKED_ENV"}
+          ]},
+          {"id":"all","label":"全部连接","kind":"table","headline":"连接与需要处理","subline":"结构样例不构成 Connected","columns":["服务与账号","用途","Scope","状态","最近验证"],"rows":[
+            {"title":"WordPress · mxzone.com","detail":"发布、在线验证","meta":"Probe 未执行","state":"BLOCKED_ENV"},
+            {"title":"Twenty CRM · 北美销售","detail":"Person / Company / Opportunity","meta":"字段映射未验证","state":"NOT_IMPLEMENTED"},
+            {"title":"X · @mxzone_official","detail":"草稿保留，写入暂停","meta":"Refresh token 样例已过期","state":"需重新授权"},
+            {"title":"Chatwoot · Sales Inbox","detail":"Inbox / Webhook / Handoff","meta":"签名 Probe 未执行","state":"BLOCKED_ENV"}
+          ]},
+          {"id":"policies","label":"权限策略","kind":"table","headline":"项目动作策略","subline":"连接不扩大 Capability 或审批范围","columns":["Capability","读取","草稿","外部写入","金额动作"],"rows":[
+            {"title":"Channel","detail":"Policy checked","meta":"草稿允许","state":"写入精确审批"},
+            {"title":"Email / CRM","detail":"Consent required","meta":"草稿允许","state":"投递精确审批"},
+            {"title":"Partner / Creator","detail":"Permission required","meta":"合同审批","state":"Payout 审批"}
+          ]},
+          {"id":"activity","label":"活动日志","kind":"table","headline":"连接活动","subline":"去标识视觉夹具，不包含 Secret/Token/PII","columns":["事件","对象","结果","时间"],"rows":[
+            {"title":"Probe requested","detail":"Twenty CRM fixture","meta":"未执行","state":"BLOCKED_ENV"},
+            {"title":"Authorization expired","detail":"X fixture account","meta":"写入暂停","state":"安全阻塞"},
+            {"title":"Connection suggested","detail":"Awin Advertiser","meta":"未授权","state":"等待用户"}
+          ]}
+        ]
+      },
+      {
+        "id":"outcomes",
+        "stats":[{"value":"16","label":"样例 Evidence"},{"value":"3","label":"样例 Work Products"},{"value":"0","label":"真实 Verified Effects"},{"value":"0","label":"真实 Revenue Events"}],
+        "tabs":[
+          {"id":"ledger","label":"Outcome Ledger","kind":"table","headline":"Outcome 与 Attribution Ledger","subline":"视觉夹具只冻结结构；金额和身份链未执行","columns":["事件","身份链","金额","归因","状态"],"rows":[
+            {"title":"Research decision adopted","detail":"Mission VM-07 fixture","meta":"—","state":"用户采用样例"},
+            {"title":"Channel effect","detail":"No ProviderReceipt","meta":"—","state":"未执行"},
+            {"title":"Order / Refund","detail":"No immutable event","meta":"$0.00 USD","state":"未发生"}
+          ]},
+          {"id":"decision","label":"下一决策","kind":"ranked","headline":"Continue / Stop / Scale / Test","subline":"不强迫一次性 Mission 进入循环","columns":[],"rows":[
+            {"title":"Test","detail":"在 $10,000 USD 合同上限内设计低量验证","meta":"候选","state":"等待用户"},
+            {"title":"Stop","detail":"如果专利或物流反证超过合同阈值则停止","meta":"合法终态","state":"可选"},
+            {"title":"Continue research","detail":"只补齐高杠杆证据缺口，不扩大渠道权限","meta":"候选","state":"可选"}
+          ]}
+        ]
+      }
+    ]
+  }
+}

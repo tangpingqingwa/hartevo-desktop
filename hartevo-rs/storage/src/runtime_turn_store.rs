@@ -5,12 +5,15 @@
 //! live resume/interrupt path; Domain Events and Outbox payloads contain only
 //! digests and bounded counters.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use hartevo_context_fabric::ContextAssemblyStatus;
 use hartevo_domain_kernel::{
     MissionId, ProjectId, RuntimeRecoveryStatus, RuntimeTurnAttempt, RuntimeTurnAttemptId,
     RuntimeTurnEvidence, RuntimeTurnEvidenceKind, RuntimeTurnPrivateMessage,
-    RuntimeTurnRestartDisposition, RuntimeTurnStatus, TenantId, WorkerHandleStatus,
+    RuntimeTurnPrivateTextDelta, RuntimeTurnRestartDisposition, RuntimeTurnStatus, TenantId,
+    WorkerHandleStatus,
 };
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
@@ -90,7 +93,7 @@ impl ProjectStore {
         attempt: &RuntimeTurnAttempt,
         expected_revision: u64,
     ) -> Result<AtomicMutation, StorageError> {
-        self.persist_runtime_turn_transition(attempt, expected_revision, None)
+        self.persist_runtime_turn_transition(attempt, expected_revision, None, None)
     }
 
     /// Persists the public, content-free Runtime transition and its private
@@ -103,7 +106,43 @@ impl ProjectStore {
         message: &RuntimeTurnPrivateMessage,
     ) -> Result<AtomicMutation, StorageError> {
         message.validate_for(attempt)?;
-        self.persist_runtime_turn_transition(attempt, expected_revision, Some(message))
+        self.persist_runtime_turn_transition(attempt, expected_revision, Some(message), None)
+    }
+
+    /// Persists one public stream-evidence transition and its private text
+    /// increment atomically. A Desktop reconnect can therefore resume from a
+    /// committed evidence cursor without inventing or losing visible text.
+    pub fn update_runtime_turn_attempt_with_private_text_delta(
+        &mut self,
+        attempt: &RuntimeTurnAttempt,
+        expected_revision: u64,
+        delta: &RuntimeTurnPrivateTextDelta,
+    ) -> Result<AtomicMutation, StorageError> {
+        let stored_deltas =
+            self.load_runtime_turn_private_text_deltas(&attempt.scope.project_id, &attempt.id)?;
+        if let Some(stored) = stored_deltas
+            .iter()
+            .find(|candidate| candidate.evidence_sequence == delta.evidence_sequence)
+        {
+            if stored != delta {
+                return Err(StorageError::ImmutableRecordMismatch {
+                    kind: "runtime turn private text delta",
+                    id: format!("{}:{}", attempt.id, delta.evidence_sequence),
+                });
+            }
+            return self.persist_runtime_turn_transition(
+                attempt,
+                expected_revision,
+                None,
+                Some(delta),
+            );
+        }
+        let previous = stored_deltas.into_iter().rfind(|candidate| {
+            candidate.item_id_digest == delta.item_id_digest
+                && candidate.evidence_sequence < delta.evidence_sequence
+        });
+        delta.validate_for(attempt, previous.as_ref())?;
+        self.persist_runtime_turn_transition(attempt, expected_revision, None, Some(delta))
     }
 
     fn persist_runtime_turn_transition(
@@ -111,6 +150,7 @@ impl ProjectStore {
         attempt: &RuntimeTurnAttempt,
         expected_revision: u64,
         private_message: Option<&RuntimeTurnPrivateMessage>,
+        private_text_delta: Option<&RuntimeTurnPrivateTextDelta>,
     ) -> Result<AtomicMutation, StorageError> {
         attempt.validate()?;
         let previous = self.load_runtime_turn_attempt(&attempt.scope.project_id, &attempt.id)?;
@@ -124,6 +164,18 @@ impl ProjectStore {
                     return Err(StorageError::ImmutableRecordMismatch {
                         kind: "runtime turn private message",
                         id: format!("{}:{}", attempt.id, message.evidence_sequence),
+                    });
+                }
+            }
+            if let Some(delta) = private_text_delta {
+                let stored = self
+                    .load_runtime_turn_private_text_deltas(&attempt.scope.project_id, &attempt.id)?
+                    .into_iter()
+                    .find(|stored| stored.evidence_sequence == delta.evidence_sequence);
+                if stored.as_ref() != Some(delta) {
+                    return Err(StorageError::ImmutableRecordMismatch {
+                        kind: "runtime turn private text delta",
+                        id: format!("{}:{}", attempt.id, delta.evidence_sequence),
                     });
                 }
             }
@@ -157,6 +209,9 @@ impl ProjectStore {
         insert_runtime_turn_evidence(&transaction, attempt, evidence)?;
         if let Some(message) = private_message {
             insert_runtime_turn_private_message(&transaction, message)?;
+        }
+        if let Some(delta) = private_text_delta {
+            insert_runtime_turn_private_text_delta(&transaction, delta)?;
         }
         let event = runtime_turn_domain_event(attempt, evidence, &record_digest);
         let (event_sequences, outbox_sequences) = append_events(
@@ -198,8 +253,8 @@ impl ProjectStore {
         let attempt = self.load_runtime_turn_attempt(project_id, id)?;
         let mut statement = self.connection.prepare(
             "SELECT tenant_id, project_id, mission_id, runtime_turn_attempt_id,
-                    evidence_sequence, worker_generation, body, body_digest,
-                    event_digest, observed_at
+                    evidence_sequence, worker_generation, item_id_digest, body,
+                    body_digest, event_digest, observed_at
              FROM runtime_turn_private_messages
              WHERE project_id = ?1 AND runtime_turn_attempt_id = ?2
              ORDER BY evidence_sequence",
@@ -216,6 +271,7 @@ impl ProjectStore {
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
                 row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
             ))
         })?;
         let messages = rows
@@ -225,6 +281,51 @@ impl ProjectStore {
             message.validate_for(&attempt)?;
         }
         Ok(messages)
+    }
+
+    pub fn load_runtime_turn_private_text_deltas(
+        &self,
+        project_id: &ProjectId,
+        id: &RuntimeTurnAttemptId,
+    ) -> Result<Vec<RuntimeTurnPrivateTextDelta>, StorageError> {
+        let attempt = self.load_runtime_turn_attempt(project_id, id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT tenant_id, project_id, mission_id, runtime_turn_attempt_id,
+                    evidence_sequence, stream_sequence, worker_generation,
+                    item_id_digest, delta, delta_digest, cumulative_byte_count,
+                    chain_digest, event_digest, observed_at
+             FROM runtime_turn_private_text_deltas
+             WHERE project_id = ?1 AND runtime_turn_attempt_id = ?2
+             ORDER BY evidence_sequence",
+        )?;
+        let rows = statement.query_map(params![project_id.as_str(), id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+            ))
+        })?;
+        let deltas = rows
+            .map(|row| decode_runtime_turn_private_text_delta(row?))
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        let mut previous_by_item = BTreeMap::<String, RuntimeTurnPrivateTextDelta>::new();
+        for delta in &deltas {
+            let previous = previous_by_item.get(&delta.item_id_digest);
+            delta.validate_for(&attempt, previous)?;
+            previous_by_item.insert(delta.item_id_digest.clone(), delta.clone());
+        }
+        Ok(deltas)
     }
 
     pub fn load_latest_runtime_turn_private_message(
@@ -610,9 +711,9 @@ fn insert_runtime_turn_private_message(
     transaction.execute(
         "INSERT INTO runtime_turn_private_messages
            (tenant_id, project_id, mission_id, runtime_turn_attempt_id,
-            evidence_sequence, worker_generation, body, body_digest,
-            event_digest, observed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            evidence_sequence, worker_generation, item_id_digest, body,
+            body_digest, event_digest, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             message.tenant_id.as_str(),
             message.project_id.as_str(),
@@ -620,10 +721,42 @@ fn insert_runtime_turn_private_message(
             message.runtime_turn_attempt_id.as_str(),
             to_sql_u64(message.evidence_sequence)?,
             to_sql_u64(message.worker_generation)?,
+            message.item_id_digest,
             message.body,
             message.body_digest,
             message.event_digest,
             message.observed_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_runtime_turn_private_text_delta(
+    transaction: &Transaction<'_>,
+    delta: &RuntimeTurnPrivateTextDelta,
+) -> Result<(), StorageError> {
+    transaction.execute(
+        "INSERT INTO runtime_turn_private_text_deltas
+           (tenant_id, project_id, mission_id, runtime_turn_attempt_id,
+            evidence_sequence, stream_sequence, worker_generation,
+            item_id_digest, delta, delta_digest, cumulative_byte_count,
+            chain_digest, event_digest, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            delta.tenant_id.as_str(),
+            delta.project_id.as_str(),
+            delta.mission_id.as_str(),
+            delta.runtime_turn_attempt_id.as_str(),
+            to_sql_u64(delta.evidence_sequence)?,
+            to_sql_u64(delta.stream_sequence)?,
+            to_sql_u64(delta.worker_generation)?,
+            delta.item_id_digest,
+            delta.delta,
+            delta.delta_digest,
+            to_sql_u64(delta.cumulative_byte_count)?,
+            delta.chain_digest,
+            delta.event_digest,
+            delta.observed_at.to_rfc3339(),
         ],
     )?;
     Ok(())
@@ -636,6 +769,7 @@ type RuntimeTurnPrivateMessageRow = (
     String,
     i64,
     i64,
+    String,
     String,
     String,
     String,
@@ -656,10 +790,55 @@ fn decode_runtime_turn_private_message(
         worker_generation: u64::try_from(row.5).map_err(|_| {
             StorageError::DomainDecode("negative Runtime private message generation".into())
         })?,
-        body: row.6,
-        body_digest: row.7,
-        event_digest: row.8,
-        observed_at: DateTime::parse_from_rfc3339(&row.9)?.with_timezone(&Utc),
+        item_id_digest: row.6,
+        body: row.7,
+        body_digest: row.8,
+        event_digest: row.9,
+        observed_at: DateTime::parse_from_rfc3339(&row.10)?.with_timezone(&Utc),
+    })
+}
+
+type RuntimeTurnPrivateTextDeltaRow = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+);
+
+fn decode_runtime_turn_private_text_delta(
+    row: RuntimeTurnPrivateTextDeltaRow,
+) -> Result<RuntimeTurnPrivateTextDelta, StorageError> {
+    Ok(RuntimeTurnPrivateTextDelta {
+        tenant_id: TenantId::from_stable(row.0),
+        project_id: ProjectId::from_stable(row.1),
+        mission_id: MissionId::from_stable(row.2),
+        runtime_turn_attempt_id: RuntimeTurnAttemptId::from_stable(row.3),
+        evidence_sequence: u64::try_from(row.4).map_err(|_| {
+            StorageError::DomainDecode("negative Runtime delta evidence sequence".into())
+        })?,
+        stream_sequence: u64::try_from(row.5).map_err(|_| {
+            StorageError::DomainDecode("negative Runtime delta stream sequence".into())
+        })?,
+        worker_generation: u64::try_from(row.6)
+            .map_err(|_| StorageError::DomainDecode("negative Runtime delta generation".into()))?,
+        item_id_digest: row.7,
+        delta: row.8,
+        delta_digest: row.9,
+        cumulative_byte_count: u64::try_from(row.10)
+            .map_err(|_| StorageError::DomainDecode("negative Runtime delta byte count".into()))?,
+        chain_digest: row.11,
+        event_digest: row.12,
+        observed_at: DateTime::parse_from_rfc3339(&row.13)?.with_timezone(&Utc),
     })
 }
 
@@ -842,6 +1021,7 @@ fn evidence_kind_text(kind: RuntimeTurnEvidenceKind) -> &'static str {
         RuntimeTurnEvidenceKind::DispatchAccepted => "dispatch_accepted",
         RuntimeTurnEvidenceKind::TurnStarted => "turn_started",
         RuntimeTurnEvidenceKind::ItemStarted => "item_started",
+        RuntimeTurnEvidenceKind::AgentMessageDelta => "agent_message_delta",
         RuntimeTurnEvidenceKind::ItemCompleted => "item_completed",
         RuntimeTurnEvidenceKind::Diagnostic => "diagnostic",
         RuntimeTurnEvidenceKind::LocalApprovalRequested => "local_approval_requested",
@@ -863,6 +1043,7 @@ fn parse_evidence_kind(value: &str) -> Result<RuntimeTurnEvidenceKind, StorageEr
         "dispatch_accepted" => Ok(RuntimeTurnEvidenceKind::DispatchAccepted),
         "turn_started" => Ok(RuntimeTurnEvidenceKind::TurnStarted),
         "item_started" => Ok(RuntimeTurnEvidenceKind::ItemStarted),
+        "agent_message_delta" => Ok(RuntimeTurnEvidenceKind::AgentMessageDelta),
         "item_completed" => Ok(RuntimeTurnEvidenceKind::ItemCompleted),
         "diagnostic" => Ok(RuntimeTurnEvidenceKind::Diagnostic),
         "local_approval_requested" => Ok(RuntimeTurnEvidenceKind::LocalApprovalRequested),
@@ -1214,9 +1395,79 @@ mod tests {
         let previous = attempt.clone();
         attempt
             .observe(
+                RuntimeTurnObservedKind::AgentMessageDelta,
+                hex::encode(Sha256::digest(b"private-text-delta-event")),
+                now() + Duration::seconds(14),
+            )
+            .expect("text delta event");
+        let private_delta = RuntimeTurnPrivateTextDelta::capture(
+            &attempt,
+            hex::encode(Sha256::digest(b"private-assistant-item")),
+            PRIVATE_RUNTIME_CONTEXT,
+            None,
+        )
+        .expect("private text delta");
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER inject_runtime_private_delta_failure
+                 BEFORE INSERT ON runtime_turn_private_text_deltas
+                 BEGIN SELECT RAISE(ABORT, 'injected Runtime private delta failure'); END;",
+            )
+            .expect("private delta failure trigger");
+        assert!(matches!(
+            store.update_runtime_turn_attempt_with_private_text_delta(
+                &attempt,
+                previous.revision,
+                &private_delta,
+            ),
+            Err(StorageError::Sql(_))
+        ));
+        assert_eq!(
+            store
+                .load_runtime_turn_attempt(&project_id, &attempt.id)
+                .expect("private delta rollback"),
+            previous
+        );
+        assert!(
+            store
+                .load_runtime_turn_private_text_deltas(&project_id, &attempt.id)
+                .expect("no partial private delta")
+                .is_empty()
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER inject_runtime_private_delta_failure;")
+            .expect("drop private delta trigger");
+        store
+            .update_runtime_turn_attempt_with_private_text_delta(
+                &attempt,
+                previous.revision,
+                &private_delta,
+            )
+            .expect("atomic private delta transition");
+        let replay = store
+            .update_runtime_turn_attempt_with_private_text_delta(
+                &attempt,
+                previous.revision,
+                &private_delta,
+            )
+            .expect("idempotent private delta replay");
+        assert!(replay.event_sequences.is_empty());
+        assert!(replay.outbox_sequences.is_empty());
+        assert_eq!(
+            store
+                .load_runtime_turn_private_text_deltas(&project_id, &attempt.id)
+                .expect("private delta readback"),
+            vec![private_delta.clone()]
+        );
+
+        let previous = attempt.clone();
+        attempt
+            .observe(
                 RuntimeTurnObservedKind::ItemCompleted,
                 hex::encode(Sha256::digest(b"private-item-body")),
-                now() + Duration::seconds(14),
+                now() + Duration::seconds(15),
             )
             .expect("item event");
         store
@@ -1224,7 +1475,7 @@ mod tests {
             .execute_batch(
                 "CREATE TRIGGER inject_runtime_turn_evidence_failure
                  BEFORE INSERT ON runtime_turn_evidence
-                 WHEN NEW.sequence = 4
+                 WHEN NEW.sequence = 5
                  BEGIN SELECT RAISE(ABORT, 'injected runtime turn evidence failure'); END;",
             )
             .expect("trigger");
@@ -1255,9 +1506,9 @@ mod tests {
         let previous = attempt.clone();
         attempt
             .observe(
-                RuntimeTurnObservedKind::Diagnostic,
+                RuntimeTurnObservedKind::ItemCompleted,
                 hex::encode(Sha256::digest(b"private-assistant-message-event")),
-                now() + Duration::seconds(15),
+                now() + Duration::seconds(16),
             )
             .expect("private message event");
         let private_message = RuntimeTurnPrivateMessage::capture(&attempt, PRIVATE_RUNTIME_CONTEXT)
@@ -1334,6 +1585,18 @@ mod tests {
             .expect("tamper encrypted private body");
         assert!(matches!(
             store.load_runtime_turn_private_messages(&project_id, &attempt.id),
+            Err(StorageError::RuntimeTurn(_))
+        ));
+        store
+            .connection
+            .execute(
+                "UPDATE runtime_turn_private_text_deltas SET delta = 'tampered'
+                 WHERE project_id = ?1 AND runtime_turn_attempt_id = ?2",
+                params![project_id.as_str(), attempt.id.as_str()],
+            )
+            .expect("tamper encrypted private delta");
+        assert!(matches!(
+            store.load_runtime_turn_private_text_deltas(&project_id, &attempt.id),
             Err(StorageError::RuntimeTurn(_))
         ));
     }
@@ -1426,7 +1689,8 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE runtime_turn_private_messages;
+                "DROP TABLE runtime_turn_private_text_deltas;
+                 DROP TABLE runtime_turn_private_messages;
                  DELETE FROM schema_migrations WHERE version >= 38;",
             )
             .expect("construct v37 schema");

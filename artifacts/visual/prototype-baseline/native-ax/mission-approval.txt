@@ -1,0 +1,98 @@
+Window: "Hartevo Desktop", App: HartevoAxBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text Hartevo
+				6 button 搜索所有项目与任务
+				7 button (collapsed) 查看全部项目通知, Help: 全部项目通知, Secondary Actions: Expand
+				8 text 新品着陆页文案
+				9 text 等待审批
+				10 toggle button 置顶当前对象, Help: 切换视觉夹具中的置顶表现, Value: off
+				11 pop up button 当前对象操作
+				12 text 新品着陆页文案
+				13 toggle button 打开任务工作台, Value: off
+				14 container 项目与任务导航
+					15 button 在当前项目描述新任务
+					16 container 项目工作面
+						17 text 工作
+						18 button 总调度 运行中
+						19 button 当前状态 Project
+						20 button 全部任务 7
+						21 button 待确认 2
+						22 text 任务 · 进行中
+						23 text 4
+						24 button 美国健身器材机会研究 3/9 步 · 运行中 1
+						25 pop up button 美国健身器材机会研究 操作
+						26 button Q3 促销策略与节奏 2/9 步 · 运行中 1
+						27 pop up button Q3 促销策略与节奏 操作
+						28 button 新品着陆页文案 6/10 步 · 等待审批 1
+						29 pop up button 新品着陆页文案 操作
+						30 button 德国经销商邮件序列 0/10 步 · 等待用户 1
+						31 pop up button 德国经销商邮件序列 操作
+						32 text 自动任务
+						33 text 持续运行
+						34 button AI 推荐与引用监测 持续运行 1
+						35 pop up button AI 推荐与引用监测 操作
+						36 button 竞品价格与评论变化 持续运行 1
+						37 pop up button 竞品价格与评论变化 操作
+						38 button SEO 周度增长循环 持续运行 1
+						39 pop up button SEO 周度增长循环 操作
+						40 text 成果与工作面
+						41 button 成果与循环 Outcome
+						42 button 渠道运营 Channel
+						43 button 关系与 CRM CRM
+						44 button 达人与联盟 Partner
+						45 button 连接中心 Probe
+						46 button 能力与证据 E0–E5
+					47 container
+						48 pop up button 北美增长项目 本地 E2EE 同步
+						49 text 路径只用于本机数据层，不进入日志或 Release Evidence
+				50 container
+					51 text Mission Conversation
+					52 text 可以随时改变方向；不会扩大 Capability VISUAL_FIXTURE · prototype-baseline-v1
+					53 button 工作台
+				54 text 先按可调哑铃做一个小规模测试方案，预算不要超过一万元。
+				55 text 10:26
+				56 container
+					57 text Hartevo
+					58 text 10:28
+					59 text 验证计划结构已经准备好。视觉夹具没有创建广告、上传素材或产生支出；任何真实对象都会重新生成精确 digest 并等待审批。 你可以直接修改预算、渠道、受众或时间；任何字段变化都会生成新的完整 digest。
+					60 container 精确审批结构样例
+						61 container
+							62 text 审阅 4 个外部动作结构 Effect Broker · VISUAL_FIXTURE
+						63 text 1
+						64 text 创建测试广告系列
+						65 text Meta Ads · US · Draft → Active 外部写入 2
+						66 text 上传并绑定素材
+						67 text 3 个变体 · fixture asset digests 外部写入 3
+						68 text 设置样例受众与排期
+						69 text US/Eastern · 7 天 外部写入 4
+						70 text 设置预算上限
+						71 text $1,400.00 USD · fixture only 金额动作
+						72 container
+							73 button 预览批准后结构
+							74 button 修改样例
+							75 button 稍后处理
+							76 button (collapsed) 完整 digest, Secondary Actions: Expand
+							77 text SAMPLE r1 · 不创建 ApprovalGrant / EffectIntent
+				78 container
+					79 text 外部动作仍在等待确认；你也可以直接修改预算、渠道或停止条件 北美增长项目 · ⌘K 随时聚焦同一 Mission
+					80 button 修改计划
+					81 button 暂时收起建议
+				82 text entry area (settable, string) Operating Contract 目标、约束与停止条件, Placeholder: 继续当前 Mission，或写明纠正与新约束…
+					83 text 继续当前 Mission，或写明纠正与新约束…
+				84 container
+					85 button (collapsed) 添加附件或上下文, Secondary Actions: Expand
+					86 button (disabled) 语音输入未实现, Help: BLOCKED_ENV · 麦克风与本地转写尚未接线
+					87 button (collapsed) Runtime · NOT_CONFIGURED, Secondary Actions: Expand
+					88 button (disabled) 续写当前持久 Mission Conversation
+	89 close button
+	90 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	91 minimize button
+	92 text Hartevo Desktop
+93 menu bar
+	94 HartevoAxBaseline
+	95 Edit
+	96 Help

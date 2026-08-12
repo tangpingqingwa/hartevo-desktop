@@ -1,0 +1,102 @@
+Window: "Hartevo Desktop", App: HartevoVisualBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text Hartevo
+				6 button 搜索所有项目与任务
+				7 button (collapsed) 查看全部项目通知, Help: 全部项目通知, Secondary Actions: Expand
+				8 text 项目总调度
+				9 text 等待持久 Mission
+				10 button 重新读取持久状态
+				11 text Mission Conversation
+				12 text 项目总调度
+				13 toggle button 打开任务工作台, Value: off
+				14 container 项目与任务导航
+					15 button 在当前项目描述新任务
+					16 container 项目工作面
+						17 text 工作
+						18 button 当前状态 Project
+						19 button 总调度 同一会话
+						20 button 全部任务 Mission
+						21 button 成果与循环 Outcome
+						22 text 增长运营
+						23 button 渠道运营 Channel
+						24 button 关系与 CRM 未接入
+						25 button 达人与联盟 未接入
+						26 text 系统与连接
+						27 button 连接中心 Probe
+						28 button 能力与证据 E0–E5
+					29 container 宣发项目
+						30 container
+							31 text 宣发项目 1
+						32 button 北 北美增长项目 revision 142 · Keyring 就绪
+					33 container 持久任务
+						34 container
+							35 text 持久 Mission 7
+						36 button 项目总调度 显式选择 VM-00～VM-11 CATALOG
+						37 button 美国健身器材机会研究 运行中 1
+						38 button Q3 促销策略与节奏 运行中 1
+						39 button 新品着陆页文案 等待审批 1
+						40 button 德国经销商邮件序列 等待用户 1
+						41 button AI 推荐与引用监测 已排期 1
+						42 button 竞品价格与评论变化 已排期 1
+						43 button SEO 周度增长循环 已排期 1
+					44 container
+						45 pop up button 北美增长项目 本地 E2EE 同步
+						46 text 路径只用于本机数据层，不进入日志或 Release Evidence
+				47 container
+					48 text Mission Conversation
+					49 text 可以随时改变方向；不会扩大 Capability VISUAL_FIXTURE · prototype-baseline-v1
+					50 button 工作台
+				51 container 北美增长项目 · 总调度
+					52 container
+						53 heading 北美增长项目 · 总调度, Value: 1
+							54 text 北美增长项目 · 总调度
+						55 text 持续协调项目里的所有任务、审批、自动运行与共享事实；这里不是某一个任务的会话。 APPLICATION PROJECTION
+					56 container 项目任务摘要
+						57 text 2
+						58 text 进行中的任务
+						59 text 2
+						60 text 等待确认
+						61 text 3
+						62 text 自动任务
+						63 text 142
+						64 text Project revision
+					65 container
+						66 heading 现在优先处理, Value: 2
+							67 text 现在优先处理
+						68 text 按状态与项目顺序投影
+					69 button 美国健身器材机会研究 运行中 · scoped_collection · cycle 1 3/9 打开
+					70 button Q3 促销策略与节奏 运行中 · pillar_calendar · cycle 2 2/9 打开
+					71 button 新品着陆页文案 等待审批 · preview_revision · cycle 1 6/10 打开
+					72 container
+						73 heading 等待你, Value: 2
+							74 text 等待你
+						75 text 只显示持久等待状态
+					76 button 新品着陆页文案 等待审批 处理
+					77 button 德国经销商邮件序列 等待用户 处理
+					78 container
+						79 text Hartevo · 刚刚 调度更新
+					80 text 任务、工作面变化与审批会汇总到同一 Project/Mission Truth；这里不会从页面样例推导 Provider 成功。
+					81 container
+						82 container 2 个 Mission 正在运行
+						83 container 2 个 Mission 等待你的明确输入
+						84 container 3 个周期任务保持排期；Provider readback 未接入时不声称已执行
+				85 text 北美增长项目 · 项目总调度 · 新建 Catalog Mission
+				86 text 外部动作仍需精确审批
+				87 button (collapsed) Operating Contract, Secondary Actions: Expand
+				88 text entry area (settable, string) Operating Contract 目标、约束与停止条件, Placeholder: 写明目标、硬约束、非目标与停止条件…
+					89 text 写明目标、硬约束、非目标与停止条件…
+				90 container
+					91 text Runtime · NOT_CONFIGURED Provider · 未配置 · 无业务 Receipt Tokenizer · DEV_FALLBACK
+					92 button (disabled) 提交 Catalog-bound 持久 Mission
+	93 close button
+	94 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	95 minimize button
+	96 text Hartevo Desktop
+97 menu bar
+	98 HartevoVisualBaseline
+	99 Edit
+	100 Help

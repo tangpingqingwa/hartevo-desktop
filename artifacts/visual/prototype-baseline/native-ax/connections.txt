@@ -1,0 +1,88 @@
+Window: "Hartevo Desktop", App: HartevoVisualBaseline.
+0 standard window Hartevo Desktop, Secondary Actions: Raise
+	1 scroll area
+		2 HTML content Description: Dioxus app, URL: dioxus://index.html/
+			3 container
+				4 image Hartevo
+				5 text Hartevo
+				6 button 搜索所有项目与任务
+				7 button (collapsed) 查看全部项目通知, Help: 全部项目通知, Secondary Actions: Expand
+				8 text 连接中心
+				9 text 等待持久 Mission
+				10 button 重新读取持久状态
+				11 text 连接中心
+				12 toggle button 打开任务工作台, Value: off
+				13 container 项目与任务导航
+					14 button 在当前项目描述新任务
+					15 container 项目工作面
+						16 text 工作
+						17 button 当前状态 Project
+						18 button 总调度 同一会话
+						19 button 全部任务 Mission
+						20 button 成果与循环 Outcome
+						21 text 增长运营
+						22 button 渠道运营 Channel
+						23 button 关系与 CRM 未接入
+						24 button 达人与联盟 未接入
+						25 text 系统与连接
+						26 button 连接中心 Probe
+						27 button 能力与证据 E0–E5
+					28 container 宣发项目
+						29 container
+							30 text 宣发项目 1
+						31 button 北 北美增长项目 revision 142 · Keyring 就绪
+					32 container 持久任务
+						33 container
+							34 text 持久 Mission 7
+						35 button 项目总调度 显式选择 VM-00～VM-11 CATALOG
+						36 button 美国健身器材机会研究 运行中 1
+						37 button Q3 促销策略与节奏 运行中 1
+						38 button 新品着陆页文案 等待审批 1
+						39 button 德国经销商邮件序列 等待用户 1
+						40 button AI 推荐与引用监测 已排期 1
+						41 button 竞品价格与评论变化 已排期 1
+						42 button SEO 周度增长循环 已排期 1
+					43 container
+						44 pop up button 北美增长项目 本地 E2EE 同步
+						45 text 路径只用于本机数据层，不进入日志或 Release Evidence
+				46 container
+					47 text Capability Availability
+					48 text 变化回写同一 Project / Mission Truth VISUAL_FIXTURE · prototype-baseline-v1
+					49 button 工作台
+				50 container
+					51 text CONNECTIONS · CAPABILITY AVAILABILITY
+					52 heading 连接中心, Value: 1
+						53 text 连接中心
+					54 text 连接只让 Capability 变得可用；外部写入仍需策略、精确审批、Receipt 与独立 Verification。
+					55 button 查看连接流程
+					56 text Project revision 142
+				57 container 连接中心视图
+					58 button 概览
+					59 button 全部连接
+					60 button 动作策略
+					61 button 活动
+				62 container
+					63 text READY Personal E2EE Keyring 就绪 Keyring 可用；可创建持久 Mission。 READY Encrypted Context 已由本机设备解锁 Keyring revision 1 · active key v1 · readable [1]
+					64 heading Mission 需要的连接, Value: 2
+						65 text Mission 需要的连接
+					66 text Provider Probe NOT_IMPLEMENTED
+					67 heading 尚无 Connection Projection, Value: 3
+						68 text 尚无 Connection Projection
+					69 text 当前 Desktop 数据面没有读取 Provider 凭据，也没有把 Catalog 中的 Provider 目标声明为 Connected。
+				70 heading 连接原则, Value: 2
+					71 text 连接原则
+				72 text Zero-trust
+				73 text 账号身份必须 Probe
+				74 text 错误账号或 Scope 撤销会立即阻塞
+				75 text 连接不扩大权限
+				76 text Capability 与 Effect Policy 独立判定
+				77 text uncertain 不自动重放
+				78 text 先 reconcile，再显式决定
+	79 close button
+	80 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	81 minimize button
+	82 text Hartevo Desktop
+83 menu bar
+	84 HartevoVisualBaseline
+	85 Edit
+	86 Help
