@@ -4224,7 +4224,7 @@ sleep 30"#;
         );
         assert_eq!(
             decided_projection.current_checkpoint_application_handler_status,
-            Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented)
+            Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented)
         );
         let persisted_decision = decided_projection
             .vm11_outcome_review
@@ -4271,6 +4271,17 @@ sleep 30"#;
         let mission = service
             .load_mission(&project_id, &started.mission_id)
             .expect("durable VM-11 Mission");
+        let next_contract_checkpoint = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
+            })
+            .expect("durable pending next-contract Checkpoint");
+        assert!(next_contract_checkpoint.completion.is_none());
         let completion = mission
             .definition
             .as_ref()
