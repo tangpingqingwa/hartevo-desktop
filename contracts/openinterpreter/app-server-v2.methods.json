@@ -15,6 +15,7 @@
     "thread/started",
     "turn/started",
     "item/started",
+    "item/agentMessage/delta",
     "item/completed",
     "turn/completed"
   ],
