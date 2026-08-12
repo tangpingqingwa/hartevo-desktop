@@ -2842,7 +2842,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the Desktop data-plane Journey proves five deterministic Application handlers, honest empty-ledger blocking, source-verified parent KPI and attribution recovery, atomic next-route handoff, and zero Runtime construction"
+        reason = "the Desktop data-plane Journey proves seven deterministic Application handlers, honest empty-ledger blocking, source-verified KPI/attribution/settlement/review recovery, atomic Human next-route handoff, and zero Runtime construction"
     )]
     fn vm11_application_handlers_recover_and_advance_without_constructing_runtime() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -3331,12 +3331,11 @@ sleep 30"#;
                     .as_deref(),
             ),
             (
-                Some(hartevo_application::ApplicationCheckpointHandlerStatus::NotImplemented),
-                None,
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                Some("vm11.refund-commission-payout-recalc/v1"),
             )
         );
-        let unsupported_revision = attributed_projection.revision;
-        let unsupported = plane
+        let settled = plane
             .resume_mission_runtime_with(
                 &secrets,
                 &project_id,
@@ -3345,34 +3344,105 @@ sleep 30"#;
                     provider: "must-not-run".into(),
                     model: "must-not-run".into(),
                     command_builder: Box::new(|_, _| {
-                        panic!("NOT_IMPLEMENTED Application route must not construct Runtime")
+                        panic!("settlement Application route must not construct Runtime")
                     }),
                 }),
                 DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
                 observed_at() + Duration::minutes(11),
             )
-            .expect("honest unsupported Application route");
+            .expect("compute nonempty settlement view without Runtime");
         assert_eq!(
-            unsupported.runtime_outcome,
-            DesktopMissionRuntimeOutcome::ApplicationCheckpointNotImplemented {
-                checkpoint_id: "refund_commission_payout_recalc".into(),
-                capability_id: "settlement.compute".into(),
+            settled.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "outcome_review".into(),
+                capability_id: "decision.evaluate".into(),
+                executor: MissionCheckpointExecutor::Application,
+                oracle_ids: BTreeSet::from([
+                    "decision".into(),
+                    "operating_state".into(),
+                    "outcome".into(),
+                ]),
+                completion_policy: MissionCheckpointCompletionPolicy::DeterministicEvidence,
+                state: MissionCheckpointDispatchState::Ready,
             }
         );
+        let settled_projection = settled.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("settled VM-11 projection");
+        assert_eq!(settled_projection.completed_checkpoint_count, 6);
         assert_eq!(
-            unsupported.snapshot.inventory.projects[0]
-                .missions
-                .iter()
-                .find(|mission| mission.mission_id == started.mission_id)
-                .expect("unchanged NOT_IMPLEMENTED projection")
-                .revision,
-            unsupported_revision
+            (
+                settled_projection.current_checkpoint_application_handler_status,
+                settled_projection
+                    .current_checkpoint_application_handler_id
+                    .as_deref(),
+            ),
+            (
+                Some(hartevo_application::ApplicationCheckpointHandlerStatus::Implemented),
+                Some("vm11.outcome-review/v1"),
+            )
+        );
+        let reviewed = plane
+            .resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("outcome review Application route must not construct Runtime")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(12),
+            )
+            .expect("freeze outcome review without Runtime");
+        assert_eq!(
+            reviewed.runtime_outcome,
+            DesktopMissionRuntimeOutcome::CheckpointRouted {
+                checkpoint_id: "continue_stop_scale_test".into(),
+                capability_id: "decision.evaluate".into(),
+                executor: MissionCheckpointExecutor::Human,
+                oracle_ids: BTreeSet::from([
+                    "decision".into(),
+                    "goal".into(),
+                    "operating_state".into(),
+                    "outcome".into(),
+                ]),
+                completion_policy: MissionCheckpointCompletionPolicy::HumanConfirmation,
+                state: MissionCheckpointDispatchState::Ready,
+            }
+        );
+        let reviewed_projection = reviewed.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("outcome-reviewed VM-11 projection");
+        assert_eq!(reviewed_projection.completed_checkpoint_count, 7);
+        assert_eq!(
+            (
+                reviewed_projection.current_checkpoint_executor,
+                reviewed_projection.current_checkpoint_completion_policy,
+                reviewed_projection.current_checkpoint_application_handler_status,
+                reviewed_projection
+                    .current_checkpoint_application_handler_id
+                    .as_deref(),
+            ),
+            (
+                Some(MissionCheckpointExecutor::Human),
+                Some(MissionCheckpointCompletionPolicy::HumanConfirmation),
+                None,
+                None,
+            )
         );
         let database_secret = secrets
             .get(plane.database_key_reference())
             .expect("database secret");
         let (service, _) = plane
-            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(12))
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(13))
             .expect("reopen completed Application route");
         let mission = service
             .load_mission(&project_id, &started.mission_id)
@@ -3466,6 +3536,42 @@ sleep 30"#;
                 .as_ref()
                 .map(|evidence| evidence.handler_id.as_str()),
             Some("vm11.attribution-and-unattributed/v1")
+        );
+        let settlement_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "refund_commission_payout_recalc")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable settlement completion");
+        assert_eq!(
+            settlement_completion
+                .application_evidence
+                .as_ref()
+                .map(|evidence| evidence.handler_id.as_str()),
+            Some("vm11.refund-commission-payout-recalc/v1")
+        );
+        let review_completion = mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "outcome_review")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable outcome review completion");
+        assert_eq!(
+            review_completion
+                .application_evidence
+                .as_ref()
+                .map(|evidence| evidence.handler_id.as_str()),
+            Some("vm11.outcome-review/v1")
         );
         assert_eq!(mission.effects.len(), 0);
     }

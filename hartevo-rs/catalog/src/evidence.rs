@@ -291,7 +291,7 @@ mod tests {
                 evidence.implemented_application_handler_count,
                 evidence.not_implemented_application_route_count,
             ),
-            (52, 5, 47)
+            (52, 7, 45)
         );
         let schema: serde_json::Value =
             serde_json::from_str(crate::RELEASE_EVIDENCE_SCHEMA_JSON).expect("release schema");

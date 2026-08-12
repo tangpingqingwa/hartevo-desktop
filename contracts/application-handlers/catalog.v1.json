@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-application-handler-registry/v1",
-  "registryVersion": "desktop-2026-08-12-v5",
+  "registryVersion": "desktop-2026-08-12-v7",
   "handlers": [
     {
       "handlerId": "vm11.event_ingest/v2",
@@ -85,6 +85,38 @@
         "outcome_attribution": ["decision", "outcome"]
       },
       "oracleIds": ["truth", "decision", "effect", "operating_state", "outcome"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm11.refund-commission-payout-recalc/v1",
+      "missionId": "VM-11",
+      "missionVersion": 3,
+      "checkpointId": "refund_commission_payout_recalc",
+      "capabilityId": "settlement.compute",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": ["mission_checkpoint", "parent_mission_contract", "outcome_settlement"],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "parent_mission_contract": ["decision"],
+        "outcome_settlement": ["truth", "outcome"]
+      },
+      "oracleIds": ["truth", "decision", "operating_state", "outcome"],
+      "implementationCrate": "hartevo-application"
+    },
+    {
+      "handlerId": "vm11.outcome-review/v1",
+      "missionId": "VM-11",
+      "missionVersion": 3,
+      "checkpointId": "outcome_review",
+      "capabilityId": "decision.evaluate",
+      "completionPolicy": "deterministic_evidence",
+      "sourceKinds": ["mission_checkpoint", "parent_mission_review", "outcome_review"],
+      "sourceOracleBindings": {
+        "mission_checkpoint": ["operating_state"],
+        "parent_mission_review": ["decision"],
+        "outcome_review": ["outcome"]
+      },
+      "oracleIds": ["decision", "operating_state", "outcome"],
       "implementationCrate": "hartevo-application"
     }
   ]

@@ -101,10 +101,14 @@ pub use money::{CurrencyCode, FxQuote, Money, MoneyError};
 pub use outcome::{
     AttributionModel, AttributionRecord, AttributionTrafficClass, CommissionRecord,
     CommissionStatus, MissionKpiMeasurement, MissionKpiObservedValue, MissionKpiProjection,
-    OrderAttributionView, OutcomeAttributionProjection, OutcomeEvent, OutcomeEventKind,
-    OutcomeIdentityChainProjection, OutcomeLedger, OutcomeLedgerError,
-    OutcomeNormalizationProjection, OutcomeOrder, OutcomeRefund, OutcomeSourceVerification,
-    OutcomeVerificationMethod, Touchpoint, attribution_effect_provider_identity_digest,
+    OrderAttributionView, OrderSettlementView, OutcomeAttributionProjection, OutcomeEvent,
+    OutcomeEventKind, OutcomeIdentityChainProjection, OutcomeLedger, OutcomeLedgerError,
+    OutcomeNormalizationProjection, OutcomeOrder, OutcomeRefund, OutcomeReviewCausalStatus,
+    OutcomeReviewCaveat, OutcomeReviewGateStatus, OutcomeReviewLoopPolicy, OutcomeReviewMoneyView,
+    OutcomeReviewProjection, OutcomeReviewRoiStatus, OutcomeSettlementProjection,
+    OutcomeSourceVerification, OutcomeVerificationMethod, PartnerSettlementView,
+    SettlementCommissionBasis, SettlementGroupStatus, Touchpoint,
+    attribution_effect_provider_identity_digest,
 };
 pub use project::{Project, ProjectDataCell, ProjectError, StorageMode};
 pub use relationship::{

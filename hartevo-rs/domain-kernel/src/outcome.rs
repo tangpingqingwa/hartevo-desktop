@@ -12,8 +12,9 @@ use crate::{
     AccountId, ApprovalDecision, AttributionId, CampaignId, CommissionId, Company, CompanyId,
     ConnectionId, ConnectionSnapshot, CurrencyCode, Effect, EffectId, EffectStatus, IdentityLink,
     IdentityLinkId, IdentityLinkStatus, IdentitySubject, KpiContract, KpiDirection, Mission,
-    MissionId, Money, Opportunity, OpportunityId, OrderId, OutcomeEventId, Partner, PartnerId,
-    PayoutId, Person, PersonId, ProjectId, RefundId, TenantId, VerificationStatus,
+    MissionId, Money, OperatingMode, Opportunity, OpportunityId, OrderId, OutcomeEventId, Partner,
+    PartnerId, PartnerSupplyClass, PayoutId, Person, PersonId, ProjectId, RefundId, TenantId,
+    VerificationStatus,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -25,6 +26,7 @@ pub enum OutcomeEventKind {
     OrderPlaced,
     RefundIssued,
     CommissionAccrued,
+    CommissionReversed,
     PayoutCompleted,
 }
 
@@ -167,7 +169,7 @@ impl OutcomeEvent {
                     && self.payout_id.is_none()
                     && amount_positive
             }
-            OutcomeEventKind::CommissionAccrued => {
+            OutcomeEventKind::CommissionAccrued | OutcomeEventKind::CommissionReversed => {
                 self.order_id.is_some()
                     && self.refund_id.is_none()
                     && self.commission_id.is_some()
@@ -444,6 +446,7 @@ pub struct OutcomeIdentityChainProjection {
     pub company_count: u64,
     pub partner_count: u64,
     pub opportunity_count: u64,
+    pub partner_policy_digest: String,
     pub source_support_digest: String,
 }
 
@@ -545,6 +548,242 @@ pub struct OutcomeAttributionProjection {
     pub orders: BTreeMap<OrderId, OrderAttributionView>,
 }
 
+/// Authority used for one payable settlement group. Official networks remain
+/// authoritative for their own immutable commission/reversal facts; Hartevo
+/// opt-in and tenant-private relationships use the locally recomputable
+/// CommissionRecord chain. These bases must never be mixed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementCommissionBasis {
+    OfficialNetworkFacts,
+    HartevoCalculated,
+    TenantPrivateCalculated,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementGroupStatus {
+    NoPaymentDue,
+    Outstanding,
+    Paid,
+}
+
+/// Immutable order/refund view at the explicit settlement cutoff. The
+/// original order amount is retained; refunds are separate reverse events.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSettlementView {
+    pub order_id: OrderId,
+    pub original_amount: Money,
+    pub refund_count: u64,
+    pub refunded_amount: Money,
+    pub eligible_net_amount: Money,
+    pub calculated_commission_record_count: u64,
+    pub network_commission_event_count: u64,
+}
+
+/// Reconciliation view for one exact partner/currency pair. Payout facts are
+/// aggregated only after provider, supply-class, currency, and obligation
+/// checks have succeeded; a provider acceptance is never synthesized here.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartnerSettlementView {
+    pub partner_id: PartnerId,
+    pub supply_class: PartnerSupplyClass,
+    pub basis: SettlementCommissionBasis,
+    pub currency: CurrencyCode,
+    pub source_order_count: u64,
+    pub source_commission_count: u64,
+    pub commission_amount: Money,
+    pub payout_count: u64,
+    pub payout_completed_amount: Money,
+    pub outstanding_amount: Money,
+    pub status: SettlementGroupStatus,
+}
+
+/// Replayable VM-11 `refund_commission_payout_recalc` Oracle. It binds the
+/// parent Mission window, current source-verified Outcome/Identity state,
+/// immutable order/refund projections, exact commission authority, and
+/// independently verified payout facts without claiming payout approval.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeSettlementProjection {
+    pub schema_version: u32,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub source_mission_id: MissionId,
+    pub source_mission_revision: u64,
+    pub source_ledger_revision: u64,
+    pub window_started_at: DateTime<Utc>,
+    pub window_ended_at: DateTime<Utc>,
+    pub order_count: u64,
+    pub refunded_order_count: u64,
+    pub refund_count: u64,
+    pub calculated_commission_count: u64,
+    pub network_commission_event_count: u64,
+    pub payout_count: u64,
+    pub settlement_group_count: u64,
+    pub paid_group_count: u64,
+    pub outstanding_group_count: u64,
+    pub no_payment_due_group_count: u64,
+    pub official_network_group_count: u64,
+    pub hartevo_managed_group_count: u64,
+    pub tenant_private_group_count: u64,
+    pub normalization_digest: String,
+    pub identity_chain_digest: String,
+    pub order_refund_digest: String,
+    pub commission_source_digest: String,
+    pub payout_source_digest: String,
+    pub partner_policy_digest: String,
+    pub orders: BTreeMap<OrderId, OrderSettlementView>,
+    pub settlements: Vec<PartnerSettlementView>,
+}
+
+/// Exact per-currency economics used by `outcome_review`. Values from
+/// different currencies remain in separate buckets; this projection never
+/// invents an FX quote or a cross-currency ROI.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeReviewMoneyView {
+    pub currency: CurrencyCode,
+    pub gross_revenue: Money,
+    pub refunded_amount: Money,
+    pub net_revenue: Money,
+    pub commission_obligation: Money,
+    pub commission_paid: Money,
+    pub commission_outstanding: Money,
+    pub verified_effect_outflow: Money,
+    pub unresolved_effect_exposure: Money,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeReviewCaveat {
+    KpiTargetGap,
+    UnattributedOrders,
+    OutstandingSettlement,
+    PendingEffect,
+    UnresolvedEffectCost,
+    BudgetExceeded,
+    CrossCurrencyCostWithoutFx,
+    ImplicitLoopForbidden,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeReviewGateStatus {
+    Satisfied,
+    Blocked,
+}
+
+impl From<bool> for OutcomeReviewGateStatus {
+    fn from(satisfied: bool) -> Self {
+        if satisfied {
+            Self::Satisfied
+        } else {
+            Self::Blocked
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeReviewLoopPolicy {
+    Eligible,
+    Forbidden,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeReviewCausalStatus {
+    NotClaimed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeReviewRoiStatus {
+    NotCalculated,
+}
+
+/// Replayable, content-free decision input for VM-11 `outcome_review`.
+/// This is deliberately not a recommendation: the following Human
+/// Checkpoint owns Continue/Stop/Scale/Test. The projection only freezes the
+/// exact KPI, attribution, settlement and verified-cost facts plus explicit
+/// caveats at one observation cutoff.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeReviewProjection {
+    pub schema_version: u32,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub source_mission_id: MissionId,
+    pub source_mission_revision: u64,
+    pub source_ledger_revision: u64,
+    pub window_started_at: DateTime<Utc>,
+    pub outcome_window_ended_at: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
+    pub measurement_count: u64,
+    pub target_met_count: u64,
+    pub target_gap_count: u64,
+    pub order_count: u64,
+    pub attributed_order_count: u64,
+    pub unattributed_order_count: u64,
+    pub settlement_group_count: u64,
+    pub paid_or_no_payment_due_group_count: u64,
+    pub outstanding_settlement_group_count: u64,
+    pub verified_effect_count: u64,
+    pub pending_effect_count: u64,
+    pub unresolved_cost_effect_count: u64,
+    pub cross_currency_cost_effect_count: u64,
+    pub budget: Money,
+    pub budget_currency_verified_cost: Money,
+    pub budget_remaining: Money,
+    pub budget_overrun: Money,
+    pub kpi_status: OutcomeReviewGateStatus,
+    pub attribution_status: OutcomeReviewGateStatus,
+    pub settlement_status: OutcomeReviewGateStatus,
+    pub cost_status: OutcomeReviewGateStatus,
+    pub budget_status: OutcomeReviewGateStatus,
+    pub scale_evidence_status: OutcomeReviewGateStatus,
+    pub loop_policy: OutcomeReviewLoopPolicy,
+    pub causal_status: OutcomeReviewCausalStatus,
+    pub roi_status: OutcomeReviewRoiStatus,
+    pub caveats: BTreeSet<OutcomeReviewCaveat>,
+    pub economics: BTreeMap<CurrencyCode, OutcomeReviewMoneyView>,
+    pub source_contract_digest: String,
+    pub normalization_digest: String,
+    pub identity_chain_digest: String,
+    pub kpi_projection_digest: String,
+    pub attribution_projection_digest: String,
+    pub settlement_projection_digest: String,
+    pub effect_cost_source_digest: String,
+}
+
+#[derive(Clone, Debug)]
+struct SettlementAccumulator {
+    partner_id: PartnerId,
+    supply_class: PartnerSupplyClass,
+    basis: SettlementCommissionBasis,
+    currency: CurrencyCode,
+    source_orders: BTreeSet<OrderId>,
+    source_commission_count: u64,
+    commission_amount_minor: i64,
+    payout_count: u64,
+    payout_completed_minor: i64,
+    authoritative_providers: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct NetworkCommissionAccumulator {
+    partner_id: PartnerId,
+    currency: CurrencyCode,
+    provider: String,
+    order_id: OrderId,
+    accrued_minor: Option<i64>,
+    reversed_minor: i64,
+    event_count: u64,
+}
+
 impl OutcomeNormalizationProjection {
     pub const SCHEMA_VERSION: u32 = 1;
 
@@ -591,6 +830,7 @@ impl OutcomeIdentityChainProjection {
         hash_projection_field(&mut digest, &self.company_count.to_string());
         hash_projection_field(&mut digest, &self.partner_count.to_string());
         hash_projection_field(&mut digest, &self.opportunity_count.to_string());
+        hash_projection_field(&mut digest, &self.partner_policy_digest);
         hash_projection_field(&mut digest, &self.source_support_digest);
         format!("{:x}", digest.finalize())
     }
@@ -613,6 +853,22 @@ impl OutcomeAttributionProjection {
         let canonical =
             serde_json::to_vec(self).map_err(|_| OutcomeLedgerError::ProjectionSerialization)?;
         Ok(format!("{:x}", Sha256::digest(canonical)))
+    }
+}
+
+impl OutcomeSettlementProjection {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn digest(&self) -> Result<String, OutcomeLedgerError> {
+        canonical_json_digest(self)
+    }
+}
+
+impl OutcomeReviewProjection {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn digest(&self) -> Result<String, OutcomeLedgerError> {
+        canonical_json_digest(self)
     }
 }
 
@@ -993,7 +1249,9 @@ impl OutcomeLedger {
                 OutcomeEventKind::LeadQualified
                 | OutcomeEventKind::MeetingBooked
                 | OutcomeEventKind::OrderPlaced => event.identity_link_id.is_some(),
-                OutcomeEventKind::RefundIssued | OutcomeEventKind::CommissionAccrued => {
+                OutcomeEventKind::RefundIssued
+                | OutcomeEventKind::CommissionAccrued
+                | OutcomeEventKind::CommissionReversed => {
                     let inherited = event
                         .order_id
                         .as_ref()
@@ -1004,8 +1262,11 @@ impl OutcomeLedger {
                             .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
                     }
                     inherited
-                        && (event.kind != OutcomeEventKind::CommissionAccrued
-                            || event.partner_id.is_some())
+                        && (!matches!(
+                            event.kind,
+                            OutcomeEventKind::CommissionAccrued
+                                | OutcomeEventKind::CommissionReversed
+                        ) || event.partner_id.is_some())
                 }
                 OutcomeEventKind::OpportunityStageChanged => event.opportunity_id.is_some(),
                 OutcomeEventKind::PayoutCompleted => event.partner_id.is_some(),
@@ -1151,6 +1412,8 @@ impl OutcomeLedger {
                     .map_err(|_| OutcomeLedgerError::ProjectionSerialization)?
             )
         );
+        let partner_policy_digest =
+            canonical_json_digest(&partner_map.values().copied().collect::<Vec<_>>())?;
 
         Ok(OutcomeIdentityChainProjection {
             schema_version: OutcomeIdentityChainProjection::SCHEMA_VERSION,
@@ -1168,6 +1431,7 @@ impl OutcomeLedger {
             company_count: projection_count(companies.len())?,
             partner_count: projection_count(partners.len())?,
             opportunity_count: projection_count(opportunities.len())?,
+            partner_policy_digest,
             source_support_digest,
         })
     }
@@ -1228,7 +1492,9 @@ impl OutcomeLedger {
         for event in &self.events {
             if matches!(
                 event.kind,
-                OutcomeEventKind::RefundIssued | OutcomeEventKind::CommissionAccrued
+                OutcomeEventKind::RefundIssued
+                    | OutcomeEventKind::CommissionAccrued
+                    | OutcomeEventKind::CommissionReversed
             ) && event
                 .order_id
                 .as_ref()
@@ -1243,7 +1509,9 @@ impl OutcomeLedger {
             .iter()
             .filter(|event| {
                 let owning_mission = match event.kind {
-                    OutcomeEventKind::RefundIssued | OutcomeEventKind::CommissionAccrued => event
+                    OutcomeEventKind::RefundIssued
+                    | OutcomeEventKind::CommissionAccrued
+                    | OutcomeEventKind::CommissionReversed => event
                         .order_id
                         .as_ref()
                         .and_then(|order_id| order_missions.get(order_id))
@@ -1295,18 +1563,7 @@ impl OutcomeLedger {
             measurements.insert(metric_id.clone(), measurement);
         }
         let measurement_count = projection_count(measurements.len())?;
-        let source_contract_digest = format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&serde_json::json!({
-                    "schemaVersion": "hartevo-mission-kpi-contract-source/v1",
-                    "missionId": source_mission.id,
-                    "missionRevision": source_mission.revision,
-                    "contract": source_mission.contract,
-                }))
-                .map_err(|_| OutcomeLedgerError::ProjectionSerialization)?
-            )
-        );
+        let source_contract_digest = mission_kpi_contract_source_digest(source_mission)?;
         Ok(MissionKpiProjection {
             schema_version: MissionKpiProjection::SCHEMA_VERSION,
             tenant_id: self.tenant_id.clone(),
@@ -1641,6 +1898,947 @@ impl OutcomeLedger {
             source_record_digest,
             effect_support_digest,
             orders: order_views,
+        })
+    }
+
+    /// Recomputes refund, commission, and verified payout state for the exact
+    /// parent Mission. Orders remain immutable, cross-period refunds are
+    /// included through `observed_at`, and stale commission revisions fail
+    /// closed until a replacement binds the current refund set.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the settlement Oracle keeps authority boundaries, cross-period refunds, commission revision selection, payout reconciliation, and all canonical digests in one auditable path"
+    )]
+    pub fn verified_settlement_projection(
+        &self,
+        source_mission: &Mission,
+        identity_chain: &OutcomeIdentityChainProjection,
+        partners: &[Partner],
+        observed_at: DateTime<Utc>,
+    ) -> Result<OutcomeSettlementProjection, OutcomeLedgerError> {
+        let normalization = self.verified_normalization_projection()?;
+        if identity_chain.tenant_id != self.tenant_id
+            || identity_chain.project_id != self.project_id
+            || identity_chain.source_ledger_revision != self.revision
+            || identity_chain.event_count != normalization.event_count
+            || identity_chain.identity_covered_event_count != normalization.event_count
+        {
+            return Err(OutcomeLedgerError::SettlementIdentityChainMismatch);
+        }
+        let (window_started_at, _order_window_ended_at, source_orders) = self
+            .source_mission_orders(source_mission, observed_at)
+            .map_err(|error| match error {
+                OutcomeLedgerError::AttributionMissionScopeMismatch => {
+                    OutcomeLedgerError::SettlementMissionScopeMismatch
+                }
+                OutcomeLedgerError::AttributionWindowMismatch => {
+                    OutcomeLedgerError::SettlementWindowMismatch
+                }
+                OutcomeLedgerError::AttributionSourceOrdersUnavailable => {
+                    OutcomeLedgerError::SettlementSourceOrdersUnavailable
+                }
+                other => other,
+            })?;
+        let source_order_ids = source_orders.keys().cloned().collect::<BTreeSet<_>>();
+
+        let mut partner_map = BTreeMap::new();
+        for partner in partners {
+            partner
+                .validate()
+                .map_err(|_| OutcomeLedgerError::SettlementPartnerPolicyMismatch)?;
+            if partner.tenant_id != self.tenant_id
+                || partner.project_id != self.project_id
+                || partner_map.insert(partner.id.clone(), partner).is_some()
+            {
+                return Err(OutcomeLedgerError::SettlementPartnerPolicyMismatch);
+            }
+        }
+        let expected_partner_ids = self
+            .events
+            .iter()
+            .filter_map(|event| event.partner_id.clone())
+            .chain(
+                self.commissions
+                    .iter()
+                    .map(|record| record.partner_id.clone()),
+            )
+            .collect::<BTreeSet<_>>();
+        if partner_map.keys().cloned().collect::<BTreeSet<_>>() != expected_partner_ids {
+            return Err(OutcomeLedgerError::SettlementPartnerSupportClosureMismatch);
+        }
+        let partner_policy = partner_map.values().copied().collect::<Vec<_>>();
+        let partner_policy_digest = canonical_json_digest(&partner_policy)?;
+        if identity_chain.partner_count != projection_count(partner_map.len())?
+            || identity_chain.partner_policy_digest != partner_policy_digest
+        {
+            return Err(OutcomeLedgerError::SettlementIdentityChainMismatch);
+        }
+
+        let mut order_views = BTreeMap::new();
+        let mut scoped_refunds = Vec::new();
+        let mut refunded_order_count = 0_u64;
+        for (order_id, (order, _order_event)) in &source_orders {
+            let mut refunds =
+                self.refunds
+                    .iter()
+                    .filter_map(|refund| {
+                        if refund.order_id != *order_id {
+                            return None;
+                        }
+                        self.events
+                            .iter()
+                            .find(|event| event.id == refund.source_event_id)
+                            .filter(|event| {
+                                event.received_at <= observed_at
+                                    && event.source_verification.as_ref().is_some_and(
+                                        |verification| verification.verified_at <= observed_at,
+                                    )
+                            })
+                            .map(|event| (refund, event))
+                    })
+                    .collect::<Vec<_>>();
+            refunds.sort_by(|(left, left_event), (right, right_event)| {
+                (left_event.received_at, left.occurred_at, left.id.as_str()).cmp(&(
+                    right_event.received_at,
+                    right.occurred_at,
+                    right.id.as_str(),
+                ))
+            });
+            let mut refunded = Money::zero(order.original_amount.currency.clone());
+            for (refund, event) in &refunds {
+                if event.occurred_at < order.occurred_at {
+                    return Err(OutcomeLedgerError::SettlementWindowMismatch);
+                }
+                refunded = refunded
+                    .checked_add(&refund.amount)
+                    .map_err(|_| OutcomeLedgerError::SettlementMoneyMismatch)?;
+                scoped_refunds.push((*refund, *event));
+            }
+            let eligible_net = order
+                .original_amount
+                .checked_sub(&refunded)
+                .map_err(|_| OutcomeLedgerError::SettlementMoneyMismatch)?;
+            if eligible_net.amount_minor < 0 {
+                return Err(OutcomeLedgerError::SettlementMoneyMismatch);
+            }
+            if !refunds.is_empty() {
+                refunded_order_count = refunded_order_count
+                    .checked_add(1)
+                    .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+            }
+            order_views.insert(
+                order_id.clone(),
+                OrderSettlementView {
+                    order_id: order_id.clone(),
+                    original_amount: order.original_amount.clone(),
+                    refund_count: projection_count(refunds.len())?,
+                    refunded_amount: refunded,
+                    eligible_net_amount: eligible_net,
+                    calculated_commission_record_count: 0,
+                    network_commission_event_count: 0,
+                },
+            );
+        }
+
+        let mut latest_calculated = BTreeMap::<(OrderId, PartnerId), &CommissionRecord>::new();
+        for record in self.commissions.iter().filter(|record| {
+            source_order_ids.contains(&record.order_id) && record.calculated_at <= observed_at
+        }) {
+            let key = (record.order_id.clone(), record.partner_id.clone());
+            if latest_calculated.get(&key).is_none_or(|current| {
+                (record.calculated_at, record.id.as_str())
+                    > (current.calculated_at, current.id.as_str())
+            }) {
+                latest_calculated.insert(key, record);
+            }
+        }
+
+        let mut accumulators = BTreeMap::<(PartnerId, CurrencyCode), SettlementAccumulator>::new();
+        let mut selected_calculated = Vec::new();
+        for ((order_id, partner_id), record) in latest_calculated {
+            let partner = partner_map
+                .get(&partner_id)
+                .copied()
+                .ok_or(OutcomeLedgerError::SettlementPartnerSupportClosureMismatch)?;
+            let basis = match partner.supply_class {
+                PartnerSupplyClass::HartevoOptIn => SettlementCommissionBasis::HartevoCalculated,
+                PartnerSupplyClass::TenantPrivate => {
+                    SettlementCommissionBasis::TenantPrivateCalculated
+                }
+                PartnerSupplyClass::OfficialAuthorizedNetwork
+                | PartnerSupplyClass::PublicCandidate => {
+                    return Err(OutcomeLedgerError::SettlementCommissionAuthorityMismatch);
+                }
+            };
+            let expected_refund_set = self.refund_set_digest_at(&order_id, observed_at)?;
+            let expected_net = order_views
+                .get(&order_id)
+                .map(|view| &view.eligible_net_amount)
+                .ok_or(OutcomeLedgerError::SettlementSourceOrdersUnavailable)?;
+            let expected_commission_minor = (Decimal::from(expected_net.amount_minor)
+                * record.rate)
+                .round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
+                .to_i64()
+                .ok_or(OutcomeLedgerError::SettlementMoneyMismatch)?;
+            if record.refund_set_digest != expected_refund_set
+                || record.eligible_net_amount != *expected_net
+                || record.commission_amount
+                    != Money::new(expected_commission_minor, expected_net.currency.clone())
+            {
+                return Err(OutcomeLedgerError::SettlementCommissionRecalculationRequired);
+            }
+            let order_view = order_views
+                .get_mut(&order_id)
+                .ok_or(OutcomeLedgerError::SettlementSourceOrdersUnavailable)?;
+            order_view.calculated_commission_record_count = order_view
+                .calculated_commission_record_count
+                .checked_add(1)
+                .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+            let currency = record.commission_amount.currency.clone();
+            let accumulator = accumulators
+                .entry((partner_id.clone(), currency.clone()))
+                .or_insert_with(|| SettlementAccumulator {
+                    partner_id: partner_id.clone(),
+                    supply_class: partner.supply_class.clone(),
+                    basis,
+                    currency,
+                    source_orders: BTreeSet::new(),
+                    source_commission_count: 0,
+                    commission_amount_minor: 0,
+                    payout_count: 0,
+                    payout_completed_minor: 0,
+                    authoritative_providers: BTreeSet::from(["stripe-connect".into()]),
+                });
+            if accumulator.basis != basis {
+                return Err(OutcomeLedgerError::SettlementCommissionAuthorityMismatch);
+            }
+            accumulator.source_orders.insert(order_id);
+            accumulator.source_commission_count = accumulator
+                .source_commission_count
+                .checked_add(1)
+                .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+            accumulator.commission_amount_minor = accumulator
+                .commission_amount_minor
+                .checked_add(record.commission_amount.amount_minor)
+                .ok_or(OutcomeLedgerError::SettlementMoneyMismatch)?;
+            selected_calculated.push(record);
+        }
+
+        let mut network_events = self
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    OutcomeEventKind::CommissionAccrued | OutcomeEventKind::CommissionReversed
+                ) && event
+                    .order_id
+                    .as_ref()
+                    .is_some_and(|order_id| source_order_ids.contains(order_id))
+                    && event.received_at <= observed_at
+                    && event
+                        .source_verification
+                        .as_ref()
+                        .is_some_and(|verification| verification.verified_at <= observed_at)
+            })
+            .collect::<Vec<_>>();
+        network_events.sort_by(|left, right| {
+            (
+                left.received_at,
+                left.occurred_at,
+                left.provider.as_str(),
+                left.source_event_id.as_str(),
+                left.id.as_str(),
+            )
+                .cmp(&(
+                    right.received_at,
+                    right.occurred_at,
+                    right.provider.as_str(),
+                    right.source_event_id.as_str(),
+                    right.id.as_str(),
+                ))
+        });
+        let mut network_commissions = BTreeMap::<CommissionId, NetworkCommissionAccumulator>::new();
+        for event in &network_events {
+            let order_id = event
+                .order_id
+                .as_ref()
+                .ok_or(OutcomeLedgerError::EventKindShapeMismatch)?;
+            let partner_id = event
+                .partner_id
+                .as_ref()
+                .ok_or(OutcomeLedgerError::EventKindShapeMismatch)?;
+            let commission_id = event
+                .commission_id
+                .as_ref()
+                .ok_or(OutcomeLedgerError::EventKindShapeMismatch)?;
+            let amount = event
+                .amount
+                .as_ref()
+                .ok_or(OutcomeLedgerError::EventKindShapeMismatch)?;
+            let partner = partner_map
+                .get(partner_id)
+                .copied()
+                .ok_or(OutcomeLedgerError::SettlementPartnerSupportClosureMismatch)?;
+            if partner.supply_class != PartnerSupplyClass::OfficialAuthorizedNetwork
+                || !official_network_provider(&event.provider)
+            {
+                return Err(OutcomeLedgerError::SettlementCommissionAuthorityMismatch);
+            }
+            let order = source_orders
+                .get(order_id)
+                .map(|(order, _)| *order)
+                .ok_or(OutcomeLedgerError::SettlementSourceOrdersUnavailable)?;
+            if event.occurred_at < order.occurred_at {
+                return Err(OutcomeLedgerError::SettlementWindowMismatch);
+            }
+            let commission = network_commissions
+                .entry(commission_id.clone())
+                .or_insert_with(|| NetworkCommissionAccumulator {
+                    partner_id: partner_id.clone(),
+                    currency: amount.currency.clone(),
+                    provider: event.provider.clone(),
+                    order_id: order_id.clone(),
+                    accrued_minor: None,
+                    reversed_minor: 0,
+                    event_count: 0,
+                });
+            if commission.partner_id != *partner_id
+                || commission.currency != amount.currency
+                || commission.provider != event.provider
+                || commission.order_id != *order_id
+            {
+                return Err(OutcomeLedgerError::SettlementCommissionAuthorityMismatch);
+            }
+            commission.event_count = commission
+                .event_count
+                .checked_add(1)
+                .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+            if event.kind == OutcomeEventKind::CommissionAccrued {
+                if commission
+                    .accrued_minor
+                    .replace(amount.amount_minor)
+                    .is_some()
+                {
+                    return Err(OutcomeLedgerError::SettlementCommissionAuthorityMismatch);
+                }
+            } else {
+                commission.reversed_minor = commission
+                    .reversed_minor
+                    .checked_add(amount.amount_minor)
+                    .ok_or(OutcomeLedgerError::SettlementMoneyMismatch)?;
+            }
+        }
+        for (_, commission) in network_commissions {
+            let accrued_minor = commission
+                .accrued_minor
+                .ok_or(OutcomeLedgerError::SettlementCommissionAuthorityMismatch)?;
+            let net_minor = accrued_minor
+                .checked_sub(commission.reversed_minor)
+                .ok_or(OutcomeLedgerError::SettlementMoneyMismatch)?;
+            if net_minor < 0 {
+                return Err(OutcomeLedgerError::SettlementMoneyMismatch);
+            }
+            let partner = partner_map
+                .get(&commission.partner_id)
+                .copied()
+                .ok_or(OutcomeLedgerError::SettlementPartnerSupportClosureMismatch)?;
+            let key = (commission.partner_id.clone(), commission.currency.clone());
+            let accumulator = accumulators
+                .entry(key)
+                .or_insert_with(|| SettlementAccumulator {
+                    partner_id: commission.partner_id.clone(),
+                    supply_class: partner.supply_class.clone(),
+                    basis: SettlementCommissionBasis::OfficialNetworkFacts,
+                    currency: commission.currency.clone(),
+                    source_orders: BTreeSet::new(),
+                    source_commission_count: 0,
+                    commission_amount_minor: 0,
+                    payout_count: 0,
+                    payout_completed_minor: 0,
+                    authoritative_providers: BTreeSet::new(),
+                });
+            if accumulator.basis != SettlementCommissionBasis::OfficialNetworkFacts {
+                return Err(OutcomeLedgerError::SettlementCommissionAuthorityMismatch);
+            }
+            accumulator
+                .source_orders
+                .insert(commission.order_id.clone());
+            accumulator.source_commission_count = accumulator
+                .source_commission_count
+                .checked_add(1)
+                .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+            accumulator
+                .authoritative_providers
+                .insert(commission.provider);
+            accumulator.commission_amount_minor = accumulator
+                .commission_amount_minor
+                .checked_add(net_minor)
+                .ok_or(OutcomeLedgerError::SettlementMoneyMismatch)?;
+            let order_view = order_views
+                .get_mut(&commission.order_id)
+                .ok_or(OutcomeLedgerError::SettlementSourceOrdersUnavailable)?;
+            order_view.network_commission_event_count = order_view
+                .network_commission_event_count
+                .checked_add(commission.event_count)
+                .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+        }
+
+        let mut payout_events = self
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == OutcomeEventKind::PayoutCompleted
+                    && event.mission_id == source_mission.id
+                    && event.received_at <= observed_at
+                    && event
+                        .source_verification
+                        .as_ref()
+                        .is_some_and(|verification| verification.verified_at <= observed_at)
+            })
+            .collect::<Vec<_>>();
+        payout_events.sort_by(|left, right| {
+            (
+                left.received_at,
+                left.occurred_at,
+                left.provider.as_str(),
+                left.source_event_id.as_str(),
+                left.id.as_str(),
+            )
+                .cmp(&(
+                    right.received_at,
+                    right.occurred_at,
+                    right.provider.as_str(),
+                    right.source_event_id.as_str(),
+                    right.id.as_str(),
+                ))
+        });
+        let mut payout_ids = BTreeSet::new();
+        for event in &payout_events {
+            let payout_id = event
+                .payout_id
+                .as_ref()
+                .ok_or(OutcomeLedgerError::EventKindShapeMismatch)?;
+            if !payout_ids.insert(payout_id.clone()) {
+                return Err(OutcomeLedgerError::SettlementDuplicatePayout);
+            }
+            let partner_id = event
+                .partner_id
+                .as_ref()
+                .ok_or(OutcomeLedgerError::EventKindShapeMismatch)?;
+            let amount = event
+                .amount
+                .as_ref()
+                .ok_or(OutcomeLedgerError::EventKindShapeMismatch)?;
+            let accumulator = accumulators
+                .get_mut(&(partner_id.clone(), amount.currency.clone()))
+                .ok_or(OutcomeLedgerError::SettlementPayoutMismatch)?;
+            let provider_allowed = match accumulator.basis {
+                SettlementCommissionBasis::OfficialNetworkFacts => accumulator
+                    .authoritative_providers
+                    .contains(&event.provider),
+                SettlementCommissionBasis::HartevoCalculated
+                | SettlementCommissionBasis::TenantPrivateCalculated => {
+                    matches!(event.provider.as_str(), "stripe" | "stripe-connect")
+                }
+            };
+            if !provider_allowed {
+                return Err(OutcomeLedgerError::SettlementPayoutMismatch);
+            }
+            accumulator.payout_count = accumulator
+                .payout_count
+                .checked_add(1)
+                .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+            accumulator.payout_completed_minor = accumulator
+                .payout_completed_minor
+                .checked_add(amount.amount_minor)
+                .ok_or(OutcomeLedgerError::SettlementMoneyMismatch)?;
+            if accumulator.payout_completed_minor > accumulator.commission_amount_minor {
+                return Err(OutcomeLedgerError::SettlementPayoutMismatch);
+            }
+        }
+
+        let mut settlements = Vec::with_capacity(accumulators.len());
+        let mut paid_group_count = 0_u64;
+        let mut outstanding_group_count = 0_u64;
+        let mut no_payment_due_group_count = 0_u64;
+        let mut official_network_group_count = 0_u64;
+        let mut hartevo_managed_group_count = 0_u64;
+        let mut tenant_private_group_count = 0_u64;
+        for (_, accumulator) in accumulators {
+            let outstanding_minor = accumulator
+                .commission_amount_minor
+                .checked_sub(accumulator.payout_completed_minor)
+                .ok_or(OutcomeLedgerError::SettlementMoneyMismatch)?;
+            if outstanding_minor < 0 {
+                return Err(OutcomeLedgerError::SettlementPayoutMismatch);
+            }
+            let status = if accumulator.commission_amount_minor == 0 {
+                no_payment_due_group_count = no_payment_due_group_count
+                    .checked_add(1)
+                    .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                SettlementGroupStatus::NoPaymentDue
+            } else if outstanding_minor == 0 {
+                paid_group_count = paid_group_count
+                    .checked_add(1)
+                    .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                SettlementGroupStatus::Paid
+            } else {
+                outstanding_group_count = outstanding_group_count
+                    .checked_add(1)
+                    .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                SettlementGroupStatus::Outstanding
+            };
+            match accumulator.basis {
+                SettlementCommissionBasis::OfficialNetworkFacts => {
+                    official_network_group_count = official_network_group_count
+                        .checked_add(1)
+                        .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                }
+                SettlementCommissionBasis::HartevoCalculated => {
+                    hartevo_managed_group_count = hartevo_managed_group_count
+                        .checked_add(1)
+                        .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                }
+                SettlementCommissionBasis::TenantPrivateCalculated => {
+                    tenant_private_group_count = tenant_private_group_count
+                        .checked_add(1)
+                        .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                }
+            }
+            settlements.push(PartnerSettlementView {
+                partner_id: accumulator.partner_id,
+                supply_class: accumulator.supply_class,
+                basis: accumulator.basis,
+                currency: accumulator.currency.clone(),
+                source_order_count: projection_count(accumulator.source_orders.len())?,
+                source_commission_count: accumulator.source_commission_count,
+                commission_amount: Money::new(
+                    accumulator.commission_amount_minor,
+                    accumulator.currency.clone(),
+                ),
+                payout_count: accumulator.payout_count,
+                payout_completed_amount: Money::new(
+                    accumulator.payout_completed_minor,
+                    accumulator.currency.clone(),
+                ),
+                outstanding_amount: Money::new(outstanding_minor, accumulator.currency),
+                status,
+            });
+        }
+        settlements.sort_by(|left, right| {
+            (left.partner_id.as_str(), left.currency.as_str())
+                .cmp(&(right.partner_id.as_str(), right.currency.as_str()))
+        });
+
+        selected_calculated.sort_by(|left, right| {
+            (
+                left.order_id.as_str(),
+                left.partner_id.as_str(),
+                left.calculated_at,
+                left.id.as_str(),
+            )
+                .cmp(&(
+                    right.order_id.as_str(),
+                    right.partner_id.as_str(),
+                    right.calculated_at,
+                    right.id.as_str(),
+                ))
+        });
+        scoped_refunds.sort_by(|(left, left_event), (right, right_event)| {
+            (
+                left.order_id.as_str(),
+                left_event.received_at,
+                left.id.as_str(),
+            )
+                .cmp(&(
+                    right.order_id.as_str(),
+                    right_event.received_at,
+                    right.id.as_str(),
+                ))
+        });
+        Ok(OutcomeSettlementProjection {
+            schema_version: OutcomeSettlementProjection::SCHEMA_VERSION,
+            tenant_id: self.tenant_id.clone(),
+            project_id: self.project_id.clone(),
+            source_mission_id: source_mission.id.clone(),
+            source_mission_revision: source_mission.revision,
+            source_ledger_revision: self.revision,
+            window_started_at,
+            window_ended_at: observed_at,
+            order_count: projection_count(order_views.len())?,
+            refunded_order_count,
+            refund_count: projection_count(scoped_refunds.len())?,
+            calculated_commission_count: projection_count(selected_calculated.len())?,
+            network_commission_event_count: projection_count(network_events.len())?,
+            payout_count: projection_count(payout_events.len())?,
+            settlement_group_count: projection_count(settlements.len())?,
+            paid_group_count,
+            outstanding_group_count,
+            no_payment_due_group_count,
+            official_network_group_count,
+            hartevo_managed_group_count,
+            tenant_private_group_count,
+            normalization_digest: normalization.digest(),
+            identity_chain_digest: identity_chain.digest(),
+            order_refund_digest: canonical_json_digest(&order_views)?,
+            commission_source_digest: canonical_json_digest(&serde_json::json!({
+                "calculated": selected_calculated,
+                "networkEvents": network_events,
+            }))?,
+            payout_source_digest: canonical_json_digest(&payout_events)?,
+            partner_policy_digest,
+            orders: order_views,
+            settlements,
+        })
+    }
+
+    /// Freezes the exact inputs shown to the following Human decision
+    /// Checkpoint. It validates that KPI, attribution and settlement were all
+    /// recomputed from the same ledger, parent Mission and cutoff, then adds a
+    /// conservative verified-Effect cost view. It never selects an action,
+    /// converts currencies, or claims causal ROI.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the review Oracle keeps cross-projection equality, money buckets, effect terminality, budget arithmetic, and decision caveats explicit in one auditable boundary"
+    )]
+    pub fn verified_outcome_review_projection(
+        &self,
+        source_mission: &Mission,
+        kpi: &MissionKpiProjection,
+        attribution: &OutcomeAttributionProjection,
+        settlement: &OutcomeSettlementProjection,
+        observed_at: DateTime<Utc>,
+    ) -> Result<OutcomeReviewProjection, OutcomeLedgerError> {
+        let normalization = self.verified_normalization_projection()?;
+        let source_matches = |tenant_id: &TenantId,
+                              project_id: &ProjectId,
+                              mission_id: &MissionId,
+                              mission_revision: u64,
+                              ledger_revision: u64| {
+            tenant_id == &self.tenant_id
+                && project_id == &self.project_id
+                && mission_id == &source_mission.id
+                && mission_revision == source_mission.revision
+                && ledger_revision == self.revision
+        };
+        if source_mission.tenant_id != self.tenant_id
+            || source_mission.project_id != self.project_id
+            || source_mission.revision == 0
+            || !source_matches(
+                &kpi.tenant_id,
+                &kpi.project_id,
+                &kpi.source_mission_id,
+                kpi.source_mission_revision,
+                kpi.source_ledger_revision,
+            )
+            || !source_matches(
+                &attribution.tenant_id,
+                &attribution.project_id,
+                &attribution.source_mission_id,
+                attribution.source_mission_revision,
+                attribution.source_ledger_revision,
+            )
+            || !source_matches(
+                &settlement.tenant_id,
+                &settlement.project_id,
+                &settlement.source_mission_id,
+                settlement.source_mission_revision,
+                settlement.source_ledger_revision,
+            )
+        {
+            return Err(OutcomeLedgerError::OutcomeReviewScopeMismatch);
+        }
+        source_mission
+            .contract
+            .validate(source_mission.contract.valid_from)
+            .map_err(|_| OutcomeLedgerError::OutcomeReviewProjectionMismatch)?;
+        let source_contract_digest = mission_kpi_contract_source_digest(source_mission)?;
+        if observed_at < source_mission.contract.valid_from
+            || kpi.schema_version != MissionKpiProjection::SCHEMA_VERSION
+            || attribution.schema_version != OutcomeAttributionProjection::SCHEMA_VERSION
+            || settlement.schema_version != OutcomeSettlementProjection::SCHEMA_VERSION
+            || kpi.window_started_at != attribution.window_started_at
+            || kpi.window_started_at != settlement.window_started_at
+            || kpi.window_ended_at != attribution.window_ended_at
+            || kpi.window_ended_at != observed_at.min(source_mission.contract.valid_until)
+            || settlement.window_ended_at != observed_at
+            || kpi.normalization_digest != normalization.digest()
+            || attribution.normalization_digest != normalization.digest()
+            || settlement.normalization_digest != normalization.digest()
+            || kpi.identity_chain_digest != attribution.identity_chain_digest
+            || kpi.identity_chain_digest != settlement.identity_chain_digest
+            || kpi.source_contract_digest != source_contract_digest
+            || kpi.measurement_count != projection_count(kpi.measurements.len())?
+            || kpi.target_met_count
+                != projection_count(
+                    kpi.measurements
+                        .values()
+                        .filter(|measurement| measurement.target_met)
+                        .count(),
+                )?
+            || attribution.order_count != projection_count(attribution.orders.len())?
+            || settlement.order_count != projection_count(settlement.orders.len())?
+            || attribution.orders.keys().collect::<BTreeSet<_>>()
+                != settlement.orders.keys().collect::<BTreeSet<_>>()
+            || attribution.causal_claim
+            || attribution.orders.values().any(|order| order.causal_claim)
+        {
+            return Err(OutcomeLedgerError::OutcomeReviewProjectionMismatch);
+        }
+        let attributed_order_count = attribution
+            .verified_identity_order_count
+            .checked_add(attribution.last_non_direct_order_count)
+            .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+        if attributed_order_count.checked_add(attribution.unattributed_order_count)
+            != Some(attribution.order_count)
+            || settlement
+                .paid_group_count
+                .checked_add(settlement.outstanding_group_count)
+                .and_then(|count| count.checked_add(settlement.no_payment_due_group_count))
+                != Some(settlement.settlement_group_count)
+        {
+            return Err(OutcomeLedgerError::OutcomeReviewProjectionMismatch);
+        }
+
+        let mut economics = BTreeMap::<CurrencyCode, OutcomeReviewMoneyView>::new();
+        for order in settlement.orders.values() {
+            let view = outcome_review_money_view(&mut economics, &order.original_amount.currency);
+            add_review_money(&mut view.gross_revenue, &order.original_amount)?;
+            add_review_money(&mut view.refunded_amount, &order.refunded_amount)?;
+            add_review_money(&mut view.net_revenue, &order.eligible_net_amount)?;
+        }
+        for group in &settlement.settlements {
+            let view = outcome_review_money_view(&mut economics, &group.currency);
+            add_review_money(&mut view.commission_obligation, &group.commission_amount)?;
+            add_review_money(&mut view.commission_paid, &group.payout_completed_amount)?;
+            add_review_money(&mut view.commission_outstanding, &group.outstanding_amount)?;
+        }
+
+        let mut effects = source_mission.effects.iter().collect::<Vec<_>>();
+        effects.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        if effects.windows(2).any(|pair| pair[0].id == pair[1].id) {
+            return Err(OutcomeLedgerError::OutcomeReviewEffectStateMismatch);
+        }
+        let mut verified_effect_count = 0_u64;
+        let mut pending_effect_count = 0_u64;
+        let mut unresolved_cost_effect_count = 0_u64;
+        let mut cross_currency_cost_effect_count = 0_u64;
+        for effect in &effects {
+            if effect.tenant_id != self.tenant_id
+                || effect.project_id != self.project_id
+                || effect.mission_id != source_mission.id
+                || effect.amount.amount_minor < 0
+            {
+                return Err(OutcomeLedgerError::OutcomeReviewEffectStateMismatch);
+            }
+            let pending = matches!(
+                effect.status,
+                EffectStatus::Proposed
+                    | EffectStatus::Approved
+                    | EffectStatus::Executing
+                    | EffectStatus::ReceiptRecorded
+                    | EffectStatus::VerificationRequired
+            );
+            if pending {
+                pending_effect_count = pending_effect_count
+                    .checked_add(1)
+                    .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+            }
+            match effect.status {
+                EffectStatus::Verified => {
+                    validate_review_verified_effect(effect, observed_at)?;
+                    verified_effect_count = verified_effect_count
+                        .checked_add(1)
+                        .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                    if effect.amount.is_positive() {
+                        let view =
+                            outcome_review_money_view(&mut economics, &effect.amount.currency);
+                        add_review_money(&mut view.verified_effect_outflow, &effect.amount)?;
+                        if effect.amount.currency != source_mission.contract.budget.currency {
+                            cross_currency_cost_effect_count = cross_currency_cost_effect_count
+                                .checked_add(1)
+                                .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                        }
+                    }
+                }
+                EffectStatus::Executing
+                | EffectStatus::ReceiptRecorded
+                | EffectStatus::VerificationRequired
+                | EffectStatus::DeadLetter
+                    if effect.amount.is_positive() =>
+                {
+                    let view = outcome_review_money_view(&mut economics, &effect.amount.currency);
+                    add_review_money(&mut view.unresolved_effect_exposure, &effect.amount)?;
+                    unresolved_cost_effect_count = unresolved_cost_effect_count
+                        .checked_add(1)
+                        .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                }
+                EffectStatus::Failed
+                    if effect.amount.is_positive()
+                        && (effect.receipt.is_some() || effect.verification.is_some()) =>
+                {
+                    let view = outcome_review_money_view(&mut economics, &effect.amount.currency);
+                    add_review_money(&mut view.unresolved_effect_exposure, &effect.amount)?;
+                    unresolved_cost_effect_count = unresolved_cost_effect_count
+                        .checked_add(1)
+                        .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+                }
+                EffectStatus::Proposed
+                | EffectStatus::Approved
+                | EffectStatus::Rejected
+                | EffectStatus::Cancelled
+                | EffectStatus::Expired
+                | EffectStatus::Reconciled
+                | EffectStatus::Failed
+                | EffectStatus::Executing
+                | EffectStatus::ReceiptRecorded
+                | EffectStatus::VerificationRequired
+                | EffectStatus::DeadLetter => {}
+            }
+            if matches!(
+                effect.status,
+                EffectStatus::Proposed
+                    | EffectStatus::Approved
+                    | EffectStatus::Rejected
+                    | EffectStatus::Cancelled
+                    | EffectStatus::Expired
+                    | EffectStatus::Reconciled
+            ) && (effect.receipt.is_some() || effect.verification.is_some())
+            {
+                return Err(OutcomeLedgerError::OutcomeReviewEffectStateMismatch);
+            }
+        }
+        let effect_cost_source_digest = canonical_json_digest(&effects)?;
+
+        let budget = source_mission.contract.budget.clone();
+        let budget_view = outcome_review_money_view(&mut economics, &budget.currency);
+        let budget_currency_verified_cost = budget_view.verified_effect_outflow.clone();
+        let (remaining_minor, overrun_minor) =
+            if budget_currency_verified_cost.amount_minor <= budget.amount_minor {
+                (
+                    budget
+                        .amount_minor
+                        .checked_sub(budget_currency_verified_cost.amount_minor)
+                        .ok_or(OutcomeLedgerError::OutcomeReviewMoneyMismatch)?,
+                    0,
+                )
+            } else {
+                (
+                    0,
+                    budget_currency_verified_cost
+                        .amount_minor
+                        .checked_sub(budget.amount_minor)
+                        .ok_or(OutcomeLedgerError::OutcomeReviewMoneyMismatch)?,
+                )
+            };
+        let budget_remaining = Money::new(remaining_minor, budget.currency.clone());
+        let budget_overrun = Money::new(overrun_minor, budget.currency.clone());
+
+        let target_gap_count = kpi
+            .measurement_count
+            .checked_sub(kpi.target_met_count)
+            .ok_or(OutcomeLedgerError::OutcomeReviewProjectionMismatch)?;
+        let paid_or_no_payment_due_group_count = settlement
+            .paid_group_count
+            .checked_add(settlement.no_payment_due_group_count)
+            .ok_or(OutcomeLedgerError::ProjectionCountOverflow)?;
+        let all_kpis_met = target_gap_count == 0;
+        let attribution_complete = attribution.unattributed_order_count == 0;
+        let settlement_reconciled = settlement.outstanding_group_count == 0;
+        let cost_complete =
+            unresolved_cost_effect_count == 0 && cross_currency_cost_effect_count == 0;
+        let budget_within_limit = budget_overrun.amount_minor == 0;
+        let implicit_loop_forbidden = matches!(
+            source_mission.contract.mode,
+            OperatingMode::BuildOnce | OperatingMode::OneOffDecision
+        );
+        let scale_evidence_ready = matches!(
+            source_mission.contract.mode,
+            OperatingMode::Campaign
+                | OperatingMode::ContinuousOperator
+                | OperatingMode::ContinuousRelationship
+        ) && all_kpis_met
+            && attribution_complete
+            && settlement_reconciled
+            && pending_effect_count == 0
+            && cost_complete
+            && budget_within_limit;
+        let mut caveats = BTreeSet::new();
+        if !all_kpis_met {
+            caveats.insert(OutcomeReviewCaveat::KpiTargetGap);
+        }
+        if !attribution_complete {
+            caveats.insert(OutcomeReviewCaveat::UnattributedOrders);
+        }
+        if !settlement_reconciled {
+            caveats.insert(OutcomeReviewCaveat::OutstandingSettlement);
+        }
+        if pending_effect_count != 0 {
+            caveats.insert(OutcomeReviewCaveat::PendingEffect);
+        }
+        if unresolved_cost_effect_count != 0 {
+            caveats.insert(OutcomeReviewCaveat::UnresolvedEffectCost);
+        }
+        if !budget_within_limit {
+            caveats.insert(OutcomeReviewCaveat::BudgetExceeded);
+        }
+        if cross_currency_cost_effect_count != 0 {
+            caveats.insert(OutcomeReviewCaveat::CrossCurrencyCostWithoutFx);
+        }
+        if implicit_loop_forbidden {
+            caveats.insert(OutcomeReviewCaveat::ImplicitLoopForbidden);
+        }
+
+        Ok(OutcomeReviewProjection {
+            schema_version: OutcomeReviewProjection::SCHEMA_VERSION,
+            tenant_id: self.tenant_id.clone(),
+            project_id: self.project_id.clone(),
+            source_mission_id: source_mission.id.clone(),
+            source_mission_revision: source_mission.revision,
+            source_ledger_revision: self.revision,
+            window_started_at: kpi.window_started_at,
+            outcome_window_ended_at: kpi.window_ended_at,
+            observed_at,
+            measurement_count: kpi.measurement_count,
+            target_met_count: kpi.target_met_count,
+            target_gap_count,
+            order_count: attribution.order_count,
+            attributed_order_count,
+            unattributed_order_count: attribution.unattributed_order_count,
+            settlement_group_count: settlement.settlement_group_count,
+            paid_or_no_payment_due_group_count,
+            outstanding_settlement_group_count: settlement.outstanding_group_count,
+            verified_effect_count,
+            pending_effect_count,
+            unresolved_cost_effect_count,
+            cross_currency_cost_effect_count,
+            budget,
+            budget_currency_verified_cost,
+            budget_remaining,
+            budget_overrun,
+            kpi_status: all_kpis_met.into(),
+            attribution_status: attribution_complete.into(),
+            settlement_status: settlement_reconciled.into(),
+            cost_status: cost_complete.into(),
+            budget_status: budget_within_limit.into(),
+            scale_evidence_status: scale_evidence_ready.into(),
+            loop_policy: if implicit_loop_forbidden {
+                OutcomeReviewLoopPolicy::Forbidden
+            } else {
+                OutcomeReviewLoopPolicy::Eligible
+            },
+            causal_status: OutcomeReviewCausalStatus::NotClaimed,
+            roi_status: OutcomeReviewRoiStatus::NotCalculated,
+            caveats,
+            economics,
+            source_contract_digest,
+            normalization_digest: normalization.digest(),
+            identity_chain_digest: kpi.identity_chain_digest.clone(),
+            kpi_projection_digest: kpi.digest()?,
+            attribution_projection_digest: attribution.digest()?,
+            settlement_projection_digest: settlement.digest()?,
+            effect_cost_source_digest,
         })
     }
 
@@ -2155,6 +3353,17 @@ fn canonical_json_digest(value: &impl Serialize) -> Result<String, OutcomeLedger
     Ok(format!("{:x}", Sha256::digest(canonical)))
 }
 
+fn mission_kpi_contract_source_digest(
+    source_mission: &Mission,
+) -> Result<String, OutcomeLedgerError> {
+    canonical_json_digest(&serde_json::json!({
+        "schemaVersion": "hartevo-mission-kpi-contract-source/v1",
+        "missionId": source_mission.id,
+        "missionRevision": source_mission.revision,
+        "contract": source_mission.contract,
+    }))
+}
+
 /// Canonical provider/account/receipt identity used by a VerifiedIdentity
 /// attribution record. Raw external identifiers enter the hash but are never
 /// returned or persisted in Checkpoint evidence.
@@ -2270,6 +3479,7 @@ enum MissionKpiMetric {
     RefundTotal,
     NetRevenue,
     CommissionAccrued,
+    CommissionReversed,
     PayoutCompleted,
 }
 
@@ -2289,6 +3499,9 @@ fn mission_kpi_metric(metric_id: &str) -> Result<MissionKpiMetric, OutcomeLedger
         "commission_accrued_count" => Ok(MissionKpiMetric::EventCount(
             OutcomeEventKind::CommissionAccrued,
         )),
+        "commission_reversed_count" => Ok(MissionKpiMetric::EventCount(
+            OutcomeEventKind::CommissionReversed,
+        )),
         "payout_completed_count" => Ok(MissionKpiMetric::EventCount(
             OutcomeEventKind::PayoutCompleted,
         )),
@@ -2296,6 +3509,7 @@ fn mission_kpi_metric(metric_id: &str) -> Result<MissionKpiMetric, OutcomeLedger
         "refund_total_minor" => Ok(MissionKpiMetric::RefundTotal),
         "net_revenue_minor" => Ok(MissionKpiMetric::NetRevenue),
         "commission_accrued_minor" => Ok(MissionKpiMetric::CommissionAccrued),
+        "commission_reversed_minor" => Ok(MissionKpiMetric::CommissionReversed),
         "payout_completed_minor" => Ok(MissionKpiMetric::PayoutCompleted),
         _ => Err(OutcomeLedgerError::UnsupportedKpiMetric),
     }
@@ -2345,6 +3559,7 @@ fn mission_kpi_measurement(
         | MissionKpiMetric::RefundTotal
         | MissionKpiMetric::NetRevenue
         | MissionKpiMetric::CommissionAccrued
+        | MissionKpiMetric::CommissionReversed
         | MissionKpiMetric::PayoutCompleted => {
             let currency = contract
                 .unit
@@ -2373,6 +3588,9 @@ fn mission_kpi_measurement(
                     ),
                     MissionKpiMetric::CommissionAccrued => {
                         event.kind == OutcomeEventKind::CommissionAccrued
+                    }
+                    MissionKpiMetric::CommissionReversed => {
+                        event.kind == OutcomeEventKind::CommissionReversed
                     }
                     MissionKpiMetric::PayoutCompleted => {
                         event.kind == OutcomeEventKind::PayoutCompleted
@@ -2418,6 +3636,72 @@ fn kpi_target_met(observed: Decimal, contract: &KpiContract) -> bool {
         KpiDirection::AtLeast => observed >= contract.target,
         KpiDirection::AtMost => observed <= contract.target,
     }
+}
+
+fn outcome_review_money_view<'a>(
+    economics: &'a mut BTreeMap<CurrencyCode, OutcomeReviewMoneyView>,
+    currency: &CurrencyCode,
+) -> &'a mut OutcomeReviewMoneyView {
+    economics
+        .entry(currency.clone())
+        .or_insert_with(|| OutcomeReviewMoneyView {
+            currency: currency.clone(),
+            gross_revenue: Money::zero(currency.clone()),
+            refunded_amount: Money::zero(currency.clone()),
+            net_revenue: Money::zero(currency.clone()),
+            commission_obligation: Money::zero(currency.clone()),
+            commission_paid: Money::zero(currency.clone()),
+            commission_outstanding: Money::zero(currency.clone()),
+            verified_effect_outflow: Money::zero(currency.clone()),
+            unresolved_effect_exposure: Money::zero(currency.clone()),
+        })
+}
+
+fn add_review_money(target: &mut Money, amount: &Money) -> Result<(), OutcomeLedgerError> {
+    *target = target
+        .checked_add(amount)
+        .map_err(|_| OutcomeLedgerError::OutcomeReviewMoneyMismatch)?;
+    Ok(())
+}
+
+fn validate_review_verified_effect(
+    effect: &Effect,
+    observed_at: DateTime<Utc>,
+) -> Result<(), OutcomeLedgerError> {
+    let approval = effect
+        .approval
+        .as_ref()
+        .ok_or(OutcomeLedgerError::OutcomeReviewEffectStateMismatch)?;
+    let receipt = effect
+        .receipt
+        .as_ref()
+        .ok_or(OutcomeLedgerError::OutcomeReviewEffectStateMismatch)?;
+    let verification = effect
+        .verification
+        .as_ref()
+        .ok_or(OutcomeLedgerError::OutcomeReviewEffectStateMismatch)?;
+    if effect.status != EffectStatus::Verified
+        || approval.decision != ApprovalDecision::Approved
+        || approval.scope_digest != effect.approval_digest()
+        || !is_sha256(&approval.permission_digest)
+        || receipt.provider != effect.provider
+        || receipt.request_digest != effect.approval_digest()
+        || receipt.external_id.trim().is_empty()
+        || !is_sha256(&receipt.response_digest)
+        || receipt.accepted_at < approval.decided_at
+        || receipt.accepted_at >= approval.valid_until
+        || receipt.accepted_at >= effect.expires_at
+        || verification.status != VerificationStatus::Confirmed
+        || !verification.independent
+        || verification.verifier.trim().is_empty()
+        || verification.receipt_id != receipt.id
+        || verification.observed_at < receipt.accepted_at
+        || verification.observed_at > observed_at
+        || !is_sha256(&verification.evidence_digest)
+    {
+        return Err(OutcomeLedgerError::OutcomeReviewEffectStateMismatch);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -2506,6 +3790,38 @@ pub enum OutcomeLedgerError {
     DuplicateAttributionTouchpoint,
     #[error("multiple equally authoritative attribution candidates disagree")]
     DisputedAttribution,
+    #[error("the settlement source Mission does not match the Outcome Ledger scope")]
+    SettlementMissionScopeMismatch,
+    #[error("the parent Mission has no verified orders addressable by settlement")]
+    SettlementSourceOrdersUnavailable,
+    #[error("the settlement projection does not bind the current complete identity chain")]
+    SettlementIdentityChainMismatch,
+    #[error("the settlement cutoff or an order/refund time relationship is inconsistent")]
+    SettlementWindowMismatch,
+    #[error("the settlement Partner support is not the exact referenced closure")]
+    SettlementPartnerSupportClosureMismatch,
+    #[error("a Partner supply class or permission record is invalid for settlement")]
+    SettlementPartnerPolicyMismatch,
+    #[error("commission authority mixes network facts with Hartevo-calculated records")]
+    SettlementCommissionAuthorityMismatch,
+    #[error("a refund changed the eligible amount and the commission needs recalculation")]
+    SettlementCommissionRecalculationRequired,
+    #[error("a verified payout does not match its partner, currency, provider, or obligation")]
+    SettlementPayoutMismatch,
+    #[error("the same provider payout identity appears more than once")]
+    SettlementDuplicatePayout,
+    #[error("settlement money uses inconsistent currency or overflows minor units")]
+    SettlementMoneyMismatch,
+    #[error("the outcome review does not match its parent Mission or Outcome Ledger scope")]
+    OutcomeReviewScopeMismatch,
+    #[error(
+        "the outcome review inputs are not the exact KPI, attribution, and settlement projections for one cutoff"
+    )]
+    OutcomeReviewProjectionMismatch,
+    #[error("an Effect cost source has an impossible or unverified lifecycle state")]
+    OutcomeReviewEffectStateMismatch,
+    #[error("outcome review money uses inconsistent currency or overflows minor units")]
+    OutcomeReviewMoneyMismatch,
     #[error("an outcome Oracle projection could not be canonically serialized")]
     ProjectionSerialization,
     #[error("decimal commission arithmetic overflowed minor units")]
@@ -2587,6 +3903,10 @@ fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn official_network_provider(provider: &str) -> bool {
+    matches!(provider, "awin" | "impact" | "impact.com" | "cj")
+}
+
 fn projection_count(count: usize) -> Result<u64, OutcomeLedgerError> {
     u64::try_from(count).map_err(|_| OutcomeLedgerError::ProjectionCountOverflow)
 }
@@ -2662,6 +3982,7 @@ fn hash_outcome_event(digest: &mut Sha256, event: &OutcomeEvent) {
             OutcomeEventKind::OrderPlaced => "order_placed",
             OutcomeEventKind::RefundIssued => "refund_issued",
             OutcomeEventKind::CommissionAccrued => "commission_accrued",
+            OutcomeEventKind::CommissionReversed => "commission_reversed",
             OutcomeEventKind::PayoutCompleted => "payout_completed",
         },
     );
@@ -3818,6 +5139,773 @@ mod tests {
             revision_jump.follows(&previous),
             Err(OutcomeLedgerError::ProjectionRevisionMismatch { .. })
         ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the settlement regression proves immutable order/refund history, cross-period commission recalculation, supply-class authority, exact minor-unit payout reconciliation, and deterministic replay together"
+    )]
+    fn settlement_oracle_recalculates_refunds_and_reconciles_only_verified_payout_facts() {
+        let parent = Mission::compile(
+            TenantId::from("tenant-1"),
+            MissionId::from("mission-11"),
+            ProjectId::from("project-1"),
+            "Parent partner Mission",
+            MissionContract::bootstrap(
+                "Reconcile immutable partner outcomes",
+                ["settlement.compute".into()],
+                now(),
+            ),
+            now(),
+        )
+        .expect("parent Mission");
+        let partner = Partner::create(
+            PartnerId::from("partner-settlement"),
+            TenantId::from("tenant-1"),
+            ProjectId::from("project-1"),
+            None,
+            None,
+            "Opt-in creator",
+            PartnerSupplyClass::HartevoOptIn,
+            ContactPermission::ExplicitOptIn,
+            Some("1".repeat(64)),
+        )
+        .expect("partner");
+        let mut ledger =
+            OutcomeLedger::new(TenantId::from("tenant-1"), ProjectId::from("project-1"))
+                .expect("ledger");
+        let order = event(
+            OutcomeEventKind::OrderPlaced,
+            "settlement-order",
+            Some(10_000),
+        );
+        ledger.ingest(order).expect("order");
+        let immutable_order = ledger.orders[0].clone();
+        ledger
+            .calculate_commission(
+                CommissionId::from("commission-before-refund"),
+                &OrderId::from("order-1"),
+                partner.id.clone(),
+                "0.15".parse().expect("rate"),
+                "2".repeat(64),
+                now() + Duration::minutes(2),
+            )
+            .expect("initial commission");
+        let mut refund = event(
+            OutcomeEventKind::RefundIssued,
+            "settlement-refund",
+            Some(2_500),
+        );
+        refund.identity_link_id = None;
+        refund.refund_id = Some(RefundId::from("settlement-refund-1"));
+        refund.occurred_at = now() + Duration::minutes(3);
+        refund.received_at = now() + Duration::minutes(4);
+        refund
+            .source_verification
+            .as_mut()
+            .expect("verification")
+            .verified_at = refund.received_at;
+        ledger.ingest(refund).expect("cross-period refund");
+        assert_eq!(ledger.orders[0], immutable_order);
+
+        let (commerce_connection, person, link) = confirmed_identity_support();
+        let stale_identity = ledger
+            .verified_identity_chain_projection(
+                std::slice::from_ref(&commerce_connection),
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                std::slice::from_ref(&partner),
+                &[],
+            )
+            .expect("identity chain");
+        assert_eq!(
+            ledger.verified_settlement_projection(
+                &parent,
+                &stale_identity,
+                std::slice::from_ref(&partner),
+                now() + Duration::minutes(5),
+            ),
+            Err(OutcomeLedgerError::SettlementCommissionRecalculationRequired)
+        );
+
+        let adjusted = ledger
+            .calculate_commission(
+                CommissionId::from("commission-after-refund"),
+                &OrderId::from("order-1"),
+                partner.id.clone(),
+                "0.15".parse().expect("rate"),
+                "2".repeat(64),
+                now() + Duration::minutes(5),
+            )
+            .expect("adjusted commission");
+        assert_eq!(
+            (
+                adjusted.eligible_net_amount.amount_minor,
+                adjusted.commission_amount.amount_minor,
+            ),
+            (7_500, 1_125)
+        );
+        let adjusted_identity = ledger
+            .verified_identity_chain_projection(
+                std::slice::from_ref(&commerce_connection),
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                std::slice::from_ref(&partner),
+                &[],
+            )
+            .expect("adjusted identity chain");
+        let outstanding = ledger
+            .verified_settlement_projection(
+                &parent,
+                &adjusted_identity,
+                std::slice::from_ref(&partner),
+                now() + Duration::minutes(6),
+            )
+            .expect("outstanding settlement");
+        assert_eq!(
+            (
+                outstanding.order_count,
+                outstanding.refunded_order_count,
+                outstanding.refund_count,
+                outstanding.calculated_commission_count,
+                outstanding.settlement_group_count,
+                outstanding.outstanding_group_count,
+                outstanding.settlements[0].outstanding_amount.amount_minor,
+            ),
+            (1, 1, 1, 1, 1, 1, 1_125)
+        );
+        assert_eq!(
+            outstanding.orders[&OrderId::from("order-1")].original_amount,
+            immutable_order.original_amount
+        );
+
+        let official_partner = Partner::create(
+            partner.id.clone(),
+            partner.tenant_id.clone(),
+            partner.project_id.clone(),
+            None,
+            None,
+            "Official network creator",
+            PartnerSupplyClass::OfficialAuthorizedNetwork,
+            ContactPermission::NetworkAuthorized,
+            Some("3".repeat(64)),
+        )
+        .expect("official partner");
+        let official_identity = ledger
+            .verified_identity_chain_projection(
+                std::slice::from_ref(&commerce_connection),
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                std::slice::from_ref(&official_partner),
+                &[],
+            )
+            .expect("official identity chain");
+        assert_eq!(
+            ledger.verified_settlement_projection(
+                &parent,
+                &official_identity,
+                std::slice::from_ref(&official_partner),
+                now() + Duration::minutes(6),
+            ),
+            Err(OutcomeLedgerError::SettlementCommissionAuthorityMismatch)
+        );
+
+        let mut payout_connection = Connection::register(
+            ConnectionId::from("payout-connection"),
+            TenantId::from("tenant-1"),
+            ProjectId::from("project-1"),
+            "stripe-connect",
+            AccountId::from("payout-account"),
+            "payout-account-external",
+            ["payout.read".into()],
+            now(),
+        )
+        .expect("payout connection");
+        payout_connection.begin_probe(now()).expect("begin probe");
+        payout_connection
+            .apply_probe(
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "payout-account-external".into(),
+                    granted_scopes: BTreeSet::from(["payout.read".into()]),
+                    probed_at: now(),
+                    valid_until: now() + Duration::hours(1),
+                    credential_expires_at: now() + Duration::hours(2),
+                    evidence_digest: "4".repeat(64),
+                },
+                now(),
+            )
+            .expect("payout probe");
+        let mut payout = event(
+            OutcomeEventKind::PayoutCompleted,
+            "settlement-payout",
+            Some(1_125),
+        );
+        payout.provider = "stripe-connect".into();
+        payout.connection_id = Some(payout_connection.id().clone());
+        payout.account_id = Some(AccountId::from("payout-account"));
+        payout.identity_link_id = None;
+        payout.order_id = None;
+        payout.payout_id = Some(PayoutId::from("settlement-payout-1"));
+        payout.partner_id = Some(partner.id.clone());
+        payout.occurred_at = now() + Duration::minutes(6);
+        payout.received_at = now() + Duration::minutes(7);
+        payout
+            .source_verification
+            .as_mut()
+            .expect("verification")
+            .verified_at = payout.received_at;
+        ledger.ingest(payout).expect("verified payout fact");
+        let paid_identity = ledger
+            .verified_identity_chain_projection(
+                &[commerce_connection, payout_connection.snapshot()],
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                std::slice::from_ref(&partner),
+                &[],
+            )
+            .expect("paid identity chain");
+        let paid = ledger
+            .verified_settlement_projection(
+                &parent,
+                &paid_identity,
+                std::slice::from_ref(&partner),
+                now() + Duration::minutes(8),
+            )
+            .expect("paid settlement");
+        assert_eq!(
+            (
+                paid.payout_count,
+                paid.paid_group_count,
+                paid.outstanding_group_count,
+                paid.settlements[0].payout_completed_amount.amount_minor,
+                paid.settlements[0].outstanding_amount.amount_minor,
+                paid.settlements[0].status,
+            ),
+            (1, 1, 0, 1_125, 0, SettlementGroupStatus::Paid)
+        );
+        assert_eq!(
+            paid,
+            ledger
+                .verified_settlement_projection(
+                    &parent,
+                    &paid_identity,
+                    std::slice::from_ref(&partner),
+                    now() + Duration::minutes(8),
+                )
+                .expect("deterministic recomputation")
+        );
+        assert!(is_sha256(&paid.digest().expect("settlement digest")));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the outcome review regression binds KPI, attribution, settlement, verified and unresolved cost, budget, no-FX/no-causality, and tamper refusal in one deterministic proof"
+    )]
+    fn outcome_review_oracle_freezes_decision_inputs_without_selecting_an_action() {
+        let mut parent = verified_attribution_support_mission(
+            "mission-11",
+            "review-verified-cost",
+            &"5".repeat(64),
+        );
+        parent.contract.kpis = BTreeMap::from([(
+            "gross_revenue_minor".into(),
+            KpiContract {
+                baseline: Some(Decimal::ZERO),
+                target: Decimal::from(10_000),
+                unit: "minor_units:USD".into(),
+                direction: KpiDirection::AtLeast,
+            },
+        )]);
+        parent.contract.budget = Money::new(500, CurrencyCode::parse("USD").expect("USD"));
+        {
+            let effect = parent.effects.first_mut().expect("verified cost Effect");
+            effect.effect_class = EffectClass::Spend;
+            effect.amount = Money::new(600, CurrencyCode::parse("USD").expect("USD"));
+        }
+        let verified_digest = parent.effects[0].approval_digest();
+        parent.effects[0]
+            .approval
+            .as_mut()
+            .expect("approval")
+            .scope_digest = verified_digest.clone();
+        parent.effects[0]
+            .receipt
+            .as_mut()
+            .expect("receipt")
+            .request_digest = verified_digest;
+        let mut cross_currency = parent.effects[0].clone();
+        cross_currency.id = EffectId::from("review-eur-verified-cost");
+        cross_currency.idempotency_key = "review-eur-verified-cost".into();
+        cross_currency.amount = Money::new(200, CurrencyCode::parse("EUR").expect("EUR"));
+        let cross_currency_receipt_id = ReceiptId::from("review-eur-receipt");
+        cross_currency
+            .receipt
+            .as_mut()
+            .expect("cross-currency receipt")
+            .id = cross_currency_receipt_id.clone();
+        {
+            let verification = cross_currency
+                .verification
+                .as_mut()
+                .expect("cross-currency verification");
+            verification.id = VerificationId::from("review-eur-verification");
+            verification.receipt_id = cross_currency_receipt_id;
+        }
+        let cross_currency_digest = cross_currency.approval_digest();
+        cross_currency
+            .approval
+            .as_mut()
+            .expect("cross-currency approval")
+            .scope_digest = cross_currency_digest.clone();
+        cross_currency
+            .receipt
+            .as_mut()
+            .expect("cross-currency receipt")
+            .request_digest = cross_currency_digest;
+        let mut unresolved = parent.effects[0].clone();
+        unresolved.id = EffectId::from("review-unresolved-cost");
+        unresolved.idempotency_key = "review-unresolved-cost".into();
+        unresolved.amount = Money::new(300, CurrencyCode::parse("USD").expect("USD"));
+        unresolved.status = EffectStatus::VerificationRequired;
+        unresolved.receipt = None;
+        unresolved.verification = None;
+        let unresolved_digest = unresolved.approval_digest();
+        unresolved
+            .approval
+            .as_mut()
+            .expect("unresolved approval")
+            .scope_digest = unresolved_digest;
+        parent.effects.extend([cross_currency, unresolved]);
+        parent.revision = 4;
+
+        let partner = Partner::create(
+            PartnerId::from("review-partner"),
+            TenantId::from("tenant-1"),
+            ProjectId::from("project-1"),
+            None,
+            None,
+            "Review partner",
+            PartnerSupplyClass::HartevoOptIn,
+            ContactPermission::ExplicitOptIn,
+            Some("6".repeat(64)),
+        )
+        .expect("partner");
+        let mut ledger =
+            OutcomeLedger::new(TenantId::from("tenant-1"), ProjectId::from("project-1"))
+                .expect("ledger");
+        ledger
+            .ingest(event(
+                OutcomeEventKind::OrderPlaced,
+                "review-order",
+                Some(10_000),
+            ))
+            .expect("order");
+        ledger
+            .calculate_commission(
+                CommissionId::from("review-commission"),
+                &OrderId::from("order-1"),
+                partner.id.clone(),
+                "0.10".parse().expect("rate"),
+                "7".repeat(64),
+                now() + Duration::minutes(4),
+            )
+            .expect("commission");
+        let (connection, person, link) = confirmed_identity_support();
+        let identity = ledger
+            .verified_identity_chain_projection(
+                std::slice::from_ref(&connection),
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                std::slice::from_ref(&partner),
+                &[],
+            )
+            .expect("identity");
+        let observed_at = now() + Duration::minutes(10);
+        let kpi = ledger
+            .verified_mission_kpi_projection(&parent, &identity, observed_at)
+            .expect("KPI");
+        let attribution = ledger
+            .verified_attribution_projection(&parent, &identity, &[], observed_at)
+            .expect("explicit synthesized Unattributed");
+        let settlement = ledger
+            .verified_settlement_projection(
+                &parent,
+                &identity,
+                std::slice::from_ref(&partner),
+                observed_at,
+            )
+            .expect("outstanding settlement");
+        let review = ledger
+            .verified_outcome_review_projection(
+                &parent,
+                &kpi,
+                &attribution,
+                &settlement,
+                observed_at,
+            )
+            .expect("deterministic outcome review");
+        assert_eq!(
+            (
+                review.measurement_count,
+                review.target_met_count,
+                review.target_gap_count,
+                review.order_count,
+                review.attributed_order_count,
+                review.unattributed_order_count,
+                review.settlement_group_count,
+                review.outstanding_settlement_group_count,
+                review.verified_effect_count,
+                review.pending_effect_count,
+                review.unresolved_cost_effect_count,
+                review.cross_currency_cost_effect_count,
+            ),
+            (1, 1, 0, 1, 0, 1, 1, 1, 2, 1, 1, 1)
+        );
+        assert_eq!(
+            (
+                review.budget_currency_verified_cost.amount_minor,
+                review.budget_remaining.amount_minor,
+                review.budget_overrun.amount_minor,
+                review.scale_evidence_status,
+                review.causal_status,
+                review.roi_status,
+            ),
+            (
+                600,
+                0,
+                100,
+                OutcomeReviewGateStatus::Blocked,
+                OutcomeReviewCausalStatus::NotClaimed,
+                OutcomeReviewRoiStatus::NotCalculated,
+            )
+        );
+        assert_eq!(
+            review.caveats,
+            BTreeSet::from([
+                OutcomeReviewCaveat::UnattributedOrders,
+                OutcomeReviewCaveat::OutstandingSettlement,
+                OutcomeReviewCaveat::PendingEffect,
+                OutcomeReviewCaveat::UnresolvedEffectCost,
+                OutcomeReviewCaveat::BudgetExceeded,
+                OutcomeReviewCaveat::CrossCurrencyCostWithoutFx,
+                OutcomeReviewCaveat::ImplicitLoopForbidden,
+            ])
+        );
+        let usd = &review.economics[&CurrencyCode::parse("USD").expect("USD")];
+        assert_eq!(
+            (
+                usd.gross_revenue.amount_minor,
+                usd.net_revenue.amount_minor,
+                usd.commission_obligation.amount_minor,
+                usd.commission_outstanding.amount_minor,
+                usd.verified_effect_outflow.amount_minor,
+                usd.unresolved_effect_exposure.amount_minor,
+            ),
+            (10_000, 10_000, 1_000, 1_000, 600, 300)
+        );
+        assert_eq!(
+            review.economics[&CurrencyCode::parse("EUR").expect("EUR")]
+                .verified_effect_outflow
+                .amount_minor,
+            200
+        );
+        assert_eq!(
+            review,
+            ledger
+                .verified_outcome_review_projection(
+                    &parent,
+                    &kpi,
+                    &attribution,
+                    &settlement,
+                    observed_at,
+                )
+                .expect("deterministic replay")
+        );
+        assert!(is_sha256(&review.digest().expect("review digest")));
+
+        let mut tampered_contract_digest = kpi.clone();
+        tampered_contract_digest.source_contract_digest = "0".repeat(64);
+        assert_eq!(
+            ledger.verified_outcome_review_projection(
+                &parent,
+                &tampered_contract_digest,
+                &attribution,
+                &settlement,
+                observed_at,
+            ),
+            Err(OutcomeLedgerError::OutcomeReviewProjectionMismatch)
+        );
+        let mut tampered_kpi = kpi;
+        tampered_kpi.target_met_count = 0;
+        assert_eq!(
+            ledger.verified_outcome_review_projection(
+                &parent,
+                &tampered_kpi,
+                &attribution,
+                &settlement,
+                observed_at,
+            ),
+            Err(OutcomeLedgerError::OutcomeReviewProjectionMismatch)
+        );
+        let mut tampered_parent = parent;
+        tampered_parent.effects[0].amount.amount_minor = 401;
+        assert_eq!(
+            ledger.verified_outcome_review_projection(
+                &tampered_parent,
+                &ledger
+                    .verified_mission_kpi_projection(&tampered_parent, &identity, observed_at)
+                    .expect("tampered parent KPI remains independently recomputable"),
+                &ledger
+                    .verified_attribution_projection(&tampered_parent, &identity, &[], observed_at)
+                    .expect("tampered parent attribution"),
+                &ledger
+                    .verified_settlement_projection(
+                        &tampered_parent,
+                        &identity,
+                        std::slice::from_ref(&partner),
+                        observed_at,
+                    )
+                    .expect("tampered parent settlement"),
+                observed_at,
+            ),
+            Err(OutcomeLedgerError::OutcomeReviewEffectStateMismatch)
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the official-network regression keeps authoritative accrual/reversal, out-of-order callbacks, refund history, payout readback, and duplicate business identity rejection visible together"
+    )]
+    fn settlement_oracle_preserves_official_network_authority_and_order_independence() {
+        let parent = Mission::compile(
+            TenantId::from("tenant-1"),
+            MissionId::from("mission-11"),
+            ProjectId::from("project-1"),
+            "Official network Mission",
+            MissionContract::bootstrap(
+                "Reconcile network-owned settlement facts",
+                ["settlement.compute".into()],
+                now(),
+            ),
+            now(),
+        )
+        .expect("parent Mission");
+        let partner = Partner::create(
+            PartnerId::from("awin-partner"),
+            TenantId::from("tenant-1"),
+            ProjectId::from("project-1"),
+            None,
+            None,
+            "Awin network partner",
+            PartnerSupplyClass::OfficialAuthorizedNetwork,
+            ContactPermission::NetworkAuthorized,
+            Some("5".repeat(64)),
+        )
+        .expect("network partner");
+        let (commerce_connection, person, link) = confirmed_identity_support();
+        let mut network_connection = Connection::register(
+            ConnectionId::from("awin-connection"),
+            TenantId::from("tenant-1"),
+            ProjectId::from("project-1"),
+            "awin",
+            AccountId::from("awin-account"),
+            "awin-account-external",
+            ["transactions.read".into()],
+            now(),
+        )
+        .expect("network connection");
+        network_connection.begin_probe(now()).expect("begin probe");
+        network_connection
+            .apply_probe(
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "awin-account-external".into(),
+                    granted_scopes: BTreeSet::from(["transactions.read".into()]),
+                    probed_at: now(),
+                    valid_until: now() + Duration::hours(1),
+                    credential_expires_at: now() + Duration::hours(2),
+                    evidence_digest: "6".repeat(64),
+                },
+                now(),
+            )
+            .expect("network probe");
+
+        let mut ledger =
+            OutcomeLedger::new(TenantId::from("tenant-1"), ProjectId::from("project-1"))
+                .expect("ledger");
+        ledger
+            .ingest(event(
+                OutcomeEventKind::OrderPlaced,
+                "network-order",
+                Some(10_000),
+            ))
+            .expect("order");
+        let mut refund = event(
+            OutcomeEventKind::RefundIssued,
+            "network-refund",
+            Some(2_500),
+        );
+        refund.identity_link_id = None;
+        refund.refund_id = Some(RefundId::from("network-refund-1"));
+        refund.occurred_at = now() + Duration::minutes(1);
+        refund.received_at = now() + Duration::minutes(2);
+        refund
+            .source_verification
+            .as_mut()
+            .expect("verification")
+            .verified_at = refund.received_at;
+        ledger.ingest(refund).expect("refund");
+
+        let mut reversal = event(
+            OutcomeEventKind::CommissionReversed,
+            "network-reversal",
+            Some(375),
+        );
+        reversal.provider = "awin".into();
+        reversal.connection_id = Some(network_connection.id().clone());
+        reversal.account_id = Some(AccountId::from("awin-account"));
+        reversal.identity_link_id = None;
+        reversal.commission_id = Some(CommissionId::from("network-commission-1"));
+        reversal.partner_id = Some(partner.id.clone());
+        reversal.occurred_at = now() + Duration::minutes(3);
+        reversal.received_at = now() + Duration::minutes(4);
+        reversal
+            .source_verification
+            .as_mut()
+            .expect("verification")
+            .verified_at = reversal.received_at;
+        ledger.ingest(reversal).expect("reversal arrives first");
+        let mut accrual = event(
+            OutcomeEventKind::CommissionAccrued,
+            "network-accrual",
+            Some(1_500),
+        );
+        accrual.provider = "awin".into();
+        accrual.connection_id = Some(network_connection.id().clone());
+        accrual.account_id = Some(AccountId::from("awin-account"));
+        accrual.identity_link_id = None;
+        accrual.commission_id = Some(CommissionId::from("network-commission-1"));
+        accrual.partner_id = Some(partner.id.clone());
+        accrual.occurred_at = now() + Duration::minutes(2);
+        accrual.received_at = now() + Duration::minutes(5);
+        accrual
+            .source_verification
+            .as_mut()
+            .expect("verification")
+            .verified_at = accrual.received_at;
+        ledger.ingest(accrual).expect("accrual arrives later");
+        let mut payout = event(
+            OutcomeEventKind::PayoutCompleted,
+            "network-payout",
+            Some(1_125),
+        );
+        payout.provider = "awin".into();
+        payout.connection_id = Some(network_connection.id().clone());
+        payout.account_id = Some(AccountId::from("awin-account"));
+        payout.identity_link_id = None;
+        payout.order_id = None;
+        payout.payout_id = Some(PayoutId::from("network-payout-1"));
+        payout.partner_id = Some(partner.id.clone());
+        payout.occurred_at = now() + Duration::minutes(6);
+        payout.received_at = now() + Duration::minutes(7);
+        payout
+            .source_verification
+            .as_mut()
+            .expect("verification")
+            .verified_at = payout.received_at;
+        ledger.ingest(payout).expect("network payout");
+
+        let identity_chain = ledger
+            .verified_identity_chain_projection(
+                &[commerce_connection.clone(), network_connection.snapshot()],
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                std::slice::from_ref(&partner),
+                &[],
+            )
+            .expect("network identity chain");
+        let projection = ledger
+            .verified_settlement_projection(
+                &parent,
+                &identity_chain,
+                std::slice::from_ref(&partner),
+                now() + Duration::minutes(8),
+            )
+            .expect("network settlement");
+        assert_eq!(
+            (
+                projection.network_commission_event_count,
+                projection.official_network_group_count,
+                projection.paid_group_count,
+                projection.settlements[0].source_commission_count,
+                projection.settlements[0].commission_amount.amount_minor,
+                projection.settlements[0]
+                    .payout_completed_amount
+                    .amount_minor,
+                projection.settlements[0].basis,
+            ),
+            (
+                2,
+                1,
+                1,
+                1,
+                1_125,
+                1_125,
+                SettlementCommissionBasis::OfficialNetworkFacts,
+            )
+        );
+
+        let mut duplicated = ledger;
+        let mut duplicate_accrual = event(
+            OutcomeEventKind::CommissionAccrued,
+            "network-duplicate-accrual",
+            Some(1_500),
+        );
+        duplicate_accrual.provider = "awin".into();
+        duplicate_accrual.connection_id = Some(network_connection.id().clone());
+        duplicate_accrual.account_id = Some(AccountId::from("awin-account"));
+        duplicate_accrual.identity_link_id = None;
+        duplicate_accrual.commission_id = Some(CommissionId::from("network-commission-1"));
+        duplicate_accrual.partner_id = Some(partner.id.clone());
+        duplicate_accrual.occurred_at = now() + Duration::minutes(2);
+        duplicate_accrual.received_at = now() + Duration::minutes(9);
+        duplicate_accrual
+            .source_verification
+            .as_mut()
+            .expect("verification")
+            .verified_at = duplicate_accrual.received_at;
+        duplicated
+            .ingest(duplicate_accrual)
+            .expect("distinct callback enters immutable ledger");
+        let duplicate_identity = duplicated
+            .verified_identity_chain_projection(
+                &[commerce_connection, network_connection.snapshot()],
+                std::slice::from_ref(&link),
+                std::slice::from_ref(&person),
+                &[],
+                std::slice::from_ref(&partner),
+                &[],
+            )
+            .expect("duplicate identity closure");
+        assert_eq!(
+            duplicated.verified_settlement_projection(
+                &parent,
+                &duplicate_identity,
+                std::slice::from_ref(&partner),
+                now() + Duration::minutes(10),
+            ),
+            Err(OutcomeLedgerError::SettlementCommissionAuthorityMismatch)
+        );
     }
 
     #[test]

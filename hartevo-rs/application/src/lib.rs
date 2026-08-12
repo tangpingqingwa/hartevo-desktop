@@ -63,14 +63,16 @@ use hartevo_domain_kernel::{
     MissionScheduleStatus, MissionStage, MissionTerminalDisposition, Money, OperatingMode,
     Opportunity, OpportunityId, OpportunityStage, OrderId, Outcome, OutcomeAttributionProjection,
     OutcomeDecision, OutcomeEvent, OutcomeIdentityChainProjection, OutcomeLedger,
-    OutcomeLedgerError, OutcomeNormalizationProjection, Partner, PartnerId, PayoutAuthorization,
-    PayoutId, Person, PersonId, PreparedAutomaticReply, Project, ProjectDataCell,
-    ProjectEncryptionMode, ProjectError, ProjectId, ProjectKeyring, ProjectKeyringBootstrap,
-    ReceiptId, RelationshipError, ReviewDecision, ReviewId, RuntimeProcessClaim,
-    RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition, RuntimeProcessIdentity,
-    RuntimeRecoveryAttempt, RuntimeRecoveryAttemptId, RuntimeRecoveryFailureClass,
-    RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt, RuntimeTurnAttemptId,
-    RuntimeTurnError, RuntimeTurnFailureClass, RuntimeTurnObservedKind, RuntimeTurnPrivateMessage,
+    OutcomeLedgerError, OutcomeNormalizationProjection, OutcomeReviewCausalStatus,
+    OutcomeReviewCaveat, OutcomeReviewLoopPolicy, OutcomeReviewProjection, OutcomeReviewRoiStatus,
+    OutcomeSettlementProjection, Partner, PartnerId, PayoutAuthorization, PayoutId, Person,
+    PersonId, PreparedAutomaticReply, Project, ProjectDataCell, ProjectEncryptionMode,
+    ProjectError, ProjectId, ProjectKeyring, ProjectKeyringBootstrap, ReceiptId, RelationshipError,
+    ReviewDecision, ReviewId, RuntimeProcessClaim, RuntimeProcessClaimStatus,
+    RuntimeProcessCleanupDisposition, RuntimeProcessIdentity, RuntimeRecoveryAttempt,
+    RuntimeRecoveryAttemptId, RuntimeRecoveryFailureClass, RuntimeRecoveryStatus,
+    RuntimeResumeStrategy, RuntimeTurnAttempt, RuntimeTurnAttemptId, RuntimeTurnError,
+    RuntimeTurnFailureClass, RuntimeTurnObservedKind, RuntimeTurnPrivateMessage,
     RuntimeTurnRestartDisposition, RuntimeTurnScope, RuntimeTurnStatus, StorageMode,
     SuppressionReason, Task, TaskId, TaskStatus, TenantId, TruthError, TruthFact,
     VerificationStatus, WebhookAttestation, WorkProduct, WorkProductDependencies, WorkProductId,
@@ -2229,6 +2231,9 @@ const VM11_NORMALIZE_DEDUPE_ORDER_HANDLER_ID: &str = "vm11.normalize-dedupe-orde
 const VM11_IDENTITY_CHAIN_HANDLER_ID: &str = "vm11.identity-chain/v1";
 const VM11_MISSION_SPECIFIC_KPI_HANDLER_ID: &str = "vm11.mission-specific-kpi/v1";
 const VM11_ATTRIBUTION_AND_UNATTRIBUTED_HANDLER_ID: &str = "vm11.attribution-and-unattributed/v1";
+const VM11_REFUND_COMMISSION_PAYOUT_RECALC_HANDLER_ID: &str =
+    "vm11.refund-commission-payout-recalc/v1";
+const VM11_OUTCOME_REVIEW_HANDLER_ID: &str = "vm11.outcome-review/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompiledApplicationCheckpointHandler {
@@ -2237,6 +2242,8 @@ enum CompiledApplicationCheckpointHandler {
     IdentityChain,
     MissionSpecificKpi,
     AttributionAndUnattributed,
+    RefundCommissionPayoutRecalc,
+    OutcomeReview,
 }
 
 impl CompiledApplicationCheckpointHandler {
@@ -2247,6 +2254,8 @@ impl CompiledApplicationCheckpointHandler {
             Self::IdentityChain => VM11_IDENTITY_CHAIN_HANDLER_ID,
             Self::MissionSpecificKpi => VM11_MISSION_SPECIFIC_KPI_HANDLER_ID,
             Self::AttributionAndUnattributed => VM11_ATTRIBUTION_AND_UNATTRIBUTED_HANDLER_ID,
+            Self::RefundCommissionPayoutRecalc => VM11_REFUND_COMMISSION_PAYOUT_RECALC_HANDLER_ID,
+            Self::OutcomeReview => VM11_OUTCOME_REVIEW_HANDLER_ID,
         }
     }
 
@@ -2257,6 +2266,8 @@ impl CompiledApplicationCheckpointHandler {
             Self::IdentityChain => "outcome_identity_chain",
             Self::MissionSpecificKpi => "outcome_mission_kpi",
             Self::AttributionAndUnattributed => "outcome_attribution",
+            Self::RefundCommissionPayoutRecalc => "outcome_settlement",
+            Self::OutcomeReview => "outcome_review",
         }
     }
 }
@@ -2517,6 +2528,10 @@ fn compiled_application_checkpoint_handler(
         VM11_ATTRIBUTION_AND_UNATTRIBUTED_HANDLER_ID => {
             Some(CompiledApplicationCheckpointHandler::AttributionAndUnattributed)
         }
+        VM11_REFUND_COMMISSION_PAYOUT_RECALC_HANDLER_ID => {
+            Some(CompiledApplicationCheckpointHandler::RefundCommissionPayoutRecalc)
+        }
+        VM11_OUTCOME_REVIEW_HANDLER_ID => Some(CompiledApplicationCheckpointHandler::OutcomeReview),
         _ => None,
     }
 }
@@ -3261,6 +3276,363 @@ fn vm11_attribution_and_unattributed_application_evidence(
                 source_revision: attribution.source_ledger_revision,
                 projection_digest: attribution.digest()?,
                 oracle_ids: BTreeSet::from(["decision".into(), "outcome".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the evidence builder keeps every settlement count invariant and per-source Oracle responsibility explicit at the completion boundary"
+)]
+fn vm11_refund_commission_payout_recalc_application_evidence(
+    mission: &Mission,
+    parent_mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    settlement: &OutcomeSettlementProjection,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let represented_groups = settlement
+        .paid_group_count
+        .checked_add(settlement.outstanding_group_count)
+        .and_then(|count| count.checked_add(settlement.no_payment_due_group_count));
+    let authority_groups = settlement
+        .official_network_group_count
+        .checked_add(settlement.hartevo_managed_group_count)
+        .and_then(|count| count.checked_add(settlement.tenant_private_group_count));
+    if settlement.tenant_id != mission.tenant_id
+        || settlement.project_id != mission.project_id
+        || mission.contract.parent_mission_id.as_ref() != Some(&settlement.source_mission_id)
+        || parent_mission.tenant_id != mission.tenant_id
+        || parent_mission.project_id != mission.project_id
+        || parent_mission.id != settlement.source_mission_id
+        || parent_mission.revision != settlement.source_mission_revision
+        || settlement.source_mission_revision == 0
+        || settlement.source_ledger_revision == 0
+        || settlement.order_count == 0
+        || usize::try_from(settlement.order_count).ok() != Some(settlement.orders.len())
+        || usize::try_from(settlement.settlement_group_count).ok()
+            != Some(settlement.settlements.len())
+        || represented_groups != Some(settlement.settlement_group_count)
+        || authority_groups != Some(settlement.settlement_group_count)
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    let parent_contract_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-settlement-parent-contract/v1",
+        "missionId": parent_mission.id,
+        "missionRevision": parent_mission.revision,
+        "contract": &parent_mission.contract,
+        "windowStartedAt": settlement.window_started_at,
+        "windowEndedAt": settlement.window_ended_at,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM11_REFUND_COMMISSION_PAYOUT_RECALC_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "parent_mission_contract".into(),
+                source_id: settlement.source_mission_id.to_string(),
+                source_revision: settlement.source_mission_revision,
+                projection_digest: parent_contract_digest,
+                oracle_ids: BTreeSet::from(["decision".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "outcome_settlement".into(),
+                source_id: settlement.project_id.to_string(),
+                source_revision: settlement.source_ledger_revision,
+                projection_digest: settlement.digest()?,
+                oracle_ids: BTreeSet::from(["outcome".into(), "truth".into()]),
+            },
+        ]),
+        observed_at: now,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the evidence builder keeps every review readiness, money, no-causality, and exact parent source invariant visible at the completion boundary"
+)]
+fn vm11_outcome_review_application_evidence(
+    mission: &Mission,
+    parent_mission: &Mission,
+    route: &MissionCheckpointRoute,
+    command: &ExecuteApplicationMissionCheckpoint,
+    review: &OutcomeReviewProjection,
+    now: DateTime<Utc>,
+) -> Result<MissionCheckpointApplicationEvidence, ApplicationError> {
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let checkpoint = definition
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == command.checkpoint_id)
+        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+    let expected_contract_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-mission-kpi-contract-source/v1",
+        "missionId": parent_mission.id,
+        "missionRevision": parent_mission.revision,
+        "contract": &parent_mission.contract,
+    }))?;
+    let represented_orders = review
+        .attributed_order_count
+        .checked_add(review.unattributed_order_count);
+    let represented_settlements = review
+        .paid_or_no_payment_due_group_count
+        .checked_add(review.outstanding_settlement_group_count);
+    let parent_effect_count = u64::try_from(parent_mission.effects.len())
+        .map_err(|_| ApplicationError::ApplicationCheckpointCommandMismatch)?;
+    let expected_budget_projection = match (
+        review.budget.amount_minor,
+        review.budget_currency_verified_cost.amount_minor,
+    ) {
+        (budget, cost) if budget >= 0 && cost >= 0 && cost <= budget => {
+            budget.checked_sub(cost).map(|remaining| (remaining, 0))
+        }
+        (budget, cost) if budget >= 0 && cost >= 0 => {
+            cost.checked_sub(budget).map(|overrun| (0, overrun))
+        }
+        _ => None,
+    };
+    let expected_all_kpis_met = review.target_gap_count == 0;
+    let expected_attribution_complete = review.unattributed_order_count == 0;
+    let expected_settlement_reconciled = review.outstanding_settlement_group_count == 0;
+    let expected_cost_complete =
+        review.unresolved_cost_effect_count == 0 && review.cross_currency_cost_effect_count == 0;
+    let expected_budget_within_limit =
+        expected_budget_projection.is_some_and(|(_, overrun)| overrun == 0);
+    let expected_implicit_loop_forbidden = matches!(
+        parent_mission.contract.mode,
+        OperatingMode::BuildOnce | OperatingMode::OneOffDecision
+    );
+    let expected_scale_evidence_ready = matches!(
+        parent_mission.contract.mode,
+        OperatingMode::Campaign
+            | OperatingMode::ContinuousOperator
+            | OperatingMode::ContinuousRelationship
+    ) && expected_all_kpis_met
+        && expected_attribution_complete
+        && expected_settlement_reconciled
+        && review.pending_effect_count == 0
+        && expected_cost_complete
+        && expected_budget_within_limit;
+    let mut expected_caveats = BTreeSet::new();
+    if !expected_all_kpis_met {
+        expected_caveats.insert(OutcomeReviewCaveat::KpiTargetGap);
+    }
+    if !expected_attribution_complete {
+        expected_caveats.insert(OutcomeReviewCaveat::UnattributedOrders);
+    }
+    if !expected_settlement_reconciled {
+        expected_caveats.insert(OutcomeReviewCaveat::OutstandingSettlement);
+    }
+    if review.pending_effect_count != 0 {
+        expected_caveats.insert(OutcomeReviewCaveat::PendingEffect);
+    }
+    if review.unresolved_cost_effect_count != 0 {
+        expected_caveats.insert(OutcomeReviewCaveat::UnresolvedEffectCost);
+    }
+    if !expected_budget_within_limit {
+        expected_caveats.insert(OutcomeReviewCaveat::BudgetExceeded);
+    }
+    if review.cross_currency_cost_effect_count != 0 {
+        expected_caveats.insert(OutcomeReviewCaveat::CrossCurrencyCostWithoutFx);
+    }
+    if expected_implicit_loop_forbidden {
+        expected_caveats.insert(OutcomeReviewCaveat::ImplicitLoopForbidden);
+    }
+    if review.tenant_id != mission.tenant_id
+        || review.project_id != mission.project_id
+        || mission.contract.parent_mission_id.as_ref() != Some(&review.source_mission_id)
+        || parent_mission.tenant_id != mission.tenant_id
+        || parent_mission.project_id != mission.project_id
+        || parent_mission.id != review.source_mission_id
+        || parent_mission.revision != review.source_mission_revision
+        || review.source_mission_revision == 0
+        || review.source_ledger_revision == 0
+        || review.observed_at != now
+        || review.measurement_count == 0
+        || review.target_met_count.checked_add(review.target_gap_count)
+            != Some(review.measurement_count)
+        || represented_orders != Some(review.order_count)
+        || represented_settlements != Some(review.settlement_group_count)
+        || review.budget != parent_mission.contract.budget
+        || review.budget_currency_verified_cost.currency != review.budget.currency
+        || review.budget_remaining.currency != review.budget.currency
+        || review.budget_overrun.currency != review.budget.currency
+        || review.budget.amount_minor < 0
+        || review.budget_currency_verified_cost.amount_minor < 0
+        || review.budget_remaining.amount_minor < 0
+        || review.budget_overrun.amount_minor < 0
+        || expected_budget_projection
+            != Some((
+                review.budget_remaining.amount_minor,
+                review.budget_overrun.amount_minor,
+            ))
+        || review.verified_effect_count > parent_effect_count
+        || review.pending_effect_count > parent_effect_count
+        || review.unresolved_cost_effect_count > parent_effect_count
+        || review.cross_currency_cost_effect_count > review.verified_effect_count
+        || review.kpi_status != expected_all_kpis_met.into()
+        || review.attribution_status != expected_attribution_complete.into()
+        || review.settlement_status != expected_settlement_reconciled.into()
+        || review.cost_status != expected_cost_complete.into()
+        || review.budget_status != expected_budget_within_limit.into()
+        || review.loop_policy
+            != if expected_implicit_loop_forbidden {
+                OutcomeReviewLoopPolicy::Forbidden
+            } else {
+                OutcomeReviewLoopPolicy::Eligible
+            }
+        || review.scale_evidence_status != expected_scale_evidence_ready.into()
+        || review.caveats != expected_caveats
+        || review.causal_status != OutcomeReviewCausalStatus::NotClaimed
+        || review.roi_status != OutcomeReviewRoiStatus::NotCalculated
+        || review.source_contract_digest != expected_contract_digest
+        || review.economics.iter().any(|(currency, money)| {
+            currency != &money.currency
+                || money.currency != money.gross_revenue.currency
+                || money.currency != money.refunded_amount.currency
+                || money.currency != money.net_revenue.currency
+                || money.currency != money.commission_obligation.currency
+                || money.currency != money.commission_paid.currency
+                || money.currency != money.commission_outstanding.currency
+                || money.currency != money.verified_effect_outflow.currency
+                || money.currency != money.unresolved_effect_exposure.currency
+                || money.gross_revenue.amount_minor < 0
+                || money.refunded_amount.amount_minor < 0
+                || money.net_revenue.amount_minor < 0
+                || money.commission_obligation.amount_minor < 0
+                || money.commission_paid.amount_minor < 0
+                || money.commission_outstanding.amount_minor < 0
+                || money.verified_effect_outflow.amount_minor < 0
+                || money.unresolved_effect_exposure.amount_minor < 0
+        })
+    {
+        return Err(ApplicationError::ApplicationCheckpointCommandMismatch);
+    }
+    let operating_state_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-application-checkpoint-state/v1",
+        "tenantId": mission.tenant_id,
+        "projectId": mission.project_id,
+        "missionId": mission.id,
+        "manifestId": definition.manifest_id,
+        "manifestVersion": definition.manifest_version,
+        "catalogDigest": definition.catalog_digest,
+        "cycle": definition.cycle,
+        "checkpointId": checkpoint.id,
+        "dispatchMissionRevision": command.expected_mission_revision,
+        "dispatchCheckpointRevision": command.expected_checkpoint_revision,
+        "verificationMissionRevision": mission.revision,
+        "verificationCheckpointRevision": checkpoint.revision,
+        "capabilityId": route.capability_id,
+        "executor": route.executor,
+        "completionPolicy": route.completion_policy,
+    }))?;
+    let parent_review_digest = canonical_sha256(&serde_json::json!({
+        "schemaVersion": "hartevo-outcome-review-parent-source/v1",
+        "missionId": parent_mission.id,
+        "missionRevision": parent_mission.revision,
+        "contract": &parent_mission.contract,
+        "effectCount": parent_mission.effects.len(),
+        "effectCostSourceDigest": review.effect_cost_source_digest,
+    }))?;
+    Ok(MissionCheckpointApplicationEvidence {
+        schema_version: MissionCheckpointApplicationEvidence::SCHEMA_VERSION,
+        handler_id: VM11_OUTCOME_REVIEW_HANDLER_ID.into(),
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        manifest_id: definition.manifest_id.clone(),
+        manifest_version: definition.manifest_version,
+        catalog_digest: definition.catalog_digest.clone(),
+        cycle: definition.cycle,
+        checkpoint_id: checkpoint.id.clone(),
+        dispatch_mission_revision: command.expected_mission_revision,
+        dispatch_checkpoint_revision: command.expected_checkpoint_revision,
+        verification_mission_revision: mission.revision,
+        verification_checkpoint_revision: checkpoint.revision,
+        capability_id: route.capability_id.clone(),
+        executor: route.executor,
+        completion_policy: route
+            .completion_policy
+            .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+        sources: BTreeSet::from([
+            MissionCheckpointOracleSource {
+                source_kind: "mission_checkpoint".into(),
+                source_id: format!("{}:{}", mission.id, checkpoint.id),
+                source_revision: command.expected_checkpoint_revision,
+                projection_digest: operating_state_digest,
+                oracle_ids: BTreeSet::from(["operating_state".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "parent_mission_review".into(),
+                source_id: parent_mission.id.to_string(),
+                source_revision: parent_mission.revision,
+                projection_digest: parent_review_digest,
+                oracle_ids: BTreeSet::from(["decision".into()]),
+            },
+            MissionCheckpointOracleSource {
+                source_kind: "outcome_review".into(),
+                source_id: review.project_id.to_string(),
+                source_revision: review.source_ledger_revision,
+                projection_digest: review.digest()?,
+                oracle_ids: BTreeSet::from(["outcome".into()]),
             },
         ]),
         observed_at: now,
@@ -7655,11 +8027,13 @@ impl ApplicationService {
             Err(error) => return Err(error.into()),
         };
         let mut application_source_fences = Vec::new();
-        let identity_chain = if matches!(
+        let (identity_chain, identity_support) = if matches!(
             compiled_handler,
             CompiledApplicationCheckpointHandler::IdentityChain
                 | CompiledApplicationCheckpointHandler::MissionSpecificKpi
                 | CompiledApplicationCheckpointHandler::AttributionAndUnattributed
+                | CompiledApplicationCheckpointHandler::RefundCommissionPayoutRecalc
+                | CompiledApplicationCheckpointHandler::OutcomeReview
         ) {
             let support = match load_outcome_identity_chain_support(&self.store, &outcome_ledger) {
                 Ok(support) => support,
@@ -7671,6 +8045,12 @@ impl ApplicationService {
                         }
                         CompiledApplicationCheckpointHandler::AttributionAndUnattributed => {
                             "attribution_identity_support_missing"
+                        }
+                        CompiledApplicationCheckpointHandler::RefundCommissionPayoutRecalc => {
+                            "settlement_identity_support_missing"
+                        }
+                        CompiledApplicationCheckpointHandler::OutcomeReview => {
+                            "outcome_review_identity_support_missing"
                         }
                         _ => "identity_chain_support_missing",
                     };
@@ -7704,7 +8084,7 @@ impl ApplicationService {
                 &support.partners,
                 &support.opportunities,
             ) {
-                Ok(projection) => Some(projection),
+                Ok(projection) => (Some(projection), Some(support)),
                 Err(
                     error @ (OutcomeLedgerError::IdentityLinkUnconfirmed
                     | OutcomeLedgerError::IdentityProviderAccountMismatch
@@ -7735,6 +8115,12 @@ impl ApplicationService {
                         CompiledApplicationCheckpointHandler::AttributionAndUnattributed => {
                             "attribution_identity_chain_changed"
                         }
+                        CompiledApplicationCheckpointHandler::RefundCommissionPayoutRecalc => {
+                            "settlement_identity_chain_changed"
+                        }
+                        CompiledApplicationCheckpointHandler::OutcomeReview => {
+                            "outcome_review_identity_chain_changed"
+                        }
                         _ => base_code,
                     };
                     return persist_application_checkpoint_block(
@@ -7757,12 +8143,14 @@ impl ApplicationService {
                 Err(error) => return Err(error.into()),
             }
         } else {
-            None
+            (None, None)
         };
         let parent_mission = if matches!(
             compiled_handler,
             CompiledApplicationCheckpointHandler::MissionSpecificKpi
                 | CompiledApplicationCheckpointHandler::AttributionAndUnattributed
+                | CompiledApplicationCheckpointHandler::RefundCommissionPayoutRecalc
+                | CompiledApplicationCheckpointHandler::OutcomeReview
         ) {
             let Some(parent_mission_id) = mission.contract.parent_mission_id.clone() else {
                 let (code, detail) = match compiled_handler {
@@ -7773,6 +8161,14 @@ impl ApplicationService {
                     CompiledApplicationCheckpointHandler::AttributionAndUnattributed => (
                         "attribution_parent_missing",
                         "attribution_and_unattributed requires an immutable parent Mission reference; no current Mission or project aggregate was substituted.",
+                    ),
+                    CompiledApplicationCheckpointHandler::RefundCommissionPayoutRecalc => (
+                        "settlement_parent_missing",
+                        "refund_commission_payout_recalc requires an immutable parent Mission reference; no current Mission or project aggregate was substituted.",
+                    ),
+                    CompiledApplicationCheckpointHandler::OutcomeReview => (
+                        "outcome_review_parent_missing",
+                        "outcome_review requires an immutable parent Mission reference; no current Mission, stale summary, or project aggregate was substituted.",
                     ),
                     _ => unreachable!("parent-bound handler alternatives are exhaustive"),
                 };
@@ -7810,6 +8206,14 @@ impl ApplicationService {
                             "attribution_parent_unavailable",
                             "The exact attribution parent Mission is unavailable; no sibling Mission contract or project aggregate was inferred.",
                         ),
+                        CompiledApplicationCheckpointHandler::RefundCommissionPayoutRecalc => (
+                            "settlement_parent_unavailable",
+                            "The exact settlement parent Mission is unavailable; no sibling Mission contract or project aggregate was inferred.",
+                        ),
+                        CompiledApplicationCheckpointHandler::OutcomeReview => (
+                            "outcome_review_parent_unavailable",
+                            "The exact review parent Mission is unavailable; no sibling Mission contract, cached narrative, or project aggregate was inferred.",
+                        ),
                         _ => unreachable!("parent-bound handler alternatives are exhaustive"),
                     };
                     return persist_application_checkpoint_block(
@@ -7834,12 +8238,20 @@ impl ApplicationService {
                 parent_mission.revision,
             ));
             if !vm11_inherits_exact_parent_contract(&mission, &parent_mission) {
-                let code = if compiled_handler
-                    == CompiledApplicationCheckpointHandler::MissionSpecificKpi
-                {
-                    "mission_kpi_parent_contract_mismatch"
-                } else {
-                    "attribution_parent_contract_mismatch"
+                let code = match compiled_handler {
+                    CompiledApplicationCheckpointHandler::MissionSpecificKpi => {
+                        "mission_kpi_parent_contract_mismatch"
+                    }
+                    CompiledApplicationCheckpointHandler::AttributionAndUnattributed => {
+                        "attribution_parent_contract_mismatch"
+                    }
+                    CompiledApplicationCheckpointHandler::RefundCommissionPayoutRecalc => {
+                        "settlement_parent_contract_mismatch"
+                    }
+                    CompiledApplicationCheckpointHandler::OutcomeReview => {
+                        "outcome_review_parent_contract_mismatch"
+                    }
+                    _ => unreachable!("parent-bound handler alternatives are exhaustive"),
                 };
                 return persist_application_checkpoint_block(
                     &mut self.store,
@@ -7860,9 +8272,11 @@ impl ApplicationService {
         } else {
             None
         };
-        let mission_kpi = if compiled_handler
-            == CompiledApplicationCheckpointHandler::MissionSpecificKpi
-        {
+        let mission_kpi = if matches!(
+            compiled_handler,
+            CompiledApplicationCheckpointHandler::MissionSpecificKpi
+                | CompiledApplicationCheckpointHandler::OutcomeReview
+        ) {
             let current_identity_chain = identity_chain.as_ref().ok_or(
                 ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
                     handler_id: handler_id.into(),
@@ -7932,9 +8346,11 @@ impl ApplicationService {
         } else {
             None
         };
-        let outcome_attribution = if compiled_handler
-            == CompiledApplicationCheckpointHandler::AttributionAndUnattributed
-        {
+        let outcome_attribution = if matches!(
+            compiled_handler,
+            CompiledApplicationCheckpointHandler::AttributionAndUnattributed
+                | CompiledApplicationCheckpointHandler::OutcomeReview
+        ) {
             let parent_mission = parent_mission.as_ref().ok_or(
                 ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
                     handler_id: handler_id.into(),
@@ -8130,6 +8546,176 @@ impl ApplicationService {
         } else {
             None
         };
+        let outcome_settlement = if matches!(
+            compiled_handler,
+            CompiledApplicationCheckpointHandler::RefundCommissionPayoutRecalc
+                | CompiledApplicationCheckpointHandler::OutcomeReview
+        ) {
+            let parent_mission = parent_mission.as_ref().ok_or(
+                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                    handler_id: handler_id.into(),
+                },
+            )?;
+            let current_identity_chain = identity_chain.as_ref().ok_or(
+                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                    handler_id: handler_id.into(),
+                },
+            )?;
+            let current_identity_support = identity_support.as_ref().ok_or(
+                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                    handler_id: handler_id.into(),
+                },
+            )?;
+            match outcome_ledger.verified_settlement_projection(
+                parent_mission,
+                current_identity_chain,
+                &current_identity_support.partners,
+                now,
+            ) {
+                Ok(projection) => Some(projection),
+                Err(
+                    error @ (OutcomeLedgerError::SettlementMissionScopeMismatch
+                    | OutcomeLedgerError::SettlementSourceOrdersUnavailable
+                    | OutcomeLedgerError::SettlementIdentityChainMismatch
+                    | OutcomeLedgerError::SettlementWindowMismatch
+                    | OutcomeLedgerError::SettlementPartnerSupportClosureMismatch
+                    | OutcomeLedgerError::SettlementPartnerPolicyMismatch
+                    | OutcomeLedgerError::SettlementCommissionAuthorityMismatch
+                    | OutcomeLedgerError::SettlementCommissionRecalculationRequired
+                    | OutcomeLedgerError::SettlementPayoutMismatch
+                    | OutcomeLedgerError::SettlementDuplicatePayout
+                    | OutcomeLedgerError::SettlementMoneyMismatch),
+                ) => {
+                    let (code, recoverable) = match error {
+                        OutcomeLedgerError::SettlementSourceOrdersUnavailable => {
+                            ("settlement_source_orders_unavailable", true)
+                        }
+                        OutcomeLedgerError::SettlementCommissionRecalculationRequired => {
+                            ("settlement_commission_recalculation_required", true)
+                        }
+                        OutcomeLedgerError::SettlementPartnerSupportClosureMismatch => {
+                            ("settlement_partner_support_changed", true)
+                        }
+                        OutcomeLedgerError::SettlementIdentityChainMismatch => {
+                            ("settlement_identity_chain_changed", true)
+                        }
+                        OutcomeLedgerError::SettlementPartnerPolicyMismatch => {
+                            ("settlement_partner_policy_invalid", false)
+                        }
+                        OutcomeLedgerError::SettlementCommissionAuthorityMismatch => {
+                            ("settlement_commission_authority_mismatch", false)
+                        }
+                        OutcomeLedgerError::SettlementPayoutMismatch => {
+                            ("settlement_payout_mismatch", false)
+                        }
+                        OutcomeLedgerError::SettlementDuplicatePayout => {
+                            ("settlement_duplicate_payout", false)
+                        }
+                        OutcomeLedgerError::SettlementMoneyMismatch => {
+                            ("settlement_money_mismatch", false)
+                        }
+                        OutcomeLedgerError::SettlementMissionScopeMismatch
+                        | OutcomeLedgerError::SettlementWindowMismatch => {
+                            ("settlement_source_inconsistent", false)
+                        }
+                        _ => unreachable!("settlement error alternatives are exhaustive"),
+                    };
+                    return persist_application_checkpoint_block(
+                        &mut self.store,
+                        &mut mission,
+                        &command,
+                        &dispatch,
+                        handler_id,
+                        code,
+                        format!(
+                            "{} failed its deterministic settlement Oracle; immutable orders, separate refunds, current commission revisions, supply-class authority, minor-unit currency, and independently verified payout facts were not weakened or fabricated.",
+                            command.checkpoint_id
+                        ),
+                        recoverable,
+                        outcome_ledger.revision,
+                        &application_source_fences,
+                        now,
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        let outcome_review = if compiled_handler
+            == CompiledApplicationCheckpointHandler::OutcomeReview
+        {
+            let parent_mission = parent_mission.as_ref().ok_or(
+                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                    handler_id: handler_id.into(),
+                },
+            )?;
+            let kpi = mission_kpi.as_ref().ok_or(
+                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                    handler_id: handler_id.into(),
+                },
+            )?;
+            let attribution = outcome_attribution.as_ref().ok_or(
+                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                    handler_id: handler_id.into(),
+                },
+            )?;
+            let settlement = outcome_settlement.as_ref().ok_or(
+                ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                    handler_id: handler_id.into(),
+                },
+            )?;
+            match outcome_ledger.verified_outcome_review_projection(
+                parent_mission,
+                kpi,
+                attribution,
+                settlement,
+                now,
+            ) {
+                Ok(projection) => Some(projection),
+                Err(
+                    error @ (OutcomeLedgerError::OutcomeReviewScopeMismatch
+                    | OutcomeLedgerError::OutcomeReviewProjectionMismatch
+                    | OutcomeLedgerError::OutcomeReviewEffectStateMismatch
+                    | OutcomeLedgerError::OutcomeReviewMoneyMismatch),
+                ) => {
+                    let code = match error {
+                        OutcomeLedgerError::OutcomeReviewScopeMismatch => {
+                            "outcome_review_source_inconsistent"
+                        }
+                        OutcomeLedgerError::OutcomeReviewProjectionMismatch => {
+                            "outcome_review_projection_inconsistent"
+                        }
+                        OutcomeLedgerError::OutcomeReviewEffectStateMismatch => {
+                            "outcome_review_effect_state_inconsistent"
+                        }
+                        OutcomeLedgerError::OutcomeReviewMoneyMismatch => {
+                            "outcome_review_money_inconsistent"
+                        }
+                        _ => unreachable!("outcome review error alternatives are exhaustive"),
+                    };
+                    return persist_application_checkpoint_block(
+                        &mut self.store,
+                        &mut mission,
+                        &command,
+                        &dispatch,
+                        handler_id,
+                        code,
+                        format!(
+                            "{} could not freeze one exact KPI, attribution, settlement and verified-cost review; no action, FX conversion, causal ROI, or replacement summary was fabricated.",
+                            command.checkpoint_id
+                        ),
+                        false,
+                        outcome_ledger.revision,
+                        &application_source_fences,
+                        now,
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
         let expected_mission_revision = mission.revision;
         if mission.stage == MissionStage::Blocked {
             mission.resume(now)?;
@@ -8200,6 +8786,42 @@ impl ApplicationService {
                     route,
                     &command,
                     outcome_attribution.as_ref().ok_or(
+                        ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                            handler_id: handler_id.into(),
+                        },
+                    )?,
+                    now,
+                )?
+            }
+            CompiledApplicationCheckpointHandler::RefundCommissionPayoutRecalc => {
+                vm11_refund_commission_payout_recalc_application_evidence(
+                    &mission,
+                    parent_mission.as_ref().ok_or(
+                        ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                            handler_id: handler_id.into(),
+                        },
+                    )?,
+                    route,
+                    &command,
+                    outcome_settlement.as_ref().ok_or(
+                        ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                            handler_id: handler_id.into(),
+                        },
+                    )?,
+                    now,
+                )?
+            }
+            CompiledApplicationCheckpointHandler::OutcomeReview => {
+                vm11_outcome_review_application_evidence(
+                    &mission,
+                    parent_mission.as_ref().ok_or(
+                        ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                            handler_id: handler_id.into(),
+                        },
+                    )?,
+                    route,
+                    &command,
+                    outcome_review.as_ref().ok_or(
                         ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
                             handler_id: handler_id.into(),
                         },
@@ -8299,6 +8921,72 @@ impl ApplicationService {
                     "causalClaim": projection.causal_claim,
                     "windowStartedAt": projection.window_started_at,
                     "windowEndedAt": projection.window_ended_at,
+                    "parentMissionRevision": projection.source_mission_revision,
+                })
+            }
+            CompiledApplicationCheckpointHandler::RefundCommissionPayoutRecalc => {
+                let projection = outcome_settlement.as_ref().ok_or(
+                    ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                        handler_id: handler_id.into(),
+                    },
+                )?;
+                serde_json::json!({
+                    "orderCount": projection.order_count,
+                    "refundedOrderCount": projection.refunded_order_count,
+                    "refundCount": projection.refund_count,
+                    "calculatedCommissionCount": projection.calculated_commission_count,
+                    "networkCommissionEventCount": projection.network_commission_event_count,
+                    "payoutCount": projection.payout_count,
+                    "settlementGroupCount": projection.settlement_group_count,
+                    "paidGroupCount": projection.paid_group_count,
+                    "outstandingGroupCount": projection.outstanding_group_count,
+                    "noPaymentDueGroupCount": projection.no_payment_due_group_count,
+                    "officialNetworkGroupCount": projection.official_network_group_count,
+                    "hartevoManagedGroupCount": projection.hartevo_managed_group_count,
+                    "tenantPrivateGroupCount": projection.tenant_private_group_count,
+                    "windowStartedAt": projection.window_started_at,
+                    "windowEndedAt": projection.window_ended_at,
+                    "parentMissionRevision": projection.source_mission_revision,
+                })
+            }
+            CompiledApplicationCheckpointHandler::OutcomeReview => {
+                let projection = outcome_review.as_ref().ok_or(
+                    ApplicationError::ApplicationCheckpointHandlerRegistryMismatch {
+                        handler_id: handler_id.into(),
+                    },
+                )?;
+                serde_json::json!({
+                    "measurementCount": projection.measurement_count,
+                    "targetMetCount": projection.target_met_count,
+                    "targetGapCount": projection.target_gap_count,
+                    "orderCount": projection.order_count,
+                    "attributedOrderCount": projection.attributed_order_count,
+                    "unattributedOrderCount": projection.unattributed_order_count,
+                    "settlementGroupCount": projection.settlement_group_count,
+                    "outstandingSettlementGroupCount": projection.outstanding_settlement_group_count,
+                    "verifiedEffectCount": projection.verified_effect_count,
+                    "pendingEffectCount": projection.pending_effect_count,
+                    "unresolvedCostEffectCount": projection.unresolved_cost_effect_count,
+                    "crossCurrencyCostEffectCount": projection.cross_currency_cost_effect_count,
+                    "budgetCurrency": projection.budget.currency,
+                    "budgetMinor": projection.budget.amount_minor,
+                    "verifiedCostMinor": projection.budget_currency_verified_cost.amount_minor,
+                    "budgetRemainingMinor": projection.budget_remaining.amount_minor,
+                    "budgetOverrunMinor": projection.budget_overrun.amount_minor,
+                    "kpiStatus": projection.kpi_status,
+                    "attributionStatus": projection.attribution_status,
+                    "settlementStatus": projection.settlement_status,
+                    "costStatus": projection.cost_status,
+                    "budgetStatus": projection.budget_status,
+                    "scaleEvidenceStatus": projection.scale_evidence_status,
+                    "loopPolicy": projection.loop_policy,
+                    "causalStatus": projection.causal_status,
+                    "roiStatus": projection.roi_status,
+                    "caveats": projection.caveats,
+                    "currencyBucketCount": projection.economics.len(),
+                    "windowStartedAt": projection.window_started_at,
+                    "outcomeWindowEndedAt": projection.outcome_window_ended_at,
+                    "observedAt": projection.observed_at,
                     "parentMissionRevision": projection.source_mission_revision,
                 })
             }
@@ -19456,9 +20144,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the VM-11 handler Journey proves empty-source and identity-conflict recovery, exact replay, parent-bound KPI recomputation, non-empty source-verified attribution, multi-source-fenced completion, next-route handoff, and unsupported-route honesty in one ordered contract"
+        reason = "the VM-11 handler Journey proves empty-source and identity-conflict recovery, exact replay, parent-bound KPI recomputation, source-verified attribution, settlement, deterministic outcome review, and Human next-route handoff in one ordered contract"
     )]
-    fn vm11_ingest_normalization_identity_kpi_and_attribution_handlers_are_source_fenced_and_replayable()
+    fn vm11_ingest_normalization_identity_kpi_attribution_settlement_and_review_handlers_are_source_fenced_and_replayable()
      {
         let workspace = tempfile::tempdir().expect("project workspace");
         let project_id = ProjectId::from("vm11-application-project");
@@ -20557,8 +21245,8 @@ mod tests {
             ),
             (
                 "refund_commission_payout_recalc",
-                Some(ApplicationCheckpointHandlerStatus::NotImplemented),
-                None,
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM11_REFUND_COMMISSION_PAYOUT_RECALC_HANDLER_ID),
             )
         );
         let attribution_mission = service
@@ -20677,6 +21365,551 @@ mod tests {
                 .len(),
             event_count_after_attribution
         );
+        let settlement_partner_id = PartnerId::from("vm11-settlement-partner");
+        service
+            .create_partner(
+                Partner::create(
+                    settlement_partner_id.clone(),
+                    tenant_id.clone(),
+                    project_id.clone(),
+                    None,
+                    None,
+                    "Verified opt-in settlement partner",
+                    PartnerSupplyClass::HartevoOptIn,
+                    ContactPermission::ExplicitOptIn,
+                    Some("6".repeat(64)),
+                )
+                .expect("settlement partner"),
+                now() + Duration::seconds(22),
+            )
+            .expect("persist settlement partner");
+        service
+            .calculate_commission(
+                CalculateCommission {
+                    project_id: project_id.clone(),
+                    order_id: OrderId::from("vm11-attributed-order"),
+                    partner_id: settlement_partner_id.clone(),
+                    commission_id: CommissionId::from("vm11-commission-before-refund"),
+                    rate: "0.10".parse().expect("commission rate"),
+                    terms_digest: "7".repeat(64),
+                },
+                now() + Duration::seconds(22),
+            )
+            .expect("initial commission");
+        service
+            .ingest_outcome_event(
+                OutcomeEvent {
+                    id: OutcomeEventId::from("vm11-refund-event"),
+                    tenant_id: tenant_id.clone(),
+                    project_id: project_id.clone(),
+                    mission_id: parent_mission_id.clone(),
+                    kind: OutcomeEventKind::RefundIssued,
+                    provider: "user-review".into(),
+                    connection_id: Some(ConnectionId::from("vm11-commerce-connection")),
+                    account_id: Some(AccountId::from("project-owner")),
+                    source_event_id: "PRIVATE-REFUND-PROVIDER-ID".into(),
+                    identity_link_id: None,
+                    opportunity_id: None,
+                    campaign_id: None,
+                    order_id: Some(OrderId::from("vm11-attributed-order")),
+                    refund_id: Some(RefundId::from("vm11-refund")),
+                    commission_id: None,
+                    payout_id: None,
+                    partner_id: None,
+                    amount: Some(Money::new(2_500, CurrencyCode::parse("USD").expect("USD"))),
+                    occurred_at: now() + Duration::seconds(23),
+                    received_at: now() + Duration::seconds(24),
+                    evidence_digest: "8".repeat(64),
+                    raw_payload_digest: "9".repeat(64),
+                    source_verification: Some(OutcomeSourceVerification {
+                        method: OutcomeVerificationMethod::SignedWebhook,
+                        verifier: "commerce-refund-webhook".into(),
+                        independent: true,
+                        verified_at: now() + Duration::seconds(24),
+                        evidence_digest: "a".repeat(64),
+                    }),
+                },
+                now() + Duration::seconds(24),
+            )
+            .expect("verified refund");
+        let stale_settlement_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: refund_dispatch.checkpoint_id.clone(),
+            expected_mission_revision: refund_dispatch.mission_revision,
+            expected_checkpoint_revision: refund_dispatch.checkpoint_revision,
+        };
+        assert_eq!(
+            service
+                .execute_application_mission_checkpoint(
+                    stale_settlement_command.clone(),
+                    now() + Duration::seconds(25),
+                )
+                .expect("stale commission must block"),
+            ApplicationMissionCheckpointExecution::Blocked {
+                checkpoint_id: "refund_commission_payout_recalc".into(),
+                code: "settlement_commission_recalculation_required".into(),
+                outcome_ledger_revision: 6,
+                replayed: false,
+            }
+        );
+        assert_eq!(
+            service
+                .execute_application_mission_checkpoint(
+                    stale_settlement_command,
+                    now() + Duration::seconds(25),
+                )
+                .expect("exact stale-commission block replay"),
+            ApplicationMissionCheckpointExecution::Blocked {
+                checkpoint_id: "refund_commission_payout_recalc".into(),
+                code: "settlement_commission_recalculation_required".into(),
+                outcome_ledger_revision: 6,
+                replayed: true,
+            }
+        );
+        let (_, adjusted_commission) = service
+            .calculate_commission(
+                CalculateCommission {
+                    project_id: project_id.clone(),
+                    order_id: OrderId::from("vm11-attributed-order"),
+                    partner_id: settlement_partner_id.clone(),
+                    commission_id: CommissionId::from("vm11-commission-after-refund"),
+                    rate: "0.10".parse().expect("commission rate"),
+                    terms_digest: "7".repeat(64),
+                },
+                now() + Duration::seconds(26),
+            )
+            .expect("refund-adjusted commission");
+        assert_eq!(
+            (
+                adjusted_commission.eligible_net_amount.amount_minor,
+                adjusted_commission.commission_amount.amount_minor,
+            ),
+            (10_000, 1_000)
+        );
+        let payout_connection_id = ConnectionId::from("vm11-stripe-payout-connection");
+        service
+            .register_connection(
+                Connection::register(
+                    payout_connection_id.clone(),
+                    tenant_id.clone(),
+                    project_id.clone(),
+                    "stripe-connect",
+                    AccountId::from("vm11-connected-account"),
+                    "vm11-connected-account-external",
+                    ["payout.read".into()],
+                    now() + Duration::seconds(26),
+                )
+                .expect("payout connection"),
+                now() + Duration::seconds(26),
+            )
+            .expect("persist payout connection");
+        service
+            .record_connection_probe(
+                &project_id,
+                &payout_connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "vm11-connected-account-external".into(),
+                    granted_scopes: BTreeSet::from(["payout.read".into()]),
+                    probed_at: now() + Duration::seconds(27),
+                    valid_until: now() + Duration::days(30),
+                    credential_expires_at: now() + Duration::days(30),
+                    evidence_digest: "b".repeat(64),
+                },
+                now() + Duration::seconds(27),
+            )
+            .expect("probe payout connection");
+        service
+            .ingest_outcome_event(
+                OutcomeEvent {
+                    id: OutcomeEventId::from("vm11-payout-event"),
+                    tenant_id: tenant_id.clone(),
+                    project_id: project_id.clone(),
+                    mission_id: parent_mission_id.clone(),
+                    kind: OutcomeEventKind::PayoutCompleted,
+                    provider: "stripe-connect".into(),
+                    connection_id: Some(payout_connection_id),
+                    account_id: Some(AccountId::from("vm11-connected-account")),
+                    source_event_id: "PRIVATE-PAYOUT-PROVIDER-ID".into(),
+                    identity_link_id: None,
+                    opportunity_id: None,
+                    campaign_id: None,
+                    order_id: None,
+                    refund_id: None,
+                    commission_id: None,
+                    payout_id: Some(PayoutId::from("vm11-payout")),
+                    partner_id: Some(settlement_partner_id),
+                    amount: Some(Money::new(1_000, CurrencyCode::parse("USD").expect("USD"))),
+                    occurred_at: now() + Duration::seconds(28),
+                    received_at: now() + Duration::seconds(29),
+                    evidence_digest: "c".repeat(64),
+                    raw_payload_digest: "d".repeat(64),
+                    source_verification: Some(OutcomeSourceVerification {
+                        method: OutcomeVerificationMethod::IndependentReadback,
+                        verifier: "stripe-payout-readback".into(),
+                        independent: true,
+                        verified_at: now() + Duration::seconds(29),
+                        evidence_digest: "e".repeat(64),
+                    }),
+                },
+                now() + Duration::seconds(29),
+            )
+            .expect("verified payout fact");
+        let recovered_settlement_dispatch = service
+            .dispatch_current_mission_checkpoint(
+                &project_id,
+                &mission_id,
+                now() + Duration::seconds(30),
+            )
+            .expect("settlement recovers after commission recalculation");
+        let settlement_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: recovered_settlement_dispatch.checkpoint_id,
+            expected_mission_revision: recovered_settlement_dispatch.mission_revision,
+            expected_checkpoint_revision: recovered_settlement_dispatch.checkpoint_revision,
+        };
+        let settlement_completed = service
+            .execute_application_mission_checkpoint(
+                settlement_command.clone(),
+                now() + Duration::seconds(30),
+            )
+            .expect("source-fenced settlement completion");
+        let ApplicationMissionCheckpointExecution::Completed {
+            completion_evidence_digest: settlement_evidence_digest,
+            outcome_ledger_revision: settlement_ledger_revision,
+            replayed: settlement_replayed,
+            next_dispatch: outcome_review_dispatch,
+            ..
+        } = settlement_completed
+        else {
+            panic!("refund_commission_payout_recalc must complete from the nonempty order view")
+        };
+        assert_eq!(
+            (settlement_ledger_revision, settlement_replayed),
+            (8, false)
+        );
+        let outcome_review_dispatch = outcome_review_dispatch.expect("outcome review route");
+        assert_eq!(
+            (
+                outcome_review_dispatch.checkpoint_id.as_str(),
+                outcome_review_dispatch.application_handler_status,
+                outcome_review_dispatch.application_handler_id.as_deref(),
+            ),
+            (
+                "outcome_review",
+                Some(ApplicationCheckpointHandlerStatus::Implemented),
+                Some(VM11_OUTCOME_REVIEW_HANDLER_ID),
+            )
+        );
+        let settled_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("settled Mission");
+        let settlement_evidence = settled_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "refund_commission_payout_recalc")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .and_then(|completion| completion.application_evidence.as_ref())
+            .expect("settlement Application evidence");
+        assert_eq!(
+            (
+                settlement_evidence.handler_id.as_str(),
+                settlement_evidence.digest(),
+                settlement_evidence
+                    .sources
+                    .iter()
+                    .map(|source| source.source_kind.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                VM11_REFUND_COMMISSION_PAYOUT_RECALC_HANDLER_ID,
+                settlement_evidence_digest,
+                BTreeSet::from([
+                    "mission_checkpoint",
+                    "outcome_settlement",
+                    "parent_mission_contract",
+                ]),
+            )
+        );
+        let settled_ledger = service
+            .store
+            .load_outcome_ledger(&project_id)
+            .expect("settled Outcome Ledger");
+        let settled_identity_support =
+            load_outcome_identity_chain_support(&service.store, &settled_ledger)
+                .expect("settled identity support");
+        let settled_identity_chain = settled_ledger
+            .verified_identity_chain_projection(
+                &settled_identity_support.connections,
+                &settled_identity_support.identity_links,
+                &settled_identity_support.people,
+                &settled_identity_support.companies,
+                &settled_identity_support.partners,
+                &settled_identity_support.opportunities,
+            )
+            .expect("settled identity chain");
+        let recomputed_settlement = settled_ledger
+            .verified_settlement_projection(
+                &current_parent,
+                &settled_identity_chain,
+                &settled_identity_support.partners,
+                now() + Duration::seconds(30),
+            )
+            .expect("recomputed settlement Oracle");
+        let expected_parent_contract_digest = canonical_sha256(&serde_json::json!({
+            "schemaVersion": "hartevo-settlement-parent-contract/v1",
+            "missionId": &current_parent.id,
+            "missionRevision": current_parent.revision,
+            "contract": &current_parent.contract,
+            "windowStartedAt": recomputed_settlement.window_started_at,
+            "windowEndedAt": recomputed_settlement.window_ended_at,
+        }))
+        .expect("parent contract evidence digest");
+        assert_eq!(
+            settlement_evidence
+                .sources
+                .iter()
+                .find(|source| source.source_kind == "parent_mission_contract")
+                .map(|source| source.projection_digest.as_str()),
+            Some(expected_parent_contract_digest.as_str())
+        );
+        assert_eq!(
+            (
+                recomputed_settlement.order_count,
+                recomputed_settlement.refund_count,
+                recomputed_settlement.settlement_group_count,
+                settlement_evidence
+                    .sources
+                    .iter()
+                    .find(|source| source.source_kind == "outcome_settlement")
+                    .map(|source| (source.source_revision, source.projection_digest.as_str())),
+            ),
+            (
+                1,
+                1,
+                1,
+                Some((
+                    8,
+                    recomputed_settlement
+                        .digest()
+                        .expect("settlement digest")
+                        .as_str(),
+                )),
+            )
+        );
+        let event_count_after_settlement = service
+            .mission_events(&project_id, &mission_id)
+            .expect("settlement events")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    settlement_command,
+                    now() + Duration::seconds(31),
+                )
+                .expect("exact settlement completion replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: true,
+                outcome_ledger_revision: 8,
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged settlement replay events")
+                .len(),
+            event_count_after_settlement
+        );
+        let review_command = ExecuteApplicationMissionCheckpoint {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            checkpoint_id: outcome_review_dispatch.checkpoint_id,
+            expected_mission_revision: outcome_review_dispatch.mission_revision,
+            expected_checkpoint_revision: outcome_review_dispatch.checkpoint_revision,
+        };
+        let review_completed = service
+            .execute_application_mission_checkpoint(
+                review_command.clone(),
+                now() + Duration::seconds(32),
+            )
+            .expect("source-fenced outcome review completion");
+        let ApplicationMissionCheckpointExecution::Completed {
+            completion_evidence_digest: review_evidence_digest,
+            outcome_ledger_revision: review_ledger_revision,
+            replayed: review_replayed,
+            next_dispatch: human_decision_dispatch,
+            ..
+        } = review_completed
+        else {
+            panic!("outcome_review must freeze deterministic decision inputs")
+        };
+        assert_eq!((review_ledger_revision, review_replayed), (8, false));
+        let human_decision_dispatch = human_decision_dispatch.expect("Human decision route");
+        assert_eq!(
+            (
+                human_decision_dispatch.checkpoint_id.as_str(),
+                human_decision_dispatch.executor,
+                human_decision_dispatch.completion_policy,
+                human_decision_dispatch.application_handler_status,
+                human_decision_dispatch.application_handler_id,
+            ),
+            (
+                "continue_stop_scale_test",
+                MissionCheckpointExecutor::Human,
+                MissionCheckpointCompletionPolicy::HumanConfirmation,
+                None,
+                None,
+            )
+        );
+        let reviewed_mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("reviewed Mission");
+        let review_evidence = reviewed_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "outcome_review")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .and_then(|completion| completion.application_evidence.as_ref())
+            .expect("outcome review Application evidence");
+        assert_eq!(
+            (
+                review_evidence.handler_id.as_str(),
+                review_evidence.digest(),
+                review_evidence
+                    .sources
+                    .iter()
+                    .map(|source| source.source_kind.as_str())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            (
+                VM11_OUTCOME_REVIEW_HANDLER_ID,
+                review_evidence_digest,
+                BTreeSet::from([
+                    "mission_checkpoint",
+                    "outcome_review",
+                    "parent_mission_review",
+                ]),
+            )
+        );
+        let review_support_missions = settled_ledger
+            .attribution_support_mission_ids(&current_parent, now() + Duration::seconds(32))
+            .expect("review attribution support IDs")
+            .into_iter()
+            .map(|support_mission_id| {
+                service
+                    .load_mission(&project_id, &support_mission_id)
+                    .expect("review attribution support Mission")
+            })
+            .collect::<Vec<_>>();
+        let review_kpi = settled_ledger
+            .verified_mission_kpi_projection(
+                &current_parent,
+                &settled_identity_chain,
+                now() + Duration::seconds(32),
+            )
+            .expect("review KPI");
+        let review_attribution = settled_ledger
+            .verified_attribution_projection(
+                &current_parent,
+                &settled_identity_chain,
+                &review_support_missions,
+                now() + Duration::seconds(32),
+            )
+            .expect("review attribution");
+        let review_settlement = settled_ledger
+            .verified_settlement_projection(
+                &current_parent,
+                &settled_identity_chain,
+                &settled_identity_support.partners,
+                now() + Duration::seconds(32),
+            )
+            .expect("review settlement");
+        let recomputed_review = settled_ledger
+            .verified_outcome_review_projection(
+                &current_parent,
+                &review_kpi,
+                &review_attribution,
+                &review_settlement,
+                now() + Duration::seconds(32),
+            )
+            .expect("recomputed outcome review Oracle");
+        assert_eq!(
+            (
+                recomputed_review.target_gap_count,
+                recomputed_review.unattributed_order_count,
+                recomputed_review.outstanding_settlement_group_count,
+                recomputed_review.unresolved_cost_effect_count,
+                recomputed_review.scale_evidence_status,
+                recomputed_review.loop_policy,
+                recomputed_review.causal_status,
+                recomputed_review.roi_status,
+                &recomputed_review.caveats,
+            ),
+            (
+                0,
+                0,
+                0,
+                0,
+                hartevo_domain_kernel::OutcomeReviewGateStatus::Blocked,
+                OutcomeReviewLoopPolicy::Forbidden,
+                OutcomeReviewCausalStatus::NotClaimed,
+                OutcomeReviewRoiStatus::NotCalculated,
+                &BTreeSet::from([
+                    hartevo_domain_kernel::OutcomeReviewCaveat::ImplicitLoopForbidden,
+                ]),
+            )
+        );
+        assert_eq!(
+            review_evidence
+                .sources
+                .iter()
+                .find(|source| source.source_kind == "outcome_review")
+                .map(|source| (source.source_revision, source.projection_digest.as_str())),
+            Some((
+                8,
+                recomputed_review
+                    .digest()
+                    .expect("outcome review digest")
+                    .as_str(),
+            ))
+        );
+        let event_count_after_review = service
+            .mission_events(&project_id, &mission_id)
+            .expect("outcome review events")
+            .len();
+        assert!(matches!(
+            service
+                .execute_application_mission_checkpoint(
+                    review_command,
+                    now() + Duration::seconds(33),
+                )
+                .expect("exact outcome review completion replay"),
+            ApplicationMissionCheckpointExecution::Completed {
+                replayed: true,
+                outcome_ledger_revision: 8,
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged outcome review replay events")
+                .len(),
+            event_count_after_review
+        );
         let visible_events = serde_json::to_string(
             &service
                 .mission_events(&project_id, &mission_id)
@@ -20691,6 +21924,8 @@ mod tests {
         )
         .expect("Application Checkpoint events JSON");
         assert!(!visible_events.contains("PRIVATE-PROVIDER-EVENT-ID"));
+        assert!(!visible_events.contains("PRIVATE-REFUND-PROVIDER-ID"));
+        assert!(!visible_events.contains("PRIVATE-PAYOUT-PROVIDER-ID"));
     }
 
     #[test]
