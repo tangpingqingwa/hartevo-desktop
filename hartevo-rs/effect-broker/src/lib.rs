@@ -1,5 +1,16 @@
 //! The only path from a proposed Hartevo business effect to a provider.
 
+pub mod provider_contract;
+
+pub use provider_contract::{
+    PROVIDER_ADAPTER_BASELINE_REGISTRY_VERSION, PROVIDER_ADAPTER_CONTRACT_JSON,
+    PROVIDER_ADAPTER_CONTRACT_SCHEMA_VERSION, PROVIDER_ADAPTER_CONTRACT_VERSION,
+    ProviderAdapterIdentity, ProviderAdapterOperation, ProviderAdapterRegistry,
+    ProviderCapabilityEvidenceClaim, ProviderCapabilityKey, ProviderCapabilitySupport,
+    ProviderContractError, ProviderEvidenceAuthority, ProviderEvidenceClass,
+    ProviderEvidenceSupport, ProviderProvenanceClass, ValidatedProviderEvidenceBinding,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
