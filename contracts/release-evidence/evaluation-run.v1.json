@@ -1,0 +1,633 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/release-evidence/evaluation-run/1.0.0",
+  "title": "Hartevo Evaluation Run Evidence",
+  "oneOf": [
+    {"$ref": "#/$defs/runPlan"},
+    {"$ref": "#/$defs/caseResult"},
+    {"$ref": "#/$defs/runReceipt"}
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "gitBlobDigest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "releaseCommit": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "missionId": {
+      "enum": [
+        "VM-00", "VM-01", "VM-02", "VM-03", "VM-04", "VM-05",
+        "VM-06", "VM-07", "VM-08", "VM-09", "VM-10", "VM-11"
+      ]
+    },
+    "writingMissionId": {
+      "enum": ["VM-01", "VM-03", "VM-04", "VM-05"]
+    },
+    "partition": {
+      "enum": ["V0", "V1", "V2", "cross_cutting"]
+    },
+    "safetyInvariantId": {
+      "enum": [
+        "approval_bypass",
+        "approved_payload_substitution",
+        "attribution_identity_violation",
+        "browser_or_recipe_effect_broker_bypass",
+        "browser_profile_or_session_scope_violation",
+        "capability_or_subagent_authority_escalation",
+        "consent_or_opt_out_violation",
+        "creator_payout_before_acceptance_or_duplicate",
+        "crm_stage_or_missing_order_claimed_as_revenue",
+        "cross_cell_data_leak",
+        "cross_project_data_leak",
+        "cross_project_memory_recall",
+        "cross_tenant_data_leak",
+        "duplicate_external_effect",
+        "false_complete_without_verified_outcome",
+        "human_handoff_violation",
+        "out_of_scope_delete_export_payment_or_contact",
+        "path_traversal_or_attachment_scope_escape",
+        "private_dataset_leak",
+        "private_reasoning_leak",
+        "prompt_injection_authority_change",
+        "provider_success_claimed_as_publish_or_payment",
+        "public_partner_candidate_autocontact",
+        "secret_or_pii_leak",
+        "token_cookie_or_provider_header_leak",
+        "uncertain_auto_replay",
+        "unsigned_update_plugin_recipe_or_harness_promotion",
+        "wrong_money_or_currency"
+      ]
+    },
+    "runProfile": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "missionId"],
+          "properties": {
+            "kind": {"const": "mission_v0"},
+            "missionId": {"$ref": "#/$defs/missionId"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {"kind": {"const": "local_rc"}},
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "writingMissionId"],
+          "properties": {
+            "kind": {"const": "engineering_foundation"},
+            "writingMissionId": {"$ref": "#/$defs/writingMissionId"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "writingMissionId"],
+          "properties": {
+            "kind": {"const": "internal_alpha"},
+            "writingMissionId": {"$ref": "#/$defs/writingMissionId"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {"kind": {"const": "controlled_beta"}},
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {"kind": {"const": "general_availability"}},
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {"kind": {"const": "mature_e5"}},
+          "additionalProperties": false
+        }
+      ]
+    },
+    "catalogBinding": {
+      "type": "object",
+      "required": [
+        "snapshotSchemaVersion",
+        "snapshotDigest",
+        "missionCatalogVersion",
+        "effectReadbackRouteContractVersion",
+        "routeGraphContractVersion",
+        "bindingDigest"
+      ],
+      "properties": {
+        "snapshotSchemaVersion": {"type": "string", "minLength": 1},
+        "snapshotDigest": {"$ref": "#/$defs/digest"},
+        "missionCatalogVersion": {"type": "string", "minLength": 1},
+        "effectReadbackRouteContractVersion": {"type": "string", "minLength": 1},
+        "routeGraphContractVersion": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "minLength": 1}
+          ]
+        },
+        "bindingDigest": {"$ref": "#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "releaseContractBinding": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "schemaBlobDigest",
+        "safetyInvariantIds",
+        "safetyInvariantIdSetDigest"
+      ],
+      "properties": {
+        "schemaVersion": {"type": "string", "minLength": 1},
+        "schemaBlobDigest": {"$ref": "#/$defs/gitBlobDigest"},
+        "safetyInvariantIds": {
+          "type": "array",
+          "minItems": 28,
+          "maxItems": 28,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/safetyInvariantId"}
+        },
+        "safetyInvariantIdSetDigest": {"$ref": "#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "requiredPartition": {
+      "type": "object",
+      "required": [
+        "missionId",
+        "partition",
+        "configuredCaseIds",
+        "configuredCaseSetDigest"
+      ],
+      "properties": {
+        "missionId": {"$ref": "#/$defs/missionId"},
+        "partition": {"$ref": "#/$defs/partition"},
+        "configuredCaseIds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+          }
+        },
+        "configuredCaseSetDigest": {"$ref": "#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "runPlan": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "documentType",
+        "authority",
+        "runId",
+        "planDigest",
+        "releaseCommit",
+        "runProfile",
+        "environmentDigest",
+        "collisionNonce",
+        "catalog",
+        "releaseContract",
+        "safetyMappingStatus",
+        "privateAttestationStatus",
+        "requiredPartitions",
+        "configuredCaseSetDigest",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": {"const": "hartevo-evaluation-run/v1"},
+        "documentType": {"const": "run_plan"},
+        "authority": {"const": "run_evidence_only"},
+        "runId": {"$ref": "#/$defs/digest"},
+        "planDigest": {"$ref": "#/$defs/digest"},
+        "releaseCommit": {"$ref": "#/$defs/releaseCommit"},
+        "runProfile": {"$ref": "#/$defs/runProfile"},
+        "environmentDigest": {"$ref": "#/$defs/digest"},
+        "collisionNonce": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]{1,128}$"
+        },
+        "catalog": {"$ref": "#/$defs/catalogBinding"},
+        "releaseContract": {"$ref": "#/$defs/releaseContractBinding"},
+        "safetyMappingStatus": {"const": "MISSING_AUTHORITATIVE_MAPPING"},
+        "privateAttestationStatus": {
+          "const": "MISSING_TRUSTED_PRIVATE_EVALUATOR_ATTESTATION"
+        },
+        "requiredPartitions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/requiredPartition"}
+        },
+        "configuredCaseSetDigest": {"$ref": "#/$defs/digest"},
+        "createdAt": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
+    },
+    "expectedTerminal": {
+      "enum": [
+        "pass",
+        "expected_refusal",
+        "private_oracle",
+        "private_oracle_expected_refusal"
+      ]
+    },
+    "caseIdentity": {
+      "type": "object",
+      "required": [
+        "caseId",
+        "caseVersion",
+        "missionId",
+        "partition",
+        "familyOrSuiteId",
+        "expectedTerminal",
+        "applicableOracleIds",
+        "requiredDeterministicOracleIds",
+        "caseManifestDigest"
+      ],
+      "properties": {
+        "caseId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "caseVersion": {"type": "integer", "minimum": 1},
+        "missionId": {"$ref": "#/$defs/missionId"},
+        "partition": {"$ref": "#/$defs/partition"},
+        "familyOrSuiteId": {"type": "string", "minLength": 1},
+        "expectedTerminal": {"$ref": "#/$defs/expectedTerminal"},
+        "applicableOracleIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "requiredDeterministicOracleIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "caseManifestDigest": {"$ref": "#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "evidenceLocator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "path"],
+          "properties": {
+            "kind": {"const": "run_relative"},
+            "path": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "handleDigest"],
+          "properties": {
+            "kind": {"const": "private_opaque"},
+            "handleDigest": {"$ref": "#/$defs/digest"}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "artifactRef": {
+      "type": "object",
+      "required": ["locator", "evidenceDigest"],
+      "properties": {
+        "locator": {"$ref": "#/$defs/evidenceLocator"},
+        "evidenceDigest": {"$ref": "#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "oracleResult": {
+      "type": "object",
+      "required": ["oracleId", "oracleKind", "passed", "result"],
+      "properties": {
+        "oracleId": {"type": "string", "minLength": 1},
+        "oracleKind": {"enum": ["deterministic", "expert_judge"]},
+        "passed": {"type": "boolean"},
+        "result": {"$ref": "#/$defs/artifactRef"}
+      },
+      "additionalProperties": false
+    },
+    "safetyAssertion": {
+      "type": "object",
+      "required": ["invariantId", "passed", "assertion"],
+      "properties": {
+        "invariantId": {"$ref": "#/$defs/safetyInvariantId"},
+        "passed": {"type": "boolean"},
+        "assertion": {"$ref": "#/$defs/artifactRef"}
+      },
+      "additionalProperties": false
+    },
+    "effectEvidence": {
+      "type": "object",
+      "required": [
+        "ledgerBeforeDigest",
+        "ledgerAfterDigest",
+        "effectAttempts",
+        "receipts",
+        "verifications"
+      ],
+      "properties": {
+        "ledgerBeforeDigest": {"$ref": "#/$defs/digest"},
+        "ledgerAfterDigest": {"$ref": "#/$defs/digest"},
+        "effectAttempts": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/artifactRef"}
+        },
+        "receipts": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/artifactRef"}
+        },
+        "verifications": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/artifactRef"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "nullableDigest": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/digest"}
+      ]
+    },
+    "caseExecution": {
+      "type": "object",
+      "required": [
+        "disposition",
+        "terminalOutcome",
+        "failureReason",
+        "startedAt",
+        "completedAt",
+        "stateBeforeDigest",
+        "stateAfterDigest",
+        "traceDigest",
+        "oracleResults",
+        "effectEvidence",
+        "safetyAssertions"
+      ],
+      "properties": {
+        "disposition": {
+          "enum": ["completed", "blocked_env", "not_implemented", "invalid"]
+        },
+        "terminalOutcome": {
+          "oneOf": [
+            {"type": "null"},
+            {"enum": ["pass", "expected_refusal", "partial", "fail"]}
+          ]
+        },
+        "failureReason": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "minLength": 1}
+          ]
+        },
+        "startedAt": {"type": "string", "format": "date-time"},
+        "completedAt": {"type": "string", "format": "date-time"},
+        "stateBeforeDigest": {"$ref": "#/$defs/nullableDigest"},
+        "stateAfterDigest": {"$ref": "#/$defs/nullableDigest"},
+        "traceDigest": {"$ref": "#/$defs/nullableDigest"},
+        "oracleResults": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/oracleResult"}
+        },
+        "effectEvidence": {"$ref": "#/$defs/effectEvidence"},
+        "safetyAssertions": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/safetyAssertion"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "caseResult": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "documentType",
+        "authority",
+        "runId",
+        "planDigest",
+        "resultDigest",
+        "catalog",
+        "releaseContract",
+        "safetyMappingStatus",
+        "privateAttestationStatus",
+        "identity",
+        "execution"
+      ],
+      "properties": {
+        "schemaVersion": {"const": "hartevo-evaluation-run/v1"},
+        "documentType": {"const": "case_result"},
+        "authority": {"const": "run_evidence_only"},
+        "runId": {"$ref": "#/$defs/digest"},
+        "planDigest": {"$ref": "#/$defs/digest"},
+        "resultDigest": {"$ref": "#/$defs/digest"},
+        "catalog": {"$ref": "#/$defs/catalogBinding"},
+        "releaseContract": {"$ref": "#/$defs/releaseContractBinding"},
+        "safetyMappingStatus": {"const": "MISSING_AUTHORITATIVE_MAPPING"},
+        "privateAttestationStatus": {
+          "const": "MISSING_TRUSTED_PRIVATE_EVALUATOR_ATTESTATION"
+        },
+        "identity": {"$ref": "#/$defs/caseIdentity"},
+        "execution": {"$ref": "#/$defs/caseExecution"}
+      },
+      "additionalProperties": false
+    },
+    "caseResultReference": {
+      "type": "object",
+      "required": ["caseId", "locator", "fileDigest", "semanticDigest"],
+      "properties": {
+        "caseId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "locator": {
+          "type": "string",
+          "pattern": "^results/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\\.json$"
+        },
+        "fileDigest": {"$ref": "#/$defs/digest"},
+        "semanticDigest": {"$ref": "#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "partitionSummary": {
+      "type": "object",
+      "required": [
+        "missionId",
+        "partition",
+        "configuredCaseCount",
+        "recordedCaseCount",
+        "executedCaseCount",
+        "successfulCaseCount",
+        "requiredPassCount",
+        "partitionComplete",
+        "thresholdMet"
+      ],
+      "properties": {
+        "missionId": {"$ref": "#/$defs/missionId"},
+        "partition": {"$ref": "#/$defs/partition"},
+        "configuredCaseCount": {"type": "integer", "minimum": 1},
+        "recordedCaseCount": {"type": "integer", "minimum": 0},
+        "executedCaseCount": {"type": "integer", "minimum": 0},
+        "successfulCaseCount": {"type": "integer", "minimum": 0},
+        "requiredPassCount": {"type": "integer", "minimum": 1},
+        "partitionComplete": {"type": "boolean"},
+        "thresholdMet": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "boolean"}
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "runSummary": {
+      "type": "object",
+      "required": [
+        "configuredCaseCount",
+        "recordedCaseCount",
+        "executedCaseCount",
+        "successfulCaseCount",
+        "blockedEnvCaseCount",
+        "notImplementedCaseCount",
+        "invalidCaseCount",
+        "failedCaseCount",
+        "structurallyComplete",
+        "partitionComplete"
+      ],
+      "properties": {
+        "configuredCaseCount": {"type": "integer", "minimum": 1},
+        "recordedCaseCount": {"type": "integer", "minimum": 0},
+        "executedCaseCount": {"type": "integer", "minimum": 0},
+        "successfulCaseCount": {"type": "integer", "minimum": 0},
+        "blockedEnvCaseCount": {"type": "integer", "minimum": 0},
+        "notImplementedCaseCount": {"type": "integer", "minimum": 0},
+        "invalidCaseCount": {"type": "integer", "minimum": 0},
+        "failedCaseCount": {"type": "integer", "minimum": 0},
+        "structurallyComplete": {"type": "boolean"},
+        "partitionComplete": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "safetyCaseReference": {
+      "type": "object",
+      "required": ["caseId", "assertionDigest", "passed"],
+      "properties": {
+        "caseId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "assertionDigest": {"$ref": "#/$defs/digest"},
+        "passed": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "safetyAggregate": {
+      "type": "object",
+      "required": [
+        "invariantId",
+        "caseReferences",
+        "caseCount",
+        "allAssertionsPassed",
+        "evidenceDigest"
+      ],
+      "properties": {
+        "invariantId": {"$ref": "#/$defs/safetyInvariantId"},
+        "caseReferences": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/safetyCaseReference"}
+        },
+        "caseCount": {"type": "integer", "minimum": 0},
+        "allAssertionsPassed": {"type": "boolean"},
+        "evidenceDigest": {"$ref": "#/$defs/nullableDigest"}
+      },
+      "additionalProperties": false
+    },
+    "runReceipt": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "documentType",
+        "authority",
+        "runId",
+        "planDigest",
+        "catalog",
+        "releaseContract",
+        "safetyMappingStatus",
+        "privateAttestationStatus",
+        "resultReferences",
+        "resultSetDigest",
+        "partitionSummaries",
+        "summary",
+        "thresholdStatus",
+        "safetyAggregates",
+        "safetyEvidenceDigest",
+        "startedAt",
+        "completedAt"
+      ],
+      "properties": {
+        "schemaVersion": {"const": "hartevo-evaluation-run/v1"},
+        "documentType": {"const": "run_receipt"},
+        "authority": {"const": "run_evidence_only"},
+        "runId": {"$ref": "#/$defs/digest"},
+        "planDigest": {"$ref": "#/$defs/digest"},
+        "catalog": {"$ref": "#/$defs/catalogBinding"},
+        "releaseContract": {"$ref": "#/$defs/releaseContractBinding"},
+        "safetyMappingStatus": {"const": "MISSING_AUTHORITATIVE_MAPPING"},
+        "privateAttestationStatus": {
+          "const": "MISSING_TRUSTED_PRIVATE_EVALUATOR_ATTESTATION"
+        },
+        "resultReferences": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/caseResultReference"}
+        },
+        "resultSetDigest": {"$ref": "#/$defs/digest"},
+        "partitionSummaries": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/partitionSummary"}
+        },
+        "summary": {"$ref": "#/$defs/runSummary"},
+        "thresholdStatus": {
+          "enum": [
+            "not_evaluated_incomplete_partition",
+            "evaluated_passed",
+            "evaluated_failed"
+          ]
+        },
+        "safetyAggregates": {
+          "type": "array",
+          "minItems": 28,
+          "maxItems": 28,
+          "items": {"$ref": "#/$defs/safetyAggregate"}
+        },
+        "safetyEvidenceDigest": {"$ref": "#/$defs/digest"},
+        "startedAt": {"type": "string", "format": "date-time"},
+        "completedAt": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

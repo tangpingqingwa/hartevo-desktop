@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use hartevo_eval::{
-    VERTICAL_SLICE_ID, catalog_snapshot, run_vertical_slice, wave_zero_release_evidence,
+    VERTICAL_SLICE_ID, catalog_snapshot, finalize_evaluation_run, run_vertical_slice,
+    validate_evaluation_run, wave_zero_release_evidence,
 };
 use serde::Serialize;
 
@@ -60,6 +61,22 @@ fn main() -> Result<()> {
             let report = wave_zero_release_evidence(commit, Utc::now())?;
             write_json(&PathBuf::from(output), &report)?;
         }
+        [evaluation_run, command, root_flag, root]
+            if evaluation_run == "evaluation-run"
+                && command == "finalize"
+                && root_flag == "--run-dir" =>
+        {
+            let receipt = finalize_evaluation_run(root)?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+        [evaluation_run, command, root_flag, root]
+            if evaluation_run == "evaluation-run"
+                && command == "validate"
+                && root_flag == "--run-dir" =>
+        {
+            let receipt = validate_evaluation_run(root)?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
         [command, mission_flag, mission] if command == "run" && mission_flag == "--mission" => {
             run(mission, None)?;
         }
@@ -113,6 +130,8 @@ fn print_help() {
          hartevo-eval catalog validate\n  \
          hartevo-eval catalog export --output <path>\n  \
          hartevo-eval evidence baseline --commit <sha> --output <path>\n  \
+         hartevo-eval evaluation-run finalize --run-dir <path>\n  \
+         hartevo-eval evaluation-run validate --run-dir <path>\n  \
          hartevo-eval run --mission VS-01 [--output <path>]"
     );
 }
