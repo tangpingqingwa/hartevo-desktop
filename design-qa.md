@@ -23,7 +23,7 @@ evidence: `artifacts/visual/prototype-baseline/`
 
 ## Open findings
 
-- P0 — Real token-delta streaming is not implemented. The production Runtime adapter currently adopts a completed agent item; fixture character replay is visual evidence only.
+- P0 — Runtime delta ingestion/persistence is implemented, but the c71061e Dioxus projection is not. The pinned adapter accepts `item/agentMessage/delta`; Domain/Application/SQLCipher bind exact Turn/item/sequence/chain and reject tamper or completion-text mismatch. Mission Conversation still shows fixture replay or completed output, so real persisted deltas, reconnect recovery and follow-latest behavior are not yet production visual evidence.
 - P0 — Pause/resume with retained cursor/lease/generation and user-visible reconnect replay are not implemented.
 - P0 — File Broker upload, malware/prompt-injection scanning, retry, and real attachment persistence are not implemented.
 - P0 — Push-to-talk, local transcription, barge-in and audio permission states remain `BLOCKED_ENV`/`NOT_IMPLEMENTED`.

@@ -151,7 +151,7 @@
 
 | # | 参考交互 | Hartevo 实际组件 | 交互与状态合同 | 数据来源 | 当前差异 | 验收方法 |
 |---:|---|---|---|---|---|---|
-| G01 | 流式正文 | `StreamingAssistantTurn` | token delta 合并、段落稳定、完成后冻结 revision；刷新不重复正文 | persisted Runtime events + Conversation | `NOT_IMPLEMENTED(P0)`；fixture 可重播字符流，但真实 Runtime adapter 目前只采纳完成后的 agent message，没有 token delta contract | virtual clock delta test + 30fps visual capture |
+| G01 | 流式正文 | `StreamingAssistantTurn` | token delta 合并、段落稳定、完成后冻结 revision；刷新不重复正文 | persisted Runtime private deltas + Conversation | `PARTIAL(P0)`；pinned Runtime adapter、Domain/Application/SQLCipher 已持久化 exact `item/agentMessage/delta`，绑定 Turn/item/stream/evidence sequence、累计字节和 chain digest，并校验完成正文精确重组；c71061e 的 Dioxus 尚未读取该私有流，fixture 字符回放仍不能冒充真实 Runtime UI | durable reconnect/replay test + virtual clock delta test + 30fps visual capture |
 | G02 | 内联运行事件 | `MissionActivityStream` | 读取、工具、浏览器、Worker、验证等事件按时间排序；状态图标与文案独立 | Runtime/Checkpoint/Browser event ledger | `PARTIAL(P1)`；真实 coordinator 输出 content-free Preparing/Dispatched/Turn/Item/Stop/terminal phases，完整持久化 Browser/Worker/Verification event projection 未完成 | duplicate/out-of-order/reconnect replay test |
 | G03 | 可折叠工具组 | `ActivityGroup` | 摘要行展开子步骤；已完成自动折叠，失败/等待保持展开 | correlated event group | `PARTIAL(P1)`；fixture activity group 的摘要/展开/折叠完成，真实 correlated event group 未持久投影 | mouse + keyboard expand/collapse + retained state |
 | G04 | 事件持续时间 | `ActivityDuration` | 运行中单调计时，结束后冻结；虚拟时钟可复现 | start/end timestamps | `PARTIAL(P1)`；fixture 有冻结时间点，真实 monotonic elapsed/虚拟时钟 UI 未实现 | virtual clock boundary/DST test |
