@@ -37,8 +37,9 @@ use data_plane::{
     DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane,
     DesktopHumanCheckpointConfirmationRequest, DesktopLoadState, DesktopMissionContinuationRequest,
     DesktopRuntimeCancellation, DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase,
-    DesktopSnapshot, DesktopVm11OutcomeDecisionRequest, ProductEvidenceProjection,
-    ProjectContextAccessProjection, ProjectContextAccessStatus, RecoveryKitDraft,
+    DesktopRuntimeTextStreamProjection, DesktopSnapshot, DesktopVm11OutcomeDecisionRequest,
+    ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
+    RecoveryKitDraft,
 };
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
@@ -617,8 +618,14 @@ impl DesktopUiModel {
 pub fn App() -> Element {
     let desktop_context = dioxus::desktop::use_window();
     let visual_zoom = active_visual_zoom();
-    let visual_streaming_fixture = active_visual_fixture_id().is_some()
-        && active_visual_surface_variant().as_deref() == Some("mission-streaming");
+    let visual_fixture_mode = active_visual_fixture_id().is_some();
+    let initial_visual_runtime_text_stream = active_visual_runtime_text_stream();
+    let visual_persisted_stream_fixture = initial_visual_runtime_text_stream.is_some();
+    let visual_streaming_fixture = visual_fixture_mode
+        && matches!(
+            active_visual_surface_variant().as_deref(),
+            Some("mission-streaming" | "mission-persisted-stream")
+        );
     use_effect(move || desktop_context.set_zoom_level(visual_zoom));
     let mut surface = use_signal(initial_surface);
     let mut model = use_signal(DesktopUiModel::load);
@@ -667,6 +674,11 @@ pub fn App() -> Element {
             Vec::new()
         }
     });
+    let mut runtime_text_scope = use_signal(|| None::<(ProjectId, MissionId)>);
+    let mut runtime_text_stream = use_signal(move || initial_visual_runtime_text_stream);
+    let mut runtime_text_error = use_signal(|| None::<UiFailure>);
+    let mut runtime_follow_latest = use_signal(|| true);
+    let mut runtime_has_unseen = use_signal(|| false);
     let mut composer_expanded = use_signal(|| false);
     let mut composer_guidance_dismissed = use_signal(|| false);
     let mut human_work_product_selection = use_signal(BTreeSet::<WorkProductId>::new);
@@ -681,6 +693,64 @@ pub fn App() -> Element {
     let mut current_object_menu = use_signal(|| false);
     let mut current_object_pinned = use_signal(|| false);
     let mut surface_before_settings = use_signal(|| Surface::Orchestrator);
+    use_effect(move || {
+        if visual_fixture_mode {
+            return;
+        }
+        let selected_scope = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.selected_mission_id.clone())
+        };
+        let scope_changed = runtime_text_scope.peek().as_ref() != selected_scope.as_ref();
+        if scope_changed {
+            runtime_text_scope.set(selected_scope.clone());
+            runtime_text_stream.set(None);
+            runtime_text_error.set(None);
+            runtime_follow_latest.set(true);
+            runtime_has_unseen.set(false);
+        }
+        let Some((project_id, mission_id)) = selected_scope else {
+            return;
+        };
+        spawn(async move {
+            let query_project_id = project_id.clone();
+            let query_mission_id = mission_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::discover().and_then(|plane| {
+                    plane.runtime_text_stream_os(&query_project_id, &query_mission_id, Utc::now())
+                })
+            })
+            .await;
+            if !desktop_scope_is_selected(model, &project_id, &mission_id) {
+                return;
+            }
+            match result {
+                Ok(Ok(projection)) => {
+                    runtime_text_error.set(None);
+                    update_runtime_text_stream(
+                        projection,
+                        runtime_text_stream,
+                        runtime_follow_latest,
+                        runtime_has_unseen,
+                    );
+                }
+                Ok(Err(error)) => {
+                    runtime_text_stream.set(None);
+                    runtime_text_error.set(Some(UiFailure::from_error(&error)));
+                }
+                Err(_) => {
+                    runtime_text_stream.set(None);
+                    runtime_text_error.set(Some(UiFailure {
+                        code: "RUNTIME_STREAM_QUERY_FAILED".into(),
+                        message: "持久 Runtime 正文查询异常结束；正文保持隐藏，Mission 与 Runtime ledger 未改变。".into(),
+                    }));
+                }
+            }
+        });
+    });
     let view = model.read().clone();
     let current_surface = surface();
     let project = view.current_project().cloned();
@@ -1525,6 +1595,12 @@ pub fn App() -> Element {
                                 project: project.clone(),
                                 mission: mission.clone(),
                                 runtime_activity: runtime_activity.clone(),
+                                runtime_text_stream: runtime_text_stream.read().clone(),
+                                runtime_text_error: runtime_text_error.read().clone(),
+                                runtime_busy,
+                                runtime_stream_is_fixture: visual_persisted_stream_fixture,
+                                runtime_follow_latest: runtime_follow_latest(),
+                                runtime_has_unseen: runtime_has_unseen(),
                                 context_access: context_access.clone(),
                                 on_initialize: move |_| {
                                     match DesktopDataPlane::discover().and_then(|plane| plane.initialize_os(Utc::now())) {
@@ -1536,6 +1612,17 @@ pub fn App() -> Element {
                                 on_error: move |error| model.write().set_notice(&error),
                                 on_select_mission: move |mission_id| model.write().select_mission(mission_id),
                                 on_open_workpad: move |()| workpad_open.set(true),
+                                on_runtime_scroll: move |near_bottom| {
+                                    runtime_follow_latest.set(near_bottom);
+                                    if near_bottom {
+                                        runtime_has_unseen.set(false);
+                                    }
+                                },
+                                on_follow_latest: move |()| {
+                                    runtime_follow_latest.set(true);
+                                    runtime_has_unseen.set(false);
+                                    scroll_mission_thread_to_latest();
+                                },
                             }
                         } else if current_surface == Surface::Current {
                             CurrentSurface { project: project.clone(), context_access: context_access.clone() }
@@ -1576,7 +1663,15 @@ pub fn App() -> Element {
                                     || application_route_catalog_mismatch
                                     || runtime_retry_needed
                                 {
-                                    if fixture_attachment_visible() { "composer-zone is-expanded has-attachments" } else { "composer-zone is-expanded" }
+                                    if runtime_busy && fixture_attachment_visible() {
+                                        "composer-zone is-expanded runtime-active has-attachments"
+                                    } else if runtime_busy {
+                                        "composer-zone is-expanded runtime-active"
+                                    } else if fixture_attachment_visible() {
+                                        "composer-zone is-expanded has-attachments"
+                                    } else {
+                                        "composer-zone is-expanded"
+                                    }
                                 } else {
                                     "composer-zone"
                                 },
@@ -2192,6 +2287,17 @@ pub fn App() -> Element {
                                                         mission_submitting,
                                                         runtime_retrying,
                                                     );
+                                                    begin_runtime_text_stream_monitor(
+                                                        model,
+                                                        project_id.clone(),
+                                                        mission_id.clone(),
+                                                        runtime_text_stream,
+                                                        runtime_text_error,
+                                                        runtime_follow_latest,
+                                                        runtime_has_unseen,
+                                                        mission_submitting,
+                                                        runtime_retrying,
+                                                    );
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
                                                             DesktopDataPlane::discover().and_then(|plane| {
@@ -2433,6 +2539,17 @@ pub fn App() -> Element {
                                                     begin_runtime_progress_monitor(
                                                         cancellation.clone(),
                                                         runtime_progress,
+                                                        mission_submitting,
+                                                        runtime_retrying,
+                                                    );
+                                                    begin_runtime_text_stream_monitor(
+                                                        model,
+                                                        request.project_id.clone(),
+                                                        request.mission_id.clone(),
+                                                        runtime_text_stream,
+                                                        runtime_text_error,
+                                                        runtime_follow_latest,
+                                                        runtime_has_unseen,
                                                         mission_submitting,
                                                         runtime_retrying,
                                                     );
@@ -4006,12 +4123,20 @@ fn OrchestratorSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
     runtime_activity: Option<MissionRuntimeProjection>,
+    runtime_text_stream: Option<DesktopRuntimeTextStreamProjection>,
+    runtime_text_error: Option<UiFailure>,
+    runtime_busy: bool,
+    runtime_stream_is_fixture: bool,
+    runtime_follow_latest: bool,
+    runtime_has_unseen: bool,
     context_access: Option<ProjectContextAccessProjection>,
     on_initialize: EventHandler<MouseEvent>,
     on_ready: EventHandler<DesktopSnapshot>,
     on_error: EventHandler<DesktopDataError>,
     on_select_mission: EventHandler<MissionId>,
     on_open_workpad: EventHandler<()>,
+    on_runtime_scroll: EventHandler<bool>,
+    on_follow_latest: EventHandler<()>,
 ) -> Element {
     match backend {
         DesktopBackendState::Uninitialized(evidence) => rsx! {
@@ -4097,7 +4222,9 @@ fn OrchestratorSurface(
                 };
             };
             #[cfg(feature = "visual-fixtures")]
-            if let Some(presentation) = visual_fixture::presentation() {
+            if let Some(presentation) = visual_fixture::presentation()
+                && active_visual_surface_variant().as_deref() != Some("mission-persisted-stream")
+            {
                 return rsx! {
                     PrototypeMissionJourney {
                         mission,
@@ -4176,25 +4303,245 @@ fn OrchestratorSurface(
             } else {
                 "LEGACY_BOOTSTRAP · 非 Catalog 完整性证据"
             };
+            let replayed_message_sequence = runtime_text_stream.as_ref().and_then(|stream| {
+                mission
+                    .conversation_messages
+                    .iter()
+                    .rev()
+                    .find(|message| {
+                        runtime_stream_matches_message(
+                            stream,
+                            message.role,
+                            message.kind,
+                            &message.body,
+                        )
+                    })
+                    .map(|message| message.sequence)
+            });
+            let render_stream_turn =
+                runtime_text_stream.is_some() && replayed_message_sequence.is_none();
             rsx! {
-                div { class: "surface-scroll",
-                    article { class: "assistant-turn",
-                        header { class: "assistant-byline", span { class: "brand-mark small", "H" } strong { "Hartevo" } time { "持久状态" } }
-                        p { class: "assistant-lead", "下面内容来自同一个 Project/Mission Domain；页面不会生成 Receipt、Verification 或完成状态。" }
-                        section { class: "mission-contract",
-                            header { strong { "Operating Contract" } span { "revision {mission.revision}" } }
-                            div { class: "contract-grid",
-                                div { small { "目标" } strong { "{mission.goal}" } }
-                                div { small { "Domain stage" } strong { "{mission_stage_label(&mission.stage)}" } }
-                                div { small { "Catalog route" } strong { "{route_label}" } }
-                                div { small { "Current Checkpoint" } strong { "{checkpoint_label}" } }
-                                div { small { "产品证据" } strong { "{mission_evidence_label}" } }
+                div {
+                    id: "persisted-mission-thread",
+                    class: "surface-scroll persisted-mission-thread",
+                    aria_label: "持久 Mission Conversation",
+                    onmounted: move |_| scroll_mission_thread_to_latest(),
+                    onscroll: move |event| {
+                        let remaining = f64::from(
+                            event.data.scroll_height() - event.data.client_height(),
+                        ) - event.data.scroll_top();
+                        on_runtime_scroll.call(remaining <= 96.0);
+                    },
+                    PersistedConversationMessages {
+                        mission: mission.clone(),
+                        runtime_text_stream: runtime_text_stream.clone(),
+                        replayed_message_sequence,
+                    }
+                    if render_stream_turn {
+                        if let Some(stream) = runtime_text_stream.clone() {
+                            PersistedRuntimeStreamTurn {
+                                stream,
+                                runtime_busy,
+                                visual_fixture: runtime_stream_is_fixture,
                             }
                         }
-                        MissionStateCard { mission, runtime_activity }
-                        ContextAccessCard { access: context_access }
+                    }
+                    if let Some(failure) = runtime_text_error {
+                        div { class: "runtime-stream-error", role: "status",
+                            UiIcon { name: UiIconName::Shield, size: 14 }
+                            span {
+                                strong { "{failure.code}" }
+                                small { "{failure.message}" }
+                            }
+                        }
+                    }
+                    details { class: "persisted-state-details",
+                        summary {
+                            UiIcon { name: UiIconName::Workflow, size: 14 }
+                            span {
+                                strong { "任务边界与持久状态" }
+                                small { "{mission_stage_label(&mission.stage)} · revision {mission.revision} · {mission.completed_checkpoint_count}/{mission.checkpoint_count} Checkpoints" }
+                            }
+                            em { "按需展开" }
+                            UiIcon { name: UiIconName::ChevronDown, size: 12 }
+                        }
+                        article { class: "assistant-turn persisted-state-turn",
+                            header { class: "assistant-byline",
+                                img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                                strong { "Hartevo" }
+                                time { "任务边界" }
+                            }
+                            p { class: "assistant-lead", "下面的合同与运行状态来自同一个 Project/Mission Domain；页面不会生成 Receipt、Verification 或完成状态。" }
+                            section { class: "mission-contract",
+                                header { strong { "Operating Contract" } span { "revision {mission.revision}" } }
+                                div { class: "contract-grid",
+                                    div { small { "目标" } strong { "{mission.goal}" } }
+                                    div { small { "Domain stage" } strong { "{mission_stage_label(&mission.stage)}" } }
+                                    div { small { "Catalog route" } strong { "{route_label}" } }
+                                    div { small { "Current Checkpoint" } strong { "{checkpoint_label}" } }
+                                    div { small { "产品证据" } strong { "{mission_evidence_label}" } }
+                                }
+                            }
+                            MissionStateCard { mission, runtime_activity }
+                            ContextAccessCard { access: context_access }
+                        }
+                    }
+                    if !runtime_follow_latest {
+                        button {
+                            class: if runtime_has_unseen { "mission-follow-latest has-unseen" } else { "mission-follow-latest" },
+                            aria_label: if runtime_has_unseen { "有新的 Runtime 正文，回到最新" } else { "回到 Mission Conversation 最新位置" },
+                            onclick: move |_| on_follow_latest.call(()),
+                            if runtime_has_unseen { span { "有新内容" } }
+                            UiIcon { name: UiIconName::ArrowUp, size: 12 }
+                            "回到最新"
+                        }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn PersistedConversationMessages(
+    mission: MissionProjection,
+    runtime_text_stream: Option<DesktopRuntimeTextStreamProjection>,
+    replayed_message_sequence: Option<u64>,
+) -> Element {
+    if mission.conversation_messages.is_empty() {
+        return rsx! {
+            article { class: "assistant-turn persisted-assistant-turn conversation-empty",
+                header { class: "assistant-byline",
+                    img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                    strong { "Hartevo" }
+                    time { "Mission 已持久化" }
+                }
+                div { class: "assistant-copy",
+                    p { "当前 Mission 还没有可展示的 Conversation 正文。你可以从下方输入目标或纠正；未开始的 Runtime 不会被绘制成答案。" }
+                }
+            }
+        };
+    }
+    rsx! {
+        for message in mission.conversation_messages.clone() {
+            {
+                let recorded_time = message.recorded_at.format("%H:%M").to_string();
+                let replayed = replayed_message_sequence == Some(message.sequence);
+                let message_key = message.message_id.to_string();
+                if message.role == MissionConversationRole::User {
+                    rsx! {
+                        div { key: "{message_key}", class: "persisted-user-row",
+                            article { class: "persisted-user-message",
+                                for (index, paragraph) in runtime_stream_paragraphs(&message.body).into_iter().enumerate() {
+                                    p { key: "{message_key}-p-{index}", "{paragraph}" }
+                                }
+                                footer {
+                                    span { "{mission_conversation_role_label(message.role)} · {mission_conversation_kind_label(message.kind)}" }
+                                    time { "{recorded_time}" }
+                                }
+                            }
+                        }
+                    }
+                } else if message.role == MissionConversationRole::Assistant {
+                    rsx! {
+                        article { key: "{message_key}", class: "assistant-turn persisted-assistant-turn",
+                            header { class: "assistant-byline",
+                                img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                                strong { "Hartevo" }
+                                time { "{recorded_time}" }
+                            }
+                            div { class: "assistant-copy persisted-assistant-copy",
+                                for (index, paragraph) in runtime_stream_paragraphs(&message.body).into_iter().enumerate() {
+                                    p { key: "{message_key}-p-{index}", "{paragraph}" }
+                                }
+                            }
+                            if replayed {
+                                if let Some(stream) = runtime_text_stream.as_ref() {
+                                    footer { class: "runtime-stream-receipt",
+                                        UiIcon { name: UiIconName::FileCheck, size: 12 }
+                                        span { "从 SQLCipher 重放 {stream.delta_count} 个正文增量" }
+                                        em { "cursor {stream.last_evidence_sequence.unwrap_or_default()}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    rsx! {
+                        div { key: "{message_key}", class: "persisted-system-notice", role: "status",
+                            UiIcon { name: UiIconName::Shield, size: 13 }
+                            span {
+                                strong { "系统边界 · {recorded_time}" }
+                                small { "{message.body}" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn PersistedRuntimeStreamTurn(
+    stream: DesktopRuntimeTextStreamProjection,
+    runtime_busy: bool,
+    visual_fixture: bool,
+) -> Element {
+    let stream_active = stream.turn_status.is_active();
+    let last_item_index = stream.items.len().saturating_sub(1);
+    rsx! {
+        article { class: if stream_active { "assistant-turn persisted-assistant-turn runtime-stream-turn is-streaming" } else { "assistant-turn persisted-assistant-turn runtime-stream-turn" },
+            header { class: "assistant-byline",
+                img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                strong { "Hartevo" }
+                time {
+                    if stream_active || runtime_busy { "正在响应" } else { "已从本机恢复" }
+                }
+            }
+            div {
+                class: "assistant-copy runtime-stream-copy",
+                aria_live: "polite",
+                aria_atomic: "false",
+                aria_busy: stream_active || runtime_busy,
+                if stream.items.is_empty() && (stream_active || runtime_busy) {
+                    p { class: "runtime-stream-waiting",
+                        "正在等待首个持久正文增量"
+                        i { class: "runtime-stream-caret", aria_hidden: "true" }
+                    }
+                }
+                for (item_index, item) in stream.items.clone().into_iter().enumerate() {
+                    {
+                        let item_key = item.item_id_digest.clone();
+                        let paragraphs = runtime_stream_paragraphs(&item.text);
+                        let last_paragraph_index = paragraphs.len().saturating_sub(1);
+                        rsx! {
+                            section { key: "{item_key}", class: "runtime-stream-item",
+                                for (paragraph_index, paragraph) in paragraphs.into_iter().enumerate() {
+                                    p { key: "{item_key}-p-{paragraph_index}",
+                                        "{paragraph}"
+                                        if stream_active && item_index == last_item_index && paragraph_index == last_paragraph_index {
+                                            i { class: "runtime-stream-caret", aria_hidden: "true" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            footer { class: "runtime-stream-receipt",
+                UiIcon { name: UiIconName::FileCheck, size: 12 }
+                span {
+                    if visual_fixture {
+                        "VISUAL_FIXTURE · 模拟 {stream.delta_count} 个正文增量；未读取 SQLCipher"
+                    } else if stream_active {
+                        "已持久化 {stream.delta_count} 个正文增量"
+                    } else {
+                        "从 SQLCipher 重放 {stream.delta_count} 个正文增量"
+                    }
+                }
+                em { "{runtime_turn_status_label(stream.turn_status)} · cursor {stream.last_evidence_sequence.unwrap_or_default()}" }
             }
         }
     }
@@ -4442,14 +4789,6 @@ fn MissionStateCard(
         .as_ref()
         .and_then(|activity| activity.turn_status)
         .map_or("未派发", runtime_turn_status_label);
-    let mut conversation_tail = mission
-        .conversation_messages
-        .iter()
-        .rev()
-        .take(8)
-        .cloned()
-        .collect::<Vec<_>>();
-    conversation_tail.reverse();
     rsx! {
         section { class: "live-work",
             div { class: "live-row",
@@ -4472,24 +4811,6 @@ fn MissionStateCard(
                     span { strong { if schedule.signal_received { "已收到" } else { "未收到" } } small { "Event signal" } }
                     span { strong { "{schedule.lease_generation}" } small { "Lease generation" } }
                     span { strong { "{schedule.failure_count}" } small { "Schedule failures" } }
-                }
-            }
-            if !conversation_tail.is_empty() {
-                section { class: "mission-conversation", aria_label: "持久 Mission Conversation",
-                    header {
-                        strong { "Mission Conversation" }
-                        span { "revision {mission.conversation_revision.unwrap_or_default()} · {mission.conversation_messages.len()} messages" }
-                    }
-                    for message in conversation_tail {
-                        article { class: if message.role == MissionConversationRole::User { "conversation-message user" } else { "conversation-message assistant" },
-                            div {
-                                strong { "{mission_conversation_role_label(message.role)}" }
-                                span { "#{message.sequence} · {mission_conversation_kind_label(message.kind)}" }
-                            }
-                            p { "{message.body}" }
-                            code { title: "{message.content_digest}", "digest {short_digest(&message.content_digest)}" }
-                        }
-                    }
                 }
             }
             if let Some(activity) = &runtime_activity {
@@ -5858,6 +6179,17 @@ fn active_visual_surface_variant() -> Option<String> {
     }
 }
 
+fn active_visual_runtime_text_stream() -> Option<DesktopRuntimeTextStreamProjection> {
+    #[cfg(feature = "visual-fixtures")]
+    {
+        visual_fixture::runtime_text_stream()
+    }
+    #[cfg(not(feature = "visual-fixtures"))]
+    {
+        None
+    }
+}
+
 fn initial_workpad_open() -> bool {
     #[cfg(feature = "visual-fixtures")]
     if active_visual_fixture_id().is_some() {
@@ -5915,6 +6247,120 @@ fn begin_runtime_progress_monitor(
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         }
     });
+}
+
+fn desktop_scope_is_selected(
+    model: Signal<DesktopUiModel>,
+    project_id: &ProjectId,
+    mission_id: &MissionId,
+) -> bool {
+    let current = model.read();
+    current.selected_project_id.as_ref() == Some(project_id)
+        && current.selected_mission_id.as_ref() == Some(mission_id)
+}
+
+fn update_runtime_text_stream(
+    projection: Option<DesktopRuntimeTextStreamProjection>,
+    mut stream: Signal<Option<DesktopRuntimeTextStreamProjection>>,
+    follow_latest: Signal<bool>,
+    mut has_unseen: Signal<bool>,
+) {
+    if stream.peek().as_ref() == projection.as_ref() {
+        return;
+    }
+    let previous_sequence = stream
+        .peek()
+        .as_ref()
+        .and_then(|current| current.last_evidence_sequence);
+    let next_sequence = projection
+        .as_ref()
+        .and_then(|current| current.last_evidence_sequence);
+    let received_new_text = next_sequence
+        .is_some_and(|sequence| previous_sequence.is_none_or(|previous| sequence > previous));
+    stream.set(projection);
+    if *follow_latest.peek() {
+        scroll_mission_thread_to_latest();
+    } else if received_new_text {
+        has_unseen.set(true);
+    }
+}
+
+fn scroll_mission_thread_to_latest() {
+    let _ = dioxus::document::eval(
+        "requestAnimationFrame(() => { const thread = document.getElementById('persisted-mission-thread'); if (!thread) return; const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; thread.scrollTo({ top: thread.scrollHeight, behavior: reduced ? 'auto' : 'smooth' }); });",
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn begin_runtime_text_stream_monitor(
+    model: Signal<DesktopUiModel>,
+    project_id: ProjectId,
+    mission_id: MissionId,
+    mut stream: Signal<Option<DesktopRuntimeTextStreamProjection>>,
+    mut stream_error: Signal<Option<UiFailure>>,
+    follow_latest: Signal<bool>,
+    has_unseen: Signal<bool>,
+    submitting: Signal<bool>,
+    retrying: Signal<bool>,
+) {
+    spawn(async move {
+        loop {
+            let query_project_id = project_id.clone();
+            let query_mission_id = mission_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::discover().and_then(|plane| {
+                    plane.runtime_text_stream_os(&query_project_id, &query_mission_id, Utc::now())
+                })
+            })
+            .await;
+            if !desktop_scope_is_selected(model, &project_id, &mission_id) {
+                break;
+            }
+            match result {
+                Ok(Ok(projection)) => {
+                    stream_error.set(None);
+                    update_runtime_text_stream(projection, stream, follow_latest, has_unseen);
+                }
+                Ok(Err(error)) => {
+                    stream.set(None);
+                    stream_error.set(Some(UiFailure::from_error(&error)));
+                    break;
+                }
+                Err(_) => {
+                    stream.set(None);
+                    stream_error.set(Some(UiFailure {
+                        code: "RUNTIME_STREAM_QUERY_FAILED".into(),
+                        message: "持久 Runtime 正文查询异常结束；正文保持隐藏，Mission 与 Runtime ledger 未改变。".into(),
+                    }));
+                    break;
+                }
+            }
+            if !*submitting.read() && !*retrying.read() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+}
+
+fn runtime_stream_paragraphs(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.split("\n\n").collect()
+}
+
+fn runtime_stream_matches_message(
+    stream: &DesktopRuntimeTextStreamProjection,
+    role: MissionConversationRole,
+    kind: MissionConversationMessageKind,
+    body: &str,
+) -> bool {
+    stream.turn_status.is_terminal()
+        && role == MissionConversationRole::Assistant
+        && kind == MissionConversationMessageKind::RuntimeDraft
+        && stream.items.len() == 1
+        && stream.items[0].text == body
 }
 
 fn request_desktop_runtime_stop(
@@ -6814,6 +7260,91 @@ mod tests {
         assert!(css.contains(".prototype-thread .assistant-copy { font-size: 12.5px"));
         assert!(source.contains("0 EffectIntent"));
         assert!(source.contains("0 Receipt · 0 Verification"));
+    }
+
+    #[test]
+    fn persisted_runtime_stream_contract_is_contextual_stable_and_accessible() {
+        let source = include_str!("lib.rs");
+        let css = include_str!("../assets/prototype.css");
+        for contract in [
+            "runtime_text_stream_os",
+            "persisted-mission-thread",
+            "aria_live: \"polite\"",
+            "aria_atomic: \"false\"",
+            "从 SQLCipher 重放",
+            "begin_runtime_text_stream_monitor",
+        ] {
+            assert!(
+                source.contains(contract),
+                "missing persisted stream contract {contract}"
+            );
+        }
+        for selector in [
+            ".persisted-mission-thread",
+            ".persisted-user-message",
+            ".persisted-assistant-turn",
+            ".runtime-stream-caret",
+            ".runtime-stream-receipt",
+            ".mission-follow-latest",
+        ] {
+            assert!(
+                css.contains(selector),
+                "missing persisted stream selector {selector}"
+            );
+        }
+        assert!(css.contains("@media (prefers-reduced-motion: reduce)"));
+    }
+
+    #[test]
+    fn runtime_stream_paragraphs_are_append_stable_and_terminal_dedupe_is_exact() {
+        assert_eq!(
+            runtime_stream_paragraphs("第一段\n仍是第一段\n\n第二段"),
+            vec!["第一段\n仍是第一段", "第二段"]
+        );
+        assert_eq!(
+            runtime_stream_paragraphs("第一段\n仍是第一段\n\n第二段追加"),
+            vec!["第一段\n仍是第一段", "第二段追加"]
+        );
+        assert!(runtime_stream_paragraphs("").is_empty());
+
+        let now = Utc::now();
+        let mut stream = DesktopRuntimeTextStreamProjection {
+            project_id: ProjectId::from("project-stream-ui"),
+            mission_id: MissionId::from("mission-stream-ui"),
+            worker_generation: 3,
+            turn_revision: 8,
+            turn_status: RuntimeTurnStatus::Completed,
+            last_evidence_sequence: Some(14),
+            delta_count: 2,
+            items: vec![data_plane::DesktopRuntimeTextItemProjection {
+                item_id_digest: "item-digest".into(),
+                text: "可恢复的真实正文".into(),
+                delta_count: 2,
+                last_stream_sequence: 2,
+                cumulative_byte_count: 27,
+                observed_at: now,
+            }],
+            updated_at: now,
+        };
+        assert!(runtime_stream_matches_message(
+            &stream,
+            MissionConversationRole::Assistant,
+            MissionConversationMessageKind::RuntimeDraft,
+            "可恢复的真实正文",
+        ));
+        assert!(!runtime_stream_matches_message(
+            &stream,
+            MissionConversationRole::Assistant,
+            MissionConversationMessageKind::RuntimeDraft,
+            "可恢复的真实正文。",
+        ));
+        stream.turn_status = RuntimeTurnStatus::Running;
+        assert!(!runtime_stream_matches_message(
+            &stream,
+            MissionConversationRole::Assistant,
+            MissionConversationMessageKind::RuntimeDraft,
+            "可恢复的真实正文",
+        ));
     }
 
     #[test]

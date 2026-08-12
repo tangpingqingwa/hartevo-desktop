@@ -2,21 +2,23 @@ use std::collections::BTreeSet;
 use std::env;
 
 use hartevo_application::{
-    DesktopInventoryProjection, DesktopProjectProjection, MissionProjection,
-    ProjectEncryptionReadiness, WorkProductProjection,
+    DesktopInventoryProjection, DesktopProjectProjection, MissionConversationMessageProjection,
+    MissionProjection, ProjectEncryptionReadiness, WorkProductProjection,
 };
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_domain_kernel::{
     MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointStatus,
-    MissionConversationId, MissionId, MissionStage, ProjectEncryptionMode, ProjectId, StorageMode,
-    TenantId, WorkProductId, WorkProductStatus,
+    MissionConversationId, MissionConversationMessageId, MissionConversationMessageKind,
+    MissionConversationRole, MissionId, MissionStage, ProjectEncryptionMode, ProjectId,
+    RuntimeTurnStatus, StorageMode, TenantId, WorkProductId, WorkProductStatus,
 };
 use hartevo_storage::RuntimeTurnStartupReconciliation;
 use serde::Deserialize;
 
 use crate::data_plane::{
-    DesktopSnapshot, MissionContractEvidenceProjection, ProductEvidenceProjection,
-    ProjectContextAccessProjection, ProjectContextAccessStatus,
+    DesktopRuntimeTextItemProjection, DesktopRuntimeTextStreamProjection, DesktopSnapshot,
+    MissionContractEvidenceProjection, ProductEvidenceProjection, ProjectContextAccessProjection,
+    ProjectContextAccessStatus,
 };
 use crate::{
     DesktopBackendState, DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection,
@@ -193,10 +195,20 @@ pub(super) fn load_from_environment() -> Option<DesktopUiModel> {
     assert_eq!(definition.disclosure, "VISUAL_FIXTURE");
 
     let project_id = ProjectId::from(definition.project.project_id.as_str());
+    let requested_surface = requested_surface_id();
+    let conversation = definition.presentation.conversation.clone();
     let missions = definition
         .missions
         .into_iter()
-        .map(|mission| mission_projection(&project_id, mission))
+        .map(|mission| {
+            let mut projection = mission_projection(&project_id, mission);
+            if requested_surface.as_deref() == Some("mission-persisted-stream")
+                && projection.manifest_id.as_deref() == Some("VM-07")
+            {
+                projection.conversation_messages = vec![fixture_user_message(&conversation)];
+            }
+            projection
+        })
         .collect::<Vec<_>>();
     let selected_mission_id = selected_fixture_mission_id(&missions);
     let project = fixture_project_projection(project_id.clone(), definition.project, missions);
@@ -234,11 +246,67 @@ pub(super) fn page(page_id: &str) -> Option<VisualPage> {
         .find(|page| page.id == page_id)
 }
 
+pub(super) fn runtime_text_stream() -> Option<DesktopRuntimeTextStreamProjection> {
+    active_id()?;
+    if requested_surface_id().as_deref() != Some("mission-persisted-stream") {
+        return None;
+    }
+    let definition: VisualFixtureDefinition = serde_json::from_str(PROTOTYPE_SCENARIO)
+        .expect("checked-in prototype visual fixture must deserialize");
+    let mission = definition
+        .missions
+        .iter()
+        .find(|mission| mission.manifest_id == "VM-07")?;
+    let observed_at = "2026-08-12T10:21:00Z"
+        .parse()
+        .expect("fixed visual fixture timestamp");
+    let text = definition.presentation.conversation.assistant_intro;
+    Some(DesktopRuntimeTextStreamProjection {
+        project_id: ProjectId::from(definition.project.project_id.as_str()),
+        mission_id: MissionId::from(mission.mission_id.as_str()),
+        worker_generation: 1,
+        turn_revision: 4,
+        turn_status: RuntimeTurnStatus::Running,
+        last_evidence_sequence: Some(12),
+        delta_count: 12,
+        items: vec![DesktopRuntimeTextItemProjection {
+            item_id_digest: "visual-fixture-runtime-item-digest".into(),
+            cumulative_byte_count: text.len() as u64,
+            text,
+            delta_count: 12,
+            last_stream_sequence: 12,
+            observed_at,
+        }],
+        updated_at: observed_at,
+    })
+}
+
+fn fixture_user_message(conversation: &VisualConversation) -> MissionConversationMessageProjection {
+    MissionConversationMessageProjection {
+        message_id: MissionConversationMessageId::from("visual-fixture-user-message"),
+        sequence: 1,
+        role: MissionConversationRole::User,
+        kind: MissionConversationMessageKind::Goal,
+        body: conversation.user_prompt.clone(),
+        content_digest: "visual-fixture-user-message-digest".into(),
+        mission_revision: 1,
+        checkpoint_id: None,
+        work_product_id: None,
+        recorded_at: "2026-08-12T10:21:00Z"
+            .parse()
+            .expect("fixed visual fixture timestamp"),
+    }
+}
+
 fn selected_fixture_mission_id(missions: &[MissionProjection]) -> Option<MissionId> {
     let requested_surface = requested_surface_id();
     let selected_manifest_id = match requested_surface.as_deref() {
         Some(
-            "mission-conversation" | "mission-streaming" | "mission-workpad" | "mission-inspector",
+            "mission-conversation"
+            | "mission-streaming"
+            | "mission-persisted-stream"
+            | "mission-workpad"
+            | "mission-inspector",
         ) => Some("VM-07"),
         Some("mission-approval" | "mission-outcome") => Some("VM-03"),
         _ => match initial_surface() {
@@ -365,6 +433,7 @@ pub(super) fn initial_surface() -> Option<Surface> {
             "orchestrator"
             | "mission-conversation"
             | "mission-streaming"
+            | "mission-persisted-stream"
             | "mission-workpad"
             | "mission-inspector"
             | "mission-approval"

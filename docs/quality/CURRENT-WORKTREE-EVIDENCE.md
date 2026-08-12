@@ -3,7 +3,7 @@
 状态：**开发机快照，不是 Release Evidence**
 观测时间：2026-08-12
 Commit：以 `git rev-parse HEAD` 返回的 checkpoint commit 为准；文档不内嵌自身 SHA，避免自引用改变提交内容
-代码/机器证据基线：`c71061e29d277fe62c724a23c118fe4c00e88657`；本次后继 checkpoint 只再认证文档，不改变该基线的 Rust、Catalog、Schema 或 Runtime/Desktop 行为
+代码/机器证据基线：`c71061e29d277fe62c724a23c118fe4c00e88657` 加 Runtime stream checkpoint `401db44a97a44cdfb8311ddb3a59742c9d374e77`；当前 integration checkpoint 合并该 Desktop slice 并再认证直接受影响的文档事实，不改变 Catalog、Release schema、SQLCipher schema 或 Mission evidence level
 
 本文件只记录当前工作树实际执行过的证据。任何较早文档中的测试数量快照均以本文件为准；机器生成的 Release baseline 仍是 `passed: false`，因此不得把这里的本地通过解释为 Mission E3、Provider E4、GA 或 E5。
 
@@ -11,7 +11,7 @@ Commit：以 `git rev-parse HEAD` 返回的 checkpoint commit 为准；文档不
 
 - `cargo fmt --all -- --check`：通过。
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`：通过。
-- `cargo test --workspace --all-targets --all-features --locked`：**489 passed、0 failed、4 ignored**。这里的 489 是 Rust 测试数，与 Dataset Registry 的 420 个 Mission Case 是两个独立计数。
+- `cargo test --workspace --all-targets --all-features --locked`：**492 passed、0 failed、4 ignored**。这里的 492 是 Rust 测试数，与 Dataset Registry 的 420 个 Mission Case 是两个独立计数。
 - 四个默认忽略的环境测试随后逐个显式运行并通过：
   - 真实 OpenInterpreter adapter、隔离 home、无凭据失败关闭；
   - 真实 OpenInterpreter Application Journey，持久记录失败且不伪造完成；
@@ -57,7 +57,7 @@ Commit：以 `git rev-parse HEAD` 返回的 checkpoint commit 为准；文档不
 - schema v36 保存机器可读 MissionDefinition/Checkpoint DAG，v37 保存 MissionConversation，v38 保存与 exact Runtime Turn evidence sequence/generation 绑定的 `runtime_turn_private_messages`，v39 新增 `runtime_process_claims`；它们由当前 v46 继续继承。完整 launch token、canonical launch path、exact process identity、Thread/Turn ID 与 Runtime 正文只进入 SQLCipher 私有 record；规范化投影、Event、Outbox 与 Debug 只保留 digest、状态和有界计数。
 - Desktop 从 Catalog 精确启动 VM-00～VM-11，持久化 Operating Contract、首个 Checkpoint 与同一 Mission Conversation；后续 correction/steering 继续同一个 Mission，不创建第二套业务状态。
 - Runtime adapter 已采纳 pinned App Server v2 的 `item/agentMessage/delta`。每个 delta 绑定 exact Thread/Turn scope、item digest、stream sequence、cumulative byte count、evidence sequence 与前向 chain digest；重排、跨 item 拼接、内容篡改或 scope 替换均失败关闭。Application 与 SQLCipher 在一个事务提交 content-free evidence、私有 delta 和 Turn 状态；故障注入证明 attempt/evidence/private row/Event/Outbox 整体回滚，exact replay 幂等。公开 Event/Outbox/Debug 不含 delta 正文。
-- `item/completed` 的完整正文必须与已持久化 delta 精确重组一致；不一致时 Turn 冻结为 `Uncertain`、清除 live mapping、禁止私有完成消息被采用。没有 delta 的合法非流式 Runtime 仍兼容。完成时，私有消息只能由 exact Turn ID 取回；Work Product、Manifest、Assistant `RuntimeDraft` 消息、Capsule Accepted、Branch/Handle Completed 与 Lease Released 在一个事务原子可见，崩溃重放不重复生成产物或事件。Application 已提供显式、context-gated 的私有 delta 读取边界；c71061e 的 Dioxus 仍未把它投影为真实逐增量正文，不能把 fixture 字符回放称为生产流式 UI。
+- `item/completed` 的完整正文必须与已持久化 delta 精确重组一致；不一致时 Turn 冻结为 `Uncertain`、清除 live mapping、禁止私有完成消息被采用。没有 delta 的合法非流式 Runtime 仍兼容。完成时，私有消息只能由 exact Turn ID 取回；Work Product、Manifest、Assistant `RuntimeDraft` 消息、Capsule Accepted、Branch/Handle Completed 与 Lease Released 在一个事务原子可见，崩溃重放不重复生成产物或事件。`DesktopDataPlane::runtime_text_stream_with/os` 现在以当前 Device Context 失败关闭地打开只读 Application，按 exact Project/Mission 取得最新 Turn 并从 SQLCipher delta chain 重组正文；Dioxus 只查询当前选中 scope，重启/重新选择会重放持久正文，active submit/retry 期间按 100ms 只读刷新，scope 改变立即清空，terminal `RuntimeDraft` 只在正文精确相等时去重，follow-latest/unseen 仅为本地 UI 状态。查询失败隐藏正文且不改变 Mission/Runtime ledger，公开 Debug 仍只含计数。新 Catalog Mission 的首轮 blocking Application 调用尚未在执行期返回 exact Mission ID，因此首轮增量须等调用返回或重启后才可见；durable handle/subscription、pause/resume/reconnect cursor 与真实高密度 process/artifact/capability 投影仍缺失。
 - 同一 Mission 的 Runtime 启动失败会在同一 generation 内按持久 recovery revision 有界重试。
 - 三次进程恢复失败耗尽后，Branch、Lease、Capsule 与 WorkerHandle 由一个事务原子退役；重复调用退役命令只得到同一投影，不产生第二个退役事件。
 - 下一次安全重试创建 generation 2，不创建第二个 Mission；完成消息只形成可审阅 `runtime_draft`，Mission 继续保持 `Running`，外部 Effect 数量为 0。
@@ -69,7 +69,7 @@ Commit：以 `git rev-parse HEAD` 返回的 checkpoint commit 为准；文档不
 - 两个真实 OpenInterpreter smoke 已在 v39 唯一启动副本路径上再次通过；退出后工作区与隔离 Home 均无 `.hartevo-runtime-launches` 子项。Runtime launch root 的首次并发创建改为原子 `create_dir`，`AlreadyExists` 后重新验证目录/拒绝 symlink；8 线程回归与两个并发 cleanup 测试通过。未固定 hash 的 Fake Runtime 仍只用于协议测试，不被声明为生产安全进程身份。
 - Runtime executable path、Thread/Turn 私有 ID 与草稿正文不进入 Domain Event/Outbox；测试明确检查 `/usr/bin/false` 和失败/成功正文均未出现在事件 JSON。
 
-这些证据仍是 Desktop/Application/SQLCipher/真实本地 Runtime/Scheduler 的 E2 切片，不是完整 Mission E3：总调度已能选择精确 executor，Human confirmation 有一个真实 VM-07 原子 handler，Application 有 VM-11 `event_ingest`、`normalize_dedupe_order`、`identity_chain`、`mission_specific_kpi`、`attribution_and_unattributed`、`refund_commission_payout_recalc` 与 `outcome_review` 七条 handler；其余 45 条 Application route、Effect Broker/Browser handler、其余 Human Checkpoint、自动 handoff、OS/Cell 远程调度、redirect、十二条 Mission 的完整 UI Journey、Provider readback/Verification 与跨平台安装证据仍然缺失。
+这些证据仍是 Desktop/Application/SQLCipher/真实本地 Runtime/Scheduler 的 E2 切片，不是完整 Mission E3：总调度已能选择精确 executor，Human confirmation 有一个真实 VM-07 原子 handler，Application 有 VM-11 `event_ingest`、`normalize_dedupe_order`、`identity_chain`、`mission_specific_kpi`、`attribution_and_unattributed`、`refund_commission_payout_recalc` 与 `outcome_review` 七条 handler，Desktop 也已有 exact Project/Mission-gated 的 Runtime private-text 只读投影与重启 replay；其余 45 条 Application route、Effect Broker/Browser handler、其余 Human Checkpoint、自动 handoff、OS/Cell 远程调度、redirect、新 Mission 首轮 execution-time subscription、真实高密度 process/artifact/capability 投影、十二条 Mission 的完整 UI Journey、Provider readback/Verification 与跨平台安装证据仍然缺失。
 
 ## 环境阻塞与未覆盖项
 

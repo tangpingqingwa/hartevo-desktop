@@ -22,8 +22,8 @@
 | Surface | 实现证据 | 当前结论 | 仍未关闭的差异 |
 |---|---|---|---|
 | Orchestrator | `comparisons/orchestrator-side-by-side.png` | hero、四格摘要、优先/等待队列、调度 narrative、quick-entry 与源层级对齐 | Dispatcher 内联过滤和真实 summary projection 未持久化 |
-| Mission Conversation | `comparisons/mission-conversation-side-by-side.png` | bubble、assistant byline、Mission Contract、活动流、能力组、连接建议、WorkProduct、结论和建议条已还原 | 正式 Runtime 仍没有 token delta；真实 correlated activity ledger 不完整 |
-| Mission Streaming | `comparisons/mission-streaming-side-by-side.png` | running 时发送动作替换为单一 square Stop；content-free Runtime phase strip 与事件序列可见 | fixture replay 不是 Runtime 证据；pause/resume、reconnect cursor 与 token stream 未实现 |
+| Mission Conversation | `comparisons/mission-conversation-side-by-side.png`；`artifacts/visual/runtime-stream-readonly/` | bubble、assistant byline、Mission Contract、活动流、能力组、连接建议、WorkProduct、结论和建议条已还原；exact Project/Mission-gated SQLCipher delta 已有只读 Dioxus 投影、重启重放与 follow-unseen | 新 Catalog Mission 首轮执行期 handle/subscription 与真实 correlated activity ledger 不完整 |
+| Mission Streaming | `comparisons/mission-streaming-side-by-side.png`；`artifacts/visual/runtime-stream-readonly/` | running 时发送动作替换为单一 square Stop；content-free Runtime phase strip 与事件序列可见；持久正文可在已有 exact Mission ID 后只读刷新 | 视觉 fixture 本身不是 SQLCipher 读回证据；durable pause/resume/reconnect cursor、首轮 live subscription 与高密度 process/artifact/capability 投影未实现 |
 | Mission Workpad | `comparisons/mission-workpad-side-by-side.png` | 四 tab、工具簇、报告、四阶段 strip、真实源 SVG、候选与 provenance 已还原 | comment/export、adoption command 与通用 PDF/image viewer 未接线 |
 | Mission Inspector | `surfaces/mission-inspector-macos-content.png` | Checkpoint、WorkProduct、Effect、Worker、Browser、Sources 分区与折叠语义完成 | live Worker/Browser/Effect/Revision projections 未完成；没有伪造 active worker |
 | Mission Approval | `comparisons/mission-approval-side-by-side.png` | 四 effect 结构、facts、minor-unit 修改、新 SAMPLE revision、延期与结果预览完成 | 真实逐 Effect Approval Service/Adapter 未接线；fixture 始终 0 Effect |
@@ -63,13 +63,13 @@
 - 17 个原生 surface AX snapshot 全部通过：窗口可识别、交互控件无空 accessible name、十种状态码 10/10 可见。
 - Search/Notifications/menu/Composer/splitter 的焦点与键盘行为使用真实原生窗口验证。
 - CSS gate 覆盖 `:focus-visible`、`prefers-reduced-motion` 与 `overflow-wrap:anywhere`。
-- `cargo test -p hartevo-desktop --features visual-fixtures`：35/35；默认 feature：34/34。
+- `cargo test -p hartevo-desktop --locked --features visual-fixtures`：38/38；默认 feature：37/37。
 - Clippy：`--all-targets --features visual-fixtures -- -D warnings` 通过。
 - VoiceOver、Windows Narrator、Windows native window 与 1600×1000 真实物理视口仍为 `BLOCKED_ENV`；AX 通过不等于 AT 实机完成。
 
 ## 仍阻断 Design QA 的高杠杆差异
 
-1. `P0`：真实 token delta/稳定段落持久化、pause/resume、reconnect cursor/replay 尚未实现。
+1. `P0`：exact Project/Mission-gated Runtime delta 只读投影、稳定段落重组、重启 replay 与 follow-unseen 已实现；仍缺新 Catalog Mission 首轮 execution-time handle/subscription、durable pause/resume/reconnect cursor，以及真实高密度 process/artifact/capability 投影。
 2. `P0`：File Broker/附件扫描、语音、live Worker/Browser handoff/Inspector 尚未接线。
 3. `P0`：CRM、Creator contract/deliverable/review/payout、Provider/OAuth/Probe、Outcome 等真实 Application/Provider 闭环未完成。
 4. `P0`：默认未接线路径仍有部分 compact `state-canvas`；完整中英 UI locale catalog 尚未实现。
