@@ -1,5 +1,15 @@
 //! Deterministic local Mission evidence for the first vertical slice.
 
+mod run_receipt;
+
+pub use run_receipt::{
+    CaseExecutionDisposition, CaseExecutionEvidence, CompletedCaseEvidence, EffectEvidence,
+    EvaluationCaseResult, EvaluationRunPlan, EvaluationRunProfile, EvaluationRunReceipt,
+    EvaluationRunWriter, EvidenceArtifactRef, MissionId as EvaluationMissionId, OracleKind,
+    OracleResultRef, SafetyAssertionRef, TerminalOutcome, finalize_evaluation_run,
+    validate_evaluation_run,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
