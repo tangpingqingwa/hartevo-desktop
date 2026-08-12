@@ -1,0 +1,204 @@
+{
+  "schemaVersion": "hartevo.commit-bound-evidence-contract/v1",
+  "contractVersion": "ev-02/v1",
+  "manifestSchemaVersion": "hartevo.commit-bound-evidence-manifest/v1",
+  "verificationReceiptSchemaVersion": "hartevo.commit-bound-evidence-verification/v1",
+  "gate": {
+    "script": "scripts/check-evidence-manifest.sh",
+    "verifyMode": "verify",
+    "selfTestMode": "self-test",
+    "requiredVerifyArguments": [
+      "--manifest-commit",
+      "--expected-source",
+      "--expected-manifest-sha256"
+    ],
+    "requiredDependencies": [
+      "git",
+      "mktemp",
+      "python3"
+    ]
+  },
+  "publication": {
+    "mode": "tracked-child-commit",
+    "pathTemplate": "artifacts/evidence/commit-bound/{sourceCommit}.json",
+    "sourceRelation": "single-direct-parent",
+    "manifestGitMode": "100644",
+    "manifestGitType": "blob",
+    "sourceMustNotContainManifestPath": true,
+    "manifestCommitStoredInManifest": false
+  },
+  "git": {
+    "cloneVerifiableUriTemplate": "git+repo://{sourceCommit}/{path}",
+    "digestOnlyUriTemplate": "urn:sha256:{sha256}",
+    "objectFormatHexLengths": {
+      "sha1": 40,
+      "sha256": 64
+    },
+    "regularBlobModes": [
+      "100644",
+      "100755"
+    ],
+    "rejectedModes": [
+      "120000",
+      "160000"
+    ],
+    "objectRead": "ls-tree+cat-file"
+  },
+  "manifest": {
+    "topLevelFields": [
+      "artifacts",
+      "build",
+      "claims",
+      "environment",
+      "manifestId",
+      "publication",
+      "releaseDecision",
+      "schemaVersion",
+      "source",
+      "verificationStatus"
+    ],
+    "sourceFields": [
+      "commit",
+      "dirty",
+      "objectFormat",
+      "repositoryUri",
+      "tree"
+    ],
+    "publicationFields": [
+      "mode",
+      "path",
+      "sourceRelation"
+    ],
+    "buildFields": [
+      "commands",
+      "receiptArtifactIds",
+      "tools"
+    ],
+    "environmentFields": [
+      "architecture",
+      "isolation",
+      "os",
+      "redaction"
+    ],
+    "commandFields": [
+      "argv",
+      "id"
+    ],
+    "toolFields": [
+      "id",
+      "sha256",
+      "version"
+    ],
+    "claimFields": [
+      "artifactIds",
+      "id",
+      "required"
+    ],
+    "artifactFields": [
+      "byteCount",
+      "id",
+      "kind",
+      "mediaType",
+      "sha256",
+      "uri",
+      "verificationClass"
+    ],
+    "verificationStatus": "VERIFIED",
+    "releaseDecision": "NOT_EVALUATED",
+    "environmentIsolationValues": [
+      "ci",
+      "ephemeral",
+      "local"
+    ],
+    "environmentRedaction": "STRICT"
+  },
+  "artifacts": {
+    "kinds": [
+      "BUILD_RECEIPT",
+      "CONTRACT",
+      "EVIDENCE_PAYLOAD",
+      "GATE_SOURCE",
+      "MACHINE_REPORT",
+      "SOURCE"
+    ],
+    "verificationClasses": [
+      "BLOCKED_ENV",
+      "DIGEST_ONLY",
+      "FAIL",
+      "SOURCE_COMMIT_BLOB",
+      "TEST_ONLY"
+    ],
+    "requiredClaimEligible": {
+      "verificationClass": "SOURCE_COMMIT_BLOB",
+      "uriScheme": "git+repo",
+      "mediaTypes": [
+        "application/json",
+        "text/*"
+      ],
+      "gitModes": [
+        "100644",
+        "100755"
+      ]
+    },
+    "forbiddenRequiredClasses": [
+      "BLOCKED_ENV",
+      "DIGEST_ONLY",
+      "FAIL",
+      "TEST_ONLY"
+    ],
+    "nonPassEvidenceChecks": [
+      "blocked_or_failure_status",
+      "dirty_source",
+      "false_success_assertion",
+      "non_positive_status",
+      "source_commit_mismatch",
+      "test_mode"
+    ],
+    "forbiddenPathPrefixes": [
+      "target/"
+    ]
+  },
+  "redaction": {
+    "strictArtifactKinds": [
+      "BUILD_RECEIPT",
+      "EVIDENCE_PAYLOAD",
+      "MACHINE_REPORT"
+    ],
+    "sourceArtifactKinds": [
+      "CONTRACT",
+      "GATE_SOURCE",
+      "SOURCE"
+    ],
+    "strictChecks": [
+      "absolute_path",
+      "email",
+      "high_entropy",
+      "hostname",
+      "pem_private_key",
+      "sensitive_field",
+      "url_userinfo"
+    ],
+    "sourceChecks": [
+      "high_entropy",
+      "pem_private_key",
+      "secret_assignment",
+      "url_userinfo"
+    ],
+    "sourceLexicalNonSecrets": [
+      "Authorization",
+      "BLOCKED_ENV",
+      "FAIL",
+      "NOT_EVALUATED",
+      "shebang",
+      "split-test-canary-literals"
+    ]
+  },
+  "result": {
+    "verifiedStatus": "VERIFIED",
+    "blockedStatus": "BLOCKED_ENV",
+    "failureStatus": "FAIL",
+    "releaseDecision": "NOT_EVALUATED",
+    "blockedExitCode": 2,
+    "failureExitCode": 1
+  }
+}
