@@ -29,6 +29,7 @@ use rust_decimal::Decimal;
 use zeroize::Zeroizing;
 
 pub mod data_plane;
+mod gm01;
 mod runtime_plane;
 mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
@@ -42,6 +43,7 @@ use data_plane::{
     DesktopSnapshot, DesktopVm11OutcomeDecisionRequest, ProductEvidenceProjection,
     ProjectContextAccessProjection, ProjectContextAccessStatus, RecoveryKitDraft,
 };
+use gm01::{Gm01NaturalLanguageMatch, compile_gm01_natural_language};
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 use runtime_subscription::{
     DESKTOP_RUNTIME_SUBSCRIPTION_PAGE_SIZE, DesktopRuntimeCommandIdentity,
