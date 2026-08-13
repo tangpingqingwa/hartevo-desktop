@@ -91,8 +91,10 @@ use hartevo_domain_kernel::{
     WorkerLeaseId, WorkerLeaseStatus, WorkerMailbox, validate_context_branch_lineage,
 };
 use hartevo_domain_kernel::{
-    MarketDecisionRecommendation, MarketEvidenceClassification, MarketEvidenceError,
-    MarketEvidencePack, Vm07DecisionAction, Vm07DecisionBinding,
+    BillingLedgerError, MarketDecisionRecommendation, MarketEvidenceClassification,
+    MarketEvidenceError, MarketEvidencePack, MissionUsageReservation, StripeBillingFact,
+    UsageCommitEvidence, UsageReleaseEvidence, Vm07DecisionAction, Vm07DecisionBinding,
+    verify_stripe_webhook,
 };
 use hartevo_effect_broker::{
     BrokerError, BrokerResult, EffectBroker, EffectCompletionAuthority, EffectCompletionPoint,
@@ -105,17 +107,17 @@ use hartevo_runtime_adapter::{
     cleanup_runtime_process, generate_runtime_launch_token, prepare_runtime_launch,
 };
 use hartevo_storage::{
-    ApplicationSourceKind, ApplicationSourceRevisionFence, BrowserRecipeRuntimeState,
-    ContentCrypto, ContentEncryptionContext, ContextMaterialDescriptor, ContextMaterialStoreError,
-    ContextQuerySnapshot, DeviceKeyAgreementCrypto, DomainEventRecord, EncryptedContent,
-    EnvelopeContext, EnvelopeCrypto, KeyBootstrapCell, KeyBootstrapOperationKind,
+    ApplicationSourceKind, ApplicationSourceRevisionFence, BillingPersistenceOutcome,
+    BrowserRecipeRuntimeState, ContentCrypto, ContentEncryptionContext, ContextMaterialDescriptor,
+    ContextMaterialStoreError, ContextQuerySnapshot, DeviceKeyAgreementCrypto, DomainEventRecord,
+    EncryptedContent, EnvelopeContext, EnvelopeCrypto, KeyBootstrapCell, KeyBootstrapOperationKind,
     KeyBootstrapOperationStatus, KeyMaterial, LocalEncryptedContextMaterialStore,
     LocalInboundSyncEnvelope, LocalInboundSyncObject, LocalInboundSyncStageDisposition,
     LocalInboundSyncStageOutcome, LocalKeyBootstrapOperation, LocalProjectCloudRegistration,
     LocalProjectCloudRegistrationPrepareOutcome, LocalSyncOperation, LocalSyncPrepareOutcome,
     LocalSyncStatus, PendingEvent, ProjectCloudRegistrationStatus, ProjectKeySecretReference,
     ProjectStore, RuntimeTurnStartupReconciliation, SecretBytes, SecretReference, SecretStore,
-    SecretStoreError, StorageError,
+    SecretStoreError, StorageError, UsagePersistenceOutcome,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -4318,6 +4320,21 @@ pub struct MissionProjection {
     pub outcome_summary: Option<String>,
     #[serde(default)]
     pub vm11_outcome_review: Option<Vm11OutcomeReviewDecisionProjection>,
+}
+
+/// Content-free billing/usage projection for Desktop surfaces. Provider
+/// acceptance and provider settlement remain distinct facts; this projection
+/// exposes only the typed minor-unit Mission credit state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionUsageProjection {
+    pub project_id: ProjectId,
+    pub ledger_revision: u64,
+    pub currency: CurrencyCode,
+    pub available: Money,
+    pub reserved: Money,
+    pub committed: Money,
+    pub reservations: Vec<MissionUsageReservation>,
 }
 
 /// Exact decision material shown by Desktop for VM-11. The review and both
@@ -16167,6 +16184,130 @@ impl ApplicationService {
         Ok(self.store.load_outcome_ledger(project_id)?)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the boundary accepts the signed provider body and exact verification scope"
+    )]
+    pub fn ingest_stripe_billing_webhook(
+        &mut self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+        body: &str,
+        signature_header: &str,
+        signing_secret: &str,
+        now: DateTime<Utc>,
+        tolerance: Duration,
+    ) -> Result<BillingPersistenceOutcome, ApplicationError> {
+        let verified =
+            verify_stripe_webhook(body, signature_header, signing_secret, now, tolerance)?;
+        let scoped = verified.bind_scope(tenant_id.clone(), project_id.clone())?;
+        Ok(self.store.ingest_stripe_billing_webhook(&scoped)?)
+    }
+
+    pub fn record_stripe_reconciliation_fact(
+        &mut self,
+        fact: StripeBillingFact,
+    ) -> Result<BillingPersistenceOutcome, ApplicationError> {
+        Ok(self.store.record_stripe_reconciliation_fact(fact)?)
+    }
+
+    pub fn load_stripe_billing_ledger(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<hartevo_domain_kernel::StripeBillingLedger, ApplicationError> {
+        Ok(self.store.load_stripe_billing_ledger(project_id)?)
+    }
+
+    pub fn apply_stripe_credit_grant(
+        &mut self,
+        project_id: &ProjectId,
+        grant_id: hartevo_domain_kernel::CreditGrantId,
+        billing_fact_digest: &str,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<UsagePersistenceOutcome, ApplicationError> {
+        Ok(self.store.apply_stripe_credit_grant(
+            project_id,
+            grant_id,
+            billing_fact_digest,
+            recorded_at,
+        )?)
+    }
+
+    pub fn reserve_mission_usage(
+        &mut self,
+        reservation: MissionUsageReservation,
+    ) -> Result<UsagePersistenceOutcome, ApplicationError> {
+        Ok(self.store.reserve_mission_usage(reservation)?)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the command binds project, Mission, Effect, reservation, revision, scope, and receipt evidence"
+    )]
+    pub fn commit_mission_usage(
+        &mut self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        effect_id: &EffectId,
+        reservation_id: &hartevo_domain_kernel::UsageReservationId,
+        mission_revision: u64,
+        effect_scope_digest: &str,
+        evidence: UsageCommitEvidence,
+    ) -> Result<UsagePersistenceOutcome, ApplicationError> {
+        Ok(self.store.commit_mission_usage(
+            project_id,
+            mission_id,
+            effect_id,
+            reservation_id,
+            mission_revision,
+            effect_scope_digest,
+            evidence,
+        )?)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the command binds project, Mission, Effect, reservation, revision, scope, and release evidence"
+    )]
+    pub fn release_mission_usage(
+        &mut self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        effect_id: &EffectId,
+        reservation_id: &hartevo_domain_kernel::UsageReservationId,
+        mission_revision: u64,
+        effect_scope_digest: &str,
+        evidence: UsageReleaseEvidence,
+    ) -> Result<UsagePersistenceOutcome, ApplicationError> {
+        Ok(self.store.release_mission_usage(
+            project_id,
+            mission_id,
+            effect_id,
+            reservation_id,
+            mission_revision,
+            effect_scope_digest,
+            evidence,
+        )?)
+    }
+
+    pub fn mission_usage_projection(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<MissionUsageProjection>, ApplicationError> {
+        let Some(ledger) = self.store.load_mission_usage_ledger(project_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(MissionUsageProjection {
+            project_id: project_id.clone(),
+            ledger_revision: ledger.revision,
+            currency: ledger.currency.clone(),
+            available: ledger.available()?,
+            reserved: ledger.reserved()?,
+            committed: ledger.committed()?,
+            reservations: ledger.reservations(),
+        }))
+    }
+
     /// Builds the exact transitive support closure required to replay one
     /// OutcomeLedger revision on another device/Cell. Unreferenced CRM or PII
     /// records are deliberately excluded from the encrypted payload.
@@ -20928,6 +21069,10 @@ pub enum ApplicationError {
     WorkProductManifest(#[from] WorkProductManifestError),
     #[error(transparent)]
     Outcome(#[from] OutcomeLedgerError),
+    #[error(transparent)]
+    Billing(#[from] BillingLedgerError),
+    #[error(transparent)]
+    Usage(#[from] hartevo_domain_kernel::UsageLedgerError),
     #[error(transparent)]
     Context(#[from] ContextError),
     #[error(transparent)]

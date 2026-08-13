@@ -3,6 +3,7 @@
 mod aggregate;
 mod attribution_spine_store;
 mod authorization;
+mod billing_store;
 mod browser_file_store;
 mod browser_recipe_store;
 mod browser_store;
@@ -33,10 +34,12 @@ mod runtime_recovery_store;
 mod runtime_turn_store;
 mod secure_store;
 mod sync_store;
+mod usage_store;
 mod work_product_store;
 pub use aggregate::{
     ApplicationSourceKind, ApplicationSourceRevisionFence, AtomicMutation, PendingEvent,
 };
+pub use billing_store::{BillingPersistenceDisposition, BillingPersistenceOutcome};
 pub use browser_recipe_store::BrowserRecipeRuntimeState;
 pub use context_material_store::{
     ContextMaterialDescriptor, ContextMaterialStoreError, ContextQuerySnapshot,
@@ -67,6 +70,7 @@ pub use sync_store::{
     LocalInboundSyncStageOutcome, LocalInboundSyncStatus, LocalSyncOperation,
     LocalSyncPrepareOutcome, LocalSyncStatus,
 };
+pub use usage_store::{UsagePersistenceDisposition, UsagePersistenceOutcome};
 
 use std::fmt;
 use std::fs;
@@ -82,7 +86,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 47;
+pub const STORAGE_SCHEMA_VERSION: i64 = 48;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4404,6 +4408,76 @@ impl ProjectStore {
             record_migration(&transaction, 47)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 48 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS stripe_billing_facts (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   revision INTEGER NOT NULL CHECK (revision > 0),
+                   fact_id TEXT NOT NULL,
+                   external_id TEXT NOT NULL,
+                   fact_kind TEXT NOT NULL,
+                   source_kind TEXT NOT NULL CHECK (source_kind IN ('webhook', 'reconciliation')),
+                   source_id TEXT NOT NULL,
+                   immutable_digest TEXT NOT NULL CHECK (length(immutable_digest) = 64),
+                   observed_at TEXT NOT NULL,
+                   record_json TEXT NOT NULL CHECK (length(trim(record_json)) > 2),
+                   PRIMARY KEY (project_id, revision),
+                   UNIQUE (project_id, fact_id),
+                   UNIQUE (project_id, immutable_digest),
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS stripe_billing_fact_scope_idx
+                   ON stripe_billing_facts(tenant_id, project_id, external_id, fact_kind);
+                 CREATE TABLE IF NOT EXISTS stripe_webhook_events (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   event_id TEXT NOT NULL,
+                   event_type TEXT NOT NULL,
+                   object_id TEXT NOT NULL,
+                   payload_digest TEXT NOT NULL CHECK (length(payload_digest) = 64),
+                   signature_digest TEXT NOT NULL CHECK (length(signature_digest) = 64),
+                   fact_digest TEXT NOT NULL CHECK (length(fact_digest) = 64),
+                   received_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id, event_id),
+                   UNIQUE (project_id, fact_digest),
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS stripe_webhook_scope_idx
+                   ON stripe_webhook_events(tenant_id, project_id, received_at);
+                 CREATE TABLE IF NOT EXISTS mission_usage_ledger_heads (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   currency TEXT NOT NULL CHECK (length(currency) = 3),
+                   revision INTEGER NOT NULL CHECK (revision >= 0),
+                   updated_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id),
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE IF NOT EXISTS mission_usage_entries (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   sequence INTEGER NOT NULL CHECK (sequence > 0),
+                   id TEXT NOT NULL,
+                   entry_kind TEXT NOT NULL,
+                   mission_id TEXT,
+                   amount_minor INTEGER,
+                   currency TEXT NOT NULL CHECK (length(currency) = 3),
+                   record_json TEXT NOT NULL CHECK (length(trim(record_json)) > 2),
+                   recorded_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id, sequence),
+                   UNIQUE (project_id, id),
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                   FOREIGN KEY (mission_id, project_id)
+                     REFERENCES missions(id, project_id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS mission_usage_entry_scope_idx
+                   ON mission_usage_entries(tenant_id, project_id, mission_id, sequence);",
+            )?;
+            record_migration(&transaction, 48)?;
+            transaction.commit()?;
+        }
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
@@ -4627,6 +4701,10 @@ pub enum StorageError {
     #[error(transparent)]
     Outcome(#[from] hartevo_domain_kernel::OutcomeLedgerError),
     #[error(transparent)]
+    Billing(#[from] hartevo_domain_kernel::BillingLedgerError),
+    #[error(transparent)]
+    Usage(#[from] hartevo_domain_kernel::UsageLedgerError),
+    #[error(transparent)]
     KeyManagement(#[from] hartevo_domain_kernel::KeyManagementError),
     #[error(transparent)]
     Deletion(#[from] hartevo_domain_kernel::DeletionError),
@@ -4640,6 +4718,21 @@ pub enum StorageError {
     },
     #[error("revision cannot be represented by SQLite INTEGER: {0}")]
     RevisionOverflow(u64),
+    #[error("Stripe webhook {event_id} was replayed with a different payload")]
+    BillingWebhookConflict { event_id: String },
+    #[error("persisted Stripe Billing ledger is inconsistent")]
+    BillingLedgerIntegrity,
+    #[error("Mission usage ledger does not exist for project {0}")]
+    UsageLedgerNotFound(ProjectId),
+    #[error("Effect {effect_id} was not found inside Mission {mission_id}")]
+    UsageEffectNotFound {
+        mission_id: MissionId,
+        effect_id: String,
+    },
+    #[error("usage reservation scope does not match the persisted Effect")]
+    UsageEffectScopeMismatch,
+    #[error("usage mutation does not match the persisted Effect terminal state")]
+    UsageEffectStateMismatch,
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -5334,7 +5427,10 @@ mod tests {
 
         let mut migrated =
             ProjectStore::open(&database, &database_key()).expect("migrate v46 to v47");
-        assert_eq!(migrated.schema_version().expect("v47 schema"), 47);
+        assert_eq!(
+            migrated.schema_version().expect("v47 schema"),
+            STORAGE_SCHEMA_VERSION
+        );
         assert!(checkpoint_policy_table_sql(&migrated.connection).contains("effect_readback_v2"));
         assert_eq!(
             migrated
@@ -5445,7 +5541,10 @@ mod tests {
             .execute_batch("DROP TABLE mission_checkpoints_v47;")
             .expect("remove injected collision");
         store.migrate().expect("retry v47 migration");
-        assert_eq!(store.schema_version().expect("retried schema"), 47);
+        assert_eq!(
+            store.schema_version().expect("retried schema"),
+            STORAGE_SCHEMA_VERSION
+        );
         assert_eq!(
             store
                 .load_mission(&project.id, &legacy.id)

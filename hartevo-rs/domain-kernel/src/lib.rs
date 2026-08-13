@@ -4,6 +4,7 @@
 //! kernel. They are never accepted as business truth without a domain command.
 
 mod attribution_spine;
+mod billing;
 mod connection;
 mod context;
 mod context_collaboration;
@@ -26,6 +27,7 @@ mod runtime_process;
 mod runtime_recovery;
 mod runtime_turn;
 mod truth;
+mod usage;
 mod work_product;
 
 pub use attribution_spine::{
@@ -37,6 +39,17 @@ pub use attribution_spine::{
     ProviderEntityRef, ProviderEventIdentity, SourceEntityKind, SourceEvent, SourceEventId,
     SourceEventKind, SourceEventLinks, SourceObservationBatch, VerificationMethod, VerifiedOutcome,
     VerifiedOutcomeId,
+};
+pub use billing::StripeFactSource as BillingFactSource;
+pub use billing::{
+    BillingLedgerError, BillingLedgerIngest, STRIPE_BILLING_CONTRACT_VERSION,
+    STRIPE_WEBHOOK_SIGNATURE_TOLERANCE_SECONDS, ScopedStripeWebhook, ScopedVerifiedStripeWebhook,
+    StripeBillingFact, StripeBillingFactKind, StripeBillingFactPayload, StripeBillingLedger,
+    StripeBillingRequest, StripeCheckoutPaymentStatus, StripeCreditDirection, StripeDisputeStatus,
+    StripeFactSource, StripeHttpMethod, StripeInvoiceStatus, StripePaymentStatus,
+    StripePayoutStatus, StripeRefundStatus, StripeRequest, StripeSignature,
+    StripeSubscriptionStatus, StripeWebhookError, StripeWebhookEvent, StripeWebhookEventType,
+    VerifiedStripeWebhook, verify_stripe_webhook,
 };
 pub use context::{
     ContextBranch, ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleStatus,
@@ -75,12 +88,13 @@ pub use ids::{
     ContextCheckpointId, ContextCompactionRecordId, ContextContinuationLedgerId,
     ContextWorkerMailboxId, ContextWorkerMessageId, ContextWorkingSetId, ContextWorkspaceId,
     ConversationId, CreatorApplicationId, CreatorHiringId, CreatorId, CreatorMilestoneId,
-    CreatorTaskId, DeletionId, DeletionReceiptId, DeliverableId, DeviceAttachmentId,
+    CreatorTaskId, CreditGrantId, DeletionId, DeletionReceiptId, DeliverableId, DeviceAttachmentId,
     DeviceHandoffId, DeviceId, EffectId, EvidenceId, ExecutionAttemptId, FactId, IdentityLinkId,
     KeyEnvelopeId, MemberId, MessageId, MissionConversationId, MissionConversationMessageId,
     MissionId, MissionScheduleId, OpportunityId, OrderId, OutcomeEventId, PartnerId, PayoutId,
     PersonId, ProjectId, ReceiptId, RefundId, ReviewId, RuntimeRecoveryAttemptId,
-    RuntimeTurnAttemptId, TaskId, TenantId, VerificationId, WorkProductId, WorkerId, WorkerLeaseId,
+    RuntimeTurnAttemptId, TaskId, TenantId, UsageEntryId, UsageReservationId, VerificationId,
+    WorkProductId, WorkerId, WorkerLeaseId,
 };
 pub use key_management::{
     DeviceAttachment, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffCiphertext,
@@ -155,6 +169,11 @@ pub use runtime_turn::{
 };
 pub use truth::{
     TruthCandidate, TruthError, TruthFact, TruthRevisionLink, TruthSource, TruthStatus, TruthValue,
+};
+pub use usage::{
+    MissionUsageEntry, MissionUsageEntryKind, MissionUsageLedger, MissionUsageReservation,
+    UsageCommitEvidence, UsageLedgerError, UsageLedgerMutation, UsageReleaseEvidence,
+    UsageReleaseReason, UsageReservationStatus,
 };
 pub use work_product::{
     WorkProductDependencies, WorkProductManifest, WorkProductManifestError, WorkProductPreview,
