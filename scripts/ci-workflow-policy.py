@@ -198,6 +198,21 @@ def validate_pr_secrets(path: Path, text: str) -> None:
             raise PolicyError(f"{path} exposes secrets to an untrusted PR event")
 
 
+def validate_dependency_audit_contract(path: Path, text: str) -> None:
+    """Keep Cargo lock validation separate from cargo-audit's own CLI flags."""
+    if path.name != "integration.yml":
+        return
+    if re.search(r"^\s*(?:run:\s*)?cargo\s+audit\b[^\n]*--locked\b", text, re.MULTILINE):
+        raise PolicyError(f"{path} passes unsupported --locked to cargo audit")
+    required = (
+        "test -s Cargo.lock",
+        "cargo metadata --format-version 1 --locked",
+        "cargo audit --json",
+    )
+    if any(item not in text for item in required):
+        raise PolicyError(f"{path} is missing the locked dependency audit contract")
+
+
 def validate_required_workflow_contract(path: Path, text: str) -> None:
     if path.name == "ci.yml":
         required = ("pull_request:", "scripts/ci-scope.py", "rust-reusable.yml", "scripts/ci-workflow-policy.py", "scripts/ci-result.py", "PR / Result taxonomy")
@@ -209,6 +224,7 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
         required = ("bootstrap/macos-r0", "pull_request_review:", "HARTEVO_TEST_POSTGRES_URL", "postgres:18.4", "check-evidence-doc-truth.sh", "check-openinterpreter-schema.sh", "check-dioxus-toolchain.sh", "catalog export", "evidence baseline", "Integration / Result taxonomy")
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing a required integration contract")
+        validate_dependency_audit_contract(path, text)
     elif path.name == "release-promotion.yml":
         required = ("workflow_dispatch:", "environment: release-promotion", "id-token: write", "source_commit", "refs/heads/main", "release-baseline", "releaseCommit", "passed", "sha256", "rollback", "release: false", "ci-distribution-hook.sh", "ci-oidc-interface")
         if any(item not in text for item in required):
@@ -306,6 +322,32 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("self-test accepted an unfenced release workflow")
+
+    dependency_fixture = """\
+      - name: Verify the checked-in locked dependency graph
+        run: |
+          test -s Cargo.lock
+          cargo metadata --format-version 1 --locked > metadata.json
+      - name: Generate license and vulnerability evidence
+        run: cargo audit --json > cargo-audit.json
+    """
+    validate_dependency_audit_contract(Path("integration.yml"), dependency_fixture)
+    try:
+        validate_dependency_audit_contract(
+            Path("integration.yml"), dependency_fixture.replace("cargo audit --json", "cargo audit --locked --json")
+        )
+    except PolicyError:
+        pass
+    else:
+        raise AssertionError("self-test accepted unsupported cargo audit --locked")
+    try:
+        validate_dependency_audit_contract(
+            Path("integration.yml"), dependency_fixture.replace("test -s Cargo.lock", "true")
+        )
+    except PolicyError:
+        pass
+    else:
+        raise AssertionError("self-test accepted an audit without an explicit lockfile check")
     print(json.dumps({"schema": "hartevo-ci-workflow-policy-self-test/v1", "status": "PASS"}, sort_keys=True))
 
 
