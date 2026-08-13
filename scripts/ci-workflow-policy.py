@@ -163,6 +163,32 @@ def validate_concurrency(path: Path, text: str) -> None:
         raise PolicyError(f"{path} must serialize rather than cancel integration/release runs")
 
 
+def reusable_concurrency_key(
+    check_prefix: str,
+    workflow: str,
+    *,
+    pull_request_number: int | None = None,
+    run_id: int | None = None,
+) -> str:
+    """Model the GitHub expression used by rust-reusable.yml for self-tests."""
+    identity = pull_request_number if pull_request_number is not None else run_id
+    if identity is None:
+        raise ValueError("a pull request number or run id is required")
+    return f"hartevo-rust-reusable-{check_prefix}-{workflow}-{identity}"
+
+
+def validate_reusable_concurrency_contract(path: Path, text: str) -> None:
+    if path.name != "rust-reusable.yml":
+        return
+    required = (
+        "group: hartevo-rust-reusable-${{ inputs.check_prefix }}-${{ github.workflow }}-"
+        "${{ github.event.pull_request.number || github.run_id }}",
+        "cancel-in-progress: false",
+    )
+    if any(item not in text for item in required):
+        raise PolicyError(f"{path} must isolate reusable concurrency by caller PR or run")
+
+
 def validate_actions(path: Path, text: str, pins: dict[str, str]) -> list[str]:
     actions: list[str] = []
     for line in text.splitlines():
@@ -250,6 +276,7 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
         required = ("workflow_call:", "inputs:", "check_prefix", "ci-rust-gate.sh", "all-targets", "all-features", "--locked")
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing the reusable Rust gate contract")
+        validate_reusable_concurrency_contract(path, text)
 
 
 def verify(root: Path) -> dict[str, object]:
@@ -322,6 +349,29 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("self-test accepted a PR workflow without cancellation")
+
+    reusable_fixture = """\
+concurrency:
+  group: hartevo-rust-reusable-${{ inputs.check_prefix }}-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+"""
+    validate_reusable_concurrency_contract(Path("rust-reusable.yml"), reusable_fixture)
+    pr_one_key = reusable_concurrency_key("PR / Fast Rust", "Reusable / Rust gates", pull_request_number=203)
+    pr_one_again_key = reusable_concurrency_key("PR / Fast Rust", "Reusable / Rust gates", pull_request_number=203)
+    pr_two_key = reusable_concurrency_key("PR / Fast Rust", "Reusable / Rust gates", pull_request_number=204)
+    assert pr_one_key == pr_one_again_key, "same PR must use one reusable concurrency key"
+    assert pr_one_key != pr_two_key, "different PRs must use different reusable concurrency keys"
+    assert reusable_concurrency_key("Integration / Full Rust", "Reusable / Rust gates", run_id=301) != reusable_concurrency_key(
+        "Integration / Full Rust", "Reusable / Rust gates", run_id=302
+    ), "non-PR runs must use distinct run-id fallback keys"
+    try:
+        validate_reusable_concurrency_contract(
+            Path("rust-reusable.yml"), reusable_fixture.replace("github.event.pull_request.number || github.run_id", "github.workflow")
+        )
+    except PolicyError:
+        pass
+    else:
+        raise AssertionError("self-test accepted a shared reusable concurrency key")
 
     try:
         validate_job_blocks(Path("fixture.yml"), ["jobs:", "  check:", "    runs-on: ubuntu-24.04"])

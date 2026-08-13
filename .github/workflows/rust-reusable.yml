@@ -22,7 +22,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: hartevo-rust-reusable-${{ inputs.check_prefix }}-${{ github.workflow }}
+  # workflow_call retains the caller event context. Keep PR callers in separate
+  # pending slots, and use run_id for non-PR callers that have no PR number.
+  # The caller workflow owns same-PR cancellation; this reusable layer must not
+  # cause a different PR to replace a pending Rust gate.
+  group: hartevo-rust-reusable-${{ inputs.check_prefix }}-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: false
 
 env:
