@@ -2,8 +2,10 @@
 //!
 //! This crate deliberately owns only the partner-network vertical contract:
 //! typed network identities, account/program scope, provider-native reads,
-//! signed callbacks and deterministic fixture worlds. The generic Connector
-//! SDK lifecycle remains an integration boundary owned by CONN-01 (#67).
+//! signed callbacks and deterministic fixture worlds. The generic lifecycle
+//! is the merged CONN-01 Connector SDK; [`ConnectorAdapterBridge`] only maps
+//! this provider-native contract into that SDK and does not define a second
+//! worker, auth, probe, read, or webhook authority.
 //! It does not create Hartevo Opt-in consent, employment, escrow, or hiring
 //! payout facts; those remain separate domain/effect-broker concerns.
 
@@ -12,12 +14,18 @@ mod contract;
 mod fixture;
 mod ids;
 mod replay;
+mod sdk;
 mod state;
 mod support;
 
 pub mod awin;
 pub mod cj;
 pub mod impact;
+
+pub use hartevo_connector_sdk::{
+    ConnectorAdapter, ConnectorDescriptor, ConnectorError, ConnectorScope, ProviderAdapterIdentity,
+};
+pub use sdk::ConnectorAdapterBridge;
 
 pub use callback::{
     CallbackChannel, CallbackDisposition, CallbackEvent, CallbackEventKind, CallbackObservation,
@@ -30,11 +38,11 @@ pub use contract::{
     NetworkCapability, NetworkProbeObservation, NetworkProbeRequest, NetworkProbeStatus,
     NetworkProvenance, NetworkProvider, NetworkReadData, NetworkReadObservation,
     NetworkReadRequest, NetworkResource, NetworkScope, OpaqueSecretReference,
-    PARTNER_NETWORK_CONTRACT_SCHEMA_VERSION, PARTNER_NETWORK_CONTRACT_VERSION,
-    PartnerNetworkAdapter, PartnerNetworkError, PartnerRecord, PartnerRelationshipState,
-    PayoutRecord, PayoutState, ProgramExpectation, ProgramRecord, ProgramState, ReadCursor,
-    ReadPage, ReportRecord, ReportRow, ReportSettlementState, ReversalRecord, ReversalState,
-    SettlementPeriod, TrackingLinkRecord,
+    PARTNER_NETWORK_CONTRACT_SCHEMA_VERSION, PARTNER_NETWORK_CONTRACT_VERSION, PartnerNetworkError,
+    PartnerRecord, PartnerRelationshipState, PayoutRecord, PayoutState, ProgramExpectation,
+    ProgramRecord, ProgramState, ReadCursor, ReadPage, ReportRecord, ReportRow,
+    ReportSettlementState, ReversalRecord, ReversalState, SettlementPeriod, TrackingLinkRecord,
+    TypedPartnerNetworkAdapter,
 };
 pub use ids::{
     ActionId, CallbackEventId, ClickId, CommissionId, ContractId, ConversionId, LinkId,

@@ -12,8 +12,8 @@ use crate::contract::{
     AuthorizationGrant, AuthorizationObservation, BlockedEnvironmentReason, FixtureScenario,
     NetworkProbeObservation, NetworkProbeRequest, NetworkProvenance, NetworkProvider,
     NetworkReadData, NetworkReadObservation, NetworkReadRequest, NetworkResource, NetworkScope,
-    OpaqueSecretReference, PartnerNetworkAdapter, PartnerNetworkError, ProgramExpectation,
-    ReadPage,
+    OpaqueSecretReference, PartnerNetworkError, ProgramExpectation, ReadPage,
+    TypedPartnerNetworkAdapter,
 };
 use crate::fixture::{PartnerFixtureWorld, sign_body};
 use crate::support::{
@@ -298,7 +298,7 @@ impl AwinAdapter<AwinFixtureWorld> {
     }
 }
 
-impl<C: AwinApi> PartnerNetworkAdapter for AwinAdapter<C> {
+impl<C: AwinApi> TypedPartnerNetworkAdapter for AwinAdapter<C> {
     fn provider(&self) -> NetworkProvider {
         NetworkProvider::Awin
     }

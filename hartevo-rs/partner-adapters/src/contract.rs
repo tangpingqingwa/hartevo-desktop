@@ -1058,7 +1058,11 @@ pub enum PartnerNetworkError {
     UnsupportedCallbackSignature,
 }
 
-pub trait PartnerNetworkAdapter {
+/// Provider-native typed operations consumed by the SDK bridge. This is not
+/// a second connector lifecycle: callers use `hartevo_connector_sdk::ConnectorAdapter`
+/// and `ConnectorWorker` for generic auth, probes, reads, callbacks, and
+/// revocation; this crate keeps only the network-shaped evidence seam here.
+pub trait TypedPartnerNetworkAdapter {
     fn provider(&self) -> NetworkProvider;
 
     fn authorize(

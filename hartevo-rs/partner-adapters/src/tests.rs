@@ -1,14 +1,20 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use hartevo_connector_sdk::{
+    BeginAuthRequest, ConnectorAdapter, ConnectorAuth, ConnectorScope, ConnectorWorker,
+    ProbeRequest, ProviderAdapterOperation, ProviderAdapterRegistry, ProviderCapabilityKey,
+    ProviderProvenanceClass, SecretReference,
+};
 
 use crate::awin::{AwinAdapter, AwinFixtureWorld};
 use crate::cj::{CjAdapter, CjFixtureWorld};
+use crate::contract::TypedPartnerNetworkAdapter;
 use crate::impact::{ImpactAdapter, ImpactFixtureWorld};
 use crate::{
     ActionState, AuthorizationState, CallbackChannel, CallbackDisposition, CallbackRequest,
-    CallbackSignatureScheme, CommissionState, ConversionState, FixtureScenario, NetworkAccountId,
-    NetworkProbeRequest, NetworkProbeStatus, NetworkReadData, NetworkReadRequest, NetworkResource,
-    NetworkScope, PartnerNetworkAdapter, PartnerNetworkError, ProgramId, ReportSettlementState,
-    ReversalState,
+    CallbackSignatureScheme, CommissionState, ConnectorAdapterBridge, ConversionState,
+    FixtureScenario, NetworkAccountId, NetworkProbeRequest, NetworkProbeStatus, NetworkReadData,
+    NetworkReadRequest, NetworkResource, NetworkScope, PartnerNetworkError, ProgramId,
+    ReportSettlementState, ReversalState,
 };
 
 fn observed_at() -> DateTime<Utc> {
@@ -34,7 +40,7 @@ fn all_resources() -> [NetworkResource; 11] {
 }
 
 fn assert_fixture_adapter(
-    adapter: &mut dyn PartnerNetworkAdapter,
+    adapter: &mut dyn TypedPartnerNetworkAdapter,
     scope: &NetworkScope,
     authorization: crate::AuthorizationGrant,
     expectation: &crate::ProgramExpectation,
@@ -109,6 +115,87 @@ fn impact_awin_and_cj_share_the_typed_network_contract() {
         &cj_expectation,
         at,
     );
+}
+
+#[test]
+fn merged_connector_sdk_bridge_keeps_fixture_probe_out_of_connected_authority()
+-> Result<(), hartevo_connector_sdk::ConnectorError> {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let network_scope = world.scope();
+    let sdk_scope = ConnectorScope::new(
+        network_scope.tenant_id.clone(),
+        network_scope.project_id.clone(),
+        "impact",
+        network_scope.account_id.as_str(),
+        [
+            "partner.read".to_owned(),
+            format!(
+                "program:{}",
+                network_scope.program_id.as_ref().expect("program").as_str()
+            ),
+        ],
+    )?;
+    let bridge = ConnectorAdapterBridge::with_program_expectation(
+        ImpactAdapter::new(world.clone()),
+        world.current_program_expectation(),
+    )?;
+    let descriptor = bridge.descriptor().clone();
+    let registry =
+        ProviderAdapterRegistry::new("partner-fixture-sdk-1", descriptor.registrations().to_vec())?;
+    let mut worker = ConnectorWorker::new(
+        "worker-impact-sdk",
+        bridge,
+        registry,
+        sdk_scope.clone(),
+        at,
+        at + Duration::minutes(5),
+    )?;
+    let secret = SecretReference::new("secret-ref-impact-fixture", sdk_scope.clone(), 1)?;
+    let lease = ConnectorAuth::issue_credential_lease(
+        &secret,
+        descriptor.identity().clone(),
+        "credential-lease-impact-fixture",
+        1,
+        at,
+        at + Duration::minutes(5),
+    )?;
+    let dispatch = worker.dispatch_fence();
+    let session = worker.begin_auth(BeginAuthRequest {
+        dispatch: dispatch.clone(),
+        scope: sdk_scope.clone(),
+        secret_reference: secret.clone(),
+        credential_lease: lease.clone(),
+        auth_revision: 1,
+        issued_at: at,
+        expires_at: at + Duration::minutes(5),
+    })?;
+    let probe = worker.probe(ProbeRequest {
+        dispatch,
+        scope: sdk_scope,
+        secret_reference: secret,
+        credential_lease: lease,
+        session,
+        probe_revision: 1,
+        result_id: "probe-result-impact-fixture".to_owned(),
+        at: at + Duration::seconds(1),
+    })?;
+    assert_eq!(probe.provenance_class(), ProviderProvenanceClass::Fixture);
+    assert_eq!(
+        probe.status(),
+        hartevo_connector_sdk::ProbeStatus::Reachable
+    );
+    assert_eq!(
+        worker.authorize_probe(&probe, at + Duration::seconds(1)),
+        Err(hartevo_connector_sdk::ConnectorError::UnsupportedProvenance)
+    );
+    let conversion_key = ProviderCapabilityKey::new("impact", "partner.conversion.read")?;
+    assert!(worker.descriptor().supports(
+        &conversion_key,
+        ProviderAdapterOperation::Read,
+        ProviderProvenanceClass::Fixture,
+    ));
+    Ok(())
 }
 
 #[test]

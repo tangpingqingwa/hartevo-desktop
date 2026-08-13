@@ -11,8 +11,8 @@ use crate::contract::{
     AuthorizationGrant, AuthorizationObservation, BlockedEnvironmentReason, FixtureScenario,
     NetworkProbeObservation, NetworkProbeRequest, NetworkProvenance, NetworkProvider,
     NetworkReadData, NetworkReadObservation, NetworkReadRequest, NetworkResource, NetworkScope,
-    OpaqueSecretReference, PartnerNetworkAdapter, PartnerNetworkError, ProgramExpectation,
-    ReadPage,
+    OpaqueSecretReference, PartnerNetworkError, ProgramExpectation, ReadPage,
+    TypedPartnerNetworkAdapter,
 };
 use crate::fixture::{PartnerFixtureWorld, sign_body};
 use crate::support::{
@@ -303,7 +303,7 @@ impl ImpactAdapter<ImpactFixtureWorld> {
     }
 }
 
-impl<C: ImpactApi> PartnerNetworkAdapter for ImpactAdapter<C> {
+impl<C: ImpactApi> TypedPartnerNetworkAdapter for ImpactAdapter<C> {
     fn provider(&self) -> NetworkProvider {
         NetworkProvider::Impact
     }

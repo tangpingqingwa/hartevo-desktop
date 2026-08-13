@@ -8,7 +8,9 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+hartevo-connector-sdk = { path = "../connector-sdk" }
 hartevo-domain-kernel = { path = "../domain-kernel" }
+hartevo-effect-broker = { path = "../effect-broker" }
 hex.workspace = true
 ring.workspace = true
 rust_decimal.workspace = true

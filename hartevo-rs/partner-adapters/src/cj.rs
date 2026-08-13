@@ -11,8 +11,8 @@ use crate::contract::{
     AuthorizationGrant, AuthorizationObservation, BlockedEnvironmentReason, FixtureScenario,
     NetworkProbeObservation, NetworkProbeRequest, NetworkProvenance, NetworkProvider,
     NetworkReadData, NetworkReadObservation, NetworkReadRequest, NetworkResource, NetworkScope,
-    OpaqueSecretReference, PartnerNetworkAdapter, PartnerNetworkError, ProgramExpectation,
-    ReadPage,
+    OpaqueSecretReference, PartnerNetworkError, ProgramExpectation, ReadPage,
+    TypedPartnerNetworkAdapter,
 };
 use crate::fixture::{PartnerFixtureWorld, sign_body};
 use crate::support::{
@@ -297,7 +297,7 @@ impl CjAdapter<CjFixtureWorld> {
     }
 }
 
-impl<C: CjApi> PartnerNetworkAdapter for CjAdapter<C> {
+impl<C: CjApi> TypedPartnerNetworkAdapter for CjAdapter<C> {
     fn provider(&self) -> NetworkProvider {
         NetworkProvider::Cj
     }
