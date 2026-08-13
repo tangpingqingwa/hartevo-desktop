@@ -1772,7 +1772,15 @@ mod tests {
         assert!(validate_journey(&cross, &commit).is_err());
 
         let mut drift = journey(ComponentMode::Native);
-        drift.provider.provider_digest.replace_range(..1, "0");
+        let replacement = if drift.provider.provider_digest.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        drift
+            .provider
+            .provider_digest
+            .replace_range(..1, replacement);
         assert!(validate_journey(&drift, &commit).is_err());
     }
 
