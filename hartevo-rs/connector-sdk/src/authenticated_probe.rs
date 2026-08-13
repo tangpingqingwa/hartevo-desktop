@@ -26,6 +26,190 @@ use super::{
 
 const CONNECTION_PROBE_CAPABILITY: &str = "connection.probe";
 const HANDLE_BYTES: usize = 32;
+const AUTHENTICATED_PROBE_CONTRACT_JSON: &str =
+    include_str!("../../../contracts/connectors/authenticated-probe.v1.json");
+const AUTHENTICATED_PROBE_SCHEMA_VERSION: &str = "hartevo-connector-authenticated-probe/v1";
+const AUTHENTICATED_PROBE_CONTRACT_VERSION: &str = "connector-authenticated-probe-e1/v1";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthenticatedProbeContract {
+    schema_version: String,
+    contract_version: String,
+    authority: ProbeContractAuthority,
+    secret_material: ProbeSecretMaterial,
+    operations: Vec<ProbeOperation>,
+    statuses: Vec<ProbeContractStatus>,
+    provenance_classes: Vec<ProviderProvenanceClass>,
+    scope_bindings: Vec<ProbeScopeBinding>,
+    evidence_fields: Vec<ProbeEvidenceField>,
+    lifecycle_recovery: Vec<ProbeLifecycleResource>,
+    registrations: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ProbeContractAuthority {
+    AuthenticatedProbeEvidenceOnly,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ProbeSecretMaterial {
+    OpaqueReferenceOnly,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+enum ProbeOperation {
+    Mount,
+    Probe,
+    Unmount,
+    Revoke,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+enum ProbeContractStatus {
+    Reachable,
+    Unreachable,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+enum ProbeScopeBinding {
+    Tenant,
+    Project,
+    Provider,
+    Account,
+    Mission,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+enum ProbeEvidenceField {
+    Quota,
+    Freshness,
+    Cost,
+    ProviderDigest,
+    EvidenceDigest,
+    ObservedAt,
+    MountDigest,
+    RegistryDigest,
+    ContractDigest,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+enum ProbeLifecycleResource {
+    ProbeMount,
+    MissionAvailability,
+    ProviderState,
+    SecretResolution,
+}
+
+impl AuthenticatedProbeContract {
+    pub fn baseline() -> Result<Self, AuthenticatedProbeError> {
+        Self::from_json(AUTHENTICATED_PROBE_CONTRACT_JSON)
+    }
+
+    pub fn from_json(document: &str) -> Result<Self, AuthenticatedProbeError> {
+        let contract: Self = serde_json::from_str(document)
+            .map_err(|error| AuthenticatedProbeError::InvalidContract(error.to_string()))?;
+        contract.validate()?;
+        Ok(contract)
+    }
+
+    pub fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    pub fn contract_version(&self) -> &str {
+        &self.contract_version
+    }
+
+    pub fn digest(&self) -> String {
+        super::canonical_digest([AUTHENTICATED_PROBE_CONTRACT_JSON])
+    }
+
+    pub fn registrations(&self) -> &[serde_json::Value] {
+        &self.registrations
+    }
+
+    fn validate(&self) -> Result<(), AuthenticatedProbeError> {
+        if self.schema_version != AUTHENTICATED_PROBE_SCHEMA_VERSION
+            || self.contract_version != AUTHENTICATED_PROBE_CONTRACT_VERSION
+            || self.authority != ProbeContractAuthority::AuthenticatedProbeEvidenceOnly
+            || self.secret_material != ProbeSecretMaterial::OpaqueReferenceOnly
+            || !exact_set(
+                &self.operations,
+                &[
+                    ProbeOperation::Mount,
+                    ProbeOperation::Probe,
+                    ProbeOperation::Unmount,
+                    ProbeOperation::Revoke,
+                ],
+            )
+            || !exact_set(
+                &self.statuses,
+                &[
+                    ProbeContractStatus::Reachable,
+                    ProbeContractStatus::Unreachable,
+                    ProbeContractStatus::Rejected,
+                ],
+            )
+            || !exact_set(
+                &self.provenance_classes,
+                &[
+                    ProviderProvenanceClass::Fixture,
+                    ProviderProvenanceClass::ComponentHarness,
+                    ProviderProvenanceClass::ControlledProvider,
+                    ProviderProvenanceClass::ProductionProvider,
+                ],
+            )
+            || !exact_set(
+                &self.scope_bindings,
+                &[
+                    ProbeScopeBinding::Tenant,
+                    ProbeScopeBinding::Project,
+                    ProbeScopeBinding::Provider,
+                    ProbeScopeBinding::Account,
+                    ProbeScopeBinding::Mission,
+                ],
+            )
+            || !exact_set(
+                &self.evidence_fields,
+                &[
+                    ProbeEvidenceField::Quota,
+                    ProbeEvidenceField::Freshness,
+                    ProbeEvidenceField::Cost,
+                    ProbeEvidenceField::ProviderDigest,
+                    ProbeEvidenceField::EvidenceDigest,
+                    ProbeEvidenceField::ObservedAt,
+                    ProbeEvidenceField::MountDigest,
+                    ProbeEvidenceField::RegistryDigest,
+                    ProbeEvidenceField::ContractDigest,
+                ],
+            )
+            || !exact_set(
+                &self.lifecycle_recovery,
+                &[
+                    ProbeLifecycleResource::ProbeMount,
+                    ProbeLifecycleResource::MissionAvailability,
+                    ProbeLifecycleResource::ProviderState,
+                    ProbeLifecycleResource::SecretResolution,
+                ],
+            )
+            || !self.registrations.is_empty()
+        {
+            return Err(AuthenticatedProbeError::InvalidContract(
+                "exact authenticated probe contract set mismatch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// A short-lived secret view returned by a keyring/project-secret resolver.
 ///
@@ -129,11 +313,11 @@ impl fmt::Debug for AuthenticatedProbeRequest<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AuthenticatedProbeRequest")
-            .field("scope", &self.scope)
-            .field("secret_reference", &self.secret_reference)
-            .field("credential_lease", &self.credential_lease)
-            .field("auth_session", &self.auth_session)
-            .field("resolver", &"[OPAQUE]")
+            .field("scope_digest", &self.scope.digest())
+            .field("secret_reference", &"<opaque>")
+            .field("credential_lease", &"<opaque>")
+            .field("auth_session", &"<opaque>")
+            .field("resolver", &"<opaque>")
             .field("at", &self.at)
             .field("probe_revision", &self.probe_revision)
             .finish_non_exhaustive()
@@ -142,7 +326,7 @@ impl fmt::Debug for AuthenticatedProbeRequest<'_> {
 
 /// A lifecycle request without credential bytes.  It is used to unwind a
 /// provider's in-memory state after unmount or revoke.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ProbeLifecycleRequest {
     scope: ConnectorScope,
     secret_reference: SecretReference,
@@ -150,6 +334,20 @@ pub struct ProbeLifecycleRequest {
     auth_session: AuthSession,
     mount_digest: String,
     at: DateTime<Utc>,
+}
+
+impl fmt::Debug for ProbeLifecycleRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProbeLifecycleRequest")
+            .field("scope_digest", &self.scope.digest())
+            .field("secret_reference", &"<opaque>")
+            .field("credential_lease", &"<opaque>")
+            .field("auth_session", &"<opaque>")
+            .field("mount_digest", &"<digest>")
+            .field("at", &self.at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProbeLifecycleRequest {
@@ -195,7 +393,7 @@ pub trait AuthenticatedProbeProvider {
 /// Read-only evidence returned by a provider after it used the resolved
 /// SecretReference credential.  It is not accepted directly by a Mission
 /// consumer until the service validates the exact provider registry binding.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AuthenticatedProbeObservation {
     scope: ConnectorScope,
     capabilities: BTreeSet<ProviderCapabilityKey>,
@@ -208,6 +406,25 @@ pub struct AuthenticatedProbeObservation {
     provenance: ProviderProvenanceClass,
     evidence_digest: String,
     observed_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for AuthenticatedProbeObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedProbeObservation")
+            .field("scope_digest", &self.scope.digest())
+            .field("capability_count", &self.capabilities.len())
+            .field("quota", &self.quota)
+            .field("freshness", &self.freshness)
+            .field("cost", &self.cost)
+            .field("provider_identity", &self.provider_identity)
+            .field("provider_digest", &"<digest>")
+            .field("status", &self.status)
+            .field("provenance", &self.provenance)
+            .field("evidence_digest", &"<digest>")
+            .field("observed_at", &self.observed_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AuthenticatedProbeObservation {
@@ -307,11 +524,13 @@ impl AuthenticatedProbeObservation {
 }
 
 /// A successful, registry-bound authenticated probe result.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthenticatedProbeResult {
     result_id: String,
     mount_digest: String,
+    registry_digest: String,
+    contract_digest: String,
     scope: ConnectorScope,
     capabilities: BTreeSet<ProviderCapabilityKey>,
     quota: QuotaState,
@@ -326,6 +545,30 @@ pub struct AuthenticatedProbeResult {
     result_digest: String,
 }
 
+impl fmt::Debug for AuthenticatedProbeResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedProbeResult")
+            .field("result_id", &self.result_id)
+            .field("mount_digest", &"<digest>")
+            .field("registry_digest", &"<digest>")
+            .field("contract_digest", &"<digest>")
+            .field("scope_digest", &self.scope.digest())
+            .field("capability_count", &self.capabilities.len())
+            .field("quota", &self.quota)
+            .field("freshness", &self.freshness)
+            .field("cost", &self.cost)
+            .field("provider_identity", &self.provider_identity)
+            .field("provider_digest", &"<digest>")
+            .field("status", &self.status)
+            .field("provenance", &self.provenance)
+            .field("evidence_digest", &"<digest>")
+            .field("observed_at", &self.observed_at)
+            .field("result_digest", &"<digest>")
+            .finish_non_exhaustive()
+    }
+}
+
 impl AuthenticatedProbeResult {
     pub fn result_id(&self) -> &str {
         &self.result_id
@@ -334,6 +577,14 @@ impl AuthenticatedProbeResult {
     /// A digest of the opaque mount, not the opaque handle itself.
     pub fn mount_digest(&self) -> &str {
         &self.mount_digest
+    }
+
+    pub fn registry_digest(&self) -> &str {
+        &self.registry_digest
+    }
+
+    pub fn contract_digest(&self) -> &str {
+        &self.contract_digest
     }
 
     pub fn scope(&self) -> &ConnectorScope {
@@ -386,14 +637,21 @@ impl AuthenticatedProbeResult {
 
     fn from_observation(
         mount_digest: String,
+        registry_digest: String,
+        contract_digest: String,
         observation: AuthenticatedProbeObservation,
     ) -> Result<Self, AuthenticatedProbeError> {
         observation.validate_shape()?;
-        if !super::is_sha256(&mount_digest) {
+        if !super::is_sha256(&mount_digest)
+            || !super::is_sha256(&registry_digest)
+            || !super::is_sha256(&contract_digest)
+        {
             return Err(AuthenticatedProbeError::InvalidObservation);
         }
         let result_digest = digest_values([
             mount_digest.as_str(),
+            registry_digest.as_str(),
+            contract_digest.as_str(),
             observation.scope.digest().as_str(),
             &capability_digest_material(&observation.capabilities),
             &observation.quota.limit().to_string(),
@@ -414,6 +672,8 @@ impl AuthenticatedProbeResult {
         Ok(Self {
             result_id: format!("probe-result-{result_digest}"),
             mount_digest,
+            registry_digest,
+            contract_digest,
             scope: observation.scope,
             capabilities: observation.capabilities,
             quota: observation.quota,
@@ -427,6 +687,43 @@ impl AuthenticatedProbeResult {
             observed_at: observation.observed_at,
             result_digest,
         })
+    }
+
+    fn validate_integrity(&self) -> Result<(), AuthenticatedProbeError> {
+        if !super::is_sha256(&self.mount_digest)
+            || !super::is_sha256(&self.registry_digest)
+            || !super::is_sha256(&self.contract_digest)
+            || self.contract_digest != AuthenticatedProbeContract::baseline()?.digest()
+            || self.result_id != format!("probe-result-{}", self.result_digest)
+            || self.result_digest != self.calculate_digest()
+        {
+            return Err(AuthenticatedProbeError::ResultDigestMismatch);
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> String {
+        digest_values([
+            self.mount_digest.as_str(),
+            self.registry_digest.as_str(),
+            self.contract_digest.as_str(),
+            self.scope.digest().as_str(),
+            &capability_digest_material(&self.capabilities),
+            &self.quota.limit().to_string(),
+            &self.quota.used().to_string(),
+            &self.freshness.observed_at().to_rfc3339(),
+            &self.freshness.valid_until().to_rfc3339(),
+            &self.freshness.source_revision().to_string(),
+            &self.cost.limit_minor().to_string(),
+            &self.cost.used_minor().to_string(),
+            self.provider_identity.adapter_id(),
+            &self.provider_identity.adapter_version().to_string(),
+            self.provider_digest.as_str(),
+            &format!("{:?}", self.status),
+            &format!("{:?}", self.provenance),
+            self.evidence_digest.as_str(),
+            &self.observed_at.to_rfc3339(),
+        ])
     }
 
     fn validate_live_at(&self, at: DateTime<Utc>) -> Result<(), AuthenticatedProbeError> {
@@ -511,13 +808,15 @@ impl MissionScope {
 
 /// A Mission-facing projection of authenticated availability.  This is not a
 /// catalog entry: it is bound to one Mission and one live probe result.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MissionCapabilityAvailability {
     mission: MissionScope,
     source_result_id: String,
     source_result_digest: String,
     source_mount_digest: String,
+    source_registry_digest: String,
+    source_contract_digest: String,
     scope: ConnectorScope,
     capabilities: BTreeSet<ProviderCapabilityKey>,
     quota: QuotaState,
@@ -527,6 +826,29 @@ pub struct MissionCapabilityAvailability {
     provider_digest: String,
     observed_at: DateTime<Utc>,
     availability_digest: String,
+}
+
+impl fmt::Debug for MissionCapabilityAvailability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MissionCapabilityAvailability")
+            .field("mission", &self.mission)
+            .field("source_result_id", &self.source_result_id)
+            .field("source_result_digest", &"<digest>")
+            .field("source_mount_digest", &"<digest>")
+            .field("source_registry_digest", &"<digest>")
+            .field("source_contract_digest", &"<digest>")
+            .field("scope_digest", &self.scope.digest())
+            .field("capability_count", &self.capabilities.len())
+            .field("quota", &self.quota)
+            .field("freshness", &self.freshness)
+            .field("cost", &self.cost)
+            .field("provider_identity", &self.provider_identity)
+            .field("provider_digest", &"<digest>")
+            .field("observed_at", &self.observed_at)
+            .field("availability_digest", &"<digest>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl MissionCapabilityAvailability {
@@ -544,6 +866,14 @@ impl MissionCapabilityAvailability {
 
     pub fn source_mount_digest(&self) -> &str {
         &self.source_mount_digest
+    }
+
+    pub fn source_registry_digest(&self) -> &str {
+        &self.source_registry_digest
+    }
+
+    pub fn source_contract_digest(&self) -> &str {
+        &self.source_contract_digest
     }
 
     pub fn scope(&self) -> &ConnectorScope {
@@ -598,6 +928,8 @@ impl MissionCapabilityAvailability {
             mission.digest().as_str(),
             result.result_digest(),
             result.scope.digest().as_str(),
+            result.registry_digest(),
+            result.contract_digest(),
             result.provider_digest(),
         ]);
         Self {
@@ -605,6 +937,8 @@ impl MissionCapabilityAvailability {
             source_result_id: result.result_id.clone(),
             source_result_digest: result.result_digest.clone(),
             source_mount_digest: result.mount_digest.clone(),
+            source_registry_digest: result.registry_digest.clone(),
+            source_contract_digest: result.contract_digest.clone(),
             scope: result.scope.clone(),
             capabilities: result.capabilities.clone(),
             quota: result.quota.clone(),
@@ -642,6 +976,7 @@ impl MissionCapabilityConsumer {
         result: &AuthenticatedProbeResult,
         at: DateTime<Utc>,
     ) -> Result<MissionCapabilityAvailability, AuthenticatedProbeError> {
+        result.validate_integrity()?;
         result.validate_live_at(at)?;
         if result.scope.tenant_id() != self.mission.tenant_id
             || result.scope.project_id() != self.mission.project_id
@@ -767,6 +1102,8 @@ where
     provider: P,
     resolver: R,
     registry: ProviderAdapterRegistry,
+    registry_digest: String,
+    contract_digest: String,
     mounts: BTreeMap<String, MountedProbe>,
     next_mount_revision: u64,
 }
@@ -781,6 +1118,8 @@ where
             .debug_struct("AuthenticatedProbeService")
             .field("provider_identity", self.provider.identity())
             .field("registry_version", &self.registry.registry_version())
+            .field("registry_digest", &"<digest>")
+            .field("contract_digest", &"<digest>")
             .field("active_mount_count", &self.mounts.len())
             .finish_non_exhaustive()
     }
@@ -796,16 +1135,20 @@ where
         resolver: R,
         registry: ProviderAdapterRegistry,
     ) -> Result<Self, AuthenticatedProbeError> {
+        let contract_digest = AuthenticatedProbeContract::baseline()?.digest();
         registry
             .validate()
             .map_err(|_| AuthenticatedProbeError::InvalidRegistry)?;
         if registry.is_empty() {
             return Err(AuthenticatedProbeError::EmptyRegistry);
         }
+        let registry_digest = digest_registry(&registry);
         Ok(Self {
             provider,
             resolver,
             registry,
+            registry_digest,
+            contract_digest,
             mounts: BTreeMap::new(),
             next_mount_revision: 1,
         })
@@ -821,6 +1164,14 @@ where
 
     pub fn registry(&self) -> &ProviderAdapterRegistry {
         &self.registry
+    }
+
+    pub fn registry_digest(&self) -> &str {
+        &self.registry_digest
+    }
+
+    pub fn contract_digest(&self) -> &str {
+        &self.contract_digest
     }
 
     pub fn active_mount_count(&self) -> usize {
@@ -953,7 +1304,14 @@ where
             self.reclaim_mount(handle, at);
             return Err(error);
         }
-        AuthenticatedProbeResult::from_observation(mount_digest, observation)
+        let result = AuthenticatedProbeResult::from_observation(
+            mount_digest,
+            self.registry_digest.clone(),
+            self.contract_digest.clone(),
+            observation,
+        )?;
+        result.validate_integrity()?;
+        Ok(result)
     }
 
     pub fn unmount(
@@ -1091,6 +1449,8 @@ where
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum AuthenticatedProbeError {
+    #[error("authenticated probe contract is invalid: {0}")]
+    InvalidContract(String),
     #[error("connector scope is invalid")]
     InvalidScope,
     #[error("Mission scope is invalid")]
@@ -1133,6 +1493,8 @@ pub enum AuthenticatedProbeError {
     CapabilityNotRegistered,
     #[error("provider probe has expired")]
     ProbeExpired,
+    #[error("authenticated probe result digest does not match its fields")]
+    ResultDigestMismatch,
     #[error("provider probe quota is exhausted")]
     QuotaExhausted,
     #[error("provider probe cost budget is exhausted")]
@@ -1193,6 +1555,18 @@ fn capability_digest_material(capabilities: &BTreeSet<ProviderCapabilityKey>) ->
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn digest_registry(registry: &ProviderAdapterRegistry) -> String {
+    let serialized =
+        serde_json::to_string(registry).expect("provider adapter registry is serializable");
+    digest_values([registry.registry_version(), serialized.as_str()])
+}
+
+fn exact_set<T: Copy + Ord>(actual: &[T], expected: &[T]) -> bool {
+    actual.len() == expected.len()
+        && actual.iter().copied().collect::<BTreeSet<_>>()
+            == expected.iter().copied().collect::<BTreeSet<_>>()
 }
 
 fn digest_values<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
@@ -1441,7 +1815,18 @@ mod tests {
         assert_eq!(result.freshness().source_revision(), 1);
         assert_eq!(result.provider_identity().adapter_id(), ADAPTER_ID);
         assert_eq!(result.provider_digest().len(), 64);
+        assert_eq!(result.registry_digest(), service.registry_digest());
+        assert_eq!(result.contract_digest(), service.contract_digest());
+        assert_eq!(
+            result.contract_digest(),
+            AuthenticatedProbeContract::baseline()
+                .expect("checked-in probe contract")
+                .digest()
+        );
         assert_eq!(result.observed_at(), at + Duration::seconds(1));
+        let result_debug = format!("{result:?}");
+        assert!(!result_debug.contains("account-test"));
+        assert!(!result_debug.contains("secret-ref-authenticated-probe"));
         assert_eq!(service.provider().probes, 1);
         assert_eq!(service.provider().write_effects, 0);
         assert_eq!(
@@ -1477,9 +1862,19 @@ mod tests {
         assert!(consumer.supports(&capability, at + Duration::seconds(2)));
         assert_eq!(availability.mission().mission_id(), "mission-test");
         assert_eq!(availability.source_result_digest(), result.result_digest());
+        assert_eq!(
+            availability.source_registry_digest(),
+            result.registry_digest()
+        );
+        assert_eq!(
+            availability.source_contract_digest(),
+            result.contract_digest()
+        );
         let serialized = serde_json::to_string(&availability).expect("safe availability");
         assert!(!serialized.contains("catalog"));
         assert!(!serialized.contains("opaque-provider-credential"));
+        let availability_debug = format!("{availability:?}");
+        assert!(!availability_debug.contains("account-test"));
 
         let expired = at + Duration::seconds(32);
         assert!(!consumer.supports(&capability, expired));
@@ -1631,6 +2026,55 @@ mod tests {
         assert_eq!(
             consumer.accept(&result, at + Duration::seconds(2)),
             Err(AuthenticatedProbeError::MissionScopeMismatch)
+        );
+        assert_eq!(consumer.availability_count(), 0);
+    }
+
+    #[test]
+    fn checked_in_contract_and_result_binding_fail_closed_on_tamper() {
+        let baseline = include_str!("../../../contracts/connectors/authenticated-probe.v1.json");
+        let contract = AuthenticatedProbeContract::baseline().expect("checked-in contract");
+        assert!(contract.registrations().is_empty());
+        assert_eq!(
+            contract.schema_version(),
+            AUTHENTICATED_PROBE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            contract.contract_version(),
+            AUTHENTICATED_PROBE_CONTRACT_VERSION
+        );
+        assert!(matches!(
+            AuthenticatedProbeContract::from_json(&baseline.replace(
+                "\"registrations\": []",
+                "\"registrations\": [], \"unknown\": true"
+            )),
+            Err(AuthenticatedProbeError::InvalidContract(_))
+        ));
+        assert!(matches!(
+            AuthenticatedProbeContract::from_json(
+                &baseline.replace("\"mount\",\n    \"probe\"", "\"mount\",\n    \"mount\"")
+            ),
+            Err(AuthenticatedProbeError::InvalidContract(_))
+        ));
+
+        let at = now();
+        let mut service = service();
+        let handle = service.mount(scope(), secret(), at).expect("mount");
+        let result = service
+            .probe(&handle, at + Duration::seconds(1))
+            .expect("probe");
+        let mut consumer = MissionCapabilityConsumer::new(mission());
+        let mut tampered = result.clone();
+        tampered.registry_digest = super::digest_values(["registry-tampered"]);
+        assert_eq!(
+            consumer.accept(&tampered, at + Duration::seconds(2)),
+            Err(AuthenticatedProbeError::ResultDigestMismatch)
+        );
+        tampered = result.clone();
+        tampered.result_digest = super::digest_values(["result-tampered"]);
+        assert_eq!(
+            consumer.accept(&tampered, at + Duration::seconds(2)),
+            Err(AuthenticatedProbeError::ResultDigestMismatch)
         );
         assert_eq!(consumer.availability_count(), 0);
     }
