@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,14 +12,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::workspace::{digest, digest_json, is_sha256};
 use crate::{
-    BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionRisk, BrowserControlHost,
-    BrowserElementRef, BrowserError, BrowserLeaseProof, BrowserLocatorResolution,
-    BrowserNavigationPolicy, BrowserProfile, BrowserPromptRisk,
-    BrowserRecipeExecutionAuthorization, BrowserRecipePreparedPlan, BrowserRecipeRegistry,
-    BrowserRecipeTrustStore, BrowserStableLocator, BrowserWorkspace, SemanticSnapshot,
+    BrowserAction, BrowserActionBatch, BrowserActionRisk, BrowserControlHost, BrowserElementRef,
+    BrowserError, BrowserLeaseProof, BrowserLocatorResolution, BrowserNavigationPolicy,
+    BrowserProfile, BrowserPromptRisk, BrowserRecipeExecutionAuthorization,
+    BrowserRecipePreparedPlan, BrowserRecipeRegistry, BrowserRecipeTrustStore,
+    BrowserStableLocator, BrowserWorkspace, SemanticSnapshot,
 };
 
 static HOST_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+const MAX_SESSION_BATCH_CLAIMS: usize = 1_024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +62,9 @@ struct FakeBrowserWorkspaceState {
 pub struct FakeBrowserHost {
     session_id: u64,
     workspaces: BTreeMap<BrowserWorkspaceId, FakeBrowserWorkspaceState>,
+    claimed_batch_ids: BTreeSet<BrowserActionBatchId>,
+    #[cfg(test)]
+    fail_after_next_input: bool,
 }
 
 impl fmt::Debug for FakeBrowserHost {
@@ -69,7 +73,8 @@ impl fmt::Debug for FakeBrowserHost {
             .debug_struct("FakeBrowserHost")
             .field("session_digest", &digest(&self.session_id.to_le_bytes()))
             .field("workspace_count", &self.workspaces.len())
-            .finish()
+            .field("claimed_batch_count", &self.claimed_batch_ids.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -84,6 +89,9 @@ impl FakeBrowserHost {
         Self {
             session_id: HOST_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed),
             workspaces: BTreeMap::new(),
+            claimed_batch_ids: BTreeSet::new(),
+            #[cfg(test)]
+            fail_after_next_input: false,
         }
     }
 
@@ -263,10 +271,11 @@ impl FakeBrowserHost {
     }
 
     pub fn begin_read_only_batch(
-        &self,
+        &mut self,
         batch: &BrowserActionBatch,
         now: DateTime<Utc>,
     ) -> Result<BrowserBatchCursor, BrowserError> {
+        self.ensure_batch_id_available(&batch.id)?;
         if batch.effect_binding.is_some()
             || batch
                 .actions
@@ -283,38 +292,58 @@ impl FakeBrowserHost {
         cursor: &mut BrowserBatchCursor,
         now: DateTime<Utc>,
     ) -> Result<Option<BrowserActionResult>, BrowserError> {
+        if cursor.is_terminal() {
+            return Err(BrowserError::RealActionRejected);
+        }
+        match self.execute_next_active(cursor, now) {
+            Ok(Some(result)) => Ok(Some(result)),
+            Ok(None) => {
+                cursor.mark_completed();
+                Ok(None)
+            }
+            Err(error) => {
+                cursor.mark_failed();
+                Err(error)
+            }
+        }
+    }
+
+    fn execute_next_active(
+        &mut self,
+        cursor: &mut BrowserBatchCursor,
+        now: DateTime<Utc>,
+    ) -> Result<Option<BrowserActionResult>, BrowserError> {
         if cursor.host_session_id != self.session_id {
             return Err(BrowserError::HostRestarted);
         }
-        let state = self
-            .workspaces
-            .get(&cursor.batch.workspace_id)
-            .ok_or(BrowserError::WorkspaceNotRegistered)?;
-        cursor
-            .batch
-            .validate_for(&state.profile, &state.workspace, now)?;
-        let Some(action) = cursor.batch.actions.get(cursor.next_action) else {
+        let Some((action_sequence, dispatches_external_input, action_digest, observation_digest)) =
+            self.observe_next_action(cursor, now)?
+        else {
             return Ok(None);
         };
-        validate_action_against_live_page(state, action)?;
-        let action_digest = digest_json(action)?;
+        cursor.record_observation(observation_digest.clone())?;
+        if dispatches_external_input {
+            cursor.mark_external_input_dispatched();
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_after_next_input) {
+                return Err(BrowserError::HostExited);
+            }
+        }
         let host_receipt_digest = digest_json(&(
-            "hartevo-fake-browser-action/v1",
+            "hartevo-fake-browser-action/v2",
             self.session_id,
             cursor.batch.id.as_str(),
-            action.sequence,
+            action_sequence,
             &action_digest,
+            &observation_digest,
         ))?;
         cursor.next_action = cursor
             .next_action
             .checked_add(1)
             .ok_or(BrowserError::CounterOverflow)?;
-        if action.risk == BrowserActionRisk::PotentialExternalWrite {
-            cursor.external_write_may_have_occurred = true;
-        }
         Ok(Some(BrowserActionResult {
             batch_id: cursor.batch.id.clone(),
-            action_sequence: action.sequence,
+            action_sequence,
             action_digest,
             host_receipt_digest,
             external_write_may_have_occurred: cursor.external_write_may_have_occurred,
@@ -322,11 +351,41 @@ impl FakeBrowserHost {
         }))
     }
 
-    fn begin_effect_batch(
+    fn observe_next_action(
         &self,
+        cursor: &BrowserBatchCursor,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(u32, bool, String, String)>, BrowserError> {
+        let state = self
+            .workspaces
+            .get(&cursor.batch.workspace_id)
+            .ok_or(BrowserError::WorkspaceNotRegistered)?;
+        cursor
+            .batch
+            .validate_for(&state.profile, &state.workspace, now)?;
+        let Some(action) = cursor.batch.action_for_cursor(cursor.next_action)? else {
+            return Ok(None);
+        };
+        let observation_sequence = u64::try_from(cursor.observation_count)
+            .map_err(|_| BrowserError::CounterOverflow)?
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        let observation_digest =
+            observe_action_against_live_page(state, action, observation_sequence)?;
+        Ok(Some((
+            action.sequence,
+            action.dispatches_external_input(),
+            digest_json(action)?,
+            observation_digest,
+        )))
+    }
+
+    fn begin_effect_batch(
+        &mut self,
         batch: &BrowserActionBatch,
         now: DateTime<Utc>,
     ) -> Result<BrowserBatchCursor, BrowserError> {
+        self.ensure_batch_id_available(&batch.id)?;
         if batch.effect_binding.is_none()
             || !batch
                 .actions
@@ -339,7 +398,7 @@ impl FakeBrowserHost {
     }
 
     fn begin_batch(
-        &self,
+        &mut self,
         batch: &BrowserActionBatch,
         now: DateTime<Utc>,
     ) -> Result<BrowserBatchCursor, BrowserError> {
@@ -355,12 +414,38 @@ impl FakeBrowserHost {
         {
             return Err(BrowserError::AccountIdentityMismatch);
         }
-        Ok(BrowserBatchCursor {
-            batch: batch.clone(),
-            host_session_id: self.session_id,
-            next_action: 0,
-            external_write_may_have_occurred: false,
-        })
+        let cursor = BrowserBatchCursor::new(batch.clone(), self.session_id);
+        self.claim_validated_batch_id(&batch.id)?;
+        Ok(cursor)
+    }
+
+    fn ensure_batch_id_available(
+        &self,
+        batch_id: &BrowserActionBatchId,
+    ) -> Result<(), BrowserError> {
+        if self.claimed_batch_ids.contains(batch_id)
+            || self.claimed_batch_ids.len() >= MAX_SESSION_BATCH_CLAIMS
+        {
+            return Err(BrowserError::RealActionRejected);
+        }
+        Ok(())
+    }
+
+    fn claim_validated_batch_id(
+        &mut self,
+        batch_id: &BrowserActionBatchId,
+    ) -> Result<(), BrowserError> {
+        if self.claimed_batch_ids.len() >= MAX_SESSION_BATCH_CLAIMS
+            || !self.claimed_batch_ids.insert(batch_id.clone())
+        {
+            return Err(BrowserError::RealActionRejected);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_after_next_external_input_for_test(&mut self) {
+        self.fail_after_next_input = true;
     }
 }
 
@@ -370,22 +455,83 @@ impl BrowserControlHost for FakeBrowserHost {
     }
 }
 
-#[derive(Clone)]
 pub struct BrowserBatchCursor {
     batch: BrowserActionBatch,
     host_session_id: u64,
     next_action: usize,
+    observation_count: usize,
+    last_observation_digest: Option<String>,
     external_write_may_have_occurred: bool,
+    state: BrowserBatchCursorState,
 }
 
 impl BrowserBatchCursor {
+    fn new(batch: BrowserActionBatch, host_session_id: u64) -> Self {
+        Self {
+            batch,
+            host_session_id,
+            next_action: 0,
+            observation_count: 0,
+            last_observation_digest: None,
+            external_write_may_have_occurred: false,
+            state: BrowserBatchCursorState::Active,
+        }
+    }
+
     pub fn completed_action_count(&self) -> usize {
         self.next_action
+    }
+
+    pub fn observed_action_count(&self) -> usize {
+        self.observation_count
+    }
+
+    pub fn last_observation_digest(&self) -> Option<&str> {
+        self.last_observation_digest.as_deref()
     }
 
     pub fn external_write_may_have_occurred(&self) -> bool {
         self.external_write_may_have_occurred
     }
+
+    pub fn is_terminal(&self) -> bool {
+        self.state != BrowserBatchCursorState::Active
+    }
+
+    pub fn requires_reconciliation(&self, error: &BrowserError) -> bool {
+        matches!(error, BrowserError::HostRestarted) || self.external_write_may_have_occurred
+    }
+
+    fn record_observation(&mut self, observation_digest: String) -> Result<(), BrowserError> {
+        if !is_sha256(&observation_digest) {
+            return Err(BrowserError::InvalidSnapshot);
+        }
+        self.observation_count = self
+            .observation_count
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        self.last_observation_digest = Some(observation_digest);
+        Ok(())
+    }
+
+    fn mark_external_input_dispatched(&mut self) {
+        self.external_write_may_have_occurred = true;
+    }
+
+    fn mark_completed(&mut self) {
+        self.state = BrowserBatchCursorState::Completed;
+    }
+
+    fn mark_failed(&mut self) {
+        self.state = BrowserBatchCursorState::Failed;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserBatchCursorState {
+    Active,
+    Completed,
+    Failed,
 }
 
 impl fmt::Debug for BrowserBatchCursor {
@@ -398,10 +544,16 @@ impl fmt::Debug for BrowserBatchCursor {
                 &digest(&self.host_session_id.to_le_bytes()),
             )
             .field("next_action", &self.next_action)
+            .field("observation_count", &self.observation_count)
+            .field(
+                "has_last_observation",
+                &self.last_observation_digest.is_some(),
+            )
             .field(
                 "external_write_may_have_occurred",
                 &self.external_write_may_have_occurred,
             )
+            .field("state", &self.state)
             .finish()
     }
 }
@@ -508,7 +660,7 @@ impl EffectExecutor for FakeBrowserEffectExecutor<'_> {
             match self.host.execute_next(&mut cursor, self.now) {
                 Ok(Some(result)) => results.push(result),
                 Ok(None) => break,
-                Err(error) if cursor.external_write_may_have_occurred() => {
+                Err(error) if cursor.requires_reconciliation(&error) => {
                     return Err(ProviderFailure::Uncertain(error.code().into()));
                 }
                 Err(error) => return Err(ProviderFailure::Rejected(error.code().into())),
@@ -527,33 +679,45 @@ impl EffectExecutor for FakeBrowserEffectExecutor<'_> {
     }
 }
 
-fn validate_action_against_live_page(
+fn observe_action_against_live_page(
     state: &FakeBrowserWorkspaceState,
     action: &BrowserAction,
-) -> Result<(), BrowserError> {
+    observation_sequence: u64,
+) -> Result<String, BrowserError> {
     let page = state
         .pages
         .get(&action.tab_id)
         .ok_or(BrowserError::TabNotFound)?;
+    page.validate()?;
     if page.identity_digest != state.workspace.expected_identity_digest {
         return Err(BrowserError::AccountIdentityMismatch);
     }
-    if page.prompt_risk != BrowserPromptRisk::None
-        && !matches!(
-            action.kind,
-            BrowserActionKind::Observe | BrowserActionKind::Verify
-        )
-    {
+    if action.target_origin_digest != page.origin_digest {
+        return Err(BrowserError::NavigationTargetRejected);
+    }
+    if page.prompt_risk != BrowserPromptRisk::None && !action.allows_prompt_risk() {
         return Err(BrowserError::PromptInjectionDetected);
     }
-    if let Some(snapshot_id) = action.snapshot_id.as_ref() {
+    let snapshot_digest = if action.requires_snapshot_fence() {
+        let snapshot_id = action
+            .snapshot_id
+            .as_ref()
+            .ok_or(BrowserError::InvalidAction)?;
         let snapshot = state
             .latest_snapshots
             .get(&action.tab_id)
             .ok_or(BrowserError::StaleSnapshot)?;
-        if &snapshot.id != snapshot_id
+        snapshot.validate_for(&state.workspace)?;
+        if snapshot.id != *snapshot_id
+            || snapshot.tab_id != action.tab_id
             || snapshot.lease_generation != state.workspace.lease_generation
             || snapshot.document_generation != page.document_generation
+            || snapshot.identity_digest != page.identity_digest
+            || snapshot.url_digest != page.url_digest
+            || snapshot.content_digest != page.content_digest
+            || snapshot.redaction_digest != page.redaction_digest
+            || snapshot.prompt_risk != page.prompt_risk
+            || snapshot.element_refs != page.element_refs
         {
             return Err(BrowserError::StaleSnapshot);
         }
@@ -565,8 +729,27 @@ fn validate_action_against_live_page(
         {
             return Err(BrowserError::StaleElementRef);
         }
-    }
-    Ok(())
+        Some(snapshot.digest()?)
+    } else {
+        None
+    };
+    digest_json(&(
+        "hartevo-fake-browser-live-observation/v1",
+        observation_sequence,
+        action.sequence,
+        digest(state.workspace.id.as_str().as_bytes()),
+        digest(action.tab_id.as_str().as_bytes()),
+        state.workspace.lease_generation,
+        page.document_generation,
+        &page.identity_digest,
+        &page.url_digest,
+        &page.origin_digest,
+        &page.content_digest,
+        &page.redaction_digest,
+        page.prompt_risk,
+        page.element_refs.len(),
+        snapshot_digest,
+    ))
 }
 
 #[cfg(test)]
@@ -583,7 +766,7 @@ mod tests {
     use hartevo_effect_broker::{EffectExecutor, ProviderFailure};
 
     use super::*;
-    use crate::BrowserActionSurface;
+    use crate::{BrowserActionKind, BrowserActionSurface};
 
     const CREDENTIAL_REFERENCE: &str = "keychain://browser/profile-1";
 
@@ -740,8 +923,16 @@ mod tests {
         fixture: &Fixture,
         actions: Vec<BrowserAction>,
     ) -> Result<BrowserActionBatch, BrowserError> {
+        read_batch_with_id(fixture, "batch-read-1", actions)
+    }
+
+    fn read_batch_with_id(
+        fixture: &Fixture,
+        batch_id: &str,
+        actions: Vec<BrowserAction>,
+    ) -> Result<BrowserActionBatch, BrowserError> {
         BrowserActionBatch::read_only(
-            BrowserActionBatchId::from("batch-read-1"),
+            BrowserActionBatchId::from(batch_id),
             &fixture.profile,
             &fixture.workspace,
             fixture.workspace.agent_lease_proof(fixture.now)?,
@@ -822,6 +1013,236 @@ mod tests {
             fixture.now + Duration::minutes(5),
         )
         .expect("effect batch")
+    }
+
+    #[test]
+    fn typed_multi_action_cursor_observes_each_step_once_in_order() {
+        let mut fixture = fixture(BrowserPromptRisk::None);
+        let snapshot = observe(&mut fixture);
+        let actions = vec![
+            action(
+                1,
+                BrowserActionKind::Observe,
+                BrowserActionRisk::ReadOnly,
+                &fixture.tab_id,
+                None,
+                None,
+            ),
+            action(
+                2,
+                BrowserActionKind::Resolve,
+                BrowserActionRisk::ReadOnly,
+                &fixture.tab_id,
+                Some(snapshot.id.clone()),
+                Some("element-1"),
+            ),
+            action(
+                3,
+                BrowserActionKind::Verify,
+                BrowserActionRisk::ReadOnly,
+                &fixture.tab_id,
+                Some(snapshot.id),
+                None,
+            ),
+        ];
+        let batch = read_batch(&fixture, actions).expect("typed read batch");
+        let serialized_batch = serde_json::to_value(&batch).expect("v1 batch JSON");
+        let plan_digest = batch.plan_digest.clone();
+        assert_eq!(batch.schema_version, 1);
+        let mut cursor = fixture
+            .host
+            .begin_read_only_batch(&batch, fixture.now)
+            .expect("begin typed cursor");
+        let mut observation_digests = BTreeSet::new();
+        let mut receipt_digests = BTreeSet::new();
+
+        for expected_sequence in 1_u32..=3 {
+            let expected_count = usize::try_from(expected_sequence).expect("bounded sequence");
+            let result = fixture
+                .host
+                .execute_next(&mut cursor, fixture.now)
+                .expect("execute typed step")
+                .expect("action result");
+            assert_eq!(result.action_sequence, expected_sequence);
+            assert_eq!(cursor.completed_action_count(), expected_count);
+            assert_eq!(cursor.observed_action_count(), expected_count);
+            assert!(!result.external_write_may_have_occurred);
+            assert!(!result.business_verified);
+            assert!(receipt_digests.insert(result.host_receipt_digest));
+            assert!(
+                observation_digests.insert(
+                    cursor
+                        .last_observation_digest()
+                        .expect("content-free observation digest")
+                        .to_owned(),
+                )
+            );
+        }
+
+        assert!(
+            fixture
+                .host
+                .execute_next(&mut cursor, fixture.now)
+                .expect("complete cursor")
+                .is_none()
+        );
+        assert!(cursor.is_terminal());
+        assert_eq!(cursor.completed_action_count(), 3);
+        assert_eq!(cursor.observed_action_count(), 3);
+        assert_eq!(observation_digests.len(), 3);
+        assert_eq!(receipt_digests.len(), 3);
+        assert_eq!(
+            BrowserActionBatch::plan_digest(&batch.actions).expect("unchanged v1 action plan"),
+            plan_digest
+        );
+        assert_eq!(
+            serde_json::to_value(&batch).expect("unchanged v1 batch JSON"),
+            serialized_batch
+        );
+        assert_eq!(
+            fixture
+                .host
+                .execute_next(&mut cursor, fixture.now)
+                .expect_err("completed cursor is single-use")
+                .code(),
+            "BROWSER_REAL_ACTION_REJECTED"
+        );
+    }
+
+    #[test]
+    fn invalid_begin_does_not_claim_batch_id() {
+        let mut fixture = fixture(BrowserPromptRisk::None);
+        let actions = vec![action(
+            1,
+            BrowserActionKind::Observe,
+            BrowserActionRisk::ReadOnly,
+            &fixture.tab_id,
+            None,
+            None,
+        )];
+        let valid = read_batch(&fixture, actions).expect("valid batch");
+        let mut invalid = valid.clone();
+        invalid.policy_digest = "not-a-policy-digest".into();
+
+        assert_eq!(
+            fixture
+                .host
+                .begin_read_only_batch(&invalid, fixture.now)
+                .expect_err("invalid begin must fail before claim")
+                .code(),
+            "BROWSER_INVALID_BATCH"
+        );
+        assert!(!fixture.host.claimed_batch_ids.contains(&valid.id));
+        fixture
+            .host
+            .begin_read_only_batch(&valid, fixture.now)
+            .expect("same id remains available after failed validation");
+        assert!(fixture.host.claimed_batch_ids.contains(&valid.id));
+    }
+
+    #[test]
+    fn same_session_claim_rejects_same_id_without_inspecting_new_plan() {
+        let mut fixture = fixture(BrowserPromptRisk::None);
+        let first = read_batch_with_id(
+            &fixture,
+            "batch-shared-id",
+            vec![action(
+                1,
+                BrowserActionKind::Observe,
+                BrowserActionRisk::ReadOnly,
+                &fixture.tab_id,
+                None,
+                None,
+            )],
+        )
+        .expect("first plan");
+        let different_plan = read_batch_with_id(
+            &fixture,
+            "batch-shared-id",
+            vec![action(
+                1,
+                BrowserActionKind::Wait,
+                BrowserActionRisk::ReadOnly,
+                &fixture.tab_id,
+                None,
+                None,
+            )],
+        )
+        .expect("different valid plan");
+        assert_ne!(first.plan_digest, different_plan.plan_digest);
+        let mut malformed_rebinding = different_plan.clone();
+        malformed_rebinding.plan_digest = "not-a-plan-digest".into();
+
+        let mut cursor = fixture
+            .host
+            .begin_read_only_batch(&first, fixture.now)
+            .expect("first claim");
+        for replay in [&first, &different_plan, &malformed_rebinding] {
+            assert_eq!(
+                fixture
+                    .host
+                    .begin_read_only_batch(replay, fixture.now)
+                    .expect_err("same session batch id cannot be rebound or replayed")
+                    .code(),
+                "BROWSER_REAL_ACTION_REJECTED"
+            );
+        }
+        assert_eq!(fixture.host.claimed_batch_ids.len(), 1);
+        assert!(
+            fixture
+                .host
+                .execute_next(&mut cursor, fixture.now)
+                .expect("original claimed cursor remains valid")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn session_claim_capacity_fails_closed_without_eviction() {
+        let mut fixture = fixture(BrowserPromptRisk::None);
+        let batch = read_batch(
+            &fixture,
+            vec![action(
+                1,
+                BrowserActionKind::Observe,
+                BrowserActionRisk::ReadOnly,
+                &fixture.tab_id,
+                None,
+                None,
+            )],
+        )
+        .expect("unclaimed batch");
+        for index in 0..MAX_SESSION_BATCH_CLAIMS {
+            assert!(
+                fixture
+                    .host
+                    .claimed_batch_ids
+                    .insert(BrowserActionBatchId::from_stable(format!(
+                        "claimed-batch-{index}"
+                    )),)
+            );
+        }
+        let retained_claim = fixture
+            .host
+            .claimed_batch_ids
+            .first()
+            .cloned()
+            .expect("retained claim");
+
+        assert_eq!(
+            fixture
+                .host
+                .begin_read_only_batch(&batch, fixture.now)
+                .expect_err("saturated claim set must fail closed")
+                .code(),
+            "BROWSER_REAL_ACTION_REJECTED"
+        );
+        assert_eq!(
+            fixture.host.claimed_batch_ids.len(),
+            MAX_SESSION_BATCH_CLAIMS
+        );
+        assert!(fixture.host.claimed_batch_ids.contains(&retained_claim));
+        assert!(!fixture.host.claimed_batch_ids.contains(&batch.id));
     }
 
     #[test]
@@ -920,7 +1341,18 @@ mod tests {
                 .expect_err("old batch must be stopped before queued write");
             assert_eq!(failure.code(), "BROWSER_CONTROL_LEASE_LOST");
             assert_eq!(cursor.completed_action_count(), 1);
+            assert_eq!(cursor.observed_action_count(), 1);
             assert!(!cursor.external_write_may_have_occurred());
+            assert!(!cursor.requires_reconciliation(&failure));
+            assert!(cursor.is_terminal());
+            assert_eq!(
+                fixture
+                    .host
+                    .execute_next(&mut cursor, fixture.now + Duration::seconds(1))
+                    .expect_err("failed cursor cannot retry queued write")
+                    .code(),
+                "BROWSER_REAL_ACTION_REJECTED"
+            );
         }
     }
 
@@ -1009,6 +1441,135 @@ mod tests {
     }
 
     #[test]
+    fn live_account_origin_and_prompt_fences_recheck_between_steps() {
+        for drift in ["account", "origin", "prompt"] {
+            let mut fixture = fixture(BrowserPromptRisk::None);
+            let snapshot = observe(&mut fixture);
+            let batch = read_batch(
+                &fixture,
+                vec![
+                    action(
+                        1,
+                        BrowserActionKind::Verify,
+                        BrowserActionRisk::ReadOnly,
+                        &fixture.tab_id,
+                        Some(snapshot.id.clone()),
+                        None,
+                    ),
+                    action(
+                        2,
+                        BrowserActionKind::Resolve,
+                        BrowserActionRisk::ReadOnly,
+                        &fixture.tab_id,
+                        Some(snapshot.id),
+                        Some("element-1"),
+                    ),
+                ],
+            )
+            .expect("two-step batch");
+            let mut cursor = fixture
+                .host
+                .begin_read_only_batch(&batch, fixture.now)
+                .expect("begin two-step batch");
+            assert!(
+                fixture
+                    .host
+                    .execute_next(&mut cursor, fixture.now)
+                    .expect("first observed step")
+                    .is_some()
+            );
+
+            let state = fixture
+                .host
+                .workspaces
+                .get_mut(&fixture.workspace.id)
+                .expect("registered workspace");
+            let page = state
+                .pages
+                .get_mut(&fixture.tab_id)
+                .expect("registered page");
+            let expected_code = match drift {
+                "account" => {
+                    page.identity_digest = sha('0');
+                    "BROWSER_ACCOUNT_IDENTITY_MISMATCH"
+                }
+                "origin" => {
+                    page.origin_digest = sha('0');
+                    "BROWSER_NAVIGATION_TARGET_REJECTED"
+                }
+                "prompt" => {
+                    page.prompt_risk = BrowserPromptRisk::SuspectedInjection;
+                    "BROWSER_PROMPT_INJECTION_DETECTED"
+                }
+                _ => unreachable!("bounded drift fixture"),
+            };
+
+            let failure = fixture
+                .host
+                .execute_next(&mut cursor, fixture.now)
+                .expect_err("live drift must stop the second step");
+            assert_eq!(failure.code(), expected_code);
+            assert_eq!(cursor.completed_action_count(), 1);
+            assert_eq!(cursor.observed_action_count(), 1);
+            assert!(!cursor.external_write_may_have_occurred());
+            assert!(!cursor.requires_reconciliation(&failure));
+            assert!(cursor.is_terminal());
+        }
+    }
+
+    #[test]
+    fn full_snapshot_uses_existing_page_digests_and_element_refs_as_one_fence() {
+        for drift in ["url", "content", "redaction", "document", "elements"] {
+            let mut fixture = fixture(BrowserPromptRisk::None);
+            let snapshot = observe(&mut fixture);
+            let batch = read_batch(
+                &fixture,
+                vec![action(
+                    1,
+                    BrowserActionKind::Verify,
+                    BrowserActionRisk::ReadOnly,
+                    &fixture.tab_id,
+                    Some(snapshot.id),
+                    None,
+                )],
+            )
+            .expect("snapshot-bound batch");
+            let state = fixture
+                .host
+                .workspaces
+                .get_mut(&fixture.workspace.id)
+                .expect("registered workspace");
+            let page = state
+                .pages
+                .get_mut(&fixture.tab_id)
+                .expect("registered page");
+            match drift {
+                "url" => page.url_digest = sha('a'),
+                "content" => page.content_digest = sha('b'),
+                "redaction" => page.redaction_digest = sha('c'),
+                "document" => page.document_generation = 2,
+                "elements" => page.element_refs.clear(),
+                _ => unreachable!("bounded snapshot fixture"),
+            }
+            let mut cursor = fixture
+                .host
+                .begin_read_only_batch(&batch, fixture.now)
+                .expect("begin remains lease and account valid");
+
+            let failure = fixture
+                .host
+                .execute_next(&mut cursor, fixture.now)
+                .expect_err("canonical snapshot drift must fail closed");
+            assert_eq!(failure.code(), "BROWSER_STALE_SNAPSHOT");
+            assert_eq!(cursor.completed_action_count(), 0);
+            assert_eq!(cursor.observed_action_count(), 0);
+            assert!(!cursor.external_write_may_have_occurred());
+            assert!(!cursor.requires_reconciliation(&failure));
+            assert!(cursor.is_terminal());
+        }
+    }
+
+    #[test]
     fn page_change_and_hidden_reference_are_independently_fenced() {
         let mut fixture = fixture(BrowserPromptRisk::None);
         let snapshot = observe(&mut fixture);
@@ -1062,8 +1623,9 @@ mod tests {
                 fixture.now,
             )
             .expect("fresh observe");
-        let bad_ref = read_batch(
+        let bad_ref = read_batch_with_id(
             &fixture,
+            "batch-read-2",
             vec![action(
                 1,
                 BrowserActionKind::Resolve,
@@ -1225,13 +1787,28 @@ mod tests {
         ];
         let effect = approved_effect(&failure_fixture, &actions);
         let batch = effect_batch(&failure_fixture, actions, &effect);
-        let mut executor =
-            FakeBrowserEffectExecutor::new(&mut failure_fixture.host, batch, failure_fixture.now);
-
+        let replay_batch = batch.clone();
+        {
+            let mut executor = FakeBrowserEffectExecutor::new(
+                &mut failure_fixture.host,
+                batch,
+                failure_fixture.now,
+            );
+            assert!(matches!(
+                executor.execute(&effect),
+                Err(ProviderFailure::Uncertain(reason))
+                    if reason == "BROWSER_STALE_ELEMENT_REF"
+            ));
+        }
+        let mut replay_executor = FakeBrowserEffectExecutor::new(
+            &mut failure_fixture.host,
+            replay_batch,
+            failure_fixture.now,
+        );
         assert!(matches!(
-            executor.execute(&effect),
-            Err(ProviderFailure::Uncertain(reason))
-                if reason == "BROWSER_STALE_ELEMENT_REF"
+            replay_executor.execute(&effect),
+            Err(ProviderFailure::Rejected(reason))
+                if reason == "BROWSER_REAL_ACTION_REJECTED"
         ));
 
         let mut success_fixture = fixture(BrowserPromptRisk::None);
@@ -1252,6 +1829,110 @@ mod tests {
         assert_eq!(receipt.request_digest, effect.payload_digest);
         assert!(effect.verification.is_none());
         assert_eq!(effect.status, EffectStatus::Approved);
+    }
+
+    #[test]
+    fn pre_input_fence_is_rejected_without_claiming_a_business_write() {
+        let mut fixture = fixture(BrowserPromptRisk::None);
+        let snapshot = observe(&mut fixture);
+        let mut click = action(
+            1,
+            BrowserActionKind::Click,
+            BrowserActionRisk::PotentialExternalWrite,
+            &fixture.tab_id,
+            Some(snapshot.id),
+            Some("element-1"),
+        );
+        click.target_origin_digest = sha('0');
+        let actions = vec![click];
+        let effect = approved_effect(&fixture, &actions);
+        let batch = effect_batch(&fixture, actions, &effect);
+        let mut executor = FakeBrowserEffectExecutor::new(&mut fixture.host, batch, fixture.now);
+
+        assert!(matches!(
+            executor.execute(&effect),
+            Err(ProviderFailure::Rejected(reason))
+                if reason == "BROWSER_NAVIGATION_TARGET_REJECTED"
+        ));
+    }
+
+    #[test]
+    fn post_input_failure_is_uncertain_and_same_session_batch_never_replays() {
+        let mut executor_fixture = fixture(BrowserPromptRisk::None);
+        let snapshot = observe(&mut executor_fixture);
+        let actions = vec![action(
+            1,
+            BrowserActionKind::Click,
+            BrowserActionRisk::PotentialExternalWrite,
+            &executor_fixture.tab_id,
+            Some(snapshot.id),
+            Some("element-1"),
+        )];
+        let effect = approved_effect(&executor_fixture, &actions);
+        let batch = effect_batch(&executor_fixture, actions, &effect);
+        let replay_batch = batch.clone();
+        executor_fixture
+            .host
+            .fail_after_next_external_input_for_test();
+        {
+            let mut executor = FakeBrowserEffectExecutor::new(
+                &mut executor_fixture.host,
+                batch,
+                executor_fixture.now,
+            );
+            assert!(matches!(
+                executor.execute(&effect),
+                Err(ProviderFailure::Uncertain(reason)) if reason == "BROWSER_HOST_EXITED"
+            ));
+        }
+        let mut replay_executor = FakeBrowserEffectExecutor::new(
+            &mut executor_fixture.host,
+            replay_batch,
+            executor_fixture.now,
+        );
+        assert!(matches!(
+            replay_executor.execute(&effect),
+            Err(ProviderFailure::Rejected(reason))
+                if reason == "BROWSER_REAL_ACTION_REJECTED"
+        ));
+
+        let mut cursor_fixture = fixture(BrowserPromptRisk::None);
+        let snapshot = observe(&mut cursor_fixture);
+        let actions = vec![action(
+            1,
+            BrowserActionKind::Click,
+            BrowserActionRisk::PotentialExternalWrite,
+            &cursor_fixture.tab_id,
+            Some(snapshot.id),
+            Some("element-1"),
+        )];
+        let effect = approved_effect(&cursor_fixture, &actions);
+        let batch = effect_batch(&cursor_fixture, actions, &effect);
+        cursor_fixture
+            .host
+            .fail_after_next_external_input_for_test();
+        let mut cursor = cursor_fixture
+            .host
+            .begin_effect_batch(&batch, cursor_fixture.now)
+            .expect("begin input cursor");
+        let failure = cursor_fixture
+            .host
+            .execute_next(&mut cursor, cursor_fixture.now)
+            .expect_err("injected post-input host failure");
+        assert_eq!(failure.code(), "BROWSER_HOST_EXITED");
+        assert_eq!(cursor.completed_action_count(), 0);
+        assert_eq!(cursor.observed_action_count(), 1);
+        assert!(cursor.external_write_may_have_occurred());
+        assert!(cursor.requires_reconciliation(&failure));
+        assert!(cursor.is_terminal());
+        assert_eq!(
+            cursor_fixture
+                .host
+                .execute_next(&mut cursor, cursor_fixture.now)
+                .expect_err("failed input cursor cannot retry")
+                .code(),
+            "BROWSER_REAL_ACTION_REJECTED"
+        );
     }
 
     #[test]
@@ -1298,12 +1979,21 @@ mod tests {
             )
             .expect("restart registration");
 
+        let restart_failure = restarted
+            .execute_next(&mut cursor, fixture.now)
+            .expect_err("old cursor is bound to dead host session");
+        assert_eq!(restart_failure.code(), "BROWSER_HOST_RESTARTED");
+        assert!(cursor.is_terminal());
+        assert!(cursor.requires_reconciliation(&restart_failure));
+        assert!(!cursor.external_write_may_have_occurred());
+        assert_eq!(cursor.completed_action_count(), 0);
+        assert_eq!(cursor.observed_action_count(), 0);
         assert_eq!(
             restarted
                 .execute_next(&mut cursor, fixture.now)
-                .expect_err("old cursor is bound to dead host session")
+                .expect_err("restarted cursor is terminal and cannot replay")
                 .code(),
-            "BROWSER_HOST_RESTARTED"
+            "BROWSER_REAL_ACTION_REJECTED"
         );
         let fresh_batch = read_batch(
             &fixture,
@@ -1320,27 +2010,54 @@ mod tests {
         let mut fresh_cursor = restarted
             .begin_read_only_batch(&fresh_batch, fixture.now)
             .expect("new host accepts lease-bound batch");
-        assert_eq!(
-            restarted
-                .execute_next(&mut fresh_cursor, fixture.now)
-                .expect_err("snapshot cache is intentionally not restored")
-                .code(),
-            "BROWSER_STALE_SNAPSHOT"
-        );
+        let stale_failure = restarted
+            .execute_next(&mut fresh_cursor, fixture.now)
+            .expect_err("snapshot cache is intentionally not restored");
+        assert_eq!(stale_failure.code(), "BROWSER_STALE_SNAPSHOT");
+        assert!(fresh_cursor.is_terminal());
+        assert!(!fresh_cursor.requires_reconciliation(&stale_failure));
+        assert!(!fresh_cursor.external_write_may_have_occurred());
     }
 
     #[test]
     fn debug_surfaces_redact_credential_and_temporary_element_reference() {
         let mut fixture = fixture(BrowserPromptRisk::None);
         let snapshot = observe(&mut fixture);
+        let batch = read_batch(
+            &fixture,
+            vec![action(
+                1,
+                BrowserActionKind::Resolve,
+                BrowserActionRisk::ReadOnly,
+                &fixture.tab_id,
+                Some(snapshot.id.clone()),
+                Some("element-1"),
+            )],
+        )
+        .expect("debug batch");
+        let mut cursor = fixture
+            .host
+            .begin_read_only_batch(&batch, fixture.now)
+            .expect("debug cursor");
+        let result = fixture
+            .host
+            .execute_next(&mut cursor, fixture.now)
+            .expect("debug action")
+            .expect("debug result");
         let profile_debug = format!("{:?}", fixture.profile);
         let snapshot_debug = format!("{snapshot:?}");
         let host_debug = format!("{:?}", fixture.host);
+        let cursor_debug = format!("{cursor:?}");
+        let result_debug = format!("{result:?}");
 
         assert!(!profile_debug.contains(CREDENTIAL_REFERENCE));
         assert!(!snapshot_debug.contains("element-1"));
         assert!(!host_debug.contains(CREDENTIAL_REFERENCE));
+        assert!(!host_debug.contains("element-1"));
+        assert!(!cursor_debug.contains("element-1"));
+        assert!(!result_debug.contains("element-1"));
         assert!(profile_debug.contains("credential_reference_digest"));
         assert!(snapshot_debug.contains("element_ref_count"));
+        assert!(cursor_debug.contains("observation_count"));
     }
 }

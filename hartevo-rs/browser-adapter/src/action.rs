@@ -387,6 +387,21 @@ impl BrowserAction {
         ))
     }
 
+    pub(crate) fn dispatches_external_input(&self) -> bool {
+        self.risk == BrowserActionRisk::PotentialExternalWrite
+    }
+
+    pub(crate) fn allows_prompt_risk(&self) -> bool {
+        matches!(
+            self.kind,
+            BrowserActionKind::Observe | BrowserActionKind::Verify
+        )
+    }
+
+    pub(crate) fn requires_snapshot_fence(&self) -> bool {
+        self.snapshot_id.is_some()
+    }
+
     pub fn validate(&self) -> Result<(), BrowserError> {
         let shape_matches = match self.kind {
             BrowserActionKind::Observe => {
@@ -641,6 +656,27 @@ impl BrowserActionBatch {
             }
         }
         digest_json(&actions)
+    }
+
+    pub(crate) fn action_for_cursor(
+        &self,
+        completed_action_count: usize,
+    ) -> Result<Option<&BrowserAction>, BrowserError> {
+        if completed_action_count > self.actions.len() {
+            return Err(BrowserError::InvalidBatch);
+        }
+        let Some(action) = self.actions.get(completed_action_count) else {
+            return Ok(None);
+        };
+        action.validate()?;
+        let expected_sequence = u32::try_from(completed_action_count)
+            .map_err(|_| BrowserError::CounterOverflow)?
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        if action.sequence != expected_sequence {
+            return Err(BrowserError::InvalidBatch);
+        }
+        Ok(Some(action))
     }
 
     pub fn recipe_plan_digest(
