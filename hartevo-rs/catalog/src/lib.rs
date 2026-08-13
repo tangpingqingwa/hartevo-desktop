@@ -14,6 +14,7 @@ mod evidence;
 mod mission_contract;
 mod provider_closure;
 mod route_graph;
+mod route_runtime_authority;
 
 pub use evidence::{
     EvidenceLevel, MissionEvidenceRecord, MissionEvidenceStatus, ReleaseEvidence, ReleaseStage,
@@ -39,6 +40,19 @@ pub use route_graph::{
     RouteGraphTransitionTarget, RouteGraphTransitionTargetKind, RouteNodeCompletionGate,
     RouteNodeCompletionGateKind, route_graph_node_count, route_graph_normal_edge_count,
     route_graph_redirect_edge_count, route_graph_terminal_count, validate_route_graph_closure,
+};
+use route_runtime_authority::ROUTE_RUNTIME_AUTHORITY_CONTRACT_JSON;
+pub use route_runtime_authority::{
+    ApplicationHandlerRouteTerminalExecutionAuthority,
+    ApplicationHandlerRouteTerminalExecutionAuthorityKind, DefaultTerminalExecutionAuthority,
+    DeniedRouteTerminalExecutionAuthority, DeniedRouteTerminalExecutionAuthorityKind,
+    EXPECTED_DENIED_TERMINAL_TRANSITION_AUTHORITY_COUNT,
+    EXPECTED_IMPLEMENTED_TERMINAL_TRANSITION_AUTHORITY_COUNT,
+    EXPECTED_TERMINAL_TRANSITION_AUTHORITY_COUNT, RouteRuntimeAuthorityContract,
+    RouteTerminalAuthorityExecutor, RouteTerminalCompletionPolicy, RouteTerminalExecutionAuthority,
+    RouteTerminalExecutionBinding, denied_terminal_transition_authority_count,
+    implemented_terminal_transition_authority_count, terminal_transition_authority_count,
+    validate_route_runtime_authority_closure,
 };
 
 const MISSION_CATALOG_JSON: &str = include_str!("../../../contracts/missions/catalog.v1.json");
@@ -338,6 +352,7 @@ pub struct Catalog {
     pub missions: MissionCatalog,
     pub effect_readback_routes: EffectReadbackRouteContract,
     pub route_graphs: RouteGraphContract,
+    pub route_runtime_authority: RouteRuntimeAuthorityContract,
     pub application_handlers: ApplicationHandlerRegistry,
     pub capabilities: CapabilityCatalog,
     pub providers: ProviderCatalog,
@@ -356,6 +371,10 @@ impl Catalog {
             route_graphs: parse_contract(
                 "Mission route graph contract",
                 ROUTE_GRAPH_CONTRACT_JSON,
+            )?,
+            route_runtime_authority: parse_contract(
+                "Mission route runtime authority contract",
+                ROUTE_RUNTIME_AUTHORITY_CONTRACT_JSON,
             )?,
             application_handlers: parse_contract(
                 "application handler registry",
@@ -421,6 +440,14 @@ impl Catalog {
             &self.capabilities,
             &self.effect_readback_routes,
             &self.route_graphs,
+        ) {
+            violations.append(&mut contract_violations);
+        }
+        if let Err(mut contract_violations) = validate_route_runtime_authority_closure(
+            &self.missions,
+            &self.route_graphs,
+            &self.application_handlers,
+            &self.route_runtime_authority,
         ) {
             violations.append(&mut contract_violations);
         }
@@ -1003,6 +1030,7 @@ impl Catalog {
             &self.missions,
             &self.effect_readback_routes,
             &self.route_graphs,
+            &self.route_runtime_authority,
             &self.application_handlers,
             &self.capabilities,
             &self.providers,
