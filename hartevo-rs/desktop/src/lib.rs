@@ -30,6 +30,8 @@ use zeroize::Zeroizing;
 
 mod agent_operations;
 pub mod data_plane;
+#[cfg(feature = "native-journey")]
+pub mod native_runtime_journey;
 mod runtime_plane;
 mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]

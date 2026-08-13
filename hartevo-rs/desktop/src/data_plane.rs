@@ -388,12 +388,12 @@ impl fmt::Debug for DesktopVm11OutcomeDecisionRequest {
     }
 }
 
-#[cfg(test)]
-type DesktopRuntimeCommandBuilder = Box<dyn FnOnce(&Path, &Path) -> RuntimeCommand>;
+#[cfg(any(test, feature = "native-journey"))]
+pub(crate) type DesktopRuntimeCommandBuilder = Box<dyn FnOnce(&Path, &Path) -> RuntimeCommand>;
 
-enum DesktopRuntimeSource {
+pub(crate) enum DesktopRuntimeSource {
     Pinned(Box<DesktopRuntimeConfiguration>),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native-journey"))]
     Fixture {
         provider: String,
         model: String,
@@ -411,7 +411,7 @@ impl DesktopRuntimeSource {
     fn provider(&self) -> &str {
         match self {
             Self::Pinned(configuration) => &configuration.provider,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture { provider, .. } => provider,
         }
     }
@@ -419,7 +419,7 @@ impl DesktopRuntimeSource {
     fn model(&self) -> &str {
         match self {
             Self::Pinned(configuration) => &configuration.model,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture { model, .. } => model,
         }
     }
@@ -434,7 +434,7 @@ impl DesktopRuntimeSource {
                 .artifact
                 .runtime_command(project_root, runtime_home)
                 .map_err(|error| DesktopDataError::Application(ApplicationError::Runtime(error))),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture {
                 command_builder, ..
             } => Ok(command_builder(project_root, runtime_home)),
@@ -835,6 +835,16 @@ impl DesktopDataPlane {
         Ok(DesktopCatalogMissionExecutionStart { snapshot, handle })
     }
 
+    #[cfg(feature = "native-journey")]
+    pub(crate) fn start_catalog_mission_execution_native(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopCatalogMissionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopCatalogMissionExecutionStart, DesktopDataError> {
+        self.start_catalog_mission_execution_with(secret_store, request, now)
+    }
+
     /// Pulls one integrity-checked page from the encrypted Runtime text ledger
     /// after exact Tenant/Project/Device context authorization. The signed
     /// Application handle and cursor are returned unchanged; this read cannot
@@ -863,6 +873,18 @@ impl DesktopDataPlane {
         let service = self.open_read_application_from_secret(&database_secret)?;
         self.require_runtime_subscription_context_access(&service, secret_store, handle, now)?;
         Ok(service.read_runtime_text_subscription(handle, cursor, page_size)?)
+    }
+
+    #[cfg(feature = "native-journey")]
+    pub(crate) fn runtime_text_subscription_native(
+        &self,
+        secret_store: &impl SecretStore,
+        handle: &CatalogMissionExecutionHandle,
+        cursor: Option<&RuntimeTextSubscriptionCursor>,
+        page_size: usize,
+        now: DateTime<Utc>,
+    ) -> Result<RuntimeTextSubscriptionBatch, DesktopDataError> {
+        self.runtime_text_subscription_with(secret_store, handle, cursor, page_size, now)
     }
 
     /// Starts an explicitly confirmed VM-00..VM-11 Mission from the machine
@@ -1099,6 +1121,27 @@ impl DesktopDataPlane {
                 .configuration
                 .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
             runtime.projection.status,
+            Some(cancellation),
+            now,
+        )
+    }
+
+    #[cfg(feature = "native-journey")]
+    pub(crate) fn resume_mission_runtime_native(
+        &self,
+        secret_store: &impl SecretStore,
+        scope: (&ProjectId, &MissionId),
+        runtime: DesktopRuntimeSource,
+        cancellation: &DesktopRuntimeCancellation,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let (project_id, mission_id) = scope;
+        self.resume_mission_runtime_with_cancellation(
+            secret_store,
+            project_id,
+            mission_id,
+            Some(runtime),
+            DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
             Some(cancellation),
             now,
         )
