@@ -241,9 +241,7 @@ impl ProductionFileScanner {
             process_boundary_poisoned: false,
         };
         let probe = scanner.run_process(ProcessOperation::Version)?;
-        if !probe.status.success() {
-            return Err(BrowserError::FileScanUnavailable);
-        }
+        probe.validate_result_candidate(scanner.limits)?;
         let version: VersionResponse = scanner.parse_process_response(&probe.stdout.retained)?;
         scanner.validate_response_identity(&probe.identity.launch, version.identity())?;
         scanner.version_probe_evidence_digest = digest_json(&serde_json::json!({
@@ -499,21 +497,25 @@ impl FileSafetyScanner for ProductionFileScanner {
             return Err(BrowserError::FileChanged);
         }
         let process = process_result?;
-        if !process.status.success() {
+        process.validate_result_candidate(self.limits)?;
+        let executable_identity_digest = self.executable_identity.evidence_digest()?;
+        let Ok(result_envelope) = ScannerResultEnvelope::from_completed_process(
+            &self.release_pin,
+            &self.version_probe_evidence_digest,
+            &executable_identity_digest,
+            &process,
+            self.limits,
+        ) else {
+            self.poison_process_boundary();
             return Err(BrowserError::FileScanUnavailable);
-        }
-        let response: ScanResponse = self.parse_process_response(&process.stdout.retained)?;
-        self.validate_response_identity(&process.identity.launch, response.identity())?;
-        let decision = match response.decision {
-            ScannerDecision::Clean => FileScanDecision::Clean,
-            ScannerDecision::Rejected => FileScanDecision::Rejected,
         };
+        let decision = result_envelope.decision;
         let evidence_digest = digest_json(&serde_json::json!({
             "protocol": SCANNER_PROTOCOL,
             "operation": SCAN_OPERATION,
             "releaseDigest": self.release_pin.release_digest,
             "versionProbeEvidenceDigest": self.version_probe_evidence_digest,
-            "executableIdentityDigest": self.executable_identity.evidence_digest()?,
+            "executableIdentityDigest": executable_identity_digest,
             "launchIdentityDigest": process.identity.launch.evidence_digest()?,
             "request": {
                 "contentDigest": request.content_digest,
@@ -524,7 +526,7 @@ impl FileSafetyScanner for ProductionFileScanner {
             "stagedIdentityBeforeDigest": staged_before.evidence_digest()?,
             "stagedIdentityAfterDigest": staged_after.evidence_digest()?,
             "decision": decision,
-            "processObservationDigest": process.evidence_digest()?,
+            "scannerResultEnvelopeDigest": result_envelope.evidence_digest()?,
         }))?;
         Ok(FileScanReport {
             scanner_id: self.release_pin.scanner_id.clone(),
@@ -993,6 +995,21 @@ struct BoundedOutput {
 }
 
 impl BoundedOutput {
+    fn validate_complete(&self, maximum: usize) -> Result<(), BrowserError> {
+        let retained_byte_count =
+            u64::try_from(self.retained.len()).map_err(|_| BrowserError::FileScanUnavailable)?;
+        let maximum = u64::try_from(maximum).map_err(|_| BrowserError::FileScanUnavailable)?;
+        if self.overflowed
+            || self.byte_count > maximum
+            || self.byte_count != retained_byte_count
+            || !is_sha256(&self.content_digest)
+            || digest(&self.retained) != self.content_digest
+        {
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        Ok(())
+    }
+
     fn evidence_digest(&self) -> Result<String, BrowserError> {
         digest_json(&serde_json::json!({
             "byteCount": self.byte_count,
@@ -1034,14 +1051,40 @@ impl ExitObservation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessCleanupOutcome {
+    VerifiedNoResidualProcessGroup,
+}
+
+impl ProcessCleanupOutcome {
+    fn protocol_name(self) -> &'static str {
+        match self {
+            Self::VerifiedNoResidualProcessGroup => "verified_no_residual_process_group",
+        }
+    }
+}
+
 struct ProcessObservation {
     identity: ObservedScannerProcessIdentity,
     status: ExitObservation,
     stdout: BoundedOutput,
     stderr: BoundedOutput,
+    cleanup_outcome: ProcessCleanupOutcome,
 }
 
 impl ProcessObservation {
+    fn validate_result_candidate(&self, limits: ScannerProcessLimits) -> Result<(), BrowserError> {
+        if !self.status.success()
+            || !self.identity.matches_launch(&self.identity.launch)
+            || self.cleanup_outcome != ProcessCleanupOutcome::VerifiedNoResidualProcessGroup
+        {
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        self.stdout.validate_complete(limits.max_stdout_bytes)?;
+        self.stderr.validate_complete(limits.max_stderr_bytes)?;
+        Ok(())
+    }
+
     fn evidence_digest(&self) -> Result<String, BrowserError> {
         digest_json(&serde_json::json!({
             "processIdentityDigest": self.identity.evidence_digest()?,
@@ -1052,6 +1095,7 @@ impl ProcessObservation {
             },
             "stdoutDigest": self.stdout.evidence_digest()?,
             "stderrDigest": self.stderr.evidence_digest()?,
+            "cleanupOutcome": self.cleanup_outcome.protocol_name(),
         }))
     }
 }
@@ -1067,7 +1111,139 @@ impl fmt::Debug for ProcessObservation {
             .field("status", &self.status)
             .field("stdout", &self.stdout)
             .field("stderr", &self.stderr)
+            .field("cleanup_outcome", &self.cleanup_outcome)
             .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct ScannerResultEnvelope {
+    release_digest: String,
+    version_probe_evidence_digest: String,
+    scanner_id: String,
+    scanner_version: String,
+    executable_sha256: String,
+    executable_identity_digest: String,
+    process_identity_digest: String,
+    launch_identity_digest: String,
+    exit: ExitObservation,
+    stdout_observation_digest: String,
+    stderr_observation_digest: String,
+    cleanup_outcome: ProcessCleanupOutcome,
+    response_digest: String,
+    decision: FileScanDecision,
+}
+
+impl ScannerResultEnvelope {
+    fn from_completed_process(
+        release_pin: &ScannerReleasePin,
+        version_probe_evidence_digest: &str,
+        executable_identity_digest: &str,
+        process: &ProcessObservation,
+        limits: ScannerProcessLimits,
+    ) -> Result<Self, BrowserError> {
+        release_pin.validate()?;
+        process.validate_result_candidate(limits)?;
+        if !is_sha256(version_probe_evidence_digest)
+            || !is_sha256(executable_identity_digest)
+            || process.identity.launch.operation != SCAN_OPERATION
+            || process.identity.launch.release_digest != release_pin.release_digest
+            || process.identity.launch.executable_identity_digest != executable_identity_digest
+        {
+            return Err(BrowserError::FileScanUnavailable);
+        }
+
+        let response: ScanResponse = parse_exact_json(&process.stdout.retained)?;
+        let identity = response.identity();
+        if identity.schema_version != 2
+            || identity.scanner_id != release_pin.scanner_id
+            || identity.scanner_version != release_pin.scanner_version
+            || identity.executable_sha256 != release_pin.executable_sha256
+            || identity.launch_digest != process.identity.launch.launch_digest
+        {
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        let decision = match response.decision {
+            ScannerDecision::Clean => FileScanDecision::Clean,
+            ScannerDecision::Rejected => FileScanDecision::Rejected,
+        };
+        let response_digest = digest_json(&serde_json::json!({
+            "schemaVersion": response.schema_version,
+            "scannerId": response.scanner_id,
+            "scannerVersion": response.scanner_version,
+            "executableSha256": response.executable_sha256,
+            "launchDigest": response.launch_digest,
+            "decision": decision,
+        }))?;
+        Ok(Self {
+            release_digest: release_pin.release_digest.clone(),
+            version_probe_evidence_digest: version_probe_evidence_digest.to_owned(),
+            scanner_id: release_pin.scanner_id.clone(),
+            scanner_version: release_pin.scanner_version.clone(),
+            executable_sha256: release_pin.executable_sha256.clone(),
+            executable_identity_digest: executable_identity_digest.to_owned(),
+            process_identity_digest: process.identity.evidence_digest()?,
+            launch_identity_digest: process.identity.launch.evidence_digest()?,
+            exit: process.status,
+            stdout_observation_digest: process.stdout.evidence_digest()?,
+            stderr_observation_digest: process.stderr.evidence_digest()?,
+            cleanup_outcome: process.cleanup_outcome,
+            response_digest,
+            decision,
+        })
+    }
+
+    fn evidence_digest(&self) -> Result<String, BrowserError> {
+        digest_json(&serde_json::json!({
+            "protocol": SCANNER_PROTOCOL,
+            "envelope": "scanner-result",
+            "releaseDigest": self.release_digest,
+            "versionProbeEvidenceDigest": self.version_probe_evidence_digest,
+            "scannerId": self.scanner_id,
+            "scannerVersion": self.scanner_version,
+            "executableSha256": self.executable_sha256,
+            "executableIdentityDigest": self.executable_identity_digest,
+            "processIdentityDigest": self.process_identity_digest,
+            "launchIdentityDigest": self.launch_identity_digest,
+            "exit": {
+                "code": self.exit.code,
+                "signal": self.exit.signal,
+                "success": self.exit.success,
+            },
+            "stdoutObservationDigest": self.stdout_observation_digest,
+            "stderrObservationDigest": self.stderr_observation_digest,
+            "cleanupOutcome": self.cleanup_outcome.protocol_name(),
+            "responseDigest": self.response_digest,
+            "decision": self.decision,
+        }))
+    }
+}
+
+impl fmt::Debug for ScannerResultEnvelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScannerResultEnvelope")
+            .field("release_digest", &self.release_digest)
+            .field(
+                "version_probe_evidence_digest",
+                &self.version_probe_evidence_digest,
+            )
+            .field("scanner_id", &self.scanner_id)
+            .field("scanner_version", &self.scanner_version)
+            .field("executable_sha256", &self.executable_sha256)
+            .field(
+                "executable_identity_digest",
+                &self.executable_identity_digest,
+            )
+            .field("process_identity_digest", &self.process_identity_digest)
+            .field("launch_identity_digest", &self.launch_identity_digest)
+            .field("exit", &self.exit)
+            .field("stdout_observation_digest", &self.stdout_observation_digest)
+            .field("stderr_observation_digest", &self.stderr_observation_digest)
+            .field("cleanup_outcome", &self.cleanup_outcome)
+            .field("response_digest", &self.response_digest)
+            .field("decision", &self.decision)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1196,6 +1372,7 @@ fn execute_bounded_process(
         status: ExitObservation::from_status(cleanup.status),
         stdout,
         stderr,
+        cleanup_outcome: ProcessCleanupOutcome::VerifiedNoResidualProcessGroup,
     })))
 }
 
@@ -1582,6 +1759,15 @@ esac
         format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"))
     }
 
+    fn bounded_test_output(bytes: &[u8]) -> BoundedOutput {
+        BoundedOutput {
+            retained: Zeroizing::new(bytes.to_vec()),
+            byte_count: u64::try_from(bytes.len()).expect("bounded fixture output"),
+            content_digest: digest(bytes),
+            overflowed: false,
+        }
+    }
+
     #[test]
     fn process_environment_is_an_exact_allowlist_without_path() {
         let fixture = ScannerFixture::new();
@@ -1705,6 +1891,136 @@ esac
         assert!(!debug.contains("private-scanner-diagnostic"));
         assert!(!debug.contains(source.to_string_lossy().as_ref()));
         assert!(!debug.contains("private-customer-deliverable.json"));
+    }
+
+    #[test]
+    fn result_envelope_binds_identity_version_exit_streams_and_cleanup_without_raw_output() {
+        let release_pin =
+            ScannerReleasePin::new(FIXTURE_SCANNER_ID, FIXTURE_SCANNER_VERSION, sha('5'))
+                .expect("release pin");
+        let executable_identity_digest = sha('6');
+        let launch = ScannerProcessLaunch::new(
+            9,
+            SCAN_OPERATION,
+            release_pin.release_digest(),
+            &executable_identity_digest,
+            &sha('7'),
+        )
+        .expect("launch");
+        let stdout = format!(
+            r#"{{"schemaVersion":2,"scannerId":"{FIXTURE_SCANNER_ID}","scannerVersion":"{FIXTURE_SCANNER_VERSION}","executableSha256":"{}","launchDigest":"{}","decision":"clean"}}
+"#,
+            release_pin.executable_sha256(),
+            launch.launch_digest,
+        );
+        let process = ProcessObservation {
+            identity: ObservedScannerProcessIdentity {
+                process_id: 42,
+                launch,
+            },
+            status: ExitObservation {
+                code: Some(0),
+                signal: None,
+                success: true,
+            },
+            stdout: bounded_test_output(stdout.as_bytes()),
+            stderr: bounded_test_output(b"private-result-envelope-stderr"),
+            cleanup_outcome: ProcessCleanupOutcome::VerifiedNoResidualProcessGroup,
+        };
+        let envelope = ScannerResultEnvelope::from_completed_process(
+            &release_pin,
+            &sha('8'),
+            &executable_identity_digest,
+            &process,
+            default_limits(),
+        )
+        .expect("verified result envelope");
+        let baseline = envelope.evidence_digest().expect("envelope evidence");
+        assert_eq!(envelope.decision, FileScanDecision::Clean);
+        assert_eq!(
+            envelope.cleanup_outcome.protocol_name(),
+            "verified_no_residual_process_group"
+        );
+        assert!(!format!("{envelope:?}").contains("private-result-envelope-stderr"));
+
+        let mut variants = Vec::new();
+        let mut changed = envelope.clone();
+        changed.scanner_version = "fixture-v2".to_owned();
+        variants.push(changed);
+        let mut changed = envelope.clone();
+        changed.process_identity_digest = sha('9');
+        variants.push(changed);
+        let mut changed = envelope.clone();
+        changed.executable_sha256 = sha('a');
+        variants.push(changed);
+        let mut changed = envelope.clone();
+        changed.exit.code = Some(23);
+        variants.push(changed);
+        let mut changed = envelope.clone();
+        changed.exit.signal = Some(9);
+        variants.push(changed);
+        let mut changed = envelope.clone();
+        changed.stdout_observation_digest = sha('b');
+        variants.push(changed);
+        let mut changed = envelope.clone();
+        changed.stderr_observation_digest = sha('c');
+        variants.push(changed);
+        let mut changed = envelope;
+        changed.response_digest = sha('d');
+        variants.push(changed);
+        for changed in variants {
+            assert_ne!(
+                changed.evidence_digest().expect("changed evidence"),
+                baseline
+            );
+        }
+    }
+
+    #[test]
+    fn partial_truncated_malformed_and_killed_generation_results_fail_closed_without_raw_output() {
+        let cases = [
+            (
+                "truncated",
+                r#"    printf '%s' '{"schemaVersion":2,"scannerId":"private-truncated-result'"#,
+            ),
+            (
+                "malformed",
+                r"    emit_scan clean
+    printf '%s' 'private-malformed-trailing-result'",
+            ),
+            (
+                "signaled",
+                r"    emit_scan clean
+    printf '%s' 'private-signaled-result' >&2
+    kill -9 $$",
+            ),
+            (
+                "killed-after-timeout",
+                r"    emit_scan clean
+    printf '%s' 'private-killed-buffered-result' >&2
+    /bin/sleep 30",
+            ),
+        ];
+        for (index, (name, body)) in cases.into_iter().enumerate() {
+            let fixture = ScannerFixture::new();
+            let source = fixture.source(&format!("invalid-result-{index}.json"), b"{}");
+            let (mut scanner, _) = scanner_with_limits(&fixture, body, default_limits());
+            let mut broker = fixture.broker();
+            let grant_id_value = format!("grant-invalid-result-{index}");
+            let grant_id = BrowserFileGrantId::from(grant_id_value.as_str());
+            let result = fixture.prepare(&mut broker, &mut scanner, grant_id.as_str(), &source);
+            assert!(
+                matches!(result, Err(BrowserError::FileScanUnavailable)),
+                "{name} result was not rejected"
+            );
+            assert!(broker.grant(&grant_id).is_none());
+            let debug = format!("{result:?} {scanner:?} {broker:?}");
+            assert!(!debug.contains("private-truncated-result"));
+            assert!(!debug.contains("private-malformed-trailing-result"));
+            assert!(!debug.contains("private-signaled-result"));
+            assert!(!debug.contains("private-killed-buffered-result"));
+            assert_no_run_directory_residue(&scanner);
+        }
     }
 
     #[test]
