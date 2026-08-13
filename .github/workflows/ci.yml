@@ -119,9 +119,14 @@ jobs:
           RUST_SCOPE: ${{ needs.scope.outputs.rust }}
         run: |
           mkdir -p target/ci
-          allow=()
+          planned=()
           if [[ "$RUST_SCOPE" == false ]]; then
-            allow+=(--allow-skipped rust)
+            planned+=(--planned-scope rust)
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / fmt")
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)")
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)")
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)")
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)")
           fi
           python3 scripts/ci-result.py aggregate \
             --workflow "$GITHUB_WORKFLOW" \
@@ -140,7 +145,7 @@ jobs:
             --kind policy=code \
             --kind scope=infra \
             --kind rust=code \
-            "${allow[@]}"
+            "${planned[@]}"
       - name: Upload redacted CI result and JUnit envelope
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

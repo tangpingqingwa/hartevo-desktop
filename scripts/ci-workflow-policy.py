@@ -220,16 +220,53 @@ def validate_reusable_scope_contract(path: Path, text: str) -> None:
         "name: ${{ inputs.check_prefix }} / clippy (${{ matrix.os }})",
         "name: ${{ inputs.check_prefix }} / test (${{ matrix.os }})",
         "os: [ubuntu-24.04, macos-15]",
+        "name: Planned scope skip marker",
+        "if: ${{ !inputs.run_rust }}",
     )
     if any(item not in text for item in required):
         raise PolicyError(f"{path} is missing the scope-aware stable Rust check contract")
+    heavy_steps = (
+        "Checkout reviewed source",
+        "Install Ubuntu desktop development libraries",
+        "Cache Cargo and Rust toolchain",
+        "Install the locked Rust components",
+        "Format gate",
+        "Strict Clippy gate",
+        "Locked Rust test gate",
+    )
     for job_name in ("fmt", "clippy", "test"):
         match = re.search(
             rf"(?ms)^  {re.escape(job_name)}:\s*\n.*?(?=^  [A-Za-z0-9_.-]+:\s*$|\Z)",
             text,
         )
-        if not match or not re.search(r"^\s+if:\s*inputs\.run_rust\s*$", match.group(0), re.MULTILINE):
-            raise PolicyError(f"{path} {job_name} must be skipped at job scope when run_rust is false")
+        if not match:
+            raise PolicyError(f"{path} is missing reusable Rust job {job_name}")
+        block = match.group(0)
+        header = block.split("    steps:", 1)[0]
+        if re.search(r"^    if:.*inputs\.run_rust", header, re.MULTILINE):
+            raise PolicyError(f"{path} {job_name} must not use a job-level run_rust condition")
+        if "name: Planned scope skip marker" not in block:
+            raise PolicyError(f"{path} {job_name} is missing the planned scope marker")
+        marker = re.search(
+            r"(?ms)^      - name: Planned scope skip marker\s*\n.*?(?=^      - name:|\Z)",
+            block,
+        )
+        if not marker or not re.search(r"^        if:\s*\$\{\{\s*!inputs\.run_rust\s*\}\}\s*$", marker.group(0), re.MULTILINE):
+            raise PolicyError(f"{path} {job_name} marker must be the run_rust=false path")
+        for step_name in heavy_steps:
+            step = re.search(
+                rf"(?ms)^      - name: {re.escape(step_name)}\s*\n.*?(?=^      - name:|\Z)",
+                block,
+            )
+            if not step or not re.search(r"^        if:\s*(?:\$\{\{\s*)?inputs\.run_rust\b", step.group(0), re.MULTILINE):
+                # A job only owns one gate step; the other gate names are checked
+                # in their owning job below.
+                if step_name in {
+                    "Format gate" if job_name == "fmt" else "Strict Clippy gate" if job_name == "clippy" else "Locked Rust test gate"
+                } or step_name in {"Checkout reviewed source", "Cache Cargo and Rust toolchain", "Install the locked Rust components"}:
+                    raise PolicyError(f"{path} {job_name} heavy step is not guarded by inputs.run_rust: {step_name}")
+        if job_name in {"clippy", "test"} and any(item not in block for item in ("strategy:", "matrix:", "os: [ubuntu-24.04, macos-15]")):
+            raise PolicyError(f"{path} {job_name} must retain the two-platform matrix")
 
 
 def validate_actions(path: Path, text: str, pins: dict[str, str]) -> list[str]:
@@ -302,6 +339,8 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             "scripts/ci-scope.py",
             "rust-reusable.yml",
             "run_rust: ${{ needs.scope.outputs.rust == 'true' }}",
+            "--planned-scope rust",
+            "--planned-job-name",
             "scripts/ci-workflow-policy.py",
             "scripts/ci-result.py",
             "PR / Result taxonomy",
@@ -437,26 +476,71 @@ on:
         type: boolean
 jobs:
   fmt:
-    if: inputs.run_rust
     name: ${{ inputs.check_prefix }} / fmt
     steps:
-      - run: cargo fmt --all -- --check
+      - name: Planned scope skip marker
+        if: ${{ !inputs.run_rust }}
+        run: echo planned
+      - name: Checkout reviewed source
+        if: inputs.run_rust
+        uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - name: Cache Cargo and Rust toolchain
+        if: inputs.run_rust
+        uses: actions/cache@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - name: Install the locked Rust components
+        if: inputs.run_rust
+        run: rustup component add clippy
+      - name: Format gate
+        if: inputs.run_rust
+        run: cargo fmt --all -- --check
   clippy:
-    if: inputs.run_rust
     name: ${{ inputs.check_prefix }} / clippy (${{ matrix.os }})
     strategy:
       matrix:
         os: [ubuntu-24.04, macos-15]
     steps:
-      - run: cargo clippy --locked
+      - name: Planned scope skip marker
+        if: ${{ !inputs.run_rust }}
+        run: echo planned
+      - name: Checkout reviewed source
+        if: inputs.run_rust
+        uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - name: Install Ubuntu desktop development libraries
+        if: inputs.run_rust && matrix.os == 'ubuntu-24.04'
+        run: sudo apt-get update
+      - name: Cache Cargo and Rust toolchain
+        if: inputs.run_rust
+        uses: actions/cache@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - name: Install the locked Rust components
+        if: inputs.run_rust
+        run: rustup component add clippy
+      - name: Strict Clippy gate
+        if: inputs.run_rust
+        run: cargo clippy --locked
   test:
-    if: inputs.run_rust
     name: ${{ inputs.check_prefix }} / test (${{ matrix.os }})
     strategy:
       matrix:
         os: [ubuntu-24.04, macos-15]
     steps:
-      - run: cargo test --locked
+      - name: Planned scope skip marker
+        if: ${{ !inputs.run_rust }}
+        run: echo planned
+      - name: Checkout reviewed source
+        if: inputs.run_rust
+        uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - name: Install Ubuntu desktop development libraries
+        if: inputs.run_rust && matrix.os == 'ubuntu-24.04'
+        run: sudo apt-get update
+      - name: Cache Cargo and Rust toolchain
+        if: inputs.run_rust
+        uses: actions/cache@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - name: Install the locked Rust components
+        if: inputs.run_rust
+        run: rustup component add clippy
+      - name: Locked Rust test gate
+        if: inputs.run_rust
+        run: cargo test --locked
 """
     validate_reusable_scope_contract(Path("rust-reusable.yml"), scope_fixture)
     scope_skip_plan = reusable_rust_scope_plan("PR / Fast Rust", False)
@@ -470,11 +554,13 @@ jobs:
     assert all(item["plannedSkip"] is True and item["executesRust"] is False for item in scope_skip_plan)
     assert all(item["plannedSkip"] is False and item["executesRust"] is True for item in reusable_rust_scope_plan("PR / Fast Rust", True))
     try:
-        validate_reusable_scope_contract(Path("rust-reusable.yml"), scope_fixture.replace("if: inputs.run_rust", "if: inputs.run_rust_at_step"))
+        validate_reusable_scope_contract(
+            Path("rust-reusable.yml"), scope_fixture.replace("  fmt:\n    name:", "  fmt:\n    if: inputs.run_rust\n    name:")
+        )
     except PolicyError:
         pass
     else:
-        raise AssertionError("self-test accepted a reusable Rust workflow without job-level scope skips")
+        raise AssertionError("self-test accepted a reusable Rust workflow with a job-level scope condition")
 
     try:
         validate_job_blocks(Path("fixture.yml"), ["jobs:", "  check:", "    runs-on: ubuntu-24.04"])
