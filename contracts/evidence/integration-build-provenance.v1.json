@@ -1,0 +1,92 @@
+{
+  "schemaVersion": "hartevo.integration-build-provenance-contract/v1",
+  "contractId": "ev-04-integration-build-provenance-v1",
+  "authority": "INTEGRATION_BUILD_PROVENANCE_ONLY",
+  "currentInstance": {
+    "manifestPath": "artifacts/evidence/integration-build/5991c80d2bf7b072f45621b03f55a7cf4b7e555f/manifest.json",
+    "manifestSha256": "ea3e1230ad9a1f358b7f4c05114f6ca425878f84c8dd8abe9657400a7b20530e",
+    "manifestBytes": 9634,
+    "rawArtifactPath": "artifacts/evidence/integration-build/5991c80d2bf7b072f45621b03f55a7cf4b7e555f/github-pr-ci-observation.raw.json",
+    "rawArtifactSha256": "3a867cb5bcad7acb0e76eda1ca0eb235d1a5d621262499f61c1a278bab68280a",
+    "rawArtifactBytes": 17927
+  },
+  "source": {
+    "repository": "tangpingqingwa/hartevo-desktop",
+    "branch": "bootstrap/macos-r0",
+    "objectFormat": "sha1",
+    "rangeBaseCommit": "4ce38354541771820a7739a2d04dcc7b4bac88fc",
+    "headCommit": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
+    "headTree": "b6728edc1c1a07bf774bf27232fd1a70432110a9",
+    "expectedFirstParentCommitCount": 11,
+    "expectedFeaturePullRequestMergeCount": 10,
+    "expectedRevertCommitCount": 1
+  },
+  "pullRequestPolicy": {
+    "state": "closed",
+    "merged": true,
+    "draft": false,
+    "baseRef": "bootstrap/macos-r0",
+    "headRefPrefix": "codex/",
+    "mergeParentCount": 2,
+    "featureHeadMustEqualSecondParent": true,
+    "observedBaseMustBeAncestorOfIntegrationParent": true
+  },
+  "integrationHistoryPolicy": {
+    "allowedKinds": [
+      "FEATURE_PR_MERGE",
+      "REVERT"
+    ],
+    "revertMustTargetPriorFeatureMerge": true,
+    "revertedFeatureMayCountActive": false
+  },
+  "ciPolicy": {
+    "provider": "github-actions",
+    "workflowId": 333267489,
+    "workflowName": "ci",
+    "workflowPath": ".github/workflows/ci.yml",
+    "event": "pull_request",
+    "status": "completed",
+    "conclusion": "success",
+    "runAttemptPolicy": "POSITIVE_EXACT_MATCH",
+    "requiredJobs": [
+      "PostgreSQL 18 Cell contract",
+      "Rust workspace"
+    ]
+  },
+  "resultPolicy": {
+    "verificationCode": "INTEGRATION_BUILD_PROVENANCE_VERIFIED",
+    "verificationStatus": "VERIFIED",
+    "releaseDecision": "NOT_EVALUATED",
+    "releasePassed": false,
+    "missionEvidenceLevelPromoted": false,
+    "maySatisfyReleaseEvidence": false,
+    "mayPromoteMissionEvidenceLevel": false
+  },
+  "failClosedCodes": [
+    "CI_CONCLUSION_NOT_SUCCESS",
+    "CI_HEAD_MISMATCH",
+    "CI_JOB_MISSING",
+    "CI_JOB_NOT_SUCCESS",
+    "CI_RUN_MISSING",
+    "CI_RUN_POLICY_MISMATCH",
+    "CI_STATUS_NOT_COMPLETED",
+    "CONTRACT_DIGEST_MISMATCH",
+    "HEAD_NOT_DESCENDANT",
+    "INTEGRATION_HEAD_MISMATCH",
+    "MANIFEST_DIGEST_MISMATCH",
+    "MANIFEST_SOURCE_MISMATCH",
+    "PR_BASE_ANCESTRY_MISMATCH",
+    "PR_BASE_MISMATCH",
+    "PR_DRAFT",
+    "PR_HEAD_MISMATCH",
+    "PR_MERGE_CHAIN_MISMATCH",
+    "PR_NOT_MERGED",
+    "RAW_ARTIFACT_DIGEST_MISMATCH",
+    "RELEASE_AUTHORITY_ESCALATION",
+    "REVERT_HISTORY_MISMATCH"
+  ],
+  "gate": {
+    "verifyCommand": "bash scripts/check-integration-build-provenance.sh verify",
+    "selfTestCommand": "bash scripts/check-integration-build-provenance.sh self-test"
+  }
+}
