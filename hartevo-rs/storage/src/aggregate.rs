@@ -6,8 +6,8 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::Value;
 
 use crate::normalized::{
-    insert_mission_normalized, insert_project_normalized, update_mission_normalized_cas,
-    update_project_normalized_cas,
+    insert_mission_normalized, insert_project_normalized, load_mission_normalized,
+    update_mission_normalized_cas, update_project_normalized_cas,
 };
 use crate::{ProjectStore, StorageError};
 
@@ -41,6 +41,8 @@ pub struct AtomicMutation {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ApplicationSourceKind {
     Mission,
+    ConsentRecord,
+    DomainEvent,
     Connection,
     IdentityLink,
     Person,
@@ -150,6 +152,126 @@ impl ProjectStore {
             "mission",
             mission.id.as_str(),
             events,
+        )?;
+        transaction.commit()?;
+        Ok(AtomicMutation {
+            event_sequences,
+            outbox_sequences,
+            state_revision: mission.revision,
+        })
+    }
+
+    /// Appends Mission-scoped Event/Outbox records while fencing the exact
+    /// Mission revision that the caller read. This is intentionally an
+    /// event-only transaction: adapters can publish a typed request after an
+    /// existing aggregate mutation without manufacturing a second aggregate
+    /// revision or bypassing the durable outbox.
+    pub fn append_mission_events_atomic(
+        &mut self,
+        project_id: &hartevo_domain_kernel::ProjectId,
+        mission_id: &hartevo_domain_kernel::MissionId,
+        expected_mission_revision: u64,
+        events: &[PendingEvent],
+    ) -> Result<AtomicMutation, StorageError> {
+        if events.is_empty() {
+            return Err(StorageError::EmptyAtomicEventSet);
+        }
+        let transaction = self.connection.transaction()?;
+        let mission =
+            load_mission_normalized(&transaction, project_id, mission_id)?.ok_or_else(|| {
+                StorageError::MissionNotFound {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                }
+            })?;
+        ensure_project_scope(
+            &transaction,
+            mission.tenant_id.as_str(),
+            mission.project_id.as_str(),
+        )?;
+        if mission.revision != expected_mission_revision {
+            return Err(StorageError::OptimisticConflict {
+                aggregate: format!("mission:{}", mission.id),
+                expected_revision: expected_mission_revision,
+            });
+        }
+        let (event_sequences, outbox_sequences) = append_events(
+            &transaction,
+            mission.tenant_id.as_str(),
+            mission.project_id.as_str(),
+            Some(mission.id.as_str()),
+            "mission",
+            mission.id.as_str(),
+            events,
+        )?;
+        transaction.commit()?;
+        Ok(AtomicMutation {
+            event_sequences,
+            outbox_sequences,
+            state_revision: mission.revision,
+        })
+    }
+
+    /// Appends one Mission-scoped Event/Outbox record only when the exact
+    /// event payload is not already present. The idempotency check lives in
+    /// the same transaction as the Event/Outbox append so concurrent exact
+    /// replays cannot create duplicate durable rows.
+    pub fn append_mission_event_if_absent_atomic(
+        &mut self,
+        project_id: &hartevo_domain_kernel::ProjectId,
+        mission_id: &hartevo_domain_kernel::MissionId,
+        expected_mission_revision: u64,
+        event: &PendingEvent,
+    ) -> Result<AtomicMutation, StorageError> {
+        let transaction = self.connection.transaction()?;
+        let mission =
+            load_mission_normalized(&transaction, project_id, mission_id)?.ok_or_else(|| {
+                StorageError::MissionNotFound {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                }
+            })?;
+        ensure_project_scope(
+            &transaction,
+            mission.tenant_id.as_str(),
+            mission.project_id.as_str(),
+        )?;
+        if mission.revision != expected_mission_revision {
+            return Err(StorageError::OptimisticConflict {
+                aggregate: format!("mission:{}", mission.id),
+                expected_revision: expected_mission_revision,
+            });
+        }
+        let payload_json = serde_json::to_string(&event.payload)?;
+        let duplicate = transaction
+            .query_row(
+                "SELECT 1 FROM domain_events
+                 WHERE project_id = ?1 AND mission_id = ?2
+                   AND event_type = ?3 AND payload_json = ?4
+                 LIMIT 1",
+                rusqlite::params![
+                    project_id.as_str(),
+                    mission_id.as_str(),
+                    event.event_type,
+                    payload_json,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if duplicate.is_some() {
+            return Err(StorageError::OptimisticConflict {
+                aggregate: "mission_event_idempotency".into(),
+                expected_revision: expected_mission_revision,
+            });
+        }
+        let (event_sequences, outbox_sequences) = append_events(
+            &transaction,
+            mission.tenant_id.as_str(),
+            mission.project_id.as_str(),
+            Some(mission.id.as_str()),
+            "mission",
+            mission.id.as_str(),
+            std::slice::from_ref(event),
         )?;
         transaction.commit()?;
         Ok(AtomicMutation {
@@ -364,6 +486,12 @@ pub(crate) fn require_application_source_fence(
         ApplicationSourceKind::Mission => {
             "SELECT tenant_id, revision FROM missions WHERE project_id = ?1 AND id = ?2"
         }
+        ApplicationSourceKind::ConsentRecord => {
+            "SELECT tenant_id, revision FROM consent_records WHERE project_id = ?1 AND id = ?2"
+        }
+        ApplicationSourceKind::DomainEvent => {
+            "SELECT tenant_id, sequence FROM domain_events WHERE project_id = ?1 AND sequence = ?2"
+        }
         ApplicationSourceKind::Connection => {
             "SELECT tenant_id, revision FROM connections WHERE project_id = ?1 AND id = ?2"
         }
@@ -416,6 +544,8 @@ pub(crate) fn require_application_source_fence(
 pub(crate) const fn application_source_name(kind: ApplicationSourceKind) -> &'static str {
     match kind {
         ApplicationSourceKind::Mission => "mission",
+        ApplicationSourceKind::ConsentRecord => "consent_record",
+        ApplicationSourceKind::DomainEvent => "domain_event",
         ApplicationSourceKind::Connection => "connection",
         ApplicationSourceKind::IdentityLink => "identity_link",
         ApplicationSourceKind::Person => "person",
