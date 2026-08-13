@@ -513,6 +513,16 @@ impl PluginSessionJournal {
             .unwrap_or(1);
         journal.validate()?;
         if let Some(event) = journal.events.last() {
+            let cursor_matches_history = match event.cursor_after {
+                Some(cursor_after) => {
+                    journal.current_fence.cursor == event.fence.cursor
+                        || journal.current_fence.cursor == cursor_after
+                }
+                None => journal.current_fence.cursor == event.fence.cursor,
+            };
+            if !cursor_matches_history {
+                return Err(PluginSessionError::StaleFence);
+            }
             if let Some(cursor_after) = event.cursor_after {
                 journal.current_fence.cursor = cursor_after;
             }
@@ -966,6 +976,19 @@ impl PluginSessionService {
         now: &str,
     ) -> Result<Vec<PluginSessionReceipt>, PluginSessionError> {
         self.journal.unmount(fence, now)
+    }
+
+    pub fn terminal(
+        &mut self,
+        fence: &PluginSessionFence,
+        now: &str,
+    ) -> Result<Vec<PluginSessionReceipt>, PluginSessionError> {
+        self.journal.cancel(
+            fence,
+            PluginSessionLifecycle::Terminal,
+            PluginSessionCancelReason::Terminal,
+            now,
+        )
     }
 
     pub fn into_events(self) -> Vec<PluginSessionEvent> {
