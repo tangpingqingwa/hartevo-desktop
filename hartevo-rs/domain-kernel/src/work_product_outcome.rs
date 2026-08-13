@@ -656,6 +656,1430 @@ impl WorkProductHandoffSnapshot {
     }
 }
 
+pub const WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION: u32 = 1;
+pub const WORK_PRODUCT_ADOPTION_PLUGIN_ID: &str = "hartevo.adoptable-result";
+pub const WORK_PRODUCT_ADOPTION_PLUGIN_VERSION: u32 = 1;
+pub const WORK_PRODUCT_ADOPTION_SUMMARY_MEDIA_TYPE: &str =
+    "application/vnd.hartevo.work-product-adoption-summary+json";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkProductAdoptionPluginCapability {
+    AdoptVerifiedHandoff,
+    ContextualSummary,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkProductAdoptionPluginService {
+    pub schema_version: u32,
+    pub plugin_id: String,
+    pub version: u32,
+    pub provider_id: String,
+    pub capabilities: BTreeSet<WorkProductAdoptionPluginCapability>,
+    pub service_digest: String,
+}
+
+impl WorkProductAdoptionPluginService {
+    pub fn new(provider_id: impl Into<String>) -> Result<Self, WorkProductOutcomeError> {
+        let mut capabilities = BTreeSet::new();
+        capabilities.insert(WorkProductAdoptionPluginCapability::AdoptVerifiedHandoff);
+        capabilities.insert(WorkProductAdoptionPluginCapability::ContextualSummary);
+        let mut service = Self {
+            schema_version: WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION,
+            plugin_id: WORK_PRODUCT_ADOPTION_PLUGIN_ID.into(),
+            version: WORK_PRODUCT_ADOPTION_PLUGIN_VERSION,
+            provider_id: provider_id.into(),
+            capabilities,
+            service_digest: String::new(),
+        };
+        service.service_digest = service.calculate_digest()?;
+        service.validate()?;
+        Ok(service)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkProductOutcomeError> {
+        let expected_capabilities = [
+            WorkProductAdoptionPluginCapability::AdoptVerifiedHandoff,
+            WorkProductAdoptionPluginCapability::ContextualSummary,
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        if self.schema_version != WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION
+            || self.plugin_id != WORK_PRODUCT_ADOPTION_PLUGIN_ID
+            || self.version != WORK_PRODUCT_ADOPTION_PLUGIN_VERSION
+            || !valid_reference(&self.provider_id)
+            || self.capabilities != expected_capabilities
+            || !is_sha256(&self.service_digest)
+            || self.service_digest != self.calculate_digest()?
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionPlugin);
+        }
+        Ok(())
+    }
+
+    pub fn supports(&self, capability: WorkProductAdoptionPluginCapability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+
+    pub fn mount_request(
+        &self,
+        scope: WorkProductAdoptionScope,
+        consumer_id: impl Into<String>,
+        generation: u64,
+        requested_at: DateTime<Utc>,
+    ) -> Result<WorkProductAdoptionMountRequest, WorkProductOutcomeError> {
+        self.validate()?;
+        scope.validate()?;
+        WorkProductAdoptionMountRequest::new(self, scope, consumer_id, generation, requested_at)
+    }
+
+    fn calculate_digest(&self) -> Result<String, WorkProductOutcomeError> {
+        let mut material = self.clone();
+        material.service_digest.clear();
+        digest_json(&material)
+    }
+}
+
+pub type AdoptableResultPluginService = WorkProductAdoptionPluginService;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkProductAdoptionScope {
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub mission_revision: u64,
+    pub source_mission_revision: u64,
+    pub work_product_id: WorkProductId,
+    pub work_product_revision: u64,
+    pub packet_digest: String,
+    pub result_classification: ResultClassification,
+    pub outcome_link_id: String,
+    pub outcome_link_digest: String,
+    pub scope_digest: String,
+}
+
+impl WorkProductAdoptionScope {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_verified_handoff(
+        snapshot: &WorkProductHandoffSnapshot,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        mission_revision: u64,
+        work_product_revision: u64,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        snapshot.validate()?;
+        let revision = snapshot.revision(work_product_revision)?;
+        if mission_revision == 0
+            || snapshot.packet.tenant_id != *tenant_id
+            || snapshot.packet.project_id != *project_id
+            || snapshot.packet.mission_id != *mission_id
+            || revision.mission_revision > mission_revision
+            || !snapshot.has_adopted_revision(work_product_revision, &revision.packet_digest)
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionScope);
+        }
+        let link = snapshot
+            .outcome_links
+            .iter()
+            .find(|link| {
+                link.work_product_revision == work_product_revision
+                    && link.packet_digest == revision.packet_digest
+                    && link.verification_kind.is_independent()
+            })
+            .ok_or(WorkProductOutcomeError::AdoptionUnavailable)?;
+        link.validate()?;
+        let mut scope = Self {
+            tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            mission_revision,
+            source_mission_revision: revision.mission_revision,
+            work_product_id: revision.work_product_id.clone(),
+            work_product_revision,
+            packet_digest: revision.packet_digest.clone(),
+            result_classification: snapshot.packet.classification.clone(),
+            outcome_link_id: link.link_id.clone(),
+            outcome_link_digest: link.link_digest.clone(),
+            scope_digest: String::new(),
+        };
+        scope.scope_digest = scope.calculate_digest()?;
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    pub fn matches_verified_handoff(
+        &self,
+        snapshot: &WorkProductHandoffSnapshot,
+    ) -> Result<(), WorkProductOutcomeError> {
+        let expected = Self::from_verified_handoff(
+            snapshot,
+            &self.tenant_id,
+            &self.project_id,
+            &self.mission_id,
+            self.mission_revision,
+            self.work_product_revision,
+        )?;
+        if expected != *self {
+            return Err(WorkProductOutcomeError::InvalidAdoptionScope);
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), WorkProductOutcomeError> {
+        if !valid_id(self.tenant_id.as_str())
+            || !valid_id(self.project_id.as_str())
+            || !valid_id(self.mission_id.as_str())
+            || self.mission_revision == 0
+            || self.source_mission_revision == 0
+            || self.source_mission_revision > self.mission_revision
+            || !valid_id(self.work_product_id.as_str())
+            || self.work_product_revision == 0
+            || !is_sha256(&self.packet_digest)
+            || !valid_reference(&self.outcome_link_id)
+            || !is_sha256(&self.outcome_link_digest)
+            || !is_sha256(&self.scope_digest)
+            || self.scope_digest != self.calculate_digest()?
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionScope);
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> Result<String, WorkProductOutcomeError> {
+        let mut material = self.clone();
+        material.scope_digest.clear();
+        digest_json(&material)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkProductAdoptionMountRequest {
+    pub schema_version: u32,
+    pub plugin_id: String,
+    pub service_digest: String,
+    pub scope: WorkProductAdoptionScope,
+    pub consumer_id: String,
+    pub generation: u64,
+    pub requested_at: DateTime<Utc>,
+    pub mount_digest: String,
+}
+
+impl WorkProductAdoptionMountRequest {
+    fn new(
+        service: &WorkProductAdoptionPluginService,
+        scope: WorkProductAdoptionScope,
+        consumer_id: impl Into<String>,
+        generation: u64,
+        requested_at: DateTime<Utc>,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        let mut mount = Self {
+            schema_version: WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION,
+            plugin_id: service.plugin_id.clone(),
+            service_digest: service.service_digest.clone(),
+            scope,
+            consumer_id: consumer_id.into(),
+            generation,
+            requested_at,
+            mount_digest: String::new(),
+        };
+        mount.mount_digest = mount.calculate_digest()?;
+        mount.validate_for(service)?;
+        Ok(mount)
+    }
+
+    pub fn validate_for(
+        &self,
+        service: &WorkProductAdoptionPluginService,
+    ) -> Result<(), WorkProductOutcomeError> {
+        service.validate()?;
+        self.scope.validate()?;
+        if self.schema_version != WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION
+            || self.plugin_id != service.plugin_id
+            || self.service_digest != service.service_digest
+            || !valid_reference(&self.consumer_id)
+            || self.generation == 0
+            || !is_sha256(&self.mount_digest)
+            || self.mount_digest != self.calculate_digest()?
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionMount);
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> Result<String, WorkProductOutcomeError> {
+        let mut material = self.clone();
+        material.mount_digest.clear();
+        digest_json(&material)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkProductAdoptionLifecycle {
+    Mounted,
+    Unmounted,
+    Revoked,
+    Crashed,
+}
+
+impl WorkProductAdoptionLifecycle {
+    pub const fn can_adopt(self) -> bool {
+        matches!(self, Self::Mounted)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkProductAdoptionOperationKind {
+    Mount,
+    Unmount,
+    Revoke,
+    Crash,
+    Adopt,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkProductAdoptionConsumerBinding {
+    pub consumer_id: String,
+    pub mount_generation: u64,
+    pub mount_digest: String,
+    pub consumer_digest: String,
+}
+
+impl WorkProductAdoptionConsumerBinding {
+    fn from_mount(
+        mount: &WorkProductAdoptionMountRequest,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        let mut binding = Self {
+            consumer_id: mount.consumer_id.clone(),
+            mount_generation: mount.generation,
+            mount_digest: mount.mount_digest.clone(),
+            consumer_digest: String::new(),
+        };
+        binding.consumer_digest = binding.calculate_digest()?;
+        binding.validate_for(mount)?;
+        Ok(binding)
+    }
+
+    fn validate_for(
+        &self,
+        mount: &WorkProductAdoptionMountRequest,
+    ) -> Result<(), WorkProductOutcomeError> {
+        if !valid_reference(&self.consumer_id)
+            || self.mount_generation != mount.generation
+            || self.mount_digest != mount.mount_digest
+            || !is_sha256(&self.consumer_digest)
+            || self.consumer_digest != self.calculate_digest()?
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionState);
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> Result<String, WorkProductOutcomeError> {
+        let mut material = self.clone();
+        material.consumer_digest.clear();
+        digest_json(&material)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextualWorkProductOutcomeSummary {
+    pub schema_version: u32,
+    pub media_type: String,
+    pub plugin_id: String,
+    pub service_digest: String,
+    pub scope_digest: String,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub mission_revision: u64,
+    pub source_mission_revision: u64,
+    pub work_product_id: WorkProductId,
+    pub work_product_revision: u64,
+    pub packet_digest: String,
+    pub result_classification: ResultClassification,
+    pub outcome_link_id: String,
+    pub outcome_link_digest: String,
+    pub lifecycle: WorkProductAdoptionLifecycle,
+    pub mount_generation: u64,
+    pub adoption_available: bool,
+    pub summary_digest: String,
+}
+
+impl ContextualWorkProductOutcomeSummary {
+    fn from_scope(
+        service: &WorkProductAdoptionPluginService,
+        scope: &WorkProductAdoptionScope,
+        lifecycle: WorkProductAdoptionLifecycle,
+        mount_generation: u64,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        let mut summary = Self {
+            schema_version: WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION,
+            media_type: WORK_PRODUCT_ADOPTION_SUMMARY_MEDIA_TYPE.into(),
+            plugin_id: service.plugin_id.clone(),
+            service_digest: service.service_digest.clone(),
+            scope_digest: scope.scope_digest.clone(),
+            tenant_id: scope.tenant_id.clone(),
+            project_id: scope.project_id.clone(),
+            mission_id: scope.mission_id.clone(),
+            mission_revision: scope.mission_revision,
+            source_mission_revision: scope.source_mission_revision,
+            work_product_id: scope.work_product_id.clone(),
+            work_product_revision: scope.work_product_revision,
+            packet_digest: scope.packet_digest.clone(),
+            result_classification: scope.result_classification.clone(),
+            outcome_link_id: scope.outcome_link_id.clone(),
+            outcome_link_digest: scope.outcome_link_digest.clone(),
+            lifecycle,
+            mount_generation,
+            adoption_available: lifecycle.can_adopt(),
+            summary_digest: String::new(),
+        };
+        summary.summary_digest = summary.calculate_digest()?;
+        summary.validate_for(service, scope)?;
+        Ok(summary)
+    }
+
+    pub fn validate_for(
+        &self,
+        service: &WorkProductAdoptionPluginService,
+        scope: &WorkProductAdoptionScope,
+    ) -> Result<(), WorkProductOutcomeError> {
+        service.validate()?;
+        scope.validate()?;
+        if self.schema_version != WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION
+            || self.media_type != WORK_PRODUCT_ADOPTION_SUMMARY_MEDIA_TYPE
+            || self.plugin_id != service.plugin_id
+            || self.service_digest != service.service_digest
+            || self.scope_digest != scope.scope_digest
+            || self.tenant_id != scope.tenant_id
+            || self.project_id != scope.project_id
+            || self.mission_id != scope.mission_id
+            || self.mission_revision != scope.mission_revision
+            || self.source_mission_revision != scope.source_mission_revision
+            || self.work_product_id != scope.work_product_id
+            || self.work_product_revision != scope.work_product_revision
+            || self.packet_digest != scope.packet_digest
+            || self.result_classification != scope.result_classification
+            || self.outcome_link_id != scope.outcome_link_id
+            || self.outcome_link_digest != scope.outcome_link_digest
+            || self.mount_generation == 0
+            || self.adoption_available != self.lifecycle.can_adopt()
+            || !is_sha256(&self.summary_digest)
+            || self.summary_digest != self.calculate_digest()?
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionState);
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> Result<String, WorkProductOutcomeError> {
+        let mut material = self.clone();
+        material.summary_digest.clear();
+        digest_json(&material)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkProductAdoptionReceipt {
+    pub schema_version: u32,
+    pub receipt_id: String,
+    pub plugin_id: String,
+    pub service_digest: String,
+    pub provider_id: String,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub mission_revision: u64,
+    pub source_mission_revision: u64,
+    pub work_product_id: WorkProductId,
+    pub work_product_revision: u64,
+    pub packet_digest: String,
+    pub scope_digest: String,
+    pub outcome_link_id: String,
+    pub outcome_link_digest: String,
+    pub consumer_id: String,
+    pub mount_generation: u64,
+    pub mount_digest: String,
+    pub adopted_at: DateTime<Utc>,
+    pub receipt_digest: String,
+}
+
+impl WorkProductAdoptionReceipt {
+    fn new(
+        service: &WorkProductAdoptionPluginService,
+        mount: &WorkProductAdoptionMountRequest,
+        consumer: &MissionWorkProductAdoptionConsumer,
+        receipt_id: impl Into<String>,
+        adopted_at: DateTime<Utc>,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        let scope = &mount.scope;
+        let mut receipt = Self {
+            schema_version: WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION,
+            receipt_id: receipt_id.into(),
+            plugin_id: service.plugin_id.clone(),
+            service_digest: service.service_digest.clone(),
+            provider_id: service.provider_id.clone(),
+            tenant_id: scope.tenant_id.clone(),
+            project_id: scope.project_id.clone(),
+            mission_id: scope.mission_id.clone(),
+            mission_revision: scope.mission_revision,
+            source_mission_revision: scope.source_mission_revision,
+            work_product_id: scope.work_product_id.clone(),
+            work_product_revision: scope.work_product_revision,
+            packet_digest: scope.packet_digest.clone(),
+            scope_digest: scope.scope_digest.clone(),
+            outcome_link_id: scope.outcome_link_id.clone(),
+            outcome_link_digest: scope.outcome_link_digest.clone(),
+            consumer_id: consumer.consumer_id.clone(),
+            mount_generation: mount.generation,
+            mount_digest: mount.mount_digest.clone(),
+            adopted_at,
+            receipt_digest: String::new(),
+        };
+        receipt.receipt_digest = receipt.calculate_digest()?;
+        receipt.validate_for(service, scope, mount, consumer)?;
+        Ok(receipt)
+    }
+
+    pub fn validate_for(
+        &self,
+        service: &WorkProductAdoptionPluginService,
+        scope: &WorkProductAdoptionScope,
+        mount: &WorkProductAdoptionMountRequest,
+        consumer: &MissionWorkProductAdoptionConsumer,
+    ) -> Result<(), WorkProductOutcomeError> {
+        service.validate()?;
+        mount.validate_for(service)?;
+        scope.validate()?;
+        self.validate_scope_only(service, scope)?;
+        if self.schema_version != WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION
+            || !valid_reference(&self.receipt_id)
+            || self.plugin_id != service.plugin_id
+            || self.service_digest != service.service_digest
+            || self.provider_id != service.provider_id
+            || self.tenant_id != scope.tenant_id
+            || self.project_id != scope.project_id
+            || self.mission_id != scope.mission_id
+            || self.mission_revision != scope.mission_revision
+            || self.source_mission_revision != scope.source_mission_revision
+            || self.work_product_id != scope.work_product_id
+            || self.work_product_revision != scope.work_product_revision
+            || self.packet_digest != scope.packet_digest
+            || self.scope_digest != scope.scope_digest
+            || self.outcome_link_id != scope.outcome_link_id
+            || self.outcome_link_digest != scope.outcome_link_digest
+            || self.consumer_id != consumer.consumer_id
+            || self.consumer_id != mount.consumer_id
+            || self.mount_generation != mount.generation
+            || self.mount_digest != mount.mount_digest
+            || self.adopted_at < mount.requested_at
+            || !is_sha256(&self.receipt_digest)
+            || self.receipt_digest != self.calculate_digest()?
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionReceipt);
+        }
+        Ok(())
+    }
+
+    fn validate_scope_only(
+        &self,
+        service: &WorkProductAdoptionPluginService,
+        scope: &WorkProductAdoptionScope,
+    ) -> Result<(), WorkProductOutcomeError> {
+        service.validate()?;
+        scope.validate()?;
+        if self.schema_version != WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION
+            || !valid_reference(&self.receipt_id)
+            || self.plugin_id != service.plugin_id
+            || self.service_digest != service.service_digest
+            || self.provider_id != service.provider_id
+            || self.tenant_id != scope.tenant_id
+            || self.project_id != scope.project_id
+            || self.mission_id != scope.mission_id
+            || self.mission_revision != scope.mission_revision
+            || self.source_mission_revision != scope.source_mission_revision
+            || self.work_product_id != scope.work_product_id
+            || self.work_product_revision != scope.work_product_revision
+            || self.packet_digest != scope.packet_digest
+            || self.scope_digest != scope.scope_digest
+            || self.outcome_link_id != scope.outcome_link_id
+            || self.outcome_link_digest != scope.outcome_link_digest
+            || !valid_reference(&self.consumer_id)
+            || self.mount_generation == 0
+            || !is_sha256(&self.mount_digest)
+            || !is_sha256(&self.receipt_digest)
+            || self.receipt_digest != self.calculate_digest()?
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionReceipt);
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> Result<String, WorkProductOutcomeError> {
+        let mut material = self.clone();
+        material.receipt_digest.clear();
+        digest_json(&material)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkProductAdoptionOperationRecord {
+    pub operation_id: String,
+    pub operation_kind: WorkProductAdoptionOperationKind,
+    pub operation_digest: String,
+    pub service_digest: String,
+    pub resulting_lifecycle: WorkProductAdoptionLifecycle,
+    pub generation: u64,
+    pub mount_digest: String,
+    pub consumer_id: Option<String>,
+    pub receipt_id: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+}
+
+impl WorkProductAdoptionOperationRecord {
+    fn new(
+        command: &WorkProductAdoptionCommand,
+        resulting_lifecycle: WorkProductAdoptionLifecycle,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        let record = Self {
+            operation_id: command.operation_id().to_owned(),
+            operation_kind: command.operation_kind(),
+            operation_digest: command.operation_digest()?,
+            service_digest: command.service_digest().to_owned(),
+            resulting_lifecycle,
+            generation: command.generation(),
+            mount_digest: command.mount_digest().to_owned(),
+            consumer_id: command.consumer_id().map(ToOwned::to_owned),
+            receipt_id: command.receipt_id().map(ToOwned::to_owned),
+            occurred_at,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkProductOutcomeError> {
+        if !valid_reference(&self.operation_id)
+            || !is_sha256(&self.operation_digest)
+            || !is_sha256(&self.service_digest)
+            || self.generation == 0
+            || !is_sha256(&self.mount_digest)
+            || self
+                .consumer_id
+                .as_deref()
+                .is_some_and(|value| !valid_reference(value))
+            || self
+                .receipt_id
+                .as_deref()
+                .is_some_and(|value| !valid_reference(value))
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionState);
+        }
+        if self.operation_digest
+            != adoption_operation_digest(
+                self.operation_kind,
+                &self.operation_id,
+                &self.service_digest,
+                &self.mount_digest,
+                self.generation,
+                self.consumer_id.as_deref(),
+                self.receipt_id.as_deref(),
+            )?
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionState);
+        }
+        if (self.operation_kind == WorkProductAdoptionOperationKind::Mount
+            && (self.resulting_lifecycle != WorkProductAdoptionLifecycle::Mounted
+                || self.consumer_id.is_some()
+                || self.receipt_id.is_some()))
+            || (self.operation_kind == WorkProductAdoptionOperationKind::Adopt
+                && (self.resulting_lifecycle != WorkProductAdoptionLifecycle::Mounted
+                    || self.consumer_id.is_none()
+                    || self.receipt_id.is_none()))
+            || (matches!(
+                self.operation_kind,
+                WorkProductAdoptionOperationKind::Unmount
+                    | WorkProductAdoptionOperationKind::Revoke
+                    | WorkProductAdoptionOperationKind::Crash
+            ) && (self.consumer_id.is_some() || self.receipt_id.is_some()))
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionState);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkProductAdoptionState {
+    pub schema_version: u32,
+    pub plugin_id: String,
+    pub service: WorkProductAdoptionPluginService,
+    pub scope: WorkProductAdoptionScope,
+    pub lifecycle: WorkProductAdoptionLifecycle,
+    pub generation: u64,
+    pub mount: WorkProductAdoptionMountRequest,
+    pub consumer: WorkProductAdoptionConsumerBinding,
+    pub summary: ContextualWorkProductOutcomeSummary,
+    pub receipts: Vec<WorkProductAdoptionReceipt>,
+    pub operations: Vec<WorkProductAdoptionOperationRecord>,
+    pub state_digest: String,
+}
+
+impl WorkProductAdoptionState {
+    pub fn initial(
+        service: WorkProductAdoptionPluginService,
+        mount: WorkProductAdoptionMountRequest,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        mount.validate_for(&service)?;
+        let consumer = WorkProductAdoptionConsumerBinding::from_mount(&mount)?;
+        let summary = ContextualWorkProductOutcomeSummary::from_scope(
+            &service,
+            &mount.scope,
+            WorkProductAdoptionLifecycle::Mounted,
+            mount.generation,
+        )?;
+        let command = WorkProductAdoptionCommand::Mount {
+            service: service.clone(),
+            mount: Box::new(mount.clone()),
+        };
+        let operations = vec![WorkProductAdoptionOperationRecord::new(
+            &command,
+            WorkProductAdoptionLifecycle::Mounted,
+            occurred_at,
+        )?];
+        let mut state = Self {
+            schema_version: WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION,
+            plugin_id: service.plugin_id.clone(),
+            service,
+            scope: mount.scope.clone(),
+            lifecycle: WorkProductAdoptionLifecycle::Mounted,
+            generation: mount.generation,
+            mount,
+            consumer,
+            summary,
+            receipts: Vec::new(),
+            operations,
+            state_digest: String::new(),
+        };
+        state.state_digest = state.calculate_digest()?;
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn remount(
+        &self,
+        service: WorkProductAdoptionPluginService,
+        mount: WorkProductAdoptionMountRequest,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        self.validate()?;
+        if self.lifecycle == WorkProductAdoptionLifecycle::Revoked {
+            return Err(WorkProductOutcomeError::AdoptionPluginRevoked);
+        }
+        if !matches!(
+            self.lifecycle,
+            WorkProductAdoptionLifecycle::Unmounted | WorkProductAdoptionLifecycle::Crashed
+        ) || mount.generation <= self.generation
+        {
+            return Err(WorkProductOutcomeError::AdoptionLifecycleConflict);
+        }
+        if mount.scope != self.scope {
+            return Err(WorkProductOutcomeError::InvalidAdoptionScope);
+        }
+        if service.service_digest != self.service.service_digest {
+            return Err(WorkProductOutcomeError::InvalidAdoptionPlugin);
+        }
+        mount.validate_for(&service)?;
+        let consumer = WorkProductAdoptionConsumerBinding::from_mount(&mount)?;
+        let summary = ContextualWorkProductOutcomeSummary::from_scope(
+            &service,
+            &self.scope,
+            WorkProductAdoptionLifecycle::Mounted,
+            mount.generation,
+        )?;
+        let command = WorkProductAdoptionCommand::Mount {
+            service: service.clone(),
+            mount: Box::new(mount.clone()),
+        };
+        let mut state = Self {
+            schema_version: WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION,
+            plugin_id: service.plugin_id.clone(),
+            service,
+            scope: self.scope.clone(),
+            lifecycle: WorkProductAdoptionLifecycle::Mounted,
+            generation: mount.generation,
+            mount,
+            consumer,
+            summary,
+            receipts: self.receipts.clone(),
+            operations: self.operations.clone(),
+            state_digest: String::new(),
+        };
+        state
+            .operations
+            .push(WorkProductAdoptionOperationRecord::new(
+                &command,
+                WorkProductAdoptionLifecycle::Mounted,
+                occurred_at,
+            )?);
+        state.state_digest = state.calculate_digest()?;
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn transition(
+        &self,
+        lifecycle: WorkProductAdoptionLifecycle,
+        command: &WorkProductAdoptionCommand,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        self.validate()?;
+        if !self.lifecycle.can_adopt()
+            || !matches!(
+                lifecycle,
+                WorkProductAdoptionLifecycle::Unmounted
+                    | WorkProductAdoptionLifecycle::Revoked
+                    | WorkProductAdoptionLifecycle::Crashed
+            )
+            || command.operation_kind() == WorkProductAdoptionOperationKind::Mount
+        {
+            return Err(WorkProductOutcomeError::AdoptionLifecycleConflict);
+        }
+        self.validate_command_binding(command)?;
+        let operation = WorkProductAdoptionOperationRecord::new(command, lifecycle, occurred_at)?;
+        let summary = ContextualWorkProductOutcomeSummary::from_scope(
+            &self.service,
+            &self.scope,
+            lifecycle,
+            self.generation,
+        )?;
+        let mut state = self.clone();
+        state.lifecycle = lifecycle;
+        state.summary = summary;
+        state.operations.push(operation);
+        state.state_digest = state.calculate_digest()?;
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn adopt(
+        &self,
+        command: &WorkProductAdoptionCommand,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<(Self, WorkProductAdoptionReceipt), WorkProductOutcomeError> {
+        self.validate()?;
+        if !self.lifecycle.can_adopt()
+            || command.operation_kind() != WorkProductAdoptionOperationKind::Adopt
+        {
+            return Err(WorkProductOutcomeError::AdoptionLifecycleConflict);
+        }
+        self.validate_command_binding(command)?;
+        let consumer_id = command
+            .consumer_id()
+            .ok_or(WorkProductOutcomeError::AdoptionConsumerMismatch)?;
+        if consumer_id != self.consumer.consumer_id {
+            return Err(WorkProductOutcomeError::AdoptionConsumerMismatch);
+        }
+        let consumer =
+            MissionWorkProductAdoptionConsumer::from_binding(&self.mount, &self.consumer)?;
+        let receipt_id = command
+            .receipt_id()
+            .ok_or(WorkProductOutcomeError::InvalidAdoptionReceipt)?;
+        if self
+            .receipts
+            .iter()
+            .any(|receipt| receipt.receipt_id == receipt_id)
+        {
+            return Err(WorkProductOutcomeError::AdoptionReplayMismatch);
+        }
+        let receipt = WorkProductAdoptionReceipt::new(
+            &self.service,
+            &self.mount,
+            &consumer,
+            receipt_id,
+            occurred_at,
+        )?;
+        let mut state = self.clone();
+        state.receipts.push(receipt.clone());
+        state
+            .operations
+            .push(WorkProductAdoptionOperationRecord::new(
+                command,
+                WorkProductAdoptionLifecycle::Mounted,
+                occurred_at,
+            )?);
+        state.state_digest = state.calculate_digest()?;
+        state.validate()?;
+        Ok((state, receipt))
+    }
+
+    pub fn operation(&self, operation_id: &str) -> Option<&WorkProductAdoptionOperationRecord> {
+        self.operations
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+    }
+
+    pub fn receipt_for_operation(&self, operation_id: &str) -> Option<&WorkProductAdoptionReceipt> {
+        self.operation(operation_id)
+            .and_then(|operation| operation.receipt_id.as_ref())
+            .and_then(|receipt_id| {
+                self.receipts
+                    .iter()
+                    .find(|receipt| &receipt.receipt_id == receipt_id)
+            })
+    }
+
+    pub fn validate(&self) -> Result<(), WorkProductOutcomeError> {
+        self.service.validate()?;
+        self.scope.validate()?;
+        self.mount.validate_for(&self.service)?;
+        self.consumer.validate_for(&self.mount)?;
+        self.summary.validate_for(&self.service, &self.scope)?;
+        if self.schema_version != WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION
+            || self.plugin_id != self.service.plugin_id
+            || self.scope != self.mount.scope
+            || self.generation != self.mount.generation
+            || self.summary.lifecycle != self.lifecycle
+            || self.summary.mount_generation != self.generation
+            || self.lifecycle == WorkProductAdoptionLifecycle::Mounted
+                && !self.summary.adoption_available
+            || self.lifecycle != WorkProductAdoptionLifecycle::Mounted
+                && self.summary.adoption_available
+            || self.operations.is_empty()
+            || self
+                .operations
+                .iter()
+                .any(|operation| operation.validate().is_err())
+            || self.validate_operation_history().is_err()
+            || self
+                .operations
+                .windows(2)
+                .any(|window| window[0].operation_id == window[1].operation_id)
+            || self.receipts.iter().any(|receipt| {
+                receipt
+                    .validate_scope_only(&self.service, &self.scope)
+                    .is_err()
+            })
+            || !is_sha256(&self.state_digest)
+            || self.state_digest != self.calculate_digest()?
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionState);
+        }
+        let mut operation_ids = BTreeSet::new();
+        if self
+            .operations
+            .iter()
+            .any(|operation| !operation_ids.insert(operation.operation_id.clone()))
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionState);
+        }
+        Ok(())
+    }
+
+    fn validate_operation_history(&self) -> Result<(), WorkProductOutcomeError> {
+        let mut lifecycle = None;
+        let mut generation = 0;
+        let mut mount_digest = None;
+        for operation in &self.operations {
+            if operation.service_digest != self.service.service_digest {
+                return Err(WorkProductOutcomeError::InvalidAdoptionState);
+            }
+            match operation.operation_kind {
+                WorkProductAdoptionOperationKind::Mount => {
+                    if lifecycle.is_some_and(|value| {
+                        !matches!(
+                            value,
+                            WorkProductAdoptionLifecycle::Unmounted
+                                | WorkProductAdoptionLifecycle::Crashed
+                        )
+                    }) || lifecycle.is_some() && operation.generation <= generation
+                    {
+                        return Err(WorkProductOutcomeError::InvalidAdoptionState);
+                    }
+                }
+                WorkProductAdoptionOperationKind::Adopt => {
+                    if operation.resulting_lifecycle != WorkProductAdoptionLifecycle::Mounted
+                        || lifecycle != Some(WorkProductAdoptionLifecycle::Mounted)
+                        || operation.generation != generation
+                        || mount_digest.as_deref() != Some(operation.mount_digest.as_str())
+                    {
+                        return Err(WorkProductOutcomeError::InvalidAdoptionState);
+                    }
+                    let receipt_id = operation
+                        .receipt_id
+                        .as_deref()
+                        .ok_or(WorkProductOutcomeError::InvalidAdoptionState)?;
+                    let receipt = self
+                        .receipts
+                        .iter()
+                        .find(|receipt| receipt.receipt_id == receipt_id)
+                        .ok_or(WorkProductOutcomeError::InvalidAdoptionState)?;
+                    if receipt.mount_generation != operation.generation
+                        || receipt.mount_digest != operation.mount_digest
+                        || operation.consumer_id.as_deref() != Some(receipt.consumer_id.as_str())
+                        || receipt.adopted_at < operation.occurred_at
+                    {
+                        return Err(WorkProductOutcomeError::InvalidAdoptionState);
+                    }
+                }
+                WorkProductAdoptionOperationKind::Unmount
+                | WorkProductAdoptionOperationKind::Revoke
+                | WorkProductAdoptionOperationKind::Crash => {
+                    let expected_lifecycle = match operation.operation_kind {
+                        WorkProductAdoptionOperationKind::Unmount => {
+                            WorkProductAdoptionLifecycle::Unmounted
+                        }
+                        WorkProductAdoptionOperationKind::Revoke => {
+                            WorkProductAdoptionLifecycle::Revoked
+                        }
+                        WorkProductAdoptionOperationKind::Crash => {
+                            WorkProductAdoptionLifecycle::Crashed
+                        }
+                        _ => unreachable!(),
+                    };
+                    if operation.resulting_lifecycle != expected_lifecycle
+                        || lifecycle != Some(WorkProductAdoptionLifecycle::Mounted)
+                        || operation.generation != generation
+                        || mount_digest.as_deref() != Some(operation.mount_digest.as_str())
+                    {
+                        return Err(WorkProductOutcomeError::InvalidAdoptionState);
+                    }
+                }
+            }
+            lifecycle = Some(operation.resulting_lifecycle);
+            generation = operation.generation;
+            mount_digest = Some(operation.mount_digest.clone());
+        }
+        if lifecycle != Some(self.lifecycle)
+            || generation != self.generation
+            || mount_digest.as_deref() != Some(self.mount.mount_digest.as_str())
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionState);
+        }
+        for receipt in &self.receipts {
+            if !self.operations.iter().any(|operation| {
+                operation.operation_kind == WorkProductAdoptionOperationKind::Adopt
+                    && operation.receipt_id.as_deref() == Some(receipt.receipt_id.as_str())
+            }) {
+                return Err(WorkProductOutcomeError::InvalidAdoptionState);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_command_binding(
+        &self,
+        command: &WorkProductAdoptionCommand,
+    ) -> Result<(), WorkProductOutcomeError> {
+        if command.service_digest() != self.service.service_digest
+            || command.mount_digest() != self.mount.mount_digest
+            || command.generation() != self.generation
+        {
+            return Err(WorkProductOutcomeError::AdoptionMountMismatch);
+        }
+        command.validate()?;
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> Result<String, WorkProductOutcomeError> {
+        let mut material = self.clone();
+        material.state_digest.clear();
+        digest_json(&material)
+    }
+}
+
+fn adoption_operation_digest(
+    operation_kind: WorkProductAdoptionOperationKind,
+    operation_id: &str,
+    service_digest: &str,
+    mount_digest: &str,
+    generation: u64,
+    consumer_id: Option<&str>,
+    receipt_id: Option<&str>,
+) -> Result<String, WorkProductOutcomeError> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct OperationMaterial<'a> {
+        operation_kind: WorkProductAdoptionOperationKind,
+        operation_id: &'a str,
+        service_digest: &'a str,
+        mount_digest: &'a str,
+        generation: u64,
+        consumer_id: Option<&'a str>,
+        receipt_id: Option<&'a str>,
+    }
+    digest_json(&OperationMaterial {
+        operation_kind,
+        operation_id,
+        service_digest,
+        mount_digest,
+        generation,
+        consumer_id,
+        receipt_id,
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum WorkProductAdoptionCommand {
+    Mount {
+        service: WorkProductAdoptionPluginService,
+        mount: Box<WorkProductAdoptionMountRequest>,
+    },
+    Unmount {
+        operation_id: String,
+        service_digest: String,
+        mount_digest: String,
+        generation: u64,
+    },
+    Revoke {
+        operation_id: String,
+        service_digest: String,
+        mount_digest: String,
+        generation: u64,
+    },
+    Crash {
+        operation_id: String,
+        service_digest: String,
+        mount_digest: String,
+        generation: u64,
+    },
+    Adopt {
+        operation_id: String,
+        service_digest: String,
+        mount_digest: String,
+        generation: u64,
+        consumer_id: String,
+        receipt_id: String,
+    },
+}
+
+impl WorkProductAdoptionCommand {
+    pub fn mount(
+        service: WorkProductAdoptionPluginService,
+        mount: WorkProductAdoptionMountRequest,
+    ) -> Self {
+        Self::Mount {
+            service,
+            mount: Box::new(mount),
+        }
+    }
+
+    pub fn unmount(
+        operation_id: impl Into<String>,
+        service_digest: impl Into<String>,
+        mount_digest: impl Into<String>,
+        generation: u64,
+    ) -> Self {
+        Self::Unmount {
+            operation_id: operation_id.into(),
+            service_digest: service_digest.into(),
+            mount_digest: mount_digest.into(),
+            generation,
+        }
+    }
+
+    pub fn revoke(
+        operation_id: impl Into<String>,
+        service_digest: impl Into<String>,
+        mount_digest: impl Into<String>,
+        generation: u64,
+    ) -> Self {
+        Self::Revoke {
+            operation_id: operation_id.into(),
+            service_digest: service_digest.into(),
+            mount_digest: mount_digest.into(),
+            generation,
+        }
+    }
+
+    pub fn crash(
+        operation_id: impl Into<String>,
+        service_digest: impl Into<String>,
+        mount_digest: impl Into<String>,
+        generation: u64,
+    ) -> Self {
+        Self::Crash {
+            operation_id: operation_id.into(),
+            service_digest: service_digest.into(),
+            mount_digest: mount_digest.into(),
+            generation,
+        }
+    }
+
+    pub fn adopt(
+        operation_id: impl Into<String>,
+        service_digest: impl Into<String>,
+        mount_digest: impl Into<String>,
+        generation: u64,
+        consumer_id: impl Into<String>,
+        receipt_id: impl Into<String>,
+    ) -> Self {
+        Self::Adopt {
+            operation_id: operation_id.into(),
+            service_digest: service_digest.into(),
+            mount_digest: mount_digest.into(),
+            generation,
+            consumer_id: consumer_id.into(),
+            receipt_id: receipt_id.into(),
+        }
+    }
+
+    pub fn operation_id(&self) -> &str {
+        match self {
+            Self::Mount { mount, .. } => &mount.mount_digest,
+            Self::Unmount { operation_id, .. }
+            | Self::Revoke { operation_id, .. }
+            | Self::Crash { operation_id, .. }
+            | Self::Adopt { operation_id, .. } => operation_id,
+        }
+    }
+
+    fn operation_kind(&self) -> WorkProductAdoptionOperationKind {
+        match self {
+            Self::Mount { .. } => WorkProductAdoptionOperationKind::Mount,
+            Self::Unmount { .. } => WorkProductAdoptionOperationKind::Unmount,
+            Self::Revoke { .. } => WorkProductAdoptionOperationKind::Revoke,
+            Self::Crash { .. } => WorkProductAdoptionOperationKind::Crash,
+            Self::Adopt { .. } => WorkProductAdoptionOperationKind::Adopt,
+        }
+    }
+
+    fn service_digest(&self) -> &str {
+        match self {
+            Self::Mount { service, .. } => &service.service_digest,
+            Self::Unmount { service_digest, .. }
+            | Self::Revoke { service_digest, .. }
+            | Self::Crash { service_digest, .. }
+            | Self::Adopt { service_digest, .. } => service_digest,
+        }
+    }
+
+    fn mount_digest(&self) -> &str {
+        match self {
+            Self::Mount { mount, .. } => &mount.mount_digest,
+            Self::Unmount { mount_digest, .. }
+            | Self::Revoke { mount_digest, .. }
+            | Self::Crash { mount_digest, .. }
+            | Self::Adopt { mount_digest, .. } => mount_digest,
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Mount { mount, .. } => mount.generation,
+            Self::Unmount { generation, .. }
+            | Self::Revoke { generation, .. }
+            | Self::Crash { generation, .. }
+            | Self::Adopt { generation, .. } => *generation,
+        }
+    }
+
+    fn consumer_id(&self) -> Option<&str> {
+        match self {
+            Self::Adopt { consumer_id, .. } => Some(consumer_id),
+            _ => None,
+        }
+    }
+
+    fn receipt_id(&self) -> Option<&str> {
+        match self {
+            Self::Adopt { receipt_id, .. } => Some(receipt_id),
+            _ => None,
+        }
+    }
+
+    pub fn operation_digest(&self) -> Result<String, WorkProductOutcomeError> {
+        adoption_operation_digest(
+            self.operation_kind(),
+            self.operation_id(),
+            self.service_digest(),
+            self.mount_digest(),
+            self.generation(),
+            self.consumer_id(),
+            self.receipt_id(),
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), WorkProductOutcomeError> {
+        if !valid_reference(self.operation_id())
+            || !is_sha256(self.mount_digest())
+            || self.generation() == 0
+            || !is_sha256(self.service_digest())
+            || self
+                .consumer_id()
+                .is_some_and(|value| !valid_reference(value))
+            || self
+                .receipt_id()
+                .is_some_and(|value| !valid_reference(value))
+        {
+            return Err(WorkProductOutcomeError::InvalidAdoptionState);
+        }
+        if let Self::Mount { service, mount } = self {
+            service.validate()?;
+            mount.validate_for(service)?;
+            if mount.mount_digest != self.mount_digest() {
+                return Err(WorkProductOutcomeError::InvalidAdoptionMount);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct WorkProductAdoptionProvider {
+    pub service: WorkProductAdoptionPluginService,
+    pub mount: WorkProductAdoptionMountRequest,
+    pub lifecycle: WorkProductAdoptionLifecycle,
+}
+
+impl WorkProductAdoptionProvider {
+    pub fn mount(
+        service: WorkProductAdoptionPluginService,
+        mount: WorkProductAdoptionMountRequest,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        mount.validate_for(&service)?;
+        Ok(Self {
+            service,
+            mount,
+            lifecycle: WorkProductAdoptionLifecycle::Mounted,
+        })
+    }
+
+    pub fn adopt(
+        &self,
+        consumer: &MissionWorkProductAdoptionConsumer,
+        receipt_id: impl Into<String>,
+        adopted_at: DateTime<Utc>,
+    ) -> Result<WorkProductAdoptionReceipt, WorkProductOutcomeError> {
+        if !self.lifecycle.can_adopt() {
+            return Err(WorkProductOutcomeError::AdoptionLifecycleConflict);
+        }
+        consumer.validate_for(&self.mount)?;
+        WorkProductAdoptionReceipt::new(
+            &self.service,
+            &self.mount,
+            consumer,
+            receipt_id,
+            adopted_at,
+        )
+    }
+
+    pub fn transition(
+        &self,
+        lifecycle: WorkProductAdoptionLifecycle,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        if !self.lifecycle.can_adopt() || lifecycle == WorkProductAdoptionLifecycle::Mounted {
+            return Err(WorkProductOutcomeError::AdoptionLifecycleConflict);
+        }
+        Ok(Self {
+            service: self.service.clone(),
+            mount: self.mount.clone(),
+            lifecycle,
+        })
+    }
+}
+
+pub type AdoptableResultPluginProvider = WorkProductAdoptionProvider;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionWorkProductAdoptionConsumer {
+    pub consumer_id: String,
+    pub mount_generation: u64,
+    pub mount_digest: String,
+    pub lifecycle: WorkProductAdoptionLifecycle,
+}
+
+impl MissionWorkProductAdoptionConsumer {
+    pub fn new(
+        consumer_id: impl Into<String>,
+        mount: &WorkProductAdoptionMountRequest,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        let consumer_id = consumer_id.into();
+        if consumer_id != mount.consumer_id {
+            return Err(WorkProductOutcomeError::AdoptionConsumerMismatch);
+        }
+        let consumer = Self {
+            consumer_id,
+            mount_generation: mount.generation,
+            mount_digest: mount.mount_digest.clone(),
+            lifecycle: WorkProductAdoptionLifecycle::Mounted,
+        };
+        consumer.validate_for(mount)?;
+        Ok(consumer)
+    }
+
+    fn from_binding(
+        mount: &WorkProductAdoptionMountRequest,
+        binding: &WorkProductAdoptionConsumerBinding,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        let consumer = Self {
+            consumer_id: binding.consumer_id.clone(),
+            mount_generation: binding.mount_generation,
+            mount_digest: binding.mount_digest.clone(),
+            lifecycle: WorkProductAdoptionLifecycle::Mounted,
+        };
+        consumer.validate_for(mount)?;
+        Ok(consumer)
+    }
+
+    pub fn validate_for(
+        &self,
+        mount: &WorkProductAdoptionMountRequest,
+    ) -> Result<(), WorkProductOutcomeError> {
+        if !valid_reference(&self.consumer_id)
+            || self.consumer_id != mount.consumer_id
+            || self.mount_generation != mount.generation
+            || self.mount_digest != mount.mount_digest
+            || !self.lifecycle.can_adopt()
+        {
+            return Err(WorkProductOutcomeError::AdoptionConsumerMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn adopt(
+        &self,
+        provider: &WorkProductAdoptionProvider,
+        receipt_id: impl Into<String>,
+        adopted_at: DateTime<Utc>,
+    ) -> Result<WorkProductAdoptionReceipt, WorkProductOutcomeError> {
+        if !self.lifecycle.can_adopt() {
+            return Err(WorkProductOutcomeError::AdoptionLifecycleConflict);
+        }
+        provider.adopt(self, receipt_id, adopted_at)
+    }
+
+    pub fn transition(
+        &self,
+        lifecycle: WorkProductAdoptionLifecycle,
+    ) -> Result<Self, WorkProductOutcomeError> {
+        if !self.lifecycle.can_adopt() || lifecycle == WorkProductAdoptionLifecycle::Mounted {
+            return Err(WorkProductOutcomeError::AdoptionLifecycleConflict);
+        }
+        Ok(Self {
+            consumer_id: self.consumer_id.clone(),
+            mount_generation: self.mount_generation,
+            mount_digest: self.mount_digest.clone(),
+            lifecycle,
+        })
+    }
+}
+
+pub type AdoptableResultMissionConsumer = MissionWorkProductAdoptionConsumer;
+
 #[derive(Debug, Error)]
 pub enum WorkProductOutcomeError {
     #[error("result packet scope, time, content digest, or packet digest is invalid")]
@@ -686,6 +2110,28 @@ pub enum WorkProductOutcomeError {
     OutcomeRequiresAdoption,
     #[error("the referenced work product revision does not exist")]
     UnknownWorkProductRevision,
+    #[error("the adoptable-result plugin service is invalid")]
+    InvalidAdoptionPlugin,
+    #[error("the adoption scope is not an exact verified Work Product and Outcome handoff")]
+    InvalidAdoptionScope,
+    #[error("the adoption mount request is invalid")]
+    InvalidAdoptionMount,
+    #[error("the adoption receipt is invalid or not revision-bound")]
+    InvalidAdoptionReceipt,
+    #[error("the persisted adoption plugin state is invalid or tampered")]
+    InvalidAdoptionState,
+    #[error("the exact Work Product revision has no adopted independently verified Outcome")]
+    AdoptionUnavailable,
+    #[error("the adoption plugin lifecycle does not permit this operation")]
+    AdoptionLifecycleConflict,
+    #[error("the adoption operation replay does not match its original digest")]
+    AdoptionReplayMismatch,
+    #[error("the adoption consumer is not the exact mounted Mission consumer")]
+    AdoptionConsumerMismatch,
+    #[error("the adoption operation is bound to a stale or different mount")]
+    AdoptionMountMismatch,
+    #[error("the adoption plugin was revoked and cannot be remounted")]
+    AdoptionPluginRevoked,
 }
 
 fn same_scope(
@@ -830,6 +2276,144 @@ mod tests {
         assert!(matches!(
             snapshot.append_revision(second),
             Err(WorkProductOutcomeError::InvalidWorkProductRevision)
+        ));
+    }
+
+    fn verified_snapshot() -> WorkProductHandoffSnapshot {
+        let packet = packet();
+        let revision = WorkProductRevision::from_packet(
+            &packet,
+            WorkProductId::from("work-product-1"),
+            1,
+            now(),
+        )
+        .expect("revision");
+        let mut snapshot =
+            WorkProductHandoffSnapshot::new(packet.clone(), revision).expect("snapshot");
+        snapshot
+            .append_adoption_decision(
+                AdoptionDecision::new(
+                    "decision-1",
+                    packet.tenant_id.clone(),
+                    packet.project_id.clone(),
+                    packet.mission_id.clone(),
+                    packet.mission_revision,
+                    WorkProductId::from("work-product-1"),
+                    1,
+                    packet.packet_digest.clone(),
+                    AdoptionDecisionKind::Adopt,
+                    "bounded adoption",
+                    now(),
+                )
+                .expect("decision"),
+            )
+            .expect("adoption");
+        snapshot
+            .append_outcome_link(
+                OutcomeLink::new(
+                    "outcome-link-1",
+                    packet.tenant_id,
+                    packet.project_id,
+                    packet.mission_id,
+                    packet.mission_revision,
+                    WorkProductId::from("work-product-1"),
+                    1,
+                    packet.packet_digest,
+                    OutcomeVerificationKind::IndependentProvider,
+                    "provider://independent-1",
+                    "outcome://event-1",
+                    OutcomeClassification::Positive,
+                    "c".repeat(64),
+                    "d".repeat(64),
+                    now(),
+                )
+                .expect("outcome link"),
+            )
+            .expect("outcome");
+        snapshot
+    }
+
+    #[test]
+    fn adoption_provider_and_consumer_require_the_exact_mount_lifecycle() {
+        let snapshot = verified_snapshot();
+        let scope = WorkProductAdoptionScope::from_verified_handoff(
+            &snapshot,
+            &TenantId::from("tenant-1"),
+            &ProjectId::from("project-1"),
+            &MissionId::from("mission-1"),
+            5,
+            1,
+        )
+        .expect("scope");
+        let service =
+            WorkProductAdoptionPluginService::new("provider://adoption-1").expect("service");
+        let mount = service
+            .mount_request(scope, "mission-consumer-1", 1, now())
+            .expect("mount");
+        let provider =
+            WorkProductAdoptionProvider::mount(service, mount.clone()).expect("provider");
+        let consumer = MissionWorkProductAdoptionConsumer::new("mission-consumer-1", &mount)
+            .expect("consumer");
+        let receipt = consumer
+            .adopt(&provider, "receipt-1", now())
+            .expect("receipt");
+        assert_eq!(receipt.work_product_revision, 1);
+
+        let unmounted = provider
+            .transition(WorkProductAdoptionLifecycle::Unmounted)
+            .expect("unmount");
+        assert!(matches!(
+            consumer.adopt(&unmounted, "receipt-2", now()),
+            Err(WorkProductOutcomeError::AdoptionLifecycleConflict)
+        ));
+        let stale_consumer = consumer
+            .transition(WorkProductAdoptionLifecycle::Unmounted)
+            .expect("consumer unmount");
+        assert!(matches!(
+            stale_consumer.adopt(&provider, "receipt-3", now()),
+            Err(WorkProductOutcomeError::AdoptionLifecycleConflict)
+        ));
+    }
+
+    #[test]
+    fn adoption_scope_rejects_a_result_without_independent_outcome_verification() {
+        let packet = packet();
+        let revision = WorkProductRevision::from_packet(
+            &packet,
+            WorkProductId::from("work-product-1"),
+            1,
+            now(),
+        )
+        .expect("revision");
+        let mut snapshot = WorkProductHandoffSnapshot::new(packet, revision).expect("snapshot");
+        snapshot
+            .append_adoption_decision(
+                AdoptionDecision::new(
+                    "decision-1",
+                    TenantId::from("tenant-1"),
+                    ProjectId::from("project-1"),
+                    MissionId::from("mission-1"),
+                    4,
+                    WorkProductId::from("work-product-1"),
+                    1,
+                    snapshot.packet.packet_digest.clone(),
+                    AdoptionDecisionKind::Adopt,
+                    "adopt packet only",
+                    now(),
+                )
+                .expect("decision"),
+            )
+            .expect("adoption");
+        assert!(matches!(
+            WorkProductAdoptionScope::from_verified_handoff(
+                &snapshot,
+                &TenantId::from("tenant-1"),
+                &ProjectId::from("project-1"),
+                &MissionId::from("mission-1"),
+                5,
+                1,
+            ),
+            Err(WorkProductOutcomeError::AdoptionUnavailable)
         ));
     }
 }
