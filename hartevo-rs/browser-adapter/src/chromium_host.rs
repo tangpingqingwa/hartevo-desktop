@@ -1085,6 +1085,24 @@ impl ManagedChromiumHost {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_create_unmanaged_tab(&mut self) -> Result<(), BrowserError> {
+        let created = self.command(
+            CdpMethod::TargetCreateTarget,
+            json!({"url": "about:blank", "background": false}),
+            None,
+        )?;
+        let _ = required_bounded_string(&created, "targetId").map_err(|_| self.poison())?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_terminate_process(&mut self) -> Result<(), BrowserError> {
+        let child = self.child.as_mut().ok_or(BrowserError::HostExited)?;
+        terminate_group_best_effort(child);
+        Ok(())
+    }
+
     fn read_page_target_ids(&mut self) -> Result<BTreeSet<String>, BrowserError> {
         let result = self.command(CdpMethod::TargetGetTargets, json!({}), None)?;
         let target_infos = result
