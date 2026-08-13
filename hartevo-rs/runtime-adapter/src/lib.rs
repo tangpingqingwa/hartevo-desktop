@@ -1268,6 +1268,9 @@ pub struct StdioRuntime {
     pending: HashMap<RequestId, PendingRequest>,
     server_requests: HashSet<RequestId>,
     deferred: VecDeque<RuntimeEvent>,
+    // stderr EOF is nonfatal; let the stdout reader deliver already-produced
+    // protocol frames before exposing the lifecycle diagnostic.
+    stderr_closed_pending: bool,
     deferred_capacity: usize,
     max_line_bytes: usize,
     shutdown_grace: Duration,
@@ -1291,6 +1294,7 @@ impl fmt::Debug for StdioRuntime {
             .field("pending_request_count", &self.pending.len())
             .field("server_request_count", &self.server_requests.len())
             .field("deferred_event_count", &self.deferred.len())
+            .field("stderr_closed_pending", &self.stderr_closed_pending)
             .field("config_digest", &self.config_digest)
             .field("instance_digest", &self.instance_digest)
             .field("poisoned", &self.poisoned)
@@ -1432,6 +1436,7 @@ impl StdioRuntime {
             pending: HashMap::new(),
             server_requests: HashSet::new(),
             deferred: VecDeque::new(),
+            stderr_closed_pending: false,
             deferred_capacity: config.deferred_capacity,
             max_line_bytes: config.max_line_bytes,
             shutdown_grace: config.shutdown_grace,
@@ -1515,52 +1520,73 @@ impl StdioRuntime {
     }
 
     pub fn next_event(&mut self, timeout: Duration) -> Result<RuntimeEvent, AdapterError> {
-        if let Some(event) = self.deferred.pop_front() {
-            return Ok(event);
-        }
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(AdapterError::TimeoutOutOfRange)?;
-        if let Some(event) = self.try_ready_event() {
+        loop {
+            if let Some(event) = self.deferred.pop_front() {
+                return Ok(event);
+            }
+            if self.stderr_closed_pending && self.stdout_rx.is_none() {
+                self.stderr_closed_pending = false;
+                return Ok(RuntimeEvent::StderrClosed);
+            }
+            if let Some(event) = self.try_ready_event() {
+                if matches!(event, RuntimeEvent::StderrClosed) {
+                    continue;
+                }
+                return Ok(event);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if self.stderr_closed_pending {
+                    self.stderr_closed_pending = false;
+                    return Ok(RuntimeEvent::StderrClosed);
+                }
+                return Err(AdapterError::NextEventTimedOut);
+            }
+            let stdout_rx = self.stdout_rx.clone();
+            let stderr_rx = self.stderr_rx.clone();
+            let selected = match (stdout_rx, stderr_rx) {
+                (Some(stdout_rx), Some(stderr_rx)) => {
+                    select! {
+                        recv(stdout_rx) -> message => Some((RuntimeStream::Stdout, message)),
+                        recv(stderr_rx) -> message => Some((RuntimeStream::Stderr, message)),
+                        default(remaining) => None,
+                    }
+                }
+                (Some(stdout_rx), None) => match stdout_rx.recv_timeout(remaining) {
+                    Ok(message) => Some((RuntimeStream::Stdout, Ok(message))),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        Some((RuntimeStream::Stdout, Err(crossbeam_channel::RecvError)))
+                    }
+                    Err(RecvTimeoutError::Timeout) => None,
+                },
+                (None, Some(stderr_rx)) => match stderr_rx.recv_timeout(remaining) {
+                    Ok(message) => Some((RuntimeStream::Stderr, Ok(message))),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        Some((RuntimeStream::Stderr, Err(crossbeam_channel::RecvError)))
+                    }
+                    Err(RecvTimeoutError::Timeout) => None,
+                },
+                (None, None) => return Err(AdapterError::RuntimeStreamsClosed),
+            };
+            let Some((stream, message)) = selected else {
+                if self.stderr_closed_pending {
+                    self.stderr_closed_pending = false;
+                    return Ok(RuntimeEvent::StderrClosed);
+                }
+                return Err(AdapterError::NextEventTimedOut);
+            };
+            let event = match message {
+                Ok(message) => self.handle_reader_message(stream, message),
+                Err(_) => self.handle_reader_disconnect(stream),
+            };
+            if matches!(event, RuntimeEvent::StderrClosed) {
+                continue;
+            }
             return Ok(event);
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(AdapterError::NextEventTimedOut);
-        }
-        let stdout_rx = self.stdout_rx.clone();
-        let stderr_rx = self.stderr_rx.clone();
-        let selected = match (stdout_rx, stderr_rx) {
-            (Some(stdout_rx), Some(stderr_rx)) => {
-                select! {
-                    recv(stdout_rx) -> message => Some((RuntimeStream::Stdout, message)),
-                    recv(stderr_rx) -> message => Some((RuntimeStream::Stderr, message)),
-                    default(remaining) => None,
-                }
-            }
-            (Some(stdout_rx), None) => match stdout_rx.recv_timeout(remaining) {
-                Ok(message) => Some((RuntimeStream::Stdout, Ok(message))),
-                Err(RecvTimeoutError::Disconnected) => {
-                    Some((RuntimeStream::Stdout, Err(crossbeam_channel::RecvError)))
-                }
-                Err(RecvTimeoutError::Timeout) => None,
-            },
-            (None, Some(stderr_rx)) => match stderr_rx.recv_timeout(remaining) {
-                Ok(message) => Some((RuntimeStream::Stderr, Ok(message))),
-                Err(RecvTimeoutError::Disconnected) => {
-                    Some((RuntimeStream::Stderr, Err(crossbeam_channel::RecvError)))
-                }
-                Err(RecvTimeoutError::Timeout) => None,
-            },
-            (None, None) => return Err(AdapterError::RuntimeStreamsClosed),
-        };
-        let Some((stream, message)) = selected else {
-            return Err(AdapterError::NextEventTimedOut);
-        };
-        Ok(match message {
-            Ok(message) => self.handle_reader_message(stream, message),
-            Err(_) => self.handle_reader_disconnect(stream),
-        })
     }
 
     pub fn health_check(&mut self, timeout: Duration) -> Result<RuntimeHealth, AdapterError> {
@@ -2195,6 +2221,7 @@ impl StdioRuntime {
             }
             RuntimeStream::Stderr => {
                 self.stderr_rx = None;
+                self.stderr_closed_pending = true;
                 RuntimeEvent::StderrClosed
             }
         }
@@ -4023,6 +4050,70 @@ printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"approved":%s}}\n' 
                 ..
             }
         ));
+        runtime.shutdown().expect("shutdown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_eof_cannot_overtake_terminal_stdout_notification() {
+        let command = shell_runtime(
+            r#"IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{}}'
+printf '%s\n' '{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"command":"private-command"}}'
+IFS= read -r approval
+exec 2>&-
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"approved":true}}'"#,
+        );
+        let mut runtime = StdioRuntime::spawn(&command).expect("spawn fake runtime");
+        runtime
+            .send_request(&AppServerContract::initialize(RequestId::Number(5)))
+            .expect("send initialize");
+        let _ = next_correlated_response(&mut runtime);
+        let request_id = loop {
+            match runtime
+                .next_event(Duration::from_secs(1))
+                .expect("server request")
+            {
+                RuntimeEvent::ServerRequest { kind, request } => {
+                    assert_eq!(kind, RuntimeEventKind::LocalApprovalRequested);
+                    break request.id;
+                }
+                RuntimeEvent::Diagnostic(_) | RuntimeEvent::StderrClosed => {}
+                other => panic!("unexpected event: {other:?}"),
+            }
+        };
+        runtime
+            .send_response(&AppServerContract::local_approval_response(
+                request_id, true,
+            ))
+            .expect("approval response");
+
+        let terminal = runtime
+            .next_event(Duration::from_secs(1))
+            .expect("terminal notification");
+        assert!(matches!(
+            terminal,
+            RuntimeEvent::Notification {
+                kind: RuntimeEventKind::TurnCompleted,
+                ..
+            }
+        ));
+
+        let mut saw_stderr_closed = false;
+        for _ in 0..3 {
+            match runtime
+                .next_event(Duration::from_secs(1))
+                .expect("post-terminal stream event")
+            {
+                RuntimeEvent::StdoutClosed => {}
+                RuntimeEvent::StderrClosed => {
+                    saw_stderr_closed = true;
+                    break;
+                }
+                other => panic!("unexpected post-terminal event: {other:?}"),
+            }
+        }
+        assert!(saw_stderr_closed);
         runtime.shutdown().expect("shutdown");
     }
 
