@@ -16,7 +16,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use command_fds::{CommandFdExt, FdMapping};
-use command_group::{CommandGroup, GroupChild};
+use command_group::{CommandGroup, GroupChild, Signal, UnixChildExt};
 use crossbeam_channel::{Sender, TryRecvError, bounded};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -1450,8 +1450,8 @@ fn execute_bounded_process(
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
         }
-        // GroupChild::try_wait observes the Unix process group. Poll the exact
-        // leader here, then audit and clear the group separately below.
+        // Poll only the exact leader here. GroupChild::try_wait also reaps
+        // descendants and can lose the leader status on a later call.
         match child.inner().try_wait() {
             Ok(Some(status)) => break ProcessStop::Exited(status),
             Ok(None) => {}
@@ -1534,35 +1534,59 @@ fn terminate_process_group(
     let deadline = Instant::now()
         .checked_add(PROCESS_CLEANUP_TIMEOUT)
         .ok_or(BrowserError::FileScanUnavailable)?;
+    let soft_deadline = Instant::now()
+        .checked_add(PROCESS_CLEANUP_TIMEOUT / 2)
+        .ok_or(BrowserError::FileScanUnavailable)?;
+    let leader_status_supplied = leader_status.is_some();
     let mut status = leader_status;
     let mut had_live_group_after_leader = false;
+    let mut force_kill_sent = false;
 
     if leader_status.is_some() {
         // The exact leader was already reaped through std::process::Child.
-        // A successful group kill therefore proves that another group member
-        // remained, and contains it without a PID-reuse or escape delay.
-        had_live_group_after_leader = kill_process_group(child)?;
+        // Give remaining group members a bounded chance to terminate together
+        // so a shell can reap its children before force termination.
+        had_live_group_after_leader = signal_process_group(child, Signal::SIGTERM)?;
     }
     let mut group_absent = if leader_status.is_some() {
         !had_live_group_after_leader
     } else {
-        !kill_process_group(child)?
+        !signal_process_group(child, Signal::SIGTERM)?
     };
 
     loop {
         // Preserve the leader's exact status independently of group teardown.
-        match child.inner().try_wait() {
-            Ok(Some(observed)) => {
-                status.get_or_insert(observed);
+        // Once it is reaped, never wait again; only audit the process group.
+        if status.is_none() {
+            match child.inner().try_wait() {
+                Ok(Some(observed)) => {
+                    status = Some(observed);
+                }
+                Ok(None) => {}
+                Err(_) => return Err(BrowserError::FileScanUnavailable),
             }
-            Ok(None) => {}
-            Err(_) => return Err(BrowserError::FileScanUnavailable),
+        }
+        if !leader_status_supplied && status.is_some() && !group_absent {
+            // The exact leader was reaped through std::process::Child above,
+            // so the grouped wait can only reap descendants. Its return value
+            // is not authoritative for the already-cached leader status.
+            child
+                .try_wait()
+                .map_err(|_| BrowserError::FileScanUnavailable)?;
         }
         if status.is_some() && group_absent {
             break;
         }
         if !group_absent {
-            group_absent = !kill_process_group(child)?;
+            if force_kill_sent || Instant::now() >= soft_deadline {
+                force_kill_sent = true;
+                group_absent = !kill_process_group(child)?;
+            } else {
+                // Re-signal during the bounded cooperative phase. On macOS,
+                // EPERM can transiently mean a group whose final member is
+                // exiting; only an absent-group error is conclusive.
+                group_absent = !signal_process_group(child, Signal::SIGTERM)?;
+            }
         }
         if Instant::now() >= deadline {
             return Err(BrowserError::FileScanUnavailable);
@@ -1580,6 +1604,15 @@ fn kill_process_group(child: &mut GroupChild) -> Result<bool, BrowserError> {
     match child.kill() {
         Ok(()) => Ok(true),
         Err(error) if process_group_is_absent(&error) => Ok(false),
+        Err(_) => Err(BrowserError::FileScanUnavailable),
+    }
+}
+
+fn signal_process_group(child: &GroupChild, signal: Signal) -> Result<bool, BrowserError> {
+    match child.signal(signal) {
+        Ok(()) => Ok(true),
+        Err(error) if process_group_is_absent(&error) => Ok(false),
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(true),
         Err(_) => Err(BrowserError::FileScanUnavailable),
     }
 }
