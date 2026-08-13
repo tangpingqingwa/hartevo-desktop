@@ -786,6 +786,7 @@ mod tests {
                 effect_status: EffectStatus::Verified,
                 evidence_digest: "d".repeat(64),
                 observed_at: now() + chrono::Duration::minutes(3),
+                usage_receipt: None,
             },
         );
         assert!(matches!(

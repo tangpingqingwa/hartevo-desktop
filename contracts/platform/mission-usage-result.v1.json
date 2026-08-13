@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/platform/mission-usage-result.v1.json",
+  "title": "Hartevo Mission usage result packet v1",
+  "description": "A typed, reservation-bound accounting receipt that a Mission result packet may adopt. It grants no provider or payment authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "missionId", "usageReceipt"],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-mission-usage-result/v1"},
+    "missionId": {"$ref": "#/$defs/id"},
+    "usageReceipt": {"$ref": "#/$defs/usageReceipt"}
+  },
+  "$defs": {
+    "id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "money": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amountMinor", "currency"],
+      "properties": {
+        "amountMinor": {"type": "integer", "minimum": 0},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"}
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "quantity"],
+      "properties": {
+        "unit": {"enum": ["request", "token", "byte", "millisecond", "item"]},
+        "quantity": {"type": "integer", "minimum": 1}
+      }
+    },
+    "usageReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "receiptId",
+        "tenantId",
+        "projectId",
+        "missionId",
+        "effectId",
+        "reservationId",
+        "effectScopeDigest",
+        "serviceDefinitionDigest",
+        "providerId",
+        "providerReceiptDigest",
+        "measurement",
+        "cost",
+        "evidenceDigest",
+        "observedAt",
+        "receiptDigest"
+      ],
+      "properties": {
+        "schemaVersion": {"const": "hartevo-mission-usage-receipt/v1"},
+        "receiptId": {"$ref": "#/$defs/id"},
+        "tenantId": {"$ref": "#/$defs/id"},
+        "projectId": {"$ref": "#/$defs/id"},
+        "missionId": {"$ref": "#/$defs/id"},
+        "effectId": {"$ref": "#/$defs/id"},
+        "reservationId": {"$ref": "#/$defs/id"},
+        "effectScopeDigest": {"$ref": "#/$defs/digest"},
+        "serviceDefinitionDigest": {"$ref": "#/$defs/digest"},
+        "providerId": {"$ref": "#/$defs/id"},
+        "providerReceiptDigest": {"$ref": "#/$defs/digest"},
+        "measurement": {"$ref": "#/$defs/measurement"},
+        "cost": {"$ref": "#/$defs/money"},
+        "evidenceDigest": {"$ref": "#/$defs/digest"},
+        "observedAt": {"type": "string", "format": "date-time"},
+        "receiptDigest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  }
+}
