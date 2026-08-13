@@ -24,6 +24,7 @@ mod normalized;
 mod outbox;
 mod outcome_review_store;
 mod outcome_store;
+mod privacy_plugin;
 mod privacy_store;
 mod registration_store;
 mod relationship_store;
@@ -51,6 +52,7 @@ pub use keyring_store::{DeviceAttachmentPrepareOutcome, ProjectKeySecretReferenc
 pub use outbox::{
     OutboxAcknowledgeTimes, OutboxMessage, OutboxRelease, OutboxReleaseTimes, OutboxStatus,
 };
+pub use privacy_plugin::LocalPrivacyPluginLedger;
 pub use registration_store::{
     LocalProjectCloudRegistration, LocalProjectCloudRegistrationPrepareOutcome,
     ProjectCloudRegistrationStatus,
@@ -81,7 +83,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 48;
+pub const STORAGE_SCHEMA_VERSION: i64 = 49;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4451,6 +4453,69 @@ impl ProjectStore {
             record_migration(&transaction, 48)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 49 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS privacy_plugin_scopes (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   scope_id TEXT NOT NULL CHECK (length(trim(scope_id)) > 0),
+                   scope_generation INTEGER NOT NULL CHECK (scope_generation > 0),
+                   policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+                   scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
+                   status TEXT NOT NULL CHECK (
+                     status IN ('active', 'unmounted', 'revoked')
+                   ),
+                   issued_at TEXT NOT NULL,
+                   expires_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id, scope_id),
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS privacy_plugin_scope_status_idx
+                   ON privacy_plugin_scopes(
+                     tenant_id, project_id, status, scope_generation, expires_at
+                   );
+                 CREATE TABLE IF NOT EXISTS privacy_plugin_deletion_requests (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   scope_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   deletion_id TEXT NOT NULL,
+                   idempotency_key_digest TEXT NOT NULL CHECK (
+                     length(idempotency_key_digest) = 64
+                   ),
+                   object_id TEXT NOT NULL CHECK (length(trim(object_id)) > 0),
+                   object_kind TEXT NOT NULL CHECK (length(trim(object_kind)) > 0),
+                   scope_generation INTEGER NOT NULL CHECK (scope_generation > 0),
+                   policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+                   consent_id TEXT NOT NULL CHECK (length(trim(consent_id)) > 0),
+                   tombstone_digest TEXT NOT NULL CHECK (length(tombstone_digest) = 64),
+                   local_record_revision INTEGER NOT NULL CHECK (local_record_revision > 0),
+                   operation_revision INTEGER NOT NULL CHECK (operation_revision > 0),
+                   local_receipt_digest TEXT CHECK (
+                     local_receipt_digest IS NULL OR length(local_receipt_digest) = 64
+                   ),
+                   local_receipt_json TEXT,
+                   requested_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL,
+                   PRIMARY KEY (project_id, deletion_id),
+                   UNIQUE (project_id, idempotency_key_digest),
+                   FOREIGN KEY (project_id, scope_id)
+                     REFERENCES privacy_plugin_scopes(project_id, scope_id)
+                       ON DELETE CASCADE,
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS privacy_plugin_deletion_scope_idx
+                   ON privacy_plugin_deletion_requests(
+                     tenant_id, project_id, scope_id, mission_id, requested_at
+                   );",
+            )?;
+            validate_privacy_plugin_schema(&transaction)?;
+            record_migration(&transaction, 49)?;
+            transaction.commit()?;
+        }
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
@@ -4471,6 +4536,27 @@ fn validate_privacy_schema(transaction: &Transaction<'_>) -> Result<(), StorageE
                     authorization_evidence_digest, status, redaction_profile, artifact_json,
                     generated_at, export_digest, revision, record_json
              FROM privacy_data_subject_exports WHERE 1 = 0",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_privacy_plugin_schema(transaction: &Transaction<'_>) -> Result<(), StorageError> {
+    {
+        let _ = transaction.prepare(
+            "SELECT tenant_id, project_id, mission_id, scope_id, scope_generation,
+                    policy_digest, scope_digest, status, issued_at, expires_at, updated_at
+             FROM privacy_plugin_scopes WHERE 1 = 0",
+        )?;
+    }
+    {
+        let _ = transaction.prepare(
+            "SELECT tenant_id, project_id, scope_id, mission_id, deletion_id,
+                    idempotency_key_digest, object_id, object_kind, scope_generation,
+                    policy_digest, consent_id, tombstone_digest, local_record_revision,
+                    operation_revision, local_receipt_digest, local_receipt_json,
+                    requested_at, updated_at
+             FROM privacy_plugin_deletion_requests WHERE 1 = 0",
         )?;
     }
     Ok(())
@@ -4629,6 +4715,12 @@ pub enum StorageError {
     },
     #[error("deletion surface {0} is not managed by a propagation worker")]
     DeletionSurfaceNotWorkerManaged(String),
+    #[error("privacy plugin scope {scope_id} generation {generation} is no longer active")]
+    PrivacyPluginScopeLost { scope_id: String, generation: u64 },
+    #[error("privacy plugin scope {scope_id} has a stale or conflicting generation")]
+    PrivacyPluginScopeConflict { scope_id: String },
+    #[error("privacy plugin deletion request is outside its durable scope")]
+    PrivacyPluginRequestScopeMismatch,
     #[error("project not found: {0}")]
     ProjectNotFound(ProjectId),
     #[error("mission {mission_id} was not found inside project {project_id}")]
@@ -5533,9 +5625,13 @@ mod tests {
             .execute_batch(
                 "DROP INDEX privacy_export_scope_idx;
                  DROP INDEX privacy_retention_policy_scope_idx;
+                 DROP INDEX privacy_plugin_deletion_scope_idx;
+                 DROP INDEX privacy_plugin_scope_status_idx;
+                 DROP TABLE privacy_plugin_deletion_requests;
+                 DROP TABLE privacy_plugin_scopes;
                  DROP TABLE privacy_data_subject_exports;
                  DROP TABLE privacy_retention_policies;
-                 DELETE FROM schema_migrations WHERE version = 48;
+                 DELETE FROM schema_migrations WHERE version >= 48;
                  CREATE TABLE privacy_retention_policies (sentinel INTEGER NOT NULL);",
             )
             .expect("inject privacy table collision");
