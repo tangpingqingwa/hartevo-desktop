@@ -27,6 +27,7 @@ PACKAGES = {
     "domain-kernel": "hartevo-domain-kernel",
     "effect-broker": "hartevo-effect-broker",
     "eval": "hartevo-eval",
+    "mission-scheduler": "hartevo-mission-scheduler",
     "runtime-adapter": "hartevo-runtime-adapter",
     "storage": "hartevo-storage",
 }
@@ -169,6 +170,10 @@ def self_test() -> None:
     assert scoped["full"] is False
     assert scoped["packages"] == ["hartevo-catalog"]
     assert scoped["rust"] is True
+
+    mission_scheduler = plan_for_files(["hartevo-rs/mission-scheduler/src/lib.rs"])
+    assert mission_scheduler["full"] is False
+    assert mission_scheduler["packages"] == ["hartevo-mission-scheduler"]
 
     docs = plan_for_files(["docs/quality/example.md"])
     assert docs["full"] is False and docs["rust"] is False and docs["docs"] is True
