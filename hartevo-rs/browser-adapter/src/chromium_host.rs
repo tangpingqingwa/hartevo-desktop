@@ -27,10 +27,10 @@ use crate::profile_dir::{BrowserExecutableIdentity, ManagedProfileDirectory};
 use crate::workspace::{digest, digest_json};
 use crate::{
     BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionRisk, BrowserActionSurface,
-    BrowserControlHost, BrowserElementRef, BrowserError, BrowserFileGrant, BrowserFileType,
-    BrowserHandoffFrameBinding, BrowserHandoffHost, BrowserHandoffScope, BrowserHandoffSnapshot,
-    BrowserLeaseProof, BrowserLocatorResolution, BrowserNavigationPolicy, BrowserNavigationReceipt,
-    BrowserNavigationTarget, BrowserProfile, BrowserPromptRisk,
+    BrowserControlHost, BrowserControlState, BrowserElementRef, BrowserError, BrowserFileGrant,
+    BrowserFileType, BrowserHandoffFrameBinding, BrowserHandoffHost, BrowserHandoffScope,
+    BrowserHandoffSnapshot, BrowserLeaseProof, BrowserLocatorResolution, BrowserNavigationPolicy,
+    BrowserNavigationReceipt, BrowserNavigationTarget, BrowserProfile, BrowserPromptRisk,
     BrowserRecipeExecutionAuthorization, BrowserRecipePreparedPlan, BrowserRecipeRegistry,
     BrowserRecipeTrustStore, BrowserStableLocator, BrowserTextInput, BrowserWorkspace,
     FileUploadHandle, SemanticSnapshot,
@@ -887,6 +887,7 @@ pub struct ManagedChromiumHost {
     profile: BrowserProfile,
     workspace: BrowserWorkspace,
     tabs: BTreeMap<BrowserTabId, CdpTabSession>,
+    target_topology_baseline: BTreeSet<String>,
     deferred_events: VecDeque<DeferredEvent>,
     next_request_id: u64,
     request_timeout: Duration,
@@ -953,6 +954,7 @@ impl ManagedChromiumHost {
             profile,
             workspace,
             tabs: BTreeMap::new(),
+            target_topology_baseline: BTreeSet::new(),
             deferred_events: VecDeque::new(),
             next_request_id: 1,
             request_timeout: config.request_timeout,
@@ -965,6 +967,13 @@ impl ManagedChromiumHost {
         if let Err(error) = host.health() {
             let _ = host.shutdown_inner();
             return Err(error);
+        }
+        match host.read_page_target_ids() {
+            Ok(targets) => host.target_topology_baseline = targets,
+            Err(error) => {
+                let _ = host.shutdown_inner();
+                return Err(error);
+            }
         }
         Ok(host)
     }
@@ -1073,6 +1082,46 @@ impl ManagedChromiumHost {
                 blocked_request_count: 0,
             },
         );
+        Ok(())
+    }
+
+    fn read_page_target_ids(&mut self) -> Result<BTreeSet<String>, BrowserError> {
+        let result = self.command(CdpMethod::TargetGetTargets, json!({}), None)?;
+        let target_infos = result
+            .get("targetInfos")
+            .and_then(Value::as_array)
+            .ok_or_else(|| self.poison())?;
+        let mut targets = BTreeSet::new();
+        for target_info in target_infos {
+            let target_info = target_info.as_object().ok_or_else(|| self.poison())?;
+            let target_type = target_info
+                .get("type")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 128)
+                .ok_or_else(|| self.poison())?;
+            if target_type != "page" {
+                continue;
+            }
+            let target_id = target_info
+                .get("targetId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 4_096)
+                .ok_or_else(|| self.poison())?;
+            if !targets.insert(target_id.to_owned()) {
+                return Err(self.poison());
+            }
+        }
+        Ok(targets)
+    }
+
+    fn validate_handoff_target_topology(&mut self) -> Result<(), BrowserError> {
+        let mut expected = self.target_topology_baseline.clone();
+        for tab in self.tabs.values() {
+            expected.insert(tab.target_id.clone());
+        }
+        if self.read_page_target_ids()? != expected {
+            return Err(BrowserError::StaleSnapshot);
+        }
         Ok(())
     }
 
@@ -1497,6 +1546,7 @@ impl ManagedChromiumHost {
         {
             return Err(BrowserError::ScopeMismatch);
         }
+        self.validate_handoff_target_topology()?;
         let (target_id, session_id) = {
             let tab = self
                 .tabs
@@ -1524,6 +1574,7 @@ impl ManagedChromiumHost {
         let scope = BrowserHandoffScope::bind(profile, workspace)?;
         let frame = BrowserHandoffFrameBinding::from_verified(
             workspace.active_tab_id.clone(),
+            &session_id,
             &frame_tree.root.frame_id,
             &frame_tree.root.loader_id,
             &frame_tree.root.url,
@@ -1539,6 +1590,47 @@ impl ManagedChromiumHost {
             control_state: workspace.control_state,
             observed_at: now,
         })
+    }
+
+    fn fence_handoff_transport(
+        &mut self,
+        profile: &BrowserProfile,
+        workspace: &BrowserWorkspace,
+        frame: &BrowserHandoffFrameBinding,
+        expected_state: BrowserControlState,
+        now: DateTime<Utc>,
+    ) -> Result<(), BrowserError> {
+        let snapshot = self.observe_handoff_snapshot(profile, workspace, now)?;
+        if snapshot.control_state != expected_state || snapshot.frame != *frame {
+            return Err(BrowserError::StaleSnapshot);
+        }
+        let (target_id, session_id) = {
+            let tab = self
+                .tabs
+                .get(&workspace.active_tab_id)
+                .ok_or(BrowserError::TabNotFound)?;
+            (tab.target_id.clone(), tab.session_id.clone())
+        };
+        self.command(
+            CdpMethod::TargetActivateTarget,
+            json!({"targetId": target_id}),
+            None,
+        )?;
+        self.command(CdpMethod::PageBringToFront, json!({}), Some(&session_id))?;
+        self.clear_handoff_transport_state();
+        Ok(())
+    }
+
+    fn clear_handoff_transport_state(&mut self) {
+        self.deferred_events.clear();
+        for tab in self.tabs.values_mut() {
+            tab.latest_snapshot = None;
+            tab.locator_map.clear();
+            tab.latest_frame_tree = None;
+            tab.latest_execution_context = None;
+            tab.execution_context_registry = CdpExecutionContextRegistry::default();
+            tab.lifecycle_events.clear();
+        }
     }
 
     fn read_target_url_unchecked(&mut self, target_id: &str) -> Result<String, BrowserError> {
@@ -3754,11 +3846,14 @@ impl BrowserControlHost for ManagedChromiumHost {
             return Err(BrowserError::ScopeMismatch);
         }
         self.workspace = workspace.clone();
+        self.deferred_events.clear();
         for tab in self.tabs.values_mut() {
             tab.latest_snapshot = None;
             tab.locator_map.clear();
             tab.latest_frame_tree = None;
             tab.latest_execution_context = None;
+            tab.execution_context_registry = CdpExecutionContextRegistry::default();
+            tab.lifecycle_events.clear();
         }
         Ok(())
     }
@@ -3772,6 +3867,38 @@ impl BrowserHandoffHost for ManagedChromiumHost {
         now: DateTime<Utc>,
     ) -> Result<BrowserHandoffSnapshot, BrowserError> {
         ManagedChromiumHost::observe_handoff_snapshot(self, profile, workspace, now)
+    }
+
+    fn fence_for_takeover(
+        &mut self,
+        profile: &BrowserProfile,
+        workspace: &BrowserWorkspace,
+        frame: &BrowserHandoffFrameBinding,
+        now: DateTime<Utc>,
+    ) -> Result<(), BrowserError> {
+        self.fence_handoff_transport(
+            profile,
+            workspace,
+            frame,
+            BrowserControlState::AgentControlled,
+            now,
+        )
+    }
+
+    fn fence_for_resume(
+        &mut self,
+        profile: &BrowserProfile,
+        workspace: &BrowserWorkspace,
+        frame: &BrowserHandoffFrameBinding,
+        now: DateTime<Utc>,
+    ) -> Result<(), BrowserError> {
+        self.fence_handoff_transport(
+            profile,
+            workspace,
+            frame,
+            BrowserControlState::UserControlled,
+            now,
+        )
     }
 
     fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
@@ -3820,6 +3947,8 @@ enum CdpMethod {
     TargetCreateTarget,
     TargetAttachToTarget,
     TargetGetTargetInfo,
+    TargetGetTargets,
+    TargetActivateTarget,
     TargetCloseTarget,
     AccessibilityEnable,
     AccessibilityGetFullAxTree,
@@ -3833,6 +3962,7 @@ enum CdpMethod {
     InputDispatchMouseEvent,
     InputInsertText,
     PageEnable,
+    PageBringToFront,
     PageGetFrameTree,
     PageGetLayoutMetrics,
     PageSetLifecycleEventsEnabled,
@@ -3850,6 +3980,8 @@ impl CdpMethod {
             Self::TargetCreateTarget => "Target.createTarget",
             Self::TargetAttachToTarget => "Target.attachToTarget",
             Self::TargetGetTargetInfo => "Target.getTargetInfo",
+            Self::TargetGetTargets => "Target.getTargets",
+            Self::TargetActivateTarget => "Target.activateTarget",
             Self::TargetCloseTarget => "Target.closeTarget",
             Self::AccessibilityEnable => "Accessibility.enable",
             Self::AccessibilityGetFullAxTree => "Accessibility.getFullAXTree",
@@ -3863,6 +3995,7 @@ impl CdpMethod {
             Self::InputDispatchMouseEvent => "Input.dispatchMouseEvent",
             Self::InputInsertText => "Input.insertText",
             Self::PageEnable => "Page.enable",
+            Self::PageBringToFront => "Page.bringToFront",
             Self::PageGetFrameTree => "Page.getFrameTree",
             Self::PageGetLayoutMetrics => "Page.getLayoutMetrics",
             Self::PageSetLifecycleEventsEnabled => "Page.setLifecycleEventsEnabled",

@@ -19,6 +19,8 @@ mod chromium_host;
 mod fake_host;
 mod file_broker;
 mod handoff;
+#[cfg(unix)]
+mod handoff_chromium;
 mod locator;
 mod navigation;
 mod profile_dir;
@@ -56,6 +58,8 @@ pub use handoff::{
     BrowserResumeReceipt, BrowserTakeoverOffer, BrowserTakeoverReceipt,
     BrowserWorkspaceHandoffProvider, MissionBrowserHandoffConsumer,
 };
+#[cfg(unix)]
+pub use handoff_chromium::BrowserWorkspaceHandoffService;
 pub use locator::{BrowserLocatorResolution, BrowserStableLocator};
 pub use navigation::{BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserNavigationTarget};
 pub use profile_dir::{BrowserExecutableIdentity, ManagedProfileDirectory};

@@ -183,6 +183,7 @@ impl fmt::Debug for BrowserHandoffScope {
 #[serde(rename_all = "camelCase")]
 pub struct BrowserHandoffFrameBinding {
     pub tab_id: BrowserTabId,
+    pub session_id_digest: String,
     pub frame_id_digest: String,
     pub loader_id_digest: String,
     pub url_digest: String,
@@ -192,6 +193,7 @@ pub struct BrowserHandoffFrameBinding {
 impl BrowserHandoffFrameBinding {
     pub(crate) fn from_verified(
         tab_id: BrowserTabId,
+        session_id: &str,
         frame_id: &str,
         loader_id: &str,
         url: &str,
@@ -199,6 +201,7 @@ impl BrowserHandoffFrameBinding {
     ) -> Result<Self, BrowserError> {
         let binding = Self {
             tab_id,
+            session_id_digest: digest(session_id.as_bytes()),
             frame_id_digest: digest(frame_id.as_bytes()),
             loader_id_digest: digest(loader_id.as_bytes()),
             url_digest: digest(url.as_bytes()),
@@ -211,16 +214,25 @@ impl BrowserHandoffFrameBinding {
     #[cfg(test)]
     fn from_test_values(
         tab_id: BrowserTabId,
+        session_id: &str,
         frame_id: &str,
         loader_id: &str,
         url: &str,
         navigation_revision: u64,
     ) -> Result<Self, BrowserError> {
-        Self::from_verified(tab_id, frame_id, loader_id, url, navigation_revision)
+        Self::from_verified(
+            tab_id,
+            session_id,
+            frame_id,
+            loader_id,
+            url,
+            navigation_revision,
+        )
     }
 
     pub fn validate(&self) -> Result<(), BrowserError> {
         if !is_bounded_identifier(self.tab_id.as_str())
+            || !is_sha256(&self.session_id_digest)
             || !is_sha256(&self.frame_id_digest)
             || !is_sha256(&self.loader_id_digest)
             || !is_sha256(&self.url_digest)
@@ -237,6 +249,7 @@ impl fmt::Debug for BrowserHandoffFrameBinding {
         formatter
             .debug_struct("BrowserHandoffFrameBinding")
             .field("tab_id", &self.tab_id)
+            .field("session_id_digest", &self.session_id_digest)
             .field("frame_id_digest", &self.frame_id_digest)
             .field("loader_id_digest", &self.loader_id_digest)
             .field("url_digest", &self.url_digest)
@@ -835,6 +848,14 @@ impl BrowserHandoffLog {
         Ok(())
     }
 
+    /// Validate a journal recovered from Mission storage before it becomes
+    /// model-visible again. Recovery never reactivates a provider or any old
+    /// lease; it only proves the content-free receipt chain is intact.
+    pub fn restore(log: Self) -> Result<Self, BrowserError> {
+        log.validate()?;
+        Ok(log)
+    }
+
     pub fn digest(&self) -> Result<String, BrowserError> {
         self.validate()?;
         Ok(self.log_digest.clone())
@@ -895,6 +916,29 @@ pub trait BrowserHandoffHost {
         workspace: &BrowserWorkspace,
         now: DateTime<Utc>,
     ) -> Result<BrowserHandoffSnapshot, BrowserError>;
+
+    /// Fence the managed transport before the workspace enters
+    /// `UserControlled`. Implementations must validate the exact binding,
+    /// stop queued agent work, invalidate read/dispatch state, and make the
+    /// target available for direct human interaction before returning.
+    fn fence_for_takeover(
+        &mut self,
+        profile: &BrowserProfile,
+        workspace: &BrowserWorkspace,
+        frame: &BrowserHandoffFrameBinding,
+        now: DateTime<Utc>,
+    ) -> Result<(), BrowserError>;
+
+    /// Re-read and fence the managed transport immediately before the CAS
+    /// that grants a fresh agent lease. Implementations must reject any
+    /// frame, loader, URL, tab, window, or lifecycle drift.
+    fn fence_for_resume(
+        &mut self,
+        profile: &BrowserProfile,
+        workspace: &BrowserWorkspace,
+        frame: &BrowserHandoffFrameBinding,
+        now: DateTime<Utc>,
+    ) -> Result<(), BrowserError>;
 
     fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError>;
 }
@@ -1042,6 +1086,14 @@ impl BrowserWorkspaceHandoffProvider {
             &snapshot,
             self.active_offer.as_ref(),
         )?;
+        let fence_result = self
+            .host
+            .as_mut()
+            .ok_or(BrowserError::HandoffHostUnavailable)?
+            .fence_for_takeover(&self.profile, &self.workspace, &offer.frame, now);
+        if let Err(error) = fence_result {
+            return Err(self.fail_closed_host(error, now));
+        }
         let mut next = self.workspace.clone();
         next.user_takeover(
             self.workspace.revision,
@@ -1127,6 +1179,14 @@ impl BrowserWorkspaceHandoffProvider {
             || snapshot.observed_at < receipt.issued_at
         {
             return Err(BrowserError::StaleSnapshot);
+        }
+        let fence_result = self
+            .host
+            .as_mut()
+            .ok_or(BrowserError::HandoffHostUnavailable)?
+            .fence_for_resume(&self.profile, &self.workspace, &receipt.frame, now);
+        if let Err(error) = fence_result {
+            return Err(self.fail_closed_host(error, now));
         }
         let mut next = self.workspace.clone();
         next.continue_agent(
@@ -1750,6 +1810,7 @@ mod tests {
             let scope = BrowserHandoffScope::bind(profile, workspace)?;
             let frame = BrowserHandoffFrameBinding::from_test_values(
                 workspace.active_tab_id.clone(),
+                "session-handoff",
                 &self.frame_id,
                 &self.loader_id,
                 &self.url,
@@ -1768,6 +1829,38 @@ mod tests {
                 control_state: workspace.control_state,
                 observed_at,
             })
+        }
+
+        fn fence_for_takeover(
+            &mut self,
+            profile: &BrowserProfile,
+            workspace: &BrowserWorkspace,
+            frame: &BrowserHandoffFrameBinding,
+            now: DateTime<Utc>,
+        ) -> Result<(), BrowserError> {
+            let snapshot = self.observe_handoff_snapshot(profile, workspace, now)?;
+            if snapshot.frame != *frame
+                || snapshot.control_state != BrowserControlState::AgentControlled
+            {
+                return Err(BrowserError::StaleSnapshot);
+            }
+            Ok(())
+        }
+
+        fn fence_for_resume(
+            &mut self,
+            profile: &BrowserProfile,
+            workspace: &BrowserWorkspace,
+            frame: &BrowserHandoffFrameBinding,
+            now: DateTime<Utc>,
+        ) -> Result<(), BrowserError> {
+            let snapshot = self.observe_handoff_snapshot(profile, workspace, now)?;
+            if snapshot.frame != *frame
+                || snapshot.control_state != BrowserControlState::UserControlled
+            {
+                return Err(BrowserError::StaleSnapshot);
+            }
+            Ok(())
         }
 
         fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
@@ -1797,6 +1890,30 @@ mod tests {
             self.0
                 .borrow_mut()
                 .observe_handoff_snapshot(profile, workspace, observed_at)
+        }
+
+        fn fence_for_takeover(
+            &mut self,
+            profile: &BrowserProfile,
+            workspace: &BrowserWorkspace,
+            frame: &BrowserHandoffFrameBinding,
+            now: DateTime<Utc>,
+        ) -> Result<(), BrowserError> {
+            self.0
+                .borrow_mut()
+                .fence_for_takeover(profile, workspace, frame, now)
+        }
+
+        fn fence_for_resume(
+            &mut self,
+            profile: &BrowserProfile,
+            workspace: &BrowserWorkspace,
+            frame: &BrowserHandoffFrameBinding,
+            now: DateTime<Utc>,
+        ) -> Result<(), BrowserError> {
+            self.0
+                .borrow_mut()
+                .fence_for_resume(profile, workspace, frame, now)
         }
 
         fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
