@@ -69,11 +69,13 @@ pub use identity::{
     IdentitySubject, LegalBasis, Partner, PartnerSupplyClass, Person,
 };
 pub use identity_team_plugin::{
-    IdentityCapabilityRequirement, IdentityMembershipReceipt, IdentityMembershipReceiptKind,
-    IdentityMissionScope, IdentityOfflineMembershipCache, IdentityOidcSession,
-    IdentityPluginHandle, IdentityPluginMountRequest, IdentityPluginPolicyDecision,
-    IdentityPluginSessionFacts, IdentitySessionAccessMode, IdentitySessionHead,
-    IdentitySessionHeadStatus, IdentityTeamMembership, IdentityTeamMembershipConsumer,
+    CapabilityPolicyInput, IdentityCapabilityPolicyConsumer, IdentityCapabilityPolicyInput,
+    IdentityCapabilityPolicyProvider, IdentityCapabilityPolicyRoles, IdentityCapabilityRequirement,
+    IdentityMembershipReceipt, IdentityMembershipReceiptKind, IdentityMissionScope,
+    IdentityOfflineMembershipCache, IdentityOidcSession, IdentityPluginHandle,
+    IdentityPluginMountRequest, IdentityPluginPolicyDecision, IdentityPluginSessionFacts,
+    IdentitySessionAccessMode, IdentitySessionHead, IdentitySessionHeadStatus,
+    IdentityTeamMembership, IdentityTeamMembershipBinding, IdentityTeamMembershipConsumer,
     IdentityTeamMembershipError, IdentityTeamMembershipProvider, IdentityTeamMembershipService,
     IdentityTeamMembershipStatus, IdentityTeamRole, OidcIdentityTeamMembershipService,
     ProjectMissionIdentityService,

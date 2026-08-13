@@ -3,6 +3,7 @@ use std::fmt;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -724,6 +725,17 @@ impl IdentityPluginSessionFacts {
         self.offline_expires_at
     }
 
+    pub fn policy_expires_at(&self) -> DateTime<Utc> {
+        match self.mode {
+            IdentitySessionAccessMode::Online => self.session_head.expires_at(),
+            IdentitySessionAccessMode::Offline => self.offline_expires_at,
+        }
+    }
+
+    pub fn provider_digest(&self) -> String {
+        identity_provider_digest(self)
+    }
+
     pub fn authorize_capability(
         &self,
         requirement: &IdentityCapabilityRequirement,
@@ -738,9 +750,13 @@ impl IdentityPluginSessionFacts {
             capability_id: requirement.capability_id.clone(),
             scope: self.scope.clone(),
             role: self.role,
+            minimum_role: requirement.minimum_role,
             membership_revision: self.membership_revision,
             role_revision: self.role_revision,
             session_revision: self.session_head.revision,
+            mode: self.mode,
+            expires_at: self.policy_expires_at(),
+            provider_digest: self.provider_digest(),
         })
     }
 
@@ -773,6 +789,11 @@ impl fmt::Debug for IdentityPluginSessionFacts {
             .finish()
     }
 }
+
+/// Naming alias for the exact live Team/Mission binding consumed by the
+/// capability-policy projection. The alias keeps the lower-level identity
+/// facts type stable while making the boundary explicit to policy code.
+pub type IdentityTeamMembershipBinding = IdentityPluginSessionFacts;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdentityCapabilityRequirement {
@@ -812,17 +833,48 @@ impl IdentityCapabilityRequirement {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IdentityPluginPolicyDecision {
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityCapabilityPolicyRoles {
+    granted: IdentityTeamRole,
+    required: IdentityTeamRole,
+}
+
+impl IdentityCapabilityPolicyRoles {
+    pub fn granted(&self) -> IdentityTeamRole {
+        self.granted
+    }
+
+    pub fn required(&self) -> IdentityTeamRole {
+        self.required
+    }
+
+    pub fn is_satisfied(&self) -> bool {
+        self.granted.satisfies(self.required)
+    }
+}
+
+/// Content-free, exact-scope policy material delivered to a capability
+/// consumer. The skipped handle is an internal live-binding fence: it is
+/// never serialized or exposed, and every authorization revalidates it with
+/// the host-owned provider.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityCapabilityPolicyInput {
     capability_id: String,
     scope: IdentityMissionScope,
-    role: IdentityTeamRole,
+    roles: IdentityCapabilityPolicyRoles,
     membership_revision: u64,
     role_revision: u64,
     session_revision: u64,
+    mode: IdentitySessionAccessMode,
+    expires_at: DateTime<Utc>,
+    provider_digest: String,
+    #[serde(skip)]
+    handle: IdentityPluginHandle,
 }
 
-impl IdentityPluginPolicyDecision {
+impl IdentityCapabilityPolicyInput {
     pub fn capability_id(&self) -> &str {
         &self.capability_id
     }
@@ -831,8 +883,16 @@ impl IdentityPluginPolicyDecision {
         &self.scope
     }
 
-    pub fn role(&self) -> IdentityTeamRole {
-        self.role
+    pub fn roles(&self) -> IdentityCapabilityPolicyRoles {
+        self.roles
+    }
+
+    pub fn granted_role(&self) -> IdentityTeamRole {
+        self.roles.granted
+    }
+
+    pub fn required_role(&self) -> IdentityTeamRole {
+        self.roles.required
     }
 
     pub fn membership_revision(&self) -> u64 {
@@ -845,6 +905,200 @@ impl IdentityPluginPolicyDecision {
 
     pub fn session_revision(&self) -> u64 {
         self.session_revision
+    }
+
+    pub fn mode(&self) -> IdentitySessionAccessMode {
+        self.mode
+    }
+
+    pub fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+
+    pub fn provider_digest(&self) -> &str {
+        &self.provider_digest
+    }
+
+    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at <= now
+    }
+
+    /// Revalidate and authorize this content-free input through the host.
+    /// Keeping the live binding check here prevents a consumer from treating
+    /// a cached input as authority after a role change, revoke, or expiry.
+    pub fn authorize(
+        &self,
+        provider: &mut dyn IdentityCapabilityPolicyProvider,
+        now: DateTime<Utc>,
+    ) -> Result<IdentityPluginPolicyDecision, IdentityTeamMembershipError> {
+        self.validate_shape()?;
+        provider.validate_capability_policy_input(self, now)?;
+        if !self.roles.is_satisfied() {
+            return Err(IdentityTeamMembershipError::InsufficientRole);
+        }
+        Ok(IdentityPluginPolicyDecision::from_policy_input(self))
+    }
+
+    fn from_facts(
+        handle: &IdentityPluginHandle,
+        facts: &IdentityPluginSessionFacts,
+        requirement: &IdentityCapabilityRequirement,
+        now: DateTime<Utc>,
+    ) -> Result<Self, IdentityTeamMembershipError> {
+        if facts.scope != requirement.scope {
+            return Err(IdentityTeamMembershipError::CapabilityScopeMismatch);
+        }
+        let expires_at = facts.policy_expires_at();
+        if expires_at <= now {
+            return Err(match facts.mode {
+                IdentitySessionAccessMode::Online => IdentityTeamMembershipError::SessionExpired,
+                IdentitySessionAccessMode::Offline => {
+                    IdentityTeamMembershipError::OfflineMembershipExpired
+                }
+            });
+        }
+        let input = Self {
+            capability_id: requirement.capability_id.clone(),
+            scope: facts.scope.clone(),
+            roles: IdentityCapabilityPolicyRoles {
+                granted: facts.role,
+                required: requirement.minimum_role,
+            },
+            membership_revision: facts.membership_revision,
+            role_revision: facts.role_revision,
+            session_revision: facts.session_head.revision,
+            mode: facts.mode,
+            expires_at,
+            provider_digest: identity_provider_digest(facts),
+            handle: handle.clone(),
+        };
+        input.validate_shape()?;
+        Ok(input)
+    }
+
+    fn validate_shape(&self) -> Result<(), IdentityTeamMembershipError> {
+        if self.capability_id.trim().is_empty()
+            || self.capability_id.chars().any(char::is_control)
+            || self.membership_revision == 0
+            || self.role_revision == 0
+            || self.session_revision == 0
+            || !is_sha256(&self.provider_digest)
+            || self.expires_at.timestamp() < 0
+        {
+            return Err(IdentityTeamMembershipError::InvalidCapabilityPolicyInput);
+        }
+        self.scope.validate()
+    }
+
+    fn same_material(&self, other: &Self) -> bool {
+        self.capability_id == other.capability_id
+            && self.scope == other.scope
+            && self.roles == other.roles
+            && self.membership_revision == other.membership_revision
+            && self.role_revision == other.role_revision
+            && self.session_revision == other.session_revision
+            && self.mode == other.mode
+            && self.expires_at == other.expires_at
+            && self.provider_digest == other.provider_digest
+    }
+}
+
+impl fmt::Debug for IdentityCapabilityPolicyInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdentityCapabilityPolicyInput")
+            .field("capability_id", &self.capability_id)
+            .field("scope", &self.scope)
+            .field("roles", &self.roles)
+            .field("membership_revision", &self.membership_revision)
+            .field("role_revision", &self.role_revision)
+            .field("session_revision", &self.session_revision)
+            .field("mode", &self.mode)
+            .field("expires_at", &self.expires_at)
+            .field("provider_digest", &self.provider_digest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for IdentityCapabilityPolicyInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_material(other)
+    }
+}
+
+impl Eq for IdentityCapabilityPolicyInput {}
+
+/// Identity-owned spelling for the generic capability policy contract.
+pub type CapabilityPolicyInput = IdentityCapabilityPolicyInput;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentityPluginPolicyDecision {
+    capability_id: String,
+    scope: IdentityMissionScope,
+    role: IdentityTeamRole,
+    minimum_role: IdentityTeamRole,
+    membership_revision: u64,
+    role_revision: u64,
+    session_revision: u64,
+    mode: IdentitySessionAccessMode,
+    expires_at: DateTime<Utc>,
+    provider_digest: String,
+}
+
+impl IdentityPluginPolicyDecision {
+    fn from_policy_input(input: &IdentityCapabilityPolicyInput) -> Self {
+        Self {
+            capability_id: input.capability_id.clone(),
+            scope: input.scope.clone(),
+            role: input.roles.granted,
+            minimum_role: input.roles.required,
+            membership_revision: input.membership_revision,
+            role_revision: input.role_revision,
+            session_revision: input.session_revision,
+            mode: input.mode,
+            expires_at: input.expires_at,
+            provider_digest: input.provider_digest.clone(),
+        }
+    }
+
+    pub fn capability_id(&self) -> &str {
+        &self.capability_id
+    }
+
+    pub fn scope(&self) -> &IdentityMissionScope {
+        &self.scope
+    }
+
+    pub fn role(&self) -> IdentityTeamRole {
+        self.role
+    }
+
+    pub fn minimum_role(&self) -> IdentityTeamRole {
+        self.minimum_role
+    }
+
+    pub fn membership_revision(&self) -> u64 {
+        self.membership_revision
+    }
+
+    pub fn role_revision(&self) -> u64 {
+        self.role_revision
+    }
+
+    pub fn session_revision(&self) -> u64 {
+        self.session_revision
+    }
+
+    pub fn mode(&self) -> IdentitySessionAccessMode {
+        self.mode
+    }
+
+    pub fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+
+    pub fn provider_digest(&self) -> &str {
+        &self.provider_digest
     }
 }
 
@@ -872,6 +1126,7 @@ pub struct ProjectMissionIdentityService {
     memberships: BTreeMap<MemberId, IdentityTeamMembership>,
     session_heads: BTreeMap<IdentitySessionId, IdentitySessionHead>,
     bindings: HashMap<IdentityPluginHandle, MountedIdentityBinding>,
+    policy_inputs: HashMap<IdentityPluginHandle, HashMap<String, IdentityCapabilityPolicyInput>>,
     receipts: Vec<IdentityMembershipReceipt>,
 }
 
@@ -885,6 +1140,7 @@ impl ProjectMissionIdentityService {
             memberships: BTreeMap::new(),
             session_heads: BTreeMap::new(),
             bindings: HashMap::new(),
+            policy_inputs: HashMap::new(),
             receipts: Vec::new(),
         })
     }
@@ -1190,21 +1446,78 @@ impl ProjectMissionIdentityService {
         Ok(self.insert_binding(request, facts))
     }
 
+    pub fn provide_capability_policy_input(
+        &mut self,
+        handle: &IdentityPluginHandle,
+        requirement: &IdentityCapabilityRequirement,
+        now: DateTime<Utc>,
+    ) -> Result<IdentityCapabilityPolicyInput, IdentityTeamMembershipError> {
+        let facts = self.provide_identity_facts(handle, requirement.scope(), now)?;
+        let input = IdentityCapabilityPolicyInput::from_facts(handle, &facts, requirement, now)?;
+        self.policy_inputs
+            .entry(handle.clone())
+            .or_default()
+            .insert(input.capability_id.clone(), input.clone());
+        Ok(input)
+    }
+
+    pub fn validate_capability_policy_input(
+        &mut self,
+        input: &IdentityCapabilityPolicyInput,
+        now: DateTime<Utc>,
+    ) -> Result<(), IdentityTeamMembershipError> {
+        input.validate_shape()?;
+        if input.is_expired(now) {
+            return Err(IdentityTeamMembershipError::CapabilityPolicyInputExpired);
+        }
+        let issued = self
+            .policy_inputs
+            .get(&input.handle)
+            .and_then(|inputs| inputs.get(&input.capability_id))
+            .cloned()
+            .ok_or(IdentityTeamMembershipError::BindingNotFound)?;
+        if !issued.same_material(input) {
+            return Err(IdentityTeamMembershipError::CapabilityPolicyInputStale);
+        }
+        let requirement = IdentityCapabilityRequirement::new(
+            issued.capability_id.clone(),
+            issued.scope.clone(),
+            issued.required_role(),
+        )?;
+        let facts = self.provide_identity_facts(&issued.handle, &requirement.scope, now)?;
+        let expected =
+            IdentityCapabilityPolicyInput::from_facts(&issued.handle, &facts, &requirement, now)?;
+        if input.same_material(&expected) {
+            Ok(())
+        } else {
+            Err(IdentityTeamMembershipError::CapabilityPolicyInputStale)
+        }
+    }
+
     pub fn unmount(
         &mut self,
         handle: &IdentityPluginHandle,
     ) -> Result<(), IdentityTeamMembershipError> {
-        self.bindings
-            .remove(handle)
-            .map(|_| ())
-            .ok_or(IdentityTeamMembershipError::BindingNotFound)
+        if self.bindings.remove(handle).is_some() {
+            self.policy_inputs.remove(handle);
+            Ok(())
+        } else {
+            Err(IdentityTeamMembershipError::BindingNotFound)
+        }
     }
 
     pub fn reclaim_consumer(&mut self, consumer_id: &str) -> usize {
-        let before = self.bindings.len();
-        self.bindings
-            .retain(|_, binding| binding.consumer_id != consumer_id);
-        before.saturating_sub(self.bindings.len())
+        let handles = self
+            .bindings
+            .iter()
+            .filter(|(_, binding)| binding.consumer_id == consumer_id)
+            .map(|(handle, _)| handle.clone())
+            .collect::<Vec<_>>();
+        for handle in &handles {
+            self.bindings.remove(handle);
+            self.policy_inputs.remove(handle);
+        }
+        handles.len()
     }
 
     fn append_membership_transition(
@@ -1414,6 +1727,7 @@ impl ProjectMissionIdentityService {
 impl Drop for ProjectMissionIdentityService {
     fn drop(&mut self) {
         self.bindings.clear();
+        self.policy_inputs.clear();
     }
 }
 
@@ -1453,6 +1767,24 @@ pub trait IdentityTeamMembershipProvider {
     ) -> Result<IdentityPluginSessionFacts, IdentityTeamMembershipError>;
 }
 
+/// Narrow provider surface for capability consumers. It intentionally does
+/// not inherit the identity-facts provider, so a policy consumer can only
+/// request content-free scope, role, revision, expiry, and digest material.
+pub trait IdentityCapabilityPolicyProvider {
+    fn provide_capability_policy_input(
+        &mut self,
+        handle: &IdentityPluginHandle,
+        requirement: &IdentityCapabilityRequirement,
+        now: DateTime<Utc>,
+    ) -> Result<IdentityCapabilityPolicyInput, IdentityTeamMembershipError>;
+
+    fn validate_capability_policy_input(
+        &mut self,
+        input: &IdentityCapabilityPolicyInput,
+        now: DateTime<Utc>,
+    ) -> Result<(), IdentityTeamMembershipError>;
+}
+
 pub trait IdentityTeamMembershipService: IdentityTeamMembershipProvider {
     fn mount_online(
         &mut self,
@@ -1484,6 +1816,29 @@ pub trait IdentityTeamMembershipConsumer {
     ) -> Result<IdentityPluginPolicyDecision, IdentityTeamMembershipError>;
 
     fn release_identity(&mut self, handle: &IdentityPluginHandle);
+}
+
+pub trait IdentityCapabilityPolicyConsumer {
+    fn consume_capability_policy(
+        &mut self,
+        provider: &mut dyn IdentityCapabilityPolicyProvider,
+        handle: &IdentityPluginHandle,
+        requirement: &IdentityCapabilityRequirement,
+        now: DateTime<Utc>,
+    ) -> Result<IdentityCapabilityPolicyInput, IdentityTeamMembershipError>;
+
+    fn evaluate_capability_policy(
+        &mut self,
+        provider: &mut dyn IdentityCapabilityPolicyProvider,
+        handle: &IdentityPluginHandle,
+        requirement: &IdentityCapabilityRequirement,
+        now: DateTime<Utc>,
+    ) -> Result<IdentityPluginPolicyDecision, IdentityTeamMembershipError> {
+        let input = self.consume_capability_policy(provider, handle, requirement, now)?;
+        input.authorize(provider, now)
+    }
+
+    fn release_capability_policy(&mut self, handle: &IdentityPluginHandle);
 }
 
 impl IdentityTeamMembershipProvider for ProjectMissionIdentityService {
@@ -1557,6 +1912,30 @@ impl IdentityTeamMembershipProvider for ProjectMissionIdentityService {
     }
 }
 
+impl IdentityCapabilityPolicyProvider for ProjectMissionIdentityService {
+    fn provide_capability_policy_input(
+        &mut self,
+        handle: &IdentityPluginHandle,
+        requirement: &IdentityCapabilityRequirement,
+        now: DateTime<Utc>,
+    ) -> Result<IdentityCapabilityPolicyInput, IdentityTeamMembershipError> {
+        ProjectMissionIdentityService::provide_capability_policy_input(
+            self,
+            handle,
+            requirement,
+            now,
+        )
+    }
+
+    fn validate_capability_policy_input(
+        &mut self,
+        input: &IdentityCapabilityPolicyInput,
+        now: DateTime<Utc>,
+    ) -> Result<(), IdentityTeamMembershipError> {
+        ProjectMissionIdentityService::validate_capability_policy_input(self, input, now)
+    }
+}
+
 impl IdentityTeamMembershipService for ProjectMissionIdentityService {
     fn mount_online(
         &mut self,
@@ -1609,6 +1988,12 @@ pub enum IdentityTeamMembershipError {
     InvalidReceipt,
     #[error("identity capability requirement is invalid")]
     InvalidCapabilityRequirement,
+    #[error("identity capability policy input is invalid")]
+    InvalidCapabilityPolicyInput,
+    #[error("identity capability policy input has expired")]
+    CapabilityPolicyInputExpired,
+    #[error("identity capability policy input is stale")]
+    CapabilityPolicyInputStale,
     #[error("identity consumer identifier is invalid")]
     InvalidConsumer,
     #[error("team membership was not found")]
@@ -1669,6 +2054,52 @@ fn is_https_url(value: &str) -> bool {
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn identity_provider_digest(facts: &IdentityPluginSessionFacts) -> String {
+    let mut digest = Sha256::new();
+    for value in [
+        "hartevo.identity.capability-policy-provider.v1",
+        facts.issuer_url(),
+        facts.subject_digest(),
+        facts.session_id().as_str(),
+        facts.membership_id().as_str(),
+        facts.account_id().as_str(),
+        facts.scope.tenant_id.as_str(),
+        facts.scope.team_id.as_str(),
+        facts.scope.project_id.as_str(),
+        facts.scope.mission_id.as_str(),
+    ] {
+        digest_field(&mut digest, value.as_bytes());
+    }
+    for value in [
+        facts.scope.mission_revision,
+        facts.membership_revision,
+        facts.role_revision,
+        facts.session_head.revision,
+    ] {
+        digest_field(&mut digest, &value.to_be_bytes());
+    }
+    digest_field(&mut digest, &[facts.role.rank()]);
+    digest_field(
+        &mut digest,
+        &[match facts.mode {
+            IdentitySessionAccessMode::Online => 1,
+            IdentitySessionAccessMode::Offline => 2,
+        }],
+    );
+    let expires_at = facts.policy_expires_at();
+    digest_field(&mut digest, &expires_at.timestamp().to_be_bytes());
+    digest_field(
+        &mut digest,
+        &expires_at.timestamp_subsec_nanos().to_be_bytes(),
+    );
+    format!("{:x}", digest.finalize())
+}
+
+fn digest_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
 }
 
 fn min_expiry(left: DateTime<Utc>, right: DateTime<Utc>) -> DateTime<Utc> {
@@ -1771,6 +2202,29 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TestCapabilityPolicyConsumer {
+        input: Option<IdentityCapabilityPolicyInput>,
+    }
+
+    impl IdentityCapabilityPolicyConsumer for TestCapabilityPolicyConsumer {
+        fn consume_capability_policy(
+            &mut self,
+            provider: &mut dyn IdentityCapabilityPolicyProvider,
+            handle: &IdentityPluginHandle,
+            requirement: &IdentityCapabilityRequirement,
+            now: DateTime<Utc>,
+        ) -> Result<IdentityCapabilityPolicyInput, IdentityTeamMembershipError> {
+            let input = provider.provide_capability_policy_input(handle, requirement, now)?;
+            self.input = Some(input.clone());
+            Ok(input)
+        }
+
+        fn release_capability_policy(&mut self, _handle: &IdentityPluginHandle) {
+            self.input = None;
+        }
+    }
+
     #[test]
     fn oidc_session_maps_membership_role_and_exact_mission_scope_to_plugin_policy() {
         let exact_scope = scope(TEAM, PROJECT, MISSION, 7);
@@ -1808,6 +2262,93 @@ mod tests {
     }
 
     #[test]
+    fn capability_policy_input_is_exact_content_free_and_live_revalidated() {
+        let exact_scope = scope(TEAM, PROJECT, MISSION, 7);
+        let mut service = seeded_service(Duration::hours(1));
+        let oidc = session(&exact_scope, "session-policy-input");
+        let handle = service
+            .mount_online(&request(exact_scope.clone(), "policy-plugin"), &oidc, now())
+            .expect("online mount");
+        let requirement = IdentityCapabilityRequirement::new(
+            "research.discover",
+            exact_scope.clone(),
+            IdentityTeamRole::Member,
+        )
+        .expect("capability requirement");
+        let mut consumer = TestCapabilityPolicyConsumer::default();
+        let input = consumer
+            .consume_capability_policy(&mut service, &handle, &requirement, now())
+            .expect("policy input");
+        assert_eq!(input.scope(), &exact_scope);
+        assert_eq!(input.roles().granted(), IdentityTeamRole::Admin);
+        assert_eq!(input.roles().required(), IdentityTeamRole::Member);
+        assert!(input.roles().is_satisfied());
+        assert_eq!(input.membership_revision(), 1);
+        assert_eq!(input.role_revision(), 1);
+        assert_eq!(input.session_revision(), 1);
+        assert_eq!(input.mode(), IdentitySessionAccessMode::Online);
+        assert_eq!(input.expires_at(), now() + Duration::hours(4));
+        assert!(is_sha256(input.provider_digest()));
+        let decision = input.authorize(&mut service, now()).expect("live policy");
+        assert_eq!(decision.provider_digest(), input.provider_digest());
+        assert_eq!(decision.expires_at(), input.expires_at());
+        let serialized = serde_json::to_string(&input).expect("policy input json");
+        assert!(serialized.contains("providerDigest"));
+        assert!(!serialized.contains("handle"));
+        assert!(!serialized.contains("issuer"));
+        assert!(!serialized.contains("subject"));
+        assert!(!serialized.contains("access_token"));
+        assert!(!serialized.contains("SecretStore"));
+        assert!(!format!("{input:?}").contains("token"));
+
+        let mut lowered_requirement = input.clone();
+        lowered_requirement.roles.required = IdentityTeamRole::Viewer;
+        assert_eq!(
+            lowered_requirement.authorize(&mut service, now()),
+            Err(IdentityTeamMembershipError::CapabilityPolicyInputStale)
+        );
+
+        service
+            .change_role(
+                &MemberId::from("member-growth"),
+                IdentityTeamRole::Owner,
+                ActorId::from("owner"),
+                digest("policy-role-change"),
+                now() + Duration::minutes(1),
+            )
+            .expect("role change");
+        assert_eq!(
+            input.authorize(&mut service, now() + Duration::minutes(1)),
+            Err(IdentityTeamMembershipError::BindingStale)
+        );
+
+        let new_handle = service
+            .mount_online(
+                &request(exact_scope.clone(), "policy-plugin"),
+                &oidc,
+                now() + Duration::minutes(1),
+            )
+            .expect("new role mount");
+        let new_input = service
+            .provide_capability_policy_input(&new_handle, &requirement, now())
+            .expect("new policy input");
+        assert_eq!(new_input.granted_role(), IdentityTeamRole::Owner);
+        assert_ne!(new_input.provider_digest(), input.provider_digest());
+        service
+            .revoke_member(
+                &MemberId::from("member-growth"),
+                ActorId::from("owner"),
+                digest("policy-revoke"),
+                now() + Duration::minutes(2),
+            )
+            .expect("revoke");
+        assert_eq!(
+            new_input.authorize(&mut service, now() + Duration::minutes(2)),
+            Err(IdentityTeamMembershipError::BindingRevoked)
+        );
+    }
+
+    #[test]
     fn cross_team_and_cross_mission_policy_composition_fails_closed() {
         let exact_scope = scope(TEAM, PROJECT, MISSION, 7);
         let foreign_team_scope = scope("team-foreign", PROJECT, MISSION, 7);
@@ -1829,6 +2370,10 @@ mod tests {
         .expect("foreign requirement");
         assert_eq!(
             service.provide_identity_facts(&handle, &foreign_project_scope, now()),
+            Err(IdentityTeamMembershipError::ScopeMismatch)
+        );
+        assert_eq!(
+            service.provide_capability_policy_input(&handle, &requirement, now(),),
             Err(IdentityTeamMembershipError::ScopeMismatch)
         );
         assert_eq!(
@@ -2019,6 +2564,104 @@ mod tests {
     }
 
     #[test]
+    fn offline_policy_input_expires_and_reopens_deterministically() {
+        let exact_scope = scope(TEAM, PROJECT, MISSION, 7);
+        let ttl = Duration::minutes(20);
+        let mut service = seeded_service(ttl);
+        let oidc = session(&exact_scope, "session-policy-offline");
+        let online_handle = service
+            .mount_online(
+                &request(exact_scope.clone(), "offline-policy-plugin"),
+                &oidc,
+                now(),
+            )
+            .expect("online mount");
+        let requirement = IdentityCapabilityRequirement::new(
+            "research.discover",
+            exact_scope.clone(),
+            IdentityTeamRole::Member,
+        )
+        .expect("capability requirement");
+        let cache = service
+            .provide_identity_facts(&online_handle, &exact_scope, now())
+            .expect("online facts")
+            .offline_cache();
+        service.unmount(&online_handle).expect("unmount online");
+        let offline_handle = service
+            .reopen_offline(
+                &request(exact_scope.clone(), "offline-policy-plugin"),
+                &cache,
+                now() + Duration::minutes(5),
+            )
+            .expect("offline reopen");
+        let offline_input = service
+            .provide_capability_policy_input(
+                &offline_handle,
+                &requirement,
+                now() + Duration::minutes(5),
+            )
+            .expect("offline policy input");
+        assert_eq!(offline_input.mode(), IdentitySessionAccessMode::Offline);
+        assert_eq!(offline_input.expires_at(), now() + ttl);
+        assert!(
+            offline_input
+                .authorize(&mut service, now() + Duration::minutes(19))
+                .is_ok()
+        );
+        assert_eq!(
+            offline_input.authorize(&mut service, now() + Duration::minutes(20)),
+            Err(IdentityTeamMembershipError::CapabilityPolicyInputExpired)
+        );
+        assert_eq!(
+            service.reopen_offline(
+                &request(exact_scope.clone(), "offline-policy-plugin"),
+                &cache,
+                now() + Duration::minutes(20),
+            ),
+            Err(IdentityTeamMembershipError::OfflineMembershipExpired)
+        );
+
+        let mut restarted = seeded_service(ttl);
+        restarted
+            .register_session_head(cache.session_head().clone())
+            .expect("rehydrate session head");
+        let reopened_handle = restarted
+            .reopen_offline(
+                &request(exact_scope.clone(), "offline-policy-plugin"),
+                &cache,
+                now() + Duration::minutes(5),
+            )
+            .expect("deterministic offline reopen");
+        let reopened_input = restarted
+            .provide_capability_policy_input(
+                &reopened_handle,
+                &requirement,
+                now() + Duration::minutes(5),
+            )
+            .expect("reopened policy input");
+        assert_eq!(reopened_input, offline_input);
+        assert_eq!(
+            reopened_input.provider_digest(),
+            offline_input.provider_digest()
+        );
+
+        let serialized = serde_json::to_string(&offline_input).expect("offline policy json");
+        let restored: IdentityCapabilityPolicyInput =
+            serde_json::from_str(&serialized).expect("content-free policy restore");
+        assert_eq!(
+            restarted.validate_capability_policy_input(&restored, now() + Duration::minutes(5)),
+            Err(IdentityTeamMembershipError::BindingNotFound)
+        );
+
+        let mut tampered = offline_input.clone();
+        tampered.provider_digest = digest("tampered-provider");
+        assert_eq!(
+            tampered.authorize(&mut service, now() + Duration::minutes(5)),
+            Err(IdentityTeamMembershipError::CapabilityPolicyInputStale)
+        );
+    }
+
+    #[test]
     fn invite_role_change_and_revoke_receipts_invalidate_old_bindings() {
         let exact_scope = scope(TEAM, PROJECT, MISSION, 7);
         let mut service = ProjectMissionIdentityService::new(Duration::hours(1)).expect("service");
@@ -2115,6 +2758,15 @@ mod tests {
             .provide_identity_facts(&handle, &exact_scope, now())
             .expect("facts")
             .offline_cache();
+        let requirement = IdentityCapabilityRequirement::new(
+            "research.discover",
+            exact_scope.clone(),
+            IdentityTeamRole::Viewer,
+        )
+        .expect("capability requirement");
+        let policy_input = service
+            .provide_capability_policy_input(&handle, &requirement, now())
+            .expect("policy input");
         let newer_head = IdentitySessionHead::active(
             IdentitySessionId::from("session-stale"),
             exact_scope.clone(),
@@ -2132,6 +2784,10 @@ mod tests {
             .expect("advance session head");
         assert_eq!(
             service.provide_identity_facts(&handle, &exact_scope, now()),
+            Err(IdentityTeamMembershipError::StaleSession)
+        );
+        assert_eq!(
+            policy_input.authorize(&mut service, now()),
             Err(IdentityTeamMembershipError::StaleSession)
         );
         assert_eq!(
