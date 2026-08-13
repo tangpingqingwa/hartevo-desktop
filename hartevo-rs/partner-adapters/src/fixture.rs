@@ -286,6 +286,11 @@ fn build_data(
         observed_at,
         source_digest: fixture_digest(&format!("{}-conversion", provider.as_str())),
     };
+    let conversion_records = if matches!(scenario, FixtureScenario::DuplicateConversion) {
+        vec![conversion.clone(), conversion.clone()]
+    } else {
+        vec![conversion.clone()]
+    };
     let action = ActionRecord {
         account_id: account_id.clone(),
         program_id: program_id.clone(),
@@ -433,7 +438,7 @@ fn build_data(
         (
             NetworkResource::Conversions,
             NetworkReadData::Conversions {
-                records: vec![conversion],
+                records: conversion_records,
             },
         ),
         (
@@ -474,6 +479,9 @@ fn build_data(
 
 pub(crate) fn sign_body(scheme: CallbackSignatureScheme, body: &[u8]) -> String {
     let algorithm = match scheme {
+        CallbackSignatureScheme::ImpactHookJwsDetached => {
+            unreachable!("fixture cannot produce a production detached JWS")
+        }
         CallbackSignatureScheme::ImpactHookHmacSha1 => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
         CallbackSignatureScheme::FixtureHmacSha256 => hmac::HMAC_SHA256,
     };

@@ -261,6 +261,44 @@ fn impact_signed_callbacks_dedupe_conversions_and_preserve_out_of_order_events()
 }
 
 #[test]
+fn impact_production_detached_jws_requires_an_injected_verifier() {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let mut adapter = ImpactAdapter::new(world.clone());
+    adapter
+        .authorize(world.authorization(), at)
+        .expect("fixture grant is valid");
+    let body = world.callback_body(
+        "impact-jws-event-1",
+        "conversion.recorded",
+        at - Duration::minutes(1),
+        Some("impact-conversion-jws"),
+        Some("impact-order-jws"),
+        Some("impact-action-jws"),
+        Some("impact-commission-jws"),
+        None,
+        None,
+        Some(10_000),
+    );
+    let result = adapter.handle_callback(CallbackRequest {
+        scope: world.scope(),
+        channel: CallbackChannel::Webhook,
+        body: &body,
+        signature: "detached-jws-header..signature",
+        signature_key: b"jwks-key-reference",
+        scheme: CallbackSignatureScheme::ImpactHookJwsDetached,
+        received_at: at,
+    });
+    assert!(matches!(
+        result,
+        Err(PartnerNetworkError::BlockedEnv {
+            provider: crate::NetworkProvider::Impact,
+            reason: crate::BlockedEnvironmentReason::ProductionCallbackVerifierRequired,
+        })
+    ));
+}
+
+#[test]
 fn settlement_fixtures_keep_refunds_reversals_and_payouts_explicit() {
     let at = observed_at();
 
@@ -415,6 +453,25 @@ fn scope_revoke_and_program_drift_are_distinct_outcomes() {
             at,
         )),
         Err(PartnerNetworkError::ProgramDrift)
+    ));
+}
+
+#[test]
+fn duplicate_conversion_fixture_is_rejected_as_duplicate_identity() {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::new(FixtureScenario::DuplicateConversion, at);
+    let mut adapter = ImpactAdapter::new(world.clone());
+    adapter
+        .authorize(world.authorization(), at)
+        .expect("fixture grant is valid");
+    assert!(matches!(
+        adapter.read(NetworkReadRequest::for_program(
+            world.scope(),
+            NetworkResource::Conversions,
+            world.current_program_expectation(),
+            at,
+        )),
+        Err(PartnerNetworkError::DuplicateIdentity)
     ));
 }
 

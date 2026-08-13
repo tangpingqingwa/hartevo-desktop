@@ -337,6 +337,7 @@ impl<C: ImpactApi> PartnerNetworkAdapter for ImpactAdapter<C> {
         self.inner.handle_callback(
             &request,
             &[
+                CallbackSignatureScheme::ImpactHookJwsDetached,
                 CallbackSignatureScheme::ImpactHookHmacSha1,
                 CallbackSignatureScheme::FixtureHmacSha256,
             ],

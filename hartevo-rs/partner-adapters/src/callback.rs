@@ -20,6 +20,7 @@ pub enum CallbackChannel {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CallbackSignatureScheme {
+    ImpactHookJwsDetached,
     ImpactHookHmacSha1,
     FixtureHmacSha256,
 }
@@ -189,12 +190,19 @@ pub(crate) fn verify_signature(
     body: &[u8],
     signature: &str,
 ) -> Result<(), PartnerNetworkError> {
+    if scheme == CallbackSignatureScheme::ImpactHookJwsDetached {
+        return Err(PartnerNetworkError::BlockedEnv {
+            provider: NetworkProvider::Impact,
+            reason: crate::BlockedEnvironmentReason::ProductionCallbackVerifierRequired,
+        });
+    }
     if key.is_empty() || signature.trim().is_empty() {
         return Err(PartnerNetworkError::InvalidSignature);
     }
     let decoded =
         hex::decode(signature.trim()).map_err(|_| PartnerNetworkError::InvalidSignature)?;
     let algorithm = match scheme {
+        CallbackSignatureScheme::ImpactHookJwsDetached => unreachable!("handled above"),
         CallbackSignatureScheme::ImpactHookHmacSha1 => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
         CallbackSignatureScheme::FixtureHmacSha256 => hmac::HMAC_SHA256,
     };
