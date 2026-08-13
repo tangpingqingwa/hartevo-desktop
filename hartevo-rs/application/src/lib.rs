@@ -10,9 +10,12 @@ pub use provider_transport::{
 };
 pub use relationship_sync::{
     HUBSPOT_ACCESS_TOKEN_ENV, HUBSPOT_API_BASE_URL_ENV, HUBSPOT_DEFAULT_API_BASE_URL,
-    HUBSPOT_DEFAULT_PAGE_SIZE, HUBSPOT_READ_PROBE_GATE_ENV, HubSpotReadConfig,
-    HubSpotReadObservation, HubSpotReadPage, HubSpotReadProbeOutcome, HubSpotRelationshipReader,
-    ProviderReadError, run_hubspot_read_probe_from_env,
+    HUBSPOT_DEFAULT_PAGE_SIZE, HUBSPOT_READ_PROBE_GATE_ENV, HubSpotConversationReadPage,
+    HubSpotReadConfig, HubSpotReadObservation, HubSpotReadPage, HubSpotReadProbeOutcome,
+    HubSpotRelationshipReadJourney, HubSpotRelationshipReadProbeOutcome, HubSpotRelationshipReader,
+    HubSpotWebhookEvent, ProviderReadError, parse_hubspot_webhook_events,
+    parse_hubspot_webhook_events_for_account, run_hubspot_read_probe_from_env,
+    run_hubspot_relationship_read_probe_from_env, verify_hubspot_webhook_signature,
 };
 
 pub use runtime_text_subscription::{
@@ -50,27 +53,28 @@ use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, ApprovalPolicy, AttributionRecord,
     AutomatedReplyAuthorization, AutonomyLevel, BrowserControlLeaseId, BrowserFileClaimId,
     BrowserFileGrantId, BrowserProfileId, BrowserRecipeId, BrowserTabId, BrowserWorkspaceId,
-    Cadence, CadenceTriggerKind, Campaign, CampaignId, CampaignSendAuthorization, CommissionId,
-    CommissionRecord, Company, CompanyId, Connection, ConnectionError, ConnectionId,
-    ConnectionProbe, ConnectionSnapshot, ConsentPurpose, ConsentRecord, ConsentRecordId,
-    ConsentRequirement, ConsentState, Constraint, ContextAssemblyId, ContextBranch,
-    ContextBranchId, ContextBranchMerge, ContextBranchMergeId, ContextBranchStatus, ContextBudget,
-    ContextCapsule, ContextCapsuleId, ContextCapsuleStatus, ContextCheckpoint, ContextCheckpointId,
-    ContextCompactionRecord, ContextCompactionRecordId, ContextContinuationLedgerId,
-    ContextDataPolicy, ContextError, ContextFactGrant, ContextFoundationSnapshot, ContextInputRefs,
-    ContextMergePolicy, ContextReturnContract, ContextReturnReceipt, ContextWorkerMailboxId,
-    ContextWorkerMessage, ContextWorkerMessageId, ContextWorkerMessageKind, ContextWorkingItem,
-    ContextWorkingSet, ContextWorkingSetId, ContextWorkspace, ContextWorkspaceId,
-    ContinuationEntry, ContinuationEntryInput, ContinuationEntryKind, ContinuationLedger,
-    Conversation, ConversationEffectGuard, ConversationId, ConversationIdentitySnapshot,
-    CreatorApplicationId, CreatorApplicationInput, CreatorCandidate, CreatorContactEffectGuard,
-    CreatorDeliverableInput, CreatorEligibility, CreatorExternalProof, CreatorHiring,
-    CreatorHiringError, CreatorHiringId, CreatorHiringSpec, CreatorId, CreatorIdentitySnapshot,
-    CreatorMilestoneId, CreatorPayoutConfirmation, CreatorTask, CreatorTaskId, CreatorTaskSpec,
-    CreatorWorkError, CurrencyCode, DeletionError, DeletionId, DeletionReason, DeletionTombstone,
-    DeliverableId, DeliverableReviewInput, DeviceAttachment, DeviceAttachmentId,
-    DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim, DeviceHandoffContext,
-    DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
+    Cadence, CadenceTriggerKind, Campaign, CampaignId, CampaignSendAuthorization,
+    CanonicalRelationshipRecord, CommissionId, CommissionRecord, Company, CompanyId, Connection,
+    ConnectionError, ConnectionId, ConnectionProbe, ConnectionSnapshot, ConsentPurpose,
+    ConsentRecord, ConsentRecordId, ConsentRequirement, ConsentState, Constraint,
+    ContextAssemblyId, ContextBranch, ContextBranchId, ContextBranchMerge, ContextBranchMergeId,
+    ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleId, ContextCapsuleStatus,
+    ContextCheckpoint, ContextCheckpointId, ContextCompactionRecord, ContextCompactionRecordId,
+    ContextContinuationLedgerId, ContextDataPolicy, ContextError, ContextFactGrant,
+    ContextFoundationSnapshot, ContextInputRefs, ContextMergePolicy, ContextReturnContract,
+    ContextReturnReceipt, ContextWorkerMailboxId, ContextWorkerMessage, ContextWorkerMessageId,
+    ContextWorkerMessageKind, ContextWorkingItem, ContextWorkingSet, ContextWorkingSetId,
+    ContextWorkspace, ContextWorkspaceId, ContinuationEntry, ContinuationEntryInput,
+    ContinuationEntryKind, ContinuationLedger, Conversation, ConversationEffectGuard,
+    ConversationId, ConversationIdentitySnapshot, ConversationSourceProjection,
+    ConversationSourceState, CreatorApplicationId, CreatorApplicationInput, CreatorCandidate,
+    CreatorContactEffectGuard, CreatorDeliverableInput, CreatorEligibility, CreatorExternalProof,
+    CreatorHiring, CreatorHiringError, CreatorHiringId, CreatorHiringSpec, CreatorId,
+    CreatorIdentitySnapshot, CreatorMilestoneId, CreatorPayoutConfirmation, CreatorTask,
+    CreatorTaskId, CreatorTaskSpec, CreatorWorkError, CurrencyCode, DeletionError, DeletionId,
+    DeletionReason, DeletionTombstone, DeliverableId, DeliverableReviewInput, DeviceAttachment,
+    DeviceAttachmentId, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim,
+    DeviceHandoffContext, DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
     DevicePublicKeyRegistration, Effect, EffectClass, EffectId, EffectRisk, EffectSpec,
     EffectStatus, Evidence, EvidenceId, EvidenceStatus, FactId, FundingReservation, IdentityError,
     IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject, InboundIngest,
@@ -92,8 +96,8 @@ use hartevo_domain_kernel::{
     OutcomeReviewRoiStatus, OutcomeSettlementProjection, Partner, PartnerId, PayoutAuthorization,
     PayoutId, Person, PersonId, PreparedAutomaticReply, Project, ProjectDataCell,
     ProjectEncryptionMode, ProjectError, ProjectId, ProjectKeyring, ProjectKeyringBootstrap,
-    ReceiptId, RelationshipError, RelationshipSourceStream, ReviewDecision, ReviewId,
-    RuntimeProcessClaim, RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition,
+    ReceiptId, RelationshipError, RelationshipSourceRef, RelationshipSourceStream, ReviewDecision,
+    ReviewId, RuntimeProcessClaim, RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition,
     RuntimeProcessIdentity, RuntimeRecoveryAttempt, RuntimeRecoveryAttemptId,
     RuntimeRecoveryFailureClass, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt,
     RuntimeTurnAttemptId, RuntimeTurnError, RuntimeTurnFailureClass, RuntimeTurnObservedKind,
@@ -102,7 +106,8 @@ use hartevo_domain_kernel::{
     TenantId, TruthError, TruthFact, VerificationStatus, WebhookAttestation, WorkProduct,
     WorkProductDependencies, WorkProductId, WorkProductManifest, WorkProductManifestError,
     WorkProductPreview, WorkProductStatus, WorkerHandle, WorkerHandleStatus, WorkerId, WorkerLease,
-    WorkerLeaseId, WorkerLeaseStatus, WorkerMailbox, validate_context_branch_lineage,
+    WorkerLeaseId, WorkerLeaseStatus, WorkerMailbox, canonical_conversation_id,
+    canonical_relationship_id, digest_relationship_value, validate_context_branch_lineage,
 };
 use hartevo_domain_kernel::{
     MarketDecisionRecommendation, MarketEvidenceClassification, MarketEvidenceError,
@@ -4458,6 +4463,14 @@ pub enum HubSpotSyncOutcome {
     },
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HubSpotWebhookReconcileOutcome {
+    pub accepted_event_count: usize,
+    pub duplicate_event_count: usize,
+    pub projection: Box<InboxProjection>,
+}
+
 /// Content-free Runtime evidence for one Mission. Private Runtime thread/turn
 /// identifiers and prompt/output bodies never cross this projection boundary.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4475,6 +4488,70 @@ pub struct MissionRuntimeProjection {
     pub turn_evidence_count: usize,
     pub last_updated_at: Option<DateTime<Utc>>,
     pub requires_reconciliation: bool,
+}
+
+fn hubspot_contact_tombstone(
+    tenant_id: &TenantId,
+    project_id: &ProjectId,
+    account_id: &AccountId,
+    external_id: &str,
+    source_revision_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+) -> Result<CanonicalRelationshipRecord, ProviderReadError> {
+    let source = RelationshipSourceRef {
+        provider: "hubspot".into(),
+        account_id: account_id.clone(),
+        stream: RelationshipSourceStream::People,
+        external_id: external_id.trim().to_owned(),
+    };
+    source.validate()?;
+    Ok(CanonicalRelationshipRecord {
+        canonical_id: canonical_relationship_id(tenant_id, project_id, &source),
+        source,
+        source_revision: source_revision_at.to_rfc3339(),
+        display_name_digest: digest_relationship_value(external_id),
+        value_digests: BTreeSet::new(),
+        deleted: true,
+        observed_at,
+        revision: 1,
+    })
+}
+
+fn hubspot_conversation_tombstone(
+    tenant_id: &TenantId,
+    project_id: &ProjectId,
+    account_id: &AccountId,
+    external_id: &str,
+    source_revision_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+    event_digest: &str,
+) -> Result<ConversationSourceProjection, ProviderReadError> {
+    let source = RelationshipSourceRef {
+        provider: "hubspot".into(),
+        account_id: account_id.clone(),
+        stream: RelationshipSourceStream::Conversations,
+        external_id: external_id.trim().to_owned(),
+    };
+    source.validate()?;
+    Ok(ConversationSourceProjection {
+        tenant_id: tenant_id.clone(),
+        project_id: project_id.clone(),
+        conversation_id: ConversationId::from_stable(canonical_conversation_id(
+            tenant_id, project_id, &source,
+        )),
+        person_id: None,
+        source,
+        source_revision: source_revision_at.to_rfc3339(),
+        source_revision_digest: digest_relationship_value(event_digest),
+        source_state: ConversationSourceState::Archived,
+        archived: true,
+        deleted: true,
+        latest_activity_at: None,
+        latest_received_at: None,
+        latest_sent_at: None,
+        observed_at,
+        revision: 1,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -16884,7 +16961,9 @@ impl ApplicationService {
             let inbox = self.store.load_inbox_projection(&project.id)?;
             let inbox = (!inbox.items.is_empty()
                 || !inbox.relationships.is_empty()
-                || !inbox.source_cursors.is_empty())
+                || !inbox.conversation_sources.is_empty()
+                || !inbox.source_cursors.is_empty()
+                || !inbox.source_events.is_empty())
             .then_some(inbox);
             projects.push(DesktopProjectProjection {
                 tenant_id: project.tenant_id,
@@ -16919,34 +16998,47 @@ impl ApplicationService {
             return Err(ProviderReadError::ConnectionScopeMismatch.into());
         }
         let projection = self.store.load_inbox_projection(project_id)?;
-        let cursor = projection
+        let people_cursor = projection
             .source_cursor(
                 "hubspot",
                 connection.account_id(),
                 RelationshipSourceStream::People,
             )
             .cloned();
-        match run_hubspot_read_probe_from_env(
+        let conversation_cursor = projection
+            .source_cursor(
+                "hubspot",
+                connection.account_id(),
+                RelationshipSourceStream::Conversations,
+            )
+            .cloned();
+        match run_hubspot_relationship_read_probe_from_env(
             transport,
             connection.tenant_id(),
             project_id,
             connection.account_id(),
-            cursor.as_ref(),
+            connection.expected_external_account_id(),
+            people_cursor.as_ref(),
+            conversation_cursor.as_ref(),
             observed_at,
         )? {
-            HubSpotReadProbeOutcome::BlockedEnv { reason } => {
+            HubSpotRelationshipReadProbeOutcome::BlockedEnv { reason } => {
                 Ok(HubSpotSyncOutcome::BlockedEnv { reason })
             }
-            HubSpotReadProbeOutcome::Observed(page) => {
-                let projection = self.store.apply_relationship_source_page(
+            HubSpotRelationshipReadProbeOutcome::Observed(journey) => {
+                let projection = self.store.apply_relationship_source_batch(
                     connection.tenant_id(),
                     project_id,
-                    &page.records,
-                    &page.cursor,
+                    &journey.people.records,
+                    &journey.conversations.sources,
+                    &[
+                        journey.people.cursor.clone(),
+                        journey.conversations.cursor.clone(),
+                    ],
                     observed_at,
                 )?;
                 Ok(HubSpotSyncOutcome::Applied {
-                    observation: page.observation,
+                    observation: journey.people.observation,
                     projection: Box::new(projection),
                 })
             }
@@ -16971,30 +17063,166 @@ impl ApplicationService {
             return Err(ProviderReadError::ConnectionScopeMismatch.into());
         }
         let projection = self.store.load_inbox_projection(project_id)?;
-        let cursor = projection
+        let people_cursor = projection
             .source_cursor(
                 "hubspot",
                 connection.account_id(),
                 RelationshipSourceStream::People,
             )
             .cloned();
-        let page = HubSpotRelationshipReader::new(transport, config).read_contacts(
+        let conversation_cursor = projection
+            .source_cursor(
+                "hubspot",
+                connection.account_id(),
+                RelationshipSourceStream::Conversations,
+            )
+            .cloned();
+        let reader = HubSpotRelationshipReader::new(transport, config);
+        let journey = reader.read_scoped_journey(
             connection.tenant_id(),
             project_id,
             connection.account_id(),
-            cursor.as_ref(),
+            connection.expected_external_account_id(),
+            people_cursor.as_ref(),
+            conversation_cursor.as_ref(),
             credential,
             observed_at,
         )?;
-        let projection = self.store.apply_relationship_source_page(
+        let projection = self.store.apply_relationship_source_batch(
             connection.tenant_id(),
             project_id,
-            &page.records,
-            &page.cursor,
+            &journey.people.records,
+            &journey.conversations.sources,
+            &[
+                journey.people.cursor.clone(),
+                journey.conversations.cursor.clone(),
+            ],
             observed_at,
         )?;
         Ok(HubSpotSyncOutcome::Applied {
-            observation: page.observation,
+            observation: journey.people.observation,
+            projection: Box::new(projection),
+        })
+    }
+
+    /// Verifies a HubSpot webhook, re-reads the changed object through the
+    /// same narrow HTTP transport, and durably reconciles only source metadata.
+    /// It never advances a poll cursor, mutates Connection status, or creates
+    /// a provider write Effect.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "webhook reconciliation keeps connection scope, transport, two opaque credentials, raw signature inputs, and observation time explicit"
+    )]
+    pub fn reconcile_hubspot_webhook<T: ProviderHttpTransport>(
+        &mut self,
+        project_id: &ProjectId,
+        connection_id: &ConnectionId,
+        transport: &T,
+        config: HubSpotReadConfig,
+        access_token: &OpaqueCredential,
+        client_secret: &OpaqueCredential,
+        raw_body: &[u8],
+        signature: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Result<HubSpotWebhookReconcileOutcome, ApplicationError> {
+        let connection = self.store.load_connection(project_id, connection_id)?;
+        if connection.provider() != "hubspot" {
+            return Err(ProviderReadError::ConnectionScopeMismatch.into());
+        }
+        let events = parse_hubspot_webhook_events_for_account(
+            raw_body,
+            signature,
+            client_secret,
+            connection.tenant_id(),
+            project_id,
+            connection.account_id(),
+            connection.expected_external_account_id(),
+            observed_at,
+        )?;
+        let reader = HubSpotRelationshipReader::new(transport, config);
+        reader.verify_account_scope(connection.expected_external_account_id(), access_token)?;
+        let mut projection = self.store.load_inbox_projection(project_id)?;
+        let mut accepted_event_count = 0;
+        let mut duplicate_event_count = 0;
+        for webhook in events {
+            let event = webhook.as_source_event(connection.tenant_id(), project_id, observed_at);
+            if projection
+                .source_event(&event.source, &event.event_id, &event.event_digest)
+                .is_some()
+            {
+                duplicate_event_count += 1;
+                continue;
+            }
+            let is_delete = webhook
+                .subscription_type
+                .to_ascii_lowercase()
+                .contains("deletion");
+            let (relationship, conversation_source) = match webhook.source.stream {
+                RelationshipSourceStream::People => {
+                    let record = if is_delete {
+                        hubspot_contact_tombstone(
+                            connection.tenant_id(),
+                            project_id,
+                            connection.account_id(),
+                            &webhook.source.external_id,
+                            webhook.occurred_at,
+                            observed_at,
+                        )?
+                    } else {
+                        reader.read_contact(
+                            connection.tenant_id(),
+                            project_id,
+                            connection.account_id(),
+                            &webhook.source.external_id,
+                            access_token,
+                            observed_at,
+                        )?
+                    };
+                    (Some(record), None)
+                }
+                RelationshipSourceStream::Conversations => {
+                    let source = if is_delete {
+                        hubspot_conversation_tombstone(
+                            connection.tenant_id(),
+                            project_id,
+                            connection.account_id(),
+                            &webhook.source.external_id,
+                            webhook.occurred_at,
+                            observed_at,
+                            &event.event_digest,
+                        )?
+                    } else {
+                        reader.read_conversation_thread(
+                            connection.tenant_id(),
+                            project_id,
+                            connection.account_id(),
+                            &webhook.source.external_id,
+                            access_token,
+                            observed_at,
+                        )?
+                    };
+                    (None, Some(source))
+                }
+                _ => {
+                    return Err(ProviderReadError::UnsupportedWebhookEvent {
+                        subscription_type: webhook.subscription_type,
+                    }
+                    .into());
+                }
+            };
+            projection = self.store.apply_relationship_source_event(
+                connection.tenant_id(),
+                project_id,
+                &event,
+                relationship.as_ref(),
+                conversation_source.as_ref(),
+                observed_at,
+            )?;
+            accepted_event_count += 1;
+        }
+        Ok(HubSpotWebhookReconcileOutcome {
+            accepted_event_count,
+            duplicate_event_count,
             projection: Box::new(projection),
         })
     }
