@@ -1009,6 +1009,10 @@ impl LinkedInPaginationCursor {
         self.source_digest.as_deref()
     }
 
+    pub fn previous_digest(&self) -> Option<&str> {
+        self.previous_digest.as_deref()
+    }
+
     pub fn token_generation_digest(&self) -> Option<&str> {
         self.token_generation_digest.as_deref()
     }
@@ -1207,6 +1211,8 @@ pub struct LinkedInInsightObservation {
 impl LinkedInInsightObservation {
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), LinkedInConnectorError> {
+        self.scope.validate(None)?;
+        self.scope.validate_target(&self.target)?;
         if self.schema_version != LINKEDIN_INSIGHT_READ_SCHEMA
             || self.observation_id.is_empty()
             || !is_digest(&self.connector_scope_digest)
@@ -1308,6 +1314,14 @@ impl LinkedInInsightObservation {
                         self.binding.token_generation_digest.clone(),
                         plan_page_index.to_string(),
                     ])
+                || self.cursor.current_digest
+                    != self
+                        .cursor
+                        .durable_cursor
+                        .previous_digest()
+                        .map(str::to_owned)
+                || (plan_page_index == 0 && self.cursor.current_digest.is_some())
+                || (plan_page_index > 0 && self.cursor.current_digest.is_none())
             {
                 return Err(LinkedInConnectorError::InvalidObservation);
             }
@@ -1324,6 +1338,21 @@ impl LinkedInInsightObservation {
                 return Err(LinkedInConnectorError::InvalidObservation);
             }
             plan_cursor.validate()?;
+        }
+        if let Some(reconcile) = &self.reconcile
+            && let Some(poll_cursor) = &reconcile.poll_cursor
+            && (poll_cursor.plan_digest().is_some()
+                || poll_cursor.scope_digest != expected_cursor_scope
+                || poll_cursor.credential_reference_digest.as_deref()
+                    != Some(self.binding.credential_reference_digest.as_str())
+                || poll_cursor.credential_revision != Some(self.binding.credential_revision)
+                || poll_cursor.lease_revision != Some(self.binding.lease_revision)
+                || poll_cursor.token_generation_digest()
+                    != Some(self.binding.token_generation_digest.as_str())
+                || poll_cursor.adapter_id.as_deref() != Some(LINKEDIN_ADAPTER_ID)
+                || poll_cursor.adapter_version != Some(LINKEDIN_ADAPTER_VERSION))
+        {
+            return Err(LinkedInConnectorError::InvalidObservation);
         }
         Ok(())
     }
@@ -1797,6 +1826,7 @@ pub struct LinkedInReconcileReceipt {
     pub observed_at: DateTime<Utc>,
     pub payload_digest: String,
     pub source_digest: String,
+    pub poll_source: Option<LinkedInRequestEvidence>,
     pub rate_limit: LinkedInRateLimit,
     pub cost_minor: i64,
     pub poll_cursor: Option<LinkedInPaginationCursor>,
@@ -1833,6 +1863,32 @@ impl LinkedInReconcileReceipt {
                 || !is_digest(cursor.token_generation_digest().unwrap_or_default()))
         {
             return Err(LinkedInConnectorError::InvalidObservation);
+        }
+        let mut delivery_digests = self.notification_digests.clone();
+        delivery_digests.sort();
+        if self.delivery_digest != digest_serializable(&delivery_digests)? {
+            return Err(LinkedInConnectorError::InvalidObservation);
+        }
+        match (&self.source, &self.poll_source, &self.poll_cursor) {
+            (LinkedInReconcileSource::Webhook, Some(_), _)
+            | (LinkedInReconcileSource::Webhook, None, Some(_))
+            | (LinkedInReconcileSource::Poll, None, _)
+            | (LinkedInReconcileSource::Poll, _, None) => {
+                return Err(LinkedInConnectorError::InvalidObservation);
+            }
+            (LinkedInReconcileSource::Poll, Some(source), Some(cursor))
+                if source.method != "GET"
+                    || source.status / 100 != 2
+                    || !is_digest(&source.query_digest)
+                    || !is_digest(&source.response_digest)
+                    || source.response_digest != self.source_digest
+                    || cursor.query_digest() != Some(source.query_digest.as_str())
+                    || cursor.source_digest() != Some(source.response_digest.as_str()) =>
+            {
+                return Err(LinkedInConnectorError::InvalidObservation);
+            }
+            (LinkedInReconcileSource::Webhook, None, None)
+            | (LinkedInReconcileSource::Poll, Some(_), Some(_)) => {}
         }
         Ok(())
     }
@@ -1985,6 +2041,25 @@ impl DurableObservationLog {
         observation: LinkedInInsightObservation,
     ) -> Result<(), LinkedInConnectorError> {
         observation.validate()?;
+        if let Some(previous) = self.entries.last()
+            && previous.mission_id == observation.mission_id
+            && previous.cursor.durable_cursor.plan_digest()
+                == observation.cursor.durable_cursor.plan_digest()
+            && observation.cursor.durable_cursor.plan_digest().is_some()
+        {
+            let expected_page_index = previous
+                .cursor
+                .durable_cursor
+                .page_index()
+                .and_then(|value| value.checked_add(1))
+                .ok_or(LinkedInConnectorError::CursorRollback)?;
+            if observation.cursor.durable_cursor.page_index() != Some(expected_page_index)
+                || observation.cursor.current_digest
+                    != Some(previous.cursor.durable_checkpoint_digest.clone())
+            {
+                return Err(LinkedInConnectorError::CursorRollback);
+            }
+        }
         self.revision = self
             .revision
             .checked_add(1)
@@ -2005,8 +2080,26 @@ impl DurableObservationLog {
         {
             return Err(LinkedInConnectorError::InvalidObservation);
         }
-        for entry in &log.entries {
+        for (index, entry) in log.entries.iter().enumerate() {
             entry.validate()?;
+            if let Some(previous) = index
+                .checked_sub(1)
+                .and_then(|value| log.entries.get(value))
+                && previous.mission_id == entry.mission_id
+                && previous.cursor.durable_cursor.plan_digest()
+                    == entry.cursor.durable_cursor.plan_digest()
+                && entry.cursor.durable_cursor.plan_digest().is_some()
+                && (entry.cursor.durable_cursor.page_index()
+                    != previous
+                        .cursor
+                        .durable_cursor
+                        .page_index()
+                        .and_then(|value| value.checked_add(1))
+                    || entry.cursor.current_digest
+                        != Some(previous.cursor.durable_checkpoint_digest.clone()))
+            {
+                return Err(LinkedInConnectorError::CursorRollback);
+            }
         }
         Ok(log)
     }
@@ -2560,6 +2653,7 @@ struct LinkedInPendingReconcile {
     observed_at: DateTime<Utc>,
     payload_digest: String,
     source_digest: String,
+    poll_source: Option<LinkedInRequestEvidence>,
     rate_limit: LinkedInRateLimit,
     cost_minor: i64,
     poll_cursor: Option<LinkedInPaginationCursor>,
@@ -2788,6 +2882,7 @@ impl PaidSocialInsightReadService {
             event.payload_digest.clone(),
             source_digest,
             event.received_at,
+            None,
             LinkedInRateLimit::default(),
             0,
             None,
@@ -2883,6 +2978,7 @@ impl PaidSocialInsightReadService {
             payload_digest,
             batch.source.response_digest.clone(),
             batch.observed_at,
+            Some(batch.source.clone()),
             batch.rate_limit.clone(),
             self.policy.cost_minor,
             Some(next_poll_cursor),
@@ -3213,6 +3309,7 @@ impl PaidSocialInsightReadService {
             observed_at: pending.observed_at,
             payload_digest: pending.payload_digest,
             source_digest: pending.source_digest,
+            poll_source: pending.poll_source,
             rate_limit: pending.rate_limit,
             cost_minor: pending.cost_minor,
             poll_cursor: pending.poll_cursor,
@@ -3305,6 +3402,7 @@ impl PaidSocialInsightReadService {
         payload_digest: String,
         source_digest: String,
         observed_at: DateTime<Utc>,
+        poll_source: Option<LinkedInRequestEvidence>,
         rate_limit: LinkedInRateLimit,
         cost_minor: i64,
         poll_cursor: Option<LinkedInPaginationCursor>,
@@ -3360,6 +3458,7 @@ impl PaidSocialInsightReadService {
             observed_at,
             payload_digest,
             source_digest,
+            poll_source,
             rate_limit,
             cost_minor,
             poll_cursor,
@@ -3608,6 +3707,7 @@ impl PaidSocialInsightReadService {
         request: &LinkedInProbeRequest,
         observation: &LinkedInProbeObservation,
     ) -> Result<(), LinkedInConnectorError> {
+        let replacing_existing_mount = self.mount.is_some();
         observation.validate()?;
         if observation.scope != request.insight_scope
             || observation.connector_scope_digest != request.scope.digest()
@@ -3629,11 +3729,13 @@ impl PaidSocialInsightReadService {
             generation: 1,
         });
         self.state = LinkedInConnectionState::Mounted;
-        self.cursor = None;
-        self.plan_cursor = None;
-        self.poll_cursor = None;
-        self.reconcile_seen.clear();
-        self.reconcile_watermarks.clear();
+        if replacing_existing_mount {
+            self.cursor = None;
+            self.plan_cursor = None;
+            self.poll_cursor = None;
+            self.reconcile_seen.clear();
+            self.reconcile_watermarks.clear();
+        }
         Ok(())
     }
 
@@ -5140,12 +5242,12 @@ mod tests {
             LinkedInReadPolicy::default(),
         ));
         restored
-            .attach("mission-linkedin-1", &probe, &resolver)
-            .expect("reattach");
-        restored
             .service_mut()
             .restore_observation_log(&checkpoint)
-            .expect("restore cursor");
+            .expect("restore cursor before attach");
+        restored
+            .attach("mission-linkedin-1", &probe, &resolver)
+            .expect("reattach");
         let third = restored
             .read_plan_page("mission-linkedin-1", &plan, &resolver)
             .expect("third page");

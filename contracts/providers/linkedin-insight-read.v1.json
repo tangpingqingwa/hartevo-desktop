@@ -150,6 +150,7 @@
       "delivery_and_payload_digest",
       "notification_ids_and_modified_watermark",
       "source_request_and_response_digest",
+      "poll_request_evidence_when_poll_reconciled",
       "reconcile_rate_limit_and_cost",
       "insight_page_digest_and_cursor_digest",
       "native_attribution_model",
