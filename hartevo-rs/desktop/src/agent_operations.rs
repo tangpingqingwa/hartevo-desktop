@@ -1,4 +1,4 @@
-//! Read-only Agent Operations Workbench model for Desktop.
+//! Read-only on-demand Mission plugin surface model for Desktop.
 //!
 //! OI-01, CAP-01, CTX-01 and BW-01 own the durable control-plane records that
 //! will eventually fill these panels.  Until those APIs land, this module
@@ -6,15 +6,13 @@
 //! unavailable field as an honest typed state.  It has no persistence,
 //! runtime loop, browser control, approval authority or Effect path.
 
-use hartevo_application::{
-    DesktopProjectProjection, MissionProjection, MissionRuntimeProjection, WorkProductProjection,
-};
-use hartevo_domain_kernel::{
-    MissionStage, RuntimeProcessClaimStatus, RuntimeRecoveryStatus, RuntimeTurnStatus,
-    WorkProductStatus,
-};
+use std::fmt;
 
-use crate::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
+use hartevo_application::{MissionProjection, MissionRuntimeProjection};
+use hartevo_domain_kernel::{
+    MissionConversationMessageKind, MissionConversationRole, MissionId, ProjectId,
+    RuntimeRecoveryStatus, RuntimeTurnStatus, WorkProductStatus,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationsStatus {
@@ -22,10 +20,7 @@ pub enum OperationsStatus {
     Active,
     Empty,
     WaitingUser,
-    WaitingApproval,
     RecoveryRequired,
-    BlockedEnv,
-    NotImplemented,
     Failed,
 }
 
@@ -36,10 +31,7 @@ impl OperationsStatus {
             Self::Active => "RUNNING",
             Self::Empty => "EMPTY",
             Self::WaitingUser => "WAITING_USER",
-            Self::WaitingApproval => "WAITING_APPROVAL",
             Self::RecoveryRequired => "RECOVERY_REQUIRED",
-            Self::BlockedEnv => "BLOCKED_ENV",
-            Self::NotImplemented => "NOT_IMPLEMENTED",
             Self::Failed => "FAILED",
         }
     }
@@ -48,10 +40,8 @@ impl OperationsStatus {
         match self {
             Self::Ready | Self::Active => "ready",
             Self::Empty => "empty",
-            Self::WaitingUser | Self::WaitingApproval => "attention",
-            Self::RecoveryRequired | Self::BlockedEnv | Self::NotImplemented | Self::Failed => {
-                "blocked"
-            }
+            Self::WaitingUser => "attention",
+            Self::RecoveryRequired | Self::Failed => "blocked",
         }
     }
 
@@ -60,309 +50,457 @@ impl OperationsStatus {
     }
 }
 
+/// Content-free optimistic-concurrency material held by the Desktop command
+/// surface. It intentionally carries revisions only; Mission/Project IDs stay
+/// in the selected read model and are never rendered as implementation IDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationsRevisionFence {
+    pub mission: u64,
+    pub checkpoint: Option<u64>,
+    pub conversation: Option<u64>,
+}
+
+impl OperationsRevisionFence {
+    pub fn from_mission(mission: &MissionProjection) -> Self {
+        Self {
+            mission: mission.revision,
+            checkpoint: mission.current_checkpoint_revision,
+            conversation: mission.conversation_revision,
+        }
+    }
+
+    pub fn matches_mission(self, mission: &MissionProjection) -> bool {
+        self == Self::from_mission(mission)
+    }
+
+    pub fn label(self) -> String {
+        format!(
+            "Mission r{} · Checkpoint {} · Conversation {}",
+            self.mission,
+            self.checkpoint
+                .map_or_else(|| "—".into(), |revision| format!("r{revision}")),
+            self.conversation
+                .map_or_else(|| "—".into(), |revision| format!("r{revision}")),
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MissionControlProjection {
+pub struct ExecutionSurfaceProjection {
     pub status: OperationsStatus,
-    pub objective: String,
-    pub current_gate: String,
-    pub next_todos: Vec<String>,
-    pub active_claims: Vec<ClaimProjection>,
-    pub quota: QuotaProjection,
-    pub evidence: EvidenceChangeProjection,
-    pub stage: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClaimProjection {
-    pub title: String,
-    pub status: OperationsStatus,
-    pub detail: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QuotaProjection {
-    pub status: OperationsStatus,
-    pub used: String,
-    pub limit: String,
-    pub detail: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EvidenceChangeProjection {
-    pub evidence_count: usize,
-    pub work_product_count: usize,
-    pub verified_effect_count: usize,
-    pub detail: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeConfigurationProjection {
-    pub status: OperationsStatus,
-    pub provider: String,
-    pub model: String,
-    pub harness: String,
-    pub reasoning_effort: String,
-    pub service_tier: String,
-    pub data_boundary: String,
-    pub pinned_release: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkerProjection {
-    pub worker_type: String,
-    pub task: String,
-    pub lease: String,
-    pub generation: String,
-    pub progress: String,
-    pub budget: String,
-    pub handoff: String,
+    pub gate: String,
+    pub worker: String,
     pub recovery: String,
-    pub status: OperationsStatus,
+    pub transport: String,
+    pub revision_fence: OperationsRevisionFence,
+    pub stop_available: bool,
+    pub stop_requested: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArtifactActionsProjection {
-    pub diff: OperationsStatus,
-    pub adopt: OperationsStatus,
-    pub reject: OperationsStatus,
-    pub rollback: OperationsStatus,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArtifactProjection {
+#[derive(Clone, Eq, PartialEq)]
+pub struct ResultSurfaceProjection {
     pub title: String,
     pub kind: String,
     pub revision: String,
     pub lineage: String,
     pub preview: String,
-    pub evidence_count: usize,
     pub status: OperationsStatus,
-    pub actions: ArtifactActionsProjection,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ApprovalEffectProjection {
-    pub external_approval_count: usize,
-    pub verified_effect_count: usize,
-    pub external_status: OperationsStatus,
-    pub local_runtime_status: OperationsStatus,
-    pub local_runtime_detail: String,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissionPluginNodeKind {
+    Invocation,
+    Result,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BrowserWorkspaceProjection {
-    pub status: OperationsStatus,
-    pub identity: String,
-    pub control_owner: String,
-    pub next_action: String,
+impl MissionPluginNodeKind {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Invocation => "TOOL_INVOCATION",
+            Self::Result => "TOOL_RESULT",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Invocation => "Execution",
+            Self::Result => "Result",
+        }
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecoveryProjection {
-    pub status: OperationsStatus,
-    pub detail: String,
-    pub next_action: String,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissionPluginNodeStatus {
+    Awaiting,
+    Running,
+    Completed,
+    Failed,
+    Uncertain,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QuickEntryProjection {
-    pub status: OperationsStatus,
-    pub hint: String,
+impl MissionPluginNodeStatus {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Awaiting => "AWAITING",
+            Self::Running => "RUNNING",
+            Self::Completed => "COMPLETED",
+            Self::Failed => "FAILED",
+            Self::Uncertain => "UNCERTAIN",
+        }
+    }
+
+    pub const fn tone(self) -> &'static str {
+        match self {
+            Self::Awaiting => "attention",
+            Self::Running | Self::Completed => "ready",
+            Self::Failed | Self::Uncertain => "blocked",
+        }
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AgentOperationsWorkbenchProjection {
-    pub project_name: String,
-    pub mission: MissionControlProjection,
-    pub runtime: RuntimeConfigurationProjection,
-    pub workers: Vec<WorkerProjection>,
-    pub artifacts: Vec<ArtifactProjection>,
-    pub approvals: ApprovalEffectProjection,
-    pub browser: BrowserWorkspaceProjection,
-    pub recovery: RecoveryProjection,
-    pub quick_entry: QuickEntryProjection,
+/// Content-free token for opening an inline plugin detail. It carries exact
+/// scope and persisted revisions so a reselect cannot reveal the old Mission's
+/// private Conversation body.
+#[derive(Clone, Eq, PartialEq)]
+pub struct MissionPluginNodeSelection {
+    project_id: ProjectId,
+    mission_id: MissionId,
+    sequence: u64,
+    revision_fence: OperationsRevisionFence,
 }
 
-impl AgentOperationsWorkbenchProjection {
-    pub fn from_parts(
-        project: Option<&DesktopProjectProjection>,
+impl fmt::Debug for MissionPluginNodeSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MissionPluginNodeSelection")
+            .field("sequence", &self.sequence)
+            .field("revision_fence", &self.revision_fence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MissionPluginNodeSelection {
+    fn new(mission: &MissionProjection, sequence: u64) -> Self {
+        Self {
+            project_id: mission.project_id.clone(),
+            mission_id: mission.mission_id.clone(),
+            sequence,
+            revision_fence: OperationsRevisionFence::from_mission(mission),
+        }
+    }
+
+    pub fn matches_mission(&self, mission: &MissionProjection) -> bool {
+        self.project_id == mission.project_id
+            && self.mission_id == mission.mission_id
+            && mission.conversation_messages.iter().any(|message| {
+                message.sequence == self.sequence
+                    && message.role == MissionConversationRole::Assistant
+                    && message.kind == MissionConversationMessageKind::RuntimeDraft
+            })
+            && self.revision_fence.matches_mission(mission)
+    }
+}
+
+/// A durable RuntimeDraft message mapped to an inline Conversation node. The
+/// body stays owned by MissionProjection and is only passed to the renderer
+/// when the user opens details; this projection never duplicates private text.
+#[derive(Clone, Eq, PartialEq)]
+pub struct MissionPluginConversationNode {
+    pub sequence: u64,
+    pub kind: MissionPluginNodeKind,
+    pub status: MissionPluginNodeStatus,
+    pub title: String,
+    pub summary: String,
+    pub selected_result: bool,
+    pub detail_available: bool,
+    pub selection: MissionPluginNodeSelection,
+}
+
+impl fmt::Debug for MissionPluginConversationNode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MissionPluginConversationNode")
+            .field("sequence", &self.sequence)
+            .field("kind", &self.kind)
+            .field("status", &self.status)
+            .field("selected_result", &self.selected_result)
+            .field("detail_available", &self.detail_available)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MissionPluginConversationNode {
+    pub fn is_selected_by(&self, selection: Option<&MissionPluginNodeSelection>) -> bool {
+        selection == Some(&self.selection)
+    }
+
+    pub fn detail_body<'a>(
+        &self,
+        mission: &'a MissionProjection,
+        selection: Option<&MissionPluginNodeSelection>,
+    ) -> Option<&'a str> {
+        if !self.is_selected_by(selection) || !self.selection.matches_mission(mission) {
+            return None;
+        }
+        mission
+            .conversation_messages
+            .iter()
+            .find(|message| {
+                message.sequence == self.sequence
+                    && message.role == MissionConversationRole::Assistant
+                    && message.kind == MissionConversationMessageKind::RuntimeDraft
+            })
+            .map(|message| message.body.as_str())
+    }
+}
+
+impl fmt::Debug for ResultSurfaceProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResultSurfaceProjection")
+            .field("kind", &self.kind)
+            .field("revision", &self.revision)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Crate-private plugin slots. Empty slots are omitted from the Mission shell;
+/// they never render placeholder controls for capabilities whose owner is not
+/// mounted.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MissionPluginSurfaceRegistry {
+    pub execution: Option<ExecutionSurfaceProjection>,
+    pub result: Option<ResultSurfaceProjection>,
+    pub conversation_nodes: Vec<MissionPluginConversationNode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeActivitySurface {
+    Idle,
+    Busy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeTurnSurface {
+    Hidden,
+    Awaiting,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeStreamSurface {
+    Hidden,
+    Visible,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeErrorSurface {
+    Hidden,
+    Visible,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeTransportSurface {
+    Live,
+    CaughtUp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeStopSurface {
+    Unavailable,
+    Available,
+    Requested,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MissionPluginSurfaceInput {
+    pub activity: RuntimeActivitySurface,
+    pub turn: RuntimeTurnSurface,
+    pub stream: RuntimeStreamSurface,
+    pub error: RuntimeErrorSurface,
+    pub transport: RuntimeTransportSurface,
+    pub stop: RuntimeStopSurface,
+}
+
+impl Default for MissionPluginSurfaceInput {
+    fn default() -> Self {
+        Self {
+            activity: RuntimeActivitySurface::Idle,
+            turn: RuntimeTurnSurface::Hidden,
+            stream: RuntimeStreamSurface::Hidden,
+            error: RuntimeErrorSurface::Hidden,
+            transport: RuntimeTransportSurface::Live,
+            stop: RuntimeStopSurface::Unavailable,
+        }
+    }
+}
+
+impl MissionPluginSurfaceRegistry {
+    pub fn from_read_models(
         mission: Option<&MissionProjection>,
         runtime_activity: Option<&MissionRuntimeProjection>,
-        runtime: Option<&DesktopRuntimeProjection>,
+        input: MissionPluginSurfaceInput,
     ) -> Self {
-        let project_name =
-            project.map_or_else(|| "未选择 Project".into(), |project| project.name.clone());
-        let mission_control = mission_control_projection(mission, runtime_activity);
-        let runtime_projection = runtime_projection(runtime);
-        let workers = worker_projection(mission, runtime_activity);
-        let artifacts = mission.map_or_else(Vec::new, |mission| {
-            mission
-                .work_products
-                .iter()
-                .map(artifact_projection)
-                .collect()
-        });
-        let approvals = approval_projection(mission, runtime_activity);
-        let browser = browser_projection(mission);
-        let recovery = recovery_projection(runtime_activity);
-        let quick_entry = QuickEntryProjection {
-            status: if mission.is_some() {
-                OperationsStatus::Ready
-            } else {
-                OperationsStatus::WaitingUser
-            },
-            hint: if mission.is_some() {
-                "输入目标、纠正或停止条件；消息仍归属于当前 Mission。".into()
-            } else {
-                "先选择或创建一个持久 Mission，再进入 Quick Entry。".into()
-            },
+        let Some(mission) = mission else {
+            return Self::default();
         };
-        Self {
-            project_name,
-            mission: mission_control,
-            runtime: runtime_projection,
-            workers,
-            artifacts,
-            approvals,
-            browser,
-            recovery,
-            quick_entry,
-        }
-    }
-}
 
-fn mission_control_projection(
-    mission: Option<&MissionProjection>,
-    runtime_activity: Option<&MissionRuntimeProjection>,
-) -> MissionControlProjection {
-    let Some(mission) = mission else {
-        return MissionControlProjection {
-            status: OperationsStatus::Empty,
-            objective: "选择一个持久 Mission 以查看目标与下一道门".into(),
-            current_gate: "尚未选择 Mission".into(),
-            next_todos: vec!["从 Mission 列表选择一个真实目标".into()],
-            active_claims: Vec::new(),
-            quota: quota_not_available(),
-            evidence: EvidenceChangeProjection {
-                evidence_count: 0,
-                work_product_count: 0,
-                verified_effect_count: 0,
-                detail: "选择 Mission 后读取持久证据变化".into(),
-            },
-            stage: "未选择".into(),
-        };
-    };
-    let status = mission_status(mission);
-    let current_gate = mission
-        .current_checkpoint_id
-        .as_deref()
-        .map_or_else(|| "当前合同没有活动检查点".into(), humanize_checkpoint);
-    let next_todos = next_todos_for(mission, status);
-    let active_claims = claim_projection(runtime_activity);
-    MissionControlProjection {
-        status,
-        objective: mission.goal.clone(),
-        current_gate,
-        next_todos,
-        active_claims,
-        quota: quota_not_available(),
-        evidence: EvidenceChangeProjection {
-            evidence_count: mission.evidence_count,
-            work_product_count: mission.work_product_count,
-            verified_effect_count: mission.verified_effect_count,
-            detail: "计数来自当前 Mission projection；quota delta 等待 CTX-01/OI-01 read model。"
-                .into(),
-        },
-        stage: mission_stage_label(&mission.stage),
-    }
-}
+        let conversation_nodes = durable_conversation_nodes(mission, runtime_activity);
 
-fn mission_status(mission: &MissionProjection) -> OperationsStatus {
-    match mission.stage {
-        MissionStage::Running | MissionStage::Verifying => OperationsStatus::Active,
-        MissionStage::WaitingApproval => OperationsStatus::WaitingApproval,
-        MissionStage::WaitingUser => OperationsStatus::WaitingUser,
-        MissionStage::Blocked | MissionStage::Failed => OperationsStatus::BlockedEnv,
-        MissionStage::Draft | MissionStage::Ready | MissionStage::Scheduled => {
-            OperationsStatus::Ready
-        }
-        MissionStage::CycleReviewed | MissionStage::Completed | MissionStage::Cancelled => {
-            OperationsStatus::Empty
-        }
-        MissionStage::Partial | MissionStage::ExpectedRefusal => OperationsStatus::Failed,
-    }
-}
-
-fn next_todos_for(mission: &MissionProjection, status: OperationsStatus) -> Vec<String> {
-    match status {
-        OperationsStatus::WaitingApproval => vec!["审阅独立 Effect approval surface".into()],
-        OperationsStatus::WaitingUser => vec!["输入下一步判断、纠正或停止条件".into()],
-        OperationsStatus::RecoveryRequired => vec!["先完成精确 Runtime recovery".into()],
-        OperationsStatus::BlockedEnv => vec!["查看阻塞原因并保持当前 Mission 不变".into()],
-        OperationsStatus::Empty if mission.stage.is_terminal() => {
-            vec!["复核持久证据与最终状态".into()]
-        }
-        OperationsStatus::Active => vec![
-            "观察当前 gate 与 worker progress".into(),
-            "必要时使用 Quick Entry steer 或 interrupt".into(),
-        ],
-        _ if mission.current_checkpoint_id.is_some() => {
-            vec!["审阅当前 gate 的持久输入与下一转换".into()]
-        }
-        _ => vec!["确认 Mission objective 与运行边界".into()],
-    }
-}
-
-fn claim_projection(runtime_activity: Option<&MissionRuntimeProjection>) -> Vec<ClaimProjection> {
-    let Some(activity) = runtime_activity else {
-        return Vec::new();
-    };
-    let mut claims = Vec::new();
-    if let Some(status) = activity.process_claim_status {
-        claims.push(ClaimProjection {
-            title: "Runtime worker claim".into(),
-            status: if status == RuntimeProcessClaimStatus::Blocked {
-                OperationsStatus::BlockedEnv
-            } else if status.is_terminal() {
-                OperationsStatus::Empty
-            } else {
-                OperationsStatus::Active
-            },
-            detail: process_claim_detail(status),
+        let recovery_required = runtime_activity.is_some_and(|activity| {
+            activity.requires_reconciliation
+                || activity.recovery_status == Some(RuntimeRecoveryStatus::Failed)
+                || activity.turn_status == Some(RuntimeTurnStatus::Uncertain)
         });
-    }
-    if let Some(status) = activity.recovery_status {
-        claims.push(ClaimProjection {
-            title: "Recovery claim".into(),
-            status: if status == RuntimeRecoveryStatus::Failed {
+        let active_turn = runtime_activity
+            .and_then(|activity| activity.turn_status)
+            .is_some_and(RuntimeTurnStatus::is_active);
+        let execution_mounted = matches!(input.activity, RuntimeActivitySurface::Busy)
+            || matches!(input.turn, RuntimeTurnSurface::Awaiting)
+            || matches!(input.stream, RuntimeStreamSurface::Visible)
+            || matches!(input.error, RuntimeErrorSurface::Visible)
+            || active_turn
+            || recovery_required;
+        let execution = execution_mounted.then(|| {
+            let status = if recovery_required {
                 OperationsStatus::RecoveryRequired
-            } else if status == RuntimeRecoveryStatus::Attached {
-                OperationsStatus::Ready
-            } else {
+            } else if matches!(input.error, RuntimeErrorSurface::Visible) {
+                OperationsStatus::Failed
+            } else if matches!(input.turn, RuntimeTurnSurface::Awaiting) {
+                OperationsStatus::WaitingUser
+            } else if matches!(input.activity, RuntimeActivitySurface::Busy)
+                || matches!(input.stream, RuntimeStreamSurface::Visible)
+                || active_turn
+            {
                 OperationsStatus::Active
-            },
-            detail: recovery_status_detail(status),
+            } else {
+                OperationsStatus::Ready
+            };
+            let gate = mission
+                .current_checkpoint_id
+                .as_deref()
+                .map_or_else(|| "当前 Mission gate".into(), humanize_checkpoint);
+            let worker = runtime_activity
+                .and_then(|activity| activity.turn_status)
+                .map_or_else(|| "等待 Runtime worker claim".into(), turn_status_detail);
+            let recovery = runtime_activity
+                .and_then(|activity| activity.recovery_status)
+                .map_or_else(|| "No recovery fence".into(), recovery_status_detail);
+            let transport = if matches!(input.transport, RuntimeTransportSurface::CaughtUp) {
+                "Transport caught up · business state unchanged".into()
+            } else if matches!(input.turn, RuntimeTurnSurface::Awaiting) {
+                "Awaiting first durable turn".into()
+            } else if matches!(input.stream, RuntimeStreamSurface::Visible) {
+                "Streaming durable Runtime text".into()
+            } else {
+                "Runtime contribution mounted".into()
+            };
+            ExecutionSurfaceProjection {
+                status,
+                gate,
+                worker,
+                recovery,
+                transport,
+                revision_fence: OperationsRevisionFence::from_mission(mission),
+                stop_available: matches!(input.stop, RuntimeStopSurface::Available)
+                    && !recovery_required,
+                stop_requested: matches!(input.stop, RuntimeStopSurface::Requested),
+            }
         });
+        let result = mission
+            .work_products
+            .last()
+            .map(|product| ResultSurfaceProjection {
+                title: product.title.clone(),
+                kind: humanize_checkpoint(product.work_product_type.as_str()),
+                revision: format!(
+                    "Manifest v{} · revision {}",
+                    product.manifest_version, product.work_product_revision
+                ),
+                lineage: format!(
+                    "{} evidence references · Mission-owned lineage",
+                    product.evidence_count
+                ),
+                preview: product.preview_text.clone(),
+                status: artifact_status(&product.adoption_status),
+            });
+        Self {
+            execution,
+            result,
+            conversation_nodes,
+        }
     }
-    if let Some(status) = activity.turn_status {
-        claims.push(ClaimProjection {
-            title: "Current turn".into(),
-            status: turn_operations_status(status),
-            detail: turn_status_detail(status),
-        });
-    }
-    claims
 }
 
-fn process_claim_detail(status: RuntimeProcessClaimStatus) -> String {
-    match status {
-        RuntimeProcessClaimStatus::Prepared => "Worker claim 已准备，尚未证明进程已启动。".into(),
-        RuntimeProcessClaimStatus::Spawned => "本机进程 identity 已由持久 claim 管理。".into(),
-        RuntimeProcessClaimStatus::Terminated => "进程已被精确终止；不会按 PID 猜测重放。".into(),
-        RuntimeProcessClaimStatus::Exited => "进程已退出；等待同一 Mission 的恢复判断。".into(),
-        RuntimeProcessClaimStatus::Blocked => {
-            "进程清理或 identity 检查阻塞，保持 fail-closed。".into()
+fn durable_conversation_nodes(
+    mission: &MissionProjection,
+    runtime_activity: Option<&MissionRuntimeProjection>,
+) -> Vec<MissionPluginConversationNode> {
+    let last_work_product_id = mission
+        .work_products
+        .last()
+        .map(|product| &product.work_product_id);
+    let status = runtime_plugin_node_status(runtime_activity);
+    mission
+        .conversation_messages
+        .iter()
+        .filter(|message| {
+            message.role == MissionConversationRole::Assistant
+                && message.kind == MissionConversationMessageKind::RuntimeDraft
+        })
+        .map(|message| {
+            let kind = if message.work_product_id.is_some() {
+                MissionPluginNodeKind::Result
+            } else {
+                MissionPluginNodeKind::Invocation
+            };
+            let title = message.checkpoint_id.as_deref().map_or_else(
+                || match kind {
+                    MissionPluginNodeKind::Invocation => "Runtime execution".into(),
+                    MissionPluginNodeKind::Result => "Selected result".into(),
+                },
+                humanize_checkpoint,
+            );
+            let selected_result = message
+                .work_product_id
+                .as_ref()
+                .is_some_and(|work_product_id| Some(work_product_id) == last_work_product_id);
+            MissionPluginConversationNode {
+                sequence: message.sequence,
+                kind,
+                status,
+                title,
+                summary: if selected_result {
+                    "Durable result is available in the selected Workpad surface.".into()
+                } else {
+                    "Durable Runtime invocation recorded in this Mission Conversation.".into()
+                },
+                selected_result,
+                detail_available: !message.body.is_empty(),
+                selection: MissionPluginNodeSelection::new(mission, message.sequence),
+            }
+        })
+        .collect()
+}
+
+fn runtime_plugin_node_status(
+    runtime_activity: Option<&MissionRuntimeProjection>,
+) -> MissionPluginNodeStatus {
+    match runtime_activity.and_then(|activity| activity.turn_status) {
+        Some(
+            RuntimeTurnStatus::Prepared
+            | RuntimeTurnStatus::Dispatching
+            | RuntimeTurnStatus::Running
+            | RuntimeTurnStatus::ApprovalResponding
+            | RuntimeTurnStatus::InterruptRequested,
+        ) => MissionPluginNodeStatus::Running,
+        Some(RuntimeTurnStatus::WaitingLocalApproval) => MissionPluginNodeStatus::Awaiting,
+        None => MissionPluginNodeStatus::Completed,
+        Some(RuntimeTurnStatus::Completed | RuntimeTurnStatus::Interrupted) => {
+            MissionPluginNodeStatus::Completed
         }
+        Some(RuntimeTurnStatus::Failed) => MissionPluginNodeStatus::Failed,
+        Some(RuntimeTurnStatus::Uncertain) => MissionPluginNodeStatus::Uncertain,
     }
 }
 
@@ -376,20 +514,6 @@ fn recovery_status_detail(status: RuntimeRecoveryStatus) -> String {
         }
         RuntimeRecoveryStatus::Attached => "恢复已附着到持久上下文。".into(),
         RuntimeRecoveryStatus::Failed => "恢复失败；uncertain 状态不会自动重放。".into(),
-    }
-}
-
-fn turn_operations_status(status: RuntimeTurnStatus) -> OperationsStatus {
-    match status {
-        RuntimeTurnStatus::Prepared
-        | RuntimeTurnStatus::Dispatching
-        | RuntimeTurnStatus::Running
-        | RuntimeTurnStatus::ApprovalResponding
-        | RuntimeTurnStatus::InterruptRequested => OperationsStatus::Active,
-        RuntimeTurnStatus::WaitingLocalApproval => OperationsStatus::WaitingApproval,
-        RuntimeTurnStatus::Completed | RuntimeTurnStatus::Interrupted => OperationsStatus::Empty,
-        RuntimeTurnStatus::Failed => OperationsStatus::Failed,
-        RuntimeTurnStatus::Uncertain => OperationsStatus::RecoveryRequired,
     }
 }
 
@@ -407,246 +531,12 @@ fn turn_status_detail(status: RuntimeTurnStatus) -> String {
     }
 }
 
-fn runtime_projection(
-    runtime: Option<&DesktopRuntimeProjection>,
-) -> RuntimeConfigurationProjection {
-    let Some(runtime) = runtime else {
-        return RuntimeConfigurationProjection {
-            status: OperationsStatus::BlockedEnv,
-            provider: "未读取".into(),
-            model: "未读取".into(),
-            harness: "等待 OI-01".into(),
-            reasoning_effort: "等待 OI-01".into(),
-            service_tier: "等待 OI-01".into(),
-            data_boundary: "Project-bound local Context".into(),
-            pinned_release: "未读取".into(),
-        };
-    };
-    let status = runtime_operations_status(runtime.status);
-    RuntimeConfigurationProjection {
-        status,
-        provider: runtime.provider.clone().unwrap_or_else(|| "未配置".into()),
-        model: runtime.model.clone().unwrap_or_else(|| "未配置".into()),
-        harness: if status.is_actionable() {
-            "Pinned OpenInterpreter App Server".into()
-        } else {
-            "等待 OI-01 harness identity".into()
-        },
-        reasoning_effort: "等待 OI-01 typed setting".into(),
-        service_tier: "等待 OI-01 typed setting".into(),
-        data_boundary: "Project-bound local Context".into(),
-        pinned_release: runtime.release.clone(),
-    }
-}
-
-fn runtime_operations_status(status: DesktopRuntimeAvailabilityStatus) -> OperationsStatus {
-    match status {
-        DesktopRuntimeAvailabilityStatus::ReadyDevelopment
-        | DesktopRuntimeAvailabilityStatus::ReadyDistribution => OperationsStatus::Ready,
-        DesktopRuntimeAvailabilityStatus::NotConfigured
-        | DesktopRuntimeAvailabilityStatus::ConfigurationRequired => OperationsStatus::WaitingUser,
-        DesktopRuntimeAvailabilityStatus::EvidenceMissing
-        | DesktopRuntimeAvailabilityStatus::UnsupportedHost => OperationsStatus::NotImplemented,
-        DesktopRuntimeAvailabilityStatus::BlockedEnvironment => OperationsStatus::BlockedEnv,
-        DesktopRuntimeAvailabilityStatus::IntegrityError => OperationsStatus::Failed,
-    }
-}
-
-fn worker_projection(
-    mission: Option<&MissionProjection>,
-    runtime_activity: Option<&MissionRuntimeProjection>,
-) -> Vec<WorkerProjection> {
-    let Some(mission) = mission else {
-        return Vec::new();
-    };
-    let Some(activity) = runtime_activity else {
-        return vec![WorkerProjection {
-            worker_type: "Mission coordinator".into(),
-            task: "No active worker claim".into(),
-            lease: "No active lease".into(),
-            generation: "Worker generation pending CTX-01".into(),
-            progress: "等待持久 Runtime 状态".into(),
-            budget: "Quota read model pending".into(),
-            handoff: "User remains in control".into(),
-            recovery: "No recovery record".into(),
-            status: OperationsStatus::Empty,
-        }];
-    };
-    let status = if activity.requires_reconciliation {
-        OperationsStatus::RecoveryRequired
-    } else if activity
-        .turn_status
-        .is_some_and(RuntimeTurnStatus::is_active)
-    {
-        OperationsStatus::Active
-    } else {
-        OperationsStatus::Empty
-    };
-    vec![WorkerProjection {
-        worker_type: "Local Runtime worker".into(),
-        task: mission
-            .current_checkpoint_id
-            .as_deref()
-            .map_or_else(|| "Current Mission objective".into(), humanize_checkpoint),
-        lease: activity
-            .process_claim_status
-            .map_or_else(|| "No active process claim".into(), process_claim_lease),
-        generation: "Worker generation pending CTX-01 read model".into(),
-        progress: activity
-            .turn_status
-            .map_or_else(|| "No active turn".into(), turn_status_detail),
-        budget: "Quota read model pending CTX-01/OI-01".into(),
-        handoff: if activity.requires_reconciliation {
-            "Handoff held until exact recovery".into()
-        } else {
-            "User can steer or interrupt the current turn".into()
-        },
-        recovery: activity
-            .recovery_status
-            .map_or_else(|| "No recovery record".into(), recovery_status_detail),
-        status,
-    }]
-}
-
-fn process_claim_lease(status: RuntimeProcessClaimStatus) -> String {
-    match status {
-        RuntimeProcessClaimStatus::Prepared => "Lease prepared".into(),
-        RuntimeProcessClaimStatus::Spawned => "Lease active".into(),
-        RuntimeProcessClaimStatus::Terminated | RuntimeProcessClaimStatus::Exited => {
-            "Lease closed".into()
-        }
-        RuntimeProcessClaimStatus::Blocked => "Lease blocked".into(),
-    }
-}
-
-fn artifact_projection(product: &WorkProductProjection) -> ArtifactProjection {
-    ArtifactProjection {
-        title: product.title.clone(),
-        kind: humanize_checkpoint(product.work_product_type.as_str()),
-        revision: format!(
-            "Manifest v{} · revision {}",
-            product.manifest_version, product.work_product_revision
-        ),
-        lineage: format!(
-            "{} evidence references · Mission-owned lineage",
-            product.evidence_count
-        ),
-        preview: product.preview_text.clone(),
-        evidence_count: product.evidence_count,
-        status: artifact_status(&product.adoption_status),
-        actions: ArtifactActionsProjection {
-            diff: OperationsStatus::NotImplemented,
-            adopt: OperationsStatus::NotImplemented,
-            reject: OperationsStatus::NotImplemented,
-            rollback: OperationsStatus::NotImplemented,
-        },
-    }
-}
-
 fn artifact_status(status: &WorkProductStatus) -> OperationsStatus {
     match status {
         WorkProductStatus::Draft | WorkProductStatus::ReadyForReview => OperationsStatus::Ready,
         WorkProductStatus::Accepted => OperationsStatus::Active,
         WorkProductStatus::Superseded => OperationsStatus::Empty,
     }
-}
-
-fn approval_projection(
-    mission: Option<&MissionProjection>,
-    runtime_activity: Option<&MissionRuntimeProjection>,
-) -> ApprovalEffectProjection {
-    let external_approval_count = mission.map_or(0, |mission| mission.pending_approval_count);
-    let verified_effect_count = mission.map_or(0, |mission| mission.verified_effect_count);
-    let local_runtime_status = match runtime_activity.and_then(|activity| activity.turn_status) {
-        Some(RuntimeTurnStatus::WaitingLocalApproval | RuntimeTurnStatus::ApprovalResponding) => {
-            OperationsStatus::WaitingApproval
-        }
-        Some(_) | None => OperationsStatus::Empty,
-    };
-    ApprovalEffectProjection {
-        external_approval_count,
-        verified_effect_count,
-        external_status: if external_approval_count > 0 {
-            OperationsStatus::WaitingApproval
-        } else {
-            OperationsStatus::Empty
-        },
-        local_runtime_status,
-        local_runtime_detail: "Local Runtime approval is separate from external Effect approval."
-            .into(),
-    }
-}
-
-fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspaceProjection {
-    if mission.is_none() {
-        return BrowserWorkspaceProjection {
-            status: OperationsStatus::Empty,
-            identity: "No Mission-bound Browser Workspace".into(),
-            control_owner: "No owner".into(),
-            next_action: "Select a Mission".into(),
-        };
-    }
-    BrowserWorkspaceProjection {
-        status: OperationsStatus::NotImplemented,
-        identity: "No active authenticated profile".into(),
-        control_owner: "User control is required".into(),
-        next_action: "BW-01 must establish exact profile and takeover lease".into(),
-    }
-}
-
-fn recovery_projection(runtime_activity: Option<&MissionRuntimeProjection>) -> RecoveryProjection {
-    let Some(activity) = runtime_activity else {
-        return RecoveryProjection {
-            status: OperationsStatus::Empty,
-            detail: "No active recovery record".into(),
-            next_action: "No recovery action required".into(),
-        };
-    };
-    if activity.requires_reconciliation
-        || activity.recovery_status == Some(RuntimeRecoveryStatus::Failed)
-        || activity.turn_status == Some(RuntimeTurnStatus::Uncertain)
-    {
-        return RecoveryProjection {
-            status: OperationsStatus::RecoveryRequired,
-            detail: "A persisted Runtime/worker state needs exact reconciliation before retry."
-                .into(),
-            next_action: "Open recovery review; do not replay uncertain work".into(),
-        };
-    }
-    RecoveryProjection {
-        status: OperationsStatus::Ready,
-        detail: "No recovery fence is currently active.".into(),
-        next_action: "Continue normal Mission review".into(),
-    }
-}
-
-fn quota_not_available() -> QuotaProjection {
-    QuotaProjection {
-        status: OperationsStatus::NotImplemented,
-        used: "—".into(),
-        limit: "Not available".into(),
-        detail: "Quota/claim accounting waits for the CTX-01 and OI-01 typed read models.".into(),
-    }
-}
-
-fn mission_stage_label(stage: &MissionStage) -> String {
-    match stage {
-        MissionStage::Draft => "Draft",
-        MissionStage::Ready => "Ready",
-        MissionStage::Running => "Running",
-        MissionStage::WaitingUser => "Waiting for user",
-        MissionStage::WaitingApproval => "Waiting for approval",
-        MissionStage::Blocked => "Blocked",
-        MissionStage::Verifying => "Verifying",
-        MissionStage::Scheduled => "Scheduled",
-        MissionStage::CycleReviewed => "Cycle reviewed",
-        MissionStage::Completed => "Completed",
-        MissionStage::Partial => "Partial",
-        MissionStage::ExpectedRefusal => "Expected refusal",
-        MissionStage::Failed => "Failed",
-        MissionStage::Cancelled => "Cancelled",
-    }
-    .into()
 }
 
 fn humanize_checkpoint(value: &str) -> String {
@@ -671,126 +561,308 @@ fn humanize_checkpoint(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use hartevo_application::{MissionConversationMessageProjection, WorkProductProjection};
+    use hartevo_domain_kernel::{MissionConversationMessageId, MissionStage};
 
-    #[test]
-    fn runtime_config_maps_missing_control_plane_fields_honestly() {
-        let runtime = DesktopRuntimeProjection {
-            status: DesktopRuntimeAvailabilityStatus::ConfigurationRequired,
-            target: Some("private-target-path".into()),
-            release: "pinned-release".into(),
-            program_sha256: Some("private-program-digest".into()),
-            provider: None,
-            model: None,
-            distribution_signature_evidence: None,
-            exact_tokenizer_evidence: false,
-        };
-        let projection = runtime_projection(Some(&runtime));
-        assert_eq!(projection.status, OperationsStatus::WaitingUser);
-        assert_eq!(projection.provider, "未配置");
-        assert_eq!(projection.model, "未配置");
-        assert_eq!(projection.reasoning_effort, "等待 OI-01 typed setting");
-        assert!(!projection.harness.contains("private-target-path"));
-        assert!(!projection.harness.contains("private-program-digest"));
+    fn running_input() -> MissionPluginSurfaceInput {
+        MissionPluginSurfaceInput {
+            activity: RuntimeActivitySurface::Busy,
+            turn: RuntimeTurnSurface::Hidden,
+            stream: RuntimeStreamSurface::Visible,
+            error: RuntimeErrorSurface::Hidden,
+            transport: RuntimeTransportSurface::Live,
+            stop: RuntimeStopSurface::Available,
+        }
     }
 
     #[test]
-    fn checkpoint_ids_are_not_normal_product_language() {
-        assert_eq!(
-            humanize_checkpoint("go_no_go_need_more_evidence"),
-            "Go No Go Need More Evidence"
+    fn revision_fence_changes_when_any_persisted_revision_changes() {
+        let mut mission = mission_projection_for_test();
+        let fence = OperationsRevisionFence::from_mission(&mission);
+        assert!(fence.matches_mission(&mission));
+
+        mission.revision = mission.revision.saturating_add(1);
+        assert!(!fence.matches_mission(&mission));
+        mission.revision = fence.mission;
+
+        mission.current_checkpoint_revision =
+            Some(fence.checkpoint.unwrap_or_default().saturating_add(1));
+        assert!(!fence.matches_mission(&mission));
+        mission.current_checkpoint_revision = fence.checkpoint;
+
+        mission.conversation_revision =
+            Some(fence.conversation.unwrap_or_default().saturating_add(1));
+        assert!(!fence.matches_mission(&mission));
+    }
+
+    #[test]
+    fn revision_fence_label_is_content_free() {
+        let mission = mission_projection_for_test();
+        let label = OperationsRevisionFence::from_mission(&mission).label();
+        assert!(label.contains("Mission r"));
+        assert!(label.contains("Checkpoint r"));
+        assert!(label.contains("Conversation r"));
+        assert!(!label.contains(mission.project_id.as_str()));
+        assert!(!label.contains(mission.mission_id.as_str()));
+        assert!(!label.contains(mission.goal.as_str()));
+    }
+
+    #[test]
+    fn no_plugin_keeps_the_mission_shell_free_of_operations_dashboard() {
+        let mission = mission_projection_for_test();
+        let registry = MissionPluginSurfaceRegistry::from_read_models(
+            Some(&mission),
+            None,
+            MissionPluginSurfaceInput::default(),
         );
-        assert_eq!(humanize_checkpoint("_"), "Current gate");
+        assert_eq!(registry, MissionPluginSurfaceRegistry::default());
     }
 
     #[test]
-    fn local_runtime_approval_is_separate_from_external_effect_approval() {
-        let activity = MissionRuntimeProjection {
-            project_id: "project".into(),
-            mission_id: "mission".into(),
-            process_claim_status: None,
-            process_cleanup_attempt_count: 0,
-            recovery_status: None,
-            recovery_failure_count: 0,
-            recovery_process_attempt: None,
-            turn_status: Some(RuntimeTurnStatus::WaitingLocalApproval),
-            turn_failure_count: 0,
-            turn_evidence_count: 0,
-            last_updated_at: None,
-            requires_reconciliation: false,
-        };
-        let approval = approval_projection(None, Some(&activity));
-        assert_eq!(approval.external_status, OperationsStatus::Empty);
-        assert_eq!(
-            approval.local_runtime_status,
-            OperationsStatus::WaitingApproval
+    fn execution_plugin_mounts_and_unmounts_without_retaining_authority() {
+        let mission = mission_projection_for_test();
+        let mounted =
+            MissionPluginSurfaceRegistry::from_read_models(Some(&mission), None, running_input());
+        assert!(mounted.execution.as_ref().is_some_and(|surface| {
+            surface.stop_available && surface.revision_fence.matches_mission(&mission)
+        }));
+
+        let unmounted = MissionPluginSurfaceRegistry::from_read_models(
+            Some(&mission),
+            None,
+            MissionPluginSurfaceInput::default(),
         );
-        assert!(approval.local_runtime_detail.contains("separate"));
+        assert!(unmounted.execution.is_none());
+        assert!(unmounted.result.is_none());
     }
 
     #[test]
-    fn uncertain_runtime_requires_recovery_without_claiming_success() {
-        let activity = MissionRuntimeProjection {
-            project_id: "project".into(),
-            mission_id: "mission".into(),
-            process_claim_status: Some(RuntimeProcessClaimStatus::Blocked),
-            process_cleanup_attempt_count: 1,
-            recovery_status: Some(RuntimeRecoveryStatus::Failed),
-            recovery_failure_count: 1,
-            recovery_process_attempt: Some(1),
-            turn_status: Some(RuntimeTurnStatus::Uncertain),
-            turn_failure_count: 0,
-            turn_evidence_count: 1,
-            last_updated_at: None,
-            requires_reconciliation: true,
+    fn result_plugin_mounts_only_for_a_selected_work_product() {
+        let mut mission = mission_projection_for_test();
+        mission.work_products.push(work_product_for_test());
+        let mounted = MissionPluginSurfaceRegistry::from_read_models(
+            Some(&mission),
+            None,
+            MissionPluginSurfaceInput::default(),
+        );
+        assert!(mounted.execution.is_none());
+        assert!(mounted.result.is_some());
+
+        mission.work_products.clear();
+        let unmounted = MissionPluginSurfaceRegistry::from_read_models(
+            Some(&mission),
+            None,
+            MissionPluginSurfaceInput::default(),
+        );
+        assert!(unmounted.result.is_none());
+    }
+
+    #[test]
+    fn durable_runtime_drafts_mount_inline_nodes_and_selected_result() {
+        let mut mission = mission_projection_for_test();
+        mission.conversation_messages = vec![
+            runtime_message_for_test(1, None, "private invocation body"),
+            runtime_message_for_test(2, Some("private-work-product"), "private result body"),
+        ];
+        mission.work_products.push(work_product_for_test());
+
+        let registry = MissionPluginSurfaceRegistry::from_read_models(
+            Some(&mission),
+            None,
+            MissionPluginSurfaceInput::default(),
+        );
+
+        assert_eq!(registry.conversation_nodes.len(), 2);
+        assert_eq!(
+            registry.conversation_nodes[0].kind,
+            MissionPluginNodeKind::Invocation
+        );
+        assert_eq!(
+            registry.conversation_nodes[1].kind,
+            MissionPluginNodeKind::Result
+        );
+        assert!(!registry.conversation_nodes[0].selected_result);
+        assert!(registry.conversation_nodes[1].selected_result);
+        assert!(
+            registry
+                .conversation_nodes
+                .iter()
+                .all(|node| node.detail_available)
+        );
+    }
+
+    #[test]
+    fn inline_node_selection_is_revision_and_scope_fenced() {
+        let mut mission = mission_projection_for_test();
+        mission.conversation_messages.push(runtime_message_for_test(
+            1,
+            None,
+            "private invocation body",
+        ));
+        let registry = MissionPluginSurfaceRegistry::from_read_models(
+            Some(&mission),
+            None,
+            MissionPluginSurfaceInput::default(),
+        );
+        let selection = registry.conversation_nodes[0].selection.clone();
+        assert!(selection.matches_mission(&mission));
+        assert!(registry.conversation_nodes[0].is_selected_by(Some(&selection)));
+        assert_eq!(
+            registry.conversation_nodes[0].detail_body(&mission, Some(&selection)),
+            Some("private invocation body")
+        );
+
+        mission.mission_id = "reselected-private-mission".into();
+        assert!(!selection.matches_mission(&mission));
+        assert!(!registry.conversation_nodes[0].is_selected_by(None));
+        assert!(
+            registry.conversation_nodes[0]
+                .detail_body(&mission, Some(&selection))
+                .is_none()
+        );
+        let debug = format!("{registry:?}");
+        assert!(!debug.contains("private invocation body"));
+        assert!(!debug.contains("private-project-id"));
+        assert!(!debug.contains("private-mission-id"));
+    }
+
+    #[test]
+    fn inline_nodes_unmount_when_durable_conversation_is_no_longer_selected() {
+        let mut mission = mission_projection_for_test();
+        mission.conversation_messages.push(runtime_message_for_test(
+            1,
+            None,
+            "private invocation body",
+        ));
+        let mounted = MissionPluginSurfaceRegistry::from_read_models(
+            Some(&mission),
+            None,
+            MissionPluginSurfaceInput::default(),
+        );
+        assert_eq!(mounted.conversation_nodes.len(), 1);
+
+        mission.conversation_messages.clear();
+        let unmounted = MissionPluginSurfaceRegistry::from_read_models(
+            Some(&mission),
+            None,
+            MissionPluginSurfaceInput::default(),
+        );
+        assert!(unmounted.conversation_nodes.is_empty());
+    }
+
+    #[test]
+    fn stale_execution_action_and_reselect_do_not_reuse_old_scope() {
+        let mut first = mission_projection_for_test();
+        let first_registry =
+            MissionPluginSurfaceRegistry::from_read_models(Some(&first), None, running_input());
+        let Some(first_fence) = first_registry
+            .execution
+            .map(|surface| surface.revision_fence)
+        else {
+            panic!("execution plugin should mount");
         };
-        let recovery = recovery_projection(Some(&activity));
-        assert_eq!(recovery.status, OperationsStatus::RecoveryRequired);
-        assert!(!recovery.detail.contains("success"));
-        let workers = worker_projection(None, Some(&activity));
-        assert!(workers.is_empty());
+        first.mission_id = "reselected-mission-id".into();
+        first.revision = first.revision.saturating_add(1);
+        assert!(!first_fence.matches_mission(&first));
+
+        let second_registry = MissionPluginSurfaceRegistry::from_read_models(
+            Some(&first),
+            None,
+            MissionPluginSurfaceInput::default(),
+        );
+        assert_eq!(second_registry, MissionPluginSurfaceRegistry::default());
+        assert!(!format!("{second_registry:?}").contains("Private goal"));
     }
 
     #[test]
-    fn artifact_mutations_are_disabled_until_the_owner_api_exists() {
-        let product = WorkProductProjection {
-            work_product_id: "work-product".into(),
-            title: "Typed output".into(),
-            work_product_type: "research_packet".into(),
+    fn plugin_registry_debug_is_content_free() {
+        let mut mission = mission_projection_for_test();
+        mission.work_products.push(work_product_for_test());
+        let registry =
+            MissionPluginSurfaceRegistry::from_read_models(Some(&mission), None, running_input());
+        let debug = format!("{registry:?}");
+        assert!(!debug.contains(mission.project_id.as_str()));
+        assert!(!debug.contains(mission.mission_id.as_str()));
+        assert!(!debug.contains(mission.goal.as_str()));
+        assert!(!debug.contains("private-preview"));
+    }
+
+    fn mission_projection_for_test() -> MissionProjection {
+        MissionProjection {
+            surface: "test".into(),
+            project_id: "private-project-id".into(),
+            mission_id: "private-mission-id".into(),
+            title: "Private title".into(),
+            goal: "Private goal".into(),
+            manifest_id: Some("VM-07".into()),
+            manifest_version: Some(1),
+            catalog_digest: Some("catalog-digest".into()),
+            current_checkpoint_id: Some("evidence_plan".into()),
+            current_checkpoint_status: Some(
+                hartevo_domain_kernel::MissionCheckpointStatus::Running,
+            ),
+            current_checkpoint_revision: Some(5),
+            current_checkpoint_capability_id: Some("market.evidence".into()),
+            current_checkpoint_executor: Some(
+                hartevo_domain_kernel::MissionCheckpointExecutor::Runtime,
+            ),
+            current_checkpoint_application_handler_status: None,
+            current_checkpoint_application_handler_id: None,
+            current_checkpoint_oracle_ids: std::collections::BTreeSet::default(),
+            current_checkpoint_completion_policy: None,
+            completed_checkpoint_count: 1,
+            checkpoint_count: 8,
+            cycle: 0,
+            schedule: None,
+            conversation_id: Some("private-conversation-id".into()),
+            conversation_revision: Some(7),
+            conversation_messages: Vec::new(),
+            stage: MissionStage::Running,
+            revision: 9,
+            evidence_count: 2,
+            work_product_count: 0,
+            work_products: Vec::new(),
+            pending_approval_count: 0,
+            verified_effect_count: 0,
+            outcome_summary: None,
+            vm11_outcome_review: None,
+        }
+    }
+
+    fn work_product_for_test() -> WorkProductProjection {
+        WorkProductProjection {
+            work_product_id: "private-work-product".into(),
+            title: "Private result".into(),
+            work_product_type: "market_evidence_pack".into(),
             manifest_version: 1,
             work_product_revision: 2,
             preview_media_type: "text/plain".into(),
-            preview_text: "preview".into(),
+            preview_text: "private-preview".into(),
             preview_digest: "preview-digest".into(),
             manifest_digest: "manifest-digest".into(),
-            adoption_status: WorkProductStatus::Draft,
+            adoption_status: hartevo_domain_kernel::WorkProductStatus::ReadyForReview,
             editable_scope_count: 0,
             evidence_count: 1,
-        };
-        let artifact = artifact_projection(&product);
-        assert_eq!(artifact.actions.adopt, OperationsStatus::NotImplemented);
-        assert_eq!(artifact.actions.reject, OperationsStatus::NotImplemented);
-        assert_eq!(artifact.actions.rollback, OperationsStatus::NotImplemented);
+        }
     }
 
-    #[test]
-    fn reduced_motion_and_quick_entry_contracts_are_not_authority() {
-        assert!(OperationsStatus::Ready.is_actionable());
-        assert!(!OperationsStatus::NotImplemented.is_actionable());
-        assert_eq!(OperationsStatus::RecoveryRequired.tone(), "blocked");
-        let quick = QuickEntryProjection {
-            status: OperationsStatus::Ready,
-            hint: "same Mission".into(),
-        };
-        assert!(quick.hint.contains("Mission"));
-    }
-
-    #[test]
-    fn workbench_css_covers_focus_reduced_motion_and_zoom() {
-        let css = include_str!("../assets/main.css");
-        assert!(css.contains(".agent-operations-workbench"));
-        assert!(css.contains("button:focus-visible"));
-        assert!(css.contains("@media (prefers-reduced-motion: reduce)"));
-        assert!(css.contains("@media (max-width: 720px), (max-height: 520px)"));
-        assert!(css.contains("overflow-wrap: anywhere"));
+    fn runtime_message_for_test(
+        sequence: u64,
+        work_product_id: Option<&str>,
+        body: &str,
+    ) -> MissionConversationMessageProjection {
+        MissionConversationMessageProjection {
+            message_id: MissionConversationMessageId::from("private-message"),
+            sequence,
+            role: MissionConversationRole::Assistant,
+            kind: MissionConversationMessageKind::RuntimeDraft,
+            body: body.into(),
+            content_digest: format!("private-digest-{sequence}"),
+            mission_revision: 9,
+            checkpoint_id: Some("evidence_plan".into()),
+            work_product_id: work_product_id.map(Into::into),
+            recorded_at: Utc::now(),
+        }
     }
 }
