@@ -39,6 +39,9 @@ pub const PROVIDER_APPROVAL_AUTHORITY_CONTRACT_JSON: &str =
     include_str!("../../../contracts/providers/approval-authority.v1.json");
 
 const CHECKED_IN_APPROVAL_REGISTRY_REVISION: u64 = 1;
+const CHECKED_IN_APPROVAL_REGISTRY_ISSUED_AT: &str = "2026-08-12T00:00:00Z";
+const CHECKED_IN_APPROVAL_REGISTRY_NOT_BEFORE: &str = "2026-08-12T00:00:00Z";
+const CHECKED_IN_APPROVAL_REGISTRY_EXPIRES_AT: &str = "2027-08-12T00:00:00Z";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum ContractEvidenceLevel {
@@ -1296,13 +1299,75 @@ struct ApprovalAdapterRegistrySnapshot<'a> {
     revision: u64,
     minimum_accepted_revision: u64,
     digest: &'a str,
+    freshness: ApprovalRegistryFreshness,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ApprovalRegistryFreshness {
+    issued_at: DateTime<Utc>,
+    not_before: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
+}
+
+impl ApprovalRegistryFreshness {
+    fn validate_at(self, operation_at: DateTime<Utc>) -> Result<(), ApprovalAuthorityError> {
+        if self.issued_at > self.not_before
+            || self.not_before >= self.expires_at
+            || self
+                .revoked_at
+                .is_some_and(|revoked_at| revoked_at < self.not_before)
+        {
+            return Err(ApprovalAuthorityError::InvalidProviderRegistryFreshness);
+        }
+        if operation_at < self.issued_at {
+            return Err(ApprovalAuthorityError::ProviderRegistryClockRegression);
+        }
+        if operation_at < self.not_before {
+            return Err(ApprovalAuthorityError::ProviderRegistryNotYetValid);
+        }
+        if operation_at >= self.expires_at {
+            return Err(ApprovalAuthorityError::ProviderRegistryExpired);
+        }
+        if self
+            .revoked_at
+            .is_some_and(|revoked_at| revoked_at <= operation_at)
+        {
+            return Err(ApprovalAuthorityError::ProviderRegistryRevoked);
+        }
+        Ok(())
+    }
+
+    fn effective_until(self) -> DateTime<Utc> {
+        self.revoked_at.map_or(self.expires_at, |revoked_at| {
+            revoked_at.min(self.expires_at)
+        })
+    }
+}
+
+fn checked_in_registry_freshness() -> Result<ApprovalRegistryFreshness, ApprovalAuthorityError> {
+    let issued_at = CHECKED_IN_APPROVAL_REGISTRY_ISSUED_AT
+        .parse::<DateTime<Utc>>()
+        .map_err(|_| ApprovalAuthorityError::InvalidProviderRegistryFreshness)?;
+    let not_before = CHECKED_IN_APPROVAL_REGISTRY_NOT_BEFORE
+        .parse::<DateTime<Utc>>()
+        .map_err(|_| ApprovalAuthorityError::InvalidProviderRegistryFreshness)?;
+    let expires_at = CHECKED_IN_APPROVAL_REGISTRY_EXPIRES_AT
+        .parse::<DateTime<Utc>>()
+        .map_err(|_| ApprovalAuthorityError::InvalidProviderRegistryFreshness)?;
+    Ok(ApprovalRegistryFreshness {
+        issued_at,
+        not_before,
+        expires_at,
+        revoked_at: None,
+    })
 }
 
 struct ValidatedProviderCapabilityMetadata {
     version: String,
     revision: u64,
     digest: String,
+    freshness: ApprovalRegistryFreshness,
 }
 
 impl ConnectedApprovalBinding {
@@ -1415,6 +1480,7 @@ pub struct ApprovalRequest {
     adapter_registry_version: String,
     adapter_registry_revision: u64,
     adapter_registry_digest: String,
+    adapter_registry_freshness: ApprovalRegistryFreshness,
     adapter: ProviderAdapterIdentity,
     credential_revision: u64,
     lease_revision: u64,
@@ -1512,6 +1578,7 @@ impl ApprovalRequest {
         hash_field(&mut digest, &self.adapter_registry_version);
         hash_field(&mut digest, &self.adapter_registry_revision.to_string());
         hash_field(&mut digest, &self.adapter_registry_digest);
+        hash_registry_freshness(&mut digest, self.adapter_registry_freshness);
         hash_field(&mut digest, self.adapter.adapter_id());
         hash_field(&mut digest, &self.adapter.adapter_version().to_string());
         hash_field(&mut digest, &self.credential_revision.to_string());
@@ -1575,9 +1642,12 @@ impl ProviderApprovalAuthorityPolicy {
         let connected = provider.authorize(requested_at)?;
         let adapter_registry = ProviderAdapterRegistry::contract_baseline()
             .map_err(|_| ApprovalAuthorityError::InvalidAdapterRegistry)?;
+        let adapter_registry_freshness = checked_in_registry_freshness()?;
         let adapter_registry_digest = provider_approval_registry_digest(
             &adapter_registry,
             CHECKED_IN_APPROVAL_REGISTRY_REVISION,
+            CHECKED_IN_APPROVAL_REGISTRY_REVISION,
+            adapter_registry_freshness,
         );
         self.prepare_request_against_registries(
             context,
@@ -1590,7 +1660,7 @@ impl ProviderApprovalAuthorityPolicy {
                     revision: CHECKED_IN_APPROVAL_REGISTRY_REVISION,
                     minimum_accepted_revision: CHECKED_IN_APPROVAL_REGISTRY_REVISION,
                     digest: &adapter_registry_digest,
-                    revoked_at: None,
+                    freshness: adapter_registry_freshness,
                 },
                 human_issuers: &self.human_operation_authority.issuer_registrations,
             },
@@ -1619,6 +1689,7 @@ impl ProviderApprovalAuthorityPolicy {
             effect,
             &connected.adapter,
             requested_at,
+            None,
             None,
         )?;
         validate_human_request_evidence(&HumanRequestValidation {
@@ -1666,6 +1737,7 @@ impl ProviderApprovalAuthorityPolicy {
             adapter_registry_version: adapter_registry.version,
             adapter_registry_revision: adapter_registry.revision,
             adapter_registry_digest: adapter_registry.digest,
+            adapter_registry_freshness: adapter_registry.freshness,
             adapter: connected.adapter.clone(),
             credential_revision: connected.credential_revision,
             lease_revision: connected.lease_revision,
@@ -1719,9 +1791,12 @@ impl ProviderApprovalAuthorityPolicy {
         let connected = provider.authorize(operation_at)?;
         let adapter_registry = ProviderAdapterRegistry::contract_baseline()
             .map_err(|_| ApprovalAuthorityError::InvalidAdapterRegistry)?;
+        let adapter_registry_freshness = checked_in_registry_freshness()?;
         let adapter_registry_digest = provider_approval_registry_digest(
             &adapter_registry,
             CHECKED_IN_APPROVAL_REGISTRY_REVISION,
+            CHECKED_IN_APPROVAL_REGISTRY_REVISION,
+            adapter_registry_freshness,
         );
         self.issue_against_registries(
             request,
@@ -1734,7 +1809,7 @@ impl ProviderApprovalAuthorityPolicy {
                     revision: CHECKED_IN_APPROVAL_REGISTRY_REVISION,
                     minimum_accepted_revision: CHECKED_IN_APPROVAL_REGISTRY_REVISION,
                     digest: &adapter_registry_digest,
-                    revoked_at: None,
+                    freshness: adapter_registry_freshness,
                 },
                 human_issuers: &self.human_operation_authority.issuer_registrations,
             },
@@ -1768,6 +1843,7 @@ impl ProviderApprovalAuthorityPolicy {
             &connected.adapter,
             operation_at,
             Some(request.adapter_registry_revision),
+            Some(request.adapter_registry_freshness.issued_at),
         )?;
         validate_request_against_live_context(&LiveRequestValidation {
             policy: self,
@@ -1803,6 +1879,7 @@ impl ProviderApprovalAuthorityPolicy {
             request.actor_session_expires_at,
             step_up_assertion.expires_at,
             connected.observed_valid_until,
+            adapter_registry.freshness.effective_until(),
         ]
         .into_iter()
         .min()
@@ -2177,6 +2254,7 @@ fn validate_provider_capability_metadata(
     connected_adapter: &ProviderAdapterIdentity,
     operation_at: DateTime<Utc>,
     request_registry_revision: Option<u64>,
+    request_registry_issued_at: Option<DateTime<Utc>>,
 ) -> Result<ValidatedProviderCapabilityMetadata, ApprovalAuthorityError> {
     snapshot
         .registry
@@ -2188,18 +2266,22 @@ fn validate_provider_capability_metadata(
     {
         return Err(ApprovalAuthorityError::InvalidProviderRegistryState);
     }
+    snapshot.freshness.validate_at(operation_at)?;
     if snapshot.revision < snapshot.minimum_accepted_revision
         || request_registry_revision.is_some_and(|revision| snapshot.revision < revision)
     {
         return Err(ApprovalAuthorityError::ProviderRegistryVersionRollback);
     }
-    if snapshot
-        .revoked_at
-        .is_some_and(|revoked_at| revoked_at <= operation_at)
+    if request_registry_issued_at.is_some_and(|issued_at| snapshot.freshness.issued_at < issued_at)
     {
-        return Err(ApprovalAuthorityError::ProviderRegistryRevoked);
+        return Err(ApprovalAuthorityError::ProviderRegistryClockRegression);
     }
-    let registry_digest = provider_approval_registry_digest(snapshot.registry, snapshot.revision);
+    let registry_digest = provider_approval_registry_digest(
+        snapshot.registry,
+        snapshot.revision,
+        snapshot.minimum_accepted_revision,
+        snapshot.freshness,
+    );
     if snapshot.digest != registry_digest {
         return Err(ApprovalAuthorityError::ProviderRegistryDigestMismatch);
     }
@@ -2226,10 +2308,16 @@ fn validate_provider_capability_metadata(
         version: snapshot.registry.registry_version().to_owned(),
         revision: snapshot.revision,
         digest: registry_digest,
+        freshness: snapshot.freshness,
     })
 }
 
-fn provider_approval_registry_digest(registry: &ProviderAdapterRegistry, revision: u64) -> String {
+fn provider_approval_registry_digest(
+    registry: &ProviderAdapterRegistry,
+    revision: u64,
+    minimum_accepted_revision: u64,
+    freshness: ApprovalRegistryFreshness,
+) -> String {
     let mut digest = Sha256::new();
     hash_field(
         &mut digest,
@@ -2239,6 +2327,8 @@ fn provider_approval_registry_digest(registry: &ProviderAdapterRegistry, revisio
     hash_field(&mut digest, PROVIDER_ADAPTER_CONTRACT_VERSION);
     hash_field(&mut digest, registry.registry_version());
     hash_field(&mut digest, &revision.to_string());
+    hash_field(&mut digest, &minimum_accepted_revision.to_string());
+    hash_registry_freshness(&mut digest, freshness);
     let mut registrations = registry.registrations().iter().collect::<Vec<_>>();
     registrations.sort_by(|left, right| left.key().cmp(right.key()));
     hash_field(&mut digest, "registrations");
@@ -2481,6 +2571,7 @@ fn validate_request_against_live_context(
         || request.adapter_registry_version != adapter_registry.version
         || request.adapter_registry_revision != adapter_registry.revision
         || request.adapter_registry_digest != adapter_registry.digest
+        || request.adapter_registry_freshness != adapter_registry.freshness
         || request.adapter != connected.adapter
         || request.credential_revision != connected.credential_revision
         || request.lease_revision != connected.lease_revision
@@ -2616,6 +2707,19 @@ fn step_up_method_name(value: HumanStepUpMethod) -> &'static str {
 
 fn hash_time(digest: &mut Sha256, value: DateTime<Utc>) {
     hash_field(digest, &value.to_rfc3339());
+}
+
+fn hash_registry_freshness(digest: &mut Sha256, freshness: ApprovalRegistryFreshness) {
+    hash_field(digest, "registry_freshness");
+    hash_time(digest, freshness.issued_at);
+    hash_time(digest, freshness.not_before);
+    hash_time(digest, freshness.expires_at);
+    hash_field(digest, "revoked_at");
+    if let Some(revoked_at) = freshness.revoked_at {
+        hash_time(digest, revoked_at);
+    } else {
+        hash_field(digest, "none");
+    }
 }
 
 fn hash_field(digest: &mut Sha256, value: &str) {
@@ -2759,6 +2863,14 @@ pub enum ApprovalAuthorityError {
     InvalidAdapterRegistry,
     #[error("Provider approval registry revision/digest state is invalid")]
     InvalidProviderRegistryState,
+    #[error("Provider approval registry freshness window is invalid")]
+    InvalidProviderRegistryFreshness,
+    #[error("Provider approval registry clock regressed")]
+    ProviderRegistryClockRegression,
+    #[error("Provider approval registry snapshot is not yet valid")]
+    ProviderRegistryNotYetValid,
+    #[error("Provider approval registry snapshot expired")]
+    ProviderRegistryExpired,
     #[error("Provider approval registry digest does not match its canonical snapshot")]
     ProviderRegistryDigestMismatch,
     #[error("Provider approval registry revision is revoked")]
@@ -2841,7 +2953,7 @@ mod tests {
         adapter_registry_revision: u64,
         adapter_registry_minimum_revision: u64,
         adapter_registry_digest: String,
-        adapter_registry_revoked_at: Option<DateTime<Utc>>,
+        adapter_registry_freshness: ApprovalRegistryFreshness,
         human_issuers: Vec<HumanAuthorityIssuerRegistration>,
     }
 
@@ -2851,8 +2963,19 @@ mod tests {
         let permission_evidence = synthetic_permission_evidence();
         let (connected, adapter_registry) = synthetic_provider_registry();
         let adapter_registry_revision = 7;
-        let adapter_registry_digest =
-            provider_approval_registry_digest(&adapter_registry, adapter_registry_revision);
+        let adapter_registry_minimum_revision = adapter_registry_revision;
+        let adapter_registry_freshness = ApprovalRegistryFreshness {
+            issued_at: now() - Duration::seconds(10),
+            not_before: now() - Duration::seconds(5),
+            expires_at: now() + Duration::seconds(80),
+            revoked_at: None,
+        };
+        let adapter_registry_digest = provider_approval_registry_digest(
+            &adapter_registry,
+            adapter_registry_revision,
+            adapter_registry_minimum_revision,
+            adapter_registry_freshness,
+        );
         let (actor_authorization, actor_session, human_issuers) =
             synthetic_human_authority(&mission, &effect_id);
         SyntheticState {
@@ -2865,9 +2988,9 @@ mod tests {
             connected,
             adapter_registry,
             adapter_registry_revision,
-            adapter_registry_minimum_revision: adapter_registry_revision,
+            adapter_registry_minimum_revision,
             adapter_registry_digest,
-            adapter_registry_revoked_at: None,
+            adapter_registry_freshness,
             human_issuers,
         }
     }
@@ -3027,7 +3150,7 @@ mod tests {
                 revision: state.adapter_registry_revision,
                 minimum_accepted_revision: state.adapter_registry_minimum_revision,
                 digest: &state.adapter_registry_digest,
-                revoked_at: state.adapter_registry_revoked_at,
+                freshness: state.adapter_registry_freshness,
             },
             human_issuers: &state.human_issuers,
         }
@@ -3037,7 +3160,20 @@ mod tests {
         state.adapter_registry_digest = provider_approval_registry_digest(
             &state.adapter_registry,
             state.adapter_registry_revision,
+            state.adapter_registry_minimum_revision,
+            state.adapter_registry_freshness,
         );
+    }
+
+    fn drift_synthetic_registry_freshness(state: &mut SyntheticState, field: usize) {
+        match field {
+            0 => state.adapter_registry_freshness.issued_at += Duration::seconds(1),
+            1 => state.adapter_registry_freshness.not_before += Duration::seconds(1),
+            2 => state.adapter_registry_freshness.expires_at += Duration::seconds(1),
+            _ => {
+                state.adapter_registry_freshness.revoked_at = Some(now() + Duration::seconds(30));
+            }
+        }
     }
 
     fn synthetic_human_authority(
@@ -3633,7 +3769,7 @@ mod tests {
         );
 
         let mut revoked = synthetic_state();
-        revoked.adapter_registry_revoked_at = Some(now());
+        revoked.adapter_registry_freshness.revoked_at = Some(now());
         assert_prepare_rejected(
             &policy,
             &revoked,
@@ -3703,7 +3839,7 @@ mod tests {
 
         let mut revoked = synthetic_state();
         let revoked_request = synthetic_request(&policy, &revoked);
-        revoked.adapter_registry_revoked_at = Some(now() + Duration::seconds(1));
+        revoked.adapter_registry_freshness.revoked_at = Some(now() + Duration::seconds(1));
         assert!(matches!(
             issue_synthetic(
                 &policy,
@@ -3771,9 +3907,240 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_registry_digest_binds_every_freshness_field_on_prepare_and_issue() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+
+        for field in 0..4 {
+            let mut prepare_state = synthetic_state();
+            drift_synthetic_registry_freshness(&mut prepare_state, field);
+            assert_prepare_rejected(
+                &policy,
+                &prepare_state,
+                ApprovalAuthorityErrorKind::RegistryDigest,
+            );
+
+            let mut issue_state = synthetic_state();
+            let request = synthetic_request(&policy, &issue_state);
+            drift_synthetic_registry_freshness(&mut issue_state, field);
+            assert!(matches!(
+                issue_synthetic(&policy, &issue_state, request, now() + Duration::seconds(2),),
+                Err(ApprovalAuthorityError::ProviderRegistryDigestMismatch)
+            ));
+            assert_eq!(
+                issue_state
+                    .mission
+                    .effect(&issue_state.effect_id)
+                    .expect("effect")
+                    .status,
+                EffectStatus::Proposed
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_rejects_invalid_not_yet_valid_expired_and_clock_regressed_snapshots() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+
+        let mut invalid = synthetic_state();
+        invalid.adapter_registry_freshness.issued_at = now();
+        invalid.adapter_registry_freshness.not_before = now() - Duration::seconds(1);
+        refresh_synthetic_registry_digest(&mut invalid);
+        assert_prepare_rejected(
+            &policy,
+            &invalid,
+            ApprovalAuthorityErrorKind::RegistryFreshness,
+        );
+
+        let mut clock_regression = synthetic_state();
+        clock_regression.adapter_registry_freshness.issued_at = now() + Duration::seconds(1);
+        clock_regression.adapter_registry_freshness.not_before = now() + Duration::seconds(2);
+        refresh_synthetic_registry_digest(&mut clock_regression);
+        assert_prepare_rejected(
+            &policy,
+            &clock_regression,
+            ApprovalAuthorityErrorKind::RegistryClock,
+        );
+
+        let mut not_yet_valid = synthetic_state();
+        not_yet_valid.adapter_registry_freshness.issued_at = now() - Duration::seconds(1);
+        not_yet_valid.adapter_registry_freshness.not_before = now() + Duration::seconds(1);
+        refresh_synthetic_registry_digest(&mut not_yet_valid);
+        assert_prepare_rejected(
+            &policy,
+            &not_yet_valid,
+            ApprovalAuthorityErrorKind::RegistryNotYetValid,
+        );
+
+        let mut expired = synthetic_state();
+        expired.adapter_registry_freshness.expires_at = now();
+        refresh_synthetic_registry_digest(&mut expired);
+        assert_prepare_rejected(
+            &policy,
+            &expired,
+            ApprovalAuthorityErrorKind::RegistryExpired,
+        );
+
+        for state in [&invalid, &clock_regression, &not_yet_valid, &expired] {
+            assert_eq!(
+                state
+                    .mission
+                    .effect(&state.effect_id)
+                    .expect("effect")
+                    .status,
+                EffectStatus::Proposed
+            );
+        }
+    }
+
+    #[test]
+    fn issue_rejects_expiry_not_before_drift_and_monotonic_clock_regression() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+
+        let mut expired = synthetic_state();
+        expired.adapter_registry_freshness.expires_at = now() + Duration::seconds(1);
+        refresh_synthetic_registry_digest(&mut expired);
+        let expired_request = synthetic_request(&policy, &expired);
+        assert!(matches!(
+            issue_synthetic(
+                &policy,
+                &expired,
+                expired_request,
+                now() + Duration::seconds(1),
+            ),
+            Err(ApprovalAuthorityError::ProviderRegistryExpired)
+        ));
+
+        let mut not_yet_valid = synthetic_state();
+        let not_yet_valid_request = synthetic_request(&policy, &not_yet_valid);
+        not_yet_valid.adapter_registry_freshness.not_before = now() + Duration::seconds(3);
+        refresh_synthetic_registry_digest(&mut not_yet_valid);
+        assert!(matches!(
+            issue_synthetic(
+                &policy,
+                &not_yet_valid,
+                not_yet_valid_request,
+                now() + Duration::seconds(2),
+            ),
+            Err(ApprovalAuthorityError::ProviderRegistryNotYetValid)
+        ));
+
+        let mut clock_regression = synthetic_state();
+        let clock_regression_request = synthetic_request(&policy, &clock_regression);
+        clock_regression.adapter_registry_freshness.issued_at -= Duration::seconds(1);
+        refresh_synthetic_registry_digest(&mut clock_regression);
+        assert!(matches!(
+            issue_synthetic(
+                &policy,
+                &clock_regression,
+                clock_regression_request,
+                now() + Duration::seconds(2),
+            ),
+            Err(ApprovalAuthorityError::ProviderRegistryClockRegression)
+        ));
+
+        for state in [&expired, &not_yet_valid, &clock_regression] {
+            assert_eq!(
+                state
+                    .mission
+                    .effect(&state.effect_id)
+                    .expect("effect")
+                    .status,
+                EffectStatus::Proposed
+            );
+        }
+    }
+
+    #[test]
+    fn issue_rejects_live_validity_window_drift_after_prepare() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+
+        for field in 0..3 {
+            let mut state = synthetic_state();
+            let request = synthetic_request(&policy, &state);
+            drift_synthetic_registry_freshness(&mut state, field);
+            refresh_synthetic_registry_digest(&mut state);
+            assert!(matches!(
+                issue_synthetic(&policy, &state, request, now() + Duration::seconds(2)),
+                Err(ApprovalAuthorityError::RequestContextChanged)
+            ));
+            assert_eq!(
+                state
+                    .mission
+                    .effect(&state.effect_id)
+                    .expect("effect")
+                    .status,
+                EffectStatus::Proposed
+            );
+        }
+    }
+
+    #[test]
+    fn registry_expiry_and_future_revocation_bound_record_authority_and_fail_when_effective() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+
+        let mut expires = synthetic_state();
+        expires.adapter_registry_freshness.expires_at = now() + Duration::seconds(25);
+        refresh_synthetic_registry_digest(&mut expires);
+        let expires_request = synthetic_request(&policy, &expires);
+        let expires_authority = issue_synthetic(
+            &policy,
+            &expires,
+            expires_request,
+            now() + Duration::seconds(2),
+        )
+        .expect("live expiring registry");
+        assert_eq!(
+            expires_authority.approval_record_valid_until(),
+            now() + Duration::seconds(25)
+        );
+
+        let mut scheduled = synthetic_state();
+        scheduled.adapter_registry_freshness.revoked_at = Some(now() + Duration::seconds(30));
+        refresh_synthetic_registry_digest(&mut scheduled);
+        let scheduled_request = synthetic_request(&policy, &scheduled);
+        let scheduled_authority = issue_synthetic(
+            &policy,
+            &scheduled,
+            scheduled_request,
+            now() + Duration::seconds(2),
+        )
+        .expect("registry before scheduled revocation");
+        assert_eq!(
+            scheduled_authority.approval_record_valid_until(),
+            now() + Duration::seconds(30)
+        );
+
+        let mut becomes_effective = synthetic_state();
+        let becomes_effective_request = synthetic_request(&policy, &becomes_effective);
+        becomes_effective.adapter_registry_freshness.revoked_at =
+            Some(now() + Duration::seconds(2));
+        refresh_synthetic_registry_digest(&mut becomes_effective);
+        assert!(matches!(
+            issue_synthetic(
+                &policy,
+                &becomes_effective,
+                becomes_effective_request,
+                now() + Duration::seconds(2),
+            ),
+            Err(ApprovalAuthorityError::ProviderRegistryRevoked)
+        ));
+
+        for state in [&expires, &scheduled, &becomes_effective] {
+            assert_eq!(
+                state
+                    .mission
+                    .effect(&state.effect_id)
+                    .expect("effect")
+                    .status,
+                EffectStatus::Proposed
+            );
+        }
+    }
+
     proptest! {
         #[test]
-        fn any_single_request_field_tamper_breaks_its_original_digest(field in 0usize..22) {
+        fn any_single_request_field_tamper_breaks_its_original_digest(field in 0usize..26) {
             let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
             let state = synthetic_state();
             let mut request = synthetic_request(&policy, &state);
@@ -3791,7 +4158,7 @@ mod tests {
         }
 
         #[test]
-        fn rehashed_single_request_field_drift_hits_live_context_closure(field in 0usize..22) {
+        fn rehashed_single_request_field_drift_hits_live_context_closure(field in 0usize..26) {
             let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
             let state = synthetic_state();
             let mut request = synthetic_request(&policy, &state);
@@ -3803,10 +4170,17 @@ mod tests {
                 request,
                 now() + Duration::seconds(2),
             );
-            prop_assert!(matches!(
-                result,
-                Err(ApprovalAuthorityError::RequestContextChanged)
-            ));
+            if field == 21 {
+                prop_assert!(matches!(
+                    result,
+                    Err(ApprovalAuthorityError::ProviderRegistryClockRegression)
+                ));
+            } else {
+                prop_assert!(matches!(
+                    result,
+                    Err(ApprovalAuthorityError::RequestContextChanged)
+                ));
+            }
         }
     }
 
@@ -4064,6 +4438,12 @@ mod tests {
             18 => request.adapter_registry_version = "synthetic-a3-registry-v0".into(),
             19 => request.adapter_registry_revision -= 1,
             20 => request.adapter_registry_digest = "8".repeat(64),
+            21 => request.adapter_registry_freshness.issued_at += Duration::seconds(1),
+            22 => request.adapter_registry_freshness.not_before += Duration::seconds(1),
+            23 => request.adapter_registry_freshness.expires_at += Duration::seconds(1),
+            24 => {
+                request.adapter_registry_freshness.revoked_at = Some(now() + Duration::seconds(30));
+            }
             _ => request.provider_probe_expires_at += Duration::seconds(1),
         }
     }
@@ -4209,6 +4589,10 @@ mod tests {
         RegistryDigest,
         RegistryRevoked,
         RegistryRollback,
+        RegistryFreshness,
+        RegistryClock,
+        RegistryNotYetValid,
+        RegistryExpired,
     }
 
     fn assert_prepare_rejected(
@@ -4271,6 +4655,22 @@ mod tests {
             ApprovalAuthorityErrorKind::RegistryRollback => assert!(matches!(
                 result,
                 Err(ApprovalAuthorityError::ProviderRegistryVersionRollback)
+            )),
+            ApprovalAuthorityErrorKind::RegistryFreshness => assert!(matches!(
+                result,
+                Err(ApprovalAuthorityError::InvalidProviderRegistryFreshness)
+            )),
+            ApprovalAuthorityErrorKind::RegistryClock => assert!(matches!(
+                result,
+                Err(ApprovalAuthorityError::ProviderRegistryClockRegression)
+            )),
+            ApprovalAuthorityErrorKind::RegistryNotYetValid => assert!(matches!(
+                result,
+                Err(ApprovalAuthorityError::ProviderRegistryNotYetValid)
+            )),
+            ApprovalAuthorityErrorKind::RegistryExpired => assert!(matches!(
+                result,
+                Err(ApprovalAuthorityError::ProviderRegistryExpired)
             )),
         }
     }
