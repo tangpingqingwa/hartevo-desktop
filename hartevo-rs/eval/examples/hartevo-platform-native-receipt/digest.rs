@@ -12,20 +12,27 @@ pub fn sha256_json(value: &impl Serialize) -> serde_json::Result<String> {
 
 #[cfg(test)]
 pub fn sha256_canonical_json(value: &Value) -> serde_json::Result<String> {
-    let mut bytes = Vec::new();
-    write_canonical_json(value, &mut bytes)?;
-    Ok(sha256_hex(&bytes))
+    canonical_json_bytes(value).map(|bytes| sha256_hex(&bytes))
 }
 
 pub fn sha256_domain_canonical_json(domain: &str, value: &Value) -> serde_json::Result<String> {
-    let mut canonical = Vec::new();
-    write_canonical_json(value, &mut canonical)?;
-    let mut hasher = Sha256::new();
-    hasher.update((domain.len() as u64).to_be_bytes());
-    hasher.update(domain.as_bytes());
-    hasher.update((canonical.len() as u64).to_be_bytes());
-    hasher.update(canonical);
-    Ok(hex::encode(hasher.finalize()))
+    domain_canonical_json_bytes(domain, value).map(|bytes| sha256_hex(&bytes))
+}
+
+pub fn domain_canonical_json_bytes(domain: &str, value: &Value) -> serde_json::Result<Vec<u8>> {
+    let canonical = canonical_json_bytes(value)?;
+    let mut message = Vec::with_capacity(16 + domain.len() + canonical.len());
+    message.extend_from_slice(&(domain.len() as u64).to_be_bytes());
+    message.extend_from_slice(domain.as_bytes());
+    message.extend_from_slice(&(canonical.len() as u64).to_be_bytes());
+    message.extend_from_slice(&canonical);
+    Ok(message)
+}
+
+fn canonical_json_bytes(value: &Value) -> serde_json::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    write_canonical_json(value, &mut bytes)?;
+    Ok(bytes)
 }
 
 fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> serde_json::Result<()> {
@@ -73,7 +80,10 @@ pub fn is_lower_hex(value: &str, byte_count: usize) -> bool {
 mod tests {
     use serde_json::json;
 
-    use super::{is_lower_hex, sha256_canonical_json, sha256_domain_canonical_json, sha256_hex};
+    use super::{
+        domain_canonical_json_bytes, is_lower_hex, sha256_canonical_json,
+        sha256_domain_canonical_json, sha256_hex,
+    };
 
     #[test]
     fn digest_is_lowercase_sha256() {
@@ -98,6 +108,20 @@ mod tests {
         assert_ne!(
             sha256_domain_canonical_json("domain-a", &payload).expect("digest"),
             sha256_domain_canonical_json("domain-b", &payload).expect("digest")
+        );
+    }
+
+    #[test]
+    fn signed_payload_bytes_are_canonical_and_length_delimited() {
+        let first = json!({"b": 2, "a": 1});
+        let second = json!({"a": 1, "b": 2});
+        assert_eq!(
+            domain_canonical_json_bytes("receipt/v2", &first).expect("message"),
+            domain_canonical_json_bytes("receipt/v2", &second).expect("message")
+        );
+        assert_ne!(
+            domain_canonical_json_bytes("receipt/v2", &first).expect("message"),
+            domain_canonical_json_bytes("receipt/v20", &first).expect("message")
         );
     }
 }

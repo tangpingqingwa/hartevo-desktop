@@ -1,5 +1,6 @@
 mod digest;
 mod model;
+mod signature;
 mod verifier;
 
 use std::collections::BTreeSet;
@@ -15,10 +16,10 @@ use crate::digest::sha256_hex;
 use crate::model::{PlatformMatrix, PlatformReceipt, parse_strict_json};
 use crate::verifier::{
     HOST_ATTESTATION_VERIFIER_AVAILABLE, INVENTORY_AUTHORITY, MatrixValidation,
-    NATIVE_RECEIPT_EMISSION_ALLOWED, PRODUCER_READINESS, RELEASE_DECISION,
-    SIGNATURE_VERIFIER_AVAILABLE, VALIDATION_SCHEMA_VERSION, is_git_tool_unavailable,
-    validate_content_free_receipt_json, validate_matrix, validate_matrix_raw, validate_receipt,
-    validate_receipt_schema, validate_receipt_schema_raw,
+    NATIVE_RECEIPT_EMISSION_ALLOWED, PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE, PRODUCER_READINESS,
+    RELEASE_DECISION, SIGNATURE_VERIFIER_AVAILABLE, VALIDATION_SCHEMA_VERSION,
+    is_git_tool_unavailable, validate_content_free_receipt_json, validate_matrix,
+    validate_matrix_raw, validate_receipt, validate_receipt_schema, validate_receipt_schema_raw,
 };
 
 const MATRIX_PATH: &str = "contracts/platform/matrix.v2.json";
@@ -34,6 +35,7 @@ fn main() {
             "releaseDecision": RELEASE_DECISION,
             "producerReadiness": PRODUCER_READINESS,
             "nativeReceiptEmissionAllowed": NATIVE_RECEIPT_EMISSION_ALLOWED,
+            "persistentNonceReplayGuardAvailable": PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE,
             "validatorStatus": if blocked_environment { "BLOCKED_ENV" } else { "FAIL" },
             "errorCode": if blocked_environment {
                 "GIT_OBJECT_READER_UNAVAILABLE"
@@ -105,6 +107,9 @@ fn run() -> Result<()> {
         "nativeReceiptEmissionAllowed": NATIVE_RECEIPT_EMISSION_ALLOWED,
         "signatureVerifierAvailable": SIGNATURE_VERIFIER_AVAILABLE,
         "hostAttestationVerifierAvailable": HOST_ATTESTATION_VERIFIER_AVAILABLE,
+        "persistentNonceReplayGuardAvailable": PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE,
+        "canonicalPayloadEncoding": matrix.native_producer_policy.canonical_payload_encoding,
+        "signaturePayloadProjection": matrix.native_producer_policy.signature_payload_projection,
         "sourceCommit": matrix.source_commit,
         "matrixVersion": matrix.matrix_version,
         "matrixDigest": matrix_digest,
@@ -152,6 +157,8 @@ fn validate_receipt_inputs(
     let mut summaries = Vec::with_capacity(receipt_paths.len());
     let mut prior_receipt_id = None;
     let mut run_ids = BTreeSet::new();
+    let mut challenge_ids = BTreeSet::new();
+    let mut challenge_nonces = BTreeSet::new();
     let mut challenge_nonce_digests = BTreeSet::new();
     for (index, path) in receipt_paths.iter().enumerate() {
         let bytes = fs::read(PathBuf::from(path))
@@ -180,6 +187,14 @@ fn validate_receipt_inputs(
         ensure!(
             run_ids.insert(summary.run_id.clone()),
             "duplicate native run id"
+        );
+        ensure!(
+            challenge_ids.insert(receipt.challenge_binding.challenge_id.clone()),
+            "duplicate challenge id"
+        );
+        ensure!(
+            challenge_nonces.insert(receipt.challenge_binding.nonce_hex.clone()),
+            "duplicate challenge nonce"
         );
         ensure!(
             challenge_nonce_digests.insert(receipt.challenge_binding.nonce_digest.clone()),

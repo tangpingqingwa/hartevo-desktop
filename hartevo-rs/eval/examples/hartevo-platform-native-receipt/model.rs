@@ -132,6 +132,18 @@ pub enum SignatureAlgorithm {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum CanonicalPayloadEncoding {
+    #[serde(rename = "hartevo_sorted_json/v1")]
+    HartevoSortedJsonV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum SignaturePayloadProjection {
+    #[serde(rename = "receipt_without_signature_and_runner_signature_evidence/v1")]
+    ReceiptWithoutSignatureAndRunnerSignatureEvidenceV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum ReadinessClassification {
     #[serde(rename = "BLOCKED_ENV")]
     BlockedEnv,
@@ -249,8 +261,12 @@ pub struct NativeProducerPolicy {
     pub host_attestation_verifier_available: bool,
     pub real_host_required: bool,
     pub content_free: bool,
+    pub canonical_payload_encoding: CanonicalPayloadEncoding,
+    pub signature_payload_projection: SignaturePayloadProjection,
     pub challenge_nonce_digest_required: bool,
+    pub persistent_nonce_replay_guard_available: bool,
     pub max_challenge_age_seconds: u64,
+    pub max_receipt_age_seconds: u64,
     pub max_run_duration_seconds: u64,
     pub signature_payload_domain: String,
     pub preflight_evidence_kinds: Vec<EvidenceReferenceKind>,
@@ -268,11 +284,19 @@ pub struct ReadinessBlocker {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunnerRevocation {
+    pub revoked_at: String,
+    pub reason_code: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunnerRegistration {
     pub runner_id: String,
     pub runner_identity_digest: String,
     pub registry_epoch: u64,
     pub signing_key_digest: String,
+    pub verification_key_hex: String,
     pub signature_algorithm: SignatureAlgorithm,
     pub producer_binary_digest: String,
     pub valid_from: String,
@@ -280,6 +304,9 @@ pub struct RunnerRegistration {
     pub allowed_receipt_kinds: Vec<ReceiptKind>,
     pub allowed_targets: Vec<String>,
     pub allowed_host_identity_digests: Vec<String>,
+    pub allowed_challenge_issuer_digests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation: Option<RunnerRevocation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -362,6 +389,8 @@ pub struct ProductionBinding {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChallengeBinding {
+    pub challenge_id: String,
+    pub nonce_hex: String,
     pub nonce_digest: String,
     pub issuer_digest: String,
     pub issued_at: String,
@@ -376,6 +405,7 @@ pub struct ReceiptSignature {
     pub signed_payload_digest: String,
     pub signature_reference_id: String,
     pub signature_digest: String,
+    pub signature_hex: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

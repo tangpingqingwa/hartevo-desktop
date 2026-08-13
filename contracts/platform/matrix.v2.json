@@ -1,10 +1,10 @@
 {
   "schemaVersion": "hartevo-platform-matrix/v2",
-  "matrixVersion": "i-01b-native-receipt-matrix/2026-08-13-v2",
+  "matrixVersion": "i-01c-authenticated-receipt-signature/2026-08-13-v2",
   "repositoryId": "tangpingqingwa/hartevo-desktop",
-  "sourceCommit": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+  "sourceCommit": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
   "receiptSchemaUri": "https://hartevo.local/contracts/platform/receipt.schema.v2.json",
-  "receiptSchemaSha256": "28dd733c2456da23eb9782cb666abb3b6fea1b41f3227129e25f3ece7b20d65e",
+  "receiptSchemaSha256": "f1142ff4ca9b0a6723ac285e9f0b197dc3e02914161998a7518aa861f2a8c1b8",
   "evidenceMode": "source_audit_baseline",
   "releaseEligible": false,
   "nativeReceiptCount": 0,
@@ -15,12 +15,16 @@
     "trustedRegistryRequired": true,
     "runnerSignatureRequired": true,
     "signatureAlgorithm": "ed25519",
-    "signatureVerifierAvailable": false,
+    "signatureVerifierAvailable": true,
     "hostAttestationVerifierAvailable": false,
     "realHostRequired": true,
     "contentFree": true,
+    "canonicalPayloadEncoding": "hartevo_sorted_json/v1",
+    "signaturePayloadProjection": "receipt_without_signature_and_runner_signature_evidence/v1",
     "challengeNonceDigestRequired": true,
+    "persistentNonceReplayGuardAvailable": false,
     "maxChallengeAgeSeconds": 300,
+    "maxReceiptAgeSeconds": 600,
     "maxRunDurationSeconds": 3600,
     "signaturePayloadDomain": "hartevo-platform-native-receipt-signature/v2",
     "preflightEvidenceKinds": [
@@ -47,16 +51,16 @@
       "exitCondition": "A privacy-safe actual-host attestation verifier is configured for the exact target OS and architecture."
     },
     {
+      "code": "NONCE_REPLAY_GUARD_NOT_IMPLEMENTED",
+      "classification": "NOT_IMPLEMENTED",
+      "observationSource": "native_producer_preflight:persistent_nonce_replay_guard",
+      "exitCondition": "A durable atomic nonce-consumption ledger is wired to native receipt admission and proves cross-invocation replay rejection."
+    },
+    {
       "code": "RUNNER_REGISTRY_EMPTY",
       "classification": "BLOCKED_ENV",
       "observationSource": "matrix.allowedRunners",
-      "exitCondition": "A reviewed, time-bounded runner registration with target and host allowlists is committed in a separately approved contract update."
-    },
-    {
-      "code": "RUNNER_SIGNATURE_VERIFIER_NOT_IMPLEMENTED",
-      "classification": "NOT_IMPLEMENTED",
-      "observationSource": "native_producer_preflight:compiled_verifier_capabilities",
-      "exitCondition": "A reviewed Ed25519 verifier dependency and canonical signed-payload implementation are added in a separate Cargo-scoped change."
+      "exitCondition": "A reviewed, time-bounded Ed25519 runner registration with challenge issuer, target, and host allowlists is committed in a separately approved contract update."
     }
   ],
   "sourceAuditDispositionCounts": {
@@ -75,7 +79,7 @@
     "missingReceiptDisposition": "aggregate_failure"
   },
   "runnerRegistryEpoch": 0,
-  "runnerRegistryDigest": "de924a0eaed0d3472388b3431ba5df5c396f1a6bd1b51d16bc3c55a38ec8131a",
+  "runnerRegistryDigest": "67875a5baea0ba0b126c86a2ea88d589249fb2ff5ca8084525d80ed3d47da658",
   "allowedRunners": [],
   "prohibitedUpgradeEvidence": [
     "compile_only",
@@ -203,8 +207,8 @@
           "locator": "ChromiumLaunchConfig::default/ManagedChromiumHost::spawn",
           "fact": "Production configuration defaults to PlatformDefault and launches a Unix remote-debugging pipe; existing real smoke is ignored and explicitly mock-keychain.",
           "mode": "100644",
-          "blobSha256": "3ce35bdea1feb1af45db4d861514bd82c692da63263a055f165ed826a4a25dc3",
-          "byteCount": 242711
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
         }
       ]
     },
@@ -272,8 +276,8 @@
           "locator": "spawn_chromium_process",
           "fact": "Unix Chromium launch uses a grouped child process and bounded shutdown; architecture-specific native cleanup evidence is absent.",
           "mode": "100644",
-          "blobSha256": "3ce35bdea1feb1af45db4d861514bd82c692da63263a055f165ed826a4a25dc3",
-          "byteCount": 242711
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
         }
       ]
     },
@@ -304,8 +308,8 @@
           "locator": "ManagedChromiumHost::observe_ax",
           "fact": "Semantic snapshots copy the workspace expected identity digest rather than reading the authenticated provider account.",
           "mode": "100644",
-          "blobSha256": "3ce35bdea1feb1af45db4d861514bd82c692da63263a055f165ed826a4a25dc3",
-          "byteCount": 242711
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
         }
       ]
     },
@@ -427,8 +431,8 @@
           "locator": "ChromiumLaunchConfig::default/ManagedChromiumHost::spawn",
           "fact": "Unix PlatformDefault pipe code is present, while macOS x86_64 has no qualifying native execution.",
           "mode": "100644",
-          "blobSha256": "3ce35bdea1feb1af45db4d861514bd82c692da63263a055f165ed826a4a25dc3",
-          "byteCount": 242711
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
         }
       ]
     },
@@ -496,8 +500,8 @@
           "locator": "spawn_chromium_process",
           "fact": "Unix grouped-child lifecycle code exists; no macOS x86_64 descendant cleanup receipt exists.",
           "mode": "100644",
-          "blobSha256": "3ce35bdea1feb1af45db4d861514bd82c692da63263a055f165ed826a4a25dc3",
-          "byteCount": 242711
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
         }
       ]
     },
@@ -520,8 +524,8 @@
           "locator": "ManagedChromiumHost::observe_ax",
           "fact": "No architecture-independent provider account readback exists; snapshots use the expected identity digest.",
           "mode": "100644",
-          "blobSha256": "3ce35bdea1feb1af45db4d861514bd82c692da63263a055f165ed826a4a25dc3",
-          "byteCount": 242711
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
         }
       ]
     },
@@ -592,8 +596,8 @@
           "locator": "cfg(unix) chromium_host",
           "fact": "The Windows ARM64 target cannot compile a managed Chromium pipe host because the module is Unix-only.",
           "mode": "100644",
-          "blobSha256": "c70471dc6c7a26c3ee5e3bd28d245f66002eaab580fc93892fb011bb08d598b5",
-          "byteCount": 16489
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
         }
       ]
     },
@@ -615,8 +619,8 @@
           "locator": "cfg(unix) chromium_host",
           "fact": "No Windows ARM64 browser host exists to establish a Job Object lifecycle.",
           "mode": "100644",
-          "blobSha256": "c70471dc6c7a26c3ee5e3bd28d245f66002eaab580fc93892fb011bb08d598b5",
-          "byteCount": 16489
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
         }
       ]
     },
@@ -795,8 +799,8 @@
           "locator": "cfg(unix) chromium_host",
           "fact": "Windows ARM64 has neither a browser host nor provider account identity readback.",
           "mode": "100644",
-          "blobSha256": "c70471dc6c7a26c3ee5e3bd28d245f66002eaab580fc93892fb011bb08d598b5",
-          "byteCount": 16489
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
         }
       ]
     },
@@ -819,8 +823,8 @@
           "locator": "cfg(unix) chromium_host",
           "fact": "Windows ARM64 has no authenticated cookie restart or isolation path.",
           "mode": "100644",
-          "blobSha256": "c70471dc6c7a26c3ee5e3bd28d245f66002eaab580fc93892fb011bb08d598b5",
-          "byteCount": 16489
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
         }
       ]
     },
@@ -867,8 +871,8 @@
           "locator": "cfg(unix) chromium_host",
           "fact": "The managed Chromium host and pipe exports are compiled only on Unix.",
           "mode": "100644",
-          "blobSha256": "c70471dc6c7a26c3ee5e3bd28d245f66002eaab580fc93892fb011bb08d598b5",
-          "byteCount": 16489
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
         }
       ]
     },
@@ -890,8 +894,8 @@
           "locator": "cfg(unix) chromium_host",
           "fact": "No Windows browser host exists to assign Chrome descendants to a Job Object.",
           "mode": "100644",
-          "blobSha256": "c70471dc6c7a26c3ee5e3bd28d245f66002eaab580fc93892fb011bb08d598b5",
-          "byteCount": 16489
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
         }
       ]
     },
@@ -1078,8 +1082,8 @@
           "locator": "cfg(unix) chromium_host",
           "fact": "Windows has neither a managed Chromium host nor provider account identity readback.",
           "mode": "100644",
-          "blobSha256": "c70471dc6c7a26c3ee5e3bd28d245f66002eaab580fc93892fb011bb08d598b5",
-          "byteCount": 16489
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
         }
       ]
     },
@@ -1102,8 +1106,8 @@
           "locator": "cfg(unix) chromium_host",
           "fact": "Windows has no managed Chromium runtime or authenticated cookie restart probe.",
           "mode": "100644",
-          "blobSha256": "c70471dc6c7a26c3ee5e3bd28d245f66002eaab580fc93892fb011bb08d598b5",
-          "byteCount": 16489
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
         }
       ]
     },
@@ -1162,8 +1166,8 @@
           "locator": "ManagedChromiumHost::spawn",
           "fact": "The Unix pipe host is available to Linux builds, but no Linux x86_64 native receipt exists.",
           "mode": "100644",
-          "blobSha256": "3ce35bdea1feb1af45db4d861514bd82c692da63263a055f165ed826a4a25dc3",
-          "byteCount": 242711
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
         }
       ]
     },
@@ -1196,8 +1200,8 @@
           "locator": "spawn_chromium_process",
           "fact": "The Unix grouped-child implementation exists, but Linux descendant cleanup has not run natively.",
           "mode": "100644",
-          "blobSha256": "3ce35bdea1feb1af45db4d861514bd82c692da63263a055f165ed826a4a25dc3",
-          "byteCount": 242711
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
         }
       ]
     },
@@ -1289,8 +1293,8 @@
           "locator": "ManagedChromiumHost::observe_ax",
           "fact": "Linux snapshots use the workspace expected identity digest and do not read the provider account.",
           "mode": "100644",
-          "blobSha256": "3ce35bdea1feb1af45db4d861514bd82c692da63263a055f165ed826a4a25dc3",
-          "byteCount": 242711
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
         }
       ]
     },
