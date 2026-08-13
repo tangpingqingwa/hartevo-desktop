@@ -20,7 +20,9 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounde
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
+use sysinfo::{
+    Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, RefreshKind, System, UpdateKind,
+};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -2991,7 +2993,8 @@ pub fn cleanup_runtime_process(
     if let Some(expected) = &target.identity {
         let root = system.process(Pid::from_u32(expected.process_id));
         let root_matches_identity = root.is_some_and(|process| {
-            process.start_time() == expected.started_at_epoch_seconds
+            !process_is_terminal(process)
+                && process.start_time() == expected.started_at_epoch_seconds
                 && process.exe().is_some_and(|path| {
                     digest_hex(path.to_string_lossy().as_bytes()) == expected.executable_path_digest
                 })
@@ -3097,11 +3100,21 @@ fn process_has_launch_token(process: &sysinfo::Process, launch_token: &str) -> b
     })
 }
 
+fn process_is_terminal(process: &sysinfo::Process) -> bool {
+    matches!(
+        process.status(),
+        ProcessStatus::Zombie | ProcessStatus::Dead
+    )
+}
+
 fn processes_for_runtime_claim(system: &System, target: &RuntimeProcessCleanupTarget) -> Vec<Pid> {
     let marker_processes = system
         .processes()
         .iter()
         .filter_map(|(pid, process)| {
+            if process_is_terminal(process) {
+                return None;
+            }
             let executable_matches = process.exe().is_some_and(|path| {
                 digest_hex(path.to_string_lossy().as_bytes())
                     == target.launch_executable_path_digest
@@ -4152,6 +4165,39 @@ wait"#,
             .expect("idempotent cleanup replay");
         assert_eq!(replay.disposition, ProcessCleanupDisposition::AlreadyExited);
         assert_eq!(replay.signalled_process_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn externally_killed_runtime_is_not_reported_as_cleanup_blocked() {
+        let token = "8".repeat(64);
+        let command = pinned_cleanup_fixture_runtime();
+        let launch = prepare_runtime_launch(&command, &token).expect("launch spec");
+        let runtime =
+            StdioRuntime::spawn_prepared(&command, &launch).expect("spawn token-bound runtime");
+        let identity = runtime.process_identity().clone();
+        let kill_status = Command::new("/bin/kill")
+            .args(["-KILL", &identity.process_id.to_string()])
+            .status()
+            .expect("kill runtime fixture");
+        assert!(kill_status.success());
+        std::mem::forget(runtime);
+
+        let target = RuntimeProcessCleanupTarget::new(
+            token,
+            launch.executable_path().to_path_buf(),
+            launch.executable_path_digest().to_owned(),
+            launch.program_sha256().to_owned(),
+            Some(identity),
+        )
+        .expect("exact cleanup target");
+        let report = cleanup_runtime_process(&target, Duration::from_millis(250))
+            .expect("reconcile externally killed runtime");
+        assert!(matches!(
+            report.disposition,
+            ProcessCleanupDisposition::Terminated | ProcessCleanupDisposition::AlreadyExited
+        ));
+        assert_eq!(report.remaining_process_count, 0);
     }
 
     #[cfg(unix)]
