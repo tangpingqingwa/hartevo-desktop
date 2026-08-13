@@ -2363,6 +2363,17 @@ dependencies = [
  "hartevo-cloud-storage",
  "hartevo-domain-kernel",
  "rusqlite",
+]
+
+[[package]]
+name = "hartevo-partner-adapters"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hartevo-domain-kernel",
+ "hex",
+ "ring",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sha2 0.10.9",
