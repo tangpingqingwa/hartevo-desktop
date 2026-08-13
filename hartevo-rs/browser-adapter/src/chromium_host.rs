@@ -31,8 +31,8 @@ use crate::{
     BrowserLeaseProof, BrowserLocatorResolution, BrowserNavigationPolicy, BrowserNavigationReceipt,
     BrowserNavigationTarget, BrowserProfile, BrowserPromptRisk,
     BrowserRecipeExecutionAuthorization, BrowserRecipePreparedPlan, BrowserRecipeRegistry,
-    BrowserRecipeTrustStore, BrowserStableLocator, BrowserTextInput, BrowserWorkspace,
-    FileUploadHandle, SemanticSnapshot,
+    BrowserRecipeResumeContext, BrowserRecipeResumeCursor, BrowserRecipeTrustStore,
+    BrowserStableLocator, BrowserTextInput, BrowserWorkspace, FileUploadHandle, SemanticSnapshot,
 };
 
 const DEFAULT_MAX_FRAME_BYTES: usize = 8 * 1_024 * 1_024;
@@ -211,8 +211,8 @@ pub struct ChromiumHostShutdown {
 /// Digest-only evidence that Chromium accepted the two low-level input
 /// dispatches for one exact Effect-bound semantic click. This is a Provider
 /// receipt, not proof that the intended business operation happened.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChromiumClickDispatchEvidence {
     pub schema_version: u32,
     pub batch_id: BrowserActionBatchId,
@@ -1726,6 +1726,48 @@ impl ManagedChromiumHost {
         let [action] = batch.actions.as_slice() else {
             return Err(BrowserError::RealActionRejected);
         };
+        Self::validate_semantic_write_action_binding(
+            batch,
+            resolution,
+            action,
+            expected_kind,
+            expected_surface,
+            expected_payload_digest,
+        )
+    }
+
+    fn validate_recipe_click_binding(
+        &self,
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        action_index: usize,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserAction, BrowserError> {
+        batch.validate_for(&self.profile, &self.workspace, now)?;
+        resolution.validate()?;
+        let action = batch
+            .actions
+            .get(action_index)
+            .ok_or(BrowserError::RealActionRejected)?;
+        let resolution_digest = resolution.evidence_digest()?;
+        Self::validate_semantic_write_action_binding(
+            batch,
+            resolution,
+            action,
+            BrowserActionKind::Click,
+            BrowserActionSurface::Semantic,
+            &resolution_digest,
+        )
+    }
+
+    fn validate_semantic_write_action_binding(
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        action: &BrowserAction,
+        expected_kind: BrowserActionKind,
+        expected_surface: BrowserActionSurface,
+        expected_payload_digest: &str,
+    ) -> Result<BrowserAction, BrowserError> {
         if batch.effect_binding.is_none()
             || action.kind != expected_kind
             || action.surface != expected_surface
@@ -1756,6 +1798,31 @@ impl ManagedChromiumHost {
         guard: &OperationLeaseGuard<'_>,
     ) -> Result<ChromiumClickPreflight, BrowserError> {
         let action = self.validate_click_binding(batch, resolution, guard.logical_started_at)?;
+        let context = self.load_semantic_target_context(action, batch, resolution, guard)?;
+        let binding = context.input_binding();
+        self.resolve_click_geometry(resolution, &binding, guard)?;
+        self.workspace
+            .validate_agent_lease(&batch.lease, guard.observed_at()?)?;
+        Ok(ChromiumClickPreflight {
+            binding,
+            action_digest: digest_json(&context.action)?,
+            locator_resolution_digest: resolution.evidence_digest()?,
+        })
+    }
+
+    fn preflight_recipe_semantic_click(
+        &mut self,
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        action_index: usize,
+        guard: &OperationLeaseGuard<'_>,
+    ) -> Result<ChromiumClickPreflight, BrowserError> {
+        let action = self.validate_recipe_click_binding(
+            batch,
+            resolution,
+            action_index,
+            guard.logical_started_at,
+        )?;
         let context = self.load_semantic_target_context(action, batch, resolution, guard)?;
         let binding = context.input_binding();
         self.resolve_click_geometry(resolution, &binding, guard)?;
@@ -2148,13 +2215,37 @@ impl ManagedChromiumHost {
         effect: &Effect,
         now: DateTime<Utc>,
     ) -> Result<(Receipt, ChromiumClickDispatchEvidence), ChromiumActionFailure> {
+        self.execute_effect_bound_click_at(batch, resolution, effect, None, now)
+    }
+
+    fn execute_effect_bound_recipe_click_step(
+        &mut self,
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        effect: &Effect,
+        action_index: usize,
+        now: DateTime<Utc>,
+    ) -> Result<(Receipt, ChromiumClickDispatchEvidence), ChromiumActionFailure> {
+        self.execute_effect_bound_click_at(batch, resolution, effect, Some(action_index), now)
+    }
+
+    fn execute_effect_bound_click_at(
+        &mut self,
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        effect: &Effect,
+        action_index: Option<usize>,
+        now: DateTime<Utc>,
+    ) -> Result<(Receipt, ChromiumClickDispatchEvidence), ChromiumActionFailure> {
         batch
             .validate_effect(effect, now)
             .map_err(ChromiumActionFailure::rejected)?;
         let guard = OperationLeaseGuard::new(&batch.lease, now);
-        let preflight = self
-            .preflight_semantic_click(batch, resolution, &guard)
-            .map_err(ChromiumActionFailure::rejected)?;
+        let preflight = match action_index {
+            Some(index) => self.preflight_recipe_semantic_click(batch, resolution, index, &guard),
+            None => self.preflight_semantic_click(batch, resolution, &guard),
+        }
+        .map_err(ChromiumActionFailure::rejected)?;
         let observed_at = guard
             .observed_at()
             .map_err(ChromiumActionFailure::rejected)?;
@@ -2226,10 +2317,13 @@ impl ManagedChromiumHost {
         let response_digest = evidence
             .evidence_digest()
             .map_err(ChromiumActionFailure::uncertain)?;
+        let step_suffix = action_index
+            .and_then(|index| batch.actions.get(index))
+            .map_or_else(String::new, |action| format!("-step-{}", action.sequence));
         let receipt = Receipt {
-            id: ReceiptId::from_stable(format!("chromium-click-receipt-{}", batch.id)),
+            id: ReceiptId::from_stable(format!("chromium-click-receipt-{}{step_suffix}", batch.id)),
             provider: effect.provider.clone(),
-            external_id: format!("chromium-click-batch-{}", batch.id),
+            external_id: format!("chromium-click-batch-{}{step_suffix}", batch.id),
             accepted_at: dispatched_at,
             request_digest: batch.plan_digest.clone(),
             response_digest,
@@ -3376,6 +3470,119 @@ impl EffectExecutor for ManagedChromiumClickExecutor<'_> {
             .host
             .execute_effect_bound_click(&self.batch, &self.resolution, effect, self.now)
         {
+            Ok((receipt, evidence)) => {
+                self.last_evidence = Some(evidence);
+                Ok(receipt)
+            }
+            Err(failure) if failure.external_write_may_have_occurred => {
+                Err(ProviderFailure::Uncertain(failure.error.code().into()))
+            }
+            Err(failure) => Err(ProviderFailure::Rejected(failure.error.code().into())),
+        }
+    }
+}
+
+/// Single-use bridge for exactly the next unacknowledged click in a durable
+/// signed-Recipe cursor. Cursor, Recipe authority, full batch, selected action,
+/// and locator resolution are revalidated before Chromium receives input.
+pub struct ManagedChromiumRecipeClickStepExecutor<'a> {
+    host: &'a mut ManagedChromiumHost,
+    context: BrowserRecipeResumeContext<'a>,
+    cursor: &'a BrowserRecipeResumeCursor,
+    batch: BrowserActionBatch,
+    resolution: BrowserLocatorResolution,
+    recipe_authorization: BrowserRecipeExecutionAuthorization<'a>,
+    action_index: usize,
+    now: DateTime<Utc>,
+    consumed: bool,
+    last_evidence: Option<ChromiumClickDispatchEvidence>,
+}
+
+impl<'a> ManagedChromiumRecipeClickStepExecutor<'a> {
+    pub fn new(
+        host: &'a mut ManagedChromiumHost,
+        context: BrowserRecipeResumeContext<'a>,
+        cursor: &'a BrowserRecipeResumeCursor,
+        resolution: BrowserLocatorResolution,
+        now: DateTime<Utc>,
+    ) -> Result<Self, BrowserError> {
+        cursor.validate_for(context, now)?;
+        let action_index = cursor.next_action_index();
+        let action = context
+            .batch
+            .actions
+            .get(action_index)
+            .ok_or(BrowserError::RecipeScopeMismatch)?;
+        let recipe_authorization = BrowserRecipeExecutionAuthorization::new(
+            context.prepared_plan.clone(),
+            context.registry,
+            context.trust,
+            context.batch,
+            now,
+        )?;
+        let selected =
+            host.validate_recipe_click_binding(context.batch, &resolution, action_index, now)?;
+        if &selected != action {
+            return Err(BrowserError::RecipeScopeMismatch);
+        }
+        recipe_authorization.validate_resolution(action, &resolution)?;
+        Ok(Self {
+            host,
+            context,
+            cursor,
+            batch: context.batch.clone(),
+            resolution,
+            recipe_authorization,
+            action_index,
+            now,
+            consumed: false,
+            last_evidence: None,
+        })
+    }
+
+    pub fn last_evidence(&self) -> Option<&ChromiumClickDispatchEvidence> {
+        self.last_evidence.as_ref()
+    }
+}
+
+impl fmt::Debug for ManagedChromiumRecipeClickStepExecutor<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedChromiumRecipeClickStepExecutor")
+            .field("batch_id", &self.batch.id)
+            .field("workspace_id", &self.batch.workspace_id)
+            .field("action_index", &self.action_index)
+            .field("cursor_revision", &self.cursor.revision())
+            .field("consumed", &self.consumed)
+            .field("has_evidence", &self.last_evidence.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl EffectExecutor for ManagedChromiumRecipeClickStepExecutor<'_> {
+    fn execute(&mut self, effect: &Effect) -> Result<Receipt, ProviderFailure> {
+        if self.consumed {
+            return Err(ProviderFailure::Uncertain(
+                BrowserError::RealActionRejected.code().into(),
+            ));
+        }
+        self.consumed = true;
+        if let Err(error) = self.cursor.validate_for(self.context, self.now) {
+            return Err(ProviderFailure::Rejected(error.code().into()));
+        }
+        if let Err(error) = self
+            .recipe_authorization
+            .validate_effect(&self.batch, effect, self.now)
+        {
+            return Err(ProviderFailure::Rejected(error.code().into()));
+        }
+        match self.host.execute_effect_bound_recipe_click_step(
+            &self.batch,
+            &self.resolution,
+            effect,
+            self.action_index,
+            self.now,
+        ) {
             Ok((receipt, evidence)) => {
                 self.last_evidence = Some(evidence);
                 Ok(receipt)

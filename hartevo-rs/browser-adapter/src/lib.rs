@@ -25,6 +25,8 @@ mod profile_dir;
 mod real_chromium_signed_recipe_test;
 mod recipe;
 #[cfg(unix)]
+mod recipe_resume;
+#[cfg(unix)]
 mod scanner;
 mod workspace;
 
@@ -37,7 +39,8 @@ pub use chromium_host::{
     ChromiumClickDispatchEvidence, ChromiumCredentialStoreMode, ChromiumFileUploadDispatchEvidence,
     ChromiumHostHealth, ChromiumHostShutdown, ChromiumLaunchConfig,
     ChromiumTextInputDispatchEvidence, ManagedChromiumClickExecutor,
-    ManagedChromiumFileUploadExecutor, ManagedChromiumHost, ManagedChromiumTextInputExecutor,
+    ManagedChromiumFileUploadExecutor, ManagedChromiumHost, ManagedChromiumRecipeClickStepExecutor,
+    ManagedChromiumTextInputExecutor,
 };
 pub use fake_host::{
     BrowserActionResult, BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost,
@@ -59,6 +62,8 @@ pub use recipe::{
     BrowserRecipeResolvedAction, BrowserRecipeStep, BrowserRecipeStepBinding,
     BrowserRecipeTrustSnapshot, BrowserRecipeTrustStore, TrustedBrowserRecipeKey,
 };
+#[cfg(unix)]
+pub use recipe_resume::{BrowserRecipeResumeContext, BrowserRecipeResumeCursor};
 #[cfg(unix)]
 pub use scanner::{ProductionFileScanner, ScannerProcessLimits, ScannerReleasePin};
 pub use workspace::{
