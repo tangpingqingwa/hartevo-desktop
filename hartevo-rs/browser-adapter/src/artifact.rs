@@ -512,6 +512,395 @@ impl BrowserArtifactResultLog {
     }
 }
 
+/// Typed request from the quarantine provider to a File Inspection consumer.
+///
+/// It carries no native path or executable authority.  Every source and byte
+/// fact is copied from the immutable [`BrowserArtifactQuarantineReceipt`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserArtifactFileInspectionRequest {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub provider_generation: u64,
+    pub sequence: u64,
+    pub receipt_digest: String,
+    pub artifact_id: String,
+    pub scope: BrowserArtifactScope,
+    pub frame: BrowserArtifactFrameRevision,
+    pub quarantine_ref: String,
+    pub bytes_digest: String,
+    pub media_type: String,
+    pub byte_count: u64,
+    pub source_url: String,
+    pub source_origin: String,
+    pub requested_at: DateTime<Utc>,
+}
+
+impl BrowserArtifactFileInspectionRequest {
+    fn from_receipt(
+        request_id: String,
+        receipt: &BrowserArtifactQuarantineReceipt,
+        requested_at: DateTime<Utc>,
+    ) -> Result<Self, BrowserError> {
+        let request = Self {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            request_id,
+            provider_generation: receipt.provider_generation,
+            sequence: receipt.sequence,
+            receipt_digest: receipt.evidence_digest()?,
+            artifact_id: receipt.artifact_id.clone(),
+            scope: receipt.scope.clone(),
+            frame: receipt.frame.clone(),
+            quarantine_ref: receipt.quarantine_ref.clone(),
+            bytes_digest: receipt.bytes_digest.clone(),
+            media_type: receipt.media_type.clone(),
+            byte_count: receipt.byte_count,
+            source_url: receipt.source_url.clone(),
+            source_origin: receipt.source_origin.clone(),
+            requested_at,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> Result<(), BrowserError> {
+        if self.schema_version != ARTIFACT_SCHEMA_VERSION
+            || !is_sha256(&self.request_id)
+            || self.provider_generation == 0
+            || self.sequence == 0
+            || !is_sha256(&self.receipt_digest)
+            || !is_bounded_identifier(&self.artifact_id)
+            || !is_sha256(&self.quarantine_ref)
+            || !is_sha256(&self.bytes_digest)
+            || self.byte_count > MAX_ARTIFACT_BYTES as u64
+            || !valid_media_type(&self.media_type)
+        {
+            return Err(BrowserError::ArtifactInspectionInvalid);
+        }
+        self.scope.validate()?;
+        self.frame
+            .validate_for(
+                &self.scope,
+                &BrowserLeaseProof {
+                    workspace_id: self.scope.workspace_id.clone(),
+                    lease_id: hartevo_domain_kernel::BrowserControlLeaseId::from(
+                        "inspection-request-validation",
+                    ),
+                    generation: self.frame.lease_generation,
+                },
+            )
+            .map_err(|_| BrowserError::ArtifactInspectionInvalid)?;
+        let (canonical_url, canonical_origin) = canonical_source_identity(&self.source_url)
+            .map_err(|_| BrowserError::ArtifactInspectionInvalid)?;
+        if canonical_url != self.source_url
+            || canonical_origin != self.source_origin
+            || digest(self.source_url.as_bytes()) != self.frame.url_digest
+            || digest(self.source_origin.as_bytes()) != self.frame.origin_digest
+        {
+            return Err(BrowserError::ArtifactInspectionInvalid);
+        }
+        Ok(())
+    }
+
+    fn matches_receipt(&self, receipt: &BrowserArtifactQuarantineReceipt) -> bool {
+        self.provider_generation == receipt.provider_generation
+            && self.sequence == receipt.sequence
+            && self.receipt_digest
+                == receipt
+                    .evidence_digest()
+                    .ok()
+                    .as_deref()
+                    .unwrap_or_default()
+            && self.artifact_id == receipt.artifact_id
+            && self.scope == receipt.scope
+            && self.frame == receipt.frame
+            && self.quarantine_ref == receipt.quarantine_ref
+            && self.bytes_digest == receipt.bytes_digest
+            && self.media_type == receipt.media_type
+            && self.byte_count == receipt.byte_count
+            && self.source_url == receipt.source_url
+            && self.source_origin == receipt.source_origin
+    }
+
+    pub fn evidence_digest(&self) -> Result<String, BrowserError> {
+        self.validate()?;
+        digest_json(self)
+    }
+}
+
+/// The only result that can transition a quarantined artifact to adoption is
+/// `Clean`; every other verdict is terminally rejected by the provider.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserArtifactInspectionVerdict {
+    Clean,
+    Malware,
+    Tampered,
+    Unknown,
+    ScannerUnavailable,
+}
+
+/// Scanner identity/evidence supplied with one inspection result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserArtifactInspectionEvidence {
+    pub verdict: BrowserArtifactInspectionVerdict,
+    pub inspector_id: String,
+    pub inspector_version: String,
+    pub scanner_evidence_digest: String,
+    pub inspected_at: DateTime<Utc>,
+}
+
+/// Typed result returned by a File Inspection consumer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserArtifactFileInspectionResult {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub verdict: BrowserArtifactInspectionVerdict,
+    pub receipt_digest: String,
+    pub artifact_id: String,
+    pub scope: BrowserArtifactScope,
+    pub frame: BrowserArtifactFrameRevision,
+    pub quarantine_ref: String,
+    pub bytes_digest: String,
+    pub media_type: String,
+    pub byte_count: u64,
+    pub source_url: String,
+    pub source_origin: String,
+    pub inspector_id: String,
+    pub inspector_version: String,
+    pub scanner_evidence_digest: String,
+    pub inspected_at: DateTime<Utc>,
+}
+
+impl BrowserArtifactFileInspectionResult {
+    pub fn from_request(
+        request: &BrowserArtifactFileInspectionRequest,
+        evidence: BrowserArtifactInspectionEvidence,
+    ) -> Result<Self, BrowserError> {
+        let result = Self {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            request_id: request.request_id.clone(),
+            verdict: evidence.verdict,
+            receipt_digest: request.receipt_digest.clone(),
+            artifact_id: request.artifact_id.clone(),
+            scope: request.scope.clone(),
+            frame: request.frame.clone(),
+            quarantine_ref: request.quarantine_ref.clone(),
+            bytes_digest: request.bytes_digest.clone(),
+            media_type: request.media_type.clone(),
+            byte_count: request.byte_count,
+            source_url: request.source_url.clone(),
+            source_origin: request.source_origin.clone(),
+            inspector_id: evidence.inspector_id,
+            inspector_version: evidence.inspector_version,
+            scanner_evidence_digest: evidence.scanner_evidence_digest,
+            inspected_at: evidence.inspected_at,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    pub fn validate(&self) -> Result<(), BrowserError> {
+        if self.schema_version != ARTIFACT_SCHEMA_VERSION
+            || !is_sha256(&self.request_id)
+            || !is_sha256(&self.receipt_digest)
+            || !is_bounded_identifier(&self.artifact_id)
+            || !is_sha256(&self.quarantine_ref)
+            || !is_sha256(&self.bytes_digest)
+            || self.byte_count > MAX_ARTIFACT_BYTES as u64
+            || !is_bounded_identifier(&self.inspector_id)
+            || !is_bounded_identifier(&self.inspector_version)
+            || !is_sha256(&self.scanner_evidence_digest)
+            || !valid_media_type(&self.media_type)
+        {
+            return Err(BrowserError::ArtifactInspectionInvalid);
+        }
+        self.scope.validate()?;
+        self.frame
+            .validate_for(
+                &self.scope,
+                &BrowserLeaseProof {
+                    workspace_id: self.scope.workspace_id.clone(),
+                    lease_id: hartevo_domain_kernel::BrowserControlLeaseId::from(
+                        "inspection-result-validation",
+                    ),
+                    generation: self.frame.lease_generation,
+                },
+            )
+            .map_err(|_| BrowserError::ArtifactInspectionInvalid)?;
+        let (canonical_url, canonical_origin) = canonical_source_identity(&self.source_url)
+            .map_err(|_| BrowserError::ArtifactInspectionInvalid)?;
+        if canonical_url != self.source_url
+            || canonical_origin != self.source_origin
+            || digest(self.source_url.as_bytes()) != self.frame.url_digest
+            || digest(self.source_origin.as_bytes()) != self.frame.origin_digest
+        {
+            return Err(BrowserError::ArtifactInspectionInvalid);
+        }
+        Ok(())
+    }
+
+    fn matches_request(&self, request: &BrowserArtifactFileInspectionRequest) -> bool {
+        self.request_id == request.request_id
+            && self.receipt_digest == request.receipt_digest
+            && self.artifact_id == request.artifact_id
+            && self.scope == request.scope
+            && self.frame == request.frame
+            && self.quarantine_ref == request.quarantine_ref
+            && self.bytes_digest == request.bytes_digest
+            && self.media_type == request.media_type
+            && self.byte_count == request.byte_count
+            && self.source_url == request.source_url
+            && self.source_origin == request.source_origin
+            && self.inspected_at >= request.requested_at
+    }
+
+    pub fn evidence_digest(&self) -> Result<String, BrowserError> {
+        self.validate()?;
+        digest_json(self)
+    }
+}
+
+/// A scanner/inspection implementation consumes only a typed request and
+/// returns a typed result.  It cannot return a path or an execution command.
+pub trait BrowserArtifactInspector {
+    fn inspect(
+        &mut self,
+        request: &BrowserArtifactFileInspectionRequest,
+    ) -> Result<BrowserArtifactFileInspectionResult, BrowserError>;
+}
+
+/// Explicit NOT_EVALUATED boundary when no real scanner is available.
+#[derive(Debug, Default)]
+pub struct UnavailableBrowserArtifactInspector;
+
+impl BrowserArtifactInspector for UnavailableBrowserArtifactInspector {
+    fn inspect(
+        &mut self,
+        _request: &BrowserArtifactFileInspectionRequest,
+    ) -> Result<BrowserArtifactFileInspectionResult, BrowserError> {
+        Err(BrowserError::ArtifactInspectionUnavailable)
+    }
+}
+
+/// Adoption authorization is a receipt only.  It never opens, executes, or
+/// moves the quarantined bytes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserArtifactSafeForAdoption {
+    pub schema_version: u32,
+    pub provider_generation: u64,
+    pub request_id: String,
+    pub artifact_id: String,
+    pub receipt_digest: String,
+    pub scope: BrowserArtifactScope,
+    pub frame: BrowserArtifactFrameRevision,
+    pub quarantine_ref: String,
+    pub bytes_digest: String,
+    pub media_type: String,
+    pub byte_count: u64,
+    pub source_url: String,
+    pub source_origin: String,
+    pub inspector_id: String,
+    pub inspector_version: String,
+    pub scanner_evidence_digest: String,
+    pub inspected_at: DateTime<Utc>,
+    pub state: BrowserArtifactAdoptionState,
+    pub opened: bool,
+    pub execution_permitted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserArtifactAdoptionState {
+    SafeForAdoption,
+}
+
+impl BrowserArtifactSafeForAdoption {
+    fn from_result(
+        provider_generation: u64,
+        result: &BrowserArtifactFileInspectionResult,
+    ) -> Result<Self, BrowserError> {
+        if result.verdict != BrowserArtifactInspectionVerdict::Clean {
+            return Err(BrowserError::ArtifactInspectionRejected);
+        }
+        let adoption = Self {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            provider_generation,
+            request_id: result.request_id.clone(),
+            artifact_id: result.artifact_id.clone(),
+            receipt_digest: result.receipt_digest.clone(),
+            scope: result.scope.clone(),
+            frame: result.frame.clone(),
+            quarantine_ref: result.quarantine_ref.clone(),
+            bytes_digest: result.bytes_digest.clone(),
+            media_type: result.media_type.clone(),
+            byte_count: result.byte_count,
+            source_url: result.source_url.clone(),
+            source_origin: result.source_origin.clone(),
+            inspector_id: result.inspector_id.clone(),
+            inspector_version: result.inspector_version.clone(),
+            scanner_evidence_digest: result.scanner_evidence_digest.clone(),
+            inspected_at: result.inspected_at,
+            state: BrowserArtifactAdoptionState::SafeForAdoption,
+            opened: false,
+            execution_permitted: false,
+        };
+        adoption.validate()?;
+        Ok(adoption)
+    }
+
+    pub fn validate(&self) -> Result<(), BrowserError> {
+        if self.schema_version != ARTIFACT_SCHEMA_VERSION
+            || self.provider_generation == 0
+            || !is_sha256(&self.request_id)
+            || !is_bounded_identifier(&self.artifact_id)
+            || !is_sha256(&self.receipt_digest)
+            || !is_sha256(&self.quarantine_ref)
+            || !is_sha256(&self.bytes_digest)
+            || self.byte_count > MAX_ARTIFACT_BYTES as u64
+            || !valid_media_type(&self.media_type)
+            || !is_bounded_identifier(&self.inspector_id)
+            || !is_bounded_identifier(&self.inspector_version)
+            || !is_sha256(&self.scanner_evidence_digest)
+            || self.state != BrowserArtifactAdoptionState::SafeForAdoption
+            || self.opened
+            || self.execution_permitted
+        {
+            return Err(BrowserError::ArtifactInspectionInvalid);
+        }
+        self.scope.validate()?;
+        self.frame
+            .validate_for(
+                &self.scope,
+                &BrowserLeaseProof {
+                    workspace_id: self.scope.workspace_id.clone(),
+                    lease_id: hartevo_domain_kernel::BrowserControlLeaseId::from(
+                        "adoption-validation",
+                    ),
+                    generation: self.frame.lease_generation,
+                },
+            )
+            .map_err(|_| BrowserError::ArtifactInspectionInvalid)?;
+        let (canonical_url, canonical_origin) = canonical_source_identity(&self.source_url)
+            .map_err(|_| BrowserError::ArtifactInspectionInvalid)?;
+        if canonical_url != self.source_url
+            || canonical_origin != self.source_origin
+            || digest(self.source_url.as_bytes()) != self.frame.url_digest
+            || digest(self.source_origin.as_bytes()) != self.frame.origin_digest
+        {
+            return Err(BrowserError::ArtifactInspectionInvalid);
+        }
+        Ok(())
+    }
+
+    pub fn evidence_digest(&self) -> Result<String, BrowserError> {
+        self.validate()?;
+        digest_json(self)
+    }
+}
+
 /// Provider lifecycle used to fail closed after restart, revoke, or a stale
 /// frame observation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -557,6 +946,11 @@ pub struct BrowserArtifactPlugin {
     result_log: BrowserArtifactResultLog,
     captured: BTreeMap<String, BrowserArtifactQuarantineReceipt>,
     delivered: BTreeSet<String>,
+    pending_inspections: BTreeMap<String, BrowserArtifactFileInspectionRequest>,
+    completed_inspections: BTreeSet<String>,
+    rejected_inspections: BTreeSet<String>,
+    safe_adoptions: BTreeMap<String, BrowserArtifactSafeForAdoption>,
+    next_inspection_sequence: u64,
 }
 
 impl BrowserArtifactPlugin {
@@ -577,6 +971,11 @@ impl BrowserArtifactPlugin {
             result_log,
             captured: BTreeMap::new(),
             delivered: BTreeSet::new(),
+            pending_inspections: BTreeMap::new(),
+            completed_inspections: BTreeSet::new(),
+            rejected_inspections: BTreeSet::new(),
+            safe_adoptions: BTreeMap::new(),
+            next_inspection_sequence: 1,
         })
     }
 
@@ -616,6 +1015,11 @@ impl BrowserArtifactPlugin {
             result_log: new_log,
             captured,
             delivered: BTreeSet::new(),
+            pending_inspections: BTreeMap::new(),
+            completed_inspections: BTreeSet::new(),
+            rejected_inspections: BTreeSet::new(),
+            safe_adoptions: BTreeMap::new(),
+            next_inspection_sequence: 1,
         })
     }
 
@@ -635,6 +1039,7 @@ impl BrowserArtifactPlugin {
         match self.state {
             BrowserArtifactProviderState::Mounted | BrowserArtifactProviderState::Invalidated => {
                 self.state = BrowserArtifactProviderState::Restarted;
+                self.clear_inspection_state();
                 Ok(())
             }
             BrowserArtifactProviderState::Revoked => Err(BrowserError::ArtifactProviderRevoked),
@@ -660,6 +1065,7 @@ impl BrowserArtifactPlugin {
         }
         profile.revoke(expected_revision, evidence_digest, now)?;
         self.state = BrowserArtifactProviderState::Revoked;
+        self.clear_inspection_state();
         Ok(())
     }
 
@@ -762,6 +1168,168 @@ impl BrowserArtifactPlugin {
         Ok(())
     }
 
+    /// Unmounts the provider and reclaims every pending inspection cursor.
+    pub fn unmount(&mut self) -> Result<(), BrowserError> {
+        self.restart()
+    }
+
+    /// Creates one typed File Inspection request from one exact quarantine
+    /// receipt.  A second request for the same receipt is rejected.
+    pub fn prepare_file_inspection(
+        &mut self,
+        receipt: &BrowserArtifactQuarantineReceipt,
+        requested_at: DateTime<Utc>,
+    ) -> Result<BrowserArtifactFileInspectionRequest, BrowserError> {
+        self.ensure_mounted()?;
+        receipt.validate()?;
+        if receipt.provider_generation != self.provider_generation
+            || receipt.scope != self.scope
+            || self.captured.get(&receipt.artifact_id) != Some(receipt)
+        {
+            return Err(BrowserError::ArtifactProviderRestarted);
+        }
+        if requested_at < receipt.observed_at {
+            return Err(BrowserError::ArtifactInspectionInvalid);
+        }
+        let receipt_digest = receipt.evidence_digest()?;
+        if self.rejected_inspections.contains(&receipt_digest)
+            || self.completed_inspections.contains(&receipt_digest)
+            || self
+                .pending_inspections
+                .values()
+                .any(|request| request.receipt_digest == receipt_digest)
+            || self.safe_adoptions.contains_key(&receipt.artifact_id)
+        {
+            return Err(BrowserError::ArtifactInspectionDuplicate);
+        }
+        let sequence = self.next_inspection_sequence;
+        self.next_inspection_sequence = self
+            .next_inspection_sequence
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        let request_id = digest_json(&(
+            self.provider_generation,
+            sequence,
+            &receipt_digest,
+            requested_at,
+        ))?;
+        let request =
+            BrowserArtifactFileInspectionRequest::from_receipt(request_id, receipt, requested_at)?;
+        if !request.matches_receipt(receipt) {
+            return Err(BrowserError::ArtifactInspectionInvalid);
+        }
+        if self
+            .pending_inspections
+            .insert(request.request_id.clone(), request.clone())
+            .is_some()
+        {
+            return Err(BrowserError::ArtifactInspectionDuplicate);
+        }
+        Ok(request)
+    }
+
+    /// Runs one typed inspector and closes the request exactly once.
+    pub fn inspect_pending<I: BrowserArtifactInspector>(
+        &mut self,
+        inspector: &mut I,
+        request_id: &str,
+    ) -> Result<BrowserArtifactSafeForAdoption, BrowserError> {
+        self.ensure_mounted()?;
+        let request = self
+            .pending_inspections
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| self.reopened_or_invalid_request(request_id))?;
+        let result = match inspector.inspect(&request) {
+            Ok(result) => result,
+            Err(error) => {
+                self.reject_inspection(&request);
+                return Err(error);
+            }
+        };
+        self.submit_file_inspection_result(&request, &result)
+    }
+
+    /// Accepts one typed File Inspection result and marks the artifact
+    /// `SafeForAdoption` only after every original receipt field matches.
+    pub fn submit_file_inspection_result(
+        &mut self,
+        request: &BrowserArtifactFileInspectionRequest,
+        result: &BrowserArtifactFileInspectionResult,
+    ) -> Result<BrowserArtifactSafeForAdoption, BrowserError> {
+        self.ensure_mounted()?;
+        let pending = self
+            .pending_inspections
+            .get(&request.request_id)
+            .cloned()
+            .ok_or_else(|| self.reopened_or_invalid_request(&request.request_id))?;
+        if pending != *request {
+            self.reject_inspection(&pending);
+            return Err(BrowserError::ArtifactInspectionInvalid);
+        }
+        if let Err(error) = request.validate() {
+            self.reject_inspection(&pending);
+            return Err(error);
+        }
+        if let Err(error) = result.validate() {
+            self.reject_inspection(&pending);
+            return Err(error);
+        }
+        if !result.matches_request(&pending) {
+            self.reject_inspection(&pending);
+            return Err(BrowserError::ArtifactInspectionInvalid);
+        }
+        if result.verdict != BrowserArtifactInspectionVerdict::Clean {
+            self.reject_inspection(&pending);
+            return Err(
+                if result.verdict == BrowserArtifactInspectionVerdict::ScannerUnavailable {
+                    BrowserError::ArtifactInspectionUnavailable
+                } else {
+                    BrowserError::ArtifactInspectionRejected
+                },
+            );
+        }
+        let adoption =
+            match BrowserArtifactSafeForAdoption::from_result(self.provider_generation, result) {
+                Ok(adoption) => adoption,
+                Err(error) => {
+                    self.reject_inspection(&pending);
+                    return Err(error);
+                }
+            };
+        self.pending_inspections.remove(&pending.request_id);
+        self.completed_inspections
+            .insert(pending.request_id.clone());
+        self.completed_inspections
+            .insert(pending.receipt_digest.clone());
+        if self
+            .safe_adoptions
+            .insert(adoption.artifact_id.clone(), adoption.clone())
+            .is_some()
+        {
+            return Err(BrowserError::ArtifactInspectionDuplicate);
+        }
+        Ok(adoption)
+    }
+
+    pub fn safe_for_adoption(
+        &self,
+        artifact_id: &str,
+    ) -> Result<&BrowserArtifactSafeForAdoption, BrowserError> {
+        self.ensure_mounted()?;
+        self.safe_adoptions
+            .get(artifact_id)
+            .ok_or(BrowserError::ArtifactNotSafeForAdoption)
+    }
+
+    pub fn pending_inspection_count(&self) -> usize {
+        self.pending_inspections.len()
+    }
+
+    pub fn safe_adoption_count(&self) -> usize {
+        self.safe_adoptions.len()
+    }
+
     fn ensure_mounted(&self) -> Result<(), BrowserError> {
         match self.state {
             BrowserArtifactProviderState::Mounted => Ok(()),
@@ -775,6 +1343,7 @@ impl BrowserArtifactPlugin {
 
     fn invalidate(&mut self, error: BrowserError) -> BrowserError {
         self.state = BrowserArtifactProviderState::Invalidated;
+        self.clear_inspection_state();
         error
     }
 
@@ -787,10 +1356,34 @@ impl BrowserArtifactPlugin {
                 | BrowserError::ProtocolUnavailable
         ) {
             self.state = BrowserArtifactProviderState::Restarted;
+            self.clear_inspection_state();
         } else if matches!(error, BrowserError::ArtifactFrameStale) {
             self.state = BrowserArtifactProviderState::Invalidated;
+            self.clear_inspection_state();
         }
         error
+    }
+
+    fn reject_inspection(&mut self, request: &BrowserArtifactFileInspectionRequest) {
+        self.pending_inspections.remove(&request.request_id);
+        self.rejected_inspections.insert(request.request_id.clone());
+        self.rejected_inspections
+            .insert(request.receipt_digest.clone());
+    }
+
+    fn reopened_or_invalid_request(&self, request_id: &str) -> BrowserError {
+        if self.rejected_inspections.contains(request_id)
+            || self.completed_inspections.contains(request_id)
+        {
+            BrowserError::ArtifactInspectionReopened
+        } else {
+            BrowserError::ArtifactInspectionInvalid
+        }
+    }
+
+    fn clear_inspection_state(&mut self) {
+        self.pending_inspections.clear();
+        self.safe_adoptions.clear();
     }
 }
 
@@ -1012,6 +1605,34 @@ mod tests {
         .expect("capture")
     }
 
+    fn mounted_inspection_fixture(
+        profile: &BrowserProfile,
+        workspace: &BrowserWorkspace,
+        scope: BrowserArtifactScope,
+        frame: BrowserArtifactFrameRevision,
+        artifact_id: &str,
+    ) -> (
+        BrowserArtifactPlugin,
+        BrowserArtifactQuarantineReceipt,
+        BrowserArtifactFileInspectionRequest,
+    ) {
+        let mut plugin = BrowserArtifactPlugin::mount(profile, workspace, scope).expect("mount");
+        let mut host = FakeArtifactHost {
+            frame: frame.clone(),
+            capture: Some(capture(frame, artifact_id)),
+            second_frame: None,
+            fail_closed: None,
+        };
+        let proof = workspace.agent_lease_proof(now()).expect("lease");
+        let receipt = plugin
+            .capture_download(&mut host, profile, workspace, &proof, artifact_id, now())
+            .expect("capture");
+        let request = plugin
+            .prepare_file_inspection(&receipt, now() + Duration::seconds(1))
+            .expect("request");
+        (plugin, receipt, request)
+    }
+
     #[derive(Default)]
     struct Sink {
         receipts: Vec<BrowserArtifactQuarantineReceipt>,
@@ -1024,6 +1645,43 @@ mod tests {
         ) -> Result<(), BrowserError> {
             self.receipts.push(receipt.clone());
             Ok(())
+        }
+    }
+
+    struct FakeInspector {
+        verdict: BrowserArtifactInspectionVerdict,
+        tamper_bytes: bool,
+        tamper_frame_and_source: bool,
+    }
+
+    impl BrowserArtifactInspector for FakeInspector {
+        fn inspect(
+            &mut self,
+            request: &BrowserArtifactFileInspectionRequest,
+        ) -> Result<BrowserArtifactFileInspectionResult, BrowserError> {
+            let mut result = BrowserArtifactFileInspectionResult::from_request(
+                request,
+                BrowserArtifactInspectionEvidence {
+                    verdict: self.verdict,
+                    inspector_id: "fake-inspector".into(),
+                    inspector_version: "fixture-1".into(),
+                    scanner_evidence_digest: sha('e'),
+                    inspected_at: request.requested_at + Duration::seconds(1),
+                },
+            )?;
+            if self.tamper_bytes {
+                result.bytes_digest = sha('f');
+            }
+            if self.tamper_frame_and_source {
+                let source_url = "https://example.com/research/other.pdf".to_owned();
+                result.source_url = source_url.clone();
+                result.source_origin = "https://example.com".into();
+                result.frame = BrowserArtifactFrameRevision {
+                    url_digest: digest(source_url.as_bytes()),
+                    ..result.frame
+                };
+            }
+            Ok(result)
         }
     }
 
@@ -1059,6 +1717,276 @@ mod tests {
         assert!(!receipt.execution_permitted);
         assert_eq!(plugin.result_log().entries.len(), 1);
         assert!(!format!("{receipt:?}").contains("research evidence"));
+    }
+
+    #[test]
+    fn clean_file_inspection_exactly_matches_receipt_and_marks_safe_for_adoption() {
+        let (profile, workspace, scope, frame) = fixture();
+        let mut plugin = BrowserArtifactPlugin::mount(&profile, &workspace, scope).expect("mount");
+        let mut host = FakeArtifactHost {
+            frame: frame.clone(),
+            capture: Some(capture(frame, "artifact-inspection-clean")),
+            second_frame: None,
+            fail_closed: None,
+        };
+        let proof = workspace.agent_lease_proof(now()).expect("lease");
+        let receipt = plugin
+            .capture_download(
+                &mut host,
+                &profile,
+                &workspace,
+                &proof,
+                "artifact-inspection-clean",
+                now(),
+            )
+            .expect("capture");
+        let request = plugin
+            .prepare_file_inspection(&receipt, now() + Duration::seconds(1))
+            .expect("inspection request");
+        assert_eq!(request.artifact_id, receipt.artifact_id);
+        assert_eq!(
+            request.receipt_digest,
+            receipt.evidence_digest().expect("receipt digest")
+        );
+        assert_eq!(request.bytes_digest, receipt.bytes_digest);
+        assert_eq!(request.media_type, receipt.media_type);
+        assert_eq!(request.byte_count, receipt.byte_count);
+        assert_eq!(request.source_url, receipt.source_url);
+        assert_eq!(request.source_origin, receipt.source_origin);
+        assert_eq!(request.frame, receipt.frame);
+        assert_eq!(plugin.pending_inspection_count(), 1);
+        assert!(matches!(
+            plugin.prepare_file_inspection(&receipt, now() + Duration::seconds(2)),
+            Err(BrowserError::ArtifactInspectionDuplicate)
+        ));
+
+        let mut inspector = FakeInspector {
+            verdict: BrowserArtifactInspectionVerdict::Clean,
+            tamper_bytes: false,
+            tamper_frame_and_source: false,
+        };
+        let adoption = plugin
+            .inspect_pending(&mut inspector, &request.request_id)
+            .expect("safe adoption");
+        assert_eq!(
+            adoption.state,
+            BrowserArtifactAdoptionState::SafeForAdoption
+        );
+        assert_eq!(adoption.receipt_digest, request.receipt_digest);
+        assert_eq!(adoption.bytes_digest, receipt.bytes_digest);
+        assert_eq!(adoption.byte_count, receipt.byte_count);
+        assert_eq!(adoption.source_url, receipt.source_url);
+        assert_eq!(adoption.frame, receipt.frame);
+        assert!(!adoption.opened);
+        assert!(!adoption.execution_permitted);
+        assert_eq!(plugin.safe_adoption_count(), 1);
+        assert_eq!(
+            plugin
+                .safe_for_adoption(&receipt.artifact_id)
+                .expect("safe")
+                .state,
+            adoption.state
+        );
+        assert!(matches!(
+            plugin.inspect_pending(&mut inspector, &request.request_id),
+            Err(BrowserError::ArtifactInspectionReopened)
+        ));
+    }
+
+    #[test]
+    fn tampered_inspection_never_marks_safe_and_cannot_reopen() {
+        let (profile, workspace, scope, frame) = fixture();
+        let (mut plugin, _, request) = mounted_inspection_fixture(
+            &profile,
+            &workspace,
+            scope,
+            frame,
+            "artifact-inspection-tamper",
+        );
+        let mut tampered = FakeInspector {
+            verdict: BrowserArtifactInspectionVerdict::Clean,
+            tamper_bytes: true,
+            tamper_frame_and_source: false,
+        };
+        assert!(matches!(
+            plugin.inspect_pending(&mut tampered, &request.request_id),
+            Err(BrowserError::ArtifactInspectionInvalid)
+        ));
+        assert_eq!(plugin.pending_inspection_count(), 0);
+        assert_eq!(plugin.safe_adoption_count(), 0);
+        assert!(matches!(
+            plugin.inspect_pending(&mut tampered, &request.request_id),
+            Err(BrowserError::ArtifactInspectionReopened)
+        ));
+    }
+
+    #[test]
+    fn unknown_inspection_never_marks_safe() {
+        let (profile, workspace, scope, frame) = fixture();
+        let (mut plugin, _, request) = mounted_inspection_fixture(
+            &profile,
+            &workspace,
+            scope,
+            frame,
+            "artifact-inspection-unknown",
+        );
+        let mut unknown = FakeInspector {
+            verdict: BrowserArtifactInspectionVerdict::Unknown,
+            tamper_bytes: false,
+            tamper_frame_and_source: false,
+        };
+        assert!(matches!(
+            plugin.inspect_pending(&mut unknown, &request.request_id),
+            Err(BrowserError::ArtifactInspectionRejected)
+        ));
+        assert_eq!(plugin.safe_adoption_count(), 0);
+    }
+
+    #[test]
+    fn malware_inspection_never_marks_safe() {
+        let (profile, workspace, scope, frame) = fixture();
+        let (mut plugin, _, request) = mounted_inspection_fixture(
+            &profile,
+            &workspace,
+            scope,
+            frame,
+            "artifact-inspection-malware",
+        );
+        let mut malware = FakeInspector {
+            verdict: BrowserArtifactInspectionVerdict::Malware,
+            tamper_bytes: false,
+            tamper_frame_and_source: false,
+        };
+        assert!(matches!(
+            plugin.inspect_pending(&mut malware, &request.request_id),
+            Err(BrowserError::ArtifactInspectionRejected)
+        ));
+        assert_eq!(plugin.safe_adoption_count(), 0);
+    }
+
+    #[test]
+    fn unavailable_inspection_is_not_evaluated_and_cannot_reopen() {
+        let (profile, workspace, scope, frame) = fixture();
+        let (mut plugin, _, request) = mounted_inspection_fixture(
+            &profile,
+            &workspace,
+            scope,
+            frame,
+            "artifact-inspection-unavailable",
+        );
+        let mut unavailable = UnavailableBrowserArtifactInspector;
+        assert!(matches!(
+            plugin.inspect_pending(&mut unavailable, &request.request_id),
+            Err(BrowserError::ArtifactInspectionUnavailable)
+        ));
+        assert_eq!(plugin.pending_inspection_count(), 0);
+        assert!(matches!(
+            plugin.inspect_pending(&mut unavailable, &request.request_id),
+            Err(BrowserError::ArtifactInspectionReopened)
+        ));
+    }
+
+    #[test]
+    fn scanner_unavailable_verdict_is_not_evaluated() {
+        let (profile, workspace, scope, frame) = fixture();
+        let (mut plugin, _, request) = mounted_inspection_fixture(
+            &profile,
+            &workspace,
+            scope,
+            frame,
+            "artifact-inspection-not-evaluated",
+        );
+        let mut inspector = FakeInspector {
+            verdict: BrowserArtifactInspectionVerdict::ScannerUnavailable,
+            tamper_bytes: false,
+            tamper_frame_and_source: false,
+        };
+        assert!(matches!(
+            plugin.inspect_pending(&mut inspector, &request.request_id),
+            Err(BrowserError::ArtifactInspectionUnavailable)
+        ));
+        assert_eq!(plugin.safe_adoption_count(), 0);
+    }
+
+    #[test]
+    fn source_revision_mismatch_never_marks_safe() {
+        let (profile, workspace, scope, frame) = fixture();
+        let (mut plugin, _, request) = mounted_inspection_fixture(
+            &profile,
+            &workspace,
+            scope,
+            frame,
+            "artifact-inspection-revision",
+        );
+        let mut inspector = FakeInspector {
+            verdict: BrowserArtifactInspectionVerdict::Clean,
+            tamper_bytes: false,
+            tamper_frame_and_source: true,
+        };
+        assert!(matches!(
+            plugin.inspect_pending(&mut inspector, &request.request_id),
+            Err(BrowserError::ArtifactInspectionInvalid)
+        ));
+        assert_eq!(plugin.safe_adoption_count(), 0);
+    }
+
+    #[test]
+    fn unmount_reclaims_pending_inspection_and_rejects_result() {
+        let (profile, workspace, scope, frame) = fixture();
+        let (mut plugin, _, request) = mounted_inspection_fixture(
+            &profile,
+            &workspace,
+            scope,
+            frame,
+            "artifact-inspection-unmount",
+        );
+        assert_eq!(plugin.pending_inspection_count(), 1);
+        plugin.unmount().expect("unmount");
+        assert_eq!(plugin.pending_inspection_count(), 0);
+        assert!(matches!(
+            plugin.submit_file_inspection_result(
+                &request,
+                &BrowserArtifactFileInspectionResult::from_request(
+                    &request,
+                    BrowserArtifactInspectionEvidence {
+                        verdict: BrowserArtifactInspectionVerdict::Clean,
+                        inspector_id: "fake-inspector".into(),
+                        inspector_version: "fixture-1".into(),
+                        scanner_evidence_digest: sha('e'),
+                        inspected_at: now() + Duration::seconds(2),
+                    },
+                )
+                .expect("result"),
+            ),
+            Err(BrowserError::ArtifactProviderRestarted)
+        ));
+    }
+
+    #[test]
+    fn revoke_reclaims_pending_inspection_and_rejects_result() {
+        let (mut profile, workspace, scope, frame) = fixture();
+        let (mut plugin, _, request) = mounted_inspection_fixture(
+            &profile,
+            &workspace,
+            scope,
+            frame,
+            "artifact-inspection-revoke",
+        );
+        let profile_revision = profile.revision;
+        plugin
+            .revoke(
+                &mut profile,
+                profile_revision,
+                sha('d'),
+                now() + Duration::seconds(1),
+            )
+            .expect("revoke");
+        assert_eq!(plugin.pending_inspection_count(), 0);
+        let mut unavailable = UnavailableBrowserArtifactInspector;
+        assert!(matches!(
+            plugin.inspect_pending(&mut unavailable, &request.request_id),
+            Err(BrowserError::ArtifactProviderRevoked)
+        ));
     }
 
     #[test]
