@@ -1450,9 +1450,11 @@ fn execute_bounded_process(
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
         }
-        // GroupChild::try_wait observes the Unix process group. Poll the exact
-        // leader here, then audit and clear the group separately below.
-        match child.inner().try_wait() {
+        // Keep the leader status in GroupChild's lifecycle cache while it
+        // observes the Unix process group. Mixing a direct std::process::Child
+        // reap with GroupChild::kill/try_wait leaves teardown racing its own
+        // cached state on macOS.
+        match child.try_wait() {
             Ok(Some(status)) => break ProcessStop::Exited(status),
             Ok(None) => {}
             Err(_) => break ProcessStop::WaitFailure,
@@ -1538,8 +1540,8 @@ fn terminate_process_group(
     let mut had_live_group_after_leader = false;
 
     if leader_status.is_some() {
-        // The exact leader was already reaped through std::process::Child.
-        // A successful group kill therefore proves that another group member
+        // The exact leader was already reaped and cached by GroupChild. A
+        // successful group kill therefore proves that another group member
         // remained, and contains it without a PID-reuse or escape delay.
         had_live_group_after_leader = kill_process_group(child)?;
     }
@@ -1550,8 +1552,9 @@ fn terminate_process_group(
     };
 
     loop {
-        // Preserve the leader's exact status independently of group teardown.
-        match child.inner().try_wait() {
+        // Preserve the leader's exact status independently of group teardown;
+        // GroupChild::try_wait returns its cached status after the first reap.
+        match child.try_wait() {
             Ok(Some(observed)) => {
                 status.get_or_insert(observed);
             }
@@ -2535,6 +2538,116 @@ esac
         assert_eq!(second.scan_report.decision, FileScanDecision::Clean);
         assert_eq!(scanner.process_generation, 3);
         assert_no_run_directory_residue(&scanner);
+    }
+
+    fn assert_timeout_restart_cycle(cycle: usize) {
+        let fixture = ScannerFixture::new();
+        let first_marker = fixture.temp.path().join("timeout-first.marker");
+        let body = format!(
+            r"    if [ ! -f {marker} ]; then
+      printf first > {marker}
+      printf partial
+      /bin/sleep 30 &
+      wait
+    fi
+    emit_scan clean",
+            marker = shell_quote(&first_marker),
+        );
+        let (mut scanner, _) = scanner_with_limits(&fixture, &body, default_limits());
+        let mut broker = fixture.broker();
+        let first_source = fixture.source(&format!("timeout-repeat-{cycle}-first.json"), b"{}");
+        assert!(matches!(
+            fixture.prepare(
+                &mut broker,
+                &mut scanner,
+                &format!("grant-timeout-repeat-{cycle}-first"),
+                &first_source,
+            ),
+            Err(BrowserError::FileScanUnavailable)
+        ));
+        assert_eq!(scanner.process_generation, 2);
+        assert!(
+            !scanner.process_boundary_poisoned,
+            "timeout cycle {cycle} poisoned"
+        );
+        assert_no_run_directory_residue(&scanner);
+
+        let second_source = fixture.source(&format!("timeout-repeat-{cycle}-second.json"), b"{}");
+        let second = fixture
+            .prepare(
+                &mut broker,
+                &mut scanner,
+                &format!("grant-timeout-repeat-{cycle}-second"),
+                &second_source,
+            )
+            .expect("timeout restart");
+        assert_eq!(second.scan_report.decision, FileScanDecision::Clean);
+        assert!(
+            !scanner.process_boundary_poisoned,
+            "timeout restart {cycle} poisoned"
+        );
+        assert_no_run_directory_residue(&scanner);
+    }
+
+    fn assert_overflow_restart_cycle(cycle: usize) {
+        let fixture = ScannerFixture::new();
+        let first_marker = fixture.temp.path().join("overflow-first.marker");
+        let body = format!(
+            r#"    if [ ! -f {marker} ]; then
+      printf first > {marker}
+      count=0
+      while [ "$count" -lt 4096 ]; do
+        printf x
+        count=$((count + 1))
+      done
+    else
+      emit_scan clean
+    fi"#,
+            marker = shell_quote(&first_marker),
+        );
+        let limits = ScannerProcessLimits::new(Duration::from_secs(2), 512, 512).expect("limits");
+        let (mut scanner, _) = scanner_with_limits(&fixture, &body, limits);
+        let mut broker = fixture.broker();
+        let first_source = fixture.source(&format!("overflow-repeat-{cycle}-first.json"), b"{}");
+        assert!(matches!(
+            fixture.prepare(
+                &mut broker,
+                &mut scanner,
+                &format!("grant-overflow-repeat-{cycle}-first"),
+                &first_source,
+            ),
+            Err(BrowserError::FileScanUnavailable)
+        ));
+        assert_eq!(scanner.process_generation, 2);
+        assert!(
+            !scanner.process_boundary_poisoned,
+            "overflow cycle {cycle} poisoned"
+        );
+        assert_no_run_directory_residue(&scanner);
+
+        let second_source = fixture.source(&format!("overflow-repeat-{cycle}-second.json"), b"{}");
+        let second = fixture
+            .prepare(
+                &mut broker,
+                &mut scanner,
+                &format!("grant-overflow-repeat-{cycle}-second"),
+                &second_source,
+            )
+            .expect("overflow restart");
+        assert_eq!(second.scan_report.decision, FileScanDecision::Clean);
+        assert!(
+            !scanner.process_boundary_poisoned,
+            "overflow restart {cycle} poisoned"
+        );
+        assert_no_run_directory_residue(&scanner);
+    }
+
+    #[test]
+    fn repeated_timeout_and_overflow_restarts_keep_boundary_unpoisoned() {
+        for cycle in 0..6 {
+            assert_timeout_restart_cycle(cycle);
+            assert_overflow_restart_cycle(cycle);
+        }
     }
 
     #[test]
