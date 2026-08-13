@@ -6,9 +6,9 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use hartevo_eval::{
     HarnessEvaluationInput, HarnessLabPlan, HarnessPromotionKey, HarnessSignedPromotionRecord,
-    VERTICAL_SLICE_ID, catalog_snapshot, evaluate_harness_lab, finalize_evaluation_run,
-    harness_lab_source_commit, run_vertical_slice, validate_evaluation_run,
-    wave_zero_release_evidence,
+    VERTICAL_SLICE_ID, catalog_snapshot, evaluate_harness_lab, export_public_key,
+    finalize_evaluation_run, generate_keypair, harness_lab_source_commit, run_vertical_slice,
+    sign_file, validate_evaluation_run, validate_gate, verify_file, wave_zero_release_evidence,
 };
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +89,7 @@ fn run_standard_command(arguments: &[String]) -> Result<()> {
             let receipt = validate_evaluation_run(root)?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
         }
+        [distribution, ..] if distribution == "distribution" => run_distribution(arguments)?,
         [command, mission_flag, mission] if command == "run" && mission_flag == "--mission" => {
             run(mission, None)?;
         }
@@ -144,6 +145,97 @@ fn run_harness_command(arguments: &[String]) -> Result<()> {
     run_harness_lab_validation(plan_path, results_path, keys_path, promotion_path)
 }
 
+fn run_distribution(arguments: &[String]) -> Result<()> {
+    match arguments {
+        [distribution, validate, gate_flag, gate, commit_flag, commit]
+            if distribution == "distribution"
+                && validate == "validate"
+                && gate_flag == "--gate"
+                && commit_flag == "--commit" =>
+        {
+            validate_gate(gate, commit)?;
+            println!(
+                r#"{{"schema":"hartevo-distribution-gate-verification/v1","status":"PASS","releaseDecision":"NOT_EVALUATED","releasePassed":false,"releaseCommit":"{commit}"}}"#
+            );
+        }
+        [
+            distribution,
+            crypto,
+            operation,
+            private_flag,
+            private_path,
+            public_flag,
+            public_path,
+        ] if distribution == "distribution"
+            && crypto == "crypto"
+            && operation == "keygen"
+            && private_flag == "--private-key"
+            && public_flag == "--public-key" =>
+        {
+            generate_keypair(private_path, public_path)?;
+        }
+        [
+            distribution,
+            crypto,
+            operation,
+            private_flag,
+            private_path,
+            public_flag,
+            public_path,
+        ] if distribution == "distribution"
+            && crypto == "crypto"
+            && operation == "public-key"
+            && private_flag == "--private-key"
+            && public_flag == "--public-key" =>
+        {
+            export_public_key(private_path, public_path)?;
+        }
+        [
+            distribution,
+            crypto,
+            operation,
+            private_flag,
+            private_path,
+            input_flag,
+            input_path,
+            output_flag,
+            output_path,
+        ] if distribution == "distribution"
+            && crypto == "crypto"
+            && operation == "sign"
+            && private_flag == "--private-key"
+            && input_flag == "--input"
+            && output_flag == "--output" =>
+        {
+            sign_file(private_path, input_path, output_path)?;
+        }
+        [
+            distribution,
+            crypto,
+            operation,
+            public_flag,
+            public_path,
+            input_flag,
+            input_path,
+            signature_flag,
+            signature_path,
+        ] if distribution == "distribution"
+            && crypto == "crypto"
+            && operation == "verify"
+            && public_flag == "--public-key"
+            && input_flag == "--input"
+            && signature_flag == "--signature" =>
+        {
+            verify_file(public_path, input_path, signature_path)?;
+        }
+        _ => {
+            print_help();
+            bail!("invalid distribution command");
+        }
+    }
+    Ok(())
+}
+
 fn run(mission: &str, output: Option<PathBuf>) -> Result<()> {
     if mission != VERTICAL_SLICE_ID {
         bail!("unknown Mission fixture {mission}; available: {VERTICAL_SLICE_ID}");
@@ -183,6 +275,11 @@ fn print_help() {
          hartevo-eval evaluation-run finalize --run-dir <path>\n  \
          hartevo-eval evaluation-run validate --run-dir <path>\n  \
          hartevo-eval harness-lab validate --plan <plan.json> --results <results.json> [--keys <keys.json>] [--promotion <record.json>]\n  \
+         hartevo-eval distribution validate --gate <path> --commit <sha>\n  \
+         hartevo-eval distribution crypto keygen --private-key <path> --public-key <path>\n  \
+         hartevo-eval distribution crypto public-key --private-key <path> --public-key <path>\n  \
+         hartevo-eval distribution crypto sign --private-key <path> --input <path> --output <path>\n  \
+         hartevo-eval distribution crypto verify --public-key <path> --input <path> --signature <path>\n  \
          hartevo-eval run --mission VS-01 [--output <path>]"
     );
 }
