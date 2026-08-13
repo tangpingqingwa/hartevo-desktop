@@ -14,6 +14,7 @@ members = [
   "hartevo-rs/eval",
   "hartevo-rs/runtime-adapter",
   "hartevo-rs/mission-scheduler",
+  "hartevo-rs/plugin-runtime",
   "hartevo-rs/storage",
 ]
 resolver = "3"
