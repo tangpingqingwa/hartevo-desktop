@@ -19,6 +19,7 @@ mod mission_conversation;
 mod mission_schedule;
 mod money;
 mod outcome;
+mod privacy;
 mod project;
 mod relationship;
 mod runtime_process;
@@ -47,8 +48,8 @@ pub use context_foundation::{
 };
 pub use deletion::{
     DeletionError, DeletionPropagationReceipt, DeletionPropagationStatus, DeletionReason,
-    DeletionRecord, DeletionRetentionMode, DeletionSurface, DeletionSurfaceState,
-    DeletionTombstone,
+    DeletionRecord, DeletionRequestStatus, DeletionRetentionMode, DeletionSurface,
+    DeletionSurfaceState, DeletionTombstone,
 };
 pub use identity::{
     Company, ConsentPurpose, ConsentRecord, ConsentRequirement, ConsentStatus, ContactChannel,
@@ -64,12 +65,13 @@ pub use ids::{
     ContextCheckpointId, ContextCompactionRecordId, ContextContinuationLedgerId,
     ContextWorkerMailboxId, ContextWorkerMessageId, ContextWorkingSetId, ContextWorkspaceId,
     ConversationId, CreatorApplicationId, CreatorHiringId, CreatorId, CreatorMilestoneId,
-    CreatorTaskId, DeletionId, DeletionReceiptId, DeliverableId, DeviceAttachmentId,
-    DeviceHandoffId, DeviceId, EffectId, EvidenceId, ExecutionAttemptId, FactId, IdentityLinkId,
-    KeyEnvelopeId, MemberId, MessageId, MissionConversationId, MissionConversationMessageId,
-    MissionId, MissionScheduleId, OpportunityId, OrderId, OutcomeEventId, PartnerId, PayoutId,
-    PersonId, ProjectId, ReceiptId, RefundId, ReviewId, RuntimeRecoveryAttemptId,
-    RuntimeTurnAttemptId, TaskId, TenantId, VerificationId, WorkProductId, WorkerId, WorkerLeaseId,
+    CreatorTaskId, DataSubjectExportId, DeletionId, DeletionReceiptId, DeliverableId,
+    DeviceAttachmentId, DeviceHandoffId, DeviceId, EffectId, EvidenceId, ExecutionAttemptId,
+    FactId, IdentityLinkId, KeyEnvelopeId, MemberId, MessageId, MissionConversationId,
+    MissionConversationMessageId, MissionId, MissionScheduleId, OpportunityId, OrderId,
+    OutcomeEventId, PartnerId, PayoutId, PersonId, ProjectId, ReceiptId, RefundId, ReviewId,
+    RuntimeRecoveryAttemptId, RuntimeTurnAttemptId, TaskId, TenantId, VerificationId,
+    WorkProductId, WorkerId, WorkerLeaseId,
 };
 pub use key_management::{
     DeviceAttachment, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffCiphertext,
@@ -118,6 +120,11 @@ pub use outcome::{
     OutcomeSourceVerification, OutcomeVerificationMethod, PartnerSettlementView,
     SettlementCommissionBasis, SettlementGroupStatus, Touchpoint,
     attribution_effect_provider_identity_digest,
+};
+pub use privacy::{
+    DataClassification, DataSubjectExport, DataSubjectExportArtifact, DataSubjectExportRedaction,
+    DataSubjectExportStatus, PrivacyError, RetentionAction, RetentionDecision, RetentionPolicy,
+    RetentionRule,
 };
 pub use project::{Project, ProjectDataCell, ProjectError, StorageMode};
 pub use relationship::{

@@ -164,6 +164,34 @@ impl ProjectStore {
         now: DateTime<Utc>,
         dead_letter: bool,
     ) -> Result<DeletionPropagationJob, StorageError> {
+        self.release_deletion_propagation_job_with_residual(
+            project_id,
+            deletion_id,
+            surface,
+            owner,
+            generation,
+            error_code,
+            available_at,
+            now,
+            dead_letter,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn release_deletion_propagation_job_with_residual(
+        &mut self,
+        project_id: &ProjectId,
+        deletion_id: &DeletionId,
+        surface: DeletionSurface,
+        owner: &str,
+        generation: u64,
+        error_code: &str,
+        available_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+        dead_letter: bool,
+        residual_items: Option<u64>,
+    ) -> Result<DeletionPropagationJob, StorageError> {
         require_worker_surface(surface)?;
         if owner.trim().is_empty()
             || generation == 0
@@ -179,7 +207,8 @@ impl ProjectStore {
         } else {
             "pending"
         };
-        let updated = self.connection.execute(
+        let transaction = self.connection.transaction()?;
+        let updated = transaction.execute(
             "UPDATE deletion_propagation_jobs
              SET status = ?6, available_at = ?7, lease_owner = NULL,
                  lease_expires_at = NULL, last_error_code = ?8, updated_at = ?9
@@ -199,7 +228,50 @@ impl ProjectStore {
             ],
         )?;
         require_lease(updated, deletion_id, surface, owner, generation)?;
-        load_job(&self.connection, project_id, deletion_id, surface)
+        let job = load_job(&transaction, project_id, deletion_id, surface)?;
+        let record =
+            load_deletion_record(&transaction, project_id, &job.object_kind, &job.object_id)?
+                .ok_or_else(|| {
+                    StorageError::DomainDecode("propagation job lacks deletion record".into())
+                })?;
+        if job.tenant_id != record.tombstone.tenant_id
+            || job.object_id != record.tombstone.object_id
+            || job.object_kind != record.tombstone.object_kind
+            || job.deletion_generation != record.tombstone.deletion_generation
+            || job.tombstone_digest != record.tombstone.tombstone_digest
+        {
+            return Err(StorageError::DomainDecode(
+                "propagation job scope differs from deletion tombstone".into(),
+            ));
+        }
+        let updated_record = if dead_letter {
+            record.mark_surface_dead_letter(surface, error_code, residual_items, now)?
+        } else {
+            record.mark_surface_failed(surface, error_code, residual_items, now)?
+        };
+        if updated_record.revision != record.revision {
+            update_deletion_record(&transaction, &updated_record, record.revision)?;
+        }
+        transaction.execute(
+            "INSERT INTO domain_events
+               (tenant_id, project_id, mission_id, event_type, payload_json, recorded_at)
+             VALUES (?1, ?2, NULL, 'sync.deletion.surface_failed', ?3, ?4)",
+            params![
+                updated_record.tombstone.tenant_id.as_str(),
+                updated_record.tombstone.project_id.as_str(),
+                serde_json::to_string(&json!({
+                    "deletionId": deletion_id,
+                    "surface": surface,
+                    "status": if dead_letter { "dead_letter" } else { "failed" },
+                    "errorCode": error_code,
+                    "residualItems": residual_items,
+                    "recordStatus": updated_record.status(),
+                }))?,
+                now.to_rfc3339(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(job)
     }
 
     #[allow(

@@ -51,6 +51,26 @@ impl ProjectStore {
         )
     }
 
+    pub fn list_deletion_records(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<DeletionRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT object_kind, object_id FROM sync_deletion_records
+             WHERE project_id = ?1 ORDER BY requested_at, deletion_id",
+        )?;
+        let rows = statement.query_map([project_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let keys = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        keys.into_iter()
+            .map(|(object_kind, object_id)| {
+                self.load_deletion_record(project_id, &object_kind, &object_id)
+            })
+            .collect()
+    }
+
     pub fn ensure_sync_object_not_deleted(
         &self,
         project_id: &ProjectId,
@@ -454,7 +474,7 @@ fn pending_record(
         "surface": "local_projection",
         "objectId": tombstone.object_id,
         "priorRevision": tombstone.prior_object_revision,
-        "deleted": evidence,
+        "projectionPurgeEvidence": evidence,
     }))?;
     let context_evidence = digest_json(&json!({
         "surface": "context_derived",

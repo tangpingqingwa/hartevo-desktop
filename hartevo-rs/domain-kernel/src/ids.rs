@@ -77,6 +77,7 @@ entity_id!(CreatorApplicationId);
 entity_id!(CreatorHiringId);
 entity_id!(CreatorMilestoneId);
 entity_id!(CreatorTaskId);
+entity_id!(DataSubjectExportId);
 entity_id!(DeliverableId);
 entity_id!(DeletionId);
 entity_id!(DeletionReceiptId);
