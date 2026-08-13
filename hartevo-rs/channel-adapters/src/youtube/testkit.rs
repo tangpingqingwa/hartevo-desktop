@@ -77,12 +77,28 @@ pub fn readback_response(
     visibility: &str,
     processing_status: &str,
 ) -> YouTubeProviderResponse {
+    readback_response_for(
+        "fixture-video-01",
+        "UCfixture01",
+        title,
+        visibility,
+        processing_status,
+    )
+}
+
+pub fn readback_response_for(
+    video_id: &str,
+    channel_id: &str,
+    title: &str,
+    visibility: &str,
+    processing_status: &str,
+) -> YouTubeProviderResponse {
     let body = format!(
         r#"{{
           "kind":"youtube#videoListResponse",
           "items":[{{
-            "id":"fixture-video-01",
-            "snippet":{{"channelId":"UCfixture01","title":"{title}"}},
+            "id":"{video_id}",
+            "snippet":{{"channelId":"{channel_id}","title":"{title}"}},
             "status":{{"uploadStatus":"uploaded","privacyStatus":"{visibility}"}},
             "processingDetails":{{"processingStatus":"{processing_status}"}}
           }}]
