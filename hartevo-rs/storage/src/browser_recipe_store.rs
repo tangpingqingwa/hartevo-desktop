@@ -8,20 +8,44 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use hartevo_browser_adapter::{
-    BrowserRecipeActivation, BrowserRecipeActiveVersion, BrowserRecipeCandidate,
+    BrowserRecipeActivation, BrowserRecipeActiveVersion, BrowserRecipeAuthorityBlockKind,
+    BrowserRecipeAuthorityKeyPurpose, BrowserRecipeAuthorityObservation,
+    BrowserRecipeAuthorityRootHead, BrowserRecipeAuthorityTombstone, BrowserRecipeCandidate,
     BrowserRecipeKeyPurpose, BrowserRecipeRegistry, BrowserRecipeRegistrySnapshot,
     BrowserRecipeRelease, BrowserRecipeTrustSnapshot, BrowserRecipeTrustStore,
     TrustedBrowserRecipeKey,
 };
 use hartevo_domain_kernel::{BrowserRecipeId, EffectClass, ProjectId, TenantId};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::aggregate::{AtomicMutation, PendingEvent, append_events};
-use crate::{ProjectStore, StorageError};
+use crate::{ProjectStore, SecretReference, StorageError};
 
 const RECIPE_PERSISTENCE_SCHEMA_VERSION: u32 = 1;
+const RECIPE_AUTHORITY_PERSISTENCE_SCHEMA_VERSION: u32 = 1;
+
+/// Result of an atomic, monotonic Recipe root-authority persistence attempt.
+/// Exact current-head retries have no event/outbox side effects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserRecipeAuthorityPersistOutcome {
+    pub snapshot_revision: u64,
+    pub rotation_epoch: u64,
+    pub duplicate: bool,
+    pub event_sequences: Vec<i64>,
+    pub outbox_sequences: Vec<i64>,
+}
+
+/// Crash-recovered, secret-free lifecycle state plus its opaque OS-store
+/// reference. The referenced private root bytes never enter SQLCipher.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableBrowserRecipeAuthorityState {
+    pub observation: BrowserRecipeAuthorityObservation,
+    pub previous_snapshot_digest: Option<String>,
+    pub active_root_secret_reference: Option<SecretReference>,
+}
 
 #[derive(Debug)]
 pub struct BrowserRecipeRuntimeState {
@@ -362,6 +386,1080 @@ impl ProjectStore {
         let tenant_id = tenant_for_project(&self.connection, project_id)?;
         load_runtime_state(&self.connection, project_id, &tenant_id)
     }
+
+    /// Validates the checked lifecycle admission contract before any database
+    /// transaction begins. With the baseline empty registration set this
+    /// always fails closed and cannot create durable rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn persist_browser_recipe_root_authority_snapshot_atomic(
+        &mut self,
+        snapshot_json: &str,
+        expected_tenant_id: &TenantId,
+        expected_project_id: &ProjectId,
+        expected_snapshot_revision: u64,
+        expected_snapshot_as_of: DateTime<Utc>,
+        expected_snapshot_digest: &str,
+        validation_at: DateTime<Utc>,
+        active_root_secret_reference: Option<&SecretReference>,
+    ) -> Result<BrowserRecipeAuthorityPersistOutcome, StorageError> {
+        let observation =
+            BrowserRecipeTrustStore::validate_supplied_root_authority_snapshot_for_persistence(
+                snapshot_json,
+                expected_tenant_id,
+                expected_project_id,
+                expected_snapshot_revision,
+                expected_snapshot_as_of,
+                expected_snapshot_digest,
+                validation_at,
+            )?;
+        self.persist_browser_recipe_authority_observation_atomic(
+            &observation,
+            active_root_secret_reference,
+        )
+    }
+
+    /// Restores and revalidates the complete append-only observation chain,
+    /// tombstone set, head projection, and opaque root-secret references.
+    /// Returned data is not current authority and cannot authorize dispatch.
+    pub fn load_browser_recipe_root_authority_state(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<DurableBrowserRecipeAuthorityState>, StorageError> {
+        let tenant_id = tenant_for_project(&self.connection, project_id)?;
+        load_durable_authority_state(&self.connection, project_id, &tenant_id)
+    }
+
+    fn persist_browser_recipe_authority_observation_atomic(
+        &mut self,
+        observation: &BrowserRecipeAuthorityObservation,
+        active_root_secret_reference: Option<&SecretReference>,
+    ) -> Result<BrowserRecipeAuthorityPersistOutcome, StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tenant_id = tenant_for_project(&transaction, &observation.project_id)?;
+        validate_authority_observation(observation, &tenant_id, &observation.project_id)?;
+        let credential_id =
+            validate_active_root_secret_reference(observation, active_root_secret_reference)?;
+        let current =
+            load_durable_authority_state(&transaction, &observation.project_id, &tenant_id)?;
+        if let Some(current) = current.as_ref() {
+            if observation.snapshot_revision == current.observation.snapshot_revision {
+                if observation == &current.observation
+                    && active_root_secret_reference == current.active_root_secret_reference.as_ref()
+                {
+                    return Ok(BrowserRecipeAuthorityPersistOutcome {
+                        snapshot_revision: observation.snapshot_revision,
+                        rotation_epoch: observation.rotation_epoch,
+                        duplicate: true,
+                        event_sequences: Vec::new(),
+                        outbox_sequences: Vec::new(),
+                    });
+                }
+                return Err(authority_mismatch(
+                    "browser recipe authority replay conflict",
+                    &observation.project_id,
+                ));
+            }
+            validate_authority_transition(&current.observation, observation)?;
+        }
+        let previous_snapshot_digest = current
+            .as_ref()
+            .map(|state| state.observation.snapshot_digest.as_str());
+        insert_authority_snapshot(
+            &transaction,
+            observation,
+            previous_snapshot_digest,
+            credential_id.as_deref(),
+        )?;
+        persist_authority_tombstones(&transaction, observation)?;
+        if let (Some(root), Some(reference)) = (
+            observation.active_root.as_ref(),
+            active_root_secret_reference,
+        ) {
+            persist_root_secret_reference(&transaction, observation, root, reference)?;
+        }
+        write_authority_head(
+            &transaction,
+            observation,
+            credential_id.as_deref(),
+            current
+                .as_ref()
+                .map(|state| state.observation.snapshot_revision),
+        )?;
+        let event = PendingEvent::new(
+            "browser.recipe_root_authority_snapshot_observed",
+            serde_json::json!({
+                "snapshotDigest": observation.snapshot_digest,
+                "stateDigest": observation.state_digest,
+                "snapshotRevision": observation.snapshot_revision,
+                "rotationEpoch": observation.rotation_epoch,
+                "activeRootKeyIdDigest": observation.active_root.as_ref()
+                    .map(|root| digest_identity(&root.key_id)),
+                "tombstoneDigests": observation.tombstones.iter()
+                    .map(|tombstone| authority_tombstone_digest(
+                        &observation.tenant_id,
+                        &observation.project_id,
+                        tombstone,
+                    ))
+                    .collect::<Result<Vec<_>, _>>()?,
+                "snapshotFreshnessAuthority": false,
+                "productionDispatch": false,
+            }),
+            observation.validation_at,
+        );
+        let (event_sequences, outbox_sequences) = append_events(
+            &transaction,
+            observation.tenant_id.as_str(),
+            observation.project_id.as_str(),
+            None,
+            "browser_recipe_root_authority",
+            &digest_identity(observation.project_id.as_str()),
+            &[event],
+        )?;
+        transaction.commit()?;
+        Ok(BrowserRecipeAuthorityPersistOutcome {
+            snapshot_revision: observation.snapshot_revision,
+            rotation_epoch: observation.rotation_epoch,
+            duplicate: false,
+            event_sequences,
+            outbox_sequences,
+        })
+    }
+}
+
+fn authority_mismatch(kind: &'static str, project_id: &ProjectId) -> StorageError {
+    StorageError::ImmutableRecordMismatch {
+        kind,
+        id: digest_identity(project_id.as_str()),
+    }
+}
+
+fn valid_authority_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1_024
+        && value == value.trim()
+        && !value.chars().any(char::is_control)
+}
+
+fn validate_authority_observation(
+    observation: &BrowserRecipeAuthorityObservation,
+    expected_tenant_id: &TenantId,
+    expected_project_id: &ProjectId,
+) -> Result<(), StorageError> {
+    if observation.schema_version != RECIPE_AUTHORITY_PERSISTENCE_SCHEMA_VERSION
+        || &observation.tenant_id != expected_tenant_id
+        || &observation.project_id != expected_project_id
+        || observation.snapshot_revision == 0
+        || observation.rotation_epoch == 0
+        || observation.snapshot_as_of > observation.validation_at
+        || !is_sha256(&observation.snapshot_digest)
+        || !is_sha256(&observation.state_digest)
+        || observation.snapshot_freshness_authority
+        || observation.production_dispatch
+    {
+        return Err(authority_mismatch(
+            "browser recipe authority observation",
+            expected_project_id,
+        ));
+    }
+    if let Some(root) = observation.active_root.as_ref()
+        && (!valid_authority_identifier(&root.key_id)
+            || !is_sha256(&root.public_key_digest)
+            || root.generation != observation.rotation_epoch
+            || root.revision == 0
+            || !is_sha256(&root.lineage_digest))
+    {
+        return Err(authority_mismatch(
+            "browser recipe authority active root",
+            expected_project_id,
+        ));
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    let mut previous_identity = None;
+    for tombstone in &observation.tombstones {
+        let identity = (tombstone.key_id.clone(), tombstone.kind);
+        if !valid_authority_identifier(&tombstone.key_id)
+            || !is_sha256(&tombstone.public_key_digest)
+            || tombstone.blocked_revision == 0
+            || !is_sha256(&tombstone.lineage_digest)
+            || tombstone.effective_at > observation.snapshot_as_of
+            || !identities.insert(identity.clone())
+            || previous_identity
+                .as_ref()
+                .is_some_and(|previous| previous >= &identity)
+            || observation
+                .active_root
+                .as_ref()
+                .is_some_and(|root| root.key_id == tombstone.key_id)
+        {
+            return Err(authority_mismatch(
+                "browser recipe authority tombstone",
+                expected_project_id,
+            ));
+        }
+        previous_identity = Some(identity);
+    }
+    Ok(())
+}
+
+fn validate_active_root_secret_reference(
+    observation: &BrowserRecipeAuthorityObservation,
+    reference: Option<&SecretReference>,
+) -> Result<Option<String>, StorageError> {
+    match (&observation.active_root, reference) {
+        (None, None) => Ok(None),
+        (Some(root), Some(reference)) => {
+            let expected = SecretReference::browser_recipe_root_signing_key(
+                observation.tenant_id.clone(),
+                observation.project_id.clone(),
+                &root.key_id,
+                root.generation,
+            )
+            .map_err(|error| StorageError::DomainDecode(error.to_string()))?;
+            if reference != &expected {
+                return Err(authority_mismatch(
+                    "browser recipe root secret reference",
+                    &observation.project_id,
+                ));
+            }
+            reference
+                .credential_id()
+                .map(Some)
+                .map_err(|error| StorageError::DomainDecode(error.to_string()))
+        }
+        _ => Err(authority_mismatch(
+            "browser recipe root secret reference",
+            &observation.project_id,
+        )),
+    }
+}
+
+fn validate_authority_transition(
+    current: &BrowserRecipeAuthorityObservation,
+    next: &BrowserRecipeAuthorityObservation,
+) -> Result<(), StorageError> {
+    if current.tenant_id != next.tenant_id
+        || current.project_id != next.project_id
+        || next.snapshot_revision <= current.snapshot_revision
+        || next.snapshot_as_of < current.snapshot_as_of
+        || next.snapshot_digest == current.snapshot_digest
+    {
+        return Err(authority_mismatch(
+            "browser recipe authority rollback",
+            &next.project_id,
+        ));
+    }
+    let next_tombstones = next
+        .tombstones
+        .iter()
+        .map(|tombstone| ((&tombstone.key_id, tombstone.kind), tombstone))
+        .collect::<BTreeMap<_, _>>();
+    if current.tombstones.iter().any(|tombstone| {
+        next_tombstones
+            .get(&(&tombstone.key_id, tombstone.kind))
+            .is_none_or(|next| *next != tombstone)
+    }) {
+        return Err(authority_mismatch(
+            "browser recipe authority tombstone rollback",
+            &next.project_id,
+        ));
+    }
+    if next.rotation_epoch == current.rotation_epoch {
+        match (&current.active_root, &next.active_root) {
+            (Some(current_root), Some(next_root)) if current_root == next_root => {}
+            (Some(current_root), None)
+                if next.tombstones.iter().any(|tombstone| {
+                    tombstone.key_id == current_root.key_id
+                        && tombstone.public_key_digest == current_root.public_key_digest
+                        && tombstone.kind == BrowserRecipeAuthorityBlockKind::Compromised
+                }) => {}
+            (None, None) => {}
+            _ => {
+                return Err(authority_mismatch(
+                    "browser recipe authority epoch binding",
+                    &next.project_id,
+                ));
+            }
+        }
+    } else {
+        let expected_epoch = current
+            .rotation_epoch
+            .checked_add(1)
+            .ok_or(StorageError::RevisionOverflow(current.rotation_epoch))?;
+        let (Some(current_root), Some(next_root)) = (&current.active_root, &next.active_root)
+        else {
+            return Err(authority_mismatch(
+                "browser recipe authority rotation head",
+                &next.project_id,
+            ));
+        };
+        if next.rotation_epoch != expected_epoch
+            || next_root.generation != expected_epoch
+            || next_root.key_id == current_root.key_id
+            || next_root.public_key_digest == current_root.public_key_digest
+            || next_root.lineage_digest == current_root.lineage_digest
+        {
+            return Err(authority_mismatch(
+                "browser recipe authority rotation epoch",
+                &next.project_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn authority_observation_digest(
+    observation: &BrowserRecipeAuthorityObservation,
+) -> Result<String, StorageError> {
+    digest_json(&(
+        "hartevo-browser-recipe-authority-observation/v1",
+        observation,
+    ))
+}
+
+fn authority_tombstone_digest(
+    tenant_id: &TenantId,
+    project_id: &ProjectId,
+    tombstone: &BrowserRecipeAuthorityTombstone,
+) -> Result<String, StorageError> {
+    digest_json(&(
+        "hartevo-browser-recipe-authority-tombstone/v1",
+        tenant_id,
+        project_id,
+        tombstone,
+    ))
+}
+
+fn root_reference_digest(reference: &SecretReference) -> Result<String, StorageError> {
+    digest_json(&("hartevo-browser-recipe-root-secret-reference/v1", reference))
+}
+
+fn authority_purpose_name(purpose: BrowserRecipeAuthorityKeyPurpose) -> &'static str {
+    match purpose {
+        BrowserRecipeAuthorityKeyPurpose::RootAuthority => "root_authority",
+        BrowserRecipeAuthorityKeyPurpose::CandidatePublisher => "candidate_publisher",
+        BrowserRecipeAuthorityKeyPurpose::ProductionRelease => "production_release",
+    }
+}
+
+fn authority_block_kind_name(kind: BrowserRecipeAuthorityBlockKind) -> &'static str {
+    match kind {
+        BrowserRecipeAuthorityBlockKind::Revoked => "revoked",
+        BrowserRecipeAuthorityBlockKind::Compromised => "compromised",
+    }
+}
+
+fn insert_authority_snapshot(
+    transaction: &Transaction<'_>,
+    observation: &BrowserRecipeAuthorityObservation,
+    previous_snapshot_digest: Option<&str>,
+    active_secret_credential_id: Option<&str>,
+) -> Result<(), StorageError> {
+    let root = observation.active_root.as_ref();
+    transaction.execute(
+        "INSERT INTO browser_recipe_authority_snapshots
+           (tenant_id, project_id, snapshot_revision, snapshot_as_of, validation_at,
+            snapshot_digest, state_digest, rotation_epoch, previous_snapshot_digest,
+            active_root_key_id, active_root_public_key_digest, active_root_generation,
+            active_root_revision, active_root_lineage_digest, active_secret_credential_id,
+            observation_digest, observation_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 ?14, ?15, ?16, ?17)",
+        params![
+            observation.tenant_id.as_str(),
+            observation.project_id.as_str(),
+            to_sql_u64(observation.snapshot_revision)?,
+            observation.snapshot_as_of.to_rfc3339(),
+            observation.validation_at.to_rfc3339(),
+            observation.snapshot_digest,
+            observation.state_digest,
+            to_sql_u64(observation.rotation_epoch)?,
+            previous_snapshot_digest,
+            root.map(|root| root.key_id.as_str()),
+            root.map(|root| root.public_key_digest.as_str()),
+            root.map(|root| to_sql_u64(root.generation)).transpose()?,
+            root.map(|root| to_sql_u64(root.revision)).transpose()?,
+            root.map(|root| root.lineage_digest.as_str()),
+            active_secret_credential_id,
+            authority_observation_digest(observation)?,
+            serde_json::to_string(observation)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn persist_authority_tombstones(
+    transaction: &Transaction<'_>,
+    observation: &BrowserRecipeAuthorityObservation,
+) -> Result<(), StorageError> {
+    for tombstone in &observation.tombstones {
+        let digest =
+            authority_tombstone_digest(&observation.tenant_id, &observation.project_id, tombstone)?;
+        let record_json = serde_json::to_string(tombstone)?;
+        let inserted = transaction.execute(
+            "INSERT INTO browser_recipe_authority_tombstones
+               (tenant_id, project_id, key_id, key_id_digest, purpose,
+                public_key_digest, blocked_revision, lineage_digest, block_kind,
+                effective_at, first_snapshot_revision, tombstone_digest, tombstone_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(project_id, key_id, block_kind) DO NOTHING",
+            params![
+                observation.tenant_id.as_str(),
+                observation.project_id.as_str(),
+                tombstone.key_id,
+                digest_identity(&tombstone.key_id),
+                authority_purpose_name(tombstone.purpose),
+                tombstone.public_key_digest,
+                to_sql_u64(tombstone.blocked_revision)?,
+                tombstone.lineage_digest,
+                authority_block_kind_name(tombstone.kind),
+                tombstone.effective_at.to_rfc3339(),
+                to_sql_u64(observation.snapshot_revision)?,
+                digest,
+                record_json,
+            ],
+        )?;
+        if inserted == 0 {
+            let stored = transaction
+                .query_row(
+                    "SELECT tombstone_digest, tombstone_json
+                     FROM browser_recipe_authority_tombstones
+                     WHERE project_id = ?1 AND key_id = ?2 AND block_kind = ?3",
+                    params![
+                        observation.project_id.as_str(),
+                        tombstone.key_id,
+                        authority_block_kind_name(tombstone.kind),
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    authority_mismatch(
+                        "browser recipe authority tombstone",
+                        &observation.project_id,
+                    )
+                })?;
+            if stored.0 != digest || stored.1 != record_json {
+                return Err(authority_mismatch(
+                    "browser recipe authority tombstone",
+                    &observation.project_id,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn persist_root_secret_reference(
+    transaction: &Transaction<'_>,
+    observation: &BrowserRecipeAuthorityObservation,
+    root: &BrowserRecipeAuthorityRootHead,
+    reference: &SecretReference,
+) -> Result<(), StorageError> {
+    let credential_id = reference
+        .credential_id()
+        .map_err(|error| StorageError::DomainDecode(error.to_string()))?;
+    let reference_digest = root_reference_digest(reference)?;
+    let reference_json = serde_json::to_string(reference)?;
+    let inserted = transaction.execute(
+        "INSERT INTO browser_recipe_root_secret_references
+           (tenant_id, project_id, root_key_id, root_key_id_digest, public_key_digest,
+            generation, credential_id, reference_digest, reference_json,
+            first_snapshot_revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(project_id, root_key_id, generation) DO NOTHING",
+        params![
+            observation.tenant_id.as_str(),
+            observation.project_id.as_str(),
+            root.key_id,
+            digest_identity(&root.key_id),
+            root.public_key_digest,
+            to_sql_u64(root.generation)?,
+            credential_id,
+            reference_digest,
+            reference_json,
+            to_sql_u64(observation.snapshot_revision)?,
+        ],
+    )?;
+    if inserted == 0 {
+        let stored = transaction
+            .query_row(
+                "SELECT public_key_digest, credential_id, reference_digest, reference_json
+                 FROM browser_recipe_root_secret_references
+                 WHERE project_id = ?1 AND root_key_id = ?2 AND generation = ?3",
+                params![
+                    observation.project_id.as_str(),
+                    root.key_id,
+                    to_sql_u64(root.generation)?,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                authority_mismatch(
+                    "browser recipe root secret reference",
+                    &observation.project_id,
+                )
+            })?;
+        if stored
+            != (
+                root.public_key_digest.clone(),
+                credential_id,
+                reference_digest,
+                reference_json,
+            )
+        {
+            return Err(authority_mismatch(
+                "browser recipe root secret reference",
+                &observation.project_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_authority_head(
+    transaction: &Transaction<'_>,
+    observation: &BrowserRecipeAuthorityObservation,
+    active_secret_credential_id: Option<&str>,
+    expected_snapshot_revision: Option<u64>,
+) -> Result<(), StorageError> {
+    let root = observation.active_root.as_ref();
+    let snapshot_revision = to_sql_u64(observation.snapshot_revision)?;
+    let snapshot_as_of = observation.snapshot_as_of.to_rfc3339();
+    let rotation_epoch = to_sql_u64(observation.rotation_epoch)?;
+    let root_generation = root.map(|root| to_sql_u64(root.generation)).transpose()?;
+    let root_revision = root.map(|root| to_sql_u64(root.revision)).transpose()?;
+    let observation_digest = authority_observation_digest(observation)?;
+    let updated_at = observation.validation_at.to_rfc3339();
+    let changed = if let Some(expected) = expected_snapshot_revision {
+        transaction.execute(
+            "UPDATE browser_recipe_authority_heads
+             SET tenant_id = ?1, snapshot_revision = ?3, snapshot_as_of = ?4,
+                 snapshot_digest = ?5, state_digest = ?6, rotation_epoch = ?7,
+                 active_root_key_id = ?8, active_root_public_key_digest = ?9,
+                 active_root_generation = ?10, active_root_revision = ?11,
+                 active_root_lineage_digest = ?12, active_secret_credential_id = ?13,
+                 observation_digest = ?14, updated_at = ?15
+             WHERE project_id = ?2 AND snapshot_revision = ?16",
+            params![
+                observation.tenant_id.as_str(),
+                observation.project_id.as_str(),
+                snapshot_revision,
+                snapshot_as_of,
+                observation.snapshot_digest,
+                observation.state_digest,
+                rotation_epoch,
+                root.map(|root| root.key_id.as_str()),
+                root.map(|root| root.public_key_digest.as_str()),
+                root_generation,
+                root_revision,
+                root.map(|root| root.lineage_digest.as_str()),
+                active_secret_credential_id,
+                observation_digest,
+                updated_at,
+                to_sql_u64(expected)?,
+            ],
+        )?
+    } else {
+        transaction.execute(
+            "INSERT INTO browser_recipe_authority_heads
+               (tenant_id, project_id, snapshot_revision, snapshot_as_of,
+                snapshot_digest, state_digest, rotation_epoch, active_root_key_id,
+                active_root_public_key_digest, active_root_generation,
+                active_root_revision, active_root_lineage_digest,
+                active_secret_credential_id, observation_digest, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                observation.tenant_id.as_str(),
+                observation.project_id.as_str(),
+                snapshot_revision,
+                snapshot_as_of,
+                observation.snapshot_digest,
+                observation.state_digest,
+                rotation_epoch,
+                root.map(|root| root.key_id.as_str()),
+                root.map(|root| root.public_key_digest.as_str()),
+                root_generation,
+                root_revision,
+                root.map(|root| root.lineage_digest.as_str()),
+                active_secret_credential_id,
+                observation_digest,
+                updated_at,
+            ],
+        )?
+    };
+    if changed != 1 {
+        return Err(StorageError::OptimisticConflict {
+            aggregate: format!(
+                "browser_recipe_root_authority:{}",
+                digest_identity(observation.project_id.as_str())
+            ),
+            expected_revision: expected_snapshot_revision.unwrap_or(0),
+        });
+    }
+    Ok(())
+}
+
+struct AuthoritySnapshotProjection {
+    tenant_id: String,
+    snapshot_revision: i64,
+    snapshot_as_of: String,
+    validation_at: String,
+    snapshot_digest: String,
+    state_digest: String,
+    rotation_epoch: i64,
+    previous_snapshot_digest: Option<String>,
+    active_root_key_id: Option<String>,
+    active_root_public_key_digest: Option<String>,
+    active_root_generation: Option<i64>,
+    active_root_revision: Option<i64>,
+    active_root_lineage_digest: Option<String>,
+    active_secret_credential_id: Option<String>,
+    observation_digest: String,
+    observation_json: String,
+}
+
+impl AuthoritySnapshotProjection {
+    fn read(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            tenant_id: row.get(0)?,
+            snapshot_revision: row.get(1)?,
+            snapshot_as_of: row.get(2)?,
+            validation_at: row.get(3)?,
+            snapshot_digest: row.get(4)?,
+            state_digest: row.get(5)?,
+            rotation_epoch: row.get(6)?,
+            previous_snapshot_digest: row.get(7)?,
+            active_root_key_id: row.get(8)?,
+            active_root_public_key_digest: row.get(9)?,
+            active_root_generation: row.get(10)?,
+            active_root_revision: row.get(11)?,
+            active_root_lineage_digest: row.get(12)?,
+            active_secret_credential_id: row.get(13)?,
+            observation_digest: row.get(14)?,
+            observation_json: row.get(15)?,
+        })
+    }
+
+    fn decode(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+    ) -> Result<BrowserRecipeAuthorityObservation, StorageError> {
+        let observation: BrowserRecipeAuthorityObservation =
+            serde_json::from_str(&self.observation_json)?;
+        validate_authority_observation(&observation, tenant_id, project_id)?;
+        let root = observation.active_root.as_ref();
+        if self.tenant_id != tenant_id.as_str()
+            || to_u64(self.snapshot_revision)? != observation.snapshot_revision
+            || self.snapshot_as_of != observation.snapshot_as_of.to_rfc3339()
+            || self.validation_at != observation.validation_at.to_rfc3339()
+            || self.snapshot_digest != observation.snapshot_digest
+            || self.state_digest != observation.state_digest
+            || to_u64(self.rotation_epoch)? != observation.rotation_epoch
+            || self.active_root_key_id.as_deref() != root.map(|root| root.key_id.as_str())
+            || self.active_root_public_key_digest.as_deref()
+                != root.map(|root| root.public_key_digest.as_str())
+            || self.active_root_generation.map(to_u64).transpose()?
+                != root.map(|root| root.generation)
+            || self.active_root_revision.map(to_u64).transpose()? != root.map(|root| root.revision)
+            || self.active_root_lineage_digest.as_deref()
+                != root.map(|root| root.lineage_digest.as_str())
+            || self.observation_digest != authority_observation_digest(&observation)?
+        {
+            return Err(authority_mismatch(
+                "browser recipe authority snapshot projection",
+                project_id,
+            ));
+        }
+        Ok(observation)
+    }
+}
+
+struct RootSecretReferenceProjection {
+    tenant_id: String,
+    root_key_id: String,
+    root_key_id_digest: String,
+    public_key_digest: String,
+    generation: i64,
+    credential_id: String,
+    reference_digest: String,
+    reference_json: String,
+    first_snapshot_revision: i64,
+}
+
+impl RootSecretReferenceProjection {
+    fn read(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            tenant_id: row.get(0)?,
+            root_key_id: row.get(1)?,
+            root_key_id_digest: row.get(2)?,
+            public_key_digest: row.get(3)?,
+            generation: row.get(4)?,
+            credential_id: row.get(5)?,
+            reference_digest: row.get(6)?,
+            reference_json: row.get(7)?,
+            first_snapshot_revision: row.get(8)?,
+        })
+    }
+}
+
+struct LoadedRootSecretReference {
+    reference: SecretReference,
+    public_key_digest: String,
+    first_snapshot_revision: u64,
+}
+
+fn load_root_secret_references(
+    connection: &Connection,
+    project_id: &ProjectId,
+    tenant_id: &TenantId,
+) -> Result<BTreeMap<String, LoadedRootSecretReference>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT tenant_id, root_key_id, root_key_id_digest, public_key_digest,
+                generation, credential_id, reference_digest, reference_json,
+                first_snapshot_revision
+         FROM browser_recipe_root_secret_references
+         WHERE project_id = ?1 ORDER BY generation, root_key_id",
+    )?;
+    let rows = statement
+        .query_map([project_id.as_str()], RootSecretReferenceProjection::read)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut references = BTreeMap::new();
+    for row in rows {
+        let generation = to_u64(row.generation)?;
+        let reference: SecretReference = serde_json::from_str(&row.reference_json)?;
+        let expected = SecretReference::browser_recipe_root_signing_key(
+            tenant_id.clone(),
+            project_id.clone(),
+            &row.root_key_id,
+            generation,
+        )
+        .map_err(|error| StorageError::DomainDecode(error.to_string()))?;
+        if row.tenant_id != tenant_id.as_str()
+            || row.root_key_id_digest != digest_identity(&row.root_key_id)
+            || !is_sha256(&row.public_key_digest)
+            || reference != expected
+            || row.credential_id
+                != reference
+                    .credential_id()
+                    .map_err(|error| StorageError::DomainDecode(error.to_string()))?
+            || row.reference_digest != root_reference_digest(&reference)?
+            || row.reference_json != serde_json::to_string(&reference)?
+            || references
+                .insert(
+                    row.credential_id.clone(),
+                    LoadedRootSecretReference {
+                        reference,
+                        public_key_digest: row.public_key_digest,
+                        first_snapshot_revision: to_u64(row.first_snapshot_revision)?,
+                    },
+                )
+                .is_some()
+        {
+            return Err(authority_mismatch(
+                "browser recipe root secret reference projection",
+                project_id,
+            ));
+        }
+    }
+    Ok(references)
+}
+
+struct AuthorityTombstoneProjection {
+    tenant_id: String,
+    key_id: String,
+    key_id_digest: String,
+    purpose: String,
+    public_key_digest: String,
+    blocked_revision: i64,
+    lineage_digest: String,
+    block_kind: String,
+    effective_at: String,
+    first_snapshot_revision: i64,
+    tombstone_digest: String,
+    tombstone_json: String,
+}
+
+impl AuthorityTombstoneProjection {
+    fn read(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            tenant_id: row.get(0)?,
+            key_id: row.get(1)?,
+            key_id_digest: row.get(2)?,
+            purpose: row.get(3)?,
+            public_key_digest: row.get(4)?,
+            blocked_revision: row.get(5)?,
+            lineage_digest: row.get(6)?,
+            block_kind: row.get(7)?,
+            effective_at: row.get(8)?,
+            first_snapshot_revision: row.get(9)?,
+            tombstone_digest: row.get(10)?,
+            tombstone_json: row.get(11)?,
+        })
+    }
+
+    fn decode(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+    ) -> Result<BrowserRecipeAuthorityTombstone, StorageError> {
+        let tombstone: BrowserRecipeAuthorityTombstone =
+            serde_json::from_str(&self.tombstone_json)?;
+        if self.tenant_id != tenant_id.as_str()
+            || self.key_id != tombstone.key_id
+            || self.key_id_digest != digest_identity(&tombstone.key_id)
+            || self.purpose != authority_purpose_name(tombstone.purpose)
+            || self.public_key_digest != tombstone.public_key_digest
+            || to_u64(self.blocked_revision)? != tombstone.blocked_revision
+            || self.lineage_digest != tombstone.lineage_digest
+            || self.block_kind != authority_block_kind_name(tombstone.kind)
+            || self.effective_at != tombstone.effective_at.to_rfc3339()
+            || self.tombstone_digest
+                != authority_tombstone_digest(tenant_id, project_id, &tombstone)?
+            || self.tombstone_json != serde_json::to_string(&tombstone)?
+        {
+            return Err(authority_mismatch(
+                "browser recipe authority tombstone projection",
+                project_id,
+            ));
+        }
+        Ok(tombstone)
+    }
+}
+
+fn load_authority_tombstones(
+    connection: &Connection,
+    project_id: &ProjectId,
+    tenant_id: &TenantId,
+) -> Result<Vec<(BrowserRecipeAuthorityTombstone, u64)>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT tenant_id, key_id, key_id_digest, purpose, public_key_digest,
+                blocked_revision, lineage_digest, block_kind, effective_at,
+                first_snapshot_revision,
+                tombstone_digest, tombstone_json
+         FROM browser_recipe_authority_tombstones
+         WHERE project_id = ?1
+         ORDER BY key_id, CASE block_kind WHEN 'revoked' THEN 0 ELSE 1 END",
+    )?;
+    statement
+        .query_map([project_id.as_str()], AuthorityTombstoneProjection::read)?
+        .map(|row| {
+            let row = row.map_err(StorageError::from)?;
+            Ok((
+                row.decode(tenant_id, project_id)?,
+                to_u64(row.first_snapshot_revision)?,
+            ))
+        })
+        .collect()
+}
+
+fn authority_head_matches(
+    connection: &Connection,
+    project_id: &ProjectId,
+    tenant_id: &TenantId,
+    observation: &BrowserRecipeAuthorityObservation,
+    active_secret_credential_id: Option<&str>,
+) -> Result<bool, StorageError> {
+    let head = connection
+        .query_row(
+            "SELECT tenant_id, snapshot_revision, snapshot_as_of, snapshot_digest,
+                    state_digest, rotation_epoch, active_root_key_id,
+                    active_root_public_key_digest, active_root_generation,
+                    active_root_revision, active_root_lineage_digest,
+                    active_secret_credential_id, observation_digest, updated_at
+             FROM browser_recipe_authority_heads WHERE project_id = ?1",
+            [project_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(head) = head else {
+        return Ok(false);
+    };
+    let root = observation.active_root.as_ref();
+    Ok(head.0 == tenant_id.as_str()
+        && to_u64(head.1)? == observation.snapshot_revision
+        && head.2 == observation.snapshot_as_of.to_rfc3339()
+        && head.3 == observation.snapshot_digest
+        && head.4 == observation.state_digest
+        && to_u64(head.5)? == observation.rotation_epoch
+        && head.6.as_deref() == root.map(|root| root.key_id.as_str())
+        && head.7.as_deref() == root.map(|root| root.public_key_digest.as_str())
+        && head.8.map(to_u64).transpose()? == root.map(|root| root.generation)
+        && head.9.map(to_u64).transpose()? == root.map(|root| root.revision)
+        && head.10.as_deref() == root.map(|root| root.lineage_digest.as_str())
+        && head.11.as_deref() == active_secret_credential_id
+        && head.12 == authority_observation_digest(observation)?
+        && head.13 == observation.validation_at.to_rfc3339())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "crash recovery validates the snapshot chain, tombstones, secret references, and head as one fail-closed proof"
+)]
+fn load_durable_authority_state(
+    connection: &Connection,
+    project_id: &ProjectId,
+    tenant_id: &TenantId,
+) -> Result<Option<DurableBrowserRecipeAuthorityState>, StorageError> {
+    let references = load_root_secret_references(connection, project_id, tenant_id)?;
+    let persisted_tombstones = load_authority_tombstones(connection, project_id, tenant_id)?;
+    let mut statement = connection.prepare(
+        "SELECT tenant_id, snapshot_revision, snapshot_as_of, validation_at,
+                snapshot_digest, state_digest, rotation_epoch, previous_snapshot_digest,
+                active_root_key_id, active_root_public_key_digest, active_root_generation,
+                active_root_revision, active_root_lineage_digest,
+                active_secret_credential_id, observation_digest, observation_json
+         FROM browser_recipe_authority_snapshots
+         WHERE project_id = ?1 ORDER BY snapshot_revision",
+    )?;
+    let rows = statement
+        .query_map([project_id.as_str()], AuthoritySnapshotProjection::read)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        let head_count = connection.query_row(
+            "SELECT COUNT(*) FROM browser_recipe_authority_heads WHERE project_id = ?1",
+            [project_id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if head_count != 0 || !references.is_empty() || !persisted_tombstones.is_empty() {
+            return Err(authority_mismatch(
+                "browser recipe authority orphan projection",
+                project_id,
+            ));
+        }
+        return Ok(None);
+    }
+    let mut previous_observation: Option<BrowserRecipeAuthorityObservation> = None;
+    let mut latest_previous_digest = None;
+    let mut latest_credential_id = None;
+    let mut used_credentials = std::collections::BTreeSet::new();
+    let persisted_tombstone_first_revisions = persisted_tombstones
+        .iter()
+        .map(|(tombstone, revision)| ((tombstone.key_id.clone(), tombstone.kind), *revision))
+        .collect::<BTreeMap<_, _>>();
+    let mut observed_tombstone_first_revisions = BTreeMap::new();
+    for row in &rows {
+        let observation = row.decode(tenant_id, project_id)?;
+        match previous_observation.as_ref() {
+            None if row.previous_snapshot_digest.is_some() => {
+                return Err(authority_mismatch(
+                    "browser recipe authority snapshot chain",
+                    project_id,
+                ));
+            }
+            Some(previous)
+                if row.previous_snapshot_digest.as_deref()
+                    != Some(previous.snapshot_digest.as_str()) =>
+            {
+                return Err(authority_mismatch(
+                    "browser recipe authority snapshot chain",
+                    project_id,
+                ));
+            }
+            Some(previous) => validate_authority_transition(previous, &observation)?,
+            None => {}
+        }
+        for tombstone in &observation.tombstones {
+            observed_tombstone_first_revisions
+                .entry((tombstone.key_id.clone(), tombstone.kind))
+                .or_insert(observation.snapshot_revision);
+        }
+        match (
+            &observation.active_root,
+            row.active_secret_credential_id.as_deref(),
+        ) {
+            (Some(root), Some(credential_id)) => {
+                let Some(stored_reference) = references.get(credential_id) else {
+                    return Err(authority_mismatch(
+                        "browser recipe root secret reference recovery",
+                        project_id,
+                    ));
+                };
+                let expected_credential = validate_active_root_secret_reference(
+                    &observation,
+                    Some(&stored_reference.reference),
+                )?;
+                if expected_credential.as_deref() != Some(credential_id)
+                    || stored_reference.public_key_digest != root.public_key_digest
+                    || (used_credentials.insert(credential_id.to_owned())
+                        && stored_reference.first_snapshot_revision
+                            != observation.snapshot_revision)
+                {
+                    return Err(authority_mismatch(
+                        "browser recipe root secret reference recovery",
+                        project_id,
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(authority_mismatch(
+                    "browser recipe root secret reference recovery",
+                    project_id,
+                ));
+            }
+        }
+        latest_previous_digest.clone_from(&row.previous_snapshot_digest);
+        latest_credential_id.clone_from(&row.active_secret_credential_id);
+        previous_observation = Some(observation);
+    }
+    let observation = previous_observation.expect("non-empty authority snapshots");
+    let persisted_tombstone_values = persisted_tombstones
+        .iter()
+        .map(|(tombstone, _)| tombstone.clone())
+        .collect::<Vec<_>>();
+    if persisted_tombstone_values != observation.tombstones
+        || persisted_tombstone_first_revisions != observed_tombstone_first_revisions
+        || used_credentials.len() != references.len()
+        || !authority_head_matches(
+            connection,
+            project_id,
+            tenant_id,
+            &observation,
+            latest_credential_id.as_deref(),
+        )?
+    {
+        return Err(authority_mismatch(
+            "browser recipe authority recovery projection",
+            project_id,
+        ));
+    }
+    let active_root_secret_reference = latest_credential_id
+        .as_ref()
+        .and_then(|credential_id| references.get(credential_id))
+        .map(|stored| stored.reference.clone());
+    Ok(Some(DurableBrowserRecipeAuthorityState {
+        observation,
+        previous_snapshot_digest: latest_previous_digest,
+        active_root_secret_reference,
+    }))
 }
 
 fn load_runtime_state(
@@ -1463,6 +2561,307 @@ mod tests {
                 .register_browser_recipe_release_atomic(&fixture.project.id, release, fixture.now)
                 .expect("register release");
         }
+    }
+
+    fn authority_observation(
+        fixture: &RecipeFixture,
+        snapshot_revision: u64,
+        rotation_epoch: u64,
+        root_key_id: Option<&str>,
+        tombstones: Vec<BrowserRecipeAuthorityTombstone>,
+    ) -> BrowserRecipeAuthorityObservation {
+        let snapshot_as_of = fixture.now
+            + Duration::seconds(i64::try_from(snapshot_revision).expect("fixture revision"));
+        BrowserRecipeAuthorityObservation {
+            schema_version: 1,
+            tenant_id: fixture.project.tenant_id.clone(),
+            project_id: fixture.project.id.clone(),
+            snapshot_revision,
+            snapshot_as_of,
+            validation_at: snapshot_as_of + Duration::seconds(1),
+            snapshot_digest: digest_bytes(
+                format!("snapshot:{snapshot_revision}:{rotation_epoch}").as_bytes(),
+            ),
+            state_digest: digest_bytes(
+                format!("state:{snapshot_revision}:{rotation_epoch}").as_bytes(),
+            ),
+            rotation_epoch,
+            active_root: root_key_id.map(|key_id| BrowserRecipeAuthorityRootHead {
+                key_id: key_id.to_owned(),
+                public_key_digest: digest_bytes(format!("public:{key_id}").as_bytes()),
+                generation: rotation_epoch,
+                revision: 1,
+                lineage_digest: digest_bytes(
+                    format!("lineage:{key_id}:{rotation_epoch}").as_bytes(),
+                ),
+            }),
+            tombstones,
+            snapshot_freshness_authority: false,
+            production_dispatch: false,
+        }
+    }
+
+    fn authority_tombstone(
+        fixture: &RecipeFixture,
+        key_id: &str,
+    ) -> BrowserRecipeAuthorityTombstone {
+        BrowserRecipeAuthorityTombstone {
+            key_id: key_id.to_owned(),
+            purpose: BrowserRecipeAuthorityKeyPurpose::CandidatePublisher,
+            public_key_digest: digest_bytes(format!("public:{key_id}").as_bytes()),
+            blocked_revision: 2,
+            lineage_digest: digest_bytes(format!("lineage:{key_id}").as_bytes()),
+            kind: BrowserRecipeAuthorityBlockKind::Revoked,
+            effective_at: fixture.now + Duration::seconds(2),
+        }
+    }
+
+    fn authority_reference(observation: &BrowserRecipeAuthorityObservation) -> SecretReference {
+        let root = observation.active_root.as_ref().expect("active root");
+        SecretReference::browser_recipe_root_signing_key(
+            observation.tenant_id.clone(),
+            observation.project_id.clone(),
+            &root.key_id,
+            root.generation,
+        )
+        .expect("root secret reference")
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one durable journey proves epoch rotation, tombstone monotonicity, replay rejection, redaction, and crash recovery"
+    )]
+    fn root_authority_epoch_tombstone_and_secret_reference_survive_restart() {
+        let directory = tempdir().expect("directory");
+        let database_path = directory.path().join("recipe-authority.sqlite3");
+        let key = DatabaseKey::new([71; 32]).expect("database key");
+        let fixture = fixture(directory.path());
+        let first = authority_observation(&fixture, 1, 1, Some("root-1"), Vec::new());
+        let first_reference = authority_reference(&first);
+        let tombstone = authority_tombstone(&fixture, "candidate-1");
+        let revoked =
+            authority_observation(&fixture, 2, 1, Some("root-1"), vec![tombstone.clone()]);
+        let rotated =
+            authority_observation(&fixture, 3, 2, Some("root-2"), vec![tombstone.clone()]);
+        let rotated_reference = authority_reference(&rotated);
+        {
+            let mut store = ProjectStore::open(&database_path, &key).expect("store");
+            store.save_project(&fixture.project).expect("project");
+            let first_outcome = store
+                .persist_browser_recipe_authority_observation_atomic(&first, Some(&first_reference))
+                .expect("persist initial epoch");
+            assert!(!first_outcome.duplicate);
+            assert_eq!(first_outcome.rotation_epoch, 1);
+            assert_eq!(first_outcome.event_sequences.len(), 1);
+            let duplicate = store
+                .persist_browser_recipe_authority_observation_atomic(&first, Some(&first_reference))
+                .expect("idempotent crash retry");
+            assert!(duplicate.duplicate);
+            assert!(duplicate.event_sequences.is_empty());
+            store
+                .persist_browser_recipe_authority_observation_atomic(
+                    &revoked,
+                    Some(&first_reference),
+                )
+                .expect("persist leaf revocation tombstone");
+
+            assert!(matches!(
+                store.persist_browser_recipe_authority_observation_atomic(
+                    &first,
+                    Some(&first_reference),
+                ),
+                Err(StorageError::ImmutableRecordMismatch {
+                    kind: "browser recipe authority rollback",
+                    ..
+                })
+            ));
+            let mut same_revision_fork = revoked.clone();
+            same_revision_fork.state_digest = "f".repeat(64);
+            assert!(matches!(
+                store.persist_browser_recipe_authority_observation_atomic(
+                    &same_revision_fork,
+                    Some(&first_reference),
+                ),
+                Err(StorageError::ImmutableRecordMismatch {
+                    kind: "browser recipe authority replay conflict",
+                    ..
+                })
+            ));
+            let removed_tombstone =
+                authority_observation(&fixture, 3, 1, Some("root-1"), Vec::new());
+            assert!(matches!(
+                store.persist_browser_recipe_authority_observation_atomic(
+                    &removed_tombstone,
+                    Some(&first_reference),
+                ),
+                Err(StorageError::ImmutableRecordMismatch {
+                    kind: "browser recipe authority tombstone rollback",
+                    ..
+                })
+            ));
+            let epoch_jump =
+                authority_observation(&fixture, 3, 3, Some("root-3"), vec![tombstone.clone()]);
+            assert!(matches!(
+                store.persist_browser_recipe_authority_observation_atomic(
+                    &epoch_jump,
+                    Some(&authority_reference(&epoch_jump)),
+                ),
+                Err(StorageError::ImmutableRecordMismatch {
+                    kind: "browser recipe authority rotation epoch",
+                    ..
+                })
+            ));
+            let wrong_reference = SecretReference::browser_recipe_root_signing_key(
+                rotated.tenant_id.clone(),
+                rotated.project_id.clone(),
+                "root-substitution",
+                2,
+            )
+            .expect("wrong reference shape");
+            assert!(matches!(
+                store.persist_browser_recipe_authority_observation_atomic(
+                    &rotated,
+                    Some(&wrong_reference),
+                ),
+                Err(StorageError::ImmutableRecordMismatch {
+                    kind: "browser recipe root secret reference",
+                    ..
+                })
+            ));
+            store
+                .persist_browser_recipe_authority_observation_atomic(
+                    &rotated,
+                    Some(&rotated_reference),
+                )
+                .expect("persist next root epoch");
+
+            let payloads = store
+                .connection
+                .prepare(
+                    "SELECT payload_json FROM domain_events
+                     WHERE project_id = ?1 AND event_type =
+                       'browser.recipe_root_authority_snapshot_observed'",
+                )
+                .expect("event query")
+                .query_map([fixture.project.id.as_str()], |row| row.get::<_, String>(0))
+                .expect("event rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("event payloads")
+                .join("\n");
+            for secret_or_identity in ["root-1", "root-2", "candidate-1", "privateKey"] {
+                assert!(!payloads.contains(secret_or_identity));
+            }
+        }
+        let restarted = ProjectStore::open(&database_path, &key).expect("crash restart");
+        let recovered = restarted
+            .load_browser_recipe_root_authority_state(&fixture.project.id)
+            .expect("recover authority chain")
+            .expect("durable authority state");
+        assert_eq!(recovered.observation, rotated);
+        assert_eq!(
+            recovered.previous_snapshot_digest.as_deref(),
+            Some(revoked.snapshot_digest.as_str())
+        );
+        assert_eq!(
+            recovered.active_root_secret_reference,
+            Some(rotated_reference)
+        );
+        assert_eq!(recovered.observation.tombstones, vec![tombstone]);
+
+        restarted
+            .connection
+            .execute(
+                "DELETE FROM browser_recipe_authority_tombstones
+                 WHERE project_id = ?1 AND key_id = 'candidate-1'",
+                [fixture.project.id.as_str()],
+            )
+            .expect("tamper tombstone projection");
+        assert!(matches!(
+            restarted.load_browser_recipe_root_authority_state(&fixture.project.id),
+            Err(StorageError::ImmutableRecordMismatch {
+                kind: "browser recipe authority recovery projection",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn schema_v48_migration_is_transactional_and_retryable() {
+        let mut store = ProjectStore::in_memory().expect("current store");
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE browser_recipe_authority_heads;
+                 DROP TABLE browser_recipe_authority_tombstones;
+                 DROP TABLE browser_recipe_root_secret_references;
+                 DROP TABLE browser_recipe_authority_snapshots;
+                 DELETE FROM schema_migrations WHERE version = 48;",
+            )
+            .expect("construct schema v47");
+        assert_eq!(store.schema_version().expect("v47 schema"), 47);
+        store
+            .connection
+            .execute_batch(
+                "CREATE TABLE browser_recipe_authority_heads (
+                   sentinel INTEGER NOT NULL
+                 );",
+            )
+            .expect("inject migration collision");
+        assert!(matches!(
+            store.migrate(),
+            Err(StorageError::DomainDecode(_))
+        ));
+        assert_eq!(store.schema_version().expect("rolled back schema"), 47);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'browser_recipe_authority_snapshots'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("rolled back table count"),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 48",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("rolled back ledger"),
+            0
+        );
+        store
+            .connection
+            .execute_batch("DROP TABLE browser_recipe_authority_heads;")
+            .expect("remove collision");
+        store.migrate().expect("retry schema v48 migration");
+        assert_eq!(
+            store.schema_version().expect("current schema"),
+            STORAGE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+                     AND name IN (
+                       'browser_recipe_authority_snapshots',
+                       'browser_recipe_authority_heads',
+                       'browser_recipe_authority_tombstones',
+                       'browser_recipe_root_secret_references'
+                     )",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("authority lifecycle tables"),
+            4
+        );
     }
 
     #[test]

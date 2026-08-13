@@ -38,6 +38,71 @@ pub enum BrowserRecipeKeyPurpose {
     ProductionRelease,
 }
 
+/// Public, secret-free key role emitted by supplied Recipe authority snapshot
+/// validation. It is persistence metadata, not lifecycle admission or dispatch
+/// authority.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserRecipeAuthorityKeyPurpose {
+    RootAuthority,
+    CandidatePublisher,
+    ProductionRelease,
+}
+
+/// The permanent blocking fact represented by a durable authority tombstone.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserRecipeAuthorityBlockKind {
+    Revoked,
+    Compromised,
+}
+
+/// Exact active root identity observed after replaying a supplied public
+/// authority snapshot. No private root material is present.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserRecipeAuthorityRootHead {
+    pub key_id: String,
+    pub public_key_digest: String,
+    pub generation: u64,
+    pub revision: u64,
+    pub lineage_digest: String,
+}
+
+/// Append-only blocking fact derived from a signed lifecycle mutation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserRecipeAuthorityTombstone {
+    pub key_id: String,
+    pub purpose: BrowserRecipeAuthorityKeyPurpose,
+    pub public_key_digest: String,
+    pub blocked_revision: u64,
+    pub lineage_digest: String,
+    pub kind: BrowserRecipeAuthorityBlockKind,
+    pub effective_at: DateTime<Utc>,
+}
+
+/// Secret-free result of validating one exact supplied public authority
+/// snapshot. The two false flags are intentional: persistence must not turn a
+/// caller-supplied snapshot into current authority or a dispatch permit.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserRecipeAuthorityObservation {
+    pub schema_version: u32,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub snapshot_revision: u64,
+    pub snapshot_as_of: DateTime<Utc>,
+    pub validation_at: DateTime<Utc>,
+    pub snapshot_digest: String,
+    pub state_digest: String,
+    pub rotation_epoch: u64,
+    pub active_root: Option<BrowserRecipeAuthorityRootHead>,
+    pub tombstones: Vec<BrowserRecipeAuthorityTombstone>,
+    pub snapshot_freshness_authority: bool,
+    pub production_dispatch: bool,
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrustedBrowserRecipeKey {
@@ -180,6 +245,31 @@ impl BrowserRecipeTrustStore {
         expected_snapshot_digest: &str,
         validation_at: DateTime<Utc>,
     ) -> Result<(), BrowserError> {
+        recipe_authority::validate_supplied_authority_snapshot_json(
+            snapshot_json,
+            expected_tenant_id,
+            expected_project_id,
+            expected_snapshot_revision,
+            expected_snapshot_as_of,
+            expected_snapshot_digest,
+            validation_at,
+        )
+        .map(|_| ())
+        .map_err(|_| BrowserError::InvalidRecipeKey)
+    }
+
+    /// Returns secret-free lifecycle metadata only after the same checked
+    /// admission path used above succeeds. The baseline registration set is
+    /// empty, so this currently fails closed before Storage can write.
+    pub fn validate_supplied_root_authority_snapshot_for_persistence(
+        snapshot_json: &str,
+        expected_tenant_id: &TenantId,
+        expected_project_id: &ProjectId,
+        expected_snapshot_revision: u64,
+        expected_snapshot_as_of: DateTime<Utc>,
+        expected_snapshot_digest: &str,
+        validation_at: DateTime<Utc>,
+    ) -> Result<BrowserRecipeAuthorityObservation, BrowserError> {
         recipe_authority::validate_supplied_authority_snapshot_json(
             snapshot_json,
             expected_tenant_id,

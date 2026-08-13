@@ -35,7 +35,10 @@ mod work_product_store;
 pub use aggregate::{
     ApplicationSourceKind, ApplicationSourceRevisionFence, AtomicMutation, PendingEvent,
 };
-pub use browser_recipe_store::BrowserRecipeRuntimeState;
+pub use browser_recipe_store::{
+    BrowserRecipeAuthorityPersistOutcome, BrowserRecipeRuntimeState,
+    DurableBrowserRecipeAuthorityState,
+};
 pub use context_material_store::{
     ContextMaterialDescriptor, ContextMaterialStoreError, ContextQuerySnapshot,
     LocalEncryptedContextMaterialStore,
@@ -80,7 +83,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 47;
+pub const STORAGE_SCHEMA_VERSION: i64 = 48;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4402,10 +4405,306 @@ impl ProjectStore {
             record_migration(&transaction, 47)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 48 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS browser_recipe_authority_snapshots (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   snapshot_revision INTEGER NOT NULL CHECK (snapshot_revision > 0),
+                   snapshot_as_of TEXT NOT NULL,
+                   validation_at TEXT NOT NULL,
+                   snapshot_digest TEXT NOT NULL CHECK (length(snapshot_digest) = 64),
+                   state_digest TEXT NOT NULL CHECK (length(state_digest) = 64),
+                   rotation_epoch INTEGER NOT NULL CHECK (rotation_epoch > 0),
+                   previous_snapshot_digest TEXT CHECK (
+                     previous_snapshot_digest IS NULL
+                     OR length(previous_snapshot_digest) = 64
+                   ),
+                   active_root_key_id TEXT,
+                   active_root_public_key_digest TEXT CHECK (
+                     active_root_public_key_digest IS NULL
+                     OR length(active_root_public_key_digest) = 64
+                   ),
+                   active_root_generation INTEGER CHECK (active_root_generation > 0),
+                   active_root_revision INTEGER CHECK (active_root_revision > 0),
+                   active_root_lineage_digest TEXT CHECK (
+                     active_root_lineage_digest IS NULL
+                     OR length(active_root_lineage_digest) = 64
+                   ),
+                   active_secret_credential_id TEXT CHECK (
+                     active_secret_credential_id IS NULL
+                     OR length(active_secret_credential_id) = 64
+                   ),
+                   observation_digest TEXT NOT NULL CHECK (length(observation_digest) = 64),
+                   observation_json TEXT NOT NULL,
+                   PRIMARY KEY (project_id, snapshot_revision),
+                   UNIQUE (project_id, snapshot_digest),
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                   CHECK (validation_at >= snapshot_as_of),
+                   CHECK (
+                     (active_root_key_id IS NULL
+                       AND active_root_public_key_digest IS NULL
+                       AND active_root_generation IS NULL
+                       AND active_root_revision IS NULL
+                       AND active_root_lineage_digest IS NULL
+                       AND active_secret_credential_id IS NULL)
+                     OR (active_root_key_id IS NOT NULL
+                       AND active_root_public_key_digest IS NOT NULL
+                       AND active_root_generation = rotation_epoch
+                       AND active_root_revision IS NOT NULL
+                       AND active_root_lineage_digest IS NOT NULL
+                       AND active_secret_credential_id IS NOT NULL)
+                   )
+                 );
+                 CREATE INDEX IF NOT EXISTS browser_recipe_authority_snapshot_scope_idx
+                   ON browser_recipe_authority_snapshots(
+                     tenant_id, project_id, rotation_epoch, snapshot_revision
+                   );
+                 CREATE TABLE IF NOT EXISTS browser_recipe_authority_heads (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT PRIMARY KEY,
+                   snapshot_revision INTEGER NOT NULL CHECK (snapshot_revision > 0),
+                   snapshot_as_of TEXT NOT NULL,
+                   snapshot_digest TEXT NOT NULL CHECK (length(snapshot_digest) = 64),
+                   state_digest TEXT NOT NULL CHECK (length(state_digest) = 64),
+                   rotation_epoch INTEGER NOT NULL CHECK (rotation_epoch > 0),
+                   active_root_key_id TEXT,
+                   active_root_public_key_digest TEXT CHECK (
+                     active_root_public_key_digest IS NULL
+                     OR length(active_root_public_key_digest) = 64
+                   ),
+                   active_root_generation INTEGER CHECK (active_root_generation > 0),
+                   active_root_revision INTEGER CHECK (active_root_revision > 0),
+                   active_root_lineage_digest TEXT CHECK (
+                     active_root_lineage_digest IS NULL
+                     OR length(active_root_lineage_digest) = 64
+                   ),
+                   active_secret_credential_id TEXT CHECK (
+                     active_secret_credential_id IS NULL
+                     OR length(active_secret_credential_id) = 64
+                   ),
+                   observation_digest TEXT NOT NULL CHECK (length(observation_digest) = 64),
+                   updated_at TEXT NOT NULL,
+                   FOREIGN KEY (project_id, snapshot_revision)
+                     REFERENCES browser_recipe_authority_snapshots(
+                       project_id, snapshot_revision
+                     ),
+                   CHECK (
+                     (active_root_key_id IS NULL
+                       AND active_root_public_key_digest IS NULL
+                       AND active_root_generation IS NULL
+                       AND active_root_revision IS NULL
+                       AND active_root_lineage_digest IS NULL
+                       AND active_secret_credential_id IS NULL)
+                     OR (active_root_key_id IS NOT NULL
+                       AND active_root_public_key_digest IS NOT NULL
+                       AND active_root_generation = rotation_epoch
+                       AND active_root_revision IS NOT NULL
+                       AND active_root_lineage_digest IS NOT NULL
+                       AND active_secret_credential_id IS NOT NULL)
+                   )
+                 );
+                 CREATE TABLE IF NOT EXISTS browser_recipe_authority_tombstones (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   key_id TEXT NOT NULL CHECK (length(trim(key_id)) > 0),
+                   key_id_digest TEXT NOT NULL CHECK (length(key_id_digest) = 64),
+                   purpose TEXT NOT NULL CHECK (purpose IN (
+                     'root_authority', 'candidate_publisher', 'production_release'
+                   )),
+                   public_key_digest TEXT NOT NULL CHECK (length(public_key_digest) = 64),
+                   blocked_revision INTEGER NOT NULL CHECK (blocked_revision > 0),
+                   lineage_digest TEXT NOT NULL CHECK (length(lineage_digest) = 64),
+                   block_kind TEXT NOT NULL CHECK (block_kind IN ('revoked', 'compromised')),
+                   effective_at TEXT NOT NULL,
+                   first_snapshot_revision INTEGER NOT NULL CHECK (first_snapshot_revision > 0),
+                   tombstone_digest TEXT NOT NULL CHECK (length(tombstone_digest) = 64),
+                   tombstone_json TEXT NOT NULL,
+                   PRIMARY KEY (project_id, key_id, block_kind),
+                   UNIQUE (project_id, tombstone_digest),
+                   FOREIGN KEY (project_id, first_snapshot_revision)
+                     REFERENCES browser_recipe_authority_snapshots(
+                       project_id, snapshot_revision
+                     )
+                 );
+                 CREATE INDEX IF NOT EXISTS browser_recipe_authority_tombstone_scope_idx
+                   ON browser_recipe_authority_tombstones(
+                     tenant_id, project_id, purpose, block_kind, effective_at
+                   );
+                 CREATE TABLE IF NOT EXISTS browser_recipe_root_secret_references (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   root_key_id TEXT NOT NULL CHECK (length(trim(root_key_id)) > 0),
+                   root_key_id_digest TEXT NOT NULL CHECK (length(root_key_id_digest) = 64),
+                   public_key_digest TEXT NOT NULL CHECK (length(public_key_digest) = 64),
+                   generation INTEGER NOT NULL CHECK (generation > 0),
+                   credential_id TEXT NOT NULL CHECK (length(credential_id) = 64),
+                   reference_digest TEXT NOT NULL CHECK (length(reference_digest) = 64),
+                   reference_json TEXT NOT NULL,
+                   first_snapshot_revision INTEGER NOT NULL CHECK (first_snapshot_revision > 0),
+                   PRIMARY KEY (project_id, root_key_id, generation),
+                   UNIQUE (project_id, credential_id),
+                   FOREIGN KEY (project_id, first_snapshot_revision)
+                     REFERENCES browser_recipe_authority_snapshots(
+                       project_id, snapshot_revision
+                     )
+                 );",
+            )?;
+            validate_recipe_authority_schema_v48(&transaction)?;
+            record_migration(&transaction, 48)?;
+            transaction.commit()?;
+        }
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
     }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the migration validator keeps every exact v48 table, column, index, and constraint in one auditable matrix"
+)]
+fn validate_recipe_authority_schema_v48(transaction: &Transaction<'_>) -> Result<(), StorageError> {
+    const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
+        (
+            "browser_recipe_authority_snapshots",
+            &[
+                "tenant_id",
+                "project_id",
+                "snapshot_revision",
+                "snapshot_as_of",
+                "validation_at",
+                "snapshot_digest",
+                "state_digest",
+                "rotation_epoch",
+                "previous_snapshot_digest",
+                "active_root_key_id",
+                "active_root_public_key_digest",
+                "active_root_generation",
+                "active_root_revision",
+                "active_root_lineage_digest",
+                "active_secret_credential_id",
+                "observation_digest",
+                "observation_json",
+            ],
+        ),
+        (
+            "browser_recipe_authority_heads",
+            &[
+                "tenant_id",
+                "project_id",
+                "snapshot_revision",
+                "snapshot_as_of",
+                "snapshot_digest",
+                "state_digest",
+                "rotation_epoch",
+                "active_root_key_id",
+                "active_root_public_key_digest",
+                "active_root_generation",
+                "active_root_revision",
+                "active_root_lineage_digest",
+                "active_secret_credential_id",
+                "observation_digest",
+                "updated_at",
+            ],
+        ),
+        (
+            "browser_recipe_authority_tombstones",
+            &[
+                "tenant_id",
+                "project_id",
+                "key_id",
+                "key_id_digest",
+                "purpose",
+                "public_key_digest",
+                "blocked_revision",
+                "lineage_digest",
+                "block_kind",
+                "effective_at",
+                "first_snapshot_revision",
+                "tombstone_digest",
+                "tombstone_json",
+            ],
+        ),
+        (
+            "browser_recipe_root_secret_references",
+            &[
+                "tenant_id",
+                "project_id",
+                "root_key_id",
+                "root_key_id_digest",
+                "public_key_digest",
+                "generation",
+                "credential_id",
+                "reference_digest",
+                "reference_json",
+                "first_snapshot_revision",
+            ],
+        ),
+    ];
+    for (table, expected) in EXPECTED_COLUMNS {
+        let mut statement = transaction.prepare(&format!("PRAGMA table_info('{table}')"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns != *expected {
+            return Err(StorageError::DomainDecode(format!(
+                "schema v48 authority table {table} does not match its checked columns"
+            )));
+        }
+    }
+    for index in [
+        "browser_recipe_authority_snapshot_scope_idx",
+        "browser_recipe_authority_tombstone_scope_idx",
+    ] {
+        let count = transaction.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [index],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if count != 1 {
+            return Err(StorageError::DomainDecode(format!(
+                "schema v48 authority index {index} is missing or ambiguous"
+            )));
+        }
+    }
+    for (table, required_fragments) in [
+        (
+            "browser_recipe_authority_snapshots",
+            &[
+                "active_root_generation = rotation_epoch",
+                "validation_at >= snapshot_as_of",
+            ][..],
+        ),
+        (
+            "browser_recipe_authority_heads",
+            &["active_root_generation = rotation_epoch"][..],
+        ),
+        (
+            "browser_recipe_authority_tombstones",
+            &["'revoked', 'compromised'", "tombstone_digest"][..],
+        ),
+        (
+            "browser_recipe_root_secret_references",
+            &["credential_id", "reference_digest"][..],
+        ),
+    ] {
+        let sql = transaction.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, String>(0),
+        )?;
+        if required_fragments
+            .iter()
+            .any(|fragment| !sql.contains(fragment))
+        {
+            return Err(StorageError::DomainDecode(format!(
+                "schema v48 authority table {table} lost a checked constraint"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validated_database_path(path: &Path) -> Result<PathBuf, StorageError> {
@@ -5328,7 +5627,10 @@ mod tests {
 
         let mut migrated =
             ProjectStore::open(&database, &database_key()).expect("migrate v46 to v47");
-        assert_eq!(migrated.schema_version().expect("v47 schema"), 47);
+        assert_eq!(
+            migrated.schema_version().expect("current schema"),
+            STORAGE_SCHEMA_VERSION
+        );
         assert!(checkpoint_policy_table_sql(&migrated.connection).contains("effect_readback_v2"));
         assert_eq!(
             migrated
@@ -5439,7 +5741,10 @@ mod tests {
             .execute_batch("DROP TABLE mission_checkpoints_v47;")
             .expect("remove injected collision");
         store.migrate().expect("retry v47 migration");
-        assert_eq!(store.schema_version().expect("retried schema"), 47);
+        assert_eq!(
+            store.schema_version().expect("retried schema"),
+            STORAGE_SCHEMA_VERSION
+        );
         assert_eq!(
             store
                 .load_mission(&project.id, &legacy.id)

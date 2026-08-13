@@ -52,7 +52,9 @@ pub use locator::{BrowserLocatorResolution, BrowserStableLocator};
 pub use navigation::{BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserNavigationTarget};
 pub use profile_dir::{BrowserExecutableIdentity, ManagedProfileDirectory};
 pub use recipe::{
-    BrowserRecipeActivation, BrowserRecipeActiveVersion, BrowserRecipeCandidate,
+    BrowserRecipeActivation, BrowserRecipeActiveVersion, BrowserRecipeAuthorityBlockKind,
+    BrowserRecipeAuthorityKeyPurpose, BrowserRecipeAuthorityObservation,
+    BrowserRecipeAuthorityRootHead, BrowserRecipeAuthorityTombstone, BrowserRecipeCandidate,
     BrowserRecipeEvaluationEvidence, BrowserRecipeExecutionAuthorization, BrowserRecipeKeyPurpose,
     BrowserRecipeManifest, BrowserRecipePreparedPlan, BrowserRecipePromotion,
     BrowserRecipeRegistry, BrowserRecipeRegistrySnapshot, BrowserRecipeRelease,

@@ -15,9 +15,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::BrowserRecipeKeyPurpose;
 #[cfg(test)]
 use super::TrustedBrowserRecipeKey;
+use super::{
+    BrowserRecipeAuthorityBlockKind, BrowserRecipeAuthorityKeyPurpose,
+    BrowserRecipeAuthorityObservation, BrowserRecipeAuthorityRootHead,
+    BrowserRecipeAuthorityTombstone, BrowserRecipeKeyPurpose,
+};
 use crate::workspace::is_bounded_identifier;
 
 const AUTHORITY_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -746,18 +750,6 @@ struct BrowserRecipeAuthoritySnapshotExpectation {
     snapshot_revision: u64,
     snapshot_as_of: DateTime<Utc>,
     snapshot_digest: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SnapshotValidatedAuthorization {
-    tenant_id: TenantId,
-    project_id: ProjectId,
-    snapshot_revision: u64,
-    snapshot_as_of: DateTime<Utc>,
-    snapshot_digest: String,
-    state_digest: String,
-    snapshot_freshness_authority: bool,
-    production_dispatch: bool,
 }
 
 impl BrowserRecipeAuthoritySnapshot {
@@ -1489,18 +1481,107 @@ fn validate_supplied_authority_snapshot(
     snapshot: &BrowserRecipeAuthoritySnapshot,
     expectation: &BrowserRecipeAuthoritySnapshotExpectation,
     validation_at: DateTime<Utc>,
-) -> Result<SnapshotValidatedAuthorization, BrowserRecipeAuthorityError> {
+) -> Result<BrowserRecipeAuthorityObservation, BrowserRecipeAuthorityError> {
     let replayed = ReplayedAuthoritySnapshot::replay(snapshot, validation_at, expectation)?;
-    Ok(SnapshotValidatedAuthorization {
+    let rotation_epoch = replayed
+        .keys
+        .values()
+        .filter_map(|key| {
+            (key.purpose == AuthorityKeyPurpose::RootAuthority)
+                .then_some(key.generation)
+                .flatten()
+        })
+        .max()
+        .ok_or(BrowserRecipeAuthorityError::InvalidRootHead)?;
+    let active_root = replayed
+        .active_root_key_id
+        .as_ref()
+        .map(|key_id| {
+            let key = replayed
+                .keys
+                .get(key_id)
+                .ok_or(BrowserRecipeAuthorityError::InvalidRootHead)?;
+            Ok(BrowserRecipeAuthorityRootHead {
+                key_id: key.key_id.clone(),
+                public_key_digest: key.public_key_digest.clone(),
+                generation: key
+                    .generation
+                    .ok_or(BrowserRecipeAuthorityError::InvalidRootHead)?,
+                revision: key.revision,
+                lineage_digest: key.lineage_digest.clone(),
+            })
+        })
+        .transpose()?;
+    if active_root
+        .as_ref()
+        .is_some_and(|root| root.generation != rotation_epoch)
+    {
+        return Err(BrowserRecipeAuthorityError::InvalidRootHead);
+    }
+    let tombstones = replayed
+        .keys
+        .values()
+        .flat_map(|key| {
+            let revocation_revision = key
+                .revision
+                .checked_sub(u64::from(key.compromised_from.is_some()));
+            let revoked = key
+                .revoked_at
+                .zip(revocation_revision)
+                .map(|(at, revision)| {
+                    authority_tombstone(key, revision, BrowserRecipeAuthorityBlockKind::Revoked, at)
+                });
+            let compromised = key.compromised_from.map(|at| {
+                authority_tombstone(
+                    key,
+                    key.revision,
+                    BrowserRecipeAuthorityBlockKind::Compromised,
+                    at,
+                )
+            });
+            revoked.into_iter().chain(compromised)
+        })
+        .collect();
+    Ok(BrowserRecipeAuthorityObservation {
+        schema_version: 1,
         tenant_id: replayed.tenant_id.clone(),
         project_id: replayed.project_id.clone(),
         snapshot_revision: replayed.snapshot_revision,
         snapshot_as_of: replayed.snapshot_as_of,
+        validation_at,
         snapshot_digest: replayed.snapshot_digest.clone(),
         state_digest: replayed.state_digest()?,
+        rotation_epoch,
+        active_root,
+        tombstones,
         snapshot_freshness_authority: false,
         production_dispatch: false,
     })
+}
+
+fn authority_tombstone(
+    key: &AuthorityKeyRecord,
+    blocked_revision: u64,
+    kind: BrowserRecipeAuthorityBlockKind,
+    effective_at: DateTime<Utc>,
+) -> BrowserRecipeAuthorityTombstone {
+    BrowserRecipeAuthorityTombstone {
+        key_id: key.key_id.clone(),
+        purpose: match key.purpose {
+            AuthorityKeyPurpose::RootAuthority => BrowserRecipeAuthorityKeyPurpose::RootAuthority,
+            AuthorityKeyPurpose::CandidatePublisher => {
+                BrowserRecipeAuthorityKeyPurpose::CandidatePublisher
+            }
+            AuthorityKeyPurpose::ProductionRelease => {
+                BrowserRecipeAuthorityKeyPurpose::ProductionRelease
+            }
+        },
+        public_key_digest: key.public_key_digest.clone(),
+        blocked_revision,
+        lineage_digest: key.lineage_digest.clone(),
+        kind,
+        effective_at,
+    }
 }
 
 /// Production entry point: validate the checked contract and supplied snapshot,
@@ -1513,7 +1594,7 @@ pub(super) fn validate_supplied_authority_snapshot_json(
     expected_snapshot_as_of: DateTime<Utc>,
     expected_snapshot_digest: &str,
     validation_at: DateTime<Utc>,
-) -> Result<(), BrowserRecipeAuthorityError> {
+) -> Result<BrowserRecipeAuthorityObservation, BrowserRecipeAuthorityError> {
     let contract = BrowserRecipeAuthorityContract::baseline()?;
     let snapshot = serde_json::from_str::<BrowserRecipeAuthoritySnapshot>(snapshot_json)
         .map_err(|_| BrowserRecipeAuthorityError::InvalidMutation)?;
@@ -1524,8 +1605,9 @@ pub(super) fn validate_supplied_authority_snapshot_json(
         snapshot_as_of: expected_snapshot_as_of,
         snapshot_digest: expected_snapshot_digest.to_owned(),
     };
-    let _ = validate_supplied_authority_snapshot(&snapshot, &expectation, validation_at)?;
-    contract.deny_unregistered_admission()
+    let observation = validate_supplied_authority_snapshot(&snapshot, &expectation, validation_at)?;
+    contract.deny_unregistered_admission()?;
+    Ok(observation)
 }
 
 fn exact_key<'a>(
@@ -2383,6 +2465,15 @@ mod tests {
             .expect("supplied snapshot validation");
         assert!(!validated.snapshot_freshness_authority);
         assert!(!validated.production_dispatch);
+        assert_eq!(validated.validation_at, at);
+        assert_eq!(validated.rotation_epoch, 1);
+        assert_eq!(
+            validated
+                .active_root
+                .as_ref()
+                .map(|root| (root.key_id.as_str(), root.generation)),
+            Some(("root-1", 1))
+        );
         assert_eq!(
             validate_supplied_authority_snapshot_json(
                 &serde_json::to_string(&snapshot).expect("snapshot JSON"),
@@ -2395,6 +2486,65 @@ mod tests {
             ),
             Err(BrowserRecipeAuthorityError::LifecycleAdmissionDenied)
         );
+    }
+
+    #[test]
+    fn persistence_observation_binds_rotation_epoch_and_stable_revocation_tombstone() {
+        let keys = SigningFixture::new();
+        let at = now();
+        let revoked_at = at + Duration::minutes(3);
+        let snapshot = snapshot(
+            vec![
+                provision_root(1, at, "root-1", 1, &keys.root_one),
+                authorize_leaf(
+                    2,
+                    at + Duration::minutes(1),
+                    "root-1",
+                    1,
+                    &keys.root_one,
+                    "candidate-1",
+                    AuthorityKeyPurpose::CandidatePublisher,
+                    &keys.candidate_one,
+                ),
+                rotate_root(
+                    3,
+                    at + Duration::minutes(2),
+                    "root-1",
+                    1,
+                    &keys.root_one,
+                    "root-2",
+                    2,
+                    &keys.root_two,
+                ),
+                revoke_key(4, revoked_at, "root-2", 1, &keys.root_two, "candidate-1", 1),
+            ],
+            at + Duration::minutes(4),
+        );
+        let expectation = snapshot.expectation().expect("expectation");
+        let observation = validate_supplied_authority_snapshot(
+            &snapshot,
+            &expectation,
+            at + Duration::minutes(4),
+        )
+        .expect("secret-free persistence observation");
+        assert_eq!(observation.rotation_epoch, 2);
+        assert_eq!(
+            observation
+                .active_root
+                .as_ref()
+                .map(|root| (root.key_id.as_str(), root.generation)),
+            Some(("root-2", 2))
+        );
+        assert_eq!(observation.tombstones.len(), 1);
+        assert_eq!(observation.tombstones[0].key_id, "candidate-1");
+        assert_eq!(
+            observation.tombstones[0].kind,
+            BrowserRecipeAuthorityBlockKind::Revoked
+        );
+        assert_eq!(observation.tombstones[0].blocked_revision, 2);
+        assert_eq!(observation.tombstones[0].effective_at, revoked_at);
+        assert!(!observation.snapshot_freshness_authority);
+        assert!(!observation.production_dispatch);
     }
 
     #[test]
