@@ -29,8 +29,9 @@ mod scanner;
 mod workspace;
 
 pub use action::{
-    BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionRisk, BrowserActionSurface,
-    BrowserEffectBinding, BrowserElementRef, BrowserPromptRisk, BrowserTextInput, SemanticSnapshot,
+    BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionResult, BrowserActionRisk,
+    BrowserActionSurface, BrowserBatchReceipt, BrowserBatchReceiptState, BrowserEffectBinding,
+    BrowserElementRef, BrowserPromptRisk, BrowserTextInput, SemanticSnapshot,
 };
 #[cfg(unix)]
 pub use chromium_host::{
@@ -40,8 +41,7 @@ pub use chromium_host::{
     ManagedChromiumFileUploadExecutor, ManagedChromiumHost, ManagedChromiumTextInputExecutor,
 };
 pub use fake_host::{
-    BrowserActionResult, BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost,
-    FakeBrowserPage,
+    BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost, FakeBrowserPage,
 };
 pub use file_broker::{
     BrowserFileGrant, BrowserFileGrantState, BrowserFileType, FileBroker, FileBrokerReconciliation,
@@ -99,6 +99,8 @@ pub enum BrowserError {
     InvalidAction,
     #[error("browser action batch is malformed or expired")]
     InvalidBatch,
+    #[error("browser batch receipt does not acknowledge an exact digest-bound action prefix")]
+    InvalidBatchReceipt,
     #[error("potential browser external write requires the Effect Broker")]
     EffectBrokerRequired,
     #[error("browser action batch does not match the exact approved Effect")]
@@ -241,6 +243,7 @@ impl BrowserError {
             Self::InvalidSnapshot => "BROWSER_INVALID_SNAPSHOT",
             Self::InvalidAction => "BROWSER_INVALID_ACTION",
             Self::InvalidBatch => "BROWSER_INVALID_BATCH",
+            Self::InvalidBatchReceipt => "BROWSER_INVALID_BATCH_RECEIPT",
             Self::EffectBrokerRequired => "BROWSER_EFFECT_BROKER_REQUIRED",
             Self::EffectScopeMismatch => "BROWSER_EFFECT_SCOPE_MISMATCH",
             Self::WorkspaceNotRegistered => "BROWSER_WORKSPACE_NOT_REGISTERED",
