@@ -38,7 +38,10 @@ fn production_route_graph_and_snapshot_v4_have_the_frozen_shape() {
         contract.schema_version,
         "hartevo-mission-route-graph-contract/v2"
     );
-    assert_eq!(contract.contract_version, "desktop-2026-08-12-ct02-v1");
+    assert_eq!(
+        contract.contract_version,
+        "desktop-2026-08-13-signal01-ct01-v1"
+    );
     assert_eq!(contract.evidence_level, "E1");
     assert!(!contract.runtime_authority.branch_execution());
     assert!(!contract.runtime_authority.redirect_execution());
@@ -78,11 +81,11 @@ fn production_route_graph_and_snapshot_v4_have_the_frozen_shape() {
     assert_eq!(snapshot.schema_version, "hartevo-catalog-snapshot/v4");
     assert_eq!(
         snapshot.route_graph_contract_version,
-        "desktop-2026-08-12-ct02-v1"
+        "desktop-2026-08-13-signal01-ct01-v1"
     );
     assert_eq!(snapshot.summary.route_graph_count, 12);
-    assert_eq!(snapshot.summary.route_graph_node_count, 123);
-    assert_eq!(snapshot.summary.route_graph_normal_edge_count, 124);
+    assert_eq!(snapshot.summary.route_graph_node_count, 124);
+    assert_eq!(snapshot.summary.route_graph_normal_edge_count, 125);
     assert_eq!(snapshot.summary.route_graph_redirect_edge_count, 1);
     assert_eq!(snapshot.summary.route_graph_terminal_count, 12);
     let serialized = serde_json::to_value(&snapshot).expect("Snapshot v4 JSON");
@@ -90,7 +93,7 @@ fn production_route_graph_and_snapshot_v4_have_the_frozen_shape() {
         serialized
             .get("routeGraphContractVersion")
             .and_then(serde_json::Value::as_str),
-        Some("desktop-2026-08-12-ct02-v1")
+        Some("desktop-2026-08-13-signal01-ct01-v1")
     );
 }
 

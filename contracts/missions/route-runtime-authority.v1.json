@@ -2,7 +2,7 @@
   "schemaVersion": "hartevo-mission-route-runtime-authority-contract/v1",
   "contractVersion": "desktop-2026-08-13-ct03-v1",
   "evidenceLevel": "E1",
-  "routeGraphContractVersion": "desktop-2026-08-12-ct02-v1",
+  "routeGraphContractVersion": "desktop-2026-08-13-signal01-ct01-v1",
   "applicationHandlerRegistryVersion": "desktop-2026-08-12-v8",
   "defaultTerminalExecutionAuthority": "denied",
   "terminalTransitions": [

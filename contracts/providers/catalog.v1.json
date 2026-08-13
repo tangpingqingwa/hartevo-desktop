@@ -1,9 +1,10 @@
 {
   "schemaVersion": "hartevo-provider-catalog/v1",
-  "catalogVersion": "desktop-2026-08-10-v1",
+  "catalogVersion": "desktop-2026-08-13-signal01-v1",
   "providers": [
     {"id":"keycloak","status":"target_contract","integrationMode":"official_api","authMode":"oidc","capabilityIds":["identity.resolve"],"regions":["us","eu","self_hosted"],"requiresExternalApproval":false,"evidenceLevel":"E0"},
     {"id":"google-oidc","status":"target_contract","integrationMode":"official_api","authMode":"oidc","capabilityIds":["identity.resolve","connection.probe"],"regions":["global"],"requiresExternalApproval":true,"evidenceLevel":"E0"},
+    {"id":"google-ads","status":"target_contract","integrationMode":"official_api","authMode":"oauth","capabilityIds":["connection.probe","ads.read"],"regions":["global"],"requiresExternalApproval":true,"evidenceLevel":"E0"},
     {"id":"stripe","status":"target_contract","integrationMode":"official_api","authMode":"oauth_or_secret","capabilityIds":["billing.checkout","connection.probe","settlement.reserve","settlement.payout","outcome.ingest"],"regions":["us","eu","jp"],"requiresExternalApproval":true,"evidenceLevel":"E0"},
     {"id":"adyen","status":"contract_only","integrationMode":"official_api","authMode":"secret","capabilityIds":["billing.checkout","settlement.payout"],"regions":["us","eu","jp"],"requiresExternalApproval":true,"evidenceLevel":"E1"},
     {"id":"hubspot","status":"target_contract","integrationMode":"official_api","authMode":"oauth","capabilityIds":["connection.probe","crm.read","crm.write","webhook.ingest","outcome.ingest"],"regions":["global"],"requiresExternalApproval":true,"evidenceLevel":"E0"},
@@ -12,7 +13,7 @@
     {"id":"google-search-console","status":"target_contract","integrationMode":"official_api","authMode":"oauth","capabilityIds":["connection.probe","search.measure","publication.verify"],"regions":["global"],"requiresExternalApproval":true,"evidenceLevel":"E0"},
     {"id":"google-analytics","status":"target_contract","integrationMode":"official_api","authMode":"oauth","capabilityIds":["connection.probe","analytics.read","outcome.ingest"],"regions":["global"],"requiresExternalApproval":true,"evidenceLevel":"E0"},
     {"id":"google-trends","status":"authorization_required","integrationMode":"official_api","authMode":"early_access","capabilityIds":["research.discover","search.measure"],"regions":["global"],"requiresExternalApproval":true,"evidenceLevel":"E1"},
-    {"id":"dataforseo","status":"target_contract","integrationMode":"official_api","authMode":"secret","capabilityIds":["search.measure","research.discover"],"regions":["global"],"requiresExternalApproval":true,"evidenceLevel":"E0"},
+    {"id":"dataforseo","status":"target_contract","integrationMode":"official_api","authMode":"secret","capabilityIds":["connection.probe","search.measure","research.discover"],"regions":["global"],"requiresExternalApproval":true,"evidenceLevel":"E0"},
     {"id":"sorftime","status":"target_contract","integrationMode":"official_api","authMode":"secret","capabilityIds":["marketplace.read","research.discover"],"regions":["global"],"requiresExternalApproval":true,"evidenceLevel":"E0"},
     {"id":"amazon-sp-api","status":"target_contract","integrationMode":"official_api","authMode":"oauth","capabilityIds":["connection.probe","marketplace.read","marketplace.write","outcome.ingest"],"regions":["us","eu","jp"],"requiresExternalApproval":true,"evidenceLevel":"E0"},
     {"id":"github","status":"target_contract","integrationMode":"official_api","authMode":"oauth_or_secret","capabilityIds":["connection.probe","source.write","publication.publish","publication.verify"],"regions":["global"],"requiresExternalApproval":true,"evidenceLevel":"E0"},

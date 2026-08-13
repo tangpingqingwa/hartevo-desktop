@@ -16,7 +16,7 @@
 | 能力组 | Provider | 主要 Mission | 默认边界 |
 | --- | --- | --- | --- |
 | Identity/Billing | Keycloak、Google OIDC、Stripe | VM-00 | OIDC state/nonce、账号确认、Webhook 幂等 |
-| Search/Analytics | GSC、GA4、DataForSEO、Google Trends（授权后） | VM-01、02、07 | 第一方与估算分离、市场/时间口径 |
+| Search/Analytics | GSC、GA4、Google Ads、DataForSEO、Google Trends（授权后） | VM-01、02、07 | 第一方与估算分离、账号/属性/市场/语言/时间口径；Google Ads 只读 GAQL |
 | Models/GT | OpenAI、DeepSeek、OpenAI-compatible local | VM-02、07 | BYOK/Credits、固定 Harness Profile |
 | Marketplace | Amazon SP-API、Sorftime | VM-07、08 | Seller/市场身份、估算标签、Listing readback |
 | Site/Domain | GitHub、WordPress、Shopify、IndexNow、GoDaddy、Cloudflare Registrar（实验） | VM-01、03 | 购买/发布独立审批、在线 Verification |
@@ -47,6 +47,10 @@ revoke
 ```
 
 Provider 返回只形成候选事实或 Receipt；它不能直接写 Mission 业务状态。所有 Domain 变化经过 Application Service，所有外部写入经过 Effect Broker。
+
+SIGNAL-01 的 E1 注册表仅绑定四个只读增长信号 Provider 的 `probe`/`read` 元数据：Google Ads 的 OAuth + developer-token 账号探测和只读 GAQL、GSC 的 site/property 查询、GA4 的 property `runReport`、以及 DataForSEO v3 的 Basic-auth live/standard SERP task。DataForSEO 估算、live 结果和 first-party 账号/属性事实必须使用不同的证据分类；标准 task 的 task ID/callback/poll、速率头、费用、freshness 和 durable replay digest 只能形成可审计引用，不能把估算升级为第一方事实。
+
+当前 registry 不授予 `Connected`、Provider receipt、业务验证或 E4 authority；没有真实凭据时，生产 probe 属于 `BLOCKED_ENV`，fixture/component-harness worlds 也不会伪造 live 成功。campaign、budget、conversion upload 等外部写入不在本 Slice 内。
 
 ## 4. 标准合同测试
 

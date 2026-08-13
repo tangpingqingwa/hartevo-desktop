@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-capability-catalog/v1",
-  "catalogVersion": "desktop-2026-08-12-v3",
+  "catalogVersion": "desktop-2026-08-13-signal01-v1",
   "capabilities": [
     {"id":"identity.resolve","category":"identity","providerRequired":false,"effectClass":"read","missionIds":["VM-00","VM-05","VM-06","VM-09","VM-10"]},
     {"id":"project.inventory","category":"project","providerRequired":false,"effectClass":"read","missionIds":["VM-00"]},
@@ -9,6 +9,7 @@
     {"id":"connection.probe","category":"integration","providerRequired":true,"effectClass":"read","missionIds":["VM-00","VM-03","VM-04"]},
     {"id":"mission.compile","category":"orchestration","providerRequired":false,"effectClass":"local_write","missionIds":["VM-00"]},
     {"id":"analytics.read","category":"measurement","providerRequired":true,"effectClass":"read","missionIds":["VM-01","VM-03"]},
+    {"id":"ads.read","category":"measurement","providerRequired":true,"effectClass":"read","missionIds":["VM-01"]},
     {"id":"search.measure","category":"search","providerRequired":true,"effectClass":"read","missionIds":["VM-01","VM-07"]},
     {"id":"seo.plan","category":"search","providerRequired":false,"effectClass":"local_write","missionIds":["VM-01"]},
     {"id":"content.draft","category":"content","providerRequired":false,"effectClass":"local_write","missionIds":["VM-01","VM-02","VM-04","VM-05","VM-08","VM-09"]},

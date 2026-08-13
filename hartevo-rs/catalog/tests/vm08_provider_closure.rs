@@ -224,7 +224,7 @@ fn free_json_or_missing_substage_cannot_escape_catalog_validation() {
     assert!(
         violations
             .iter()
-            .any(|violation| violation.contains("exactly 124 executable stages"))
+            .any(|violation| violation.contains("exactly 125 executable stages"))
     );
 }
 

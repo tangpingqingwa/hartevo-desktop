@@ -1322,7 +1322,7 @@ impl Catalog {
         require(
             violations,
             snapshot.schema_version == "hartevo-catalog-snapshot/v4"
-                && snapshot.route_graph_contract_version == "desktop-2026-08-12-ct02-v1",
+                && snapshot.route_graph_contract_version == "desktop-2026-08-13-signal01-ct01-v1",
             "Catalog Snapshot v4 must exactly bind the Mission route graph companion contract",
         );
         require(
@@ -1337,7 +1337,7 @@ impl Catalog {
             violations,
             summary.checkpoint_route_count == EXPECTED_CHECKPOINT_ROUTE_COUNT
                 && summary.executable_stage_count == EXPECTED_EXECUTABLE_STAGE_COUNT,
-            "Catalog snapshot must expose exactly 123 checkpoint routes and 124 executable stages",
+            "Catalog snapshot must expose exactly 124 checkpoint routes and 125 executable stages",
         );
         require(
             violations,
@@ -1347,7 +1347,7 @@ impl Catalog {
                 && summary.route_graph_redirect_edge_count
                     == EXPECTED_ROUTE_GRAPH_REDIRECT_EDGE_COUNT
                 && summary.route_graph_terminal_count == EXPECTED_ROUTE_GRAPH_TERMINAL_COUNT,
-            "Catalog Snapshot v4 must freeze 12 graphs, 123 nodes, 124 normal edges, one bounded redirect and 12 terminals",
+            "Catalog Snapshot v4 must freeze 12 graphs, 124 nodes, 125 normal edges, one bounded redirect and 12 terminals",
         );
         require(
             violations,

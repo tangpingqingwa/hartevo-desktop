@@ -3440,10 +3440,10 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_empty_provider_registry_keeps_public_positive_path_unreachable() {
+    fn checked_in_provider_registry_keeps_public_positive_path_unreachable() {
         let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
         let adapter_registry = ProviderAdapterRegistry::contract_baseline().expect("A1 registry");
-        assert!(adapter_registry.is_empty());
+        assert!(!adapter_registry.is_empty());
         assert!(
             policy
                 .human_operation_authority

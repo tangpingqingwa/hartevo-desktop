@@ -129,7 +129,7 @@ fn production_contract_grants_only_the_exact_vm11_stop_terminal() {
     assert_eq!(snapshot.schema_version, "hartevo-catalog-snapshot/v4");
     assert_eq!(
         snapshot.route_graph_contract_version,
-        "desktop-2026-08-12-ct02-v1"
+        "desktop-2026-08-13-signal01-ct01-v1"
     );
 }
 

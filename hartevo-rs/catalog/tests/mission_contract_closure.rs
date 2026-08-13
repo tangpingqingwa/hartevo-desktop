@@ -45,7 +45,7 @@ fn frozen_shape_rejects_missing_mission_route_or_capability() {
     assert!(
         violations(&missions, &capabilities)
             .iter()
-            .any(|violation| violation.contains("exactly 123 checkpoint routes"))
+            .any(|violation| violation.contains("exactly 124 checkpoint routes"))
     );
 
     let (missions, mut capabilities) = loaded_contracts();
@@ -53,7 +53,7 @@ fn frozen_shape_rejects_missing_mission_route_or_capability() {
     assert!(
         violations(&missions, &capabilities)
             .iter()
-            .any(|violation| violation.contains("exactly 48 capabilities"))
+            .any(|violation| violation.contains("exactly 49 capabilities"))
     );
 }
 

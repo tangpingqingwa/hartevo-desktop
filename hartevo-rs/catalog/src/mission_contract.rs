@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{CapabilityCatalog, EXPECTED_MISSION_COUNT, MissionCatalog};
 
-pub const EXPECTED_CHECKPOINT_ROUTE_COUNT: usize = 123;
-pub const EXPECTED_CAPABILITY_COUNT: usize = 48;
+pub const EXPECTED_CHECKPOINT_ROUTE_COUNT: usize = 124;
+pub const EXPECTED_CAPABILITY_COUNT: usize = 49;
 
 /// Validates the frozen Mission/route/Capability shape and both directions of
 /// Mission-to-Capability authority. Keeping this separate from Provider and

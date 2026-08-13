@@ -1,9 +1,9 @@
 //! Non-secret Provider adapter identity and capability-support metadata.
 //!
 //! This E1 contract deliberately grants no Provider execution, connection,
-//! receipt, verification, or E4 authority. The checked-in registry is empty;
-//! validation only proves that metadata exactly matches an explicitly supplied
-//! registration.
+//! receipt, verification, or E4 authority. The checked-in registry contains
+//! only the current E1 metadata bindings; validation proves that metadata
+//! exactly matches an explicitly supplied registration.
 
 use std::collections::BTreeSet;
 
@@ -12,7 +12,7 @@ use thiserror::Error;
 
 pub const PROVIDER_ADAPTER_CONTRACT_SCHEMA_VERSION: &str = "hartevo-provider-adapter-contract/v1";
 pub const PROVIDER_ADAPTER_CONTRACT_VERSION: &str = "provider-adapter-e1/v1";
-pub const PROVIDER_ADAPTER_BASELINE_REGISTRY_VERSION: &str = "desktop-2026-08-12-a1";
+pub const PROVIDER_ADAPTER_BASELINE_REGISTRY_VERSION: &str = "desktop-2026-08-13-signal01-a1";
 pub const PROVIDER_ADAPTER_CONTRACT_JSON: &str =
     include_str!("../../../contracts/providers/adapter-contract.v1.json");
 
@@ -867,10 +867,14 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_contract_is_e1_metadata_with_an_empty_registry() {
+    fn checked_in_contract_is_e1_metadata_with_signal_registrations() {
         let baseline = ProviderAdapterRegistry::contract_baseline().expect("typed contract");
         baseline.validate().expect("baseline");
-        assert!(baseline.is_empty());
+        assert!(!baseline.is_empty());
+        assert_eq!(
+            baseline.registry_version(),
+            PROVIDER_ADAPTER_BASELINE_REGISTRY_VERSION
+        );
         assert_eq!(
             baseline.schema_version,
             PROVIDER_ADAPTER_CONTRACT_SCHEMA_VERSION
@@ -1245,7 +1249,11 @@ mod tests {
                 .push(registration_value());
         })
         .expect("typed E1 registration");
-        assert_eq!(parsed.registrations().len(), 1);
+        let baseline_count = ProviderAdapterRegistry::contract_baseline()
+            .expect("baseline")
+            .registrations()
+            .len();
+        assert_eq!(parsed.registrations().len(), baseline_count + 1);
         assert_eq!(
             parsed.authority(),
             ProviderEvidenceAuthority::MetadataBindingOnly

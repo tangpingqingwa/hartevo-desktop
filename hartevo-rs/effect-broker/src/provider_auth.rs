@@ -1273,13 +1273,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_actual_registry_makes_connected_unreachable() {
+    fn unregistered_provider_makes_connected_unreachable() {
         let chain = live_chain(
             ProbeStatus::Reachable,
             ProviderProvenanceClass::ProductionProvider,
         );
         let registry = ProviderAdapterRegistry::contract_baseline().expect("actual registry");
-        assert!(registry.is_empty());
+        assert!(!registry.is_empty());
         assert_eq!(
             chain.policy.authorize_connected(
                 &chain.secret,

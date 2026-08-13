@@ -7,7 +7,7 @@ use crate::{CapabilityCatalog, MissionCatalog, MissionManifest, ProviderCatalog}
 pub(crate) const EFFECT_READBACK_ROUTE_CONTRACT_JSON: &str =
     include_str!("../../../contracts/missions/effect-readback-routes.v2.json");
 
-pub const EXPECTED_EXECUTABLE_STAGE_COUNT: usize = 124;
+pub const EXPECTED_EXECUTABLE_STAGE_COUNT: usize = 125;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

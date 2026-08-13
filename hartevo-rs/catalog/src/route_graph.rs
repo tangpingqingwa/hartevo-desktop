@@ -8,8 +8,8 @@ pub(crate) const ROUTE_GRAPH_CONTRACT_JSON: &str =
     include_str!("../../../contracts/missions/route-graph.v2.json");
 
 pub const EXPECTED_ROUTE_GRAPH_COUNT: usize = 12;
-pub const EXPECTED_ROUTE_GRAPH_NODE_COUNT: usize = 123;
-pub const EXPECTED_ROUTE_GRAPH_NORMAL_EDGE_COUNT: usize = 124;
+pub const EXPECTED_ROUTE_GRAPH_NODE_COUNT: usize = 124;
+pub const EXPECTED_ROUTE_GRAPH_NORMAL_EDGE_COUNT: usize = 125;
 pub const EXPECTED_ROUTE_GRAPH_REDIRECT_EDGE_COUNT: usize = 1;
 pub const EXPECTED_ROUTE_GRAPH_TERMINAL_COUNT: usize = 12;
 
@@ -277,7 +277,7 @@ fn validate_contract_header(contract: &RouteGraphContract, violations: &mut Vec<
     require(
         violations,
         contract.schema_version == "hartevo-mission-route-graph-contract/v2"
-            && contract.contract_version == "desktop-2026-08-12-ct02-v1"
+            && contract.contract_version == "desktop-2026-08-13-signal01-ct01-v1"
             && contract.evidence_level == "E1",
         "Mission route graphs must use the frozen v2 E1 contract",
     );

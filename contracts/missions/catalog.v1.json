@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-mission-catalog/v1",
-  "catalogVersion": "desktop-2026-08-12-v11",
+  "catalogVersion": "desktop-2026-08-13-signal01-v12",
   "missions": [
     {
       "id": "VM-00",
@@ -34,10 +34,11 @@
       "goal": "Continuously improve qualified organic discovery through measured, evidence-backed and independently verified SEO work.",
       "modes": ["continuous_operator"],
       "defaultCadence": "weekly",
-      "checkpointIds": ["scope_locked", "analytics_and_search_baseline", "opportunity_prioritized", "work_queue", "brief_or_patch_ready", "selective_approval", "publication_or_submission", "url_link_readback", "ranking_traffic_review", "next_cycle"],
+      "checkpointIds": ["scope_locked", "analytics_and_search_baseline", "ads_read_baseline", "opportunity_prioritized", "work_queue", "brief_or_patch_ready", "selective_approval", "publication_or_submission", "url_link_readback", "ranking_traffic_review", "next_cycle"],
       "checkpointRoutes": [
         {"checkpointId":"scope_locked","capabilityId":"seo.plan","executor":"human","oracleIds":["goal","truth","decision","operating_state"],"completionPolicy":"human_confirmation"},
         {"checkpointId":"analytics_and_search_baseline","capabilityId":"analytics.read","executor":"runtime","oracleIds":["truth","work_product","operating_state"],"completionPolicy":"work_product"},
+        {"checkpointId":"ads_read_baseline","capabilityId":"ads.read","executor":"runtime","oracleIds":["truth","work_product","operating_state"],"completionPolicy":"work_product"},
         {"checkpointId":"opportunity_prioritized","capabilityId":"search.measure","executor":"runtime","oracleIds":["truth","decision","work_product","operating_state"],"completionPolicy":"work_product"},
         {"checkpointId":"work_queue","capabilityId":"outreach.send","executor":"application","oracleIds":["decision","work_product","operating_state"],"completionPolicy":"deterministic_evidence"},
         {"checkpointId":"brief_or_patch_ready","capabilityId":"content.draft","executor":"runtime","oracleIds":["decision","work_product","operating_state"],"completionPolicy":"work_product"},
@@ -47,9 +48,9 @@
         {"checkpointId":"ranking_traffic_review","capabilityId":"attribution.compute","executor":"application","oracleIds":["truth","decision","operating_state","outcome"],"completionPolicy":"deterministic_evidence"},
         {"checkpointId":"next_cycle","capabilityId":"outcome.review","executor":"application","oracleIds":["goal","decision","operating_state","outcome"],"completionPolicy":"deterministic_evidence"}
       ],
-      "requiredArtifacts": ["seo_baseline", "keyword_page_map", "seo_work_queue", "brief_or_patch", "verified_publication", "weekly_review"],
-      "capabilityIds": ["analytics.read", "search.measure", "seo.plan", "content.draft", "source.write", "publication.publish", "publication.verify", "outreach.send", "attribution.compute", "outcome.review"],
-      "providerIds": ["google-search-console", "google-analytics", "dataforseo", "github", "wordpress", "shopify", "indexnow", "gmail"],
+      "requiredArtifacts": ["seo_baseline", "ads_baseline", "keyword_page_map", "seo_work_queue", "brief_or_patch", "verified_publication", "weekly_review"],
+      "capabilityIds": ["analytics.read", "ads.read", "search.measure", "seo.plan", "content.draft", "source.write", "publication.publish", "publication.verify", "outreach.send", "attribution.compute", "outcome.review"],
+      "providerIds": ["google-search-console", "google-analytics", "google-ads", "dataforseo", "github", "wordpress", "shopify", "indexnow", "gmail"],
       "oracleIds": ["goal", "truth", "decision", "work_product", "effect", "operating_state", "outcome"],
       "failureFamilies": ["authorization_expired", "analytics_lag", "canonical_market_conflict", "ranking_drop", "unsafe_link_source", "provider_success_missing_url", "uncertain_write"],
       "evidenceTargets": {"e3": "two-cycle local SEO journey with verified simulated change", "e4": "GSC/GA4 plus a real site write and readback", "e5": "five tenant-projects operating for ninety days with loop closure"}

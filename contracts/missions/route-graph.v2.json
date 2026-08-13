@@ -1,6 +1,6 @@
 {
   "schemaVersion": "hartevo-mission-route-graph-contract/v2",
-  "contractVersion": "desktop-2026-08-12-ct02-v1",
+  "contractVersion": "desktop-2026-08-13-signal01-ct01-v1",
   "evidenceLevel": "E1",
   "runtimeAuthority": {
     "branchExecution": false,
@@ -230,9 +230,21 @@
           "waitingUserConditions": []
         },
         {
-          "checkpointId": "opportunity_prioritized",
+          "checkpointId": "ads_read_baseline",
           "dependsOn": [
             "analytics_and_search_baseline"
+          ],
+          "optional": false,
+          "completionGate": {
+            "kind": "checkpoint_route_policy",
+            "flowId": null
+          },
+          "waitingUserConditions": []
+        },
+        {
+          "checkpointId": "opportunity_prioritized",
+          "dependsOn": [
+            "ads_read_baseline"
           ],
           "optional": false,
           "completionGate": {
@@ -338,8 +350,18 @@
           }
         },
         {
-          "id": "vm01.analytics_and_search_baseline.to.opportunity_prioritized/v2",
+          "id": "vm01.analytics_and_search_baseline.to.ads_read_baseline/v2",
           "sourceCheckpointId": "analytics_and_search_baseline",
+          "condition": "checkpoint.completed",
+          "target": {
+            "kind": "checkpoint",
+            "checkpointId": "ads_read_baseline",
+            "terminalId": null
+          }
+        },
+        {
+          "id": "vm01.ads_read_baseline.to.opportunity_prioritized/v2",
+          "sourceCheckpointId": "ads_read_baseline",
           "condition": "checkpoint.completed",
           "target": {
             "kind": "checkpoint",
