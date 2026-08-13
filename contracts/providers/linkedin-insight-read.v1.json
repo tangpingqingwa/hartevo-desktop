@@ -88,6 +88,14 @@
       "scopeParameter": "accounts=List(urn:li:sponsoredAccount:{adAccountId})",
       "pivot": "ACCOUNT",
       "timeGranularity": "DAILY"
+    },
+    "organizationNotificationPull": {
+      "method": "GET",
+      "path": "/rest/organizationalEntityNotifications",
+      "model": "linkedin_organization_social_action_notification",
+      "activity": "reconcile_only; not an insight metric",
+      "scopeParameter": "organizationalEntity=urn:li:organization:{pageId}",
+      "retention": "provider_retains_notifications_for_60_days"
     }
   },
   "requestHeaders": {
@@ -97,9 +105,65 @@
   },
   "pagination": {
     "providerBehavior": "organizationalEntityShareStatistics_and_adAnalytics_do_not_support_pagination",
-    "connectorCursor": "scope_and_request_bound_durable_complete_cursor",
+    "connectorCursor": "durable_plan_cursor_over_provider_non_paginated_target_and_time_window_units",
+    "planOrder": "caller_target_order_then_ascending_bounded_time_windows; organization-posts_are_provider_lifetime_single_units",
+    "crossScope": "one_Mission_plan_can_bind_probed_member_organization_page_and_ad_account_scope; every_target_must_match_the_mounted_scope",
+    "cursorBinding": [
+      "tenant_project_provider_member_scope_digest",
+      "credential_reference_digest",
+      "credential_revision",
+      "lease_revision",
+      "token_generation_digest",
+      "adapter_id_and_version",
+      "plan_digest",
+      "target_index",
+      "window_index_and_window_digest",
+      "page_index",
+      "request_query_digest",
+      "source_response_digest",
+      "page_digest",
+      "previous_cursor_digest"
+    ],
     "providerNextPage": "typed_fail_closed",
-    "pageSize": "bounded_request_contract_only; not sent to_non_paginated_provider_endpoints"
+    "pageSize": "bounded_request_contract_only_for_insight_reads; not sent_as_provider_pagination_to_non_paginated_provider_endpoints",
+    "restart": "durable_observation_checkpoint_restores_the_last_plan_cursor_before_next_provider_request",
+    "duplicateProtection": "cursor_sequence_and_page_digest_are_durable; cursor_rollback_or_replay_is_typed_fail_closed"
+  },
+  "reconcile": {
+    "webhook": {
+      "eventType": "ORGANIZATION_SOCIAL_ACTION_NOTIFICATIONS",
+      "payload": "notificationId_organizationalEntity_action_lastModifiedAt_and_urn_references_only",
+      "providerDelivery": "HTTPS_webhook_inbound; no_provider_write_or_Effect_authority",
+      "dedupeKey": "notificationId_plus_lastModifiedAt",
+      "deliveryReliability": "provider_redelivers_for_up_to_8_hours; late_or_duplicate_delivery_is_not_adopted"
+    },
+    "poll": {
+      "method": "GET",
+      "path": "/rest/organizationalEntityNotifications",
+      "purpose": "bootstrap_or_missed_webhook_recovery_only",
+      "providerPagination": "Restli_start_count_next_link",
+      "cursor": "scope_request_token_generation_and_source_digest_bound_durable_poll_cursor"
+    },
+    "adoption": "notification_is_durable_event_evidence; authenticated_insight_GET_must_succeed_before_Mission_adoptable_result",
+    "receipt": [
+      "source_webhook_or_poll",
+      "delivery_and_payload_digest",
+      "notification_ids_and_modified_watermark",
+      "source_request_and_response_digest",
+      "reconcile_rate_limit_and_cost",
+      "insight_page_digest_and_cursor_digest",
+      "native_attribution_model",
+      "causal_status_not_claimed"
+    ],
+    "failClosed": [
+      "duplicate_delivery",
+      "out_of_order_delivery",
+      "cursor_rollback",
+      "late_response_after_mount_generation_drift",
+      "permission_downgrade",
+      "revocation",
+      "organic_sponsored_model_drift"
+    ]
   },
   "rateLimitAndBudget": {
     "providerEvidenceHeaders": [
@@ -127,9 +191,12 @@
       "quota",
       "cost",
       "durable_cursor",
+      "scope_credential_generation_and_plugin_binding",
+      "window_and_page_digest",
       "classification",
       "attribution_model",
-      "causal_status_not_claimed"
+      "causal_status_not_claimed",
+      "reconcile_receipt_when_event_driven"
     ],
     "unknownProviderFields": "digest_only",
     "secretAndPayloadLogging": "forbidden"
@@ -148,7 +215,10 @@
     "credentialLease": "typed_fail_closed",
     "providerUnauthorized": "typed_fail_closed",
     "unmount": "clears_mount_and_cursor",
+    "reconcileSession": "unmount_or_revoke_clears_plan_cursor_poll_cursor_delivery_deduplication_and_watermarks",
     "refreshScopeOrRevisionDrift": "typed_fail_closed",
+    "permissionDowngrade": "stale_and_typed_fail_closed",
+    "lateProviderResponse": "mount_generation_and_credential_binding_checked_before_durable_append",
     "writeAuthority": "never_granted"
   },
   "credentialedProbe": {
