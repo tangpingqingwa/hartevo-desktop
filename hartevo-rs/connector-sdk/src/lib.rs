@@ -28,8 +28,10 @@ use zeroize::Zeroizing;
 
 pub mod authenticated_probe;
 mod contract;
+mod live;
 
 pub use contract::{ConnectorContract, ConnectorContractError};
+pub use live::*;
 
 pub const CONNECTOR_SDK_SCHEMA_VERSION: &str = "hartevo-connector-sdk/v1";
 pub const MAX_CREDENTIAL_LEASE_TTL_SECONDS: i64 = 900;
@@ -2686,6 +2688,8 @@ fn valid_scope(value: &str) -> bool {
 
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit {
+    pub use super::deterministic::{DeterministicReadTransport, FixedSecretResolver};
+
     use super::{
         AuthSession, BeginAuthRequest, ConnectorAdapter, ConnectorAuth, ConnectorDescriptor,
         ConnectorError, ConnectorScope, ConnectorWorker, Cursor, ExecuteRequest, FreshnessWindow,
