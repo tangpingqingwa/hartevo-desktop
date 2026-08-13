@@ -26,6 +26,16 @@ controlled-provider results are deterministic test evidence and are rejected
 by the Mission consumer. Production admission also requires an exact bound
 revision, live credential, matching secret reference, and fresh evidence.
 
+The second-layer video-list read path checkpoints the cursor as a provider and
+account-bound page sequence. Each accepted page has a monotonic generation,
+sorted video/performance observations, an exact-once page digest, and a chained
+evidence root. A provider HTTP 429 produces a durable RetryAfter receipt from
+the observed reset headers; it does not advance the cursor or create data. A
+checkpoint reopened after a crash resumes from the stored cursor and receipt.
+Credential rotation, revocation, or unmount invalidates the old cursor. Mission
+sequence admission stays Pending until the complete page sequence closes its
+evidence root; duplicate pages produce a receipt instead of being re-applied.
+
 Missing real-read environment or credential material returns typed
 BlockedEnvironment; it does not upgrade a local fake transport to first-party
 evidence.

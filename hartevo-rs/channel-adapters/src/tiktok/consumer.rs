@@ -1,10 +1,13 @@
 //! Mission-side admission for exact TikTok read evidence.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 
 use super::{
     EvidenceProvenance, OAuthCredential, TiktokError, TiktokObservationEnvelope,
-    TiktokReadObservation, TiktokReadScope, TiktokRevisionIdentity,
+    TiktokPageSequence, TiktokReadObservation, TiktokReadScope, TiktokRevisionIdentity,
+    TiktokVideoPageEnvelope,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,6 +93,198 @@ pub struct TiktokMissionAcceptedRead {
 impl TiktokMissionAcceptedRead {
     pub const fn envelope(&self) -> &TiktokObservationEnvelope {
         &self.envelope
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TiktokMissionPageProgress {
+    Pending {
+        sequence: TiktokPageSequence,
+        next_cursor: Option<super::TiktokCursor>,
+        evidence_root: String,
+    },
+    Duplicate {
+        sequence: TiktokPageSequence,
+        page_digest: String,
+    },
+    Complete(TiktokMissionAcceptedSequence),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionTiktokVideoSequenceConsumer {
+    scope: TiktokReadScope,
+    page_size: u8,
+    next_generation: u64,
+    expected_cursor: Option<super::TiktokCursor>,
+    evidence_root: String,
+    credential_generation: Option<u64>,
+    seen_page_digests: BTreeSet<String>,
+    seen_video_ids: BTreeSet<super::TiktokVideoId>,
+    pages: Vec<TiktokVideoPageEnvelope>,
+    closed: bool,
+}
+
+impl MissionTiktokVideoSequenceConsumer {
+    pub fn new(scope: TiktokReadScope, page_size: u8) -> Result<Self, TiktokError> {
+        if !(1..=super::DEFAULT_VIDEO_PAGE_SIZE).contains(&page_size) {
+            return Err(TiktokError::InvalidRequest(
+                "TikTok video.list max_count must be one through twenty",
+            ));
+        }
+        Ok(Self {
+            evidence_root: super::initial_evidence_root(&scope, page_size),
+            scope,
+            page_size,
+            next_generation: 1,
+            expected_cursor: None,
+            credential_generation: None,
+            seen_page_digests: BTreeSet::new(),
+            seen_video_ids: BTreeSet::new(),
+            pages: Vec::new(),
+            closed: false,
+        })
+    }
+
+    pub const fn scope(&self) -> &TiktokReadScope {
+        &self.scope
+    }
+
+    pub const fn page_size(&self) -> u8 {
+        self.page_size
+    }
+
+    pub const fn next_generation(&self) -> u64 {
+        self.next_generation
+    }
+
+    pub const fn expected_cursor(&self) -> Option<super::TiktokCursor> {
+        self.expected_cursor
+    }
+
+    pub fn evidence_root(&self) -> &str {
+        &self.evidence_root
+    }
+
+    pub fn accept_page(
+        &mut self,
+        page: TiktokVideoPageEnvelope,
+        credential: &OAuthCredential,
+        now: DateTime<Utc>,
+    ) -> Result<TiktokMissionPageProgress, TiktokError> {
+        page.validate_at(now)?;
+        credential.require_for(super::TiktokApiOperation::VideoList, &self.scope, now)?;
+        if page.provenance() != EvidenceProvenance::ProductionProvider {
+            return Err(TiktokError::ProvenanceRejected);
+        }
+        if page.scope() != &self.scope
+            || page.provider() != super::ProviderId::Tiktok
+            || page.account().open_id() != self.scope.account()
+        {
+            return Err(TiktokError::ScopeMismatch);
+        }
+        if page.credential_generation() != credential.generation() {
+            return Err(TiktokError::CredentialGenerationMismatch);
+        }
+        if self
+            .credential_generation
+            .is_some_and(|generation| generation != credential.generation())
+        {
+            return Err(TiktokError::CredentialGenerationMismatch);
+        }
+        if self.seen_page_digests.contains(page.page_digest()) {
+            return Ok(TiktokMissionPageProgress::Duplicate {
+                sequence: page.sequence().clone(),
+                page_digest: page.page_digest().to_owned(),
+            });
+        }
+        if self.closed {
+            return Err(TiktokError::PageSequenceClosed);
+        }
+        if page.sequence().generation() != self.next_generation
+            || page.requested_cursor() != self.expected_cursor
+        {
+            return Err(TiktokError::CursorDrift);
+        }
+        if page.expected_evidence_root(&self.evidence_root)? != page.evidence_root() {
+            return Err(TiktokError::EvidenceRootMismatch);
+        }
+        let video_ids = page
+            .observations()
+            .iter()
+            .map(|observation| match observation.observation() {
+                TiktokReadObservation::Video(video) => Ok(video.identity().video_id().clone()),
+                TiktokReadObservation::Account(_) => Err(TiktokError::CursorDrift),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if video_ids
+            .iter()
+            .any(|video_id| self.seen_video_ids.contains(video_id))
+        {
+            return Err(TiktokError::CursorDrift);
+        }
+        self.credential_generation = Some(credential.generation());
+        self.seen_page_digests.insert(page.page_digest().to_owned());
+        self.seen_video_ids.extend(video_ids);
+        self.evidence_root = page.evidence_root().to_owned();
+        self.expected_cursor = page.next_cursor();
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or(TiktokError::CursorDrift)?;
+        let sequence = page.sequence().clone();
+        self.pages.push(page);
+        if self.expected_cursor.is_some() {
+            Ok(TiktokMissionPageProgress::Pending {
+                sequence,
+                next_cursor: self.expected_cursor,
+                evidence_root: self.evidence_root.clone(),
+            })
+        } else {
+            self.closed = true;
+            let accepted = TiktokMissionAcceptedSequence {
+                scope: self.scope.clone(),
+                provider: super::ProviderId::Tiktok,
+                credential_generation: credential.generation(),
+                evidence_root: self.evidence_root.clone(),
+                pages: self.pages.clone(),
+            };
+            Ok(TiktokMissionPageProgress::Complete(accepted))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TiktokMissionAcceptedSequence {
+    scope: TiktokReadScope,
+    provider: super::ProviderId,
+    credential_generation: u64,
+    evidence_root: String,
+    pages: Vec<TiktokVideoPageEnvelope>,
+}
+
+impl TiktokMissionAcceptedSequence {
+    pub const fn provider(&self) -> super::ProviderId {
+        self.provider
+    }
+
+    pub const fn scope(&self) -> &TiktokReadScope {
+        &self.scope
+    }
+
+    pub const fn credential_generation(&self) -> u64 {
+        self.credential_generation
+    }
+
+    pub fn evidence_root(&self) -> &str {
+        &self.evidence_root
+    }
+
+    pub fn pages(&self) -> &[TiktokVideoPageEnvelope] {
+        &self.pages
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
     }
 }
 

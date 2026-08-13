@@ -1,6 +1,6 @@
 //! Official TikTok Display API request and response boundary.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use url::Url;
 
@@ -12,9 +12,9 @@ use crate::transport::{
 use super::{
     DISPLAY_API_BASE_URL, EvidenceProvenance, ProviderId, TiktokAccountIdentity,
     TiktokApiOperation, TiktokCursor, TiktokError, TiktokFreshness, TiktokOAuthScope,
-    TiktokObservationEnvelope, TiktokPerformanceObservation, TiktokReadObservation,
-    TiktokReadScope, TiktokRevisionIdentity, TiktokVideoIdentity, TiktokVideoObservation,
-    TiktokVideoPage, USER_INFO_PATH, VIDEO_LIST_PATH, VIDEO_QUERY_PATH,
+    TiktokObservationEnvelope, TiktokPerformanceObservation, TiktokProviderResetObservation,
+    TiktokReadObservation, TiktokReadScope, TiktokRevisionIdentity, TiktokVideoIdentity,
+    TiktokVideoObservation, TiktokVideoPage, USER_INFO_PATH, VIDEO_LIST_PATH, VIDEO_QUERY_PATH,
     video_list_request_fingerprint,
 };
 
@@ -78,6 +78,38 @@ impl<T: ReadOnlyTransport> TiktokDisplayApiProvider<T> {
                 TransportError::Unavailable | TransportError::TimedOut => TiktokError::Disconnected,
             })
     }
+}
+
+pub fn rate_limit_observation(
+    response: &ProviderResponse,
+) -> Result<Option<TiktokProviderResetObservation>, TiktokError> {
+    if response.status() != 429 {
+        return Ok(None);
+    }
+    let retry_after_seconds = response
+        .header("retry-after")
+        .and_then(|value| value.parse().ok());
+    let provider_reset_at = response
+        .header("x-ratelimit-reset")
+        .or_else(|| response.header("x-rate-limit-reset"))
+        .and_then(parse_epoch_seconds)
+        .or_else(|| {
+            retry_after_seconds.and_then(|seconds| {
+                i64::try_from(seconds).ok().and_then(|seconds| {
+                    response
+                        .observed_at()
+                        .checked_add_signed(Duration::seconds(seconds))
+                })
+            })
+        });
+    let observation = TiktokProviderResetObservation::new(
+        429,
+        response.observed_at(),
+        response.body_digest(),
+        retry_after_seconds,
+        provider_reset_at,
+    )?;
+    Ok(Some(observation))
 }
 
 pub fn probe_request(credential: SecretReference) -> Result<ProviderReadRequest, TiktokError> {
@@ -213,12 +245,13 @@ pub fn parse_video_page_response(
         None
     };
     let account = account_for_scope(expected_scope);
-    let observations = videos
+    let mut observations = videos
         .iter()
         .map(|video| {
             parse_video_observation(expected_scope, &account, video, freshness, provenance)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    sort_video_observations(&mut observations)?;
     Ok(TiktokVideoPage {
         scope: expected_scope.clone(),
         requested_cursor,
@@ -244,12 +277,14 @@ pub fn parse_video_query_response(
         .and_then(Value::as_array)
         .ok_or_else(|| invalid_response("data.videos"))?;
     let account = account_for_scope(expected_scope);
-    videos
+    let mut observations = videos
         .iter()
         .map(|video| {
             parse_video_observation(expected_scope, &account, video, freshness, provenance)
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    sort_video_observations(&mut observations)?;
+    Ok(observations)
 }
 
 fn parse_video_observation(
@@ -398,6 +433,50 @@ fn parse_timestamp(value: &Value) -> Result<DateTime<Utc>, TiktokError> {
         .as_i64()
         .ok_or_else(|| invalid_response("create_time"))?;
     DateTime::from_timestamp(seconds, 0).ok_or_else(|| invalid_response("create_time"))
+}
+
+fn sort_video_observations(
+    observations: &mut [TiktokObservationEnvelope],
+) -> Result<(), TiktokError> {
+    if observations
+        .iter()
+        .any(|observation| matches!(observation.observation(), TiktokReadObservation::Account(_)))
+    {
+        return Err(TiktokError::CursorDrift);
+    }
+    observations.sort_by(|left, right| {
+        let TiktokReadObservation::Video(left_video) = left.observation() else {
+            return std::cmp::Ordering::Equal;
+        };
+        let TiktokReadObservation::Video(right_video) = right.observation() else {
+            return std::cmp::Ordering::Equal;
+        };
+        left_video
+            .identity()
+            .video_id()
+            .cmp(right_video.identity().video_id())
+    });
+    if observations.windows(2).any(|pair| {
+        let left = match pair[0].observation() {
+            TiktokReadObservation::Video(video) => video.identity().video_id(),
+            TiktokReadObservation::Account(_) => return true,
+        };
+        let right = match pair[1].observation() {
+            TiktokReadObservation::Video(video) => video.identity().video_id(),
+            TiktokReadObservation::Account(_) => return true,
+        };
+        left == right
+    }) {
+        return Err(TiktokError::CursorDrift);
+    }
+    Ok(())
+}
+
+fn parse_epoch_seconds(value: &str) -> Option<DateTime<Utc>> {
+    value
+        .parse::<i64>()
+        .ok()
+        .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
 }
 
 fn invalid_response(field: impl Into<String>) -> TiktokError {
