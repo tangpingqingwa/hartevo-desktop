@@ -1293,6 +1293,7 @@ mod tests {
         let key = DatabaseKey::new([23; 32]).expect("key");
         {
             let mut store = ProjectStore::open(&database_path, &key).expect("current store");
+            crate::downgrade_identity_bootstrap_schema_for_test(&store.connection);
             let (project, mission) = project_and_mission();
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("mission");

@@ -990,6 +990,7 @@ mod tests {
     #[test]
     fn migration_v39_creates_runtime_process_claim_ledger_idempotently() {
         let RecoveryStoreFixture { mut store, .. } = fixture();
+        crate::downgrade_identity_bootstrap_schema_for_test(&store.connection);
         store
             .connection
             .execute_batch(

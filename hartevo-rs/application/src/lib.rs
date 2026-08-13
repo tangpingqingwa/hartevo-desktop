@@ -1,6 +1,12 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod identity_bootstrap;
 mod runtime_text_subscription;
+
+pub use identity_bootstrap::{
+    BeginOidcAuthorization, CompleteIdentityBootstrap, IdentityBootstrapResult,
+    IdentityScopeAuthorization, IdentitySessionRevocationResult,
+};
 
 pub use runtime_text_subscription::{
     CatalogMissionExecutionHandle, CatalogMissionExecutionStart,
@@ -59,8 +65,9 @@ use hartevo_domain_kernel::{
     DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim, DeviceHandoffContext,
     DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
     DevicePublicKeyRegistration, Effect, EffectClass, EffectId, EffectRisk, EffectSpec,
-    EffectStatus, Evidence, EvidenceId, EvidenceStatus, FactId, FundingReservation, IdentityError,
-    IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject, InboundIngest,
+    EffectStatus, Evidence, EvidenceId, EvidenceStatus, FactId, FundingReservation,
+    IdentityBootstrapError, IdentityError, IdentityLink, IdentityLinkId, IdentityLinkStatus,
+    IdentityProviderError, IdentitySessionError, IdentitySubject, InboundIngest,
     InboundMessageInput, KeyEnvelope, KeyEnvelopeId, KeyManagementError, KeyRecipient, KpiContract,
     MessageDelivery, MessageId, MetricValue, Mission, MissionCheckpointApplicationEvidence,
     MissionCheckpointCompletion, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
@@ -20920,6 +20927,22 @@ pub enum ApplicationError {
     Connection(#[from] ConnectionError),
     #[error(transparent)]
     Identity(#[from] IdentityError),
+    #[error(transparent)]
+    IdentityBootstrap(#[from] IdentityBootstrapError),
+    #[error(transparent)]
+    IdentityProvider(#[from] IdentityProviderError),
+    #[error(transparent)]
+    IdentitySession(#[from] IdentitySessionError),
+    #[error("identity bootstrap could not obtain cryptographic randomness")]
+    IdentityRandomnessUnavailable,
+    #[error("identity device binding secret is unavailable")]
+    IdentityDeviceBindingUnavailable,
+    #[error("identity access-token secret is unavailable")]
+    IdentityAccessSecretUnavailable,
+    #[error("identity refresh-token secret is unavailable")]
+    IdentityRefreshSecretUnavailable,
+    #[error("identity bootstrap secret cleanup failed after persistence rejection")]
+    IdentitySecretCompensationFailed,
     #[error(transparent)]
     Relationship(#[from] RelationshipError),
     #[error(transparent)]

@@ -949,6 +949,7 @@ mod tests {
         let project_id;
         {
             let store = ProjectStore::open(&database, &key).expect("current store");
+            crate::downgrade_identity_bootstrap_schema_for_test(&store.connection);
             let (mut store, project, mission_id, _) = populate_store(store);
             project_id = project;
             let mut ledger =

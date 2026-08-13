@@ -1514,6 +1514,7 @@ mod tests {
     #[test]
     fn migrations_v40_v41_install_mission_schedule_ledger_idempotently() {
         let (mut store, _, _) = fixture();
+        crate::downgrade_identity_bootstrap_schema_for_test(&store.connection);
         store
             .connection
             .execute_batch(

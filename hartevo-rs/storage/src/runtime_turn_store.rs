@@ -1686,6 +1686,7 @@ mod tests {
     #[test]
     fn migration_v38_creates_private_runtime_message_ledger_idempotently() {
         let (mut store, _) = turn_fixture();
+        crate::downgrade_identity_bootstrap_schema_for_test(&store.connection);
         store
             .connection
             .execute_batch(
