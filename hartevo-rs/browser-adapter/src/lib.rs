@@ -16,6 +16,7 @@
 mod action;
 #[cfg(unix)]
 mod chromium_host;
+mod control;
 mod fake_host;
 mod file_broker;
 mod locator;
@@ -38,6 +39,9 @@ pub use chromium_host::{
     ChromiumHostHealth, ChromiumHostShutdown, ChromiumLaunchConfig,
     ChromiumTextInputDispatchEvidence, ManagedChromiumClickExecutor,
     ManagedChromiumFileUploadExecutor, ManagedChromiumHost, ManagedChromiumTextInputExecutor,
+};
+pub use control::{
+    BrowserControlHandoff, BrowserQueuedBatch, BrowserQueuedBatchState, BrowserWorkspaceControl,
 };
 pub use fake_host::{
     BrowserActionResult, BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost,
