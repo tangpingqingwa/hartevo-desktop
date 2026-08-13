@@ -259,12 +259,15 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-audit-0.22.2-${{ hashFiles('Cargo.lock') }}
       - name: Install pinned advisory tool
         run: cargo install cargo-audit --version 0.22.2 --locked
-      - name: Generate lock, license and vulnerability evidence
+      - name: Verify the checked-in locked dependency graph
         run: |
           mkdir -p target/ci/dependencies
+          test -s Cargo.lock
           cargo metadata --format-version 1 --locked > target/ci/dependencies/metadata.json
           cargo tree --workspace --locked --edges normal > target/ci/dependencies/tree.txt
-          cargo audit --locked --json > target/ci/dependencies/cargo-audit.json
+      - name: Generate license and vulnerability evidence
+        run: |
+          cargo audit --json > target/ci/dependencies/cargo-audit.json
           python3 scripts/ci-dependency-audit.py audit \
             --metadata target/ci/dependencies/metadata.json \
             --tree target/ci/dependencies/tree.txt \
