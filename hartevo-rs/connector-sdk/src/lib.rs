@@ -9,6 +9,7 @@
 //! a second authority model.
 
 pub mod linkedin;
+pub mod x;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -43,6 +44,19 @@ use ring::hmac;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+pub use x::{
+    EnvXCredentialResolver, InMemoryXCredentialResolver, MissionXInsightConsumer,
+    X_ACCESS_TOKEN_ENV, X_ADAPTER_ID, X_ADAPTER_VERSION, X_API_VERSION, X_DEFAULT_API_BASE_URL,
+    X_INSIGHT_READ_SCHEMA, X_REGISTRATIONS, X_RUN_PROBE_ENV, XAccessToken, XApiBinding, XApiConfig,
+    XApiV2Adapter, XAttribution, XCausalStatus, XClassification, XConnectionState, XConnectorError,
+    XCostReceipt, XCredentialResolver, XCurlHttpsTransport, XCursorReceipt, XDurableObservationLog,
+    XFreshnessReceipt, XHttpRequest, XHttpResponse, XHttpTransport, XInsightObservation,
+    XInsightProvider, XInsightReadRequest, XInsightReadService, XInsightRecord, XInsightScope,
+    XInsightTarget, XInsightTargetKind, XMetricValue, XMissionCapability, XMissionCapabilityGrant,
+    XMissionInsightResult, XMount, XPaginationCursor, XPermissionObservation, XProbeObservation,
+    XProbeRequest, XProviderPage, XQuotaReceipt, XRateLimit, XReadPolicy, XRequestEvidence,
+    XRetryReceipt, XReviewState, XTransportError, env_gated_x_credentialed_probe,
+};
 use zeroize::Zeroizing;
 
 pub mod authenticated_probe;
