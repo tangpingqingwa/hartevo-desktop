@@ -17,6 +17,7 @@ mod deletion_propagation;
 mod deletion_store;
 mod effect_ledger;
 mod identity_bootstrap_store;
+mod identity_plugin_store;
 mod identity_store;
 mod key_bootstrap_store;
 mod keyring_store;
@@ -46,6 +47,7 @@ pub use context_material_store::{
 pub use creator::PersistedMutation;
 pub use deletion_propagation::{DeletionPropagationJob, DeletionPropagationJobStatus};
 pub use identity_bootstrap_store::IdentitySessionSecretReferences;
+pub use identity_plugin_store::ProjectIdentityPluginService;
 pub use key_bootstrap_store::{
     KeyBootstrapCell, KeyBootstrapOperationKind, KeyBootstrapOperationStatus,
     KeyBootstrapPrepareOutcome, LocalKeyBootstrapOperation,
