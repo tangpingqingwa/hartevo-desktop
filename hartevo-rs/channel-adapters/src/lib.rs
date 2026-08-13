@@ -1,12 +1,12 @@
 //! Provider-specific channel contracts.
 //!
-//! This crate intentionally stops at read-only request planning, probe/read
-//! parsing, and provider observation models. It does not implement the
-//! generic Connector SDK lifecycle from CONN-01 and it contains no publish or
-//! reply effect path.
+//! This crate contains provider-specific request planning, probe/read parsing,
+//! observations, and the controlled Reddit post/reply effect boundary. It does
+//! not implement the generic Connector SDK lifecycle from CONN-01.
 
 pub mod identity;
 pub mod reddit;
+pub mod reddit_effect;
 pub mod testkit;
 pub mod tiktok;
 pub mod transport;
@@ -20,3 +20,5 @@ pub use transport::{
     AuthorizationReason, ChannelAdapterError, CredentialReference, HttpMethod, ProviderReadRequest,
     ProviderResponse, ReadOnlyTransport, ReadOperation, ScopeName, TransportError,
 };
+
+pub use reddit_effect::{ChannelPublishService, MissionRedditEffectConsumer};
