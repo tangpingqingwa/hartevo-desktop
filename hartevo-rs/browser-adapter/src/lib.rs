@@ -14,6 +14,7 @@
 //! independent verification.
 
 mod action;
+mod artifact;
 #[cfg(unix)]
 mod chromium_host;
 mod fake_host;
@@ -31,6 +32,12 @@ mod workspace;
 pub use action::{
     BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionRisk, BrowserActionSurface,
     BrowserEffectBinding, BrowserElementRef, BrowserPromptRisk, BrowserTextInput, SemanticSnapshot,
+};
+pub use artifact::{
+    BrowserArtifactCapture, BrowserArtifactCaptureInput, BrowserArtifactFrameObservation,
+    BrowserArtifactFrameRevision, BrowserArtifactHost, BrowserArtifactPlugin,
+    BrowserArtifactProviderState, BrowserArtifactQuarantineReceipt, BrowserArtifactResultLog,
+    BrowserArtifactResultSink, BrowserArtifactScope, UnavailableBrowserArtifactHost,
 };
 #[cfg(unix)]
 pub use chromium_host::{
@@ -195,6 +202,20 @@ pub enum BrowserError {
     NavigationFailed,
     #[error("browser navigation attempted to produce a download outside the File Broker")]
     NavigationDownloadBlocked,
+    #[error("browser artifact metadata, bytes, source, or receipt is malformed")]
+    InvalidArtifact,
+    #[error("browser artifact is outside the exact Mission, profile, workspace, or frame scope")]
+    ArtifactScopeMismatch,
+    #[error("browser artifact has already been captured or delivered")]
+    ArtifactDuplicate,
+    #[error("browser artifact provider is no longer mounted")]
+    ArtifactProviderUnavailable,
+    #[error("browser artifact frame, loader, navigation, or source changed during capture")]
+    ArtifactFrameStale,
+    #[error("browser artifact provider was revoked")]
+    ArtifactProviderRevoked,
+    #[error("browser artifact provider was restarted and its old cursor is invalid")]
+    ArtifactProviderRestarted,
     #[error("browser file is outside every canonical project root or crosses a symlink")]
     FileOutsideProject,
     #[error("browser file is empty or exceeds the configured size boundary")]
@@ -291,6 +312,13 @@ impl BrowserError {
             Self::NavigationRequestBlocked => "BROWSER_NAVIGATION_REQUEST_BLOCKED",
             Self::NavigationFailed => "BROWSER_NAVIGATION_FAILED",
             Self::NavigationDownloadBlocked => "BROWSER_NAVIGATION_DOWNLOAD_BLOCKED",
+            Self::InvalidArtifact => "BROWSER_INVALID_ARTIFACT",
+            Self::ArtifactScopeMismatch => "BROWSER_ARTIFACT_SCOPE_MISMATCH",
+            Self::ArtifactDuplicate => "BROWSER_ARTIFACT_DUPLICATE",
+            Self::ArtifactProviderUnavailable => "BROWSER_ARTIFACT_PROVIDER_UNAVAILABLE",
+            Self::ArtifactFrameStale => "BROWSER_ARTIFACT_FRAME_STALE",
+            Self::ArtifactProviderRevoked => "BROWSER_ARTIFACT_PROVIDER_REVOKED",
+            Self::ArtifactProviderRestarted => "BROWSER_ARTIFACT_PROVIDER_RESTARTED",
             Self::FileOutsideProject => "BROWSER_FILE_OUTSIDE_PROJECT",
             Self::FileSizeRejected => "BROWSER_FILE_SIZE_REJECTED",
             Self::FileTypeRejected => "BROWSER_FILE_TYPE_REJECTED",
