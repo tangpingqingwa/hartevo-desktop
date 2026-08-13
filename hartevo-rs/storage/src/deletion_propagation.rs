@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use hartevo_domain_kernel::{
     DeletionId, DeletionPropagationReceipt, DeletionPropagationStatus, DeletionReceiptId,
-    DeletionRecord, DeletionSurface, ProjectId, TenantId,
+    DeletionRecord, DeletionSurface, PrivacyPluginScope, ProjectId, TenantId,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -192,6 +192,40 @@ impl ProjectStore {
         dead_letter: bool,
         residual_items: Option<u64>,
     ) -> Result<DeletionPropagationJob, StorageError> {
+        let transaction = self.connection.transaction()?;
+        let job = Self::release_deletion_propagation_job_in_transaction(
+            &transaction,
+            project_id,
+            deletion_id,
+            surface,
+            owner,
+            generation,
+            error_code,
+            available_at,
+            now,
+            dead_letter,
+            residual_items,
+            None,
+        )?;
+        transaction.commit()?;
+        Ok(job)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn release_deletion_propagation_job_in_transaction(
+        transaction: &Transaction<'_>,
+        project_id: &ProjectId,
+        deletion_id: &DeletionId,
+        surface: DeletionSurface,
+        owner: &str,
+        generation: u64,
+        error_code: &str,
+        available_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+        dead_letter: bool,
+        residual_items: Option<u64>,
+        privacy_scope: Option<&PrivacyPluginScope>,
+    ) -> Result<DeletionPropagationJob, StorageError> {
         require_worker_surface(surface)?;
         if owner.trim().is_empty()
             || generation == 0
@@ -207,7 +241,9 @@ impl ProjectStore {
         } else {
             "pending"
         };
-        let transaction = self.connection.transaction()?;
+        if let Some(scope) = privacy_scope {
+            require_privacy_plugin_scope(transaction, scope, now)?;
+        }
         let updated = transaction.execute(
             "UPDATE deletion_propagation_jobs
              SET status = ?6, available_at = ?7, lease_owner = NULL,
@@ -228,9 +264,9 @@ impl ProjectStore {
             ],
         )?;
         require_lease(updated, deletion_id, surface, owner, generation)?;
-        let job = load_job(&transaction, project_id, deletion_id, surface)?;
+        let job = load_job(transaction, project_id, deletion_id, surface)?;
         let record =
-            load_deletion_record(&transaction, project_id, &job.object_kind, &job.object_id)?
+            load_deletion_record(transaction, project_id, &job.object_kind, &job.object_id)?
                 .ok_or_else(|| {
                     StorageError::DomainDecode("propagation job lacks deletion record".into())
                 })?;
@@ -250,7 +286,7 @@ impl ProjectStore {
             record.mark_surface_failed(surface, error_code, residual_items, now)?
         };
         if updated_record.revision != record.revision {
-            update_deletion_record(&transaction, &updated_record, record.revision)?;
+            update_deletion_record(transaction, &updated_record, record.revision)?;
         }
         transaction.execute(
             "INSERT INTO domain_events
@@ -270,7 +306,6 @@ impl ProjectStore {
                 now.to_rfc3339(),
             ],
         )?;
-        transaction.commit()?;
         Ok(job)
     }
 
@@ -283,10 +318,30 @@ impl ProjectStore {
         receipt: &DeletionPropagationReceipt,
         now: DateTime<Utc>,
     ) -> Result<DeletionRecord, StorageError> {
-        require_worker_surface(receipt.surface)?;
         let transaction = self.connection.transaction()?;
+        let record =
+            Self::complete_deletion_propagation_in_transaction(&transaction, receipt, now, None)?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "one scoped transaction fences the lease, receipt, deletion surface, and audit event"
+    )]
+    pub(crate) fn complete_deletion_propagation_in_transaction(
+        transaction: &Transaction<'_>,
+        receipt: &DeletionPropagationReceipt,
+        now: DateTime<Utc>,
+        privacy_scope: Option<&PrivacyPluginScope>,
+    ) -> Result<DeletionRecord, StorageError> {
+        require_worker_surface(receipt.surface)?;
+        if let Some(scope) = privacy_scope {
+            require_privacy_plugin_scope(transaction, scope, now)?;
+        }
         if let Some(existing) = load_receipt(
-            &transaction,
+            transaction,
             &receipt.project_id,
             &receipt.deletion_id,
             receipt.surface,
@@ -298,24 +353,23 @@ impl ProjectStore {
                 });
             }
             let record = load_deletion_record(
-                &transaction,
+                transaction,
                 &receipt.project_id,
                 &receipt.object_kind,
                 &receipt.object_id,
             )?
             .ok_or_else(|| StorageError::DomainDecode("receipt lacks deletion record".into()))?;
-            transaction.commit()?;
             return Ok(record);
         }
 
         let job = load_job(
-            &transaction,
+            transaction,
             &receipt.project_id,
             &receipt.deletion_id,
             receipt.surface,
         )?;
         let record = load_deletion_record(
-            &transaction,
+            transaction,
             &receipt.project_id,
             &receipt.object_kind,
             &receipt.object_id,
@@ -365,8 +419,8 @@ impl ProjectStore {
             receipt.worker_id.as_str(),
             receipt.lease_generation,
         )?;
-        insert_receipt(&transaction, receipt)?;
-        update_deletion_record(&transaction, &updated_record, previous_revision)?;
+        insert_receipt(transaction, receipt)?;
+        update_deletion_record(transaction, &updated_record, previous_revision)?;
         transaction.execute(
             "INSERT INTO domain_events
                (tenant_id, project_id, mission_id, event_type, payload_json, recorded_at)
@@ -389,7 +443,6 @@ impl ProjectStore {
                 now.to_rfc3339(),
             ],
         )?;
-        transaction.commit()?;
         Ok(updated_record)
     }
 
@@ -402,6 +455,55 @@ impl ProjectStore {
         require_worker_surface(surface)?;
         load_job(&self.connection, project_id, deletion_id, surface)
     }
+}
+
+pub(crate) fn require_privacy_plugin_scope(
+    transaction: &Transaction<'_>,
+    scope: &PrivacyPluginScope,
+    now: DateTime<Utc>,
+) -> Result<(), StorageError> {
+    let row = transaction
+        .query_row(
+            "SELECT tenant_id, mission_id, scope_generation, policy_digest,
+                    scope_digest, status, expires_at
+             FROM privacy_plugin_scopes
+             WHERE project_id = ?1 AND scope_id = ?2",
+            params![scope.project_id.as_str(), scope.scope_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Err(StorageError::PrivacyPluginScopeLost {
+            scope_id: scope.scope_id.clone(),
+            generation: scope.scope_generation,
+        });
+    };
+    let generation = from_sql_u64(row.2, "privacy plugin scope generation")?;
+    let expires_at = parse_time(&row.6)?;
+    if row.0 != scope.tenant_id.as_str()
+        || row.1 != scope.mission_id.as_str()
+        || generation != scope.scope_generation
+        || row.3 != scope.policy_digest
+        || row.4 != scope.scope_digest
+        || row.5 != "active"
+        || expires_at <= now
+    {
+        return Err(StorageError::PrivacyPluginScopeLost {
+            scope_id: scope.scope_id.clone(),
+            generation: scope.scope_generation,
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn enqueue_deletion_jobs(
@@ -436,7 +538,7 @@ pub(crate) fn enqueue_deletion_jobs(
     Ok(())
 }
 
-fn load_job(
+pub(crate) fn load_job(
     connection: &Connection,
     project_id: &ProjectId,
     deletion_id: &DeletionId,

@@ -20,6 +20,7 @@ mod mission_schedule;
 mod money;
 mod outcome;
 mod privacy;
+mod privacy_plugin;
 mod project;
 mod relationship;
 mod runtime_process;
@@ -125,6 +126,14 @@ pub use privacy::{
     DataClassification, DataSubjectExport, DataSubjectExportArtifact, DataSubjectExportRedaction,
     DataSubjectExportStatus, PrivacyError, RetentionAction, RetentionDecision, RetentionPolicy,
     RetentionRule,
+};
+pub use privacy_plugin::{
+    PrivacyConsentPurpose, PrivacyConsumeOutcome, PrivacyDeletionAcceptance,
+    PrivacyDeletionConsent, PrivacyDeletionRequest, PrivacyLocalDeletionPlan,
+    PrivacyLocalDeletionReceipt, PrivacyPluginConsumer, PrivacyPluginError,
+    PrivacyPluginRepository, PrivacyPluginScope, PrivacyPluginScopeStatus, PrivacyPluginService,
+    PrivacyPropagationClaim, PrivacyPropagationEvidence, PrivacyPropagationProvider,
+    PrivacyPropagationResult, PrivacyProviderFailure,
 };
 pub use project::{Project, ProjectDataCell, ProjectError, StorageMode};
 pub use relationship::{

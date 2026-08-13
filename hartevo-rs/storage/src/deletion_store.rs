@@ -91,6 +91,24 @@ impl ProjectStore {
         tombstone: &DeletionTombstone,
         now: DateTime<Utc>,
     ) -> Result<LocalSyncPrepareOutcome, StorageError> {
+        self.prepare_local_context_capsule_deletion_with_binding(
+            operation,
+            tombstone,
+            now,
+            |_transaction, _record| Ok(()),
+        )
+    }
+
+    pub(crate) fn prepare_local_context_capsule_deletion_with_binding<F>(
+        &mut self,
+        operation: &LocalSyncOperation,
+        tombstone: &DeletionTombstone,
+        now: DateTime<Utc>,
+        binding: F,
+    ) -> Result<LocalSyncPrepareOutcome, StorageError>
+    where
+        F: FnOnce(&Transaction<'_>, &DeletionRecord) -> Result<(), StorageError>,
+    {
         validate_local_context_deletion(operation, tombstone, now)?;
         let transaction = self.connection.transaction()?;
         ensure_registered_sync_project(
@@ -124,6 +142,7 @@ impl ProjectStore {
                     id: tombstone.id.to_string(),
                 });
             }
+            binding(&transaction, &deletion)?;
             transaction.commit()?;
             return Ok(LocalSyncPrepareOutcome {
                 operation: existing,
@@ -164,6 +183,7 @@ impl ProjectStore {
 
         insert_operation(&transaction, operation)?;
         insert_deletion_record(&transaction, &record)?;
+        binding(&transaction, &record)?;
         let event_payload = deletion_event_payload(&record, operation);
         let (events, outbox) = append_events(
             &transaction,
