@@ -2399,7 +2399,9 @@ impl ToolSelfRecoveryResult {
         if self.schema != CAPABILITY_EXECUTION_SCHEMA
             || self.receipt.adapter_invocations == 0
             || self.receipt.automatic_read_retries > MAX_AUTOMATIC_READ_RETRIES
-            || self.receipt.automatic_read_retries >= self.receipt.adapter_invocations
+            || self.receipt.automatic_read_retries > self.policy.max_read_retries
+            || self.receipt.automatic_read_retries.checked_add(1)
+                != Some(self.receipt.adapter_invocations)
         {
             return Err(GatewayError::InvalidResult);
         }
@@ -2499,7 +2501,10 @@ impl ToolSelfRecoveryExecutor {
                         );
                     }
                 }
-                Some(disposition) => return Err(GatewayError::Recovery(disposition.clone())),
+                Some(disposition) => {
+                    disposition.validate_for(request)?;
+                    return Err(GatewayError::Recovery(disposition.clone()));
+                }
                 None => return Err(GatewayError::InvalidResult),
             }
         }
