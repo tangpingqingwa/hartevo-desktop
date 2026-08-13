@@ -37458,7 +37458,7 @@ sleep 30"#
                 tab_id: fixture.workspace.active_tab_id.clone(),
                 snapshot_id: Some(snapshot.id.clone()),
                 element_ref: None,
-                target_origin_digest: "8".repeat(64),
+                target_origin_digest: sha256(b"https://example.com"),
                 payload_digest: "9".repeat(64),
             })
             .collect::<Vec<_>>();
