@@ -1,0 +1,24 @@
+[package]
+name = "hartevo-connector-sdk"
+description = "Typed Hartevo connector lifecycle, worker fencing, and deterministic provider testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+hartevo-effect-broker = { path = "../effect-broker" }
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[features]
+default = []
+testkit = []
+
+[lints]
+workspace = true

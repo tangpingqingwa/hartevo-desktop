@@ -2299,6 +2299,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hartevo-connector-sdk"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hartevo-effect-broker",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "zeroize",
+]
+
+[[package]]
 name = "hartevo-context-fabric"
 version = "0.1.0"
 dependencies = [
