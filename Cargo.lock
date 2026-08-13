@@ -2299,6 +2299,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hartevo-channel-adapters"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
 name = "hartevo-cloud-storage"
 version = "0.1.0"
 dependencies = [
