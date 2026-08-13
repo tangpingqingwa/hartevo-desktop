@@ -189,6 +189,49 @@ def validate_reusable_concurrency_contract(path: Path, text: str) -> None:
         raise PolicyError(f"{path} must isolate reusable concurrency by caller PR or run")
 
 
+RUST_REUSABLE_CHECK_SUFFIXES = (
+    "fmt",
+    "clippy (ubuntu-24.04)",
+    "clippy (macos-15)",
+    "test (ubuntu-24.04)",
+    "test (macos-15)",
+)
+
+
+def reusable_rust_scope_plan(check_prefix: str, run_rust: bool) -> list[dict[str, object]]:
+    """Model the stable child checks and their planned scope behavior for policy tests."""
+    return [
+        {
+            "name": f"{check_prefix} / {suffix}",
+            "plannedSkip": not run_rust,
+            "executesRust": run_rust,
+        }
+        for suffix in RUST_REUSABLE_CHECK_SUFFIXES
+    ]
+
+
+def validate_reusable_scope_contract(path: Path, text: str) -> None:
+    if path.name != "rust-reusable.yml":
+        return
+    required = (
+        "run_rust:\n",
+        "type: boolean",
+        "name: ${{ inputs.check_prefix }} / fmt",
+        "name: ${{ inputs.check_prefix }} / clippy (${{ matrix.os }})",
+        "name: ${{ inputs.check_prefix }} / test (${{ matrix.os }})",
+        "os: [ubuntu-24.04, macos-15]",
+    )
+    if any(item not in text for item in required):
+        raise PolicyError(f"{path} is missing the scope-aware stable Rust check contract")
+    for job_name in ("fmt", "clippy", "test"):
+        match = re.search(
+            rf"(?ms)^  {re.escape(job_name)}:\s*\n.*?(?=^  [A-Za-z0-9_.-]+:\s*$|\Z)",
+            text,
+        )
+        if not match or not re.search(r"^\s+if:\s*inputs\.run_rust\s*$", match.group(0), re.MULTILINE):
+            raise PolicyError(f"{path} {job_name} must be skipped at job scope when run_rust is false")
+
+
 def validate_actions(path: Path, text: str, pins: dict[str, str]) -> list[str]:
     actions: list[str] = []
     for line in text.splitlines():
@@ -254,13 +297,23 @@ def validate_dioxus_artifact_contract(path: Path, text: str) -> None:
 
 def validate_required_workflow_contract(path: Path, text: str) -> None:
     if path.name == "ci.yml":
-        required = ("pull_request:", "scripts/ci-scope.py", "rust-reusable.yml", "scripts/ci-workflow-policy.py", "scripts/ci-result.py", "PR / Result taxonomy")
+        required = (
+            "pull_request:",
+            "scripts/ci-scope.py",
+            "rust-reusable.yml",
+            "run_rust: ${{ needs.scope.outputs.rust == 'true' }}",
+            "scripts/ci-workflow-policy.py",
+            "scripts/ci-result.py",
+            "PR / Result taxonomy",
+        )
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing a required fast-PR contract")
+        if re.search(r"^\s+if:\s+needs\.scope\.outputs\.rust\s*==\s*['\"]true['\"]\s*$", text, re.MULTILINE):
+            raise PolicyError(f"{path} must always call the reusable Rust workflow")
         if "branches: [main]" in text or "branches: [bootstrap/macos-r0]" in text:
             raise PolicyError(f"{path} must not run the integration push tier")
     elif path.name == "integration.yml":
-        required = ("bootstrap/macos-r0", "pull_request_review:", "HARTEVO_TEST_POSTGRES_URL", "postgres:18.4", "check-evidence-doc-truth.sh", "check-openinterpreter-schema.sh", "check-dioxus-toolchain.sh", "catalog export", "evidence baseline", "Integration / Result taxonomy")
+        required = ("bootstrap/macos-r0", "pull_request_review:", "run_rust: true", "HARTEVO_TEST_POSTGRES_URL", "postgres:18.4", "check-evidence-doc-truth.sh", "check-openinterpreter-schema.sh", "check-dioxus-toolchain.sh", "catalog export", "evidence baseline", "Integration / Result taxonomy")
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing a required integration contract")
         validate_dependency_audit_contract(path, text)
@@ -277,6 +330,7 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing the reusable Rust gate contract")
         validate_reusable_concurrency_contract(path, text)
+        validate_reusable_scope_contract(path, text)
 
 
 def verify(root: Path) -> dict[str, object]:
@@ -372,6 +426,55 @@ concurrency:
         pass
     else:
         raise AssertionError("self-test accepted a shared reusable concurrency key")
+
+    scope_fixture = """\
+on:
+  workflow_call:
+    inputs:
+      run_rust:
+        description: Scope gate
+        required: true
+        type: boolean
+jobs:
+  fmt:
+    if: inputs.run_rust
+    name: ${{ inputs.check_prefix }} / fmt
+    steps:
+      - run: cargo fmt --all -- --check
+  clippy:
+    if: inputs.run_rust
+    name: ${{ inputs.check_prefix }} / clippy (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - run: cargo clippy --locked
+  test:
+    if: inputs.run_rust
+    name: ${{ inputs.check_prefix }} / test (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - run: cargo test --locked
+"""
+    validate_reusable_scope_contract(Path("rust-reusable.yml"), scope_fixture)
+    scope_skip_plan = reusable_rust_scope_plan("PR / Fast Rust", False)
+    assert [item["name"] for item in scope_skip_plan] == [
+        "PR / Fast Rust / fmt",
+        "PR / Fast Rust / clippy (ubuntu-24.04)",
+        "PR / Fast Rust / clippy (macos-15)",
+        "PR / Fast Rust / test (ubuntu-24.04)",
+        "PR / Fast Rust / test (macos-15)",
+    ]
+    assert all(item["plannedSkip"] is True and item["executesRust"] is False for item in scope_skip_plan)
+    assert all(item["plannedSkip"] is False and item["executesRust"] is True for item in reusable_rust_scope_plan("PR / Fast Rust", True))
+    try:
+        validate_reusable_scope_contract(Path("rust-reusable.yml"), scope_fixture.replace("if: inputs.run_rust", "if: inputs.run_rust_at_step"))
+    except PolicyError:
+        pass
+    else:
+        raise AssertionError("self-test accepted a reusable Rust workflow without job-level scope skips")
 
     try:
         validate_job_blocks(Path("fixture.yml"), ["jobs:", "  check:", "    runs-on: ubuntu-24.04"])

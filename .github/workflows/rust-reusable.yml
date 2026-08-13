@@ -9,6 +9,10 @@ on:
         description: Stable check-name prefix for the caller tier.
         required: true
         type: string
+      run_rust:
+        description: Instantiate and execute Rust gates for this changed scope.
+        required: true
+        type: boolean
       full_workspace:
         description: Run the full workspace instead of package-local scope.
         required: true
@@ -36,6 +40,7 @@ env:
 
 jobs:
   fmt:
+    if: inputs.run_rust
     name: ${{ inputs.check_prefix }} / fmt
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -63,6 +68,7 @@ jobs:
         run: bash scripts/ci-rust-gate.sh fmt
 
   clippy:
+    if: inputs.run_rust
     name: ${{ inputs.check_prefix }} / clippy (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -117,6 +123,7 @@ jobs:
             --packages '${{ inputs.rust_packages }}'
 
   test:
+    if: inputs.run_rust
     name: ${{ inputs.check_prefix }} / test (${{ matrix.os }})
     strategy:
       fail-fast: false

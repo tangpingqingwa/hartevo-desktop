@@ -38,6 +38,8 @@ def parse_mapping(values: list[str], label: str) -> dict[str, str]:
 
 
 def classify(job: Job) -> str:
+    if job.allowed_skip and job.result == "skipped":
+        return "PASS"
     if job.no_steps:
         return "CI_NOT_EXECUTED"
     if job.result == "success":
@@ -52,13 +54,14 @@ def classify(job: Job) -> str:
 def aggregate(jobs: list[Job]) -> tuple[str, list[dict[str, object]]]:
     entries: list[dict[str, object]] = []
     for job in jobs:
+        planned_skip = job.allowed_skip and job.result == "skipped"
         classification = classify(job)
-        reason = None
+        reason = "scope-allowed skip" if planned_skip else None
         if classification == "CI_NOT_EXECUTED":
             if job.no_steps:
                 reason = "job did not execute: GitHub created no steps (runner/billing or hosted infrastructure gate)"
             else:
-                reason = "scope-allowed skip" if job.allowed_skip and job.result == "skipped" else "job did not execute"
+                reason = "job did not execute"
         entries.append(
             {
                 "name": job.name,
@@ -66,6 +69,7 @@ def aggregate(jobs: list[Job]) -> tuple[str, list[dict[str, object]]]:
                 "kind": job.kind,
                 "classification": classification,
                 "allowedSkip": job.allowed_skip,
+                "plannedSkip": planned_skip,
                 "noSteps": job.no_steps,
                 "reason": reason,
             }
@@ -77,7 +81,7 @@ def aggregate(jobs: list[Job]) -> tuple[str, list[dict[str, object]]]:
     elif "CODE_FAILURE" in classifications:
         overall = "CODE_FAILURE"
     elif any(
-        entry["classification"] == "CI_NOT_EXECUTED" and not entry["allowedSkip"]
+        entry["classification"] == "CI_NOT_EXECUTED" and not entry["plannedSkip"]
         for entry in entries
     ):
         overall = "CI_NOT_EXECUTED"
@@ -87,7 +91,7 @@ def aggregate(jobs: list[Job]) -> tuple[str, list[dict[str, object]]]:
 
 
 def write_junit(path: Path, workflow: str, overall: str, entries: list[dict[str, object]]) -> None:
-    failures = sum(entry["classification"] in {"CODE_FAILURE", "INFRA_FAILURE", "CI_NOT_EXECUTED"} and not entry["allowedSkip"] for entry in entries)
+    failures = sum(entry["classification"] in {"CODE_FAILURE", "INFRA_FAILURE", "CI_NOT_EXECUTED"} and not entry["plannedSkip"] for entry in entries)
     lines = [
         f'<testsuite name="{escape(workflow)}" tests="{len(entries)}" failures="{failures}" skipped="0">'
     ]
@@ -95,7 +99,7 @@ def write_junit(path: Path, workflow: str, overall: str, entries: list[dict[str,
         name = escape(str(entry["name"]))
         classification = str(entry["classification"])
         lines.append(f'  <testcase classname="ci" name="{name}">')
-        if classification != "PASS" and not entry["allowedSkip"]:
+        if classification != "PASS" and not entry["plannedSkip"]:
             detail = escape(str(entry.get("reason") or classification))
             lines.append(f"    <failure message=\"{classification}\">{detail}</failure>")
         lines.append("  </testcase>")
@@ -160,7 +164,12 @@ def self_test() -> None:
         [Job("pass", "success", "code"), Job("scope", "skipped", "code", True)]
     )
     assert overall == "PASS"
-    assert {entry["classification"] for entry in entries} == {"PASS", "CI_NOT_EXECUTED"}
+    assert {entry["classification"] for entry in entries} == {"PASS"}
+    assert entries[1]["plannedSkip"] is True
+    planned_no_steps, planned_no_steps_entries = aggregate([Job("scope", "skipped", "code", True, True)])
+    assert planned_no_steps == "PASS"
+    assert planned_no_steps_entries[0]["classification"] == "PASS"
+    assert planned_no_steps_entries[0]["plannedSkip"] is True
     assert aggregate([Job("code", "failure", "code")])[0] == "CODE_FAILURE"
     assert aggregate([Job("runner", "timed_out", "infra")])[0] == "INFRA_FAILURE"
     assert aggregate([Job("never", "skipped", "code")])[0] == "CI_NOT_EXECUTED"
