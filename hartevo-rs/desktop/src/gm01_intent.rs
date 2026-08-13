@@ -13,12 +13,6 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const GM01_MANIFEST_ID: &str = "VM-07";
-pub const GM01_MARKET: &str = "DE";
-pub const GM01_LANGUAGE: &str = "de-DE";
-pub const GM01_CURRENCY: &str = "EUR";
-pub const GM01_TIMEZONE: &str = "Europe/Berlin";
-pub const GM01_CANONICAL_GOAL: &str =
-    "判断 MXZONE Shark 替换配件是否值得进入德国，并给出符合预算的下一步";
 
 const ONE_OFF_DECISION_MODE: &str = "one_off_decision";
 
@@ -51,40 +45,58 @@ impl Gm01MissionMode {
     }
 }
 
-/// A product scope understood by the current GM-01 golden Mission.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum Gm01ProductScope {
-    MxzoneSharkReplacementAccessory,
+/// A normalized product scope.  The compiler keeps a stable semantic slug,
+/// never the source prompt, so the entry point can be reused for other
+/// products without giving raw user text a durable shape.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Gm01ProductScope {
+    slug: String,
 }
 
 impl Gm01ProductScope {
-    pub const fn as_str(self) -> &'static str {
-        "mxzone_shark_replacement_accessory"
+    fn new(slug: impl Into<String>) -> Self {
+        Self { slug: slug.into() }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.slug
     }
 }
 
-/// The target market is intentionally typed rather than copied from user
-/// text.  This prevents a draft from carrying an unreviewed market string.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum Gm01Market {
-    Germany,
+/// A market profile resolved from a country/region mention.  Locale defaults
+/// are compiler metadata, not authority: the result remains read-only.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Gm01Market {
+    code: String,
+    language: String,
+    currency: String,
+    timezone: String,
 }
 
 impl Gm01Market {
-    pub const fn code(self) -> &'static str {
-        GM01_MARKET
+    fn new(code: &str, language: &str, currency: &str, timezone: &str) -> Self {
+        Self {
+            code: code.into(),
+            language: language.into(),
+            currency: currency.into(),
+            timezone: timezone.into(),
+        }
     }
 
-    pub const fn language(self) -> &'static str {
-        GM01_LANGUAGE
+    pub fn code(&self) -> &str {
+        &self.code
     }
 
-    pub const fn currency(self) -> &'static str {
-        GM01_CURRENCY
+    pub fn language(&self) -> &str {
+        &self.language
     }
 
-    pub const fn timezone(self) -> &'static str {
-        GM01_TIMEZONE
+    pub fn currency(&self) -> &str {
+        &self.currency
+    }
+
+    pub fn timezone(&self) -> &str {
+        &self.timezone
     }
 }
 
@@ -103,17 +115,17 @@ pub struct Gm01BudgetConstraint {
 }
 
 impl Gm01BudgetConstraint {
-    fn user_bound() -> Self {
+    fn user_bound(currency: &str) -> Self {
         Self {
-            currency: GM01_CURRENCY.into(),
+            currency: currency.into(),
             maximum_minor: None,
             source: Gm01BudgetSource::UserBound,
         }
     }
 
-    fn explicit_maximum(maximum_minor: i64) -> Self {
+    fn explicit_maximum(currency: &str, maximum_minor: i64) -> Self {
         Self {
-            currency: GM01_CURRENCY.into(),
+            currency: currency.into(),
             maximum_minor: Some(maximum_minor),
             source: Gm01BudgetSource::ExplicitMaximum,
         }
@@ -130,20 +142,28 @@ impl Gm01BudgetConstraint {
     }
 }
 
-/// The compiler only recognizes a decision goal; it never stores a user
-/// prompt as a Mission fact.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum Gm01Goal {
-    EvaluateGermanyMarketEntry,
+/// A normalized decision goal; source wording is not persisted as a Mission
+/// fact and no market is embedded in this type.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Gm01Goal {
+    slug: String,
+    canonical_text: String,
 }
 
 impl Gm01Goal {
-    pub const fn canonical_text(self) -> &'static str {
-        GM01_CANONICAL_GOAL
+    fn market_decision() -> Self {
+        Self {
+            slug: "evaluate_market_entry".into(),
+            canonical_text: "Evaluate whether the requested product should enter the requested market and define the next bounded step".into(),
+        }
     }
 
-    const fn as_str() -> &'static str {
-        "evaluate_germany_market_entry"
+    pub fn canonical_text(&self) -> &str {
+        &self.canonical_text
+    }
+
+    fn as_str(&self) -> &str {
+        &self.slug
     }
 }
 
@@ -279,7 +299,7 @@ impl Gm01IntentDraft {
         self.authority.allows_external_effects()
     }
 
-    pub fn canonical_goal(&self) -> &'static str {
+    pub fn canonical_goal(&self) -> &str {
         self.goal.canonical_text()
     }
 }
@@ -316,7 +336,7 @@ impl Gm01Refusal {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Gm01IntentOutcome {
-    Draft(Gm01IntentDraft),
+    Draft(Box<Gm01IntentDraft>),
     Clarification(Gm01Clarification),
     Refusal(Gm01Refusal),
 }
@@ -324,7 +344,7 @@ pub enum Gm01IntentOutcome {
 impl Gm01IntentOutcome {
     pub fn draft(&self) -> Option<&Gm01IntentDraft> {
         match self {
-            Self::Draft(draft) => Some(draft),
+            Self::Draft(draft) => Some(draft.as_ref()),
             Self::Clarification(_) | Self::Refusal(_) => None,
         }
     }
@@ -469,40 +489,50 @@ impl Gm01IntentCompiler {
         let mut reasons = BTreeSet::new();
         let mut requested_fields = BTreeSet::new();
 
-        match product {
-            ProductDetection::Known => {}
+        let product_scope = match product {
+            ProductDetection::Known(product_scope) => product_scope,
             ProductDetection::Missing => {
                 reasons.insert(Gm01ClarificationReason::MissingProductScope);
                 requested_fields.insert(Gm01ClarificationField::ProductScope);
+                Gm01ProductScope::new("")
             }
             ProductDetection::Ambiguous => {
                 reasons.insert(Gm01ClarificationReason::AmbiguousProductScope);
                 requested_fields.insert(Gm01ClarificationField::ProductScope);
+                Gm01ProductScope::new("")
             }
-        }
+        };
 
-        match market {
-            MarketDetection::Germany => {}
+        let market_profile = match market {
+            MarketDetection::Known(market_profile) => market_profile,
             MarketDetection::Missing => {
                 reasons.insert(Gm01ClarificationReason::MissingMarket);
                 requested_fields.insert(Gm01ClarificationField::Market);
+                Gm01Market::new("", "", "", "")
             }
             MarketDetection::Multiple => {
                 reasons.insert(Gm01ClarificationReason::MultipleMarkets);
                 requested_fields.insert(Gm01ClarificationField::Market);
+                Gm01Market::new("", "", "", "")
             }
             MarketDetection::Unsupported => {
                 reasons.insert(Gm01ClarificationReason::UnsupportedMarket);
                 requested_fields.insert(Gm01ClarificationField::Market);
+                Gm01Market::new("", "", "", "")
             }
-        }
+        };
 
         if !has_decision_goal(&normalized) {
             reasons.insert(Gm01ClarificationReason::AmbiguousGoal);
             requested_fields.insert(Gm01ClarificationField::Goal);
         }
 
-        let Some(budget) = detect_budget(&normalized, &mut reasons, &mut requested_fields) else {
+        let Some(budget) = detect_budget(
+            &normalized,
+            market_profile.currency(),
+            &mut reasons,
+            &mut requested_fields,
+        ) else {
             return clarification(reasons, requested_fields);
         };
 
@@ -510,25 +540,32 @@ impl Gm01IntentCompiler {
             return clarification(reasons, requested_fields);
         }
 
-        let semantic_digest = draft_digest(&self.catalog_binding, &budget);
-        Gm01IntentOutcome::Draft(Gm01IntentDraft {
+        let goal = Gm01Goal::market_decision();
+        let semantic_digest = draft_digest(
+            &self.catalog_binding,
+            &product_scope,
+            &goal,
+            &market_profile,
+            &budget,
+        );
+        Gm01IntentOutcome::Draft(Box::new(Gm01IntentDraft {
             manifest_id: self.catalog_binding.manifest_id.clone(),
             manifest_version: self.catalog_binding.manifest_version,
             catalog_digest: self.catalog_binding.catalog_digest.clone(),
             mode: Gm01MissionMode::OneOffDecision,
-            product_scope: Gm01ProductScope::MxzoneSharkReplacementAccessory,
-            goal: Gm01Goal::EvaluateGermanyMarketEntry,
-            market: Gm01Market::Germany,
-            language: GM01_LANGUAGE.into(),
-            currency: GM01_CURRENCY.into(),
-            timezone: GM01_TIMEZONE.into(),
+            product_scope,
+            goal,
+            market: market_profile.clone(),
+            language: market_profile.language().into(),
+            currency: market_profile.currency().into(),
+            timezone: market_profile.timezone().into(),
             audience: "owner".into(),
             authority: Gm01Authority::ReadOnly,
             budget,
             capability_ids: self.catalog_binding.capability_ids.clone(),
             required_artifact_ids: self.catalog_binding.required_artifact_ids.clone(),
             semantic_digest,
-        })
+        }))
     }
 }
 
@@ -577,19 +614,25 @@ fn refusal(
     })
 }
 
-fn draft_digest(binding: &Gm01CatalogBinding, budget: &Gm01BudgetConstraint) -> String {
+fn draft_digest(
+    binding: &Gm01CatalogBinding,
+    product_scope: &Gm01ProductScope,
+    goal: &Gm01Goal,
+    market: &Gm01Market,
+    budget: &Gm01BudgetConstraint,
+) -> String {
     digest_parts([
         "draft",
         &binding.manifest_id,
         &binding.manifest_version.to_string(),
         &binding.catalog_digest,
         Gm01MissionMode::OneOffDecision.as_str(),
-        Gm01ProductScope::MxzoneSharkReplacementAccessory.as_str(),
-        Gm01Goal::as_str(),
-        GM01_MARKET,
-        GM01_LANGUAGE,
-        GM01_CURRENCY,
-        GM01_TIMEZONE,
+        product_scope.as_str(),
+        goal.as_str(),
+        market.code(),
+        market.language(),
+        market.currency(),
+        market.timezone(),
         Gm01Authority::ReadOnly.as_str(),
         &budget.canonical_value(),
         &binding.capability_ids.join(","),
@@ -606,9 +649,9 @@ fn digest_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
     format!("{:x}", digest.finalize())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ProductDetection {
-    Known,
+    Known(Gm01ProductScope),
     Missing,
     Ambiguous,
 }
@@ -649,7 +692,7 @@ fn detect_product_scope(text: &str) -> ProductDetection {
     }
 
     if has_brand && has_family && has_component {
-        ProductDetection::Known
+        ProductDetection::Known(Gm01ProductScope::new("mxzone_shark_replacement_accessory"))
     } else if has_brand || has_family || has_component {
         ProductDetection::Ambiguous
     } else {
@@ -657,32 +700,67 @@ fn detect_product_scope(text: &str) -> ProductDetection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum MarketDetection {
-    Germany,
+    Known(Gm01Market),
     Missing,
     Multiple,
     Unsupported,
 }
 
 fn detect_market_scope(text: &str) -> MarketDetection {
-    let mut signals = BTreeSet::new();
-    if contains_positive(
-        text,
-        &[
-            "germany",
-            "german market",
-            "deutschland",
-            "deutscher markt",
-            "deutschen markt",
-            "deutsche markt",
-            "german",
-            "德国",
-            "德國",
-            "de de",
-        ],
-    ) {
-        signals.insert(MarketSignal::Germany);
+    let mut matches = Vec::new();
+    for (signal, patterns) in [
+        (
+            MarketSignal::Germany,
+            [
+                "germany",
+                "german market",
+                "deutschland",
+                "deutscher markt",
+                "deutschen markt",
+                "deutsche markt",
+                "german",
+                "德国",
+                "德國",
+                "de de",
+            ]
+            .as_slice(),
+        ),
+        (
+            MarketSignal::UnitedStates,
+            ["united states", "usa", "us market", "美国"].as_slice(),
+        ),
+        (
+            MarketSignal::UnitedKingdom,
+            ["united kingdom", "uk market", "英国"].as_slice(),
+        ),
+        (
+            MarketSignal::France,
+            ["france", "frankreich", "法国"].as_slice(),
+        ),
+        (MarketSignal::Spain, ["spain", "西班牙"].as_slice()),
+        (MarketSignal::Italy, ["italy", "意大利"].as_slice()),
+        (
+            MarketSignal::Netherlands,
+            ["netherlands", "荷兰"].as_slice(),
+        ),
+        (MarketSignal::Austria, ["austria", "奥地利"].as_slice()),
+        (
+            MarketSignal::Switzerland,
+            ["switzerland", "瑞士"].as_slice(),
+        ),
+        (MarketSignal::China, ["china", "中国"].as_slice()),
+        (MarketSignal::Japan, ["japan", "日本"].as_slice()),
+        (MarketSignal::Canada, ["canada", "加拿大"].as_slice()),
+        (
+            MarketSignal::Australia,
+            ["australia", "澳大利亚"].as_slice(),
+        ),
+    ] {
+        if contains_positive(text, patterns) {
+            matches.push(signal);
+        }
     }
     if contains_positive(
         text,
@@ -695,59 +773,24 @@ fn detect_market_scope(text: &str) -> MarketDetection {
             "欧盟",
             "all european markets",
             "多个市场",
-            "多个市场",
             "multiple markets",
             "several markets",
         ],
     ) {
-        signals.insert(MarketSignal::Regional);
-    }
-    if contains_positive(
-        text,
-        &[
-            "united states",
-            "usa",
-            "us market",
-            "united kingdom",
-            "uk market",
-            "france",
-            "frankreich",
-            "spain",
-            "italy",
-            "netherlands",
-            "austria",
-            "switzerland",
-            "china",
-            "japan",
-            "canada",
-            "australia",
-            "美国",
-            "英国",
-            "法国",
-            "西班牙",
-            "意大利",
-            "荷兰",
-            "奥地利",
-            "瑞士",
-            "中国",
-            "日本",
-            "加拿大",
-            "澳大利亚",
-        ],
-    ) {
-        signals.insert(MarketSignal::OtherCountry);
+        matches.push(MarketSignal::Regional);
     }
 
-    match signals.len() {
-        0 => MarketDetection::Missing,
-        1 if signals.contains(&MarketSignal::Germany) => MarketDetection::Germany,
-        1 => {
-            if signals.contains(&MarketSignal::Regional) {
-                MarketDetection::Multiple
-            } else {
-                MarketDetection::Unsupported
-            }
+    match matches.as_slice() {
+        [] if contains_positive(
+            text,
+            &["market", "country", "region", "市场", "国家", "地区"],
+        ) =>
+        {
+            MarketDetection::Unsupported
         }
+        [] => MarketDetection::Missing,
+        [MarketSignal::Regional] => MarketDetection::Multiple,
+        [signal] => MarketDetection::Known(market_profile(*signal)),
         _ => MarketDetection::Multiple,
     }
 }
@@ -755,8 +798,38 @@ fn detect_market_scope(text: &str) -> MarketDetection {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum MarketSignal {
     Germany,
+    UnitedStates,
+    UnitedKingdom,
+    France,
+    Spain,
+    Italy,
+    Netherlands,
+    Austria,
+    Switzerland,
+    China,
+    Japan,
+    Canada,
+    Australia,
     Regional,
-    OtherCountry,
+}
+
+fn market_profile(signal: MarketSignal) -> Gm01Market {
+    match signal {
+        MarketSignal::Germany => Gm01Market::new("DE", "de-DE", "EUR", "Europe/Berlin"),
+        MarketSignal::UnitedStates => Gm01Market::new("US", "en-US", "USD", "America/New_York"),
+        MarketSignal::UnitedKingdom => Gm01Market::new("GB", "en-GB", "GBP", "Europe/London"),
+        MarketSignal::France => Gm01Market::new("FR", "fr-FR", "EUR", "Europe/Paris"),
+        MarketSignal::Spain => Gm01Market::new("ES", "es-ES", "EUR", "Europe/Madrid"),
+        MarketSignal::Italy => Gm01Market::new("IT", "it-IT", "EUR", "Europe/Rome"),
+        MarketSignal::Netherlands => Gm01Market::new("NL", "nl-NL", "EUR", "Europe/Amsterdam"),
+        MarketSignal::Austria => Gm01Market::new("AT", "de-AT", "EUR", "Europe/Vienna"),
+        MarketSignal::Switzerland => Gm01Market::new("CH", "de-CH", "CHF", "Europe/Zurich"),
+        MarketSignal::China => Gm01Market::new("CN", "zh-CN", "CNY", "Asia/Shanghai"),
+        MarketSignal::Japan => Gm01Market::new("JP", "ja-JP", "JPY", "Asia/Tokyo"),
+        MarketSignal::Canada => Gm01Market::new("CA", "en-CA", "CAD", "America/Toronto"),
+        MarketSignal::Australia => Gm01Market::new("AU", "en-AU", "AUD", "Australia/Sydney"),
+        MarketSignal::Regional => Gm01Market::new("", "", "", ""),
+    }
 }
 
 fn has_decision_goal(text: &str) -> bool {
@@ -806,6 +879,7 @@ fn has_decision_goal(text: &str) -> bool {
 
 fn detect_budget(
     text: &str,
+    expected_currency: &str,
     reasons: &mut BTreeSet<Gm01ClarificationReason>,
     requested_fields: &mut BTreeSet<Gm01ClarificationField>,
 ) -> Option<Gm01BudgetConstraint> {
@@ -821,49 +895,51 @@ fn detect_budget(
             "预算",
         ],
     );
-    let has_eur_marker = contains_positive(text, &["eur", "euro", "€", "欧元"]);
-    let has_other_currency = contains_positive(
-        text,
-        &[
-            "usd",
-            "dollar",
-            "dollars",
-            "$",
-            "cny",
-            "yuan",
-            "人民币",
-            "gbp",
-            "pound",
-            "英镑",
-        ],
-    );
+    let currencies = [
+        ("EUR", ["eur", "euro", "€", "欧元"].as_slice()),
+        ("USD", ["usd", "dollar", "dollars", "$"].as_slice()),
+        ("GBP", ["gbp", "pound", "pounds", "£", "英镑"].as_slice()),
+        ("CNY", ["cny", "yuan", "¥", "人民币"].as_slice()),
+        ("CHF", ["chf", "swiss franc", "瑞郎"].as_slice()),
+        ("JPY", ["jpy", "yen", "日元"].as_slice()),
+        ("CAD", ["cad", "canadian dollar"].as_slice()),
+        ("AUD", ["aud", "australian dollar"].as_slice()),
+    ];
+    let explicit_currencies: Vec<_> = currencies
+        .iter()
+        .filter(|(_, patterns)| contains_positive(text, patterns))
+        .map(|(currency, _)| *currency)
+        .collect();
+    let has_expected_currency = currencies
+        .iter()
+        .find(|(currency, _)| *currency == expected_currency)
+        .is_some_and(|(_, patterns)| contains_positive(text, patterns));
 
-    if has_other_currency && !has_eur_marker {
+    if explicit_currencies
+        .iter()
+        .any(|currency| *currency != expected_currency)
+    {
         reasons.insert(Gm01ClarificationReason::BudgetCurrencyConflict);
         requested_fields.insert(Gm01ClarificationField::BudgetBoundary);
         return None;
     }
 
-    if !has_budget_marker && !has_eur_marker {
+    if !has_budget_marker && !has_expected_currency {
         reasons.insert(Gm01ClarificationReason::MissingBudgetBoundary);
         requested_fields.insert(Gm01ClarificationField::BudgetBoundary);
         return None;
     }
 
-    Some(parse_explicit_eur_amount(text).map_or_else(
-        Gm01BudgetConstraint::user_bound,
-        Gm01BudgetConstraint::explicit_maximum,
+    Some(parse_explicit_amount(text, expected_currency).map_or_else(
+        || Gm01BudgetConstraint::user_bound(expected_currency),
+        |amount| Gm01BudgetConstraint::explicit_maximum(expected_currency, amount),
     ))
 }
 
-fn parse_explicit_eur_amount(text: &str) -> Option<i64> {
+fn parse_explicit_amount(text: &str, currency: &str) -> Option<i64> {
     let tokens: Vec<_> = text.split_whitespace().collect();
     for (index, token) in tokens.iter().enumerate() {
-        if !token.contains("eur")
-            && !token.contains("euro")
-            && !token.contains('€')
-            && *token != "€"
-        {
+        if !currency_token_matches(token, currency) {
             continue;
         }
         for candidate in [
@@ -883,6 +959,20 @@ fn parse_explicit_eur_amount(text: &str) -> Option<i64> {
         }
     }
     None
+}
+
+fn currency_token_matches(token: &str, currency: &str) -> bool {
+    match currency {
+        "EUR" => token.contains("eur") || token.contains("euro") || token.contains('€'),
+        "USD" => token.contains("usd") || token.contains("dollar") || token.contains('$'),
+        "GBP" => token.contains("gbp") || token.contains("pound") || token.contains('£'),
+        "CNY" => token.contains("cny") || token.contains("yuan") || token.contains('¥'),
+        "CHF" => token.contains("chf") || token.contains("franc"),
+        "JPY" => token.contains("jpy") || token.contains("yen"),
+        "CAD" => token.contains("cad") || token.contains("canadian"),
+        "AUD" => token.contains("aud") || token.contains("australian"),
+        _ => false,
+    }
 }
 
 fn detect_prompt_injection(text: &str) -> bool {
@@ -1128,7 +1218,7 @@ mod tests {
 
     fn draft(outcome: Gm01IntentOutcome) -> Gm01IntentDraft {
         match outcome {
-            Gm01IntentOutcome::Draft(draft) => draft,
+            Gm01IntentOutcome::Draft(draft) => *draft,
             other => panic!("expected draft, got {other:?}"),
         }
     }
@@ -1142,14 +1232,14 @@ mod tests {
         assert_eq!(draft.manifest_version, 3);
         assert_eq!(draft.mode, Gm01MissionMode::OneOffDecision);
         assert_eq!(
-            draft.product_scope,
-            Gm01ProductScope::MxzoneSharkReplacementAccessory
+            draft.product_scope.as_str(),
+            "mxzone_shark_replacement_accessory"
         );
-        assert_eq!(draft.goal, Gm01Goal::EvaluateGermanyMarketEntry);
-        assert_eq!(draft.market, Gm01Market::Germany);
-        assert_eq!(draft.language, GM01_LANGUAGE);
-        assert_eq!(draft.currency, GM01_CURRENCY);
-        assert_eq!(draft.timezone, GM01_TIMEZONE);
+        assert_eq!(draft.goal.as_str(), "evaluate_market_entry");
+        assert_eq!(draft.market.code(), "DE");
+        assert_eq!(draft.language, "de-DE");
+        assert_eq!(draft.currency, "EUR");
+        assert_eq!(draft.timezone, "Europe/Berlin");
         assert_eq!(draft.authority, Gm01Authority::ReadOnly);
         assert!(draft.is_read_only());
         assert!(!draft.allows_external_effects());
@@ -1186,6 +1276,27 @@ mod tests {
             "Assess whether the MXZONE Shark replacement accessory is worth entering the German market and give the next step within budget.",
         ));
         assert_eq!(chinese, english);
+    }
+
+    #[test]
+    fn compiler_is_market_generic_and_does_not_reuse_a_germany_binding() {
+        let compiler = compiler();
+        let us = draft(compiler.compile(
+            "Assess whether the MXZONE Shark replacement accessory is worth entering the US market and give the next step within budget.",
+        ));
+        assert_eq!(us.market.code(), "US");
+        assert_eq!(us.language, "en-US");
+        assert_eq!(us.currency, "USD");
+        assert_eq!(us.timezone, "America/New_York");
+        assert_eq!(us.budget.currency, "USD");
+        assert_ne!(us.market.code(), "DE");
+
+        let france = draft(compiler.compile(
+            "Assess whether the MXZONE Shark replacement accessory is worth entering the France market with a budget of 100 EUR.",
+        ));
+        assert_eq!(france.market.code(), "FR");
+        assert_eq!(france.currency, "EUR");
+        assert_eq!(france.budget.maximum_minor, Some(10_000));
     }
 
     #[test]
