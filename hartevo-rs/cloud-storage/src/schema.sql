@@ -37,6 +37,37 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.projects (
     CHECK (created_at <= updated_at)
 );
 
+-- The project key-generation fence is the durable boundary for remote Worker
+-- recovery.  A generation identifies one key lineage; the Cell stores only
+-- the generation/key version metadata and never the cleartext project key.
+CREATE TABLE IF NOT EXISTS hartevo_cell.project_key_generation_versions (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    key_generation BIGINT NOT NULL CHECK (key_generation > 0),
+    key_version BIGINT NOT NULL CHECK (key_version > 0),
+    idempotency_key TEXT NOT NULL CHECK (idempotency_key ~ '^[0-9a-f]{64}$'),
+    request_digest TEXT NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    advanced_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (cell, tenant_id, project_id, key_generation),
+    UNIQUE (cell, tenant_id, project_id, idempotency_key),
+    FOREIGN KEY (cell, tenant_id, project_id)
+        REFERENCES hartevo_cell.projects (cell, tenant_id, project_id)
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.project_key_generation_heads (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    current_key_generation BIGINT NOT NULL CHECK (current_key_generation > 0),
+    key_version BIGINT NOT NULL CHECK (key_version > 0),
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (cell, tenant_id, project_id),
+    FOREIGN KEY (cell, tenant_id, project_id, current_key_generation)
+        REFERENCES hartevo_cell.project_key_generation_versions
+            (cell, tenant_id, project_id, key_generation)
+);
+
 CREATE TABLE IF NOT EXISTS hartevo_cell.sync_object_versions (
     cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
     tenant_id TEXT NOT NULL,
@@ -285,6 +316,7 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.remote_worker_mailbox_messages (
     mission_id TEXT NOT NULL CHECK (length(btrim(mission_id)) > 0),
     task_id TEXT NOT NULL CHECK (length(btrim(task_id)) > 0),
     worker_id TEXT NOT NULL CHECK (length(btrim(worker_id)) > 0),
+    key_generation BIGINT NOT NULL CHECK (key_generation > 0),
     payload_key_version BIGINT NOT NULL CHECK (payload_key_version > 0),
     payload_nonce BYTEA NOT NULL CHECK (octet_length(payload_nonce) = 12),
     payload_ciphertext BYTEA NOT NULL
@@ -370,6 +402,7 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.remote_worker_claims (
     tenant_id TEXT NOT NULL,
     project_id TEXT NOT NULL,
     task_id TEXT NOT NULL,
+    key_generation BIGINT NOT NULL CHECK (key_generation > 0),
     claim_idempotency_key TEXT NOT NULL CHECK (claim_idempotency_key ~ '^[0-9a-f]{64}$'),
     claim_request_digest TEXT NOT NULL CHECK (claim_request_digest ~ '^[0-9a-f]{64}$'),
     lease_id TEXT NOT NULL CHECK (length(btrim(lease_id)) > 0),
@@ -917,6 +950,66 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.effect_rate_limit_decisions (
     )
 );
 
+-- Upgrade existing v5 mailbox/claim rows before enforcing the generation
+-- fence.  Legacy rows are generation 1, matching the initial project key.
+ALTER TABLE hartevo_cell.remote_worker_mailbox_messages
+    ADD COLUMN IF NOT EXISTS key_generation BIGINT NOT NULL DEFAULT 1
+        CHECK (key_generation > 0);
+ALTER TABLE hartevo_cell.remote_worker_claims
+    ADD COLUMN IF NOT EXISTS key_generation BIGINT NOT NULL DEFAULT 1
+        CHECK (key_generation > 0);
+
+-- Projects created before the generation fence receive an immutable generation
+-- 1 record.  The all-zero digests are migration markers, not request values;
+-- newly-created projects always persist their registration idempotency/digest.
+-- The version guard keeps this backfill out of subsequent idempotent migrate()
+-- calls, where v6 RLS is already forced and no tenant scope is available.
+DO $hartevo_key_generation_backfill$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM hartevo_cell.schema_migrations
+        WHERE version = 6
+    ) THEN
+        INSERT INTO hartevo_cell.project_key_generation_versions
+            (cell, tenant_id, project_id, key_generation, key_version,
+             idempotency_key, request_digest, advanced_at)
+        SELECT p.cell, p.tenant_id, p.project_id, 1,
+               COALESCE(
+                   (
+                       SELECT v.key_version
+                       FROM hartevo_cell.sync_object_versions AS v
+                       WHERE v.cell = p.cell
+                         AND v.tenant_id = p.tenant_id
+                         AND v.project_id = p.project_id
+                         AND v.object_id = p.project_id
+                         AND v.revision = 1
+                   ),
+                   1
+               ),
+               repeat('0', 64), repeat('0', 64), p.created_at
+        FROM hartevo_cell.projects AS p
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM hartevo_cell.project_key_generation_versions AS existing
+            WHERE existing.cell = p.cell
+              AND existing.tenant_id = p.tenant_id
+              AND existing.project_id = p.project_id
+              AND existing.key_generation = 1
+        )
+        ON CONFLICT DO NOTHING;
+
+        INSERT INTO hartevo_cell.project_key_generation_heads
+            (cell, tenant_id, project_id, current_key_generation, key_version, updated_at)
+        SELECT v.cell, v.tenant_id, v.project_id, v.key_generation, v.key_version,
+               v.advanced_at
+        FROM hartevo_cell.project_key_generation_versions AS v
+        WHERE v.key_generation = 1
+        ON CONFLICT DO NOTHING;
+    END IF;
+END
+$hartevo_key_generation_backfill$;
+
 CREATE INDEX IF NOT EXISTS outbox_claim_idx
     ON hartevo_cell.outbox_messages
         (cell, tenant_id, status, available_at, sequence);
@@ -938,6 +1031,9 @@ CREATE INDEX IF NOT EXISTS sync_versions_replay_idx
 CREATE INDEX IF NOT EXISTS remote_worker_claim_idx
     ON hartevo_cell.remote_worker_mailbox_messages
         (cell, tenant_id, project_id, worker_id, status, enqueued_at, task_id);
+CREATE INDEX IF NOT EXISTS project_key_generation_version_idx
+    ON hartevo_cell.project_key_generation_versions
+        (cell, tenant_id, project_id, key_generation);
 CREATE INDEX IF NOT EXISTS device_handoff_target_idx
     ON hartevo_cell.device_handoff_grants
         (cell, tenant_id, project_id, target_device_id, expires_at);
@@ -955,6 +1051,10 @@ ALTER TABLE hartevo_cell.tenant_cells ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.tenant_cells FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.projects FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.project_key_generation_versions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.project_key_generation_versions FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.project_key_generation_heads ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.project_key_generation_heads FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.sync_object_versions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.sync_object_versions FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.sync_object_heads ENABLE ROW LEVEL SECURITY;
@@ -1023,6 +1123,8 @@ BEGIN
     FOREACH scoped_table IN ARRAY ARRAY[
         'tenant_cells',
         'projects',
+        'project_key_generation_versions',
+        'project_key_generation_heads',
         'sync_object_versions',
         'sync_object_heads',
         'domain_events',

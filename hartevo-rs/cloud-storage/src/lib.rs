@@ -31,7 +31,7 @@ pub use scheduler::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_CIPHERTEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REMOTE_WORKER_LEASE: Duration = Duration::seconds(15 * 60);
 const CLAIM_OUTBOX_SQL: &str = "WITH candidates AS (
@@ -70,7 +70,7 @@ const RELEASE_OUTBOX_SQL: &str = "UPDATE hartevo_cell.outbox_messages
        AND status = 'leased' AND lease_owner = $4
        AND lease_generation = $5 AND lease_expires_at > $8";
 const REMOTE_WORKER_TASK_COLUMNS: &str = "task_id, project_id, mission_id, worker_id,
-       payload_key_version, payload_nonce, payload_ciphertext,
+       key_generation, payload_key_version, payload_nonce, payload_ciphertext,
        payload_aad_digest, payload_content_digest, idempotency_key,
        request_digest, status, attempts, lease_id, lease_generation,
        lease_owner, lease_token_digest, claim_idempotency_key,
@@ -225,6 +225,58 @@ impl CloudProjectRegistration {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CloudProjectKeyGenerationMutation {
+    pub scope: CellScope,
+    pub project_id: ProjectId,
+    pub expected_generation: u64,
+    pub key_version: u64,
+    pub idempotency_key_digest: String,
+    pub advanced_at: DateTime<Utc>,
+}
+
+impl CloudProjectKeyGenerationMutation {
+    fn validate(&self, expected_cell: DataCell) -> Result<(), CloudStorageError> {
+        self.scope.validate(expected_cell)?;
+        if self.project_id.as_str().trim().is_empty()
+            || self.expected_generation == 0
+            || self.key_version == 0
+            || !is_sha256(&self.idempotency_key_digest)
+        {
+            return Err(CloudStorageError::InvalidProjectKeyGeneration);
+        }
+        Ok(())
+    }
+
+    fn request_digest(&self) -> Result<String, CloudStorageError> {
+        canonical_digest(&serde_json::json!({
+            "cell": self.scope.cell,
+            "tenantId": self.scope.tenant_id,
+            "projectId": self.project_id,
+            "expectedGeneration": self.expected_generation,
+            "keyVersion": self.key_version,
+            "advancedAt": self.advanced_at,
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudProjectKeyFence {
+    pub scope: CellScope,
+    pub project_id: ProjectId,
+    pub key_generation: u64,
+    pub key_version: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudProjectKeyGenerationMutationResult {
+    pub key_generation: u64,
+    pub key_version: u64,
+    pub duplicate: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EncryptedSyncMutation {
     pub scope: CellScope,
     pub project_id: ProjectId,
@@ -310,6 +362,7 @@ pub struct CloudRemoteWorkerTask {
     pub mission_id: MissionId,
     pub task_id: TaskId,
     pub worker_id: WorkerId,
+    pub key_generation: u64,
     pub payload: EncryptedPayload,
     pub idempotency_key_digest: String,
     pub enqueued_at: DateTime<Utc>,
@@ -325,6 +378,7 @@ impl CloudRemoteWorkerTask {
             || self.task_id.as_str().trim().is_empty()
             || self.worker_id.as_str().trim().is_empty()
             || self.worker_id.as_str().len() > 256
+            || self.key_generation == 0
             || !is_sha256(&self.idempotency_key_digest)
             || self.deadline_at <= self.enqueued_at
         {
@@ -341,6 +395,7 @@ impl CloudRemoteWorkerTask {
             "missionId": self.mission_id,
             "taskId": self.task_id,
             "workerId": self.worker_id,
+            "keyGeneration": self.key_generation,
             "payload": self.payload,
             "enqueuedAt": self.enqueued_at,
             "deadlineAt": self.deadline_at,
@@ -364,6 +419,7 @@ pub struct CloudRemoteWorkerTaskLease {
     pub mission_id: MissionId,
     pub task_id: TaskId,
     pub worker_id: WorkerId,
+    pub key_generation: u64,
     pub lease_id: WorkerLeaseId,
     pub lease_generation: u64,
     pub lease_owner: String,
@@ -404,6 +460,7 @@ pub struct CloudRemoteWorkerCompletion {
     pub scope: CellScope,
     pub project_id: ProjectId,
     pub task_id: TaskId,
+    pub key_generation: u64,
     pub lease_id: WorkerLeaseId,
     pub lease_generation: u64,
     pub lease_owner: String,
@@ -418,6 +475,7 @@ impl CloudRemoteWorkerCompletion {
         self.scope.validate(expected_cell)?;
         if self.project_id.as_str().trim().is_empty()
             || self.task_id.as_str().trim().is_empty()
+            || self.key_generation == 0
             || self.lease_id.as_str().trim().is_empty()
             || self.lease_generation == 0
             || self.lease_owner.trim().is_empty()
@@ -437,6 +495,7 @@ impl CloudRemoteWorkerCompletion {
             "tenantId": self.scope.tenant_id,
             "projectId": self.project_id,
             "taskId": self.task_id,
+            "keyGeneration": self.key_generation,
             "leaseId": self.lease_id,
             "leaseGeneration": self.lease_generation,
             "leaseOwner": self.lease_owner,
@@ -721,6 +780,17 @@ impl PostgresCellStore {
             return Err(CloudStorageError::ProjectAlreadyExists);
         }
 
+        persist_initial_project_key_fence(
+            &transaction,
+            &registration.scope,
+            &registration.project_id,
+            registration.initial_payload.key_version,
+            &registration.idempotency_key_digest,
+            &request_digest,
+            registration.created_at,
+        )
+        .await?;
+
         let result = write_revision(
             &transaction,
             &RevisionWrite {
@@ -740,6 +810,133 @@ impl PostgresCellStore {
         .await?;
         transaction.commit().await?;
         Ok(result)
+    }
+
+    pub async fn load_project_key_fence(
+        &self,
+        client: &mut Client,
+        scope: &CellScope,
+        project_id: &ProjectId,
+    ) -> Result<CloudProjectKeyFence, CloudStorageError> {
+        scope.validate(self.cell)?;
+        if project_id.as_str().trim().is_empty() {
+            return Err(CloudStorageError::InvalidProjectKeyGeneration);
+        }
+        let transaction = client.transaction().await?;
+        set_scope(&transaction, scope).await?;
+        ensure_database_cell(&transaction, self.cell).await?;
+        let fence = load_project_key_fence_tx(&transaction, scope, project_id, false)
+            .await?
+            .ok_or(CloudStorageError::ProjectKeyGenerationNotFound)?;
+        transaction.commit().await?;
+        Ok(fence)
+    }
+
+    pub async fn advance_project_key_generation(
+        &self,
+        client: &mut Client,
+        mutation: &CloudProjectKeyGenerationMutation,
+    ) -> Result<CloudProjectKeyGenerationMutationResult, CloudStorageError> {
+        mutation.validate(self.cell)?;
+        let request_digest = mutation.request_digest()?;
+        let transaction = client.transaction().await?;
+        set_scope(&transaction, &mutation.scope).await?;
+        ensure_database_cell(&transaction, self.cell).await?;
+        lock_project(&transaction, &mutation.scope, &mutation.project_id).await?;
+        ensure_project_exists(&transaction, &mutation.scope, &mutation.project_id).await?;
+
+        if let Some(existing) = transaction
+            .query_opt(
+                "SELECT key_generation, key_version, request_digest
+                 FROM hartevo_cell.project_key_generation_versions
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                   AND idempotency_key = $4",
+                &[
+                    &mutation.scope.cell.as_str(),
+                    &mutation.scope.tenant_id.as_str(),
+                    &mutation.project_id.as_str(),
+                    &mutation.idempotency_key_digest,
+                ],
+            )
+            .await?
+        {
+            ensure_request_digest(&existing.get::<_, String>(2), &request_digest)?;
+            let key_generation = from_sql_u64(existing.get(0), "project key generation")?;
+            let key_version = from_sql_u64(existing.get(1), "project key version")?;
+            transaction.commit().await?;
+            return Ok(CloudProjectKeyGenerationMutationResult {
+                key_generation,
+                key_version,
+                duplicate: true,
+            });
+        }
+
+        let previous =
+            load_project_key_fence_tx(&transaction, &mutation.scope, &mutation.project_id, true)
+                .await?
+                .ok_or(CloudStorageError::ProjectKeyGenerationNotFound)?;
+        if previous.key_generation != mutation.expected_generation {
+            return Err(CloudStorageError::ProjectKeyGenerationConflict {
+                expected: mutation.expected_generation,
+                actual: previous.key_generation,
+            });
+        }
+        if mutation.key_version <= previous.key_version {
+            return Err(CloudStorageError::InvalidProjectKeyGeneration);
+        }
+        let key_generation = previous
+            .key_generation
+            .checked_add(1)
+            .ok_or(CloudStorageError::RevisionOverflow)?;
+        let key_generation_sql = to_sql_u64(key_generation)?;
+        let key_version_sql = to_sql_u64(mutation.key_version)?;
+        transaction
+            .execute(
+                "INSERT INTO hartevo_cell.project_key_generation_versions
+                   (cell, tenant_id, project_id, key_generation, key_version,
+                    idempotency_key, request_digest, advanced_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &mutation.scope.cell.as_str(),
+                    &mutation.scope.tenant_id.as_str(),
+                    &mutation.project_id.as_str(),
+                    &key_generation_sql,
+                    &key_version_sql,
+                    &mutation.idempotency_key_digest,
+                    &request_digest,
+                    &mutation.advanced_at,
+                ],
+            )
+            .await?;
+        let updated = transaction
+            .execute(
+                "UPDATE hartevo_cell.project_key_generation_heads
+                 SET current_key_generation = $4, key_version = $5, updated_at = $6
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                   AND current_key_generation = $7",
+                &[
+                    &mutation.scope.cell.as_str(),
+                    &mutation.scope.tenant_id.as_str(),
+                    &mutation.project_id.as_str(),
+                    &key_generation_sql,
+                    &key_version_sql,
+                    &mutation.advanced_at,
+                    &to_sql_u64(mutation.expected_generation)?,
+                ],
+            )
+            .await?;
+        if updated != 1 {
+            return Err(CloudStorageError::ProjectKeyGenerationConflict {
+                expected: mutation.expected_generation,
+                actual: previous.key_generation,
+            });
+        }
+        transaction.commit().await?;
+        Ok(CloudProjectKeyGenerationMutationResult {
+            key_generation,
+            key_version: mutation.key_version,
+            duplicate: false,
+        })
     }
 
     #[allow(
@@ -1732,17 +1929,23 @@ impl PostgresCellStore {
             return Err(CloudStorageError::RemoteWorkerTaskAlreadyExists);
         }
 
+        let key_fence =
+            load_project_key_fence_tx(&transaction, &task.scope, &task.project_id, true)
+                .await?
+                .ok_or(CloudStorageError::ProjectKeyGenerationNotFound)?;
+        ensure_remote_worker_key_fence(&key_fence, task.key_generation, task.payload.key_version)?;
+        let key_generation = to_sql_u64(task.key_generation)?;
         let payload_key_version = to_sql_u64(task.payload.key_version)?;
         transaction
             .execute(
                 "INSERT INTO hartevo_cell.remote_worker_mailbox_messages
                    (cell, tenant_id, project_id, mission_id, task_id, worker_id,
-                    payload_key_version, payload_nonce, payload_ciphertext,
+                    key_generation, payload_key_version, payload_nonce, payload_ciphertext,
                     payload_aad_digest, payload_content_digest, idempotency_key,
                     request_digest, status, enqueued_at, deadline_at, updated_at,
                     revision)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                         $13, 'pending', $14, $15, $14, 1)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                         $14, 'pending', $15, $16, $15, 1)",
                 &[
                     &task.scope.cell.as_str(),
                     &task.scope.tenant_id.as_str(),
@@ -1750,6 +1953,7 @@ impl PostgresCellStore {
                     &task.mission_id.as_str(),
                     &task.task_id.as_str(),
                     &task.worker_id.as_str(),
+                    &key_generation,
                     &payload_key_version,
                     &task.payload.nonce,
                     &task.payload.ciphertext,
@@ -1834,6 +2038,9 @@ impl PostgresCellStore {
         set_scope(&transaction, scope).await?;
         ensure_database_cell(&transaction, self.cell).await?;
         ensure_remote_worker_project(&transaction, scope, project_id).await?;
+        let key_fence = load_project_key_fence_tx(&transaction, scope, project_id, true)
+            .await?
+            .ok_or(CloudStorageError::ProjectKeyGenerationNotFound)?;
         lock_remote_worker_claim_key(
             &transaction,
             scope,
@@ -1843,7 +2050,7 @@ impl PostgresCellStore {
         .await?;
         let existing_claim = transaction
             .query_opt(
-                "SELECT task_id, claim_request_digest, lease_id, lease_generation,
+                "SELECT task_id, key_generation, claim_request_digest, lease_id, lease_generation,
                         lease_owner, lease_token_digest, attempts, heartbeat_at,
                         lease_expires_at, revision
                  FROM hartevo_cell.remote_worker_claims
@@ -1858,25 +2065,35 @@ impl PostgresCellStore {
             )
             .await?;
         if let Some(existing_claim) = existing_claim {
-            ensure_request_digest(&existing_claim.get::<_, String>(1), &claim_request_digest)?;
+            ensure_request_digest(&existing_claim.get::<_, String>(2), &claim_request_digest)?;
             let task_id = TaskId::from_stable(existing_claim.get::<_, String>(0));
             let row =
                 load_remote_worker_task_row_tx(&transaction, scope, project_id, &task_id, true)
                     .await?
                     .ok_or(CloudStorageError::RemoteWorkerTaskNotFound)?;
-            let attempts = u32::try_from(existing_claim.get::<_, i32>(6)).map_err(|_| {
+            let claim_key_generation =
+                from_sql_u64(existing_claim.get(1), "remote worker claim key generation")?;
+            if claim_key_generation != row.key_generation {
+                return Err(CloudStorageError::RemoteWorkerKeyFenceLost);
+            }
+            ensure_remote_worker_key_fence(
+                &key_fence,
+                row.key_generation,
+                row.payload.key_version,
+            )?;
+            let attempts = u32::try_from(existing_claim.get::<_, i32>(7)).map_err(|_| {
                 CloudStorageError::StoredValueInvalid("remote worker attempts".into())
             })?;
             let lease = row.historical_lease(
                 scope.clone(),
-                WorkerLeaseId::from_stable(existing_claim.get::<_, String>(2)),
-                from_sql_u64(existing_claim.get(3), "remote worker lease generation")?,
-                existing_claim.get(4),
+                WorkerLeaseId::from_stable(existing_claim.get::<_, String>(3)),
+                from_sql_u64(existing_claim.get(4), "remote worker lease generation")?,
                 existing_claim.get(5),
+                existing_claim.get(6),
                 attempts,
-                existing_claim.get(7),
                 existing_claim.get(8),
-                from_sql_u64(existing_claim.get(9), "remote worker revision")?,
+                existing_claim.get(9),
+                from_sql_u64(existing_claim.get(10), "remote worker revision")?,
             )?;
             transaction.commit().await?;
             return Ok(Some(CloudRemoteWorkerClaimResult {
@@ -1892,6 +2109,7 @@ impl PostgresCellStore {
                      FROM hartevo_cell.remote_worker_mailbox_messages
                      WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
                        AND worker_id = $4 AND enqueued_at <= $5 AND deadline_at > $5
+                       AND key_generation = $6 AND payload_key_version = $7
                        AND (status = 'pending'
                             OR (status = 'leased' AND lease_expires_at <= $5))
                      ORDER BY enqueued_at ASC, task_id ASC
@@ -1904,6 +2122,8 @@ impl PostgresCellStore {
                     &project_id.as_str(),
                     &worker_id.as_str(),
                     &now,
+                    &to_sql_u64(key_fence.key_generation)?,
+                    &to_sql_u64(key_fence.key_version)?,
                 ],
             )
             .await?;
@@ -1912,6 +2132,11 @@ impl PostgresCellStore {
             return Ok(None);
         };
         let candidate = decode_remote_worker_task_row(&candidate, scope, None)?;
+        ensure_remote_worker_key_fence(
+            &key_fence,
+            candidate.key_generation,
+            candidate.payload.key_version,
+        )?;
         let lease_expires_at =
             bounded_remote_worker_lease_expiry(now, lease_for, candidate.deadline_at)?;
         let lease_id = WorkerLeaseId::new();
@@ -1956,17 +2181,19 @@ impl PostgresCellStore {
         transaction
             .execute(
                 "INSERT INTO hartevo_cell.remote_worker_claims
-                   (cell, tenant_id, project_id, task_id, claim_idempotency_key,
+                   (cell, tenant_id, project_id, task_id, key_generation,
+                    claim_idempotency_key,
                     claim_request_digest, lease_id, lease_generation, lease_owner,
                     lease_token_digest, attempts, heartbeat_at, lease_expires_at,
                     revision, claimed_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                         $13, $14, $15)",
+                         $13, $14, $15, $16)",
                 &[
                     &scope.cell.as_str(),
                     &scope.tenant_id.as_str(),
                     &project_id.as_str(),
                     &lease.task_id.as_str(),
+                    &to_sql_u64(lease.key_generation)?,
                     &claim_idempotency_key_digest,
                     &claim_request_digest,
                     &lease.lease_id.as_str(),
@@ -2018,10 +2245,18 @@ impl PostgresCellStore {
         set_scope(&transaction, scope).await?;
         ensure_database_cell(&transaction, self.cell).await?;
         ensure_remote_worker_project(&transaction, scope, project_id).await?;
+        let key_fence = load_project_key_fence_tx(&transaction, scope, project_id, true)
+            .await?
+            .ok_or(CloudStorageError::ProjectKeyGenerationNotFound)?;
         let current =
             load_remote_worker_task_row_tx(&transaction, scope, project_id, task_id, true)
                 .await?
                 .ok_or(CloudStorageError::RemoteWorkerTaskNotFound)?;
+        ensure_remote_worker_key_fence(
+            &key_fence,
+            current.key_generation,
+            current.payload.key_version,
+        )?;
         require_current_remote_worker_lease(
             &current,
             lease_id,
@@ -2097,6 +2332,10 @@ impl PostgresCellStore {
         Ok(lease)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "completion keeps key-generation, lease, idempotency, and terminal writeback fences in one transaction"
+    )]
     pub async fn complete_remote_worker_task(
         &self,
         client: &mut Client,
@@ -2109,6 +2348,14 @@ impl PostgresCellStore {
         ensure_database_cell(&transaction, self.cell).await?;
         ensure_remote_worker_project(&transaction, &completion.scope, &completion.project_id)
             .await?;
+        let key_fence = load_project_key_fence_tx(
+            &transaction,
+            &completion.scope,
+            &completion.project_id,
+            true,
+        )
+        .await?
+        .ok_or(CloudStorageError::ProjectKeyGenerationNotFound)?;
         let current = load_remote_worker_task_row_tx(
             &transaction,
             &completion.scope,
@@ -2118,6 +2365,16 @@ impl PostgresCellStore {
         )
         .await?
         .ok_or(CloudStorageError::RemoteWorkerTaskNotFound)?;
+        ensure_remote_worker_key_fence(
+            &key_fence,
+            completion.key_generation,
+            current.payload.key_version,
+        )?;
+        ensure_remote_worker_key_fence(
+            &key_fence,
+            current.key_generation,
+            current.payload.key_version,
+        )?;
         if current.status == CloudRemoteWorkerTaskStatus::Completed {
             if current.completion_idempotency_key.as_deref()
                 == Some(completion.idempotency_key_digest.as_str())
@@ -2419,6 +2676,100 @@ async fn ensure_project_exists(
     Ok(())
 }
 
+async fn persist_initial_project_key_fence(
+    transaction: &Transaction<'_>,
+    scope: &CellScope,
+    project_id: &ProjectId,
+    key_version: u64,
+    idempotency_key_digest: &str,
+    request_digest: &str,
+    advanced_at: DateTime<Utc>,
+) -> Result<(), CloudStorageError> {
+    let key_generation = to_sql_u64(1)?;
+    let key_version = to_sql_u64(key_version)?;
+    transaction
+        .execute(
+            "INSERT INTO hartevo_cell.project_key_generation_versions
+               (cell, tenant_id, project_id, key_generation, key_version,
+                idempotency_key, request_digest, advanced_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                &scope.cell.as_str(),
+                &scope.tenant_id.as_str(),
+                &project_id.as_str(),
+                &key_generation,
+                &key_version,
+                &idempotency_key_digest,
+                &request_digest,
+                &advanced_at,
+            ],
+        )
+        .await?;
+    transaction
+        .execute(
+            "INSERT INTO hartevo_cell.project_key_generation_heads
+               (cell, tenant_id, project_id, current_key_generation, key_version, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &scope.cell.as_str(),
+                &scope.tenant_id.as_str(),
+                &project_id.as_str(),
+                &key_generation,
+                &key_version,
+                &advanced_at,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn load_project_key_fence_tx(
+    transaction: &Transaction<'_>,
+    scope: &CellScope,
+    project_id: &ProjectId,
+    lock: bool,
+) -> Result<Option<CloudProjectKeyFence>, CloudStorageError> {
+    let base = "SELECT current_key_generation, key_version, updated_at
+                FROM hartevo_cell.project_key_generation_heads
+                WHERE cell = $1 AND tenant_id = $2 AND project_id = $3";
+    let sql = if lock {
+        format!("{base} FOR UPDATE")
+    } else {
+        base.to_owned()
+    };
+    transaction
+        .query_opt(
+            &sql,
+            &[
+                &scope.cell.as_str(),
+                &scope.tenant_id.as_str(),
+                &project_id.as_str(),
+            ],
+        )
+        .await?
+        .map(|row| {
+            Ok(CloudProjectKeyFence {
+                scope: scope.clone(),
+                project_id: project_id.clone(),
+                key_generation: from_sql_u64(row.get(0), "project key generation")?,
+                key_version: from_sql_u64(row.get(1), "project key version")?,
+                updated_at: row.get(2),
+            })
+        })
+        .transpose()
+}
+
+fn ensure_remote_worker_key_fence(
+    fence: &CloudProjectKeyFence,
+    key_generation: u64,
+    payload_key_version: u64,
+) -> Result<(), CloudStorageError> {
+    if fence.key_generation != key_generation || fence.key_version != payload_key_version {
+        return Err(CloudStorageError::RemoteWorkerKeyFenceLost);
+    }
+    Ok(())
+}
+
 async fn load_project_mode(
     transaction: &Transaction<'_>,
     scope: &CellScope,
@@ -2494,6 +2845,7 @@ struct RemoteWorkerTaskRow {
     project_id: ProjectId,
     mission_id: MissionId,
     worker_id: WorkerId,
+    key_generation: u64,
     payload: EncryptedPayload,
     idempotency_key_digest: String,
     status: CloudRemoteWorkerTaskStatus,
@@ -2541,6 +2893,7 @@ impl RemoteWorkerTaskRow {
             mission_id: self.mission_id.clone(),
             task_id: self.task_id.clone(),
             worker_id: self.worker_id.clone(),
+            key_generation: self.key_generation,
             lease_id,
             lease_generation,
             lease_owner,
@@ -2571,6 +2924,7 @@ impl RemoteWorkerTaskRow {
             mission_id: self.mission_id,
             task_id: self.task_id,
             worker_id: self.worker_id,
+            key_generation: self.key_generation,
             lease_id: self
                 .lease_id
                 .ok_or(CloudStorageError::RemoteWorkerLeaseLost)?,
@@ -2609,6 +2963,7 @@ impl RemoteWorkerTaskRow {
             mission_id: self.mission_id.clone(),
             task_id: self.task_id.clone(),
             worker_id: self.worker_id.clone(),
+            key_generation: self.key_generation,
             payload: self.payload.clone(),
             idempotency_key_digest: self.idempotency_key_digest.clone(),
             enqueued_at: self.enqueued_at,
@@ -2665,24 +3020,25 @@ fn decode_remote_worker_task_row(
     project_override: Option<ProjectId>,
 ) -> Result<RemoteWorkerTaskRow, CloudStorageError> {
     let payload = EncryptedPayload {
-        key_version: from_sql_u64(row.get(4), "remote worker payload key version")?,
-        nonce: row.get(5),
-        ciphertext: row.get(6),
-        aad_digest: row.get(7),
-        content_digest: row.get(8),
+        key_version: from_sql_u64(row.get(5), "remote worker payload key version")?,
+        nonce: row.get(6),
+        ciphertext: row.get(7),
+        aad_digest: row.get(8),
+        content_digest: row.get(9),
     };
     payload.validate()?;
-    let request_digest = row.get::<_, String>(10);
-    if !is_sha256(&request_digest) || !is_sha256(&row.get::<_, String>(9)) {
+    let request_digest = row.get::<_, String>(11);
+    if !is_sha256(&request_digest) || !is_sha256(&row.get::<_, String>(10)) {
         return Err(CloudStorageError::StoredValueInvalid(
             "remote worker request digest".into(),
         ));
     }
-    let lease_generation = from_sql_u64(row.get(14), "remote worker lease generation")?;
-    let attempts = u32::try_from(row.get::<_, i32>(12))
+    let key_generation = from_sql_u64(row.get(4), "remote worker key generation")?;
+    let lease_generation = from_sql_u64(row.get(15), "remote worker lease generation")?;
+    let attempts = u32::try_from(row.get::<_, i32>(13))
         .map_err(|_| CloudStorageError::StoredValueInvalid("remote worker attempts".into()))?;
-    let enqueued_at = row.get::<_, DateTime<Utc>>(25);
-    let updated_at = row.get::<_, DateTime<Utc>>(27);
+    let enqueued_at = row.get::<_, DateTime<Utc>>(26);
+    let updated_at = row.get::<_, DateTime<Utc>>(28);
     if updated_at < enqueued_at {
         return Err(CloudStorageError::StoredValueInvalid(
             "remote worker updated timestamp".into(),
@@ -2694,27 +3050,28 @@ fn decode_remote_worker_task_row(
             .unwrap_or_else(|| ProjectId::from_stable(row.get::<_, String>(1))),
         mission_id: MissionId::from_stable(row.get::<_, String>(2)),
         worker_id: WorkerId::from_stable(row.get::<_, String>(3)),
+        key_generation,
         payload,
-        idempotency_key_digest: row.get(9),
-        status: decode_remote_worker_task_status(&row.get::<_, String>(11))?,
+        idempotency_key_digest: row.get(10),
+        status: decode_remote_worker_task_status(&row.get::<_, String>(12))?,
         attempts,
         lease_id: row
-            .get::<_, Option<String>>(13)
+            .get::<_, Option<String>>(14)
             .map(WorkerLeaseId::from_stable),
         lease_generation,
-        lease_owner: row.get(15),
-        lease_token_digest: row.get(16),
-        claim_idempotency_key: row.get(17),
-        claim_request_digest: row.get(18),
-        lease_expires_at: row.get(19),
-        heartbeat_at: row.get(20),
-        result_digest: row.get(21),
-        completion_idempotency_key: row.get(22),
-        completion_request_digest: row.get(23),
-        completed_at: row.get(24),
+        lease_owner: row.get(16),
+        lease_token_digest: row.get(17),
+        claim_idempotency_key: row.get(18),
+        claim_request_digest: row.get(19),
+        lease_expires_at: row.get(20),
+        heartbeat_at: row.get(21),
+        result_digest: row.get(22),
+        completion_idempotency_key: row.get(23),
+        completion_request_digest: row.get(24),
+        completed_at: row.get(25),
         enqueued_at,
-        deadline_at: row.get(26),
-        revision: from_sql_u64(row.get(28), "remote worker revision")?,
+        deadline_at: row.get(27),
+        revision: from_sql_u64(row.get(29), "remote worker revision")?,
     })
 }
 
@@ -3584,6 +3941,12 @@ pub enum CloudStorageError {
     ProjectAlreadyExists,
     #[error("project is not visible in the exact tenant and Cell scope")]
     ProjectNotFound,
+    #[error("project key-generation fence is not visible in the exact tenant and Cell scope")]
+    ProjectKeyGenerationNotFound,
+    #[error("project key-generation mutation is malformed")]
+    InvalidProjectKeyGeneration,
+    #[error("project key-generation fence expected {expected} but is at {actual}")]
+    ProjectKeyGenerationConflict { expected: u64, actual: u64 },
     #[error("remote Worker task identity already exists")]
     RemoteWorkerTaskAlreadyExists,
     #[error("remote Worker task is not visible in the exact tenant/project scope")]
@@ -3592,6 +3955,8 @@ pub enum CloudStorageError {
     RemoteWorkerTaskAlreadyCompleted,
     #[error("remote Worker lease owner, token, generation, or expiry is no longer current")]
     RemoteWorkerLeaseLost,
+    #[error("remote Worker task key-generation or payload key-version fence is no longer current")]
+    RemoteWorkerKeyFenceLost,
     #[error("device public key is not visible in the exact tenant/project/device scope")]
     DevicePublicKeyNotFound,
     #[error("device public-key revision is not the exact next transition")]
@@ -3865,6 +4230,41 @@ mod tests {
     }
 
     #[test]
+    fn project_key_generation_request_binds_region_generation_and_key_version() {
+        let base = CloudProjectKeyGenerationMutation {
+            scope: scope(DataCell::Us),
+            project_id: ProjectId::from("project-1"),
+            expected_generation: 1,
+            key_version: 2,
+            idempotency_key_digest: "d".repeat(64),
+            advanced_at: now(),
+        };
+        base.validate(DataCell::Us)
+            .expect("valid key-generation mutation");
+        let digest = base.request_digest().expect("key-generation digest");
+
+        let mut changed_region = base.clone();
+        changed_region.scope.cell = DataCell::Eu;
+        let mut changed_generation = base.clone();
+        changed_generation.expected_generation = 2;
+        let mut changed_key_version = base.clone();
+        changed_key_version.key_version = 3;
+        assert_ne!(
+            digest,
+            changed_generation.request_digest().expect("generation")
+        );
+        assert_ne!(
+            digest,
+            changed_key_version.request_digest().expect("key version")
+        );
+        assert_ne!(digest, changed_region.request_digest().expect("region"));
+        assert!(matches!(
+            changed_region.validate(DataCell::Us),
+            Err(CloudStorageError::CellOrTenantScopeMismatch)
+        ));
+    }
+
+    #[test]
     fn tombstoned_head_permanently_rejects_resurrection_and_kind_rebinding() {
         let mutation = EncryptedSyncMutation {
             scope: scope(DataCell::Us),
@@ -3909,6 +4309,7 @@ mod tests {
             mission_id: MissionId::from("mission-1"),
             task_id: TaskId::from("task-1"),
             worker_id: WorkerId::from("worker-1"),
+            key_generation: 1,
             payload: payload(8),
             idempotency_key_digest: "d".repeat(64),
             enqueued_at: now(),
@@ -3969,6 +4370,7 @@ mod tests {
             scope: scope(DataCell::Us),
             project_id: ProjectId::from("project-1"),
             task_id: TaskId::from("task-1"),
+            key_generation: 1,
             lease_id: WorkerLeaseId::from("lease-1"),
             lease_generation: 1,
             lease_owner: "worker-process".into(),
@@ -3985,7 +4387,7 @@ mod tests {
 
     #[test]
     fn schema_contract_has_physical_cell_rls_ciphertext_and_append_only_versions() {
-        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(SCHEMA_VERSION, 6);
         assert!(SCHEMA.contains("FORCE ROW LEVEL SECURITY"));
         assert!(SCHEMA.contains("current_setting(''hartevo.tenant_id'', true)"));
         assert!(SCHEMA.contains("current_setting(''hartevo.cell'', true)"));
@@ -3994,6 +4396,21 @@ mod tests {
         assert!(SCHEMA.contains("sync_mutations"));
         assert!(SCHEMA.contains("remote_worker_mailbox_messages"));
         assert!(SCHEMA.contains("remote_worker_claims"));
+        assert!(SCHEMA.contains("project_key_generation_versions"));
+        assert!(SCHEMA.contains("project_key_generation_heads"));
+        assert!(SCHEMA.contains("current_key_generation"));
+        assert!(SCHEMA.contains("key_generation BIGINT"));
+        for key_fence_table in [
+            "project_key_generation_versions",
+            "project_key_generation_heads",
+        ] {
+            assert!(
+                SCHEMA.contains(&format!(
+                    "ALTER TABLE hartevo_cell.{key_fence_table} FORCE ROW LEVEL SECURITY"
+                )),
+                "key-generation table is not forced through RLS: {key_fence_table}"
+            );
+        }
         assert!(SCHEMA.contains("claim_request_digest"));
         assert!(SCHEMA.contains("device_public_key_versions"));
         assert!(SCHEMA.contains("keyring_bootstrap_versions"));
