@@ -13,6 +13,7 @@ mod deletion;
 mod identity;
 mod ids;
 mod key_management;
+mod market_evidence;
 mod mission;
 mod mission_conversation;
 mod mission_schedule;
@@ -76,6 +77,12 @@ pub use key_management::{
     DeviceHandoffRevocation, DeviceKeyAgreementAlgorithm, DevicePublicKeyRegistration, KeyEnvelope,
     KeyManagementError, KeyRecipient, KeyWrapAlgorithm, ProjectEncryptionMode, ProjectKeyring,
     ProjectKeyringBootstrap, WrappedKeyCiphertext,
+};
+pub use market_evidence::{
+    MarketCounterevidence, MarketDecisionRecommendation, MarketEvidenceClaim,
+    MarketEvidenceClassification, MarketEvidenceError, MarketEvidencePack,
+    MarketExperimentPlanItem, MarketUncertainty, MarketUncertaintyMateriality, Vm07DecisionAction,
+    Vm07DecisionBinding,
 };
 pub use mission::{
     Approval, ApprovalDecision, ApprovalPolicy, AutonomyLevel, Cadence, CadenceTriggerKind,

@@ -195,6 +195,81 @@ impl ProjectStore {
         })
     }
 
+    /// Commits a revision-fenced Mission transition together with one private
+    /// Conversation message.  VM-07 uses this boundary for Continue, Stop and
+    /// Test: the typed decision and the Mission state can never be observed
+    /// separately, and a rejected stale/replay command appends nothing.
+    pub fn update_mission_with_conversation_atomic(
+        &mut self,
+        mission: &Mission,
+        expected_mission_revision: u64,
+        conversation: &MissionConversation,
+        expected_conversation_revision: u64,
+        events: &[PendingEvent],
+    ) -> Result<AtomicMutation, StorageError> {
+        let next_conversation_revision =
+            expected_conversation_revision
+                .checked_add(1)
+                .ok_or(StorageError::RevisionOverflow(
+                    expected_conversation_revision,
+                ))?;
+        if mission.revision <= expected_mission_revision {
+            return Err(StorageError::UnexpectedNewerRevision {
+                expected_revision: expected_mission_revision,
+                actual: mission.revision,
+            });
+        }
+        if events.is_empty() || conversation.revision != next_conversation_revision {
+            return Err(StorageError::UnexpectedNextRevision {
+                expected: next_conversation_revision,
+                actual: conversation.revision,
+            });
+        }
+        conversation.validate_for(mission, conversation.updated_at)?;
+        let previous =
+            self.load_mission_conversation(&conversation.project_id, &conversation.mission_id)?;
+        if previous.revision != expected_conversation_revision
+            || !conversation.follows(&previous)?
+        {
+            return Err(StorageError::OptimisticConflict {
+                aggregate: format!("mission_conversation:{}", conversation.id),
+                expected_revision: expected_conversation_revision,
+            });
+        }
+        let message = conversation
+            .messages
+            .last()
+            .ok_or_else(|| StorageError::DomainDecode("missing decision message".into()))?;
+        let transaction = self.connection.transaction()?;
+        ensure_project_scope(
+            &transaction,
+            mission.tenant_id.as_str(),
+            mission.project_id.as_str(),
+        )?;
+        update_mission_normalized_cas(&transaction, mission, expected_mission_revision)?;
+        update_mission_conversation_append(
+            &transaction,
+            conversation,
+            expected_conversation_revision,
+            message,
+        )?;
+        let (event_sequences, outbox_sequences) = append_events(
+            &transaction,
+            mission.tenant_id.as_str(),
+            mission.project_id.as_str(),
+            Some(mission.id.as_str()),
+            "mission_conversation",
+            conversation.id.as_str(),
+            events,
+        )?;
+        transaction.commit()?;
+        Ok(AtomicMutation {
+            event_sequences,
+            outbox_sequences,
+            state_revision: mission.revision,
+        })
+    }
+
     pub(crate) fn backfill_mission_conversations(&mut self) -> Result<(), StorageError> {
         let mission_ids = {
             let mut statement = self.connection.prepare(
