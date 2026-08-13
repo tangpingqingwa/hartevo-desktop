@@ -1,19 +1,21 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
+use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Duration, Utc};
 use hartevo_connector_sdk::{
     BeginAuthRequest, ConnectorAdapter, ConnectorAuth, ConnectorDescriptor, ConnectorError,
-    ConnectorScope, ConnectorWorker, DispatchBudget, FreshnessWindow, LiveProbeFence,
-    PrepareEffectRequest, PreparedEffect, ProbeObservation, ProbeRequest, ProbeStatus,
-    ProviderAdapterIdentity, ProviderAdapterOperation, ProviderAdapterRegistry,
+    ConnectorScope, ConnectorWorker, DispatchBudget, ExecuteRequest, FreshnessWindow,
+    LiveProbeFence, PrepareEffectRequest, PreparedEffect, ProbeObservation, ProbeRequest,
+    ProbeStatus, ProviderAdapterIdentity, ProviderAdapterOperation, ProviderAdapterRegistry,
     ProviderCapabilityKey, ProviderCapabilitySupport, ProviderEvidenceClass,
-    ProviderProvenanceClass, ReadObservation, ReadRequest, ReconcileRequest,
-    ReconciliationObservation, RefreshAuthRequest, RevokeRequest, SecretReference,
-    VerificationObservation, VerifyRequest, WebhookObservation, WebhookRequest,
+    ProviderProvenanceClass, ReadObservation, ReadRequest, ReceiptCandidate,
+    ReceiptCandidateStatus, ReconcileRequest, ReconciliationObservation, ReconciliationStatus,
+    RefreshAuthRequest, RevokeRequest, SecretReference, VerificationObservation,
+    VerificationStatus, VerifyRequest, WebhookObservation, WebhookRequest,
 };
 use hartevo_domain_kernel::{AccountId, ConnectionId, MissionId, ProjectId, TenantId};
 use hartevo_effect_broker::ProviderEvidenceSupport;
@@ -25,8 +27,8 @@ use zeroize::Zeroizing;
 use crate::{
     GITHUB_PAGES_ADAPTER_ID, GITHUB_PAGES_ADAPTER_VERSION, GITHUB_PAGES_REGISTRY_VERSION,
     GITHUB_PAGES_REQUIRED_SCOPES, GITHUB_PROVIDER_ID, GithubPagesEnvironment, PublicationTarget,
-    SiteFile, WebPublicationError, canonical_files, canonical_pages_url, digest_json, digest_parts,
-    file_tree_digest, map_provider_connector_error,
+    SiteFile, WebPublicationError, canonical_files, canonical_pages_url, digest_bytes, digest_json,
+    digest_parts, file_tree_digest, map_provider_connector_error,
 };
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -39,6 +41,8 @@ pub enum GithubPagesProviderError {
     Rejected { detail: String },
     #[error("GitHub provider response is uncertain: {detail}")]
     Uncertain { detail: String },
+    #[error("GitHub provider rate limit blocked the request: {detail}")]
+    RateLimited { detail: String },
     #[error("GitHub provider response could not be decoded: {detail}")]
     Decode { detail: String },
     #[error("GitHub provider transport failed: {detail}")]
@@ -61,6 +65,7 @@ impl From<GithubPagesProviderError> for WebPublicationError {
             GithubPagesProviderError::Unauthorized { detail }
             | GithubPagesProviderError::Rejected { detail } => Self::Disconnected { detail },
             GithubPagesProviderError::Uncertain { detail }
+            | GithubPagesProviderError::RateLimited { detail }
             | GithubPagesProviderError::Transport { detail }
             | GithubPagesProviderError::Decode { detail } => Self::Provider { detail },
             GithubPagesProviderError::InvalidConfiguration { detail } => {
@@ -78,6 +83,8 @@ impl From<GithubPagesProviderError> for WebPublicationError {
 pub enum GithubPagesTransportError {
     #[error("authenticated request was rejected with HTTP status {status}")]
     Rejected { status: u16 },
+    #[error("authenticated request was rate limited with HTTP status {status}")]
+    RateLimited { status: u16 },
     #[error("authenticated request returned an uncertain HTTP status {status}")]
     Uncertain { status: u16 },
     #[error("HTTP transport failed: {detail}")]
@@ -110,6 +117,10 @@ pub struct GithubPagesApiObject {
 pub struct GithubPagesApiCommit {
     pub sha: Option<String>,
     pub tree: GithubPagesApiObject,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub parents: Option<Vec<GithubPagesApiObject>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -133,6 +144,143 @@ pub struct GithubPagesApiBlob {
     pub sha: Option<String>,
     pub content: String,
     pub encoding: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GithubPagesApiReference {
+    pub object: GithubPagesApiObject,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GithubPagesApiBlobWrite {
+    pub sha: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GithubPagesApiTreeWrite {
+    pub sha: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GithubPagesApiCommitWrite {
+    pub sha: String,
+    pub tree: GithubPagesApiObject,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GithubPagesApiRefUpdate {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub object: GithubPagesApiObject,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubPagesApiTreeWriteEntry {
+    pub path: String,
+    pub mode: String,
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    pub sha: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubPagesPublicReadback {
+    pub url: String,
+    pub http_status: u16,
+    pub dns_digest: String,
+    pub root_body_digest: String,
+    pub content_digest: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubPagesPublicationAction {
+    Publish,
+    Rollback,
+}
+
+impl GithubPagesPublicationAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Publish => "publish",
+            Self::Rollback => "rollback",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GithubPagesPublishPayload {
+    pub action: GithubPagesPublicationAction,
+    pub target: PublicationTarget,
+    pub base_head_sha: String,
+    pub base_tree_sha: String,
+    pub target_tree_digest: String,
+    pub diff_digest: String,
+    pub site_id: crate::SiteId,
+    pub site_revision: u64,
+    pub source_work_product_id: hartevo_domain_kernel::WorkProductId,
+    pub source_work_product_revision: u64,
+    pub source_work_product_digest: String,
+    pub payload_digest: String,
+    pub idempotency_key: String,
+    pub files: Vec<SiteFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GithubPagesProviderReceipt {
+    pub action: GithubPagesPublicationAction,
+    pub effect_digest: String,
+    pub payload_digest: String,
+    pub idempotency_key: String,
+    pub target: PublicationTarget,
+    pub base_head_sha: String,
+    pub commit_sha: String,
+    pub tree_sha: String,
+    pub provider_request_id_digest: String,
+    pub response_digest: String,
+    pub accepted_at: DateTime<Utc>,
+    pub receipt_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GithubPagesIndependentReadback {
+    pub target: PublicationTarget,
+    pub authenticated_snapshot: GithubPagesRepositorySnapshot,
+    pub public: GithubPagesPublicReadback,
+    pub expected_content_digest: String,
+    pub authenticated_content_matches: bool,
+    pub public_content_matches: bool,
+    pub independent: bool,
+    pub evidence_digest: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GithubPagesVerification {
+    pub observation: VerificationObservation,
+    pub readback: GithubPagesIndependentReadback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GithubPagesProviderExecution {
+    pub receipt: GithubPagesProviderReceipt,
+    pub receipt_candidate: ReceiptCandidate,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GithubPagesProviderReconciliation {
+    pub snapshot: GithubPagesRepositorySnapshot,
+    pub receipt: Option<GithubPagesProviderReceipt>,
+    pub observation: ReconciliationObservation,
 }
 
 /// The provider-specific HTTP boundary. Implementations receive the resolved
@@ -176,6 +324,69 @@ pub trait GithubPagesHttpTransport: Send {
         repository: &str,
         blob_sha: &str,
     ) -> Result<GithubPagesApiBlob, GithubPagesTransportError>;
+
+    fn create_blob(
+        &self,
+        _token: &str,
+        _owner: &str,
+        _repository: &str,
+        _content_base64: &str,
+    ) -> Result<GithubPagesApiBlobWrite, GithubPagesTransportError> {
+        Err(GithubPagesTransportError::Transport {
+            detail: "GitHub mutation transport is not available".to_owned(),
+        })
+    }
+
+    fn create_tree(
+        &self,
+        _token: &str,
+        _owner: &str,
+        _repository: &str,
+        _base_tree_sha: &str,
+        _entries: &[GithubPagesApiTreeWriteEntry],
+    ) -> Result<GithubPagesApiTreeWrite, GithubPagesTransportError> {
+        Err(GithubPagesTransportError::Transport {
+            detail: "GitHub mutation transport is not available".to_owned(),
+        })
+    }
+
+    fn create_commit(
+        &self,
+        _token: &str,
+        _owner: &str,
+        _repository: &str,
+        _message: &str,
+        _tree_sha: &str,
+        _parent_sha: &str,
+    ) -> Result<GithubPagesApiCommitWrite, GithubPagesTransportError> {
+        Err(GithubPagesTransportError::Transport {
+            detail: "GitHub mutation transport is not available".to_owned(),
+        })
+    }
+
+    fn update_ref(
+        &self,
+        _token: &str,
+        _owner: &str,
+        _repository: &str,
+        _git_ref: &str,
+        _commit_sha: &str,
+        _force: bool,
+    ) -> Result<GithubPagesApiRefUpdate, GithubPagesTransportError> {
+        Err(GithubPagesTransportError::Transport {
+            detail: "GitHub mutation transport is not available".to_owned(),
+        })
+    }
+
+    fn public_readback(
+        &self,
+        _pages_url: &str,
+        _expected_files: &[SiteFile],
+    ) -> Result<GithubPagesPublicReadback, GithubPagesTransportError> {
+        Err(GithubPagesTransportError::Transport {
+            detail: "independent public readback transport is not available".to_owned(),
+        })
+    }
 }
 
 /// Real GitHub API transport. It is deliberately separate from the adapter so
@@ -268,6 +479,80 @@ impl UreqGithubPagesTransport {
             detail: error.to_string(),
         })
     }
+
+    fn post_json<T: for<'de> Deserialize<'de>, P: Serialize>(
+        &self,
+        token: &str,
+        url: &str,
+        payload: &P,
+    ) -> Result<T, GithubPagesTransportError> {
+        let mut response = self
+            .agent
+            .post(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("Content-Type", "application/json")
+            .send(serde_json::to_vec(payload).map_err(|error| {
+                GithubPagesTransportError::Decode {
+                    detail: error.to_string(),
+                }
+            })?)
+            .map_err(classify_http_error)?;
+        let body = response.body_mut().read_to_string().map_err(|error| {
+            GithubPagesTransportError::Transport {
+                detail: error.to_string(),
+            }
+        })?;
+        serde_json::from_str(&body).map_err(|error| GithubPagesTransportError::Decode {
+            detail: error.to_string(),
+        })
+    }
+
+    fn patch_json<T: for<'de> Deserialize<'de>, P: Serialize>(
+        &self,
+        token: &str,
+        url: &str,
+        payload: &P,
+    ) -> Result<T, GithubPagesTransportError> {
+        let mut response = self
+            .agent
+            .patch(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("Content-Type", "application/json")
+            .send(serde_json::to_vec(payload).map_err(|error| {
+                GithubPagesTransportError::Decode {
+                    detail: error.to_string(),
+                }
+            })?)
+            .map_err(classify_http_error)?;
+        let body = response.body_mut().read_to_string().map_err(|error| {
+            GithubPagesTransportError::Transport {
+                detail: error.to_string(),
+            }
+        })?;
+        serde_json::from_str(&body).map_err(|error| GithubPagesTransportError::Decode {
+            detail: error.to_string(),
+        })
+    }
+
+    fn get_public_body(&self, url: &str) -> Result<(u16, Vec<u8>), GithubPagesTransportError> {
+        let mut response = self
+            .agent
+            .get(url)
+            .header("Accept", "text/html, application/json")
+            .call()
+            .map_err(classify_http_error)?;
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_vec().map_err(|error| {
+            GithubPagesTransportError::Transport {
+                detail: error.to_string(),
+            }
+        })?;
+        Ok((status, body))
+    }
 }
 
 impl GithubPagesHttpTransport for UreqGithubPagesTransport {
@@ -290,19 +575,11 @@ impl GithubPagesHttpTransport for UreqGithubPagesTransport {
         repository: &str,
         git_ref: &str,
     ) -> Result<GithubPagesApiObject, GithubPagesTransportError> {
-        self.get_json(
-            token,
-            &self.endpoint(
-                owner,
-                repository,
-                [
-                    "git".to_owned(),
-                    "ref".to_owned(),
-                    "heads".to_owned(),
-                    git_ref.to_owned(),
-                ],
-            )?,
-        )
+        let mut suffix = vec!["git".to_owned(), "ref".to_owned(), "heads".to_owned()];
+        suffix.extend(git_ref.split('/').map(str::to_owned));
+        let reference: GithubPagesApiReference =
+            self.get_json(token, &self.endpoint(owner, repository, suffix)?)?;
+        Ok(reference.object)
     }
 
     fn commit(
@@ -361,10 +638,173 @@ impl GithubPagesHttpTransport for UreqGithubPagesTransport {
             )?,
         )
     }
+
+    fn create_blob(
+        &self,
+        token: &str,
+        owner: &str,
+        repository: &str,
+        content_base64: &str,
+    ) -> Result<GithubPagesApiBlobWrite, GithubPagesTransportError> {
+        self.post_json(
+            token,
+            &self.endpoint(owner, repository, ["git".to_owned(), "blobs".to_owned()])?,
+            &serde_json::json!({"content": content_base64, "encoding": "base64"}),
+        )
+    }
+
+    fn create_tree(
+        &self,
+        token: &str,
+        owner: &str,
+        repository: &str,
+        base_tree_sha: &str,
+        entries: &[GithubPagesApiTreeWriteEntry],
+    ) -> Result<GithubPagesApiTreeWrite, GithubPagesTransportError> {
+        self.post_json(
+            token,
+            &self.endpoint(owner, repository, ["git".to_owned(), "trees".to_owned()])?,
+            &serde_json::json!({"base_tree": base_tree_sha, "tree": entries}),
+        )
+    }
+
+    fn create_commit(
+        &self,
+        token: &str,
+        owner: &str,
+        repository: &str,
+        message: &str,
+        tree_sha: &str,
+        parent_sha: &str,
+    ) -> Result<GithubPagesApiCommitWrite, GithubPagesTransportError> {
+        self.post_json(
+            token,
+            &self.endpoint(owner, repository, ["git".to_owned(), "commits".to_owned()])?,
+            &serde_json::json!({
+                "message": message,
+                "tree": tree_sha,
+                "parents": [parent_sha]
+            }),
+        )
+    }
+
+    fn update_ref(
+        &self,
+        token: &str,
+        owner: &str,
+        repository: &str,
+        git_ref: &str,
+        commit_sha: &str,
+        force: bool,
+    ) -> Result<GithubPagesApiRefUpdate, GithubPagesTransportError> {
+        let mut suffix = vec!["git".to_owned(), "refs".to_owned(), "heads".to_owned()];
+        suffix.extend(git_ref.split('/').map(str::to_owned));
+        self.patch_json(
+            token,
+            &self.endpoint(owner, repository, suffix)?,
+            &serde_json::json!({"sha": commit_sha, "force": force}),
+        )
+    }
+
+    fn public_readback(
+        &self,
+        pages_url: &str,
+        expected_files: &[SiteFile],
+    ) -> Result<GithubPagesPublicReadback, GithubPagesTransportError> {
+        let pages_url = canonical_pages_url(pages_url).map_err(|error| {
+            GithubPagesTransportError::Transport {
+                detail: error.to_string(),
+            }
+        })?;
+        let parsed =
+            Url::parse(&pages_url).map_err(|error| GithubPagesTransportError::Transport {
+                detail: error.to_string(),
+            })?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| GithubPagesTransportError::Transport {
+                detail: "Pages URL has no host".to_owned(),
+            })?;
+        let port =
+            parsed
+                .port_or_known_default()
+                .ok_or_else(|| GithubPagesTransportError::Transport {
+                    detail: "Pages URL has no known port".to_owned(),
+                })?;
+        let mut addresses = format!("{host}:{port}")
+            .to_socket_addrs()
+            .map_err(|error| GithubPagesTransportError::Transport {
+                detail: error.to_string(),
+            })?
+            .map(|address| address.ip().to_string())
+            .collect::<Vec<_>>();
+        addresses.sort();
+        addresses.dedup();
+        if addresses.is_empty() {
+            return Err(GithubPagesTransportError::Transport {
+                detail: "Pages hostname did not resolve".to_owned(),
+            });
+        }
+        let root_url = format!("{pages_url}/");
+        let (root_status, root_body) = self.get_public_body(&root_url)?;
+        if !(200..=299).contains(&root_status) {
+            return Err(GithubPagesTransportError::Rejected {
+                status: root_status,
+            });
+        }
+        let mut served_files = Vec::with_capacity(expected_files.len());
+        for file in expected_files {
+            let body = if file.path == "index.html" {
+                root_body.clone()
+            } else {
+                let mut url = Url::parse(&root_url).map_err(|error| {
+                    GithubPagesTransportError::Transport {
+                        detail: error.to_string(),
+                    }
+                })?;
+                {
+                    let mut segments = url.path_segments_mut().map_err(|()| {
+                        GithubPagesTransportError::Transport {
+                            detail: "Pages URL cannot accept a file path".to_owned(),
+                        }
+                    })?;
+                    for segment in file.path.split('/') {
+                        segments.push(segment);
+                    }
+                }
+                let (status, body) = self.get_public_body(url.as_str())?;
+                if !(200..=299).contains(&status) {
+                    return Err(GithubPagesTransportError::Rejected { status });
+                }
+                body
+            };
+            let served = SiteFile::new(file.path.clone(), body).map_err(|error| {
+                GithubPagesTransportError::Decode {
+                    detail: error.to_string(),
+                }
+            })?;
+            if served.content_digest != file.content_digest {
+                return Err(GithubPagesTransportError::Rejected {
+                    status: root_status,
+                });
+            }
+            served_files.push(served);
+        }
+        let content_digest = file_tree_digest(&served_files);
+        Ok(GithubPagesPublicReadback {
+            url: pages_url,
+            http_status: root_status,
+            dns_digest: digest_parts(addresses.iter().map(String::as_str)),
+            root_body_digest: digest_bytes(&root_body),
+            content_digest,
+            observed_at: Utc::now(),
+        })
+    }
 }
 
 fn classify_http_error(error: ureq::Error) -> GithubPagesTransportError {
     match error {
+        ureq::Error::StatusCode(429) => GithubPagesTransportError::RateLimited { status: 429 },
         ureq::Error::StatusCode(status) if status < 500 => {
             GithubPagesTransportError::Rejected { status }
         }
@@ -650,6 +1090,9 @@ pub struct GithubPagesRepositorySnapshot {
 pub(crate) struct AdapterState {
     failure: Mutex<Option<GithubPagesProviderError>>,
     snapshot: Mutex<Option<GithubPagesRepositorySnapshot>>,
+    prepared_payloads: Mutex<BTreeMap<String, GithubPagesPublishPayload>>,
+    receipts: Mutex<BTreeMap<String, GithubPagesProviderReceipt>>,
+    readbacks: Mutex<BTreeMap<String, GithubPagesIndependentReadback>>,
 }
 
 impl Default for AdapterState {
@@ -657,6 +1100,9 @@ impl Default for AdapterState {
         Self {
             failure: Mutex::new(None),
             snapshot: Mutex::new(None),
+            prepared_payloads: Mutex::new(BTreeMap::new()),
+            receipts: Mutex::new(BTreeMap::new()),
+            readbacks: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -686,6 +1132,45 @@ impl AdapterState {
             .lock()
             .ok()
             .and_then(|snapshot| snapshot.clone())
+    }
+
+    fn store_payload(&self, effect_digest: String, payload: GithubPagesPublishPayload) {
+        if let Ok(mut payloads) = self.prepared_payloads.lock() {
+            payloads.insert(effect_digest, payload);
+        }
+    }
+
+    fn payload(&self, effect_digest: &str) -> Option<GithubPagesPublishPayload> {
+        self.prepared_payloads
+            .lock()
+            .ok()
+            .and_then(|payloads| payloads.get(effect_digest).cloned())
+    }
+
+    fn store_receipt(&self, receipt: GithubPagesProviderReceipt) {
+        if let Ok(mut receipts) = self.receipts.lock() {
+            receipts.insert(receipt.effect_digest.clone(), receipt);
+        }
+    }
+
+    fn receipt(&self, effect_digest: &str) -> Option<GithubPagesProviderReceipt> {
+        self.receipts
+            .lock()
+            .ok()
+            .and_then(|receipts| receipts.get(effect_digest).cloned())
+    }
+
+    fn store_readback(&self, effect_digest: String, readback: GithubPagesIndependentReadback) {
+        if let Ok(mut readbacks) = self.readbacks.lock() {
+            readbacks.insert(effect_digest, readback);
+        }
+    }
+
+    fn readback(&self, effect_digest: &str) -> Option<GithubPagesIndependentReadback> {
+        self.readbacks
+            .lock()
+            .ok()
+            .and_then(|readbacks| readbacks.get(effect_digest).cloned())
     }
 }
 
@@ -892,9 +1377,268 @@ where
         })
     }
 
+    fn validate_payload(
+        &self,
+        payload: &GithubPagesPublishPayload,
+    ) -> Result<Vec<SiteFile>, GithubPagesProviderError> {
+        let target = self
+            .connection
+            .target()
+            .map_err(|error| provider_invalid(&error))?;
+        if payload.target != target
+            || !valid_git_sha(&payload.base_head_sha)
+            || !valid_git_sha(&payload.base_tree_sha)
+            || !crate::is_digest(&payload.target_tree_digest)
+            || !crate::is_digest(&payload.diff_digest)
+            || !crate::is_digest(&payload.payload_digest)
+            || payload.site_revision == 0
+            || payload.source_work_product_revision == 0
+        {
+            return Err(GithubPagesProviderError::Scope {
+                detail: "publication payload is outside the registered GitHub Pages target"
+                    .to_owned(),
+            });
+        }
+        let files =
+            canonical_files(payload.files.clone()).map_err(|error| provider_invalid(&error))?;
+        if file_tree_digest(&files) != payload.target_tree_digest {
+            return Err(GithubPagesProviderError::Rejected {
+                detail: "publication payload content digest changed after approval".to_owned(),
+            });
+        }
+        Ok(files)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the provider mutation binds the fresh head, complete canonical tree, commit parent, ref CAS, and receipt"
+    )]
+    fn execute_payload(
+        &mut self,
+        request: &ExecuteRequest,
+    ) -> Result<ReceiptCandidate, ConnectorError> {
+        let payload = self
+            .state
+            .payload(request.prepared_effect.effect_digest())
+            .ok_or_else(|| {
+                self.provider_failure(GithubPagesProviderError::Rejected {
+                    detail: "prepared publication payload is not available for this Effect"
+                        .to_owned(),
+                })
+            })?;
+        let files = self
+            .validate_payload(&payload)
+            .map_err(|error| self.provider_failure(error))?;
+        let token = self
+            .resolver
+            .resolve(&self.secret)
+            .map_err(|error| self.provider_failure(error))?;
+        let current = self
+            .snapshot_from_provider(request.at)
+            .map_err(|error| self.provider_failure(error))?;
+        if current.target != payload.target
+            || current.head_sha != payload.base_head_sha
+            || current.tree_sha != payload.base_tree_sha
+        {
+            return Err(self.provider_failure(GithubPagesProviderError::Rejected {
+                detail: "GitHub Pages repository drifted after the canonical proposal".to_owned(),
+            }));
+        }
+
+        let mut blob_shas = BTreeMap::new();
+        for file in &files {
+            let blob = self
+                .transport
+                .create_blob(
+                    token.as_str(),
+                    &payload.target.owner,
+                    &payload.target.repository,
+                    STANDARD.encode(&file.content).as_str(),
+                )
+                .map_err(|error| self.provider_failure(map_transport_error(error)))?;
+            if !valid_git_sha(&blob.sha) {
+                return Err(self.provider_failure(GithubPagesProviderError::Decode {
+                    detail: "GitHub blob mutation returned an invalid SHA".to_owned(),
+                }));
+            }
+            blob_shas.insert(file.path.as_str().to_owned(), blob.sha);
+        }
+
+        let target_paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let deleted_paths = current
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .filter(|path| !target_paths.contains(path))
+            .collect::<BTreeSet<_>>();
+        let mut entries = Vec::with_capacity(files.len() + deleted_paths.len());
+        for file in &files {
+            entries.push(GithubPagesApiTreeWriteEntry {
+                path: file.path.clone(),
+                mode: "100644".to_owned(),
+                entry_type: "blob".to_owned(),
+                sha: blob_shas.get(file.path.as_str()).cloned(),
+            });
+        }
+        for path in deleted_paths {
+            entries.push(GithubPagesApiTreeWriteEntry {
+                path: path.to_owned(),
+                mode: "100644".to_owned(),
+                entry_type: "blob".to_owned(),
+                sha: None,
+            });
+        }
+        let tree = self
+            .transport
+            .create_tree(
+                token.as_str(),
+                &payload.target.owner,
+                &payload.target.repository,
+                &payload.base_tree_sha,
+                &entries,
+            )
+            .map_err(|error| self.provider_failure(map_transport_error(error)))?;
+        if !valid_git_sha(&tree.sha) {
+            return Err(self.provider_failure(GithubPagesProviderError::Decode {
+                detail: "GitHub tree mutation returned an invalid SHA".to_owned(),
+            }));
+        }
+        let action = payload.action.as_str();
+        let message = format!("Hartevo {action} {}", payload.payload_digest);
+        let commit = self
+            .transport
+            .create_commit(
+                token.as_str(),
+                &payload.target.owner,
+                &payload.target.repository,
+                &message,
+                &tree.sha,
+                &payload.base_head_sha,
+            )
+            .map_err(|error| self.provider_failure(map_transport_error(error)))?;
+        if !valid_git_sha(&commit.sha) || commit.tree.sha != tree.sha {
+            return Err(self.provider_failure(GithubPagesProviderError::Decode {
+                detail: "GitHub commit mutation returned an invalid tree binding".to_owned(),
+            }));
+        }
+        let updated = self
+            .transport
+            .update_ref(
+                token.as_str(),
+                &payload.target.owner,
+                &payload.target.repository,
+                &payload.target.git_ref,
+                &commit.sha,
+                false,
+            )
+            .map_err(|error| self.provider_failure(map_transport_error(error)))?;
+        let expected_ref = format!("refs/heads/{}", payload.target.git_ref);
+        if updated.reference != expected_ref || updated.object.sha != commit.sha {
+            return Err(self.provider_failure(GithubPagesProviderError::Uncertain {
+                detail: "GitHub ref mutation response did not bind the exact commit".to_owned(),
+            }));
+        }
+        let provider_request_id_digest = digest_parts([
+            "github-git-data",
+            commit.sha.as_str(),
+            tree.sha.as_str(),
+            payload.payload_digest.as_str(),
+            action,
+        ]);
+        let response_digest = digest_json(&(
+            &payload.target,
+            &payload.base_head_sha,
+            &payload.base_tree_sha,
+            &commit,
+            &updated,
+            &payload.target_tree_digest,
+        ))
+        .map_err(|error| self.provider_failure(provider_invalid(&error)))?;
+        let mut receipt = GithubPagesProviderReceipt {
+            action: payload.action,
+            effect_digest: request.prepared_effect.effect_digest().to_owned(),
+            payload_digest: payload.payload_digest.clone(),
+            idempotency_key: request.prepared_effect.idempotency_key().to_owned(),
+            target: payload.target.clone(),
+            base_head_sha: payload.base_head_sha.clone(),
+            commit_sha: commit.sha,
+            tree_sha: tree.sha,
+            provider_request_id_digest,
+            response_digest,
+            accepted_at: request.at,
+            receipt_digest: String::new(),
+        };
+        receipt.receipt_digest = digest_json(&receipt)
+            .map_err(|error| self.provider_failure(provider_invalid(&error)))?;
+        let candidate = ReceiptCandidate::new(
+            &request.prepared_effect,
+            receipt.provider_request_id_digest.clone(),
+            ReceiptCandidateStatus::Accepted,
+            receipt.response_digest.clone(),
+            request.at,
+        )?;
+        self.state.store_receipt(receipt);
+        Ok(candidate)
+    }
+
+    fn independent_readback_from_provider(
+        &self,
+        payload: &GithubPagesPublishPayload,
+        effect_digest: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Result<GithubPagesIndependentReadback, GithubPagesProviderError> {
+        let files = self.validate_payload(payload)?;
+        let snapshot = self.snapshot_from_provider(observed_at)?;
+        let public = self
+            .transport
+            .public_readback(&payload.target.pages_url, &files)
+            .map_err(map_transport_error)?;
+        let expected_content_digest = file_tree_digest(&files);
+        let authenticated_content_matches = snapshot.target == payload.target
+            && snapshot.content_digest == expected_content_digest
+            && snapshot.files == files;
+        let public_content_matches = public.url == payload.target.pages_url
+            && (200..=299).contains(&public.http_status)
+            && public.content_digest == expected_content_digest;
+        let evidence_digest = digest_json(&(
+            effect_digest,
+            &payload.target,
+            &snapshot.response_digest,
+            &public,
+            &expected_content_digest,
+            authenticated_content_matches,
+            public_content_matches,
+        ))
+        .map_err(|error| provider_invalid(&error))?;
+        Ok(GithubPagesIndependentReadback {
+            target: payload.target.clone(),
+            authenticated_snapshot: snapshot,
+            public,
+            expected_content_digest,
+            authenticated_content_matches,
+            public_content_matches,
+            independent: true,
+            evidence_digest,
+            observed_at,
+        })
+    }
+
     fn provider_failure(&self, error: GithubPagesProviderError) -> ConnectorError {
+        let uncertain = matches!(
+            error,
+            GithubPagesProviderError::Uncertain { .. }
+                | GithubPagesProviderError::Transport { .. }
+                | GithubPagesProviderError::RateLimited { .. }
+        );
         self.state.record_failure(error);
-        ConnectorError::ProviderRejected
+        if uncertain {
+            ConnectorError::ProviderUncertain
+        } else {
+            ConnectorError::ProviderRejected
+        }
     }
 }
 
@@ -1002,23 +1746,157 @@ where
 
     fn execute(
         &mut self,
-        _request: hartevo_connector_sdk::ExecuteRequest,
+        request: ExecuteRequest,
     ) -> Result<hartevo_connector_sdk::ReceiptCandidate, ConnectorError> {
-        Err(ConnectorError::ProviderRejected)
+        self.execute_payload(&request)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "reconciliation binds fresh repository state to an existing Effect without granting a new execution permit"
+    )]
     fn reconcile(
         &mut self,
-        _request: ReconcileRequest,
+        request: ReconcileRequest,
     ) -> Result<ReconciliationObservation, ConnectorError> {
-        Err(ConnectorError::ProviderRejected)
+        let payload = self.state.payload(&request.effect_digest).ok_or_else(|| {
+            self.provider_failure(GithubPagesProviderError::Rejected {
+                detail: "reconciliation payload is not available for this Effect".to_owned(),
+            })
+        })?;
+        let files = self
+            .validate_payload(&payload)
+            .map_err(|error| self.provider_failure(error))?;
+        let snapshot = self
+            .snapshot_from_provider(request.at)
+            .map_err(|error| self.provider_failure(error))?;
+        self.state.store_snapshot(snapshot.clone());
+        let target_content_matches = snapshot.target == payload.target
+            && snapshot.content_digest == payload.target_tree_digest
+            && snapshot.files == files;
+        let mut receipt = self.state.receipt(&request.effect_digest);
+        let status = if let Some(existing) = receipt.clone() {
+            if target_content_matches && snapshot.head_sha == existing.commit_sha {
+                ReconciliationStatus::ReceiptFound
+            } else {
+                return Err(self.provider_failure(GithubPagesProviderError::Rejected {
+                    detail: "persisted provider receipt no longer matches GitHub readback"
+                        .to_owned(),
+                }));
+            }
+        } else if target_content_matches && snapshot.head_sha != payload.base_head_sha {
+            let token = self
+                .resolver
+                .resolve(&self.secret)
+                .map_err(|error| self.provider_failure(error))?;
+            let commit = self
+                .transport
+                .commit(
+                    token.as_str(),
+                    &payload.target.owner,
+                    &payload.target.repository,
+                    &snapshot.head_sha,
+                )
+                .map_err(|error| self.provider_failure(map_transport_error(error)))?;
+            let expected_message = format!(
+                "Hartevo {} {}",
+                payload.action.as_str(),
+                payload.payload_digest
+            );
+            let parent_matches = commit.parents.as_ref().is_some_and(|parents| {
+                parents
+                    .iter()
+                    .any(|parent| parent.sha == payload.base_head_sha)
+            });
+            if commit.message.as_deref() == Some(expected_message.as_str()) && parent_matches {
+                let provider_request_id_digest = digest_parts([
+                    "github-git-data",
+                    snapshot.head_sha.as_str(),
+                    snapshot.tree_sha.as_str(),
+                    payload.payload_digest.as_str(),
+                    payload.action.as_str(),
+                ]);
+                let mut synthesized = GithubPagesProviderReceipt {
+                    action: payload.action,
+                    effect_digest: request.effect_digest.clone(),
+                    payload_digest: payload.payload_digest.clone(),
+                    idempotency_key: payload.idempotency_key.clone(),
+                    target: payload.target.clone(),
+                    base_head_sha: payload.base_head_sha.clone(),
+                    commit_sha: snapshot.head_sha.clone(),
+                    tree_sha: snapshot.tree_sha.clone(),
+                    provider_request_id_digest,
+                    response_digest: snapshot.response_digest.clone(),
+                    accepted_at: snapshot.observed_at,
+                    receipt_digest: String::new(),
+                };
+                synthesized.receipt_digest = digest_json(&synthesized)
+                    .map_err(|error| self.provider_failure(provider_invalid(&error)))?;
+                self.state.store_receipt(synthesized.clone());
+                receipt = Some(synthesized);
+                ReconciliationStatus::ReceiptFound
+            } else {
+                ReconciliationStatus::ProviderRejected
+            }
+        } else if snapshot.head_sha == payload.base_head_sha {
+            ReconciliationStatus::NotExecuted
+        } else {
+            ReconciliationStatus::ProviderRejected
+        };
+        let freshness = FreshnessWindow::new(
+            snapshot.observed_at,
+            snapshot.observed_at + Duration::seconds(60),
+            1,
+        )
+        .map_err(|error| {
+            self.provider_failure(GithubPagesProviderError::Rejected {
+                detail: error.to_string(),
+            })
+        })?;
+        let observation = ReconciliationObservation::new(
+            request.effect_digest,
+            request.scope,
+            status,
+            snapshot.response_digest.clone(),
+            request.at,
+            freshness,
+        )?;
+        if receipt.is_none() && status == ReconciliationStatus::ReceiptFound {
+            return Err(self.provider_failure(GithubPagesProviderError::Rejected {
+                detail: "receipt-found reconciliation had no provider receipt".to_owned(),
+            }));
+        }
+        Ok(observation)
     }
 
     fn verify(
         &mut self,
-        _request: VerifyRequest,
+        request: VerifyRequest,
     ) -> Result<VerificationObservation, ConnectorError> {
-        Err(ConnectorError::ProviderRejected)
+        let payload = self.state.payload(&request.subject_digest).ok_or_else(|| {
+            self.provider_failure(GithubPagesProviderError::Rejected {
+                detail: "verification payload is not available for this Effect".to_owned(),
+            })
+        })?;
+        let readback = self
+            .independent_readback_from_provider(&payload, &request.subject_digest, request.at)
+            .map_err(|error| self.provider_failure(error))?;
+        let status = if readback.authenticated_content_matches && readback.public_content_matches {
+            VerificationStatus::Confirmed
+        } else {
+            VerificationStatus::Rejected
+        };
+        let evidence_digest = readback.evidence_digest.clone();
+        self.state
+            .store_readback(request.subject_digest.clone(), readback);
+        VerificationObservation::new(
+            request.subject_digest,
+            request.scope,
+            status,
+            evidence_digest,
+            request.at,
+            true,
+        )
     }
 
     fn handle_webhook(
@@ -1223,6 +2101,155 @@ where
         prepared.map_err(|error| provider_error_from_state(&self.state, &error))
     }
 
+    pub fn register_publish_payload(
+        &mut self,
+        effect_digest: impl Into<String>,
+        payload: GithubPagesPublishPayload,
+    ) -> Result<(), WebPublicationError> {
+        let effect_digest = effect_digest.into();
+        if !crate::is_digest(&effect_digest) {
+            return Err(WebPublicationError::InvalidInput {
+                detail: "Connector effect digest must be a lowercase SHA-256 digest".to_owned(),
+            });
+        }
+        self.state.store_payload(effect_digest, payload);
+        Ok(())
+    }
+
+    pub fn prepare_publish_payload(
+        &mut self,
+        payload: GithubPagesPublishPayload,
+        idempotency_key: &str,
+        prepared_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<PreparedEffect, WebPublicationError> {
+        let prepared = self.prepare_publish(
+            &payload.payload_digest,
+            idempotency_key,
+            prepared_at,
+            expires_at,
+        )?;
+        self.state
+            .store_payload(prepared.effect_digest().to_owned(), payload);
+        Ok(prepared)
+    }
+
+    pub fn execute_publish(
+        &mut self,
+        payload: GithubPagesPublishPayload,
+        prepared_effect: &PreparedEffect,
+        execution_context: hartevo_connector_sdk::EffectExecutionContext,
+        at: DateTime<Utc>,
+    ) -> Result<GithubPagesProviderExecution, WebPublicationError> {
+        if prepared_effect.payload_digest() != payload.payload_digest {
+            return Err(WebPublicationError::ScopeMismatch {
+                detail: "prepared Effect payload does not match the approved publication"
+                    .to_owned(),
+            });
+        }
+        self.connection.validate_at(&self.secret, at)?;
+        self.state
+            .store_payload(prepared_effect.effect_digest().to_owned(), payload);
+        self.worker.set_now(at);
+        let receipt_candidate = self
+            .worker
+            .execute(ExecuteRequest {
+                dispatch: self.worker.dispatch_fence(),
+                scope: self.connection.scope()?,
+                live_probe: self.live_probe.clone(),
+                prepared_effect: (*prepared_effect).clone(),
+                execution_context,
+                at,
+            })
+            .map_err(|error| provider_error_from_state(&self.state, &error))?;
+        let receipt = self
+            .state
+            .receipt(prepared_effect.effect_digest())
+            .ok_or_else(|| WebPublicationError::Provider {
+                detail: "GitHub mutation returned a candidate without a provider receipt"
+                    .to_owned(),
+            })?;
+        Ok(GithubPagesProviderExecution {
+            receipt,
+            receipt_candidate,
+        })
+    }
+
+    pub fn reconcile_publish(
+        &mut self,
+        payload: GithubPagesPublishPayload,
+        effect_digest: &str,
+        at: DateTime<Utc>,
+    ) -> Result<GithubPagesProviderReconciliation, WebPublicationError> {
+        if !crate::is_digest(effect_digest) {
+            return Err(WebPublicationError::InvalidInput {
+                detail: "Connector effect digest must be a lowercase SHA-256 digest".to_owned(),
+            });
+        }
+        self.connection.validate_at(&self.secret, at)?;
+        self.state.store_payload(effect_digest.to_owned(), payload);
+        self.worker.set_now(at);
+        let observation = self
+            .worker
+            .reconcile(ReconcileRequest {
+                dispatch: self.worker.dispatch_fence(),
+                scope: self.connection.scope()?,
+                live_probe: self.live_probe.clone(),
+                capability: ProviderCapabilityKey::new(GITHUB_PROVIDER_ID, "publication.publish")?,
+                effect_digest: effect_digest.to_owned(),
+                at,
+            })
+            .map_err(|error| provider_error_from_state(&self.state, &error))?;
+        let snapshot = self
+            .state
+            .snapshot()
+            .ok_or_else(|| WebPublicationError::Provider {
+                detail: "GitHub reconciliation returned no repository snapshot".to_owned(),
+            })?;
+        Ok(GithubPagesProviderReconciliation {
+            snapshot,
+            receipt: self.state.receipt(effect_digest),
+            observation,
+        })
+    }
+
+    pub fn verify_publish(
+        &mut self,
+        payload: GithubPagesPublishPayload,
+        effect_digest: &str,
+        at: DateTime<Utc>,
+    ) -> Result<GithubPagesVerification, WebPublicationError> {
+        if !crate::is_digest(effect_digest) {
+            return Err(WebPublicationError::InvalidInput {
+                detail: "Connector effect digest must be a lowercase SHA-256 digest".to_owned(),
+            });
+        }
+        self.connection.validate_at(&self.secret, at)?;
+        self.state.store_payload(effect_digest.to_owned(), payload);
+        self.worker.set_now(at);
+        let observation = self
+            .worker
+            .verify(VerifyRequest {
+                dispatch: self.worker.dispatch_fence(),
+                scope: self.connection.scope()?,
+                live_probe: self.live_probe.clone(),
+                capability: ProviderCapabilityKey::new(GITHUB_PROVIDER_ID, "publication.publish")?,
+                subject_digest: effect_digest.to_owned(),
+                at,
+            })
+            .map_err(|error| provider_error_from_state(&self.state, &error))?;
+        let readback =
+            self.state
+                .readback(effect_digest)
+                .ok_or_else(|| WebPublicationError::Provider {
+                    detail: "GitHub verification returned no independent readback".to_owned(),
+                })?;
+        Ok(GithubPagesVerification {
+            observation,
+            readback,
+        })
+    }
+
     pub fn registry_digest(&self) -> String {
         digest_parts([
             self.connection.registry_version.as_str(),
@@ -1263,38 +2290,56 @@ fn descriptor() -> Result<ConnectorDescriptor, WebPublicationError> {
 fn registrations(
     identity: &ProviderAdapterIdentity,
 ) -> Result<Vec<ProviderCapabilitySupport>, WebPublicationError> {
-    [
-        (
-            "connection.probe",
-            ProviderAdapterOperation::Probe,
-            ProviderEvidenceClass::ProbeObservation,
-        ),
-        (
-            "site.read",
-            ProviderAdapterOperation::Read,
-            ProviderEvidenceClass::ReadObservation,
-        ),
-        (
-            "publication.publish",
-            ProviderAdapterOperation::PrepareEffect,
-            ProviderEvidenceClass::PreparedEffect,
-        ),
-    ]
-    .into_iter()
-    .map(|(capability, operation, evidence_class)| {
-        let key = ProviderCapabilityKey::new(GITHUB_PROVIDER_ID, capability)?;
-        let evidence = ProviderEvidenceSupport::new(
-            operation,
-            evidence_class,
-            ProviderProvenanceClass::ProductionProvider,
-        )?;
-        Ok(ProviderCapabilitySupport::new(
-            key,
-            identity.clone(),
-            [evidence],
-        )?)
-    })
-    .collect()
+    ["connection.probe", "site.read", "publication.publish"]
+        .into_iter()
+        .map(|capability| {
+            let key = ProviderCapabilityKey::new(GITHUB_PROVIDER_ID, capability)?;
+            let operations = match capability {
+                "connection.probe" => vec![(
+                    ProviderAdapterOperation::Probe,
+                    ProviderEvidenceClass::ProbeObservation,
+                )],
+                "site.read" => vec![(
+                    ProviderAdapterOperation::Read,
+                    ProviderEvidenceClass::ReadObservation,
+                )],
+                "publication.publish" => vec![
+                    (
+                        ProviderAdapterOperation::PrepareEffect,
+                        ProviderEvidenceClass::PreparedEffect,
+                    ),
+                    (
+                        ProviderAdapterOperation::Execute,
+                        ProviderEvidenceClass::ReceiptCandidate,
+                    ),
+                    (
+                        ProviderAdapterOperation::Reconcile,
+                        ProviderEvidenceClass::ReconciliationObservation,
+                    ),
+                    (
+                        ProviderAdapterOperation::Verify,
+                        ProviderEvidenceClass::VerificationObservation,
+                    ),
+                ],
+                _ => unreachable!("all GitHub Pages capabilities are listed above"),
+            };
+            let evidence = operations
+                .into_iter()
+                .map(|(operation, evidence_class)| {
+                    ProviderEvidenceSupport::new(
+                        operation,
+                        evidence_class,
+                        ProviderProvenanceClass::ProductionProvider,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ProviderCapabilitySupport::new(
+                key,
+                identity.clone(),
+                evidence,
+            )?)
+        })
+        .collect()
 }
 
 fn required_scopes() -> BTreeSet<String> {
@@ -1312,6 +2357,11 @@ fn provider_error_from_state(state: &AdapterState, error: &ConnectorError) -> We
 
 fn map_transport_error(error: GithubPagesTransportError) -> GithubPagesProviderError {
     match error {
+        GithubPagesTransportError::RateLimited { status } => {
+            GithubPagesProviderError::RateLimited {
+                detail: format!("GitHub API HTTP status {status}"),
+            }
+        }
         GithubPagesTransportError::Rejected { status } if status == 401 || status == 403 => {
             GithubPagesProviderError::Unauthorized {
                 detail: format!("GitHub API HTTP status {status}"),
