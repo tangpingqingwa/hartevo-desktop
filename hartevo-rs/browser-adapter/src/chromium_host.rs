@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, Command, Stdio};
@@ -20,8 +21,15 @@ use os_pipe::{PipeReader, PipeWriter, pipe};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest;
+use tempfile::TempDir;
+use url::Url;
 use zeroize::Zeroizing;
 
+use crate::artifact::{
+    BrowserArtifactCapture, BrowserArtifactCaptureInput, BrowserArtifactFrameObservation,
+    BrowserArtifactFrameRevision, BrowserArtifactScope,
+};
+use crate::artifact_chromium::{BrowserArtifactDownloadDescriptor, BrowserArtifactDownloadRequest};
 use crate::locator::{canonical_accessible_name, canonical_role};
 use crate::profile_dir::{BrowserExecutableIdentity, ManagedProfileDirectory};
 use crate::workspace::{digest, digest_json};
@@ -61,6 +69,242 @@ const FILE_UPLOAD_DISPATCH_SCHEMA_VERSION: u32 = 1;
 pub enum ChromiumCredentialStoreMode {
     PlatformDefault,
     MacOsMockForTest,
+}
+
+#[cfg(all(test, unix))]
+mod artifact_real_smoke {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use chrono::{Duration, TimeZone, Utc};
+    use hartevo_domain_kernel::{
+        AccountId, BrowserControlLeaseId, BrowserProfileId, BrowserTabId, BrowserWorkspaceId,
+        Mission, MissionContract, MissionId, Project, ProjectId, StorageMode, TenantId,
+    };
+    use tempfile::TempDir;
+    use url::Url;
+
+    use super::*;
+    use crate::{
+        BrowserArtifactCaptureService, BrowserArtifactDownloadProvider, BrowserArtifactHost,
+        BrowserArtifactScope, BrowserIdentity, ChromiumArtifactDownloadTransport,
+    };
+
+    #[test]
+    #[ignore = "requires HARTEVO_TEST_CHROME_BINARY, HTTPS trigger/download fixture, and exact GUID"]
+    fn real_chromium_download_transport_smoke() {
+        let executable = std::env::var_os("HARTEVO_TEST_CHROME_BINARY").map_or_else(
+            || panic!("BLOCKED_ENV: reason=chrome_binary_missing"),
+            PathBuf::from,
+        );
+        let trigger_url = std::env::var("HARTEVO_TEST_CHROME_ARTIFACT_PAGE_URL")
+            .unwrap_or_else(|_| panic!("BLOCKED_ENV: reason=artifact_page_url_missing"));
+        let download_url = std::env::var("HARTEVO_TEST_CHROME_ARTIFACT_URL")
+            .unwrap_or_else(|_| panic!("BLOCKED_ENV: reason=artifact_url_missing"));
+        let download_guid = std::env::var("HARTEVO_TEST_CHROME_ARTIFACT_GUID")
+            .unwrap_or_else(|_| panic!("BLOCKED_ENV: reason=artifact_guid_missing"));
+        let now = Utc
+            .with_ymd_and_hms(2026, 8, 14, 8, 0, 0)
+            .single()
+            .expect("time");
+        let mut fixture = RealArtifactFixture::new(&executable, &trigger_url, &download_url, now);
+        let trigger = fixture
+            .policy
+            .authorize(&trigger_url)
+            .expect("trigger target");
+        fixture
+            .host
+            .navigate_allowlisted(
+                &fixture.tab_id,
+                &fixture.proof,
+                &fixture.policy,
+                &trigger,
+                now,
+            )
+            .expect("trigger page");
+        let mut service = BrowserArtifactCaptureService::mount(
+            &fixture.profile,
+            &fixture.workspace,
+            fixture.scope.clone(),
+        )
+        .expect("service");
+        let request = {
+            let mut transport = ChromiumArtifactDownloadTransport::new(&mut fixture.host);
+            let frame = transport
+                .observe_artifact_frame(&fixture.scope, now)
+                .expect("frame");
+            let descriptor = crate::BrowserArtifactDownloadDescriptor::new(
+                "artifact-real-chromium",
+                download_guid,
+                download_url.clone(),
+                fixture.download_origin.clone(),
+                service.provider_generation(),
+            );
+            let request = transport
+                .request_for_download(&fixture.scope, &frame, &descriptor, now)
+                .expect("request");
+            transport
+                .arm_download(&fixture.scope, &request, now)
+                .expect("arm");
+            request
+        };
+        let download_target = fixture
+            .policy
+            .authorize(&download_url)
+            .expect("download target");
+        assert!(matches!(
+            fixture.host.navigate_allowlisted(
+                &fixture.tab_id,
+                &fixture.proof,
+                &fixture.policy,
+                &download_target,
+                now,
+            ),
+            Err(BrowserError::NavigationDownloadBlocked)
+        ));
+        let mut transport = ChromiumArtifactDownloadTransport::new(&mut fixture.host);
+        let receipt = service
+            .capture_download(
+                &mut transport,
+                &fixture.profile,
+                &fixture.workspace,
+                &fixture.proof,
+                &request,
+                now,
+            )
+            .expect("quarantine receipt");
+        assert_eq!(receipt.source_url, download_url);
+        assert!(!receipt.opened);
+        assert!(!receipt.execution_permitted);
+        fixture.host.shutdown().expect("shutdown");
+    }
+
+    struct RealArtifactFixture {
+        _temp: TempDir,
+        host: ManagedChromiumHost,
+        profile: BrowserProfile,
+        workspace: BrowserWorkspace,
+        scope: BrowserArtifactScope,
+        proof: BrowserLeaseProof,
+        tab_id: BrowserTabId,
+        policy: BrowserNavigationPolicy,
+        download_origin: String,
+    }
+
+    impl RealArtifactFixture {
+        fn new(
+            executable: &std::path::Path,
+            trigger_url: &str,
+            download_url: &str,
+            now: DateTime<Utc>,
+        ) -> Self {
+            let temp = TempDir::new().expect("temp");
+            let (profile, workspace, scope, proof, tab_id, profile_root) =
+                real_artifact_domain(&temp, now);
+            let config = ChromiumLaunchConfig::new(executable, profile_root, true).expect("config");
+            #[cfg(target_os = "macos")]
+            let config = config
+                .with_macos_mock_keychain_for_test()
+                .expect("mock keychain");
+            let mut host = ManagedChromiumHost::spawn(profile.clone(), workspace.clone(), &config)
+                .expect("spawn");
+            host.attach_about_blank_tab(&tab_id, &proof, now)
+                .expect("attach");
+            let trigger_origin = Url::parse(trigger_url)
+                .expect("trigger URL")
+                .origin()
+                .ascii_serialization();
+            let download_origin = Url::parse(download_url)
+                .expect("download URL")
+                .origin()
+                .ascii_serialization();
+            let policy =
+                BrowserNavigationPolicy::https_only([trigger_origin, download_origin.clone()])
+                    .expect("policy");
+            Self {
+                _temp: temp,
+                host,
+                profile,
+                workspace,
+                scope,
+                proof,
+                tab_id,
+                policy,
+                download_origin,
+            }
+        }
+    }
+
+    fn real_artifact_domain(
+        temp: &TempDir,
+        now: DateTime<Utc>,
+    ) -> (
+        BrowserProfile,
+        BrowserWorkspace,
+        BrowserArtifactScope,
+        BrowserLeaseProof,
+        BrowserTabId,
+        PathBuf,
+    ) {
+        let profile_root = temp.path().join("profiles");
+        fs::create_dir(&profile_root).expect("profile root");
+        let project_root = temp.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let project = Project::create_local(
+            TenantId::from("tenant-real-artifact"),
+            ProjectId::from("project-real-artifact"),
+            "Real artifact",
+            "",
+            project_root.to_str().expect("project path"),
+            StorageMode::LocalExisting,
+        )
+        .expect("project");
+        let mission = Mission::compile(
+            project.tenant_id.clone(),
+            MissionId::from("mission-real-artifact"),
+            project.id.clone(),
+            "Capture real artifact",
+            MissionContract::bootstrap("Capture a download", ["browser.read".into()], now),
+            now,
+        )
+        .expect("mission");
+        let profile = BrowserProfile::create_managed(
+            BrowserProfileId::from("profile-real-artifact"),
+            &project,
+            "keyring://real-artifact",
+            BrowserIdentity::new(
+                "chromium",
+                AccountId::from("account-real-artifact"),
+                sha('a'),
+                sha('b'),
+                now,
+            )
+            .expect("identity"),
+            now,
+        )
+        .expect("profile");
+        let tab_id = BrowserTabId::from("tab-real-artifact");
+        let workspace = BrowserWorkspace::create(
+            BrowserWorkspaceId::from("workspace-real-artifact"),
+            &project,
+            &mission,
+            &profile,
+            tab_id.clone(),
+            BrowserControlLeaseId::from("lease-real-artifact"),
+            now + Duration::hours(1),
+            sha('c'),
+            now,
+        )
+        .expect("workspace");
+        let scope = BrowserArtifactScope::from_workspace(&profile, &workspace, tab_id.clone())
+            .expect("scope");
+        let proof = workspace.agent_lease_proof(now).expect("proof");
+        (profile, workspace, scope, proof, tab_id, profile_root)
+    }
+
+    fn sha(byte: char) -> String {
+        byte.to_string().repeat(64)
+    }
 }
 
 impl ChromiumCredentialStoreMode {
@@ -875,6 +1119,33 @@ struct DeferredEvent {
     frame_digest: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ChromiumDownloadEvent {
+    session_id: String,
+    guid: String,
+    url: String,
+    suggested_filename: String,
+    frame_id: String,
+    state: ChromiumDownloadState,
+    received_bytes: u64,
+    total_bytes: u64,
+    file_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChromiumDownloadState {
+    InProgress,
+    Completed,
+    Canceled,
+}
+
+struct ChromiumPendingDownload {
+    request: BrowserArtifactDownloadRequest,
+    context_id: String,
+    target_id: String,
+    temp_dir: TempDir,
+}
+
 pub struct ManagedChromiumHost {
     child: Option<GroupChild>,
     input: Option<PipeWriter>,
@@ -887,6 +1158,8 @@ pub struct ManagedChromiumHost {
     workspace: BrowserWorkspace,
     tabs: BTreeMap<BrowserTabId, CdpTabSession>,
     deferred_events: VecDeque<DeferredEvent>,
+    download_events: VecDeque<ChromiumDownloadEvent>,
+    pending_download: Option<ChromiumPendingDownload>,
     next_request_id: u64,
     request_timeout: Duration,
     shutdown_grace: Duration,
@@ -953,6 +1226,8 @@ impl ManagedChromiumHost {
             workspace,
             tabs: BTreeMap::new(),
             deferred_events: VecDeque::new(),
+            download_events: VecDeque::new(),
+            pending_download: None,
             next_request_id: 1,
             request_timeout: config.request_timeout,
             shutdown_grace: config.shutdown_grace,
@@ -2484,6 +2759,343 @@ impl ManagedChromiumHost {
         self.shutdown_inner()
     }
 
+    pub(crate) fn browser_artifact_observe_frame(
+        &mut self,
+        scope: &BrowserArtifactScope,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserArtifactFrameRevision, BrowserError> {
+        self.validate_browser_artifact_scope(scope)?;
+        let proof = self.workspace.agent_lease_proof(now)?;
+        let guard = OperationLeaseGuard::new(&proof, now);
+        let session_id = self
+            .tabs
+            .get(&scope.tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .session_id
+            .clone();
+        let (frame_tree, document_generation) =
+            self.read_scoped_frame_tree_snapshot(&scope.tab_id, &session_id, &guard)?;
+        let root = frame_tree.root;
+        let navigation_revision = self
+            .tabs
+            .get(&scope.tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .frame_lifecycle_revisions
+            .get(&root.frame_id)
+            .copied()
+            .unwrap_or(1);
+        BrowserArtifactFrameRevision::observed(
+            scope,
+            &BrowserArtifactFrameObservation {
+                session_id,
+                frame_id: root.frame_id,
+                loader_id: root.loader_id,
+                navigation_revision,
+                document_generation,
+                url: root.url,
+            },
+        )?
+        .with_lease_generation(self.workspace.lease_generation)
+    }
+
+    pub(crate) fn browser_artifact_arm_download(
+        &mut self,
+        scope: &BrowserArtifactScope,
+        request: &BrowserArtifactDownloadRequest,
+        now: DateTime<Utc>,
+    ) -> Result<(), BrowserError> {
+        self.validate_browser_artifact_scope(scope)?;
+        request.validate_for(scope, None, None, None)?;
+        if let Some(pending) = self.pending_download.as_ref() {
+            return if pending.request == *request {
+                Ok(())
+            } else {
+                Err(BrowserError::ArtifactDuplicate)
+            };
+        }
+        if !self.download_events.is_empty() {
+            return Err(self.poison());
+        }
+        let proof = self.workspace.agent_lease_proof(now)?;
+        let guard = OperationLeaseGuard::new(&proof, now);
+        let (target_id, context_id) = self.read_artifact_target_binding(&scope.tab_id, &guard)?;
+        if digest(target_id.as_bytes()) != request.target_id_digest
+            || digest(context_id.as_bytes()) != request.browser_context_digest
+        {
+            return Err(BrowserError::ArtifactScopeMismatch);
+        }
+        let temp_dir = TempDir::new()?;
+        let download_path = temp_dir
+            .path()
+            .to_str()
+            .filter(|path| !path.is_empty() && path.len() <= 32 * 1_024)
+            .ok_or(BrowserError::InvalidArtifact)?
+            .to_owned();
+        self.pending_download = Some(ChromiumPendingDownload {
+            request: request.clone(),
+            context_id: context_id.clone(),
+            target_id: target_id.clone(),
+            temp_dir,
+        });
+        let configured = self.command_guarded(
+            CdpMethod::BrowserSetDownloadBehavior,
+            json!({
+                "behavior": "allowAndName",
+                "browserContextId": context_id,
+                "downloadPath": download_path,
+                "eventsEnabled": true,
+            }),
+            None,
+            &guard,
+        );
+        if let Err(error) = configured {
+            let _ = self.browser_artifact_cleanup_download();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn browser_artifact_build_request(
+        &mut self,
+        scope: &BrowserArtifactScope,
+        frame: &BrowserArtifactFrameRevision,
+        descriptor: &BrowserArtifactDownloadDescriptor,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserArtifactDownloadRequest, BrowserError> {
+        self.validate_browser_artifact_scope(scope)?;
+        let current = self.browser_artifact_observe_frame(scope, now)?;
+        if current != *frame {
+            return Err(BrowserError::ArtifactFrameStale);
+        }
+        let proof = self.workspace.agent_lease_proof(now)?;
+        let guard = OperationLeaseGuard::new(&proof, now);
+        let (target_id, context_id) = self.read_artifact_target_binding(&scope.tab_id, &guard)?;
+        BrowserArtifactDownloadRequest::new(
+            scope,
+            frame.clone(),
+            descriptor,
+            &context_id,
+            &target_id,
+        )
+    }
+
+    pub(crate) fn browser_artifact_capture_download(
+        &mut self,
+        scope: &BrowserArtifactScope,
+        expected_frame: &BrowserArtifactFrameRevision,
+        artifact_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserArtifactCapture, BrowserError> {
+        self.validate_browser_artifact_scope(scope)?;
+        let (pending_request, pending_target_id, pending_context_id) = self
+            .pending_download
+            .as_ref()
+            .map(|pending| {
+                (
+                    pending.request.clone(),
+                    pending.target_id.clone(),
+                    pending.context_id.clone(),
+                )
+            })
+            .ok_or(BrowserError::ArtifactProviderUnavailable)?;
+        if pending_request.artifact_id != artifact_id || pending_request.frame != *expected_frame {
+            return Err(BrowserError::ArtifactFrameStale);
+        }
+        let proof = self.workspace.agent_lease_proof(now)?;
+        let guard = OperationLeaseGuard::new(&proof, now);
+        let (target_id, context_id) = self.read_artifact_target_binding(&scope.tab_id, &guard)?;
+        if target_id != pending_target_id || context_id != pending_context_id {
+            return Err(BrowserError::ArtifactFrameStale);
+        }
+        let current_frame = self.browser_artifact_observe_frame(scope, now)?;
+        if current_frame != *expected_frame {
+            return Err(BrowserError::ArtifactFrameStale);
+        }
+        let event = self.wait_for_artifact_download(&guard)?;
+        if digest(event.guid.as_bytes()) != pending_request.download_guid_digest
+            || digest(event.session_id.as_bytes()) != expected_frame.session_id_digest
+            || digest(event.frame_id.as_bytes()) != expected_frame.frame_id_digest
+            || event.url != pending_request.expected_url
+        {
+            return Err(BrowserError::ArtifactScopeMismatch);
+        }
+        let (canonical_url, canonical_origin) = canonical_download_source(&event.url)?;
+        if canonical_url != pending_request.expected_url
+            || canonical_origin != pending_request.expected_origin
+        {
+            return Err(BrowserError::ArtifactScopeMismatch);
+        }
+        if event.state != ChromiumDownloadState::Completed {
+            return Err(BrowserError::ArtifactProviderUnavailable);
+        }
+        if event.total_bytes != 0 && event.total_bytes != event.received_bytes {
+            return Err(BrowserError::ArtifactFrameStale);
+        }
+        let pending = self
+            .pending_download
+            .as_ref()
+            .ok_or(BrowserError::ArtifactProviderUnavailable)?;
+        let bytes = Self::read_artifact_download_bytes(pending, &event)?;
+        let filename = event.suggested_filename;
+        let capture = BrowserArtifactCapture::new(BrowserArtifactCaptureInput {
+            artifact_id: artifact_id.to_owned(),
+            frame: expected_frame.clone(),
+            filename,
+            // CDP's download lifecycle does not expose a trusted MIME field;
+            // preserve that fact as the conservative octet-stream type.
+            media_type: "application/octet-stream".into(),
+            source_url: canonical_url,
+            source_origin: canonical_origin,
+            bytes,
+            observed_at: now,
+        })?;
+        Ok(capture)
+    }
+
+    pub(crate) fn browser_artifact_cleanup_download(&mut self) -> Result<(), BrowserError> {
+        let disable_result = if let Some(pending) = self.pending_download.as_ref() {
+            self.command(
+                CdpMethod::BrowserSetDownloadBehavior,
+                json!({
+                    "behavior": "deny",
+                    "browserContextId": pending.context_id,
+                }),
+                None,
+            )
+            .map(|_| ())
+        } else {
+            Ok(())
+        };
+        let close_result = self
+            .pending_download
+            .take()
+            .map(|pending| pending.temp_dir.close())
+            .transpose()
+            .map(|_| ());
+        self.download_events.clear();
+        match (disable_result, close_result) {
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(BrowserError::Io(error)),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn validate_browser_artifact_scope(
+        &self,
+        scope: &BrowserArtifactScope,
+    ) -> Result<(), BrowserError> {
+        scope.validate()?;
+        if self.profile.status != crate::BrowserProfileStatus::Active
+            || scope.tenant_id != self.workspace.tenant_id
+            || scope.project_id != self.workspace.project_id
+            || scope.mission_id != self.workspace.mission_id
+            || scope.profile_id != self.profile.id
+            || scope.profile_revision != self.profile.revision
+            || scope.workspace_id != self.workspace.id
+            || scope.workspace_revision != self.workspace.revision
+            || scope.identity_digest != self.profile.identity.identity_digest
+            || !self.workspace.tabs.contains(&scope.tab_id)
+        {
+            return Err(BrowserError::ArtifactScopeMismatch);
+        }
+        Ok(())
+    }
+
+    fn read_artifact_target_binding(
+        &mut self,
+        tab_id: &BrowserTabId,
+        guard: &OperationLeaseGuard<'_>,
+    ) -> Result<(String, String), BrowserError> {
+        let target_id = self
+            .tabs
+            .get(tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .target_id
+            .clone();
+        let result = self.command_guarded(
+            CdpMethod::TargetGetTargetInfo,
+            json!({"targetId": target_id}),
+            None,
+            guard,
+        )?;
+        let target_info = result
+            .get("targetInfo")
+            .and_then(Value::as_object)
+            .ok_or_else(|| self.poison())?;
+        let observed_target_id = target_info
+            .get("targetId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 4_096)
+            .ok_or_else(|| self.poison())?;
+        let browser_context_id = target_info
+            .get("browserContextId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 4_096)
+            .ok_or_else(|| self.poison())?;
+        if observed_target_id != target_id {
+            return Err(self.poison());
+        }
+        Ok((target_id, browser_context_id.to_owned()))
+    }
+
+    fn wait_for_artifact_download(
+        &mut self,
+        guard: &OperationLeaseGuard<'_>,
+    ) -> Result<ChromiumDownloadEvent, BrowserError> {
+        let deadline = Instant::now() + self.request_timeout;
+        loop {
+            if let Some(event) = self.download_events.pop_front() {
+                return Ok(event);
+            }
+            let message = self.receive_protocol_message(deadline, Some(guard))?;
+            match message {
+                ReaderMessage::Frame(frame) => {
+                    if frame.truncated || frame.byte_count == 0 {
+                        return Err(self.poison());
+                    }
+                    let envelope: CdpEnvelope =
+                        serde_json::from_slice(&frame.bytes).map_err(|_| self.poison())?;
+                    if envelope.id.is_some() {
+                        return Err(self.poison());
+                    }
+                    self.process_protocol_event(
+                        envelope,
+                        frame.digest,
+                        Some(guard),
+                        &mut BTreeMap::new(),
+                    )?;
+                }
+                ReaderMessage::Failure { .. } => return Err(self.poison()),
+                ReaderMessage::Closed => {
+                    self.poisoned = true;
+                    return Err(BrowserError::HostExited);
+                }
+            }
+        }
+    }
+
+    fn read_artifact_download_bytes(
+        pending: &ChromiumPendingDownload,
+        event: &ChromiumDownloadEvent,
+    ) -> Result<Vec<u8>, BrowserError> {
+        let root = pending.temp_dir.path().canonicalize()?;
+        let candidate = event
+            .file_path
+            .clone()
+            .unwrap_or_else(|| pending.temp_dir.path().join(&event.guid));
+        let canonical = candidate.canonicalize()?;
+        if !canonical.starts_with(&root) || canonical == root {
+            return Err(BrowserError::ArtifactScopeMismatch);
+        }
+        let metadata = fs::metadata(&canonical)?;
+        if !metadata.file_type().is_file() {
+            return Err(BrowserError::ArtifactScopeMismatch);
+        }
+        let bytes = fs::read(&canonical)?;
+        fs::remove_file(&canonical)?;
+        Ok(bytes)
+    }
+
     fn command(
         &mut self,
         method: CdpMethod,
@@ -2918,6 +3530,18 @@ impl ManagedChromiumHost {
                     envelope.params.as_ref(),
                 )?;
             }
+            "Page.downloadWillBegin" => {
+                self.record_download_will_begin(
+                    envelope.session_id.as_deref(),
+                    envelope.params.as_ref(),
+                )?;
+            }
+            "Page.downloadProgress" => {
+                self.record_download_progress(
+                    envelope.session_id.as_deref(),
+                    envelope.params.as_ref(),
+                )?;
+            }
             "Runtime.executionContextCreated" => {
                 self.record_execution_context_created(
                     envelope.session_id.as_deref(),
@@ -3081,6 +3705,126 @@ impl ManagedChromiumHost {
         Ok(())
     }
 
+    fn record_download_will_begin(
+        &mut self,
+        session_id: Option<&str>,
+        params: Option<&Value>,
+    ) -> Result<(), BrowserError> {
+        if self.pending_download.is_none() {
+            return Err(self.poison());
+        }
+        let session_id = session_id
+            .filter(|value| !value.is_empty() && value.len() <= 4_096)
+            .ok_or_else(|| self.poison())?
+            .to_owned();
+        if self.tab_for_session(Some(&session_id)).is_none() {
+            return Err(self.poison());
+        }
+        let params = params
+            .and_then(Value::as_object)
+            .ok_or_else(|| self.poison())?;
+        let guid = params
+            .get("guid")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 4_096)
+            .ok_or_else(|| self.poison())?
+            .to_owned();
+        if self.download_events.iter().any(|event| event.guid == guid) {
+            return Err(self.poison());
+        }
+        let url = params
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 32 * 1_024)
+            .ok_or_else(|| self.poison())?
+            .to_owned();
+        let suggested_filename = params
+            .get("suggestedFilename")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 512)
+            .ok_or_else(|| self.poison())?
+            .to_owned();
+        let frame_id = params
+            .get("frameId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 4_096)
+            .ok_or_else(|| self.poison())?
+            .to_owned();
+        if self.download_events.len() >= 128 {
+            return Err(self.poison());
+        }
+        self.download_events.push_back(ChromiumDownloadEvent {
+            session_id,
+            guid,
+            url,
+            suggested_filename,
+            frame_id,
+            state: ChromiumDownloadState::InProgress,
+            received_bytes: 0,
+            total_bytes: 0,
+            file_path: None,
+        });
+        Ok(())
+    }
+
+    fn record_download_progress(
+        &mut self,
+        session_id: Option<&str>,
+        params: Option<&Value>,
+    ) -> Result<(), BrowserError> {
+        if self.pending_download.is_none() {
+            return Err(self.poison());
+        }
+        let session_id = session_id
+            .filter(|value| !value.is_empty() && value.len() <= 4_096)
+            .ok_or_else(|| self.poison())?;
+        let params = params
+            .and_then(Value::as_object)
+            .ok_or_else(|| self.poison())?;
+        let guid = params
+            .get("guid")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 4_096)
+            .ok_or_else(|| self.poison())?;
+        let state = match params.get("state").and_then(Value::as_str) {
+            Some("inProgress") => ChromiumDownloadState::InProgress,
+            Some("completed") => ChromiumDownloadState::Completed,
+            Some("canceled") => ChromiumDownloadState::Canceled,
+            _ => return Err(self.poison()),
+        };
+        let received_bytes = params
+            .get("receivedBytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| self.poison())?;
+        let total_bytes = params
+            .get("totalBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let file_path = match params.get("filePath") {
+            None => None,
+            Some(Value::String(value)) if !value.is_empty() && value.len() <= 32 * 1_024 => {
+                Some(PathBuf::from(value))
+            }
+            _ => return Err(self.poison()),
+        };
+        let index = self
+            .download_events
+            .iter()
+            .position(|event| event.guid == guid)
+            .ok_or_else(|| self.poison())?;
+        if self.download_events[index].session_id != session_id {
+            return Err(self.poison());
+        }
+        let event = &mut self.download_events[index];
+        event.state = state;
+        event.received_bytes = received_bytes;
+        event.total_bytes = total_bytes;
+        if file_path.is_some() {
+            event.file_path = file_path;
+        }
+        Ok(())
+    }
+
     fn record_frame_lifecycle_revision(
         &mut self,
         session_id: Option<&str>,
@@ -3199,6 +3943,8 @@ impl ManagedChromiumHost {
     }
 
     fn shutdown_inner(&mut self) -> Result<ChromiumHostShutdown, BrowserError> {
+        self.download_events.clear();
+        self.pending_download.take();
         self.tabs.clear();
         self.input.take();
         let Some(mut child) = self.child.take() else {
@@ -3702,6 +4448,7 @@ impl Drop for ManagedChromiumHost {
 #[derive(Clone, Copy)]
 enum CdpMethod {
     BrowserGetVersion,
+    BrowserSetDownloadBehavior,
     TargetCreateTarget,
     TargetAttachToTarget,
     TargetGetTargetInfo,
@@ -3732,6 +4479,7 @@ impl CdpMethod {
     fn as_str(self) -> &'static str {
         match self {
             Self::BrowserGetVersion => "Browser.getVersion",
+            Self::BrowserSetDownloadBehavior => "Browser.setDownloadBehavior",
             Self::TargetCreateTarget => "Target.createTarget",
             Self::TargetAttachToTarget => "Target.attachToTarget",
             Self::TargetGetTargetInfo => "Target.getTargetInfo",
@@ -3806,6 +4554,24 @@ struct CdpEnvelope {
 #[derive(Deserialize)]
 struct CdpError {
     code: i64,
+}
+
+fn canonical_download_source(source_url: &str) -> Result<(String, String), BrowserError> {
+    let parsed = Url::parse(source_url).map_err(|_| BrowserError::InvalidArtifact)?;
+    if parsed.scheme() != "https"
+        || parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(BrowserError::InvalidArtifact);
+    }
+    let canonical_url = parsed.to_string();
+    let origin = parsed.origin();
+    if !origin.is_tuple() {
+        return Err(BrowserError::InvalidArtifact);
+    }
+    Ok((canonical_url, origin.ascii_serialization()))
 }
 
 struct BoundedFrame {

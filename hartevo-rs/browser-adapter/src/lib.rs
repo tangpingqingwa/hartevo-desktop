@@ -15,6 +15,7 @@
 
 mod action;
 mod artifact;
+mod artifact_chromium;
 #[cfg(unix)]
 mod chromium_host;
 mod fake_host;
@@ -38,6 +39,12 @@ pub use artifact::{
     BrowserArtifactFrameRevision, BrowserArtifactHost, BrowserArtifactPlugin,
     BrowserArtifactProviderState, BrowserArtifactQuarantineReceipt, BrowserArtifactResultLog,
     BrowserArtifactResultSink, BrowserArtifactScope, UnavailableBrowserArtifactHost,
+};
+#[cfg(unix)]
+pub use artifact_chromium::ChromiumArtifactDownloadTransport;
+pub use artifact_chromium::{
+    BrowserArtifactCaptureService, BrowserArtifactDownloadDescriptor,
+    BrowserArtifactDownloadProvider, BrowserArtifactDownloadRequest,
 };
 #[cfg(unix)]
 pub use chromium_host::{

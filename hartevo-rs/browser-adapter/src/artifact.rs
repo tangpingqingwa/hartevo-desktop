@@ -436,7 +436,6 @@ impl BrowserArtifactQuarantineReceipt {
         let (canonical_url, canonical_origin) = canonical_source_identity(&self.source_url)?;
         if canonical_url != self.source_url
             || canonical_origin != self.source_origin
-            || digest(self.source_url.as_bytes()) != self.frame.url_digest
             || digest(self.source_origin.as_bytes()) != self.frame.origin_digest
         {
             return Err(BrowserError::InvalidArtifact);
