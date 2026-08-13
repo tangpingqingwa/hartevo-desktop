@@ -179,6 +179,10 @@
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
+    "ed25519Signature": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    },
     "token": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9_.-]{0,127}$"
@@ -312,12 +316,20 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "challengeId",
+        "nonceHex",
         "nonceDigest",
         "issuerDigest",
         "issuedAt",
         "expiresAt"
       ],
       "properties": {
+        "challengeId": {
+          "$ref": "#/$defs/token"
+        },
+        "nonceHex": {
+          "$ref": "#/$defs/sha256"
+        },
         "nonceDigest": {
           "$ref": "#/$defs/sha256"
         },
@@ -621,7 +633,8 @@
         "keyDigest",
         "signedPayloadDigest",
         "signatureReferenceId",
-        "signatureDigest"
+        "signatureDigest",
+        "signatureHex"
       ],
       "properties": {
         "algorithm": {
@@ -638,6 +651,9 @@
         },
         "signatureDigest": {
           "$ref": "#/$defs/sha256"
+        },
+        "signatureHex": {
+          "$ref": "#/$defs/ed25519Signature"
         }
       }
     }
@@ -913,7 +929,11 @@
     "trustedRunnerRegistryRequired": true,
     "runnerSignatureRequired": true,
     "actualHostAttestationRequired": true,
-    "signatureVerifierAvailable": false,
-    "hostAttestationVerifierAvailable": false
+    "signatureVerifierAvailable": true,
+    "hostAttestationVerifierAvailable": false,
+    "canonicalPayloadEncoding": "hartevo_sorted_json/v1",
+    "signaturePayloadProjection": "receipt_without_signature_and_runner_signature_evidence/v1",
+    "admissionTimeSource": "validator_clock_utc",
+    "persistentNonceReplayGuardAvailable": false
   }
 }

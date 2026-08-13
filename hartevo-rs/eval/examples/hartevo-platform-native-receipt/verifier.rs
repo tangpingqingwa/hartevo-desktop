@@ -4,38 +4,46 @@ use std::path::{Component, Path};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::digest::{is_lower_hex, sha256_domain_canonical_json, sha256_hex, sha256_json};
+use crate::digest::{
+    domain_canonical_json_bytes, is_lower_hex, sha256_domain_canonical_json, sha256_hex,
+    sha256_json,
+};
 use crate::model::{
-    Architecture, AssertionOutcome, CaseDefinitionDigestMaterial, DispositionCounts, EvidenceMode,
-    EvidenceReferenceKind, EvidenceRequirement, ImplementationState, MissingReceiptDisposition,
-    NativeProducerMode, OperatingSystem, PlatformMatrix, PlatformReceipt, PlatformStatus,
-    PlatformTarget, ReadinessClassification, ReceiptKind, RegistryEmptyPolicy, SignatureAlgorithm,
-    SupportClass,
+    Architecture, AssertionOutcome, CanonicalPayloadEncoding, CaseDefinitionDigestMaterial,
+    DispositionCounts, EvidenceMode, EvidenceReferenceKind, EvidenceRequirement,
+    ImplementationState, MissingReceiptDisposition, NativeProducerMode, OperatingSystem,
+    PlatformMatrix, PlatformReceipt, PlatformStatus, PlatformTarget, ReadinessClassification,
+    ReceiptKind, RegistryEmptyPolicy, RunnerRegistration, SignatureAlgorithm,
+    SignaturePayloadProjection, SupportClass,
+};
+use crate::signature::{
+    decode_lower_hex_exact, signature_digest, verification_key_digest, verify_ed25519,
 };
 
-pub const EXPECTED_SOURCE_COMMIT: &str = "cc662d53d55216b32be43afdc61e0195f9e5659f";
+pub const EXPECTED_SOURCE_COMMIT: &str = "5991c80d2bf7b072f45621b03f55a7cf4b7e555f";
 pub const EXPECTED_MATRIX_SCHEMA_VERSION: &str = "hartevo-platform-matrix/v2";
-pub const EXPECTED_MATRIX_VERSION: &str = "i-01b-native-receipt-matrix/2026-08-13-v2";
+pub const EXPECTED_MATRIX_VERSION: &str = "i-01c-authenticated-receipt-signature/2026-08-13-v2";
 pub const MATRIX_V2_SHA256: &str =
-    "6384d8b7e60a73c57757d0ea7920df911c254a92180549390542c8540792dbaa";
+    "61add9931a55658caa7c2ccb3694686341dca27a31d087cef885c75bd977c13d";
 pub const EXPECTED_RECEIPT_SCHEMA_VERSION: &str = "hartevo-platform-native-receipt/v2";
 pub const RECEIPT_SCHEMA_V2_URI: &str =
     "https://hartevo.local/contracts/platform/receipt.schema.v2.json";
 pub const RECEIPT_SCHEMA_V2_SHA256: &str =
-    "28dd733c2456da23eb9782cb666abb3b6fea1b41f3227129e25f3ece7b20d65e";
+    "f1142ff4ca9b0a6723ac285e9f0b197dc3e02914161998a7518aa861f2a8c1b8";
 pub const VALIDATION_SCHEMA_VERSION: &str = "hartevo-platform-native-receipt-validation/v2";
 pub const INVENTORY_AUTHORITY: &str = "platform_inventory_only";
 pub const RELEASE_DECISION: &str = "NOT_EVALUATED";
 pub const EXPECTED_REPOSITORY_ID: &str = "tangpingqingwa/hartevo-desktop";
 pub const PRODUCER_READINESS: &str = "BLOCKED_ENV";
 pub const NATIVE_RECEIPT_EMISSION_ALLOWED: bool = false;
-pub const SIGNATURE_VERIFIER_AVAILABLE: bool = false;
+pub const SIGNATURE_VERIFIER_AVAILABLE: bool = true;
 pub const HOST_ATTESTATION_VERIFIER_AVAILABLE: bool = false;
+pub const PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE: bool = false;
 
 const EXPECTED_BLOCKED_ENV_COUNT: usize = 16;
 const EXPECTED_NOT_IMPLEMENTED_COUNT: usize = 25;
@@ -224,11 +232,11 @@ const EXPECTED_READINESS_BLOCKERS: &[(&str, ReadinessClassification)] = &[
         "NATIVE_HOST_ATTESTATION_UNAVAILABLE",
         ReadinessClassification::BlockedEnv,
     ),
-    ("RUNNER_REGISTRY_EMPTY", ReadinessClassification::BlockedEnv),
     (
-        "RUNNER_SIGNATURE_VERIFIER_NOT_IMPLEMENTED",
+        "NONCE_REPLAY_GUARD_NOT_IMPLEMENTED",
         ReadinessClassification::NotImplemented,
     ),
+    ("RUNNER_REGISTRY_EMPTY", ReadinessClassification::BlockedEnv),
 ];
 
 pub fn validate_matrix(
@@ -259,7 +267,7 @@ pub fn validate_matrix(
     validate_git_commit(repository_root, &matrix.source_commit)?;
     ensure!(
         matrix.evidence_mode == EvidenceMode::SourceAuditBaseline,
-        "I-01B must preserve source-audit inventory authority"
+        "I-01C must preserve source-audit inventory authority"
     );
     ensure!(
         !matrix.release_eligible,
@@ -267,11 +275,11 @@ pub fn validate_matrix(
     );
     ensure!(
         matrix.native_receipt_count == 0,
-        "I-01B contract-only preflight cannot claim native receipts"
+        "I-01C authenticated verifier cannot claim native receipts"
     );
     ensure!(
         matrix.allowed_runners.is_empty(),
-        "I-01B must remain fail-closed with an empty runner registry"
+        "I-01C must remain fail-closed with an empty runner registry"
     );
     validate_native_producer_policy(matrix)?;
     validate_readiness_blockers(matrix)?;
@@ -305,7 +313,7 @@ pub fn validate_matrix(
             && recomputed.fail == 0
             && recomputed.blocked_env == EXPECTED_BLOCKED_ENV_COUNT
             && recomputed.not_implemented == EXPECTED_NOT_IMPLEMENTED_COUNT,
-        "I-01B must preserve 0 PASS / 0 FAIL / 16 BLOCKED_ENV / 25 NOT_IMPLEMENTED"
+        "I-01C must preserve 0 PASS / 0 FAIL / 16 BLOCKED_ENV / 25 NOT_IMPLEMENTED"
     );
     Ok(MatrixValidation {
         counts: recomputed,
@@ -331,12 +339,17 @@ fn validate_native_producer_policy(matrix: &PlatformMatrix) -> Result<()> {
             && policy.trusted_registry_required
             && policy.runner_signature_required
             && policy.signature_algorithm == SignatureAlgorithm::Ed25519
-            && !policy.signature_verifier_available
+            && policy.signature_verifier_available
             && !policy.host_attestation_verifier_available
             && policy.real_host_required
             && policy.content_free
+            && policy.canonical_payload_encoding == CanonicalPayloadEncoding::HartevoSortedJsonV1
+            && policy.signature_payload_projection
+                == SignaturePayloadProjection::ReceiptWithoutSignatureAndRunnerSignatureEvidenceV1
             && policy.challenge_nonce_digest_required
+            && !policy.persistent_nonce_replay_guard_available
             && policy.max_challenge_age_seconds == 300
+            && policy.max_receipt_age_seconds == 600
             && policy.max_run_duration_seconds == 3600
             && policy.signature_payload_domain == "hartevo-platform-native-receipt-signature/v2"
             && policy.preflight_evidence_kinds == EXPECTED_PREFLIGHT_EVIDENCE_KINDS
@@ -344,8 +357,9 @@ fn validate_native_producer_policy(matrix: &PlatformMatrix) -> Result<()> {
         "native producer policy is not the frozen fail-closed contract"
     );
     ensure!(
-        !SIGNATURE_VERIFIER_AVAILABLE
+        SIGNATURE_VERIFIER_AVAILABLE
             && !HOST_ATTESTATION_VERIFIER_AVAILABLE
+            && !PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE
             && !NATIVE_RECEIPT_EMISSION_ALLOWED,
         "compiled verifier capabilities cannot silently enable native receipts"
     );
@@ -374,15 +388,14 @@ fn validate_readiness_blockers(matrix: &PlatformMatrix) -> Result<()> {
 }
 
 fn derive_runner_registry_digest(matrix: &PlatformMatrix) -> Result<String> {
-    ensure!(
-        matrix.allowed_runners.is_empty(),
-        "v2 contract cannot derive an authenticated non-empty registry without signature support"
-    );
-    let material = format!(
-        "{RUNNER_REGISTRY_DIGEST_DOMAIN}\nrepositoryId={}\nsourceCommit={}\nepoch={}\nrunnerCount=0\n",
-        matrix.repository_id, matrix.source_commit, matrix.runner_registry_epoch
-    );
-    Ok(sha256_hex(material.as_bytes()))
+    let material = serde_json::json!({
+        "repositoryId": matrix.repository_id,
+        "sourceCommit": matrix.source_commit,
+        "epoch": matrix.runner_registry_epoch,
+        "allowedRunners": matrix.allowed_runners,
+    });
+    sha256_domain_canonical_json(RUNNER_REGISTRY_DIGEST_DOMAIN, &material)
+        .context("serializing runner registry digest material")
 }
 
 fn validate_receipt_policy(matrix: &PlatformMatrix) -> Result<()> {
@@ -807,9 +820,18 @@ pub fn validate_receipt_schema(
             && bool_at(schema, "/x-hartevo-policy/trustedRunnerRegistryRequired")? == Some(true)
             && bool_at(schema, "/x-hartevo-policy/runnerSignatureRequired")? == Some(true)
             && bool_at(schema, "/x-hartevo-policy/actualHostAttestationRequired")? == Some(true)
-            && bool_at(schema, "/x-hartevo-policy/signatureVerifierAvailable")? == Some(false)
+            && bool_at(schema, "/x-hartevo-policy/signatureVerifierAvailable")? == Some(true)
             && bool_at(schema, "/x-hartevo-policy/hostAttestationVerifierAvailable")?
-                == Some(false),
+                == Some(false)
+            && string_at(schema, "/x-hartevo-policy/canonicalPayloadEncoding")?
+                == "hartevo_sorted_json/v1"
+            && string_at(schema, "/x-hartevo-policy/signaturePayloadProjection")?
+                == "receipt_without_signature_and_runner_signature_evidence/v1"
+            && string_at(schema, "/x-hartevo-policy/admissionTimeSource")? == "validator_clock_utc"
+            && bool_at(
+                schema,
+                "/x-hartevo-policy/persistentNonceReplayGuardAvailable"
+            )? == Some(false),
         "receipt schema inventory-only authority changed"
     );
     Ok(())
@@ -929,6 +951,7 @@ fn validate_v2_schema_shape(schema: &Value) -> Result<()> {
             "evidenceArtifact",
             "evidenceQualifiers",
             "evidenceReference",
+            "ed25519Signature",
             "nativeEvidenceQualifiers",
             "productionBinding",
             "receiptSignature",
@@ -1079,6 +1102,27 @@ pub fn validate_receipt(
     matrix_digest: &str,
     receipt_schema_digest: &str,
 ) -> Result<ReceiptValidationSummary> {
+    validate_receipt_at(
+        receipt,
+        receipt_bytes,
+        matrix,
+        matrix_validation,
+        matrix_digest,
+        receipt_schema_digest,
+        Utc::now().fixed_offset(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_receipt_at(
+    receipt: &PlatformReceipt,
+    receipt_bytes: &[u8],
+    matrix: &PlatformMatrix,
+    matrix_validation: &MatrixValidation,
+    matrix_digest: &str,
+    receipt_schema_digest: &str,
+    admission_time: DateTime<chrono::FixedOffset>,
+) -> Result<ReceiptValidationSummary> {
     validate_receipt_identity(receipt, matrix, matrix_digest, receipt_schema_digest)?;
     let case = matrix
         .cases
@@ -1107,19 +1151,27 @@ pub fn validate_receipt(
     );
 
     let (started_at, completed_at) = validate_receipt_time_window(receipt, matrix)?;
-    validate_challenge(receipt, matrix, started_at, completed_at)?;
+    validate_challenge(receipt, matrix, started_at, completed_at, admission_time)?;
     validate_artifact_graph(receipt, started_at, completed_at)?;
     validate_evidence_references(receipt, matrix)?;
     validate_actual_host(receipt, target, matrix, started_at)?;
     validate_production_binding(receipt, case, matrix_validation)?;
-    validate_signature_envelope(receipt, matrix)?;
     validate_receipt_common_safety(receipt)?;
     validate_status_semantics(receipt, case)?;
 
-    validate_runner_authorization(receipt, matrix, started_at, completed_at)?;
+    let runner =
+        validate_runner_authorization(receipt, matrix, started_at, completed_at, admission_time)?;
     ensure!(
         SIGNATURE_VERIFIER_AVAILABLE && matrix.native_producer_policy.signature_verifier_available,
         "RUNNER_SIGNATURE_VERIFIER_NOT_IMPLEMENTED"
+    );
+    validate_signature_envelope(receipt, matrix, runner)?;
+    ensure!(
+        PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE
+            && matrix
+                .native_producer_policy
+                .persistent_nonce_replay_guard_available,
+        "NONCE_REPLAY_GUARD_NOT_IMPLEMENTED"
     );
     ensure!(
         HOST_ATTESTATION_VERIFIER_AVAILABLE
@@ -1214,33 +1266,72 @@ fn validate_challenge(
     matrix: &PlatformMatrix,
     started_at: DateTime<chrono::FixedOffset>,
     completed_at: DateTime<chrono::FixedOffset>,
+    admission_time: DateTime<chrono::FixedOffset>,
 ) -> Result<()> {
-    let challenge = &receipt.challenge_binding;
+    validate_challenge_binding(
+        &receipt.challenge_binding,
+        matrix,
+        started_at,
+        completed_at,
+        admission_time,
+    )
+}
+
+fn validate_challenge_binding(
+    challenge: &crate::model::ChallengeBinding,
+    matrix: &PlatformMatrix,
+    started_at: DateTime<chrono::FixedOffset>,
+    completed_at: DateTime<chrono::FixedOffset>,
+    admission_time: DateTime<chrono::FixedOffset>,
+) -> Result<()> {
+    validate_machine_token(&challenge.challenge_id, "challengeId")?;
+    let nonce = decode_lower_hex_exact(&challenge.nonce_hex, 32, "challenge nonceHex")?;
     validate_digest(&challenge.nonce_digest, "challenge nonceDigest")?;
     validate_digest(&challenge.issuer_digest, "challenge issuerDigest")?;
+    ensure!(
+        challenge.nonce_digest == sha256_hex(&nonce),
+        "challenge nonceDigest does not match nonceHex"
+    );
     let issued_at = parse_utc_rfc3339(&challenge.issued_at, "challenge issuedAt")?;
     let expires_at = parse_utc_rfc3339(&challenge.expires_at, "challenge expiresAt")?;
     ensure!(
-        issued_at <= started_at && completed_at <= expires_at && issued_at < expires_at,
+        issued_at <= started_at
+            && started_at <= completed_at
+            && completed_at <= admission_time
+            && admission_time <= expires_at
+            && issued_at < expires_at,
         "receipt is outside its challenge validity window"
     );
     let challenge_age = started_at.signed_duration_since(issued_at).num_seconds();
+    let challenge_lifetime = expires_at.signed_duration_since(issued_at).num_seconds();
+    let receipt_age = admission_time
+        .signed_duration_since(completed_at)
+        .num_seconds();
     ensure!(
         challenge_age >= 0
             && u64::try_from(challenge_age).is_ok_and(|seconds| {
                 seconds <= matrix.native_producer_policy.max_challenge_age_seconds
+            })
+            && challenge_lifetime > 0
+            && u64::try_from(challenge_lifetime).is_ok_and(|seconds| {
+                seconds <= matrix.native_producer_policy.max_challenge_age_seconds
+            })
+            && receipt_age >= 0
+            && u64::try_from(receipt_age).is_ok_and(|seconds| {
+                seconds <= matrix.native_producer_policy.max_receipt_age_seconds
             }),
         "challenge is stale"
     );
     Ok(())
 }
 
-fn validate_runner_authorization(
+fn validate_runner_authorization<'a>(
     receipt: &PlatformReceipt,
-    matrix: &PlatformMatrix,
+    matrix: &'a PlatformMatrix,
     started_at: DateTime<chrono::FixedOffset>,
     completed_at: DateTime<chrono::FixedOffset>,
-) -> Result<()> {
+    admission_time: DateTime<chrono::FixedOffset>,
+) -> Result<&'a RunnerRegistration> {
     validate_native_admission(receipt.status, receipt.receipt_kind, matrix)?;
     let binding = &receipt.runner_binding;
     validate_machine_token(&binding.runner_id, "runnerId")?;
@@ -1262,6 +1353,7 @@ fn validate_runner_authorization(
         .iter()
         .find(|runner| runner.runner_id == binding.runner_id)
         .context("receipt runner is unknown")?;
+    validate_runner_registration_shape(runner)?;
     ensure!(
         runner.runner_identity_digest == binding.runner_identity_digest
             && runner.registry_epoch == binding.registry_epoch
@@ -1272,15 +1364,92 @@ fn validate_runner_authorization(
             && runner.allowed_targets.contains(&receipt.target_id)
             && runner
                 .allowed_host_identity_digests
-                .contains(&receipt.actual_host.host_identity_digest),
-        "runner registration does not authorize this receipt/target/host"
+                .contains(&receipt.actual_host.host_identity_digest)
+            && runner
+                .allowed_challenge_issuer_digests
+                .contains(&receipt.challenge_binding.issuer_digest),
+        "runner registration does not authorize this receipt/target/host/challenge issuer"
     );
+    validate_runner_registration_window(runner, started_at, completed_at, admission_time)?;
+    Ok(runner)
+}
+
+fn validate_runner_registration_window(
+    runner: &RunnerRegistration,
+    started_at: DateTime<chrono::FixedOffset>,
+    completed_at: DateTime<chrono::FixedOffset>,
+    admission_time: DateTime<chrono::FixedOffset>,
+) -> Result<()> {
     let valid_from = parse_utc_rfc3339(&runner.valid_from, "runner validFrom")?;
     let valid_until = parse_utc_rfc3339(&runner.valid_until, "runner validUntil")?;
     ensure!(
-        valid_from <= started_at && completed_at < valid_until,
+        valid_from <= started_at && completed_at < valid_until && admission_time < valid_until,
         "receipt is outside runner validity"
     );
+    if let Some(revocation) = &runner.revocation {
+        let revoked_at = parse_utc_rfc3339(&revocation.revoked_at, "runner revokedAt")?;
+        ensure!(
+            admission_time < revoked_at && completed_at < revoked_at,
+            "RUNNER_SIGNING_KEY_REVOKED"
+        );
+    }
+    Ok(())
+}
+
+fn validate_runner_registration_shape(runner: &RunnerRegistration) -> Result<()> {
+    validate_machine_token(&runner.runner_id, "runner registration id")?;
+    for (value, label) in [
+        (&runner.runner_identity_digest, "runner identity digest"),
+        (&runner.signing_key_digest, "runner signing key digest"),
+        (
+            &runner.producer_binary_digest,
+            "runner producer binary digest",
+        ),
+    ] {
+        validate_digest(value, label)?;
+    }
+    ensure!(
+        runner.registry_epoch > 0 && runner.signature_algorithm == SignatureAlgorithm::Ed25519,
+        "runner registration epoch or signature algorithm is invalid"
+    );
+    ensure!(
+        verification_key_digest(&runner.verification_key_hex)? == runner.signing_key_digest,
+        "runner signing key digest does not match its Ed25519 verification key"
+    );
+    ensure!(
+        !runner.allowed_receipt_kinds.is_empty()
+            && runner
+                .allowed_receipt_kinds
+                .windows(2)
+                .all(|window| window[0] < window[1]),
+        "runner receipt-kind allowlist must be sorted and unique"
+    );
+    validate_sorted_unique_tokens(&runner.allowed_targets, "runner target allowlist")?;
+    validate_sorted_unique_digests(
+        &runner.allowed_host_identity_digests,
+        "runner host allowlist",
+    )?;
+    validate_sorted_unique_digests(
+        &runner.allowed_challenge_issuer_digests,
+        "runner challenge issuer allowlist",
+    )?;
+    ensure!(
+        !runner.allowed_targets.is_empty()
+            && !runner.allowed_host_identity_digests.is_empty()
+            && !runner.allowed_challenge_issuer_digests.is_empty(),
+        "runner authorization allowlists cannot be empty"
+    );
+    let valid_from = parse_utc_rfc3339(&runner.valid_from, "runner validFrom")?;
+    let valid_until = parse_utc_rfc3339(&runner.valid_until, "runner validUntil")?;
+    ensure!(valid_from < valid_until, "runner validity window is empty");
+    if let Some(revocation) = &runner.revocation {
+        validate_blocker_code(&revocation.reason_code)?;
+        let revoked_at = parse_utc_rfc3339(&revocation.revoked_at, "runner revokedAt")?;
+        ensure!(
+            valid_from <= revoked_at && revoked_at < valid_until,
+            "runner revocation is outside key validity"
+        );
+    }
     Ok(())
 }
 
@@ -1374,40 +1543,40 @@ fn validate_production_binding(
     )
 }
 
-fn validate_signature_envelope(receipt: &PlatformReceipt, matrix: &PlatformMatrix) -> Result<()> {
+fn validate_signature_envelope(
+    receipt: &PlatformReceipt,
+    matrix: &PlatformMatrix,
+    runner: &RunnerRegistration,
+) -> Result<()> {
     let signature = &receipt.signature;
     ensure!(
         signature.algorithm == SignatureAlgorithm::Ed25519
             && signature.algorithm == receipt.runner_binding.signature_algorithm
-            && signature.key_digest == receipt.runner_binding.signing_key_digest,
+            && signature.key_digest == receipt.runner_binding.signing_key_digest
+            && signature.key_digest == runner.signing_key_digest,
         "receipt signature key/algorithm binding mismatch"
     );
     validate_digest(&signature.key_digest, "signature keyDigest")?;
     validate_digest(&signature.signed_payload_digest, "signedPayloadDigest")?;
     validate_digest(&signature.signature_digest, "signatureDigest")?;
-    let mut unsigned = serde_json::to_value(receipt).context("serializing signed receipt")?;
-    unsigned
-        .as_object_mut()
-        .context("serialized receipt must be an object")?
-        .remove("signature")
-        .context("serialized receipt signature field missing")?;
-    for field in ["artifacts", "evidenceReferences"] {
-        unsigned
-            .get_mut(field)
-            .and_then(Value::as_array_mut)
-            .with_context(|| format!("serialized receipt {field} must be an array"))?
-            .retain(|entry| {
-                entry.get("kind").and_then(Value::as_str) != Some("runner_signature_digest")
-            });
-    }
     ensure!(
-        signature.signed_payload_digest
-            == sha256_domain_canonical_json(
-                &matrix.native_producer_policy.signature_payload_domain,
-                &unsigned,
-            )?,
+        signature.signature_digest == signature_digest(&signature.signature_hex)?,
+        "signatureDigest does not match the Ed25519 signature bytes"
+    );
+    ensure!(
+        signature.key_digest == verification_key_digest(&runner.verification_key_hex)?,
+        "signature keyDigest does not match the registered verification key"
+    );
+    let message = canonical_receipt_signature_message(receipt, matrix)?;
+    ensure!(
+        signature.signed_payload_digest == sha256_hex(&message),
         "signedPayloadDigest does not cover the canonical receipt envelope"
     );
+    verify_ed25519(
+        &runner.verification_key_hex,
+        &message,
+        &signature.signature_hex,
+    )?;
     validate_digest_kind(
         receipt,
         EvidenceReferenceKind::ProducerBinary,
@@ -1421,6 +1590,47 @@ fn validate_signature_envelope(receipt: &PlatformReceipt, matrix: &PlatformMatri
         EvidenceReferenceKind::RunnerSignature,
         "runner signature",
     )
+}
+
+fn canonical_receipt_signature_message(
+    receipt: &PlatformReceipt,
+    matrix: &PlatformMatrix,
+) -> Result<Vec<u8>> {
+    ensure!(
+        matrix.native_producer_policy.signature_payload_projection
+            == SignaturePayloadProjection::ReceiptWithoutSignatureAndRunnerSignatureEvidenceV1,
+        "signature payload projection is unsupported"
+    );
+    let receipt_value = serde_json::to_value(receipt).context("serializing signed receipt")?;
+    let payload = project_detached_signature_payload(receipt_value)?;
+    domain_canonical_json_bytes(
+        &matrix.native_producer_policy.signature_payload_domain,
+        &payload,
+    )
+    .context("encoding canonical receipt signature payload")
+}
+
+fn project_detached_signature_payload(mut receipt_value: Value) -> Result<Value> {
+    receipt_value
+        .as_object_mut()
+        .context("serialized receipt must be an object")?
+        .remove("signature")
+        .context("serialized receipt signature field missing")?;
+    for field in ["artifacts", "evidenceReferences"] {
+        let entries = receipt_value
+            .get_mut(field)
+            .and_then(Value::as_array_mut)
+            .with_context(|| format!("serialized receipt {field} must be an array"))?;
+        let before = entries.len();
+        entries.retain(|entry| {
+            entry.get("kind").and_then(Value::as_str) != Some("runner_signature_digest")
+        });
+        ensure!(
+            before == entries.len() + 1,
+            "signature payload projection requires exactly one runner signature {field} entry"
+        );
+    }
+    Ok(receipt_value)
 }
 
 fn validate_receipt_common_safety(receipt: &PlatformReceipt) -> Result<()> {
@@ -1781,6 +1991,21 @@ fn validate_sorted_unique_tokens(values: &[String], label: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_sorted_unique_digests(values: &[String], label: &str) -> Result<()> {
+    let mut prior = None;
+    for value in values {
+        validate_digest(value, label)?;
+        if let Some(previous) = prior {
+            ensure!(
+                previous < value.as_str(),
+                "{label} must be sorted and unique"
+            );
+        }
+        prior = Some(value.as_str());
+    }
+    Ok(())
+}
+
 fn validate_sorted_unique_blocker_codes(values: &[String], label: &str) -> Result<()> {
     let mut prior = None;
     for value in values {
@@ -1922,16 +2147,24 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use ring::signature::{Ed25519KeyPair, KeyPair};
     use serde_json::{Value, json};
 
     use super::{
-        EXPECTED_SOURCE_COMMIT, MATRIX_V2_SHA256, RECEIPT_SCHEMA_V2_SHA256, case_definition_digest,
-        parse_utc_rfc3339, validate_content_free_receipt_json, validate_matrix,
+        EXPECTED_SOURCE_COMMIT, MATRIX_V2_SHA256, PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE,
+        RECEIPT_SCHEMA_V2_SHA256, SIGNATURE_VERIFIER_AVAILABLE, case_definition_digest,
+        derive_runner_registry_digest, parse_utc_rfc3339, project_detached_signature_payload,
+        validate_challenge_binding, validate_content_free_receipt_json, validate_matrix,
         validate_matrix_raw, validate_native_admission, validate_receipt_schema,
+        validate_runner_registration_shape, validate_runner_registration_window,
         validate_v2_schema_shape,
     };
-    use crate::digest::sha256_hex;
-    use crate::model::{PlatformMatrix, PlatformStatus, ReceiptKind, parse_strict_json};
+    use crate::digest::{domain_canonical_json_bytes, sha256_hex};
+    use crate::model::{
+        ChallengeBinding, PlatformMatrix, PlatformStatus, ReceiptKind, RunnerRegistration,
+        RunnerRevocation, SignatureAlgorithm, parse_strict_json,
+    };
+    use crate::signature::verification_key_digest;
 
     const MATRIX: &[u8] = include_bytes!("../../../../contracts/platform/matrix.v2.json");
     const RECEIPT_SCHEMA: &[u8] =
@@ -1943,6 +2176,28 @@ mod tests {
 
     fn matrix() -> PlatformMatrix {
         parse_strict_json::<PlatformMatrix>(MATRIX).expect("strict v2 matrix")
+    }
+
+    fn runner_registration() -> RunnerRegistration {
+        let signer = Ed25519KeyPair::from_seed_unchecked(&[43; 32]).expect("fixed test signer");
+        let verification_key_hex = hex::encode(signer.public_key().as_ref());
+        RunnerRegistration {
+            runner_id: "runner_01".to_owned(),
+            runner_identity_digest: "11".repeat(32),
+            registry_epoch: 1,
+            signing_key_digest: verification_key_digest(&verification_key_hex)
+                .expect("verification key digest"),
+            verification_key_hex,
+            signature_algorithm: SignatureAlgorithm::Ed25519,
+            producer_binary_digest: "22".repeat(32),
+            valid_from: "2026-08-13T00:00:00Z".to_owned(),
+            valid_until: "2026-08-13T01:00:00Z".to_owned(),
+            allowed_receipt_kinds: vec![ReceiptKind::NativeExecution],
+            allowed_targets: vec!["macos-aarch64".to_owned()],
+            allowed_host_identity_digests: vec!["33".repeat(32)],
+            allowed_challenge_issuer_digests: vec!["44".repeat(32)],
+            revocation: None,
+        }
     }
 
     #[test]
@@ -1957,6 +2212,14 @@ mod tests {
         assert_eq!(matrix.runner_registry_epoch, 0);
         assert_eq!(matrix.native_receipt_count, 0);
         assert_eq!(matrix.readiness_blockers.len(), 3);
+        assert!(SIGNATURE_VERIFIER_AVAILABLE);
+        assert!(matrix.native_producer_policy.signature_verifier_available);
+        assert!(!PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE);
+        assert!(
+            !matrix
+                .native_producer_policy
+                .persistent_nonce_replay_guard_available
+        );
         assert_eq!(validation.counts.pass, 0);
         assert_eq!(validation.counts.fail, 0);
         assert_eq!(validation.counts.blocked_env, 16);
@@ -2024,6 +2287,10 @@ mod tests {
         constant["properties"]["authority"]["const"] = json!("release_authority");
         mutations.push(("authority const", constant));
 
+        let mut projection = baseline.clone();
+        projection["x-hartevo-policy"]["signaturePayloadProjection"] = json!("caller_selected/v1");
+        mutations.push(("signature payload projection", projection));
+
         let mut root_closure = baseline;
         root_closure["additionalProperties"] = json!(true);
         mutations.push(("root closure", root_closure));
@@ -2070,7 +2337,7 @@ mod tests {
     #[test]
     fn worktree_only_source_binding_cannot_satisfy_source_commit() {
         let mut matrix = matrix();
-        let worktree_only = "contracts/platform/matrix.v2.json";
+        let worktree_only = "hartevo-rs/eval/examples/hartevo-platform-native-receipt/signature.rs";
         assert!(repository_root().join(worktree_only).is_file());
         matrix.cases[0].source_bindings[0].path = worktree_only.to_owned();
         matrix.cases[0].source_bindings[0].mode = "100644".to_owned();
@@ -2145,6 +2412,136 @@ mod tests {
     }
 
     #[test]
+    fn runner_key_shape_validity_and_revocation_fail_closed() {
+        let runner = runner_registration();
+        validate_runner_registration_shape(&runner).expect("active runner key shape");
+        validate_runner_registration_window(
+            &runner,
+            parse_utc_rfc3339("2026-08-13T00:01:00Z", "started").expect("started"),
+            parse_utc_rfc3339("2026-08-13T00:02:00Z", "completed").expect("completed"),
+            parse_utc_rfc3339("2026-08-13T00:03:00Z", "admission").expect("admission"),
+        )
+        .expect("runner is active");
+
+        let mut wrong_digest = runner.clone();
+        wrong_digest.signing_key_digest = "ff".repeat(32);
+        validate_runner_registration_shape(&wrong_digest)
+            .expect_err("caller-selected key digest must fail");
+
+        let mut revoked = runner;
+        revoked.revocation = Some(RunnerRevocation {
+            revoked_at: "2026-08-13T00:02:30Z".to_owned(),
+            reason_code: "RUNNER_KEY_COMPROMISED".to_owned(),
+        });
+        validate_runner_registration_shape(&revoked).expect("typed revocation shape");
+        let error = validate_runner_registration_window(
+            &revoked,
+            parse_utc_rfc3339("2026-08-13T00:01:00Z", "started").expect("started"),
+            parse_utc_rfc3339("2026-08-13T00:02:00Z", "completed").expect("completed"),
+            parse_utc_rfc3339("2026-08-13T00:03:00Z", "admission").expect("admission"),
+        )
+        .expect_err("revoked key must fail admission");
+        assert_eq!(error.to_string(), "RUNNER_SIGNING_KEY_REVOKED");
+    }
+
+    #[test]
+    fn nonce_preimage_and_admission_freshness_are_closed() {
+        let matrix = matrix();
+        let nonce_hex = "55".repeat(32);
+        let challenge = ChallengeBinding {
+            challenge_id: "challenge_01".to_owned(),
+            nonce_digest: sha256_hex(&hex::decode(&nonce_hex).expect("nonce")),
+            nonce_hex,
+            issuer_digest: "44".repeat(32),
+            issued_at: "2026-08-13T00:00:00Z".to_owned(),
+            expires_at: "2026-08-13T00:05:00Z".to_owned(),
+        };
+        let started = parse_utc_rfc3339("2026-08-13T00:01:00Z", "started").expect("started");
+        let completed = parse_utc_rfc3339("2026-08-13T00:02:00Z", "completed").expect("completed");
+        let admission = parse_utc_rfc3339("2026-08-13T00:03:00Z", "admission").expect("admission");
+        validate_challenge_binding(&challenge, &matrix, started, completed, admission)
+            .expect("fresh bound nonce");
+
+        let mut tampered = challenge.clone();
+        tampered.nonce_digest = "66".repeat(32);
+        validate_challenge_binding(&tampered, &matrix, started, completed, admission)
+            .expect_err("nonce digest mismatch must fail");
+
+        let stale = parse_utc_rfc3339("2026-08-13T00:05:01Z", "admission").expect("admission");
+        validate_challenge_binding(&challenge, &matrix, started, completed, stale)
+            .expect_err("expired challenge must fail");
+    }
+
+    #[test]
+    fn runner_registry_digest_covers_key_and_revocation_state() {
+        let mut with_runner = matrix();
+        with_runner.runner_registry_epoch = 1;
+        with_runner.allowed_runners.push(runner_registration());
+        let active = derive_runner_registry_digest(&with_runner).expect("active registry digest");
+
+        with_runner.allowed_runners[0].revocation = Some(RunnerRevocation {
+            revoked_at: "2026-08-13T00:30:00Z".to_owned(),
+            reason_code: "RUNNER_KEY_RETIRED".to_owned(),
+        });
+        let revoked = derive_runner_registry_digest(&with_runner).expect("revoked registry digest");
+        assert_ne!(active, revoked);
+    }
+
+    #[test]
+    fn canonical_projection_excludes_only_detached_signature_evidence() {
+        let receipt = json!({
+            "receiptId": "receipt_01",
+            "status": "PASS",
+            "signature": {
+                "algorithm": "ed25519",
+                "signatureHex": "aa"
+            },
+            "artifacts": [
+                {"artifactId": "native", "kind": "native_execution_digest", "digest": "11"},
+                {"artifactId": "signature", "kind": "runner_signature_digest", "digest": "22"}
+            ],
+            "evidenceReferences": [
+                {"referenceId": "native", "kind": "native_execution_digest", "digest": "11"},
+                {"referenceId": "signature", "kind": "runner_signature_digest", "digest": "22"}
+            ]
+        });
+        let projected = project_detached_signature_payload(receipt.clone()).expect("projection");
+        assert!(projected.get("signature").is_none());
+        assert_eq!(
+            projected["artifacts"].as_array().expect("artifacts").len(),
+            1
+        );
+        assert_eq!(
+            projected["evidenceReferences"]
+                .as_array()
+                .expect("references")
+                .len(),
+            1
+        );
+        let baseline = domain_canonical_json_bytes("receipt/v2", &projected).expect("message");
+
+        let mut detached_tamper = receipt.clone();
+        detached_tamper["signature"]["signatureHex"] = json!("bb");
+        detached_tamper["artifacts"][1]["digest"] = json!("33");
+        detached_tamper["evidenceReferences"][1]["digest"] = json!("33");
+        let detached_projection =
+            project_detached_signature_payload(detached_tamper).expect("detached projection");
+        assert_eq!(
+            baseline,
+            domain_canonical_json_bytes("receipt/v2", &detached_projection).expect("message")
+        );
+
+        let mut payload_tamper = receipt;
+        payload_tamper["receiptId"] = json!("receipt_02");
+        let payload_projection =
+            project_detached_signature_payload(payload_tamper).expect("payload projection");
+        assert_ne!(
+            baseline,
+            domain_canonical_json_bytes("receipt/v2", &payload_projection).expect("message")
+        );
+    }
+
+    #[test]
     fn empty_runner_registry_rejects_all_native_statuses() {
         let matrix = matrix();
         for (status, kind) in [
@@ -2183,9 +2580,16 @@ mod tests {
         let mut signature = matrix();
         signature
             .native_producer_policy
-            .signature_verifier_available = true;
+            .signature_verifier_available = false;
         validate_matrix(&signature, &repository_root())
-            .expect_err("signature verification cannot be self-reported");
+            .expect_err("compiled signature verification cannot be disabled by contract drift");
+
+        let mut replay = matrix();
+        replay
+            .native_producer_policy
+            .persistent_nonce_replay_guard_available = true;
+        validate_matrix(&replay, &repository_root())
+            .expect_err("nonce replay guard cannot be self-reported");
 
         let mut host = matrix();
         host.native_producer_policy
