@@ -161,10 +161,19 @@ pub use work_product::{
     WorkProductDependencies, WorkProductManifest, WorkProductManifestError, WorkProductPreview,
 };
 pub use work_product_outcome::{
-    AdoptionDecision, AdoptionDecisionKind, OutcomeClassification, OutcomeLink,
+    AdoptableResultMissionConsumer, AdoptableResultPluginProvider, AdoptableResultPluginService,
+    AdoptionDecision, AdoptionDecisionKind, ContextualWorkProductOutcomeSummary,
+    MissionWorkProductAdoptionConsumer, OutcomeClassification, OutcomeLink,
     OutcomeVerificationKind, ResultClassification, ResultCounterevidence, ResultPacket,
+    WORK_PRODUCT_ADOPTION_PLUGIN_ID, WORK_PRODUCT_ADOPTION_PLUGIN_SCHEMA_VERSION,
+    WORK_PRODUCT_ADOPTION_PLUGIN_VERSION, WORK_PRODUCT_ADOPTION_SUMMARY_MEDIA_TYPE,
     WORK_PRODUCT_HANDOFF_PREVIEW_MEDIA_TYPE, WORK_PRODUCT_HANDOFF_SCHEMA_VERSION,
-    WORK_PRODUCT_HANDOFF_TYPE, WorkProductHandoffSnapshot, WorkProductOutcomeError,
+    WORK_PRODUCT_HANDOFF_TYPE, WorkProductAdoptionCommand, WorkProductAdoptionConsumerBinding,
+    WorkProductAdoptionLifecycle, WorkProductAdoptionMountRequest,
+    WorkProductAdoptionOperationKind, WorkProductAdoptionOperationRecord,
+    WorkProductAdoptionPluginCapability, WorkProductAdoptionPluginService,
+    WorkProductAdoptionProvider, WorkProductAdoptionReceipt, WorkProductAdoptionScope,
+    WorkProductAdoptionState, WorkProductHandoffSnapshot, WorkProductOutcomeError,
     WorkProductRevision,
 };
 
