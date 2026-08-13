@@ -22,6 +22,8 @@ mod locator;
 mod navigation;
 mod profile_dir;
 mod recipe;
+#[cfg(unix)]
+mod scanner;
 mod workspace;
 
 pub use action::{
@@ -55,6 +57,8 @@ pub use recipe::{
     BrowserRecipeResolvedAction, BrowserRecipeStep, BrowserRecipeStepBinding,
     BrowserRecipeTrustSnapshot, BrowserRecipeTrustStore, TrustedBrowserRecipeKey,
 };
+#[cfg(unix)]
+pub use scanner::{ProductionFileScanner, ScannerProcessLimits, ScannerReleasePin};
 pub use workspace::{
     BrowserControlState, BrowserControlTransition, BrowserIdentity, BrowserLeaseProof,
     BrowserProfile, BrowserProfileSource, BrowserProfileStatus, BrowserWorkspace,
