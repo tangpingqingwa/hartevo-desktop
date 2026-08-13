@@ -2,6 +2,7 @@
 
 mod aggregate;
 mod attribution_outcome_adoption_store;
+mod attribution_outcome_feedback_store;
 mod attribution_spine_store;
 mod authorization;
 mod browser_file_store;

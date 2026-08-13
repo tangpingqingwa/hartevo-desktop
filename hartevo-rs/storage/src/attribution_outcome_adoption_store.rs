@@ -415,7 +415,7 @@ impl ProjectStore {
         Ok(snapshot)
     }
 
-    fn replay_attribution_adoption_ledger(
+    pub(crate) fn replay_attribution_adoption_ledger(
         &self,
         project_id: &ProjectId,
         reporting_currency: CurrencyCode,
@@ -504,12 +504,24 @@ impl ProjectStore {
         Ok(ledger)
     }
 
-    fn replay_attribution_adoption_consumers(
+    pub(crate) fn replay_attribution_adoption_consumers(
         &self,
         project_id: &ProjectId,
     ) -> Result<BTreeMap<String, AttributionAdoptionConsumerRecord>, StorageError> {
+        self.replay_attribution_adoption_consumers_through(project_id, i64::MAX)
+    }
+
+    pub(crate) fn replay_attribution_adoption_consumers_through(
+        &self,
+        project_id: &ProjectId,
+        through_sequence: i64,
+    ) -> Result<BTreeMap<String, AttributionAdoptionConsumerRecord>, StorageError> {
         let mut consumers = BTreeMap::new();
-        for event in self.events_for_project(project_id)? {
+        for event in self
+            .events_for_project(project_id)?
+            .into_iter()
+            .filter(|event| event.sequence <= through_sequence)
+        {
             if matches!(
                 event.event_type.as_str(),
                 ATTRIBUTION_ADOPTION_CONSUMER_MOUNT_EVENT_TYPE

@@ -313,6 +313,39 @@ impl AttributionOutcomeCandidate {
         window: AttributionWindow,
         model_version: AttributionModelVersion,
     ) -> Result<Option<Self>, AttributionAdoptionError> {
+        Self::from_verified_ledger_with_bounds(ledger, consumer, window, model_version, None)
+    }
+
+    /// Derives a candidate only from verified events observed inside the
+    /// supplied evaluation interval. The interval is exclusive at the end,
+    /// matching the feedback window contract.
+    pub fn from_verified_ledger_in_window(
+        ledger: &AttributionLedger,
+        consumer: &AttributionAdoptionConsumer,
+        window: AttributionWindow,
+        model_version: AttributionModelVersion,
+        starts_at: DateTime<Utc>,
+        ends_at: DateTime<Utc>,
+    ) -> Result<Option<Self>, AttributionAdoptionError> {
+        if starts_at >= ends_at {
+            return Err(AttributionAdoptionError::InvalidOutcomeCandidate);
+        }
+        Self::from_verified_ledger_with_bounds(
+            ledger,
+            consumer,
+            window,
+            model_version,
+            Some((starts_at, ends_at)),
+        )
+    }
+
+    fn from_verified_ledger_with_bounds(
+        ledger: &AttributionLedger,
+        consumer: &AttributionAdoptionConsumer,
+        window: AttributionWindow,
+        model_version: AttributionModelVersion,
+        bounds: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<Option<Self>, AttributionAdoptionError> {
         consumer.validate()?;
         window.validate().map_err(|error| spine_error(&error))?;
         model_version.validate()?;
@@ -326,7 +359,7 @@ impl AttributionOutcomeCandidate {
             .replay(window.clone())
             .map_err(|error| spine_error(&error))?;
         let Some(assignment) =
-            latest_verified_assignment(ledger, &projection, &consumer.scope.mission_id)
+            latest_verified_assignment(ledger, &projection, &consumer.scope.mission_id, bounds)
         else {
             return Ok(None);
         };
@@ -807,6 +840,7 @@ fn latest_verified_assignment<'a>(
     ledger: &'a AttributionLedger,
     projection: &'a crate::AttributionProjection,
     mission_id: &MissionId,
+    bounds: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Option<&'a AttributionAssignment> {
     projection
         .assignments
@@ -818,6 +852,9 @@ fn latest_verified_assignment<'a>(
                 .find(|event| event.id == assignment.source_event_id)
                 .is_some_and(|event| {
                     event.mission_id.as_ref() == Some(mission_id)
+                        && bounds.is_none_or(|(starts_at, ends_at)| {
+                            event.observed_at >= starts_at && event.observed_at < ends_at
+                        })
                         && matches!(
                             event.provenance.origin,
                             ObservationOrigin::FirstParty | ObservationOrigin::PartnerNetwork

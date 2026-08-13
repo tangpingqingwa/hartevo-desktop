@@ -4,6 +4,7 @@
 //! kernel. They are never accepted as business truth without a domain command.
 
 mod attribution_outcome_adoption;
+mod attribution_outcome_feedback;
 mod attribution_spine;
 mod connection;
 mod context;
@@ -39,6 +40,12 @@ pub use attribution_outcome_adoption::{
     AttributionAdoptionConsumerState, AttributionAdoptionDecision, AttributionAdoptionError,
     AttributionAdoptionReceipt, AttributionAdoptionScope, AttributionAdoptionSnapshot,
     AttributionModelVersion, AttributionOutcomeCandidate, AttributionVerificationRecord,
+};
+pub use attribution_outcome_feedback::{
+    ATTRIBUTION_FEEDBACK_EVENT_TYPE, ATTRIBUTION_OUTCOME_FEEDBACK_CONTRACT_VERSION,
+    ATTRIBUTION_OUTCOME_FEEDBACK_SCHEMA_VERSION, AttributionFeedbackError,
+    AttributionFeedbackInput, AttributionFeedbackRecord, AttributionFeedbackSignal,
+    AttributionFeedbackSignalKind, AttributionFeedbackSnapshot, AttributionFeedbackWindow,
 };
 pub use attribution_spine::{
     ATTRIBUTION_SPINE_EVENT_TYPE, ATTRIBUTION_SPINE_SCHEMA_VERSION, AttributionAssignment,
