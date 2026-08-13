@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/openinterpreter/openinterpreter-native-plugin-receipt.v1.json",
+  "title": "Hartevo native OpenInterpreter provider plugin journey receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "documentType",
+    "authority",
+    "releaseDecision",
+    "sourceCommit",
+    "scope",
+    "source",
+    "selection",
+    "process",
+    "stages",
+    "durableLog",
+    "turn",
+    "result",
+    "interrupt",
+    "cleanup",
+    "oracleInput",
+    "provenance",
+    "evidenceRoot",
+    "receiptDigest"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "hartevo.openinterpreter-native-plugin-receipt/v1" },
+    "documentType": { "const": "openinterpreter_native_plugin_journey" },
+    "authority": { "const": "native_openinterpreter_local_evidence" },
+    "releaseDecision": { "const": "NOT_EVALUATED" },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "scope": { "$ref": "#/$defs/journeyScope" },
+    "source": { "$ref": "#/$defs/sourceBinding" },
+    "selection": { "$ref": "#/$defs/selectionBinding" },
+    "process": { "$ref": "#/$defs/processEvidence" },
+    "stages": { "type": "array", "minItems": 11, "items": { "$ref": "#/$defs/stageReceipt" } },
+    "durableLog": { "type": "array", "minItems": 3, "items": { "$ref": "#/$defs/durableEventReceipt" } },
+    "turn": { "$ref": "#/$defs/turnEvidence" },
+    "result": { "$ref": "#/$defs/resultEvidence" },
+    "interrupt": { "$ref": "#/$defs/interruptEvidence" },
+    "cleanup": { "$ref": "#/$defs/cleanupEvidence" },
+    "oracleInput": { "$ref": "#/$defs/oracleInput" },
+    "provenance": { "enum": ["native", "fixture", "simulator", "ignored", "blocked_env"] },
+    "evidenceRoot": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "journeyScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projectId", "missionId", "sessionId", "scopeDigest", "runtimeGeneration"],
+      "properties": {
+        "projectId": { "type": "string", "minLength": 1 },
+        "missionId": { "type": "string", "minLength": 1 },
+        "sessionId": { "type": "string", "minLength": 1 },
+        "scopeDigest": { "$ref": "#/$defs/digest" },
+        "runtimeGeneration": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "sourceBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceCommit", "runtimeCommit", "runtimeRelease", "appServerSchemaDigest", "controlPlaneContractDigest", "binaryDigest", "toolDigest", "commandDigest"],
+      "properties": {
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "runtimeCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "runtimeRelease": { "type": "string", "minLength": 1 },
+        "appServerSchemaDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "controlPlaneContractDigest": { "$ref": "#/$defs/digest" },
+        "binaryDigest": { "$ref": "#/$defs/digest" },
+        "toolDigest": { "$ref": "#/$defs/digest" },
+        "commandDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "selectionBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["serviceId", "serviceRevision", "providerId", "providerRevision", "modelId", "modelRevision", "harnessId", "harnessRevision", "endpointClass", "manifestDigest", "serviceDefinitionDigest", "catalogDigest", "configDigest", "policyDigest"],
+      "properties": {
+        "serviceId": { "const": "runtime.execution" },
+        "serviceRevision": { "const": "v1" },
+        "providerId": { "const": "openinterpreter" },
+        "providerRevision": { "$ref": "#/$defs/digest" },
+        "modelId": { "type": "string", "minLength": 1 },
+        "modelRevision": { "$ref": "#/$defs/digest" },
+        "harnessId": { "type": "string", "minLength": 1 },
+        "harnessRevision": { "$ref": "#/$defs/digest" },
+        "endpointClass": { "enum": ["responses", "chat", "messages", "local"] },
+        "manifestDigest": { "$ref": "#/$defs/digest" },
+        "serviceDefinitionDigest": { "$ref": "#/$defs/digest" },
+        "catalogDigest": { "$ref": "#/$defs/digest" },
+        "configDigest": { "$ref": "#/$defs/digest" },
+        "policyDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "processEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["processIdDigest", "observedAtEpochSeconds", "executablePathDigest", "runtimeInstanceDigest", "processBindingDigest", "binaryDigest", "runtimeGeneration"],
+      "properties": {
+        "processIdDigest": { "$ref": "#/$defs/digest" },
+        "observedAtEpochSeconds": { "type": "integer", "minimum": 1 },
+        "executablePathDigest": { "$ref": "#/$defs/digest" },
+        "runtimeInstanceDigest": { "$ref": "#/$defs/digest" },
+        "processBindingDigest": { "$ref": "#/$defs/digest" },
+        "binaryDigest": { "$ref": "#/$defs/digest" },
+        "runtimeGeneration": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "stageReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "name", "evidenceDigest"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "name": { "enum": ["initialize", "provider_selection", "model_selection", "harness_selection", "mount", "thread", "turn", "stream", "result", "interrupt", "cleanup"] },
+        "evidenceDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "durableEventReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "kind", "sourceItemIdDigest", "sourceEventDigest", "contentDigest", "contentByteCount", "eventDigest", "scopeDigest", "providerManifestDigest", "configDigest", "catalogDigest", "policyDigest"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "kind": { "enum": ["input", "assistant_delta", "assistant_result"] },
+        "sourceItemIdDigest": { "$ref": "#/$defs/digest" },
+        "sourceEventDigest": { "$ref": "#/$defs/digest" },
+        "contentDigest": { "$ref": "#/$defs/digest" },
+        "contentByteCount": { "type": "integer", "minimum": 1 },
+        "eventDigest": { "$ref": "#/$defs/digest" },
+        "scopeDigest": { "$ref": "#/$defs/digest" },
+        "providerManifestDigest": { "$ref": "#/$defs/digest" },
+        "configDigest": { "$ref": "#/$defs/digest" },
+        "catalogDigest": { "$ref": "#/$defs/digest" },
+        "policyDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "turnEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clientMessageIdDigest", "requestDigest", "responseDigest", "threadIdDigest", "turnIdDigest", "completionStatus", "turnDigest"],
+      "properties": {
+        "clientMessageIdDigest": { "$ref": "#/$defs/digest" },
+        "requestDigest": { "$ref": "#/$defs/digest" },
+        "responseDigest": { "$ref": "#/$defs/digest" },
+        "threadIdDigest": { "$ref": "#/$defs/digest" },
+        "turnIdDigest": { "$ref": "#/$defs/digest" },
+        "completionStatus": { "enum": ["completed", "interrupted"] },
+        "turnDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "resultEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "authority", "resultKind", "projectId", "missionId", "runtimeGeneration", "runtimeInstanceDigest", "runtimeCommit", "runtimeRelease", "mappingDigest", "runtimeThreadIdDigest", "runtimeTurnIdDigest", "appServerSchemaDigest", "runtimeConfigDigest", "catalogDigest", "sourceItemIdDigest", "sourceEventDigest", "contentDigest", "contentByteCount", "resultDigest"],
+      "properties": {
+        "schema": { "const": "hartevo.runtime-result-packet/v1" },
+        "authority": { "const": "local_execution_evidence" },
+        "resultKind": { "const": "agent_message" },
+        "projectId": { "type": "string", "minLength": 1 },
+        "missionId": { "type": "string", "minLength": 1 },
+        "runtimeGeneration": { "type": "integer", "minimum": 1 },
+        "runtimeInstanceDigest": { "$ref": "#/$defs/digest" },
+        "runtimeCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "runtimeRelease": { "type": "string", "minLength": 1 },
+        "mappingDigest": { "$ref": "#/$defs/digest" },
+        "runtimeThreadIdDigest": { "$ref": "#/$defs/digest" },
+        "runtimeTurnIdDigest": { "$ref": "#/$defs/digest" },
+        "appServerSchemaDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "runtimeConfigDigest": { "$ref": "#/$defs/digest" },
+        "catalogDigest": { "$ref": "#/$defs/digest" },
+        "sourceItemIdDigest": { "$ref": "#/$defs/digest" },
+        "sourceEventDigest": { "$ref": "#/$defs/digest" },
+        "contentDigest": { "$ref": "#/$defs/digest" },
+        "contentByteCount": { "type": "integer", "minimum": 1 },
+        "resultDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "interruptEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestDigest", "responseDigest", "turnIdDigest", "acknowledged", "interruptDigest"],
+      "properties": {
+        "requestDigest": { "$ref": "#/$defs/digest" },
+        "responseDigest": { "$ref": "#/$defs/digest" },
+        "turnIdDigest": { "$ref": "#/$defs/digest" },
+        "acknowledged": { "const": true },
+        "interruptDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "cleanupEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mountDigest", "pluginState", "stoppedRegistrationCount", "residualRegistrationCount", "shutdownSuccess", "shutdownForced", "exitCode", "cleanupDigest"],
+      "properties": {
+        "mountDigest": { "$ref": "#/$defs/digest" },
+        "pluginState": { "enum": ["revoked", "unmounted"] },
+        "stoppedRegistrationCount": { "type": "integer", "minimum": 1 },
+        "residualRegistrationCount": { "const": 0 },
+        "shutdownSuccess": { "const": true },
+        "shutdownForced": { "const": false },
+        "exitCode": { "const": 0 },
+        "cleanupDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "oracleInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["journeySchema", "journeyId", "sourceCommit", "projectId", "missionId", "sessionId", "runtimePluginDigest", "providerDigest", "modelDigest", "serviceDigest", "consumerId", "consumerResultDigest", "durableLogDigest", "resultDigest", "evidenceRoot", "provenance"],
+      "properties": {
+        "journeySchema": { "const": "hartevo.plugin-native-journey/v1" },
+        "journeyId": { "$ref": "#/$defs/digest" },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "projectId": { "type": "string", "minLength": 1 },
+        "missionId": { "type": "string", "minLength": 1 },
+        "sessionId": { "type": "string", "minLength": 1 },
+        "runtimePluginDigest": { "$ref": "#/$defs/digest" },
+        "providerDigest": { "$ref": "#/$defs/digest" },
+        "modelDigest": { "$ref": "#/$defs/digest" },
+        "serviceDigest": { "$ref": "#/$defs/digest" },
+        "consumerId": { "const": "hartevo-plugin-native-journey-oracle" },
+        "consumerResultDigest": { "$ref": "#/$defs/digest" },
+        "durableLogDigest": { "$ref": "#/$defs/digest" },
+        "resultDigest": { "$ref": "#/$defs/digest" },
+        "evidenceRoot": { "$ref": "#/$defs/digest" },
+        "provenance": { "const": "native" }
+      }
+    }
+  }
+}
