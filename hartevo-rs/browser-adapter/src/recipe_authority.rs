@@ -1749,6 +1749,10 @@ pub(super) enum BrowserRecipeAuthorityError {
 }
 
 #[cfg(test)]
+#[path = "real_chromium_recipe_negative_lifecycle_test.rs"]
+mod real_chromium_recipe_negative_lifecycle_test;
+
+#[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone};
     use ring::signature::{Ed25519KeyPair, KeyPair};
