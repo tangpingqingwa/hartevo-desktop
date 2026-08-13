@@ -9,7 +9,7 @@ use std::fmt;
 
 use chrono::{DateTime, Utc};
 use hartevo_domain_kernel::{MissionId, ProjectId};
-use serde::{Serialize, Serializer, ser::SerializeStruct};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use thiserror::Error;
 
 use super::{
@@ -335,7 +335,7 @@ pub enum CapabilityInvocationEventKind {
     Reopened,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityInvocationCloseReason {
     Timeout,
@@ -1302,6 +1302,26 @@ impl CapabilityInvocationLease {
         self.finish(
             CapabilityInvocationEventKind::Crashed,
             Some(CapabilityInvocationCloseReason::Crashed),
+            None,
+            None,
+            None,
+            observed_at,
+            log,
+        )
+    }
+
+    /// Close a live lease with a typed boundary reason supplied by the
+    /// provider seam (for example revoke, unmount, or generation drift).
+    /// This does not retry or grant any new authority.
+    pub fn invalidate<L: CapabilityInvocationLog>(
+        &mut self,
+        reason: CapabilityInvocationCloseReason,
+        observed_at: DateTime<Utc>,
+        log: &mut L,
+    ) -> Result<CapabilityInvocationReleaseReceipt, CapabilityInvocationError> {
+        self.finish(
+            CapabilityInvocationEventKind::Invalidated,
+            Some(reason),
             None,
             None,
             None,

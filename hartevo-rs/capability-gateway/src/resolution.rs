@@ -8,7 +8,7 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use serde::{Serialize, Serializer, ser::SerializeStruct};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use thiserror::Error;
 
 use super::{
@@ -26,7 +26,7 @@ pub const MAX_COMPOSITION_CONTRIBUTIONS: usize = 1024;
 
 /// A semver-like version used by the typed service/provider/consumer bridge.
 /// The resolver intentionally requires an exact version for this slice.
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityVersion {
     major: u16,

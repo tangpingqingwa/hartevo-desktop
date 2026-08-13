@@ -2898,10 +2898,19 @@ where
         model: &SkillPackModelContext,
         runtime: &PluginRuntime,
     ) -> Result<(), SkillPackError> {
+        self.validate_context_receipt(context, model.receipt(), runtime)
+    }
+
+    pub(crate) fn validate_context_receipt(
+        &mut self,
+        context: &SkillPackMissionContext,
+        receipt: &SkillPackContextReceipt,
+        runtime: &PluginRuntime,
+    ) -> Result<(), SkillPackError> {
         self.ensure_live(context, runtime)?;
-        model.receipt.validate_against(&self.metadata)?;
-        if *model.receipt.scope_digest() != context.scope().digest()
-            || model.receipt.policy_digest() != context.policy_digest()
+        receipt.validate_against(&self.metadata)?;
+        if *receipt.scope_digest() != context.scope().digest()
+            || receipt.policy_digest() != context.policy_digest()
         {
             return Err(SkillPackError::LateConsumer);
         }

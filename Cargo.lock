@@ -2373,8 +2373,11 @@ dependencies = [
 name = "hartevo-plugin-runtime"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "hartevo-capability-gateway",
  "hex",
  "proptest",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",
