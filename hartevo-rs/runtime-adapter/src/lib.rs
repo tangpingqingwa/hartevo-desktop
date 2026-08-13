@@ -3428,7 +3428,8 @@ pub fn cleanup_runtime_process(
     if let Some(expected) = &target.identity {
         let root = system.process(Pid::from_u32(expected.process_id));
         let root_matches_identity = root.is_some_and(|process| {
-            process.start_time() == expected.started_at_epoch_seconds
+            !process_is_zombie(process)
+                && process.start_time() == expected.started_at_epoch_seconds
                 && process.exe().is_some_and(|path| {
                     digest_hex(path.to_string_lossy().as_bytes()) == expected.executable_path_digest
                 })
@@ -3534,6 +3535,10 @@ fn process_has_launch_token(process: &sysinfo::Process, launch_token: &str) -> b
     })
 }
 
+fn process_is_zombie(process: &sysinfo::Process) -> bool {
+    matches!(process.status(), sysinfo::ProcessStatus::Zombie)
+}
+
 fn processes_for_runtime_claim(system: &System, target: &RuntimeProcessCleanupTarget) -> Vec<Pid> {
     let marker_processes = system
         .processes()
@@ -3543,8 +3548,9 @@ fn processes_for_runtime_claim(system: &System, target: &RuntimeProcessCleanupTa
                 digest_hex(path.to_string_lossy().as_bytes())
                     == target.launch_executable_path_digest
             });
-            (executable_matches || process_has_launch_token(process, &target.launch_token))
-                .then_some(*pid)
+            (!process_is_zombie(process)
+                && (executable_matches || process_has_launch_token(process, &target.launch_token)))
+            .then_some(*pid)
         })
         .collect::<HashSet<_>>();
     let mut selected = marker_processes.clone();
