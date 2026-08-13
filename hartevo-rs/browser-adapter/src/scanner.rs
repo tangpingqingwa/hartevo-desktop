@@ -1534,6 +1534,7 @@ fn terminate_process_group(
     let deadline = Instant::now()
         .checked_add(PROCESS_CLEANUP_TIMEOUT)
         .ok_or(BrowserError::FileScanUnavailable)?;
+    let leader_status_supplied = leader_status.is_some();
     let mut status = leader_status;
     let mut had_live_group_after_leader = false;
 
@@ -1560,6 +1561,14 @@ fn terminate_process_group(
                 Ok(None) => {}
                 Err(_) => return Err(BrowserError::FileScanUnavailable),
             }
+        }
+        if !leader_status_supplied && status.is_some() && !group_absent {
+            // The exact leader was reaped through std::process::Child above,
+            // so the grouped wait can only reap descendants. Its return value
+            // is not authoritative for the already-cached leader status.
+            child
+                .try_wait()
+                .map_err(|_| BrowserError::FileScanUnavailable)?;
         }
         if status.is_some() && group_absent {
             break;
