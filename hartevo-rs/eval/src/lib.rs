@@ -1,13 +1,26 @@
 //! Local controlled-simulator Mission evidence with live Broker authority and semantic replay.
 
-mod run_receipt;
+extern crate self as hartevo_eval;
 
+#[path = "../examples/hartevo-browser-contract/digest.rs"]
+mod digest;
+#[path = "../examples/hartevo-browser-contract/model.rs"]
+mod model;
+mod release_reference;
+mod run_receipt;
+#[path = "../examples/hartevo-browser-contract/verifier.rs"]
+mod verifier;
+
+pub use release_reference::{
+    BrowserEvaluationPayload, validate_evaluation_run_and_browser_result_references,
+    validate_evaluation_run_result_references,
+};
 pub use run_receipt::{
     CaseExecutionDisposition, CaseExecutionEvidence, CompletedCaseEvidence, EffectEvidence,
     EvaluationCaseResult, EvaluationRunPlan, EvaluationRunProfile, EvaluationRunReceipt,
     EvaluationRunWriter, EvidenceArtifactRef, MissionId as EvaluationMissionId, OracleKind,
     OracleResultRef, SafetyAssertionRef, TerminalOutcome, finalize_evaluation_run,
-    validate_evaluation_run,
+    validate_evaluation_run, validate_evaluation_run_result_reference,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

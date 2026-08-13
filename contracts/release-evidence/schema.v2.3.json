@@ -24,6 +24,7 @@
     "missionResults",
     "quality",
     "safetyInvariants",
+    "evaluationRunResultReferences",
     "notImplemented",
     "blockedEnv",
     "missingRequiredEvidence",
@@ -65,6 +66,7 @@
     },
     "quality": {"$ref": "#/$defs/qualityEvidence"},
     "safetyInvariants": {"$ref": "#/$defs/safetyEvidence"},
+    "evaluationRunResultReferences": {"$ref": "#/$defs/evaluationRunResultReferences"},
     "notImplemented": {
       "type": "array",
       "items": {"type": "string", "minLength": 1},
@@ -77,7 +79,7 @@
     },
     "missingRequiredEvidence": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "items": {
         "enum": [
           "evaluation_run_result_references",
@@ -86,7 +88,6 @@
           "e5_mission_mode_longitudinal_mapping"
         ]
       },
-      "contains": {"const": "evaluation_run_result_references"},
       "uniqueItems": true
     },
     "failures": {
@@ -107,8 +108,69 @@
         "properties": {
           "traceabilityComplete": {"const": true},
           "safetyInvariants": {"$ref": "#/$defs/passedSafetyEvidence"},
+          "evaluationRunResultReferences": {
+            "$ref": "#/$defs/eligibleEvaluationRunResultReferences"
+          },
           "missingRequiredEvidence": {"maxItems": 0},
           "failures": {"maxItems": 0}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "evaluationRunResultReferences": {
+            "required": ["run"],
+            "properties": {
+              "run": {
+                "anyOf": [
+                  {"type": "null"},
+                  {
+                    "required": ["partitionComplete"],
+                    "properties": {"partitionComplete": {"const": false}}
+                  },
+                  {
+                    "required": ["thresholdStatus"],
+                    "properties": {
+                      "thresholdStatus": {"not": {"const": "evaluated_passed"}}
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "required": ["evaluationRunResultReferences"]
+      },
+      "then": {
+        "properties": {
+          "passed": {"const": false},
+          "missingRequiredEvidence": {
+            "contains": {"const": "evaluation_run_result_references"}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "evaluationRunResultReferences": {
+            "required": ["browserResults"],
+            "properties": {
+              "browserResults": {
+                "contains": {"$ref": "#/$defs/ineligibleBrowserEvaluationResultReference"}
+              }
+            }
+          }
+        },
+        "required": ["evaluationRunResultReferences"]
+      },
+      "then": {
+        "properties": {
+          "passed": {"const": false},
+          "missingRequiredEvidence": {
+            "contains": {"const": "evaluation_run_result_references"}
+          }
         }
       }
     },
@@ -251,6 +313,307 @@
     }
   ],
   "$defs": {
+    "evaluationPartition": {
+      "enum": ["V0", "V1", "V2", "cross_cutting"]
+    },
+    "evaluationReferenceRunProfile": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "missionId"],
+          "properties": {
+            "kind": {"const": "mission_v0"},
+            "missionId": {"type": "string", "pattern": "^VM-(0[0-9]|1[01])$"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {"kind": {"const": "local_rc"}},
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "writingMissionId"],
+          "properties": {
+            "kind": {"const": "engineering_foundation"},
+            "writingMissionId": {"enum": ["VM-01", "VM-03", "VM-04", "VM-05"]}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "writingMissionId"],
+          "properties": {
+            "kind": {"const": "internal_alpha"},
+            "writingMissionId": {"enum": ["VM-01", "VM-03", "VM-04", "VM-05"]}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {"kind": {"const": "controlled_beta"}},
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {"kind": {"const": "general_availability"}},
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {"kind": {"const": "mature_e5"}},
+          "additionalProperties": false
+        }
+      ]
+    },
+    "evaluationRunResultReference": {
+      "type": "object",
+      "required": [
+        "validationAuthority",
+        "evidenceAuthority",
+        "releaseCommit",
+        "catalogDigest",
+        "releaseSchemaDigest",
+        "environmentDigest",
+        "runId",
+        "planDigest",
+        "resultSetDigest",
+        "receiptDigest",
+        "runProfile",
+        "missionIds",
+        "partitions",
+        "requiredPartitionCount",
+        "completedPartitionCount",
+        "configuredCaseCount",
+        "recordedCaseCount",
+        "executedCaseCount",
+        "successfulCaseCount",
+        "structurallyComplete",
+        "partitionComplete",
+        "thresholdStatus",
+        "safetyMappingStatus",
+        "privateAttestationStatus"
+      ],
+      "properties": {
+        "validationAuthority": {"const": "hartevo_evaluation_run_validator_v1"},
+        "evidenceAuthority": {"const": "run_evidence_only"},
+        "releaseCommit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+        "catalogDigest": {"$ref": "#/$defs/digest"},
+        "releaseSchemaDigest": {"$ref": "#/$defs/digest"},
+        "environmentDigest": {"$ref": "#/$defs/digest"},
+        "runId": {"$ref": "#/$defs/digest"},
+        "planDigest": {"$ref": "#/$defs/digest"},
+        "resultSetDigest": {"$ref": "#/$defs/digest"},
+        "receiptDigest": {"$ref": "#/$defs/digest"},
+        "runProfile": {"$ref": "#/$defs/evaluationReferenceRunProfile"},
+        "missionIds": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "items": {"type": "string", "pattern": "^VM-(0[0-9]|1[01])$"},
+          "uniqueItems": true
+        },
+        "partitions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {"$ref": "#/$defs/evaluationPartition"},
+          "uniqueItems": true
+        },
+        "requiredPartitionCount": {"type": "integer", "minimum": 1, "maximum": 48},
+        "completedPartitionCount": {"type": "integer", "minimum": 0, "maximum": 48},
+        "configuredCaseCount": {"type": "integer", "minimum": 1},
+        "recordedCaseCount": {"type": "integer", "minimum": 1},
+        "executedCaseCount": {"type": "integer", "minimum": 0},
+        "successfulCaseCount": {"type": "integer", "minimum": 0},
+        "structurallyComplete": {"type": "boolean"},
+        "partitionComplete": {"type": "boolean"},
+        "thresholdStatus": {
+          "enum": [
+            "not_evaluated_incomplete_partition",
+            "evaluated_passed",
+            "evaluated_failed"
+          ]
+        },
+        "safetyMappingStatus": {"const": "MISSING_AUTHORITATIVE_MAPPING"},
+        "privateAttestationStatus": {
+          "const": "MISSING_TRUSTED_PRIVATE_EVALUATOR_ATTESTATION"
+        }
+      },
+      "additionalProperties": false
+    },
+    "eligibleEvaluationRunResultReference": {
+      "allOf": [
+        {"$ref": "#/$defs/evaluationRunResultReference"},
+        {
+          "properties": {
+            "structurallyComplete": {"const": true},
+            "partitionComplete": {"const": true},
+            "thresholdStatus": {"const": "evaluated_passed"},
+            "completedPartitionCount": {"minimum": 1},
+            "executedCaseCount": {"minimum": 1}
+          }
+        }
+      ]
+    },
+    "browserEvidenceClass": {
+      "enum": [
+        "source_audit",
+        "native_preflight",
+        "deterministic_simulator",
+        "native_browser",
+        "native_browser_account_readback"
+      ]
+    },
+    "browserEvaluationResultReference": {
+      "type": "object",
+      "required": [
+        "validationAuthority",
+        "receiptSchemaVersion",
+        "receiptAuthority",
+        "releaseDecision",
+        "releaseCommit",
+        "catalogDigest",
+        "releaseSchemaDigest",
+        "environmentDigest",
+        "runId",
+        "resultSetDigest",
+        "caseId",
+        "providerMode",
+        "evidenceClasses",
+        "verdict",
+        "configuredAttemptCount",
+        "recordedAttemptCount",
+        "executedAttemptCount",
+        "successfulAttemptCount",
+        "executionStartedAttemptCount",
+        "testModeAttemptCount",
+        "mockAttemptCount",
+        "ignoredTestAttemptCount",
+        "receiptDigest",
+        "validationResultDigest",
+        "releaseEvidenceAuthority",
+        "eLevelCeiling"
+      ],
+      "properties": {
+        "validationAuthority": {"const": "hartevo_browser_contract_validator_v1"},
+        "receiptSchemaVersion": {"const": "hartevo-browser-run-receipt/v1"},
+        "receiptAuthority": {"const": "browser_harness_evidence_only"},
+        "releaseDecision": {"const": "NOT_EVALUATED"},
+        "releaseCommit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+        "catalogDigest": {"$ref": "#/$defs/digest"},
+        "releaseSchemaDigest": {"$ref": "#/$defs/digest"},
+        "environmentDigest": {"$ref": "#/$defs/digest"},
+        "runId": {"$ref": "#/$defs/digest"},
+        "resultSetDigest": {"$ref": "#/$defs/digest"},
+        "caseId": {"type": "string", "minLength": 1},
+        "providerMode": {"enum": ["controlled_simulator", "native_browser_account"]},
+        "evidenceClasses": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/browserEvidenceClass"},
+          "uniqueItems": true
+        },
+        "verdict": {"enum": ["PASS", "FAIL", "INCOMPLETE"]},
+        "configuredAttemptCount": {"type": "integer", "minimum": 1},
+        "recordedAttemptCount": {"type": "integer", "minimum": 0},
+        "executedAttemptCount": {"type": "integer", "minimum": 0},
+        "successfulAttemptCount": {"type": "integer", "minimum": 0},
+        "executionStartedAttemptCount": {"type": "integer", "minimum": 0},
+        "testModeAttemptCount": {"type": "integer", "minimum": 0},
+        "mockAttemptCount": {"type": "integer", "minimum": 0},
+        "ignoredTestAttemptCount": {"type": "integer", "minimum": 0},
+        "receiptDigest": {"$ref": "#/$defs/digest"},
+        "validationResultDigest": {"$ref": "#/$defs/digest"},
+        "releaseEvidenceAuthority": {"const": false},
+        "eLevelCeiling": {"const": "E1_MAX"}
+      },
+      "additionalProperties": false
+    },
+    "eligibleBrowserEvaluationResultReference": {
+      "allOf": [
+        {"$ref": "#/$defs/browserEvaluationResultReference"},
+        {
+          "properties": {
+            "providerMode": {"const": "native_browser_account"},
+            "evidenceClasses": {
+              "items": {
+                "enum": ["native_browser", "native_browser_account_readback"]
+              }
+            },
+            "verdict": {"const": "PASS"},
+            "recordedAttemptCount": {"minimum": 1},
+            "executedAttemptCount": {"minimum": 1},
+            "successfulAttemptCount": {"minimum": 1},
+            "executionStartedAttemptCount": {"minimum": 1},
+            "testModeAttemptCount": {"const": 0},
+            "mockAttemptCount": {"const": 0},
+            "ignoredTestAttemptCount": {"const": 0}
+          }
+        }
+      ]
+    },
+    "ineligibleBrowserEvaluationResultReference": {
+      "anyOf": [
+        {
+          "required": ["providerMode"],
+          "properties": {"providerMode": {"const": "controlled_simulator"}}
+        },
+        {
+          "required": ["evidenceClasses"],
+          "properties": {
+            "evidenceClasses": {
+              "contains": {
+                "enum": ["source_audit", "native_preflight", "deterministic_simulator"]
+              }
+            }
+          }
+        },
+        {
+          "required": ["verdict"],
+          "properties": {"verdict": {"not": {"const": "PASS"}}}
+        }
+      ]
+    },
+    "evaluationRunResultReferences": {
+      "type": "object",
+      "required": ["schemaVersion", "referenceSetDigest", "run", "browserResults"],
+      "properties": {
+        "schemaVersion": {"const": "hartevo-release-evaluation-result-references/v1"},
+        "referenceSetDigest": {"$ref": "#/$defs/digest"},
+        "run": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/evaluationRunResultReference"}
+          ]
+        },
+        "browserResults": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/browserEvaluationResultReference"},
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "eligibleEvaluationRunResultReferences": {
+      "allOf": [
+        {"$ref": "#/$defs/evaluationRunResultReferences"},
+        {
+          "properties": {
+            "run": {"$ref": "#/$defs/eligibleEvaluationRunResultReference"},
+            "browserResults": {
+              "items": {"$ref": "#/$defs/eligibleBrowserEvaluationResultReference"}
+            }
+          }
+        }
+      ]
+    },
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "releaseStage": {
       "enum": [
         "engineering_foundation",

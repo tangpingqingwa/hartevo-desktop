@@ -5,7 +5,12 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
-use hartevo_catalog::{Catalog, CatalogSnapshot};
+use hartevo_catalog::{
+    Catalog, CatalogSnapshot, EvaluationPartition, EvaluationPrivateAttestationStatus,
+    EvaluationReferenceRunProfile, EvaluationReferenceThresholdStatus,
+    EvaluationRunEvidenceAuthority, EvaluationRunResultReference, EvaluationRunValidationAuthority,
+    EvaluationSafetyMappingStatus,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1902,7 +1907,109 @@ pub fn finalize_evaluation_run(root: impl AsRef<Path>) -> Result<EvaluationRunRe
 }
 
 pub fn validate_evaluation_run(root: impl AsRef<Path>) -> Result<EvaluationRunReceipt> {
+    validate_evaluation_run_parts(root.as_ref()).map(|(_, receipt)| receipt)
+}
+
+pub fn validate_evaluation_run_result_reference(
+    root: impl AsRef<Path>,
+) -> Result<EvaluationRunResultReference> {
     let root = canonical_run_root(root.as_ref())?;
+    let plan_path = root.join(PLAN_FILE);
+    let receipt_path = root.join(RECEIPT_FILE);
+    let plan_before = read_regular_bytes(&plan_path)?;
+    let receipt_before = read_regular_bytes(&receipt_path)?;
+    let (plan, receipt) = validate_evaluation_run_parts(&root)?;
+    let plan_after = read_regular_bytes(&plan_path)?;
+    let receipt_after = read_regular_bytes(&receipt_path)?;
+    ensure!(
+        plan_before == plan_after && receipt_before == receipt_after,
+        "evaluation RUN changed while its Release reference was derived"
+    );
+
+    let mission_ids = plan
+        .required_partitions
+        .iter()
+        .map(|partition| partition.mission_id.as_str().to_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let partitions = plan
+        .required_partitions
+        .iter()
+        .map(|partition| match partition.partition {
+            CasePartition::V0 => EvaluationPartition::V0,
+            CasePartition::V1 => EvaluationPartition::V1,
+            CasePartition::V2 => EvaluationPartition::V2,
+            CasePartition::CrossCutting => EvaluationPartition::CrossCutting,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let run_profile = match &plan.run_profile {
+        EvaluationRunProfile::MissionV0 { mission_id } => {
+            EvaluationReferenceRunProfile::MissionV0 {
+                mission_id: mission_id.as_str().into(),
+            }
+        }
+        EvaluationRunProfile::LocalRc => EvaluationReferenceRunProfile::LocalRc,
+        EvaluationRunProfile::EngineeringFoundation { writing_mission_id } => {
+            EvaluationReferenceRunProfile::EngineeringFoundation {
+                writing_mission_id: writing_mission_id.as_str().into(),
+            }
+        }
+        EvaluationRunProfile::InternalAlpha { writing_mission_id } => {
+            EvaluationReferenceRunProfile::InternalAlpha {
+                writing_mission_id: writing_mission_id.as_str().into(),
+            }
+        }
+        EvaluationRunProfile::ControlledBeta => EvaluationReferenceRunProfile::ControlledBeta,
+        EvaluationRunProfile::GeneralAvailability => {
+            EvaluationReferenceRunProfile::GeneralAvailability
+        }
+        EvaluationRunProfile::MatureE5 => EvaluationReferenceRunProfile::MatureE5,
+    };
+    let threshold_status = match receipt.threshold_status {
+        ThresholdStatus::NotEvaluatedIncompletePartition => {
+            EvaluationReferenceThresholdStatus::NotEvaluatedIncompletePartition
+        }
+        ThresholdStatus::EvaluatedPassed => EvaluationReferenceThresholdStatus::EvaluatedPassed,
+        ThresholdStatus::EvaluatedFailed => EvaluationReferenceThresholdStatus::EvaluatedFailed,
+    };
+    Ok(EvaluationRunResultReference {
+        validation_authority: EvaluationRunValidationAuthority::HartevoEvaluationRunValidatorV1,
+        evidence_authority: EvaluationRunEvidenceAuthority::RunEvidenceOnly,
+        release_commit: plan.release_commit.clone(),
+        catalog_digest: plan.catalog.snapshot_digest.clone(),
+        release_schema_digest: sha256(RELEASE_EVIDENCE_SCHEMA),
+        environment_digest: plan.environment_digest.clone(),
+        run_id: receipt.run_id.clone(),
+        plan_digest: receipt.plan_digest.clone(),
+        result_set_digest: receipt.result_set_digest.clone(),
+        receipt_digest: sha256(&receipt_after),
+        run_profile,
+        mission_ids,
+        partitions,
+        required_partition_count: plan.required_partitions.len(),
+        completed_partition_count: receipt
+            .partition_summaries
+            .iter()
+            .filter(|partition| partition.partition_complete)
+            .count(),
+        configured_case_count: receipt.summary.configured_case_count,
+        recorded_case_count: receipt.summary.recorded_case_count,
+        executed_case_count: receipt.summary.executed_case_count,
+        successful_case_count: receipt.summary.successful_case_count,
+        structurally_complete: receipt.summary.structurally_complete,
+        partition_complete: receipt.summary.partition_complete,
+        threshold_status,
+        safety_mapping_status: EvaluationSafetyMappingStatus::MissingAuthoritativeMapping,
+        private_attestation_status:
+            EvaluationPrivateAttestationStatus::MissingTrustedPrivateEvaluatorAttestation,
+    })
+}
+
+fn validate_evaluation_run_parts(root: &Path) -> Result<(EvaluationRunPlan, EvaluationRunReceipt)> {
+    let root = canonical_run_root(root)?;
     let contracts = CurrentContracts::load()?;
     let plan: EvaluationRunPlan = read_json_regular(&root.join(PLAN_FILE))?;
     plan.validate_with(&contracts)?;
@@ -1911,7 +2018,7 @@ pub fn validate_evaluation_run(root: impl AsRef<Path>) -> Result<EvaluationRunRe
     let results = load_exact_results(&root, &plan, &contracts)?;
     let expected = EvaluationRunReceipt::derive(&plan, &results, receipt.completed_at, &contracts)?;
     ensure!(receipt == expected, "run receipt contains non-derived data");
-    Ok(receipt)
+    Ok((plan, receipt))
 }
 
 fn finalize_run_at(root: &Path, completed_at: DateTime<Utc>) -> Result<EvaluationRunReceipt> {
@@ -3250,6 +3357,48 @@ mod tests {
     }
 
     #[test]
+    fn release_reference_is_derived_from_revalidated_run_and_preserves_incomplete_status() {
+        let (directory, plan, receipt) = finalized_blocked_run("release-reference-blocked");
+        let reference = validate_evaluation_run_result_reference(directory.path())
+            .expect("validated RUN result reference");
+        assert_eq!(reference.release_commit, plan.release_commit);
+        assert_eq!(reference.catalog_digest, plan.catalog.snapshot_digest);
+        assert_eq!(reference.environment_digest, plan.environment_digest);
+        assert_eq!(reference.run_id, receipt.run_id);
+        assert_eq!(reference.plan_digest, receipt.plan_digest);
+        assert_eq!(reference.result_set_digest, receipt.result_set_digest);
+        assert_eq!(
+            reference.recorded_case_count,
+            reference.configured_case_count
+        );
+        assert_eq!(reference.executed_case_count, 0);
+        assert!(reference.structurally_complete);
+        assert!(!reference.partition_complete);
+        assert_eq!(
+            reference.threshold_status,
+            EvaluationReferenceThresholdStatus::NotEvaluatedIncompletePartition
+        );
+        assert_eq!(
+            reference.release_schema_digest,
+            sha256(RELEASE_EVIDENCE_SCHEMA)
+        );
+        assert!(is_lower_hex(&reference.receipt_digest, 64));
+    }
+
+    #[test]
+    fn browser_reference_producer_rejects_unvalidated_payload_triples() {
+        let (directory, _plan, _receipt) = finalized_blocked_run("browser-reference-invalid");
+        let payload = crate::BrowserEvaluationPayload::new(b"{}", b"{}", b"{}");
+        assert!(
+            crate::validate_evaluation_run_and_browser_result_references(
+                directory.path(),
+                &[payload],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn plan_serde_denies_top_level_missing_unknown_duplicate_and_authority_claims() {
         let plan = test_plan(
             EvaluationRunProfile::MissionV0 {
@@ -3429,6 +3578,7 @@ mod tests {
         )
         .expect("mutate receipt");
         assert!(validate_evaluation_run(directory.path()).is_err());
+        assert!(validate_evaluation_run_result_reference(directory.path()).is_err());
     }
 
     #[test]
