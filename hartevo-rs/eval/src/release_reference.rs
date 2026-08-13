@@ -367,6 +367,19 @@ fn read_regular_bytes(path: &PathBuf) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use hartevo_catalog::ReleaseEvidence;
+    use serde_json::json;
+
+    const MISSING_STAGE_ROUTE_SCOPE: &str = "stage_application_route_scope";
+
+    fn wave_zero_release_json() -> Value {
+        serde_json::to_value(
+            crate::wave_zero_release_evidence("a".repeat(40), Utc::now())
+                .expect("Wave 0 Release Evidence"),
+        )
+        .expect("Release Evidence JSON")
+    }
 
     #[test]
     fn checked_in_browser_contracts_and_release_seam_validate() {
@@ -395,5 +408,89 @@ mod tests {
         assert_eq!(payload.world, b"world");
         assert_eq!(payload.replay, b"replay");
         assert_eq!(payload.receipt, b"receipt");
+    }
+
+    #[test]
+    fn untyped_stage_route_scope_claims_cannot_be_smuggled_into_release_evidence() {
+        let schema =
+            parse_strict_json::<Value>(RELEASE_EVIDENCE_SCHEMA).expect("Release Evidence schema");
+        assert_eq!(
+            schema.get("additionalProperties").and_then(Value::as_bool),
+            Some(false)
+        );
+        for field in [
+            "stageApplicationRouteScope",
+            "stageApplicationRouteScopeDigest",
+            "stageApplicationRouteScopeReleaseCommit",
+            "stageApplicationRouteScopeHandlerIds",
+        ] {
+            assert!(
+                schema.pointer(&format!("/properties/{field}")).is_none(),
+                "{field} must remain unavailable until CT-04 defines a typed contract"
+            );
+        }
+
+        let forged_scope = json!({
+            "schemaVersion": "hartevo-stage-application-route-scope/v1",
+            "scopeDigest": "b".repeat(64),
+            "releaseCommit": "c".repeat(40),
+            "catalogDigest": "d".repeat(64),
+            "applicationHandlerRegistryVersion": "forged-handler-registry/v1",
+            "applicationRouteCount": 52,
+            "implementedHandlerCount": 52,
+            "handlerIds": ["forged-handler"]
+        });
+        for (field, claim) in [
+            ("stageApplicationRouteScope", forged_scope),
+            ("stageApplicationRouteScopeDigest", json!("b".repeat(64))),
+            (
+                "stageApplicationRouteScopeReleaseCommit",
+                json!("c".repeat(40)),
+            ),
+            (
+                "stageApplicationRouteScopeHandlerIds",
+                json!(["forged-handler"]),
+            ),
+        ] {
+            let mut candidate = wave_zero_release_json();
+            candidate["passed"] = Value::Bool(true);
+            candidate["missingRequiredEvidence"] = json!(["evaluation_run_result_references"]);
+            candidate
+                .as_object_mut()
+                .expect("Release Evidence object")
+                .insert(field.to_owned(), claim);
+            assert!(
+                serde_json::from_value::<ReleaseEvidence>(candidate).is_err(),
+                "untyped {field} claim must be rejected before gate evaluation"
+            );
+        }
+    }
+
+    #[test]
+    fn forged_catalog_counts_cannot_delete_the_stage_route_scope_gap() {
+        let mut evidence = crate::wave_zero_release_evidence("a".repeat(40), Utc::now())
+            .expect("Wave 0 Release Evidence");
+        evidence
+            .missing_required_evidence
+            .retain(|missing| missing != MISSING_STAGE_ROUTE_SCOPE);
+        evidence.passed = true;
+        evidence.release_commit = "c".repeat(40);
+        evidence.catalog_digest = "d".repeat(64);
+        evidence.application_handler_registry_version = "forged-handler-registry/v1".into();
+        evidence.implemented_application_handler_count = evidence.application_route_count;
+        evidence.not_implemented_application_route_count = 0;
+
+        let violations = evidence
+            .validate_fail_closed()
+            .expect_err("forged route coverage must remain fail-closed");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("exact current Catalog snapshot"))
+        );
+        assert!(violations.iter().any(|violation| {
+            violation.contains("missingRequiredEvidence must be machine-derived")
+        }));
+        assert!(!evidence.derived_passed());
     }
 }
