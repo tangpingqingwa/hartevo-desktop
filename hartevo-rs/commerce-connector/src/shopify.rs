@@ -33,6 +33,7 @@ pub const SHOPIFY_ORDERS_READ_SCOPE: &str = "read_orders";
 pub const SHOPIFY_PRODUCTS_READ_SCOPE: &str = "read_products";
 pub const SHOPIFY_ORDERS_CURSOR_CAPABILITY: &str = "commerce.orders.incremental_read";
 pub const SHOPIFY_PRODUCTS_CURSOR_CAPABILITY: &str = "commerce.products.incremental_read";
+pub const SHOPIFY_RECONCILIATION_MAX_POLL_PAGES: u32 = 3;
 pub const SHOPIFY_HMAC_HEADER: &str = "X-Shopify-Hmac-SHA256";
 pub const SHOPIFY_WEBHOOK_ID_HEADER: &str = "X-Shopify-Webhook-Id";
 pub const SHOPIFY_TOPIC_HEADER: &str = "X-Shopify-Topic";
@@ -426,6 +427,12 @@ impl ShopifyAuthBinding {
         &self.adapter
     }
 
+    /// Credential revisions are the SDK-owned monotonic generation boundary
+    /// for this provider-specific read consumer.
+    pub const fn generation(&self) -> u64 {
+        self.secret_reference.credential_revision()
+    }
+
     pub fn auth_digest(&self) -> String {
         shopify_digest([
             self.secret_reference.reference_id(),
@@ -587,6 +594,44 @@ impl ShopifyTypedItems {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShopifyPollCursorBinding {
+    pub generation: u64,
+    pub query_digest: String,
+    pub cursor: Option<String>,
+    pub page_sequence: u64,
+    pub cursor_digest: String,
+}
+
+impl ShopifyPollCursorBinding {
+    fn unbound(generation: u64) -> Self {
+        Self {
+            generation,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.generation > 0 && is_sha256(&self.query_digest) && is_sha256(&self.cursor_digest)
+    }
+
+    fn same_cursor(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.query_digest == other.query_digest
+            && self.cursor == other.cursor
+            && self.page_sequence == other.page_sequence
+            && self.cursor_digest == other.cursor_digest
+    }
+
+    fn compatible_with(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.query_digest == other.query_digest
+            && self.is_bound()
+            && other.is_bound()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShopifyReadResultEnvelope {
@@ -596,6 +641,7 @@ pub struct ShopifyReadResultEnvelope {
     pub tenant_scope: ShopifyTenantScope,
     pub api_version: ShopifyApiVersion,
     pub provider_digest: String,
+    pub generation: u64,
     pub auth_digest: String,
     pub provenance_class: ProviderProvenanceClass,
     pub live_validation_status: String,
@@ -604,6 +650,7 @@ pub struct ShopifyReadResultEnvelope {
     pub content_digest: String,
     pub page_sequence: u64,
     pub page_cursor: Option<String>,
+    pub poll_cursor_binding: ShopifyPollCursorBinding,
     pub next_cursor: Option<String>,
     pub page_digest: String,
     pub typed_items: ShopifyTypedItems,
@@ -639,6 +686,14 @@ impl ShopifyReadResultEnvelope {
     ) -> Result<ShopifyPollReconcile, ShopifyError> {
         if webhook.mission_id != self.mission_id {
             return Err(ShopifyError::WebhookCheckpointConflict);
+        }
+        if webhook.generation != self.generation
+            || (webhook.poll_cursor_binding.is_bound()
+                && !webhook
+                    .poll_cursor_binding
+                    .compatible_with(&self.poll_cursor_binding))
+        {
+            return Err(ShopifyError::WebhookGenerationMismatch);
         }
         webhook.validate_against_scope_digest(
             &self.tenant_scope.scope().digest(),
@@ -764,6 +819,8 @@ pub struct ShopifyCursorCheckpoint {
     shop: ShopDomain,
     api_version: ShopifyApiVersion,
     provider_digest: String,
+    #[serde(default = "default_generation")]
+    generation: u64,
     query_digest: String,
     page_size: u32,
     page_sequence: u64,
@@ -773,6 +830,8 @@ pub struct ShopifyCursorCheckpoint {
     committed_result_ids: BTreeSet<String>,
     webhook_checkpoints: Vec<ShopifyWebhookCheckpoint>,
     reconciled_webhook_ids: BTreeSet<String>,
+    #[serde(default)]
+    reconciliation_receipts: Vec<ShopifyReconciliationReceipt>,
 }
 
 impl ShopifyCursorCheckpoint {
@@ -783,9 +842,21 @@ impl ShopifyCursorCheckpoint {
         stream: ShopifyCursorStream,
         page_size: u32,
     ) -> Result<Self, ShopifyError> {
+        Self::new_for_generation(mission_id, tenant_scope, api_version, stream, page_size, 1)
+    }
+
+    pub fn new_for_generation(
+        mission_id: impl Into<String>,
+        tenant_scope: &ShopifyTenantScope,
+        api_version: ShopifyApiVersion,
+        stream: ShopifyCursorStream,
+        page_size: u32,
+        generation: u64,
+    ) -> Result<Self, ShopifyError> {
         let mission_id = mission_id.into();
         validate_mission_id(&mission_id)?;
         validate_page_size(page_size)?;
+        validate_generation(generation)?;
         tenant_scope.ensure_stream_scope(stream)?;
         let provider_digest = shopify_provider_digest(tenant_scope, &api_version, stream);
         let query_digest = shopify_query_digest(tenant_scope, &api_version, stream, page_size);
@@ -796,6 +867,7 @@ impl ShopifyCursorCheckpoint {
             shop: tenant_scope.shop().clone(),
             api_version,
             provider_digest,
+            generation,
             query_digest,
             page_size,
             page_sequence: 0,
@@ -805,6 +877,7 @@ impl ShopifyCursorCheckpoint {
             committed_result_ids: BTreeSet::new(),
             webhook_checkpoints: Vec::new(),
             reconciled_webhook_ids: BTreeSet::new(),
+            reconciliation_receipts: Vec::new(),
         })
     }
 
@@ -822,6 +895,10 @@ impl ShopifyCursorCheckpoint {
 
     pub fn provider_digest(&self) -> &str {
         &self.provider_digest
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn query_digest(&self) -> &str {
@@ -852,6 +929,14 @@ impl ShopifyCursorCheckpoint {
         &self.webhook_checkpoints
     }
 
+    pub fn reconciliation_receipts(&self) -> &[ShopifyReconciliationReceipt] {
+        &self.reconciliation_receipts
+    }
+
+    pub fn reconciled_webhook_ids(&self) -> &BTreeSet<String> {
+        &self.reconciled_webhook_ids
+    }
+
     pub fn digest(&self) -> Result<String, ShopifyError> {
         let bytes = serde_json::to_vec(self).map_err(|_| ShopifyError::InvalidCheckpoint)?;
         Ok(sha256_bytes(&bytes))
@@ -861,9 +946,20 @@ impl ShopifyCursorCheckpoint {
         let mut cursor_state = self.clone();
         cursor_state.webhook_checkpoints.clear();
         cursor_state.reconciled_webhook_ids.clear();
+        cursor_state.reconciliation_receipts.clear();
         let bytes =
             serde_json::to_vec(&cursor_state).map_err(|_| ShopifyError::InvalidCheckpoint)?;
         Ok(sha256_bytes(&bytes))
+    }
+
+    pub fn poll_cursor_binding(&self) -> Result<ShopifyPollCursorBinding, ShopifyError> {
+        Ok(ShopifyPollCursorBinding {
+            generation: self.generation,
+            query_digest: self.query_digest.clone(),
+            cursor: self.next_cursor.clone(),
+            page_sequence: self.page_sequence,
+            cursor_digest: self.cursor_digest()?,
+        })
     }
 
     pub fn sdk_cursor(&self, scope: &ConnectorScope) -> Result<Option<Cursor>, ShopifyError> {
@@ -889,11 +985,13 @@ impl ShopifyCursorCheckpoint {
         tenant_scope: &ShopifyTenantScope,
         api_version: &ShopifyApiVersion,
         stream: ShopifyCursorStream,
+        generation: u64,
     ) -> Result<(), ShopifyError> {
         if self.scope_digest != tenant_scope.scope().digest()
             || self.shop != *tenant_scope.shop()
             || self.api_version != *api_version
             || self.stream != stream
+            || self.generation != generation
             || self.provider_digest != shopify_provider_digest(tenant_scope, api_version, stream)
             || self.query_digest
                 != shopify_query_digest(tenant_scope, api_version, stream, self.page_size)
@@ -902,6 +1000,21 @@ impl ShopifyCursorCheckpoint {
         }
         validate_mission_id(&self.mission_id)?;
         validate_page_size(self.page_size)
+    }
+
+    fn rotate_generation(&mut self, generation: u64) -> Result<(), ShopifyError> {
+        validate_generation(generation)?;
+        if generation <= self.generation {
+            return Err(ShopifyError::CredentialRotationRejected);
+        }
+        self.generation = generation;
+        self.webhook_checkpoints.clear();
+        self.reconciled_webhook_ids.clear();
+        self.reconciliation_receipts.clear();
+        self.committed_result_ids.clear();
+        self.last_page_digest = None;
+        self.last_result_id = None;
+        Ok(())
     }
 
     fn preview_result(
@@ -927,11 +1040,16 @@ impl ShopifyCursorCheckpoint {
             return Ok(ShopifyCommitOutcome::AlreadyCommitted);
         }
         let before = self.cursor_digest()?;
+        let poll_cursor_binding = self.poll_cursor_binding()?;
         if before != envelope.checkpoint_before_digest
             || envelope.mission_id != self.mission_id
             || envelope.stream != self.stream
+            || envelope.generation != self.generation
             || envelope.page_sequence != self.page_sequence.saturating_add(1)
             || envelope.page_cursor.as_deref() != self.next_cursor.as_deref()
+            || !envelope
+                .poll_cursor_binding
+                .same_cursor(&poll_cursor_binding)
             || envelope.provider_digest != self.provider_digest
             || envelope.request_digest != self.query_digest
         {
@@ -945,14 +1063,28 @@ impl ShopifyCursorCheckpoint {
         if expected.cursor_digest()? != envelope.checkpoint_after.cursor_digest()? {
             return Err(ShopifyError::CheckpointConflict);
         }
+        if envelope.checkpoint_after.generation != self.generation {
+            return Err(ShopifyError::CheckpointGenerationMismatch);
+        }
         *self = expected;
         Ok(ShopifyCommitOutcome::Committed)
     }
 
     fn apply_webhook(
         &mut self,
-        webhook: ShopifyWebhookCheckpoint,
-    ) -> Result<ShopifyWebhookCommitOutcome, ShopifyError> {
+        mut webhook: ShopifyWebhookCheckpoint,
+    ) -> Result<ShopifyWebhookIngest, ShopifyError> {
+        if webhook.generation != self.generation {
+            return Err(ShopifyError::WebhookGenerationMismatch);
+        }
+        if !webhook.poll_cursor_binding.is_bound() {
+            webhook.poll_cursor_binding = self.poll_cursor_binding()?;
+        } else if !webhook
+            .poll_cursor_binding
+            .compatible_with(&self.poll_cursor_binding()?)
+        {
+            return Err(ShopifyError::WebhookCursorBindingMismatch);
+        }
         webhook.validate_against_scope_digest(
             &self.scope_digest,
             &self.shop,
@@ -969,18 +1101,104 @@ impl ShopifyCursorCheckpoint {
                     .iter()
                     .any(|existing| existing.event_id.as_deref() == Some(event_id))
             })
+            || self
+                .webhook_checkpoints
+                .iter()
+                .any(|existing| existing.sequence == webhook.sequence)
         {
-            return Ok(ShopifyWebhookCommitOutcome::AlreadyCommitted);
+            let existing = self
+                .webhook_checkpoints
+                .iter()
+                .find(|existing| {
+                    existing.delivery_id == webhook.delivery_id
+                        || existing.event_id.is_some() && existing.event_id == webhook.event_id
+                        || existing.sequence == webhook.sequence
+                })
+                .cloned()
+                .ok_or(ShopifyError::WebhookCheckpointMissing)?;
+            return Ok(ShopifyWebhookIngest::AlreadyCommitted { existing });
         }
-        if self
+        let max_sequence = self
             .webhook_checkpoints
-            .last()
-            .is_some_and(|existing| webhook.sequence <= existing.sequence)
-        {
-            return Err(ShopifyError::WebhookCheckpointConflict);
-        }
+            .iter()
+            .map(|existing| existing.sequence)
+            .max();
+        let out_of_order = max_sequence.is_some_and(|maximum| webhook.sequence < maximum);
+        let delivery_id = webhook.delivery_id.clone();
         self.webhook_checkpoints.push(webhook);
-        Ok(ShopifyWebhookCommitOutcome::Committed)
+        self.webhook_checkpoints.sort_by(|left, right| {
+            left.sequence
+                .cmp(&right.sequence)
+                .then_with(|| left.delivery_id.cmp(&right.delivery_id))
+        });
+        let webhook = self
+            .webhook_checkpoints
+            .iter()
+            .find(|existing| existing.delivery_id == delivery_id)
+            .cloned()
+            .ok_or(ShopifyError::InvalidWebhookCheckpoint)?;
+        Ok(ShopifyWebhookIngest::Committed {
+            webhook,
+            gap: self.webhook_sequence_gap(),
+            out_of_order,
+        })
+    }
+
+    pub fn webhook_sequence_gap(&self) -> Option<ShopifySequenceGap> {
+        let mut frontier: u64 = 0;
+        loop {
+            if self
+                .webhook_checkpoints
+                .iter()
+                .any(|webhook| webhook.sequence == frontier.saturating_add(1))
+            {
+                frontier = frontier.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        let observed = self
+            .webhook_checkpoints
+            .iter()
+            .map(|webhook| webhook.sequence)
+            .max()?;
+        (observed > frontier.saturating_add(1)).then(|| ShopifySequenceGap {
+            generation: self.generation,
+            first_missing_sequence: frontier.saturating_add(1),
+            last_missing_sequence: observed.saturating_sub(1),
+            observed_sequence: observed,
+        })
+    }
+
+    fn record_reconciliation_receipt(
+        &mut self,
+        receipt: ShopifyReconciliationReceipt,
+    ) -> ShopifyReconciliationReceipt {
+        if let Some(existing) = self
+            .reconciliation_receipts
+            .iter()
+            .find(|existing| existing.receipt_id == receipt.receipt_id)
+        {
+            return existing.clone();
+        }
+        self.reconciliation_receipts.push(receipt.clone());
+        self.reconciliation_receipts
+            .sort_by(|left, right| left.receipt_id.cmp(&right.receipt_id));
+        receipt
+    }
+
+    fn receipt_for_delivery(&self, delivery_id: &str) -> Option<&ShopifyReconciliationReceipt> {
+        self.reconciliation_receipts
+            .iter()
+            .find(|receipt| {
+                receipt.delivery_id == delivery_id
+                    && receipt.status == ShopifyReconciliationStatus::Exact
+            })
+            .or_else(|| {
+                self.reconciliation_receipts
+                    .iter()
+                    .find(|receipt| receipt.delivery_id == delivery_id)
+            })
     }
 
     fn mark_webhook_reconciled(
@@ -1046,6 +1264,7 @@ impl ShopifyCursorStore {
         api_version: &ShopifyApiVersion,
         stream: ShopifyCursorStream,
         page_size: u32,
+        generation: u64,
     ) -> Result<&mut ShopifyCursorCheckpoint, ShopifyError> {
         if self.lifecycle != ShopifyCursorStoreLifecycle::Mounted {
             return Err(ShopifyError::ConsumerNotMounted);
@@ -1054,19 +1273,21 @@ impl ShopifyCursorStore {
             checkpoint.mission_id == mission_id && checkpoint.stream == stream
         }) {
             let checkpoint = &mut self.checkpoints[index];
-            checkpoint.validate_against(tenant_scope, api_version, stream)?;
+            checkpoint.validate_against(tenant_scope, api_version, stream, generation)?;
             if checkpoint.page_size != page_size {
                 return Err(ShopifyError::CheckpointPageSizeMismatch);
             }
             return Ok(checkpoint);
         }
-        self.checkpoints.push(ShopifyCursorCheckpoint::new(
-            mission_id,
-            tenant_scope,
-            api_version.clone(),
-            stream,
-            page_size,
-        )?);
+        self.checkpoints
+            .push(ShopifyCursorCheckpoint::new_for_generation(
+                mission_id,
+                tenant_scope,
+                api_version.clone(),
+                stream,
+                page_size,
+                generation,
+            )?);
         self.checkpoints
             .last_mut()
             .ok_or(ShopifyError::InvalidCheckpoint)
@@ -1102,6 +1323,16 @@ impl ShopifyCursorStore {
             lifecycle: self.lifecycle,
         }
     }
+
+    fn rotate_generation(&mut self, generation: u64) -> Result<(), ShopifyError> {
+        if self.lifecycle != ShopifyCursorStoreLifecycle::Mounted {
+            return Err(ShopifyError::ConsumerNotMounted);
+        }
+        for checkpoint in &mut self.checkpoints {
+            checkpoint.rotate_generation(generation)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1120,6 +1351,81 @@ pub enum ShopifyCommitOutcome {
 pub enum ShopifyWebhookCommitOutcome {
     Committed,
     AlreadyCommitted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShopifySequenceGap {
+    pub generation: u64,
+    pub first_missing_sequence: u64,
+    pub last_missing_sequence: u64,
+    pub observed_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShopifyReconciliationSource {
+    Webhook,
+    Poll,
+    GapFill,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShopifyReconciliationStatus {
+    PendingPoll,
+    Exact,
+    Duplicate,
+    Late,
+    GapPending,
+    NotObserved,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShopifyReconciliationReceipt {
+    pub receipt_id: String,
+    pub mission_id: String,
+    pub stream: ShopifyCursorStream,
+    pub delivery_id: String,
+    pub event_id: Option<String>,
+    pub topic: String,
+    pub shop: ShopDomain,
+    pub api_version: ShopifyApiVersion,
+    pub provider_digest: String,
+    pub generation: u64,
+    pub source: ShopifyReconciliationSource,
+    pub status: ShopifyReconciliationStatus,
+    pub resource_id: String,
+    pub resource_updated_at: DateTime<Utc>,
+    pub poll_cursor_binding: ShopifyPollCursorBinding,
+    pub poll_pages: u32,
+    pub gap: Option<ShopifySequenceGap>,
+    pub duplicate_of: Option<String>,
+    pub provenance_class: ProviderProvenanceClass,
+    pub live_validation_status: String,
+}
+
+impl ShopifyReconciliationReceipt {
+    pub fn is_exact(&self) -> bool {
+        self.status == ShopifyReconciliationStatus::Exact
+    }
+
+    pub fn is_first_party(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ShopifyWebhookIngest {
+    Committed {
+        webhook: ShopifyWebhookCheckpoint,
+        gap: Option<ShopifySequenceGap>,
+        out_of_order: bool,
+    },
+    AlreadyCommitted {
+        existing: ShopifyWebhookCheckpoint,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1143,6 +1449,10 @@ pub struct ShopifyWebhookCheckpoint {
     pub shop: ShopDomain,
     pub api_version: ShopifyApiVersion,
     pub provider_digest: String,
+    #[serde(default = "default_generation")]
+    pub generation: u64,
+    #[serde(default)]
+    pub poll_cursor_binding: ShopifyPollCursorBinding,
     pub resource_id: String,
     pub resource_updated_at: DateTime<Utc>,
     pub payload_digest: String,
@@ -1165,9 +1475,39 @@ impl ShopifyWebhookCheckpoint {
         occurred_at: DateTime<Utc>,
         received_at: DateTime<Utc>,
     ) -> Result<Self, ShopifyError> {
+        Self::from_verified_for_generation(
+            verified,
+            tenant_scope,
+            stream,
+            mission_id,
+            sequence,
+            event_id,
+            resource_id,
+            resource_updated_at,
+            occurred_at,
+            received_at,
+            1,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_verified_for_generation(
+        verified: &VerifiedShopifyWebhook,
+        tenant_scope: &ShopifyTenantScope,
+        stream: ShopifyCursorStream,
+        mission_id: impl Into<String>,
+        sequence: u64,
+        event_id: Option<String>,
+        resource_id: impl Into<String>,
+        resource_updated_at: DateTime<Utc>,
+        occurred_at: DateTime<Utc>,
+        received_at: DateTime<Utc>,
+        generation: u64,
+    ) -> Result<Self, ShopifyError> {
         let resource_id = resource_id.into();
         let mission_id = mission_id.into();
         if sequence == 0
+            || generation == 0
             || occurred_at > received_at
             || !stream.accepts_webhook_topic(&verified.headers.topic)
             || verified.headers.shop_domain != *tenant_scope.shop()
@@ -1191,6 +1531,8 @@ impl ShopifyWebhookCheckpoint {
             shop: tenant_scope.shop().clone(),
             api_version,
             provider_digest,
+            generation,
+            poll_cursor_binding: ShopifyPollCursorBinding::unbound(generation),
             resource_id,
             resource_updated_at,
             payload_digest: verified.raw_body_sha256.clone(),
@@ -1213,6 +1555,7 @@ impl ShopifyWebhookCheckpoint {
             || &self.api_version != api_version
             || self.stream != stream
             || self.provider_digest != provider_digest
+            || self.generation == 0
             || !stream.accepts_webhook_topic(&self.topic)
             || !valid_resource_id(stream, &self.resource_id)
             || self.sequence == 0
@@ -1220,6 +1563,11 @@ impl ShopifyWebhookCheckpoint {
             || !is_sha256(&self.payload_digest)
         {
             return Err(ShopifyError::WebhookCheckpointConflict);
+        }
+        if self.poll_cursor_binding.generation != 0
+            && self.poll_cursor_binding.generation != self.generation
+        {
+            return Err(ShopifyError::WebhookCursorBindingMismatch);
         }
         Ok(())
     }
@@ -1304,12 +1652,18 @@ impl<T: ShopifyAdminTransport> ShopifyDurableCursorConsumer<T> {
         }
         self.tenant_scope.ensure_stream_scope(stream)?;
         let mission_id = mission_id.into();
+        let generation = self
+            .auth
+            .as_ref()
+            .ok_or(ShopifyError::AuthenticationUnavailable)?
+            .generation();
         let checkpoint = self.store.ensure_checkpoint(
             &mission_id,
             &self.tenant_scope,
             &self.api_version,
             stream,
             page_size,
+            generation,
         )?;
         if checkpoint.is_complete() {
             return Err(ShopifyError::CheckpointComplete);
@@ -1339,12 +1693,14 @@ impl<T: ShopifyAdminTransport> ShopifyDurableCursorConsumer<T> {
         }
         let response_digest = response.body_digest()?;
         let content_digest = typed_items.content_digest()?;
+        let poll_cursor_binding = checkpoint.poll_cursor_binding()?;
         let page_sequence = checkpoint.page_sequence.saturating_add(1);
         let provider_digest = checkpoint.provider_digest.clone();
         let page_digest = shopify_digest([
             mission_id.as_str(),
             stream.capability_id(),
             provider_digest.as_str(),
+            &generation.to_string(),
             checkpoint.query_digest.as_str(),
             content_digest.as_str(),
             checkpoint.next_cursor.clone().unwrap_or_default().as_str(),
@@ -1363,6 +1719,7 @@ impl<T: ShopifyAdminTransport> ShopifyDurableCursorConsumer<T> {
             tenant_scope: self.tenant_scope.clone(),
             api_version: self.api_version.clone(),
             provider_digest,
+            generation,
             auth_digest: self
                 .auth
                 .as_ref()
@@ -1375,6 +1732,7 @@ impl<T: ShopifyAdminTransport> ShopifyDurableCursorConsumer<T> {
             content_digest,
             page_sequence,
             page_cursor: checkpoint.next_cursor,
+            poll_cursor_binding,
             next_cursor: if has_next_page { next_cursor } else { None },
             page_digest,
             typed_items,
@@ -1402,7 +1760,12 @@ impl<T: ShopifyAdminTransport> ShopifyDurableCursorConsumer<T> {
         let checkpoint = self
             .store
             .checkpoint_mut(&webhook.mission_id, webhook.stream)?;
-        checkpoint.apply_webhook(webhook)
+        match checkpoint.apply_webhook(webhook)? {
+            ShopifyWebhookIngest::Committed { .. } => Ok(ShopifyWebhookCommitOutcome::Committed),
+            ShopifyWebhookIngest::AlreadyCommitted { .. } => {
+                Ok(ShopifyWebhookCommitOutcome::AlreadyCommitted)
+            }
+        }
     }
 
     pub fn reconcile_webhook(
@@ -1410,14 +1773,320 @@ impl<T: ShopifyAdminTransport> ShopifyDurableCursorConsumer<T> {
         envelope: &ShopifyReadResultEnvelope,
         webhook: &ShopifyWebhookCheckpoint,
     ) -> Result<ShopifyPollReconcile, ShopifyError> {
-        let result = envelope.reconcile_webhook(webhook)?;
+        let durable_webhook = self.durable_webhook(webhook)?.clone();
+        let result = envelope.reconcile_webhook(&durable_webhook)?;
         if matches!(result, ShopifyPollReconcile::Exact { .. }) {
             let checkpoint = self
                 .store
                 .checkpoint_mut(&envelope.mission_id, envelope.stream)?;
-            checkpoint.mark_webhook_reconciled(webhook)?;
+            checkpoint.mark_webhook_reconciled(&durable_webhook)?;
         }
         Ok(result)
+    }
+
+    /// Returns a typed, read-only reconciliation receipt for a poll page.  A
+    /// page is never treated as a Mission result until its durable cursor is
+    /// committed separately by `commit`.
+    pub fn reconcile_poll_page(
+        &mut self,
+        envelope: &ShopifyReadResultEnvelope,
+        webhook: &ShopifyWebhookCheckpoint,
+    ) -> Result<ShopifyReconciliationReceipt, ShopifyError> {
+        let durable_webhook = self.durable_webhook(webhook)?.clone();
+        if let Some(receipt) = self.exact_receipt(&durable_webhook) {
+            return Ok(receipt.clone());
+        }
+        let result = envelope.reconcile_webhook(&durable_webhook)?;
+        let status = match result {
+            ShopifyPollReconcile::Exact { .. } => ShopifyReconciliationStatus::Exact,
+            ShopifyPollReconcile::NotObserved => ShopifyReconciliationStatus::NotObserved,
+        };
+        if status == ShopifyReconciliationStatus::Exact {
+            let checkpoint = self
+                .store
+                .checkpoint_mut(&envelope.mission_id, envelope.stream)?;
+            checkpoint.mark_webhook_reconciled(&durable_webhook)?;
+        }
+        let receipt = self.build_receipt(
+            &durable_webhook,
+            ShopifyReconciliationSource::Poll,
+            status,
+            envelope.poll_cursor_binding.clone(),
+            1,
+            None,
+            None,
+        );
+        let checkpoint = self
+            .store
+            .checkpoint_mut(&envelope.mission_id, envelope.stream)?;
+        Ok(checkpoint.record_reconciliation_receipt(receipt))
+    }
+
+    /// Ingests a webhook and, when its durable sequence has a gap, performs a
+    /// bounded cursor poll fill.  The cursor and all receipts remain in the
+    /// serializable checkpoint, so reopening the Mission resumes from the
+    /// last committed page without replaying a result.
+    pub fn reconcile_webhook_delivery(
+        &mut self,
+        webhook: ShopifyWebhookCheckpoint,
+        page_size: u32,
+        at: DateTime<Utc>,
+    ) -> Result<ShopifyReconciliationReceipt, ShopifyError> {
+        if self.auth.is_none() {
+            return Err(ShopifyError::AuthenticationUnavailable);
+        }
+        if self.provenance_class == ProviderProvenanceClass::ProductionProvider {
+            return Err(ShopifyError::BlockedEnv);
+        }
+        let generation = self
+            .auth
+            .as_ref()
+            .ok_or(ShopifyError::AuthenticationUnavailable)?
+            .generation();
+        self.tenant_scope.ensure_stream_scope(webhook.stream)?;
+        self.store.ensure_checkpoint(
+            &webhook.mission_id,
+            &self.tenant_scope,
+            &self.api_version,
+            webhook.stream,
+            page_size,
+            generation,
+        )?;
+        let ingest = {
+            let checkpoint = self
+                .store
+                .checkpoint_mut(&webhook.mission_id, webhook.stream)?;
+            checkpoint.apply_webhook(webhook)?
+        };
+        match ingest {
+            ShopifyWebhookIngest::AlreadyCommitted { existing } => {
+                let (prior_receipt, retry_gap) = {
+                    let checkpoint = self
+                        .store
+                        .checkpoint(&existing.mission_id, existing.stream)
+                        .ok_or(ShopifyError::CheckpointMissing)?;
+                    (
+                        checkpoint
+                            .receipt_for_delivery(&existing.delivery_id)
+                            .cloned(),
+                        checkpoint.webhook_sequence_gap(),
+                    )
+                };
+                if retry_gap.as_ref().is_some_and(|_| {
+                    prior_receipt.as_ref().is_some_and(|receipt| {
+                        receipt.status == ShopifyReconciliationStatus::GapPending
+                    })
+                }) {
+                    return self.fill_webhook_gap(&existing, page_size, at, retry_gap);
+                }
+                let duplicate_of = prior_receipt.map(|receipt| receipt.receipt_id);
+                let receipt = self.build_receipt(
+                    &existing,
+                    ShopifyReconciliationSource::Webhook,
+                    ShopifyReconciliationStatus::Duplicate,
+                    existing.poll_cursor_binding.clone(),
+                    0,
+                    None,
+                    duplicate_of,
+                );
+                let checkpoint = self
+                    .store
+                    .checkpoint_mut(&existing.mission_id, existing.stream)?;
+                Ok(checkpoint.record_reconciliation_receipt(receipt))
+            }
+            ShopifyWebhookIngest::Committed {
+                webhook,
+                gap,
+                out_of_order,
+            } => {
+                if gap.is_some() {
+                    return self.fill_webhook_gap(&webhook, page_size, at, gap);
+                }
+                let status = if out_of_order {
+                    ShopifyReconciliationStatus::Late
+                } else {
+                    ShopifyReconciliationStatus::PendingPoll
+                };
+                let receipt = self.build_receipt(
+                    &webhook,
+                    ShopifyReconciliationSource::Webhook,
+                    status,
+                    webhook.poll_cursor_binding.clone(),
+                    0,
+                    None,
+                    None,
+                );
+                let checkpoint = self
+                    .store
+                    .checkpoint_mut(&webhook.mission_id, webhook.stream)?;
+                Ok(checkpoint.record_reconciliation_receipt(receipt))
+            }
+        }
+    }
+
+    fn durable_webhook(
+        &self,
+        webhook: &ShopifyWebhookCheckpoint,
+    ) -> Result<&ShopifyWebhookCheckpoint, ShopifyError> {
+        self.store
+            .checkpoint(&webhook.mission_id, webhook.stream)
+            .ok_or(ShopifyError::CheckpointMissing)?
+            .webhook_checkpoints()
+            .iter()
+            .find(|existing| existing.delivery_id == webhook.delivery_id)
+            .ok_or(ShopifyError::WebhookCheckpointMissing)
+    }
+
+    fn exact_receipt(
+        &self,
+        webhook: &ShopifyWebhookCheckpoint,
+    ) -> Option<&ShopifyReconciliationReceipt> {
+        self.store
+            .checkpoint(&webhook.mission_id, webhook.stream)?
+            .reconciliation_receipts()
+            .iter()
+            .find(|receipt| {
+                receipt.delivery_id == webhook.delivery_id
+                    && receipt.status == ShopifyReconciliationStatus::Exact
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_receipt(
+        &self,
+        webhook: &ShopifyWebhookCheckpoint,
+        source: ShopifyReconciliationSource,
+        status: ShopifyReconciliationStatus,
+        poll_cursor_binding: ShopifyPollCursorBinding,
+        poll_pages: u32,
+        gap: Option<ShopifySequenceGap>,
+        duplicate_of: Option<String>,
+    ) -> ShopifyReconciliationReceipt {
+        let source_tag = match source {
+            ShopifyReconciliationSource::Webhook => "webhook",
+            ShopifyReconciliationSource::Poll => "poll",
+            ShopifyReconciliationSource::GapFill => "gap-fill",
+        };
+        let status_tag = match status {
+            ShopifyReconciliationStatus::PendingPoll => "pending-poll",
+            ShopifyReconciliationStatus::Exact => "exact",
+            ShopifyReconciliationStatus::Duplicate => "duplicate",
+            ShopifyReconciliationStatus::Late => "late",
+            ShopifyReconciliationStatus::GapPending => "gap-pending",
+            ShopifyReconciliationStatus::NotObserved => "not-observed",
+        };
+        let generation = webhook.generation.to_string();
+        let poll_pages_string = poll_pages.to_string();
+        let resource_updated_at = webhook.resource_updated_at.to_rfc3339();
+        let receipt_id = shopify_digest([
+            webhook.mission_id.as_str(),
+            webhook.stream.capability_id(),
+            webhook.delivery_id.as_str(),
+            webhook.event_id.as_deref().unwrap_or_default(),
+            generation.as_str(),
+            source_tag,
+            status_tag,
+            webhook.resource_id.as_str(),
+            resource_updated_at.as_str(),
+            poll_cursor_binding.cursor_digest.as_str(),
+            poll_pages_string.as_str(),
+            duplicate_of.as_deref().unwrap_or_default(),
+        ]);
+        ShopifyReconciliationReceipt {
+            receipt_id: format!("shopify-reconciliation-{receipt_id}"),
+            mission_id: webhook.mission_id.clone(),
+            stream: webhook.stream,
+            delivery_id: webhook.delivery_id.clone(),
+            event_id: webhook.event_id.clone(),
+            topic: webhook.topic.clone(),
+            shop: webhook.shop.clone(),
+            api_version: webhook.api_version.clone(),
+            provider_digest: webhook.provider_digest.clone(),
+            generation: webhook.generation,
+            source,
+            status,
+            resource_id: webhook.resource_id.clone(),
+            resource_updated_at: webhook.resource_updated_at,
+            poll_cursor_binding,
+            poll_pages,
+            gap,
+            duplicate_of,
+            provenance_class: self.provenance_class,
+            live_validation_status: SHOPIFY_CURSOR_LIVE_VALIDATION_STATUS.into(),
+        }
+    }
+
+    fn fill_webhook_gap(
+        &mut self,
+        webhook: &ShopifyWebhookCheckpoint,
+        page_size: u32,
+        at: DateTime<Utc>,
+        gap: Option<ShopifySequenceGap>,
+    ) -> Result<ShopifyReconciliationReceipt, ShopifyError> {
+        let mut poll_pages: u32 = 0;
+        let mut last_binding = webhook.poll_cursor_binding.clone();
+        for offset in 0..SHOPIFY_RECONCILIATION_MAX_POLL_PAGES {
+            let envelope = match self.read_next(
+                webhook.mission_id.clone(),
+                webhook.stream,
+                page_size,
+                at + Duration::seconds(i64::from(offset)),
+            ) {
+                Ok(envelope) => envelope,
+                Err(ShopifyError::CheckpointComplete) => break,
+                Err(error) => return Err(error),
+            };
+            poll_pages = poll_pages.saturating_add(1);
+            last_binding = envelope.poll_cursor_binding.clone();
+            let exact = matches!(
+                envelope.reconcile_webhook(webhook)?,
+                ShopifyPollReconcile::Exact { .. }
+            );
+            if exact {
+                self.reconcile_webhook(&envelope, webhook)?;
+                self.commit(&envelope)?;
+                let receipt = self.build_receipt(
+                    webhook,
+                    ShopifyReconciliationSource::GapFill,
+                    ShopifyReconciliationStatus::Exact,
+                    last_binding,
+                    poll_pages,
+                    gap,
+                    None,
+                );
+                let checkpoint = self
+                    .store
+                    .checkpoint_mut(&webhook.mission_id, webhook.stream)?;
+                return Ok(checkpoint.record_reconciliation_receipt(receipt));
+            }
+            self.commit(&envelope)?;
+            if envelope.next_cursor.is_none() {
+                break;
+            }
+        }
+        let complete = self
+            .store
+            .checkpoint(&webhook.mission_id, webhook.stream)
+            .ok_or(ShopifyError::CheckpointMissing)?
+            .is_complete();
+        let status = if complete {
+            ShopifyReconciliationStatus::NotObserved
+        } else {
+            ShopifyReconciliationStatus::GapPending
+        };
+        let receipt = self.build_receipt(
+            webhook,
+            ShopifyReconciliationSource::GapFill,
+            status,
+            last_binding,
+            poll_pages,
+            gap,
+            None,
+        );
+        let checkpoint = self
+            .store
+            .checkpoint_mut(&webhook.mission_id, webhook.stream)?;
+        Ok(checkpoint.record_reconciliation_receipt(receipt))
     }
 
     pub fn rotate_auth(&mut self, next: ShopifyAuthBinding) -> Result<(), ShopifyError> {
@@ -1430,6 +2099,7 @@ impl<T: ShopifyAdminTransport> ShopifyDurableCursorConsumer<T> {
         {
             return Err(ShopifyError::CredentialRotationRejected);
         }
+        self.store.rotate_generation(next.generation())?;
         self.auth = Some(next);
         Ok(())
     }
@@ -1765,6 +2435,38 @@ pub fn verify_cursor_webhook_delivery(
     occurred_at: DateTime<Utc>,
     received_at: DateTime<Utc>,
 ) -> Result<ShopifyWebhookCheckpoint, ShopifyError> {
+    verify_cursor_webhook_delivery_for_generation(
+        raw_body,
+        headers,
+        client_secret,
+        tenant_scope,
+        stream,
+        mission_id,
+        sequence,
+        event_id,
+        occurred_at,
+        received_at,
+        1,
+    )
+}
+
+/// Verifies a Shopify delivery and binds it to an explicit auth generation.
+/// The generation is supplied by the mounted connector, never inferred from
+/// fixture data or from the webhook payload.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_cursor_webhook_delivery_for_generation(
+    raw_body: &[u8],
+    headers: ShopifyWebhookHeaders,
+    client_secret: &[u8],
+    tenant_scope: &ShopifyTenantScope,
+    stream: ShopifyCursorStream,
+    mission_id: impl Into<String>,
+    sequence: u64,
+    event_id: Option<String>,
+    occurred_at: DateTime<Utc>,
+    received_at: DateTime<Utc>,
+    generation: u64,
+) -> Result<ShopifyWebhookCheckpoint, ShopifyError> {
     let verified = verify_webhook_delivery(raw_body, headers, client_secret)?;
     let payload = serde_json::from_slice::<Value>(raw_body)
         .map_err(|error| ShopifyError::MalformedWebhookPayload(error.to_string()))?;
@@ -1794,7 +2496,7 @@ pub fn verify_cursor_webhook_delivery(
         .and_then(Value::as_str)
         .ok_or(ShopifyError::MissingWebhookUpdatedAt)
         .and_then(parse_shopify_time)?;
-    ShopifyWebhookCheckpoint::from_verified(
+    ShopifyWebhookCheckpoint::from_verified_for_generation(
         &verified,
         tenant_scope,
         stream,
@@ -1805,6 +2507,7 @@ pub fn verify_cursor_webhook_delivery(
         updated_at,
         occurred_at,
         received_at,
+        generation,
     )
 }
 
@@ -1842,6 +2545,8 @@ pub enum ShopifyError {
     CredentialRotationRejected,
     #[error("invalid Shopify mission id")]
     InvalidMissionId,
+    #[error("invalid Shopify auth generation")]
+    InvalidGeneration,
     #[error("invalid Shopify request: {0}")]
     InvalidRequest(String),
     #[error("Shopify HTTP status {0}")]
@@ -1868,6 +2573,8 @@ pub enum ShopifyError {
     CheckpointMissing,
     #[error("Shopify checkpoint scope/provider binding does not match")]
     CheckpointScopeMismatch,
+    #[error("Shopify checkpoint generation does not match the mounted auth")]
+    CheckpointGenerationMismatch,
     #[error("Shopify checkpoint page size does not match the mounted query")]
     CheckpointPageSizeMismatch,
     #[error("Shopify checkpoint has already reached the end")]
@@ -1888,6 +2595,10 @@ pub enum ShopifyError {
     MalformedWebhookPayload(String),
     #[error("Shopify webhook checkpoint conflicts with durable state")]
     WebhookCheckpointConflict,
+    #[error("Shopify webhook belongs to an invalidated auth generation")]
+    WebhookGenerationMismatch,
+    #[error("Shopify webhook is not bound to a compatible poll cursor")]
+    WebhookCursorBindingMismatch,
     #[error("Shopify webhook checkpoint is missing")]
     WebhookCheckpointMissing,
     #[error("Shopify webhook topic does not match the cursor stream")]
@@ -2142,6 +2853,18 @@ fn parse_shopify_time(value: &str) -> Result<DateTime<Utc>, ShopifyError> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
         .map_err(|_| ShopifyError::InvalidTimestamp(value.into()))
+}
+
+const fn default_generation() -> u64 {
+    1
+}
+
+fn validate_generation(generation: u64) -> Result<(), ShopifyError> {
+    if generation == 0 {
+        Err(ShopifyError::InvalidGeneration)
+    } else {
+        Ok(())
+    }
 }
 
 fn required_u64(value: &Value, field: &str) -> Result<u64, ShopifyError> {
