@@ -37,8 +37,8 @@ pub use provider_contract::{
 pub use secret_broker::{
     MissionSecretReference, MissionSecretScope, SecretBrokerConsumer, SecretBrokerError,
     SecretBrokerEvent, SecretBrokerEventKind, SecretBrokerProvider, SecretBrokerService,
-    SecretBrokerServiceDefinition, SecretBrokerState, SecretProviderError, SecretScope,
-    SecretUseAuthority, SecretUseHandle, SecretUseReceipt,
+    SecretBrokerServiceDefinition, SecretBrokerState, SecretProviderDispatch, SecretProviderError,
+    SecretScope, SecretUseAuthority, SecretUseHandle, SecretUseReceipt,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
