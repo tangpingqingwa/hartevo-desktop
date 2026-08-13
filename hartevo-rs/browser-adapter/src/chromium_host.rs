@@ -5452,7 +5452,9 @@ fn terminate_group_best_effort(child: &mut GroupChild) {
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
-    use std::io::{BufRead as _, BufReader, Cursor, Write as _};
+    use std::io::Cursor;
+    #[cfg(target_os = "macos")]
+    use std::io::{BufRead as _, BufReader, Write as _};
     #[cfg(target_os = "macos")]
     use std::net::{SocketAddr, TcpListener};
     #[cfg(unix)]
@@ -5479,8 +5481,10 @@ mod tests {
 
     use super::*;
     #[cfg(target_os = "macos")]
-    use crate::{BrowserFileGrantState, BrowserIdentity, FileBroker};
-    use crate::{FileSafetyScanner, FileScanDecision, FileScanReport, FileScanRequest};
+    use crate::{
+        BrowserFileGrantState, BrowserIdentity, FileBroker, FileSafetyScanner, FileScanDecision,
+        FileScanReport, FileScanRequest,
+    };
 
     fn sha(byte: char) -> String {
         byte.to_string().repeat(64)
