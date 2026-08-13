@@ -1,12 +1,17 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
 mod runtime_text_subscription;
+mod work_product_outcome;
 
 pub use runtime_text_subscription::{
     CatalogMissionExecutionHandle, CatalogMissionExecutionStart,
     RUNTIME_TEXT_SUBSCRIPTION_MAX_PAGE_SIZE, RuntimeTextSubscriptionBatch,
     RuntimeTextSubscriptionCursor, RuntimeTextSubscriptionDelta, RuntimeTextSubscriptionError,
     RuntimeTextSubscriptionPage, RuntimeTextSubscriptionTurn,
+};
+pub use work_product_outcome::{
+    AcceptResultPacket, DecideWorkProductAdoption, LinkVerifiedOutcome, ReviseWorkProductResult,
+    WorkProductOutcomeApplicationError, WorkProductOutcomeHandoff,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

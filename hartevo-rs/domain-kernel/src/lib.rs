@@ -27,6 +27,7 @@ mod runtime_recovery;
 mod runtime_turn;
 mod truth;
 mod work_product;
+mod work_product_outcome;
 
 pub use attribution_spine::{
     ATTRIBUTION_SPINE_EVENT_TYPE, ATTRIBUTION_SPINE_SCHEMA_VERSION, AttributionAssignment,
@@ -158,6 +159,13 @@ pub use truth::{
 };
 pub use work_product::{
     WorkProductDependencies, WorkProductManifest, WorkProductManifestError, WorkProductPreview,
+};
+pub use work_product_outcome::{
+    AdoptionDecision, AdoptionDecisionKind, OutcomeClassification, OutcomeLink,
+    OutcomeVerificationKind, ResultClassification, ResultCounterevidence, ResultPacket,
+    WORK_PRODUCT_HANDOFF_PREVIEW_MEDIA_TYPE, WORK_PRODUCT_HANDOFF_SCHEMA_VERSION,
+    WORK_PRODUCT_HANDOFF_TYPE, WorkProductHandoffSnapshot, WorkProductOutcomeError,
+    WorkProductRevision,
 };
 
 /// Domain schema recorded with every build and persisted snapshot.
