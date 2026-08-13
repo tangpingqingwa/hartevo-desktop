@@ -882,6 +882,10 @@ impl AdapterBinding {
     fn exact_digest(&self) -> Digest {
         digest_serialized(self)
     }
+
+    pub fn digest(&self) -> Digest {
+        self.exact_digest()
+    }
 }
 
 impl fmt::Debug for AdapterBinding {
@@ -2918,6 +2922,35 @@ impl CapabilityGateway {
         L: InvocationLedger,
     {
         let permit = self.authorize(signed_manifest, request, now)?;
+        Self::dispatch_with_permit(signed_manifest, &permit, request, adapter, ledger, now)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn dispatch_with_permit<A, L>(
+        signed_manifest: &SignedCapabilityManifest,
+        permit: &InvocationPermit,
+        request: &CapabilityRequest,
+        adapter: &A,
+        ledger: &mut L,
+        now: DateTime<Utc>,
+    ) -> Result<CapabilityResult, GatewayError>
+    where
+        A: CapabilityAdapter,
+        L: InvocationLedger,
+    {
+        signed_manifest.verify(now)?;
+        let manifest_digest = signed_manifest.digest()?;
+        let authority_digest = signed_manifest.manifest.authority_digest()?;
+        if permit.manifest_digest != manifest_digest
+            || permit.authority_digest != authority_digest
+            || permit.request_digest != request.digest()
+            || permit.manifest_digest != request.manifest_digest
+            || permit.class != request.class
+            || permit.generation != request.generation
+        {
+            return Err(GatewayError::InvalidInvocationPermit);
+        }
+        request.validate_against(&signed_manifest.manifest, now)?;
         if adapter.binding() != &permit.adapter {
             return Err(GatewayError::AdapterBindingMismatch);
         }
@@ -3162,6 +3195,8 @@ pub enum GatewayError {
     ResultScopeMismatch,
     #[error("result is invalid")]
     InvalidResult,
+    #[error("invocation authorization receipt does not match the typed request")]
+    InvalidInvocationPermit,
     #[error("resource reference is invalid")]
     InvalidResourceReference,
     #[error("adapter rejected a typed request")]
@@ -3257,6 +3292,7 @@ impl GatewayError {
             Self::RecoveryScopeViolation => "recovery_scope_violation",
             Self::ResultScopeMismatch => "result_scope_mismatch",
             Self::InvalidResult => "invalid_result",
+            Self::InvalidInvocationPermit => "invalid_invocation_permit",
             Self::InvalidResourceReference => "invalid_resource_reference",
             Self::AdapterRejected(_) => "adapter_rejected",
             Self::Recovery(_) => "recovery",
@@ -3288,7 +3324,8 @@ fn valid_capability_id(value: &str) -> bool {
     })
 }
 
-fn digest_serialized<T: Serialize>(value: &T) -> Digest {
+/// Computes the canonical SHA-256 digest used by cross-crate receipts.
+pub fn digest_serialized<T: Serialize>(value: &T) -> Digest {
     match serde_json::to_vec(value) {
         Ok(bytes) => Digest::from_bytes(&bytes),
         Err(_) => Digest::from_text("canonicalization-error"),

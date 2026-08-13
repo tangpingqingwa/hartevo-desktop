@@ -162,6 +162,15 @@ impl PluginError {
 pub struct Digest(String);
 
 impl Digest {
+    pub fn parse(value: impl Into<String>) -> Result<Self, PluginError> {
+        let value = value.into();
+        if is_digest(&value) {
+            Ok(Self(value))
+        } else {
+            Err(PluginError::InvalidDigest)
+        }
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Self(hex::encode(Sha256::digest(bytes)))
     }
@@ -2177,8 +2186,15 @@ impl ScopeRegistry {
     }
 }
 
+pub mod capability;
 pub mod sample;
 pub mod skill;
+
+pub use capability::{
+    CapabilityInvocationReceipt, CapabilityInvocationReceipt as CapabilityPluginInvocationReceipt,
+    CapabilityMountReceipt, CapabilityPluginError, CapabilityPluginInspection,
+    MountedReadOnlyCapability,
+};
 
 fn ensure_unique<'a, I, T>(values: I, duplicate: PluginError) -> Result<(), PluginError>
 where
