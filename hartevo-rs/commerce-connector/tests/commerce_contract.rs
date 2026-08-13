@@ -207,12 +207,13 @@ fn shopify_bulk_read_and_webhook_signature_are_read_only_seams() {
         }
     }));
     let poll = graphql_response(json!({
-        "node": {
+        "bulkOperation": {
             "id": "gid://shopify/BulkOperation/1",
             "status": "COMPLETED",
             "errorCode": null,
             "url": "https://storage.shopify.com/result.ndjson",
-            "objectCount": 1
+            "objectCount": 1,
+            "completedAt": "2026-08-01T00:02:00Z"
         }
     }));
     let mut transport = FakeShopifyTransport::new([start, poll]);

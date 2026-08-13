@@ -6,7 +6,7 @@
 //! verifies HTTPS webhook signatures before a payload can be parsed.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ring::hmac;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,10 @@ use crate::canonical::{CanonicalIdentityError, CanonicalSku, CanonicalTime};
 
 pub const SHOPIFY_PROVIDER_ID: &str = "shopify";
 pub const SHOPIFY_LATEST_API_VERSION: &str = "2026-07";
+pub const SHOPIFY_READ_EVIDENCE_LEVEL: &str = "E1";
+pub const SHOPIFY_LIVE_VALIDATION_STATUS: &str = "BLOCKED_ENV";
 pub const SHOPIFY_HMAC_HEADER: &str = "X-Shopify-Hmac-SHA256";
+pub const SHOPIFY_REQUEST_ID_HEADER: &str = "X-Request-ID";
 pub const SHOPIFY_WEBHOOK_ID_HEADER: &str = "X-Shopify-Webhook-Id";
 pub const SHOPIFY_TOPIC_HEADER: &str = "X-Shopify-Topic";
 pub const SHOPIFY_SHOP_DOMAIN_HEADER: &str = "X-Shopify-Shop-Domain";
@@ -30,7 +33,7 @@ pub const SHOPIFY_API_VERSION_HEADER: &str = "X-Shopify-API-Version";
 pub const SHOP_IDENTITY_QUERY: &str = "query ShopifyShopIdentity { shop { id name myshopifyDomain } currentAppInstallation { accessScopes { handle } } }";
 pub const PRODUCTS_PAGE_QUERY: &str = "query ShopifyProductsPage($first: Int!, $after: String) { products(first: $first, after: $after) { edges { cursor node { id title variants(first: 100) { nodes { id sku } pageInfo { hasNextPage endCursor } } } } pageInfo { hasNextPage endCursor } } }";
 pub const BULK_PRODUCTS_MUTATION: &str = "mutation ShopifyBulkProducts { bulkOperationRunQuery(query: \"{ products { edges { node { id title variants { nodes { id sku } } } } } }\") { bulkOperation { id status } userErrors { field message } } }";
-pub const BULK_OPERATION_QUERY: &str = "query ShopifyBulkOperation($id: ID!) { node(id: $id) { ... on BulkOperation { id status errorCode url objectCount completedAt } } }";
+pub const BULK_OPERATION_QUERY: &str = "query ShopifyBulkOperation($id: ID!) { bulkOperation(id: $id) { id status errorCode url objectCount completedAt } }";
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -60,6 +63,114 @@ impl ShopifyApiVersion {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct ShopifyCredentialReference(String);
+
+impl ShopifyCredentialReference {
+    /// Store only a vault/keychain reference; never put Shopify access tokens in this model.
+    pub fn parse(value: impl Into<String>) -> Result<Self, ShopifyError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 128
+            || value.trim() != value
+            || value.chars().any(char::is_control)
+        {
+            return Err(ShopifyError::InvalidCredentialReference(value));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShopifyAuthStatus {
+    Disconnected,
+    BlockedEnv,
+    CredentialReferenceOnly,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShopifyBlockedEnvReason {
+    CredentialsUnavailable,
+    NetworkUnavailable,
+    ProviderUnavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ShopifyAuthState {
+    Disconnected {
+        observed_at: CanonicalTime,
+    },
+    BlockedEnv {
+        observed_at: CanonicalTime,
+        reason: ShopifyBlockedEnvReason,
+    },
+    CredentialReferenceOnly {
+        observed_at: CanonicalTime,
+        credential: ShopifyCredentialReference,
+    },
+}
+
+impl ShopifyAuthState {
+    pub fn disconnected(observed_at: DateTime<Utc>) -> Self {
+        Self::Disconnected {
+            observed_at: CanonicalTime::from_datetime(observed_at),
+        }
+    }
+
+    pub fn no_credentials(observed_at: DateTime<Utc>) -> Self {
+        Self::blocked_env(observed_at, ShopifyBlockedEnvReason::CredentialsUnavailable)
+    }
+
+    pub fn blocked_env(observed_at: DateTime<Utc>, reason: ShopifyBlockedEnvReason) -> Self {
+        Self::BlockedEnv {
+            observed_at: CanonicalTime::from_datetime(observed_at),
+            reason,
+        }
+    }
+
+    pub fn credential_reference_only(
+        observed_at: DateTime<Utc>,
+        credential: ShopifyCredentialReference,
+    ) -> Self {
+        Self::CredentialReferenceOnly {
+            observed_at: CanonicalTime::from_datetime(observed_at),
+            credential,
+        }
+    }
+
+    pub fn status(&self) -> ShopifyAuthStatus {
+        match self {
+            Self::Disconnected { .. } => ShopifyAuthStatus::Disconnected,
+            Self::BlockedEnv { .. } => ShopifyAuthStatus::BlockedEnv,
+            Self::CredentialReferenceOnly { .. } => ShopifyAuthStatus::CredentialReferenceOnly,
+        }
+    }
+
+    pub fn credential(&self) -> Option<&ShopifyCredentialReference> {
+        match self {
+            Self::CredentialReferenceOnly { credential, .. } => Some(credential),
+            Self::Disconnected { .. } | Self::BlockedEnv { .. } => None,
+        }
+    }
+
+    /// A reference alone is not a live credential and cannot establish a connected state.
+    pub const fn can_issue_live_read(&self) -> bool {
+        false
+    }
+
+    pub const fn grants_connected_authority(&self) -> bool {
+        false
     }
 }
 
@@ -249,9 +360,72 @@ impl ShopifyScopeObservation {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShopifyFirstPartyProvenance {
+    pub provider_id: String,
+    pub evidence_level: String,
+    pub shop: ShopDomain,
+    pub api_version: ShopifyApiVersion,
+    pub operation_name: String,
+    pub response_status: u16,
+    pub request_id: Option<String>,
+    pub response_digest: String,
+    pub observed_at: CanonicalTime,
+}
+
+impl ShopifyFirstPartyProvenance {
+    pub fn from_response(
+        request: &ShopifyGraphqlRequest,
+        response: &ShopifyGraphqlResponse,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Self, ShopifyError> {
+        let response_digest = response.body_digest()?;
+        let request_id = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(SHOPIFY_REQUEST_ID_HEADER))
+            .map(|(_, value)| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let provenance = Self {
+            provider_id: SHOPIFY_PROVIDER_ID.into(),
+            evidence_level: SHOPIFY_READ_EVIDENCE_LEVEL.into(),
+            shop: request.shop.clone(),
+            api_version: request.api_version.clone(),
+            operation_name: request.operation_name.clone(),
+            response_status: response.status,
+            request_id,
+            response_digest,
+            observed_at: CanonicalTime::from_datetime(observed_at),
+        };
+        provenance.validate()?;
+        Ok(provenance)
+    }
+
+    pub fn validate(&self) -> Result<(), ShopifyError> {
+        if self.provider_id != SHOPIFY_PROVIDER_ID
+            || self.evidence_level != SHOPIFY_READ_EVIDENCE_LEVEL
+            || self.operation_name.trim().is_empty()
+            || self.response_digest.len() != 64
+            || !self
+                .response_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ShopifyError::InvalidReadProvenance);
+        }
+        Ok(())
+    }
+
+    pub const fn grants_connected_authority(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShopifyShopRead {
     pub identity: ShopifyShopIdentity,
     pub scopes: ShopifyScopeObservation,
+    pub provenance: ShopifyFirstPartyProvenance,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -318,6 +492,14 @@ pub struct ShopifyGraphqlResponse {
 }
 
 impl ShopifyGraphqlResponse {
+    pub fn first_party_provenance(
+        &self,
+        request: &ShopifyGraphqlRequest,
+        observed_at: DateTime<Utc>,
+    ) -> Result<ShopifyFirstPartyProvenance, ShopifyError> {
+        ShopifyFirstPartyProvenance::from_response(request, self, observed_at)
+    }
+
     pub fn data<T: DeserializeOwned>(&self) -> Result<T, ShopifyError> {
         if !(200..300).contains(&self.status) {
             return Err(ShopifyError::HttpStatus(self.status));
@@ -332,6 +514,14 @@ impl ShopifyGraphqlResponse {
             .clone();
         serde_json::from_value(data)
             .map_err(|error| ShopifyError::MalformedResponse(error.to_string()))
+    }
+
+    fn body_digest(&self) -> Result<String, ShopifyError> {
+        let bytes =
+            serde_json::to_vec(&self.body).map_err(|_| ShopifyError::InvalidReadProvenance)?;
+        let mut digest = Sha256::new();
+        digest.update(bytes);
+        Ok(format!("{:x}", digest.finalize()))
     }
 }
 
@@ -349,8 +539,10 @@ pub fn read_shop_identity<T: ShopifyAdminTransport>(
         Value::Object(serde_json::Map::new()),
     )?;
     let response = transport
-        .execute(request)
+        .execute(request.clone())
         .map_err(|error| ShopifyError::Transport(error.to_string()))?;
+    let observed_at = Utc::now();
+    let provenance = response.first_party_provenance(&request, observed_at)?;
     let payload = response.data::<ShopIdentityPayload>()?;
     let domain = ShopDomain::parse(payload.shop.myshopify_domain)?;
     if &domain != shop {
@@ -377,8 +569,9 @@ pub fn read_shop_identity<T: ShopifyAdminTransport>(
         scopes: ShopifyScopeObservation {
             requested: requested_scopes,
             granted,
-            observed_at: CanonicalTime::from_datetime(Utc::now()),
+            observed_at: CanonicalTime::from_datetime(observed_at),
         },
+        provenance,
     })
 }
 
@@ -388,6 +581,7 @@ pub struct ShopifyProductRead {
     pub product_gid: String,
     pub title: String,
     pub variant_skus: Vec<CanonicalSku>,
+    pub provenance: ShopifyFirstPartyProvenance,
 }
 
 pub fn read_products_paginated<T: ShopifyAdminTransport>(
@@ -412,8 +606,9 @@ pub fn read_products_paginated<T: ShopifyAdminTransport>(
             variables,
         )?;
         let response = transport
-            .execute(request)
+            .execute(request.clone())
             .map_err(|error| ShopifyError::Transport(error.to_string()))?;
+        let provenance = response.first_party_provenance(&request, Utc::now())?;
         let payload = response.data::<ProductsPagePayload>()?;
         for edge in payload.products.edges {
             let product_gid = edge.node.id;
@@ -433,6 +628,7 @@ pub fn read_products_paginated<T: ShopifyAdminTransport>(
                 product_gid,
                 title: edge.node.title,
                 variant_skus,
+                provenance: provenance.clone(),
             });
         }
         if !payload.products.page_info.has_next_page {
@@ -476,10 +672,15 @@ pub struct ShopifyBulkOperation {
     pub error_code: Option<String>,
     pub result_url: Option<String>,
     pub object_count: Option<u64>,
+    pub completed_at: Option<CanonicalTime>,
+    pub provenance: ShopifyFirstPartyProvenance,
 }
 
 impl ShopifyBulkOperation {
-    fn from_payload(payload: BulkOperationPayload) -> Result<Self, ShopifyError> {
+    fn from_payload(
+        payload: BulkOperationPayload,
+        provenance: ShopifyFirstPartyProvenance,
+    ) -> Result<Self, ShopifyError> {
         let id = payload.id.ok_or(ShopifyError::MissingBulkOperation)?;
         if !id.starts_with("gid://shopify/BulkOperation/") {
             return Err(ShopifyError::InvalidBulkOperationId(id));
@@ -501,6 +702,8 @@ impl ShopifyBulkOperation {
             error_code: payload.error_code,
             result_url,
             object_count: payload.object_count,
+            completed_at: payload.completed_at,
+            provenance,
         })
     }
 }
@@ -518,8 +721,9 @@ pub fn start_bulk_product_read<T: ShopifyAdminTransport>(
         Value::Object(serde_json::Map::new()),
     )?;
     let response = transport
-        .execute(request)
+        .execute(request.clone())
         .map_err(|error| ShopifyError::Transport(error.to_string()))?;
+    let provenance = response.first_party_provenance(&request, Utc::now())?;
     let payload = response.data::<BulkRunPayload>()?;
     if !payload.bulk_operation_run_query.user_errors.is_empty() {
         return Err(ShopifyError::GraphqlUserErrors(
@@ -536,6 +740,7 @@ pub fn start_bulk_product_read<T: ShopifyAdminTransport>(
             .bulk_operation_run_query
             .bulk_operation
             .ok_or(ShopifyError::MissingBulkOperation)?,
+        provenance,
     )
 }
 
@@ -557,10 +762,16 @@ pub fn poll_bulk_operation<T: ShopifyAdminTransport>(
         json!({"id": operation_id}),
     )?;
     let response = transport
-        .execute(request)
+        .execute(request.clone())
         .map_err(|error| ShopifyError::Transport(error.to_string()))?;
+    let provenance = response.first_party_provenance(&request, Utc::now())?;
     let payload = response.data::<BulkNodePayload>()?;
-    ShopifyBulkOperation::from_payload(payload.node.ok_or(ShopifyError::MissingBulkOperation)?)
+    ShopifyBulkOperation::from_payload(
+        payload
+            .bulk_operation
+            .ok_or(ShopifyError::MissingBulkOperation)?,
+        provenance,
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -657,6 +868,8 @@ pub enum ShopifyError {
     InvalidShopName,
     #[error("invalid Shopify access scope {0}")]
     InvalidScope(String),
+    #[error("invalid Shopify credential reference {0}")]
+    InvalidCredentialReference(String),
     #[error("invalid Shopify request: {0}")]
     InvalidRequest(String),
     #[error("Shopify HTTP status {0}")]
@@ -669,6 +882,8 @@ pub enum ShopifyError {
     MissingData,
     #[error("malformed Shopify response: {0}")]
     MalformedResponse(String),
+    #[error("Shopify read provenance is missing or invalid")]
+    InvalidReadProvenance,
     #[error("Shopify transport failed: {0}")]
     Transport(String),
     #[error("Shopify response belongs to {observed}, not requested {requested}")]
@@ -800,7 +1015,7 @@ struct UserErrorPayload {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BulkNodePayload {
-    node: Option<BulkOperationPayload>,
+    bulk_operation: Option<BulkOperationPayload>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -811,6 +1026,7 @@ struct BulkOperationPayload {
     error_code: Option<String>,
     url: Option<String>,
     object_count: Option<u64>,
+    completed_at: Option<CanonicalTime>,
 }
 
 #[cfg(test)]
