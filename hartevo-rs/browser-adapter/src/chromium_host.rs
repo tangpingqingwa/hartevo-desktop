@@ -437,6 +437,7 @@ struct ChromiumSemanticTargetContext {
     candidate: AxLocatorCandidate,
     target_url: String,
     frame: CdpFrameIdentity,
+    frame_tree: CdpFrameTreeSnapshot,
 }
 
 #[derive(Clone)]
@@ -447,6 +448,7 @@ struct ChromiumInputTargetBinding {
     candidate: AxLocatorCandidate,
     target_url: String,
     frame: CdpFrameIdentity,
+    frame_tree: CdpFrameTreeSnapshot,
 }
 
 impl ChromiumSemanticTargetContext {
@@ -458,6 +460,7 @@ impl ChromiumSemanticTargetContext {
             candidate: self.candidate.clone(),
             target_url: self.target_url.clone(),
             frame: self.frame.clone(),
+            frame_tree: self.frame_tree.clone(),
         }
     }
 }
@@ -481,8 +484,11 @@ struct AxLocatorCandidate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CdpFrameIdentity {
     frame_id: String,
+    parent_frame_id: Option<String>,
     loader_id: String,
     url: String,
+    security_origin: String,
+    unreachable_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -522,6 +528,7 @@ struct CdpTabSession {
     document_generation: u64,
     latest_snapshot: Option<SemanticSnapshot>,
     locator_map: BTreeMap<String, AxLocatorCandidate>,
+    latest_frame_tree: Option<CdpFrameTreeSnapshot>,
     current_frame_id: Option<String>,
     current_loader_id: Option<String>,
     current_url_digest: Option<String>,
@@ -546,6 +553,13 @@ impl fmt::Debug for CdpTabSession {
                 &self.latest_snapshot.as_ref().map(|snapshot| &snapshot.id),
             )
             .field("locator_count", &self.locator_map.len())
+            .field(
+                "latest_frame_count",
+                &self
+                    .latest_frame_tree
+                    .as_ref()
+                    .map(|snapshot| snapshot.frames.len()),
+            )
             .field(
                 "current_frame_id_digest",
                 &self
@@ -787,6 +801,7 @@ impl ManagedChromiumHost {
                 document_generation: 1,
                 latest_snapshot: None,
                 locator_map: BTreeMap::new(),
+                latest_frame_tree: None,
                 current_frame_id: None,
                 current_loader_id: None,
                 current_url_digest: None,
@@ -930,6 +945,7 @@ impl ManagedChromiumHost {
                 .ok_or(BrowserError::CounterOverflow)?;
             tab.latest_snapshot = None;
             tab.locator_map.clear();
+            tab.latest_frame_tree = None;
             tab.lifecycle_events.clear();
             tab.current_frame_id = None;
             tab.current_loader_id = None;
@@ -983,8 +999,10 @@ impl ManagedChromiumHost {
             Some(&session_id),
             guard,
         )?;
-        let frame_identity =
-            parse_root_frame_identity(&frame_tree).map_err(|_| BrowserError::NavigationFailed)?;
+        let frame_tree =
+            parse_frame_tree_snapshot(&frame_tree).map_err(|_| BrowserError::NavigationFailed)?;
+        validate_frame_tree_navigation_scope(&frame_tree, policy)?;
+        let frame_identity = frame_tree.root;
         if frame_identity.frame_id != frame_id || frame_identity.loader_id != loader_id {
             return Err(BrowserError::NavigationFailed);
         }
@@ -1018,6 +1036,7 @@ impl ManagedChromiumHost {
         let final_origin_digest = policy
             .permitted_origin_digest(final_url)
             .ok_or(BrowserError::NavigationRequestBlocked)?;
+        validate_exact_navigation_target_origin(target, &final_origin_digest)?;
         let (allowed_after, blocked_after) = {
             let tab = self.tabs.get(tab_id).ok_or(BrowserError::TabNotFound)?;
             (tab.allowed_request_count, tab.blocked_request_count)
@@ -1052,18 +1071,56 @@ impl ManagedChromiumHost {
         )
     }
 
-    fn read_root_frame_identity(
+    fn read_frame_tree_snapshot(
         &mut self,
         session_id: &str,
         guard: &OperationLeaseGuard<'_>,
-    ) -> Result<CdpFrameIdentity, BrowserError> {
+    ) -> Result<CdpFrameTreeSnapshot, BrowserError> {
         let result = self.command_guarded(
             CdpMethod::PageGetFrameTree,
             json!({}),
             Some(session_id),
             guard,
         )?;
-        parse_root_frame_identity(&result)
+        parse_frame_tree_snapshot(&result)
+    }
+
+    fn read_scoped_frame_tree_snapshot(
+        &mut self,
+        tab_id: &BrowserTabId,
+        session_id: &str,
+        guard: &OperationLeaseGuard<'_>,
+    ) -> Result<CdpFrameTreeSnapshot, BrowserError> {
+        let policy = self
+            .tabs
+            .get(tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .navigation_policy
+            .clone();
+        let snapshot = self.read_frame_tree_snapshot(session_id, guard)?;
+        if let Some(policy) = policy.as_ref() {
+            validate_frame_tree_navigation_scope(&snapshot, policy)?;
+        }
+        Ok(snapshot)
+    }
+
+    fn revalidate_input_target_binding(
+        &mut self,
+        tab_id: &BrowserTabId,
+        binding: &ChromiumInputTargetBinding,
+        guard: &OperationLeaseGuard<'_>,
+    ) -> Result<(), BrowserError> {
+        let target_url = self.read_target_url(&binding.target_id, guard)?;
+        let current = self.read_scoped_frame_tree_snapshot(tab_id, &binding.session_id, guard)?;
+        if validate_bound_frame_tree(&binding.frame_tree, &current).is_err()
+            || current.root != binding.frame
+            || target_url != binding.target_url
+            || target_url != current.root.url
+        {
+            self.sync_frame_identity(tab_id, &current.root)?;
+            return Err(BrowserError::StaleSnapshot);
+        }
+        Ok(())
     }
 
     fn read_root_ax_tree(
@@ -1137,6 +1194,7 @@ impl ManagedChromiumHost {
                 .ok_or(BrowserError::CounterOverflow)?;
             tab.latest_snapshot = None;
             tab.locator_map.clear();
+            tab.latest_frame_tree = None;
             tab.lifecycle_events.clear();
         }
         tab.current_frame_id = Some(identity.frame_id.clone());
@@ -1159,22 +1217,29 @@ impl ManagedChromiumHost {
             (tab.target_id.clone(), tab.session_id.clone())
         };
         let target_url_before = self.read_target_url(&target_id, &guard)?;
-        let frame_before = self.read_root_frame_identity(&session_id, &guard)?;
+        let frame_tree_before =
+            self.read_scoped_frame_tree_snapshot(tab_id, &session_id, &guard)?;
+        let frame_before = frame_tree_before.root.clone();
         let document_generation = self.sync_frame_identity(tab_id, &frame_before)?;
         if target_url_before != frame_before.url {
             return Err(BrowserError::StaleSnapshot);
         }
         let tree = self.read_root_ax_tree(&session_id, &frame_before, &guard)?;
-        let frame_after = self.read_root_frame_identity(&session_id, &guard)?;
+        let frame_tree_after = self.read_scoped_frame_tree_snapshot(tab_id, &session_id, &guard)?;
+        let frame_after = frame_tree_after.root.clone();
         let target_url_after = self.read_target_url(&target_id, &guard)?;
-        if frame_after != frame_before || target_url_after != frame_after.url {
+        if validate_bound_frame_tree(&frame_tree_before, &frame_tree_after).is_err()
+            || frame_after != frame_before
+            || target_url_after != frame_after.url
+        {
             self.sync_frame_identity(tab_id, &frame_after)?;
             return Err(BrowserError::StaleSnapshot);
         }
         self.workspace
             .validate_agent_lease(proof, guard.observed_at()?)?;
-        let normalized = normalize_ax_tree(&tree, &snapshot_id, document_generation, &frame_before)
-            .map_err(|_| self.poison())?;
+        let normalized =
+            normalize_ax_tree(&tree, &snapshot_id, document_generation, &frame_tree_before)
+                .map_err(|_| self.poison())?;
         let snapshot = SemanticSnapshot::new(
             snapshot_id,
             &self.workspace,
@@ -1191,6 +1256,7 @@ impl ManagedChromiumHost {
         let tab = self.tabs.get_mut(tab_id).ok_or(BrowserError::TabNotFound)?;
         tab.latest_snapshot = Some(snapshot.clone());
         tab.locator_map = normalized.locator_map;
+        tab.latest_frame_tree = Some(frame_tree_after);
         Ok(snapshot)
     }
 
@@ -1439,7 +1505,7 @@ impl ManagedChromiumHost {
             &mut initial_tree,
             &binding.snapshot,
             &binding.candidate,
-            &binding.frame,
+            &binding.frame_tree,
         )?;
         if initial_state.byte_len != 0 {
             return Err(BrowserError::TextTargetNotEmpty);
@@ -1457,18 +1523,13 @@ impl ManagedChromiumHost {
             &mut focused_tree,
             &binding.snapshot,
             &binding.candidate,
-            &binding.frame,
+            &binding.frame_tree,
         )?;
         if focused_state.byte_len != 0 || !focused_state.focused {
             return Err(BrowserError::TextTargetNotEditable);
         }
 
-        let final_frame = self.read_root_frame_identity(&binding.session_id, guard)?;
-        let final_url = self.read_target_url(&binding.target_id, guard)?;
-        if final_frame != binding.frame || final_url != binding.target_url {
-            self.sync_frame_identity(&resolution.tab_id, &final_frame)?;
-            return Err(BrowserError::StaleSnapshot);
-        }
+        self.revalidate_input_target_binding(&resolution.tab_id, &binding, guard)?;
         self.workspace
             .validate_agent_lease(&batch.lease, guard.observed_at()?)?;
         let focus_evidence_digest = digest_json(&json!({
@@ -1531,7 +1592,7 @@ impl ManagedChromiumHost {
             &mut initial_tree,
             &binding.snapshot,
             &binding.candidate,
-            &binding.frame,
+            &binding.frame_tree,
         )?;
         handle.validate_for(grant, &self.workspace)?;
         self.workspace
@@ -1566,7 +1627,7 @@ impl ManagedChromiumHost {
         resolution: &BrowserLocatorResolution,
         guard: &OperationLeaseGuard<'_>,
     ) -> Result<ChromiumSemanticTargetContext, BrowserError> {
-        let (target_id, session_id, policy, snapshot, candidate) = {
+        let (target_id, session_id, policy, snapshot, candidate, frame_tree) = {
             let tab = self
                 .tabs
                 .get(&resolution.tab_id)
@@ -1587,12 +1648,17 @@ impl ManagedChromiumHost {
                 .get(&resolution.element_ref.reference)
                 .cloned()
                 .ok_or(BrowserError::StaleElementRef)?;
+            let frame_tree = tab
+                .latest_frame_tree
+                .clone()
+                .ok_or(BrowserError::StaleSnapshot)?;
             (
                 tab.target_id.clone(),
                 tab.session_id.clone(),
                 policy,
                 snapshot,
                 candidate,
+                frame_tree,
             )
         };
         if policy.evidence_digest() != batch.policy_digest
@@ -1611,12 +1677,15 @@ impl ManagedChromiumHost {
         }
 
         let target_url = self.read_target_url(&target_id, guard)?;
-        let frame = self.read_root_frame_identity(&session_id, guard)?;
+        let current_frame_tree =
+            self.read_scoped_frame_tree_snapshot(&resolution.tab_id, &session_id, guard)?;
+        let frame = current_frame_tree.root.clone();
         let document_generation = self.sync_frame_identity(&resolution.tab_id, &frame)?;
         let current_origin_digest = policy
             .permitted_origin_digest(&target_url)
             .ok_or(BrowserError::NavigationRequestBlocked)?;
-        if target_url != frame.url
+        if validate_bound_frame_tree(&frame_tree, &current_frame_tree).is_err()
+            || target_url != frame.url
             || document_generation != resolution.document_generation
             || digest(target_url.as_bytes()) != resolution.url_digest
             || current_origin_digest != resolution.origin_digest
@@ -1626,7 +1695,7 @@ impl ManagedChromiumHost {
             return Err(BrowserError::StaleSnapshot);
         }
 
-        self.validate_fresh_ax_candidate(&session_id, &snapshot, &candidate, &frame, guard)?;
+        self.validate_fresh_ax_candidate(&session_id, &snapshot, &candidate, &frame_tree, guard)?;
         Ok(ChromiumSemanticTargetContext {
             action,
             target_id,
@@ -1635,6 +1704,7 @@ impl ManagedChromiumHost {
             candidate,
             target_url,
             frame,
+            frame_tree,
         })
     }
 
@@ -1651,12 +1721,7 @@ impl ManagedChromiumHost {
             Some(&context.session_id),
             guard,
         )?;
-        let frame_after_scroll = self.read_root_frame_identity(&context.session_id, guard)?;
-        let target_url_after_scroll = self.read_target_url(&context.target_id, guard)?;
-        if frame_after_scroll != context.frame || target_url_after_scroll != context.target_url {
-            self.sync_frame_identity(&resolution.tab_id, &frame_after_scroll)?;
-            return Err(BrowserError::StaleSnapshot);
-        }
+        self.revalidate_input_target_binding(&resolution.tab_id, context, guard)?;
 
         let described = self.command_guarded(
             CdpMethod::DomDescribeNode,
@@ -1708,15 +1773,10 @@ impl ManagedChromiumHost {
             &context.session_id,
             &context.snapshot,
             &context.candidate,
-            &context.frame,
+            &context.frame_tree,
             guard,
         )?;
-        let final_frame = self.read_root_frame_identity(&context.session_id, guard)?;
-        let final_url = self.read_target_url(&context.target_id, guard)?;
-        if final_frame != context.frame || final_url != context.target_url {
-            self.sync_frame_identity(&resolution.tab_id, &final_frame)?;
-            return Err(BrowserError::StaleSnapshot);
-        }
+        self.revalidate_input_target_binding(&resolution.tab_id, context, guard)?;
         Ok((x, y, geometry_digest, hit_test_digest))
     }
 
@@ -1725,16 +1785,16 @@ impl ManagedChromiumHost {
         session_id: &str,
         snapshot: &SemanticSnapshot,
         candidate: &AxLocatorCandidate,
-        root_frame: &CdpFrameIdentity,
+        frame_tree: &CdpFrameTreeSnapshot,
         guard: &OperationLeaseGuard<'_>,
     ) -> Result<(), BrowserError> {
-        validate_candidate_root_binding(candidate, root_frame)?;
-        let tree = self.read_root_ax_tree(session_id, root_frame, guard)?;
+        validate_candidate_root_binding(candidate, &frame_tree.root)?;
+        let tree = self.read_root_ax_tree(session_id, &frame_tree.root, guard)?;
         let normalized = normalize_ax_tree(
             &tree,
             &snapshot.id,
             snapshot.document_generation,
-            root_frame,
+            frame_tree,
         )
         .map_err(|_| self.poison())?;
         if normalized.prompt_risk != BrowserPromptRisk::None {
@@ -1944,7 +2004,7 @@ impl ManagedChromiumHost {
             &mut readback_tree,
             &preflight.binding.snapshot,
             &preflight.binding.candidate,
-            &preflight.binding.frame,
+            &preflight.binding.frame_tree,
         )?;
         if !readback.focused
             || readback.byte_len != input.byte_len()
@@ -1952,13 +2012,8 @@ impl ManagedChromiumHost {
         {
             return Err(BrowserError::TextReadbackMismatch);
         }
-        let final_frame = self.read_root_frame_identity(&preflight.binding.session_id, guard)?;
-        let final_url = self.read_target_url(&preflight.binding.target_id, guard)?;
-        if final_frame != preflight.binding.frame
-            || digest(final_url.as_bytes()) != resolution.url_digest
-            || final_url != preflight.binding.frame.url
-        {
-            self.sync_frame_identity(&resolution.tab_id, &final_frame)?;
+        self.revalidate_input_target_binding(&resolution.tab_id, &preflight.binding, guard)?;
+        if digest(preflight.binding.target_url.as_bytes()) != resolution.url_digest {
             return Err(BrowserError::StaleSnapshot);
         }
         self.workspace
@@ -2075,18 +2130,13 @@ impl ManagedChromiumHost {
             &mut readback_tree,
             &preflight.binding.snapshot,
             &preflight.binding.candidate,
-            &preflight.binding.frame,
+            &preflight.binding.frame_tree,
         )?;
         if readback.byte_len == 0 || readback.value_digest == preflight.initial_value_digest {
             return Err(BrowserError::FileSelectionReadbackMismatch);
         }
-        let final_frame = self.read_root_frame_identity(&preflight.binding.session_id, guard)?;
-        let final_url = self.read_target_url(&preflight.binding.target_id, guard)?;
-        if final_frame != preflight.binding.frame
-            || digest(final_url.as_bytes()) != resolution.url_digest
-            || final_url != preflight.binding.frame.url
-        {
-            self.sync_frame_identity(&resolution.tab_id, &final_frame)?;
+        self.revalidate_input_target_binding(&resolution.tab_id, &preflight.binding, guard)?;
+        if digest(preflight.binding.target_url.as_bytes()) != resolution.url_digest {
             return Err(BrowserError::StaleSnapshot);
         }
         handle.validate_for(grant, &self.workspace)?;
@@ -3168,6 +3218,7 @@ impl BrowserControlHost for ManagedChromiumHost {
         for tab in self.tabs.values_mut() {
             tab.latest_snapshot = None;
             tab.locator_map.clear();
+            tab.latest_frame_tree = None;
         }
         Ok(())
     }
@@ -3405,6 +3456,13 @@ fn parse_frame_identity(
         .filter(|value| !value.is_empty() && value.len() <= 4_096)
         .map(str::to_owned)
         .ok_or(BrowserError::ProtocolPoisoned)?;
+    let parent_frame_id = match frame.get("parentId") {
+        Some(Value::String(value)) if !value.is_empty() && value.len() <= 4_096 => {
+            Some(value.clone())
+        }
+        None => None,
+        _ => return Err(BrowserError::ProtocolPoisoned),
+    };
     let loader_id = frame
         .get("loaderId")
         .and_then(Value::as_str)
@@ -3417,10 +3475,25 @@ fn parse_frame_identity(
         .filter(|value| !value.is_empty() && value.len() <= 32 * 1_024)
         .map(str::to_owned)
         .ok_or(BrowserError::ProtocolPoisoned)?;
+    let security_origin = frame
+        .get("securityOrigin")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 32 * 1_024)
+        .map(str::to_owned)
+        .ok_or(BrowserError::ProtocolPoisoned)?;
+    let unreachable_url = match frame.get("unreachableUrl") {
+        None => None,
+        Some(Value::String(value)) if value.is_empty() => None,
+        Some(Value::String(value)) if value.len() <= 32 * 1_024 => Some(value.clone()),
+        _ => return Err(BrowserError::ProtocolPoisoned),
+    };
     Ok(CdpFrameIdentity {
         frame_id,
+        parent_frame_id,
         loader_id,
         url,
+        security_origin,
+        unreachable_url,
     })
 }
 
@@ -3442,14 +3515,7 @@ fn parse_frame_tree_snapshot(result: &Value) -> Result<CdpFrameTreeSnapshot, Bro
             .and_then(Value::as_object)
             .ok_or(BrowserError::ProtocolPoisoned)?;
         let identity = parse_frame_identity(frame)?;
-        let observed_parent_id = match frame.get("parentId") {
-            Some(Value::String(value)) if !value.is_empty() && value.len() <= 4_096 => {
-                Some(value.as_str())
-            }
-            None => None,
-            _ => return Err(BrowserError::ProtocolPoisoned),
-        };
-        if observed_parent_id != expected_parent_id.as_deref() {
+        if identity.parent_frame_id.as_deref() != expected_parent_id.as_deref() {
             return Err(BrowserError::ProtocolPoisoned);
         }
         if expected_parent_id.is_none() && root.replace(identity.clone()).is_some() {
@@ -3485,17 +3551,94 @@ fn parse_frame_tree_snapshot(result: &Value) -> Result<CdpFrameTreeSnapshot, Bro
     Ok(CdpFrameTreeSnapshot { root, frames })
 }
 
-fn parse_root_frame_identity(result: &Value) -> Result<CdpFrameIdentity, BrowserError> {
-    let snapshot = parse_frame_tree_snapshot(result)?;
+fn is_inherited_blank_frame_url(url: &str) -> bool {
+    matches!(url, "about:blank" | "about:srcdoc")
+}
+
+fn is_opaque_security_origin(origin: &str) -> bool {
+    matches!(origin, "://" | "null")
+}
+
+fn permitted_ancestor_origin_digest(
+    snapshot: &CdpFrameTreeSnapshot,
+    frame: &CdpFrameIdentity,
+    policy: &BrowserNavigationPolicy,
+) -> Option<String> {
+    let mut parent_id = frame.parent_frame_id.as_deref()?;
+    for _ in 0..snapshot.frames.len() {
+        let parent = snapshot.frames.get(parent_id)?;
+        if let Some(origin_digest) = policy.permitted_origin_digest(&parent.url) {
+            return Some(origin_digest);
+        }
+        if !is_inherited_blank_frame_url(&parent.url) {
+            return None;
+        }
+        parent_id = parent.parent_frame_id.as_deref()?;
+    }
+    None
+}
+
+fn validate_frame_tree_navigation_scope(
+    snapshot: &CdpFrameTreeSnapshot,
+    policy: &BrowserNavigationPolicy,
+) -> Result<(), BrowserError> {
     if snapshot.frames.get(&snapshot.root.frame_id) != Some(&snapshot.root) {
         return Err(BrowserError::ProtocolPoisoned);
     }
-    Ok(snapshot.root)
+    for frame in snapshot.frames.values() {
+        if frame.unreachable_url.is_some() {
+            return Err(BrowserError::NavigationFailed);
+        }
+        let url_origin_digest = match policy.permitted_origin_digest(&frame.url) {
+            Some(origin_digest) => origin_digest,
+            None if frame.parent_frame_id.is_some() && is_inherited_blank_frame_url(&frame.url) => {
+                permitted_ancestor_origin_digest(snapshot, frame, policy)
+                    .ok_or(BrowserError::NavigationRequestBlocked)?
+            }
+            None => return Err(BrowserError::NavigationRequestBlocked),
+        };
+        match policy.permitted_origin_digest(&frame.security_origin) {
+            Some(security_origin_digest) if security_origin_digest == url_origin_digest => {}
+            None if frame.parent_frame_id.is_some()
+                && is_opaque_security_origin(&frame.security_origin) => {}
+            _ => return Err(BrowserError::NavigationRequestBlocked),
+        }
+    }
+    Ok(())
+}
+
+fn validate_bound_frame_tree(
+    bound: &CdpFrameTreeSnapshot,
+    current: &CdpFrameTreeSnapshot,
+) -> Result<(), BrowserError> {
+    if bound.frames.get(&bound.root.frame_id) != Some(&bound.root)
+        || current.frames.get(&current.root.frame_id) != Some(&current.root)
+    {
+        return Err(BrowserError::ProtocolPoisoned);
+    }
+    if bound
+        .frames
+        .iter()
+        .any(|(frame_id, identity)| current.frames.get(frame_id) != Some(identity))
+    {
+        return Err(BrowserError::StaleSnapshot);
+    }
+    Ok(())
+}
+
+fn validate_exact_navigation_target_origin(
+    target: &BrowserNavigationTarget,
+    final_origin_digest: &str,
+) -> Result<(), BrowserError> {
+    if target.origin_digest() != final_origin_digest {
+        return Err(BrowserError::NavigationRequestBlocked);
+    }
+    Ok(())
 }
 
 fn partition_ax_nodes(
     nodes: &[AxNodeRecord],
-    expected_root_frame_id: &str,
+    frame_tree: &CdpFrameTreeSnapshot,
 ) -> Result<Vec<AxFramePartition>, BrowserError> {
     let mut nodes_by_id = BTreeMap::new();
     let mut frame_anchors = BTreeMap::new();
@@ -3515,7 +3658,7 @@ fn partition_ax_nodes(
     }
 
     let root_index = frame_anchors
-        .get(expected_root_frame_id)
+        .get(&frame_tree.root.frame_id)
         .copied()
         .ok_or(BrowserError::StaleSnapshot)?;
     let mut claimed_parents = BTreeMap::<String, Vec<usize>>::new();
@@ -3555,10 +3698,12 @@ fn partition_ax_nodes(
                 break AxFramePartition::Unproven;
             };
             if let Some(frame_id) = &node.frame.frame_id {
-                break if frame_id == expected_root_frame_id {
+                break if frame_id == &frame_tree.root.frame_id {
                     AxFramePartition::Root
-                } else {
+                } else if frame_tree.frames.contains_key(frame_id) {
                     AxFramePartition::Other
+                } else {
+                    AxFramePartition::Unproven
                 };
             }
             let Some(parent_id) = &node.frame.parent_id else {
@@ -3716,7 +3861,7 @@ fn normalize_ax_tree(
     tree: &Value,
     snapshot_id: &BrowserSnapshotId,
     document_generation: u64,
-    root_frame: &CdpFrameIdentity,
+    frame_tree: &CdpFrameTreeSnapshot,
 ) -> Result<NormalizedAxTree, BrowserError> {
     let nodes = tree
         .get("nodes")
@@ -3726,7 +3871,7 @@ fn normalize_ax_tree(
         return Err(BrowserError::ProtocolPoisoned);
     }
     let records = parse_ax_node_records(nodes)?;
-    let partitions = partition_ax_nodes(&records, &root_frame.frame_id)?;
+    let partitions = partition_ax_nodes(&records, frame_tree)?;
     let mut canonical_nodes = Vec::with_capacity(nodes.len());
     let mut locator_accumulator = AxLocatorAccumulator::default();
     let mut prompt_signals = 0_u32;
@@ -3763,7 +3908,7 @@ fn normalize_ax_tree(
             &name,
             backend_node_id,
             partition,
-            root_frame,
+            &frame_tree.root,
         )?;
     }
     let AxLocatorAccumulator {
@@ -4116,9 +4261,9 @@ fn inspect_semantic_target_ax_value(
     tree: &mut Value,
     snapshot: &SemanticSnapshot,
     candidate: &AxLocatorCandidate,
-    root_frame: &CdpFrameIdentity,
+    frame_tree: &CdpFrameTreeSnapshot,
 ) -> Result<AxTargetValueState, BrowserError> {
-    validate_candidate_root_binding(candidate, root_frame)?;
+    validate_candidate_root_binding(candidate, &frame_tree.root)?;
     let nodes = tree
         .get_mut("nodes")
         .and_then(Value::as_array_mut)
@@ -4127,7 +4272,7 @@ fn inspect_semantic_target_ax_value(
         return Err(BrowserError::ProtocolPoisoned);
     }
     let records = parse_ax_node_records(nodes)?;
-    let partitions = partition_ax_nodes(&records, &root_frame.frame_id)?;
+    let partitions = partition_ax_nodes(&records, frame_tree)?;
     let matching_indices = records
         .iter()
         .enumerate()
@@ -4162,7 +4307,7 @@ fn inspect_semantic_target_ax_value(
     };
 
     let normalized =
-        normalize_ax_tree(tree, &snapshot.id, snapshot.document_generation, root_frame)?;
+        normalize_ax_tree(tree, &snapshot.id, snapshot.document_generation, frame_tree)?;
     if normalized.prompt_risk != BrowserPromptRisk::None {
         return Err(BrowserError::PromptInjectionDetected);
     }
@@ -4736,8 +4881,19 @@ mod tests {
     fn root_frame_identity() -> CdpFrameIdentity {
         CdpFrameIdentity {
             frame_id: "frame-root".into(),
+            parent_frame_id: None,
             loader_id: "loader-root".into(),
             url: "https://example.test/root".into(),
+            security_origin: "https://example.test".into(),
+            unreachable_url: None,
+        }
+    }
+
+    fn root_frame_tree_snapshot() -> CdpFrameTreeSnapshot {
+        let root = root_frame_identity();
+        CdpFrameTreeSnapshot {
+            frames: BTreeMap::from([(root.frame_id.clone(), root.clone())]),
+            root,
         }
     }
 
@@ -4745,28 +4901,32 @@ mod tests {
         root_frame_id: &'a str,
         root_loader_id: &'a str,
         root_url: &'a str,
+        root_security_origin: &'a str,
         child_frame_id: &'a str,
         child_loader_id: &'a str,
         child_url: &'a str,
+        child_security_origin: &'a str,
         child_parent_frame_id: &'a str,
         expected_partitions: [AxFramePartition; 4],
     }
 
     fn ax_readback_tree_with_duplicate_child_backend(
         contract: &AxFrameFixtureContract<'_>,
-    ) -> Value {
+    ) -> (Value, CdpFrameTreeSnapshot) {
         let frame_tree = json!({
             "frameTree": {
                 "frame": {
                     "id": contract.root_frame_id,
                     "loaderId": contract.root_loader_id,
-                    "url": contract.root_url
+                    "url": contract.root_url,
+                    "securityOrigin": contract.root_security_origin
                 },
                 "childFrames": [{
                     "frame": {
                         "id": contract.child_frame_id,
                         "loaderId": contract.child_loader_id,
                         "url": contract.child_url,
+                        "securityOrigin": contract.child_security_origin,
                         "parentId": contract.child_parent_frame_id
                     }
                 }]
@@ -4825,10 +4985,10 @@ mod tests {
         let records = parse_ax_node_records(tree["nodes"].as_array().expect("AX fixture nodes"))
             .expect("parse AX frame fixture");
         assert_eq!(
-            partition_ax_nodes(&records, contract.root_frame_id).expect("partition AX fixture"),
+            partition_ax_nodes(&records, &parsed).expect("partition AX fixture"),
             contract.expected_partitions
         );
-        tree
+        (tree, parsed)
     }
 
     struct TestHttpServer {
@@ -5025,7 +5185,7 @@ mod tests {
             &tree,
             &BrowserSnapshotId::from("snapshot-ax-normalized"),
             1,
-            &root_frame_identity(),
+            &root_frame_tree_snapshot(),
         )
         .expect("normalize AX tree");
         assert_eq!(
@@ -5078,7 +5238,7 @@ mod tests {
             &tree,
             &BrowserSnapshotId::from("snapshot-duplicate-ax"),
             1,
-            &root_frame_identity(),
+            &root_frame_tree_snapshot(),
         )
         .expect("normalize duplicate AX tree");
 
@@ -5098,7 +5258,8 @@ mod tests {
                 "frame": {
                     "id": "frame-root",
                     "loaderId": "loader-root",
-                    "url": "https://example.test/root"
+                    "url": "https://example.test/root",
+                    "securityOrigin": "https://example.test"
                 },
                 "childFrames": [
                     {
@@ -5106,7 +5267,8 @@ mod tests {
                             "id": "frame-same-origin",
                             "parentId": "frame-root",
                             "loaderId": "loader-same-origin",
-                            "url": "https://example.test/child"
+                            "url": "https://example.test/child",
+                            "securityOrigin": "https://example.test"
                         }
                     },
                     {
@@ -5114,7 +5276,8 @@ mod tests {
                             "id": "frame-oopif",
                             "parentId": "frame-root",
                             "loaderId": "loader-oopif",
-                            "url": "https://other.test/child"
+                            "url": "https://other.test/child",
+                            "securityOrigin": "https://other.test"
                         }
                     }
                 ]
@@ -5130,19 +5293,28 @@ mod tests {
                 "frame": {
                     "id": "frame-root",
                     "loaderId": "loader-root",
-                    "url": "https://example.test/root"
+                    "url": "https://example.test/root",
+                    "securityOrigin": "https://example.test"
                 }
             }
         });
         assert_eq!(
-            parse_root_frame_identity(&tree).expect("root with dynamic children"),
-            parse_root_frame_identity(&root_only).expect("root without children")
+            parse_frame_tree_snapshot(&tree)
+                .expect("root with dynamic children")
+                .root,
+            parse_frame_tree_snapshot(&root_only)
+                .expect("root without children")
+                .root
         );
         let mut loader_drift = root_only;
         loader_drift["frameTree"]["frame"]["loaderId"] = json!("loader-drifted");
         assert_ne!(
-            parse_root_frame_identity(&tree).expect("root before loader drift"),
-            parse_root_frame_identity(&loader_drift).expect("root after loader drift")
+            parse_frame_tree_snapshot(&tree)
+                .expect("root before loader drift")
+                .root,
+            parse_frame_tree_snapshot(&loader_drift)
+                .expect("root after loader drift")
+                .root
         );
 
         let mut wrong_parent = tree.clone();
@@ -5162,6 +5334,134 @@ mod tests {
                 .code(),
             "BROWSER_PROTOCOL_POISONED"
         );
+    }
+
+    #[test]
+    fn frame_tree_scope_rejects_cross_origin_target_drift_and_failed_frames() {
+        let (_, frame_tree) =
+            ax_readback_tree_with_duplicate_child_backend(&AxFrameFixtureContract {
+                root_frame_id: "frame-root",
+                root_loader_id: "loader-root",
+                root_url: "https://example.test/root",
+                root_security_origin: "https://example.test",
+                child_frame_id: "frame-cross-origin",
+                child_loader_id: "loader-cross-origin",
+                child_url: "https://other.test/child",
+                child_security_origin: "https://other.test",
+                child_parent_frame_id: "frame-root",
+                expected_partitions: [
+                    AxFramePartition::Root,
+                    AxFramePartition::Root,
+                    AxFramePartition::Other,
+                    AxFramePartition::Other,
+                ],
+            });
+        let policy =
+            BrowserNavigationPolicy::https_only(["https://example.test", "https://other.test"])
+                .expect("two exact origins");
+        validate_frame_tree_navigation_scope(&frame_tree, &policy)
+            .expect("allowlisted cross-origin child");
+
+        let target = policy
+            .authorize("https://example.test/root")
+            .expect("root target");
+        validate_exact_navigation_target_origin(&target, target.origin_digest())
+            .expect("exact target origin");
+        let other_origin = policy
+            .permitted_origin_digest("https://other.test/child")
+            .expect("allowlisted child origin");
+        assert_eq!(
+            validate_exact_navigation_target_origin(&target, &other_origin)
+                .expect_err("allowlisted cross-origin redirect is still target drift")
+                .code(),
+            "BROWSER_NAVIGATION_REQUEST_BLOCKED"
+        );
+
+        let root_only_policy =
+            BrowserNavigationPolicy::https_only(["https://example.test"]).expect("root origin");
+        assert_eq!(
+            validate_frame_tree_navigation_scope(&frame_tree, &root_only_policy)
+                .expect_err("unlisted child origin")
+                .code(),
+            "BROWSER_NAVIGATION_REQUEST_BLOCKED"
+        );
+        let mut mismatched_root_origin = frame_tree.clone();
+        mismatched_root_origin.root.security_origin = "https://other.test".into();
+        mismatched_root_origin.frames.insert(
+            mismatched_root_origin.root.frame_id.clone(),
+            mismatched_root_origin.root.clone(),
+        );
+        assert_eq!(
+            validate_frame_tree_navigation_scope(&mismatched_root_origin, &policy)
+                .expect_err("root URL and security origin mismatch")
+                .code(),
+            "BROWSER_NAVIGATION_REQUEST_BLOCKED"
+        );
+        let mut failed_frame_tree = frame_tree;
+        failed_frame_tree
+            .frames
+            .get_mut("frame-cross-origin")
+            .expect("child frame")
+            .unreachable_url = Some("https://other.test/failed".into());
+        assert_eq!(
+            validate_frame_tree_navigation_scope(&failed_frame_tree, &policy)
+                .expect_err("unreachable child navigation")
+                .code(),
+            "BROWSER_NAVIGATION_FAILED"
+        );
+    }
+
+    #[test]
+    fn bound_iframe_identity_rejects_drift_but_allows_new_child() {
+        let (_, bound) = ax_readback_tree_with_duplicate_child_backend(&AxFrameFixtureContract {
+            root_frame_id: "frame-root",
+            root_loader_id: "loader-root",
+            root_url: "https://example.test/root",
+            root_security_origin: "https://example.test",
+            child_frame_id: "frame-child",
+            child_loader_id: "loader-child",
+            child_url: "https://example.test/child",
+            child_security_origin: "https://example.test",
+            child_parent_frame_id: "frame-root",
+            expected_partitions: [
+                AxFramePartition::Root,
+                AxFramePartition::Root,
+                AxFramePartition::Other,
+                AxFramePartition::Other,
+            ],
+        });
+        let mut loader_drift = bound.clone();
+        loader_drift
+            .frames
+            .get_mut("frame-child")
+            .expect("child frame")
+            .loader_id = "loader-child-next".into();
+        assert!(matches!(
+            validate_bound_frame_tree(&bound, &loader_drift),
+            Err(BrowserError::StaleSnapshot)
+        ));
+
+        let mut detached = bound.clone();
+        detached.frames.remove("frame-child");
+        assert!(matches!(
+            validate_bound_frame_tree(&bound, &detached),
+            Err(BrowserError::StaleSnapshot)
+        ));
+
+        let mut inserted = bound.clone();
+        inserted.frames.insert(
+            "frame-new".into(),
+            CdpFrameIdentity {
+                frame_id: "frame-new".into(),
+                parent_frame_id: Some("frame-root".into()),
+                loader_id: "loader-new".into(),
+                url: "https://example.test/new".into(),
+                security_origin: "https://example.test".into(),
+                unreachable_url: None,
+            },
+        );
+        validate_bound_frame_tree(&bound, &inserted)
+            .expect("new child alone does not stale an unrelated root target");
     }
 
     #[test]
@@ -5190,7 +5490,7 @@ mod tests {
                     "ignored": false,
                     "role": {"type": "role", "value": "RootWebArea"},
                     "name": {"type": "computedString", "value": "Same origin child"},
-                    "childIds": ["same-origin-review", "same-origin-only"],
+                    "childIds": ["same-origin-review"],
                     "frameId": "frame-same-origin"
                 },
                 {
@@ -5201,40 +5501,34 @@ mod tests {
                     "backendDOMNodeId": 51,
                     "parentId": "same-origin-root",
                     "childIds": []
-                },
-                {
-                    "nodeId": "same-origin-only",
-                    "ignored": false,
-                    "role": {"type": "role", "value": "button"},
-                    "name": {"type": "computedString", "value": "Iframe only"},
-                    "backendDOMNodeId": 52,
-                    "parentId": "same-origin-root",
-                    "childIds": []
-                },
-                {
-                    "nodeId": "oopif-root",
-                    "ignored": false,
-                    "role": {"type": "role", "value": "RootWebArea"},
-                    "name": {"type": "computedString", "value": "OOPIF child"},
-                    "childIds": ["oopif-only"],
-                    "frameId": "frame-oopif"
-                },
-                {
-                    "nodeId": "oopif-only",
-                    "ignored": false,
-                    "role": {"type": "role", "value": "button"},
-                    "name": {"type": "computedString", "value": "OOPIF only"},
-                    "backendDOMNodeId": 61,
-                    "parentId": "oopif-root",
-                    "childIds": []
                 }
             ]
         });
+        let frame_tree = parse_frame_tree_snapshot(&json!({
+            "frameTree": {
+                "frame": {
+                    "id": "frame-root",
+                    "loaderId": "loader-root",
+                    "url": "https://example.test/root",
+                    "securityOrigin": "https://example.test"
+                },
+                "childFrames": [{
+                    "frame": {
+                        "id": "frame-same-origin",
+                        "parentId": "frame-root",
+                        "loaderId": "loader-same-origin",
+                        "url": "https://example.test/child",
+                        "securityOrigin": "https://example.test"
+                    }
+                }]
+            }
+        }))
+        .expect("exact root and child frame identities");
         let normalized = normalize_ax_tree(
             &tree,
             &BrowserSnapshotId::from("snapshot-frame-partition"),
             1,
-            &root_frame_identity(),
+            &frame_tree,
         )
         .expect("partitioned AX tree");
         let candidates = normalized.locator_map.values().collect::<Vec<_>>();
@@ -5274,6 +5568,7 @@ mod tests {
                     "role": {"type": "role", "value": "button"},
                     "name": {"type": "computedString", "value": "Review"},
                     "backendDOMNodeId": 71,
+                    "frameId": "frame-not-in-page-tree",
                     "parentId": "missing-parent",
                     "childIds": []
                 }
@@ -5283,7 +5578,7 @@ mod tests {
             &tree,
             &BrowserSnapshotId::from("snapshot-unproven-frame"),
             1,
-            &root_frame_identity(),
+            &root_frame_tree_snapshot(),
         )
         .expect("unproven nodes are excluded, not guessed");
         assert_eq!(normalized.element_refs.len(), 1);
@@ -5297,7 +5592,7 @@ mod tests {
             &tree,
             &BrowserSnapshotId::from("snapshot-missing-root-anchor"),
             1,
-            &root_frame_identity(),
+            &root_frame_tree_snapshot(),
         );
         assert!(matches!(missing_anchor, Err(BrowserError::StaleSnapshot)));
     }
@@ -5584,8 +5879,8 @@ mod tests {
                 }
             ]
         });
-        let frame = root_frame_identity();
-        let state = inspect_semantic_target_ax_value(&mut tree, &snapshot, &candidate, &frame)
+        let frame_tree = root_frame_tree_snapshot();
+        let state = inspect_semantic_target_ax_value(&mut tree, &snapshot, &candidate, &frame_tree)
             .expect("exact readback");
         assert_eq!(state.value_digest, digest(secret.as_bytes()));
         assert_eq!(
@@ -5604,7 +5899,7 @@ mod tests {
         }));
         tree["nodes"][0]["value"] = json!({"type": "string", "value": secret});
         assert_eq!(
-            inspect_semantic_target_ax_value(&mut tree, &snapshot, &candidate, &frame)
+            inspect_semantic_target_ax_value(&mut tree, &snapshot, &candidate, &frame_tree)
                 .expect_err("non-target injection")
                 .code(),
             "BROWSER_PROMPT_INJECTION_DETECTED"
@@ -5612,7 +5907,7 @@ mod tests {
     }
 
     #[test]
-    fn child_frame_duplicate_backend_cannot_confuse_root_readback() {
+    fn cross_origin_child_duplicate_backend_cannot_confuse_root_readback() {
         let created_at = Utc
             .with_ymd_and_hms(2026, 8, 11, 8, 0, 0)
             .single()
@@ -5640,22 +5935,25 @@ mod tests {
             source_frame_id: frame.frame_id.clone(),
             root_loader_id: frame.loader_id.clone(),
         };
-        let mut tree = ax_readback_tree_with_duplicate_child_backend(&AxFrameFixtureContract {
-            root_frame_id: &frame.frame_id,
-            root_loader_id: &frame.loader_id,
-            root_url: &frame.url,
-            child_frame_id: "frame-child",
-            child_loader_id: "loader-child",
-            child_url: "https://example.test/child",
-            child_parent_frame_id: &frame.frame_id,
-            expected_partitions: [
-                AxFramePartition::Root,
-                AxFramePartition::Root,
-                AxFramePartition::Other,
-                AxFramePartition::Other,
-            ],
-        });
-        inspect_semantic_target_ax_value(&mut tree, &snapshot, &candidate, &frame)
+        let (mut tree, frame_tree) =
+            ax_readback_tree_with_duplicate_child_backend(&AxFrameFixtureContract {
+                root_frame_id: &frame.frame_id,
+                root_loader_id: &frame.loader_id,
+                root_url: &frame.url,
+                root_security_origin: &frame.security_origin,
+                child_frame_id: "frame-child",
+                child_loader_id: "loader-child",
+                child_url: "https://other.test/child",
+                child_security_origin: "https://other.test",
+                child_parent_frame_id: &frame.frame_id,
+                expected_partitions: [
+                    AxFramePartition::Root,
+                    AxFramePartition::Root,
+                    AxFramePartition::Other,
+                    AxFramePartition::Other,
+                ],
+            });
+        inspect_semantic_target_ax_value(&mut tree, &snapshot, &candidate, &frame_tree)
             .expect("same backend id outside root partition cannot confuse readback");
     }
 
