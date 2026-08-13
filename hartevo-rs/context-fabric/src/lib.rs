@@ -5,8 +5,19 @@
 //! every content digest, records every omission, and emits a bounded transient
 //! envelope. Only the content-free manifest is suitable for persistence.
 
+mod mission_memory;
 mod model_tokenizer;
 
+pub use mission_memory::{
+    DeterministicMissionMemoryProvider, MISSION_MEMORY_SCHEMA_VERSION,
+    MissionMemoryAppendDisposition, MissionMemoryConsumer, MissionMemoryContinuation,
+    MissionMemoryDurableLog, MissionMemoryError, MissionMemoryEvent, MissionMemoryEventRecord,
+    MissionMemoryFact, MissionMemoryFactReceipt, MissionMemoryItem, MissionMemoryLifecycleReceipt,
+    MissionMemoryProjection, MissionMemoryProvider, MissionMemoryProviderHandle,
+    MissionMemoryReadRequest, MissionMemoryReadResult, MissionMemoryRecycleCause,
+    MissionMemoryScope, MissionMemoryService, MissionMemorySession, MissionMemoryVisibilityReceipt,
+    MissionMemoryWorkingSet,
+};
 pub use model_tokenizer::{
     ConservativeByteBudgetTokenizer, PinnedModelTokenizer, PinnedTokenizerSpec,
 };
