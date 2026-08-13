@@ -53,7 +53,7 @@ jobs:
       current_main: ${{ steps.fence.outputs.current_main }}
     steps:
       - name: Checkout reviewed main history
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
@@ -87,13 +87,13 @@ jobs:
       contents: read
     steps:
       - name: Checkout the fenced source commit
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.source_commit }}
           fetch-depth: 0
           persist-credentials: false
       - name: Cache Cargo and Rust toolchain
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -134,7 +134,7 @@ jobs:
           python3 scripts/ci-oidc-interface.py \
             --output target/ci/release/oidc-interface.json
       - name: Upload exact build artifact and commit-bound receipts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-build-${{ github.run_id }}
           path: target/ci/release
@@ -154,13 +154,13 @@ jobs:
       id-token: write
     steps:
       - name: Checkout promotion verifier
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
           persist-credentials: false
       - name: Download the exact build-once artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-build-${{ github.run_id }}
           path: target/ci/release
@@ -200,7 +200,7 @@ jobs:
             target/ci/release/promotion-plan.json
       - name: Upload dry-run promotion plan
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-promotion-plan-${{ github.run_id }}
           path: target/ci/release/promotion-plan.json
@@ -218,7 +218,7 @@ jobs:
       actions: read
     steps:
       - name: Checkout result verifier
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 1
@@ -256,7 +256,7 @@ jobs:
             --kind promotion-preview=infra
       - name: Upload dry-run CI result and JUnit envelope
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-ci-result-${{ github.run_id }}
           path: |

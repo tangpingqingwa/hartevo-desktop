@@ -1,59 +1,142 @@
 {
   "schemaVersion": "hartevo-github-branch-ruleset-policy/v1",
   "repository": "tangpingqingwa/hartevo-desktop",
-  "hostedEnforcement": "not_claimed_unavailable_current_plan",
+  "hostedEnforcement": "active",
   "observedHostedStatus": {
-    "branchProtectionApi": "HTTP_403_PRIVATE_REPOSITORY_PLAN",
-    "rulesetApi": "HTTP_403_PRIVATE_REPOSITORY_PLAN",
-    "verifiedAt": "2026-08-13"
+    "branchProtectionApi": "NOT_REQUIRED_RULESET_IS_AUTHORITATIVE",
+    "rulesetApi": "ACTIVE",
+    "rulesetId": 20797159,
+    "rulesetName": "Hartevo protected integration branches",
+    "requiredStatusCheckIntegrationId": 15368,
+    "verifiedAt": "2026-08-13T12:34:47Z"
   },
   "verification": {
     "localCommand": "python3 scripts/ci-branch-policy.py verify",
     "hostedCommand": "python3 scripts/ci-branch-policy.py probe --repo tangpingqingwa/hartevo-desktop",
-    "applyWhenSupported": "re-run hosted probe, apply this document through the GitHub API, then re-verify"
+    "applyCommand": "python3 scripts/ci-branch-policy.py apply --repo tangpingqingwa/hartevo-desktop",
+    "applySemantics": "idempotently create or update the named active ruleset; never bypass or delete it"
   },
   "branches": [
     {
       "name": "bootstrap/macos-r0",
       "requirePullRequest": true,
-      "requiredApprovingReviews": 1,
-      "requireCodeOwnerReview": true,
-      "dismissStaleReviews": true,
+      "requiredApprovingReviews": 0,
+      "requireCodeOwnerReview": false,
+      "dismissStaleReviews": false,
       "requireConversationResolution": true,
       "allowForcePushes": false,
       "allowDeletions": false,
       "requiredStatusChecks": [
         "PR / Workflow policy",
         "PR / Scope plan",
-        "PR / Fast Rust / fmt",
-        "PR / Fast Rust / clippy (ubuntu-24.04)",
-        "PR / Fast Rust / clippy (macos-15)",
-        "PR / Fast Rust / test (ubuntu-24.04)",
-        "PR / Fast Rust / test (macos-15)",
+        "PR / Fast Rust matrix / PR / Fast Rust / fmt",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
         "PR / Result taxonomy"
       ]
     },
     {
       "name": "main",
       "requirePullRequest": true,
-      "requiredApprovingReviews": 1,
-      "requireCodeOwnerReview": true,
-      "dismissStaleReviews": true,
+      "requiredApprovingReviews": 0,
+      "requireCodeOwnerReview": false,
+      "dismissStaleReviews": false,
       "requireConversationResolution": true,
       "allowForcePushes": false,
       "allowDeletions": false,
       "requiredStatusChecks": [
         "PR / Workflow policy",
         "PR / Scope plan",
-        "PR / Fast Rust / fmt",
-        "PR / Fast Rust / clippy (ubuntu-24.04)",
-        "PR / Fast Rust / clippy (macos-15)",
-        "PR / Fast Rust / test (ubuntu-24.04)",
-        "PR / Fast Rust / test (macos-15)",
+        "PR / Fast Rust matrix / PR / Fast Rust / fmt",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
         "PR / Result taxonomy"
       ]
     }
   ],
+  "reviewDeadlockAvoidance": {
+    "singleMaintainerApprovalRequired": false,
+    "bypassActors": [],
+    "reason": "PR and required checks remain mandatory, but a solo maintainer is not required to approve their own pull request."
+  },
+  "ruleset": {
+    "name": "Hartevo protected integration branches",
+    "target": "branch",
+    "enforcement": "active",
+    "conditions": {
+      "ref_name": {
+        "include": [
+          "refs/heads/bootstrap/macos-r0",
+          "refs/heads/main"
+        ],
+        "exclude": []
+      }
+    },
+    "rules": [
+      {
+        "type": "deletion"
+      },
+      {
+        "type": "non_fast_forward"
+      },
+      {
+        "type": "pull_request",
+        "parameters": {
+          "dismiss_stale_reviews_on_push": false,
+          "require_code_owner_review": false,
+          "require_last_push_approval": false,
+          "required_approving_review_count": 0,
+          "required_review_thread_resolution": true
+        }
+      },
+      {
+        "type": "required_status_checks",
+        "parameters": {
+          "strict_required_status_checks_policy": true,
+          "do_not_enforce_on_create": false,
+          "required_status_checks": [
+            {
+              "context": "PR / Workflow policy",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Scope plan",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Fast Rust matrix / PR / Fast Rust / fmt",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
+              "integration_id": 15368
+            },
+            {
+              "context": "PR / Result taxonomy",
+              "integration_id": 15368
+            }
+          ]
+        }
+      }
+    ],
+    "bypass_actors": []
+  },
   "releaseEnvironment": {
     "name": "release-promotion",
     "manualApprovalRequired": true,

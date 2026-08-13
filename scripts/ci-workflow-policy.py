@@ -243,15 +243,16 @@ def verify(root: Path) -> dict[str, object]:
     if len(names) != len(set(names)):
         raise PolicyError("static workflow job/check names must be unique")
     branch_policy = load_json(root / BRANCH_POLICY)
-    if branch_policy.get("hostedEnforcement") != "not_claimed_unavailable_current_plan":
-        raise PolicyError("branch policy may not claim hosted enforcement")
+    if branch_policy.get("hostedEnforcement") not in {"desired_active_not_yet_applied", "active"}:
+        raise PolicyError("branch policy must remain desired-active or actively enforced")
+    hosted_enforcement = branch_policy["hostedEnforcement"]
     return {
         "schema": "hartevo-ci-workflow-policy/v1",
         "status": "PASS",
         "workflowCount": len(files),
         "externalActionCount": len(all_actions),
         "actionPinsVerified": sorted(set(all_actions)),
-        "hostedBranchEnforcement": "NOT_CLAIMED",
+        "hostedBranchEnforcement": "ACTIVE" if hosted_enforcement == "active" else "DESIRED_ACTIVE",
         "releaseEnabled": False,
     }
 
