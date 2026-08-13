@@ -10,13 +10,16 @@ mod model_tokenizer;
 
 pub use mission_memory::{
     DeterministicMissionMemoryProvider, MISSION_MEMORY_SCHEMA_VERSION,
-    MissionMemoryAppendDisposition, MissionMemoryConsumer, MissionMemoryContinuation,
-    MissionMemoryDurableLog, MissionMemoryError, MissionMemoryEvent, MissionMemoryEventRecord,
-    MissionMemoryFact, MissionMemoryFactReceipt, MissionMemoryItem, MissionMemoryLifecycleReceipt,
+    MissionMemoryAppendDisposition, MissionMemoryCompactionRequest, MissionMemoryCompactionResult,
+    MissionMemoryConsumer, MissionMemoryContinuation, MissionMemoryContinuationArtifact,
+    MissionMemoryContinuationProvenance, MissionMemoryContinuationProvider,
+    MissionMemoryContinuationResult, MissionMemoryContinuationToken, MissionMemoryDurableLog,
+    MissionMemoryError, MissionMemoryEvent, MissionMemoryEventRecord, MissionMemoryFact,
+    MissionMemoryFactReceipt, MissionMemoryItem, MissionMemoryLifecycleReceipt,
     MissionMemoryProjection, MissionMemoryProvider, MissionMemoryProviderHandle,
     MissionMemoryReadRequest, MissionMemoryReadResult, MissionMemoryRecycleCause,
-    MissionMemoryScope, MissionMemoryService, MissionMemorySession, MissionMemoryVisibilityReceipt,
-    MissionMemoryWorkingSet,
+    MissionMemoryResumeRequest, MissionMemoryScope, MissionMemoryService, MissionMemorySession,
+    MissionMemoryVisibilityReceipt, MissionMemoryWorkingSet,
 };
 pub use model_tokenizer::{
     ConservativeByteBudgetTokenizer, PinnedModelTokenizer, PinnedTokenizerSpec,
