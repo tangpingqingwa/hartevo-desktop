@@ -391,14 +391,20 @@ pub fn build_run_result(
             "native result cannot be produced by a simulator, fixture, or unimplemented provider"
         );
         ensure!(
-            evidence_kind == EvidenceKind::NativeRun,
-            "native result is not native evidence"
+            matches!(
+                evidence_kind,
+                EvidenceKind::NativeRun | EvidenceKind::DeterministicFake
+            ),
+            "executed result has an unsupported evidence kind"
         );
         ensure!(!cases.is_empty(), "native result has no cases");
     } else {
         ensure!(
-            evidence_kind != EvidenceKind::NativeRun,
-            "non-executed result cannot claim native evidence"
+            !matches!(
+                evidence_kind,
+                EvidenceKind::NativeRun | EvidenceKind::DeterministicFake
+            ),
+            "non-executed result cannot claim executed evidence"
         );
         ensure!(
             cases.is_empty(),
@@ -1187,7 +1193,11 @@ fn validate_result_replay(
         "run id is not derived from the bound evidence"
     );
     ensure!(
-        native_observation == (result.evidence_kind == EvidenceKind::NativeRun),
+        native_observation
+            == matches!(
+                result.evidence_kind,
+                EvidenceKind::NativeRun | EvidenceKind::DeterministicFake
+            ),
         "runner disposition and evidence kind disagree"
     );
     ensure!(

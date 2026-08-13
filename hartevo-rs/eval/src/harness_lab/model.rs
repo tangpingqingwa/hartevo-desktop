@@ -114,6 +114,7 @@ impl RunnerDisposition {
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
     NativeRun,
+    DeterministicFake,
     ControlledSimulator,
     Fixture,
     SourceAudit,

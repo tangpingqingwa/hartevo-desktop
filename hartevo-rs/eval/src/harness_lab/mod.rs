@@ -1,6 +1,7 @@
 mod digest;
 mod model;
 mod promotion;
+mod runtime;
 mod verifier;
 
 pub use model::{
@@ -20,6 +21,11 @@ pub use promotion::{
     verify_current_commit_receipt, verify_current_commit_receipt_against_run,
     verify_frozen_candidate_identity, verify_live_current_commit_receipt,
     verify_live_promotion_state_machine, verify_promotion_state_machine,
+};
+pub use runtime::{
+    RUNTIME_AUTHORITY, RUNTIME_CONTRACT_PATH, RUNTIME_RELEASE_DECISION, RUNTIME_SCHEMA_VERSION,
+    RuntimeCandidateRunner, RuntimeExecutionMode, RuntimeMatrixReport, RuntimeMetricRow,
+    RuntimeQualityStatus, RuntimeReplayPack, validate_runtime_matrix_report,
 };
 pub use verifier::{
     build_frozen_plan, build_run_result, contract_digest, current_source_commit, evaluate,

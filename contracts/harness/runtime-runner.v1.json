@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/harness/runtime-runner.v1.json",
+  "title": "Hartevo Harness Lab current-commit runtime runner contract",
+  "description": "Executable candidate-lab runtime matrix and replay pack. It compares native, upstream-recommended, and Hartevo candidates without granting Provider E2/E4 or Release authority.",
+  "oneOf": [{"$ref": "#/$defs/runtimeMatrixReport"}],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "sourceCommit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+    "token": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"},
+    "lane": {"enum": ["public", "vertical", "private_holdout", "fresh_shadow"]},
+    "role": {"enum": ["baseline", "candidate"]},
+    "harness": {"enum": ["native", "upstream_recommended", "hartevo_candidate"]},
+    "runnerDisposition": {
+      "enum": [
+        "EXECUTED",
+        "FAIL",
+        "NOT_EXECUTED",
+        "BLOCKED_ENV",
+        "BLOCKED_EXTERNAL_BILLING",
+        "NOT_IMPLEMENTED",
+        "FIXTURE",
+        "IGNORED"
+      ]
+    },
+    "evidenceKind": {
+      "enum": ["native_run", "deterministic_fake", "controlled_simulator", "fixture", "source_audit", "missing"]
+    },
+    "providerMode": {
+      "enum": ["native_credentialed", "controlled_simulator", "fixture", "not_implemented"]
+    },
+    "evaluationMode": {"enum": ["fake_deterministic", "native_credentialed"]},
+    "qualityStatus": {"enum": ["GREEN", "NOT_EVALUATED"]},
+    "decisionStatus": {
+      "enum": ["DENIED", "APPROVED", "BLOCKED_ENV", "NOT_IMPLEMENTED"]
+    },
+    "candidateIdentity": {
+      "$ref": "candidate-lab.v1.json#/$defs/candidateIdentity"
+    },
+    "labPlan": {"$ref": "candidate-lab.v1.json#/$defs/labPlan"},
+    "runResult": {"$ref": "candidate-lab.v1.json#/$defs/runResult"},
+    "promotionDecision": {"$ref": "candidate-lab.v1.json#/$defs/promotionDecision"},
+    "candidateFreeze": {
+      "$ref": "promotion-state.v1.json#/$defs/candidateIdentityFreeze"
+    },
+    "currentCommitReceipt": {
+      "$ref": "promotion-state.v1.json#/$defs/currentCommitReceipt"
+    },
+    "metricSnapshot": {
+      "$ref": "candidate-lab.v1.json#/$defs/metrics"
+    },
+    "runtimeMetricRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entryId",
+        "lane",
+        "role",
+        "harness",
+        "candidateIdentityDigest",
+        "metrics"
+      ],
+      "properties": {
+        "entryId": {"$ref": "#/$defs/token"},
+        "lane": {"$ref": "#/$defs/lane"},
+        "role": {"$ref": "#/$defs/role"},
+        "harness": {"$ref": "#/$defs/harness"},
+        "candidateIdentityDigest": {"$ref": "#/$defs/sha256"},
+        "metrics": {"$ref": "#/$defs/metricSnapshot"}
+      }
+    },
+    "runtimeReplayPack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "packDigest",
+        "sourceCommit",
+        "candidateIdentityDigest",
+        "planDigest",
+        "matrixDigest",
+        "runIds",
+        "replayDigests",
+        "deterministic",
+        "isolatedLanes"
+      ],
+      "properties": {
+        "schemaVersion": {"const": "hartevo-harness-runtime-runner/v1"},
+        "packDigest": {"$ref": "#/$defs/sha256"},
+        "sourceCommit": {"$ref": "#/$defs/sourceCommit"},
+        "candidateIdentityDigest": {"$ref": "#/$defs/sha256"},
+        "planDigest": {"$ref": "#/$defs/sha256"},
+        "matrixDigest": {"$ref": "#/$defs/sha256"},
+        "runIds": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
+        "replayDigests": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
+        "deterministic": {"type": "boolean"},
+        "isolatedLanes": {"type": "boolean"}
+      }
+    },
+    "runtimeMatrixReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "authority",
+        "releaseDecision",
+        "sourceCommit",
+        "executionMode",
+        "executionStatus",
+        "qualityStatus",
+        "plan",
+        "planDigest",
+        "matrixDigest",
+        "candidateFreeze",
+        "candidateIdentityDigest",
+        "results",
+        "metrics",
+        "candidateReceipts",
+        "replayPack",
+        "promotion",
+        "missingRequiredEvidence"
+      ],
+      "properties": {
+        "schemaVersion": {"const": "hartevo-harness-runtime-runner/v1"},
+        "authority": {"const": "candidate_lab_only"},
+        "releaseDecision": {"const": "NOT_EVALUATED"},
+        "sourceCommit": {"$ref": "#/$defs/sourceCommit"},
+        "executionMode": {"$ref": "#/$defs/evaluationMode"},
+        "executionStatus": {"$ref": "#/$defs/runnerDisposition"},
+        "qualityStatus": {"$ref": "#/$defs/qualityStatus"},
+        "plan": {"$ref": "#/$defs/labPlan"},
+        "planDigest": {"$ref": "#/$defs/sha256"},
+        "matrixDigest": {"$ref": "#/$defs/sha256"},
+        "candidateFreeze": {"$ref": "#/$defs/candidateFreeze"},
+        "candidateIdentityDigest": {"$ref": "#/$defs/sha256"},
+        "results": {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "items": {"$ref": "#/$defs/runResult"}
+        },
+        "metrics": {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "items": {"$ref": "#/$defs/runtimeMetricRow"}
+        },
+        "candidateReceipts": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {"$ref": "#/$defs/currentCommitReceipt"}
+        },
+        "replayPack": {"$ref": "#/$defs/runtimeReplayPack"},
+        "promotion": {"$ref": "#/$defs/promotionDecision"},
+        "missingRequiredEvidence": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

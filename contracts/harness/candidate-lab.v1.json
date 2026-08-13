@@ -33,7 +33,7 @@
       ]
     },
     "evidenceKind": {
-      "enum": ["native_run", "controlled_simulator", "fixture", "source_audit", "missing"]
+      "enum": ["native_run", "deterministic_fake", "controlled_simulator", "fixture", "source_audit", "missing"]
     },
     "providerMode": {
       "enum": ["native_credentialed", "controlled_simulator", "fixture", "not_implemented"]
