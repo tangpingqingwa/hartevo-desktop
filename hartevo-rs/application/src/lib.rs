@@ -90,6 +90,10 @@ use hartevo_domain_kernel::{
     WorkProductPreview, WorkProductStatus, WorkerHandle, WorkerHandleStatus, WorkerId, WorkerLease,
     WorkerLeaseId, WorkerLeaseStatus, WorkerMailbox, validate_context_branch_lineage,
 };
+use hartevo_domain_kernel::{
+    MarketDecisionRecommendation, MarketEvidenceClassification, MarketEvidenceError,
+    MarketEvidencePack, Vm07DecisionAction, Vm07DecisionBinding,
+};
 use hartevo_effect_broker::{
     BrokerError, BrokerResult, EffectBroker, EffectCompletionAuthority, EffectCompletionPoint,
     EffectExecutor, EffectReconciler, EffectVerifier,
@@ -381,6 +385,61 @@ pub struct ResearchPacket {
     pub preview: String,
     pub editable_scopes: BTreeSet<String>,
     pub evidence: Vec<EvidenceInput>,
+}
+
+/// Typed VM-07 input.  This command is intentionally separate from
+/// `ResearchPacket`; narrative research must never silently become a completed
+/// market decision artifact.
+#[derive(Clone, Debug)]
+pub struct RecordVm07MarketEvidencePack {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub work_product_id: WorkProductId,
+    pub pack: MarketEvidencePack,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vm07MarketEvidencePackResult {
+    pub mission: Mission,
+    pub manifest: WorkProductManifest,
+    pub work_product: WorkProduct,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReviseVm07MarketEvidencePack {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub work_product_id: WorkProductId,
+    pub pack: MarketEvidencePack,
+    pub expected_mission_revision: u64,
+    pub expected_manifest_version: u64,
+    pub expected_pack_revision: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct DecideVm07MarketDecision {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub pack_work_product_id: WorkProductId,
+    pub action: Vm07DecisionAction,
+    pub message_id: MissionConversationMessageId,
+    pub rationale: String,
+    pub idempotency_key: String,
+    pub expected_pack_content_digest: String,
+    pub expected_pack_revision: u64,
+    pub expected_mission_revision: u64,
+    pub expected_checkpoint_revision: u64,
+    pub expected_conversation_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vm07MarketDecisionResult {
+    pub mission: Mission,
+    pub conversation: MissionConversation,
+    pub message: MissionConversationMessage,
+    pub binding: Vm07DecisionBinding,
+    pub next_dispatch: Option<MissionCheckpointDispatch>,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2784,6 +2843,9 @@ fn compiled_handler_for_checkpoint(
 fn current_checkpoint_dispatch_projection(
     mission: &Mission,
 ) -> Result<Option<MissionCheckpointDispatch>, ApplicationError> {
+    if mission.stage.is_terminal() {
+        return Ok(None);
+    }
     let Some(definition) = mission.definition.as_ref() else {
         return Err(ApplicationError::MissionCheckpointDispatchUnavailable);
     };
@@ -16975,6 +17037,489 @@ impl ApplicationService {
     ) -> Result<Mission, ApplicationError> {
         Ok(self.store.load_mission(project_id, mission_id)?)
     }
+    /// Persists the typed VM-07 Market Evidence Pack as a normal SQLCipher
+    /// WorkProduct.  The generic `record_research` command intentionally does
+    /// not call this path: a narrative packet cannot manufacture source-bound
+    /// truth or a decision-ready artifact.
+    #[allow(
+        clippy::needless_pass_by_value,
+        clippy::too_many_lines,
+        reason = "the VM-07 Pack boundary validates typed provenance, materializes Evidence and WorkProduct state, and commits its manifest in one revision-fenced transaction"
+    )]
+    pub fn record_vm07_market_evidence_pack(
+        &mut self,
+        command: RecordVm07MarketEvidencePack,
+        now: DateTime<Utc>,
+    ) -> Result<Vm07MarketEvidencePackResult, ApplicationError> {
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        if command.pack.pack_revision != 1
+            || mission
+                .work_products
+                .iter()
+                .any(|product| product.id == command.work_product_id)
+        {
+            return Err(ApplicationError::Vm07MarketEvidencePackRevisionMismatch);
+        }
+        validate_vm07_market_pack_scope(&mission, &command.pack, now)?;
+        let expected_mission_revision = mission.revision;
+        let mut evidence_ids = Vec::with_capacity(command.pack.claims.len());
+        for claim in &command.pack.claims {
+            let evidence_id = EvidenceId::from_stable(format!(
+                "vm07-evidence:{}:{}",
+                mission.id.as_str(),
+                claim.id
+            ));
+            if mission.evidence.iter().any(|item| item.id == evidence_id) {
+                return Err(ApplicationError::Vm07MarketEvidencePackRevisionMismatch);
+            }
+            evidence_ids.push(evidence_id.clone());
+            let status = match claim.classification {
+                MarketEvidenceClassification::ConfirmedFact => EvidenceStatus::Confirmed,
+                MarketEvidenceClassification::Conflict => EvidenceStatus::Conflicted,
+                MarketEvidenceClassification::ProviderEstimate
+                | MarketEvidenceClassification::Inference
+                | MarketEvidenceClassification::Unknown => EvidenceStatus::Candidate,
+            };
+            mission.record_evidence(
+                Evidence {
+                    id: evidence_id,
+                    title: claim.statement.clone(),
+                    source_uri: claim.source_uri.clone(),
+                    observed_at: claim.observed_at,
+                    confidence: f32::from(claim.confidence) / 100.0,
+                    status,
+                    content_digest: claim.content_digest.clone(),
+                },
+                now,
+            )?;
+        }
+        let body = command.pack.canonical_body()?;
+        let work_product = WorkProduct::draft(
+            command.work_product_id.clone(),
+            format!("Market Evidence Pack · {}", command.pack.market),
+            body.clone(),
+            evidence_ids.clone(),
+        );
+        mission.record_work_product(work_product, now)?;
+        let work_product = mission
+            .work_products
+            .iter()
+            .find(|product| product.id == command.work_product_id)
+            .cloned()
+            .ok_or_else(|| MissionError::UnknownWorkProduct(command.work_product_id.clone()))?;
+        let manifest = WorkProductManifest::create(
+            mission.tenant_id.clone(),
+            mission.project_id.clone(),
+            mission.id.clone(),
+            &work_product,
+            "market_evidence_pack",
+            WorkProductDependencies {
+                fact_ids: BTreeSet::new(),
+                evidence_ids: evidence_ids.iter().cloned().collect(),
+                task_ids: mission.tasks.iter().map(|task| task.id.clone()).collect(),
+            },
+            None,
+            WorkProductPreview::new(
+                "application/json",
+                format!(
+                    "VM-07 Market Evidence Pack {} revision {} ({})",
+                    command.pack.market, command.pack.pack_revision, command.pack.content_digest
+                ),
+            )?,
+            BTreeSet::from(["/vm07/market_evidence_pack".into()]),
+            now,
+        )?;
+        self.store.create_work_product_manifest_atomic(
+            &mission,
+            expected_mission_revision,
+            &manifest,
+            &[
+                PendingEvent::new(
+                    "evidence.ready",
+                    serde_json::json!({
+                        "missionId": mission.id,
+                        "workProductId": manifest.work_product_id,
+                        "packContentDigest": command.pack.content_digest,
+                        "packRevision": command.pack.pack_revision,
+                        "sourceCount": command.pack.claims.len(),
+                        "confirmedFactCount": command
+                            .pack
+                            .claims
+                            .iter()
+                            .filter(|claim| claim.classification == MarketEvidenceClassification::ConfirmedFact)
+                            .count(),
+                        "uncertaintyCount": command.pack.truth_uncertainty_map.len(),
+                        "counterevidenceCount": command.pack.counterevidence.len(),
+                    }),
+                    now,
+                ),
+                PendingEvent::new(
+                    "work_product.created",
+                    serde_json::json!({
+                        "workProductId": manifest.work_product_id,
+                        "workProductType": manifest.work_product_type,
+                        "manifestVersion": manifest.version,
+                        "manifestDigest": manifest.manifest_digest,
+                        "packContentDigest": command.pack.content_digest,
+                        "packRevision": command.pack.pack_revision,
+                    }),
+                    now,
+                ),
+            ],
+        )?;
+        Ok(Vm07MarketEvidencePackResult {
+            mission,
+            manifest,
+            work_product,
+        })
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        clippy::too_many_lines,
+        reason = "the VM-07 Pack revision boundary validates the previous digest chain, appends new source records, and updates the manifest atomically"
+    )]
+    pub fn revise_vm07_market_evidence_pack(
+        &mut self,
+        command: ReviseVm07MarketEvidencePack,
+        now: DateTime<Utc>,
+    ) -> Result<Vm07MarketEvidencePackResult, ApplicationError> {
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        require_mission_revision(&mission, command.expected_mission_revision)?;
+        let previous = mission
+            .work_products
+            .iter()
+            .find(|product| product.id == command.work_product_id)
+            .cloned()
+            .ok_or(ApplicationError::Vm07MarketEvidencePackUnavailable)?;
+        let previous_manifest = self
+            .store
+            .load_work_product_manifest(&command.project_id, &command.work_product_id)?;
+        if previous_manifest.work_product_type != "market_evidence_pack" {
+            return Err(ApplicationError::Vm07MarketEvidencePackUnavailable);
+        }
+        require_manifest_version(&previous_manifest, command.expected_manifest_version)?;
+        let previous_pack = load_vm07_pack(&mission, &command.work_product_id)?;
+        if previous_pack.pack_revision != command.expected_pack_revision
+            || command.pack.pack_revision != command.expected_pack_revision.saturating_add(1)
+        {
+            return Err(ApplicationError::Vm07MarketEvidencePackRevisionMismatch);
+        }
+        validate_vm07_market_pack_scope(&mission, &command.pack, now)?;
+        let mut evidence_ids = BTreeSet::new();
+        for claim in &command.pack.claims {
+            let evidence_id = EvidenceId::from_stable(format!(
+                "vm07-evidence:{}:{}",
+                mission.id.as_str(),
+                claim.id
+            ));
+            if let Some(existing) = mission.evidence.iter().find(|item| item.id == evidence_id) {
+                if existing.source_uri != claim.source_uri
+                    || existing.observed_at != claim.observed_at
+                    || existing.content_digest != claim.content_digest
+                {
+                    return Err(ApplicationError::Vm07MarketEvidencePackScopeMismatch);
+                }
+            } else {
+                let status = match claim.classification {
+                    MarketEvidenceClassification::ConfirmedFact => EvidenceStatus::Confirmed,
+                    MarketEvidenceClassification::Conflict => EvidenceStatus::Conflicted,
+                    MarketEvidenceClassification::ProviderEstimate
+                    | MarketEvidenceClassification::Inference
+                    | MarketEvidenceClassification::Unknown => EvidenceStatus::Candidate,
+                };
+                mission.record_evidence(
+                    Evidence {
+                        id: evidence_id.clone(),
+                        title: claim.statement.clone(),
+                        source_uri: claim.source_uri.clone(),
+                        observed_at: claim.observed_at,
+                        confidence: f32::from(claim.confidence) / 100.0,
+                        status,
+                        content_digest: claim.content_digest.clone(),
+                    },
+                    now,
+                )?;
+            }
+            evidence_ids.insert(evidence_id);
+        }
+        let body = command.pack.canonical_body()?;
+        let revised = previous.revise_content(
+            format!("Market Evidence Pack · {}", command.pack.market),
+            body,
+            evidence_ids.iter().cloned(),
+        )?;
+        mission.revise_work_product(revised.clone(), now)?;
+        let manifest = previous_manifest.revise(
+            &revised,
+            WorkProductDependencies {
+                fact_ids: BTreeSet::new(),
+                evidence_ids,
+                task_ids: mission.tasks.iter().map(|task| task.id.clone()).collect(),
+            },
+            None,
+            WorkProductPreview::new(
+                "application/json",
+                format!(
+                    "VM-07 Market Evidence Pack {} revision {} ({})",
+                    command.pack.market, command.pack.pack_revision, command.pack.content_digest
+                ),
+            )?,
+            BTreeSet::from(["/vm07/market_evidence_pack".into()]),
+            now,
+        )?;
+        self.store.revise_work_product_manifest_atomic(
+            &mission,
+            command.expected_mission_revision,
+            &manifest,
+            command.expected_manifest_version,
+            &[PendingEvent::new(
+                "work_product.revised",
+                serde_json::json!({
+                    "workProductId": manifest.work_product_id,
+                    "workProductType": manifest.work_product_type,
+                    "manifestVersion": manifest.version,
+                    "manifestDigest": manifest.manifest_digest,
+                    "packContentDigest": command.pack.content_digest,
+                    "packRevision": command.pack.pack_revision,
+                }),
+                now,
+            )],
+        )?;
+        Ok(Vm07MarketEvidencePackResult {
+            mission,
+            manifest,
+            work_product: revised,
+        })
+    }
+
+    /// Applies one revision-fenced VM-07 Continue, Stop or Test decision.  A
+    /// decision is a private typed Conversation message and an atomic Mission
+    /// transition; stale, replayed, swapped and cross-scope commands are
+    /// rejected before any Event/Outbox/Conversation mutation.
+    #[allow(
+        clippy::needless_pass_by_value,
+        clippy::too_many_lines,
+        reason = "the typed VM-07 decision boundary keeps stale/replay checks, action-specific Mission transitions, private Conversation append, and the dual CAS in one atomic command"
+    )]
+    pub fn decide_vm07_market(
+        &mut self,
+        command: DecideVm07MarketDecision,
+        now: DateTime<Utc>,
+    ) -> Result<Vm07MarketDecisionResult, ApplicationError> {
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        let mut conversation = self
+            .store
+            .load_mission_conversation(&command.project_id, &command.mission_id)?;
+        let expected_body = vm07_decision_body(&mission, &conversation, &command)?;
+
+        if let Some(existing) = conversation
+            .messages
+            .iter()
+            .find(|message| message.idempotency_key == command.idempotency_key.trim())
+            .cloned()
+        {
+            if existing.id != command.message_id || existing.body != expected_body {
+                return Err(ApplicationError::Vm07MarketDecisionReplayMismatch);
+            }
+            let binding = vm07_decision_binding_from_body(&existing.body)?;
+            if binding.validate().is_err() {
+                return Err(ApplicationError::Vm07MarketDecisionReplayMismatch);
+            }
+            return Ok(Vm07MarketDecisionResult {
+                next_dispatch: if mission.stage.is_terminal() {
+                    None
+                } else {
+                    current_checkpoint_dispatch_projection(&mission)?
+                },
+                mission,
+                conversation,
+                message: existing,
+                binding,
+                replayed: true,
+            });
+        }
+
+        if mission.revision != command.expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: command.expected_mission_revision,
+                actual: mission.revision,
+            });
+        }
+        if conversation.revision != command.expected_conversation_revision {
+            return Err(ApplicationError::MissionConversationRevisionMismatch {
+                expected: command.expected_conversation_revision,
+                actual: conversation.revision,
+            });
+        }
+        let checkpoint = mission
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .cloned()
+            .ok_or(ApplicationError::Vm07MarketDecisionUnavailable)?;
+        let route = checkpoint
+            .route
+            .clone()
+            .ok_or(ApplicationError::Vm07MarketDecisionUnavailable)?;
+        if checkpoint.id != "go_no_go_need_more_evidence"
+            || checkpoint.status != MissionCheckpointStatus::Running
+            || checkpoint.revision != command.expected_checkpoint_revision
+            || route.executor != MissionCheckpointExecutor::Human
+            || route.completion_policy != Some(MissionCheckpointCompletionPolicy::HumanConfirmation)
+        {
+            return Err(ApplicationError::Vm07MarketDecisionUnavailable);
+        }
+        let pack = load_vm07_pack(&mission, &command.pack_work_product_id)?;
+        let pack_manifest = self
+            .store
+            .load_work_product_manifest(&command.project_id, &command.pack_work_product_id)?;
+        if pack_manifest.work_product_type != "market_evidence_pack"
+            || pack_manifest.artifact_digest
+                != mission
+                    .work_products
+                    .iter()
+                    .find(|product| product.id == command.pack_work_product_id)
+                    .map(|product| product.content_digest.clone())
+                    .ok_or(ApplicationError::Vm07MarketEvidencePackUnavailable)?
+            || pack_manifest.work_product_revision != pack.pack_revision
+        {
+            return Err(ApplicationError::Vm07MarketEvidencePackScopeMismatch);
+        }
+        if pack.content_digest != command.expected_pack_content_digest
+            || pack.pack_revision != command.expected_pack_revision
+        {
+            return Err(ApplicationError::Vm07MarketDecisionPackMismatch);
+        }
+        let (message, appended) = conversation.append_user_message(
+            command.message_id.clone(),
+            MissionConversationMessageKind::CheckpointConfirmation,
+            expected_body,
+            command.idempotency_key.clone(),
+            &mission,
+            now,
+        )?;
+        if !appended {
+            return Err(ApplicationError::Vm07MarketDecisionReplayMismatch);
+        }
+
+        let evidence_digest = sha256(
+            serde_json::to_string(&serde_json::json!({
+                "packContentDigest": pack.content_digest,
+                "packRevision": pack.pack_revision,
+                "action": command.action,
+                "missionRevision": command.expected_mission_revision,
+                "checkpointRevision": command.expected_checkpoint_revision,
+                "conversationRevision": command.expected_conversation_revision,
+                "messageContentDigest": message.content_digest,
+            }))?
+            .as_bytes(),
+        );
+        match command.action {
+            Vm07DecisionAction::Test => {
+                mission.block_checkpoint(
+                    &checkpoint.id,
+                    &hartevo_domain_kernel::MissionBlock {
+                        code: "vm07_test_plan_required".into(),
+                        detail: "Continue is held until the bounded, read-only experiment plan produces new evidence; no external write is authorized.".into(),
+                        recoverable: true,
+                        observed_at: now,
+                    },
+                    MissionStage::WaitingUser,
+                )?;
+            }
+            Vm07DecisionAction::Continue | Vm07DecisionAction::Stop => {
+                mission.begin_checkpoint_verification(&checkpoint.id, now)?;
+                mission.complete_checkpoint(
+                    &checkpoint.id,
+                    MissionCheckpointCompletion {
+                        oracle_ids: route.oracle_ids.clone(),
+                        work_product_ids: BTreeSet::new(),
+                        effect_ids: BTreeSet::new(),
+                        application_evidence: None,
+                        evidence_digest,
+                        verified_at: now,
+                    },
+                )?;
+                if command.action == Vm07DecisionAction::Stop {
+                    mission.terminate(MissionTerminalDisposition::Completed, now)?;
+                } else if let Some(next) = mission
+                    .definition
+                    .as_ref()
+                    .and_then(MissionDefinition::current_checkpoint)
+                    .filter(|next| next.status == MissionCheckpointStatus::Ready)
+                    .cloned()
+                {
+                    let task_id = TaskId::from_stable(format!(
+                        "mission-checkpoint-task:{}:{}:cycle:{}",
+                        mission.id, next.id, 1
+                    ));
+                    let next_route = next
+                        .route
+                        .as_ref()
+                        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+                    mission.begin_checkpoint_with_task(
+                        &next.id,
+                        Task {
+                            id: task_id,
+                            title: format!("Checkpoint: {}", next.id),
+                            status: TaskStatus::Running,
+                            capability: next_route.capability_id.clone(),
+                        },
+                        now,
+                    )?;
+                }
+            }
+        }
+        let binding = vm07_decision_binding_from_body(&vm07_decision_body(
+            &mission,
+            &conversation,
+            &command,
+        )?)?;
+        let events = [PendingEvent::new(
+            "mission.vm07_market_decision_recorded",
+            serde_json::json!({
+                "missionId": mission.id,
+                "checkpointId": checkpoint.id,
+                "action": command.action,
+                "contractDigest": binding.contract_digest,
+                "packContentDigest": binding.pack_content_digest,
+                "packRevision": binding.pack_revision,
+                "missionRevision": binding.mission_revision,
+                "conversationRevision": binding.conversation_revision,
+                "decisionDigest": binding.decision_digest,
+                "terminal": mission.stage.is_terminal(),
+                "externalWrite": false,
+            }),
+            now,
+        )];
+        self.store.update_mission_with_conversation_atomic(
+            &mission,
+            command.expected_mission_revision,
+            &conversation,
+            command.expected_conversation_revision,
+            &events,
+        )?;
+        let next_dispatch = if mission.stage.is_terminal() {
+            None
+        } else {
+            current_checkpoint_dispatch_projection(&mission)?
+        };
+        Ok(Vm07MarketDecisionResult {
+            mission,
+            conversation,
+            message,
+            binding,
+            next_dispatch,
+            replayed: false,
+        })
+    }
 }
 
 #[allow(
@@ -19803,6 +20348,162 @@ fn conversation_reply_effect_spec(
     }
 }
 
+fn validate_vm07_market_pack_scope(
+    mission: &Mission,
+    pack: &MarketEvidencePack,
+    now: DateTime<Utc>,
+) -> Result<(), ApplicationError> {
+    pack.validate()?;
+    let definition = mission
+        .definition
+        .as_ref()
+        .ok_or(ApplicationError::Vm07MarketEvidencePackUnavailable)?;
+    if definition.manifest_id != "VM-07"
+        || pack.tenant_id != mission.tenant_id
+        || pack.project_id != mission.project_id
+        || pack.mission_id != mission.id
+        || pack.mission_revision != mission.revision
+        || pack.market != mission.contract.market
+        || pack.language != mission.contract.language
+        || pack.contract_digest != canonical_sha256(&serde_json::to_value(&mission.contract)?)?
+        || pack.claims.iter().any(|claim| claim.observed_at > now)
+        || pack
+            .counterevidence
+            .iter()
+            .any(|item| item.observed_at > now)
+    {
+        return Err(ApplicationError::Vm07MarketEvidencePackScopeMismatch);
+    }
+    Ok(())
+}
+
+fn load_vm07_pack(
+    mission: &Mission,
+    work_product_id: &WorkProductId,
+) -> Result<MarketEvidencePack, ApplicationError> {
+    let product = mission
+        .work_products
+        .iter()
+        .find(|product| &product.id == work_product_id)
+        .ok_or(ApplicationError::Vm07MarketEvidencePackUnavailable)?;
+    let pack: MarketEvidencePack = serde_json::from_str(&product.body)?;
+    pack.validate()?;
+    if product.content_digest
+        != sha256(
+            format!(
+                "{}
+{}",
+                product.title, product.body
+            )
+            .as_bytes(),
+        )
+        || pack.content_digest.trim().is_empty()
+    {
+        return Err(ApplicationError::Vm07MarketEvidencePackScopeMismatch);
+    }
+    Ok(pack)
+}
+
+fn validate_vm07_pack_identity(
+    mission: &Mission,
+    pack: &MarketEvidencePack,
+) -> Result<(), ApplicationError> {
+    if pack.tenant_id != mission.tenant_id
+        || pack.project_id != mission.project_id
+        || pack.mission_id != mission.id
+        || pack.mission_revision == 0
+        || pack.mission_revision > mission.revision
+        || pack.market != mission.contract.market
+        || pack.language != mission.contract.language
+        || pack.contract_digest != canonical_sha256(&serde_json::to_value(&mission.contract)?)?
+    {
+        return Err(ApplicationError::Vm07MarketEvidencePackScopeMismatch);
+    }
+    Ok(())
+}
+
+fn vm07_decision_binding(
+    mission: &Mission,
+    pack: &MarketEvidencePack,
+    command: &DecideVm07MarketDecision,
+) -> Result<Vm07DecisionBinding, ApplicationError> {
+    let mut binding = Vm07DecisionBinding {
+        schema_version: Vm07DecisionBinding::SCHEMA_VERSION,
+        action: command.action,
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        checkpoint_id: "go_no_go_need_more_evidence".into(),
+        contract_digest: canonical_sha256(&serde_json::to_value(&mission.contract)?)?,
+        pack_content_digest: pack.content_digest.clone(),
+        pack_revision: pack.pack_revision,
+        mission_revision: command.expected_mission_revision,
+        checkpoint_revision: command.expected_checkpoint_revision,
+        conversation_revision: command.expected_conversation_revision,
+        idempotency_key_digest: sha256(command.idempotency_key.trim().as_bytes()),
+        decision_digest: String::new(),
+        experiment_plan_digest: (command.action == Vm07DecisionAction::Test).then(|| {
+            canonical_sha256(
+                &serde_json::to_value(&pack.experiment_plan)
+                    .expect("typed experiment plan serializes"),
+            )
+            .expect("typed experiment plan digests")
+        }),
+    };
+    binding.decision_digest = binding.calculate_digest()?;
+    binding.validate()?;
+    Ok(binding)
+}
+
+fn vm07_decision_body(
+    mission: &Mission,
+    conversation: &MissionConversation,
+    command: &DecideVm07MarketDecision,
+) -> Result<String, ApplicationError> {
+    if command.rationale.trim().is_empty()
+        || command.idempotency_key.trim().is_empty()
+        || !is_sha256_text(&command.expected_pack_content_digest)
+        || command.expected_pack_revision == 0
+        || command.expected_mission_revision == 0
+        || command.expected_checkpoint_revision == 0
+        || command.expected_conversation_revision == 0
+        || conversation.revision < command.expected_conversation_revision
+    {
+        return Err(ApplicationError::Vm07MarketDecisionCommandMismatch);
+    }
+    let pack = load_vm07_pack(mission, &command.pack_work_product_id)?;
+    validate_vm07_pack_identity(mission, &pack)?;
+    if command.action == Vm07DecisionAction::Test
+        && pack.recommendation != MarketDecisionRecommendation::NeedMoreEvidence
+    {
+        return Err(ApplicationError::Vm07MarketDecisionCommandMismatch);
+    }
+    if pack.content_digest != command.expected_pack_content_digest
+        || pack.pack_revision != command.expected_pack_revision
+    {
+        return Err(ApplicationError::Vm07MarketDecisionPackMismatch);
+    }
+    let binding = vm07_decision_binding(mission, &pack, command)?;
+    Ok(serde_json::to_string(&serde_json::json!({
+        "schemaVersion": "vm07-market-decision/v1",
+        "action": command.action,
+        "rationale": command.rationale.trim(),
+        "binding": binding,
+    }))?)
+}
+
+fn vm07_decision_binding_from_body(body: &str) -> Result<Vm07DecisionBinding, ApplicationError> {
+    let value: serde_json::Value = serde_json::from_str(body)?;
+    let binding: Vm07DecisionBinding = serde_json::from_value(
+        value
+            .get("binding")
+            .cloned()
+            .ok_or(ApplicationError::Vm07MarketDecisionReplayMismatch)?,
+    )?;
+    binding.validate()?;
+    Ok(binding)
+}
+
 pub fn compile_contract(prompt: &str, now: DateTime<Utc>) -> MissionContract {
     let mut constraints = Vec::new();
     let lower = prompt.to_lowercase();
@@ -20421,6 +21122,22 @@ pub enum ApplicationError {
     HumanCheckpointConfirmationReplayMismatch,
     #[error("Human Checkpoint confirmation does not bind the exact required WorkProducts")]
     HumanCheckpointWorkProductMismatch,
+    #[error(transparent)]
+    MarketEvidence(#[from] MarketEvidenceError),
+    #[error("VM-07 Market Evidence Pack is not available as a typed WorkProduct")]
+    Vm07MarketEvidencePackUnavailable,
+    #[error("VM-07 Market Evidence Pack does not match the exact Mission/Contract scope")]
+    Vm07MarketEvidencePackScopeMismatch,
+    #[error("VM-07 Market Evidence Pack revision is stale, duplicated, or already persisted")]
+    Vm07MarketEvidencePackRevisionMismatch,
+    #[error("VM-07 market decision route is not the active Human decision checkpoint")]
+    Vm07MarketDecisionUnavailable,
+    #[error("VM-07 market decision command is incomplete or malformed")]
+    Vm07MarketDecisionCommandMismatch,
+    #[error("VM-07 market decision does not bind the exact evidence Pack revision")]
+    Vm07MarketDecisionPackMismatch,
+    #[error("VM-07 market decision replay or payload swap does not match persisted evidence")]
+    Vm07MarketDecisionReplayMismatch,
     #[error(
         "VM-11 continue_stop_scale_test requires a structured Continue/Stop/Scale/Test command"
     )]
@@ -20566,6 +21283,10 @@ mod tests {
         RightsAttestation, Touchpoint, TruthSource, TruthStatus, TruthValue, UsageRights,
         Verification, VerificationId,
     };
+    use hartevo_domain_kernel::{
+        MarketCounterevidence, MarketDecisionRecommendation, MarketEvidenceClaim,
+        MarketExperimentPlanItem, MarketUncertainty, MarketUncertaintyMateriality,
+    };
     use hartevo_effect_broker::{
         EffectPolicy, EffectRateLimit, PermissionFailure, ProviderFailure,
         ReconciliationObservation, ReconciliationPolicy,
@@ -20703,6 +21424,383 @@ mod tests {
                 direction: KpiDirection::AtLeast,
             },
         )])
+    }
+
+    fn vm07_market_pack_for(mission: &Mission, observed_at: DateTime<Utc>) -> MarketEvidencePack {
+        let claim_digest = sha256(b"german-demand-source");
+        let mut pack = MarketEvidencePack {
+            schema_version: MarketEvidencePack::SCHEMA_VERSION,
+            tenant_id: mission.tenant_id.clone(),
+            project_id: mission.project_id.clone(),
+            mission_id: mission.id.clone(),
+            contract_digest: canonical_sha256(
+                &serde_json::to_value(&mission.contract).expect("contract JSON"),
+            )
+            .expect("contract digest"),
+            mission_revision: mission.revision,
+            pack_revision: 1,
+            market: mission.contract.market.clone(),
+            language: mission.contract.language.clone(),
+            claims: vec![MarketEvidenceClaim {
+                id: "demand-estimate".into(),
+                statement: "German buyers search for the category".into(),
+                source_id: "dataforseo:keyword-volume:de".into(),
+                source_uri: "https://evidence.example/de/keyword-volume".into(),
+                observed_at,
+                content_digest: claim_digest,
+                classification: MarketEvidenceClassification::ProviderEstimate,
+                confidence: 65,
+                uncertainty_id: "demand-uncertainty".into(),
+            }],
+            truth_uncertainty_map: vec![MarketUncertainty {
+                id: "demand-uncertainty".into(),
+                statement: "Search demand may not become paid demand".into(),
+                materiality: MarketUncertaintyMateriality::High,
+                claim_ids: BTreeSet::from(["demand-estimate".into()]),
+                resolution: "Run a bounded read-only interest test".into(),
+            }],
+            counterevidence: vec![MarketCounterevidence {
+                id: "distribution-risk".into(),
+                statement: "Local incumbents have established distribution".into(),
+                source_id: "marketplace:public-observation:de".into(),
+                source_uri: "https://evidence.example/de/incumbents".into(),
+                observed_at,
+                content_digest: sha256(b"distribution-risk"),
+                claim_ids: BTreeSet::from(["demand-estimate".into()]),
+            }],
+            recommendation: MarketDecisionRecommendation::NeedMoreEvidence,
+            recommendation_rationale: "The estimate is promising but conversion remains uncertain"
+                .into(),
+            supporting_claim_ids: BTreeSet::from(["demand-estimate".into()]),
+            counterevidence_ids: BTreeSet::from(["distribution-risk".into()]),
+            experiment_plan: vec![MarketExperimentPlanItem {
+                id: "interest-test".into(),
+                hypothesis: "German prospects will request a product demo".into(),
+                success_metric: "Five qualified requests in fourteen days".into(),
+                budget_minor: 500,
+                currency: "EUR".into(),
+                max_duration_days: 14,
+                no_external_write: true,
+            }],
+            content_digest: String::new(),
+        };
+        pack.content_digest = pack.calculate_digest().expect("pack digest");
+        pack
+    }
+
+    #[test]
+    fn vm07_market_pack_is_typed_scoped_and_duplicate_safe() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let project_id = ProjectId::from("vm07-pack-project");
+        let mission_id = MissionId::from("vm07-pack-mission");
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: TenantId::from("vm07-pack-tenant"),
+                    id: project_id.clone(),
+                    name: "VM-07 pack".into(),
+                    description: String::new(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    storage_mode: StorageMode::LocalNew,
+                },
+                now(),
+            )
+            .expect("project");
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: mission_id.clone(),
+                    first_task_id: TaskId::from("vm07-pack-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-07".into(),
+                    mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: None,
+                    title: Some("Germany market".into()),
+                    goal: "Evaluate whether our product should enter the German market".into(),
+                    market: "DE".into(),
+                    language: "de-DE".into(),
+                    audience: "founder".into(),
+                    timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
+                    budget: Money::zero(CurrencyCode::parse("EUR").expect("EUR")),
+                },
+                now(),
+            )
+            .expect("VM-07 mission");
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("mission");
+        let pack = vm07_market_pack_for(&mission, now() + Duration::milliseconds(1));
+        let result = service
+            .record_vm07_market_evidence_pack(
+                RecordVm07MarketEvidencePack {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    work_product_id: WorkProductId::from("vm07-pack-work-product"),
+                    pack: pack.clone(),
+                },
+                now() + Duration::milliseconds(2),
+            )
+            .expect("typed pack");
+        assert_eq!(result.manifest.work_product_type, "market_evidence_pack");
+        assert_eq!(
+            result.work_product.body,
+            pack.canonical_body().expect("pack body")
+        );
+        let event_count = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events")
+            .len();
+        let duplicate = service.record_vm07_market_evidence_pack(
+            RecordVm07MarketEvidencePack {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                work_product_id: WorkProductId::from("vm07-pack-work-product"),
+                pack,
+            },
+            now() + Duration::milliseconds(3),
+        );
+        assert!(matches!(
+            duplicate,
+            Err(ApplicationError::Vm07MarketEvidencePackRevisionMismatch)
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after duplicate")
+                .len(),
+            event_count
+        );
+    }
+
+    fn stage_vm07_decision_checkpoint(
+        service: &mut ApplicationService,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        pack_work_product_id: &WorkProductId,
+    ) -> Mission {
+        let mut mission = service
+            .store
+            .load_mission(project_id, mission_id)
+            .expect("mission before staging");
+        let expected_revision = mission.revision;
+        let decision_now = now() + Duration::seconds(20);
+        let definition = mission.definition.as_mut().expect("VM-07 definition");
+        for checkpoint in definition.checkpoints.iter_mut().take(5) {
+            checkpoint.status = MissionCheckpointStatus::Completed;
+            checkpoint.attempt = 1;
+            checkpoint.started_at = Some(now());
+            checkpoint.revision = checkpoint.revision.saturating_add(1);
+            checkpoint.block = None;
+            let route = checkpoint.route.as_ref().expect("routed checkpoint");
+            checkpoint.completion = Some(MissionCheckpointCompletion {
+                oracle_ids: route.oracle_ids.clone(),
+                work_product_ids: if route.oracle_ids.contains("work_product") {
+                    BTreeSet::from([pack_work_product_id.clone()])
+                } else {
+                    BTreeSet::new()
+                },
+                effect_ids: BTreeSet::new(),
+                application_evidence: None,
+                evidence_digest: sha256(checkpoint.id.as_bytes()),
+                verified_at: now() + Duration::seconds(1),
+            });
+        }
+        let decision_checkpoint = definition
+            .checkpoints
+            .get_mut(5)
+            .expect("decision checkpoint");
+        decision_checkpoint.status = MissionCheckpointStatus::Running;
+        decision_checkpoint.attempt = 1;
+        decision_checkpoint.started_at = Some(now() + Duration::seconds(2));
+        decision_checkpoint.revision = decision_checkpoint.revision.saturating_add(1);
+        decision_checkpoint.block = None;
+        decision_checkpoint.completion = None;
+        for task in &mut mission.tasks {
+            task.status = TaskStatus::Completed;
+        }
+        mission.tasks.push(Task {
+            id: TaskId::from("vm07-decision-task"),
+            title: "Checkpoint: go_no_go_need_more_evidence".into(),
+            status: TaskStatus::Running,
+            capability: "decision.evaluate".into(),
+        });
+        mission.stage = MissionStage::Running;
+        mission.block = None;
+        mission.updated_at = decision_now;
+        mission.revision = mission.revision.saturating_add(1);
+        mission
+            .definition
+            .as_ref()
+            .expect("definition")
+            .validate()
+            .expect("staged definition");
+        service
+            .store
+            .update_mission_atomic(
+                &mission,
+                expected_revision,
+                &[PendingEvent::new(
+                    "test.vm07_decision_checkpoint_staged",
+                    serde_json::json!({"checkpointId": "go_no_go_need_more_evidence"}),
+                    decision_now,
+                )],
+            )
+            .expect("stage decision checkpoint");
+        mission
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the acceptance test covers Stop terminalization, exact binding, replay and payload-swap no-op behavior"
+    )]
+    fn vm07_stop_decision_is_terminal_and_exactly_replayable() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let project_id = ProjectId::from("vm07-decision-project");
+        let mission_id = MissionId::from("vm07-decision-mission");
+        let work_product_id = WorkProductId::from("vm07-decision-pack");
+        let mut service = ApplicationService::new(ProjectStore::in_memory().expect("store"));
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: TenantId::from("vm07-decision-tenant"),
+                    id: project_id.clone(),
+                    name: "VM-07 decision".into(),
+                    description: String::new(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    storage_mode: StorageMode::LocalNew,
+                },
+                now(),
+            )
+            .expect("project");
+        service
+            .start_catalog_mission(
+                StartCatalogMission {
+                    id: mission_id.clone(),
+                    first_task_id: TaskId::from("vm07-decision-first-task"),
+                    project_id: project_id.clone(),
+                    manifest_id: "VM-07".into(),
+                    mode: OperatingMode::OneOffDecision,
+                    parent_mission_id: None,
+                    title: Some("Germany decision".into()),
+                    goal: "Evaluate whether our product should enter the German market".into(),
+                    market: "DE".into(),
+                    language: "de-DE".into(),
+                    audience: "founder".into(),
+                    timezone: "Europe/Berlin".into(),
+                    kpis: catalog_count_kpis(),
+                    budget: Money::zero(CurrencyCode::parse("EUR").expect("EUR")),
+                },
+                now(),
+            )
+            .expect("VM-07 mission");
+        let initial = service
+            .load_mission(&project_id, &mission_id)
+            .expect("initial mission");
+        let pack = vm07_market_pack_for(&initial, now() + Duration::milliseconds(1));
+        service
+            .record_vm07_market_evidence_pack(
+                RecordVm07MarketEvidencePack {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    work_product_id: work_product_id.clone(),
+                    pack: pack.clone(),
+                },
+                now() + Duration::milliseconds(2),
+            )
+            .expect("pack");
+        let staged = stage_vm07_decision_checkpoint(
+            &mut service,
+            &project_id,
+            &mission_id,
+            &work_product_id,
+        );
+        let conversation = service
+            .mission_conversation(&project_id, &mission_id)
+            .expect("conversation");
+        let checkpoint = staged
+            .definition
+            .as_ref()
+            .and_then(MissionDefinition::current_checkpoint)
+            .expect("decision checkpoint");
+        let command = DecideVm07MarketDecision {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            pack_work_product_id: work_product_id,
+            action: Vm07DecisionAction::Stop,
+            message_id: MissionConversationMessageId::from("vm07-stop-message"),
+            rationale: "The counterevidence outweighs the estimate under the frozen budget".into(),
+            idempotency_key: "vm07-decision:stop:1".into(),
+            expected_pack_content_digest: pack.content_digest,
+            expected_pack_revision: pack.pack_revision,
+            expected_mission_revision: staged.revision,
+            expected_checkpoint_revision: checkpoint.revision,
+            expected_conversation_revision: conversation.revision,
+        };
+        let events_before = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events")
+            .len();
+        let result = service
+            .decide_vm07_market(command.clone(), now() + Duration::seconds(21))
+            .expect("Stop decision");
+        assert_eq!(result.mission.stage, MissionStage::Completed);
+        assert_eq!(result.binding.action, Vm07DecisionAction::Stop);
+        assert!(!result.binding.decision_digest.is_empty());
+        let events_after = service
+            .mission_events(&project_id, &mission_id)
+            .expect("events after stop")
+            .len();
+        assert_eq!(events_after, events_before + 1);
+        let replay = service
+            .decide_vm07_market(command.clone(), now() + Duration::seconds(22))
+            .expect("Stop replay");
+        assert!(replay.replayed);
+        assert_eq!(replay.mission.stage, MissionStage::Completed);
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after replay")
+                .len(),
+            events_after
+        );
+        let mut stale = command.clone();
+        stale.idempotency_key = "vm07-decision:stale:1".into();
+        stale.expected_mission_revision = command.expected_mission_revision.saturating_sub(1);
+        assert!(matches!(
+            service.decide_vm07_market(stale, now() + Duration::seconds(23)),
+            Err(ApplicationError::MissionRevisionMismatch { .. })
+        ));
+        let mut cross_scope = command.clone();
+        cross_scope.idempotency_key = "vm07-decision:cross-scope:1".into();
+        cross_scope.project_id = ProjectId::from("vm07-other-project");
+        assert!(
+            service
+                .decide_vm07_market(cross_scope, now() + Duration::seconds(24))
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after stale and cross-scope")
+                .len(),
+            events_after
+        );
+        let mut swapped = command;
+        swapped.rationale = "swap payload".into();
+        assert!(matches!(
+            service.decide_vm07_market(swapped, now() + Duration::seconds(25)),
+            Err(ApplicationError::Vm07MarketDecisionReplayMismatch)
+        ));
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("events after swap")
+                .len(),
+            events_after
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
