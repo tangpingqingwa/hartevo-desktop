@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/distribution/checksums/1.0.0",
+  "title": "Hartevo distribution SHA-256 checksums",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "algorithm", "sourceCommit", "toolchain", "artifacts"],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-distribution-checksums/v1"},
+    "algorithm": {"const": "SHA-256"},
+    "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "toolchain": {"$ref": "#/$defs/toolchain"},
+    "artifacts": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/artifact"}}
+  },
+  "$defs": {
+    "toolchain": {"type": "object", "additionalProperties": false, "required": ["rustc", "cargo", "target"], "properties": {"rustc": {"type": "string", "minLength": 1}, "cargo": {"type": "string", "minLength": 1}, "target": {"type": "string", "minLength": 1}}},
+    "artifact": {"type": "object", "additionalProperties": false, "required": ["id", "kind", "path", "sha256", "byteCount", "evidenceClass", "sourceCommit"], "properties": {"id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"}, "kind": {"enum": ["APPLICATION", "SBOM", "MANIFEST", "TELEMETRY"]}, "path": {"type": "string", "pattern": "^(?!/)(?!.*\\.\\.)[^\\n]+$"}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "byteCount": {"type": "integer", "minimum": 0}, "evidenceClass": {"enum": ["NATIVE", "LOCAL_CONTRACT", "BLOCKED_ENV", "CI_NOT_EXECUTED"]}, "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}}}
+  }
+}

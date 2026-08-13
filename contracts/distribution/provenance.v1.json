@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/distribution/provenance/1.0.0",
+  "title": "Hartevo local distribution provenance",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "source", "toolchain", "checksumManifest", "artifacts", "signingHooks", "nativeEvidence", "releaseDecision", "releaseReady"],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-distribution-provenance/v1"},
+    "source": {"$ref": "#/$defs/source"},
+    "toolchain": {"$ref": "#/$defs/toolchain"},
+    "checksumManifest": {"$ref": "#/$defs/digestPointer"},
+    "artifacts": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/artifact"}},
+    "signingHooks": {"type": "object", "additionalProperties": false, "required": ["macosSigning", "macosNotarization", "windowsSigning"], "properties": {"macosSigning": {"$ref": "#/$defs/hook"}, "macosNotarization": {"$ref": "#/$defs/hook"}, "windowsSigning": {"$ref": "#/$defs/hook"}}},
+    "nativeEvidence": {"type": "object", "additionalProperties": false, "required": ["status", "requiredForRelease", "releaseEligible"], "properties": {"status": {"const": "NOT_PROVEN"}, "requiredForRelease": {"const": true}, "releaseEligible": {"const": false}}},
+    "releaseDecision": {"const": "NOT_EVALUATED"},
+    "releaseReady": {"const": false}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source": {"type": "object", "additionalProperties": false, "required": ["commit", "tree", "treeSha256", "dirty", "repository", "sourceDateEpoch"], "properties": {"commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "treeSha256": {"$ref": "#/$defs/sha256"}, "dirty": {"type": "boolean"}, "repository": {"type": "string", "pattern": "^https://"}, "sourceDateEpoch": {"type": "integer", "minimum": 0}}},
+    "toolchain": {"type": "object", "additionalProperties": false, "required": ["rustc", "cargo", "target"], "properties": {"rustc": {"type": "string", "minLength": 1}, "cargo": {"type": "string", "minLength": 1}, "target": {"type": "string", "minLength": 1}}},
+    "digestPointer": {"type": "object", "additionalProperties": false, "required": ["path", "sha256", "byteCount"], "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}, "byteCount": {"type": "integer", "minimum": 0}}},
+    "artifact": {"type": "object", "additionalProperties": false, "required": ["id", "kind", "path", "sha256", "byteCount", "evidenceClass", "sourceCommit"], "properties": {"id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"}, "kind": {"enum": ["APPLICATION", "SBOM", "MANIFEST", "TELEMETRY"]}, "path": {"type": "string", "pattern": "^(?!/)(?!.*\\.\\.)[^\\n]+$"}, "sha256": {"$ref": "#/$defs/sha256"}, "byteCount": {"type": "integer", "minimum": 0}, "evidenceClass": {"enum": ["NATIVE", "LOCAL_CONTRACT", "BLOCKED_ENV", "CI_NOT_EXECUTED"]}, "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}}},
+    "hook": {"type": "object", "additionalProperties": false, "required": ["status", "hook"], "properties": {"status": {"enum": ["PASS", "BLOCKED_ENV", "CI_NOT_EXECUTED", "FAIL"]}, "hook": {"type": "string", "minLength": 1}, "evidencePath": {"type": "string", "minLength": 1}, "evidenceSha256": {"$ref": "#/$defs/sha256"}}}
+  }
+}

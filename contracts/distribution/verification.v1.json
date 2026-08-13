@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/distribution/verification/1.0.0",
+  "title": "Hartevo local distribution verification receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "status", "sourceCommit", "sourceDirty", "toolchain", "checks", "blockedEnv", "releaseDecision", "releaseReady"],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-distribution-verification/v1"},
+    "status": {"const": "VERIFIED"},
+    "sourceCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sourceDirty": {"type": "boolean"},
+    "toolchain": {"type": "object", "additionalProperties": false, "required": ["rustc", "cargo", "target"], "properties": {"rustc": {"type": "string", "minLength": 1}, "cargo": {"type": "string", "minLength": 1}, "target": {"type": "string", "minLength": 1}}},
+    "checks": {"type": "object", "additionalProperties": false, "required": ["manifest", "cyclonedx", "spdx", "checksums", "provenance", "telemetry", "signingHooks"], "properties": {"manifest": {"const": "PASS"}, "cyclonedx": {"const": "PASS"}, "spdx": {"const": "PASS"}, "checksums": {"const": "PASS"}, "provenance": {"const": "PASS"}, "telemetry": {"const": "PASS"}, "signingHooks": {"enum": ["PASS", "BLOCKED_ENV", "CI_NOT_EXECUTED"]}}},
+    "blockedEnv": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "releaseDecision": {"const": "NOT_EVALUATED"},
+    "releaseReady": {"const": false}
+  }
+}
