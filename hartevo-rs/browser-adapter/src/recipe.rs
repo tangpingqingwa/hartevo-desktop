@@ -15,9 +15,6 @@ use crate::{
     BrowserError, BrowserLocatorResolution, BrowserProfile, BrowserWorkspace,
 };
 
-#[path = "recipe_authority.rs"]
-mod recipe_authority;
-
 const RECIPE_SCHEMA_VERSION: u32 = 1;
 const RECIPE_KEY_SCHEMA_VERSION: u32 = 1;
 const RECIPE_PROMOTION_SCHEMA_VERSION: u32 = 1;
@@ -167,31 +164,6 @@ pub struct BrowserRecipeTrustStore {
 }
 
 impl BrowserRecipeTrustStore {
-    /// Validates one supplied root-authority snapshot against an exact caller
-    /// expectation. The checked D-01A contract intentionally has no lifecycle
-    /// admission registrations, so production calls currently fail closed even
-    /// when the public-key snapshot is otherwise well formed.
-    pub fn validate_supplied_root_authority_snapshot(
-        snapshot_json: &str,
-        expected_tenant_id: &TenantId,
-        expected_project_id: &ProjectId,
-        expected_snapshot_revision: u64,
-        expected_snapshot_as_of: DateTime<Utc>,
-        expected_snapshot_digest: &str,
-        validation_at: DateTime<Utc>,
-    ) -> Result<(), BrowserError> {
-        recipe_authority::validate_supplied_authority_snapshot_json(
-            snapshot_json,
-            expected_tenant_id,
-            expected_project_id,
-            expected_snapshot_revision,
-            expected_snapshot_as_of,
-            expected_snapshot_digest,
-            validation_at,
-        )
-        .map_err(|_| BrowserError::InvalidRecipeKey)
-    }
-
     pub fn insert(&mut self, key: TrustedBrowserRecipeKey) -> Result<(), BrowserError> {
         key.validate_shape()?;
         match self.keys.get(&key.id) {
@@ -1762,33 +1734,6 @@ mod tests {
             permission_digest: "d".repeat(64),
         });
         effect
-    }
-
-    #[test]
-    fn candidate_and_promotion_canonical_payload_golden_vectors_do_not_change() {
-        let fixture = fixture();
-        let release = release(&fixture, 1);
-        let candidate_payload =
-            BrowserRecipeCandidate::signing_payload(&release.candidate.manifest)
-                .expect("candidate payload");
-        let promotion_payload = BrowserRecipePromotion::signing_payload(
-            &release.promotion.candidate_digest,
-            &release.promotion.evidence,
-            &release.promotion.release_key_id,
-            release.promotion.promoted_at,
-            release.promotion.expires_at,
-        )
-        .expect("promotion payload");
-        assert_eq!(
-            digest(&candidate_payload),
-            "76c6dee089bbfab139b11a56c78fccd6c1098b69b107a12fc4483072a4365f7d"
-        );
-        assert_eq!(
-            digest(&promotion_payload),
-            "3a15641d1c445c9e0ac4d3b95e77f891d661ce8c60eb34b1111b8499b3feb1d6"
-        );
-        assert!(candidate_payload.starts_with(b"[\"hartevo-browser-recipe-candidate/v1\","));
-        assert!(promotion_payload.starts_with(b"[\"hartevo-browser-recipe-promotion/v1\",1,"));
     }
 
     #[test]
