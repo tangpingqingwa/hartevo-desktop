@@ -17,13 +17,12 @@ use hartevo_application::{
 };
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_domain_kernel::{
-    CadenceTriggerKind, KpiContract, KpiDirection, MissionCheckpointCompletionPolicy,
-    MissionCheckpointExecutor, MissionCheckpointStatus, MissionConversationMessageId,
-    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionScheduleStatus,
-    MissionStage, Money, OperatingMode, OutcomeDecision, OutcomeReviewCaveat,
-    OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus, ProjectEncryptionMode, ProjectId,
-    RuntimeProcessClaimStatus, RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode,
-    WorkProductId, WorkProductStatus,
+    KpiContract, KpiDirection, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
+    MissionCheckpointStatus, MissionConversationMessageId, MissionConversationMessageKind,
+    MissionConversationRole, MissionId, MissionStage, Money, OperatingMode, OutcomeDecision,
+    OutcomeReviewCaveat, OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus,
+    ProjectEncryptionMode, ProjectId, RuntimeProcessClaimStatus, RuntimeRecoveryStatus,
+    RuntimeTurnStatus, StorageMode, WorkProductId, WorkProductStatus,
 };
 use rust_decimal::Decimal;
 use zeroize::Zeroizing;
@@ -36,7 +35,9 @@ mod runtime_subscription;
 mod visual_fixture;
 
 use agent_operations::{
-    AgentOperationsWorkbenchProjection, OperationsRevisionFence, OperationsStatus,
+    MissionPluginSurfaceInput, MissionPluginSurfaceRegistry, OperationsRevisionFence,
+    RuntimeActivitySurface, RuntimeErrorSurface, RuntimeStopSurface, RuntimeStreamSurface,
+    RuntimeTransportSurface, RuntimeTurnSurface,
 };
 use data_plane::{
     DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane,
@@ -1444,14 +1445,43 @@ pub fn App() -> Element {
         DesktopBackendState::Ready(snapshot) => Some(snapshot.runtime.clone()),
         DesktopBackendState::Uninitialized(_) | DesktopBackendState::Failed(_) => None,
     };
-    let operations_projection = AgentOperationsWorkbenchProjection::from_parts(
-        project.as_ref(),
+    let operations_interrupt_requested = runtime_stop_requested();
+    let plugin_surfaces = MissionPluginSurfaceRegistry::from_read_models(
         mission.as_ref(),
         runtime_activity.as_ref(),
-        runtime_projection.as_ref(),
+        MissionPluginSurfaceInput {
+            activity: if runtime_busy {
+                RuntimeActivitySurface::Busy
+            } else {
+                RuntimeActivitySurface::Idle
+            },
+            turn: if runtime_waiting_for_turn {
+                RuntimeTurnSurface::Awaiting
+            } else {
+                RuntimeTurnSurface::Hidden
+            },
+            stream: if rendered_runtime_text_stream.is_some() {
+                RuntimeStreamSurface::Visible
+            } else {
+                RuntimeStreamSurface::Hidden
+            },
+            error: if rendered_runtime_text_error.is_some() {
+                RuntimeErrorSurface::Visible
+            } else {
+                RuntimeErrorSurface::Hidden
+            },
+            transport: if rendered_runtime_transport_caught_up {
+                RuntimeTransportSurface::CaughtUp
+            } else {
+                RuntimeTransportSurface::Live
+            },
+            stop: match (runtime_stop_available, operations_interrupt_requested) {
+                (_, true) => RuntimeStopSurface::Requested,
+                (true, false) => RuntimeStopSurface::Available,
+                (false, false) => RuntimeStopSurface::Unavailable,
+            },
+        },
     );
-    let operations_interrupt_available = runtime_busy && runtime_stop_available;
-    let operations_interrupt_requested = runtime_stop_requested();
     let request_operations_continue = move |fence: OperationsRevisionFence| {
         let current_mission = model.read().current_mission().cloned();
         if current_mission
@@ -2078,9 +2108,7 @@ pub fn App() -> Element {
                                 runtime_follow_latest: rendered_runtime_follow_latest,
                                 runtime_has_unseen: rendered_runtime_has_unseen,
                                 context_access: context_access.clone(),
-                                operations: operations_projection.clone(),
-                                interrupt_available: operations_interrupt_available,
-                                interrupt_requested: operations_interrupt_requested,
+                                plugin_surfaces: plugin_surfaces.clone(),
                                 on_initialize: move |_| {
                                     match DesktopDataPlane::discover().and_then(|plane| plane.initialize_os(Utc::now())) {
                                         Ok(snapshot) => model.write().set_ready(snapshot, false),
@@ -2091,10 +2119,6 @@ pub fn App() -> Element {
                                 on_error: move |error| model.write().set_notice(&error),
                                 on_select_mission: move |mission_id| model.write().select_mission(mission_id),
                                 on_open_workpad: move |()| workpad_open.set(true),
-                                on_quick_entry: move |()| {
-                                    composer_expanded.set(true);
-                                    restore_ui_focus("mission-composer-input");
-                                },
                                 on_continue: request_operations_continue,
                                 on_interrupt: request_operations_interrupt,
                                 on_runtime_scroll: move |near_bottom| {
@@ -4695,319 +4719,88 @@ fn ProjectDispatcherSurface(
 }
 
 #[component]
-fn AgentOperationsWorkbench(
-    projection: AgentOperationsWorkbenchProjection,
-    interrupt_available: bool,
-    interrupt_requested: bool,
-    on_quick_entry: EventHandler<()>,
+fn MissionPluginSurfaces(
+    registry: MissionPluginSurfaceRegistry,
     on_continue: EventHandler<OperationsRevisionFence>,
     on_interrupt: EventHandler<()>,
+    on_open_workpad: EventHandler<()>,
 ) -> Element {
-    let recovery_required = projection.recovery.status == OperationsStatus::RecoveryRequired;
-    let interrupt_disabled = !interrupt_available || interrupt_requested || recovery_required;
-    let interrupt_label = if recovery_required {
-        "先恢复再中断"
-    } else if interrupt_requested {
-        "等待中断回执"
-    } else if interrupt_available {
-        "Interrupt 当前 turn"
-    } else {
-        "没有可中断 turn"
-    };
-    let continue_fence = projection.mission.revision_fence;
-    let continue_available =
-        continue_fence.is_some() && projection.mission.status.is_actionable() && !recovery_required;
-    let continue_label = if continue_available {
-        "Continue · READY"
-    } else {
-        "Continue · BLOCKED"
-    };
+    let execution = registry.execution.clone();
+    let result = registry.result.clone();
     rsx! {
-        article {
-            class: "agent-operations-workbench",
-            aria_label: "Agent Operations Workbench",
-            tabindex: "-1",
-            header { class: "operations-header",
-                div {
-                    span { class: "operations-eyebrow", "AGENT OPERATIONS" }
-                    h2 { "{projection.project_name}" }
-                    p { "Mission Control · Runtime · Worker Graph · Work Product" }
-                }
-                span {
-                    class: format!("operations-status {}", projection.mission.status.tone()),
-                    role: "status",
-                    aria_live: "polite",
-                    {projection.mission.status.code()}
-                }
-            }
-
-            section { class: "operations-section operations-mission-control", aria_label: "Mission Control",
-                header { class: "operations-section-header",
-                    div {
-                        span { class: "operations-eyebrow", "MISSION CONTROL" }
-                        h3 { "当前 Mission" }
-                    }
-                    span { class: "operations-section-state", "{projection.mission.stage}" }
-                }
-                div { class: "operations-objective",
-                    small { "Objective" }
-                    p { "{projection.mission.objective}" }
-                }
-                div { class: "operations-revision-fence", aria_label: "Exact Mission command revision fence",
-                    small { "Exact command fence" }
-                    if let Some(fence) = continue_fence {
-                        code { "{fence.label()}" }
-                        span { "旧 revision、Checkpoint 或 Conversation 变化时会 fail closed。" }
-                    } else {
-                        code { "NOT_READY" }
-                        span { "尚未读取可用于命令的持久 revision。" }
-                    }
-                }
-                div { class: "operations-fact-grid",
-                    div { class: "operations-fact",
-                        small { "Current gate" }
-                        strong { "{projection.mission.current_gate}" }
-                    }
-                    div { class: "operations-fact",
-                        small { "Next todos" }
-                        ul {
-                            for todo in projection.mission.next_todos.iter() {
-                                li { "{todo}" }
-                            }
-                        }
-                    }
-                    div { class: "operations-fact",
-                        small { "Quota" }
-                        strong { "{projection.mission.quota.used} / {projection.mission.quota.limit}" }
-                        span { "{projection.mission.quota.detail}" }
-                    }
-                    div { class: "operations-fact",
-                        small { "Evidence changes" }
-                        strong { "{projection.mission.evidence.evidence_count} evidence · {projection.mission.evidence.work_product_count} artifacts" }
-                        span { "{projection.mission.evidence.verified_effect_count} verified effects" }
-                    }
-                }
-                div { class: "operations-claims",
-                    h4 { "Active claims" }
-                    if projection.mission.active_claims.is_empty() {
-                        p { class: "operations-empty", "没有 active claim；这里不从页面动画推导 worker ownership。" }
-                    } else {
-                        for claim in projection.mission.active_claims.iter() {
-                            div { class: "operations-claim",
-                                span { class: format!("operations-status-dot {}", claim.status.tone()) }
-                                div {
-                                    strong { "{claim.title}" }
-                                    span { "{claim.detail}" }
-                                }
-                                em { "{claim.status.code()}" }
-                            }
-                        }
-                    }
-                }
-            }
-
-            section { class: "operations-section operations-runtime-grid", aria_label: "Runtime configuration and Worker Graph",
-                div { class: "operations-card operations-runtime-card",
-                    header { class: "operations-card-header",
-                        div {
-                            span { class: "operations-eyebrow", "RUNTIME CONFIGURATION" }
-                            h3 { "Provider / Model / Harness" }
-                        }
-                        span { class: format!("operations-status {}", projection.runtime.status.tone()), "{projection.runtime.status.code()}" }
-                    }
-                    div { class: "operations-definition-grid",
-                        div { small { "Provider" } strong { "{projection.runtime.provider}" } }
-                        div { small { "Model" } strong { "{projection.runtime.model}" } }
-                        div { small { "Harness" } strong { "{projection.runtime.harness}" } }
-                        div { small { "Reasoning effort" } strong { "{projection.runtime.reasoning_effort}" } }
-                        div { small { "Service tier" } strong { "{projection.runtime.service_tier}" } }
-                        div { small { "Data boundary" } strong { "{projection.runtime.data_boundary}" } }
-                        div { small { "Pinned release" } strong { "{projection.runtime.pinned_release}" } }
-                    }
-                }
-                div { class: "operations-card operations-workers-card",
-                    header { class: "operations-card-header",
-                        div {
-                            span { class: "operations-eyebrow", "WORKER GRAPH" }
-                            h3 { "Worker state" }
-                        }
-                        span { class: "operations-section-state", "{projection.workers.len()} worker" }
-                    }
-                    if projection.workers.is_empty() {
-                        p { class: "operations-empty", "选择真实 Mission 后显示 worker graph。" }
-                    } else {
-                        for worker in projection.workers.iter() {
-                            div { class: "operations-worker",
-                                div { class: "operations-worker-heading",
-                                    strong { "{worker.worker_type}" }
-                                    span { class: format!("operations-status {}", worker.status.tone()), "{worker.status.code()}" }
-                                }
-                                p { "{worker.task}" }
-                                div { class: "operations-worker-facts",
-                                    span { small { "Lease" } "{worker.lease}" }
-                                    span { small { "Generation" } "{worker.generation}" }
-                                    span { small { "Progress" } "{worker.progress}" }
-                                    span { small { "Budget" } "{worker.budget}" }
-                                    span { small { "Handoff" } "{worker.handoff}" }
-                                    span { small { "Recovery" } "{worker.recovery}" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            section { class: "operations-section operations-review-grid", aria_label: "Artifacts approvals browser and recovery",
-                div { class: "operations-card operations-artifacts-card",
-                    header { class: "operations-card-header",
-                        div {
-                            span { class: "operations-eyebrow", "WORK PRODUCT / ARTIFACTS" }
-                            h3 { "Preview and lineage" }
-                        }
-                        span { class: "operations-section-state", "{projection.artifacts.len()} artifacts" }
-                    }
-                    if projection.artifacts.is_empty() {
-                        p { class: "operations-empty", "当前 Mission 尚无持久 Work Product。" }
-                    } else {
-                        for artifact in projection.artifacts.iter() {
-                            article { class: "operations-artifact",
-                                div { class: "operations-artifact-heading",
+        if execution.is_some() || result.is_some() {
+            div {
+                class: "mission-plugin-surfaces",
+                aria_label: "按需 Mission plugin surfaces",
+                if let Some(execution) = execution {
+                    {
+                        let continue_fence = execution.revision_fence;
+                        let continue_available = execution.status.is_actionable()
+                            && !execution.stop_requested;
+                        rsx! {
+                            section {
+                                class: "mission-plugin-inline",
+                                aria_label: "Execution plugin",
+                                header { class: "mission-plugin-header",
                                     div {
-                                        strong { "{artifact.title}" }
-                                        small { "{artifact.kind} · {artifact.revision}" }
+                                        span { class: "mission-plugin-eyebrow", "EXECUTION" }
+                                        strong { "{execution.status.code()}" }
                                     }
-                                    span { class: format!("operations-status {}", artifact.status.tone()), "{artifact.status.code()}" }
+                                    span { class: format!("mission-plugin-status {}", execution.status.tone()), "{execution.transport}" }
                                 }
-                                p { class: "operations-lineage", "{artifact.lineage}" }
-                                pre { class: "operations-preview", "{artifact.preview}" }
-                                div { class: "operations-artifact-actions", aria_label: "Artifact actions",
-                                    button {
-                                        disabled: artifact.actions.diff != OperationsStatus::Ready,
-                                        aria_label: "查看 Artifact diff",
-                                        title: "等待 Artifact owner API",
-                                        "Diff · {artifact.actions.diff.code()}"
+                                div { class: "mission-plugin-facts",
+                                    span { strong { "{execution.gate}" } small { "当前 gate" } }
+                                    span { strong { "{execution.worker}" } small { "worker" } }
+                                    span { strong { "{execution.recovery}" } small { "recovery" } }
+                                    span { strong { "{continue_fence.label()}" } small { "exact revision" } }
+                                }
+                                div { class: "mission-plugin-actions",
+                                    if continue_available {
+                                        button {
+                                            class: "quiet-button",
+                                            aria_label: "按 exact revision 继续当前 Mission",
+                                            onclick: move |_| on_continue.call(continue_fence),
+                                            "Continue"
+                                        }
                                     }
-                                    button {
-                                        disabled: artifact.actions.adopt != OperationsStatus::Ready,
-                                        aria_label: "采用 Artifact",
-                                        title: "等待 Artifact owner API",
-                                        "Adopt · {artifact.actions.adopt.code()}"
-                                    }
-                                    button {
-                                        disabled: artifact.actions.reject != OperationsStatus::Ready,
-                                        aria_label: "拒绝 Artifact",
-                                        title: "等待 Artifact owner API",
-                                        "Reject · {artifact.actions.reject.code()}"
-                                    }
-                                    button {
-                                        disabled: artifact.actions.reopen != OperationsStatus::Ready,
-                                        aria_label: "重新打开 Artifact",
-                                        title: "等待 Work Product owner API；不会伪造新的 revision。",
-                                        "Reopen · {artifact.actions.reopen.code()}"
-                                    }
-                                    button {
-                                        disabled: artifact.actions.rollback != OperationsStatus::Ready,
-                                        aria_label: "回滚 Artifact",
-                                        title: "等待 Artifact owner API",
-                                        "Rollback · {artifact.actions.rollback.code()}"
+                                    if execution.stop_available {
+                                        button {
+                                            class: "quiet-button danger",
+                                            aria_label: "停止当前 Runtime turn",
+                                            disabled: execution.stop_requested,
+                                            onclick: move |_| on_interrupt.call(()),
+                                            if execution.stop_requested { "Stopping…" } else { "Stop" }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-                div { class: "operations-card operations-approval-card",
-                    header { class: "operations-card-header",
-                        div {
-                            span { class: "operations-eyebrow", "APPROVAL / EFFECT" }
-                            h3 { "外部动作边界" }
-                        }
-                    }
-                    div { class: "operations-definition-grid",
-                        div { small { "External Effect approvals" } strong { "{projection.approvals.external_approval_count}" } span { "{projection.approvals.external_status.code()}" } }
-                        div { small { "Verified effects" } strong { "{projection.approvals.verified_effect_count}" } span { "不会由本地 Runtime 状态代替" } }
-                        div { small { "Local Runtime approval" } strong { "{projection.approvals.local_runtime_status.code()}" } span { "{projection.approvals.local_runtime_detail}" } }
-                    }
-                }
-                div { class: "operations-card operations-browser-card",
-                    header { class: "operations-card-header",
-                        div {
-                            span { class: "operations-eyebrow", "BROWSER WORKSPACE" }
-                            h3 { "Identity and takeover" }
-                        }
-                        span { class: format!("operations-status {}", projection.browser.status.tone()), "{projection.browser.status.code()}" }
-                    }
-                    div { class: "operations-definition-grid",
-                        div { small { "Identity" } strong { "{projection.browser.identity}" } }
-                        div { small { "Control owner" } strong { "{projection.browser.control_owner}" } }
-                        div { small { "Next action" } strong { "{projection.browser.next_action}" } }
-                    }
-                    div { class: "operations-artifact-actions",
-                        button { disabled: true, aria_label: "接管 Browser Workspace", title: "等待 BW-01 owner API", "Take over · NOT_IMPLEMENTED" }
-                        button { disabled: true, aria_label: "继续 Browser Workspace", title: "等待 BW-01 owner API", "Continue · NOT_IMPLEMENTED" }
-                    }
-                }
-                div { class: "operations-card operations-recovery-card",
-                    header { class: "operations-card-header",
-                        div {
-                            span { class: "operations-eyebrow", "RECOVERY" }
-                            h3 { "Runtime steering" }
-                        }
-                        span { class: format!("operations-status {}", projection.recovery.status.tone()), "{projection.recovery.status.code()}" }
-                    }
-                    p { "{projection.recovery.detail}" }
-                    strong { "{projection.recovery.next_action}" }
-                }
-            }
-
-            footer { class: "operations-quick-entry",
-                div {
-                    span { class: "operations-eyebrow", "QUICK ENTRY" }
-                    p { "{projection.quick_entry.hint}" }
-                }
-                div { class: "operations-quick-entry-actions",
-                    button {
-                        class: "quiet-button",
-                        id: "mission-operations-continue",
-                        disabled: !continue_available,
-                        aria_label: if continue_available { "按 exact revision 继续当前 Mission" } else { "当前 Mission 暂不能继续" },
-                        title: if continue_available { "继续会先打开同一 Mission Conversation，并在提交时再次校验 exact revision。" } else { "等待持久 Mission revision 或恢复边界。" },
-                        onclick: move |_| {
-                            if let Some(fence) = continue_fence {
-                                on_continue.call(fence);
+                if let Some(result) = result {
+                    section {
+                        class: "mission-plugin-result",
+                        aria_label: "Selected result plugin",
+                        header { class: "mission-plugin-header",
+                            div {
+                                span { class: "mission-plugin-eyebrow", "RESULT" }
+                                strong { "{result.title}" }
                             }
-                        },
-                        "{continue_label}"
-                    }
-                    button {
-                        class: "primary-button",
-                        id: "agent-operations-quick-entry",
-                        onclick: move |_| on_quick_entry.call(()),
-                        "Open Quick Entry"
-                    }
-                    button {
-                        class: "quiet-button",
-                        id: "mission-operations-takeover",
-                        disabled: true,
-                        aria_label: "接管当前 Browser Workspace（尚未实现）",
-                        title: "Browser takeover 需要 Browser Workspace owner API；不会伪造接管成功。",
-                        "Take over · NOT_IMPLEMENTED"
-                    }
-                    button {
-                        class: "quiet-button",
-                        disabled: interrupt_disabled,
-                        id: "mission-operations-interrupt",
-                        aria_label: "中断当前 Runtime turn",
-                        onclick: move |_| on_interrupt.call(()),
-                        "{interrupt_label}"
-                    }
-                    span { class: "operations-live-region", role: "status", aria_live: "polite",
-                        if interrupt_requested {
-                            "停止请求已提交；等待 exact Runtime 回执。"
-                        } else if recovery_required {
-                            "Uncertain 状态已设 recovery fence；不会自动重放。"
-                        } else {
-                            "仅展示持久 projection；此面板不创建 Agent loop。"
+                            span { class: format!("mission-plugin-status {}", result.status.tone()), "{result.status.code()}" }
+                        }
+                        div { class: "mission-plugin-facts",
+                            span { strong { "{result.kind}" } small { "type" } }
+                            span { strong { "{result.revision}" } small { "revision" } }
+                            span { strong { "{result.lineage}" } small { "lineage" } }
+                        }
+                        p { class: "mission-plugin-preview", "{result.preview}" }
+                        div { class: "mission-plugin-actions",
+                            button {
+                                class: "quiet-button",
+                                aria_label: "在 Workpad 打开已选择的结果",
+                                onclick: move |_| on_open_workpad.call(()),
+                                "Open result"
+                            }
                         }
                     }
                 }
@@ -5032,15 +4825,12 @@ fn OrchestratorSurface(
     runtime_follow_latest: bool,
     runtime_has_unseen: bool,
     context_access: Option<ProjectContextAccessProjection>,
-    operations: AgentOperationsWorkbenchProjection,
-    interrupt_available: bool,
-    interrupt_requested: bool,
+    plugin_surfaces: MissionPluginSurfaceRegistry,
     on_initialize: EventHandler<MouseEvent>,
     on_ready: EventHandler<DesktopSnapshot>,
     on_error: EventHandler<DesktopDataError>,
     on_select_mission: EventHandler<MissionId>,
     on_open_workpad: EventHandler<()>,
-    on_quick_entry: EventHandler<()>,
     on_continue: EventHandler<OperationsRevisionFence>,
     on_interrupt: EventHandler<()>,
     on_runtime_scroll: EventHandler<bool>,
@@ -5125,14 +4915,6 @@ fn OrchestratorSurface(
             let Some(mission) = mission else {
                 return rsx! {
                     div { class: "surface-scroll",
-                        AgentOperationsWorkbench {
-                            projection: operations.clone(),
-                            interrupt_available: false,
-                            interrupt_requested: false,
-                            on_quick_entry,
-                            on_continue,
-                            on_interrupt,
-                        }
                         ProjectDispatcherSurface { project, on_select_mission }
                     }
                 };
@@ -5151,74 +4933,6 @@ fn OrchestratorSurface(
                     }
                 };
             }
-            let route_label = mission.manifest_id.as_ref().map_or_else(
-                || "LEGACY_BOOTSTRAP · 未绑定 Catalog".to_owned(),
-                |manifest_id| {
-                    format!(
-                        "{manifest_id} v{} · {}",
-                        mission.manifest_version.unwrap_or_default(),
-                        mission
-                            .catalog_digest
-                            .as_deref()
-                            .map_or("missing digest", short_digest)
-                    )
-                },
-            );
-            let checkpoint_label = mission.current_checkpoint_id.as_ref().map_or_else(
-                || "NOT_IMPLEMENTED".to_owned(),
-                |checkpoint_id| {
-                    let execution_route = mission
-                        .current_checkpoint_capability_id
-                        .as_ref()
-                        .zip(mission.current_checkpoint_executor)
-                        .map_or_else(
-                            || "ROUTE_UNBOUND".to_owned(),
-                            |(capability, executor)| {
-                                let application_status = match (
-                                    executor,
-                                    mission.current_checkpoint_application_handler_status,
-                                    mission.current_checkpoint_application_handler_id.as_deref(),
-                                ) {
-                                    (
-                                        MissionCheckpointExecutor::Application,
-                                        Some(ApplicationCheckpointHandlerStatus::Implemented),
-                                        Some(handler_id),
-                                    ) => format!(" · handler {handler_id}"),
-                                    (
-                                        MissionCheckpointExecutor::Application,
-                                        Some(ApplicationCheckpointHandlerStatus::NotImplemented),
-                                        _,
-                                    ) => " · NOT_IMPLEMENTED".to_owned(),
-                                    (
-                                        MissionCheckpointExecutor::Application,
-                                        Some(
-                                            ApplicationCheckpointHandlerStatus::CatalogRevisionMismatch,
-                                        ),
-                                        _,
-                                    ) => " · BLOCKED_CATALOG_REVISION".to_owned(),
-                                    _ => String::new(),
-                                };
-                                format!(
-                                    "{capability} via {}{application_status}",
-                                    mission_checkpoint_executor_label(executor)
-                                )
-                            },
-                        );
-                    format!(
-                        "{checkpoint_id} · {} · {execution_route} · {}/{} completed",
-                        mission
-                            .current_checkpoint_status
-                            .map_or("UNKNOWN", mission_checkpoint_status_label),
-                        mission.completed_checkpoint_count,
-                        mission.checkpoint_count
-                    )
-                },
-            );
-            let mission_evidence_label = if mission.manifest_id.is_some() {
-                "E2 FOUNDATION · E3 NOT_IMPLEMENTED"
-            } else {
-                "LEGACY_BOOTSTRAP · 非 Catalog 完整性证据"
-            };
             let replayed_message_sequence = runtime_text_stream.as_ref().and_then(|stream| {
                 mission
                     .conversation_messages
@@ -5250,13 +4964,11 @@ fn OrchestratorSurface(
                         ) - event.data.scroll_top();
                         on_runtime_scroll.call(remaining <= 96.0);
                     },
-                    AgentOperationsWorkbench {
-                        projection: operations,
-                        interrupt_available,
-                        interrupt_requested,
-                        on_quick_entry,
+                    MissionPluginSurfaces {
+                        registry: plugin_surfaces,
                         on_continue,
                         on_interrupt,
+                        on_open_workpad,
                     }
                     PersistedConversationMessages {
                         mission: mission.clone(),
@@ -5294,42 +5006,6 @@ fn OrchestratorSurface(
                                 strong { "{failure.code}" }
                                 small { "{failure.message}" }
                             }
-                        }
-                    }
-                    PersistedMissionProcessDensity {
-                        mission: mission.clone(),
-                        visual_fixture: runtime_stream_is_fixture,
-                        on_open_workpad,
-                    }
-                    details { class: "persisted-state-details",
-                        summary {
-                            UiIcon { name: UiIconName::Workflow, size: 14 }
-                            span {
-                                strong { "任务边界与持久状态" }
-                                small { "{mission_stage_label(&mission.stage)} · revision {mission.revision} · {mission.completed_checkpoint_count}/{mission.checkpoint_count} Checkpoints" }
-                            }
-                            em { "按需展开" }
-                            UiIcon { name: UiIconName::ChevronDown, size: 12 }
-                        }
-                        article { class: "assistant-turn persisted-state-turn",
-                            header { class: "assistant-byline",
-                                img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
-                                strong { "Hartevo" }
-                                time { "任务边界" }
-                            }
-                            p { class: "assistant-lead", "下面的合同与运行状态来自同一个 Project/Mission Domain；页面不会生成 Receipt、Verification 或完成状态。" }
-                            section { class: "mission-contract",
-                                header { strong { "Operating Contract" } span { "revision {mission.revision}" } }
-                                div { class: "contract-grid",
-                                    div { small { "目标" } strong { "{mission.goal}" } }
-                                    div { small { "Domain stage" } strong { "{mission_stage_label(&mission.stage)}" } }
-                                    div { small { "Catalog route" } strong { "{route_label}" } }
-                                    div { small { "Current Checkpoint" } strong { "{checkpoint_label}" } }
-                                    div { small { "产品证据" } strong { "{mission_evidence_label}" } }
-                                }
-                            }
-                            MissionStateCard { mission, runtime_activity }
-                            ContextAccessCard { access: context_access }
                         }
                     }
                     if !runtime_follow_latest {
@@ -5525,6 +5201,7 @@ fn PersistedRuntimeStreamTurn(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum MissionNextBoundaryKind {
     ApplicationNotImplemented,
     CatalogRevisionMismatch,
@@ -5544,6 +5221,7 @@ enum MissionNextBoundaryKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct MissionNextBoundaryCopy {
     code: &'static str,
     title: &'static str,
@@ -5551,6 +5229,7 @@ struct MissionNextBoundaryCopy {
     tone: &'static str,
 }
 
+#[cfg(test)]
 fn mission_next_boundary_kind(
     stage: &MissionStage,
     checkpoint_status: Option<MissionCheckpointStatus>,
@@ -5607,6 +5286,7 @@ fn mission_next_boundary_kind(
     MissionNextBoundaryKind::Ready
 }
 
+#[cfg(test)]
 const fn mission_next_boundary_copy(kind: MissionNextBoundaryKind) -> MissionNextBoundaryCopy {
     match kind {
         MissionNextBoundaryKind::ApplicationNotImplemented => MissionNextBoundaryCopy {
@@ -5699,270 +5379,6 @@ const fn mission_next_boundary_copy(kind: MissionNextBoundaryKind) -> MissionNex
             detail: "页面只投影已持久状态；未派发的执行、产物与外部动作不会被提前绘制。",
             tone: "neutral",
         },
-    }
-}
-
-fn mission_checkpoint_completion_policy_label(
-    policy: MissionCheckpointCompletionPolicy,
-) -> &'static str {
-    match policy {
-        MissionCheckpointCompletionPolicy::DeterministicEvidence => "DETERMINISTIC_EVIDENCE",
-        MissionCheckpointCompletionPolicy::WorkProduct => "WORK_PRODUCT",
-        MissionCheckpointCompletionPolicy::VerifiedEffect => "VERIFIED_EFFECT",
-        MissionCheckpointCompletionPolicy::EffectReadbackV2 => "EFFECT_READBACK_V2",
-        MissionCheckpointCompletionPolicy::HumanConfirmation => "HUMAN_CONFIRMATION",
-    }
-}
-
-fn application_checkpoint_handler_status_label(
-    status: ApplicationCheckpointHandlerStatus,
-) -> &'static str {
-    match status {
-        ApplicationCheckpointHandlerStatus::Implemented => "IMPLEMENTED",
-        ApplicationCheckpointHandlerStatus::NotImplemented => "NOT_IMPLEMENTED",
-        ApplicationCheckpointHandlerStatus::CatalogRevisionMismatch => "BLOCKED_CATALOG_REVISION",
-    }
-}
-
-fn mission_checkpoint_process_tone(status: Option<MissionCheckpointStatus>) -> &'static str {
-    match status {
-        Some(MissionCheckpointStatus::Completed | MissionCheckpointStatus::Skipped) => "done",
-        Some(MissionCheckpointStatus::Running | MissionCheckpointStatus::Verifying) => "active",
-        Some(MissionCheckpointStatus::WaitingUser | MissionCheckpointStatus::WaitingApproval) => {
-            "attention"
-        }
-        Some(MissionCheckpointStatus::Blocked) => "blocked",
-        Some(MissionCheckpointStatus::Pending | MissionCheckpointStatus::Ready) | None => "neutral",
-    }
-}
-
-fn mission_undisclosed_checkpoint_count(
-    checkpoint_count: usize,
-    completed_checkpoint_count: usize,
-    has_current_checkpoint: bool,
-    current_checkpoint_status: Option<MissionCheckpointStatus>,
-) -> usize {
-    let completed_count = completed_checkpoint_count.min(checkpoint_count);
-    // Application's completed_checkpoint_count contains only Completed. A known
-    // Skipped (or otherwise non-completed) current checkpoint therefore still
-    // occupies one disclosed slot and must not be counted again as undisclosed.
-    let current_is_not_in_completed_count = has_current_checkpoint
-        && current_checkpoint_status != Some(MissionCheckpointStatus::Completed);
-    checkpoint_count
-        .saturating_sub(completed_count + usize::from(current_is_not_in_completed_count))
-}
-
-#[component]
-fn PersistedMissionProcessDensity(
-    mission: MissionProjection,
-    visual_fixture: bool,
-    on_open_workpad: EventHandler<()>,
-) -> Element {
-    let completed_count = mission
-        .completed_checkpoint_count
-        .min(mission.checkpoint_count);
-    let undisclosed_checkpoint_count = mission_undisclosed_checkpoint_count(
-        mission.checkpoint_count,
-        mission.completed_checkpoint_count,
-        mission.current_checkpoint_id.is_some(),
-        mission.current_checkpoint_status,
-    );
-    let checkpoint_id = mission
-        .current_checkpoint_id
-        .as_deref()
-        .unwrap_or("NO_CURRENT_CHECKPOINT");
-    let checkpoint_status = mission
-        .current_checkpoint_status
-        .map_or("UNKNOWN", mission_checkpoint_status_label);
-    let capability_id = mission
-        .current_checkpoint_capability_id
-        .as_deref()
-        .unwrap_or("ROUTE_UNBOUND");
-    let executor = mission
-        .current_checkpoint_executor
-        .map_or("UNBOUND", mission_checkpoint_executor_label);
-    let completion_policy = mission
-        .current_checkpoint_completion_policy
-        .map_or("UNBOUND", mission_checkpoint_completion_policy_label);
-    let oracle_label = if mission.current_checkpoint_oracle_ids.is_empty() {
-        "ORACLE_UNBOUND".to_owned()
-    } else {
-        mission
-            .current_checkpoint_oracle_ids
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" · ")
-    };
-    let handler_label = if mission.current_checkpoint_executor
-        == Some(MissionCheckpointExecutor::Application)
-    {
-        match (
-            mission.current_checkpoint_application_handler_status,
-            mission.current_checkpoint_application_handler_id.as_deref(),
-        ) {
-            (Some(status), Some(handler_id)) => format!(
-                "{} · {handler_id}",
-                application_checkpoint_handler_status_label(status)
-            ),
-            (Some(status), None) => application_checkpoint_handler_status_label(status).to_owned(),
-            (None, _) => "HANDLER_STATUS_UNBOUND".to_owned(),
-        }
-    } else {
-        "不适用当前 Executor".to_owned()
-    };
-    let boundary_kind = mission_next_boundary_kind(
-        &mission.stage,
-        mission.current_checkpoint_status,
-        if mission.current_checkpoint_executor == Some(MissionCheckpointExecutor::Application) {
-            mission.current_checkpoint_application_handler_status
-        } else {
-            None
-        },
-    );
-    let boundary = mission_next_boundary_copy(boundary_kind);
-    let current_tone = mission_checkpoint_process_tone(mission.current_checkpoint_status);
-    let current_checkpoint_revision = mission.current_checkpoint_revision.unwrap_or_default();
-    let mission_route = mission.manifest_id.as_deref().unwrap_or("LEGACY_BOOTSTRAP");
-    let product_count = mission.work_products.len();
-    let capability_count = usize::from(mission.current_checkpoint_capability_id.is_some());
-    let completed_row_tone = if completed_count > 0 {
-        "done"
-    } else {
-        "neutral"
-    };
-    let completed_title = if completed_count > 0 {
-        format!("已完成 {completed_count} 个 Checkpoint")
-    } else {
-        "尚无完成的 Checkpoint".to_owned()
-    };
-    let projection_origin = if visual_fixture {
-        "VISUAL_FIXTURE · 未读取 SQLCipher"
-    } else {
-        "Project-local Application projection"
-    };
-
-    rsx! {
-        section { class: "persisted-process-density", aria_label: "Mission 过程与工作产物",
-            header { class: "persisted-process-head",
-                span {
-                    strong { "Mission 过程与工作产物" }
-                    small { "{mission_route} · Mission revision {mission.revision} · {projection_origin}" }
-                }
-                em { "{completed_count}/{mission.checkpoint_count} Checkpoints" }
-            }
-            div { class: "persisted-work-progress", aria_label: "Checkpoint 过程",
-                div { class: "persisted-process-row {completed_row_tone}",
-                    i {
-                        if completed_count > 0 {
-                            UiIcon { name: UiIconName::Check, size: 10 }
-                        } else {
-                            UiIcon { name: UiIconName::List, size: 10 }
-                        }
-                    }
-                    span {
-                        strong { "{completed_title}" }
-                        small { "来自持久 Mission aggregate；不等于整个 Mission 已完成。" }
-                        em { "DOMAIN · revision {mission.revision}" }
-                    }
-                    time { "{completed_count}/{mission.checkpoint_count}" }
-                }
-                div {
-                    class: "persisted-process-row current {current_tone}",
-                    aria_current: if mission.current_checkpoint_id.is_some() { "step" } else { "false" },
-                    i {
-                        if current_tone == "done" {
-                            UiIcon { name: UiIconName::Check, size: 10 }
-                        } else if current_tone == "blocked" || current_tone == "attention" {
-                            UiIcon { name: UiIconName::Shield, size: 10 }
-                        } else {
-                            span {}
-                        }
-                    }
-                    span {
-                        strong { "{checkpoint_id}" }
-                        small { "{checkpoint_status} · {capability_id}" }
-                        em { "{executor} · checkpoint revision {current_checkpoint_revision}" }
-                    }
-                    time { "当前" }
-                }
-                if undisclosed_checkpoint_count > 0 {
-                    div { class: "persisted-process-row neutral",
-                        i { UiIcon { name: UiIconName::List, size: 10 } }
-                        span {
-                            strong { "另有 {undisclosed_checkpoint_count} 个 Checkpoint 尚未展开" }
-                            small { "当前 Projection 只公开数量；不会编造名称、顺序或执行记录。" }
-                            em { "MISSION DAG · COUNT ONLY" }
-                        }
-                        time { "待后续" }
-                    }
-                }
-            }
-            details { class: "persisted-capability-stack",
-                summary {
-                    UiIcon { name: UiIconName::Blocks, size: 14 }
-                    span {
-                        strong { "当前能力与完成条件" }
-                        small { "{capability_count} Capability · {mission.current_checkpoint_oracle_ids.len()} Oracle · {executor}" }
-                    }
-                    em { "{checkpoint_status}" }
-                    UiIcon { name: UiIconName::ChevronDown, size: 12 }
-                }
-                div { class: "persisted-capability-grid",
-                    span { strong { "Capability" } small { "{capability_id}" } }
-                    span { strong { "Executor" } small { "{executor}" } }
-                    span { strong { "Completion policy" } small { "{completion_policy}" } }
-                    span { strong { "Business Oracle" } small { "{oracle_label}" } }
-                    span { strong { "Application handler" } small { "{handler_label}" } }
-                    span {
-                        strong { "Effect evidence" }
-                        small { "{mission.pending_approval_count} pending approval · {mission.verified_effect_count} verified effect" }
-                    }
-                }
-            }
-            if mission.work_products.is_empty() {
-                div { class: "persisted-work-product-empty",
-                    UiIcon { name: UiIconName::FileText, size: 14 }
-                    span {
-                        strong { "还没有持久 Work Product" }
-                        small { "Projection count {mission.work_product_count}；页面不会补一份示例报告。" }
-                    }
-                    em { "EMPTY" }
-                }
-            } else {
-                div { class: "persisted-artifact-list", aria_label: "持久工作产物 {product_count} 项",
-                    for product in mission.work_products.clone() {
-                        {
-                            let product_id = product.work_product_id.to_string();
-                            rsx! {
-                                button {
-                                    key: "{product_id}",
-                                    class: "persisted-artifact-attachment",
-                                    aria_label: "在任务工作台打开 {product.title}",
-                                    onclick: move |_| on_open_workpad.call(()),
-                                    i { UiIcon { name: UiIconName::FileText, size: 16 } }
-                                    span {
-                                        strong { "{product.title}" }
-                                        small {
-                                            "{product.work_product_type} · r{product.work_product_revision} · {product.evidence_count} evidence · {work_product_status_label(&product.adoption_status)}"
-                                        }
-                                    }
-                                    em { "在工作台打开" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            aside { class: "persisted-next-boundary {boundary.tone}", aria_label: "Mission 下一步边界",
-                i { UiIcon { name: UiIconName::Shield, size: 14 } }
-                span {
-                    strong { "{boundary.title}" }
-                    small { "{boundary.detail}" }
-                }
-                em { "{boundary.code}" }
-            }
-        }
     }
 }
 
@@ -6179,171 +5595,6 @@ fn DeviceRecoveryCard(
                     }
                 },
                 "验证并恢复本机访问"
-            }
-        }
-    }
-}
-
-#[component]
-fn MissionStateCard(
-    mission: MissionProjection,
-    runtime_activity: Option<MissionRuntimeProjection>,
-) -> Element {
-    let outcome = mission
-        .outcome_summary
-        .as_deref()
-        .unwrap_or("尚无 Outcome Review");
-    let runtime_note = runtime_activity
-        .as_ref()
-        .map(|activity| runtime_activity_note(activity, mission.work_product_count));
-    let recovery_label = runtime_activity
-        .as_ref()
-        .and_then(|activity| activity.recovery_status)
-        .map_or("未启动", runtime_recovery_status_label);
-    let process_claim_label = runtime_activity
-        .as_ref()
-        .and_then(|activity| activity.process_claim_status)
-        .map_or("未认领", runtime_process_claim_status_label);
-    let turn_label = runtime_activity
-        .as_ref()
-        .and_then(|activity| activity.turn_status)
-        .map_or("未派发", runtime_turn_status_label);
-    rsx! {
-        section { class: "live-work",
-            div { class: "live-row",
-                span { class: "status-dot live" }
-                span { strong { "{mission_stage_label(&mission.stage)}" } small { "Mission {mission.mission_id} · revision {mission.revision}" } }
-                em { "DOMAIN" }
-            }
-            div { class: "evidence-summary",
-                span { strong { "{mission.evidence_count}" } small { "Evidence" } }
-                span { strong { "{mission.work_product_count}" } small { "Work Product" } }
-                span { strong { "{mission.pending_approval_count}" } small { "Pending approval" } }
-                span { strong { "{mission.verified_effect_count}" } small { "Verified Effect" } }
-                span { strong { "{mission.cycle}" } small { "Mission cycle" } }
-            }
-            if let Some(schedule) = &mission.schedule {
-                div { class: "evidence-summary runtime-summary", aria_label: "持久 Mission Scheduler 状态",
-                    span { strong { "{mission_schedule_status_label(schedule.status)}" } small { "Schedule" } }
-                    span { strong { "{cadence_trigger_label(schedule.trigger)}" } small { "Trigger" } }
-                    span { strong { "{schedule.cycle}" } small { "Next cycle" } }
-                    span { strong { if schedule.signal_received { "已收到" } else { "未收到" } } small { "Event signal" } }
-                    span { strong { "{schedule.lease_generation}" } small { "Lease generation" } }
-                    span { strong { "{schedule.failure_count}" } small { "Schedule failures" } }
-                }
-            }
-            if let Some(activity) = &runtime_activity {
-                RuntimeProjectionTimeline { activity: activity.clone() }
-                div { class: "evidence-summary runtime-summary",
-                    span { strong { "{process_claim_label}" } small { "OS process claim" } }
-                    span { strong { "{recovery_label}" } small { "Runtime recovery" } }
-                    span { strong { "{turn_label}" } small { "Runtime turn" } }
-                    span { strong { "{activity.process_cleanup_attempt_count}" } small { "Process cleanup" } }
-                    span { strong { "{activity.turn_evidence_count}" } small { "Turn evidence" } }
-                    span { strong { "{activity.recovery_failure_count + activity.turn_failure_count}" } small { "Runtime failures" } }
-                }
-            }
-            if mission.stage == MissionStage::Running && runtime_note.is_some() {
-                div { class: "boundary-note", "{runtime_note.as_deref().unwrap_or_default()}" }
-            } else if mission.stage == MissionStage::Running && mission.evidence_count == 0 {
-                div { class: "boundary-note", "NOT_STARTED：Mission 已持久化，但尚无 Runtime Turn；没有研究结果、Provider Receipt 或业务完成声明。" }
-            } else if mission.stage == MissionStage::WaitingApproval {
-                div { class: "boundary-note", "审批数来自 Effect Ledger；Desktop 精确 digest 审批 UI 尚未接线，因此不会在此处制造批准。" }
-            } else if mission.stage == MissionStage::Verifying {
-                div { class: "boundary-note", "Domain 正处于 Verifying；只有持久 Verification 能推进，页面按钮不能直接完成 Mission。" }
-            } else if mission.stage == MissionStage::Scheduled {
-                if let Some(schedule) = &mission.schedule {
-                    div { class: "boundary-note",
-                        "SCHEDULED：cycle {schedule.cycle} · {cadence_trigger_label(schedule.trigger)} · {mission_schedule_status_label(schedule.status)}。"
-                        if let Some(due_at) = schedule.due_at {
-                            " 锚定时间 {due_at}."
-                        }
-                        if schedule.signal_received {
-                            " 已持久接收首个合法事件；等待 lease worker 原子启动 Mission。"
-                        } else {
-                            " 未到期或尚未收到合法事件；页面不能绕过 Scheduler 直接启动。"
-                        }
-                    }
-                } else {
-                    div { class: "boundary-note", "INTEGRITY_ERROR：Mission 显示 Scheduled，但没有 durable Schedule；已禁止直接启动下一周期。" }
-                }
-            } else if mission.stage.is_terminal() || mission.stage == MissionStage::CycleReviewed {
-                div { class: "boundary-note", "Outcome：{outcome}" }
-            } else {
-                div { class: "boundary-note", "当前状态仅由 Application projection 决定；未接入的下一步保持 NOT_IMPLEMENTED。" }
-            }
-        }
-    }
-}
-
-#[component]
-fn RuntimeProjectionTimeline(activity: MissionRuntimeProjection) -> Element {
-    let process = activity
-        .process_claim_status
-        .map(runtime_process_claim_status_label);
-    let recovery = activity.recovery_status.map(runtime_recovery_status_label);
-    let turn = activity.turn_status.map(runtime_turn_status_label);
-    let process_active = matches!(
-        activity.process_claim_status,
-        Some(RuntimeProcessClaimStatus::Prepared | RuntimeProcessClaimStatus::Spawned)
-    );
-    let recovery_active = matches!(
-        activity.recovery_status,
-        Some(
-            RuntimeRecoveryStatus::Prepared
-                | RuntimeRecoveryStatus::Spawned
-                | RuntimeRecoveryStatus::ThreadBound
-                | RuntimeRecoveryStatus::Attached
-        )
-    );
-    let turn_active = activity
-        .turn_status
-        .is_some_and(RuntimeTurnStatus::is_active);
-    rsx! {
-        section {
-            class: if activity.requires_reconciliation { "runtime-projection-timeline uncertain" } else { "runtime-projection-timeline" },
-            aria_label: "持久 Runtime 活动",
-            aria_live: "polite",
-            header {
-                span { strong { "Runtime 活动" } small { "来自持久 Application Projection" } }
-                if activity.requires_reconciliation {
-                    b { "UNCERTAIN · 禁止自动重放" }
-                } else {
-                    em { "{activity.turn_evidence_count} evidence" }
-                }
-            }
-            div { class: "runtime-projection-events",
-                if let Some(process) = process {
-                    div { class: if process_active { "runtime-projection-event live" } else { "runtime-projection-event done" },
-                        i { if process_active { span {} } else { UiIcon { name: UiIconName::Check, size: 10 } } }
-                        span { strong { "OS process claim" } small { "{process} · 仅代表本机执行权，不是业务完成" } }
-                    }
-                }
-                if let Some(recovery) = recovery {
-                    div { class: if recovery_active { "runtime-projection-event live" } else { "runtime-projection-event done" },
-                        i { if recovery_active { span {} } else { UiIcon { name: UiIconName::Check, size: 10 } } }
-                        span { strong { "Runtime recovery" } small { "{recovery} · generation 与 thread binding 由账本 fencing" } }
-                    }
-                }
-                if let Some(turn) = turn {
-                    div { class: if turn_active { "runtime-projection-event live" } else if activity.requires_reconciliation { "runtime-projection-event uncertain" } else { "runtime-projection-event done" },
-                        i {
-                            if turn_active { span {} } else if activity.requires_reconciliation { "?" } else { UiIcon { name: UiIconName::Check, size: 10 } }
-                        }
-                        span { strong { "Runtime turn" } small { "{turn} · 模型终态不能直接完成 Mission" } }
-                    }
-                }
-                div { class: "runtime-projection-event ledger",
-                    i { UiIcon { name: UiIconName::FileCheck, size: 10 } }
-                    span {
-                        strong { "持久事件账本" }
-                        small { "{activity.turn_evidence_count} turn evidence · {activity.process_cleanup_attempt_count} cleanup · {activity.recovery_failure_count + activity.turn_failure_count} failures" }
-                    }
-                }
-            }
-            details {
-                summary { "查看安全边界" UiIcon { name: UiIconName::ChevronDown, size: 12 } }
-                p { "当前列表只显示已经进入 SQLCipher/Application Projection 的状态；未持久化的 token、私有推理和正文不会作为遥测事件显示。停止/中断必须由精确 Runtime attempt 命令完成，页面不会只隐藏动画。" }
             }
         }
     }
@@ -8562,25 +7813,6 @@ fn mission_stage_label(stage: &MissionStage) -> &'static str {
     }
 }
 
-fn mission_schedule_status_label(status: MissionScheduleStatus) -> &'static str {
-    match status {
-        MissionScheduleStatus::Pending => "PENDING",
-        MissionScheduleStatus::Leased => "LEASED",
-        MissionScheduleStatus::Triggered => "TRIGGERED",
-        MissionScheduleStatus::Cancelled => "CANCELLED",
-        MissionScheduleStatus::Expired => "EXPIRED",
-        MissionScheduleStatus::DeadLetter => "DEAD_LETTER",
-    }
-}
-
-fn cadence_trigger_label(trigger: CadenceTriggerKind) -> &'static str {
-    match trigger {
-        CadenceTriggerKind::Interval => "INTERVAL",
-        CadenceTriggerKind::EventDriven => "EVENT_DRIVEN",
-        CadenceTriggerKind::IntervalOrEvent => "INTERVAL_OR_EVENT",
-    }
-}
-
 fn operating_mode_from_catalog_name(value: &str) -> Option<OperatingMode> {
     match value {
         "build_once" => Some(OperatingMode::BuildOnce),
@@ -8646,20 +7878,7 @@ fn catalog_kpi_contracts(
     )]))
 }
 
-fn mission_checkpoint_status_label(status: MissionCheckpointStatus) -> &'static str {
-    match status {
-        MissionCheckpointStatus::Pending => "PENDING",
-        MissionCheckpointStatus::Ready => "READY",
-        MissionCheckpointStatus::Running => "RUNNING",
-        MissionCheckpointStatus::Blocked => "BLOCKED",
-        MissionCheckpointStatus::WaitingUser => "WAITING_USER",
-        MissionCheckpointStatus::WaitingApproval => "WAITING_APPROVAL",
-        MissionCheckpointStatus::Verifying => "VERIFYING",
-        MissionCheckpointStatus::Completed => "COMPLETED",
-        MissionCheckpointStatus::Skipped => "SKIPPED",
-    }
-}
-
+#[cfg(test)]
 fn mission_checkpoint_executor_label(executor: MissionCheckpointExecutor) -> &'static str {
     match executor {
         MissionCheckpointExecutor::Application => "APPLICATION",
@@ -8743,6 +7962,7 @@ fn runtime_availability_label(status: DesktopRuntimeAvailabilityStatus) -> &'sta
     }
 }
 
+#[cfg(test)]
 fn runtime_recovery_status_label(status: RuntimeRecoveryStatus) -> &'static str {
     match status {
         RuntimeRecoveryStatus::Prepared => "PREPARED",
@@ -8776,53 +7996,6 @@ fn runtime_turn_status_label(status: RuntimeTurnStatus) -> &'static str {
         RuntimeTurnStatus::Interrupted => "INTERRUPTED",
         RuntimeTurnStatus::Failed => "FAILED",
         RuntimeTurnStatus::Uncertain => "UNCERTAIN",
-    }
-}
-
-fn runtime_activity_note(activity: &MissionRuntimeProjection, work_product_count: usize) -> String {
-    match activity.process_claim_status {
-        Some(RuntimeProcessClaimStatus::Blocked) => {
-            return "PROCESS_CLEANUP_BLOCKED：无法安全确认或终止此前认领的 OS 进程；不会按 PID 猜测清理，也不会启动第二个 Runtime。".into();
-        }
-        Some(
-            status @ (RuntimeProcessClaimStatus::Prepared | RuntimeProcessClaimStatus::Spawned),
-        ) => {
-            return format!(
-                "PROCESS_{}：存在精确 Runtime 进程认领；终止或启动恢复 reconcile 前禁止重复启动，Mission 仍未完成。",
-                runtime_process_claim_status_label(status)
-            );
-        }
-        Some(RuntimeProcessClaimStatus::Terminated | RuntimeProcessClaimStatus::Exited) | None => {}
-    }
-    if activity.requires_reconciliation {
-        return "UNCERTAIN：Runtime 请求是否产生结果尚不确定；禁止自动重放，必须先 reconcile。Mission 仍未完成。".into();
-    }
-    if activity.recovery_status == Some(RuntimeRecoveryStatus::Failed)
-        && activity.turn_status.is_none()
-    {
-        return "RUNTIME_RECOVERY_FAILED：进程恢复尝试已耗尽；当前 Worker 不会伪装为已连接，需安全重建执行 generation。".into();
-    }
-    match activity.turn_status {
-        Some(RuntimeTurnStatus::Completed) if work_product_count > 0 => {
-            "DRAFT_READY：Runtime Turn 已完成并形成可审阅草稿；这不是 Provider Verification，也没有把 Mission 自动标为完成。".into()
-        }
-        Some(RuntimeTurnStatus::Completed) => {
-            "COMPLETED_WITHOUT_ARTIFACT：Runtime Turn 已结束，但没有可采纳产物；Mission 保持 Running。".into()
-        }
-        Some(RuntimeTurnStatus::Interrupted) => {
-            "INTERRUPTED：本地 Turn 已被中断；没有外部业务完成声明。".into()
-        }
-        Some(RuntimeTurnStatus::Failed) => {
-            "FAILED：本地 Turn 已确定失败；没有生成虚假产物或外部 Effect 成功声明。".into()
-        }
-        Some(status) => format!(
-            "Runtime Turn {}；本地写入请求默认拒绝，Mission 与业务终态仍由 Domain/Oracle 决定。",
-            runtime_turn_status_label(status)
-        ),
-        None if activity.recovery_status.is_some() => {
-            "Runtime recovery 已持久化，但 Turn 尚未派发；没有 Work Product 或完成声明。".into()
-        }
-        None => "NOT_STARTED：尚无 Runtime ledger；没有 Work Product 或完成声明。".into(),
     }
 }
 
@@ -9767,74 +8940,15 @@ mod tests {
     }
 
     #[test]
-    fn persisted_mission_process_density_is_projection_bound_and_interactive() {
+    fn mission_shell_mounts_typed_plugins_on_demand() {
         let source = include_str!("lib.rs");
-        let css = include_str!("../assets/prototype.css");
-        for contract in [
-            "PersistedMissionProcessDensity",
-            "另有 {undisclosed_checkpoint_count} 个 Checkpoint 尚未展开",
-            "当前 Projection 只公开数量；不会编造名称、顺序或执行记录。",
-            "current_checkpoint_capability_id",
-            "current_checkpoint_oracle_ids",
-            "current_checkpoint_completion_policy",
-            "current_checkpoint_application_handler_status",
-            "在任务工作台打开 {product.title}",
-            "work_product_status_label(&product.adoption_status)",
-            "Mission 下一步边界",
-        ] {
-            assert!(
-                source.contains(contract),
-                "missing persisted process contract {contract}"
-            );
-        }
-        for selector in [
-            ".persisted-process-density",
-            ".persisted-process-row",
-            ".persisted-capability-stack",
-            ".persisted-capability-grid",
-            ".persisted-artifact-attachment",
-            ".persisted-next-boundary",
-        ] {
-            assert!(
-                css.contains(selector),
-                "missing persisted process selector {selector}"
-            );
-        }
-        assert!(css.contains("@media (max-width: 680px)"));
-        assert!(css.contains(".persisted-process-row.active > i > span { animation: none"));
-    }
-
-    #[test]
-    fn mission_process_counts_fail_closed() {
-        assert_eq!(
-            mission_undisclosed_checkpoint_count(
-                9,
-                3,
-                true,
-                Some(MissionCheckpointStatus::Running),
-            ),
-            5
-        );
-        assert_eq!(
-            mission_undisclosed_checkpoint_count(
-                9,
-                3,
-                true,
-                Some(MissionCheckpointStatus::Completed),
-            ),
-            6
-        );
-        assert_eq!(
-            mission_undisclosed_checkpoint_count(
-                9,
-                3,
-                true,
-                Some(MissionCheckpointStatus::Skipped),
-            ),
-            5
-        );
-        assert_eq!(mission_undisclosed_checkpoint_count(9, 3, false, None), 6);
-        assert_eq!(mission_undisclosed_checkpoint_count(3, 9, false, None), 0);
+        let css = include_str!("../assets/main.css");
+        assert!(source.contains("MissionPluginSurfaceRegistry"));
+        assert!(source.contains("MissionPluginSurfaces"));
+        assert!(source.contains("OperationsRevisionFence"));
+        assert!(css.contains(".mission-plugin-surfaces"));
+        assert!(css.contains(".mission-plugin-inline"));
+        assert!(css.contains(".mission-plugin-result"));
     }
 
     #[test]
@@ -10090,45 +9204,10 @@ mod tests {
             runtime_process_claim_status_label(RuntimeProcessClaimStatus::Blocked),
             "BLOCKED"
         );
-        let uncertain = MissionRuntimeProjection {
-            project_id: ProjectId::from("project-runtime-label"),
-            mission_id: MissionId::from("mission-runtime-label"),
-            process_claim_status: Some(RuntimeProcessClaimStatus::Terminated),
-            process_cleanup_attempt_count: 1,
-            recovery_status: Some(RuntimeRecoveryStatus::Attached),
-            recovery_failure_count: 0,
-            recovery_process_attempt: Some(1),
-            turn_status: Some(RuntimeTurnStatus::Uncertain),
-            turn_failure_count: 1,
-            turn_evidence_count: 4,
-            last_updated_at: Some(Utc::now()),
-            requires_reconciliation: true,
-        };
-        let note = runtime_activity_note(&uncertain, 0);
-        assert!(note.contains("UNCERTAIN"));
-        assert!(note.contains("禁止自动重放"));
-        assert!(!note.contains("DRAFT_READY"));
-
-        let completed = MissionRuntimeProjection {
-            turn_status: Some(RuntimeTurnStatus::Completed),
-            requires_reconciliation: false,
-            ..uncertain
-        };
-        let note = runtime_activity_note(&completed, 1);
-        assert!(note.contains("DRAFT_READY"));
-        assert!(note.contains("没有把 Mission 自动标为完成"));
-
-        let blocked_process = MissionRuntimeProjection {
-            process_claim_status: Some(RuntimeProcessClaimStatus::Blocked),
-            process_cleanup_attempt_count: 2,
-            turn_status: None,
-            requires_reconciliation: true,
-            ..completed
-        };
-        let note = runtime_activity_note(&blocked_process, 0);
-        assert!(note.contains("PROCESS_CLEANUP_BLOCKED"));
-        assert!(note.contains("不会按 PID 猜测清理"));
-        assert!(!note.contains("DRAFT_READY"));
+        assert_ne!(
+            runtime_turn_status_label(RuntimeTurnStatus::Completed),
+            runtime_turn_status_label(RuntimeTurnStatus::Uncertain)
+        );
     }
 
     #[test]
