@@ -13,6 +13,7 @@ mod callback;
 mod contract;
 mod fixture;
 mod ids;
+mod read;
 mod replay;
 mod sdk;
 mod state;
@@ -24,6 +25,11 @@ pub mod impact;
 
 pub use hartevo_connector_sdk::{
     ConnectorAdapter, ConnectorDescriptor, ConnectorError, ConnectorScope, ProviderAdapterIdentity,
+};
+pub use read::{
+    DurablePartnerReadCursor, ImpactProgramReadRequest, ImpactProgramReadServiceDefinition,
+    PartnerReadBudget, PartnerReadClassification, PartnerReadConnectionState, PartnerReadCost,
+    PartnerReadError, PartnerReadReceipt, PartnerReadScope,
 };
 pub use sdk::ConnectorAdapterBridge;
 

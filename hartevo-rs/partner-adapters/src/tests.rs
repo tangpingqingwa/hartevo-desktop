@@ -4,23 +4,396 @@ use hartevo_connector_sdk::{
     ProbeRequest, ProviderAdapterOperation, ProviderAdapterRegistry, ProviderCapabilityKey,
     ProviderProvenanceClass, SecretReference,
 };
+use hartevo_domain_kernel::{Mission, MissionContract, MissionId, ProjectId, TenantId};
 
 use crate::awin::{AwinAdapter, AwinFixtureWorld};
 use crate::cj::{CjAdapter, CjFixtureWorld};
 use crate::contract::TypedPartnerNetworkAdapter;
-use crate::impact::{ImpactAdapter, ImpactFixtureWorld};
+use crate::impact::{
+    ImpactAdapter, ImpactApi, ImpactApiError, ImpactCredentialResolver, ImpactCredentials,
+    ImpactFixtureWorld, ImpactHttpExecutor, ImpactHttpResponse, ImpactProbeResponse,
+    ImpactReadResponse,
+};
 use crate::{
     ActionState, AuthorizationState, CallbackChannel, CallbackDisposition, CallbackRequest,
     CallbackSignatureScheme, CommissionState, ConnectorAdapterBridge, ConversionState,
-    FixtureScenario, NetworkAccountId, NetworkProbeRequest, NetworkProbeStatus, NetworkReadData,
-    NetworkReadRequest, NetworkResource, NetworkScope, PartnerNetworkError, ProgramId,
-    ReportSettlementState, ReversalState,
+    DurablePartnerReadCursor, FixtureScenario, ImpactProgramReadRequest,
+    ImpactProgramReadServiceDefinition, NetworkAccountId, NetworkProbeRequest, NetworkProbeStatus,
+    NetworkProvenance, NetworkReadData, NetworkReadRequest, NetworkResource, NetworkScope,
+    PartnerNetworkError, PartnerReadBudget, PartnerReadClassification, PartnerReadConnectionState,
+    PartnerReadError, PartnerReadScope, ProgramId, ReportSettlementState, ReversalState,
 };
+
+#[derive(Clone, Debug)]
+struct ProductionPaginatedImpactApi {
+    inner: ImpactFixtureWorld,
+}
+
+impl ImpactApi for ProductionPaginatedImpactApi {
+    fn probe(
+        &self,
+        authorization: &crate::OpaqueSecretReference,
+        request: &NetworkProbeRequest,
+    ) -> Result<ImpactProbeResponse, ImpactApiError> {
+        let mut response = self.inner.probe(authorization, request)?;
+        response.provenance = NetworkProvenance::ProductionProvider;
+        Ok(response)
+    }
+
+    fn read(
+        &self,
+        authorization: &crate::OpaqueSecretReference,
+        request: &NetworkReadRequest,
+    ) -> Result<ImpactReadResponse, ImpactApiError> {
+        let mut response = self.inner.read(authorization, request)?;
+        response.provenance = NetworkProvenance::ProductionProvider;
+        response.page.next_cursor = if request.cursor.is_none() {
+            Some(crate::ReadCursor::new("page:2").expect("valid page cursor"))
+        } else {
+            None
+        };
+        response.page.has_more = request.cursor.is_none();
+        Ok(response)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct TestImpactCredentialResolver;
+
+impl ImpactCredentialResolver for TestImpactCredentialResolver {
+    fn resolve(
+        &self,
+        _authorization: &crate::OpaqueSecretReference,
+        _account_id: &NetworkAccountId,
+    ) -> Result<ImpactCredentials, ImpactApiError> {
+        ImpactCredentials::new("impact-account-1", "test-only-token")
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RecordingImpactHttpExecutor;
+
+impl ImpactHttpExecutor for RecordingImpactHttpExecutor {
+    fn get(
+        &self,
+        url: &str,
+        credentials: &ImpactCredentials,
+    ) -> Result<ImpactHttpResponse, ImpactApiError> {
+        assert_eq!(
+            url,
+            "https://api.impact.com/Mediapartners/impact-account-1/Campaigns?Page=1&PageSize=100"
+        );
+        assert_eq!(credentials.account_sid(), "impact-account-1");
+        Ok(ImpactHttpResponse {
+            status: 200,
+            body: r#"{"@numpages":"2","@nextpageuri":"/Mediapartners/impact-account-1/Campaigns?Page=2","Campaigns":[{"CampaignId":"impact-program-1","State":"ACTIVE"}]}"#.into(),
+            retry_after_seconds: None,
+        })
+    }
+}
 
 fn observed_at() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 13, 8, 0, 0)
         .single()
         .expect("valid fixture timestamp")
+}
+
+#[test]
+fn impact_http_api_uses_the_official_account_campaigns_read_and_production_class() {
+    let at = observed_at();
+    let api = crate::impact::ImpactHttpApi::with_executor(
+        TestImpactCredentialResolver,
+        RecordingImpactHttpExecutor,
+    );
+    let scope = NetworkScope::account_scope(
+        "tenant-http-test",
+        "project-http-test",
+        NetworkAccountId::from_stable("impact-account-1"),
+    )
+    .expect("valid account scope");
+    let request = NetworkReadRequest::new(scope, NetworkResource::Programs, at);
+    let authorization = crate::OpaqueSecretReference::new("secret-ref-impact-http", 1)
+        .expect("valid opaque reference");
+    let response = api
+        .read(&authorization, &request)
+        .expect("fake official response is typed");
+
+    assert_eq!(response.provenance, NetworkProvenance::ProductionProvider);
+    assert_eq!(response.page.item_count, 1);
+    assert_eq!(
+        response
+            .page
+            .next_cursor
+            .expect("official pagination metadata")
+            .as_str(),
+        "page:2"
+    );
+    assert!(matches!(response.data, NetworkReadData::Programs { .. }));
+}
+
+#[test]
+fn empty_registry_is_disconnected_and_fixture_can_never_complete_read()
+-> Result<(), Box<dyn std::error::Error>> {
+    let at = observed_at();
+    let definition = ImpactProgramReadServiceDefinition::new(at).expect("static definition");
+    let empty = ProviderAdapterRegistry::contract_baseline().expect("checked baseline");
+    assert_eq!(
+        definition.connection_state(&empty),
+        PartnerReadConnectionState::Disconnected
+    );
+    assert!(definition.connection_state(&empty).is_disconnected());
+
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let network_scope = world.scope();
+    let read_scope = PartnerReadScope::new(
+        "tenant-fixture",
+        "project-partner-fixture",
+        "mission-fixture",
+        network_scope.account_id.clone(),
+        network_scope.program_id.clone(),
+    )?;
+    let sdk_scope = read_scope.connector_scope()?;
+    let bridge = ConnectorAdapterBridge::with_program_expectation(
+        ImpactAdapter::new(world.clone()),
+        world.current_program_expectation(),
+    )?;
+    let descriptor = bridge.descriptor().clone();
+    let registry = ProviderAdapterRegistry::new(
+        "partner-fixture-read-1",
+        descriptor.registrations().to_vec(),
+    )?;
+    let mut worker = ConnectorWorker::new(
+        "worker-impact-fixture-read",
+        bridge,
+        registry,
+        sdk_scope.clone(),
+        at,
+        at + Duration::minutes(5),
+    )?;
+    let secret = SecretReference::new("secret-ref-impact-fixture-read", sdk_scope.clone(), 1)?;
+    let lease = ConnectorAuth::issue_credential_lease(
+        &secret,
+        descriptor.identity().clone(),
+        "credential-lease-impact-fixture-read",
+        1,
+        at,
+        at + Duration::minutes(5),
+    )?;
+    let dispatch = worker.dispatch_fence();
+    let session = worker.begin_auth(BeginAuthRequest {
+        dispatch: dispatch.clone(),
+        scope: sdk_scope.clone(),
+        secret_reference: secret.clone(),
+        credential_lease: lease.clone(),
+        auth_revision: 1,
+        issued_at: at,
+        expires_at: at + Duration::minutes(5),
+    })?;
+    let probe = worker.probe(ProbeRequest {
+        dispatch,
+        scope: sdk_scope,
+        secret_reference: secret,
+        credential_lease: lease,
+        session,
+        probe_revision: 1,
+        result_id: "probe-result-impact-fixture-read".to_owned(),
+        at: at + Duration::seconds(1),
+    })?;
+    let mission = Mission::compile(
+        TenantId::from("tenant-fixture"),
+        MissionId::from("mission-fixture"),
+        ProjectId::from("project-partner-fixture"),
+        "fixture read mission",
+        MissionContract::bootstrap(
+            "read partner programs",
+            [crate::read::PARTNER_PROGRAM_READ_MISSION_CAPABILITY.to_owned()],
+            at,
+        ),
+        at,
+    )?;
+    let request = ImpactProgramReadRequest::new(read_scope, at + Duration::seconds(1))?;
+    assert!(matches!(
+        definition.read_mission(&mut worker, &mission, &probe, &request),
+        Err(PartnerReadError::NonProductionEvidence(
+            PartnerReadClassification::Fixture
+        ))
+    ));
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn impact_authenticated_mission_read_emits_production_receipt_and_durable_page_cursor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let network_scope = world.scope();
+    let read_scope = PartnerReadScope::new(
+        "tenant-production",
+        "project-production",
+        "mission-production",
+        network_scope.account_id.clone(),
+        network_scope.program_id.clone(),
+    )?;
+    let sdk_scope = read_scope.connector_scope()?;
+    let bridge = ConnectorAdapterBridge::with_program_expectation(
+        ImpactAdapter::new(ProductionPaginatedImpactApi {
+            inner: world.clone(),
+        }),
+        world.current_program_expectation(),
+    )?;
+    let descriptor = bridge.descriptor().clone();
+    let registry = ProviderAdapterRegistry::new(
+        "partner-production-read-1",
+        descriptor.registrations().to_vec(),
+    )?;
+    let definition = ImpactProgramReadServiceDefinition::new(at)?;
+    assert_eq!(
+        definition.connection_state(&registry),
+        PartnerReadConnectionState::Registered
+    );
+    let mut worker = ConnectorWorker::new(
+        "worker-impact-production-read",
+        bridge,
+        registry,
+        sdk_scope.clone(),
+        at,
+        at + Duration::minutes(5),
+    )?;
+    let secret = SecretReference::new("secret-ref-impact-production-read", sdk_scope.clone(), 1)?;
+    let lease = ConnectorAuth::issue_credential_lease(
+        &secret,
+        descriptor.identity().clone(),
+        "credential-lease-impact-production-read",
+        1,
+        at,
+        at + Duration::minutes(5),
+    )?;
+    let dispatch = worker.dispatch_fence();
+    let session = worker.begin_auth(BeginAuthRequest {
+        dispatch: dispatch.clone(),
+        scope: sdk_scope.clone(),
+        secret_reference: secret.clone(),
+        credential_lease: lease.clone(),
+        auth_revision: 1,
+        issued_at: at,
+        expires_at: at + Duration::minutes(5),
+    })?;
+    let probe = worker.probe(ProbeRequest {
+        dispatch,
+        scope: sdk_scope,
+        secret_reference: secret,
+        credential_lease: lease,
+        session,
+        probe_revision: 1,
+        result_id: "probe-result-impact-production-read".to_owned(),
+        at: at + Duration::seconds(1),
+    })?;
+    assert_eq!(
+        probe.provenance_class(),
+        ProviderProvenanceClass::ProductionProvider
+    );
+
+    let mission = Mission::compile(
+        TenantId::from("tenant-production"),
+        MissionId::from("mission-production"),
+        ProjectId::from("project-production"),
+        "production partner read mission",
+        MissionContract::bootstrap(
+            "read partner programs",
+            [crate::read::PARTNER_PROGRAM_READ_MISSION_CAPABILITY.to_owned()],
+            at,
+        ),
+        at,
+    )?;
+    let first_request =
+        ImpactProgramReadRequest::new(read_scope.clone(), at + Duration::seconds(1))?
+            .with_budget(PartnerReadBudget::new(2, at + Duration::minutes(1), 2, 2)?);
+    let first = definition.read_mission(&mut worker, &mission, &probe, &first_request)?;
+    first.validate()?;
+    assert_eq!(
+        first.classification,
+        PartnerReadClassification::ProductionAuthenticated
+    );
+    assert_eq!(first.page_sequence, 1);
+    assert_eq!(first.item_count, 1);
+    assert_eq!(first.cost.units, 1);
+    assert!(first.source_uri.contains("api.impact.com/Mediapartners/"));
+    let cursor = first
+        .next_cursor
+        .clone()
+        .expect("first page has next cursor");
+    assert_eq!(cursor.page(), 2);
+    assert_eq!(cursor.provider_cursor(), "page:2");
+    assert_eq!(cursor.scope_digest, read_scope.digest());
+
+    let second_request = first_request
+        .with_cursor(cursor.clone())
+        .with_budget(PartnerReadBudget::new(2, at + Duration::minutes(1), 2, 2)?);
+    let second = definition.read_mission(&mut worker, &mission, &probe, &second_request)?;
+    second.validate()?;
+    assert_eq!(second.page_sequence, 2);
+    assert!(second.next_cursor.is_none());
+    assert_eq!(second.scope, read_scope);
+    Ok(())
+}
+
+#[test]
+fn durable_cursor_scope_query_and_receipt_digest_are_tamper_evident() -> Result<(), PartnerReadError>
+{
+    let at = observed_at();
+    let scope = PartnerReadScope::new(
+        "tenant-cursor",
+        "project-cursor",
+        "mission-cursor",
+        NetworkAccountId::from_stable("impact-account-1"),
+        Some(ProgramId::from_stable("impact-program-1")),
+    )?;
+    let service = ImpactProgramReadServiceDefinition::new(at)?;
+    let query_digest = crate::contract::digest_bytes(b"programs-query-v1");
+    let cursor = DurablePartnerReadCursor::new(
+        service.service_id.clone(),
+        &scope,
+        query_digest.clone(),
+        2,
+        "page:2",
+        crate::contract::digest_bytes(b"page-1"),
+    )?;
+    assert!(
+        cursor
+            .validate_for(&service.service_id, &scope, &query_digest)
+            .is_ok()
+    );
+    let mut tampered = cursor.clone();
+    tampered.scope_digest = PartnerReadScope::new(
+        "other-tenant",
+        "project-cursor",
+        "mission-cursor",
+        NetworkAccountId::from_stable("impact-account-1"),
+        Some(ProgramId::from_stable("impact-program-1")),
+    )?
+    .digest();
+    assert_eq!(
+        tampered.validate_for(&service.service_id, &scope, &query_digest),
+        Err(PartnerReadError::InvalidCursor)
+    );
+    Ok(())
+}
+
+#[test]
+fn partner_read_budget_rejects_quota_and_cost_before_provider_dispatch() {
+    let at = observed_at();
+    let cost = crate::PartnerReadCost::new(1, None, "impact-official-api/v1", at)
+        .expect("valid read cost");
+    let quota =
+        PartnerReadBudget::new(1, at + Duration::minutes(1), 0, 1).expect("valid quota boundary");
+    assert_eq!(quota.check(&cost, at), Err(PartnerReadError::QuotaExceeded));
+    let cost_boundary =
+        PartnerReadBudget::new(1, at + Duration::minutes(1), 1, 0).expect("valid cost boundary");
+    assert_eq!(
+        cost_boundary.check(&cost, at),
+        Err(PartnerReadError::CostLimitExceeded)
+    );
 }
 
 fn all_resources() -> [NetworkResource; 11] {

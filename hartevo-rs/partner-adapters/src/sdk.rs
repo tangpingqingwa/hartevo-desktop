@@ -158,7 +158,11 @@ impl<A: TypedPartnerNetworkAdapter + Send> ConnectorAdapter for ConnectorAdapter
         network_request.cursor = request
             .cursor
             .as_ref()
-            .map(|cursor| ReadCursor::new(cursor.token_digest()))
+            // Impact's official pagination cursor is a page number. The SDK
+            // deliberately persists only a token digest, so the sequence is
+            // the durable bridge back to the provider page without keeping a
+            // second cursor authority in this crate.
+            .map(|cursor| ReadCursor::new(format!("page:{}", cursor.sequence().saturating_add(1))))
             .transpose()
             .map_err(|error| map_network_error(&error))?;
         let observation = self
@@ -424,5 +428,6 @@ fn map_network_error(error: &PartnerNetworkError) -> ConnectorError {
         | PartnerNetworkError::AuthorizationExpired
         | PartnerNetworkError::ProviderUnavailable
         | PartnerNetworkError::UnsupportedCallbackSignature => ConnectorError::ProviderRejected,
+        PartnerNetworkError::ProviderRateLimited => ConnectorError::RateLimited,
     }
 }

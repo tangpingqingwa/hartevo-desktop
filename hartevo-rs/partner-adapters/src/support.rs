@@ -38,6 +38,7 @@ pub(crate) enum ProviderApiError {
     AuthorizationRequired,
     BlockedEnv(BlockedEnvironmentReason),
     ScopeRevoked,
+    RateLimited,
     Unavailable,
 }
 
@@ -252,6 +253,7 @@ impl ProviderApiError {
             },
             Self::BlockedEnv(reason) => PartnerNetworkError::BlockedEnv { provider, reason },
             Self::ScopeRevoked => PartnerNetworkError::ScopeRevoked,
+            Self::RateLimited => PartnerNetworkError::ProviderRateLimited,
             Self::Unavailable => PartnerNetworkError::ProviderUnavailable,
         }
     }
