@@ -3,6 +3,7 @@
 //! Runtime threads, model output, and provider responses are projections into this
 //! kernel. They are never accepted as business truth without a domain command.
 
+mod attribution_evidence_delivery;
 mod attribution_evidence_query;
 mod attribution_spine;
 mod connection;
@@ -29,6 +30,13 @@ mod runtime_turn;
 mod truth;
 mod work_product;
 
+pub use attribution_evidence_delivery::{
+    ATTRIBUTION_EVIDENCE_DELIVERY_CONTRACT_VERSION,
+    ATTRIBUTION_EVIDENCE_DELIVERY_RECEIPT_EVENT_TYPE, ATTRIBUTION_EVIDENCE_DELIVERY_SCHEMA_VERSION,
+    AttributionEvidenceDeliveryDisposition, AttributionEvidenceDeliveryError,
+    AttributionEvidenceDeliveryReceipt, AttributionEvidenceDeliveryService,
+    AttributionEvidenceDeliverySnapshot, AttributionEvidenceModelInvocation,
+};
 pub use attribution_evidence_query::{
     ATTRIBUTION_EVIDENCE_QUERY_CONSUMER_MOUNT_EVENT_TYPE,
     ATTRIBUTION_EVIDENCE_QUERY_CONSUMER_REVOKE_EVENT_TYPE,
