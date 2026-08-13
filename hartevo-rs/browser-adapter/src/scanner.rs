@@ -480,22 +480,23 @@ impl FileSafetyScanner for ProductionFileScanner {
         if !is_sha256(request.content_digest) || request.byte_count == 0 {
             return Err(BrowserError::FileChanged);
         }
-        let (mut staged_file, staged_before) = inspect_staged_path(request.staged_path())?;
-        if staged_before.content_digest != request.content_digest
-            || staged_before.byte_count != request.byte_count
+        let (mut retained_input, dispatched_input) = inspect_staged_path(request.staged_path())?;
+        if dispatched_input.file_identity.content_digest != request.content_digest
+            || dispatched_input.file_identity.byte_count != request.byte_count
         {
             return Err(BrowserError::FileChanged);
         }
-        staged_file.seek(SeekFrom::Start(0))?;
+        retained_input.seek(SeekFrom::Start(0))?;
+        let scanner_input = retained_input.try_clone()?;
 
         let process_result = self.run_process(ProcessOperation::Scan {
             request,
-            input: staged_file,
+            input: scanner_input,
         });
-        let staged_after = inspect_staged_path(request.staged_path())?.1;
-        if staged_after != staged_before {
-            return Err(BrowserError::FileChanged);
-        }
+        let retained_input_after = inspect_open_file(&mut retained_input, FileRole::StagedInput)?;
+        let path_after = inspect_staged_path(request.staged_path())?.1;
+        let input_revalidation =
+            DispatchedInputRevalidation::new(dispatched_input, retained_input_after, path_after)?;
         let process = process_result?;
         process.validate_result_candidate(self.limits)?;
         let executable_identity_digest = self.executable_identity.evidence_digest()?;
@@ -505,6 +506,7 @@ impl FileSafetyScanner for ProductionFileScanner {
             &executable_identity_digest,
             &process,
             self.limits,
+            &input_revalidation,
         ) else {
             self.poison_process_boundary();
             return Err(BrowserError::FileScanUnavailable);
@@ -523,8 +525,9 @@ impl FileSafetyScanner for ProductionFileScanner {
                 "detectedType": request.detected_type,
                 "observedAt": request.observed_at,
             },
-            "stagedIdentityBeforeDigest": staged_before.evidence_digest()?,
-            "stagedIdentityAfterDigest": staged_after.evidence_digest()?,
+            "dispatchedInputIdentityDigest": input_revalidation.dispatched_evidence_digest()?,
+            "retainedInputFdAfterDigest": input_revalidation.retained_fd_evidence_digest()?,
+            "inputPathAfterDigest": input_revalidation.path_evidence_digest()?,
             "decision": decision,
             "scannerResultEnvelopeDigest": result_envelope.evidence_digest()?,
         }))?;
@@ -720,6 +723,90 @@ impl ExactFileIdentity {
             "contentDigest": self.content_digest,
         }))
     }
+
+    fn matches_metadata(&self, metadata: &fs::Metadata) -> bool {
+        self.device == metadata.dev()
+            && self.inode == metadata.ino()
+            && self.byte_count == metadata.len()
+            && self.modified_seconds == metadata.mtime()
+            && self.modified_nanoseconds == metadata.mtime_nsec()
+            && self.change_seconds == metadata.ctime()
+            && self.change_nanoseconds == metadata.ctime_nsec()
+            && self.mode == metadata.mode()
+            && self.owner == metadata.uid()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct DispatchedInputSnapshot {
+    canonical_path_digest: String,
+    file_identity: ExactFileIdentity,
+}
+
+impl DispatchedInputSnapshot {
+    fn evidence_digest(&self) -> Result<String, BrowserError> {
+        digest_json(&serde_json::json!({
+            "canonicalPathDigest": self.canonical_path_digest,
+            "fileIdentityDigest": self.file_identity.evidence_digest()?,
+        }))
+    }
+}
+
+impl fmt::Debug for DispatchedInputSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DispatchedInputSnapshot")
+            .field("canonical_path_digest", &self.canonical_path_digest)
+            .field(
+                "file_identity_digest",
+                &self.file_identity.evidence_digest().ok(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct DispatchedInputRevalidation {
+    dispatched: DispatchedInputSnapshot,
+    retained_fd_after: ExactFileIdentity,
+    path_after: DispatchedInputSnapshot,
+}
+
+impl DispatchedInputRevalidation {
+    fn new(
+        dispatched: DispatchedInputSnapshot,
+        retained_fd_after: ExactFileIdentity,
+        path_after: DispatchedInputSnapshot,
+    ) -> Result<Self, BrowserError> {
+        let revalidation = Self {
+            dispatched,
+            retained_fd_after,
+            path_after,
+        };
+        revalidation.validate()?;
+        Ok(revalidation)
+    }
+
+    fn validate(&self) -> Result<(), BrowserError> {
+        if self.retained_fd_after != self.dispatched.file_identity
+            || self.path_after != self.dispatched
+        {
+            return Err(BrowserError::FileChanged);
+        }
+        Ok(())
+    }
+
+    fn dispatched_evidence_digest(&self) -> Result<String, BrowserError> {
+        self.dispatched.evidence_digest()
+    }
+
+    fn retained_fd_evidence_digest(&self) -> Result<String, BrowserError> {
+        self.retained_fd_after.evidence_digest()
+    }
+
+    fn path_evidence_digest(&self) -> Result<String, BrowserError> {
+        self.path_after.evidence_digest()
+    }
 }
 
 fn valid_release_identifier(value: &str) -> bool {
@@ -774,14 +861,31 @@ fn inspect_path(path: &Path, role: FileRole) -> Result<ExactFileIdentity, Browse
     inspect_open_file(&mut file, role)
 }
 
-fn inspect_staged_path(path: &Path) -> Result<(File, ExactFileIdentity), BrowserError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| BrowserError::FileChanged)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+fn inspect_staged_path(path: &Path) -> Result<(File, DispatchedInputSnapshot), BrowserError> {
+    let metadata_before = fs::symlink_metadata(path).map_err(|_| BrowserError::FileChanged)?;
+    if metadata_before.file_type().is_symlink() || !metadata_before.is_file() {
         return Err(BrowserError::FileChanged);
     }
+    validate_file_metadata(&metadata_before, FileRole::StagedInput)?;
+    let canonical_before = fs::canonicalize(path).map_err(|_| BrowserError::FileChanged)?;
     let mut file = open_read_only_no_follow(path).map_err(|_| BrowserError::FileChanged)?;
     let identity = inspect_open_file(&mut file, FileRole::StagedInput)?;
-    Ok((file, identity))
+    let metadata_after = fs::symlink_metadata(path).map_err(|_| BrowserError::FileChanged)?;
+    validate_file_metadata(&metadata_after, FileRole::StagedInput)?;
+    let canonical_after = fs::canonicalize(path).map_err(|_| BrowserError::FileChanged)?;
+    if canonical_after != canonical_before
+        || !same_metadata_identity(&metadata_before, &metadata_after)
+        || !identity.matches_metadata(&metadata_after)
+    {
+        return Err(BrowserError::FileChanged);
+    }
+    Ok((
+        file,
+        DispatchedInputSnapshot {
+            canonical_path_digest: digest(canonical_after.as_os_str().as_encoded_bytes()),
+            file_identity: identity,
+        },
+    ))
 }
 
 impl FileRole {
@@ -1131,6 +1235,9 @@ struct ScannerResultEnvelope {
     stderr_observation_digest: String,
     cleanup_outcome: ProcessCleanupOutcome,
     response_digest: String,
+    dispatched_input_identity_digest: String,
+    retained_input_fd_after_digest: String,
+    input_path_after_digest: String,
     decision: FileScanDecision,
 }
 
@@ -1141,9 +1248,11 @@ impl ScannerResultEnvelope {
         executable_identity_digest: &str,
         process: &ProcessObservation,
         limits: ScannerProcessLimits,
+        input_revalidation: &DispatchedInputRevalidation,
     ) -> Result<Self, BrowserError> {
         release_pin.validate()?;
         process.validate_result_candidate(limits)?;
+        input_revalidation.validate()?;
         if !is_sha256(version_probe_evidence_digest)
             || !is_sha256(executable_identity_digest)
             || process.identity.launch.operation != SCAN_OPERATION
@@ -1189,6 +1298,9 @@ impl ScannerResultEnvelope {
             stderr_observation_digest: process.stderr.evidence_digest()?,
             cleanup_outcome: process.cleanup_outcome,
             response_digest,
+            dispatched_input_identity_digest: input_revalidation.dispatched_evidence_digest()?,
+            retained_input_fd_after_digest: input_revalidation.retained_fd_evidence_digest()?,
+            input_path_after_digest: input_revalidation.path_evidence_digest()?,
             decision,
         })
     }
@@ -1214,6 +1326,9 @@ impl ScannerResultEnvelope {
             "stderrObservationDigest": self.stderr_observation_digest,
             "cleanupOutcome": self.cleanup_outcome.protocol_name(),
             "responseDigest": self.response_digest,
+            "dispatchedInputIdentityDigest": self.dispatched_input_identity_digest,
+            "retainedInputFdAfterDigest": self.retained_input_fd_after_digest,
+            "inputPathAfterDigest": self.input_path_after_digest,
             "decision": self.decision,
         }))
     }
@@ -1242,6 +1357,15 @@ impl fmt::Debug for ScannerResultEnvelope {
             .field("stderr_observation_digest", &self.stderr_observation_digest)
             .field("cleanup_outcome", &self.cleanup_outcome)
             .field("response_digest", &self.response_digest)
+            .field(
+                "dispatched_input_identity_digest",
+                &self.dispatched_input_identity_digest,
+            )
+            .field(
+                "retained_input_fd_after_digest",
+                &self.retained_input_fd_after_digest,
+            )
+            .field("input_path_after_digest", &self.input_path_after_digest)
             .field("decision", &self.decision)
             .finish_non_exhaustive()
     }
@@ -1768,6 +1892,27 @@ esac
         }
     }
 
+    fn test_input_revalidation() -> DispatchedInputRevalidation {
+        let file_identity = ExactFileIdentity {
+            device: 11,
+            inode: 12,
+            byte_count: 2,
+            modified_seconds: 13,
+            modified_nanoseconds: 14,
+            change_seconds: 15,
+            change_nanoseconds: 16,
+            mode: 0o100_400,
+            owner: 17,
+            content_digest: digest(b"{}"),
+        };
+        let dispatched = DispatchedInputSnapshot {
+            canonical_path_digest: sha('e'),
+            file_identity: file_identity.clone(),
+        };
+        DispatchedInputRevalidation::new(dispatched.clone(), file_identity, dispatched)
+            .expect("input revalidation")
+    }
+
     #[test]
     fn process_environment_is_an_exact_allowlist_without_path() {
         let fixture = ScannerFixture::new();
@@ -1927,12 +2072,14 @@ esac
             stderr: bounded_test_output(b"private-result-envelope-stderr"),
             cleanup_outcome: ProcessCleanupOutcome::VerifiedNoResidualProcessGroup,
         };
+        let input_revalidation = test_input_revalidation();
         let envelope = ScannerResultEnvelope::from_completed_process(
             &release_pin,
             &sha('8'),
             &executable_identity_digest,
             &process,
             default_limits(),
+            &input_revalidation,
         )
         .expect("verified result envelope");
         let baseline = envelope.evidence_digest().expect("envelope evidence");
@@ -1965,8 +2112,11 @@ esac
         let mut changed = envelope.clone();
         changed.stderr_observation_digest = sha('c');
         variants.push(changed);
-        let mut changed = envelope;
+        let mut changed = envelope.clone();
         changed.response_digest = sha('d');
+        variants.push(changed);
+        let mut changed = envelope;
+        changed.dispatched_input_identity_digest = sha('f');
         variants.push(changed);
         for changed in variants {
             assert_ne!(
@@ -2405,8 +2555,19 @@ esac
     }
 
     #[test]
-    fn staged_inode_or_digest_change_after_dispatch_is_file_changed() {
-        for replace_inode_with_same_digest in [true, false] {
+    fn staged_replacement_symlink_identity_or_content_drift_after_dispatch_is_file_changed() {
+        #[derive(Clone, Copy)]
+        enum Tamper {
+            ReplaceInode,
+            ReplaceWithSymlink,
+            RewriteContent,
+        }
+
+        for tamper_kind in [
+            Tamper::ReplaceInode,
+            Tamper::ReplaceWithSymlink,
+            Tamper::RewriteContent,
+        ] {
             let fixture = ScannerFixture::new();
             let marker = fixture.temp.path().join("scanner-dispatched.marker");
             let body = format!(
@@ -2430,36 +2591,53 @@ esac
             assert!(reconciliation.is_healthy());
             let private_content = br#"{"same":"digest"}"#;
             let source = fixture.source("staged-tamper.json", private_content);
+            let symlink_target = fixture.temp.path().join("private-symlink-target.json");
+            fs::write(&symlink_target, private_content).expect("symlink target content");
+            fs::set_permissions(&symlink_target, fs::Permissions::from_mode(0o400))
+                .expect("read-only symlink target");
             let tamper_root = durable_root.clone();
             let tamper_marker = marker.clone();
             let tamper_content = private_content.to_vec();
+            let tamper_symlink_target = symlink_target.clone();
             let tamper = thread::spawn(move || {
                 wait_for_path(&tamper_marker);
                 let blob = wait_for_managed_blob(&tamper_root);
-                if replace_inode_with_same_digest {
-                    fs::remove_file(&blob).expect("remove original staged inode");
-                    fs::write(&blob, tamper_content).expect("replace staged inode with same bytes");
-                } else {
-                    fs::set_permissions(&blob, fs::Permissions::from_mode(0o600))
-                        .expect("make staged inode writable for fixture");
-                    fs::write(&blob, br#"{"changed":"digest"}"#)
-                        .expect("change staged digest in place");
+                match tamper_kind {
+                    Tamper::ReplaceInode => {
+                        fs::remove_file(&blob).expect("remove original staged inode");
+                        fs::write(&blob, tamper_content)
+                            .expect("replace staged inode with same bytes");
+                        fs::set_permissions(&blob, fs::Permissions::from_mode(0o400))
+                            .expect("restore replacement read-only mode");
+                    }
+                    Tamper::ReplaceWithSymlink => {
+                        fs::remove_file(&blob).expect("remove original staged inode");
+                        std::os::unix::fs::symlink(&tamper_symlink_target, &blob)
+                            .expect("replace staged inode with symlink");
+                    }
+                    Tamper::RewriteContent => {
+                        fs::set_permissions(&blob, fs::Permissions::from_mode(0o600))
+                            .expect("make staged inode writable for fixture");
+                        fs::write(&blob, br#"{"changed":"digest"}"#)
+                            .expect("change staged digest in place");
+                        fs::set_permissions(&blob, fs::Permissions::from_mode(0o400))
+                            .expect("restore rewritten read-only mode");
+                    }
                 }
-                fs::set_permissions(&blob, fs::Permissions::from_mode(0o400))
-                    .expect("restore read-only staged mode");
             });
-            let result = fixture.prepare(
-                &mut broker,
-                &mut scanner,
-                if replace_inode_with_same_digest {
-                    "grant-staged-inode-replacement"
-                } else {
-                    "grant-staged-digest-rewrite"
-                },
-                &source,
-            );
+            let grant_id = match tamper_kind {
+                Tamper::ReplaceInode => "grant-staged-inode-replacement",
+                Tamper::ReplaceWithSymlink => "grant-staged-symlink-replacement",
+                Tamper::RewriteContent => "grant-staged-digest-rewrite",
+            };
+            let result = fixture.prepare(&mut broker, &mut scanner, grant_id, &source);
             tamper.join().expect("tamper thread");
             assert!(matches!(result, Err(BrowserError::FileChanged)));
+            assert!(broker.grant(&BrowserFileGrantId::from(grant_id)).is_none());
+            let debug = format!("{result:?} {scanner:?} {broker:?}");
+            assert!(!debug.contains(r#"{"same":"digest"}"#));
+            assert!(!debug.contains(symlink_target.to_string_lossy().as_ref()));
+            assert_no_run_directory_residue(&scanner);
         }
     }
 
