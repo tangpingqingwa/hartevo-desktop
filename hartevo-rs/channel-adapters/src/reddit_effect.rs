@@ -5,6 +5,8 @@
 //! at most one provider write, and `reconcile` performs a separate readback.
 //! No HTML/browser fallback is available here.  The caller must supply an
 //! already authority-bound approval ingress before `execute` can dispatch.
+//! `Uncertain` and `ReceiptPending` checkpoints are readback-only and are never
+//! automatically replayed.
 
 use std::{
     collections::BTreeSet,
@@ -797,6 +799,8 @@ pub struct RedditProviderReceipt {
     idempotency_key: RedditIdempotencyKey,
     draft_revision: String,
     content_digest: String,
+    #[serde(default)]
+    request_digest: String,
     provider_response_digest: String,
     observed_at: DateTime<Utc>,
 }
@@ -826,6 +830,10 @@ impl RedditProviderReceipt {
         &self.content_digest
     }
 
+    pub fn request_digest(&self) -> &str {
+        &self.request_digest
+    }
+
     pub fn provider_response_digest(&self) -> &str {
         &self.provider_response_digest
     }
@@ -840,7 +848,15 @@ impl RedditProviderReceipt {
 pub struct RedditVerificationEvidence {
     fullname: RedditThingId,
     permalink: String,
+    #[serde(default)]
+    account: Option<RedditAccountIdentity>,
+    #[serde(default)]
+    subreddit: Option<RedditCommunityIdentity>,
+    #[serde(default)]
+    parent: Option<RedditThingId>,
     body_digest: String,
+    #[serde(default)]
+    title_digest: Option<String>,
     moderation: RedditModerationState,
     removal_reason: Option<RedditRemovalReason>,
     revision: RevisionIdentity,
@@ -858,8 +874,24 @@ impl RedditVerificationEvidence {
         &self.permalink
     }
 
+    pub const fn account(&self) -> Option<&RedditAccountIdentity> {
+        self.account.as_ref()
+    }
+
+    pub const fn subreddit(&self) -> Option<&RedditCommunityIdentity> {
+        self.subreddit.as_ref()
+    }
+
+    pub const fn parent(&self) -> Option<&RedditThingId> {
+        self.parent.as_ref()
+    }
+
     pub fn body_digest(&self) -> &str {
         &self.body_digest
+    }
+
+    pub fn title_digest(&self) -> Option<&str> {
+        self.title_digest.as_deref()
     }
 
     pub const fn moderation(&self) -> RedditModerationState {
@@ -902,6 +934,8 @@ pub struct RedditPublishOutcome {
     receipt: RedditProviderReceipt,
     verification: RedditVerificationEvidence,
     quota: RedditQuotaSnapshot,
+    #[serde(default)]
+    sent_reason: RedditSentReason,
 }
 
 impl RedditPublishOutcome {
@@ -952,6 +986,233 @@ impl RedditPublishOutcome {
     pub const fn quota(&self) -> &RedditQuotaSnapshot {
         &self.quota
     }
+
+    pub const fn sent_reason(&self) -> RedditSentReason {
+        self.sent_reason
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedditSentReason {
+    #[default]
+    ProviderReceiptVerified,
+    ExistingIdempotencyMatch,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedditRejectedReason {
+    ApprovalDrift,
+    AuthorizationRequired,
+    CredentialRevoked,
+    CredentialExpired,
+    CredentialUnmounted,
+    ScopeMismatch,
+    PolicyRejected,
+    ParentRejected,
+    ProviderRejected,
+    DuplicateIdempotency,
+    Deleted,
+    Moderated,
+    InvalidProviderReceipt,
+    RateLimitWithoutReset,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedditVerificationReason {
+    NetworkUncertain,
+    ProcessCrashRecovery,
+    ReceiptPending,
+    ReadbackMismatch,
+    UnknownProviderState,
+    UnknownModerationState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RedditProviderResponseEvidence {
+    status: u16,
+    body_digest: String,
+    observed_at: DateTime<Utc>,
+}
+
+impl RedditProviderResponseEvidence {
+    pub const fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn body_digest(&self) -> &str {
+        &self.body_digest
+    }
+
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RedditRejectedOutcome {
+    provenance: RedditEffectProvenance,
+    operation: RedditPublishOperation,
+    scope: RedditEffectScope,
+    effect_id: RedditEffectId,
+    draft_revision: String,
+    content_digest: String,
+    credential_generation: u64,
+    authorization_digest: String,
+    approval_revision: RedditApprovalRevision,
+    reason: RedditRejectedReason,
+    receipt: Option<RedditProviderReceipt>,
+    readback: Option<RedditPublishReadback>,
+    provider_response: Option<RedditProviderResponseEvidence>,
+    quota: RedditQuotaSnapshot,
+    observed_at: DateTime<Utc>,
+}
+
+impl RedditRejectedOutcome {
+    pub const fn provenance(&self) -> RedditEffectProvenance {
+        self.provenance
+    }
+
+    pub const fn operation(&self) -> RedditPublishOperation {
+        self.operation
+    }
+
+    pub const fn scope(&self) -> &RedditEffectScope {
+        &self.scope
+    }
+
+    pub const fn effect_id(&self) -> &RedditEffectId {
+        &self.effect_id
+    }
+
+    pub fn draft_revision(&self) -> &str {
+        &self.draft_revision
+    }
+
+    pub fn content_digest(&self) -> &str {
+        &self.content_digest
+    }
+
+    pub const fn credential_generation(&self) -> u64 {
+        self.credential_generation
+    }
+
+    pub fn authorization_digest(&self) -> &str {
+        &self.authorization_digest
+    }
+
+    pub const fn approval_revision(&self) -> &RedditApprovalRevision {
+        &self.approval_revision
+    }
+
+    pub const fn reason(&self) -> RedditRejectedReason {
+        self.reason
+    }
+
+    pub const fn receipt(&self) -> Option<&RedditProviderReceipt> {
+        self.receipt.as_ref()
+    }
+
+    pub const fn readback(&self) -> Option<&RedditPublishReadback> {
+        self.readback.as_ref()
+    }
+
+    pub const fn provider_response(&self) -> Option<&RedditProviderResponseEvidence> {
+        self.provider_response.as_ref()
+    }
+
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RedditVerificationRequiredOutcome {
+    provenance: RedditEffectProvenance,
+    operation: RedditPublishOperation,
+    scope: RedditEffectScope,
+    effect_id: RedditEffectId,
+    draft_revision: String,
+    content_digest: String,
+    credential_generation: u64,
+    authorization_digest: String,
+    approval_revision: RedditApprovalRevision,
+    reason: RedditVerificationReason,
+    receipt: Option<RedditProviderReceipt>,
+    readback: Option<RedditPublishReadback>,
+    provider_response: Option<RedditProviderResponseEvidence>,
+    quota: RedditQuotaSnapshot,
+    observed_at: DateTime<Utc>,
+}
+
+impl RedditVerificationRequiredOutcome {
+    pub const fn provenance(&self) -> RedditEffectProvenance {
+        self.provenance
+    }
+
+    pub const fn operation(&self) -> RedditPublishOperation {
+        self.operation
+    }
+
+    pub const fn scope(&self) -> &RedditEffectScope {
+        &self.scope
+    }
+
+    pub const fn effect_id(&self) -> &RedditEffectId {
+        &self.effect_id
+    }
+
+    pub fn draft_revision(&self) -> &str {
+        &self.draft_revision
+    }
+
+    pub fn content_digest(&self) -> &str {
+        &self.content_digest
+    }
+
+    pub const fn credential_generation(&self) -> u64 {
+        self.credential_generation
+    }
+
+    pub fn authorization_digest(&self) -> &str {
+        &self.authorization_digest
+    }
+
+    pub const fn approval_revision(&self) -> &RedditApprovalRevision {
+        &self.approval_revision
+    }
+
+    pub const fn reason(&self) -> RedditVerificationReason {
+        self.reason
+    }
+
+    pub const fn receipt(&self) -> Option<&RedditProviderReceipt> {
+        self.receipt.as_ref()
+    }
+
+    pub const fn readback(&self) -> Option<&RedditPublishReadback> {
+        self.readback.as_ref()
+    }
+
+    pub const fn provider_response(&self) -> Option<&RedditProviderResponseEvidence> {
+        self.provider_response.as_ref()
+    }
+
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedditTerminalState {
+    Rejected(RedditRejectedReason),
+    VerificationRequired(RedditVerificationReason),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -961,7 +1222,7 @@ pub struct RedditRetryAfterReceipt {
     retry_after_seconds: u64,
     rate_limit_reset: Option<u64>,
     rate_limit_remaining: Option<u64>,
-    provider_response_digest: String,
+    provider_response_digest: Option<String>,
     observed_at: DateTime<Utc>,
 }
 
@@ -973,11 +1234,23 @@ impl RedditRetryAfterReceipt {
     pub const fn rate_limit_reset(&self) -> Option<u64> {
         self.rate_limit_reset
     }
+
+    pub fn provider_response_digest(&self) -> Option<&str> {
+        self.provider_response_digest.as_deref()
+    }
+
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RedditPublishDispatch {
+    Sent(RedditPublishOutcome),
+    Rejected(RedditRejectedOutcome),
+    VerificationRequired(RedditVerificationRequiredOutcome),
+    #[serde(alias = "verified")]
     Verified(RedditPublishOutcome),
     DuplicateIdempotency(RedditPublishOutcome),
     RetryAfter(RedditRetryAfterReceipt),
@@ -1138,6 +1411,7 @@ pub enum RedditCheckpointPhase {
     ReceiptPending,
     Uncertain,
     Verified,
+    Rejected,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1156,6 +1430,12 @@ pub struct RedditPublishCheckpoint {
     readback: Option<RedditPublishReadback>,
     retry_after: Option<RedditRetryAfterReceipt>,
     quota_receipts: Vec<RedditQuotaReceipt>,
+    #[serde(default)]
+    last_provider_response: Option<RedditProviderResponseEvidence>,
+    #[serde(default)]
+    terminal: Option<RedditTerminalState>,
+    #[serde(default)]
+    sent_reason: Option<RedditSentReason>,
 }
 
 impl RedditPublishCheckpoint {
@@ -1178,6 +1458,9 @@ impl RedditPublishCheckpoint {
             readback: None,
             retry_after: None,
             quota_receipts: Vec::new(),
+            last_provider_response: None,
+            terminal: None,
+            sent_reason: None,
         })
     }
 
@@ -1201,12 +1484,28 @@ impl RedditPublishCheckpoint {
         &self.quota_receipts
     }
 
+    pub const fn last_provider_response(&self) -> Option<&RedditProviderResponseEvidence> {
+        self.last_provider_response.as_ref()
+    }
+
+    pub const fn terminal(&self) -> Option<&RedditTerminalState> {
+        self.terminal.as_ref()
+    }
+
     pub fn durable_json(&self) -> Result<Value, RedditEffectError> {
         serde_json::to_value(self).map_err(|_| RedditEffectError::CheckpointCorrupt)
     }
 
     pub fn reopen(value: Value) -> Result<Self, RedditEffectError> {
-        serde_json::from_value(value).map_err(|_| RedditEffectError::CheckpointCorrupt)
+        let mut checkpoint: Self =
+            serde_json::from_value(value).map_err(|_| RedditEffectError::CheckpointCorrupt)?;
+        if checkpoint.phase == RedditCheckpointPhase::Executing {
+            checkpoint.phase = RedditCheckpointPhase::Uncertain;
+            checkpoint.terminal = Some(RedditTerminalState::VerificationRequired(
+                RedditVerificationReason::ProcessCrashRecovery,
+            ));
+        }
+        Ok(checkpoint)
     }
 }
 
@@ -1661,6 +1960,25 @@ fn response_error(response: &ProviderResponse) -> RedditEffectError {
             status,
             code,
         }),
+    }
+}
+
+fn response_evidence(response: &ProviderResponse) -> RedditProviderResponseEvidence {
+    RedditProviderResponseEvidence {
+        status: response.status(),
+        body_digest: response.body_digest(),
+        observed_at: response.observed_at(),
+    }
+}
+
+fn provider_rejection_reason(response: &ProviderResponse) -> RedditRejectedReason {
+    if response.status() == 409 {
+        return RedditRejectedReason::DuplicateIdempotency;
+    }
+    match response.status() {
+        401 => RedditRejectedReason::CredentialRevoked,
+        403 => RedditRejectedReason::AuthorizationRequired,
+        _ => RedditRejectedReason::ProviderRejected,
     }
 }
 
@@ -2254,9 +2572,14 @@ where
         let mut matches = Vec::new();
         for thing in collect_things(&body) {
             let parsed = parse_thing(thing, fallback_subreddit, response.observed_at())?;
-            if let Some(readback) =
-                parse_publish_readback(&parsed, &draft.scope, draft.operation, draft, &response)?
-            {
+            if let Some(readback) = parse_publish_readback(
+                &parsed,
+                &draft.scope,
+                draft.operation,
+                draft,
+                &response,
+                receipt_hint,
+            )? {
                 matches.push(readback);
             }
         }
@@ -2279,21 +2602,7 @@ where
             RedditPublishOperation::Reply => reddit_url(&["api", "comment"], []),
         }
         .map_err(|_| TransportError::Unavailable)?;
-        let body = match draft.operation {
-            RedditPublishOperation::Post => json!({
-                "api_type": "json",
-                "kind": "self",
-                "resubmit": false,
-                "sr": draft.scope.subreddit.name().as_str(),
-                "text": draft.body,
-                "title": draft.title.as_deref().unwrap_or_default(),
-            }),
-            RedditPublishOperation::Reply => json!({
-                "api_type": "json",
-                "text": draft.body,
-                "thing_id": draft.scope.parent().map(RedditThingId::as_str).unwrap_or_default(),
-            }),
-        };
+        let body = publish_request_body(draft);
         let request = RedditEffectRequest::new(
             RedditQuotaOperation::Execute,
             HttpMethod::Post,
@@ -2307,33 +2616,68 @@ where
     }
 }
 
+fn publish_request_body(draft: &RedditPublishDraft) -> Value {
+    match draft.operation {
+        RedditPublishOperation::Post => json!({
+            "api_type": "json",
+            "kind": "self",
+            "resubmit": false,
+            "sr": draft.scope.subreddit.name().as_str(),
+            "text": draft.body,
+            "title": draft.title.as_deref().unwrap_or_default(),
+        }),
+        RedditPublishOperation::Reply => json!({
+            "api_type": "json",
+            "text": draft.body,
+            "thing_id": draft.scope.parent().map(RedditThingId::as_str).unwrap_or_default(),
+        }),
+    }
+}
+
+fn publish_request_digest(draft: &RedditPublishDraft) -> String {
+    digest_json(&json!({
+        "method": "POST",
+        "path": match draft.operation {
+            RedditPublishOperation::Post => "/api/submit",
+            RedditPublishOperation::Reply => "/api/comment",
+        },
+        "body": publish_request_body(draft),
+    }))
+}
+
 fn parse_publish_readback(
     parsed: &ParsedRedditThing,
     scope: &RedditEffectScope,
     operation: RedditPublishOperation,
     draft: &RedditPublishDraft,
     response: &ProviderResponse,
+    receipt_hint: Option<&RedditThingId>,
 ) -> Result<Option<RedditPublishReadback>, RedditEffectError> {
+    let receipt_hint_match = receipt_hint.is_some_and(|hint| hint == &parsed.fullname);
     if parsed.kind != operation.expected_kind()
         || parsed.subreddit_id.as_ref() != Some(scope.subreddit.subreddit_id())
         || parsed.subreddit_name.as_ref() != Some(scope.subreddit.name())
-        || parsed.body_digest != draft.content_digest
+        || (!receipt_hint_match && parsed.body_digest != draft.content_digest)
     {
         return Ok(None);
     }
     if operation == RedditPublishOperation::Post {
-        if parsed.parent_fullname.is_some()
-            || parsed.title_digest.as_deref() != draft.title.as_deref().map(digest_bytes).as_deref()
+        if !receipt_hint_match
+            && (parsed.parent_fullname.is_some()
+                || parsed.title_digest.as_deref()
+                    != draft.title.as_deref().map(digest_bytes).as_deref())
         {
             return Ok(None);
         }
-    } else if parsed.parent_fullname.as_ref() != scope.parent() {
+    } else if !receipt_hint_match && parsed.parent_fullname.as_ref() != scope.parent() {
         return Ok(None);
     }
-    let Some(AccountIdentity::Reddit(account)) = parsed.account.as_ref() else {
-        return Ok(None);
+    let account = match parsed.account.as_ref() {
+        Some(AccountIdentity::Reddit(account)) => account.clone(),
+        None if receipt_hint_match => scope.account().clone(),
+        _ => return Ok(None),
     };
-    if account != scope.account() {
+    if !receipt_hint_match && account != *scope.account() {
         return Ok(None);
     }
     let permalink = parsed
@@ -2344,7 +2688,7 @@ fn parse_publish_readback(
         operation,
         fullname: parsed.fullname.clone(),
         permalink,
-        account: account.clone(),
+        account,
         subreddit: RedditCommunityIdentity::new(
             parsed
                 .subreddit_id
@@ -2525,6 +2869,7 @@ where
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn execute(
         &mut self,
         draft: &RedditPublishDraft,
@@ -2541,32 +2886,70 @@ where
         match checkpoint.phase {
             RedditCheckpointPhase::Verified => {
                 let outcome = self.outcome_from_checkpoint(draft, ingress, checkpoint)?;
-                return Ok(RedditPublishDispatch::Verified(outcome));
+                return Ok(RedditPublishDispatch::Sent(outcome));
+            }
+            RedditCheckpointPhase::Rejected => {
+                return Ok(RedditPublishDispatch::Rejected(
+                    self.rejected_from_checkpoint(draft, ingress, checkpoint)?,
+                ));
             }
             RedditCheckpointPhase::Uncertain | RedditCheckpointPhase::ReceiptPending => {
-                return Err(RedditEffectError::TimeoutUncertain);
+                return Ok(RedditPublishDispatch::VerificationRequired(
+                    self.verification_required_from_checkpoint(draft, ingress, checkpoint)?,
+                ));
             }
             RedditCheckpointPhase::Executing => {
-                return Err(RedditEffectError::CheckpointNeedsRecovery);
+                checkpoint.phase = RedditCheckpointPhase::Uncertain;
+                checkpoint.terminal = Some(RedditTerminalState::VerificationRequired(
+                    RedditVerificationReason::ProcessCrashRecovery,
+                ));
+                return Ok(RedditPublishDispatch::VerificationRequired(
+                    self.verification_required_from_checkpoint(draft, ingress, checkpoint)?,
+                ));
             }
-            RedditCheckpointPhase::Prepared => {}
+            RedditCheckpointPhase::Prepared => {
+                if let Some(retry_after) = checkpoint.retry_after.as_ref() {
+                    if retry_after_is_active(retry_after, observed_at) {
+                        return Ok(RedditPublishDispatch::RetryAfter(retry_after.clone()));
+                    }
+                    checkpoint.retry_after = None;
+                }
+            }
         }
         credential.require(RedditScope::Submit, observed_at)?;
         let preflight = {
             self.reserve_checkpoint(RedditQuotaOperation::Reconcile, 1, observed_at, checkpoint)?;
-            self.provider
-                .reconcile(credential, draft, None, observed_at)?
+            match self
+                .provider
+                .reconcile(credential, draft, None, observed_at)
+            {
+                Ok(preflight) => preflight,
+                Err(error) => {
+                    if let Some(retry_after) =
+                        retry_after_from_error(draft.operation(), &error, observed_at)?
+                    {
+                        checkpoint.retry_after = Some(retry_after.clone());
+                        return Ok(RedditPublishDispatch::RetryAfter(retry_after));
+                    }
+                    return Err(error);
+                }
+            }
         };
         if preflight.matches().len() > 1 {
-            return Err(RedditEffectError::DuplicateIdempotency);
+            checkpoint.phase = RedditCheckpointPhase::Rejected;
+            checkpoint.terminal = Some(RedditTerminalState::Rejected(
+                RedditRejectedReason::DuplicateIdempotency,
+            ));
+            return Ok(RedditPublishDispatch::Rejected(
+                self.rejected_from_checkpoint(draft, ingress, checkpoint)?,
+            ));
         }
         if let Some(existing) = preflight.matches().first() {
-            let receipt = receipt_from_readback(draft, existing);
-            checkpoint.receipt = Some(receipt);
+            checkpoint.receipt = Some(receipt_from_readback(draft, existing));
             checkpoint.readback = Some(existing.clone());
-            checkpoint.phase = RedditCheckpointPhase::Verified;
-            let outcome = self.outcome_from_checkpoint(draft, ingress, checkpoint)?;
-            return Ok(RedditPublishDispatch::DuplicateIdempotency(outcome));
+            checkpoint.phase = RedditCheckpointPhase::ReceiptPending;
+            checkpoint.sent_reason = Some(RedditSentReason::ExistingIdempotencyMatch);
+            return self.finish_reconcile(draft, ingress, checkpoint, &preflight);
         }
         self.reserve_checkpoint(RedditQuotaOperation::Execute, 1, observed_at, checkpoint)?;
         checkpoint.phase = RedditCheckpointPhase::Executing;
@@ -2577,24 +2960,74 @@ where
             Ok(response) => response,
             Err(TransportError::Unavailable | TransportError::TimedOut) => {
                 checkpoint.phase = RedditCheckpointPhase::Uncertain;
-                return Err(RedditEffectError::TimeoutUncertain);
+                checkpoint.terminal = Some(RedditTerminalState::VerificationRequired(
+                    RedditVerificationReason::NetworkUncertain,
+                ));
+                return Ok(RedditPublishDispatch::VerificationRequired(
+                    self.verification_required_from_checkpoint(draft, ingress, checkpoint)?,
+                ));
             }
         };
+        checkpoint.last_provider_response = Some(response_evidence(&response));
         if response.status() == 429 {
             let retry = retry_after_receipt(draft.operation(), &response)?;
             checkpoint.phase = RedditCheckpointPhase::Prepared;
             checkpoint.retry_after = Some(retry.clone());
             return Ok(RedditPublishDispatch::RetryAfter(retry));
         }
-        if response.status() >= 400 {
-            checkpoint.phase = RedditCheckpointPhase::Prepared;
-            return Err(response_error(&response));
+        if response.status() >= 500 {
+            checkpoint.phase = RedditCheckpointPhase::ReceiptPending;
+            checkpoint.terminal = Some(RedditTerminalState::VerificationRequired(
+                RedditVerificationReason::UnknownProviderState,
+            ));
+            return Ok(RedditPublishDispatch::VerificationRequired(
+                self.verification_required_from_checkpoint(draft, ingress, checkpoint)?,
+            ));
         }
-        let receipt = parse_provider_receipt(&response, draft)?;
+        if response.status() >= 400 {
+            checkpoint.phase = RedditCheckpointPhase::Rejected;
+            checkpoint.terminal = Some(RedditTerminalState::Rejected(provider_rejection_reason(
+                &response,
+            )));
+            return Ok(RedditPublishDispatch::Rejected(
+                self.rejected_from_checkpoint(draft, ingress, checkpoint)?,
+            ));
+        }
+        let receipt = match parse_provider_receipt(&response, draft) {
+            Ok(receipt) => receipt,
+            Err(RedditEffectError::Adapter(ChannelAdapterError::ProviderRejected { .. })) => {
+                checkpoint.phase = RedditCheckpointPhase::Rejected;
+                checkpoint.terminal = Some(RedditTerminalState::Rejected(
+                    provider_rejection_reason(&response),
+                ));
+                return Ok(RedditPublishDispatch::Rejected(
+                    self.rejected_from_checkpoint(draft, ingress, checkpoint)?,
+                ));
+            }
+            Err(_) => {
+                checkpoint.phase = RedditCheckpointPhase::ReceiptPending;
+                checkpoint.terminal = Some(RedditTerminalState::VerificationRequired(
+                    RedditVerificationReason::ReceiptPending,
+                ));
+                return Ok(RedditPublishDispatch::VerificationRequired(
+                    self.verification_required_from_checkpoint(draft, ingress, checkpoint)?,
+                ));
+            }
+        };
         checkpoint.receipt = Some(receipt);
         checkpoint.phase = RedditCheckpointPhase::ReceiptPending;
-        self.reserve_checkpoint(RedditQuotaOperation::Reconcile, 1, observed_at, checkpoint)?;
-        let readback = self.provider.reconcile(
+        if self
+            .reserve_checkpoint(RedditQuotaOperation::Reconcile, 1, observed_at, checkpoint)
+            .is_err()
+        {
+            checkpoint.terminal = Some(RedditTerminalState::VerificationRequired(
+                RedditVerificationReason::UnknownProviderState,
+            ));
+            return Ok(RedditPublishDispatch::VerificationRequired(
+                self.verification_required_from_checkpoint(draft, ingress, checkpoint)?,
+            ));
+        }
+        let readback = match self.provider.reconcile(
             credential,
             draft,
             checkpoint
@@ -2602,7 +3035,12 @@ where
                 .as_ref()
                 .map(RedditProviderReceipt::fullname),
             observed_at,
-        )?;
+        ) {
+            Ok(readback) => readback,
+            Err(error) => {
+                return self.reconcile_error(draft, ingress, checkpoint, observed_at, error);
+            }
+        };
         self.finish_reconcile(draft, ingress, checkpoint, &readback)
     }
 
@@ -2617,12 +3055,35 @@ where
         validate_ingress_at(draft, ingress, credential, observed_at)?;
         validate_checkpoint(draft, ingress, credential, checkpoint)?;
         if checkpoint.phase == RedditCheckpointPhase::Verified {
-            return Ok(RedditPublishDispatch::Verified(
+            return Ok(RedditPublishDispatch::Sent(
                 self.outcome_from_checkpoint(draft, ingress, checkpoint)?,
             ));
         }
-        self.reserve_checkpoint(RedditQuotaOperation::Reconcile, 1, observed_at, checkpoint)?;
-        let scan = self.provider.reconcile(
+        if checkpoint.phase == RedditCheckpointPhase::Rejected {
+            return Ok(RedditPublishDispatch::Rejected(
+                self.rejected_from_checkpoint(draft, ingress, checkpoint)?,
+            ));
+        }
+        if let Some(retry_after) = checkpoint.retry_after.as_ref() {
+            if retry_after_is_active(retry_after, observed_at) {
+                return Ok(RedditPublishDispatch::RetryAfter(retry_after.clone()));
+            }
+            checkpoint.retry_after = None;
+        }
+        if let Err(error) =
+            self.reserve_checkpoint(RedditQuotaOperation::Reconcile, 1, observed_at, checkpoint)
+        {
+            if checkpoint.phase == RedditCheckpointPhase::Prepared {
+                return Err(error);
+            }
+            checkpoint.terminal = Some(RedditTerminalState::VerificationRequired(
+                RedditVerificationReason::UnknownProviderState,
+            ));
+            return Ok(RedditPublishDispatch::VerificationRequired(
+                self.verification_required_from_checkpoint(draft, ingress, checkpoint)?,
+            ));
+        }
+        let scan = match self.provider.reconcile(
             credential,
             draft,
             checkpoint
@@ -2630,20 +3091,59 @@ where
                 .as_ref()
                 .map(RedditProviderReceipt::fullname),
             observed_at,
-        )?;
+        ) {
+            Ok(scan) => scan,
+            Err(error) => {
+                return self.reconcile_error(draft, ingress, checkpoint, observed_at, error);
+            }
+        };
         if scan.matches().is_empty() {
             return if checkpoint.phase == RedditCheckpointPhase::Uncertain
                 || checkpoint.phase == RedditCheckpointPhase::ReceiptPending
             {
-                Err(RedditEffectError::TimeoutUncertain)
+                checkpoint.terminal = Some(RedditTerminalState::VerificationRequired(
+                    RedditVerificationReason::UnknownProviderState,
+                ));
+                Ok(RedditPublishDispatch::VerificationRequired(
+                    self.verification_required_from_checkpoint(draft, ingress, checkpoint)?,
+                ))
             } else {
                 Ok(RedditPublishDispatch::NoMatch)
             };
         }
         if scan.matches().len() > 1 {
-            return Err(RedditEffectError::DuplicateIdempotency);
+            checkpoint.phase = RedditCheckpointPhase::Rejected;
+            checkpoint.terminal = Some(RedditTerminalState::Rejected(
+                RedditRejectedReason::DuplicateIdempotency,
+            ));
+            return Ok(RedditPublishDispatch::Rejected(
+                self.rejected_from_checkpoint(draft, ingress, checkpoint)?,
+            ));
         }
         self.finish_reconcile(draft, ingress, checkpoint, &scan)
+    }
+
+    fn reconcile_error(
+        &mut self,
+        draft: &RedditPublishDraft,
+        ingress: &RedditApprovedEffectIngress,
+        checkpoint: &mut RedditPublishCheckpoint,
+        observed_at: DateTime<Utc>,
+        error: RedditEffectError,
+    ) -> Result<RedditPublishDispatch, RedditEffectError> {
+        if checkpoint.phase == RedditCheckpointPhase::Prepared {
+            return Err(error);
+        }
+        if let Some(retry_after) = retry_after_from_error(draft.operation(), &error, observed_at)? {
+            checkpoint.retry_after = Some(retry_after.clone());
+            return Ok(RedditPublishDispatch::RetryAfter(retry_after));
+        }
+        checkpoint.terminal = Some(RedditTerminalState::VerificationRequired(
+            RedditVerificationReason::UnknownProviderState,
+        ));
+        Ok(RedditPublishDispatch::VerificationRequired(
+            self.verification_required_from_checkpoint(draft, ingress, checkpoint)?,
+        ))
     }
 
     fn finish_reconcile(
@@ -2657,31 +3157,68 @@ where
             .matches()
             .first()
             .ok_or(RedditEffectError::ReadbackMismatch)?;
-        let receipt = checkpoint
+        let mut receipt = checkpoint
             .receipt
             .clone()
             .unwrap_or_else(|| receipt_from_readback(draft, readback));
+        if receipt.request_digest().is_empty() {
+            receipt.request_digest = publish_request_digest(draft);
+        }
+        checkpoint.receipt = Some(receipt.clone());
+        checkpoint.readback = Some(readback.clone());
+        if readback.moderation() == RedditModerationState::Unknown {
+            checkpoint.terminal = Some(RedditTerminalState::VerificationRequired(
+                RedditVerificationReason::UnknownModerationState,
+            ));
+            return Ok(RedditPublishDispatch::VerificationRequired(
+                self.verification_required_from_checkpoint(draft, ingress, checkpoint)?,
+            ));
+        }
+        if readback.moderation() != RedditModerationState::Visible
+            || readback.removal_reason().is_some()
+        {
+            checkpoint.phase = RedditCheckpointPhase::Rejected;
+            checkpoint.terminal = Some(RedditTerminalState::Rejected(
+                if readback.moderation() == RedditModerationState::DeletedByAuthor {
+                    RedditRejectedReason::Deleted
+                } else {
+                    RedditRejectedReason::Moderated
+                },
+            ));
+            return Ok(RedditPublishDispatch::Rejected(
+                self.rejected_from_checkpoint(draft, ingress, checkpoint)?,
+            ));
+        }
         if receipt.fullname() != readback.fullname()
             || receipt.permalink() != readback.permalink()
+            || receipt.operation() != draft.operation()
+            || receipt.idempotency_key() != draft.idempotency_key()
+            || receipt.draft_revision() != draft.draft_revision()
             || receipt.content_digest() != draft.content_digest()
+            || (!receipt.request_digest().is_empty()
+                && receipt.request_digest() != publish_request_digest(draft))
             || readback.body_digest() != draft.content_digest()
+            || readback.title_digest() != draft.title().map(digest_bytes).as_deref()
             || readback.operation() != draft.operation()
             || readback.account() != draft.scope().account()
             || readback.subreddit() != draft.scope().subreddit()
             || readback.parent() != draft.scope().parent()
         {
-            return Err(RedditEffectError::ReadbackMismatch);
+            checkpoint.terminal = Some(RedditTerminalState::VerificationRequired(
+                RedditVerificationReason::ReadbackMismatch,
+            ));
+            return Ok(RedditPublishDispatch::VerificationRequired(
+                self.verification_required_from_checkpoint(draft, ingress, checkpoint)?,
+            ));
         }
-        if readback.moderation() != RedditModerationState::Visible
-            || readback.removal_reason().is_some()
-        {
-            return Err(RedditEffectError::ModerationDrift);
-        }
-        checkpoint.receipt = Some(receipt);
-        checkpoint.readback = Some(readback.clone());
         checkpoint.phase = RedditCheckpointPhase::Verified;
+        checkpoint.retry_after = None;
+        checkpoint.terminal = None;
+        checkpoint
+            .sent_reason
+            .get_or_insert(RedditSentReason::ProviderReceiptVerified);
         let outcome = self.outcome_from_checkpoint(draft, ingress, checkpoint)?;
-        Ok(RedditPublishDispatch::Verified(outcome))
+        Ok(RedditPublishDispatch::Sent(outcome))
     }
 
     fn outcome_from_checkpoint(
@@ -2727,7 +3264,11 @@ where
             verification: RedditVerificationEvidence {
                 fullname: readback.fullname.clone(),
                 permalink: readback.permalink.clone(),
+                account: Some(readback.account.clone()),
+                subreddit: Some(readback.subreddit.clone()),
+                parent: readback.parent.clone(),
                 body_digest: readback.body_digest.clone(),
+                title_digest: readback.title_digest.clone(),
                 moderation: readback.moderation,
                 removal_reason: readback.removal_reason,
                 revision: readback.revision.clone(),
@@ -2736,6 +3277,88 @@ where
                 observed_at: readback.observed_at,
             },
             quota: self.quota.snapshot(readback.observed_at),
+            sent_reason: checkpoint.sent_reason.unwrap_or_default(),
+        })
+    }
+
+    fn rejected_from_checkpoint(
+        &self,
+        draft: &RedditPublishDraft,
+        ingress: &RedditApprovedEffectIngress,
+        checkpoint: &RedditPublishCheckpoint,
+    ) -> Result<RedditRejectedOutcome, RedditEffectError> {
+        let RedditTerminalState::Rejected(reason) = checkpoint
+            .terminal
+            .ok_or(RedditEffectError::IncompleteOutcome)?
+        else {
+            return Err(RedditEffectError::IncompleteOutcome);
+        };
+        Ok(RedditRejectedOutcome {
+            provenance: self.provider.provenance(),
+            operation: draft.operation,
+            scope: draft.scope.clone(),
+            effect_id: ingress.effect_id.clone(),
+            draft_revision: draft.draft_revision.clone(),
+            content_digest: draft.content_digest.clone(),
+            credential_generation: ingress.credential_generation,
+            authorization_digest: ingress.authorization_digest.clone(),
+            approval_revision: ingress.approval_revision.clone(),
+            reason,
+            receipt: checkpoint.receipt.clone(),
+            readback: checkpoint.readback.clone(),
+            provider_response: checkpoint.last_provider_response.clone(),
+            quota: self.quota.snapshot(
+                checkpoint
+                    .receipt
+                    .as_ref()
+                    .map_or(draft.prepared_at, RedditProviderReceipt::observed_at),
+            ),
+            observed_at: checkpoint
+                .readback
+                .as_ref()
+                .map_or(draft.prepared_at, RedditPublishReadback::observed_at),
+        })
+    }
+
+    fn verification_required_from_checkpoint(
+        &self,
+        draft: &RedditPublishDraft,
+        ingress: &RedditApprovedEffectIngress,
+        checkpoint: &RedditPublishCheckpoint,
+    ) -> Result<RedditVerificationRequiredOutcome, RedditEffectError> {
+        let RedditTerminalState::VerificationRequired(reason) =
+            checkpoint
+                .terminal
+                .unwrap_or(RedditTerminalState::VerificationRequired(
+                    RedditVerificationReason::UnknownProviderState,
+                ))
+        else {
+            return Err(RedditEffectError::IncompleteOutcome);
+        };
+        Ok(RedditVerificationRequiredOutcome {
+            provenance: self.provider.provenance(),
+            operation: draft.operation,
+            scope: draft.scope.clone(),
+            effect_id: ingress.effect_id.clone(),
+            draft_revision: draft.draft_revision.clone(),
+            content_digest: draft.content_digest.clone(),
+            credential_generation: ingress.credential_generation,
+            authorization_digest: ingress.authorization_digest.clone(),
+            approval_revision: ingress.approval_revision.clone(),
+            reason,
+            receipt: checkpoint.receipt.clone(),
+            readback: checkpoint.readback.clone(),
+            provider_response: checkpoint.last_provider_response.clone(),
+            quota: self.quota.snapshot(
+                checkpoint
+                    .receipt
+                    .as_ref()
+                    .map_or(draft.prepared_at, RedditProviderReceipt::observed_at),
+            ),
+            observed_at: checkpoint
+                .readback
+                .as_ref()
+                .map_or(draft.prepared_at, RedditPublishReadback::observed_at),
         })
     }
 
@@ -2885,6 +3508,7 @@ fn receipt_from_readback(
         idempotency_key: draft.idempotency_key.clone(),
         draft_revision: draft.draft_revision.clone(),
         content_digest: draft.content_digest.clone(),
+        request_digest: publish_request_digest(draft),
         provider_response_digest: readback.provider_response_digest.clone(),
         observed_at: readback.observed_at,
     }
@@ -2921,6 +3545,7 @@ fn parse_provider_receipt(
         idempotency_key: draft.idempotency_key.clone(),
         draft_revision: draft.draft_revision.clone(),
         content_digest: draft.content_digest.clone(),
+        request_digest: publish_request_digest(draft),
         provider_response_digest: response.body_digest(),
         observed_at: response.observed_at(),
     })
@@ -2994,9 +3619,45 @@ fn retry_after_receipt(
         rate_limit_remaining: response
             .header("x-ratelimit-remaining")
             .and_then(|value| value.trim().parse::<u64>().ok()),
-        provider_response_digest: response.body_digest(),
+        provider_response_digest: Some(response.body_digest()),
         observed_at: response.observed_at(),
     })
+}
+
+fn retry_after_from_error(
+    operation: RedditPublishOperation,
+    error: &RedditEffectError,
+    observed_at: DateTime<Utc>,
+) -> Result<Option<RedditRetryAfterReceipt>, RedditEffectError> {
+    let retry_after_seconds = match error {
+        RedditEffectError::Adapter(ChannelAdapterError::RateLimited {
+            retry_after_seconds,
+            ..
+        }) => *retry_after_seconds,
+        RedditEffectError::RateLimitWithoutReset => {
+            return Err(RedditEffectError::RateLimitWithoutReset);
+        }
+        _ => return Ok(None),
+    };
+    let Some(retry_after_seconds) = retry_after_seconds else {
+        return Err(RedditEffectError::RateLimitWithoutReset);
+    };
+    Ok(Some(RedditRetryAfterReceipt {
+        operation,
+        retry_after_seconds,
+        rate_limit_reset: None,
+        rate_limit_remaining: None,
+        provider_response_digest: None,
+        observed_at,
+    }))
+}
+
+fn retry_after_is_active(receipt: &RedditRetryAfterReceipt, observed_at: DateTime<Utc>) -> bool {
+    let seconds = i64::try_from(receipt.retry_after_seconds()).unwrap_or(i64::MAX);
+    receipt
+        .observed_at()
+        .checked_add_signed(Duration::seconds(seconds))
+        .is_some_and(|deadline| observed_at < deadline)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3083,9 +3744,17 @@ impl MissionRedditEffectConsumer {
             || outcome.authorization_digest() != ingress.authorization_digest()
             || outcome.approval_revision() != &self.capability.approval_revision
             || outcome.approval_revision() != ingress.approval_revision()
+            || outcome.receipt().operation() != draft.operation()
+            || outcome.receipt().idempotency_key() != draft.idempotency_key()
+            || outcome.receipt().draft_revision() != draft.draft_revision()
+            || outcome.receipt().request_digest() != publish_request_digest(draft)
             || outcome.receipt().fullname() != outcome.verification().fullname()
             || outcome.receipt().permalink() != outcome.verification().permalink()
             || outcome.receipt().content_digest() != outcome.verification().body_digest()
+            || outcome.verification().account() != Some(draft.scope().account())
+            || outcome.verification().subreddit() != Some(draft.scope().subreddit())
+            || outcome.verification().parent() != draft.scope().parent()
+            || outcome.verification().title_digest() != draft.title().map(digest_bytes).as_deref()
             || outcome.verification().moderation() != RedditModerationState::Visible
             || outcome.verification().removal_reason().is_some()
         {
@@ -3363,6 +4032,13 @@ mod tests {
     }
 
     fn info_readback(body: &str, removed: bool) -> ProviderResponse {
+        info_readback_with_category(body, removed.then_some("moderator"))
+    }
+
+    fn info_readback_with_category(
+        body: &str,
+        removed_by_category: Option<&str>,
+    ) -> ProviderResponse {
         let mut data = serde_json::json!({
             "name": "t3_post01",
             "subreddit_id": "t5_sub01",
@@ -3376,11 +4052,35 @@ mod tests {
             "locked": false,
             "archived": false,
         });
-        if removed {
-            data["removed_by_category"] = serde_json::json!("moderator");
+        if let Some(category) = removed_by_category {
+            data["removed_by_category"] = serde_json::json!(category);
         }
         let content = serde_json::json!({
             "data": [{"kind": "t3", "data": data}]
+        })
+        .to_string();
+        response(&content)
+    }
+
+    fn duplicate_post_listing() -> ProviderResponse {
+        let data = serde_json::json!({
+            "name": "t3_post01",
+            "subreddit_id": "t5_sub01",
+            "subreddit": "phaseone",
+            "author": "builder01",
+            "author_fullname": "t2_account01",
+            "selftext": "hello",
+            "title": "A title",
+            "permalink": "/r/phaseone/comments/post01/a-title/",
+            "edited": false,
+            "locked": false,
+            "archived": false,
+        });
+        let content = serde_json::json!({
+            "data": {"children": [
+                {"kind": "t3", "data": data.clone()},
+                {"kind": "t3", "data": data}
+            ]}
         })
         .to_string();
         response(&content)
@@ -3542,8 +4242,8 @@ mod tests {
         let dispatch = service
             .execute(&draft, &ingress, &credential, &mut checkpoint, now())
             .expect("approved post executes");
-        let RedditPublishDispatch::Verified(outcome) = dispatch else {
-            panic!("expected verified outcome");
+        let RedditPublishDispatch::Sent(outcome) = dispatch else {
+            panic!("expected sent outcome");
         };
         assert_eq!(checkpoint.phase(), RedditCheckpointPhase::Verified);
         assert_eq!(outcome.receipt().fullname().as_str(), "t3_post01");
@@ -3599,8 +4299,8 @@ mod tests {
         let dispatch = service
             .execute(&draft, &ingress, &credential, &mut checkpoint, now())
             .expect("approved reply executes");
-        let RedditPublishDispatch::Verified(outcome) = dispatch else {
-            panic!("expected verified reply");
+        let RedditPublishDispatch::Sent(outcome) = dispatch else {
+            panic!("expected sent reply");
         };
         assert_eq!(outcome.receipt().fullname().as_str(), "t1_comment01");
         assert_eq!(
@@ -3631,8 +4331,8 @@ mod tests {
         let dispatch = service
             .execute(&draft, &ingress, &credential, &mut checkpoint, now())
             .expect("post executes");
-        let RedditPublishDispatch::Verified(outcome) = dispatch else {
-            panic!("expected verified outcome");
+        let RedditPublishDispatch::Sent(outcome) = dispatch else {
+            panic!("expected sent outcome");
         };
         assert_eq!(
             outcome.provenance(),
@@ -3682,9 +4382,15 @@ mod tests {
         let ingress = ingress_for(&draft, &credential);
         let mut checkpoint =
             RedditPublishCheckpoint::new(&draft, &ingress).expect("checkpoint binds exact draft");
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("uncertain dispatch is durable");
+        let RedditPublishDispatch::VerificationRequired(verification) = dispatch else {
+            panic!("expected verification-required outcome");
+        };
         assert_eq!(
-            service.execute(&draft, &ingress, &credential, &mut checkpoint, now()),
-            Err(RedditEffectError::TimeoutUncertain)
+            verification.reason(),
+            RedditVerificationReason::NetworkUncertain
         );
         assert_eq!(checkpoint.phase(), RedditCheckpointPhase::Uncertain);
         let reopened = RedditPublishCheckpoint::reopen(
@@ -3699,7 +4405,13 @@ mod tests {
         let dispatch = service
             .reconcile(&draft, &ingress, &credential, &mut checkpoint, now())
             .expect("independent reconcile succeeds");
-        assert!(matches!(dispatch, RedditPublishDispatch::Verified(_)));
+        let RedditPublishDispatch::Sent(outcome) = dispatch else {
+            panic!("expected sent outcome after reconcile");
+        };
+        assert_eq!(
+            outcome.sent_reason(),
+            RedditSentReason::ProviderReceiptVerified
+        );
         assert_eq!(checkpoint.phase(), RedditCheckpointPhase::Verified);
         assert_eq!(
             service
@@ -3714,6 +4426,406 @@ mod tests {
     }
 
     #[test]
+    fn crash_ahead_reopen_is_verification_required_and_never_replays() {
+        let (mut service, credential) = prepare_service([]);
+        let draft = service
+            .prepare(&post_intent(), &credential, now())
+            .expect("draft prepares");
+        let ingress = ingress_for(&draft, &credential);
+        let mut checkpoint =
+            RedditPublishCheckpoint::new(&draft, &ingress).expect("checkpoint binds exact draft");
+        checkpoint.phase = RedditCheckpointPhase::Executing;
+        let mut checkpoint = RedditPublishCheckpoint::reopen(
+            checkpoint.durable_json().expect("checkpoint serializes"),
+        )
+        .expect("executing checkpoint reopens as uncertain");
+        assert_eq!(checkpoint.phase(), RedditCheckpointPhase::Uncertain);
+        assert_eq!(
+            checkpoint.terminal(),
+            Some(&RedditTerminalState::VerificationRequired(
+                RedditVerificationReason::ProcessCrashRecovery
+            ))
+        );
+
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("reopened checkpoint reports verification requirement");
+        let RedditPublishDispatch::VerificationRequired(verification) = dispatch else {
+            panic!("expected process-crash verification requirement");
+        };
+        assert_eq!(
+            verification.reason(),
+            RedditVerificationReason::ProcessCrashRecovery
+        );
+        assert_eq!(
+            service
+                .provider()
+                .transport()
+                .requests
+                .iter()
+                .filter(|request| request.method() == HttpMethod::Post)
+                .count(),
+            0
+        );
+
+        service
+            .provider_mut()
+            .transport_mut()
+            .push(Ok(post_listing("hello", false)));
+        let dispatch = service
+            .reconcile(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("independent readback closes the crash-ahead state");
+        assert!(matches!(dispatch, RedditPublishDispatch::Sent(_)));
+        assert_eq!(
+            service
+                .provider()
+                .transport()
+                .requests
+                .iter()
+                .filter(|request| request.method() == HttpMethod::Post)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn receipt_pending_requires_reconcile_without_replay() {
+        let (mut service, credential) =
+            prepare_service([Ok(empty_listing()), Ok(response("{}")), Ok(empty_listing())]);
+        let draft = service
+            .prepare(&post_intent(), &credential, now())
+            .expect("draft prepares");
+        let ingress = ingress_for(&draft, &credential);
+        let mut checkpoint =
+            RedditPublishCheckpoint::new(&draft, &ingress).expect("checkpoint binds exact draft");
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("missing provider receipt is durable");
+        let RedditPublishDispatch::VerificationRequired(verification) = dispatch else {
+            panic!("expected receipt-pending outcome");
+        };
+        assert_eq!(
+            verification.reason(),
+            RedditVerificationReason::ReceiptPending
+        );
+        assert!(verification.receipt().is_none());
+
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("receipt-pending execution must not replay");
+        let RedditPublishDispatch::VerificationRequired(verification) = dispatch else {
+            panic!("expected receipt-pending outcome on replay attempt");
+        };
+        assert_eq!(
+            verification.reason(),
+            RedditVerificationReason::ReceiptPending
+        );
+        let dispatch = service
+            .reconcile(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("empty readback is still verification-required");
+        let RedditPublishDispatch::VerificationRequired(verification) = dispatch else {
+            panic!("expected unknown-provider verification requirement");
+        };
+        assert_eq!(
+            verification.reason(),
+            RedditVerificationReason::UnknownProviderState
+        );
+        service
+            .provider_mut()
+            .transport_mut()
+            .push(Ok(info_readback("hello", false)));
+        let dispatch = service
+            .reconcile(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("exact readback closes the receipt-pending state");
+        assert!(matches!(dispatch, RedditPublishDispatch::Sent(_)));
+        assert_eq!(
+            service
+                .provider()
+                .transport()
+                .requests
+                .iter()
+                .filter(|request| request.method() == HttpMethod::Post)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn readback_mismatch_is_verification_required_and_replay_is_blocked() {
+        let (mut service, credential) = prepare_service([
+            Ok(empty_listing()),
+            Ok(submit_receipt()),
+            Ok(info_readback("different body", false)),
+        ]);
+        let draft = service
+            .prepare(&post_intent(), &credential, now())
+            .expect("draft prepares");
+        let ingress = ingress_for(&draft, &credential);
+        let mut checkpoint =
+            RedditPublishCheckpoint::new(&draft, &ingress).expect("checkpoint binds exact draft");
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("mismatched readback is durable");
+        let RedditPublishDispatch::VerificationRequired(verification) = dispatch else {
+            panic!("expected readback verification requirement");
+        };
+        assert_eq!(
+            verification.reason(),
+            RedditVerificationReason::ReadbackMismatch
+        );
+        assert!(verification.receipt().is_some());
+        assert!(verification.readback().is_some());
+
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("mismatch must not replay");
+        assert!(matches!(
+            dispatch,
+            RedditPublishDispatch::VerificationRequired(_)
+        ));
+        assert_eq!(
+            service
+                .provider()
+                .transport()
+                .requests
+                .iter()
+                .filter(|request| request.method() == HttpMethod::Post)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn provider_5xx_is_unknown_and_reconciles_without_replay() {
+        let (mut service, credential) = prepare_service([
+            Ok(empty_listing()),
+            Ok(response_with_headers(503, [], r#"{"error":"unavailable"}"#)),
+        ]);
+        let draft = service
+            .prepare(&post_intent(), &credential, now())
+            .expect("draft prepares");
+        let ingress = ingress_for(&draft, &credential);
+        let mut checkpoint =
+            RedditPublishCheckpoint::new(&draft, &ingress).expect("checkpoint binds exact draft");
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("provider 5xx is not replayable");
+        let RedditPublishDispatch::VerificationRequired(verification) = dispatch else {
+            panic!("expected unknown-provider verification requirement");
+        };
+        assert_eq!(
+            verification.reason(),
+            RedditVerificationReason::UnknownProviderState
+        );
+        assert_eq!(checkpoint.phase(), RedditCheckpointPhase::ReceiptPending);
+        assert_eq!(
+            checkpoint
+                .last_provider_response()
+                .map(RedditProviderResponseEvidence::status),
+            Some(503)
+        );
+
+        service
+            .provider_mut()
+            .transport_mut()
+            .push(Ok(post_listing("hello", false)));
+        let dispatch = service
+            .reconcile(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("independent readback closes provider unknown state");
+        assert!(matches!(dispatch, RedditPublishDispatch::Sent(_)));
+        assert_eq!(
+            service
+                .provider()
+                .transport()
+                .requests
+                .iter()
+                .filter(|request| request.method() == HttpMethod::Post)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_provider_matches_are_rejected_without_write() {
+        let (mut service, credential) = prepare_service([Ok(duplicate_post_listing())]);
+        let draft = service
+            .prepare(&post_intent(), &credential, now())
+            .expect("draft prepares");
+        let ingress = ingress_for(&draft, &credential);
+        let mut checkpoint =
+            RedditPublishCheckpoint::new(&draft, &ingress).expect("checkpoint binds exact draft");
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("duplicate provider state is terminal");
+        let RedditPublishDispatch::Rejected(rejected) = dispatch else {
+            panic!("expected duplicate rejection");
+        };
+        assert_eq!(
+            rejected.reason(),
+            RedditRejectedReason::DuplicateIdempotency
+        );
+        assert_eq!(checkpoint.phase(), RedditCheckpointPhase::Rejected);
+        assert_eq!(
+            service
+                .provider()
+                .transport()
+                .requests
+                .iter()
+                .filter(|request| request.method() == HttpMethod::Post)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn deleted_and_unknown_moderation_states_never_become_sent() {
+        let (mut service, credential) = prepare_service([
+            Ok(empty_listing()),
+            Ok(submit_receipt()),
+            Ok(info_readback_with_category("[deleted]", Some("author"))),
+        ]);
+        let draft = service
+            .prepare(&post_intent(), &credential, now())
+            .expect("draft prepares");
+        let ingress = ingress_for(&draft, &credential);
+        let mut checkpoint =
+            RedditPublishCheckpoint::new(&draft, &ingress).expect("checkpoint binds exact draft");
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("deleted readback is terminal");
+        let RedditPublishDispatch::Rejected(rejected) = dispatch else {
+            panic!("expected deleted rejection");
+        };
+        assert_eq!(rejected.reason(), RedditRejectedReason::Deleted);
+        assert_eq!(checkpoint.phase(), RedditCheckpointPhase::Rejected);
+
+        let (mut service, credential) = prepare_service([
+            Ok(empty_listing()),
+            Ok(submit_receipt()),
+            Ok(info_readback_with_category("hello", Some("unknown"))),
+        ]);
+        let draft = service
+            .prepare(&post_intent(), &credential, now())
+            .expect("draft prepares");
+        let ingress = ingress_for(&draft, &credential);
+        let mut checkpoint =
+            RedditPublishCheckpoint::new(&draft, &ingress).expect("checkpoint binds exact draft");
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("unknown moderation is verification-required");
+        let RedditPublishDispatch::VerificationRequired(verification) = dispatch else {
+            panic!("expected unknown moderation verification requirement");
+        };
+        assert_eq!(
+            verification.reason(),
+            RedditVerificationReason::UnknownModerationState
+        );
+        assert_eq!(checkpoint.phase(), RedditCheckpointPhase::ReceiptPending);
+    }
+
+    #[test]
+    fn readback_rate_limit_preserves_receipt_and_allows_only_reconcile() {
+        let (mut service, credential) = prepare_service([
+            Ok(empty_listing()),
+            Ok(submit_receipt()),
+            Ok(response_with_headers(
+                429,
+                [("retry-after", "9")],
+                r#"{"error":"RATELIMIT"}"#,
+            )),
+        ]);
+        let draft = service
+            .prepare(&post_intent(), &credential, now())
+            .expect("draft prepares");
+        let ingress = ingress_for(&draft, &credential);
+        let mut checkpoint =
+            RedditPublishCheckpoint::new(&draft, &ingress).expect("checkpoint binds exact draft");
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("readback rate limit is retryable");
+        let RedditPublishDispatch::RetryAfter(retry) = dispatch else {
+            panic!("expected readback retry receipt");
+        };
+        assert_eq!(retry.retry_after_seconds(), 9);
+        assert!(checkpoint.receipt().is_some());
+        assert_eq!(checkpoint.phase(), RedditCheckpointPhase::ReceiptPending);
+        service
+            .provider_mut()
+            .transport_mut()
+            .push(Ok(info_readback("hello", false)));
+        let dispatch = service
+            .reconcile(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("retry-after is durable and enforced");
+        assert!(matches!(dispatch, RedditPublishDispatch::RetryAfter(_)));
+        let dispatch = service
+            .reconcile(
+                &draft,
+                &ingress,
+                &credential,
+                &mut checkpoint,
+                now() + Duration::seconds(9),
+            )
+            .expect("later independent readback succeeds");
+        assert!(matches!(dispatch, RedditPublishDispatch::Sent(_)));
+        assert_eq!(
+            service
+                .provider()
+                .transport()
+                .requests
+                .iter()
+                .filter(|request| request.method() == HttpMethod::Post)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn quota_exhaustion_after_provider_write_requires_recovery() {
+        let responses = [Ok(me()), Ok(about()), Ok(rules()), Ok(requirements())]
+            .into_iter()
+            .chain([Ok(empty_listing()), Ok(submit_receipt())]);
+        let provider = RedditApprovedDataApiProvider::new(ScriptedTransport::new(responses));
+        let mut service = ChannelPublishService::with_quota(
+            provider,
+            RedditEffectQuotaLedger::new(6).expect("fixture quota is positive"),
+        );
+        let credential = fixture_credential(1, all_scopes());
+        let draft = service
+            .prepare(&post_intent(), &credential, now())
+            .expect("draft prepares");
+        let ingress = ingress_for(&draft, &credential);
+        let mut checkpoint =
+            RedditPublishCheckpoint::new(&draft, &ingress).expect("checkpoint binds exact draft");
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("quota exhaustion after write is not replayable");
+        let RedditPublishDispatch::VerificationRequired(verification) = dispatch else {
+            panic!("expected quota recovery verification requirement");
+        };
+        assert_eq!(
+            verification.reason(),
+            RedditVerificationReason::UnknownProviderState
+        );
+        assert!(verification.receipt().is_some());
+        assert_eq!(checkpoint.phase(), RedditCheckpointPhase::ReceiptPending);
+
+        service
+            .provider_mut()
+            .transport_mut()
+            .push(Ok(info_readback("hello", false)));
+        let dispatch = service
+            .reconcile(
+                &draft,
+                &ingress,
+                &credential,
+                &mut checkpoint,
+                now() + Duration::minutes(1),
+            )
+            .expect("quota window reset permits independent recovery");
+        assert!(matches!(dispatch, RedditPublishDispatch::Sent(_)));
+    }
+
+    #[test]
     fn duplicate_preflight_adopts_exact_existing_object_without_write() {
         let (mut service, credential) = prepare_service([Ok(post_listing("hello", false))]);
         let draft = service
@@ -3725,10 +4837,42 @@ mod tests {
         let dispatch = service
             .execute(&draft, &ingress, &credential, &mut checkpoint, now())
             .expect("duplicate is reconciled");
-        assert!(matches!(
-            dispatch,
-            RedditPublishDispatch::DuplicateIdempotency(_)
-        ));
+        let RedditPublishDispatch::Sent(outcome) = dispatch else {
+            panic!("expected sent outcome from exact idempotency match");
+        };
+        assert_eq!(
+            outcome.sent_reason(),
+            RedditSentReason::ExistingIdempotencyMatch
+        );
+        assert_eq!(
+            service
+                .provider()
+                .transport()
+                .requests
+                .iter()
+                .filter(|request| request.method() == HttpMethod::Post)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn duplicate_preflight_removed_object_is_rejected_not_sent() {
+        let (mut service, credential) = prepare_service([Ok(post_listing("hello", true))]);
+        let draft = service
+            .prepare(&post_intent(), &credential, now())
+            .expect("draft prepares");
+        let ingress = ingress_for(&draft, &credential);
+        let mut checkpoint =
+            RedditPublishCheckpoint::new(&draft, &ingress).expect("checkpoint binds exact draft");
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("moderated preflight is terminal");
+        let RedditPublishDispatch::Rejected(rejected) = dispatch else {
+            panic!("expected moderated rejection");
+        };
+        assert_eq!(rejected.reason(), RedditRejectedReason::Moderated);
+        assert_eq!(checkpoint.phase(), RedditCheckpointPhase::Rejected);
         assert_eq!(
             service
                 .provider()
@@ -3827,10 +4971,13 @@ mod tests {
         let ingress = ingress_for(&draft, &credential);
         let mut checkpoint =
             RedditPublishCheckpoint::new(&draft, &ingress).expect("checkpoint binds exact draft");
-        assert_eq!(
-            service.execute(&draft, &ingress, &credential, &mut checkpoint, now()),
-            Err(RedditEffectError::ModerationDrift)
-        );
+        let dispatch = service
+            .execute(&draft, &ingress, &credential, &mut checkpoint, now())
+            .expect("moderation is a terminal rejected outcome");
+        let RedditPublishDispatch::Rejected(rejected) = dispatch else {
+            panic!("expected rejected outcome");
+        };
+        assert_eq!(rejected.reason(), RedditRejectedReason::Moderated);
         assert_eq!(
             RedditRealEffectGate::from_environment_values(None, None, None, None),
             Err(RedditEffectError::BlockedEnvironment(
