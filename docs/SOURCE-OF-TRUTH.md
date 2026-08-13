@@ -20,6 +20,7 @@
 | 十二条 Mission 的机器合同 | `/contracts/missions/catalog.v1.json`，由 `hartevo-catalog` 校验 |
 | Application route 是否真正有生产 handler | `/contracts/application-handlers/catalog.v1.json`；缺席即 `NOT_IMPLEMENTED`，注册项必须同时存在于当前二进制 |
 | Capability 与 Provider 当前状态 | `/contracts/capabilities/catalog.v1.json`、`/contracts/providers/catalog.v1.json` |
+| Paid-social provider read boundary | `/contracts/providers/paid-social-read.v1.json`；E1 contract，central Capability/Mission registration deferred until reverse mapping exists |
 | 420+180 数据集结构与私有隔离 | `/contracts/datasets/registry.v1.json` 与 `/docs/quality/DATASET-REGISTRY-AND-ISOLATION.md` |
 | 从本地到 E5 的验证顺序 | `/docs/quality/DEVELOPMENT-VALIDATION-LADDER.md` |
 | 当前 checkpoint 内容实际运行过什么、哪些环境被阻塞 | `/docs/quality/CURRENT-WORKTREE-EVIDENCE.md`；它不能把 Release baseline 改为通过 |

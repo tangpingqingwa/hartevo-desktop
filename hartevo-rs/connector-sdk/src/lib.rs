@@ -8,6 +8,25 @@
 //! `hartevo-effect-broker` provider contract types; this crate does not create
 //! a second authority model.
 
+pub mod http;
+pub mod paid_social;
+pub mod paid_social_types;
+
+pub use paid_social::{
+    InstagramLoginMode, LinkedInAdapter, LinkedInConfig, MetaAdapter, MetaConfig,
+    PaidSocialProvider, XAdsAdapter, XAdsConfig,
+};
+pub use paid_social_types::{
+    AttributionSelection, CausalStatus, CredentialResolver, Granularity,
+    InMemoryCredentialResolver, InsightLevel, InsightsQuery, OAuth1Credentials, ObservationRecord,
+    PaidSocialReadAdapter, ProviderAttribution, RateLimitObservation, ReadCommand, ReadSurface,
+    ResourceKind, ReviewState, SecretString,
+};
+pub use paid_social_types::{
+    ConnectorError as PaidSocialConnectorError, ReadObservation as PaidSocialReadObservation,
+    ReadRequest as PaidSocialReadRequest,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -294,7 +313,11 @@ impl CredentialLease {
         Ok(())
     }
 
-    fn validate(&self, secret: &SecretReference, now: DateTime<Utc>) -> Result<(), ConnectorError> {
+    pub fn validate_for(
+        &self,
+        secret: &SecretReference,
+        now: DateTime<Utc>,
+    ) -> Result<(), ConnectorError> {
         if secret.is_revoked_at(now)
             || self.scope != *secret.scope()
             || self.secret_reference_id != secret.reference_id()
@@ -419,7 +442,7 @@ impl AuthSession {
         lease: &CredentialLease,
         now: DateTime<Utc>,
     ) -> Result<(), ConnectorError> {
-        lease.validate(secret, now)?;
+        lease.validate_for(secret, now)?;
         if self.scope != *lease.scope()
             || self.adapter != *lease.adapter()
             || self.credential_revision != lease.credential_revision()
@@ -774,7 +797,7 @@ impl ConnectorAuth {
             expires_at,
             revoked_at: None,
         };
-        lease.validate(secret, issued_at)?;
+        lease.validate_for(secret, issued_at)?;
         Ok(lease)
     }
 
@@ -786,7 +809,7 @@ impl ConnectorAuth {
         issued_at: DateTime<Utc>,
         expires_at: DateTime<Utc>,
     ) -> Result<AuthSession, ConnectorError> {
-        lease.validate(secret, issued_at)?;
+        lease.validate_for(secret, issued_at)?;
         let session = AuthSession {
             session_id: session_id.into(),
             scope: lease.scope.clone(),

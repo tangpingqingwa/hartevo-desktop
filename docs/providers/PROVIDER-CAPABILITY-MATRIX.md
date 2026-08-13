@@ -48,6 +48,15 @@ revoke
 
 Provider 返回只形成候选事实或 Receipt；它不能直接写 Mission 业务状态。所有 Domain 变化经过 Application Service，所有外部写入经过 Effect Broker。
 
+PAID-SOCIAL-01 的当前切片把 Meta Marketing/Instagram、X Ads、LinkedIn Marketing 的
+`paid_social.read` 统一到 `hartevo-paid-social-read-observation/v1`。它只保留 provider
+identity、账号/实体/insight 事实、provider attribution model、权限、review state、rate-limit
+和 provenance；不把平台 attribution 解释为因果结论。三家 Provider 在机器 Catalog 中仍是
+`target_contract`/E0，组件级适配器证据为 E1；没有生产凭据、受控账号或独立 readback 时不得显示
+Connected、Provider receipt、业务成功或 Release 完成。写入策略保持关闭，直到 exact approval、
+provider receipt 和独立只读 readback 同时存在。中央 Capability/Mission route registration 仍待
+独立 route 与 reverse mapping 一起落地，不因这份 E1 contract 提前增加 catalog capability。
+
 ## 4. 标准合同测试
 
 完整 read/write/webhook Adapter 至少运行 37 个场景：Auth 7、Read 7、Write 10、Webhook 7、Data/Security 6。不适用场景要写明原因，不能 `skip`。

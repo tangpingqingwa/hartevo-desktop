@@ -16,6 +16,12 @@ Commit：以 `git rev-parse HEAD` 返回的 checkpoint commit 为准；文档不
 
 执行 `bash scripts/check-evidence-doc-truth.sh verify` 会从 Git object 复核 EV-03M original child/source 关系和 raw manifest digest、从固定 source baseline 复核 B2/B2P commit/file/代码锚点，并要求以上 Claim ID 投影逐字存在。该门禁本身不执行 native visual、AX、真实进程 restart/reconnect 或 Release evaluation。
 
+## PAID-SOCIAL-01 读边界（当前切片）
+
+- `contracts/providers/paid-social-read.v1.json` 定义 `paid_social.read` 的 E1 metadata contract；central Capability/Provider catalog registration remains deferred until a Mission route and reverse mapping are added, so the existing 48-capability catalog contract stays unchanged. 这不是 Connected、Provider receipt、业务验证或 E4 claim。
+- `hartevo-rs/connector-sdk` 复用 CONN-01 的 tenant/project/provider/account scope、opaque SecretReference、900 秒以内 credential lease、provider provenance 和 Effect Broker authority；`paid_social_types` 只增加 connection binding 与 provider-specific permission/review/rate-limit metadata，输出 `hartevo-paid-social-read-observation/v1`。Meta Marketing/Instagram、X Ads、LinkedIn Marketing 通过同一 read boundary；Meta 的 bearer credentialed path 和 Instagram login-specific scopes 已有组件测试，X 保留 OAuth 1.0a 与 account/user rate headers，LinkedIn 保留 `adAnalytics` 无分页语义。
+- 当前 13 个 connector-sdk tests 使用 deterministic transport/testkit；它们证明请求构造、credential resolution、parser、pagination、redaction、preflight permission denial 和 causal `not_claimed` boundary，不证明真实生产账号、真实 OAuth/Review、受控 Provider、读回或完整 Adapter E4。没有生产 secret 写入仓库，write gate 对三家 Provider 均 fail closed；Release 仍为 `passed=false`。
+
 ## 历史自动门禁（repair 后未重跑）
 
 - `cargo fmt --all -- --check`：通过。

@@ -26,6 +26,7 @@ repository = "https://github.com/tangpingqingwa/hartevo-desktop"
 
 [workspace.dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 command-group = "5.0.1"
 command-fds = "0.3.3"
@@ -38,6 +39,7 @@ loom = "0.7.2"
 os_pipe = "1.2.3"
 proptest = "1.11.0"
 ring = "0.17.14"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rusqlite = { version = "0.38", features = ["backup", "bundled-sqlcipher-vendored-openssl"] }
 rust_decimal = { version = "1.39", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }

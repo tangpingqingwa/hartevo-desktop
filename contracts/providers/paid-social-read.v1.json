@@ -1,0 +1,142 @@
+{
+  "schemaVersion": "hartevo-paid-social-read-contract/v1",
+  "contractVersion": "paid-social-read-e1/v1",
+  "evidenceLevel": "E1",
+  "capabilityId": "paid_social.read",
+  "catalogRegistration": "deferred_until_mission_route_and_reverse_mapping",
+  "claimAuthority": {
+    "connected": false,
+    "providerExecution": false,
+    "providerReceipt": false,
+    "businessVerification": false,
+    "e4": false
+  },
+  "observationBoundary": {
+    "schema": "hartevo-paid-social-read-observation/v1",
+    "scope": ["tenant", "project", "connection", "provider", "account"],
+    "secretMaterial": "opaque_reference_only",
+    "rawPayloadPersistence": "digest_only_for_nested_values",
+    "causalAttribution": "never_claimed",
+    "provenanceClasses": ["fixture", "component_harness", "controlled_provider", "production_provider"]
+  },
+  "writePolicy": {
+    "enabled": false,
+    "requiresExactApproval": true,
+    "requiresProviderReceipt": true,
+    "requiresIndependentReadback": true,
+    "completionAuthority": "forbidden_until_all_three_evidence_classes_exist"
+  },
+  "providers": [
+    {
+      "id": "meta",
+      "status": "target_contract",
+      "surfaces": ["marketing", "instagram"],
+      "auth": {
+        "mode": "oauth2_bearer",
+        "marketingScopes": ["ads_read"],
+        "instagramFacebookLoginScopes": ["instagram_basic", "instagram_manage_insights", "pages_read_engagement"],
+        "instagramLoginScopes": ["instagram_business_basic", "instagram_business_manage_insights"],
+        "reviewState": "external_approval_required"
+      },
+      "rateLimits": {
+        "model": "business_use_case_and_ad_account_usage",
+        "fixedLimit": false,
+        "evidenceHeaders": ["X-Business-Use-Case-Usage", "X-Ad-Account-Usage", "X-App-Usage"]
+      },
+      "attribution": {
+        "models": ["meta_ads_insights", "instagram_period_metric"],
+        "windowsMustBePreserved": true,
+        "accountAttributionSettingMustBePreserved": true,
+        "causalClaim": false
+      },
+      "readEndpoints": {
+        "marketingAccount": "GET /{version}/act_{account_id}",
+        "marketingEntities": "GET /{version}/act_{account_id}/{campaigns|adsets|ads|adcreatives}",
+        "marketingInsights": "GET /{version}/act_{account_id}/insights",
+        "instagramAccount": "GET /{version}/{instagram_business_account_id}",
+        "instagramMedia": "GET /{version}/{instagram_business_account_id}/media",
+        "instagramInsights": "GET /{version}/{instagram_business_account_id}/insights"
+      },
+      "graphHosts": {
+        "facebookLogin": "https://graph.facebook.com",
+        "instagramLogin": "https://graph.instagram.com"
+      },
+      "officialReferences": [
+        "https://developers.facebook.com/docs/marketing-api/insights-api",
+        "https://www.postman.com/meta/facebook/request/1y1c1n6/instagram-api-with-instagram-login"
+      ]
+    },
+    {
+      "id": "x",
+      "status": "target_contract",
+      "surfaces": ["ads"],
+      "auth": {
+        "mode": "oauth1a",
+        "normalizedRequirements": ["x_ads_api.standard_access", "x_ads_api.analytics_read"],
+        "reviewState": "application_and_account_access_required"
+      },
+      "rateLimits": {
+        "model": "user_and_account_headers",
+        "fixedLimit": false,
+        "evidenceHeaders": ["x-rate-limit-limit", "x-rate-limit-remaining", "x-rate-limit-reset", "x-account-rate-limit-limit", "x-account-rate-limit-remaining", "x-account-rate-limit-reset", "retry-after"]
+      },
+      "attribution": {
+        "models": ["x_ads_analytics"],
+        "windowsMustBePreserved": false,
+        "analyticsFinalizationMayChangeValues": true,
+        "causalClaim": false
+      },
+      "readEndpoints": {
+        "account": "GET /{version}/accounts/{account_id}",
+        "entities": "GET /{version}/accounts/{account_id}/{campaigns|line_items|promoted_tweets}",
+        "analytics": "GET /{version}/stats/accounts/{account_id}"
+      },
+      "pagination": {
+        "entities": "opaque next_cursor",
+        "analytics": "not_supported"
+      },
+      "officialReferences": [
+        "https://docs.x.com/x-ads-api/fundamentals/making-authenticated-requests",
+        "https://docs.x.com/x-ads-api/fundamentals/rate-limiting",
+        "https://docs.x.com/x-ads-api/analytics"
+      ]
+    },
+    {
+      "id": "linkedin",
+      "status": "target_contract",
+      "surfaces": ["ads"],
+      "auth": {
+        "mode": "oauth2_bearer",
+        "scopes": ["r_ads", "r_ads_reporting"],
+        "reviewState": "application_and_member_access_required"
+      },
+      "rateLimits": {
+        "model": "application_and_member_daily_quota",
+        "fixedLimit": false,
+        "reset": "midnight_utc",
+        "evidenceHeaders": ["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"]
+      },
+      "attribution": {
+        "models": ["linkedin_ad_analytics"],
+        "finder": "adAnalytics",
+        "windowsMustBePreserved": true,
+        "metricDelayOrApproximation": true,
+        "causalClaim": false
+      },
+      "readEndpoints": {
+        "account": "GET /rest/adAccounts/{account_id}",
+        "entities": "GET /rest/{adCampaigns|adCampaignGroups|adCreatives}",
+        "analytics": "GET /rest/adAnalytics"
+      },
+      "pagination": {
+        "adAnalytics": "not_supported",
+        "entitySearch": "provider_paging_metadata_only"
+      },
+      "officialReferences": [
+        "https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/getting-started",
+        "https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting",
+        "https://learn.microsoft.com/en-us/linkedin/shared/api-guide/concepts/rate-limits"
+      ]
+    }
+  ]
+}
