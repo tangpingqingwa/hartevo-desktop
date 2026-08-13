@@ -5090,7 +5090,6 @@ body.resizing-workpad {
 .selected-result-actions { flex-wrap: wrap; }
 .selected-result-actions .quiet-button { min-height: 28px; }
 .selected-result-actions small { margin-left: auto; color: #96979b; font-size: 8px; }
-.selected-result-reject:not(:disabled) { color: #9a5e5e; }
 .selected-result-actions button:disabled { cursor: not-allowed; opacity: .48; }
 
 @media (max-width: 620px) {

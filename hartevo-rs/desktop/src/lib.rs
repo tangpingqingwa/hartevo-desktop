@@ -1539,12 +1539,6 @@ pub fn App() -> Element {
                 selected_result_id.set(Some(binding.result_id));
                 workpad_open.set(true);
             }
-            ResultSurfaceAction::Reject(_) => {
-                model.write().notice = Some(UiFailure {
-                    code: "NOT_IMPLEMENTED".into(),
-                    message: "当前版本尚无 Reject WorkProduct 的 typed Application consumer；未改变正文、证据或状态。".into(),
-                });
-            }
             ResultSurfaceAction::Adopt(binding) => {
                 if result_action_pending() {
                     return;
@@ -5390,14 +5384,7 @@ fn SelectedResultSurface(
     on_action: EventHandler<ResultSurfaceAction>,
 ) -> Element {
     let adopt_enabled = result.can_adopt() && !action_pending;
-    let reject_enabled = result.can_adopt() && !action_pending;
-    let reject_contract_label = if SelectedResultProjection::reject_is_available() {
-        "REJECT_AVAILABLE"
-    } else {
-        "REJECT_NOT_IMPLEMENTED"
-    };
     let adopt_action = result.adopt_action();
-    let reject_action = result.reject_action();
     let open_action = result.open_artifact_action();
     let status_label = work_product_status_label(&result.adoption_status);
     let evidence_label = result.evidence.label();
@@ -5427,15 +5414,6 @@ fn SelectedResultSurface(
                     onclick: move |_| on_action.call(adopt_action.clone()),
                     UiIcon { name: UiIconName::Check, size: 13 }
                     if action_pending { "采用中…" } else { "采用" }
-                }
-                button {
-                    class: "quiet-button selected-result-reject",
-                    disabled: !reject_enabled,
-                    aria_label: "拒绝当前结果（当前版本未接入 typed consumer）",
-                    title: "{reject_contract_label} · 当前版本尚无 Reject WorkProduct typed consumer；点击后不会改变持久状态",
-                    onclick: move |_| on_action.call(reject_action.clone()),
-                    UiIcon { name: UiIconName::X, size: 13 }
-                    "拒绝"
                 }
                 button {
                     class: "quiet-button",

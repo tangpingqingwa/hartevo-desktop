@@ -80,21 +80,19 @@ impl fmt::Debug for ResultBinding {
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) enum ResultSurfaceAction {
     Adopt(ResultBinding),
-    Reject(ResultBinding),
     OpenArtifact(ResultBinding),
 }
 
 impl ResultSurfaceAction {
     pub(crate) fn binding(&self) -> &ResultBinding {
         match self {
-            Self::Adopt(binding) | Self::Reject(binding) | Self::OpenArtifact(binding) => binding,
+            Self::Adopt(binding) | Self::OpenArtifact(binding) => binding,
         }
     }
 
     pub(crate) const fn label(&self) -> &'static str {
         match self {
             Self::Adopt(_) => "ADOPT",
-            Self::Reject(_) => "REJECT",
             Self::OpenArtifact(_) => "OPEN_ARTIFACT",
         }
     }
@@ -147,23 +145,12 @@ impl SelectedResultProjection {
         ResultSurfaceAction::Adopt(self.binding.clone())
     }
 
-    pub(crate) fn reject_action(&self) -> ResultSurfaceAction {
-        ResultSurfaceAction::Reject(self.binding.clone())
-    }
-
     pub(crate) fn open_artifact_action(&self) -> ResultSurfaceAction {
         ResultSurfaceAction::OpenArtifact(self.binding.clone())
     }
 
     pub(crate) const fn can_adopt(&self) -> bool {
         matches!(self.adoption_status, WorkProductStatus::ReadyForReview)
-    }
-
-    pub(crate) const fn reject_is_available() -> bool {
-        // No RejectWorkProduct Application consumer exists in this baseline.
-        // Keep the action visible as an honest boundary, but never pretend a
-        // disabled/unsupported action changed durable state.
-        false
     }
 
     pub(crate) const fn provenance_label() -> &'static str {
@@ -396,11 +383,12 @@ mod tests {
     }
 
     #[test]
-    fn adopt_is_only_available_for_reviewable_result_and_reject_is_explicitly_unavailable() {
+    fn adopt_and_open_are_the_only_supported_result_actions() {
         let (project, mission) = project_and_mission(WorkProductStatus::ReadyForReview);
         let selected = selected_result_projection(&project, &mission, None).expect("result");
         assert!(selected.can_adopt());
-        assert!(!SelectedResultProjection::reject_is_available());
+        assert_eq!(selected.adopt_action().label(), "ADOPT");
+        assert_eq!(selected.open_artifact_action().label(), "OPEN_ARTIFACT");
         let accepted_mission = {
             let mut copy = mission.clone();
             copy.work_products[0].adoption_status = WorkProductStatus::Accepted;
