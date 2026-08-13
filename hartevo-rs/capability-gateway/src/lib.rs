@@ -51,6 +51,7 @@ pub const CAPABILITY_MANIFEST_SCHEMA: &str = "hartevo.capability-manifest/v1";
 pub const CAPABILITY_REQUEST_SCHEMA: &str = "hartevo.capability-request/v1";
 pub const CAPABILITY_RESULT_SCHEMA: &str = "hartevo.capability-result/v1";
 pub const CAPABILITY_RECOVERY_SCHEMA: &str = "hartevo.capability-recovery/v1";
+pub const CAPABILITY_EXECUTION_SCHEMA: &str = "hartevo.capability-execution/v1";
 pub const ADAPTER_REGISTRY_SCHEMA: &str = "hartevo.capability-adapter-registry/v1";
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_PROVENANCE_LINKS: usize = 8;
@@ -360,6 +361,19 @@ pub struct BudgetUse {
 }
 
 impl BudgetUse {
+    fn zero_like(&self) -> Self {
+        Self {
+            request_bytes: 0,
+            result_bytes: 0,
+            estimated_tokens: 0,
+            estimated_cost: CostLimit {
+                amount_minor: 0,
+                currency: self.estimated_cost.currency.clone(),
+            },
+            external_effect_count: 0,
+        }
+    }
+
     fn validate_against(&self, budget: &BudgetAuthority) -> Result<(), GatewayError> {
         self.estimated_cost.validate()?;
         if self.request_bytes > budget.max_request_bytes
@@ -371,6 +385,38 @@ impl BudgetUse {
             return Err(GatewayError::BudgetExceeded);
         }
         Ok(())
+    }
+
+    pub fn checked_add(&self, other: &Self) -> Result<Self, GatewayError> {
+        if self.estimated_cost.currency != other.estimated_cost.currency {
+            return Err(GatewayError::InvalidBudget);
+        }
+        Ok(Self {
+            request_bytes: self
+                .request_bytes
+                .checked_add(other.request_bytes)
+                .ok_or(GatewayError::BudgetExceeded)?,
+            result_bytes: self
+                .result_bytes
+                .checked_add(other.result_bytes)
+                .ok_or(GatewayError::BudgetExceeded)?,
+            estimated_tokens: self
+                .estimated_tokens
+                .checked_add(other.estimated_tokens)
+                .ok_or(GatewayError::BudgetExceeded)?,
+            estimated_cost: CostLimit {
+                amount_minor: self
+                    .estimated_cost
+                    .amount_minor
+                    .checked_add(other.estimated_cost.amount_minor)
+                    .ok_or(GatewayError::BudgetExceeded)?,
+                currency: self.estimated_cost.currency.clone(),
+            },
+            external_effect_count: self
+                .external_effect_count
+                .checked_add(other.external_effect_count)
+                .ok_or(GatewayError::BudgetExceeded)?,
+        })
     }
 }
 
@@ -2074,7 +2120,7 @@ impl RecoveryContract {
             || self.generation != request.generation
             || self.attempt >= self.max_attempts
             || self.max_attempts == 0
-            || self.max_attempts > 8
+            || self.max_attempts > MAX_AUTOMATIC_READ_RETRIES
             || !self.preserves_idempotency
             || request.class == CapabilityClass::ExternalEffect
         {
@@ -2119,6 +2165,7 @@ pub enum FailClosedCode {
     AdapterRevoked,
     PayloadTampered,
     BudgetExceeded,
+    RecoveryLimitExceeded,
     GenerationStale,
     UntrustedAdapter,
 }
@@ -2169,6 +2216,45 @@ impl RecoveryDisposition {
         Ok(Self::RetryRead { reason, contract })
     }
 
+    pub fn truncated_output(
+        request: &CapabilityRequest,
+        attempt: u32,
+        max_attempts: u32,
+    ) -> Result<Self, GatewayError> {
+        Self::retry_read(
+            request,
+            ReadRecoveryReason::TruncatedOutput,
+            attempt,
+            max_attempts,
+        )
+    }
+
+    pub fn empty_result(
+        request: &CapabilityRequest,
+        attempt: u32,
+        max_attempts: u32,
+    ) -> Result<Self, GatewayError> {
+        Self::retry_read(
+            request,
+            ReadRecoveryReason::EmptyResult,
+            attempt,
+            max_attempts,
+        )
+    }
+
+    pub fn retryable_read(
+        request: &CapabilityRequest,
+        attempt: u32,
+        max_attempts: u32,
+    ) -> Result<Self, GatewayError> {
+        Self::retry_read(
+            request,
+            ReadRecoveryReason::RetryableRead,
+            attempt,
+            max_attempts,
+        )
+    }
+
     pub fn retry_local_mutation(
         request: &CapabilityRequest,
         reason: LocalRecoveryReason,
@@ -2190,6 +2276,19 @@ impl RecoveryDisposition {
         Ok(Self::RetryLocalMutation { reason, contract })
     }
 
+    pub fn stale_locator_or_path(
+        request: &CapabilityRequest,
+        attempt: u32,
+        max_attempts: u32,
+    ) -> Result<Self, GatewayError> {
+        Self::retry_local_mutation(
+            request,
+            LocalRecoveryReason::StaleLocatorOrPath,
+            attempt,
+            max_attempts,
+        )
+    }
+
     pub fn duplicate(request: &CapabilityRequest, result_digest: Option<Digest>) -> Self {
         Self::DuplicateRequest {
             request_digest: request.digest(),
@@ -2202,6 +2301,10 @@ impl RecoveryDisposition {
             effect_digest,
             reconciliation_digest,
         }
+    }
+
+    pub fn uncertain_external_write(effect_digest: Digest, reconciliation_digest: Digest) -> Self {
+        Self::uncertain_external_effect(effect_digest, reconciliation_digest)
     }
 
     pub fn validate_for(&self, request: &CapabilityRequest) -> Result<(), GatewayError> {
@@ -2242,6 +2345,247 @@ impl RecoveryEnvelope {
             return Err(GatewayError::RecoveryScopeViolation);
         }
         self.disposition.validate_for(request)
+    }
+}
+
+pub const MAX_AUTOMATIC_READ_RETRIES: u32 = 8;
+
+/// Bounds the work that this execution may perform after a typed read
+/// recovery. A zero value disables automatic read retry without changing the
+/// authority in the manifest. Local mutations and external Effects never use
+/// this policy for automatic execution.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolSelfRecoveryPolicy {
+    pub max_read_retries: u32,
+}
+
+impl ToolSelfRecoveryPolicy {
+    pub fn validate(&self) -> Result<(), GatewayError> {
+        if self.max_read_retries > MAX_AUTOMATIC_READ_RETRIES {
+            return Err(GatewayError::RecoveryLimitExceeded);
+        }
+        Ok(())
+    }
+}
+
+impl Default for ToolSelfRecoveryPolicy {
+    fn default() -> Self {
+        Self {
+            max_read_retries: 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolSelfRecoveryReceipt {
+    pub adapter_invocations: u32,
+    pub automatic_read_retries: u32,
+    pub cumulative_budget_use: BudgetUse,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolSelfRecoveryResult {
+    pub schema: String,
+    pub policy: ToolSelfRecoveryPolicy,
+    pub result: CapabilityResult,
+    pub receipt: ToolSelfRecoveryReceipt,
+}
+
+impl ToolSelfRecoveryResult {
+    pub fn validate(&self) -> Result<(), GatewayError> {
+        if self.schema != CAPABILITY_EXECUTION_SCHEMA
+            || self.receipt.adapter_invocations == 0
+            || self.receipt.automatic_read_retries > MAX_AUTOMATIC_READ_RETRIES
+            || self.receipt.automatic_read_retries >= self.receipt.adapter_invocations
+        {
+            return Err(GatewayError::InvalidResult);
+        }
+        self.policy.validate()?;
+        self.receipt.cumulative_budget_use.estimated_cost.validate()
+    }
+}
+
+#[derive(Default)]
+pub struct ToolSelfRecoveryExecutor {
+    policy: ToolSelfRecoveryPolicy,
+}
+
+impl ToolSelfRecoveryExecutor {
+    pub fn new(policy: ToolSelfRecoveryPolicy) -> Result<Self, GatewayError> {
+        policy.validate()?;
+        Ok(Self { policy })
+    }
+
+    pub fn policy(&self) -> ToolSelfRecoveryPolicy {
+        self.policy
+    }
+
+    fn finalize_fail_closed<L>(
+        ledger: &mut L,
+        key: LedgerKey,
+        request: &CapabilityRequest,
+        code: FailClosedCode,
+    ) -> Result<ToolSelfRecoveryResult, GatewayError>
+    where
+        L: InvocationLedger,
+    {
+        let disposition = RecoveryDisposition::FailClosed { code };
+        ledger
+            .finalize(
+                key,
+                InvocationRecord::recovery(request, disposition.clone()),
+            )
+            .map_err(GatewayError::Ledger)?;
+        Err(GatewayError::Recovery(disposition))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn execute<A, L>(
+        &self,
+        gateway: &CapabilityGateway,
+        signed_manifest: &SignedCapabilityManifest,
+        request: &CapabilityRequest,
+        adapter: &A,
+        ledger: &mut L,
+        now: DateTime<Utc>,
+    ) -> Result<ToolSelfRecoveryResult, GatewayError>
+    where
+        A: CapabilityAdapter,
+        L: InvocationLedger,
+    {
+        let permit = gateway.authorize(signed_manifest, request, now)?;
+        if adapter.binding() != &permit.adapter {
+            return Err(GatewayError::AdapterBindingMismatch);
+        }
+        let key = LedgerKey::for_request(request);
+        let prior_state = ledger.recovery_state(&key);
+        let mut adapter_invocations: u32 = 0;
+        let mut automatic_read_retries: u32 = 0;
+        let mut cumulative_budget_use = request.budget_use.zero_like();
+        let mut recovery_max_attempts = None;
+
+        if let Some(record) = prior_state {
+            if record.request_digest != request.digest() {
+                return Err(GatewayError::IdempotencyConflict);
+            }
+            match record.recovery.as_ref() {
+                Some(disposition @ RecoveryDisposition::RetryRead { contract, .. }) => {
+                    disposition.validate_for(request)?;
+                    recovery_max_attempts = Some(contract.max_attempts);
+                    automatic_read_retries = contract
+                        .attempt
+                        .checked_add(1)
+                        .ok_or(GatewayError::RecoveryLimitExceeded)?;
+                    adapter_invocations = contract
+                        .attempt
+                        .checked_add(1)
+                        .ok_or(GatewayError::RecoveryLimitExceeded)?;
+                    for _ in 0..adapter_invocations {
+                        cumulative_budget_use = cumulative_budget_use
+                            .checked_add(&request.budget_use)
+                            .map_err(|_| GatewayError::BudgetExceeded)?;
+                    }
+                    if automatic_read_retries > self.policy.max_read_retries
+                        || automatic_read_retries >= contract.max_attempts
+                    {
+                        return Self::finalize_fail_closed(
+                            ledger,
+                            key,
+                            request,
+                            FailClosedCode::RecoveryLimitExceeded,
+                        );
+                    }
+                }
+                Some(disposition) => return Err(GatewayError::Recovery(disposition.clone())),
+                None => return Err(GatewayError::InvalidResult),
+            }
+        }
+
+        loop {
+            let next_budget = cumulative_budget_use.checked_add(&request.budget_use)?;
+            if next_budget
+                .validate_against(&signed_manifest.manifest.budget)
+                .is_err()
+            {
+                return Self::finalize_fail_closed(
+                    ledger,
+                    key,
+                    request,
+                    FailClosedCode::BudgetExceeded,
+                );
+            }
+            cumulative_budget_use = next_budget;
+            adapter_invocations = adapter_invocations
+                .checked_add(1)
+                .ok_or(GatewayError::RecoveryLimitExceeded)?;
+
+            match gateway.dispatch(signed_manifest, request, adapter, ledger, now) {
+                Ok(result) => {
+                    return Ok(ToolSelfRecoveryResult {
+                        schema: CAPABILITY_EXECUTION_SCHEMA.into(),
+                        policy: self.policy,
+                        result,
+                        receipt: ToolSelfRecoveryReceipt {
+                            adapter_invocations,
+                            automatic_read_retries,
+                            cumulative_budget_use,
+                        },
+                    });
+                }
+                Err(GatewayError::Recovery(RecoveryDisposition::RetryRead {
+                    contract, ..
+                })) => {
+                    if recovery_max_attempts
+                        .is_some_and(|max_attempts| max_attempts != contract.max_attempts)
+                    {
+                        return Self::finalize_fail_closed(
+                            ledger,
+                            key,
+                            request,
+                            FailClosedCode::UntrustedAdapter,
+                        );
+                    }
+                    let max_attempts = *recovery_max_attempts.get_or_insert(contract.max_attempts);
+                    if request.class != CapabilityClass::Read
+                        || contract.target != RecoveryTarget::Read
+                        || !contract.automatic
+                        || contract.attempt != automatic_read_retries
+                    {
+                        return Self::finalize_fail_closed(
+                            ledger,
+                            key,
+                            request,
+                            FailClosedCode::UntrustedAdapter,
+                        );
+                    }
+                    let next_retry = automatic_read_retries
+                        .checked_add(1)
+                        .ok_or(GatewayError::RecoveryLimitExceeded)?;
+                    if next_retry > self.policy.max_read_retries || next_retry >= max_attempts {
+                        return Self::finalize_fail_closed(
+                            ledger,
+                            key,
+                            request,
+                            FailClosedCode::RecoveryLimitExceeded,
+                        );
+                    }
+                    automatic_read_retries = next_retry;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl fmt::Debug for ToolSelfRecoveryExecutor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolSelfRecoveryExecutor")
+            .field("policy", &self.policy)
+            .finish()
     }
 }
 
@@ -2646,6 +2990,10 @@ pub enum LedgerClaim {
 }
 
 pub trait InvocationLedger {
+    fn recovery_state(&self, _key: &LedgerKey) -> Option<InvocationRecord> {
+        None
+    }
+
     fn claim(
         &mut self,
         key: &LedgerKey,
@@ -2653,6 +3001,10 @@ pub trait InvocationLedger {
     ) -> Result<LedgerClaim, LedgerError>;
 
     fn complete(&mut self, key: LedgerKey, record: InvocationRecord) -> Result<(), LedgerError>;
+
+    fn finalize(&mut self, key: LedgerKey, record: InvocationRecord) -> Result<(), LedgerError> {
+        self.complete(key, record)
+    }
 }
 
 #[derive(Clone, Default, Eq, PartialEq, Serialize)]
@@ -2689,6 +3041,14 @@ impl<'de> Deserialize<'de> for MemoryInvocationLedger {
 }
 
 impl InvocationLedger for MemoryInvocationLedger {
+    fn recovery_state(&self, key: &LedgerKey) -> Option<InvocationRecord> {
+        self.records.get(key).and_then(|record| {
+            (record.status == LedgerStatus::Recovery
+                || record.status == LedgerStatus::UncertainExternalEffect)
+                .then(|| record.clone())
+        })
+    }
+
     fn claim(
         &mut self,
         key: &LedgerKey,
@@ -2720,6 +3080,22 @@ impl InvocationLedger for MemoryInvocationLedger {
         let existing = self.records.get(&key).ok_or(LedgerError::MissingClaim)?;
         if existing.request_digest != record.request_digest
             || existing.status != LedgerStatus::InFlight
+        {
+            return Err(LedgerError::CommitConflict);
+        }
+        self.records.insert(key, record);
+        Ok(())
+    }
+
+    fn finalize(&mut self, key: LedgerKey, record: InvocationRecord) -> Result<(), LedgerError> {
+        let existing = self.records.get(&key).ok_or(LedgerError::MissingClaim)?;
+        if existing.request_digest != record.request_digest
+            || !matches!(
+                existing.status,
+                LedgerStatus::InFlight
+                    | LedgerStatus::Recovery
+                    | LedgerStatus::UncertainExternalEffect
+            )
         {
             return Err(LedgerError::CommitConflict);
         }
@@ -3079,6 +3455,29 @@ impl CapabilityGateway {
             })?;
         Ok(result)
     }
+
+    pub fn dispatch_with_recovery<A, L>(
+        &self,
+        signed_manifest: &SignedCapabilityManifest,
+        request: &CapabilityRequest,
+        adapter: &A,
+        ledger: &mut L,
+        now: DateTime<Utc>,
+        policy: ToolSelfRecoveryPolicy,
+    ) -> Result<ToolSelfRecoveryResult, GatewayError>
+    where
+        A: CapabilityAdapter,
+        L: InvocationLedger,
+    {
+        ToolSelfRecoveryExecutor::new(policy)?.execute(
+            self,
+            signed_manifest,
+            request,
+            adapter,
+            ledger,
+            now,
+        )
+    }
 }
 
 impl fmt::Debug for CapabilityGateway {
@@ -3158,6 +3557,8 @@ pub enum GatewayError {
     InvalidProvenance,
     #[error("invalid recovery scope")]
     RecoveryScopeViolation,
+    #[error("tool self-recovery limit is exceeded")]
+    RecoveryLimitExceeded,
     #[error("result scope does not match its request")]
     ResultScopeMismatch,
     #[error("result is invalid")]
@@ -3255,6 +3656,7 @@ impl GatewayError {
             Self::PayloadTampered => "payload_tampered",
             Self::InvalidProvenance => "invalid_provenance",
             Self::RecoveryScopeViolation => "recovery_scope_violation",
+            Self::RecoveryLimitExceeded => "recovery_limit_exceeded",
             Self::ResultScopeMismatch => "result_scope_mismatch",
             Self::InvalidResult => "invalid_result",
             Self::InvalidResourceReference => "invalid_resource_reference",
