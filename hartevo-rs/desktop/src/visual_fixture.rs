@@ -22,13 +22,74 @@ use crate::data_plane::{
 };
 use crate::{
     DesktopBackendState, DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection,
-    DesktopUiModel, Surface,
+    DesktopUiModel, Surface, VisualRuntimeFixtureState,
 };
 
 const SCENARIO_ENV: &str = "HARTEVO_DESKTOP_UI_SCENARIO";
 const SURFACE_ENV: &str = "HARTEVO_DESKTOP_UI_SURFACE";
+const RUNTIME_STATE_ENV: &str = "HARTEVO_DESKTOP_UI_RUNTIME_STATE";
 const PROTOTYPE_SCENARIO_ID: &str = "prototype-baseline-v1";
 const PROTOTYPE_SCENARIO: &str = include_str!("../fixtures/prototype-baseline.v1.json");
+
+impl VisualRuntimeFixtureState {
+    const fn environment_value(self) -> &'static str {
+        match self {
+            Self::Awaiting => "awaiting",
+            Self::FirstAppend => "first-append",
+            Self::RunningCaughtUp => "running-caught-up",
+            Self::TerminalBeforeAck => "terminal-before-ack",
+            Self::FinalCaughtUp => "final-caught-up",
+            Self::ErrorRetained => "error-retained",
+            Self::OffscreenReselect => "offscreen-reselect",
+        }
+    }
+
+    fn for_request(
+        surface: Option<&str>,
+        requested_state: Option<&str>,
+    ) -> Result<Option<Self>, VisualRuntimeFixtureStateRequestError> {
+        if surface != Some("mission-persisted-stream") {
+            return if requested_state.is_some() {
+                Err(VisualRuntimeFixtureStateRequestError::IncompatibleSurface)
+            } else {
+                Ok(None)
+            };
+        }
+        let value = requested_state.unwrap_or("first-append");
+        Self::ALL
+            .into_iter()
+            .find(|state| state.environment_value() == value)
+            .map(Some)
+            .ok_or(VisualRuntimeFixtureStateRequestError::UnsupportedState)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisualRuntimeFixtureStateRequestError {
+    IncompatibleSurface,
+    UnsupportedState,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) struct VisualRuntimeFailure {
+    pub(super) code: &'static str,
+    pub(super) message: &'static str,
+}
+
+#[derive(Clone)]
+pub(super) struct VisualRuntimeFixture {
+    pub(super) state: VisualRuntimeFixtureState,
+    pub(super) scope: Option<(ProjectId, MissionId)>,
+    pub(super) stream: Option<DesktopRuntimeTextStreamProjection>,
+    pub(super) error: Option<VisualRuntimeFailure>,
+}
+
+#[derive(Clone, Copy)]
+struct VisualRuntimeStreamSpec {
+    turn_status: RuntimeTurnStatus,
+    turn_revision: u64,
+    delta_count: usize,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -246,39 +307,141 @@ pub(super) fn page(page_id: &str) -> Option<VisualPage> {
         .find(|page| page.id == page_id)
 }
 
-pub(super) fn runtime_text_stream() -> Option<DesktopRuntimeTextStreamProjection> {
+pub(super) fn runtime_fixture() -> Option<VisualRuntimeFixture> {
     active_id()?;
-    if requested_surface_id().as_deref() != Some("mission-persisted-stream") {
-        return None;
-    }
+    let requested_surface = requested_surface_id();
+    let requested_state = env::var(RUNTIME_STATE_ENV).ok();
+    let state = VisualRuntimeFixtureState::for_request(
+        requested_surface.as_deref(),
+        requested_state.as_deref(),
+    )
+    .unwrap_or_else(|error| panic!("invalid visual Runtime state request: {error:?}"))?;
+    Some(runtime_fixture_for_state(state))
+}
+
+pub(super) fn runtime_fixture_for_state(state: VisualRuntimeFixtureState) -> VisualRuntimeFixture {
     let definition: VisualFixtureDefinition = serde_json::from_str(PROTOTYPE_SCENARIO)
         .expect("checked-in prototype visual fixture must deserialize");
-    let mission = definition
+    let selected_mission = definition
         .missions
         .iter()
-        .find(|mission| mission.manifest_id == "VM-07")?;
+        .find(|mission| mission.manifest_id == "VM-07")
+        .expect("fixture must include VM-07 selected Mission");
+    let offscreen_mission = definition
+        .missions
+        .iter()
+        .find(|mission| mission.manifest_id == "VM-03")
+        .expect("fixture must include a distinct offscreen Mission");
+    let project_id = ProjectId::from(definition.project.project_id.as_str());
+    let selected_mission_id = MissionId::from(selected_mission.mission_id.as_str());
+    let stream_mission_id = if state == VisualRuntimeFixtureState::OffscreenReselect {
+        MissionId::from(offscreen_mission.mission_id.as_str())
+    } else {
+        selected_mission_id.clone()
+    };
     let observed_at = "2026-08-12T10:21:00Z"
         .parse()
         .expect("fixed visual fixture timestamp");
-    let text = definition.presentation.conversation.assistant_intro;
-    Some(DesktopRuntimeTextStreamProjection {
-        project_id: ProjectId::from(definition.project.project_id.as_str()),
-        mission_id: MissionId::from(mission.mission_id.as_str()),
-        worker_generation: 1,
-        turn_revision: 4,
-        turn_status: RuntimeTurnStatus::Running,
-        last_evidence_sequence: Some(12),
-        delta_count: 12,
-        items: vec![DesktopRuntimeTextItemProjection {
-            item_id_digest: "visual-fixture-runtime-item-digest".into(),
-            cumulative_byte_count: text.len() as u64,
-            text,
+    let text = definition
+        .presentation
+        .conversation
+        .assistant_intro
+        .as_str();
+    let stream = runtime_stream_for_state(
+        state,
+        project_id.clone(),
+        stream_mission_id,
+        text,
+        observed_at,
+    );
+    let scope = stream.as_ref().map_or_else(
+        || Some((project_id, selected_mission_id)),
+        |projection| Some((projection.project_id.clone(), projection.mission_id.clone())),
+    );
+    VisualRuntimeFixture {
+        state,
+        scope,
+        stream,
+        error: (state == VisualRuntimeFixtureState::ErrorRetained).then_some(
+            VisualRuntimeFailure {
+                code: "RUNTIME_EXECUTION_FAILED",
+                message: "Runtime 返回失败终态；已持久正文仍可审阅，当前状态不构成 Mission 完成或 Provider 结果。",
+            },
+        ),
+    }
+}
+
+fn runtime_stream_for_state(
+    state: VisualRuntimeFixtureState,
+    project_id: ProjectId,
+    mission_id: MissionId,
+    text: &str,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> Option<DesktopRuntimeTextStreamProjection> {
+    let spec = match state {
+        VisualRuntimeFixtureState::Awaiting => None,
+        VisualRuntimeFixtureState::FirstAppend => Some(VisualRuntimeStreamSpec {
+            turn_status: RuntimeTurnStatus::Running,
+            turn_revision: 1,
+            delta_count: 1,
+        }),
+        VisualRuntimeFixtureState::RunningCaughtUp => Some(VisualRuntimeStreamSpec {
+            turn_status: RuntimeTurnStatus::Running,
+            turn_revision: 4,
             delta_count: 12,
-            last_stream_sequence: 12,
+        }),
+        VisualRuntimeFixtureState::TerminalBeforeAck | VisualRuntimeFixtureState::FinalCaughtUp => {
+            Some(VisualRuntimeStreamSpec {
+                turn_status: RuntimeTurnStatus::Completed,
+                turn_revision: 5,
+                delta_count: 13,
+            })
+        }
+        VisualRuntimeFixtureState::ErrorRetained => Some(VisualRuntimeStreamSpec {
+            turn_status: RuntimeTurnStatus::Failed,
+            turn_revision: 5,
+            delta_count: 12,
+        }),
+        VisualRuntimeFixtureState::OffscreenReselect => Some(VisualRuntimeStreamSpec {
+            turn_status: RuntimeTurnStatus::Running,
+            turn_revision: 4,
+            delta_count: 7,
+        }),
+    };
+    spec.map(|spec| {
+        runtime_stream_projection(project_id, mission_id, state, spec, text, observed_at)
+    })
+}
+
+fn runtime_stream_projection(
+    project_id: ProjectId,
+    mission_id: MissionId,
+    state: VisualRuntimeFixtureState,
+    spec: VisualRuntimeStreamSpec,
+    text: &str,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> DesktopRuntimeTextStreamProjection {
+    DesktopRuntimeTextStreamProjection {
+        project_id,
+        mission_id,
+        worker_generation: 1,
+        turn_revision: spec.turn_revision,
+        turn_status: spec.turn_status,
+        last_evidence_sequence: Some(
+            u64::try_from(spec.delta_count).expect("visual delta count fits u64"),
+        ),
+        delta_count: spec.delta_count,
+        items: vec![DesktopRuntimeTextItemProjection {
+            item_id_digest: format!("visual-fixture-runtime-item-{}", state.environment_value()),
+            cumulative_byte_count: text.len() as u64,
+            text: text.to_owned(),
+            delta_count: spec.delta_count,
+            last_stream_sequence: u64::try_from(spec.delta_count)
+                .expect("visual delta count fits u64"),
             observed_at,
         }],
         updated_at: observed_at,
-    })
+    }
 }
 
 fn fixture_user_message(conversation: &VisualConversation) -> MissionConversationMessageProjection {
@@ -539,6 +702,16 @@ fn checkpoint_status(stage: &MissionStage) -> MissionCheckpointStatus {
 mod tests {
     use super::*;
 
+    fn stream_matches_scope(fixture: &VisualRuntimeFixture) -> bool {
+        match (&fixture.stream, &fixture.scope) {
+            (Some(stream), Some((project_id, mission_id))) => {
+                stream.project_id == *project_id && stream.mission_id == *mission_id
+            }
+            (None, Some(_)) => fixture.state == VisualRuntimeFixtureState::Awaiting,
+            (Some(_) | None, None) => false,
+        }
+    }
+
     #[test]
     fn checked_in_fixture_is_explicit_and_never_claims_release_success() {
         let fixture: VisualFixtureDefinition =
@@ -571,5 +744,124 @@ mod tests {
                 .iter()
                 .all(|row| { !row.state.contains("verified") && !row.state.contains("已付款") })
         );
+    }
+
+    #[test]
+    fn runtime_state_contract_is_exactly_seven_strict_variants() {
+        assert_eq!(VisualRuntimeFixtureState::ALL.len(), 7);
+        for state in VisualRuntimeFixtureState::ALL {
+            assert_eq!(
+                VisualRuntimeFixtureState::for_request(
+                    Some("mission-persisted-stream"),
+                    Some(state.environment_value()),
+                ),
+                Ok(Some(state))
+            );
+        }
+        assert_eq!(
+            VisualRuntimeFixtureState::for_request(Some("mission-persisted-stream"), None),
+            Ok(Some(VisualRuntimeFixtureState::FirstAppend))
+        );
+        assert_eq!(
+            VisualRuntimeFixtureState::for_request(
+                Some("mission-persisted-stream"),
+                Some("connected-provider-success"),
+            ),
+            Err(VisualRuntimeFixtureStateRequestError::UnsupportedState)
+        );
+        assert_eq!(
+            VisualRuntimeFixtureState::for_request(Some("mission-conversation"), Some("awaiting")),
+            Err(VisualRuntimeFixtureStateRequestError::IncompatibleSurface)
+        );
+        assert_eq!(
+            VisualRuntimeFixtureState::for_request(Some("mission-conversation"), None),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn runtime_fixture_states_keep_transport_and_business_boundaries_distinct() {
+        for state in VisualRuntimeFixtureState::ALL {
+            let fixture = runtime_fixture_for_state(state);
+            assert_eq!(fixture.state, state);
+            assert!(stream_matches_scope(&fixture));
+            assert_eq!(
+                fixture.error.is_some(),
+                state == VisualRuntimeFixtureState::ErrorRetained
+            );
+        }
+
+        let awaiting = runtime_fixture_for_state(VisualRuntimeFixtureState::Awaiting);
+        assert!(awaiting.state.waiting_for_turn());
+        assert!(awaiting.state.runtime_busy());
+        assert!(awaiting.state.stop_available());
+        assert!(!awaiting.state.transport_caught_up());
+        assert!(awaiting.stream.is_none());
+
+        let first_append = runtime_fixture_for_state(VisualRuntimeFixtureState::FirstAppend);
+        assert!(first_append.state.runtime_busy());
+        assert!(!first_append.state.transport_caught_up());
+        assert!(first_append.stream.as_ref().is_some_and(|stream| {
+            stream.turn_status == RuntimeTurnStatus::Running && stream.delta_count == 1
+        }));
+
+        let running_caught_up =
+            runtime_fixture_for_state(VisualRuntimeFixtureState::RunningCaughtUp);
+        assert!(running_caught_up.state.runtime_busy());
+        assert!(running_caught_up.state.transport_caught_up());
+        assert!(running_caught_up.stream.as_ref().is_some_and(|stream| {
+            stream.turn_status == RuntimeTurnStatus::Running && stream.delta_count == 12
+        }));
+
+        let terminal_before_ack =
+            runtime_fixture_for_state(VisualRuntimeFixtureState::TerminalBeforeAck);
+        assert!(terminal_before_ack.state.runtime_busy());
+        assert!(!terminal_before_ack.state.stop_available());
+        assert!(!terminal_before_ack.state.transport_caught_up());
+        assert!(terminal_before_ack.stream.as_ref().is_some_and(|stream| {
+            stream.turn_status == RuntimeTurnStatus::Completed && stream.delta_count == 13
+        }));
+
+        let final_caught_up = runtime_fixture_for_state(VisualRuntimeFixtureState::FinalCaughtUp);
+        assert!(!final_caught_up.state.runtime_busy());
+        assert!(final_caught_up.state.transport_caught_up());
+        assert!(final_caught_up.stream.as_ref().is_some_and(|stream| {
+            stream.turn_status == RuntimeTurnStatus::Completed && stream.delta_count == 13
+        }));
+
+        let error_retained = runtime_fixture_for_state(VisualRuntimeFixtureState::ErrorRetained);
+        assert!(!error_retained.state.runtime_busy());
+        assert!(error_retained.stream.as_ref().is_some_and(|stream| {
+            stream.turn_status == RuntimeTurnStatus::Failed && stream.delta_count == 12
+        }));
+        assert!(error_retained.error.is_some_and(|failure| {
+            failure.code == "RUNTIME_EXECUTION_FAILED"
+                && !failure.message.contains("Receipt")
+                && !failure.message.contains("Verification")
+        }));
+    }
+
+    #[test]
+    fn offscreen_reselect_keeps_stale_private_projection_scope_distinct() {
+        let definition: VisualFixtureDefinition =
+            serde_json::from_str(PROTOTYPE_SCENARIO).expect("fixture");
+        let selected_mission_id = definition
+            .missions
+            .iter()
+            .find(|mission| mission.manifest_id == "VM-07")
+            .map(|mission| MissionId::from(mission.mission_id.as_str()))
+            .expect("selected Mission");
+        let fixture = runtime_fixture_for_state(VisualRuntimeFixtureState::OffscreenReselect);
+        assert!(fixture.state.runtime_busy());
+        assert!(fixture.state.transport_caught_up());
+        assert!(!fixture.state.follow_latest());
+        assert!(fixture.state.has_unseen());
+        assert!(fixture.stream.as_ref().is_some_and(|stream| {
+            stream.mission_id != selected_mission_id
+                && fixture
+                    .scope
+                    .as_ref()
+                    .is_some_and(|(_, mission_id)| mission_id == &stream.mission_id)
+        }));
     }
 }

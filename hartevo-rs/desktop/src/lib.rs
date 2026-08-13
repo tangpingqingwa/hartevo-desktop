@@ -636,6 +636,174 @@ impl DesktopUiModel {
 struct ScopedRuntimeRenderProjection<'a> {
     stream: Option<&'a DesktopRuntimeTextStreamProjection>,
     error: Option<&'a UiFailure>,
+    fallback_scope_matches: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisualRuntimeFixtureState {
+    Awaiting,
+    FirstAppend,
+    RunningCaughtUp,
+    TerminalBeforeAck,
+    FinalCaughtUp,
+    ErrorRetained,
+    OffscreenReselect,
+}
+
+impl VisualRuntimeFixtureState {
+    const ALL: [Self; 7] = [
+        Self::Awaiting,
+        Self::FirstAppend,
+        Self::RunningCaughtUp,
+        Self::TerminalBeforeAck,
+        Self::FinalCaughtUp,
+        Self::ErrorRetained,
+        Self::OffscreenReselect,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Awaiting => "AWAITING",
+            Self::FirstAppend => "FIRST_APPEND",
+            Self::RunningCaughtUp => "RUNNING_CAUGHT_UP",
+            Self::TerminalBeforeAck => "TERMINAL_BEFORE_ACK",
+            Self::FinalCaughtUp => "FINAL_CAUGHT_UP",
+            Self::ErrorRetained => "ERROR_RETAINED",
+            Self::OffscreenReselect => "OFFSCREEN_RESELECT",
+        }
+    }
+
+    const fn waiting_for_turn(self) -> bool {
+        matches!(self, Self::Awaiting)
+    }
+
+    const fn runtime_busy(self) -> bool {
+        matches!(
+            self,
+            Self::Awaiting
+                | Self::FirstAppend
+                | Self::RunningCaughtUp
+                | Self::TerminalBeforeAck
+                | Self::OffscreenReselect
+        )
+    }
+
+    const fn stop_available(self) -> bool {
+        matches!(
+            self,
+            Self::Awaiting | Self::FirstAppend | Self::RunningCaughtUp
+        )
+    }
+
+    const fn transport_caught_up(self) -> bool {
+        matches!(
+            self,
+            Self::RunningCaughtUp | Self::FinalCaughtUp | Self::OffscreenReselect
+        )
+    }
+
+    const fn follow_latest(self) -> bool {
+        !matches!(self, Self::OffscreenReselect)
+    }
+
+    const fn has_unseen(self) -> bool {
+        matches!(self, Self::OffscreenReselect)
+    }
+}
+
+#[derive(Default)]
+struct InitialVisualRuntimeState {
+    state: Option<VisualRuntimeFixtureState>,
+    scope: Option<(ProjectId, MissionId)>,
+    stream: Option<DesktopRuntimeTextStreamProjection>,
+    error: Option<UiFailure>,
+}
+
+#[derive(Clone, Copy)]
+struct VisualRuntimeStateCopy {
+    title: &'static str,
+    detail: &'static str,
+}
+
+const fn visual_runtime_state_copy(state: VisualRuntimeFixtureState) -> VisualRuntimeStateCopy {
+    match state {
+        VisualRuntimeFixtureState::Awaiting => VisualRuntimeStateCopy {
+            title: "首个 Runtime turn 尚未到达",
+            detail: "Mission snapshot 与 content-free handle 已进入绘制；这不是原生 paint→ack→resume 实机证据。",
+        },
+        VisualRuntimeFixtureState::FirstAppend => VisualRuntimeStateCopy {
+            title: "首段持久正文已进入同一会话",
+            detail: "正文来自确定性视觉夹具；没有 Provider、Receipt、Verification 或业务完成声明。",
+        },
+        VisualRuntimeFixtureState::RunningCaughtUp => VisualRuntimeStateCopy {
+            title: "当前游标已追平，Runtime 仍在运行",
+            detail: "CAUGHT_UP 只表示此刻没有新 delta；轮询与取消边界继续保留。",
+        },
+        VisualRuntimeFixtureState::TerminalBeforeAck => VisualRuntimeStateCopy {
+            title: "已看到 Runtime 终态，等待最终传输确认",
+            detail: "终态正文不会直接清除命令；最终同游标 CaughtUp 前仍不结束传输生命周期。",
+        },
+        VisualRuntimeFixtureState::FinalCaughtUp => VisualRuntimeStateCopy {
+            title: "Runtime 终态正文已完成最终传输确认",
+            detail: "这只结束本次正文传输；不授予 Mission、Provider 或业务结果完成权限。",
+        },
+        VisualRuntimeFixtureState::ErrorRetained => VisualRuntimeStateCopy {
+            title: "Runtime 失败后保留已持久正文",
+            detail: "失败反馈不覆盖已接收文本，也不会把失败美化为 Partial、Outcome 或可自动重试结果。",
+        },
+        VisualRuntimeFixtureState::OffscreenReselect => VisualRuntimeStateCopy {
+            title: "旧 Mission 的 transport 在后台，正文已从当前选择隔离",
+            detail: "当前页面不会绘制旧 scope 的正文、错误或未读提示；fixture 不冒充进程重开证据。",
+        },
+    }
+}
+
+fn initial_visual_runtime_progress(
+    state: Option<VisualRuntimeFixtureState>,
+    legacy_streaming_fixture: bool,
+) -> Vec<DesktopRuntimeProgressEvent> {
+    debug_assert_eq!(VisualRuntimeFixtureState::ALL.len(), 7);
+    let state = state
+        .or_else(|| legacy_streaming_fixture.then_some(VisualRuntimeFixtureState::FirstAppend));
+    let phases: &[DesktopRuntimeProgressPhase] = match state {
+        Some(VisualRuntimeFixtureState::Awaiting) => &[DesktopRuntimeProgressPhase::Preparing],
+        Some(
+            VisualRuntimeFixtureState::FirstAppend
+            | VisualRuntimeFixtureState::RunningCaughtUp
+            | VisualRuntimeFixtureState::OffscreenReselect,
+        ) => &[
+            DesktopRuntimeProgressPhase::Preparing,
+            DesktopRuntimeProgressPhase::Dispatched,
+            DesktopRuntimeProgressPhase::TurnStarted,
+            DesktopRuntimeProgressPhase::ItemStarted,
+        ],
+        Some(
+            VisualRuntimeFixtureState::TerminalBeforeAck | VisualRuntimeFixtureState::FinalCaughtUp,
+        ) => &[
+            DesktopRuntimeProgressPhase::Preparing,
+            DesktopRuntimeProgressPhase::Dispatched,
+            DesktopRuntimeProgressPhase::TurnStarted,
+            DesktopRuntimeProgressPhase::ItemStarted,
+            DesktopRuntimeProgressPhase::ItemCompleted,
+            DesktopRuntimeProgressPhase::Completed,
+        ],
+        Some(VisualRuntimeFixtureState::ErrorRetained) => &[
+            DesktopRuntimeProgressPhase::Preparing,
+            DesktopRuntimeProgressPhase::Dispatched,
+            DesktopRuntimeProgressPhase::TurnStarted,
+            DesktopRuntimeProgressPhase::ItemStarted,
+            DesktopRuntimeProgressPhase::Failed,
+        ],
+        None => &[],
+    };
+    phases
+        .iter()
+        .enumerate()
+        .map(|(index, phase)| DesktopRuntimeProgressEvent {
+            sequence: u64::try_from(index + 1).expect("fixture progress sequence fits u64"),
+            phase: *phase,
+        })
+        .collect()
 }
 
 fn runtime_text_scope_from_projection(
@@ -655,6 +823,7 @@ fn scoped_runtime_render_projection<'a>(
         return ScopedRuntimeRenderProjection {
             stream: None,
             error: None,
+            fallback_scope_matches: false,
         };
     };
     let scope_matches = runtime_text_scope.is_some_and(|(project_id, mission_id)| {
@@ -674,6 +843,7 @@ fn scoped_runtime_render_projection<'a>(
         } else {
             None
         },
+        fallback_scope_matches: scope_matches,
     }
 }
 
@@ -682,15 +852,36 @@ pub fn App() -> Element {
     let desktop_context = dioxus::desktop::use_window();
     let visual_zoom = active_visual_zoom();
     let visual_fixture_mode = active_visual_fixture_id().is_some();
-    let initial_visual_runtime_text_stream = active_visual_runtime_text_stream();
+    let InitialVisualRuntimeState {
+        state: visual_runtime_state,
+        scope: configured_visual_runtime_scope,
+        stream: initial_visual_runtime_text_stream,
+        error: initial_visual_runtime_error,
+    } = active_visual_runtime_state();
+    let visual_runtime_waiting_for_turn =
+        visual_runtime_state.is_some_and(VisualRuntimeFixtureState::waiting_for_turn);
+    let visual_runtime_busy =
+        visual_runtime_state.is_some_and(VisualRuntimeFixtureState::runtime_busy);
+    let visual_runtime_stop_available =
+        visual_runtime_state.is_some_and(VisualRuntimeFixtureState::stop_available);
+    let visual_runtime_transport_caught_up =
+        visual_runtime_state.is_some_and(VisualRuntimeFixtureState::transport_caught_up);
+    let visual_runtime_follow_latest =
+        visual_runtime_state.is_none_or(VisualRuntimeFixtureState::follow_latest);
+    let visual_runtime_has_unseen =
+        visual_runtime_state.is_some_and(VisualRuntimeFixtureState::has_unseen);
     let initial_runtime_text_scope =
-        runtime_text_scope_from_projection(initial_visual_runtime_text_stream.as_ref());
-    let visual_persisted_stream_fixture = initial_visual_runtime_text_stream.is_some();
-    let visual_streaming_fixture = visual_fixture_mode
+        runtime_text_scope_from_projection(initial_visual_runtime_text_stream.as_ref())
+            .or(configured_visual_runtime_scope);
+    let visual_persisted_stream_fixture = visual_runtime_state.is_some();
+    let legacy_visual_streaming_fixture = visual_fixture_mode
         && matches!(
             active_visual_surface_variant().as_deref(),
-            Some("mission-streaming" | "mission-persisted-stream")
+            Some("mission-streaming")
         );
+    let visual_streaming_fixture = legacy_visual_streaming_fixture || visual_runtime_busy;
+    let initial_runtime_progress =
+        initial_visual_runtime_progress(visual_runtime_state, legacy_visual_streaming_fixture);
     use_effect(move || desktop_context.set_zoom_level(visual_zoom));
     let mut surface = use_signal(initial_surface);
     let mut model = use_signal(DesktopUiModel::load);
@@ -712,39 +903,18 @@ pub fn App() -> Element {
     let mut catalog_contract_expanded = use_signal(|| false);
     let mut mission_submitting = use_signal(move || visual_streaming_fixture);
     let mut runtime_retrying = use_signal(|| false);
-    let mut runtime_cancellation =
-        use_signal(move || visual_streaming_fixture.then(DesktopRuntimeCancellation::default));
-    let mut runtime_stop_requested = use_signal(|| false);
-    let mut runtime_progress = use_signal(move || {
-        if visual_streaming_fixture {
-            vec![
-                DesktopRuntimeProgressEvent {
-                    sequence: 1,
-                    phase: DesktopRuntimeProgressPhase::Preparing,
-                },
-                DesktopRuntimeProgressEvent {
-                    sequence: 2,
-                    phase: DesktopRuntimeProgressPhase::Dispatched,
-                },
-                DesktopRuntimeProgressEvent {
-                    sequence: 3,
-                    phase: DesktopRuntimeProgressPhase::TurnStarted,
-                },
-                DesktopRuntimeProgressEvent {
-                    sequence: 4,
-                    phase: DesktopRuntimeProgressPhase::ItemStarted,
-                },
-            ]
-        } else {
-            Vec::new()
-        }
+    let mut runtime_cancellation = use_signal(move || {
+        (legacy_visual_streaming_fixture || visual_runtime_stop_available)
+            .then(DesktopRuntimeCancellation::default)
     });
+    let mut runtime_stop_requested = use_signal(|| false);
+    let mut runtime_progress = use_signal(move || initial_runtime_progress);
     let mut runtime_execution_paint = use_signal(DesktopRuntimeExecutionPaintState::default);
     let mut runtime_text_scope = use_signal(move || initial_runtime_text_scope);
     let mut runtime_text_stream = use_signal(move || initial_visual_runtime_text_stream);
-    let mut runtime_text_error = use_signal(|| None::<UiFailure>);
-    let mut runtime_follow_latest = use_signal(|| true);
-    let mut runtime_has_unseen = use_signal(|| false);
+    let mut runtime_text_error = use_signal(move || initial_visual_runtime_error);
+    let mut runtime_follow_latest = use_signal(move || visual_runtime_follow_latest);
+    let mut runtime_has_unseen = use_signal(move || visual_runtime_has_unseen);
     let mut composer_expanded = use_signal(|| false);
     let mut composer_guidance_dismissed = use_signal(|| false);
     let mut human_work_product_selection = use_signal(BTreeSet::<WorkProductId>::new);
@@ -962,7 +1132,7 @@ pub fn App() -> Element {
                 .read()
                 .paint_view(project_id, mission_id)
         });
-    let (rendered_runtime_text_stream, rendered_runtime_text_error) = {
+    let (rendered_runtime_text_stream, rendered_runtime_text_error, runtime_fallback_scope_matches) = {
         let fallback_scope = runtime_text_scope.read();
         let fallback_stream = runtime_text_stream.read();
         let fallback_error = runtime_text_error.read();
@@ -977,18 +1147,29 @@ pub fn App() -> Element {
             fallback_stream.as_ref(),
             fallback_error.as_ref(),
         );
-        (projection.stream.cloned(), projection.error.cloned())
+        (
+            projection.stream.cloned(),
+            projection.error.cloned(),
+            projection.fallback_scope_matches,
+        )
     };
     let runtime_waiting_for_turn = selected_runtime_execution_paint
         .as_ref()
-        .is_some_and(DesktopRuntimeExecutionPaintView::awaiting_turn);
+        .is_some_and(DesktopRuntimeExecutionPaintView::awaiting_turn)
+        || (visual_runtime_waiting_for_turn && runtime_fallback_scope_matches);
+    let rendered_runtime_transport_caught_up = selected_runtime_execution_paint
+        .as_ref()
+        .is_some_and(DesktopRuntimeExecutionPaintView::transport_caught_up)
+        || (visual_runtime_transport_caught_up && runtime_fallback_scope_matches);
     let rendered_runtime_follow_latest = match selected_runtime_execution_paint.as_ref() {
         Some(paint) => paint.follow_latest(),
-        None => runtime_follow_latest(),
+        None if runtime_fallback_scope_matches => runtime_follow_latest(),
+        None => true,
     };
     let rendered_runtime_has_unseen = match selected_runtime_execution_paint.as_ref() {
         Some(paint) => paint.has_unseen(),
-        None => runtime_has_unseen(),
+        None if runtime_fallback_scope_matches => runtime_has_unseen(),
+        None => false,
     };
     let execution_stop_available = runtime_execution_paint.read().stop_available_for_selection(
         project
@@ -996,7 +1177,9 @@ pub fn App() -> Element {
             .zip(mission.as_ref())
             .map(|(project, mission)| (&project.project_id, &mission.mission_id)),
     );
-    let runtime_stop_available = execution_stop_available || runtime_cancellation.read().is_some();
+    let runtime_stop_available = execution_stop_available
+        || runtime_cancellation.read().is_some()
+        || (visual_runtime_stop_available && runtime_fallback_scope_matches);
     let project_can_start_mission = view.can_start_mission();
     let evidence = view.product_evidence().cloned();
     let project_storage_status = project
@@ -1827,6 +2010,8 @@ pub fn App() -> Element {
                                 runtime_text_stream: rendered_runtime_text_stream.clone(),
                                 runtime_waiting_for_turn,
                                 runtime_text_error: rendered_runtime_text_error.clone(),
+                                runtime_fixture_state: visual_runtime_state,
+                                runtime_transport_caught_up: rendered_runtime_transport_caught_up,
                                 runtime_busy,
                                 runtime_stream_is_fixture: visual_persisted_stream_fixture,
                                 runtime_follow_latest: rendered_runtime_follow_latest,
@@ -4433,6 +4618,8 @@ fn OrchestratorSurface(
     runtime_text_stream: Option<DesktopRuntimeTextStreamProjection>,
     runtime_waiting_for_turn: bool,
     runtime_text_error: Option<UiFailure>,
+    runtime_fixture_state: Option<VisualRuntimeFixtureState>,
+    runtime_transport_caught_up: bool,
     runtime_busy: bool,
     runtime_stream_is_fixture: bool,
     runtime_follow_latest: bool,
@@ -4628,6 +4815,8 @@ fn OrchestratorSurface(
             });
             let render_stream_turn =
                 runtime_text_stream.is_some() && replayed_message_sequence.is_none();
+            let runtime_fixture_copy = runtime_fixture_state
+                .map(|state| (state.label(), visual_runtime_state_copy(state)));
             rsx! {
                 div {
                     id: "persisted-mission-thread",
@@ -4645,12 +4834,25 @@ fn OrchestratorSurface(
                         runtime_text_stream: runtime_text_stream.clone(),
                         replayed_message_sequence,
                     }
+                    if let Some((state, copy)) = runtime_fixture_copy {
+                        div {
+                            class: "persisted-system-notice visual-runtime-state",
+                            role: "status",
+                            aria_label: "Runtime 视觉回归状态 {state}",
+                            UiIcon { name: UiIconName::Workflow, size: 13 }
+                            span {
+                                strong { "VISUAL_FIXTURE · {state} · {copy.title}" }
+                                small { "{copy.detail}" }
+                            }
+                        }
+                    }
                     if render_stream_turn {
                         if let Some(stream) = runtime_text_stream.clone() {
                             PersistedRuntimeStreamTurn {
                                 stream,
                                 runtime_busy,
                                 visual_fixture: runtime_stream_is_fixture,
+                                transport_caught_up: runtime_transport_caught_up,
                             }
                         }
                     } else if runtime_waiting_for_turn {
@@ -4829,6 +5031,7 @@ fn PersistedRuntimeStreamTurn(
     stream: DesktopRuntimeTextStreamProjection,
     runtime_busy: bool,
     visual_fixture: bool,
+    transport_caught_up: bool,
 ) -> Element {
     let stream_active = stream.turn_status.is_active();
     let last_item_index = stream.items.len().saturating_sub(1);
@@ -4882,6 +5085,9 @@ fn PersistedRuntimeStreamTurn(
                     } else {
                         "从 SQLCipher 重放 {stream.delta_count} 个正文增量"
                     }
+                }
+                if transport_caught_up {
+                    b { class: "runtime-transport-state", "CAUGHT_UP · 仅传输" }
                 }
                 em { "{runtime_turn_status_label(stream.turn_status)} · cursor {stream.last_evidence_sequence.unwrap_or_default()}" }
             }
@@ -6963,14 +7169,25 @@ fn active_visual_surface_variant() -> Option<String> {
     }
 }
 
-fn active_visual_runtime_text_stream() -> Option<DesktopRuntimeTextStreamProjection> {
+fn active_visual_runtime_state() -> InitialVisualRuntimeState {
     #[cfg(feature = "visual-fixtures")]
     {
-        visual_fixture::runtime_text_stream()
+        visual_fixture::runtime_fixture().map_or_else(
+            InitialVisualRuntimeState::default,
+            |fixture| InitialVisualRuntimeState {
+                state: Some(fixture.state),
+                scope: fixture.scope,
+                stream: fixture.stream,
+                error: fixture.error.map(|failure| UiFailure {
+                    code: failure.code.to_owned(),
+                    message: failure.message.to_owned(),
+                }),
+            },
+        )
     }
     #[cfg(not(feature = "visual-fixtures"))]
     {
-        None
+        InitialVisualRuntimeState::default()
     }
 }
 
@@ -8468,6 +8685,92 @@ mod tests {
                 && visible.delta_count != stale_fallback.delta_count
         }));
         assert!(render.error.is_none());
+    }
+
+    #[cfg(feature = "visual-fixtures")]
+    #[test]
+    fn visual_runtime_state_matrix_reuses_production_render_scope_privacy_gate() {
+        let selected_fixture =
+            visual_fixture::runtime_fixture_for_state(VisualRuntimeFixtureState::Awaiting);
+        let (selected_project, selected_mission) = selected_fixture
+            .scope
+            .as_ref()
+            .expect("awaiting fixture exact selected scope");
+
+        for state in VisualRuntimeFixtureState::ALL {
+            let fixture = visual_fixture::runtime_fixture_for_state(state);
+            let failure = fixture.error.map(|failure| UiFailure {
+                code: failure.code.to_owned(),
+                message: failure.message.to_owned(),
+            });
+            let rendered = scoped_runtime_render_projection(
+                Some((selected_project, selected_mission)),
+                fixture
+                    .scope
+                    .as_ref()
+                    .map(|(project_id, mission_id)| (project_id, mission_id)),
+                None,
+                fixture.stream.as_ref(),
+                failure.as_ref(),
+            );
+            let stream_should_be_visible = !matches!(
+                state,
+                VisualRuntimeFixtureState::Awaiting | VisualRuntimeFixtureState::OffscreenReselect
+            );
+            assert_eq!(rendered.stream.is_some(), stream_should_be_visible);
+            assert_eq!(
+                rendered.error.is_some(),
+                state == VisualRuntimeFixtureState::ErrorRetained
+            );
+            assert_eq!(
+                rendered.fallback_scope_matches,
+                state != VisualRuntimeFixtureState::OffscreenReselect
+            );
+        }
+    }
+
+    #[test]
+    fn visual_runtime_progress_matches_transport_state_without_business_completion() {
+        let awaiting =
+            initial_visual_runtime_progress(Some(VisualRuntimeFixtureState::Awaiting), false);
+        assert_eq!(awaiting.len(), 1);
+        assert_eq!(
+            awaiting.last().map(|event| event.phase),
+            Some(DesktopRuntimeProgressPhase::Preparing)
+        );
+
+        for state in [
+            VisualRuntimeFixtureState::FirstAppend,
+            VisualRuntimeFixtureState::RunningCaughtUp,
+            VisualRuntimeFixtureState::OffscreenReselect,
+        ] {
+            let progress = initial_visual_runtime_progress(Some(state), false);
+            assert_eq!(progress.len(), 4);
+            assert_eq!(
+                progress.last().map(|event| event.phase),
+                Some(DesktopRuntimeProgressPhase::ItemStarted)
+            );
+        }
+
+        for state in [
+            VisualRuntimeFixtureState::TerminalBeforeAck,
+            VisualRuntimeFixtureState::FinalCaughtUp,
+        ] {
+            let progress = initial_visual_runtime_progress(Some(state), false);
+            assert_eq!(progress.len(), 6);
+            assert_eq!(
+                progress.last().map(|event| event.phase),
+                Some(DesktopRuntimeProgressPhase::Completed)
+            );
+        }
+
+        let failed =
+            initial_visual_runtime_progress(Some(VisualRuntimeFixtureState::ErrorRetained), false);
+        assert_eq!(
+            failed.last().map(|event| event.phase),
+            Some(DesktopRuntimeProgressPhase::Failed)
+        );
+        assert!(initial_visual_runtime_progress(None, false).is_empty());
     }
 
     fn execution_paint_handle() -> hartevo_application::CatalogMissionExecutionHandle {
