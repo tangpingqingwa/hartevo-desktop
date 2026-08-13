@@ -10,6 +10,12 @@ readonly test_mode="${HARTEVO_DIOXUS_TEST_MODE:-0}"
 readonly script_path="${workspace_root}/scripts/check-dioxus-toolchain.sh"
 
 work_dir=""
+target_dir=""
+target_root=""
+artifact_suffix=""
+artifact_root=""
+artifact_binary=""
+artifact_report_path=""
 contract_sha="unavailable"
 host_os="unknown"
 host_arch="unknown"
@@ -396,13 +402,23 @@ run_build() {
 }
 
 assert_no_symlink_path_components() {
-  local relative_path="$1"
-  local cursor="${workspace_root}"
+  local base_root="$1"
+  local relative_path="$2"
+  local cursor="${base_root}"
   local component
   local components=()
+  if [[ -L "${base_root}" ]]; then
+    emit_problem "FAIL" "ARTIFACT_TYPE_MISMATCH" \
+      "a Dioxus artifact root is a symbolic link" 1
+  fi
   IFS='/' read -r -a components <<<"${relative_path}"
   for component in "${components[@]}"; do
-    cursor="${cursor}/${component}"
+    [[ -z "${component}" || "${component}" == "." ]] && continue
+    if [[ "${cursor}" == "/" ]]; then
+      cursor="/${component}"
+    else
+      cursor="${cursor}/${component}"
+    fi
     if [[ -L "${cursor}" ]]; then
       emit_problem "FAIL" "ARTIFACT_TYPE_MISMATCH" \
         "a Dioxus artifact path component is a symbolic link" 1
@@ -411,31 +427,64 @@ assert_no_symlink_path_components() {
 }
 
 resolve_artifact_root() {
-  local override_root="${HARTEVO_DIOXUS_TEST_ARTIFACT_ROOT:-}"
   local relative_path
-  require_test_override_scope "HARTEVO_DIOXUS_TEST_ARTIFACT_ROOT" "${override_root}"
+  target_dir="${CARGO_TARGET_DIR:-target}"
+  if [[ "${target_dir}" != "/" && "${target_dir}" == */ ]]; then
+    target_dir="${target_dir%/}"
+  fi
+  if [[ -z "${target_dir}" || "${target_dir}" == "/" || \
+    "${target_dir}" == *$'\n'* || "${target_dir}" == *$'\r'* || \
+    "${target_dir}" == ".." || "${target_dir}" == ../* || \
+    "${target_dir}" == */../* || "${target_dir}" == */.. ]]; then
+    emit_problem "FAIL" "CONTRACT_INVALID" \
+      "the CARGO_TARGET_DIR path is unsafe" 1
+  fi
+
   relative_path="$(jq -r '.artifact.path' "${contract_path}")"
 
-  if ! is_safe_relative_path "${relative_path}"; then
+  if [[ "${relative_path}" != target/* ]] || \
+    ! is_safe_relative_path "${relative_path#target/}"; then
     emit_problem "FAIL" "CONTRACT_INVALID" \
-      "the Dioxus artifact path is unsafe" 1
+      "the Dioxus artifact path must be a safe target-relative path" 1
   fi
 
-  if [[ -n "${override_root}" ]]; then
-    artifact_root="${override_root}"
+  artifact_suffix="${relative_path#target/}"
+  if [[ "${target_dir}" == /* ]]; then
+    target_root="${target_dir}"
   else
-    assert_no_symlink_path_components "${relative_path}"
-    artifact_root="${workspace_root}/${relative_path}"
+    if ! is_safe_relative_path "${target_dir}"; then
+      emit_problem "FAIL" "CONTRACT_INVALID" \
+        "the relative CARGO_TARGET_DIR path is unsafe" 1
+    fi
+    assert_no_symlink_path_components "${workspace_root}" "${target_dir}"
+    target_root="${workspace_root}/${target_dir}"
   fi
 
+  assert_no_symlink_path_components "${target_root}" "${artifact_suffix}"
+  artifact_root="${target_root}/${artifact_suffix}"
+  artifact_report_path="${target_dir}/${artifact_suffix}"
   if [[ ! -e "${artifact_root}" ]]; then
     emit_problem "FAIL" "ARTIFACT_MISSING" \
-      "the frozen Dioxus build produced no artifact at the contracted path" 1
+      "the frozen Dioxus build produced no artifact at the exact CARGO_TARGET_DIR-relative path" 1
   fi
   if [[ ! -d "${artifact_root}" || -L "${artifact_root}" ]]; then
     emit_problem "FAIL" "ARTIFACT_TYPE_MISMATCH" \
-      "the Dioxus artifact is not the contracted app directory" 1
+      "the exact Dioxus bundle is not a regular app directory" 1
   fi
+}
+
+verify_exact_bundle_and_binary() {
+  local expected_binary="${artifact_root}/Contents/MacOS/hartevo-desktop"
+  if [[ "$(basename "${artifact_root}")" != "HartevoDesktop.app" ]]; then
+    emit_problem "FAIL" "ARTIFACT_ENTRY_MISMATCH" \
+      "the Dioxus artifact is not the exact HartevoDesktop.app bundle" 1
+  fi
+  if [[ ! -f "${expected_binary}" || -L "${expected_binary}" || \
+    ! -s "${expected_binary}" || ! -x "${expected_binary}" ]]; then
+    emit_problem "FAIL" "ARTIFACT_ENTRY_MISMATCH" \
+      "the exact HartevoDesktop.app binary is missing, empty, or not executable" 1
+  fi
+  artifact_binary="${expected_binary}"
 }
 
 verify_required_entries() {
@@ -637,7 +686,7 @@ write_pass_receipt() {
     --arg package "$(jq -r '.build.package' "${contract_path}")" \
     --arg profile "$(jq -r '.build.profile' "${contract_path}")" \
     --arg artifactType "$(jq -r '.artifact.type' "${contract_path}")" \
-    --arg artifactPath "$(jq -r '.artifact.path' "${contract_path}")" \
+    --arg artifactPath "${artifact_report_path}" \
     --arg artifactDigestAlgorithm "$(jq -r '.artifact.digest.algorithm' "${contract_path}")" \
     --arg artifactDigest "${artifact_digest}" \
     --argjson artifactFileCount "${artifact_file_count}" \
@@ -757,7 +806,7 @@ child_test_environment() {
     HARTEVO_DIOXUS_TEST_HOST_OS=Darwin \
     HARTEVO_DIOXUS_TEST_HOST_ARCH=arm64 \
     HARTEVO_DIOXUS_TEST_DX_BIN="$1" \
-    HARTEVO_DIOXUS_TEST_ARTIFACT_ROOT="$2" \
+    CARGO_TARGET_DIR="$2" \
     HARTEVO_DIOXUS_CONTRACT_PATH="$3" \
     "${script_path}" "${@:4}"
 }
@@ -780,7 +829,9 @@ assert_problem_receipt() {
 }
 
 run_self_test() {
-  local fixture_root="${work_dir}/fixture/HartevoDesktop.app"
+  local fixture_target_dir="${work_dir}/fixture-target"
+  local fixture_root="${fixture_target_dir}/dx/hartevo-desktop/debug/macos/HartevoDesktop.app"
+  local missing_target_dir="${work_dir}/missing-target"
   local fake_dx="${work_dir}/fake-dx"
   local wrong_dx="${work_dir}/wrong-dx"
   local mutated_contract="${work_dir}/mutated-contract.json"
@@ -819,7 +870,7 @@ run_self_test() {
     'exit 0' >"${wrong_dx}"
   chmod +x "${wrong_dx}"
 
-  child_test_environment "${fake_dx}" "${fixture_root}" "${contract_path}" \
+  child_test_environment "${fake_dx}" "${fixture_target_dir}" "${contract_path}" \
     >"${pass_receipt}"
   jq -e '
     .status == "TEST_ONLY"
@@ -828,12 +879,12 @@ run_self_test() {
     and .testMode == true
   ' \
     "${pass_receipt}" >/dev/null
-  child_test_environment "${fake_dx}" "${fixture_root}" "${contract_path}" \
+  child_test_environment "${fake_dx}" "${fixture_target_dir}" "${contract_path}" \
     verify-receipt "${pass_receipt}" >/dev/null
 
   printf '%s\n' 'artifact-mutation' \
     >>"${fixture_root}/Contents/Resources/assets/app.css"
-  if child_test_environment "${fake_dx}" "${fixture_root}" "${contract_path}" \
+  if child_test_environment "${fake_dx}" "${fixture_target_dir}" "${contract_path}" \
     verify-receipt "${pass_receipt}" >"${problem_receipt}" 2>"${problem_log}"; then
     printf 'Mutated artifact unexpectedly matched its receipt\n' >&2
     return 1
@@ -842,27 +893,34 @@ run_self_test() {
     "RECEIPT_PROVENANCE_MISMATCH"
 
   jq '.cli.version = "0.7.11"' "${contract_path}" >"${mutated_contract}"
-  if child_test_environment "${fake_dx}" "${fixture_root}" "${mutated_contract}" \
+  if child_test_environment "${fake_dx}" "${fixture_target_dir}" "${mutated_contract}" \
     >"${problem_receipt}" 2>"${problem_log}"; then
     printf 'Mutated contract unexpectedly passed\n' >&2
     return 1
   fi
   assert_problem_receipt "${problem_receipt}" "FAIL" "CONTRACT_INVALID"
 
-  if child_test_environment "${wrong_dx}" "${fixture_root}" "${contract_path}" \
+  if child_test_environment "${wrong_dx}" "${fixture_target_dir}" "${contract_path}" \
     >"${problem_receipt}" 2>"${problem_log}"; then
     printf 'Wrong Dioxus CLI version unexpectedly passed\n' >&2
     return 1
   fi
   assert_problem_receipt "${problem_receipt}" "FAIL" "DX_VERSION_MISMATCH"
 
-  if child_test_environment "${work_dir}/missing-dx" "${fixture_root}" \
+  if child_test_environment "${work_dir}/missing-dx" "${fixture_target_dir}" \
     "${contract_path}" >"${problem_receipt}" 2>"${problem_log}"; then
     printf 'Missing Dioxus CLI unexpectedly passed\n' >&2
     return 1
   fi
   assert_problem_receipt "${problem_receipt}" "BLOCKED_ENV" \
     "BLOCKED_ENV_DX_MISSING"
+
+  if child_test_environment "${fake_dx}" "${missing_target_dir}" "${contract_path}" \
+    >"${problem_receipt}" 2>"${problem_log}"; then
+    printf 'Missing Dioxus artifact unexpectedly passed\n' >&2
+    return 1
+  fi
+  assert_problem_receipt "${problem_receipt}" "FAIL" "ARTIFACT_MISSING"
 
   jq -cn \
     --arg schema "${self_test_schema}" \
@@ -874,8 +932,10 @@ run_self_test() {
       contractSha256: $contractSha256,
       checks: [
         "fixture-receipt-is-test-only",
+        "non-default-cargo-target-dir",
         "exact-receipt-readback",
         "artifact-mutation-rejected",
+        "missing-artifact-rejected",
         "contract-mutation-rejected",
         "dx-version-mismatch-rejected",
         "dx-missing-blocked-nonzero"
@@ -934,6 +994,7 @@ main() {
     run_build
   fi
   resolve_artifact_root
+  verify_exact_bundle_and_binary
   verify_required_entries
   digest_artifact
 
