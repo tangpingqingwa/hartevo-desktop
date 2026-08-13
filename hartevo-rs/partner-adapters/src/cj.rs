@@ -20,7 +20,8 @@ use hartevo_connector_sdk::{
     ProviderAdapterRegistry, ProviderCapabilityKey, ProviderCapabilitySupport,
     ProviderEvidenceClass, ProviderProvenanceClass, ReadObservation, ReadRequest, ReceiptCandidate,
     ReconcileRequest, ReconciliationObservation, RefreshAuthRequest, RevokeRequest,
-    SecretReference, VerificationObservation, VerifyRequest, WebhookObservation, WebhookRequest,
+    SecretReference, VerificationObservation, VerifyRequest, WebhookEnvelope, WebhookObservation,
+    WebhookRequest, WebhookSigningKey,
 };
 use hartevo_domain_kernel::Mission;
 use hartevo_effect_broker::ProviderEvidenceSupport;
@@ -31,11 +32,16 @@ use ureq::Agent;
 use url::form_urlencoded;
 use zeroize::Zeroizing;
 
+#[path = "cj_reconcile.rs"]
+pub mod reconcile;
+
 pub const CJ_PROVIDER_ID: &str = "cj";
 pub const CJ_ADAPTER_ID: &str = "hartevo.cj";
 pub const CJ_ADAPTER_VERSION: u32 = 1;
 pub const CJ_SERVICE_ID: &str = "partner.cj.authenticated-read/v1";
+pub const CJ_RECONCILE_SERVICE_ID: &str = "partner.cj.cursor-reconcile/v1";
 pub const CJ_MISSION_CAPABILITY: &str = "partner.cj.authenticated-read";
+pub const CJ_RECONCILE_MISSION_CAPABILITY: &str = "partner.cj.cursor-reconcile";
 pub const CJ_CONNECTION_CAPABILITY: &str = "connection.probe";
 pub const CJ_ADVERTISER_READ_CAPABILITY: &str = "partner.advertiser.read";
 pub const CJ_ADVERTISER_LOOKUP_ENDPOINT: &str =
@@ -82,6 +88,7 @@ macro_rules! numeric_id {
 
 numeric_id!(CjPublisherId);
 numeric_id!(CjAdvertiserId);
+numeric_id!(CjProgramId);
 
 /// Exact CJ publisher account and advertiser relationship scope.
 #[allow(clippy::struct_field_names)]
@@ -769,6 +776,26 @@ pub enum CjError {
     RateLimited,
     #[error("CJ provider rejected the request")]
     ProviderRejected,
+    #[error("CJ provider generation drifted from the authenticated read")]
+    GenerationDrift,
+    #[error("CJ delivery is invalid for the exact provider scope")]
+    InvalidDelivery,
+    #[error("CJ reconcile checkpoint is invalid")]
+    InvalidCheckpoint,
+    #[error("CJ evidence root is still open")]
+    EvidenceRootOpen,
+    #[error("CJ evidence root is already closed")]
+    EvidenceRootClosed,
+    #[error("CJ source bytes are missing")]
+    MissingSourceBytes,
+    #[error("CJ source digest does not match the source bytes")]
+    DigestMismatch,
+    #[error("CJ delivery cursor rolled back")]
+    CursorRollback,
+    #[error("CJ provider event identity drifted")]
+    ProviderEventMismatch,
+    #[error("CJ webhook event was replayed")]
+    WebhookReplay,
     #[error("CJ Mission consumer rejected the exact binding")]
     MissionBinding,
     #[error("CJ service state is poisoned")]
@@ -904,7 +931,7 @@ pub struct CjReadData {
     pub payload: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CjCostReceipt {
     pub cost_units: i64,
@@ -1392,9 +1419,24 @@ where
 
     fn handle_webhook(
         &mut self,
-        _request: WebhookRequest,
+        request: WebhookRequest,
     ) -> Result<WebhookObservation, ConnectorError> {
-        Err(ConnectorError::ProviderRejected)
+        if request.scope != self.connector_scope
+            || request.envelope.provider_id() != CJ_PROVIDER_ID
+            || request.envelope.account_id() != self.scope.publisher_id().as_str()
+        {
+            return Err(ConnectorError::ScopeMismatch);
+        }
+        if request.envelope.adapter().adapter_id() != CJ_ADAPTER_ID
+            || request.envelope.adapter().adapter_version() != CJ_ADAPTER_VERSION
+        {
+            return Err(ConnectorError::AdapterMetadataMismatch);
+        }
+        WebhookObservation::from_envelope(
+            &request.envelope,
+            self.connector_scope.clone(),
+            request.at,
+        )
     }
 
     fn revoke(&mut self, _request: RevokeRequest) -> Result<(), ConnectorError> {
@@ -1424,6 +1466,7 @@ where
     credential_lease: Option<CredentialLease>,
     auth_session: Option<AuthSession>,
     probe_result: Option<ProbeResult>,
+    reconcile_authority: reconcile::CjReconcileAuthority,
     mounted: bool,
 }
 
@@ -1492,6 +1535,7 @@ where
             credential_lease: None,
             auth_session: None,
             probe_result: None,
+            reconcile_authority: reconcile::CjReconcileAuthority::new(),
             mounted: true,
         })
     }
@@ -1520,6 +1564,10 @@ where
         &self.budget
     }
 
+    pub fn reconcile_authority(&self) -> &reconcile::CjReconcileAuthority {
+        &self.reconcile_authority
+    }
+
     pub fn begin_auth(
         &mut self,
         secret_reference: SecretReference,
@@ -1543,6 +1591,7 @@ where
             issued_at,
             expires_at,
         })?;
+        self.reconcile_authority.invalidate()?;
         self.secret_reference = Some(secret_reference);
         self.credential_lease = Some(credential_lease);
         self.auth_session = Some(session.clone());
@@ -1570,6 +1619,7 @@ where
             issued_at,
             expires_at,
         })?;
+        self.reconcile_authority.invalidate()?;
         self.secret_reference = Some(secret_reference);
         self.credential_lease = Some(credential_lease);
         self.auth_session = Some(refreshed.clone());
@@ -1584,6 +1634,7 @@ where
         at: DateTime<Utc>,
     ) -> Result<CjProbeReceipt, CjError> {
         self.ensure_mounted()?;
+        self.reconcile_authority.invalidate()?;
         let secret_reference = self
             .secret_reference
             .clone()
@@ -1613,12 +1664,58 @@ where
             .last_probe
             .clone()
             .ok_or(CjError::Disconnected)?;
+        if observation.status == CjProbeStatus::Reachable
+            && observation.classification == CjObservationClassification::FirstParty
+        {
+            self.reconcile_authority.activate()?;
+        }
         self.probe_result = Some(connector_result.clone());
         Ok(CjProbeReceipt {
             credential_revision: observation.credential_revision,
             connector_result,
             observation,
         })
+    }
+
+    pub fn reconcile_session(
+        &self,
+        probe: &CjProbeReceipt,
+        program_id: CjProgramId,
+        expected_webhook_events: u64,
+    ) -> Result<reconcile::CjReconcileSession, CjError> {
+        self.ensure_mounted()?;
+        if self.probe_result.as_ref() != Some(&probe.connector_result) {
+            return Err(CjError::GenerationDrift);
+        }
+        let generation =
+            reconcile::CjProviderGeneration::from_probe(self.scope(), program_id, probe)?;
+        reconcile::CjReconcileSession::new(
+            self.scope.clone(),
+            self.plan.clone(),
+            generation,
+            self.reconcile_authority.clone(),
+            expected_webhook_events,
+        )
+    }
+
+    pub fn handle_webhook(
+        &mut self,
+        envelope: WebhookEnvelope,
+        key: &WebhookSigningKey,
+        at: DateTime<Utc>,
+    ) -> Result<WebhookObservation, CjError> {
+        self.ensure_mounted()?;
+        self.worker
+            .handle_webhook(
+                WebhookRequest {
+                    dispatch: self.worker.dispatch_fence(),
+                    scope: self.connector_scope.clone(),
+                    envelope,
+                    at,
+                },
+                key,
+            )
+            .map_err(CjError::from)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1780,6 +1877,7 @@ where
         self.credential_lease = None;
         self.auth_session = None;
         self.probe_result = None;
+        self.reconcile_authority.invalidate()?;
         let scope_digest = self.connector_scope.digest();
         Ok(lifecycle_receipt(
             "revoke",
@@ -1797,6 +1895,7 @@ where
         self.credential_lease = None;
         self.auth_session = None;
         self.probe_result = None;
+        self.reconcile_authority.invalidate()?;
         if let Ok(mut state) = self.state.lock() {
             state.active_credential = None;
             state.last_probe = None;
@@ -2105,8 +2204,13 @@ fn revision_from_digest(digest: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::reconcile::{
+        CjMissionReconcileConsumer, CjMissionReconcileExpectation, CjPageDelivery,
+        CjReconcileOutcome, CjReconcileScope, CjWebhookDelivery,
+    };
     use super::*;
     use hartevo_connector_sdk::ConnectorAuth;
+    use hartevo_connector_sdk::{ProviderAdapterIdentity, WebhookObservation, WebhookSigningKey};
     use hartevo_domain_kernel::{Mission, MissionContract, MissionId, ProjectId, TenantId};
 
     const NOW: &str = "2026-08-14T00:00:00Z";
@@ -2168,7 +2272,7 @@ mod tests {
         ) -> Result<CjProviderPage, CjProviderError> {
             self.reads = self.reads.saturating_add(1);
             let payload = format!(
-                "<cj-api><advertisers><total-matched>2</total-matched><records-returned>1</records-returned><page-number>{}</page-number><advertiser><advertiser-id>{}</advertiser-id><program-name>CJ Contract Program</program-name></advertiser></advertisers></cj-api>",
+                "<cj-api><advertisers><total-matched>2</total-matched><records-returned>1</records-returned><page-number>{}</page-number><advertiser><advertiser-id>{}</advertiser-id><program-id>555</program-id><program-name>CJ Contract Program</program-name></advertiser></advertisers></cj-api>",
                 request.page_number,
                 request.scope.advertiser_id()
             );
@@ -2538,6 +2642,331 @@ mod tests {
         assert!(matches!(
             CjMissionConsumer.consume(&mission, service.scope(), &probe, &result, &tampered, now()),
             Err(CjError::MissionBinding)
+        ));
+    }
+
+    fn reconcile_fixture() -> (
+        CjService<ContractTransport, ContractResolver>,
+        CjProbeReceipt,
+        CjReadResult,
+        CjReadResult,
+        reconcile::CjReconcileSession,
+    ) {
+        let (mut service, probe) = authenticated_service();
+        let first = service.read(None, now()).expect("first page");
+        let cursor = first.envelope.cursor.clone().expect("second page cursor");
+        let second = service.read(Some(&cursor), now()).expect("second page");
+        let session = service
+            .reconcile_session(&probe, CjProgramId::new("555").expect("program"), 2)
+            .expect("reconcile session");
+        (service, probe, first, second, session)
+    }
+
+    fn page_delivery(
+        session: &reconcile::CjReconcileSession,
+        result: &CjReadResult,
+        input_cursor: Option<&reconcile::CjReconcileCursor>,
+    ) -> CjPageDelivery {
+        CjPageDelivery::from_read(
+            session.scope(),
+            session.plan(),
+            session.generation(),
+            input_cursor,
+            result,
+            now(),
+        )
+        .expect("page delivery")
+    }
+
+    fn webhook_bytes(sequence: u64) -> Vec<u8> {
+        format!(
+            "<cj-event><advertiser-id>98765</advertiser-id><program-id>555</program-id><sequence>{sequence}</sequence></cj-event>"
+        )
+        .into_bytes()
+    }
+
+    fn signed_webhook(
+        scope: &ConnectorScope,
+        key: &WebhookSigningKey,
+        sequence: u64,
+        bytes: &[u8],
+    ) -> WebhookEnvelope {
+        WebhookEnvelope::sign(
+            scope,
+            ProviderAdapterIdentity::new(CJ_ADAPTER_ID, CJ_ADAPTER_VERSION).expect("adapter"),
+            format!("webhook-event-cj-{sequence}"),
+            sequence,
+            now(),
+            now(),
+            sha256_hex(std::str::from_utf8(bytes).expect("utf8")),
+            key,
+        )
+        .expect("signed webhook")
+    }
+
+    fn webhook_delivery(
+        session: &reconcile::CjReconcileSession,
+        sequence: u64,
+        key: &WebhookSigningKey,
+    ) -> CjWebhookDelivery {
+        let bytes = webhook_bytes(sequence);
+        let connector_scope = session.scope().base().connector_scope().expect("scope");
+        let envelope = signed_webhook(&connector_scope, key, sequence, &bytes);
+        let observation = WebhookObservation::from_envelope(&envelope, connector_scope, now())
+            .expect("webhook observation");
+        CjWebhookDelivery::from_verified_webhook(
+            session.scope(),
+            session.generation(),
+            envelope,
+            &observation,
+            bytes,
+            now(),
+        )
+        .expect("webhook delivery")
+    }
+
+    #[test]
+    fn reconcile_deduplicates_pages_and_webhooks_exactly_once() {
+        let (_service, _probe, first, second, mut session) = reconcile_fixture();
+        let page_one = page_delivery(&session, &first, None);
+        let page_two = page_delivery(&session, &second, page_one.next_cursor());
+        assert!(matches!(
+            session.accept_page(page_two.clone(), now()),
+            Ok(CjReconcileOutcome::OutOfOrder(_))
+        ));
+        assert!(matches!(
+            session.accept_page(page_one.clone(), now()),
+            Ok(CjReconcileOutcome::Applied(_))
+        ));
+        assert!(matches!(
+            session.accept_page(page_one, now()),
+            Ok(CjReconcileOutcome::Duplicate(_))
+        ));
+        assert!(matches!(
+            session.accept_page(page_two.clone(), now()),
+            Ok(CjReconcileOutcome::Applied(_))
+        ));
+        assert!(matches!(
+            session.accept_page(page_two, now()),
+            Ok(CjReconcileOutcome::Duplicate(_))
+        ));
+
+        let key = WebhookSigningKey::new(b"cj-reconcile-webhook-key").expect("webhook key");
+        let webhook_two = webhook_delivery(&session, 2, &key);
+        let webhook_one = webhook_delivery(&session, 1, &key);
+        assert!(matches!(
+            session.accept_webhook(webhook_two.clone(), now()),
+            Ok(CjReconcileOutcome::OutOfOrder(_))
+        ));
+        assert!(matches!(
+            session.accept_webhook(webhook_one.clone(), now()),
+            Ok(CjReconcileOutcome::Applied(_))
+        ));
+        assert!(matches!(
+            session.accept_webhook(webhook_one, now()),
+            Ok(CjReconcileOutcome::Duplicate(_))
+        ));
+        assert!(matches!(
+            session.accept_webhook(webhook_two.clone(), now()),
+            Ok(CjReconcileOutcome::Applied(_))
+        ));
+        let duplicate = session
+            .accept_webhook(webhook_two, now())
+            .expect("duplicate webhook");
+        assert!(matches!(duplicate, CjReconcileOutcome::Duplicate(_)));
+    }
+
+    #[test]
+    fn service_webhook_path_uses_sdk_signature_and_replay_fence() {
+        let (mut service, _probe) = authenticated_service();
+        let key = WebhookSigningKey::new(b"cj-reconcile-webhook-key").expect("webhook key");
+        let bytes = webhook_bytes(1);
+        let envelope = signed_webhook(service.connector_scope(), &key, 1, &bytes);
+        let observation = service
+            .handle_webhook(envelope.clone(), &key, now())
+            .expect("verified webhook");
+        assert_eq!(observation.event_id(), envelope.event_id());
+        assert_eq!(observation.payload_digest(), envelope.payload_digest());
+        assert!(matches!(
+            service.handle_webhook(envelope, &key, now()),
+            Err(CjError::Connector(ConnectorError::WebhookReplay))
+        ));
+    }
+
+    #[test]
+    fn reconcile_closes_only_after_complete_evidence_and_consumes_mission_result() {
+        let (_service, probe, first, second, mut session) = reconcile_fixture();
+        let page_one = page_delivery(&session, &first, None);
+        let page_two = page_delivery(&session, &second, page_one.next_cursor());
+        session.accept_page(page_one, now()).expect("page one");
+        session.accept_page(page_two, now()).expect("page two");
+        let key = WebhookSigningKey::new(b"cj-reconcile-webhook-key").expect("webhook key");
+        session
+            .accept_webhook(webhook_delivery(&session, 1, &key), now())
+            .expect("webhook one");
+        assert_eq!(session.close_result(now()), Err(CjError::EvidenceRootOpen));
+        session
+            .accept_webhook(webhook_delivery(&session, 2, &key), now())
+            .expect("webhook two");
+        let result = session.close_result(now()).expect("closed result");
+        assert_eq!(result.page_count, 2);
+        assert_eq!(result.webhook_count, 2);
+        assert_eq!(result.evidence_root.nodes().len(), 4);
+        assert_eq!(
+            result.evidence_root_digest,
+            result.evidence_root.root_digest()
+        );
+        assert_eq!(result.generation_digest, session.generation().digest());
+
+        let mission = Mission::compile(
+            TenantId::from("tenant-cj"),
+            MissionId::from("mission-cj-reconcile"),
+            ProjectId::from("project-cj"),
+            "Reconcile CJ delivery",
+            MissionContract::bootstrap(
+                "Reconcile CJ partner delivery",
+                [CJ_RECONCILE_MISSION_CAPABILITY.to_owned()],
+                now(),
+            ),
+            now(),
+        )
+        .expect("mission");
+        let expected = CjMissionReconcileExpectation {
+            mission_id: mission.id.as_str().to_owned(),
+            mission_revision: mission.revision,
+            provider_id: CJ_PROVIDER_ID.to_owned(),
+            publisher_id: scope().publisher_id().clone(),
+            advertiser_id: scope().advertiser_id().clone(),
+            program_id: CjProgramId::new("555").expect("program"),
+            credential_revision: probe.credential_revision,
+            probe_revision: probe.connector_result.probe_revision(),
+            provider_generation: session.generation().provider_generation(),
+            generation_digest: session.generation().digest().to_owned(),
+            evidence_root_digest: result.evidence_root_digest.clone(),
+        };
+        let receipt = CjMissionReconcileConsumer
+            .consume(&mission, session.scope(), &result, &expected, now())
+            .expect("mission result");
+        assert_eq!(receipt.result_digest, result.result_digest);
+    }
+
+    #[test]
+    fn reconcile_checkpoint_reopens_and_revoke_invalidates_old_generation() {
+        let (mut service, probe, first, _second, mut session) = reconcile_fixture();
+        let page_one = page_delivery(&session, &first, None);
+        session
+            .accept_page(page_one.clone(), now())
+            .expect("page one");
+        let checkpoint = session.checkpoint().expect("checkpoint");
+        let reopened = reconcile::CjReconcileSession::reopen(
+            checkpoint.clone(),
+            scope(),
+            plan(),
+            session.generation().clone(),
+            service.reconcile_authority().clone(),
+        )
+        .expect("reopen");
+        assert_eq!(reopened.next_page(), 2);
+        service.revoke("reconcile-revoke", now()).expect("revoke");
+        assert_eq!(reopened.checkpoint(), Err(CjError::GenerationDrift));
+        assert!(matches!(
+            reconcile::CjReconcileSession::reopen(
+                checkpoint.clone(),
+                scope(),
+                plan(),
+                session.generation().clone(),
+                service.reconcile_authority().clone(),
+            ),
+            Err(CjError::GenerationDrift)
+        ));
+
+        let mut tampered_value = serde_json::to_value(&checkpoint).expect("checkpoint json");
+        tampered_value["checkpointDigest"] = serde_json::Value::String(sha256_hex("tampered"));
+        let tampered: reconcile::CjReconcileCheckpoint =
+            serde_json::from_value(tampered_value).expect("tampered checkpoint");
+        assert_eq!(tampered.validate(), Err(CjError::InvalidCheckpoint));
+        let _ = probe;
+    }
+
+    #[test]
+    fn reconcile_missing_source_tampered_digest_cursor_and_account_drift_fail_closed() {
+        let (_service, _probe, first, second, session) = reconcile_fixture();
+        let mut missing_source = first.clone();
+        missing_source.envelope.data.payload.clear();
+        assert!(matches!(
+            CjPageDelivery::from_read(
+                session.scope(),
+                session.plan(),
+                session.generation(),
+                None,
+                &missing_source,
+                now(),
+            ),
+            Err(CjError::MissingSourceBytes | CjError::InvalidDelivery)
+        ));
+
+        let mut tampered_digest = first.clone();
+        tampered_digest.envelope.data.payload.push_str("tampered");
+        assert!(
+            CjPageDelivery::from_read(
+                session.scope(),
+                session.plan(),
+                session.generation(),
+                None,
+                &tampered_digest,
+                now(),
+            )
+            .is_err()
+        );
+
+        let rollback_cursor = CjDurableCursor::new(
+            session.plan(),
+            session.scope().base(),
+            session.query_digest(),
+            1,
+        )
+        .expect("rollback cursor");
+        assert_eq!(
+            CjPageDelivery::from_read(
+                session.scope(),
+                session.plan(),
+                session.generation(),
+                Some(
+                    &reconcile::CjReconcileCursor::from_durable(
+                        rollback_cursor,
+                        session.scope(),
+                        session.plan(),
+                        session.generation(),
+                    )
+                    .expect("reconcile cursor")
+                ),
+                &second,
+                now(),
+            ),
+            Err(CjError::CursorRollback)
+        );
+
+        let drift_scope = CjReconcileScope::new(
+            CjScope::new(
+                "tenant-cj",
+                "project-cj",
+                CjPublisherId::new("12345").expect("publisher"),
+                CjAdvertiserId::new("11111").expect("other advertiser"),
+            )
+            .expect("drift scope"),
+            CjProgramId::new("555").expect("program"),
+        )
+        .expect("reconcile drift scope");
+        assert!(matches!(
+            CjPageDelivery::from_read(
+                &drift_scope,
+                session.plan(),
+                session.generation(),
+                None,
+                &first,
+                now(),
+            ),
+            Err(CjError::GenerationDrift)
         ));
     }
 }
