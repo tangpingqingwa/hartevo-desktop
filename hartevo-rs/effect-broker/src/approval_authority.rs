@@ -24,7 +24,8 @@ use crate::provider_auth::{
 };
 use crate::provider_contract::{
     PROVIDER_ADAPTER_CONTRACT_SCHEMA_VERSION, PROVIDER_ADAPTER_CONTRACT_VERSION,
-    ProviderAdapterIdentity, ProviderAdapterRegistry, ProviderCapabilityKey,
+    ProviderAdapterIdentity, ProviderAdapterOperation, ProviderAdapterRegistry,
+    ProviderCapabilityKey, ProviderEvidenceClass, ProviderProvenanceClass,
 };
 use crate::{EffectPolicy, PermissionEvidence};
 
@@ -2141,6 +2142,14 @@ fn validate_provider_capability_metadata(
     if registration.adapter() != connected_adapter {
         return Err(ApprovalAuthorityError::ProviderAdapterMismatch);
     }
+    let supports_production_preparation = registration.evidence_support().iter().any(|support| {
+        support.operation() == ProviderAdapterOperation::PrepareEffect
+            && support.evidence_class() == ProviderEvidenceClass::PreparedEffect
+            && support.provenance_class() == ProviderProvenanceClass::ProductionProvider
+    });
+    if !supports_production_preparation {
+        return Err(ApprovalAuthorityError::ProviderCapabilitySurfaceMismatch);
+    }
     Ok(registry.registry_version().to_owned())
 }
 
@@ -2592,6 +2601,8 @@ pub enum ApprovalAuthorityError {
     UnregisteredProviderCapability,
     #[error("Provider capability metadata names another adapter identity/version")]
     ProviderAdapterMismatch,
+    #[error("Provider capability metadata lacks production prepared-effect support")]
+    ProviderCapabilitySurfaceMismatch,
     #[error("Provider auth/probe binding does not match the exact Effect scope")]
     ProviderScopeMismatch,
     #[error("Provider auth/probe binding is invalid")]
@@ -2639,10 +2650,7 @@ mod tests {
 
     use super::*;
     use crate::provider_auth::{ProbeObservation, ProbeStatus, ProviderAuthScope};
-    use crate::provider_contract::{
-        ProviderAdapterOperation, ProviderCapabilitySupport, ProviderEvidenceClass,
-        ProviderEvidenceSupport, ProviderProvenanceClass,
-    };
+    use crate::provider_contract::{ProviderCapabilitySupport, ProviderEvidenceSupport};
     use crate::{EffectRateLimit, PermissionFence};
 
     fn now() -> DateTime<Utc> {
@@ -2787,16 +2795,19 @@ mod tests {
             ProviderProvenanceClass::ProductionProvider,
         )
         .expect("support");
+        (connected, synthetic_capability_registry([support]))
+    }
+
+    fn synthetic_capability_registry(
+        evidence_support: impl IntoIterator<Item = ProviderEvidenceSupport>,
+    ) -> ProviderAdapterRegistry {
         let registration = ProviderCapabilitySupport::new(
             ProviderCapabilityKey::new("fixture-provider", "channel.preview").expect("key"),
-            adapter,
-            [support],
+            ProviderAdapterIdentity::new("adapter.fixture", 3).expect("adapter"),
+            evidence_support,
         )
         .expect("registration");
-        let adapter_registry =
-            ProviderAdapterRegistry::new("synthetic-a3-registry-v1", [registration])
-                .expect("registry");
-        (connected, adapter_registry)
+        ProviderAdapterRegistry::new("synthetic-a3-registry-v1", [registration]).expect("registry")
     }
 
     fn synthetic_human_authority(
@@ -3347,6 +3358,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn matching_key_and_adapter_without_exact_production_prepare_surface_fail_closed() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+        let unsupported_surfaces = [
+            ProviderEvidenceSupport::new(
+                ProviderAdapterOperation::Read,
+                ProviderEvidenceClass::ReadObservation,
+                ProviderProvenanceClass::ProductionProvider,
+            )
+            .expect("read support"),
+            ProviderEvidenceSupport::new(
+                ProviderAdapterOperation::PrepareEffect,
+                ProviderEvidenceClass::PreparedEffect,
+                ProviderProvenanceClass::ControlledProvider,
+            )
+            .expect("controlled prepare support"),
+        ];
+
+        for support in unsupported_surfaces {
+            let mut state = synthetic_state();
+            state.adapter_registry = synthetic_capability_registry([support]);
+            assert_prepare_rejected(&policy, &state, ApprovalAuthorityErrorKind::Surface);
+        }
+    }
+
+    #[test]
+    fn issue_revalidates_provider_surface_after_request_preparation() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+        let mut state = synthetic_state();
+        let request = synthetic_request(&policy, &state);
+        state.adapter_registry = synthetic_capability_registry([ProviderEvidenceSupport::new(
+            ProviderAdapterOperation::Read,
+            ProviderEvidenceClass::ReadObservation,
+            ProviderProvenanceClass::ProductionProvider,
+        )
+        .expect("read support")]);
+
+        assert!(matches!(
+            issue_synthetic(&policy, &state, request, now() + Duration::seconds(2)),
+            Err(ApprovalAuthorityError::ProviderCapabilitySurfaceMismatch)
+        ));
+    }
+
     proptest! {
         #[test]
         fn any_single_request_field_tamper_breaks_its_original_digest(field in 0usize..19) {
@@ -3778,6 +3832,7 @@ mod tests {
     enum ApprovalAuthorityErrorKind {
         ProviderScope,
         Adapter,
+        Surface,
     }
 
     fn assert_prepare_rejected(
@@ -3827,6 +3882,10 @@ mod tests {
             ApprovalAuthorityErrorKind::Adapter => assert!(matches!(
                 result,
                 Err(ApprovalAuthorityError::ProviderAdapterMismatch)
+            )),
+            ApprovalAuthorityErrorKind::Surface => assert!(matches!(
+                result,
+                Err(ApprovalAuthorityError::ProviderCapabilitySurfaceMismatch)
             )),
         }
     }
