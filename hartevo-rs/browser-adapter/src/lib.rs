@@ -21,6 +21,8 @@ mod file_broker;
 mod locator;
 mod navigation;
 mod profile_dir;
+#[cfg(test)]
+mod real_chromium_signed_recipe_test;
 mod recipe;
 #[cfg(unix)]
 mod scanner;
