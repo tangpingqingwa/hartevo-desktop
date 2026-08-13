@@ -27234,22 +27234,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn runtime_process_orphan_fixture() {
-        if std::env::var("HARTEVO_RUNTIME_PROCESS_ORPHAN_FIXTURE").as_deref() != Ok("run") {
-            return;
-        }
-        loop {
-            std::thread::sleep(StdDuration::from_mins(1));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the crash-recovery test proves real process reaping, privacy projection, attempt fencing, a second commit-gap crash, and idempotent replay end to end"
+        reason = "the crash-recovery test proves exact exited-claim cleanup, privacy projection, attempt fencing, a second commit-gap crash, and idempotent replay end to end"
     )]
-    fn startup_reconciliation_reaps_exact_forgotten_runtime_process_claim() {
+    fn startup_reconciliation_reconciles_exact_exited_runtime_process_claim() {
         let mut fixture = runtime_recovery_fixture();
         let attached = fixture
             .service
@@ -27307,16 +27296,6 @@ mod tests {
         command.expected_program_sha256 = Some(sha256(
             &std::fs::read(&program).expect("read test executable"),
         ));
-        command.args = vec![
-            "--exact".into(),
-            "tests::runtime_process_orphan_fixture".into(),
-            "--nocapture".into(),
-        ];
-        command.environment.insert(
-            "HARTEVO_RUNTIME_PROCESS_ORPHAN_FIXTURE".into(),
-            "run".into(),
-        );
-        command.shutdown_grace = StdDuration::from_millis(25);
         let launch_token = generate_runtime_launch_token(&command).expect("launch token");
         let launch = prepare_runtime_launch(&command, &launch_token).expect("launch spec");
         let mut claim = RuntimeProcessClaim::prepare(
@@ -27345,25 +27324,18 @@ mod tests {
                 now() + Duration::seconds(7),
             )
             .expect("persist process claim");
-        let runtime = StdioRuntime::spawn_prepared(&command, &launch).expect("spawn fixture");
         let expected_recovery_revision = recovery.revision;
         let expected_claim_revision = claim.revision;
         recovery
-            .mark_spawned(
-                runtime.instance_digest().to_owned(),
-                now() + Duration::seconds(8),
-            )
+            .mark_spawned("2".repeat(64), now() + Duration::seconds(8))
             .expect("mark recovery spawned");
         claim
             .mark_spawned(
                 RuntimeProcessIdentity {
-                    process_id: runtime.process_identity().process_id,
-                    started_at_epoch_seconds: runtime.process_identity().started_at_epoch_seconds,
-                    executable_path_digest: runtime
-                        .process_identity()
-                        .executable_path_digest
-                        .clone(),
-                    runtime_instance_digest: runtime.instance_digest().to_owned(),
+                    process_id: u32::MAX,
+                    started_at_epoch_seconds: 1,
+                    executable_path_digest: launch.executable_path_digest().to_owned(),
+                    runtime_instance_digest: "2".repeat(64),
                 },
                 now() + Duration::seconds(8),
             )
@@ -27403,7 +27375,6 @@ mod tests {
         let projection_json = serde_json::to_string(&active_projection).expect("projection JSON");
         assert!(!projection_json.contains(&launch_token));
         assert!(!projection_json.contains(launch.executable_path().to_string_lossy().as_ref()));
-        std::mem::forget(runtime);
 
         let RuntimeRecoveryFixture {
             service,
@@ -27415,17 +27386,17 @@ mod tests {
         let mut restarted = ApplicationService::new(service.store);
         let report = restarted
             .reconcile_runtime_processes_on_startup(now() + Duration::seconds(9))
-            .expect("reap exact orphan");
+            .expect("reconcile exact exited claim");
         assert_eq!(report.scanned_claims, 1);
-        assert_eq!(report.terminated, 1);
-        assert_eq!(report.already_exited, 0);
+        assert_eq!(report.terminated, 0);
+        assert_eq!(report.already_exited, 1);
         assert_eq!(report.blocked, 0);
         assert_eq!(report.recovery_attempts_fenced, 1);
         let cleaned = restarted
             .store
             .load_runtime_process_claim(&project_id, &recovery.id, recovery.process_attempt)
             .expect("cleaned claim");
-        assert_eq!(cleaned.status, RuntimeProcessClaimStatus::Terminated);
+        assert_eq!(cleaned.status, RuntimeProcessClaimStatus::Exited);
         assert!(!launch.executable_path().exists());
         let cleaned_projection = restarted
             .desktop_runtime_activity()
@@ -27435,7 +27406,7 @@ mod tests {
             .expect("cleaned Mission projection");
         assert_eq!(
             cleaned_projection.process_claim_status,
-            Some(RuntimeProcessClaimStatus::Terminated)
+            Some(RuntimeProcessClaimStatus::Exited)
         );
         assert_eq!(cleaned_projection.process_cleanup_attempt_count, 1);
         assert!(!cleaned_projection.requires_reconciliation);
@@ -27917,6 +27888,58 @@ mod tests {
             initialize_response,
             thread_response,
         ];
+        command.shutdown_grace = StdDuration::from_millis(50);
+        command
+    }
+
+    #[cfg(unix)]
+    fn checkpoint_bound_health_timeout_runtime_command(
+        workspace: &Path,
+        thread_id: &str,
+    ) -> RuntimeCommand {
+        let canonical_workspace = workspace.canonicalize().expect("canonical workspace");
+        let first_process_marker = workspace.join(".hartevo-first-health-timeout");
+        let initialize_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {}
+        })
+        .to_string();
+        let thread_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "thread": {"id": thread_id},
+                "cwd": canonical_workspace,
+                "model": "fixture-model",
+                "modelProvider": "fixture-provider",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandbox": "workspace-write"
+            }
+        })
+        .to_string();
+        let mut command = RuntimeCommand::new(PathBuf::from("/bin/sh"), canonical_workspace);
+        command.args = vec![
+            "-c".into(),
+            "IFS= read -r _
+if (set -C; : > \"$1\") 2>/dev/null; then
+  IFS= read -r _
+else
+  printf '%s\\n' \"$2\"
+  IFS= read -r _
+  printf '%s\\n' \"$3\"
+  sleep 30
+fi"
+            .into(),
+            "hartevo-checkpoint-bound-runtime".into(),
+            first_process_marker.to_string_lossy().into_owned(),
+            initialize_response,
+            thread_response,
+        ];
+        command
+            .environment
+            .insert("PATH".into(), "/usr/bin:/bin".into());
         command.shutdown_grace = StdDuration::from_millis(50);
         command
     }
@@ -29163,8 +29186,10 @@ sleep 30"#
     fn runtime_recovery_is_checkpoint_bound_retryable_and_thread_redacted() {
         let mut fixture = runtime_recovery_fixture();
         let runtime_thread_id = "private-runtime-thread-recovery";
-        let runtime_command =
-            delayed_fake_runtime_command(fixture.workspace.path(), runtime_thread_id, "0.20");
+        let runtime_command = checkpoint_bound_health_timeout_runtime_command(
+            fixture.workspace.path(),
+            runtime_thread_id,
+        );
         let recovery_id = RuntimeRecoveryAttemptId::from("recovery-runtime-health-timeout");
         let first_result = fixture.service.recover_context_worker_runtime(
             RecoverContextWorkerRuntime {

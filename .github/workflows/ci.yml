@@ -1,98 +1,154 @@
-name: ci
+name: PR / Fast CI
 
 on:
   pull_request:
-  push:
-    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
 
-jobs:
-  rust:
-    name: Rust workspace
-    runs-on: macos-15
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install pinned Rust toolchain
-        run: rustup show
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --workspace --all-features
-      - name: Validate Mission, Provider and Dataset catalogs
-        run: cargo run -p hartevo-eval -- catalog validate
-      - name: Export traceability and honest release baseline
-        run: |
-          cargo run -p hartevo-eval -- catalog export --output target/eval/catalog-v1.json
-          cargo run -p hartevo-eval -- evidence baseline --commit "${GITHUB_SHA}" --output target/eval/release-baseline.json
-      - name: Desktop smoke compile
-        run: cargo check -p hartevo-desktop --all-features
-      - name: Verify OpenInterpreter schema pin
-        run: bash scripts/check-openinterpreter-schema.sh
-      - name: Replay the controlled Mission slice
-        run: cargo run -p hartevo-eval -- run --mission VS-01 --output target/eval/vs-01.json
-      - name: Upload contract and bootstrap evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hartevo-contract-evidence-${{ github.sha }}
-          path: target/eval/*.json
-          if-no-files-found: error
+concurrency:
+  group: hartevo-pr-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
-  postgres-l2:
-    name: PostgreSQL 18 Cell contract
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_TARGET_DIR: target/ci-cargo
+
+jobs:
+  policy:
+    name: PR / Workflow policy
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:18.4
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - name: Install pinned Rust toolchain
-        run: rustup show
-      - name: Install PostgreSQL client
-        run: sudo apt-get update && sudo apt-get install --yes postgresql-client
-      - name: Create non-bypass Cell role and disposable database
-        env:
-          PGPASSWORD: postgres
+      - name: Checkout untrusted source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Parse workflow YAML
+        run: bash scripts/ci-workflow-syntax.sh verify
+      - name: Verify workflow, action-pin and branch-policy contracts
         run: |
-          psql --host=127.0.0.1 --username=postgres --dbname=postgres --set=ON_ERROR_STOP=1 <<'SQL'
-          CREATE ROLE hartevo_l2 LOGIN PASSWORD 'hartevo_l2'
-            NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
-          CREATE DATABASE hartevo_l2 OWNER hartevo_l2;
-          SQL
-      - name: Run migration, RLS, encrypted sync, CAS, Effect fencing, and recovery replay
+          python3 scripts/ci-workflow-policy.py verify
+          python3 scripts/ci-workflow-policy.py verify-pins
+          python3 scripts/ci-branch-policy.py verify
+          bash scripts/ci-tests.sh
+
+  scope:
+    name: PR / Scope plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      full: ${{ steps.plan.outputs.full }}
+      rust: ${{ steps.plan.outputs.rust }}
+      packages: ${{ steps.plan.outputs.packages }}
+      plan: ${{ steps.plan.outputs.plan }}
+    steps:
+      - name: Checkout history for an exact diff
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        name: Plan conservative changed scope
         env:
-          HARTEVO_TEST_POSTGRES_URL: host=127.0.0.1 port=5432 user=hartevo_l2 password=hartevo_l2 dbname=hartevo_l2 sslmode=disable
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          cargo test -p hartevo-cloud-storage \
-            tests::postgres_l2_contract_reports_blocked_or_executes_full_replay \
-            -- --nocapture --exact
-          cargo test -p hartevo-cloud-storage \
-            --test cell_integration \
-            postgres_cell_two_process_sync_device_and_worker_recovery_contract \
-            -- --nocapture --exact
-          cargo test -p hartevo-cloud-storage \
-            effect_ledger::tests::postgres_effect_claim_contract_reports_blocked_or_executes_full_recovery \
-            -- --nocapture --exact
-          cargo test -p hartevo-cloud-storage \
-            effect_ledger::tests::postgres_effect_concurrency_and_terminal_recovery_reports_blocked_or_executes \
-            -- --nocapture --exact
-          cargo test -p hartevo-cloud-storage \
-            effect_ledger::tests::postgres_effect_reconciliation_reports_blocked_or_executes_bounded_recovery \
-            -- --nocapture --exact
+          mkdir -p target/ci
+          python3 scripts/ci-scope.py \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --github-output "$GITHUB_OUTPUT" \
+            | tee target/ci/scope.json
+      - name: Upload redacted scope evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr-scope-${{ github.run_id }}
+          path: target/ci/scope.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  rust:
+    name: PR / Fast Rust matrix
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
+    uses: ./.github/workflows/rust-reusable.yml
+    with:
+      check_prefix: PR / Fast Rust
+      full_workspace: ${{ needs.scope.outputs.full == 'true' }}
+      rust_packages: ${{ needs.scope.outputs.packages }}
+    permissions:
+      contents: read
+
+  result:
+    name: PR / Result taxonomy
+    if: always()
+    needs: [policy, scope, rust]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout result verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Capture hosted job execution evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p target/ci
+          curl --fail --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+            > target/ci/github-jobs.json
+      - name: Classify job outcomes
+        env:
+          RUST_SCOPE: ${{ needs.scope.outputs.rust }}
+        run: |
+          mkdir -p target/ci
+          allow=()
+          if [[ "$RUST_SCOPE" == false ]]; then
+            allow+=(--allow-skipped rust)
+          fi
+          python3 scripts/ci-result.py aggregate \
+            --workflow "$GITHUB_WORKFLOW" \
+            --run-id "$GITHUB_RUN_ID" \
+            --commit "$GITHUB_SHA" \
+            --event "$GITHUB_EVENT_NAME" \
+            --output target/ci/result.json \
+            --junit target/ci/result.xml \
+            --github-jobs-json target/ci/github-jobs.json \
+            --job "policy=${{ needs.policy.result }}" \
+            --job "scope=${{ needs.scope.result }}" \
+            --job "rust=${{ needs.rust.result }}" \
+            --job-name "policy=PR / Workflow policy" \
+            --job-name "scope=PR / Scope plan" \
+            --job-name "rust=PR / Fast Rust matrix" \
+            --kind policy=code \
+            --kind scope=infra \
+            --kind rust=code \
+            "${allow[@]}"
+      - name: Upload redacted CI result and JUnit envelope
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr-ci-result-${{ github.run_id }}
+          path: |
+            target/ci/result.json
+            target/ci/result.xml
+            target/ci/github-jobs.json
+          if-no-files-found: warn
+          retention-days: 14

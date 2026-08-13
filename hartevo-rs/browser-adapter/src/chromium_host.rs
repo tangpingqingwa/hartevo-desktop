@@ -5452,15 +5452,24 @@ fn terminate_group_best_effort(child: &mut GroupChild) {
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
-    use std::io::{BufRead as _, BufReader, Cursor, Write as _};
+    use std::io::Cursor;
+    #[cfg(target_os = "macos")]
+    use std::io::{BufRead as _, BufReader, Write as _};
+    #[cfg(target_os = "macos")]
     use std::net::{SocketAddr, TcpListener};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "macos")]
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(target_os = "macos")]
     use std::sync::{Arc, Mutex};
+    #[cfg(target_os = "macos")]
     use std::thread;
 
-    use chrono::{Duration as ChronoDuration, TimeZone};
+    #[cfg(target_os = "macos")]
+    use chrono::Duration as ChronoDuration;
+    use chrono::TimeZone;
+    #[cfg(target_os = "macos")]
     use hartevo_domain_kernel::{
         AccountId, ActorId, Approval, ApprovalDecision, ApprovalId, BrowserActionBatchId,
         BrowserControlLeaseId, BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId,
@@ -5471,6 +5480,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    #[cfg(target_os = "macos")]
     use crate::{
         BrowserFileGrantState, BrowserIdentity, FileBroker, FileSafetyScanner, FileScanDecision,
         FileScanReport, FileScanRequest,
@@ -5678,6 +5688,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     struct TestHttpServer {
         address: SocketAddr,
         request_count: Arc<AtomicUsize>,
@@ -5686,8 +5697,10 @@ mod tests {
         thread: Option<JoinHandle<()>>,
     }
 
+    #[cfg(target_os = "macos")]
     struct TestCleanScanner;
 
+    #[cfg(target_os = "macos")]
     impl FileSafetyScanner for TestCleanScanner {
         fn scan(&mut self, request: &FileScanRequest<'_>) -> Result<FileScanReport, BrowserError> {
             Ok(FileScanReport {
@@ -5705,6 +5718,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl TestHttpServer {
         fn start(
             handler: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static,
@@ -5791,6 +5805,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl Drop for TestHttpServer {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
@@ -5800,6 +5815,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn http_response(status: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
         let mut response = format!(
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",

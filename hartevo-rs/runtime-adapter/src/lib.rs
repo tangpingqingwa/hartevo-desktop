@@ -20,7 +20,9 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounde
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
+use sysinfo::{
+    Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, RefreshKind, System, UpdateKind,
+};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -1266,6 +1268,9 @@ pub struct StdioRuntime {
     pending: HashMap<RequestId, PendingRequest>,
     server_requests: HashSet<RequestId>,
     deferred: VecDeque<RuntimeEvent>,
+    // stderr EOF is nonfatal; let the stdout reader deliver already-produced
+    // protocol frames before exposing the lifecycle diagnostic.
+    stderr_closed_pending: bool,
     deferred_capacity: usize,
     max_line_bytes: usize,
     shutdown_grace: Duration,
@@ -1289,6 +1294,7 @@ impl fmt::Debug for StdioRuntime {
             .field("pending_request_count", &self.pending.len())
             .field("server_request_count", &self.server_requests.len())
             .field("deferred_event_count", &self.deferred.len())
+            .field("stderr_closed_pending", &self.stderr_closed_pending)
             .field("config_digest", &self.config_digest)
             .field("instance_digest", &self.instance_digest)
             .field("poisoned", &self.poisoned)
@@ -1430,6 +1436,7 @@ impl StdioRuntime {
             pending: HashMap::new(),
             server_requests: HashSet::new(),
             deferred: VecDeque::new(),
+            stderr_closed_pending: false,
             deferred_capacity: config.deferred_capacity,
             max_line_bytes: config.max_line_bytes,
             shutdown_grace: config.shutdown_grace,
@@ -1513,52 +1520,73 @@ impl StdioRuntime {
     }
 
     pub fn next_event(&mut self, timeout: Duration) -> Result<RuntimeEvent, AdapterError> {
-        if let Some(event) = self.deferred.pop_front() {
-            return Ok(event);
-        }
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(AdapterError::TimeoutOutOfRange)?;
-        if let Some(event) = self.try_ready_event() {
+        loop {
+            if let Some(event) = self.deferred.pop_front() {
+                return Ok(event);
+            }
+            if self.stderr_closed_pending && self.stdout_rx.is_none() {
+                self.stderr_closed_pending = false;
+                return Ok(RuntimeEvent::StderrClosed);
+            }
+            if let Some(event) = self.try_ready_event() {
+                if matches!(event, RuntimeEvent::StderrClosed) {
+                    continue;
+                }
+                return Ok(event);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if self.stderr_closed_pending {
+                    self.stderr_closed_pending = false;
+                    return Ok(RuntimeEvent::StderrClosed);
+                }
+                return Err(AdapterError::NextEventTimedOut);
+            }
+            let stdout_rx = self.stdout_rx.clone();
+            let stderr_rx = self.stderr_rx.clone();
+            let selected = match (stdout_rx, stderr_rx) {
+                (Some(stdout_rx), Some(stderr_rx)) => {
+                    select! {
+                        recv(stdout_rx) -> message => Some((RuntimeStream::Stdout, message)),
+                        recv(stderr_rx) -> message => Some((RuntimeStream::Stderr, message)),
+                        default(remaining) => None,
+                    }
+                }
+                (Some(stdout_rx), None) => match stdout_rx.recv_timeout(remaining) {
+                    Ok(message) => Some((RuntimeStream::Stdout, Ok(message))),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        Some((RuntimeStream::Stdout, Err(crossbeam_channel::RecvError)))
+                    }
+                    Err(RecvTimeoutError::Timeout) => None,
+                },
+                (None, Some(stderr_rx)) => match stderr_rx.recv_timeout(remaining) {
+                    Ok(message) => Some((RuntimeStream::Stderr, Ok(message))),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        Some((RuntimeStream::Stderr, Err(crossbeam_channel::RecvError)))
+                    }
+                    Err(RecvTimeoutError::Timeout) => None,
+                },
+                (None, None) => return Err(AdapterError::RuntimeStreamsClosed),
+            };
+            let Some((stream, message)) = selected else {
+                if self.stderr_closed_pending {
+                    self.stderr_closed_pending = false;
+                    return Ok(RuntimeEvent::StderrClosed);
+                }
+                return Err(AdapterError::NextEventTimedOut);
+            };
+            let event = match message {
+                Ok(message) => self.handle_reader_message(stream, message),
+                Err(_) => self.handle_reader_disconnect(stream),
+            };
+            if matches!(event, RuntimeEvent::StderrClosed) {
+                continue;
+            }
             return Ok(event);
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(AdapterError::NextEventTimedOut);
-        }
-        let stdout_rx = self.stdout_rx.clone();
-        let stderr_rx = self.stderr_rx.clone();
-        let selected = match (stdout_rx, stderr_rx) {
-            (Some(stdout_rx), Some(stderr_rx)) => {
-                select! {
-                    recv(stdout_rx) -> message => Some((RuntimeStream::Stdout, message)),
-                    recv(stderr_rx) -> message => Some((RuntimeStream::Stderr, message)),
-                    default(remaining) => None,
-                }
-            }
-            (Some(stdout_rx), None) => match stdout_rx.recv_timeout(remaining) {
-                Ok(message) => Some((RuntimeStream::Stdout, Ok(message))),
-                Err(RecvTimeoutError::Disconnected) => {
-                    Some((RuntimeStream::Stdout, Err(crossbeam_channel::RecvError)))
-                }
-                Err(RecvTimeoutError::Timeout) => None,
-            },
-            (None, Some(stderr_rx)) => match stderr_rx.recv_timeout(remaining) {
-                Ok(message) => Some((RuntimeStream::Stderr, Ok(message))),
-                Err(RecvTimeoutError::Disconnected) => {
-                    Some((RuntimeStream::Stderr, Err(crossbeam_channel::RecvError)))
-                }
-                Err(RecvTimeoutError::Timeout) => None,
-            },
-            (None, None) => return Err(AdapterError::RuntimeStreamsClosed),
-        };
-        let Some((stream, message)) = selected else {
-            return Err(AdapterError::NextEventTimedOut);
-        };
-        Ok(match message {
-            Ok(message) => self.handle_reader_message(stream, message),
-            Err(_) => self.handle_reader_disconnect(stream),
-        })
     }
 
     pub fn health_check(&mut self, timeout: Duration) -> Result<RuntimeHealth, AdapterError> {
@@ -2193,6 +2221,7 @@ impl StdioRuntime {
             }
             RuntimeStream::Stderr => {
                 self.stderr_rx = None;
+                self.stderr_closed_pending = true;
                 RuntimeEvent::StderrClosed
             }
         }
@@ -2991,7 +3020,8 @@ pub fn cleanup_runtime_process(
     if let Some(expected) = &target.identity {
         let root = system.process(Pid::from_u32(expected.process_id));
         let root_matches_identity = root.is_some_and(|process| {
-            process.start_time() == expected.started_at_epoch_seconds
+            !process_is_terminal(process)
+                && process.start_time() == expected.started_at_epoch_seconds
                 && process.exe().is_some_and(|path| {
                     digest_hex(path.to_string_lossy().as_bytes()) == expected.executable_path_digest
                 })
@@ -3097,11 +3127,21 @@ fn process_has_launch_token(process: &sysinfo::Process, launch_token: &str) -> b
     })
 }
 
+fn process_is_terminal(process: &sysinfo::Process) -> bool {
+    matches!(
+        process.status(),
+        ProcessStatus::Zombie | ProcessStatus::Dead
+    )
+}
+
 fn processes_for_runtime_claim(system: &System, target: &RuntimeProcessCleanupTarget) -> Vec<Pid> {
     let marker_processes = system
         .processes()
         .iter()
         .filter_map(|(pid, process)| {
+            if process_is_terminal(process) {
+                return None;
+            }
             let executable_matches = process.exe().is_some_and(|path| {
                 digest_hex(path.to_string_lossy().as_bytes())
                     == target.launch_executable_path_digest
@@ -4015,6 +4055,70 @@ printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"approved":%s}}\n' 
 
     #[cfg(unix)]
     #[test]
+    fn stderr_eof_cannot_overtake_terminal_stdout_notification() {
+        let command = shell_runtime(
+            r#"IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{}}'
+printf '%s\n' '{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"command":"private-command"}}'
+IFS= read -r approval
+exec 2>&-
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"approved":true}}'"#,
+        );
+        let mut runtime = StdioRuntime::spawn(&command).expect("spawn fake runtime");
+        runtime
+            .send_request(&AppServerContract::initialize(RequestId::Number(5)))
+            .expect("send initialize");
+        let _ = next_correlated_response(&mut runtime);
+        let request_id = loop {
+            match runtime
+                .next_event(Duration::from_secs(1))
+                .expect("server request")
+            {
+                RuntimeEvent::ServerRequest { kind, request } => {
+                    assert_eq!(kind, RuntimeEventKind::LocalApprovalRequested);
+                    break request.id;
+                }
+                RuntimeEvent::Diagnostic(_) | RuntimeEvent::StderrClosed => {}
+                other => panic!("unexpected event: {other:?}"),
+            }
+        };
+        runtime
+            .send_response(&AppServerContract::local_approval_response(
+                request_id, true,
+            ))
+            .expect("approval response");
+
+        let terminal = runtime
+            .next_event(Duration::from_secs(1))
+            .expect("terminal notification");
+        assert!(matches!(
+            terminal,
+            RuntimeEvent::Notification {
+                kind: RuntimeEventKind::TurnCompleted,
+                ..
+            }
+        ));
+
+        let mut saw_stderr_closed = false;
+        for _ in 0..3 {
+            match runtime
+                .next_event(Duration::from_secs(1))
+                .expect("post-terminal stream event")
+            {
+                RuntimeEvent::StdoutClosed => {}
+                RuntimeEvent::StderrClosed => {
+                    saw_stderr_closed = true;
+                    break;
+                }
+                other => panic!("unexpected post-terminal event: {other:?}"),
+            }
+        }
+        assert!(saw_stderr_closed);
+        runtime.shutdown().expect("shutdown");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn oversized_stdout_is_digest_only_and_poisoned() {
         let mut command = shell_runtime("printf '%0100d\\n' 0; sleep 20");
         command.max_line_bytes = 64;
@@ -4152,6 +4256,39 @@ wait"#,
             .expect("idempotent cleanup replay");
         assert_eq!(replay.disposition, ProcessCleanupDisposition::AlreadyExited);
         assert_eq!(replay.signalled_process_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn externally_killed_runtime_is_not_reported_as_cleanup_blocked() {
+        let token = "8".repeat(64);
+        let command = pinned_cleanup_fixture_runtime();
+        let launch = prepare_runtime_launch(&command, &token).expect("launch spec");
+        let runtime =
+            StdioRuntime::spawn_prepared(&command, &launch).expect("spawn token-bound runtime");
+        let identity = runtime.process_identity().clone();
+        let kill_status = Command::new("/bin/kill")
+            .args(["-KILL", &identity.process_id.to_string()])
+            .status()
+            .expect("kill runtime fixture");
+        assert!(kill_status.success());
+        std::mem::forget(runtime);
+
+        let target = RuntimeProcessCleanupTarget::new(
+            token,
+            launch.executable_path().to_path_buf(),
+            launch.executable_path_digest().to_owned(),
+            launch.program_sha256().to_owned(),
+            Some(identity),
+        )
+        .expect("exact cleanup target");
+        let report = cleanup_runtime_process(&target, Duration::from_millis(250))
+            .expect("reconcile externally killed runtime");
+        assert!(matches!(
+            report.disposition,
+            ProcessCleanupDisposition::Terminated | ProcessCleanupDisposition::AlreadyExited
+        ));
+        assert_eq!(report.remaining_process_count, 0);
     }
 
     #[cfg(unix)]

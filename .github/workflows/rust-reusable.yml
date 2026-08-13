@@ -1,0 +1,167 @@
+name: Reusable / Rust gates
+
+# Every Cargo invocation below is locked to Cargo.lock (--locked).
+
+on:
+  workflow_call:
+    inputs:
+      check_prefix:
+        description: Stable check-name prefix for the caller tier.
+        required: true
+        type: string
+      full_workspace:
+        description: Run the full workspace instead of package-local scope.
+        required: true
+        type: boolean
+      rust_packages:
+        description: Compact JSON array of changed Cargo package names.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hartevo-rust-reusable-${{ inputs.check_prefix }}-${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_TARGET_DIR: target/ci-cargo
+
+jobs:
+  fmt:
+    name: ${{ inputs.check_prefix }} / fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Cache Cargo and Rust toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains/1.95.0-*
+            ~/.rustup/update
+            target/ci-cargo
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}
+      - name: Install the locked Rust components
+        run: rustup component add clippy rustfmt rust-src --toolchain 1.95.0
+      - name: Format gate
+        run: bash scripts/ci-rust-gate.sh fmt
+
+  clippy:
+    name: ${{ inputs.check_prefix }} / clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Ubuntu desktop development libraries
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libpango1.0-dev \
+            libatk1.0-dev \
+            libcairo2-dev \
+            libgdk-pixbuf-2.0-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libxdo-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+      - name: Cache Cargo and Rust toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains/1.95.0-*
+            ~/.rustup/update
+            target/ci-cargo
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}
+      - name: Install the locked Rust components
+        run: rustup component add clippy rustfmt rust-src --toolchain 1.95.0
+      - name: Strict Clippy gate
+        run: |
+          bash scripts/ci-rust-gate.sh clippy \
+            ${{ inputs.full_workspace && '--full' || '' }} \
+            --packages '${{ inputs.rust_packages }}'
+
+  test:
+    name: ${{ inputs.check_prefix }} / test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Ubuntu desktop development libraries
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libpango1.0-dev \
+            libatk1.0-dev \
+            libcairo2-dev \
+            libgdk-pixbuf-2.0-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libxdo-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+      - name: Cache Cargo and Rust toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains/1.95.0-*
+            ~/.rustup/update
+            target/ci-cargo
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}
+      - name: Install the locked Rust components
+        run: rustup component add clippy rustfmt rust-src --toolchain 1.95.0
+      - name: Locked Rust test gate
+        run: |
+          bash scripts/ci-rust-gate.sh test \
+            ${{ inputs.full_workspace && '--full' || '' }} \
+            --packages '${{ inputs.rust_packages }}'
