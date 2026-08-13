@@ -1,0 +1,33 @@
+{
+  "schemaVersion": "hartevo-web-adapters/github-pages/v1",
+  "pluginId": "site-publication.github-pages",
+  "service": "SitePublicationService",
+  "provider": "GitHub Pages adapter",
+  "consumer": "Mission capability/result",
+  "adapterId": "web.github-pages",
+  "adapterVersion": 1,
+  "registryVersion": "web-publication.github-pages/v1",
+  "operations": ["probe", "read", "prepare_effect"],
+  "proposalOnly": true,
+  "externalMutation": false,
+  "readModel": "repository_tree_at_pages_source_ref",
+  "secretMaterial": "opaque_reference_only",
+  "requiredScopes": ["contents:read", "contents:write", "pages:read"],
+  "stagingProductionFence": true,
+  "registrationBinding": {
+    "tenant": true,
+    "project": true,
+    "mission": true,
+    "connection": true,
+    "digest": true,
+    "revocable": true
+  },
+  "durableModelVisibleLog": true,
+  "claimAuthority": {
+    "connected": false,
+    "providerExecution": false,
+    "providerReceipt": false,
+    "businessVerification": false,
+    "e4": false
+  }
+}

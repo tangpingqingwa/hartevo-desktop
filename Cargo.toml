@@ -16,6 +16,7 @@ members = [
   "hartevo-rs/mission-scheduler",
   "hartevo-rs/plugin-runtime",
   "hartevo-rs/storage",
+  "hartevo-rs/web-adapters",
 ]
 resolver = "3"
 
@@ -55,6 +56,7 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ureq = "3.4"
 url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v7"] }
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }

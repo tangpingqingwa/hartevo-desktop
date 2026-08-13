@@ -1,0 +1,25 @@
+[package]
+name = "hartevo-web-adapters"
+description = "First-party web publication adapters and Mission proposal results"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+hartevo-connector-sdk = { path = "../connector-sdk" }
+hartevo-domain-kernel = { path = "../domain-kernel" }
+hartevo-effect-broker = { path = "../effect-broker" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true
