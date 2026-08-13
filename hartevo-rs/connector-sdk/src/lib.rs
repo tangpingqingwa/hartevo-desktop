@@ -11,6 +11,7 @@
 pub mod http;
 pub mod paid_social;
 pub mod paid_social_types;
+pub mod paid_social_vertical;
 
 pub use paid_social::{
     InstagramLoginMode, LinkedInAdapter, LinkedInConfig, MetaAdapter, MetaConfig,
@@ -25,6 +26,15 @@ pub use paid_social_types::{
 pub use paid_social_types::{
     ConnectorError as PaidSocialConnectorError, ReadObservation as PaidSocialReadObservation,
     ReadRequest as PaidSocialReadRequest,
+};
+pub use paid_social_vertical::{
+    ClassificationKind, ClassificationReceipt, CostReceipt, CursorReceipt, DigestReceipt,
+    DurableCursor, FreshnessReceipt, META_MARKETING_ADAPTER_ID, META_MARKETING_ADAPTER_VERSION,
+    META_MARKETING_READ_RECEIPT_SCHEMA, META_MARKETING_REGISTRATIONS, MetaMarketingAccountScope,
+    MetaMarketingCommand, MetaMarketingMissionConsumer, MetaMarketingReadPlugin,
+    MetaMarketingReadPolicy, MetaMarketingReadProvider, MetaMarketingReadReceipt,
+    MetaMarketingReadRequest, MetaMarketingReadResult, MetaMarketingReadService, MissionReadResult,
+    PluginConnectionState, QuotaReceipt, SourceReceipt,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1191,7 +1201,11 @@ impl DispatchBudget {
         })
     }
 
-    fn admit(&mut self, now: DateTime<Utc>, cost_minor: i64) -> Result<(), ConnectorError> {
+    pub(crate) fn admit(
+        &mut self,
+        now: DateTime<Utc>,
+        cost_minor: i64,
+    ) -> Result<(), ConnectorError> {
         if now >= self.rate_limit.reset_at() && self.rate_limit.remaining == 0 {
             self.rate_limit.remaining = 1;
         }

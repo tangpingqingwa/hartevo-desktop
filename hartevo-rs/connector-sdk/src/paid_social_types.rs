@@ -522,6 +522,16 @@ pub trait PaidSocialReadAdapter: fmt::Debug + Send + Sync {
 pub enum ConnectorError {
     #[error("invalid connector request")]
     InvalidRequest,
+    #[error("read cursor is not bound to the requested scope and command")]
+    CursorMismatch,
+    #[error("read cursor is invalid")]
+    InvalidCursor,
+    #[error("read freshness policy is invalid")]
+    InvalidFreshness,
+    #[error("read admission budget rejected the request")]
+    Budget(#[source] crate::ConnectorError),
+    #[error("mission identifier is invalid")]
+    InvalidMission,
     #[error("connector scope mismatch")]
     ScopeMismatch,
     #[error("invalid credential lease")]

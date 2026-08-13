@@ -20,7 +20,13 @@ Commit：以 `git rev-parse HEAD` 返回的 checkpoint commit 为准；文档不
 
 - `contracts/providers/paid-social-read.v1.json` 定义 `paid_social.read` 的 E1 metadata contract；central Capability/Provider catalog registration remains deferred until a Mission route and reverse mapping are added, so the existing 48-capability catalog contract stays unchanged. 这不是 Connected、Provider receipt、业务验证或 E4 claim。
 - `hartevo-rs/connector-sdk` 复用 CONN-01 的 tenant/project/provider/account scope、opaque SecretReference、900 秒以内 credential lease、provider provenance 和 Effect Broker authority；`paid_social_types` 只增加 connection binding 与 provider-specific permission/review/rate-limit metadata，输出 `hartevo-paid-social-read-observation/v1`。Meta Marketing/Instagram、X Ads、LinkedIn Marketing 通过同一 read boundary；Meta 的 bearer credentialed path 和 Instagram login-specific scopes 已有组件测试，X 保留 OAuth 1.0a 与 account/user rate headers，LinkedIn 保留 `adAnalytics` 无分页语义。
-- 当前 13 个 connector-sdk tests 使用 deterministic transport/testkit；它们证明请求构造、credential resolution、parser、pagination、redaction、preflight permission denial 和 causal `not_claimed` boundary，不证明真实生产账号、真实 OAuth/Review、受控 Provider、读回或完整 Adapter E4。没有生产 secret 写入仓库，write gate 对三家 Provider 均 fail closed；Release 仍为 `passed=false`。
+- 当前 20 个 connector-sdk tests 覆盖 PS01 boundary 与 PS02 Meta Marketing vertical slice；它们证明请求构造、credential resolution、parser、pagination、redaction、preflight permission denial、Meta account/ad-account binding、SDK budget admission、freshness/cost/quota receipt、durable cursor checkpoint、controlled loopback `ReqwestTransport` authenticated read 和 causal `not_claimed` boundary。真实生产账号、真实 OAuth/Review、provider readback、Mission/Application/Desktop wiring 和完整 Adapter E4 仍未证明。没有生产 secret 写入仓库，write gate 对三家 Provider 均 fail closed；Release 仍为 `passed=false`。
+
+### PAID-SOCIAL-02 Meta Marketing authenticated read（当前组件切片）
+
+- `hartevo-rs/connector-sdk/src/paid_social_vertical.rs` 的 `MetaMarketingReadProvider` 复用既有 `MetaAdapter`，`MetaMarketingReadService` 复用 SDK `DispatchBudget` 与 credential lease，`MetaMarketingMissionConsumer` 只返回只读 observation/result，不写 Mission、不创建 Effect authority。`MetaMarketingAccountScope` 同时绑定业务 account 与 `act_` ad-account；scope、secret reference、lease、adapter identity 必须精确匹配。
+- 每次 read 产出 source/path/status/provider request ID、request/response/records/observation digest、observed/valid-until freshness、SDK quota/rate/cost admission、opaque durable cursor checkpoint 与 provider classification/attribution receipt。Meta attribution windows 与 `CausalStatus::NotClaimed` 原样保留；写策略为 disabled，`META_MARKETING_REGISTRATIONS` 保持空切片，connection state 固定 `Disconnected`，central catalog 仍未注册。
+- 新增测试包含真实 `ReqwestTransport` 的 loopback controlled-provider HTTP read，仅证明组件路径、Bearer header、Meta response parsing 与 rate/request ID receipt；不属于 production evidence，不能替代真实账号、OAuth review、readback 或 E4。PS02 当前最高为 component/controlled-harness evidence，Release 仍为 `passed=false`。
 
 ## 历史自动门禁（repair 后未重跑）
 
