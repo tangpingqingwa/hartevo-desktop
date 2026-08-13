@@ -20,6 +20,7 @@ mod identity_store;
 mod key_bootstrap_store;
 mod keyring_store;
 mod mission_conversation_store;
+mod mission_recovery_store;
 mod mission_schedule_store;
 mod normalized;
 mod outbox;
@@ -4607,6 +4608,10 @@ pub enum StorageError {
     WorkProductManifest(#[from] hartevo_domain_kernel::WorkProductManifestError),
     #[error(transparent)]
     ContextAssembly(#[from] hartevo_context_fabric::ContextAssemblyError),
+    #[error(transparent)]
+    MissionRestart(#[from] hartevo_context_fabric::MissionRestartError),
+    #[error(transparent)]
+    MissionControl(#[from] hartevo_context_fabric::MissionControlError),
     #[error(transparent)]
     Browser(#[from] hartevo_browser_adapter::BrowserError),
     #[error(transparent)]

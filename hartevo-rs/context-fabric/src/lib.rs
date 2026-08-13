@@ -1581,6 +1581,747 @@ pub enum ContextAssemblyError {
     EnvelopeManifestMismatch,
 }
 
+/// The typed, content-free Mission Control records that make the Context
+/// Fabric durable without introducing a second task-board authority.  Bodies
+/// and credentials stay in the existing Project/Mission stores; this surface
+/// binds only their stable digests, revisions, and ownership fences.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionControlGateStatus {
+    Pending,
+    Ready,
+    Running,
+    Blocked,
+    WaitingHuman,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionControlTodoStatus {
+    Pending,
+    Claimed,
+    Completed,
+    Blocked,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionControlObjective {
+    pub objective_digest: String,
+    pub contract_digest: String,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionControlGate {
+    pub gate_id: String,
+    pub status: MissionControlGateStatus,
+    pub required_evidence_digest: Option<String>,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionControlTodo {
+    pub todo_id: String,
+    pub status: MissionControlTodoStatus,
+    pub idempotency_digest: String,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionControlEvidence {
+    pub evidence_digest: String,
+    pub source_digest: String,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionControlQuota {
+    pub token_limit: u64,
+    pub token_spent: u64,
+    pub cost_limit_minor: i64,
+    pub cost_spent_minor: i64,
+    pub deadline_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionControlClaim {
+    pub owner_digest: String,
+    pub generation: u64,
+    pub attachment_epoch: u64,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionControlHandoff {
+    pub from_owner_digest: String,
+    pub to_owner_digest: String,
+    pub generation: u64,
+    pub attachment_epoch: u64,
+    pub reason_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionControlWriteback {
+    pub idempotency_digest: String,
+    pub payload_digest: String,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionControlSnapshot {
+    pub tenant_id: String,
+    pub project_id: String,
+    pub mission_id: String,
+    pub objective: MissionControlObjective,
+    pub gates: Vec<MissionControlGate>,
+    pub todos: Vec<MissionControlTodo>,
+    pub evidence: Vec<MissionControlEvidence>,
+    pub quota: MissionControlQuota,
+    pub claim: Option<MissionControlClaim>,
+    pub handoff: Option<MissionControlHandoff>,
+    pub worker_graph_digest: String,
+    pub accepted_writebacks: Vec<MissionControlWriteback>,
+    pub mission_revision: u64,
+}
+
+impl fmt::Debug for MissionControlSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MissionControlSnapshot")
+            .field("tenant_digest", &digest(self.tenant_id.as_bytes()))
+            .field("project_digest", &digest(self.project_id.as_bytes()))
+            .field("mission_digest", &digest(self.mission_id.as_bytes()))
+            .field("objective_digest", &self.objective.objective_digest)
+            .field("gate_count", &self.gates.len())
+            .field("todo_count", &self.todos.len())
+            .field("evidence_count", &self.evidence.len())
+            .field("quota", &(&self.quota.token_limit, &self.quota.token_spent))
+            .field("has_claim", &self.claim.is_some())
+            .field("has_handoff", &self.handoff.is_some())
+            .field("worker_graph_digest", &self.worker_graph_digest)
+            .field("accepted_writeback_count", &self.accepted_writebacks.len())
+            .field("mission_revision", &self.mission_revision)
+            .finish()
+    }
+}
+
+impl MissionControlSnapshot {
+    pub fn validate(&self, now: DateTime<Utc>) -> Result<(), MissionControlError> {
+        if self.tenant_id.trim().is_empty()
+            || self.project_id.trim().is_empty()
+            || self.mission_id.trim().is_empty()
+            || self.objective.revision == 0
+            || !is_sha256(&self.objective.objective_digest)
+            || !is_sha256(&self.objective.contract_digest)
+            || self.mission_revision == 0
+            || !is_sha256(&self.worker_graph_digest)
+            || self.quota.token_spent > self.quota.token_limit
+            || self.quota.cost_limit_minor < 0
+            || self.quota.cost_spent_minor < 0
+            || self.quota.cost_spent_minor > self.quota.cost_limit_minor
+            || self.quota.deadline_at < now
+        {
+            return Err(MissionControlError::InvalidSnapshot);
+        }
+        let mut gate_ids = BTreeSet::new();
+        for gate in &self.gates {
+            if gate.gate_id.trim().is_empty()
+                || !gate_ids.insert(gate.gate_id.as_str())
+                || gate.revision == 0
+                || gate
+                    .required_evidence_digest
+                    .as_deref()
+                    .is_some_and(|value| !is_sha256(value))
+            {
+                return Err(MissionControlError::InvalidSnapshot);
+            }
+        }
+        let mut todo_ids = BTreeSet::new();
+        let mut writeback_ids = BTreeSet::new();
+        for todo in &self.todos {
+            if todo.todo_id.trim().is_empty()
+                || !todo_ids.insert(todo.todo_id.as_str())
+                || todo.revision == 0
+                || !is_sha256(&todo.idempotency_digest)
+            {
+                return Err(MissionControlError::InvalidSnapshot);
+            }
+        }
+        for evidence in &self.evidence {
+            if !is_sha256(&evidence.evidence_digest)
+                || !is_sha256(&evidence.source_digest)
+                || evidence.revision == 0
+            {
+                return Err(MissionControlError::InvalidSnapshot);
+            }
+        }
+        if let Some(claim) = &self.claim
+            && (!is_sha256(&claim.owner_digest)
+                || claim.generation == 0
+                || claim.attachment_epoch == 0)
+        {
+            return Err(MissionControlError::InvalidClaim);
+        }
+        if let Some(handoff) = &self.handoff {
+            if !is_sha256(&handoff.from_owner_digest)
+                || !is_sha256(&handoff.to_owner_digest)
+                || !is_sha256(&handoff.reason_digest)
+                || handoff.generation == 0
+                || handoff.attachment_epoch == 0
+            {
+                return Err(MissionControlError::InvalidHandoff);
+            }
+            if self.claim.as_ref().is_some_and(|claim| {
+                claim.owner_digest != handoff.to_owner_digest
+                    || claim.generation != handoff.generation
+                    || claim.attachment_epoch != handoff.attachment_epoch
+            }) {
+                return Err(MissionControlError::InvalidHandoff);
+            }
+        }
+        for writeback in &self.accepted_writebacks {
+            if !is_sha256(&writeback.idempotency_digest)
+                || !is_sha256(&writeback.payload_digest)
+                || !writeback_ids.insert(writeback.idempotency_digest.as_str())
+            {
+                return Err(MissionControlError::InvalidWriteback);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String, MissionControlError> {
+        serde_json::to_vec(self)
+            .map(|bytes| digest(&bytes))
+            .map_err(|_| MissionControlError::InvalidSnapshot)
+    }
+
+    /// Claims the current generation.  A different owner cannot steal an
+    /// active lease; reclamation must present a strictly newer generation.
+    pub fn claim(
+        &self,
+        owner: &str,
+        generation: u64,
+        attachment_epoch: u64,
+        lease_expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(Self, MissionControlClaimDisposition), MissionControlError> {
+        self.validate(now)?;
+        if owner.trim().is_empty() || generation == 0 || attachment_epoch == 0 {
+            return Err(MissionControlError::InvalidClaim);
+        }
+        let owner_digest = digest(owner.as_bytes());
+        if lease_expires_at <= now {
+            return Err(MissionControlError::InvalidClaim);
+        }
+        if let Some(current) = &self.claim {
+            if current.lease_expires_at > now {
+                if current.owner_digest == owner_digest
+                    && current.generation == generation
+                    && current.attachment_epoch == attachment_epoch
+                {
+                    return Ok((self.clone(), MissionControlClaimDisposition::Replay));
+                }
+                return Err(MissionControlError::ClaimLost);
+            }
+            if generation <= current.generation || attachment_epoch < current.attachment_epoch {
+                return Err(MissionControlError::StaleGeneration);
+            }
+        }
+        let mut next = self.clone();
+        next.claim = Some(MissionControlClaim {
+            owner_digest,
+            generation,
+            attachment_epoch,
+            lease_expires_at,
+        });
+        next.handoff = None;
+        next.validate(now)?;
+        Ok((next, MissionControlClaimDisposition::Acquired))
+    }
+
+    pub fn handoff(
+        &self,
+        owner: &str,
+        generation: u64,
+        attachment_epoch: u64,
+        next_owner: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Self, MissionControlError> {
+        self.validate(now)?;
+        let claim = self.claim.as_ref().ok_or(MissionControlError::ClaimLost)?;
+        if owner.trim().is_empty()
+            || next_owner.trim().is_empty()
+            || reason.trim().is_empty()
+            || claim.owner_digest != digest(owner.as_bytes())
+            || claim.generation != generation
+            || claim.attachment_epoch != attachment_epoch
+            || claim.lease_expires_at <= now
+        {
+            return Err(MissionControlError::ClaimLost);
+        }
+        let mut next = self.clone();
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or(MissionControlError::RevisionOverflow)?;
+        let next_attachment_epoch = attachment_epoch
+            .checked_add(1)
+            .ok_or(MissionControlError::RevisionOverflow)?;
+        next.handoff = Some(MissionControlHandoff {
+            from_owner_digest: claim.owner_digest.clone(),
+            to_owner_digest: digest(next_owner.as_bytes()),
+            generation: next_generation,
+            attachment_epoch: next_attachment_epoch,
+            reason_digest: digest(reason.as_bytes()),
+        });
+        next.claim = Some(MissionControlClaim {
+            owner_digest: digest(next_owner.as_bytes()),
+            generation: next_generation,
+            attachment_epoch: next_attachment_epoch,
+            lease_expires_at: claim.lease_expires_at,
+        });
+        next.validate(now)?;
+        Ok(next)
+    }
+
+    /// Commits one accepted writeback.  Replaying the same idempotency and
+    /// payload is a no-op; reusing an idempotency key for different state is
+    /// rejected before any caller can mutate Mission/Event/Outbox rows.
+    pub fn accept_writeback(
+        &self,
+        owner: &str,
+        generation: u64,
+        attachment_epoch: u64,
+        idempotency_key: &str,
+        payload_digest: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(Self, MissionControlWritebackDisposition), MissionControlError> {
+        self.validate(now)?;
+        let claim = self.claim.as_ref().ok_or(MissionControlError::ClaimLost)?;
+        if claim.owner_digest != digest(owner.as_bytes())
+            || claim.generation != generation
+            || claim.attachment_epoch != attachment_epoch
+            || claim.lease_expires_at <= now
+            || idempotency_key.trim().is_empty()
+            || !is_sha256(payload_digest)
+        {
+            return Err(MissionControlError::ClaimLost);
+        }
+        let idempotency_digest = digest(idempotency_key.as_bytes());
+        if let Some(existing) = self
+            .accepted_writebacks
+            .iter()
+            .find(|value| value.idempotency_digest == idempotency_digest)
+        {
+            if existing.payload_digest == payload_digest {
+                return Ok((self.clone(), MissionControlWritebackDisposition::Replay));
+            }
+            return Err(MissionControlError::DuplicateWriteback);
+        }
+        let mut next = self.clone();
+        next.accepted_writebacks.push(MissionControlWriteback {
+            idempotency_digest,
+            payload_digest: payload_digest.to_owned(),
+        });
+        next.validate(now)?;
+        Ok((next, MissionControlWritebackDisposition::Accepted))
+    }
+
+    pub fn reserve_quota(
+        &self,
+        token_cost: u64,
+        cost_minor: i64,
+        now: DateTime<Utc>,
+    ) -> Result<Self, MissionControlError> {
+        self.validate(now)?;
+        if token_cost == 0
+            || cost_minor < 0
+            || self.quota.token_spent.saturating_add(token_cost) > self.quota.token_limit
+            || self.quota.cost_spent_minor.saturating_add(cost_minor) > self.quota.cost_limit_minor
+        {
+            return Err(MissionControlError::QuotaExceeded);
+        }
+        let mut next = self.clone();
+        next.quota.token_spent += token_cost;
+        next.quota.cost_spent_minor += cost_minor;
+        next.validate(now)?;
+        Ok(next)
+    }
+
+    /// Returns a bounded control decision without reserving anything.  The
+    /// caller must perform an accepted `reserve_quota` write only for
+    /// `Deliver`; asking, waiting, falling back, and stopping are read-only.
+    pub fn decide_quota(
+        &self,
+        token_cost: u64,
+        cost_minor: i64,
+        human_decision_required: bool,
+        safe_fallback_available: bool,
+        now: DateTime<Utc>,
+    ) -> Result<MissionControlQuotaDecision, MissionControlError> {
+        self.validate(now)?;
+        if token_cost == 0 || cost_minor < 0 {
+            return Ok(MissionControlQuotaDecision::Stop);
+        }
+        if now >= self.quota.deadline_at {
+            return Ok(MissionControlQuotaDecision::Stop);
+        }
+        let fits = self
+            .quota
+            .token_spent
+            .checked_add(token_cost)
+            .is_some_and(|spent| spent <= self.quota.token_limit)
+            && self
+                .quota
+                .cost_spent_minor
+                .checked_add(cost_minor)
+                .is_some_and(|spent| spent <= self.quota.cost_limit_minor);
+        if fits {
+            Ok(MissionControlQuotaDecision::Deliver)
+        } else if human_decision_required {
+            Ok(MissionControlQuotaDecision::Ask)
+        } else if safe_fallback_available {
+            Ok(MissionControlQuotaDecision::SafeFallback)
+        } else {
+            Ok(MissionControlQuotaDecision::Wait)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissionControlClaimDisposition {
+    Acquired,
+    Replay,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissionControlWritebackDisposition {
+    Accepted,
+    Replay,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionControlQuotaDecision {
+    Deliver,
+    Ask,
+    Wait,
+    SafeFallback,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum MissionControlError {
+    #[error("mission control snapshot is malformed or exceeds its declared authority")]
+    InvalidSnapshot,
+    #[error("mission control claim is missing, expired, or outside its generation fence")]
+    ClaimLost,
+    #[error("mission control generation or attachment epoch is stale")]
+    StaleGeneration,
+    #[error("mission control claim fields are invalid")]
+    InvalidClaim,
+    #[error("mission control handoff fields are invalid")]
+    InvalidHandoff,
+    #[error("mission control writeback fields are invalid")]
+    InvalidWriteback,
+    #[error("mission control idempotency key was reused with different state")]
+    DuplicateWriteback,
+    #[error("mission control quota would be exceeded")]
+    QuotaExceeded,
+    #[error("mission control revision overflowed")]
+    RevisionOverflow,
+}
+
+/// The three user-visible recovery boundaries of a long-running Mission.
+///
+/// These are deliberately not Runtime states.  A Runtime generation may be
+/// replaced while the Mission, its evidence, and its decision contract stay
+/// the same.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionRestartPhase {
+    BeforeFirstDelta,
+    DuringStreaming,
+    BeforeHumanDecision,
+}
+
+/// Content-free, exact identity/revision fence used when reopening a Mission.
+/// All payloads are represented by digests; the snapshot is safe to carry in
+/// an Event, Outbox, or diagnostic response.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionRestartSnapshot {
+    pub tenant_id: hartevo_domain_kernel::TenantId,
+    pub project_id: hartevo_domain_kernel::ProjectId,
+    pub mission_id: hartevo_domain_kernel::MissionId,
+    pub conversation_id: hartevo_domain_kernel::MissionConversationId,
+    pub checkpoint_id: hartevo_domain_kernel::ContextCheckpointId,
+    pub project_digest: String,
+    pub mission_digest: String,
+    pub contract_digest: String,
+    pub conversation_digest: String,
+    pub mission_control_digest: String,
+    pub pack_digest: Option<String>,
+    pub pack_revision: Option<u64>,
+    pub mission_revision: u64,
+    pub conversation_revision: u64,
+    pub cursor_digest: String,
+    pub generation: u64,
+    pub attachment_epoch: u64,
+    pub idempotency_digest: String,
+    pub event_log_digest: String,
+    pub outbox_digest: String,
+}
+
+impl fmt::Debug for MissionRestartSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MissionRestartSnapshot")
+            .field("tenant_digest", &digest(self.tenant_id.as_str().as_bytes()))
+            .field(
+                "project_digest",
+                &digest(self.project_id.as_str().as_bytes()),
+            )
+            .field(
+                "mission_digest",
+                &digest(self.mission_id.as_str().as_bytes()),
+            )
+            .field(
+                "conversation_digest",
+                &digest(self.conversation_id.as_str().as_bytes()),
+            )
+            .field(
+                "checkpoint_id_digest",
+                &digest(self.checkpoint_id.as_str().as_bytes()),
+            )
+            .field("project_state_digest", &self.project_digest)
+            .field("mission_state_digest", &self.mission_digest)
+            .field("contract_digest", &self.contract_digest)
+            .field("conversation_state_digest", &self.conversation_digest)
+            .field("mission_control_digest", &self.mission_control_digest)
+            .field("pack_digest", &self.pack_digest)
+            .field("pack_revision", &self.pack_revision)
+            .field("mission_revision", &self.mission_revision)
+            .field("conversation_revision", &self.conversation_revision)
+            .field("cursor_digest", &self.cursor_digest)
+            .field("generation", &self.generation)
+            .field("attachment_epoch", &self.attachment_epoch)
+            .field("idempotency_digest", &self.idempotency_digest)
+            .field("event_log_digest", &self.event_log_digest)
+            .field("outbox_digest", &self.outbox_digest)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionRestartSnapshotParts {
+    pub tenant_id: hartevo_domain_kernel::TenantId,
+    pub project_id: hartevo_domain_kernel::ProjectId,
+    pub mission_id: hartevo_domain_kernel::MissionId,
+    pub conversation_id: hartevo_domain_kernel::MissionConversationId,
+    pub checkpoint_id: hartevo_domain_kernel::ContextCheckpointId,
+    pub project_digest: String,
+    pub mission_digest: String,
+    pub contract_digest: String,
+    pub conversation_digest: String,
+    pub mission_control_digest: String,
+    pub pack_digest: Option<String>,
+    pub pack_revision: Option<u64>,
+    pub mission_revision: u64,
+    pub conversation_revision: u64,
+    pub cursor_digest: String,
+    pub generation: u64,
+    pub attachment_epoch: u64,
+    pub idempotency_digest: String,
+    pub event_log_digest: String,
+    pub outbox_digest: String,
+}
+
+impl MissionRestartSnapshot {
+    pub fn from_parts(parts: MissionRestartSnapshotParts) -> Result<Self, MissionRestartError> {
+        let value = Self {
+            tenant_id: parts.tenant_id,
+            project_id: parts.project_id,
+            mission_id: parts.mission_id,
+            conversation_id: parts.conversation_id,
+            checkpoint_id: parts.checkpoint_id,
+            project_digest: parts.project_digest,
+            mission_digest: parts.mission_digest,
+            contract_digest: parts.contract_digest,
+            conversation_digest: parts.conversation_digest,
+            mission_control_digest: parts.mission_control_digest,
+            pack_digest: parts.pack_digest,
+            pack_revision: parts.pack_revision,
+            mission_revision: parts.mission_revision,
+            conversation_revision: parts.conversation_revision,
+            cursor_digest: parts.cursor_digest,
+            generation: parts.generation,
+            attachment_epoch: parts.attachment_epoch,
+            idempotency_digest: parts.idempotency_digest,
+            event_log_digest: parts.event_log_digest,
+            outbox_digest: parts.outbox_digest,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), MissionRestartError> {
+        let valid_ids = !self.tenant_id.as_str().trim().is_empty()
+            && !self.project_id.as_str().trim().is_empty()
+            && !self.mission_id.as_str().trim().is_empty()
+            && !self.conversation_id.as_str().trim().is_empty()
+            && !self.checkpoint_id.as_str().trim().is_empty();
+        let valid_digests = [
+            self.project_digest.as_str(),
+            self.mission_digest.as_str(),
+            self.contract_digest.as_str(),
+            self.conversation_digest.as_str(),
+            self.mission_control_digest.as_str(),
+            self.cursor_digest.as_str(),
+            self.idempotency_digest.as_str(),
+            self.event_log_digest.as_str(),
+            self.outbox_digest.as_str(),
+        ]
+        .into_iter()
+        .all(is_sha256);
+        if !valid_ids
+            || !valid_digests
+            || self
+                .pack_digest
+                .as_deref()
+                .is_some_and(|value| !is_sha256(value))
+            || self.pack_digest.is_some() != self.pack_revision.is_some()
+            || self.pack_revision.is_some_and(|value| value == 0)
+            || self.mission_revision == 0
+            || self.conversation_revision == 0
+            || self.generation == 0
+            || self.attachment_epoch == 0
+        {
+            return Err(MissionRestartError::InvalidSnapshot);
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String, MissionRestartError> {
+        self.validate()?;
+        serde_json::to_vec(self)
+            .map(|bytes| digest(&bytes))
+            .map_err(|_| MissionRestartError::InvalidSnapshot)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionRestartCheckpoint {
+    pub schema_version: u32,
+    pub phase: MissionRestartPhase,
+    pub snapshot: MissionRestartSnapshot,
+    pub checkpoint_digest: String,
+}
+
+impl MissionRestartCheckpoint {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn new(
+        phase: MissionRestartPhase,
+        snapshot: MissionRestartSnapshot,
+    ) -> Result<Self, MissionRestartError> {
+        snapshot.validate()?;
+        if phase == MissionRestartPhase::BeforeHumanDecision && snapshot.pack_digest.is_none() {
+            return Err(MissionRestartError::MissingAuthority);
+        }
+        let mut value = Self {
+            schema_version: Self::SCHEMA_VERSION,
+            phase,
+            snapshot,
+            checkpoint_digest: String::new(),
+        };
+        value.checkpoint_digest = value.calculate_digest()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), MissionRestartError> {
+        if self.schema_version != Self::SCHEMA_VERSION
+            || self.snapshot.validate().is_err()
+            || (self.phase == MissionRestartPhase::BeforeHumanDecision
+                && self.snapshot.pack_digest.is_none())
+            || self.checkpoint_digest != self.calculate_digest()?
+        {
+            return Err(MissionRestartError::InvalidCheckpoint);
+        }
+        Ok(())
+    }
+
+    pub fn validate_reopen(
+        &self,
+        current: &MissionRestartCheckpoint,
+    ) -> Result<MissionRestartDisposition, MissionRestartError> {
+        self.validate()?;
+        current.validate()?;
+        if self.snapshot.tenant_id != current.snapshot.tenant_id
+            || self.snapshot.project_id != current.snapshot.project_id
+            || self.snapshot.mission_id != current.snapshot.mission_id
+            || self.snapshot.conversation_id != current.snapshot.conversation_id
+        {
+            return Err(MissionRestartError::CrossProject);
+        }
+        if self.phase != current.phase || self.snapshot != current.snapshot {
+            return Err(MissionRestartError::StaleSnapshot);
+        }
+        Ok(MissionRestartDisposition::ExactReplay)
+    }
+
+    fn calculate_digest(&self) -> Result<String, MissionRestartError> {
+        let mut value = serde_json::to_value(&self.snapshot)
+            .map_err(|_| MissionRestartError::InvalidCheckpoint)?;
+        let object = value
+            .as_object_mut()
+            .ok_or(MissionRestartError::InvalidCheckpoint)?;
+        object.insert("phase".into(), serde_json::json!(self.phase));
+        object.insert(
+            "schemaVersion".into(),
+            serde_json::json!(self.schema_version),
+        );
+        object.insert(
+            "checkpointDigest".into(),
+            serde_json::Value::String(String::new()),
+        );
+        serde_json::to_vec(&value)
+            .map(|bytes| digest(&bytes))
+            .map_err(|_| MissionRestartError::InvalidCheckpoint)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissionRestartDisposition {
+    ExactReplay,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum MissionRestartError {
+    #[error("restart snapshot is malformed or incomplete")]
+    InvalidSnapshot,
+    #[error("restart checkpoint is malformed or its digest does not match")]
+    InvalidCheckpoint,
+    #[error("restart checkpoint lacks required durable authority")]
+    MissingAuthority,
+    #[error("restart checkpoint belongs to another project or mission")]
+    CrossProject,
+    #[error("restart checkpoint cursor, generation, epoch, or revision is stale")]
+    StaleSnapshot,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -2471,5 +3212,275 @@ mod tests {
             ContextAssembler::assemble(&request, &fixture.resolver, &ByteTokenizer),
             Err(ContextAssemblyError::ScopeMismatch)
         ));
+    }
+
+    fn restart_snapshot(pack: bool) -> MissionRestartSnapshot {
+        let digest = || "a".repeat(64);
+        MissionRestartSnapshot::from_parts(MissionRestartSnapshotParts {
+            tenant_id: TenantId::from("restart-tenant"),
+            project_id: ProjectId::from("restart-project"),
+            mission_id: MissionId::from("restart-mission"),
+            conversation_id: hartevo_domain_kernel::MissionConversationId::from(
+                "restart-conversation",
+            ),
+            checkpoint_id: ContextCheckpointId::from("restart-checkpoint"),
+            project_digest: digest(),
+            mission_digest: digest(),
+            contract_digest: digest(),
+            conversation_digest: digest(),
+            mission_control_digest: digest(),
+            pack_digest: pack.then(digest),
+            pack_revision: pack.then_some(3),
+            mission_revision: 4,
+            conversation_revision: 5,
+            cursor_digest: digest(),
+            generation: 6,
+            attachment_epoch: 7,
+            idempotency_digest: digest(),
+            event_log_digest: digest(),
+            outbox_digest: digest(),
+        })
+        .expect("valid restart snapshot")
+    }
+
+    #[test]
+    fn mission_restart_checkpoint_is_exact_and_fails_closed_on_scope_or_cursor_drift() {
+        for phase in [
+            MissionRestartPhase::BeforeFirstDelta,
+            MissionRestartPhase::DuringStreaming,
+            MissionRestartPhase::BeforeHumanDecision,
+        ] {
+            let snapshot = restart_snapshot(true);
+            let checkpoint = MissionRestartCheckpoint::new(phase, snapshot.clone())
+                .expect("phase has required durable fields");
+            assert_eq!(
+                checkpoint
+                    .validate_reopen(&checkpoint)
+                    .expect("exact reopen"),
+                MissionRestartDisposition::ExactReplay
+            );
+
+            let mut stale_snapshot = snapshot.clone();
+            stale_snapshot.cursor_digest = "b".repeat(64);
+            let stale = MissionRestartCheckpoint::new(phase, stale_snapshot)
+                .expect("stale snapshot remains well-formed");
+            assert_eq!(
+                checkpoint.validate_reopen(&stale),
+                Err(MissionRestartError::StaleSnapshot)
+            );
+
+            let mutations: [fn(&mut MissionRestartSnapshot); 3] = [
+                |snapshot: &mut MissionRestartSnapshot| snapshot.generation += 1,
+                |snapshot: &mut MissionRestartSnapshot| snapshot.attachment_epoch += 1,
+                |snapshot: &mut MissionRestartSnapshot| snapshot.mission_revision += 1,
+            ];
+            for mutate in mutations {
+                let mut stale_snapshot = snapshot.clone();
+                mutate(&mut stale_snapshot);
+                let stale = MissionRestartCheckpoint::new(phase, stale_snapshot)
+                    .expect("fenced snapshot remains well-formed");
+                assert_eq!(
+                    checkpoint.validate_reopen(&stale),
+                    Err(MissionRestartError::StaleSnapshot)
+                );
+            }
+
+            let mut cross_project = snapshot;
+            cross_project.project_id = ProjectId::from("other-project");
+            let cross_project = MissionRestartCheckpoint::new(phase, cross_project)
+                .expect("cross-project snapshot remains well-formed");
+            assert_eq!(
+                checkpoint.validate_reopen(&cross_project),
+                Err(MissionRestartError::CrossProject)
+            );
+        }
+    }
+
+    #[test]
+    fn mission_restart_checkpoint_requires_pack_before_human_decision_and_redacts_ids() {
+        assert_eq!(
+            MissionRestartCheckpoint::new(
+                MissionRestartPhase::BeforeHumanDecision,
+                restart_snapshot(false),
+            ),
+            Err(MissionRestartError::MissingAuthority)
+        );
+
+        let snapshot = restart_snapshot(true);
+        let debug = format!("{snapshot:?}");
+        assert!(!debug.contains("restart-project"));
+        assert!(!debug.contains("restart-mission"));
+        assert!(debug.contains("project_state_digest"));
+
+        let mut invalid = snapshot;
+        invalid.cursor_digest.clear();
+        assert_eq!(
+            invalid.validate(),
+            Err(MissionRestartError::InvalidSnapshot)
+        );
+    }
+
+    fn mission_control_snapshot(at: DateTime<Utc>) -> MissionControlSnapshot {
+        let digest = || "a".repeat(64);
+        MissionControlSnapshot {
+            tenant_id: "restart-tenant".into(),
+            project_id: "restart-project".into(),
+            mission_id: "restart-mission".into(),
+            objective: MissionControlObjective {
+                objective_digest: digest(),
+                contract_digest: digest(),
+                revision: 1,
+            },
+            gates: vec![MissionControlGate {
+                gate_id: "gate-one".into(),
+                status: MissionControlGateStatus::Ready,
+                required_evidence_digest: None,
+                revision: 1,
+            }],
+            todos: vec![MissionControlTodo {
+                todo_id: "todo-one".into(),
+                status: MissionControlTodoStatus::Pending,
+                idempotency_digest: digest(),
+                revision: 1,
+            }],
+            evidence: vec![MissionControlEvidence {
+                evidence_digest: digest(),
+                source_digest: digest(),
+                revision: 1,
+            }],
+            quota: MissionControlQuota {
+                token_limit: 100,
+                token_spent: 0,
+                cost_limit_minor: 10_000,
+                cost_spent_minor: 0,
+                deadline_at: at + chrono::Duration::hours(1),
+            },
+            claim: None,
+            handoff: None,
+            worker_graph_digest: digest(),
+            accepted_writebacks: Vec::new(),
+            mission_revision: 1,
+        }
+    }
+
+    #[test]
+    fn mission_control_claim_handoff_quota_and_writeback_are_generation_fenced() {
+        let at = Utc
+            .with_ymd_and_hms(2026, 8, 13, 9, 0, 0)
+            .single()
+            .expect("valid time");
+        let snapshot = mission_control_snapshot(at);
+        snapshot.validate(at).expect("valid control snapshot");
+        assert_eq!(
+            snapshot
+                .decide_quota(10, 100, false, false, at)
+                .expect("deliver decision"),
+            MissionControlQuotaDecision::Deliver
+        );
+        assert_eq!(
+            snapshot
+                .decide_quota(101, 100, true, false, at)
+                .expect("ask decision"),
+            MissionControlQuotaDecision::Ask
+        );
+        assert_eq!(
+            snapshot
+                .decide_quota(101, 100, false, false, at)
+                .expect("wait decision"),
+            MissionControlQuotaDecision::Wait
+        );
+        assert_eq!(
+            snapshot
+                .decide_quota(101, 100, false, true, at)
+                .expect("fallback decision"),
+            MissionControlQuotaDecision::SafeFallback
+        );
+        assert_eq!(
+            snapshot
+                .decide_quota(0, 0, false, false, at)
+                .expect("stop decision"),
+            MissionControlQuotaDecision::Stop
+        );
+        let (claimed, disposition) = snapshot
+            .claim("worker-a", 1, 1, at + chrono::Duration::minutes(5), at)
+            .expect("claim");
+        assert_eq!(disposition, MissionControlClaimDisposition::Acquired);
+        assert_eq!(
+            claimed.claim("worker-b", 1, 1, at + chrono::Duration::minutes(5), at),
+            Err(MissionControlError::ClaimLost)
+        );
+        let (_, replay) = claimed
+            .claim("worker-a", 1, 1, at + chrono::Duration::minutes(5), at)
+            .expect("same owner replay");
+        assert_eq!(replay, MissionControlClaimDisposition::Replay);
+
+        let payload = "b".repeat(64);
+        let (written, writeback) = claimed
+            .accept_writeback("worker-a", 1, 1, "request-1", &payload, at)
+            .expect("accepted writeback");
+        assert_eq!(writeback, MissionControlWritebackDisposition::Accepted);
+        let (_, replay) = written
+            .accept_writeback("worker-a", 1, 1, "request-1", &payload, at)
+            .expect("idempotent writeback replay");
+        assert_eq!(replay, MissionControlWritebackDisposition::Replay);
+        assert_eq!(
+            written.accept_writeback("worker-a", 1, 1, "request-1", &"c".repeat(64), at),
+            Err(MissionControlError::DuplicateWriteback)
+        );
+
+        let handed = written
+            .handoff("worker-a", 1, 1, "worker-b", "operator takeover", at)
+            .expect("handoff");
+        assert_eq!(
+            handed.handoff.as_ref().expect("handoff record").generation,
+            2
+        );
+        assert_eq!(
+            handed.accept_writeback("worker-a", 1, 1, "request-2", &payload, at),
+            Err(MissionControlError::ClaimLost)
+        );
+        let (handed_writeback, _) = handed
+            .accept_writeback("worker-b", 2, 2, "request-2", &payload, at)
+            .expect("new owner writeback");
+        assert_eq!(
+            handed_writeback.reserve_quota(101, 0, at),
+            Err(MissionControlError::QuotaExceeded)
+        );
+        let spent = handed_writeback
+            .reserve_quota(10, 100, at)
+            .expect("quota reservation");
+        assert_eq!(spent.quota.token_spent, 10);
+    }
+
+    #[test]
+    fn mission_control_expired_claim_requires_new_generation_and_rejects_invalid_records() {
+        let at = Utc
+            .with_ymd_and_hms(2026, 8, 13, 9, 0, 0)
+            .single()
+            .expect("valid time");
+        let snapshot = mission_control_snapshot(at);
+        let (claimed, _) = snapshot
+            .claim("worker-a", 3, 2, at + chrono::Duration::minutes(1), at)
+            .expect("claim");
+        assert_eq!(
+            claimed.claim("worker-b", 3, 2, at + chrono::Duration::minutes(5), at),
+            Err(MissionControlError::ClaimLost)
+        );
+        let (_, _) = claimed
+            .claim(
+                "worker-b",
+                4,
+                3,
+                at + chrono::Duration::minutes(5),
+                at + chrono::Duration::minutes(2),
+            )
+            .expect("new generation after expiry");
+
+        let mut invalid = mission_control_snapshot(at);
+        invalid.gates.push(invalid.gates[0].clone());
+        assert_eq!(
+            invalid.validate(at),
+            Err(MissionControlError::InvalidSnapshot)
+        );
     }
 }
