@@ -2314,6 +2314,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hartevo-commerce-connector"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "hartevo-connector-sdk",
+ "hartevo-domain-kernel",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
 name = "hartevo-connector-sdk"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "hartevo-commerce-connector-contract/v1",
+  "contractVersion": "commerce-01-readonly/v1",
+  "evidenceLevel": "E1",
+  "readOnly": true,
+  "providerIds": ["amazon-sp-api", "shopify", "sorftime"],
+  "firstPartyProviderIds": ["amazon-sp-api", "shopify"],
+  "estimateOnlyProviderIds": ["sorftime"],
+  "mixingForbidden": true,
+  "connected": false,
+  "providerExecution": false,
+  "providerReceipt": false,
+  "businessVerification": false,
+  "e4": false
+}
