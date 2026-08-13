@@ -12,6 +12,7 @@ members = [
   "hartevo-rs/domain-kernel",
   "hartevo-rs/effect-broker",
   "hartevo-rs/eval",
+  "hartevo-rs/federation-runtime",
   "hartevo-rs/runtime-adapter",
   "hartevo-rs/mission-scheduler",
   "hartevo-rs/plugin-runtime",
