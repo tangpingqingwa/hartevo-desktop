@@ -6,9 +6,16 @@
 //! envelope. Only the content-free manifest is suitable for persistence.
 
 mod model_tokenizer;
+mod vm07_progress;
 
 pub use model_tokenizer::{
     ConservativeByteBudgetTokenizer, PinnedModelTokenizer, PinnedTokenizerSpec,
+};
+pub use vm07_progress::{
+    DurableUsefulProgressIdentity, VM07_MISSION_ID, VM07_MISSION_VERSION,
+    VM07_PACK_CONTRACT_VERSION, VM07_PROGRESS_SCHEMA, VM07_PROGRESS_SCHEMA_VERSION,
+    Vm07ContractFence, Vm07ObservationSourceClass, Vm07ProgressCursor,
+    Vm07ProgressIdentityError, Vm07UsefulProgressKind,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
