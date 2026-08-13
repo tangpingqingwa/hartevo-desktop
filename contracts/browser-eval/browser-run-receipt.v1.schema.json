@@ -1,0 +1,702 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/browser-eval/browser-run-receipt/1.0.0",
+  "title": "Hartevo Browser Run Receipt Payload",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "authority",
+    "releaseDecision",
+    "evaluationRun",
+    "contractBindings",
+    "binary",
+    "environment",
+    "provider",
+    "profiles",
+    "executionMode",
+    "case",
+    "world",
+    "replay",
+    "campaign",
+    "authorityClaims",
+    "attempts",
+    "aggregate"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-browser-run-receipt/v1"},
+    "authority": {"const": "browser_harness_evidence_only"},
+    "releaseDecision": {"const": "NOT_EVALUATED"},
+    "evaluationRun": {"$ref": "#/$defs/evaluationRunRef"},
+    "contractBindings": {"$ref": "#/$defs/contractBindings"},
+    "binary": {"$ref": "#/$defs/binaryBinding"},
+    "environment": {"$ref": "#/$defs/environmentBinding"},
+    "provider": {"$ref": "#/$defs/providerBinding"},
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {"$ref": "#/$defs/profileBinding"}
+    },
+    "executionMode": {"$ref": "#/$defs/executionMode"},
+    "case": {"$ref": "#/$defs/caseBinding"},
+    "world": {"$ref": "#/$defs/worldBinding"},
+    "replay": {"$ref": "#/$defs/replayBinding"},
+    "campaign": {"$ref": "#/$defs/campaign"},
+    "authorityClaims": {"$ref": "#/$defs/authorityClaims"},
+    "attempts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10000,
+      "items": {"$ref": "#/$defs/attempt"}
+    },
+    "aggregate": {"$ref": "#/$defs/aggregate"}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "gitCommit": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "caseId": {
+      "type": "string",
+      "pattern": "^BROWSER-(REC|SEC|FILE|INJ)-[0-9]{3}$"
+    },
+    "worldId": {
+      "type": "string",
+      "pattern": "^BROWSER-WORLD-[A-Z0-9][A-Z0-9-]{0,63}$"
+    },
+    "replayId": {
+      "type": "string",
+      "pattern": "^BROWSER-REPLAY-[A-Z0-9][A-Z0-9-]{0,63}$"
+    },
+    "safetyInvariantId": {
+      "enum": [
+        "approval_bypass",
+        "approved_payload_substitution",
+        "attribution_identity_violation",
+        "browser_or_recipe_effect_broker_bypass",
+        "browser_profile_or_session_scope_violation",
+        "capability_or_subagent_authority_escalation",
+        "consent_or_opt_out_violation",
+        "creator_payout_before_acceptance_or_duplicate",
+        "crm_stage_or_missing_order_claimed_as_revenue",
+        "cross_cell_data_leak",
+        "cross_project_data_leak",
+        "cross_project_memory_recall",
+        "cross_tenant_data_leak",
+        "duplicate_external_effect",
+        "false_complete_without_verified_outcome",
+        "human_handoff_violation",
+        "out_of_scope_delete_export_payment_or_contact",
+        "path_traversal_or_attachment_scope_escape",
+        "private_dataset_leak",
+        "private_reasoning_leak",
+        "prompt_injection_authority_change",
+        "provider_success_claimed_as_publish_or_payment",
+        "public_partner_candidate_autocontact",
+        "secret_or_pii_leak",
+        "token_cookie_or_provider_header_leak",
+        "uncertain_auto_replay",
+        "unsigned_update_plugin_recipe_or_harness_promotion",
+        "wrong_money_or_currency"
+      ]
+    },
+    "evaluationRunRef": {
+      "type": "object",
+      "required": [
+        "runId",
+        "resultSetDigest",
+        "structurallyComplete",
+        "partitionComplete",
+        "executedCaseCount"
+      ],
+      "properties": {
+        "runId": {"$ref": "#/$defs/sha256"},
+        "resultSetDigest": {"$ref": "#/$defs/sha256"},
+        "structurallyComplete": {"type": "boolean"},
+        "partitionComplete": {"type": "boolean"},
+        "executedCaseCount": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "contractBindings": {
+      "type": "object",
+      "required": [
+        "caseRegistryDigest",
+        "worldSchemaDigest",
+        "replaySchemaDigest",
+        "receiptSchemaDigest"
+      ],
+      "properties": {
+        "caseRegistryDigest": {"$ref": "#/$defs/sha256"},
+        "worldSchemaDigest": {"$ref": "#/$defs/sha256"},
+        "replaySchemaDigest": {"$ref": "#/$defs/sha256"},
+        "receiptSchemaDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "binaryBinding": {
+      "type": "object",
+      "required": [
+        "sourceCommit",
+        "applicationBinaryDigest",
+        "applicationBinaryByteCount",
+        "runnerBinaryDigest",
+        "browserBinaryDigest",
+        "browserVersionDigest",
+        "targetTriple"
+      ],
+      "properties": {
+        "sourceCommit": {"$ref": "#/$defs/gitCommit"},
+        "applicationBinaryDigest": {"$ref": "#/$defs/sha256"},
+        "applicationBinaryByteCount": {"type": "integer", "minimum": 1},
+        "runnerBinaryDigest": {"$ref": "#/$defs/sha256"},
+        "browserBinaryDigest": {"$ref": "#/$defs/sha256"},
+        "browserVersionDigest": {"$ref": "#/$defs/sha256"},
+        "targetTriple": {"$ref": "#/$defs/token"}
+      },
+      "additionalProperties": false
+    },
+    "environmentBinding": {
+      "type": "object",
+      "required": [
+        "environmentDigest",
+        "os",
+        "arch",
+        "providerEnvironmentDigest",
+        "profileRootPolicyDigest"
+      ],
+      "properties": {
+        "environmentDigest": {"$ref": "#/$defs/sha256"},
+        "os": {"enum": ["macos", "windows", "linux"]},
+        "arch": {"enum": ["aarch64", "x86_64"]},
+        "providerEnvironmentDigest": {"$ref": "#/$defs/sha256"},
+        "profileRootPolicyDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "providerBinding": {
+      "type": "object",
+      "required": ["providerId", "mode", "providerDigest", "accountScopeDigest"],
+      "properties": {
+        "providerId": {"$ref": "#/$defs/token"},
+        "mode": {"enum": ["controlled_simulator", "native_browser_account"]},
+        "providerDigest": {"$ref": "#/$defs/sha256"},
+        "accountScopeDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "profileBinding": {
+      "type": "object",
+      "required": ["profileId", "profileDigest"],
+      "properties": {
+        "profileId": {"$ref": "#/$defs/token"},
+        "profileDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "executionMode": {
+      "type": "object",
+      "required": ["kind", "maxConfiguredCrossProfileConcurrency"],
+      "properties": {
+        "kind": {
+          "enum": ["single_profile_serial", "cross_profile_bounded_parallel"]
+        },
+        "maxConfiguredCrossProfileConcurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        }
+      },
+      "additionalProperties": false
+    },
+    "caseBinding": {
+      "type": "object",
+      "required": [
+        "caseId",
+        "caseVersion",
+        "caseDefinitionDigest",
+        "releaseSafetyInvariantIds"
+      ],
+      "properties": {
+        "caseId": {"$ref": "#/$defs/caseId"},
+        "caseVersion": {"type": "integer", "minimum": 1},
+        "caseDefinitionDigest": {"$ref": "#/$defs/sha256"},
+        "releaseSafetyInvariantIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/safetyInvariantId"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "worldBinding": {
+      "type": "object",
+      "required": ["worldId", "worldVersion", "worldDigest", "deterministicSeed"],
+      "properties": {
+        "worldId": {"$ref": "#/$defs/worldId"},
+        "worldVersion": {"type": "integer", "minimum": 1},
+        "worldDigest": {"$ref": "#/$defs/sha256"},
+        "deterministicSeed": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "replayBinding": {
+      "type": "object",
+      "required": ["replayId", "replayDigest", "semanticProjectionDigest"],
+      "properties": {
+        "replayId": {"$ref": "#/$defs/replayId"},
+        "replayDigest": {"$ref": "#/$defs/sha256"},
+        "semanticProjectionDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "campaign": {
+      "type": "object",
+      "required": [
+        "kind",
+        "configuredAttemptCount",
+        "campaignDurationMs",
+        "minimumDurationMs"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "single_case",
+            "journey_30",
+            "race",
+            "process_kill",
+            "soak_8h",
+            "resource_cost"
+          ]
+        },
+        "configuredAttemptCount": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "campaignDurationMs": {"type": "integer", "minimum": 0},
+        "minimumDurationMs": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "authorityClaims": {
+      "type": "object",
+      "required": [
+        "providerReceiptAuthority",
+        "businessVerificationAuthority",
+        "releaseEvidenceAuthority",
+        "eLevel"
+      ],
+      "properties": {
+        "providerReceiptAuthority": {"const": false},
+        "businessVerificationAuthority": {"const": false},
+        "releaseEvidenceAuthority": {"const": false},
+        "eLevel": {"const": "E1_MAX"}
+      },
+      "additionalProperties": false
+    },
+    "attemptDisposition": {
+      "enum": ["PASS", "FAIL", "BLOCKED_ENV", "NOT_IMPLEMENTED", "NOT_RUN", "IGNORED"]
+    },
+    "attempt": {
+      "type": "object",
+      "required": [
+        "ordinal",
+        "attemptId",
+        "profileId",
+        "disposition",
+        "evidenceClass",
+        "executionStarted",
+        "testMode",
+        "mock",
+        "ignoredTest",
+        "startedAt",
+        "completedAt",
+        "durationMs",
+        "replayDigest",
+        "semanticProjectionDigest",
+        "effectState",
+        "automaticReplayPerformed",
+        "readback",
+        "stateDigest",
+        "traceDigest",
+        "evidenceDigest",
+        "resource",
+        "cost"
+      ],
+      "properties": {
+        "ordinal": {"type": "integer", "minimum": 1},
+        "attemptId": {"$ref": "#/$defs/token"},
+        "profileId": {"$ref": "#/$defs/token"},
+        "disposition": {"$ref": "#/$defs/attemptDisposition"},
+        "evidenceClass": {
+          "enum": [
+            "source_audit",
+            "native_preflight",
+            "deterministic_simulator",
+            "native_browser",
+            "native_browser_account_readback"
+          ]
+        },
+        "executionStarted": {"type": "boolean"},
+        "testMode": {"type": "boolean"},
+        "mock": {"type": "boolean"},
+        "ignoredTest": {"type": "boolean"},
+        "startedAt": {"type": "string", "format": "date-time"},
+        "completedAt": {"type": "string", "format": "date-time"},
+        "durationMs": {"type": "integer", "minimum": 0},
+        "replayDigest": {"$ref": "#/$defs/sha256"},
+        "semanticProjectionDigest": {"$ref": "#/$defs/sha256"},
+        "effectState": {
+          "enum": [
+            "no_effect",
+            "before_dispatch_failure",
+            "uncertain_after_dispatch",
+            "receipt_candidate",
+            "host_corroborated",
+            "independent_account_readback"
+          ]
+        },
+        "automaticReplayPerformed": {"type": "boolean"},
+        "readback": {"$ref": "#/$defs/readbackEvidence"},
+        "stateDigest": {"$ref": "#/$defs/sha256"},
+        "traceDigest": {"$ref": "#/$defs/sha256"},
+        "evidenceDigest": {"$ref": "#/$defs/sha256"},
+        "resource": {"$ref": "#/$defs/resourceEvidence"},
+        "cost": {"$ref": "#/$defs/costMeasurement"},
+        "blocker": {"$ref": "#/$defs/blockerEvidence"}
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"disposition": {"enum": ["PASS", "FAIL"]}}},
+          "then": {
+            "properties": {"executionStarted": {"const": true}}
+          }
+        },
+        {
+          "if": {"properties": {"disposition": {"const": "BLOCKED_ENV"}}},
+          "then": {"required": ["blocker"]}
+        },
+        {
+          "if": {"properties": {"disposition": {"const": "IGNORED"}}},
+          "then": {
+            "properties": {
+              "executionStarted": {"const": false},
+              "ignoredTest": {"const": true}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "disposition": {"enum": ["NOT_IMPLEMENTED", "NOT_RUN"]}
+            }
+          },
+          "then": {"properties": {"executionStarted": {"const": false}}}
+        }
+      ]
+    },
+    "readbackEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["stage"],
+          "properties": {"stage": {"const": "none"}},
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["stage", "receiptCandidateDigest"],
+          "properties": {
+            "stage": {"const": "receipt_candidate"},
+            "receiptCandidateDigest": {"$ref": "#/$defs/sha256"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["stage", "receiptCandidateDigest", "hostCorroborationDigest"],
+          "properties": {
+            "stage": {"const": "host_corroborated"},
+            "receiptCandidateDigest": {"$ref": "#/$defs/sha256"},
+            "hostCorroborationDigest": {"$ref": "#/$defs/sha256"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "stage",
+            "receiptCandidateDigest",
+            "hostCorroborationDigest",
+            "independentAccountReadbackDigest"
+          ],
+          "properties": {
+            "stage": {"const": "independent_account_readback"},
+            "receiptCandidateDigest": {"$ref": "#/$defs/sha256"},
+            "hostCorroborationDigest": {"$ref": "#/$defs/sha256"},
+            "independentAccountReadbackDigest": {"$ref": "#/$defs/sha256"}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "resourceEvidence": {
+      "type": "object",
+      "required": [
+        "sampleCount",
+        "firstSampleOffsetMs",
+        "lastSampleOffsetMs",
+        "maximumSampleGapMs",
+        "startRssBytes",
+        "endRssBytes",
+        "peakRssBytes",
+        "startChildProcessCount",
+        "endChildProcessCount",
+        "maximumChildProcessCount",
+        "startOpenFileCount",
+        "endOpenFileCount",
+        "maximumOpenFileCount",
+        "sampleSetDigest"
+      ],
+      "properties": {
+        "sampleCount": {"type": "integer", "minimum": 0},
+        "firstSampleOffsetMs": {"type": "integer", "minimum": 0},
+        "lastSampleOffsetMs": {"type": "integer", "minimum": 0},
+        "maximumSampleGapMs": {"type": "integer", "minimum": 0},
+        "startRssBytes": {"type": "integer", "minimum": 0},
+        "endRssBytes": {"type": "integer", "minimum": 0},
+        "peakRssBytes": {"type": "integer", "minimum": 0},
+        "startChildProcessCount": {"type": "integer", "minimum": 0},
+        "endChildProcessCount": {"type": "integer", "minimum": 0},
+        "maximumChildProcessCount": {"type": "integer", "minimum": 0},
+        "startOpenFileCount": {"type": "integer", "minimum": 0},
+        "endOpenFileCount": {"type": "integer", "minimum": 0},
+        "maximumOpenFileCount": {"type": "integer", "minimum": 0},
+        "sampleSetDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "costMeasurement": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "currency", "amountMicros", "evidenceDigest"],
+          "properties": {
+            "kind": {"const": "known"},
+            "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+            "amountMicros": {"type": "integer", "minimum": 0},
+            "evidenceDigest": {"$ref": "#/$defs/sha256"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "reasonCode", "evidenceDigest"],
+          "properties": {
+            "kind": {"const": "unknown"},
+            "reasonCode": {"$ref": "#/$defs/token"},
+            "evidenceDigest": {"$ref": "#/$defs/sha256"}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "blockerEvidence": {
+      "type": "object",
+      "required": ["code", "observationDigest", "exitConditionDigest"],
+      "properties": {
+        "code": {"$ref": "#/$defs/token"},
+        "observationDigest": {"$ref": "#/$defs/sha256"},
+        "exitConditionDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "outcomeCounts": {
+      "type": "object",
+      "required": ["pass", "fail", "blockedEnv", "notImplemented", "notRun", "ignored"],
+      "properties": {
+        "pass": {"type": "integer", "minimum": 0},
+        "fail": {"type": "integer", "minimum": 0},
+        "blockedEnv": {"type": "integer", "minimum": 0},
+        "notImplemented": {"type": "integer", "minimum": 0},
+        "notRun": {"type": "integer", "minimum": 0},
+        "ignored": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "latencySummary": {
+      "type": "object",
+      "required": ["sampleCount", "p50Ms", "p95Ms", "maxMs", "p99Reported"],
+      "properties": {
+        "sampleCount": {"type": "integer", "minimum": 0},
+        "p50Ms": {"type": "integer", "minimum": 0},
+        "p95Ms": {"type": "integer", "minimum": 0},
+        "maxMs": {"type": "integer", "minimum": 0},
+        "p99Reported": {"const": false}
+      },
+      "additionalProperties": false
+    },
+    "determinismSummary": {
+      "type": "object",
+      "required": ["executedAttemptCount", "matchingSemanticProjectionCount", "allMatched", "groupDigest"],
+      "properties": {
+        "executedAttemptCount": {"type": "integer", "minimum": 0},
+        "matchingSemanticProjectionCount": {"type": "integer", "minimum": 0},
+        "allMatched": {"type": "boolean"},
+        "groupDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "concurrencySummary": {
+      "type": "object",
+      "required": [
+        "sameProfileOverlapCount",
+        "maximumObservedSameProfileConcurrency",
+        "maximumObservedCrossProfileConcurrency",
+        "scheduleDigest"
+      ],
+      "properties": {
+        "sameProfileOverlapCount": {"type": "integer", "minimum": 0},
+        "maximumObservedSameProfileConcurrency": {"type": "integer", "minimum": 0},
+        "maximumObservedCrossProfileConcurrency": {"type": "integer", "minimum": 0},
+        "scheduleDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "resourceSummary": {
+      "type": "object",
+      "required": [
+        "attemptEvidenceCount",
+        "peakRssBytes",
+        "maximumEndMinusStartRssBytes",
+        "maximumChildProcessCount",
+        "maximumOpenFileCount",
+        "leakDetected",
+        "evidenceSetDigest"
+      ],
+      "properties": {
+        "attemptEvidenceCount": {"type": "integer", "minimum": 0},
+        "peakRssBytes": {"type": "integer", "minimum": 0},
+        "maximumEndMinusStartRssBytes": {"type": "integer"},
+        "maximumChildProcessCount": {"type": "integer", "minimum": 0},
+        "maximumOpenFileCount": {"type": "integer", "minimum": 0},
+        "leakDetected": {"type": "boolean"},
+        "evidenceSetDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "costSummary": {
+      "type": "object",
+      "required": ["knownAttemptCount", "unknownAttemptCount", "measurement"],
+      "properties": {
+        "knownAttemptCount": {"type": "integer", "minimum": 0},
+        "unknownAttemptCount": {"type": "integer", "minimum": 0},
+        "measurement": {"$ref": "#/$defs/costMeasurement"}
+      },
+      "additionalProperties": false
+    },
+    "cleanupSummary": {
+      "type": "object",
+      "required": [
+        "required",
+        "attemptedCount",
+        "succeededCount",
+        "orphanProcessCountAfter",
+        "retainedProfileArtifactCount",
+        "evidenceDigest"
+      ],
+      "properties": {
+        "required": {"const": true},
+        "attemptedCount": {"type": "integer", "minimum": 0},
+        "succeededCount": {"type": "integer", "minimum": 0},
+        "orphanProcessCountAfter": {"type": "integer", "minimum": 0},
+        "retainedProfileArtifactCount": {"type": "integer", "minimum": 0},
+        "evidenceDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "raceEvidence": {
+      "type": "object",
+      "required": [
+        "seed",
+        "barrierParticipantCount",
+        "barrierDigest",
+        "scheduleDigest",
+        "winnerCount",
+        "externalEffectCount"
+      ],
+      "properties": {
+        "seed": {"$ref": "#/$defs/sha256"},
+        "barrierParticipantCount": {"type": "integer", "minimum": 2},
+        "barrierDigest": {"$ref": "#/$defs/sha256"},
+        "scheduleDigest": {"$ref": "#/$defs/sha256"},
+        "winnerCount": {"type": "integer", "minimum": 0},
+        "externalEffectCount": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "processKillEvidence": {
+      "type": "object",
+      "required": [
+        "externalKill",
+        "targetKind",
+        "targetProcessIdentityDigest",
+        "killerProcessIdentityDigest",
+        "distinctProcessConfirmed",
+        "signal",
+        "faultEventOrdinal",
+        "terminationObserved",
+        "cleanupDigest"
+      ],
+      "properties": {
+        "externalKill": {"type": "boolean"},
+        "targetKind": {"enum": ["browser", "renderer", "harness"]},
+        "targetProcessIdentityDigest": {"$ref": "#/$defs/sha256"},
+        "killerProcessIdentityDigest": {"$ref": "#/$defs/sha256"},
+        "distinctProcessConfirmed": {"type": "boolean"},
+        "signal": {"enum": ["SIGKILL", "TerminateProcess"]},
+        "faultEventOrdinal": {"type": "integer", "minimum": 0},
+        "terminationObserved": {"type": "boolean"},
+        "cleanupDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "aggregate": {
+      "type": "object",
+      "required": [
+        "verdict",
+        "configuredAttemptCount",
+        "recordedAttemptCount",
+        "outcomes",
+        "latency",
+        "determinism",
+        "concurrency",
+        "resource",
+        "cost",
+        "cleanup"
+      ],
+      "properties": {
+        "verdict": {"enum": ["PASS", "FAIL", "INCOMPLETE"]},
+        "configuredAttemptCount": {"type": "integer", "minimum": 1},
+        "recordedAttemptCount": {"type": "integer", "minimum": 0},
+        "outcomes": {"$ref": "#/$defs/outcomeCounts"},
+        "latency": {"$ref": "#/$defs/latencySummary"},
+        "determinism": {"$ref": "#/$defs/determinismSummary"},
+        "concurrency": {"$ref": "#/$defs/concurrencySummary"},
+        "resource": {"$ref": "#/$defs/resourceSummary"},
+        "cost": {"$ref": "#/$defs/costSummary"},
+        "cleanup": {"$ref": "#/$defs/cleanupSummary"},
+        "race": {"$ref": "#/$defs/raceEvidence"},
+        "processKill": {"$ref": "#/$defs/processKillEvidence"}
+      },
+      "additionalProperties": false
+    }
+  }
+}
