@@ -1,6 +1,13 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod gm01_application_research_pipeline;
 mod runtime_text_subscription;
+
+pub use gm01_application_research_pipeline::{
+    RunVm07MarketResearch, Vm07ObservationOrigin, Vm07ObservationRole, Vm07ResearchNextStep,
+    Vm07ResearchPlan, Vm07ResearchResult, Vm07RuntimeObservation, Vm07RuntimeObservationAdapter,
+    Vm07RuntimeRequest, Vm07SourceScope, Vm07UncertaintyTemplate,
+};
 
 pub use runtime_text_subscription::{
     CatalogMissionExecutionHandle, CatalogMissionExecutionStart,
@@ -21130,6 +21137,44 @@ pub enum ApplicationError {
     Vm07MarketEvidencePackScopeMismatch,
     #[error("VM-07 Market Evidence Pack revision is stale, duplicated, or already persisted")]
     Vm07MarketEvidencePackRevisionMismatch,
+    #[error("VM-07 research plan is malformed or digest-invalid")]
+    Vm07ResearchPlanInvalid,
+    #[error("VM-07 research plan is stale for the current Mission or Contract")]
+    Vm07ResearchPlanStale,
+    #[error("VM-07 research plan does not match the current Mission route")]
+    Vm07ResearchPlanMismatch,
+    #[error("VM-07 research request is malformed or authority-invalid")]
+    Vm07RuntimeRequestInvalid,
+    #[error("VM-07 research command is outside the exact Mission scope")]
+    Vm07ResearchScopeMismatch,
+    #[error("VM-07 research Checkpoint is unavailable or not a read-only Runtime route")]
+    Vm07ResearchCheckpointUnavailable,
+    #[error("VM-07 research Mission is terminal and cannot accept observations")]
+    Vm07ResearchMissionStopped,
+    #[error("VM-07 observation adapter failed: {0}")]
+    Vm07ObservationAdapter(String),
+    #[error("VM-07 observation batch is empty")]
+    Vm07ObservationBatchEmpty,
+    #[error(
+        "VM-07 observation batch is malformed, incomplete, or lacks supporting/counter evidence"
+    )]
+    Vm07ObservationBatchInvalid,
+    #[error("VM-07 observation scope does not match the exact Mission/Checkpoint/request")]
+    Vm07ObservationScopeMismatch,
+    #[error("VM-07 observation source URI or origin drifted from the frozen plan")]
+    Vm07ObservationSourceDrift,
+    #[error("VM-07 observation time is outside the frozen plan window")]
+    Vm07ObservationTimeInvalid,
+    #[error("VM-07 observation content digest does not match the observed content")]
+    Vm07ObservationDigestMismatch,
+    #[error("public VM-07 observation cannot be classified as a first-party Confirmed fact")]
+    Vm07PublicObservationCannotBeConfirmed,
+    #[error("VM-07 observation replay or payload swap does not match persisted evidence")]
+    Vm07ObservationReplayMismatch,
+    #[error("VM-07 observation Pack or manifest state is inconsistent")]
+    Vm07ResearchPackConflict,
+    #[error("VM-07 observation Pack revision does not match the expected revision")]
+    Vm07ResearchPackRevisionMismatch,
     #[error("VM-07 market decision route is not the active Human decision checkpoint")]
     Vm07MarketDecisionUnavailable,
     #[error("VM-07 market decision command is incomplete or malformed")]
