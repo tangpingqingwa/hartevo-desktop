@@ -19,6 +19,7 @@ use crate::webhook::{WebhookEnvelope, WebhookError};
 
 pub const OPEN_API_BASE_URL: &str = "https://open.tiktokapis.com/v2/";
 pub const TIKTOK_USER_INFO_BASIC_SCOPE: &str = "user.info.basic";
+pub const TIKTOK_VIDEO_LIST_SCOPE: &str = "video.list";
 pub const TIKTOK_VIDEO_PUBLISH_SCOPE: &str = "video.publish";
 pub const TIKTOK_VIDEO_UPLOAD_SCOPE: &str = "video.upload";
 
@@ -26,6 +27,7 @@ pub const TIKTOK_VIDEO_UPLOAD_SCOPE: &str = "video.upload";
 #[serde(rename_all = "snake_case")]
 pub enum TiktokScope {
     UserInfoBasic,
+    VideoList,
     VideoPublish,
     VideoUpload,
 }
@@ -34,6 +36,7 @@ impl TiktokScope {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UserInfoBasic => TIKTOK_USER_INFO_BASIC_SCOPE,
+            Self::VideoList => TIKTOK_VIDEO_LIST_SCOPE,
             Self::VideoPublish => TIKTOK_VIDEO_PUBLISH_SCOPE,
             Self::VideoUpload => TIKTOK_VIDEO_UPLOAD_SCOPE,
         }
@@ -46,6 +49,7 @@ impl TiktokScope {
     fn parse(value: &str) -> Option<Self> {
         match value {
             TIKTOK_USER_INFO_BASIC_SCOPE => Some(Self::UserInfoBasic),
+            TIKTOK_VIDEO_LIST_SCOPE => Some(Self::VideoList),
             TIKTOK_VIDEO_PUBLISH_SCOPE => Some(Self::VideoPublish),
             TIKTOK_VIDEO_UPLOAD_SCOPE => Some(Self::VideoUpload),
             _ => None,
@@ -433,6 +437,10 @@ impl TiktokContentStatusObservation {
 
     pub fn publicly_available_post_ids(&self) -> &[TiktokPostId] {
         &self.publicly_available_post_ids
+    }
+
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
     }
 }
 

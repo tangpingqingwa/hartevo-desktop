@@ -9,6 +9,7 @@ pub mod identity;
 pub mod reddit;
 pub mod testkit;
 pub mod tiktok;
+pub mod tiktok_insight;
 pub mod transport;
 pub mod webhook;
 pub mod youtube;
@@ -16,6 +17,7 @@ pub mod youtube;
 pub use identity::{
     AccountIdentity, ChannelIdentity, ContentIdentity, ProviderId, RevisionIdentity,
 };
+pub use tiktok_insight::{ChannelInsightReadService, MissionTiktokInsightConsumer};
 pub use transport::{
     AuthorizationReason, ChannelAdapterError, CredentialReference, HttpMethod, ProviderReadRequest,
     ProviderResponse, ReadOnlyTransport, ReadOperation, ScopeName, TransportError,
