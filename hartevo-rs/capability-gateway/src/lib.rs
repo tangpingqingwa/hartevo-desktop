@@ -9,6 +9,17 @@
 
 #![forbid(unsafe_code)]
 
+mod resolution;
+pub use resolution::{
+    CapabilityBinding, CapabilityCompositionLifecycle, CapabilityCompositionScope,
+    CapabilityCompositionSnapshot, CapabilityConsumerDefinition, CapabilityProviderDefinition,
+    CapabilityReleaseReceipt, CapabilityResolutionAuditEvent, CapabilityResolutionAuditEventKind,
+    CapabilityResolutionAuditLedger, CapabilityResolutionError, CapabilityResolutionLease,
+    CapabilityResolutionReceipt, CapabilityResolutionSelector, CapabilityResolver,
+    CapabilityServiceDefinition, CapabilityVersion, ContributionLifecycle,
+    MemoryCapabilityResolutionLedger, ResolutionLedgerError,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
