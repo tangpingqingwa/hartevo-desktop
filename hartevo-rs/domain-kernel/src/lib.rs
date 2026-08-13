@@ -28,6 +28,7 @@ mod runtime_recovery;
 mod runtime_turn;
 mod truth;
 mod usage;
+mod usage_service;
 mod work_product;
 
 pub use attribution_spine::{
@@ -174,6 +175,16 @@ pub use usage::{
     MissionUsageEntry, MissionUsageEntryKind, MissionUsageLedger, MissionUsageReservation,
     UsageCommitEvidence, UsageLedgerError, UsageLedgerMutation, UsageReleaseEvidence,
     UsageReleaseReason, UsageReservationStatus,
+};
+pub use usage_service::{
+    AccountingProviderReceipt, CAPABILITY_ADAPTER_REGISTRY_SCHEMA,
+    MISSION_USAGE_RECEIPT_SCHEMA_VERSION, MISSION_USAGE_RESULT_PACKET_SCHEMA_VERSION,
+    MISSION_USAGE_SERVICE_SCHEMA_VERSION, MissionAccountingProvider, MissionUsageConsumeRequest,
+    MissionUsageConsumer, MissionUsageConsumption, MissionUsageResultPacket,
+    MissionUsageServiceDefinition, MissionUsageServiceRegistration, MissionUsageServiceRegistry,
+    MissionUsageServiceStatus, PROVIDER_ADAPTER_REGISTRY_SCHEMA, UnitPriceAccountingProvider,
+    UsageMeasurement, UsageProviderRegistryBinding, UsageRegistryMutation, UsageServiceError,
+    UsageUnit,
 };
 pub use work_product::{
     WorkProductDependencies, WorkProductManifest, WorkProductManifestError, WorkProductPreview,

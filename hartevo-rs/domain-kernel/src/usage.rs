@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::usage_service::MissionUsageReceipt;
 use crate::{
     CreditGrantId, CurrencyCode, EffectId, EffectStatus, MissionId, Money, ProjectId, ReceiptId,
     TenantId, UsageEntryId, UsageReservationId,
@@ -75,6 +76,8 @@ pub struct UsageCommitEvidence {
     pub effect_status: EffectStatus,
     pub evidence_digest: String,
     pub observed_at: DateTime<Utc>,
+    #[serde(default)]
+    pub usage_receipt: Option<MissionUsageReceipt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -94,6 +97,7 @@ pub struct UsageReleaseEvidence {
     pub observed_at: DateTime<Utc>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum MissionUsageEntryKind {
@@ -246,6 +250,19 @@ impl MissionUsageLedger {
             .collect()
     }
 
+    pub fn committed_usage_receipt(
+        &self,
+        reservation_id: &UsageReservationId,
+    ) -> Option<MissionUsageReceipt> {
+        self.entries.iter().find_map(|entry| match &entry.kind {
+            MissionUsageEntryKind::Committed {
+                reservation_id: committed_id,
+                evidence,
+            } if committed_id == reservation_id => evidence.usage_receipt.clone(),
+            _ => None,
+        })
+    }
+
     pub fn reserve(
         &mut self,
         reservation: MissionUsageReservation,
@@ -299,6 +316,20 @@ impl MissionUsageLedger {
         }
         match reservation.status {
             UsageReservationStatus::Committed => {
+                let existing = self
+                    .entries
+                    .iter()
+                    .find_map(|entry| match &entry.kind {
+                        MissionUsageEntryKind::Committed {
+                            reservation_id: committed_id,
+                            evidence,
+                        } if committed_id == reservation_id => Some(evidence),
+                        _ => None,
+                    })
+                    .ok_or(UsageLedgerError::LedgerIntegrityFailure)?;
+                if existing != &evidence {
+                    return Err(UsageLedgerError::CommitConflict);
+                }
                 return Ok(UsageLedgerMutation::Replayed(reservation));
             }
             UsageReservationStatus::Released => return Err(UsageLedgerError::ReservationTerminal),
@@ -567,6 +598,17 @@ fn validate_commit_evidence(evidence: &UsageCommitEvidence) -> Result<(), UsageL
     {
         return Err(UsageLedgerError::CommitRequiresReceipt);
     }
+    if let Some(receipt) = &evidence.usage_receipt {
+        receipt
+            .validate()
+            .map_err(|_| UsageLedgerError::CommitRequiresTypedUsageReceipt)?;
+        if receipt.receipt_id != evidence.receipt_id
+            || receipt.evidence_digest != evidence.evidence_digest
+            || receipt.observed_at != evidence.observed_at
+        {
+            return Err(UsageLedgerError::CommitRequiresTypedUsageReceipt);
+        }
+    }
     Ok(())
 }
 
@@ -601,6 +643,10 @@ pub enum UsageLedgerError {
     UnknownReservation(UsageReservationId),
     #[error("usage commit requires a durable ReceiptRecorded or Verified Effect")]
     CommitRequiresReceipt,
+    #[error("usage commit typed receipt does not match its evidence")]
+    CommitRequiresTypedUsageReceipt,
+    #[error("usage commit conflicts with an existing committed evidence record")]
+    CommitConflict,
     #[error("usage release evidence is invalid")]
     InvalidReleaseEvidence,
     #[error("usage evidence falls outside the reservation window")]
@@ -681,6 +727,7 @@ mod tests {
             effect_status: EffectStatus::Verified,
             evidence_digest: "c".repeat(64),
             observed_at: now() + chrono::Duration::minutes(1),
+            usage_receipt: None,
         };
         let committed = ledger
             .commit(
@@ -714,6 +761,7 @@ mod tests {
             effect_status: EffectStatus::VerificationRequired,
             evidence_digest: "c".repeat(64),
             observed_at: now(),
+            usage_receipt: None,
         };
         assert_eq!(
             ledger.commit(
