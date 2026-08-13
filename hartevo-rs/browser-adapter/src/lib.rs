@@ -19,6 +19,7 @@ mod chromium_host;
 mod fake_host;
 mod file_broker;
 mod form_draft;
+mod form_result;
 mod locator;
 mod navigation;
 mod profile_dir;
@@ -56,6 +57,13 @@ pub use form_draft::{
     BrowserFormFieldPolicy, BrowserFormFrameObservation, BrowserFormFrameSnapshot, BrowserFormHost,
     BrowserFormObservation, BrowserFormScope, BrowserFormSecretClass, BrowserFormServiceState,
     UnavailableBrowserFormHost,
+};
+pub use form_result::{
+    BrowserFormFieldMutation, BrowserFormResult, BrowserFormResultConsumer, BrowserFormResultFrame,
+    BrowserFormResultFrameEvidence, BrowserFormResultHost, BrowserFormResultIdentity,
+    BrowserFormResultLog, BrowserFormResultPolicy, BrowserFormResultPolicyRequirement,
+    BrowserFormResultProvider, BrowserFormResultProviderState, BrowserFormResultStatus,
+    UnavailableBrowserFormResultHost,
 };
 pub use locator::{BrowserLocatorResolution, BrowserStableLocator};
 pub use navigation::{BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserNavigationTarget};
@@ -228,6 +236,26 @@ pub enum BrowserError {
     FormProviderRestarted,
     #[error("browser form dispatch is not performed by the draft service")]
     FormDispatchRejected,
+    #[error("browser form result projection is malformed")]
+    InvalidFormResult,
+    #[error(
+        "browser form result does not match the exact plugin, Mission, profile, or draft scope"
+    )]
+    FormResultScopeMismatch,
+    #[error("browser form result frame, navigation, DOM, or session changed")]
+    FormResultSnapshotStale,
+    #[error("browser form result projection was duplicated or already delivered")]
+    FormResultDuplicate,
+    #[error("browser form result belongs to a closed or reopened provider cursor")]
+    FormResultReopened,
+    #[error("browser form result provider was invalidated by stale evidence")]
+    FormResultProviderInvalidated,
+    #[error("browser form result provider was revoked")]
+    FormResultProviderRevoked,
+    #[error("browser form result provider was restarted and its old cursor is invalid")]
+    FormResultProviderRestarted,
+    #[error("browser form result consumer rejected the typed projection")]
+    FormResultConsumerRejected,
     #[error("browser file is outside every canonical project root or crosses a symlink")]
     FileOutsideProject,
     #[error("browser file is empty or exceeds the configured size boundary")]
@@ -336,6 +364,15 @@ impl BrowserError {
             Self::FormProviderRevoked => "BROWSER_FORM_PROVIDER_REVOKED",
             Self::FormProviderRestarted => "BROWSER_FORM_PROVIDER_RESTARTED",
             Self::FormDispatchRejected => "BROWSER_FORM_DISPATCH_REJECTED",
+            Self::InvalidFormResult => "BROWSER_INVALID_FORM_RESULT",
+            Self::FormResultScopeMismatch => "BROWSER_FORM_RESULT_SCOPE_MISMATCH",
+            Self::FormResultSnapshotStale => "BROWSER_FORM_RESULT_SNAPSHOT_STALE",
+            Self::FormResultDuplicate => "BROWSER_FORM_RESULT_DUPLICATE",
+            Self::FormResultReopened => "BROWSER_FORM_RESULT_REOPENED",
+            Self::FormResultProviderInvalidated => "BROWSER_FORM_RESULT_PROVIDER_INVALIDATED",
+            Self::FormResultProviderRevoked => "BROWSER_FORM_RESULT_PROVIDER_REVOKED",
+            Self::FormResultProviderRestarted => "BROWSER_FORM_RESULT_PROVIDER_RESTARTED",
+            Self::FormResultConsumerRejected => "BROWSER_FORM_RESULT_CONSUMER_REJECTED",
             Self::FileOutsideProject => "BROWSER_FILE_OUTSIDE_PROJECT",
             Self::FileSizeRejected => "BROWSER_FILE_SIZE_REJECTED",
             Self::FileTypeRejected => "BROWSER_FILE_TYPE_REJECTED",
