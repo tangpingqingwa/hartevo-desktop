@@ -2,7 +2,7 @@ use chrono::{TimeZone, Utc};
 use hartevo_connector_sdk::{
     ProviderAdapterOperation, ProviderAdapterRegistry, ProviderProvenanceClass,
 };
-use hartevo_domain_kernel::{ProjectId, TenantId};
+use hartevo_domain_kernel::{MissionId, ProjectId, TenantId};
 use hartevo_growth_signals::{
     CalendarDateRange, LanguageCode, MarketCode, ReadScope,
     dataforseo::DataForSeoDevice,
@@ -11,6 +11,10 @@ use hartevo_growth_signals::{
     dataforseo::DataForSeoWorldScenario,
     dataforseo::FakeDataForSeoTransport,
     dataforseo_canary::{DataForSeoCanaryConfig, run_with_transport},
+    dataforseo_service::{
+        DATAFORSEO_READ_CAPABILITY, DataForSeoConnectorService, DataForSeoMissionConsumer,
+        DataForSeoReadProvider, DataForSeoRegistrationState,
+    },
     parse_date,
 };
 use rust_decimal::Decimal;
@@ -133,5 +137,88 @@ fn signal02_canary_contract_binds_estimate_scope_evidence_and_replay_cost() {
             .as_u64()
             .unwrap_or_default()
             > 0
+    );
+}
+
+#[test]
+fn signal03_mission_consumer_contract_emits_scoped_read_result_envelope() {
+    let scope = ReadScope::new(
+        TenantId::from("tenant-mission-contract"),
+        ProjectId::from("project-mission-contract"),
+        MarketCode::new("DE").expect("market"),
+        LanguageCode::new("de").expect("language"),
+        CalendarDateRange::new(
+            parse_date("2026-08-01").expect("date"),
+            parse_date("2026-08-07").expect("date"),
+        )
+        .expect("window"),
+    );
+    let request = DataForSeoSearchRequest::new(
+        scope.clone(),
+        "mission contract keyword",
+        2276,
+        DataForSeoDevice::Desktop,
+        10,
+        DataForSeoMode::Live,
+        Decimal::new(10, 2),
+        Some(Decimal::new(20, 2)),
+    )
+    .expect("request");
+    let config = DataForSeoCanaryConfig::new(
+        scope.clone(),
+        "dataforseo-mission-account",
+        request.clone(),
+        2,
+        Utc.with_ymd_and_hms(2026, 8, 13, 0, 0, 0)
+            .single()
+            .expect("time"),
+    )
+    .expect("config");
+    let client = hartevo_growth_signals::dataforseo::DataForSeoClient::new(
+        config.secret_reference().expect("secret"),
+        FakeDataForSeoTransport::new(DataForSeoWorldScenario::PaginatedResults),
+    )
+    .expect("client");
+    let provider = DataForSeoReadProvider::new(
+        client,
+        request,
+        2,
+        config.observed_at(),
+        ProviderProvenanceClass::ControlledProvider,
+    )
+    .expect("provider");
+    let mut service = DataForSeoConnectorService::new(provider).expect("service");
+    assert_eq!(
+        service.registration().state(),
+        DataForSeoRegistrationState::Unmounted
+    );
+    service.mount().expect("mount");
+    let result = service.read_result().expect("read result");
+    let consumer = DataForSeoMissionConsumer::new(
+        MissionId::from_stable("mission-signal03-contract"),
+        scope.tenant_id().clone(),
+        scope.project_id().clone(),
+        "dataforseo-mission-account",
+        DATAFORSEO_READ_CAPABILITY,
+    )
+    .expect("consumer");
+    let output = consumer.consume(&result).expect("mission output");
+    let value = serde_json::to_value(output).expect("mission output JSON");
+    assert_eq!(value["consumerId"], "hartevo.mission.growth-signal");
+    assert_eq!(value["providerId"], "dataforseo");
+    assert_eq!(value["accountId"], "dataforseo-mission-account");
+    assert_eq!(value["classification"], "provider_estimate");
+    assert_eq!(value["firstParty"], false);
+    assert_eq!(value["probeStatus"], "reachable");
+    assert_eq!(value["evidence"]["status"], "candidate");
+    assert_eq!(value["evidence"]["confidence"], 0.0);
+    assert_eq!(value["cursor"]["sequence"], 2);
+    assert_eq!(
+        value["readObservation"]["capability"]["capabilityId"],
+        "search.measure"
+    );
+    assert_eq!(
+        value["accountProbe"]["scope"]["projectId"],
+        "project-mission-contract"
     );
 }

@@ -9,6 +9,7 @@ pub mod attribution;
 mod common;
 pub mod dataforseo;
 pub mod dataforseo_canary;
+pub mod dataforseo_service;
 pub mod google_ads;
 pub mod google_analytics;
 pub mod sdk;

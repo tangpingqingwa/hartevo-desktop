@@ -9,8 +9,8 @@ use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_connector_sdk::{
-    ConnectorDescriptor, ConnectorError, ConnectorScope, Cursor, ProviderProvenanceClass,
-    ReadObservation, SecretReference,
+    ConnectorDescriptor, ConnectorError, ConnectorScope, Cursor, ProbeObservation, ProbeStatus,
+    ProviderProvenanceClass, ReadObservation, SecretReference,
 };
 use reqwest::blocking::Client;
 use rust_decimal::Decimal;
@@ -317,6 +317,77 @@ impl DataForSeoRateLimit {
 
     pub const fn remaining(&self) -> Option<u64> {
         self.remaining
+    }
+}
+
+/// A free authenticated account probe from `/v3/appendix/user_data`.
+///
+/// The provider login is never returned; only its digest is retained as
+/// evidence that the authenticated account response was present.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DataForSeoAccountProbe {
+    scope: ConnectorScope,
+    status: ProbeStatus,
+    provenance_class: ProviderProvenanceClass,
+    observed_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    evidence_digest: String,
+    raw_evidence_digest: String,
+    account_login_digest: String,
+    rate_limit: DataForSeoRateLimit,
+    cost_usd: Decimal,
+}
+
+impl DataForSeoAccountProbe {
+    pub const fn scope(&self) -> &ConnectorScope {
+        &self.scope
+    }
+
+    pub const fn status(&self) -> ProbeStatus {
+        self.status
+    }
+
+    pub const fn provenance_class(&self) -> ProviderProvenanceClass {
+        self.provenance_class
+    }
+
+    pub const fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+
+    pub const fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+
+    pub fn evidence_digest(&self) -> &str {
+        &self.evidence_digest
+    }
+
+    pub fn raw_evidence_digest(&self) -> &str {
+        &self.raw_evidence_digest
+    }
+
+    pub fn account_login_digest(&self) -> &str {
+        &self.account_login_digest
+    }
+
+    pub const fn rate_limit(&self) -> &DataForSeoRateLimit {
+        &self.rate_limit
+    }
+
+    pub fn cost_usd(&self) -> Decimal {
+        self.cost_usd
+    }
+
+    pub fn sdk_observation(&self) -> Result<ProbeObservation, ConnectorError> {
+        ProbeObservation::new(
+            self.status,
+            self.provenance_class,
+            self.observed_at,
+            self.expires_at,
+            self.evidence_digest.clone(),
+        )
     }
 }
 
@@ -948,6 +1019,71 @@ impl<T: DataForSeoTransport> DataForSeoClient<T> {
         &self.secret_reference
     }
 
+    /// Probe the authenticated DataForSEO account without consuming a SERP
+    /// task. The Appendix User Data endpoint is a free account-data request;
+    /// the login itself is reduced to a digest before it leaves this module.
+    pub fn probe_account_with_provenance(
+        &mut self,
+        observed_at: DateTime<Utc>,
+        provenance: ProviderProvenanceClass,
+    ) -> Result<DataForSeoAccountProbe, DataForSeoError> {
+        let path = "/v3/appendix/user_data";
+        let response = self.transport.execute(DataForSeoHttpRequest::new(
+            DataForSeoHttpMethod::Get,
+            path,
+            None,
+        ))?;
+        let (task, rate_limit) = parse_task(&response)?;
+        let result = task
+            .get("result")
+            .and_then(|value| match value {
+                Value::Array(values) => values.first(),
+                Value::Object(_) => Some(value),
+                _ => None,
+            })
+            .ok_or(DataForSeoError::MalformedResponse)?;
+        let login = result
+            .get("login")
+            .and_then(Value::as_str)
+            .or_else(|| task.get("login").and_then(Value::as_str))
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(DataForSeoError::MalformedResponse)?;
+        let cost_usd = task
+            .get("cost")
+            .or_else(|| response.body.get("cost"))
+            .map(|value| Decimal::from_str(&value.to_string()))
+            .transpose()
+            .map_err(|_| DataForSeoError::MalformedResponse)?
+            .unwrap_or(Decimal::ZERO);
+        let raw_evidence_digest = response.raw_evidence_digest().to_owned();
+        let observation = ProbeObservation::new(
+            ProbeStatus::Reachable,
+            provenance,
+            observed_at,
+            observed_at + Duration::seconds(120),
+            raw_evidence_digest.clone(),
+        )
+        .map_err(DataForSeoError::Connector)?;
+        Ok(DataForSeoAccountProbe {
+            scope: self.secret_reference.scope().clone(),
+            status: observation.status,
+            provenance_class: observation.provenance_class,
+            observed_at: observation.observed_at,
+            expires_at: observation.expires_at,
+            evidence_digest: observation.evidence_digest,
+            raw_evidence_digest,
+            account_login_digest: dataforseo_password_digest(login),
+            rate_limit,
+            cost_usd,
+        })
+    }
+
+    pub fn revoke(&mut self, revoked_at: DateTime<Utc>) -> Result<(), DataForSeoError> {
+        self.secret_reference
+            .revoke(revoked_at)
+            .map_err(DataForSeoError::Connector)
+    }
+
     pub fn connector_descriptor() -> Result<ConnectorDescriptor, ConnectorError> {
         crate::sdk::descriptor_for(DATAFORSEO_PROVIDER_ID, "hartevo.dataforseo")
     }
@@ -1465,7 +1601,20 @@ impl DataForSeoTransport for FakeDataForSeoTransport {
         } else {
             "2026-08-13T00:00:00Z"
         };
-        let response = if request.path.ends_with("task_post") {
+        let response = if request.path.ends_with("/appendix/user_data") {
+            json!({
+                "status_code": 20000,
+                "tasks": [{
+                    "id": task_id,
+                    "status_code": 20000,
+                    "cost": 0.0,
+                    "result": [{
+                        "login": "fixture-dataforseo-login",
+                        "money": {"balance": 100.0}
+                    }]
+                }]
+            })
+        } else if request.path.ends_with("task_post") {
             json!({
                 "status_code": 20000,
                 "tasks": [{"id": task_id, "status_code": 20100, "cost": cost}]

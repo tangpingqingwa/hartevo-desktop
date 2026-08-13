@@ -19,11 +19,12 @@ use zeroize::Zeroizing;
 use crate::{
     CalendarDateRange, EvidenceClassification, Freshness, LanguageCode, MarketCode, ReadScope,
     dataforseo::{
-        DATAFORSEO_MAX_DEPTH, DATAFORSEO_MAX_PAGE_SIZE, DATAFORSEO_PROVIDER_ID, DataForSeoClient,
-        DataForSeoDevice, DataForSeoError, DataForSeoHttpTransport, DataForSeoMode,
-        DataForSeoPageCursor, DataForSeoRateLimit, DataForSeoSearchPage, DataForSeoSearchRequest,
-        DataForSeoTransport,
+        DATAFORSEO_MAX_DEPTH, DATAFORSEO_MAX_PAGE_SIZE, DATAFORSEO_PROVIDER_ID,
+        DataForSeoAccountProbe, DataForSeoClient, DataForSeoDevice, DataForSeoError,
+        DataForSeoHttpTransport, DataForSeoMode, DataForSeoPageCursor, DataForSeoRateLimit,
+        DataForSeoSearchPage, DataForSeoSearchRequest, DataForSeoTransport,
     },
+    dataforseo_service::{DataForSeoReadProvider, DataForSeoServiceError},
     parse_date,
 };
 
@@ -33,7 +34,7 @@ const DEFAULT_DEVICE: &str = "desktop";
 const DEFAULT_SECRET_REFERENCE_ID: &str = "secret-ref-dataforseo-canary";
 const DEFAULT_CONNECTOR_SCOPE: &str = "serp.read";
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Debug, Error)]
 pub enum DataForSeoCanaryError {
     #[error("BLOCKED_ENV: missing required environment variables: {missing:?}")]
     BlockedEnv { missing: Vec<String> },
@@ -43,6 +44,8 @@ pub enum DataForSeoCanaryError {
     DataForSeo(#[from] DataForSeoError),
     #[error(transparent)]
     Connector(#[from] ConnectorError),
+    #[error(transparent)]
+    Service(#[from] DataForSeoServiceError),
     #[error("DataForSEO canary exceeded the provider depth bound while paginating")]
     PaginationBound,
 }
@@ -303,6 +306,7 @@ pub struct DataForSeoCanaryReport {
     secret_reference_id: String,
     credential_revision: u64,
     account_scope: DataForSeoCanaryScopeReport,
+    account_probe: DataForSeoAccountProbe,
     mode: DataForSeoMode,
     classification: EvidenceClassification,
     first_party: bool,
@@ -319,6 +323,10 @@ pub struct DataForSeoCanaryReport {
 impl DataForSeoCanaryReport {
     pub fn account_scope(&self) -> &DataForSeoCanaryScopeReport {
         &self.account_scope
+    }
+
+    pub const fn account_probe(&self) -> &DataForSeoAccountProbe {
+        &self.account_probe
     }
 
     pub fn request_digest(&self) -> &str {
@@ -453,6 +461,23 @@ impl DataForSeoCanaryEnv {
     pub const fn config(&self) -> &DataForSeoCanaryConfig {
         &self.config
     }
+
+    pub fn authenticated_read_provider(
+        &self,
+    ) -> Result<DataForSeoReadProvider<DataForSeoHttpTransport>, DataForSeoCanaryError> {
+        let transport = DataForSeoHttpTransport::production(
+            self.credentials.login.as_str().to_owned(),
+            self.credentials.password.as_str().to_owned(),
+        )?;
+        let client = DataForSeoClient::new(self.config.secret_reference()?, transport)?;
+        Ok(DataForSeoReadProvider::new(
+            client,
+            self.config.request().clone(),
+            self.config.page_size(),
+            self.config.observed_at(),
+            ProviderProvenanceClass::ProductionProvider,
+        )?)
+    }
 }
 
 pub fn run_authenticated(
@@ -491,6 +516,7 @@ fn run_with_transport_and_provenance<T: DataForSeoTransport>(
     let connector_scope = config.connector_scope()?;
     let secret_reference = config.secret_reference()?;
     let mut client = DataForSeoClient::new(secret_reference, transport)?;
+    let account_probe = client.probe_account_with_provenance(config.observed_at(), provenance)?;
     let mut cursor = None;
     let mut pages = Vec::new();
     let mut charged_cost_usd = Decimal::ZERO;
@@ -523,6 +549,7 @@ fn run_with_transport_and_provenance<T: DataForSeoTransport>(
                     secret_reference_id: config.secret_reference_id().into(),
                     credential_revision: config.credential_revision(),
                     account_scope: scope_report(&connector_scope),
+                    account_probe,
                     mode: config.request().mode(),
                     classification: EvidenceClassification::ProviderEstimate,
                     first_party: false,
@@ -649,6 +676,7 @@ fn parse_scopes() -> Result<Vec<String>, DataForSeoCanaryError> {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
+    use hartevo_connector_sdk::ProbeStatus;
     use hartevo_domain_kernel::{ProjectId, TenantId};
     use rust_decimal::Decimal;
 
@@ -699,6 +727,13 @@ mod tests {
         )
         .expect("canary report");
         assert_eq!(report.account_scope().account_id(), "dataforseo-account");
+        assert_eq!(report.account_probe().status(), ProbeStatus::Reachable);
+        assert_eq!(
+            report.account_probe().scope(),
+            &config().connector_scope().expect("scope")
+        );
+        assert_eq!(report.account_probe().cost_usd(), Decimal::ZERO);
+        assert_eq!(report.account_probe().raw_evidence_digest().len(), 64);
         assert_eq!(report.pages().len(), 2);
         assert_eq!(report.total_item_count(), 3);
         assert_eq!(report.charged_page_count(), 1);
