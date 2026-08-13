@@ -1,0 +1,21 @@
+[package]
+name = "hartevo-memory-runtime"
+description = "Mission-scoped, consent-gated memory candidate lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+hartevo-plugin-runtime = { path = "../plugin-runtime" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

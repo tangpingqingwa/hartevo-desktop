@@ -2356,6 +2356,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hartevo-memory-runtime"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hartevo-plugin-runtime",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "hartevo-mission-scheduler"
 version = "0.1.0"
 dependencies = [
