@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/capabilities/adapter/v1",
+  "title": "Hartevo Capability Adapter Registry v1",
+  "description": "Registry of exact adapter implementation, binary, schema and revocation bindings. A registry entry is not permission to execute arbitrary host code.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "revision", "registrations"],
+  "properties": {
+    "schema": {"const": "hartevo.capability-adapter-registry/v1"},
+    "revision": {"type": "integer", "minimum": 1},
+    "registrations": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/registration"}
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapterId", "implementationId", "implementationDigest", "binaryDigest", "schemaDigest", "version", "revocationEpoch"],
+      "properties": {
+        "adapterId": {"$ref": "#/$defs/id"},
+        "implementationId": {"type": "string", "minLength": 1, "maxLength": 256},
+        "implementationDigest": {"$ref": "#/$defs/digest"},
+        "binaryDigest": {"$ref": "#/$defs/digest"},
+        "schemaDigest": {"$ref": "#/$defs/digest"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 256},
+        "revocationEpoch": {"type": "integer", "minimum": 1}
+      }
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding", "capabilities", "status", "registryRevision", "recordDigest"],
+      "properties": {
+        "binding": {"$ref": "#/$defs/binding"},
+        "capabilities": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)*$"}},
+        "status": {"enum": ["active", "revoked"]},
+        "registryRevision": {"type": "integer", "minimum": 1},
+        "recordDigest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  }
+}
