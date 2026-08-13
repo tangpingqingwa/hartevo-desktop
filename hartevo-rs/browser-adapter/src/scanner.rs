@@ -1450,8 +1450,8 @@ fn execute_bounded_process(
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
         }
-        // GroupChild::try_wait observes the Unix process group. Poll the exact
-        // leader here, then audit and clear the group separately below.
+        // Poll only the exact leader here. GroupChild::try_wait also reaps
+        // descendants and can lose the leader status on a later call.
         match child.inner().try_wait() {
             Ok(Some(status)) => break ProcessStop::Exited(status),
             Ok(None) => {}
@@ -1551,12 +1551,15 @@ fn terminate_process_group(
 
     loop {
         // Preserve the leader's exact status independently of group teardown.
-        match child.inner().try_wait() {
-            Ok(Some(observed)) => {
-                status.get_or_insert(observed);
+        // Once it is reaped, never wait again; only audit the process group.
+        if status.is_none() {
+            match child.inner().try_wait() {
+                Ok(Some(observed)) => {
+                    status = Some(observed);
+                }
+                Ok(None) => {}
+                Err(_) => return Err(BrowserError::FileScanUnavailable),
             }
-            Ok(None) => {}
-            Err(_) => return Err(BrowserError::FileScanUnavailable),
         }
         if status.is_some() && group_absent {
             break;
