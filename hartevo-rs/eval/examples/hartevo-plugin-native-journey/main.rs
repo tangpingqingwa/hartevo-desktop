@@ -1,4 +1,5 @@
 mod digest;
+mod evidence;
 mod model;
 mod verifier;
 
@@ -9,6 +10,11 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
+use crate::evidence::{
+    CONTRACT_PATH as EVIDENCE_CONTRACT_PATH, EvidenceVerificationReport, HonestyClassification,
+    contract_digest as evidence_contract_digest, read_manifest,
+    validate_contract as validate_evidence_contract,
+};
 use crate::model::{OracleReport, OracleStatus};
 use crate::verifier::{
     AUTHORITY, CONTRACT_PATH, CONTRACT_SCHEMA_VERSION, DOCUMENT_TYPE, RELEASE_DECISION,
@@ -39,6 +45,8 @@ fn main() -> ExitCode {
                     "nativePass": false,
                     "contractPath": CONTRACT_PATH,
                     "contractDigest": contract_digest(),
+                    "evidenceContractDigest": evidence_contract_digest(),
+                    "evidenceContractPath": EVIDENCE_CONTRACT_PATH,
                     "error": format!("{error:#}"),
                 }))
                 .expect("static failure report serializes")
@@ -50,6 +58,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<CommandOutcome> {
     validate_contract().context("validate checked-in plugin native journey contract")?;
+    validate_evidence_contract().context("validate checked-in plugin journey evidence contract")?;
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     match args.as_slice() {
         [] => {
@@ -68,6 +77,8 @@ fn run() -> Result<CommandOutcome> {
                     "contractSchemaVersion": CONTRACT_SCHEMA_VERSION,
                     "contractPath": CONTRACT_PATH,
                     "contractDigest": contract_digest(),
+                    "evidenceContractDigest": evidence_contract_digest(),
+                    "evidenceContractPath": EVIDENCE_CONTRACT_PATH,
                     "authority": AUTHORITY,
                     "releaseDecision": RELEASE_DECISION,
                     "oracleStatus": "NOT_EVALUATED",
@@ -77,7 +88,12 @@ fn run() -> Result<CommandOutcome> {
             Ok(CommandOutcome::NotEvaluated)
         }
         [command, path] if command == "verify" => verify_path(path),
-        _ => bail!("unsupported command; use --help, validate-contract, or verify <journey.json>"),
+        [command, journey_path, manifest_path] if command == "verify-evidence" => {
+            verify_evidence_path(journey_path, manifest_path)
+        }
+        _ => bail!(
+            "unsupported command; use --help, validate-contract, verify <journey.json>, or verify-evidence <journey.json> <manifest.json>"
+        ),
     }
 }
 
@@ -94,7 +110,32 @@ fn verify_path(path: &std::ffi::OsStr) -> Result<CommandOutcome> {
     })
 }
 
+fn verify_evidence_path(
+    journey_path: &std::ffi::OsStr,
+    manifest_path: &std::ffi::OsStr,
+) -> Result<CommandOutcome> {
+    let expected_commit = current_source_commit()?;
+    let journey = read_journey(PathBuf::from(journey_path))?;
+    let oracle = validate_journey(&journey, &expected_commit)?;
+    let manifest = read_manifest(PathBuf::from(manifest_path))?;
+    let mut replay_guard = evidence::ReplayGuard::default();
+    let report = replay_guard.verify_once(&manifest, &journey, &oracle, &expected_commit)?;
+    print_evidence_report(&report)?;
+    Ok(if report.verdict == evidence::EvidenceVerdict::NativePass {
+        CommandOutcome::Success
+    } else if report.classification == HonestyClassification::BlockedEnv {
+        CommandOutcome::BlockedEnv
+    } else {
+        CommandOutcome::NotEvaluated
+    })
+}
+
 fn print_report(report: &OracleReport) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(report)?);
+    Ok(())
+}
+
+fn print_evidence_report(report: &EvidenceVerificationReport) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(report)?);
     Ok(())
 }
@@ -112,6 +153,8 @@ fn print_blocked_report(reason: &str) -> Result<()> {
             "missingReasons": [reason],
             "contractPath": CONTRACT_PATH,
             "contractDigest": contract_digest(),
+            "evidenceContractDigest": evidence_contract_digest(),
+            "evidenceContractPath": EVIDENCE_CONTRACT_PATH,
         }))?
     );
     Ok(())
@@ -120,7 +163,7 @@ fn print_blocked_report(reason: &str) -> Result<()> {
 fn print_help() {
     println!(
         "Usage: cargo run -p hartevo-eval --example hartevo-plugin-native-journey -- \\
-         [validate-contract | verify <journey.json>]"
+         [validate-contract | verify <journey.json> | verify-evidence <journey.json> <manifest.json>]"
     );
     println!(
         "No input is a deliberate BLOCKED_ENV result; fixture, simulator, ignored, and missing real components never PASS."
