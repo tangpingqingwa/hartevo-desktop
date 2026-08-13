@@ -1,0 +1,89 @@
+{
+  "schemaVersion": "hartevo-browser-recipe-authority/v1",
+  "contractVersion": "recipe-authority-d01a/v1",
+  "authority": "public_snapshot_validation_only",
+  "secretMaterial": "forbidden",
+  "snapshotFreshnessAuthority": false,
+  "productionDispatch": false,
+  "permitCandidateMaxTtlSeconds": 60,
+  "emptyReferenceBehavior": "deny_lifecycle_admission",
+  "requiredAuthorityKind": "recipe_root_lifecycle",
+  "acceptedHumanOperationAuthorityReferences": [],
+  "lifecycleAdmissionRegistrations": [],
+  "keyPurposes": [
+    "root_authority",
+    "candidate_publisher",
+    "production_release"
+  ],
+  "lifecycleStates": [
+    "active",
+    "retired",
+    "revoked",
+    "compromised"
+  ],
+  "mutationKinds": [
+    "provision_root",
+    "rotate_root",
+    "authorize_leaf",
+    "rotate_leaf",
+    "retire_key",
+    "revoke_key",
+    "record_compromise"
+  ],
+  "digestDomains": {
+    "snapshot": "hartevo-browser-recipe-authority-snapshot/v1",
+    "lifecycleAuthorityBinding": "hartevo-browser-recipe-lifecycle-authority-binding/v1",
+    "rootProvisioning": "hartevo-browser-recipe-root-provisioning/v1",
+    "rootRotation": "hartevo-browser-recipe-root-rotation/v1",
+    "leafAuthorization": "hartevo-browser-recipe-leaf-authorization/v1",
+    "leafRotation": "hartevo-browser-recipe-leaf-rotation/v1",
+    "keyRetirement": "hartevo-browser-recipe-key-retirement/v1",
+    "keyRevocation": "hartevo-browser-recipe-key-revocation/v1",
+    "keyCompromise": "hartevo-browser-recipe-key-compromise/v1",
+    "rootPossession": "hartevo-browser-recipe-root-possession/v1",
+    "leafPossession": "hartevo-browser-recipe-leaf-possession/v1",
+    "candidate": "hartevo-browser-recipe-candidate/v1",
+    "promotion": "hartevo-browser-recipe-promotion/v1"
+  },
+  "targetBindings": {
+    "provisionRoot": "new_root",
+    "rotateRoot": "existing_root_and_new_root",
+    "authorizeLeaf": "new_leaf",
+    "rotateLeaf": "existing_leaf_and_new_leaf",
+    "retireKey": "existing_key",
+    "revokeKey": "existing_key",
+    "recordCompromise": "existing_key"
+  },
+  "signatureBindings": {
+    "provisionRoot": [
+      "root_self_possession",
+      "sealed_lifecycle_authority"
+    ],
+    "rotateRoot": [
+      "predecessor_root_authorization",
+      "successor_root_possession",
+      "sealed_lifecycle_authority"
+    ],
+    "authorizeLeaf": [
+      "current_root_authorization",
+      "new_leaf_possession",
+      "sealed_lifecycle_authority"
+    ],
+    "rotateLeaf": [
+      "current_root_authorization",
+      "new_leaf_possession",
+      "sealed_lifecycle_authority"
+    ],
+    "retireKey": [
+      "current_root_authorization",
+      "sealed_lifecycle_authority"
+    ],
+    "revokeKey": [
+      "current_root_authorization",
+      "sealed_lifecycle_authority"
+    ],
+    "recordCompromise": [
+      "sealed_lifecycle_authority"
+    ]
+  }
+}
