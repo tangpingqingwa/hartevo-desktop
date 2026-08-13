@@ -22,8 +22,8 @@ use hartevo_domain_kernel::{
     MissionConversationMessageKind, MissionConversationRole, MissionId, MissionScheduleStatus,
     MissionStage, Money, OperatingMode, OutcomeDecision, OutcomeReviewCaveat,
     OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus, ProjectEncryptionMode, ProjectId,
-    RuntimeProcessClaimStatus, RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode,
-    WorkProductId, WorkProductStatus,
+    PublicationActivityKind, PublicationEnvironment, PublicationStatus, RuntimeProcessClaimStatus,
+    RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode, WorkProductId, WorkProductStatus,
 };
 use rust_decimal::Decimal;
 use zeroize::Zeroizing;
@@ -7095,6 +7095,47 @@ fn Workpad(
                             }
                         }
                     }
+                    if !mission.publications.is_empty() {
+                        section { class: "publication-review", aria_label: "网站发布审阅",
+                            header {
+                                span { class: "file-mark", "WEB" }
+                                span {
+                                    strong { "Publication review" }
+                                    small { "canonical diff · provider receipt · independent readback" }
+                                }
+                            }
+                            for publication in mission.publications {
+                                article { class: "publication-card",
+                                    header {
+                                        span {
+                                            strong { "{publication.target_resource}" }
+                                            small { "{publication.target_url} · {publication_environment_label(publication.environment)}" }
+                                        }
+                                        em { "{publication_status_label(publication.status)}" }
+                                    }
+                                    div { class: "publication-fences",
+                                        span { "source r{publication.source_revision} → base r{publication.base_revision}" }
+                                        code { title: "{publication.canonical_diff_digest}", "diff {short_digest(&publication.canonical_diff_digest)}" }
+                                        code { title: "{publication.payload_digest}", "payload {short_digest(&publication.payload_digest)}" }
+                                    }
+                                    pre { class: "publication-diff", "{publication.canonical_diff}" }
+                                    if let Some(receipt) = publication.provider_receipt_external_id {
+                                        div { class: "publication-receipt", "Provider receipt · {receipt}" }
+                                    }
+                                    if let Some(readback) = publication.readback_content_digest {
+                                        div { class: "publication-readback", "Online readback · HTTP {publication.readback_http_status.unwrap_or_default()} · {short_digest(&readback)}" }
+                                    }
+                                    if !publication.activity.is_empty() {
+                                        footer {
+                                            for activity in publication.activity {
+                                                span { "{publication_activity_label(activity.kind)} · {short_digest(&activity.digest)}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     div { class: "document-state", small { "Mission state" } strong { "{mission_stage_label(&mission.stage)}" } span { "revision {mission.revision}" } }
                 } else {
                     div { class: "document-kicker", "NO ACTIVE MISSION" }
@@ -7112,6 +7153,41 @@ fn work_product_status_label(status: &WorkProductStatus) -> &'static str {
         WorkProductStatus::ReadyForReview => "READY_FOR_REVIEW",
         WorkProductStatus::Accepted => "ACCEPTED",
         WorkProductStatus::Superseded => "SUPERSEDED",
+    }
+}
+
+const fn publication_environment_label(environment: PublicationEnvironment) -> &'static str {
+    match environment {
+        PublicationEnvironment::Staging => "STAGING",
+        PublicationEnvironment::Production => "PRODUCTION",
+    }
+}
+
+const fn publication_status_label(status: PublicationStatus) -> &'static str {
+    match status {
+        PublicationStatus::Draft => "DRAFT",
+        PublicationStatus::WaitingApproval => "WAITING_APPROVAL",
+        PublicationStatus::Approved => "APPROVED",
+        PublicationStatus::Publishing => "PUBLISHING",
+        PublicationStatus::ProviderAccepted => "PROVIDER_ACCEPTED",
+        PublicationStatus::OnlineVerified => "ONLINE_VERIFIED",
+        PublicationStatus::Failed => "FAILED",
+        PublicationStatus::Uncertain => "UNCERTAIN",
+        PublicationStatus::Reopened => "REOPENED",
+    }
+}
+
+const fn publication_activity_label(kind: PublicationActivityKind) -> &'static str {
+    match kind {
+        PublicationActivityKind::Proposed => "PROPOSED",
+        PublicationActivityKind::ApprovalRequested => "APPROVAL_REQUESTED",
+        PublicationActivityKind::Approved => "APPROVED",
+        PublicationActivityKind::Publishing => "PUBLISHING",
+        PublicationActivityKind::ProviderAccepted => "PROVIDER_ACCEPTED",
+        PublicationActivityKind::OnlineVerified => "ONLINE_VERIFIED",
+        PublicationActivityKind::Failed => "FAILED",
+        PublicationActivityKind::Uncertain => "UNCERTAIN",
+        PublicationActivityKind::Reopened => "REOPENED",
     }
 }
 

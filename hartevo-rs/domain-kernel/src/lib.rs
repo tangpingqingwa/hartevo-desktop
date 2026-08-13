@@ -25,6 +25,7 @@ mod runtime_process;
 mod runtime_recovery;
 mod runtime_turn;
 mod truth;
+mod web_publication;
 mod work_product;
 
 pub use context::{
@@ -64,12 +65,13 @@ pub use ids::{
     ContextCheckpointId, ContextCompactionRecordId, ContextContinuationLedgerId,
     ContextWorkerMailboxId, ContextWorkerMessageId, ContextWorkingSetId, ContextWorkspaceId,
     ConversationId, CreatorApplicationId, CreatorHiringId, CreatorId, CreatorMilestoneId,
-    CreatorTaskId, DeletionId, DeletionReceiptId, DeliverableId, DeviceAttachmentId,
-    DeviceHandoffId, DeviceId, EffectId, EvidenceId, ExecutionAttemptId, FactId, IdentityLinkId,
-    KeyEnvelopeId, MemberId, MessageId, MissionConversationId, MissionConversationMessageId,
-    MissionId, MissionScheduleId, OpportunityId, OrderId, OutcomeEventId, PartnerId, PayoutId,
-    PersonId, ProjectId, ReceiptId, RefundId, ReviewId, RuntimeRecoveryAttemptId,
-    RuntimeTurnAttemptId, TaskId, TenantId, VerificationId, WorkProductId, WorkerId, WorkerLeaseId,
+    CreatorTaskId, DeletionId, DeletionReceiptId, DeliverableId, DeploymentId, DeviceAttachmentId,
+    DeviceHandoffId, DeviceId, DomainId, EffectId, EvidenceId, ExecutionAttemptId, FactId,
+    IdentityLinkId, KeyEnvelopeId, MemberId, MessageId, MissionConversationId,
+    MissionConversationMessageId, MissionId, MissionScheduleId, OpportunityId, OrderId,
+    OutcomeEventId, PartnerId, PayoutId, PersonId, ProjectId, PublicationActivityId, PublicationId,
+    ReceiptId, RefundId, ReviewId, RuntimeRecoveryAttemptId, RuntimeTurnAttemptId, SiteId, TaskId,
+    TenantId, VerificationId, WorkProductId, WorkerId, WorkerLeaseId,
 };
 pub use key_management::{
     DeviceAttachment, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffCiphertext,
@@ -144,6 +146,14 @@ pub use runtime_turn::{
 };
 pub use truth::{
     TruthCandidate, TruthError, TruthFact, TruthRevisionLink, TruthSource, TruthStatus, TruthValue,
+};
+pub use web_publication::{
+    CanonicalDiffEntry, CanonicalDiffEntryKind, CanonicalSiteDiff, Deployment, DeploymentStatus,
+    Domain, DomainStatus, Publication, PublicationActivity, PublicationActivityKind,
+    PublicationEnvironment, PublicationProviderReceipt, PublicationPublishRequest,
+    PublicationReadback, PublicationStatus, PublicationTarget, Site, SiteFile, SitePreview,
+    SiteRevision, SiteStatus, WEB_PUBLICATION_SCHEMA_VERSION, WebPublicationError,
+    WebPublicationProjection,
 };
 pub use work_product::{
     WorkProductDependencies, WorkProductManifest, WorkProductManifestError, WorkProductPreview,

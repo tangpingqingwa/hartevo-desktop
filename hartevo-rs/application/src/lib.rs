@@ -78,17 +78,19 @@ use hartevo_domain_kernel::{
     OutcomeReviewRoiStatus, OutcomeSettlementProjection, Partner, PartnerId, PayoutAuthorization,
     PayoutId, Person, PersonId, PreparedAutomaticReply, Project, ProjectDataCell,
     ProjectEncryptionMode, ProjectError, ProjectId, ProjectKeyring, ProjectKeyringBootstrap,
-    ReceiptId, RelationshipError, ReviewDecision, ReviewId, RuntimeProcessClaim,
-    RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition, RuntimeProcessIdentity,
-    RuntimeRecoveryAttempt, RuntimeRecoveryAttemptId, RuntimeRecoveryFailureClass,
-    RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt, RuntimeTurnAttemptId,
-    RuntimeTurnError, RuntimeTurnFailureClass, RuntimeTurnObservedKind, RuntimeTurnPrivateMessage,
+    PublicationActivity, PublicationEnvironment, PublicationId, PublicationStatus, ReceiptId,
+    RelationshipError, ReviewDecision, ReviewId, RuntimeProcessClaim, RuntimeProcessClaimStatus,
+    RuntimeProcessCleanupDisposition, RuntimeProcessIdentity, RuntimeRecoveryAttempt,
+    RuntimeRecoveryAttemptId, RuntimeRecoveryFailureClass, RuntimeRecoveryStatus,
+    RuntimeResumeStrategy, RuntimeTurnAttempt, RuntimeTurnAttemptId, RuntimeTurnError,
+    RuntimeTurnFailureClass, RuntimeTurnObservedKind, RuntimeTurnPrivateMessage,
     RuntimeTurnPrivateTextDelta, RuntimeTurnRestartDisposition, RuntimeTurnScope,
     RuntimeTurnStatus, StorageMode, SuppressionReason, Task, TaskId, TaskStatus, TenantId,
-    TruthError, TruthFact, VerificationStatus, WebhookAttestation, WorkProduct,
-    WorkProductDependencies, WorkProductId, WorkProductManifest, WorkProductManifestError,
-    WorkProductPreview, WorkProductStatus, WorkerHandle, WorkerHandleStatus, WorkerId, WorkerLease,
-    WorkerLeaseId, WorkerLeaseStatus, WorkerMailbox, validate_context_branch_lineage,
+    TruthError, TruthFact, VerificationStatus, WebPublicationProjection, WebhookAttestation,
+    WorkProduct, WorkProductDependencies, WorkProductId, WorkProductManifest,
+    WorkProductManifestError, WorkProductPreview, WorkProductStatus, WorkerHandle,
+    WorkerHandleStatus, WorkerId, WorkerLease, WorkerLeaseId, WorkerLeaseStatus, WorkerMailbox,
+    validate_context_branch_lineage,
 };
 use hartevo_domain_kernel::{
     MarketDecisionRecommendation, MarketEvidenceClassification, MarketEvidenceError,
@@ -4313,11 +4315,44 @@ pub struct MissionProjection {
     pub evidence_count: usize,
     pub work_product_count: usize,
     pub work_products: Vec<WorkProductProjection>,
+    #[serde(default)]
+    pub publications: Vec<PublicationProjection>,
     pub pending_approval_count: usize,
     pub verified_effect_count: usize,
     pub outcome_summary: Option<String>,
     #[serde(default)]
     pub vm11_outcome_review: Option<Vm11OutcomeReviewDecisionProjection>,
+}
+
+/// Content-free Application projection for a typed Site/Domain/Deployment/
+/// Publication record. The encrypted publish request is never copied into
+/// this UI-facing shape; Workpad receives exact digests, diff paths, provider
+/// receipt metadata, independent readback, and the activity timeline.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationProjection {
+    pub publication_id: PublicationId,
+    pub site_id: hartevo_domain_kernel::SiteId,
+    pub domain_id: hartevo_domain_kernel::DomainId,
+    pub deployment_id: hartevo_domain_kernel::DeploymentId,
+    pub environment: PublicationEnvironment,
+    pub status: PublicationStatus,
+    pub source_revision: u64,
+    pub base_revision: u64,
+    pub canonical_diff_digest: String,
+    pub canonical_diff: String,
+    pub payload_digest: String,
+    pub idempotency_key: String,
+    pub target_resource: String,
+    pub target_url: String,
+    pub approval_digest: Option<String>,
+    pub provider_receipt_external_id: Option<String>,
+    pub provider_receipt_response_digest: Option<String>,
+    pub readback_http_status: Option<u16>,
+    pub readback_content_digest: Option<String>,
+    pub readback_evidence_digest: Option<String>,
+    #[serde(default)]
+    pub activity: Vec<PublicationActivity>,
 }
 
 /// Exact decision material shown by Desktop for VM-11. The review and both
@@ -16820,6 +16855,35 @@ impl ApplicationService {
         mission_projection(&self.store, mission, surface, false)
     }
 
+    /// Persists the typed web publication aggregate through the Application
+    /// boundary. The Desktop projection remains content-free while the
+    /// encrypted request and site files stay in SQLCipher.
+    pub fn save_web_publication(
+        &mut self,
+        projection: &WebPublicationProjection,
+    ) -> Result<(), ApplicationError> {
+        self.store.save_web_publication(projection)?;
+        Ok(())
+    }
+
+    pub fn web_publication(
+        &self,
+        project_id: &ProjectId,
+        publication_id: &PublicationId,
+    ) -> Result<WebPublicationProjection, ApplicationError> {
+        Ok(self
+            .store
+            .load_web_publication(project_id, publication_id)?)
+    }
+
+    pub fn record_web_publication_activity(
+        &mut self,
+        activity: &PublicationActivity,
+    ) -> Result<(), ApplicationError> {
+        self.store.append_web_publication_activity(activity)?;
+        Ok(())
+    }
+
     /// Application-owned Desktop inventory. The UI never queries SQLCipher
     /// tables directly and never manufactures Project, Mission, or encryption
     /// readiness state from page-local demo data.
@@ -17532,6 +17596,12 @@ fn mission_projection(
     surface: WorkSurface,
     include_work_product_previews: bool,
 ) -> Result<MissionProjection, ApplicationError> {
+    let publications = store
+        .list_web_publications(&mission.project_id)?
+        .into_iter()
+        .filter(|projection| projection.publication.mission_id == mission.id)
+        .map(publication_projection)
+        .collect::<Vec<_>>();
     let mut work_products = Vec::with_capacity(mission.work_products.len());
     if include_work_product_previews {
         for work_product in &mission.work_products {
@@ -17738,6 +17808,7 @@ fn mission_projection(
         evidence_count: mission.evidence.len(),
         work_product_count: mission.work_products.len(),
         work_products,
+        publications,
         pending_approval_count: mission
             .effects
             .iter()
@@ -17751,6 +17822,55 @@ fn mission_projection(
         outcome_summary,
         vm11_outcome_review,
     })
+}
+
+fn publication_projection(projection: WebPublicationProjection) -> PublicationProjection {
+    let publication = projection.publication;
+    let canonical_diff_digest = publication.request.canonical_diff.digest.clone();
+    let canonical_diff = publication.request.canonical_diff.render();
+    let provider_receipt_external_id = publication
+        .provider_receipt
+        .as_ref()
+        .map(|receipt| receipt.external_id.clone());
+    let provider_receipt_response_digest = publication
+        .provider_receipt
+        .as_ref()
+        .map(|receipt| receipt.response_digest.clone());
+    let readback_http_status = publication
+        .readback
+        .as_ref()
+        .map(|readback| readback.http_status);
+    let readback_content_digest = publication
+        .readback
+        .as_ref()
+        .map(|readback| readback.content_digest.clone());
+    let readback_evidence_digest = publication
+        .readback
+        .as_ref()
+        .map(|readback| readback.evidence_digest.clone());
+    PublicationProjection {
+        publication_id: publication.id,
+        site_id: publication.site_id,
+        domain_id: publication.domain_id,
+        deployment_id: publication.deployment_id,
+        environment: publication.request.environment,
+        status: publication.status,
+        source_revision: publication.request.source_revision,
+        base_revision: publication.request.base_revision,
+        canonical_diff_digest,
+        canonical_diff,
+        payload_digest: publication.request.payload_digest,
+        idempotency_key: publication.request.idempotency_key,
+        target_resource: publication.request.target.resource_id,
+        target_url: publication.request.target.url,
+        approval_digest: publication.approval_digest,
+        provider_receipt_external_id,
+        provider_receipt_response_digest,
+        readback_http_status,
+        readback_content_digest,
+        readback_evidence_digest,
+        activity: projection.activity,
+    }
 }
 
 fn vm11_outcome_review_decision_projection(

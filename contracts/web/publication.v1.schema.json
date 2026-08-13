@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/web/publication.v1.schema.json",
+  "title": "Hartevo typed web publication projection",
+  "schemaVersion": "hartevo-web-publication/v1",
+  "type": "object",
+  "required": ["site", "domain", "deployment", "publication", "activity"],
+  "properties": {
+    "site": {"$ref": "#/$defs/site"},
+    "domain": {"$ref": "#/$defs/domain"},
+    "deployment": {"$ref": "#/$defs/deployment"},
+    "publication": {"$ref": "#/$defs/publication"},
+    "activity": {"type": "array", "items": {"$ref": "#/$defs/activity"}}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "environment": {"type": "string", "enum": ["staging", "production"]},
+    "site": {
+      "type": "object",
+      "required": ["tenantId", "projectId", "id", "name", "status", "latestRevision", "revision"],
+      "properties": {
+        "tenantId": {"type": "string", "minLength": 1},
+        "projectId": {"type": "string", "minLength": 1},
+        "id": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "enum": ["draft", "active", "archived"]},
+        "latestRevision": {"type": "integer", "minimum": 0},
+        "revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "domain": {
+      "type": "object",
+      "required": ["tenantId", "projectId", "siteId", "id", "hostname", "status", "revision"],
+      "properties": {
+        "tenantId": {"type": "string", "minLength": 1},
+        "projectId": {"type": "string", "minLength": 1},
+        "siteId": {"type": "string", "minLength": 1},
+        "id": {"type": "string", "minLength": 1},
+        "hostname": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$"},
+        "status": {"type": "string", "enum": ["unconfigured", "pending_verification", "verified", "expired"]},
+        "revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "required": ["tenantId", "projectId", "siteId", "id", "sourceRevision", "environment", "artifactDigest", "previewDigest", "status", "revision"],
+      "properties": {
+        "tenantId": {"type": "string", "minLength": 1},
+        "projectId": {"type": "string", "minLength": 1},
+        "siteId": {"type": "string", "minLength": 1},
+        "id": {"type": "string", "minLength": 1},
+        "sourceRevision": {"type": "integer", "minimum": 1},
+        "environment": {"$ref": "#/$defs/environment"},
+        "artifactDigest": {"$ref": "#/$defs/digest"},
+        "previewDigest": {"$ref": "#/$defs/digest"},
+        "status": {"type": "string", "enum": ["preview_ready", "approved_for_publication", "published", "verified", "failed"]},
+        "revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "publication": {
+      "type": "object",
+      "required": ["tenantId", "projectId", "missionId", "siteId", "domainId", "deploymentId", "id", "request", "status", "revision"],
+      "properties": {
+        "tenantId": {"type": "string", "minLength": 1},
+        "projectId": {"type": "string", "minLength": 1},
+        "missionId": {"type": "string", "minLength": 1},
+        "siteId": {"type": "string", "minLength": 1},
+        "domainId": {"type": "string", "minLength": 1},
+        "deploymentId": {"type": "string", "minLength": 1},
+        "id": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "enum": ["draft", "waiting_approval", "approved", "publishing", "provider_accepted", "online_verified", "failed", "uncertain", "reopened"]},
+        "revision": {"type": "integer", "minimum": 1},
+        "approvalDigest": {"anyOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]},
+        "request": {"$ref": "#/$defs/publishRequest"}
+      }
+    },
+    "publishRequest": {
+      "type": "object",
+      "required": ["siteId", "domainId", "deploymentId", "environment", "target", "sourceRevision", "baseRevision", "canonicalDiff", "files", "preview", "contentDigest", "payloadDigest", "idempotencyKey"],
+      "properties": {
+        "siteId": {"type": "string", "minLength": 1},
+        "domainId": {"type": "string", "minLength": 1},
+        "deploymentId": {"type": "string", "minLength": 1},
+        "environment": {"$ref": "#/$defs/environment"},
+        "target": {"type": "object", "required": ["provider", "accountId", "resourceId", "branch", "url", "environment", "configurationDigest"], "properties": {"provider": {"type": "string", "minLength": 1}, "accountId": {"type": "string", "minLength": 1}, "resourceId": {"type": "string", "minLength": 1}, "branch": {"type": "string", "minLength": 1}, "url": {"type": "string", "pattern": "^https://"}, "environment": {"$ref": "#/$defs/environment"}, "configurationDigest": {"$ref": "#/$defs/digest"}}},
+        "sourceRevision": {"type": "integer", "minimum": 1},
+        "baseRevision": {"type": "integer", "minimum": 1},
+        "canonicalDiff": {"type": "object", "required": ["baseRevision", "baseAuthorityDigest", "entries", "digest"], "properties": {"baseRevision": {"type": "integer", "minimum": 1}, "baseAuthorityDigest": {"$ref": "#/$defs/digest"}, "entries": {"type": "array"}, "digest": {"$ref": "#/$defs/digest"}}},
+        "files": {"type": "array"},
+        "preview": {"type": "object"},
+        "contentDigest": {"$ref": "#/$defs/digest"},
+        "payloadDigest": {"$ref": "#/$defs/digest"},
+        "idempotencyKey": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "activity": {
+      "type": "object",
+      "required": ["id", "tenantId", "projectId", "missionId", "publicationId", "kind", "status", "digest", "recordedAt"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "tenantId": {"type": "string", "minLength": 1},
+        "projectId": {"type": "string", "minLength": 1},
+        "missionId": {"type": "string", "minLength": 1},
+        "publicationId": {"type": "string", "minLength": 1},
+        "kind": {"type": "string"},
+        "status": {"type": "string"},
+        "digest": {"$ref": "#/$defs/digest"},
+        "recordedAt": {"type": "string", "format": "date-time"}
+      }
+    }
+  },
+  "x-invariants": [
+    "previewDigest is never a provider receipt or online verification",
+    "target.environment equals request.environment and staging/production authorities are distinct",
+    "provider receipt requestDigest equals the exact approved Effect approvalDigest",
+    "online verification requires independent=true, DNS success, HTTP 200, and content/payload digest equality",
+    "restart/replay returns the durable receipt or reconciliation result and never authorizes a second mutation"
+  ]
+}

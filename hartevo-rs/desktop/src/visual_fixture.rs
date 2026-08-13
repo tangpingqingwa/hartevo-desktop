@@ -671,6 +671,7 @@ fn mission_projection(project_id: &ProjectId, source: VisualMission) -> MissionP
         evidence_count: 0,
         work_product_count: work_products.len(),
         work_products,
+        publications: Vec::new(),
         pending_approval_count: source.pending_approvals,
         verified_effect_count: 0,
         outcome_summary: None,

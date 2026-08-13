@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "hartevo-github-pages/v1",
+  "providerId": "github",
+  "adapterId": "github.pages.publication",
+  "implementationStatus": "native_component",
+  "operations": {
+    "read": "repository ref/tree/blob plus Pages source configuration",
+    "propose": "canonical SiteFile diff and payload digest in the Domain Kernel",
+    "publish": "approved Effect Broker execution through the Git data API",
+    "reconcile": "read-only manifest/ref inspection without an execution lease",
+    "verify": "independent unauthenticated Pages URL, DNS, HTTP, and manifest readback"
+  },
+  "providerOwnedManifestPath": "hartevo-publication.json",
+  "environmentFence": {
+    "stagingAndProductionMustUseDistinctRepositoryBranchAndUrl": true,
+    "pagesSourceConfigurationIsReadAndBoundBeforePublish": true,
+    "baseBranchHeadMustMatchCanonicalProposal": true
+  },
+  "secretBoundary": {
+    "tokenStoredIn": "runtime_credential_lease_only",
+    "tokenInDomainProjection": false,
+    "tokenInReceiptActivityOrLogs": false
+  },
+  "releaseEvidence": {
+    "fixturesCountAsNativeCompletion": false,
+    "controlledProviderEvidenceRequired": true,
+    "releasePassed": false
+  }
+}

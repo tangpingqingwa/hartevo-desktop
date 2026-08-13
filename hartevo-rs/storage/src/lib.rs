@@ -31,6 +31,7 @@ mod runtime_recovery_store;
 mod runtime_turn_store;
 mod secure_store;
 mod sync_store;
+mod web_publication_store;
 mod work_product_store;
 pub use aggregate::{
     ApplicationSourceKind, ApplicationSourceRevisionFence, AtomicMutation, PendingEvent,
@@ -65,6 +66,7 @@ pub use sync_store::{
     LocalInboundSyncStageOutcome, LocalInboundSyncStatus, LocalSyncOperation,
     LocalSyncPrepareOutcome, LocalSyncStatus,
 };
+pub use web_publication_store::PublicationActivityRecord;
 
 use std::fmt;
 use std::fs;
@@ -80,7 +82,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 47;
+pub const STORAGE_SCHEMA_VERSION: i64 = 48;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4402,6 +4404,69 @@ impl ProjectStore {
             record_migration(&transaction, 47)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 48 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS web_publications (
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   publication_id TEXT NOT NULL,
+                   site_id TEXT NOT NULL,
+                   domain_id TEXT NOT NULL,
+                   deployment_id TEXT NOT NULL,
+                   environment TEXT NOT NULL CHECK (environment IN ('staging', 'production')),
+                   status TEXT NOT NULL CHECK (status IN (
+                     'draft', 'waiting_approval', 'approved', 'publishing',
+                     'provider_accepted', 'online_verified', 'failed', 'uncertain', 'reopened'
+                   )),
+                   revision INTEGER NOT NULL CHECK (revision > 0),
+                   payload_digest TEXT NOT NULL CHECK (length(payload_digest) = 64),
+                   idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) = 64),
+                   created_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL,
+                   projection_json TEXT NOT NULL CHECK (length(trim(projection_json)) > 2),
+                   PRIMARY KEY (project_id, publication_id),
+                   UNIQUE (project_id, payload_digest),
+                   UNIQUE (project_id, idempotency_key),
+                   FOREIGN KEY (mission_id, project_id)
+                     REFERENCES missions(id, project_id) ON DELETE CASCADE,
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS web_publication_scope_idx
+                   ON web_publications(
+                     tenant_id, project_id, mission_id, environment, status, updated_at
+                   );
+                 CREATE TABLE IF NOT EXISTS web_publication_activity (
+                   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                   id TEXT NOT NULL,
+                   tenant_id TEXT NOT NULL CHECK (length(trim(tenant_id)) > 0),
+                   project_id TEXT NOT NULL,
+                   mission_id TEXT NOT NULL,
+                   publication_id TEXT NOT NULL,
+                   kind TEXT NOT NULL CHECK (kind IN (
+                     'proposed', 'approval_requested', 'approved', 'publishing',
+                     'provider_accepted', 'online_verified', 'failed', 'uncertain', 'reopened'
+                   )),
+                   status TEXT NOT NULL CHECK (status IN (
+                     'draft', 'waiting_approval', 'approved', 'publishing',
+                     'provider_accepted', 'online_verified', 'failed', 'uncertain', 'reopened'
+                   )),
+                   digest TEXT NOT NULL CHECK (length(digest) = 64),
+                   recorded_at TEXT NOT NULL,
+                   UNIQUE (project_id, id),
+                   FOREIGN KEY (project_id, publication_id)
+                     REFERENCES web_publications(project_id, publication_id) ON DELETE CASCADE,
+                   FOREIGN KEY (mission_id, project_id)
+                     REFERENCES missions(id, project_id) ON DELETE CASCADE,
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS web_publication_activity_order_idx
+                   ON web_publication_activity(project_id, publication_id, sequence);",
+            )?;
+            record_migration(&transaction, 48)?;
+            transaction.commit()?;
+        }
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
@@ -5328,7 +5393,7 @@ mod tests {
 
         let mut migrated =
             ProjectStore::open(&database, &database_key()).expect("migrate v46 to v47");
-        assert_eq!(migrated.schema_version().expect("v47 schema"), 47);
+        assert_eq!(migrated.schema_version().expect("v48 schema"), 48);
         assert!(checkpoint_policy_table_sql(&migrated.connection).contains("effect_readback_v2"));
         assert_eq!(
             migrated
@@ -5438,8 +5503,8 @@ mod tests {
             .connection
             .execute_batch("DROP TABLE mission_checkpoints_v47;")
             .expect("remove injected collision");
-        store.migrate().expect("retry v47 migration");
-        assert_eq!(store.schema_version().expect("retried schema"), 47);
+        store.migrate().expect("retry v47/v48 migrations");
+        assert_eq!(store.schema_version().expect("retried schema"), 48);
         assert_eq!(
             store
                 .load_mission(&project.id, &legacy.id)

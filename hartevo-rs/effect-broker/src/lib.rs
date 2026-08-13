@@ -1,6 +1,7 @@
 //! The only path from a proposed Hartevo business effect to a provider.
 
 pub mod approval_authority;
+pub mod github_pages;
 pub mod provider_auth;
 pub mod provider_contract;
 
