@@ -11,6 +11,7 @@ mod context_collaboration_store;
 mod context_foundation_store;
 mod context_material_store;
 mod context_store;
+mod context_worker_graph_store;
 mod creator;
 mod creator_hiring_store;
 mod deletion_propagation;
@@ -41,6 +42,9 @@ pub use browser_recipe_store::BrowserRecipeRuntimeState;
 pub use context_material_store::{
     ContextMaterialDescriptor, ContextMaterialStoreError, ContextQuerySnapshot,
     LocalEncryptedContextMaterialStore,
+};
+pub use context_worker_graph_store::{
+    ContextWorkerGraphError, ContextWorkerGraphSnapshot, WorkerGraphStoreDisposition,
 };
 pub use creator::PersistedMutation;
 pub use deletion_propagation::{DeletionPropagationJob, DeletionPropagationJobStatus};
