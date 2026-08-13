@@ -2176,6 +2176,7 @@ impl ScopeRegistry {
 }
 
 pub mod sample;
+pub mod skill;
 
 fn ensure_unique<'a, I, T>(values: I, duplicate: PluginError) -> Result<(), PluginError>
 where
