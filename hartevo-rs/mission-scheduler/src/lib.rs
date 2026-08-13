@@ -20,6 +20,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 pub mod os;
+pub mod trigger_receipt;
 
 pub const DEFAULT_MAX_PENDING: usize = 64;
 pub const DEFAULT_MAX_CONCURRENT: usize = 8;
