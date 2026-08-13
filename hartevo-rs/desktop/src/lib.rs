@@ -4772,8 +4772,6 @@ fn MissionPluginSurfaces(
                                 }
                                 div { class: "mission-plugin-facts",
                                     span { strong { "{execution.gate}" } small { "当前 gate" } }
-                                    span { strong { "{execution.worker}" } small { "worker" } }
-                                    span { strong { "{execution.recovery}" } small { "recovery" } }
                                     span { strong { "{continue_fence.label()}" } small { "exact revision" } }
                                 }
                                 div { class: "mission-plugin-actions",

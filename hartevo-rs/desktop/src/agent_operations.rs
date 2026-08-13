@@ -89,8 +89,6 @@ impl OperationsRevisionFence {
 pub struct ExecutionSurfaceProjection {
     pub status: OperationsStatus,
     pub gate: String,
-    pub worker: String,
-    pub recovery: String,
     pub transport: String,
     pub revision_fence: OperationsRevisionFence,
     pub stop_available: bool,
@@ -380,12 +378,6 @@ impl MissionPluginSurfaceRegistry {
                 .current_checkpoint_id
                 .as_deref()
                 .map_or_else(|| "当前 Mission gate".into(), humanize_checkpoint);
-            let worker = runtime_activity
-                .and_then(|activity| activity.turn_status)
-                .map_or_else(|| "等待 Runtime worker claim".into(), turn_status_detail);
-            let recovery = runtime_activity
-                .and_then(|activity| activity.recovery_status)
-                .map_or_else(|| "No recovery fence".into(), recovery_status_detail);
             let transport = if matches!(input.transport, RuntimeTransportSurface::CaughtUp) {
                 "Transport caught up · business state unchanged".into()
             } else if matches!(input.turn, RuntimeTurnSurface::Awaiting) {
@@ -398,8 +390,6 @@ impl MissionPluginSurfaceRegistry {
             ExecutionSurfaceProjection {
                 status,
                 gate,
-                worker,
-                recovery,
                 transport,
                 revision_fence: OperationsRevisionFence::from_mission(mission),
                 stop_available: matches!(input.stop, RuntimeStopSurface::Available)
@@ -501,33 +491,6 @@ fn runtime_plugin_node_status(
         }
         Some(RuntimeTurnStatus::Failed) => MissionPluginNodeStatus::Failed,
         Some(RuntimeTurnStatus::Uncertain) => MissionPluginNodeStatus::Uncertain,
-    }
-}
-
-fn recovery_status_detail(status: RuntimeRecoveryStatus) -> String {
-    match status {
-        RuntimeRecoveryStatus::Prepared => "恢复记录已准备，尚未获得健康运行时。".into(),
-        RuntimeRecoveryStatus::Spawned => "恢复进程已启动，等待健康检查。".into(),
-        RuntimeRecoveryStatus::Healthy => "健康检查通过，仍需绑定同一 Mission turn。".into(),
-        RuntimeRecoveryStatus::ThreadBound => {
-            "Runtime thread 已绑定，等待 Desktop 读取终态。".into()
-        }
-        RuntimeRecoveryStatus::Attached => "恢复已附着到持久上下文。".into(),
-        RuntimeRecoveryStatus::Failed => "恢复失败；uncertain 状态不会自动重放。".into(),
-    }
-}
-
-fn turn_status_detail(status: RuntimeTurnStatus) -> String {
-    match status {
-        RuntimeTurnStatus::WaitingLocalApproval => {
-            "这是本机 Runtime 请求，不等同于外部 Effect approval。".into()
-        }
-        RuntimeTurnStatus::Uncertain => "内容与执行状态保留；恢复前不允许自动重放。".into(),
-        RuntimeTurnStatus::Completed => "本次 turn 已终态；不据此声明业务 Outcome。".into(),
-        RuntimeTurnStatus::Failed => {
-            "Runtime 失败保持 content-free；已收到的持久正文不会被覆盖。".into()
-        }
-        _ => "状态来自持久 Runtime ledger；页面不创建第二个 Agent loop。".into(),
     }
 }
 
