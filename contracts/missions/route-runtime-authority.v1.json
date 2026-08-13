@@ -1,0 +1,161 @@
+{
+  "schemaVersion": "hartevo-mission-route-runtime-authority-contract/v1",
+  "contractVersion": "desktop-2026-08-13-ct03-v1",
+  "evidenceLevel": "E1",
+  "routeGraphContractVersion": "desktop-2026-08-12-ct02-v1",
+  "applicationHandlerRegistryVersion": "desktop-2026-08-12-v8",
+  "defaultTerminalExecutionAuthority": "denied",
+  "terminalTransitions": [
+    {
+      "transitionId": "vm00.mission_handoff.to.valid-terminal/v2",
+      "missionId": "VM-00",
+      "missionVersion": 3,
+      "sourceCheckpointId": "mission_handoff",
+      "condition": "checkpoint.completed",
+      "terminalId": "vm00.valid-terminal/v2",
+      "authority": {
+        "kind": "denied"
+      }
+    },
+    {
+      "transitionId": "vm01.next_cycle.to.valid-terminal/v2",
+      "missionId": "VM-01",
+      "missionVersion": 3,
+      "sourceCheckpointId": "next_cycle",
+      "condition": "checkpoint.completed",
+      "terminalId": "vm01.valid-terminal/v2",
+      "authority": {
+        "kind": "denied"
+      }
+    },
+    {
+      "transitionId": "vm02.trend_review.to.valid-terminal/v2",
+      "missionId": "VM-02",
+      "missionVersion": 3,
+      "sourceCheckpointId": "trend_review",
+      "condition": "checkpoint.completed",
+      "terminalId": "vm02.valid-terminal/v2",
+      "authority": {
+        "kind": "denied"
+      }
+    },
+    {
+      "transitionId": "vm03.analytics_form_lead_ready.to.valid-terminal/v2",
+      "missionId": "VM-03",
+      "missionVersion": 3,
+      "sourceCheckpointId": "analytics_form_lead_ready",
+      "condition": "checkpoint.completed",
+      "terminalId": "vm03.valid-terminal/v2",
+      "authority": {
+        "kind": "denied"
+      }
+    },
+    {
+      "transitionId": "vm04.channel_rebalance.to.valid-terminal/v2",
+      "missionId": "VM-04",
+      "missionVersion": 3,
+      "sourceCheckpointId": "channel_rebalance",
+      "condition": "checkpoint.completed",
+      "terminalId": "vm04.valid-terminal/v2",
+      "authority": {
+        "kind": "denied"
+      }
+    },
+    {
+      "transitionId": "vm05.cycle_review.to.valid-terminal/v2",
+      "missionId": "VM-05",
+      "missionVersion": 3,
+      "sourceCheckpointId": "cycle_review",
+      "condition": "checkpoint.completed",
+      "terminalId": "vm05.valid-terminal/v2",
+      "authority": {
+        "kind": "denied"
+      }
+    },
+    {
+      "transitionId": "vm06.portfolio_review.to.valid-terminal/v2",
+      "missionId": "VM-06",
+      "missionVersion": 4,
+      "sourceCheckpointId": "portfolio_review",
+      "condition": "checkpoint.completed",
+      "terminalId": "vm06.valid-terminal/v2",
+      "authority": {
+        "kind": "denied"
+      }
+    },
+    {
+      "transitionId": "vm07.replan_or_terminal.to.valid-terminal/v2",
+      "missionId": "VM-07",
+      "missionVersion": 3,
+      "sourceCheckpointId": "replan_or_terminal",
+      "condition": "vm07_replan_resolution.valid_terminal",
+      "terminalId": "vm07.valid-terminal/v2",
+      "authority": {
+        "kind": "denied"
+      }
+    },
+    {
+      "transitionId": "vm08.conversion_return_rank_profit_review.to.valid-terminal/v2",
+      "missionId": "VM-08",
+      "missionVersion": 4,
+      "sourceCheckpointId": "conversion_return_rank_profit_review",
+      "condition": "checkpoint.completed",
+      "terminalId": "vm08.valid-terminal/v2",
+      "authority": {
+        "kind": "denied"
+      }
+    },
+    {
+      "transitionId": "vm09.stage_and_win_loss_review.to.valid-terminal/v2",
+      "missionId": "VM-09",
+      "missionVersion": 3,
+      "sourceCheckpointId": "stage_and_win_loss_review",
+      "condition": "checkpoint.completed",
+      "terminalId": "vm09.valid-terminal/v2",
+      "authority": {
+        "kind": "denied"
+      }
+    },
+    {
+      "transitionId": "vm10.reconciliation.to.valid-terminal/v2",
+      "missionId": "VM-10",
+      "missionVersion": 3,
+      "sourceCheckpointId": "reconciliation",
+      "condition": "checkpoint.completed",
+      "terminalId": "vm10.valid-terminal/v2",
+      "authority": {
+        "kind": "denied"
+      }
+    },
+    {
+      "transitionId": "vm11.candidate_learning.to.valid-terminal/v2",
+      "missionId": "VM-11",
+      "missionVersion": 3,
+      "sourceCheckpointId": "candidate_learning",
+      "condition": "checkpoint.completed",
+      "terminalId": "vm11.valid-terminal/v2",
+      "authority": {
+        "kind": "denied"
+      }
+    },
+    {
+      "transitionId": "vm11.next_contract_or_valid_terminal.to.valid-terminal.stop/v2",
+      "missionId": "VM-11",
+      "missionVersion": 3,
+      "sourceCheckpointId": "next_contract_or_valid_terminal",
+      "condition": "outcome_review_next_contract_resolution.stop_valid_terminal",
+      "terminalId": "vm11.valid-terminal/v2",
+      "authority": {
+        "kind": "application_handler",
+        "executor": "application",
+        "handlerId": "vm11.next-contract-or-valid-terminal/v1",
+        "implementationCrate": "hartevo-application",
+        "completionPolicy": "deterministic_evidence",
+        "missionDisposition": "completed",
+        "skippedCheckpointIds": [
+          "candidate_learning"
+        ]
+      }
+    }
+  ]
+}
