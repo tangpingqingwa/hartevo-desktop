@@ -17,6 +17,7 @@ mod action;
 #[cfg(unix)]
 mod chromium_host;
 mod fake_host;
+mod fallback;
 mod file_broker;
 mod locator;
 mod navigation;
@@ -27,6 +28,7 @@ mod real_chromium_signed_recipe_test;
 mod recipe;
 #[cfg(unix)]
 mod scanner;
+mod visual_observation;
 mod workspace;
 
 pub use action::{
@@ -43,6 +45,10 @@ pub use chromium_host::{
 pub use fake_host::{
     BrowserActionResult, BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost,
     FakeBrowserPage,
+};
+pub use fallback::{
+    BrowserFallbackPath, BrowserFallbackReason, BrowserFallbackStep, BrowserFallbackTrace,
+    BrowserFallbackTraceBuilder,
 };
 pub use file_broker::{
     BrowserFileGrant, BrowserFileGrantState, BrowserFileType, FileBroker, FileBrokerReconciliation,
@@ -65,6 +71,10 @@ pub use recipe::{
 };
 #[cfg(unix)]
 pub use scanner::{ProductionFileScanner, ScannerProcessLimits, ScannerReleasePin};
+pub use visual_observation::{
+    BrowserProtocolObservation, BrowserProtocolProbeKind, BrowserVisualObservation,
+    BrowserVisualObservationMetadata,
+};
 pub use workspace::{
     BrowserControlState, BrowserControlTransition, BrowserIdentity, BrowserLeaseProof,
     BrowserProfile, BrowserProfileSource, BrowserProfileStatus, BrowserWorkspace,
@@ -157,6 +167,22 @@ pub enum BrowserError {
     ReadObservationMediaTypeInvalid,
     #[error("browser read observation was tampered with or drifted before emission")]
     ReadObservationTampered,
+    #[error("browser visual observation is malformed or internally inconsistent")]
+    InvalidVisualObservation,
+    #[error("browser visual observation response is malformed")]
+    VisualObservationResponseInvalid,
+    #[error("browser visual observation image is malformed, oversized, or not PNG")]
+    VisualObservationImageInvalid,
+    #[error("browser visual observation was tampered with or drifted before emission")]
+    VisualObservationTampered,
+    #[error("browser protocol observation is malformed or internally inconsistent")]
+    InvalidProtocolObservation,
+    #[error("browser typed protocol probe response is malformed")]
+    ProtocolProbeResponseInvalid,
+    #[error("browser fallback trace is malformed or scope-mismatched")]
+    InvalidFallbackTrace,
+    #[error("browser fallback trace attempted an invalid semantic/visual/protocol order")]
+    FallbackOrderViolation,
     #[error("browser Recipe manifest, action template, or validity window is invalid")]
     InvalidRecipe,
     #[error("browser Recipe trust key is malformed or invalid for this use and time")]
@@ -286,6 +312,14 @@ impl BrowserError {
             Self::ReadObservationBodyInvalid => "BROWSER_READ_OBSERVATION_BODY_INVALID",
             Self::ReadObservationMediaTypeInvalid => "BROWSER_READ_OBSERVATION_MEDIA_TYPE_INVALID",
             Self::ReadObservationTampered => "BROWSER_READ_OBSERVATION_TAMPERED",
+            Self::InvalidVisualObservation => "BROWSER_INVALID_VISUAL_OBSERVATION",
+            Self::VisualObservationResponseInvalid => "BROWSER_VISUAL_OBSERVATION_RESPONSE_INVALID",
+            Self::VisualObservationImageInvalid => "BROWSER_VISUAL_OBSERVATION_IMAGE_INVALID",
+            Self::VisualObservationTampered => "BROWSER_VISUAL_OBSERVATION_TAMPERED",
+            Self::InvalidProtocolObservation => "BROWSER_INVALID_PROTOCOL_OBSERVATION",
+            Self::ProtocolProbeResponseInvalid => "BROWSER_PROTOCOL_PROBE_RESPONSE_INVALID",
+            Self::InvalidFallbackTrace => "BROWSER_INVALID_FALLBACK_TRACE",
+            Self::FallbackOrderViolation => "BROWSER_FALLBACK_ORDER_VIOLATION",
             Self::InvalidRecipe => "BROWSER_INVALID_RECIPE",
             Self::InvalidRecipeKey => "BROWSER_INVALID_RECIPE_KEY",
             Self::RecipeKeyUnavailable => "BROWSER_RECIPE_KEY_UNAVAILABLE",

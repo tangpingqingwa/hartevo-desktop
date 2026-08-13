@@ -28,6 +28,9 @@ use crate::read_observation::{
     BrowserReadObservation, canonical_public_https_url, decode_resource_content,
     parse_main_document_resource,
 };
+use crate::visual_observation::{
+    BrowserProtocolObservation, BrowserVisualObservation, decode_screenshot, parse_layout_metrics,
+};
 use crate::workspace::{digest, digest_json};
 use crate::{
     BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionRisk, BrowserActionSurface,
@@ -455,6 +458,16 @@ struct ChromiumInputTargetBinding {
     target_url: String,
     frame: CdpFrameIdentity,
     frame_tree: CdpFrameTreeSnapshot,
+    execution_context: CdpExecutionContextBinding,
+}
+
+#[derive(Clone)]
+struct ChromiumObservationBinding {
+    target_id: String,
+    session_id: String,
+    target_url: String,
+    frame_tree: CdpFrameTreeSnapshot,
+    document_generation: u64,
     execution_context: CdpExecutionContextBinding,
 }
 
@@ -1289,6 +1302,184 @@ impl ManagedChromiumHost {
             &content,
         )?
         .with_document_generation(document_generation)
+    }
+
+    /// Captures a bounded PNG for the visual fallback. The screenshot is
+    /// transient and scope-bound; no image bytes enter the serializable
+    /// observation metadata or any durable browser record.
+    pub fn capture_visual_observation(
+        &mut self,
+        tab_id: &BrowserTabId,
+        proof: &BrowserLeaseProof,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserVisualObservation, BrowserError> {
+        self.workspace.validate_agent_lease(proof, now)?;
+        let guard = OperationLeaseGuard::new(proof, now);
+        let binding = self.bind_observation(tab_id, &guard)?;
+        let metrics_before = parse_layout_metrics(&self.command_guarded(
+            CdpMethod::PageGetLayoutMetrics,
+            json!({}),
+            Some(&binding.session_id),
+            &guard,
+        )?)?;
+        let screenshot = self.command_guarded(
+            CdpMethod::PageCaptureScreenshot,
+            json!({
+                "format": "png",
+                "fromSurface": true,
+                "captureBeyondViewport": false
+            }),
+            Some(&binding.session_id),
+            &guard,
+        )?;
+        let image = decode_screenshot(&screenshot)?;
+        let metrics_after = parse_layout_metrics(&self.command_guarded(
+            CdpMethod::PageGetLayoutMetrics,
+            json!({}),
+            Some(&binding.session_id),
+            &guard,
+        )?)?;
+        if metrics_before != metrics_after {
+            return Err(BrowserError::VisualObservationTampered);
+        }
+        let (frame_tree_after, generation_after) =
+            self.validate_observation_binding_after(tab_id, &binding, &guard)?;
+        if generation_after != binding.document_generation
+            || frame_tree_after.root != binding.frame_tree.root
+        {
+            return Err(BrowserError::VisualObservationTampered);
+        }
+        let observed_at = guard.observed_at()?;
+        self.workspace.validate_agent_lease(proof, observed_at)?;
+        BrowserVisualObservation::from_captured(
+            &self.workspace,
+            tab_id.clone(),
+            binding.document_generation,
+            digest(binding.target_url.as_bytes()),
+            digest(binding.frame_tree.root.security_origin.as_bytes()),
+            &binding.frame_tree.root.frame_id,
+            &binding.frame_tree.root.loader_id,
+            &binding.execution_context.identity.unique_id,
+            binding.execution_context.context_revision,
+            metrics_before,
+            image,
+            observed_at,
+        )
+    }
+
+    /// Runs the only protocol fallback exposed by the adapter: a bounded,
+    /// content-free layout metrics probe bound to the exact page generation.
+    pub fn probe_protocol_layout_metrics(
+        &mut self,
+        tab_id: &BrowserTabId,
+        proof: &BrowserLeaseProof,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserProtocolObservation, BrowserError> {
+        self.workspace.validate_agent_lease(proof, now)?;
+        let guard = OperationLeaseGuard::new(proof, now);
+        let binding = self.bind_observation(tab_id, &guard)?;
+        let metrics_before = parse_layout_metrics(&self.command_guarded(
+            CdpMethod::PageGetLayoutMetrics,
+            json!({}),
+            Some(&binding.session_id),
+            &guard,
+        )?)?;
+        let metrics_after = parse_layout_metrics(&self.command_guarded(
+            CdpMethod::PageGetLayoutMetrics,
+            json!({}),
+            Some(&binding.session_id),
+            &guard,
+        )?)?;
+        if metrics_before != metrics_after {
+            return Err(BrowserError::VisualObservationTampered);
+        }
+        let (frame_tree_after, generation_after) =
+            self.validate_observation_binding_after(tab_id, &binding, &guard)?;
+        if generation_after != binding.document_generation
+            || frame_tree_after.root != binding.frame_tree.root
+        {
+            return Err(BrowserError::InvalidProtocolObservation);
+        }
+        let observed_at = guard.observed_at()?;
+        self.workspace.validate_agent_lease(proof, observed_at)?;
+        BrowserProtocolObservation::from_layout_metrics(
+            &self.workspace,
+            tab_id.clone(),
+            binding.document_generation,
+            digest(binding.target_url.as_bytes()),
+            digest(binding.frame_tree.root.security_origin.as_bytes()),
+            &binding.frame_tree.root.frame_id,
+            &binding.frame_tree.root.loader_id,
+            &binding.execution_context.identity.unique_id,
+            binding.execution_context.context_revision,
+            metrics_before,
+            observed_at,
+        )
+    }
+
+    fn bind_observation(
+        &mut self,
+        tab_id: &BrowserTabId,
+        guard: &OperationLeaseGuard<'_>,
+    ) -> Result<ChromiumObservationBinding, BrowserError> {
+        let (target_id, session_id) = {
+            let tab = self.tabs.get(tab_id).ok_or(BrowserError::TabNotFound)?;
+            (tab.target_id.clone(), tab.session_id.clone())
+        };
+        let target_url = self.read_target_url(&target_id, guard)?;
+        let (frame_tree, document_generation) =
+            self.read_scoped_frame_tree_snapshot(tab_id, &session_id, guard)?;
+        if target_url != frame_tree.root.url {
+            return Err(BrowserError::VisualObservationTampered);
+        }
+        let execution_context = {
+            let tab = self.tabs.get(tab_id).ok_or(BrowserError::TabNotFound)?;
+            if !tab.runtime_events.is_enabled() {
+                return Err(BrowserError::VisualObservationTampered);
+            }
+            tab.execution_context_registry.bind(
+                &frame_tree,
+                CdpExecutionWorld::Main,
+                document_generation,
+            )?
+        };
+        Ok(ChromiumObservationBinding {
+            target_id,
+            session_id,
+            target_url,
+            frame_tree,
+            document_generation,
+            execution_context,
+        })
+    }
+
+    fn validate_observation_binding_after(
+        &mut self,
+        tab_id: &BrowserTabId,
+        binding: &ChromiumObservationBinding,
+        guard: &OperationLeaseGuard<'_>,
+    ) -> Result<(CdpFrameTreeSnapshot, u64), BrowserError> {
+        let target_url = self.read_target_url(&binding.target_id, guard)?;
+        let (frame_tree, document_generation) =
+            self.read_scoped_frame_tree_snapshot(tab_id, &binding.session_id, guard)?;
+        if document_generation != binding.document_generation
+            || validate_bound_frame_tree(&binding.frame_tree, &frame_tree).is_err()
+            || frame_tree.root != binding.frame_tree.root
+            || target_url != binding.target_url
+            || target_url != frame_tree.root.url
+        {
+            return Err(BrowserError::VisualObservationTampered);
+        }
+        let tab = self.tabs.get(tab_id).ok_or(BrowserError::TabNotFound)?;
+        tab.execution_context_registry
+            .validate_binding(
+                &binding.execution_context,
+                &frame_tree,
+                &CdpExecutionWorld::Main,
+                document_generation,
+            )
+            .map_err(|_| BrowserError::VisualObservationTampered)?;
+        Ok((frame_tree, document_generation))
     }
 
     fn configure_navigation_policy(
@@ -3863,6 +4054,14 @@ impl BrowserControlHost for ManagedChromiumHost {
             tab.locator_map.clear();
             tab.latest_frame_tree = None;
             tab.latest_execution_context = None;
+            tab.generation_frame_tree = None;
+            tab.frame_lifecycle_revisions.clear();
+            tab.lifecycle_events.clear();
+            tab.current_frame_id = None;
+            tab.current_loader_id = None;
+            tab.current_url_digest = None;
+            tab.read_observation_origin_digest = None;
+            tab.read_observation_target_url_digest = None;
         }
         Ok(())
     }
@@ -3926,6 +4125,7 @@ enum CdpMethod {
     PageGetResourceContent,
     PageGetResourceTree,
     PageGetLayoutMetrics,
+    PageCaptureScreenshot,
     PageSetLifecycleEventsEnabled,
     PageNavigate,
     RuntimeEnable,
@@ -3958,6 +4158,7 @@ impl CdpMethod {
             Self::PageGetResourceContent => "Page.getResourceContent",
             Self::PageGetResourceTree => "Page.getResourceTree",
             Self::PageGetLayoutMetrics => "Page.getLayoutMetrics",
+            Self::PageCaptureScreenshot => "Page.captureScreenshot",
             Self::PageSetLifecycleEventsEnabled => "Page.setLifecycleEventsEnabled",
             Self::PageNavigate => "Page.navigate",
             Self::RuntimeEnable => "Runtime.enable",
@@ -7669,6 +7870,23 @@ mod tests {
         assert_eq!(page_snapshot.document_generation, 2);
         assert_eq!(page_snapshot.url_digest, first_navigation.final_url_digest);
         assert_ne!(page_snapshot.content_digest, snapshot.content_digest);
+        let protocol_observation = host
+            .probe_protocol_layout_metrics(&tab_id, &proof, now)
+            .expect("typed protocol layout probe");
+        protocol_observation
+            .validate_for(&workspace)
+            .expect("valid protocol observation");
+        let visual_observation = host
+            .capture_visual_observation(&tab_id, &proof, now)
+            .expect("transient visual observation");
+        visual_observation
+            .validate_for(&workspace)
+            .expect("valid visual observation");
+        assert_eq!(
+            visual_observation.metadata().media_type.as_str(),
+            "image/png"
+        );
+        assert!(!visual_observation.image_bytes().is_empty());
         let email_locator = BrowserStableLocator::exact_accessible_name(
             &workspace,
             tab_id.clone(),
