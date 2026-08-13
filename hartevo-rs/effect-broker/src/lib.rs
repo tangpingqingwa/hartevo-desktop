@@ -4,6 +4,7 @@ pub mod approval_authority;
 pub mod github_pages;
 pub mod provider_auth;
 pub mod provider_contract;
+pub mod web_publication_plugin;
 
 pub use approval_authority::{
     ApprovalAuthority, ApprovalAuthorityError, ApprovalAuthorityKind, ApprovalRecordAuthorization,

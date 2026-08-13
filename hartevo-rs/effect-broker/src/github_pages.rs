@@ -307,6 +307,16 @@ impl<T> GithubPagesExecutor<T> {
     }
 }
 
+impl<T: GithubPagesRepositoryTransport> GithubPagesExecutor<T> {
+    pub fn read_snapshot(
+        &mut self,
+        environment: PublicationEnvironment,
+    ) -> Result<GithubPagesRepositorySnapshot, GithubPagesError> {
+        let target = self.targets.selected(environment).clone();
+        self.transport.read(&target)
+    }
+}
+
 impl<T: GithubPagesRepositoryTransport> EffectExecutor for GithubPagesExecutor<T> {
     fn execute(&mut self, effect: &Effect) -> Result<Receipt, ProviderFailure> {
         let registration = self.registrations.get(&effect.id).cloned().ok_or_else(|| {

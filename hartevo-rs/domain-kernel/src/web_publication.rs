@@ -7,8 +7,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    DeploymentId, DomainId, MissionId, ProjectId, PublicationActivityId, PublicationId, SiteId,
-    TenantId,
+    DeploymentId, DomainId, Mission, MissionId, ProjectId, PublicationActivityId, PublicationId,
+    SiteId, TenantId, WorkProductId, WorkProductManifest, WorkProductManifestError,
+    WorkProductPreview, WorkProductStatus,
 };
 
 pub const WEB_PUBLICATION_SCHEMA_VERSION: &str = "hartevo-web-publication/v1";
@@ -269,6 +270,137 @@ impl SiteRevision {
         }
         Ok(())
     }
+}
+
+/// The durable source binding consumed by the publication plugin. It is
+/// deliberately constructed from the Mission aggregate and the exact
+/// WorkProductManifest rather than from a page-local title or preview.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationWorkProductSelection {
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub mission_revision: u64,
+    pub site_id: SiteId,
+    pub work_product_id: WorkProductId,
+    pub work_product_revision: u64,
+    pub work_product_type: String,
+    pub work_product_status: WorkProductStatus,
+    pub work_product_digest: String,
+    pub manifest_digest: String,
+    pub preview: WorkProductPreview,
+    pub site_revision: SiteRevision,
+}
+
+impl PublicationWorkProductSelection {
+    pub fn from_mission(
+        mission: &Mission,
+        site_id: &SiteId,
+        work_product_id: &WorkProductId,
+        manifest: &WorkProductManifest,
+        site_revision: SiteRevision,
+    ) -> Result<Self, WebPublicationError> {
+        if mission.revision == 0
+            || mission.tenant_id != manifest.tenant_id
+            || mission.project_id != manifest.project_id
+            || mission.id != manifest.mission_id
+            || manifest.work_product_id != *work_product_id
+        {
+            return Err(WebPublicationError::WorkProductScopeMismatch);
+        }
+        let work_product = mission
+            .work_products
+            .iter()
+            .find(|candidate| candidate.id == *work_product_id)
+            .ok_or_else(|| WebPublicationError::WorkProductNotFound(work_product_id.clone()))?;
+        manifest
+            .validate_against(work_product)
+            .map_err(|error| map_manifest_selection_error(&error))?;
+        if !matches!(
+            work_product.status,
+            WorkProductStatus::ReadyForReview | WorkProductStatus::Accepted
+        ) {
+            return Err(WebPublicationError::WorkProductNotAdoptable(
+                work_product.id.clone(),
+            ));
+        }
+        if is_fixture_work_product_type(&manifest.work_product_type) {
+            return Err(WebPublicationError::FixtureWorkProduct(
+                manifest.work_product_type.clone(),
+            ));
+        }
+        if manifest.file_digest.as_deref() != Some(site_revision.artifact_digest.as_str()) {
+            return Err(WebPublicationError::SourceDigestMismatch);
+        }
+        let selection = Self {
+            tenant_id: mission.tenant_id.clone(),
+            project_id: mission.project_id.clone(),
+            mission_id: mission.id.clone(),
+            mission_revision: mission.revision,
+            site_id: site_id.clone(),
+            work_product_id: work_product.id.clone(),
+            work_product_revision: work_product.revision,
+            work_product_type: manifest.work_product_type.clone(),
+            work_product_status: work_product.status.clone(),
+            work_product_digest: work_product.content_digest.clone(),
+            manifest_digest: manifest.manifest_digest.clone(),
+            preview: manifest.preview.clone(),
+            site_revision,
+        };
+        selection.validate()?;
+        Ok(selection)
+    }
+
+    pub fn validate(&self) -> Result<(), WebPublicationError> {
+        if self.mission_revision == 0
+            || self.work_product_revision == 0
+            || self.tenant_id.as_str().trim().is_empty()
+            || self.project_id.as_str().trim().is_empty()
+            || self.mission_id.as_str().trim().is_empty()
+            || self.site_id.as_str().trim().is_empty()
+            || self.work_product_id.as_str().trim().is_empty()
+            || is_fixture_work_product_type(&self.work_product_type)
+        {
+            return Err(WebPublicationError::InvalidSourceBinding);
+        }
+        validate_digest(&self.work_product_digest, "work product digest")?;
+        validate_digest(&self.manifest_digest, "work product manifest digest")?;
+        self.preview
+            .validate()
+            .map_err(|_| WebPublicationError::InvalidSourceBinding)?;
+        self.site_revision.validate()?;
+        if self.site_revision.site_id != self.site_id
+            || self.site_revision.revision == 0
+            || !matches!(
+                self.work_product_status,
+                WorkProductStatus::ReadyForReview | WorkProductStatus::Accepted
+            )
+        {
+            return Err(WebPublicationError::InvalidSourceBinding);
+        }
+        Ok(())
+    }
+
+    pub fn is_adoptable(&self) -> bool {
+        self.work_product_status == WorkProductStatus::Accepted
+    }
+}
+
+fn map_manifest_selection_error(error: &WorkProductManifestError) -> WebPublicationError {
+    match error {
+        WorkProductManifestError::WorkProductMismatch
+        | WorkProductManifestError::InvalidRevisionChain => {
+            WebPublicationError::WorkProductManifestMismatch
+        }
+        _ => WebPublicationError::InvalidSourceBinding,
+    }
+}
+
+fn is_fixture_work_product_type(work_product_type: &str) -> bool {
+    work_product_type
+        .split(['_', '-', '.', ':'])
+        .any(|part| part.eq_ignore_ascii_case("fixture"))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1129,6 +1261,20 @@ pub enum WebPublicationError {
         from: PublicationStatus,
         to: PublicationStatus,
     },
+    #[error("the selected WorkProduct is outside the publication Mission scope")]
+    WorkProductScopeMismatch,
+    #[error("selected WorkProduct {0} was not found in the Mission")]
+    WorkProductNotFound(WorkProductId),
+    #[error("selected WorkProduct {0} is not adoptable")]
+    WorkProductNotAdoptable(WorkProductId),
+    #[error("WorkProduct type {0} is a fixture and cannot be published")]
+    FixtureWorkProduct(String),
+    #[error("selected WorkProduct manifest does not bind its exact revision")]
+    WorkProductManifestMismatch,
+    #[error("selected WorkProduct source digest does not match the site revision")]
+    SourceDigestMismatch,
+    #[error("selected WorkProduct source binding is invalid")]
+    InvalidSourceBinding,
     #[error("approval is required")]
     ApprovalRequired,
     #[error("provider receipt is required")]

@@ -151,9 +151,9 @@ pub use web_publication::{
     CanonicalDiffEntry, CanonicalDiffEntryKind, CanonicalSiteDiff, Deployment, DeploymentStatus,
     Domain, DomainStatus, Publication, PublicationActivity, PublicationActivityKind,
     PublicationEnvironment, PublicationProviderReceipt, PublicationPublishRequest,
-    PublicationReadback, PublicationStatus, PublicationTarget, Site, SiteFile, SitePreview,
-    SiteRevision, SiteStatus, WEB_PUBLICATION_SCHEMA_VERSION, WebPublicationError,
-    WebPublicationProjection,
+    PublicationReadback, PublicationStatus, PublicationTarget, PublicationWorkProductSelection,
+    Site, SiteFile, SitePreview, SiteRevision, SiteStatus, WEB_PUBLICATION_SCHEMA_VERSION,
+    WebPublicationError, WebPublicationProjection,
 };
 pub use work_product::{
     WorkProductDependencies, WorkProductManifest, WorkProductManifestError, WorkProductPreview,
