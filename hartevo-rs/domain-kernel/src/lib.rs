@@ -22,6 +22,7 @@ mod money;
 mod outcome;
 mod project;
 mod relationship;
+mod relationship_projection;
 mod runtime_process;
 mod runtime_recovery;
 mod runtime_turn;
@@ -138,6 +139,12 @@ pub use relationship::{
     ConversationState, InboundIngest, InboundMessageInput, MessageDelivery, MessageDirection,
     MessagingGateway, Opportunity, OpportunityStage, PreparedAutomaticReply, RelationshipError,
     StageTransition, SuppressionReason, WebhookAttestation,
+};
+pub use relationship_projection::{
+    CanonicalRelationshipRecord, InboxItemProjection, InboxProjection, RelationshipProjectionError,
+    RelationshipSourceCursor, RelationshipSourceKey, RelationshipSourceRef,
+    RelationshipSourceStream, canonical_relationship_id, digest_relationship_value,
+    relationship_source_scope_digest,
 };
 pub use runtime_process::{
     RuntimeProcessClaim, RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition,

@@ -1,6 +1,19 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod provider_transport;
+mod relationship_sync;
 mod runtime_text_subscription;
+
+pub use provider_transport::{
+    OpaqueCredential, ProviderHttpMethod, ProviderHttpRequest, ProviderHttpResponse,
+    ProviderHttpTransport, ProviderTransportError, ReqwestProviderHttpTransport,
+};
+pub use relationship_sync::{
+    HUBSPOT_ACCESS_TOKEN_ENV, HUBSPOT_API_BASE_URL_ENV, HUBSPOT_DEFAULT_API_BASE_URL,
+    HUBSPOT_DEFAULT_PAGE_SIZE, HUBSPOT_READ_PROBE_GATE_ENV, HubSpotReadConfig,
+    HubSpotReadObservation, HubSpotReadPage, HubSpotReadProbeOutcome, HubSpotRelationshipReader,
+    ProviderReadError, run_hubspot_read_probe_from_env,
+};
 
 pub use runtime_text_subscription::{
     CatalogMissionExecutionHandle, CatalogMissionExecutionStart,
@@ -61,31 +74,32 @@ use hartevo_domain_kernel::{
     DevicePublicKeyRegistration, Effect, EffectClass, EffectId, EffectRisk, EffectSpec,
     EffectStatus, Evidence, EvidenceId, EvidenceStatus, FactId, FundingReservation, IdentityError,
     IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject, InboundIngest,
-    InboundMessageInput, KeyEnvelope, KeyEnvelopeId, KeyManagementError, KeyRecipient, KpiContract,
-    MessageDelivery, MessageId, MetricValue, Mission, MissionCheckpointApplicationEvidence,
-    MissionCheckpointCompletion, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
-    MissionCheckpointOracleSource, MissionCheckpointRoute, MissionCheckpointStatus,
-    MissionContract, MissionConversation, MissionConversationError, MissionConversationId,
-    MissionConversationMessage, MissionConversationMessageId, MissionConversationMessageKind,
-    MissionConversationRole, MissionDefinition, MissionError, MissionId, MissionKpiProjection,
-    MissionSchedule, MissionScheduleError, MissionScheduleFailureClass, MissionScheduleId,
-    MissionScheduleStatus, MissionStage, MissionTerminalDisposition, Money, OperatingMode,
-    Opportunity, OpportunityId, OpportunityStage, OrderId, Outcome, OutcomeAttributionProjection,
-    OutcomeDecision, OutcomeEvent, OutcomeIdentityChainProjection, OutcomeLedger,
-    OutcomeLedgerError, OutcomeNormalizationProjection, OutcomeReviewActionGate,
-    OutcomeReviewCausalStatus, OutcomeReviewCaveat, OutcomeReviewDecision, OutcomeReviewLoopPolicy,
+    InboundMessageInput, InboxProjection, KeyEnvelope, KeyEnvelopeId, KeyManagementError,
+    KeyRecipient, KpiContract, MessageDelivery, MessageId, MetricValue, Mission,
+    MissionCheckpointApplicationEvidence, MissionCheckpointCompletion,
+    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointOracleSource,
+    MissionCheckpointRoute, MissionCheckpointStatus, MissionContract, MissionConversation,
+    MissionConversationError, MissionConversationId, MissionConversationMessage,
+    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
+    MissionDefinition, MissionError, MissionId, MissionKpiProjection, MissionSchedule,
+    MissionScheduleError, MissionScheduleFailureClass, MissionScheduleId, MissionScheduleStatus,
+    MissionStage, MissionTerminalDisposition, Money, OperatingMode, Opportunity, OpportunityId,
+    OpportunityStage, OrderId, Outcome, OutcomeAttributionProjection, OutcomeDecision,
+    OutcomeEvent, OutcomeIdentityChainProjection, OutcomeLedger, OutcomeLedgerError,
+    OutcomeNormalizationProjection, OutcomeReviewActionGate, OutcomeReviewCausalStatus,
+    OutcomeReviewCaveat, OutcomeReviewDecision, OutcomeReviewLoopPolicy,
     OutcomeReviewNextContractIntent, OutcomeReviewNextContractResolution, OutcomeReviewProjection,
     OutcomeReviewRoiStatus, OutcomeSettlementProjection, Partner, PartnerId, PayoutAuthorization,
     PayoutId, Person, PersonId, PreparedAutomaticReply, Project, ProjectDataCell,
     ProjectEncryptionMode, ProjectError, ProjectId, ProjectKeyring, ProjectKeyringBootstrap,
-    ReceiptId, RelationshipError, ReviewDecision, ReviewId, RuntimeProcessClaim,
-    RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition, RuntimeProcessIdentity,
-    RuntimeRecoveryAttempt, RuntimeRecoveryAttemptId, RuntimeRecoveryFailureClass,
-    RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt, RuntimeTurnAttemptId,
-    RuntimeTurnError, RuntimeTurnFailureClass, RuntimeTurnObservedKind, RuntimeTurnPrivateMessage,
-    RuntimeTurnPrivateTextDelta, RuntimeTurnRestartDisposition, RuntimeTurnScope,
-    RuntimeTurnStatus, StorageMode, SuppressionReason, Task, TaskId, TaskStatus, TenantId,
-    TruthError, TruthFact, VerificationStatus, WebhookAttestation, WorkProduct,
+    ReceiptId, RelationshipError, RelationshipSourceStream, ReviewDecision, ReviewId,
+    RuntimeProcessClaim, RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition,
+    RuntimeProcessIdentity, RuntimeRecoveryAttempt, RuntimeRecoveryAttemptId,
+    RuntimeRecoveryFailureClass, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt,
+    RuntimeTurnAttemptId, RuntimeTurnError, RuntimeTurnFailureClass, RuntimeTurnObservedKind,
+    RuntimeTurnPrivateMessage, RuntimeTurnPrivateTextDelta, RuntimeTurnRestartDisposition,
+    RuntimeTurnScope, RuntimeTurnStatus, StorageMode, SuppressionReason, Task, TaskId, TaskStatus,
+    TenantId, TruthError, TruthFact, VerificationStatus, WebhookAttestation, WorkProduct,
     WorkProductDependencies, WorkProductId, WorkProductManifest, WorkProductManifestError,
     WorkProductPreview, WorkProductStatus, WorkerHandle, WorkerHandleStatus, WorkerId, WorkerLease,
     WorkerLeaseId, WorkerLeaseStatus, WorkerMailbox, validate_context_branch_lineage,
@@ -4422,12 +4436,26 @@ pub struct DesktopProjectProjection {
     pub workspace_root_count: usize,
     pub encryption: ProjectEncryptionReadiness,
     pub missions: Vec<MissionProjection>,
+    #[serde(default)]
+    pub inbox: Option<InboxProjection>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopInventoryProjection {
     pub projects: Vec<DesktopProjectProjection>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "status")]
+pub enum HubSpotSyncOutcome {
+    BlockedEnv {
+        reason: String,
+    },
+    Applied {
+        observation: HubSpotReadObservation,
+        projection: Box<InboxProjection>,
+    },
 }
 
 /// Content-free Runtime evidence for one Mission. Private Runtime thread/turn
@@ -16853,6 +16881,11 @@ impl ApplicationService {
                     mission_projection(&self.store, mission, WorkSurface::Orchestrator, false)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let inbox = self.store.load_inbox_projection(&project.id)?;
+            let inbox = (!inbox.items.is_empty()
+                || !inbox.relationships.is_empty()
+                || !inbox.source_cursors.is_empty())
+            .then_some(inbox);
             projects.push(DesktopProjectProjection {
                 tenant_id: project.tenant_id,
                 project_id: project.id,
@@ -16864,9 +16897,106 @@ impl ApplicationService {
                 workspace_root_count: project.workspace_roots.len(),
                 encryption,
                 missions,
+                inbox,
             });
         }
         Ok(DesktopInventoryProjection { projects })
+    }
+
+    /// Performs the credentialed HubSpot CRM read probe and durably applies
+    /// only its content-free relationship records/cursor. A successful read
+    /// deliberately does not mutate Connection status: Probe evidence is the
+    /// sole authority for a Connected claim.
+    pub fn sync_hubspot_relationships_from_env<T: ProviderHttpTransport>(
+        &mut self,
+        project_id: &ProjectId,
+        connection_id: &ConnectionId,
+        transport: &T,
+        observed_at: DateTime<Utc>,
+    ) -> Result<HubSpotSyncOutcome, ApplicationError> {
+        let connection = self.store.load_connection(project_id, connection_id)?;
+        if connection.provider() != "hubspot" {
+            return Err(ProviderReadError::ConnectionScopeMismatch.into());
+        }
+        let projection = self.store.load_inbox_projection(project_id)?;
+        let cursor = projection
+            .source_cursor(
+                "hubspot",
+                connection.account_id(),
+                RelationshipSourceStream::People,
+            )
+            .cloned();
+        match run_hubspot_read_probe_from_env(
+            transport,
+            connection.tenant_id(),
+            project_id,
+            connection.account_id(),
+            cursor.as_ref(),
+            observed_at,
+        )? {
+            HubSpotReadProbeOutcome::BlockedEnv { reason } => {
+                Ok(HubSpotSyncOutcome::BlockedEnv { reason })
+            }
+            HubSpotReadProbeOutcome::Observed(page) => {
+                let projection = self.store.apply_relationship_source_page(
+                    connection.tenant_id(),
+                    project_id,
+                    &page.records,
+                    &page.cursor,
+                    observed_at,
+                )?;
+                Ok(HubSpotSyncOutcome::Applied {
+                    observation: page.observation,
+                    projection: Box::new(projection),
+                })
+            }
+        }
+    }
+
+    /// Deterministic test/integration seam for a caller that has already
+    /// obtained an opaque credential. This shares the same provider-neutral
+    /// projection path as the env-gated probe and still never claims
+    /// Connected or creates an outbound Effect.
+    pub fn sync_hubspot_relationships_with_credential<T: ProviderHttpTransport>(
+        &mut self,
+        project_id: &ProjectId,
+        connection_id: &ConnectionId,
+        transport: &T,
+        config: HubSpotReadConfig,
+        credential: &OpaqueCredential,
+        observed_at: DateTime<Utc>,
+    ) -> Result<HubSpotSyncOutcome, ApplicationError> {
+        let connection = self.store.load_connection(project_id, connection_id)?;
+        if connection.provider() != "hubspot" {
+            return Err(ProviderReadError::ConnectionScopeMismatch.into());
+        }
+        let projection = self.store.load_inbox_projection(project_id)?;
+        let cursor = projection
+            .source_cursor(
+                "hubspot",
+                connection.account_id(),
+                RelationshipSourceStream::People,
+            )
+            .cloned();
+        let page = HubSpotRelationshipReader::new(transport, config).read_contacts(
+            connection.tenant_id(),
+            project_id,
+            connection.account_id(),
+            cursor.as_ref(),
+            credential,
+            observed_at,
+        )?;
+        let projection = self.store.apply_relationship_source_page(
+            connection.tenant_id(),
+            project_id,
+            &page.records,
+            &page.cursor,
+            observed_at,
+        )?;
+        Ok(HubSpotSyncOutcome::Applied {
+            observation: page.observation,
+            projection: Box::new(projection),
+        })
     }
 
     /// Projects the latest durable Runtime recovery and turn evidence for each
@@ -20922,6 +21052,8 @@ pub enum ApplicationError {
     Identity(#[from] IdentityError),
     #[error(transparent)]
     Relationship(#[from] RelationshipError),
+    #[error(transparent)]
+    ProviderRead(#[from] ProviderReadError),
     #[error(transparent)]
     Truth(#[from] TruthError),
     #[error(transparent)]
