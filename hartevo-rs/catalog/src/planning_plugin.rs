@@ -68,6 +68,8 @@ pub enum PlanningError {
     RouteDrift,
     #[error("proposal provider registration digest does not match current registration")]
     RegistrationDigestMismatch,
+    #[error("proposal capability availability snapshot does not match current registry")]
+    CapabilityAvailabilityDrift,
     #[error("proposal provider lifecycle revision is stale")]
     ProposalRevisionMismatch,
     #[error("proposal replay conflicts with an existing durable record")]
@@ -183,6 +185,21 @@ impl PlanningCancellation {
             cancelled: true,
         }
     }
+}
+
+/// Inputs for a bounded plan replacement request.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanningReplanRequest<'a> {
+    /// Objective to plan again without retaining private text.
+    pub objective: &'a PlanningObjective,
+    /// Previous proposal to supersede.
+    pub previous_proposal: &'a CapabilityRouteProposal,
+    /// Cancellation fence for the replacement request.
+    pub cancellation: &'a PlanningCancellation,
+    /// Stable reason recorded in the durable replan event.
+    pub reason: PlanReplanReason,
+    /// Deadline observation time.
+    pub now: DateTime<Utc>,
 }
 
 /// Private objective input represented in the planning model by digests only.
@@ -357,6 +374,42 @@ impl ProviderLifecycleState {
     }
 }
 
+/// Why a Mission plan was declined by the consumer.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanDeclineReason {
+    /// The mounted provider is no longer available in the current scope.
+    ProviderUnavailable,
+    /// Provider version, implementation digest, or registration digest drifted.
+    ProviderBindingDrift,
+    /// The current capability availability set or binding changed.
+    CapabilityAvailabilityDrift,
+    /// The Mission Project/scope revision changed.
+    MissionRevisionDrift,
+    /// The proposal route or proposal content was changed.
+    RouteDrift,
+    /// A replay had a conflicting durable identity.
+    ReplayConflict,
+    /// The plan deadline has expired.
+    DeadlineExceeded,
+    /// The proposal could not be validated as a bounded plan.
+    InvalidProposal,
+}
+
+/// Why a new proposal superseded a previous Mission plan.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReplanReason {
+    /// A provider disappeared or a capability binding changed.
+    CapabilityAvailabilityChanged,
+    /// The previous provider was revoked or became unavailable.
+    ProviderRevoked,
+    /// The previous route was superseded after route drift was observed.
+    RouteDrift,
+    /// Caller requested a new revision without changing the objective text.
+    ExplicitRefresh,
+}
+
 /// A scoped provider registration and its lifecycle fence.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -408,6 +461,108 @@ impl PlanningProviderRegistration {
         let expected = registration_digest(self)?;
         if expected != self.registration_digest {
             return Err(PlanningError::RegistrationDigestMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Provider binding for one currently available capability.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CapabilityAvailabilityBinding {
+    /// Capability exposed by the active provider.
+    pub capability_id: PlanningCapabilityId,
+    /// Exact provider registration and implementation binding.
+    pub provider_registration_id: String,
+    pub provider_id: String,
+    pub provider_version: String,
+    pub provider_implementation_digest: String,
+    pub provider_registration_digest: String,
+    pub provider_generation: u64,
+    pub provider_lifecycle_revision: u64,
+}
+
+impl CapabilityAvailabilityBinding {
+    fn from_registration(
+        capability_id: PlanningCapabilityId,
+        registration: &PlanningProviderRegistration,
+    ) -> Self {
+        Self {
+            capability_id,
+            provider_registration_id: registration.registration_id.clone(),
+            provider_id: registration.descriptor.provider_id.clone(),
+            provider_version: registration.descriptor.provider_version.clone(),
+            provider_implementation_digest: registration.descriptor.implementation_digest.clone(),
+            provider_registration_digest: registration.registration_digest.clone(),
+            provider_generation: registration.generation,
+            provider_lifecycle_revision: registration.lifecycle_revision,
+        }
+    }
+
+    fn validate(&self) -> Result<(), PlanningError> {
+        validate_text("capability_id", self.capability_id.as_str())?;
+        validate_text("provider_registration_id", &self.provider_registration_id)?;
+        validate_text("provider_id", &self.provider_id)?;
+        validate_version(&self.provider_version)?;
+        validate_digest(
+            "provider_implementation_digest",
+            &self.provider_implementation_digest,
+        )?;
+        validate_digest(
+            "provider_registration_digest",
+            &self.provider_registration_digest,
+        )?;
+        if self.provider_generation == 0 {
+            return Err(invalid_field(
+                "provider_generation",
+                "must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Snapshot of all capability/provider bindings available in one registry revision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CapabilityAvailabilitySnapshot {
+    /// Snapshot schema version.
+    pub schema_version: String,
+    /// Exact Project/Mission scope.
+    pub scope: PlanningScope,
+    /// Registry revision used to build the snapshot.
+    pub registry_revision: u64,
+    /// Active capability bindings, keyed by capability identity.
+    pub available: BTreeMap<PlanningCapabilityId, CapabilityAvailabilityBinding>,
+    /// Digest of the exact availability set and registry revision.
+    pub snapshot_digest: String,
+}
+
+impl CapabilityAvailabilitySnapshot {
+    /// Returns whether the requested capability is in this snapshot.
+    #[must_use]
+    pub fn contains(&self, capability_id: &PlanningCapabilityId) -> bool {
+        self.available.contains_key(capability_id)
+    }
+
+    /// Verifies snapshot scope, provider bindings, and digest.
+    pub fn validate_integrity(&self) -> Result<(), PlanningError> {
+        if self.schema_version != PLANNING_PLUGIN_ROUTE_SCHEMA_VERSION {
+            return Err(invalid_field(
+                "schema_version",
+                "unsupported capability availability snapshot schema",
+            ));
+        }
+        self.scope.validate()?;
+        validate_digest("snapshot_digest", &self.snapshot_digest)?;
+        for (capability_id, binding) in &self.available {
+            binding.validate()?;
+            if capability_id != &binding.capability_id {
+                return Err(PlanningError::CapabilityAvailabilityDrift);
+            }
+        }
+        if availability_snapshot_digest(self)? != self.snapshot_digest {
+            return Err(PlanningError::CapabilityAvailabilityDrift);
         }
         Ok(())
     }
@@ -677,6 +832,42 @@ impl ScopedProviderRegistry {
             .ok_or_else(|| PlanningError::RegistrationNotFound(registration_id.into()))
     }
 
+    /// Materializes the current capability/provider availability for one scope.
+    pub fn availability_snapshot(
+        &self,
+        scope: &PlanningScope,
+    ) -> Result<CapabilityAvailabilitySnapshot, PlanningError> {
+        ensure_scope(&self.scope, scope)?;
+        let mut available = BTreeMap::new();
+        for registration in self.registrations.values() {
+            registration.validate_integrity()?;
+            if !registration.is_active() {
+                continue;
+            }
+            for capability_id in &registration.descriptor.capabilities {
+                let binding = CapabilityAvailabilityBinding::from_registration(
+                    capability_id.clone(),
+                    registration,
+                );
+                if available.insert(capability_id.clone(), binding).is_some() {
+                    return Err(PlanningError::DuplicateCapabilityProvider {
+                        capability_id: capability_id.as_str().into(),
+                    });
+                }
+            }
+        }
+        let mut snapshot = CapabilityAvailabilitySnapshot {
+            schema_version: PLANNING_PLUGIN_ROUTE_SCHEMA_VERSION.into(),
+            scope: self.scope.clone(),
+            registry_revision: self.registry_revision,
+            available,
+            snapshot_digest: String::new(),
+        };
+        snapshot.snapshot_digest = availability_snapshot_digest(&snapshot)?;
+        snapshot.validate_integrity()?;
+        Ok(snapshot)
+    }
+
     fn active_registration_for(
         &self,
         scope: &PlanningScope,
@@ -723,6 +914,10 @@ impl ScopedProviderRegistry {
     ) -> Result<(), PlanningError> {
         ensure_scope(&self.scope, scope)?;
         ensure_scope(&self.scope, &proposal.scope)?;
+        let current_snapshot = self.availability_snapshot(scope)?;
+        if current_snapshot != proposal.capability_availability_snapshot {
+            return Err(PlanningError::CapabilityAvailabilityDrift);
+        }
         let registration = self.registration(&proposal.provider_registration_id)?;
         registration.validate_integrity()?;
         if !registration.is_active() {
@@ -837,6 +1032,8 @@ pub struct CapabilityRouteProposal {
     pub objective_digest: String,
     /// Capability requested by the objective.
     pub capability_id: PlanningCapabilityId,
+    /// Capability/provider availability observed when the proposal was planned.
+    pub capability_availability_snapshot: CapabilityAvailabilitySnapshot,
     /// Provider registration binding.
     pub provider_registration_id: String,
     pub provider_id: String,
@@ -878,6 +1075,13 @@ impl CapabilityRouteProposal {
         self.scope.validate()?;
         validate_text("objective_id", &self.objective_id)?;
         validate_digest("objective_digest", &self.objective_digest)?;
+        self.capability_availability_snapshot.validate_integrity()?;
+        ensure_scope(&self.scope, &self.capability_availability_snapshot.scope)?;
+        let availability = self
+            .capability_availability_snapshot
+            .available
+            .get(&self.capability_id)
+            .ok_or_else(|| PlanningError::UnknownCapability(self.capability_id.as_str().into()))?;
         validate_text("provider_registration_id", &self.provider_registration_id)?;
         validate_text("provider_id", &self.provider_id)?;
         validate_version(&self.provider_version)?;
@@ -894,6 +1098,16 @@ impl CapabilityRouteProposal {
                 "provider_generation",
                 "must be greater than zero",
             ));
+        }
+        if availability.provider_registration_id != self.provider_registration_id
+            || availability.provider_id != self.provider_id
+            || availability.provider_version != self.provider_version
+            || availability.provider_implementation_digest != self.provider_implementation_digest
+            || availability.provider_registration_digest != self.provider_registration_digest
+            || availability.provider_generation != self.provider_generation
+            || availability.provider_lifecycle_revision != self.provider_lifecycle_revision
+        {
+            return Err(PlanningError::RegistrationDigestMismatch);
         }
         self.validate_route_shape()?;
         validate_digest("route_digest", &self.route_digest)?;
@@ -936,6 +1150,7 @@ impl CapabilityRouteProposal {
             &self.scope,
             &self.objective_digest,
             &self.capability_id,
+            &self.capability_availability_snapshot.snapshot_digest,
             &self.provider_registration_digest,
             &self.route_id,
             &self.steps,
@@ -952,6 +1167,7 @@ impl CapabilityRouteProposal {
                 &self.objective_id,
                 &self.objective_digest,
                 &self.capability_id,
+                &self.capability_availability_snapshot,
                 &self.provider_registration_id,
                 &self.provider_id,
                 &self.provider_version,
@@ -1016,17 +1232,27 @@ pub enum PlanLogEvent {
         proposal: Box<CapabilityRouteProposal>,
         recorded_at: DateTime<Utc>,
     },
-    /// Read-only proposal accepted by the Mission consumer.
-    DispatchAccepted {
-        record: DurableDispatchRecord,
+    /// Read-only plan accepted by the Mission consumer.
+    PlanAccepted {
+        record: DurablePlanAcceptance,
+        recorded_at: DateTime<Utc>,
+    },
+    /// Plan rejected by the Mission consumer with a replayable reason code.
+    PlanDeclined {
+        record: DurablePlanDecline,
+        recorded_at: DateTime<Utc>,
+    },
+    /// A replacement plan superseded an earlier proposal.
+    PlanReplanned {
+        record: DurablePlanReplan,
         recorded_at: DateTime<Utc>,
     },
 }
 
-/// Durable, effect-free record of a Mission consumer acceptance.
+/// Durable, effect-free record of a Mission plan acceptance.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct DurableDispatchRecord {
+pub struct DurablePlanAcceptance {
     /// Deterministic acceptance identity.
     pub dispatch_id: String,
     /// Proposal identity and content digests.
@@ -1034,6 +1260,46 @@ pub struct DurableDispatchRecord {
     pub proposal_digest: String,
     pub route_digest: String,
     pub provider_registration_digest: String,
+    pub provider_version: String,
+    pub provider_implementation_digest: String,
+    pub capability_snapshot_digest: String,
+    pub mission_revision: u64,
+}
+
+/// Compatibility alias for the first-layer dispatch record name.
+pub type DurableDispatchRecord = DurablePlanAcceptance;
+
+/// Durable, effect-free record of a Mission plan decline.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DurablePlanDecline {
+    /// Proposal identity and digest being declined.
+    pub proposal_id: String,
+    pub proposal_digest: String,
+    /// Stable reason code; no private text is retained.
+    pub reason: PlanDeclineReason,
+    /// Current scope digest observed by the consumer, when valid.
+    pub scope_digest: String,
+    /// Proposal snapshot digest, when the proposal remained structurally readable.
+    pub capability_snapshot_digest: Option<String>,
+    /// Current Mission revision observed by the consumer.
+    pub observed_mission_revision: u64,
+}
+
+/// Durable link between a previous proposal and its replacement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DurablePlanReplan {
+    /// Objective being replanned.
+    pub objective_id: String,
+    /// Previous proposal superseded by this replan.
+    pub previous_proposal_id: String,
+    pub previous_proposal_digest: String,
+    /// New proposal that may be dispatched if current fences pass.
+    pub replacement_proposal_id: String,
+    pub replacement_proposal_digest: String,
+    /// Stable replan cause; it carries no execution authority.
+    pub reason: PlanReplanReason,
 }
 
 /// Result returned when the Mission consumer accepts a read-only proposal.
@@ -1046,6 +1312,10 @@ pub struct MissionRouteDispatch {
     pub proposal_digest: String,
     pub route_digest: String,
     pub provider_registration_digest: String,
+    pub provider_version: String,
+    pub provider_implementation_digest: String,
+    pub capability_snapshot_digest: String,
+    pub mission_revision: u64,
     /// Exact Mission scope accepted by the consumer.
     pub scope: PlanningScope,
     /// True when this was an idempotent replay of a durable acceptance.
@@ -1076,8 +1346,9 @@ impl DurablePlanLog {
         validate_digest("head_digest", &self.head_digest)?;
         let mut previous = empty_log_digest(&self.scope)?;
         let mut objective_ids = BTreeMap::<String, String>::new();
-        let mut proposals = BTreeMap::<String, String>::new();
-        let mut dispatches = BTreeMap::<String, String>::new();
+        let mut proposals = BTreeMap::<String, CapabilityRouteProposal>::new();
+        let mut acceptances = BTreeMap::<String, String>::new();
+        let mut decline_keys = BTreeSet::<(String, PlanDeclineReason)>::new();
         for (index, entry) in self.entries.iter().enumerate() {
             let expected_sequence = (index as u64).saturating_add(1);
             if entry.sequence != expected_sequence {
@@ -1093,70 +1364,14 @@ impl DurablePlanLog {
                     "entry hash chain does not match".into(),
                 ));
             }
-            match &entry.event {
-                PlanLogEvent::ObjectiveAccepted {
-                    objective_id,
-                    objective_digest,
-                    capability_id,
-                    scope_digest,
-                    ..
-                } => {
-                    validate_text("objective_id", objective_id)?;
-                    validate_digest("objective_digest", objective_digest)?;
-                    validate_digest("scope_digest", scope_digest)?;
-                    if scope_digest != &self.scope.digest()? {
-                        return Err(PlanningError::InvalidPlanLog(
-                            "objective scope digest drifted".into(),
-                        ));
-                    }
-                    if let Some(existing) =
-                        objective_ids.insert(objective_id.clone(), objective_digest.clone())
-                        && existing != *objective_digest
-                    {
-                        return Err(PlanningError::ReplayConflict);
-                    }
-                    validate_text("capability_id", capability_id.as_str())?;
-                }
-                PlanLogEvent::RouteProposed { proposal, .. } => {
-                    proposal.validate_integrity()?;
-                    ensure_scope(&self.scope, &proposal.scope)?;
-                    let objective_digest =
-                        objective_ids.get(&proposal.objective_id).ok_or_else(|| {
-                            PlanningError::InvalidPlanLog(
-                                "route proposal has no accepted objective".into(),
-                            )
-                        })?;
-                    if objective_digest != &proposal.objective_digest {
-                        return Err(PlanningError::ReplayConflict);
-                    }
-                    if let Some(existing) = proposals.insert(
-                        proposal.proposal_id.clone(),
-                        proposal.proposal_digest.clone(),
-                    ) && existing != proposal.proposal_digest
-                    {
-                        return Err(PlanningError::ReplayConflict);
-                    }
-                }
-                PlanLogEvent::DispatchAccepted { record, .. } => {
-                    validate_dispatch_record(record)?;
-                    let proposal_digest = proposals
-                        .get(&record.proposal_id)
-                        .ok_or(PlanningError::ProposalNotInPlanLog)?;
-                    if proposal_digest != &record.proposal_digest {
-                        return Err(PlanningError::ReplayConflict);
-                    }
-                    if let Some(existing) = dispatches
-                        .insert(record.proposal_id.clone(), record.proposal_digest.clone())
-                    {
-                        if existing != record.proposal_digest {
-                            return Err(PlanningError::ReplayConflict);
-                        }
-                        return Err(PlanningError::InvalidPlanLog(
-                            "duplicate dispatch acceptance".into(),
-                        ));
-                    }
-                }
-            }
+            validate_plan_log_event(
+                &self.scope,
+                &entry.event,
+                &mut objective_ids,
+                &mut proposals,
+                &mut acceptances,
+                &mut decline_keys,
+            )?;
             previous.clone_from(&entry.entry_digest);
         }
         if self.head_digest != previous {
@@ -1180,7 +1395,7 @@ impl DurablePlanLog {
         objective_id: &str,
         objective_digest: &str,
     ) -> Option<CapabilityRouteProposal> {
-        self.entries.iter().find_map(|entry| {
+        self.entries.iter().rev().find_map(|entry| {
             let PlanLogEvent::RouteProposed { proposal, .. } = &entry.event else {
                 return None;
             };
@@ -1193,7 +1408,7 @@ impl DurablePlanLog {
     #[must_use]
     pub fn dispatch_for(&self, proposal_id: &str) -> Option<DurableDispatchRecord> {
         self.entries.iter().find_map(|entry| {
-            let PlanLogEvent::DispatchAccepted { record, .. } = &entry.event else {
+            let PlanLogEvent::PlanAccepted { record, .. } = &entry.event else {
                 return None;
             };
             (record.proposal_id == proposal_id).then(|| record.clone())
@@ -1243,17 +1458,53 @@ impl DurablePlanLog {
 
     fn record_dispatch(
         &mut self,
-        record: DurableDispatchRecord,
+        record: DurablePlanAcceptance,
         recorded_at: DateTime<Utc>,
     ) -> Result<(), PlanningError> {
-        validate_dispatch_record(&record)?;
+        validate_plan_acceptance_record(&record)?;
         if let Some(existing) = self.dispatch_for(&record.proposal_id) {
             if existing == record {
                 return Ok(());
             }
             return Err(PlanningError::ReplayConflict);
         }
-        self.append(PlanLogEvent::DispatchAccepted {
+        self.append(PlanLogEvent::PlanAccepted {
+            record,
+            recorded_at,
+        })
+    }
+
+    fn record_decline(
+        &mut self,
+        record: DurablePlanDecline,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), PlanningError> {
+        validate_plan_decline_record(&record)?;
+        if let Some(existing) = self.decline_for(&record.proposal_id, record.reason) {
+            if existing == record {
+                return Ok(());
+            }
+            return Err(PlanningError::ReplayConflict);
+        }
+        self.append(PlanLogEvent::PlanDeclined {
+            record,
+            recorded_at,
+        })
+    }
+
+    fn record_replan(
+        &mut self,
+        record: DurablePlanReplan,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), PlanningError> {
+        validate_plan_replan_record(&record)?;
+        if let Some(existing) = self.replan_for(&record.replacement_proposal_id) {
+            if existing == record {
+                return Ok(());
+            }
+            return Err(PlanningError::ReplayConflict);
+        }
+        self.append(PlanLogEvent::PlanReplanned {
             record,
             recorded_at,
         })
@@ -1293,6 +1544,135 @@ impl DurablePlanLog {
             (proposal.proposal_id == proposal_id).then(|| proposal.proposal_digest.clone())
         })
     }
+
+    fn proposal_by_id(&self, proposal_id: &str) -> Option<CapabilityRouteProposal> {
+        self.entries.iter().find_map(|entry| {
+            let PlanLogEvent::RouteProposed { proposal, .. } = &entry.event else {
+                return None;
+            };
+            (proposal.proposal_id == proposal_id).then(|| proposal.as_ref().clone())
+        })
+    }
+
+    fn decline_for(
+        &self,
+        proposal_id: &str,
+        reason: PlanDeclineReason,
+    ) -> Option<DurablePlanDecline> {
+        self.entries.iter().find_map(|entry| {
+            let PlanLogEvent::PlanDeclined { record, .. } = &entry.event else {
+                return None;
+            };
+            (record.proposal_id == proposal_id && record.reason == reason).then(|| record.clone())
+        })
+    }
+
+    fn replan_for(&self, replacement_proposal_id: &str) -> Option<DurablePlanReplan> {
+        self.entries.iter().find_map(|entry| {
+            let PlanLogEvent::PlanReplanned { record, .. } = &entry.event else {
+                return None;
+            };
+            (record.replacement_proposal_id == replacement_proposal_id).then(|| record.clone())
+        })
+    }
+}
+
+fn validate_plan_log_event(
+    scope: &PlanningScope,
+    event: &PlanLogEvent,
+    objective_ids: &mut BTreeMap<String, String>,
+    proposals: &mut BTreeMap<String, CapabilityRouteProposal>,
+    acceptances: &mut BTreeMap<String, String>,
+    decline_keys: &mut BTreeSet<(String, PlanDeclineReason)>,
+) -> Result<(), PlanningError> {
+    match event {
+        PlanLogEvent::ObjectiveAccepted {
+            objective_id,
+            objective_digest,
+            capability_id,
+            scope_digest,
+            ..
+        } => {
+            validate_text("objective_id", objective_id)?;
+            validate_digest("objective_digest", objective_digest)?;
+            validate_digest("scope_digest", scope_digest)?;
+            if scope_digest != &scope.digest()? {
+                return Err(PlanningError::InvalidPlanLog(
+                    "objective scope digest drifted".into(),
+                ));
+            }
+            if let Some(existing) =
+                objective_ids.insert(objective_id.clone(), objective_digest.clone())
+                && existing != *objective_digest
+            {
+                return Err(PlanningError::ReplayConflict);
+            }
+            validate_text("capability_id", capability_id.as_str())?;
+        }
+        PlanLogEvent::RouteProposed { proposal, .. } => {
+            proposal.validate_integrity()?;
+            ensure_scope(scope, &proposal.scope)?;
+            let objective_digest = objective_ids.get(&proposal.objective_id).ok_or_else(|| {
+                PlanningError::InvalidPlanLog("route proposal has no accepted objective".into())
+            })?;
+            if objective_digest != &proposal.objective_digest {
+                return Err(PlanningError::ReplayConflict);
+            }
+            if let Some(existing) =
+                proposals.insert(proposal.proposal_id.clone(), proposal.as_ref().clone())
+                && existing.proposal_digest != proposal.proposal_digest
+            {
+                return Err(PlanningError::ReplayConflict);
+            }
+        }
+        PlanLogEvent::PlanAccepted { record, .. } => {
+            validate_plan_acceptance_record(record)?;
+            let proposal = proposals
+                .get(&record.proposal_id)
+                .ok_or(PlanningError::ProposalNotInPlanLog)?;
+            validate_acceptance_binding(record, proposal)?;
+            if acceptances
+                .insert(record.proposal_id.clone(), record.proposal_digest.clone())
+                .is_some()
+            {
+                return Err(PlanningError::InvalidPlanLog(
+                    "duplicate plan acceptance".into(),
+                ));
+            }
+        }
+        PlanLogEvent::PlanDeclined { record, .. } => {
+            validate_plan_decline_record(record)?;
+            let proposal = proposals
+                .get(&record.proposal_id)
+                .ok_or(PlanningError::ProposalNotInPlanLog)?;
+            if proposal.proposal_digest != record.proposal_digest {
+                return Err(PlanningError::ReplayConflict);
+            }
+            if !decline_keys.insert((record.proposal_id.clone(), record.reason)) {
+                return Err(PlanningError::InvalidPlanLog(
+                    "duplicate plan decline".into(),
+                ));
+            }
+        }
+        PlanLogEvent::PlanReplanned { record, .. } => {
+            validate_plan_replan_record(record)?;
+            let previous = proposals
+                .get(&record.previous_proposal_id)
+                .ok_or(PlanningError::ProposalNotInPlanLog)?;
+            let replacement = proposals
+                .get(&record.replacement_proposal_id)
+                .ok_or(PlanningError::ProposalNotInPlanLog)?;
+            if previous.proposal_digest != record.previous_proposal_digest
+                || replacement.proposal_digest != record.replacement_proposal_digest
+                || previous.objective_id != record.objective_id
+                || replacement.objective_id != record.objective_id
+                || previous.proposal_id == replacement.proposal_id
+            {
+                return Err(PlanningError::ReplayConflict);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Typed service that turns an objective into a durable, read-only proposal.
@@ -1301,12 +1681,24 @@ pub struct PlanningService {
     log: DurablePlanLog,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlanningReplayMode {
+    Allow,
+    Force,
+}
+
 impl PlanningService {
     /// Creates a service bound to one Mission scope.
     pub fn new(scope: PlanningScope) -> Result<Self, PlanningError> {
         Ok(Self {
             log: DurablePlanLog::new(scope)?,
         })
+    }
+
+    /// Restores a service from a validated durable planning log.
+    pub fn from_plan_log(log: DurablePlanLog) -> Result<Self, PlanningError> {
+        log.validate()?;
+        Ok(Self { log })
     }
 
     /// Plans through the provider selected by the scoped registration.
@@ -1318,6 +1710,88 @@ impl PlanningService {
         cancellation: &PlanningCancellation,
         now: DateTime<Utc>,
     ) -> Result<CapabilityRouteProposal, PlanningError> {
+        self.plan_internal(
+            objective,
+            registry,
+            provider,
+            cancellation,
+            now,
+            PlanningReplayMode::Allow,
+        )
+    }
+
+    /// Creates a replacement proposal and records the supersession in the durable log.
+    pub fn replan(
+        &mut self,
+        request: &PlanningReplanRequest<'_>,
+        registry: &ScopedProviderRegistry,
+        provider: &dyn PlanningProvider,
+    ) -> Result<CapabilityRouteProposal, PlanningError> {
+        validate_plan_request(
+            request.objective,
+            &self.log.scope,
+            &registry.scope,
+            request.cancellation,
+            request.now,
+        )?;
+        request.previous_proposal.validate_integrity()?;
+        ensure_scope(&request.objective.scope, &request.previous_proposal.scope)?;
+        if request.previous_proposal.objective_id != request.objective.objective_id
+            || request.previous_proposal.objective_digest != request.objective.objective_digest
+            || self
+                .log
+                .proposal_for_id(&request.previous_proposal.proposal_id)
+                .as_deref()
+                != Some(request.previous_proposal.proposal_digest.as_str())
+        {
+            return Err(PlanningError::ProposalNotInPlanLog);
+        }
+
+        let original_log = self.log.clone();
+        let replacement = match self.plan_internal(
+            request.objective,
+            registry,
+            provider,
+            request.cancellation,
+            request.now,
+            PlanningReplayMode::Force,
+        ) {
+            Ok(proposal) => proposal,
+            Err(error) => {
+                self.log = original_log;
+                return Err(error);
+            }
+        };
+        let record = DurablePlanReplan {
+            objective_id: request.objective.objective_id.clone(),
+            previous_proposal_id: request.previous_proposal.proposal_id.clone(),
+            previous_proposal_digest: request.previous_proposal.proposal_digest.clone(),
+            replacement_proposal_id: replacement.proposal_id.clone(),
+            replacement_proposal_digest: replacement.proposal_digest.clone(),
+            reason: request.reason,
+        };
+        let mut next_log = self.log.clone();
+        if let Err(error) = next_log.record_replan(record, request.now) {
+            self.log = original_log;
+            return Err(error);
+        }
+        if let Err(error) = next_log.validate() {
+            self.log = original_log;
+            return Err(error);
+        }
+        self.log = next_log;
+        Ok(replacement)
+    }
+
+    fn plan_internal(
+        &mut self,
+        objective: &PlanningObjective,
+        registry: &ScopedProviderRegistry,
+        provider: &dyn PlanningProvider,
+        cancellation: &PlanningCancellation,
+        now: DateTime<Utc>,
+        replay_mode: PlanningReplayMode,
+    ) -> Result<CapabilityRouteProposal, PlanningError> {
         validate_plan_request(
             objective,
             &self.log.scope,
@@ -1325,13 +1799,15 @@ impl PlanningService {
             cancellation,
             now,
         )?;
-        if let Some(replayed) = self
-            .log
-            .proposal_for_objective(&objective.objective_id, &objective.objective_digest)
+        if replay_mode == PlanningReplayMode::Allow
+            && let Some(replayed) = self
+                .log
+                .proposal_for_objective(&objective.objective_id, &objective.objective_digest)
         {
             return Ok(replayed);
         }
 
+        let availability_snapshot = registry.availability_snapshot(&objective.scope)?;
         let registration =
             registry.active_registration_for(&objective.scope, &objective.requested_capability)?;
         let descriptor = provider.descriptor();
@@ -1356,7 +1832,14 @@ impl PlanningService {
         }
 
         let planning_revision = self.log.next_revision();
-        let proposal = build_proposal(objective, registration, route, planning_revision, now)?;
+        let proposal = build_proposal(
+            objective,
+            &availability_snapshot,
+            registration,
+            route,
+            planning_revision,
+            now,
+        )?;
         proposal.validate_integrity()?;
 
         let mut next_log = self.log.clone();
@@ -1385,9 +1868,33 @@ impl PlanningService {
 pub struct MissionPlanningConsumer;
 
 impl MissionPlanningConsumer {
-    /// Accepts or idempotently replays a proposal while the provider is active.
+    /// Accepts or idempotently replays a plan while every current fence passes.
     pub fn dispatch(
         &self,
+        proposal: &CapabilityRouteProposal,
+        current_scope: &PlanningScope,
+        registry: &ScopedProviderRegistry,
+        log: &mut DurablePlanLog,
+        now: DateTime<Utc>,
+    ) -> Result<MissionRouteDispatch, PlanningError> {
+        let result = Self::dispatch_checked(proposal, current_scope, registry, log, now);
+        if let Err(error) = &result
+            && let Some(record) = decline_record(proposal, current_scope, error)
+            && log.validate().is_ok()
+        {
+            let mut next_log = log.clone();
+            if next_log
+                .record_decline(record, now)
+                .and_then(|()| next_log.validate())
+                .is_ok()
+            {
+                *log = next_log;
+            }
+        }
+        result
+    }
+
+    fn dispatch_checked(
         proposal: &CapabilityRouteProposal,
         current_scope: &PlanningScope,
         registry: &ScopedProviderRegistry,
@@ -1402,20 +1909,23 @@ impl MissionPlanningConsumer {
             return Err(PlanningError::DeadlineExceeded);
         }
         log.validate()?;
-        let Some(recorded_proposal) =
-            log.proposal_for_objective(&proposal.objective_id, &proposal.objective_digest)
-        else {
+        let Some(recorded_proposal) = log.proposal_by_id(&proposal.proposal_id) else {
             return Err(PlanningError::ProposalNotInPlanLog);
         };
-        if recorded_proposal.proposal_id != proposal.proposal_id
+        if recorded_proposal.objective_id != proposal.objective_id
+            || recorded_proposal.objective_digest != proposal.objective_digest
             || recorded_proposal.proposal_digest != proposal.proposal_digest
         {
             return Err(PlanningError::ReplayConflict);
         }
 
-        // Lifecycle validation intentionally precedes the replay fast path:
-        // a revoked, unmounted, crashed, or stale provider cannot dispatch an
-        // old proposal even when that proposal was accepted earlier.
+        // Recompute availability before the replay fast path. A replay cannot
+        // revive a plan after provider removal, revocation, replacement, or
+        // any other registry revision that changes the capability snapshot.
+        let current_snapshot = registry.availability_snapshot(current_scope)?;
+        if current_snapshot != proposal.capability_availability_snapshot {
+            return Err(PlanningError::CapabilityAvailabilityDrift);
+        }
         registry.validate_proposal(proposal, current_scope)?;
         if let Some(existing) = log.dispatch_for(&proposal.proposal_id) {
             if existing.proposal_digest != proposal.proposal_digest {
@@ -1424,12 +1934,19 @@ impl MissionPlanningConsumer {
             return Ok(dispatch_from_record(existing, current_scope.clone(), true));
         }
 
-        let record = DurableDispatchRecord {
+        let record = DurablePlanAcceptance {
             dispatch_id: format!("planning-dispatch-{}", &proposal.proposal_digest[..24]),
             proposal_id: proposal.proposal_id.clone(),
             proposal_digest: proposal.proposal_digest.clone(),
             route_digest: proposal.route_digest.clone(),
             provider_registration_digest: proposal.provider_registration_digest.clone(),
+            provider_version: proposal.provider_version.clone(),
+            provider_implementation_digest: proposal.provider_implementation_digest.clone(),
+            capability_snapshot_digest: proposal
+                .capability_availability_snapshot
+                .snapshot_digest
+                .clone(),
+            mission_revision: proposal.scope.mission_revision,
         };
         let mut next_log = log.clone();
         next_log.record_dispatch(record.clone(), now)?;
@@ -1440,7 +1957,7 @@ impl MissionPlanningConsumer {
 }
 
 fn dispatch_from_record(
-    record: DurableDispatchRecord,
+    record: DurablePlanAcceptance,
     scope: PlanningScope,
     replayed: bool,
 ) -> MissionRouteDispatch {
@@ -1450,8 +1967,66 @@ fn dispatch_from_record(
         proposal_digest: record.proposal_digest,
         route_digest: record.route_digest,
         provider_registration_digest: record.provider_registration_digest,
+        provider_version: record.provider_version,
+        provider_implementation_digest: record.provider_implementation_digest,
+        capability_snapshot_digest: record.capability_snapshot_digest,
+        mission_revision: record.mission_revision,
         scope,
         replayed,
+    }
+}
+
+fn decline_record(
+    proposal: &CapabilityRouteProposal,
+    current_scope: &PlanningScope,
+    error: &PlanningError,
+) -> Option<DurablePlanDecline> {
+    if validate_text("proposal_id", &proposal.proposal_id).is_err()
+        || validate_digest("proposal_digest", &proposal.proposal_digest).is_err()
+    {
+        return None;
+    }
+    let scope_digest = current_scope.digest().ok()?;
+    let capability_snapshot_digest = validate_digest(
+        "capability_snapshot_digest",
+        &proposal.capability_availability_snapshot.snapshot_digest,
+    )
+    .ok()
+    .map(|()| {
+        proposal
+            .capability_availability_snapshot
+            .snapshot_digest
+            .clone()
+    });
+    Some(DurablePlanDecline {
+        proposal_id: proposal.proposal_id.clone(),
+        proposal_digest: proposal.proposal_digest.clone(),
+        reason: decline_reason(error),
+        scope_digest,
+        capability_snapshot_digest,
+        observed_mission_revision: current_scope.mission_revision,
+    })
+}
+
+fn decline_reason(error: &PlanningError) -> PlanDeclineReason {
+    match error {
+        PlanningError::ProviderUnavailable { .. }
+        | PlanningError::RegistrationNotFound(_)
+        | PlanningError::StaleRegistration { .. }
+        | PlanningError::ProposalRevisionMismatch => PlanDeclineReason::ProviderUnavailable,
+        PlanningError::ProviderDescriptorMismatch | PlanningError::RegistrationDigestMismatch => {
+            PlanDeclineReason::ProviderBindingDrift
+        }
+        PlanningError::CapabilityAvailabilityDrift => {
+            PlanDeclineReason::CapabilityAvailabilityDrift
+        }
+        PlanningError::ScopeMismatch { .. } => PlanDeclineReason::MissionRevisionDrift,
+        PlanningError::RouteDrift | PlanningError::ProposalDigestMismatch => {
+            PlanDeclineReason::RouteDrift
+        }
+        PlanningError::ReplayConflict => PlanDeclineReason::ReplayConflict,
+        PlanningError::DeadlineExceeded => PlanDeclineReason::DeadlineExceeded,
+        _ => PlanDeclineReason::InvalidProposal,
     }
 }
 
@@ -1495,6 +2070,7 @@ fn validate_route_capabilities(
 
 fn build_proposal(
     objective: &PlanningObjective,
+    availability_snapshot: &CapabilityAvailabilitySnapshot,
     registration: &PlanningProviderRegistration,
     route: PlanningProviderRoute,
     planning_revision: u64,
@@ -1505,6 +2081,7 @@ fn build_proposal(
         &objective.scope,
         &objective.objective_digest,
         &route.capability_id,
+        &availability_snapshot.snapshot_digest,
         &registration.registration_digest,
         &route.route_id,
         &route.steps,
@@ -1522,6 +2099,7 @@ fn build_proposal(
         objective_id: objective.objective_id.clone(),
         objective_digest: objective.objective_digest.clone(),
         capability_id: objective.requested_capability.clone(),
+        capability_availability_snapshot: availability_snapshot.clone(),
         provider_registration_id: registration.registration_id.clone(),
         provider_id: registration.descriptor.provider_id.clone(),
         provider_version: registration.descriptor.provider_version.clone(),
@@ -1558,6 +2136,17 @@ fn registration_digest(
     ))
 }
 
+fn availability_snapshot_digest(
+    snapshot: &CapabilityAvailabilitySnapshot,
+) -> Result<String, PlanningError> {
+    digest_json(&(
+        PLANNING_PLUGIN_ROUTE_SCHEMA_VERSION,
+        &snapshot.scope,
+        snapshot.registry_revision,
+        &snapshot.available,
+    ))
+}
+
 fn empty_log_digest(scope: &PlanningScope) -> Result<String, PlanningError> {
     digest_json(&(PLANNING_PLUGIN_ROUTE_SCHEMA_VERSION, scope))
 }
@@ -1577,7 +2166,7 @@ fn entry_digest(
     ))
 }
 
-fn validate_dispatch_record(record: &DurableDispatchRecord) -> Result<(), PlanningError> {
+fn validate_plan_acceptance_record(record: &DurablePlanAcceptance) -> Result<(), PlanningError> {
     validate_text("dispatch_id", &record.dispatch_id)?;
     validate_text("proposal_id", &record.proposal_id)?;
     validate_digest("proposal_digest", &record.proposal_digest)?;
@@ -1585,7 +2174,72 @@ fn validate_dispatch_record(record: &DurableDispatchRecord) -> Result<(), Planni
     validate_digest(
         "provider_registration_digest",
         &record.provider_registration_digest,
-    )
+    )?;
+    validate_version(&record.provider_version)?;
+    validate_digest(
+        "provider_implementation_digest",
+        &record.provider_implementation_digest,
+    )?;
+    validate_digest(
+        "capability_snapshot_digest",
+        &record.capability_snapshot_digest,
+    )?;
+    if record.mission_revision == 0 {
+        return Err(invalid_field(
+            "mission_revision",
+            "must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_acceptance_binding(
+    record: &DurablePlanAcceptance,
+    proposal: &CapabilityRouteProposal,
+) -> Result<(), PlanningError> {
+    if record.proposal_digest != proposal.proposal_digest
+        || record.route_digest != proposal.route_digest
+        || record.provider_registration_digest != proposal.provider_registration_digest
+        || record.provider_version != proposal.provider_version
+        || record.provider_implementation_digest != proposal.provider_implementation_digest
+        || record.capability_snapshot_digest
+            != proposal.capability_availability_snapshot.snapshot_digest
+        || record.mission_revision != proposal.scope.mission_revision
+    {
+        return Err(PlanningError::ReplayConflict);
+    }
+    Ok(())
+}
+
+fn validate_plan_decline_record(record: &DurablePlanDecline) -> Result<(), PlanningError> {
+    validate_text("proposal_id", &record.proposal_id)?;
+    validate_digest("proposal_digest", &record.proposal_digest)?;
+    validate_digest("scope_digest", &record.scope_digest)?;
+    if let Some(snapshot_digest) = &record.capability_snapshot_digest {
+        validate_digest("capability_snapshot_digest", snapshot_digest)?;
+    }
+    if record.observed_mission_revision == 0 {
+        return Err(invalid_field(
+            "observed_mission_revision",
+            "must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plan_replan_record(record: &DurablePlanReplan) -> Result<(), PlanningError> {
+    validate_text("objective_id", &record.objective_id)?;
+    validate_text("previous_proposal_id", &record.previous_proposal_id)?;
+    validate_digest("previous_proposal_digest", &record.previous_proposal_digest)?;
+    validate_text("replacement_proposal_id", &record.replacement_proposal_id)?;
+    validate_digest(
+        "replacement_proposal_digest",
+        &record.replacement_proposal_digest,
+    )?;
+    if record.previous_proposal_id == record.replacement_proposal_id {
+        return Err(PlanningError::ReplayConflict);
+    }
+    Ok(())
 }
 
 fn ensure_scope(expected: &PlanningScope, actual: &PlanningScope) -> Result<(), PlanningError> {
