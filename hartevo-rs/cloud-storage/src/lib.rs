@@ -19,11 +19,19 @@ use thiserror::Error;
 use tokio_postgres::{Client, Row, Transaction};
 
 mod effect_ledger;
+mod scheduler;
 
 pub use effect_ledger::{CloudPermissionFenceMutation, CloudPermissionFenceResult};
+pub use scheduler::{
+    MAX_SCHEDULER_LEASE_SECONDS, SchedulerAttempt, SchedulerAttemptOutcome,
+    SchedulerAttemptSurface, SchedulerBackpressure, SchedulerBackpressureState, SchedulerBudget,
+    SchedulerFairness, SchedulerLeaderLease, SchedulerLeaseKind, SchedulerLeaseProof,
+    SchedulerLeaseTakeover, SchedulerLeaseTakeoverReason, SchedulerReplay, SchedulerSchedule,
+    SchedulerScheduleStatus, SchedulerTrigger, SchedulerWorkerLease, scheduler_digest,
+};
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_CIPHERTEXT_BYTES: usize = 16 * 1024 * 1024;
 const CLAIM_OUTBOX_SQL: &str = "WITH candidates AS (
        SELECT sequence FROM hartevo_cell.outbox_messages
@@ -420,7 +428,7 @@ impl PostgresCellStore {
         let transaction = client.transaction().await?;
         transaction
             .query_one(
-                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v4'))",
+                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v5'))",
                 &[],
             )
             .await?;
@@ -2552,6 +2560,26 @@ pub enum CloudStorageError {
         owner: String,
         generation: u64,
     },
+    #[error("scheduler schedule is malformed or outside its exact contract")]
+    InvalidSchedulerSchedule,
+    #[error("scheduler schedule already exists with a different immutable request")]
+    SchedulerScheduleConflict,
+    #[error("scheduler schedule is not visible in the exact tenant, project, and Cell scope")]
+    SchedulerScheduleNotFound,
+    #[error("scheduler lease request is malformed or outside its bounded validity window")]
+    InvalidSchedulerLease,
+    #[error("scheduler lease is still active")]
+    SchedulerLeaseActive,
+    #[error("scheduler lease owner/generation no longer matches")]
+    SchedulerLeaseLost {
+        kind: SchedulerLeaseKind,
+        id: String,
+        generation: u64,
+    },
+    #[error("scheduler attempt is malformed or conflicts with an existing idempotency record")]
+    InvalidSchedulerAttempt,
+    #[error("scheduler attempt already exists with a different immutable request")]
+    SchedulerAttemptConflict,
     #[error("remote Effect execution requires a team project with explicit current opt-in")]
     RemoteEffectExecutionNotAllowed,
     #[error("remote Effect permission fence mutation is malformed or out of scope")]
@@ -2794,7 +2822,7 @@ mod tests {
 
     #[test]
     fn schema_contract_has_physical_cell_rls_ciphertext_and_append_only_versions() {
-        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(SCHEMA_VERSION, 5);
         assert!(SCHEMA.contains("FORCE ROW LEVEL SECURITY"));
         assert!(SCHEMA.contains("current_setting(''hartevo.tenant_id'', true)"));
         assert!(SCHEMA.contains("current_setting(''hartevo.cell'', true)"));
@@ -2815,6 +2843,29 @@ mod tests {
         assert!(SCHEMA.contains("effect_rate_limit_buckets"));
         assert!(SCHEMA.contains("effect_rate_limit_reservations"));
         assert!(SCHEMA.contains("effect_rate_limit_decisions"));
+        for scheduler_table in [
+            "scheduler_schedules",
+            "scheduler_leader_leases",
+            "scheduler_worker_leases",
+            "scheduler_tenant_state",
+            "scheduler_lease_takeovers",
+            "scheduler_attempts",
+        ] {
+            assert!(
+                SCHEMA.contains(scheduler_table),
+                "missing {scheduler_table}"
+            );
+            assert!(
+                SCHEMA.contains(&format!(
+                    "ALTER TABLE hartevo_cell.{scheduler_table} FORCE ROW LEVEL SECURITY"
+                )),
+                "scheduler table is not forced through RLS: {scheduler_table}"
+            );
+        }
+        assert!(SCHEMA.contains("generation = previous_generation + 1"));
+        assert!(SCHEMA.contains("outcome <> 'uncertain' OR replay = 'suppressed_uncertain'"));
+        assert!(SCHEMA.contains("backpressure_state"));
+        assert!(SCHEMA.contains("fairness_weight"));
         assert!(SCHEMA.contains("'creator_contact'"));
         assert!(SCHEMA.contains("'uncertain'"));
         assert!(SCHEMA.contains("jsonb_typeof(receipt_json) = 'object'"));

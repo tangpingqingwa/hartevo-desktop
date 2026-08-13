@@ -135,6 +135,126 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.outbox_messages (
     )
 );
 
+-- Scheduler coordination records contain only routing metadata, digests and
+-- bounded counters. Raw owner/token values and project/runtime content never
+-- cross this Cell boundary.
+CREATE TABLE IF NOT EXISTS hartevo_cell.scheduler_schedules (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    schedule_id TEXT NOT NULL CHECK (length(btrim(schedule_id)) > 0),
+    mission_id_digest TEXT NOT NULL CHECK (mission_id_digest ~ '^[0-9a-fA-F]{64}$'),
+    cycle BIGINT NOT NULL CHECK (cycle > 0),
+    trigger TEXT NOT NULL CHECK (trigger IN ('interval', 'event', 'interval_or_event')),
+    status TEXT NOT NULL CHECK (
+        status IN ('pending', 'leased', 'triggered', 'paused', 'expired', 'dead_letter', 'uncertain')
+    ),
+    next_due_at TIMESTAMPTZ,
+    contract_valid_until TIMESTAMPTZ NOT NULL,
+    revision BIGINT NOT NULL CHECK (revision > 0),
+    record_json JSONB NOT NULL CHECK (jsonb_typeof(record_json) = 'object'),
+    PRIMARY KEY (cell, tenant_id, project_id, schedule_id),
+    FOREIGN KEY (cell, tenant_id, project_id)
+        REFERENCES hartevo_cell.projects (cell, tenant_id, project_id),
+    CHECK (contract_valid_until > COALESCE(next_due_at, contract_valid_until - INTERVAL '1 microsecond'))
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.scheduler_leader_leases (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    lease_key_digest TEXT NOT NULL CHECK (lease_key_digest ~ '^[0-9a-fA-F]{64}$'),
+    owner_digest TEXT NOT NULL CHECK (owner_digest ~ '^[0-9a-fA-F]{64}$'),
+    token_digest TEXT NOT NULL CHECK (token_digest ~ '^[0-9a-fA-F]{64}$'),
+    generation BIGINT NOT NULL CHECK (generation > 0),
+    claimed_at TIMESTAMPTZ NOT NULL,
+    heartbeat_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (cell, tenant_id, lease_key_digest),
+    FOREIGN KEY (cell, tenant_id)
+        REFERENCES hartevo_cell.tenant_cells (cell, tenant_id),
+    CHECK (claimed_at <= heartbeat_at AND heartbeat_at < expires_at)
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.scheduler_worker_leases (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    schedule_id TEXT NOT NULL,
+    worker_id_digest TEXT NOT NULL CHECK (worker_id_digest ~ '^[0-9a-fA-F]{64}$'),
+    owner_digest TEXT NOT NULL CHECK (owner_digest ~ '^[0-9a-fA-F]{64}$'),
+    token_digest TEXT NOT NULL CHECK (token_digest ~ '^[0-9a-fA-F]{64}$'),
+    generation BIGINT NOT NULL CHECK (generation > 0),
+    claimed_at TIMESTAMPTZ NOT NULL,
+    heartbeat_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (cell, tenant_id, project_id, schedule_id, worker_id_digest),
+    FOREIGN KEY (cell, tenant_id, project_id, schedule_id)
+        REFERENCES hartevo_cell.scheduler_schedules
+            (cell, tenant_id, project_id, schedule_id),
+    CHECK (claimed_at <= heartbeat_at AND heartbeat_at < expires_at)
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.scheduler_tenant_state (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    fairness_weight INTEGER NOT NULL CHECK (fairness_weight > 0 AND fairness_weight <= 1000),
+    virtual_finish BIGINT NOT NULL CHECK (virtual_finish >= 0),
+    backpressure_state TEXT NOT NULL CHECK (backpressure_state IN ('open', 'soft', 'hard')),
+    pending BIGINT NOT NULL CHECK (pending >= 0),
+    in_flight BIGINT NOT NULL CHECK (in_flight >= 0),
+    max_pending BIGINT NOT NULL CHECK (max_pending > 0),
+    max_in_flight BIGINT NOT NULL CHECK (max_in_flight > 0),
+    revision BIGINT NOT NULL CHECK (revision > 0),
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (cell, tenant_id),
+    FOREIGN KEY (cell, tenant_id)
+        REFERENCES hartevo_cell.tenant_cells (cell, tenant_id),
+    CHECK (pending <= max_pending AND in_flight <= max_in_flight)
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.scheduler_lease_takeovers (
+    sequence BIGSERIAL PRIMARY KEY,
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT,
+    lease_kind TEXT NOT NULL CHECK (lease_kind IN ('leader', 'worker')),
+    lease_id_digest TEXT NOT NULL CHECK (lease_id_digest ~ '^[0-9a-fA-F]{64}$'),
+    previous_generation BIGINT NOT NULL CHECK (previous_generation > 0),
+    generation BIGINT NOT NULL CHECK (generation = previous_generation + 1),
+    previous_owner_digest TEXT NOT NULL CHECK (previous_owner_digest ~ '^[0-9a-fA-F]{64}$'),
+    owner_digest TEXT NOT NULL CHECK (owner_digest ~ '^[0-9a-fA-F]{64}$'),
+    reason TEXT NOT NULL CHECK (reason IN ('expired', 'coordinator_restart', 'explicit')),
+    evidence_digest TEXT NOT NULL CHECK (evidence_digest ~ '^[0-9a-fA-F]{64}$'),
+    observed_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (cell, tenant_id, lease_kind, lease_id_digest, generation),
+    FOREIGN KEY (cell, tenant_id)
+        REFERENCES hartevo_cell.tenant_cells (cell, tenant_id),
+    CHECK (project_id IS NULL OR length(btrim(project_id)) > 0)
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.scheduler_attempts (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    schedule_id TEXT NOT NULL,
+    attempt_id_digest TEXT NOT NULL CHECK (attempt_id_digest ~ '^[0-9a-fA-F]{64}$'),
+    worker_generation BIGINT NOT NULL CHECK (worker_generation > 0),
+    surface TEXT NOT NULL CHECK (surface IN ('runtime', 'browser', 'effect')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('running', 'succeeded', 'failed', 'uncertain', 'completed')),
+    replay TEXT NOT NULL CHECK (replay IN ('allowed', 'suppressed_uncertain', 'suppressed_completed')),
+    idempotency_key_digest TEXT NOT NULL CHECK (idempotency_key_digest ~ '^[0-9a-fA-F]{64}$'),
+    started_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    record_json JSONB NOT NULL CHECK (jsonb_typeof(record_json) = 'object'),
+    PRIMARY KEY (cell, tenant_id, project_id, attempt_id_digest),
+    FOREIGN KEY (cell, tenant_id, project_id, schedule_id)
+        REFERENCES hartevo_cell.scheduler_schedules
+            (cell, tenant_id, project_id, schedule_id),
+    CHECK (started_at <= updated_at),
+    CHECK (outcome <> 'uncertain' OR replay = 'suppressed_uncertain'),
+    CHECK (outcome <> 'completed' OR replay = 'suppressed_completed')
+);
+
 CREATE TABLE IF NOT EXISTS hartevo_cell.sync_mutations (
     cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
     tenant_id TEXT NOT NULL,
@@ -689,6 +809,18 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.effect_rate_limit_decisions (
 CREATE INDEX IF NOT EXISTS outbox_claim_idx
     ON hartevo_cell.outbox_messages
         (cell, tenant_id, status, available_at, sequence);
+CREATE INDEX IF NOT EXISTS scheduler_schedule_due_idx
+    ON hartevo_cell.scheduler_schedules
+        (cell, tenant_id, status, next_due_at, contract_valid_until, revision);
+CREATE INDEX IF NOT EXISTS scheduler_worker_takeover_idx
+    ON hartevo_cell.scheduler_worker_leases
+        (cell, tenant_id, project_id, expires_at, generation);
+CREATE INDEX IF NOT EXISTS scheduler_takeover_lookup_idx
+    ON hartevo_cell.scheduler_lease_takeovers
+        (cell, tenant_id, lease_kind, lease_id_digest, generation);
+CREATE INDEX IF NOT EXISTS scheduler_attempt_reconcile_idx
+    ON hartevo_cell.scheduler_attempts
+        (cell, tenant_id, project_id, schedule_id, outcome, updated_at);
 CREATE INDEX IF NOT EXISTS sync_versions_replay_idx
     ON hartevo_cell.sync_object_versions
         (cell, tenant_id, project_id, recorded_at, object_id, revision);
@@ -717,6 +849,18 @@ ALTER TABLE hartevo_cell.domain_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.domain_events FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.outbox_messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.outbox_messages FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.scheduler_schedules ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.scheduler_schedules FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.scheduler_leader_leases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.scheduler_leader_leases FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.scheduler_worker_leases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.scheduler_worker_leases FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.scheduler_tenant_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.scheduler_tenant_state FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.scheduler_lease_takeovers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.scheduler_lease_takeovers FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.scheduler_attempts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.scheduler_attempts FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.sync_mutations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.sync_mutations FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.device_public_key_versions ENABLE ROW LEVEL SECURITY;
@@ -765,6 +909,12 @@ BEGIN
         'sync_object_heads',
         'domain_events',
         'outbox_messages',
+        'scheduler_schedules',
+        'scheduler_leader_leases',
+        'scheduler_worker_leases',
+        'scheduler_tenant_state',
+        'scheduler_lease_takeovers',
+        'scheduler_attempts',
         'sync_mutations',
         'device_public_key_versions',
         'device_public_key_heads',
