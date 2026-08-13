@@ -1581,6 +1581,262 @@ pub enum ContextAssemblyError {
     EnvelopeManifestMismatch,
 }
 
+/// The three user-visible recovery boundaries of a long-running Mission.
+///
+/// These are deliberately not Runtime states.  A Runtime generation may be
+/// replaced while the Mission, its evidence, and its decision contract stay
+/// the same.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionRestartPhase {
+    BeforeFirstDelta,
+    DuringStreaming,
+    BeforeHumanDecision,
+}
+
+/// Content-free, exact identity/revision fence used when reopening a Mission.
+/// All payloads are represented by digests; the snapshot is safe to carry in
+/// an Event, Outbox, or diagnostic response.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionRestartSnapshot {
+    pub tenant_id: hartevo_domain_kernel::TenantId,
+    pub project_id: hartevo_domain_kernel::ProjectId,
+    pub mission_id: hartevo_domain_kernel::MissionId,
+    pub conversation_id: hartevo_domain_kernel::MissionConversationId,
+    pub checkpoint_id: hartevo_domain_kernel::ContextCheckpointId,
+    pub project_digest: String,
+    pub mission_digest: String,
+    pub contract_digest: String,
+    pub conversation_digest: String,
+    pub pack_digest: Option<String>,
+    pub pack_revision: Option<u64>,
+    pub mission_revision: u64,
+    pub conversation_revision: u64,
+    pub cursor_digest: String,
+    pub generation: u64,
+    pub attachment_epoch: u64,
+    pub idempotency_digest: String,
+    pub event_log_digest: String,
+    pub outbox_digest: String,
+}
+
+impl fmt::Debug for MissionRestartSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MissionRestartSnapshot")
+            .field("tenant_digest", &digest(self.tenant_id.as_str().as_bytes()))
+            .field("project_digest", &digest(self.project_id.as_str().as_bytes()))
+            .field("mission_digest", &digest(self.mission_id.as_str().as_bytes()))
+            .field(
+                "conversation_digest",
+                &digest(self.conversation_id.as_str().as_bytes()),
+            )
+            .field("checkpoint_id_digest", &digest(self.checkpoint_id.as_str().as_bytes()))
+            .field("project_state_digest", &self.project_digest)
+            .field("mission_state_digest", &self.mission_digest)
+            .field("contract_digest", &self.contract_digest)
+            .field("conversation_state_digest", &self.conversation_digest)
+            .field("pack_digest", &self.pack_digest)
+            .field("pack_revision", &self.pack_revision)
+            .field("mission_revision", &self.mission_revision)
+            .field("conversation_revision", &self.conversation_revision)
+            .field("cursor_digest", &self.cursor_digest)
+            .field("generation", &self.generation)
+            .field("attachment_epoch", &self.attachment_epoch)
+            .field("idempotency_digest", &self.idempotency_digest)
+            .field("event_log_digest", &self.event_log_digest)
+            .field("outbox_digest", &self.outbox_digest)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionRestartSnapshotParts {
+    pub tenant_id: hartevo_domain_kernel::TenantId,
+    pub project_id: hartevo_domain_kernel::ProjectId,
+    pub mission_id: hartevo_domain_kernel::MissionId,
+    pub conversation_id: hartevo_domain_kernel::MissionConversationId,
+    pub checkpoint_id: hartevo_domain_kernel::ContextCheckpointId,
+    pub project_digest: String,
+    pub mission_digest: String,
+    pub contract_digest: String,
+    pub conversation_digest: String,
+    pub pack_digest: Option<String>,
+    pub pack_revision: Option<u64>,
+    pub mission_revision: u64,
+    pub conversation_revision: u64,
+    pub cursor_digest: String,
+    pub generation: u64,
+    pub attachment_epoch: u64,
+    pub idempotency_digest: String,
+    pub event_log_digest: String,
+    pub outbox_digest: String,
+}
+
+impl MissionRestartSnapshot {
+    pub fn from_parts(parts: MissionRestartSnapshotParts) -> Result<Self, MissionRestartError> {
+        let value = Self {
+            tenant_id: parts.tenant_id,
+            project_id: parts.project_id,
+            mission_id: parts.mission_id,
+            conversation_id: parts.conversation_id,
+            checkpoint_id: parts.checkpoint_id,
+            project_digest: parts.project_digest,
+            mission_digest: parts.mission_digest,
+            contract_digest: parts.contract_digest,
+            conversation_digest: parts.conversation_digest,
+            pack_digest: parts.pack_digest,
+            pack_revision: parts.pack_revision,
+            mission_revision: parts.mission_revision,
+            conversation_revision: parts.conversation_revision,
+            cursor_digest: parts.cursor_digest,
+            generation: parts.generation,
+            attachment_epoch: parts.attachment_epoch,
+            idempotency_digest: parts.idempotency_digest,
+            event_log_digest: parts.event_log_digest,
+            outbox_digest: parts.outbox_digest,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), MissionRestartError> {
+        let valid_ids = !self.tenant_id.as_str().trim().is_empty()
+            && !self.project_id.as_str().trim().is_empty()
+            && !self.mission_id.as_str().trim().is_empty()
+            && !self.conversation_id.as_str().trim().is_empty()
+            && !self.checkpoint_id.as_str().trim().is_empty();
+        let valid_digests = [
+            self.project_digest.as_str(),
+            self.mission_digest.as_str(),
+            self.contract_digest.as_str(),
+            self.conversation_digest.as_str(),
+            self.cursor_digest.as_str(),
+            self.idempotency_digest.as_str(),
+            self.event_log_digest.as_str(),
+            self.outbox_digest.as_str(),
+        ]
+        .into_iter()
+        .all(is_sha256);
+        if !valid_ids
+            || !valid_digests
+            || self.pack_digest.as_deref().is_some_and(|value| !is_sha256(value))
+            || self.pack_digest.is_some() != self.pack_revision.is_some()
+            || self.pack_revision.is_some_and(|value| value == 0)
+            || self.mission_revision == 0
+            || self.conversation_revision == 0
+            || self.generation == 0
+            || self.attachment_epoch == 0
+        {
+            return Err(MissionRestartError::InvalidSnapshot);
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String, MissionRestartError> {
+        self.validate()?;
+        serde_json::to_vec(self)
+            .map(|bytes| digest(&bytes))
+            .map_err(|_| MissionRestartError::InvalidSnapshot)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissionRestartCheckpoint {
+    pub schema_version: u32,
+    pub phase: MissionRestartPhase,
+    pub snapshot: MissionRestartSnapshot,
+    pub checkpoint_digest: String,
+}
+
+impl MissionRestartCheckpoint {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn new(
+        phase: MissionRestartPhase,
+        snapshot: MissionRestartSnapshot,
+    ) -> Result<Self, MissionRestartError> {
+        snapshot.validate()?;
+        if phase == MissionRestartPhase::BeforeHumanDecision && snapshot.pack_digest.is_none() {
+            return Err(MissionRestartError::MissingAuthority);
+        }
+        let mut value = Self {
+            schema_version: Self::SCHEMA_VERSION,
+            phase,
+            snapshot,
+            checkpoint_digest: String::new(),
+        };
+        value.checkpoint_digest = value.calculate_digest()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), MissionRestartError> {
+        if self.schema_version != Self::SCHEMA_VERSION
+            || self.snapshot.validate().is_err()
+            || (self.phase == MissionRestartPhase::BeforeHumanDecision
+                && self.snapshot.pack_digest.is_none())
+            || self.checkpoint_digest != self.calculate_digest()?
+        {
+            return Err(MissionRestartError::InvalidCheckpoint);
+        }
+        Ok(())
+    }
+
+    pub fn validate_reopen(
+        &self,
+        current: &MissionRestartCheckpoint,
+    ) -> Result<MissionRestartDisposition, MissionRestartError> {
+        self.validate()?;
+        current.validate()?;
+        if self.snapshot.tenant_id != current.snapshot.tenant_id
+            || self.snapshot.project_id != current.snapshot.project_id
+            || self.snapshot.mission_id != current.snapshot.mission_id
+            || self.snapshot.conversation_id != current.snapshot.conversation_id
+        {
+            return Err(MissionRestartError::CrossProject);
+        }
+        if self.phase != current.phase || self.snapshot != current.snapshot {
+            return Err(MissionRestartError::StaleSnapshot);
+        }
+        Ok(MissionRestartDisposition::ExactReplay)
+    }
+
+    fn calculate_digest(&self) -> Result<String, MissionRestartError> {
+        let mut value = serde_json::to_value(&self.snapshot)
+            .map_err(|_| MissionRestartError::InvalidCheckpoint)?;
+        let object = value
+            .as_object_mut()
+            .ok_or(MissionRestartError::InvalidCheckpoint)?;
+        object.insert("phase".into(), serde_json::json!(self.phase));
+        object.insert("schemaVersion".into(), serde_json::json!(self.schema_version));
+        object.insert("checkpointDigest".into(), serde_json::Value::String(String::new()));
+        serde_json::to_vec(&value)
+            .map(|bytes| digest(&bytes))
+            .map_err(|_| MissionRestartError::InvalidCheckpoint)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissionRestartDisposition {
+    ExactReplay,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum MissionRestartError {
+    #[error("restart snapshot is malformed or incomplete")]
+    InvalidSnapshot,
+    #[error("restart checkpoint is malformed or its digest does not match")]
+    InvalidCheckpoint,
+    #[error("restart checkpoint lacks required durable authority")]
+    MissingAuthority,
+    #[error("restart checkpoint belongs to another project or mission")]
+    CrossProject,
+    #[error("restart checkpoint cursor, generation, epoch, or revision is stale")]
+    StaleSnapshot,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -2471,5 +2727,91 @@ mod tests {
             ContextAssembler::assemble(&request, &fixture.resolver, &ByteTokenizer),
             Err(ContextAssemblyError::ScopeMismatch)
         ));
+    }
+
+    fn restart_snapshot(pack: bool) -> MissionRestartSnapshot {
+        let digest = || "a".repeat(64);
+        MissionRestartSnapshot::from_parts(MissionRestartSnapshotParts {
+            tenant_id: TenantId::from("restart-tenant"),
+            project_id: ProjectId::from("restart-project"),
+            mission_id: MissionId::from("restart-mission"),
+            conversation_id: hartevo_domain_kernel::MissionConversationId::from(
+                "restart-conversation",
+            ),
+            checkpoint_id: ContextCheckpointId::from("restart-checkpoint"),
+            project_digest: digest(),
+            mission_digest: digest(),
+            contract_digest: digest(),
+            conversation_digest: digest(),
+            pack_digest: pack.then(digest),
+            pack_revision: pack.then_some(3),
+            mission_revision: 4,
+            conversation_revision: 5,
+            cursor_digest: digest(),
+            generation: 6,
+            attachment_epoch: 7,
+            idempotency_digest: digest(),
+            event_log_digest: digest(),
+            outbox_digest: digest(),
+        })
+        .expect("valid restart snapshot")
+    }
+
+    #[test]
+    fn mission_restart_checkpoint_is_exact_and_fails_closed_on_scope_or_cursor_drift() {
+        for phase in [
+            MissionRestartPhase::BeforeFirstDelta,
+            MissionRestartPhase::DuringStreaming,
+            MissionRestartPhase::BeforeHumanDecision,
+        ] {
+            let snapshot = restart_snapshot(true);
+            let checkpoint = MissionRestartCheckpoint::new(phase, snapshot.clone())
+                .expect("phase has required durable fields");
+            assert_eq!(
+                checkpoint
+                    .validate_reopen(&checkpoint)
+                    .expect("exact reopen"),
+                MissionRestartDisposition::ExactReplay
+            );
+
+            let mut stale_snapshot = snapshot.clone();
+            stale_snapshot.cursor_digest = "b".repeat(64);
+            let stale = MissionRestartCheckpoint::new(phase, stale_snapshot)
+                .expect("stale snapshot remains well-formed");
+            assert_eq!(
+                checkpoint.validate_reopen(&stale),
+                Err(MissionRestartError::StaleSnapshot)
+            );
+
+            let mut cross_project = snapshot;
+            cross_project.project_id = ProjectId::from("other-project");
+            let cross_project = MissionRestartCheckpoint::new(phase, cross_project)
+                .expect("cross-project snapshot remains well-formed");
+            assert_eq!(
+                checkpoint.validate_reopen(&cross_project),
+                Err(MissionRestartError::CrossProject)
+            );
+        }
+    }
+
+    #[test]
+    fn mission_restart_checkpoint_requires_pack_before_human_decision_and_redacts_ids() {
+        assert_eq!(
+            MissionRestartCheckpoint::new(
+                MissionRestartPhase::BeforeHumanDecision,
+                restart_snapshot(false),
+            ),
+            Err(MissionRestartError::MissingAuthority)
+        );
+
+        let snapshot = restart_snapshot(true);
+        let debug = format!("{snapshot:?}");
+        assert!(!debug.contains("restart-project"));
+        assert!(!debug.contains("restart-mission"));
+        assert!(debug.contains("project_state_digest"));
+
+        let mut invalid = snapshot;
+        invalid.cursor_digest.clear();
+        assert_eq!(invalid.validate(), Err(MissionRestartError::InvalidSnapshot));
     }
 }
