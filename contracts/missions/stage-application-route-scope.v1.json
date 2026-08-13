@@ -1,0 +1,102 @@
+{
+  "schemaVersion": "hartevo-stage-application-route-scope-contract/v1",
+  "contractVersion": "desktop-2026-08-13-ct04-v1",
+  "evidenceLevel": "E1",
+  "releaseEvidenceSchemaVersion": "2.3.0",
+  "missionCatalogVersion": "desktop-2026-08-12-v11",
+  "routeGraphContractVersion": "desktop-2026-08-12-ct02-v1",
+  "applicationHandlerRegistryVersion": "desktop-2026-08-12-v8",
+  "routeRuntimeAuthorityContractVersion": "desktop-2026-08-13-ct03-v1",
+  "defaultMissingHandlerStatus": "NOT_IMPLEMENTED",
+  "genericRuntimeAuthority": "denied",
+  "stages": [
+    {
+      "stage": "engineering_foundation",
+      "requiredMissionIds": [
+        "VM-00",
+        "VM-07",
+        "VM-11"
+      ],
+      "requiredAnyOfMissionSets": [
+        {
+          "kind": "writing_mission",
+          "missionIds": [
+            "VM-01",
+            "VM-03",
+            "VM-04",
+            "VM-05"
+          ],
+          "minimumSelected": 1
+        }
+      ]
+    },
+    {
+      "stage": "internal_alpha",
+      "requiredMissionIds": [
+        "VM-00",
+        "VM-07",
+        "VM-11"
+      ],
+      "requiredAnyOfMissionSets": [
+        {
+          "kind": "writing_mission",
+          "missionIds": [
+            "VM-01",
+            "VM-03",
+            "VM-04",
+            "VM-05"
+          ],
+          "minimumSelected": 1
+        }
+      ]
+    },
+    {
+      "stage": "controlled_beta",
+      "requiredMissionIds": [
+        "VM-01",
+        "VM-02",
+        "VM-03",
+        "VM-04",
+        "VM-05",
+        "VM-06"
+      ],
+      "requiredAnyOfMissionSets": []
+    },
+    {
+      "stage": "general_availability",
+      "requiredMissionIds": [
+        "VM-00",
+        "VM-01",
+        "VM-02",
+        "VM-03",
+        "VM-04",
+        "VM-05",
+        "VM-06",
+        "VM-07",
+        "VM-08",
+        "VM-09",
+        "VM-10",
+        "VM-11"
+      ],
+      "requiredAnyOfMissionSets": []
+    },
+    {
+      "stage": "mature_e5",
+      "requiredMissionIds": [
+        "VM-00",
+        "VM-01",
+        "VM-02",
+        "VM-03",
+        "VM-04",
+        "VM-05",
+        "VM-06",
+        "VM-07",
+        "VM-08",
+        "VM-09",
+        "VM-10",
+        "VM-11"
+      ],
+      "requiredAnyOfMissionSets": []
+    }
+  ]
+}
