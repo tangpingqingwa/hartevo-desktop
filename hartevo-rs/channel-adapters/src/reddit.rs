@@ -23,12 +23,14 @@ use crate::transport::{
 pub const REDDIT_OAUTH_API_BASE_URL: &str = "https://oauth.reddit.com/";
 pub const REDDIT_IDENTITY_SCOPE: &str = "identity";
 pub const REDDIT_READ_SCOPE: &str = "read";
+pub const REDDIT_SUBMIT_SCOPE: &str = "submit";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RedditScope {
     Identity,
     Read,
+    Submit,
 }
 
 impl RedditScope {
@@ -36,6 +38,7 @@ impl RedditScope {
         match self {
             Self::Identity => REDDIT_IDENTITY_SCOPE,
             Self::Read => REDDIT_READ_SCOPE,
+            Self::Submit => REDDIT_SUBMIT_SCOPE,
         }
     }
 
