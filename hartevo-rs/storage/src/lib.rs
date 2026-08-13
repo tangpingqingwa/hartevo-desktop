@@ -4610,6 +4610,8 @@ pub enum StorageError {
     #[error(transparent)]
     MissionRestart(#[from] hartevo_context_fabric::MissionRestartError),
     #[error(transparent)]
+    MissionControl(#[from] hartevo_context_fabric::MissionControlError),
+    #[error(transparent)]
     Browser(#[from] hartevo_browser_adapter::BrowserError),
     #[error(transparent)]
     RuntimeTurn(#[from] hartevo_domain_kernel::RuntimeTurnError),
