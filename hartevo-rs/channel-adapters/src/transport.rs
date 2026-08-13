@@ -307,6 +307,22 @@ pub enum ChannelAdapterError {
     },
     #[error("transport unavailable for {provider}")]
     TransportUnavailable { provider: ProviderId },
+    #[error("provider read is blocked by environment for {provider}: {requirement}")]
+    BlockedEnvironment {
+        provider: ProviderId,
+        requirement: &'static str,
+    },
+    #[error("durable cursor is stale for {provider} stream {stream}")]
+    CursorStale {
+        provider: ProviderId,
+        stream: &'static str,
+    },
+    #[error("freshness expired for {provider}: valid until {valid_until}")]
+    FreshnessExpired {
+        provider: ProviderId,
+        observed_at: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+    },
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

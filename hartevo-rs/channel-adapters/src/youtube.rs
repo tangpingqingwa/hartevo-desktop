@@ -56,6 +56,7 @@ pub enum YoutubeQuotaOperation {
     ChannelsList,
     VideosList,
     CommentThreadsList,
+    PlaylistItemsList,
     AnalyticsReportQuery,
 }
 
@@ -63,8 +64,36 @@ impl YoutubeQuotaOperation {
     const fn documented_data_api_cost(self) -> Option<u32> {
         match self {
             Self::AnalyticsReportQuery => None,
-            Self::ChannelsList | Self::VideosList | Self::CommentThreadsList => Some(1),
+            Self::ChannelsList
+            | Self::VideosList
+            | Self::CommentThreadsList
+            | Self::PlaylistItemsList => Some(1),
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct YoutubePageToken(String);
+
+impl YoutubePageToken {
+    pub fn new(value: impl Into<String>) -> Result<Self, ChannelAdapterError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 512
+            || value.chars().any(|character| {
+                !character.is_ascii() || character.is_ascii_control() || character.is_whitespace()
+            })
+        {
+            return Err(ChannelAdapterError::InvalidRequest(
+                "invalid YouTube page token",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -357,6 +386,12 @@ pub enum YoutubeReadTarget {
     Videos {
         ids: Vec<YoutubeVideoId>,
     },
+    Uploads {
+        channel_id: YoutubeChannelId,
+        playlist_id: YoutubePlaylistId,
+        page_token: Option<YoutubePageToken>,
+        max_results: u8,
+    },
     CommentThreads {
         channel_id: Option<YoutubeChannelId>,
         video_id: Option<YoutubeVideoId>,
@@ -370,6 +405,7 @@ impl YoutubeReadTarget {
     pub const fn operation(&self) -> YoutubeQuotaOperation {
         match self {
             Self::Videos { .. } => YoutubeQuotaOperation::VideosList,
+            Self::Uploads { .. } => YoutubeQuotaOperation::PlaylistItemsList,
             Self::CommentThreads { .. } => YoutubeQuotaOperation::CommentThreadsList,
             Self::Analytics(_) => YoutubeQuotaOperation::AnalyticsReportQuery,
         }
@@ -381,6 +417,12 @@ impl YoutubeReadTarget {
     ) -> Result<ProviderReadRequest, ChannelAdapterError> {
         match self {
             Self::Videos { ids } => videos_request(ids, credential),
+            Self::Uploads {
+                playlist_id,
+                page_token,
+                max_results,
+                ..
+            } => uploads_request(playlist_id, page_token.as_ref(), *max_results, credential),
             Self::CommentThreads {
                 channel_id,
                 video_id,
@@ -396,6 +438,40 @@ impl YoutubeReadTarget {
             Self::Analytics(query) => analytics_request(query, credential),
         }
     }
+}
+
+fn uploads_request(
+    playlist_id: &YoutubePlaylistId,
+    page_token: Option<&YoutubePageToken>,
+    max_results: u8,
+    credential: CredentialReference,
+) -> Result<ProviderReadRequest, ChannelAdapterError> {
+    if !(1..=50).contains(&max_results) {
+        return Err(ChannelAdapterError::InvalidRequest(
+            "YouTube playlistItems.list requires one to fifty results",
+        ));
+    }
+    let mut url = Url::parse(DATA_API_BASE_URL).map_err(|_| invalid_endpoint())?;
+    url.path_segments_mut()
+        .map_err(|()| invalid_endpoint())?
+        .push("playlistItems");
+    url.query_pairs_mut()
+        .append_pair("part", "contentDetails,snippet,status")
+        .append_pair("playlistId", playlist_id.as_str())
+        .append_pair("maxResults", &max_results.to_string());
+    if let Some(page_token) = page_token {
+        url.query_pairs_mut()
+            .append_pair("pageToken", page_token.as_str());
+    }
+    ProviderReadRequest::new(
+        crate::identity::ProviderId::Youtube,
+        ReadOperation::Content,
+        HttpMethod::Get,
+        url,
+        [YoutubeScope::YoutubeReadonly.name()?],
+        credential,
+        None,
+    )
 }
 
 fn videos_request(
@@ -658,11 +734,52 @@ pub fn parse_read_response(
     let body = successful_json(response)?;
     match target {
         YoutubeReadTarget::Videos { .. } => parse_videos(&body, response.observed_at()),
+        YoutubeReadTarget::Uploads { channel_id, .. } => {
+            parse_uploads(&body, channel_id, response.observed_at())
+        }
         YoutubeReadTarget::CommentThreads { .. } => parse_comments(&body, response.observed_at()),
         YoutubeReadTarget::Analytics(query) => {
             parse_analytics(&body, query, response.observed_at())
         }
     }
+}
+
+fn parse_uploads(
+    body: &serde_json::Value,
+    channel_id: &YoutubeChannelId,
+    observed_at: DateTime<Utc>,
+) -> Result<YoutubeReadResult, ChannelAdapterError> {
+    let items = response_items(body)?;
+    let mut observations = Vec::with_capacity(items.len());
+    for item in items {
+        let video_id = YoutubeVideoId::new(required_string_at(item, "/contentDetails/videoId")?)
+            .map_err(|_| invalid_response("playlistItem.contentDetails.videoId"))?;
+        let item_channel_id =
+            YoutubeChannelId::new(required_string_at(item, "/snippet/channelId")?)
+                .map_err(|_| invalid_response("playlistItem.snippet.channelId"))?;
+        if &item_channel_id != channel_id {
+            return Err(invalid_response("playlistItem.snippet.channelId"));
+        }
+        let etag = YoutubeEtag::new(required_string(item, "etag")?)
+            .map_err(|_| invalid_response("playlistItem.etag"))?;
+        let identity = YoutubeVideoIdentity::new(item_channel_id, video_id);
+        let content = ContentIdentity::YoutubeVideo(identity.clone());
+        let revision = YoutubeRevisionIdentity::new(content, etag, observed_at)
+            .map_err(|_| invalid_response("playlistItem.revision"))?;
+        observations.push(YoutubeReadObservation::Video(YoutubeVideoObservation {
+            identity,
+            revision,
+            visibility: YoutubeVisibility::Unknown,
+            moderation: YoutubeModerationState::Unknown,
+            views: None,
+            likes: None,
+            comments: None,
+        }));
+    }
+    Ok(YoutubeReadResult {
+        observations,
+        next_page_token: next_page_token(body),
+    })
 }
 
 fn parse_videos(
@@ -820,7 +937,9 @@ fn parse_analytics(
     })
 }
 
-fn successful_json(response: &ProviderResponse) -> Result<serde_json::Value, ChannelAdapterError> {
+pub(crate) fn successful_json(
+    response: &ProviderResponse,
+) -> Result<serde_json::Value, ChannelAdapterError> {
     let provider = crate::identity::ProviderId::Youtube;
     if (200..300).contains(&response.status()) {
         return response.json(provider);

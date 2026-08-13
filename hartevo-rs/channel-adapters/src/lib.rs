@@ -11,6 +11,7 @@ pub mod testkit;
 pub mod transport;
 pub mod youtube;
 pub mod youtube_read;
+pub mod youtube_sync;
 
 pub use identity::{
     AccountIdentity, ChannelIdentity, ContentIdentity, ProviderId, RevisionIdentity,
