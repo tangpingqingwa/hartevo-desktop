@@ -25,6 +25,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 mod control_plane;
+mod plugin;
 
 pub use control_plane::{
     CONTROL_PLANE_CONTRACT_SHA256, ResolvedSecret, RuntimeBudget, RuntimeCapabilities,
@@ -32,6 +33,13 @@ pub use control_plane::{
     RuntimeHarnessDescriptor, RuntimeModelDescriptor, RuntimeProviderDescriptor,
     RuntimeRecoveryAction, RuntimeRecoveryHint, RuntimeServiceTier, RuntimeWireApi, SecretBinding,
     SecretReference, SecretResolver, control_plane_contract_digest,
+};
+pub use plugin::{
+    RUNTIME_PLUGIN_MOUNT_SCHEMA, RUNTIME_PLUGIN_SCOPE_SCHEMA, RUNTIME_SERVICE_DEFINITION_SCHEMA,
+    RUNTIME_SERVICE_PROVIDER_MANIFEST_SCHEMA, RuntimePluginError, RuntimePluginMount,
+    RuntimePluginMountState, RuntimePluginRegistration, RuntimePluginRegistrationKind,
+    RuntimePluginRegistrationStopper, RuntimePluginScope, RuntimePluginTeardownReceipt,
+    RuntimeServiceCapability, RuntimeServiceDefinition, RuntimeServiceProviderManifest,
 };
 
 pub const OPENINTERPRETER_COMMIT: &str = "52a31019714294add53cafbc5268e1467b471263";
@@ -770,6 +778,161 @@ impl fmt::Debug for RuntimeTurnDispatch {
             .field("response_digest", &self.response_digest)
             .field("elapsed", &self.elapsed)
             .finish()
+    }
+}
+
+pub const RUNTIME_RESULT_PACKET_SCHEMA: &str = "hartevo.runtime-result-packet/v1";
+
+/// The only authority a completed runtime item can carry across the adapter boundary.
+///
+/// This is local execution evidence. It is deliberately not a provider receipt, an external
+/// effect receipt, a business Outcome, or Release evidence. The packet is separate from
+/// `RuntimeMapping`, so business content is never inserted into Runtime identity or process
+/// state merely because it is eligible for adoption.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeResultAuthority {
+    LocalExecutionEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeResultKind {
+    AgentMessage,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeResultPacket {
+    pub schema: String,
+    pub authority: RuntimeResultAuthority,
+    pub result_kind: RuntimeResultKind,
+    pub project_id: String,
+    pub mission_id: String,
+    pub runtime_generation: u64,
+    pub runtime_instance_digest: String,
+    pub runtime_commit: String,
+    pub runtime_release: String,
+    pub mapping_digest: String,
+    pub runtime_thread_id_digest: String,
+    pub runtime_turn_id_digest: String,
+    pub app_server_schema_digest: String,
+    pub runtime_config_digest: String,
+    pub catalog_digest: String,
+    pub source_item_id_digest: String,
+    pub source_event_digest: String,
+    pub content_digest: String,
+    pub content_byte_count: u64,
+    pub content: String,
+}
+
+impl RuntimeResultPacket {
+    /// Convert exactly one bounded completed agent item into an adoptable packet.
+    ///
+    /// Non-content events and completed items without a supported agent message are not
+    /// errors; they simply are not result packets.
+    pub fn from_mapped_event(
+        mapping: &RuntimeMapping,
+        event: &MappedTurnEvent,
+    ) -> Result<Option<Self>, AdapterError> {
+        if !matches!(&event.kind, MappedTurnEventKind::ItemCompleted) {
+            return Ok(None);
+        }
+        let Some(message) = event.agent_message.as_ref() else {
+            return Ok(None);
+        };
+        mapping.validate()?;
+        let config = mapping
+            .runtime_config
+            .as_ref()
+            .ok_or(AdapterError::InvalidRuntimeResultPacket)?;
+        config.validate()?;
+        let turn_id = mapping
+            .runtime_turn_id
+            .as_deref()
+            .ok_or(AdapterError::InvalidRuntimeResultPacket)?;
+        let packet = Self {
+            schema: RUNTIME_RESULT_PACKET_SCHEMA.to_owned(),
+            authority: RuntimeResultAuthority::LocalExecutionEvidence,
+            result_kind: RuntimeResultKind::AgentMessage,
+            project_id: mapping.project_id.clone(),
+            mission_id: mapping.mission_id.clone(),
+            runtime_generation: mapping.runtime_generation,
+            runtime_instance_digest: mapping.runtime_instance_digest.clone(),
+            runtime_commit: OPENINTERPRETER_COMMIT.to_owned(),
+            runtime_release: OPENINTERPRETER_RELEASE.to_owned(),
+            mapping_digest: mapping.digest()?,
+            runtime_thread_id_digest: digest_hex(mapping.runtime_thread_id.as_bytes()),
+            runtime_turn_id_digest: digest_hex(turn_id.as_bytes()),
+            app_server_schema_digest: mapping.schema_digest.clone(),
+            runtime_config_digest: config.digest()?,
+            catalog_digest: config.catalog_digest.clone(),
+            source_item_id_digest: message.item_id_digest.clone(),
+            source_event_digest: event.event_digest.clone(),
+            content_digest: message.content_digest.clone(),
+            content_byte_count: message.byte_count,
+            content: message.as_str().to_owned(),
+        };
+        packet.validate()?;
+        Ok(Some(packet))
+    }
+
+    pub fn validate(&self) -> Result<(), AdapterError> {
+        let content_byte_count = u64::try_from(self.content.len())
+            .map_err(|_| AdapterError::InvalidRuntimeResultPacket)?;
+        if self.schema != RUNTIME_RESULT_PACKET_SCHEMA
+            || self.authority != RuntimeResultAuthority::LocalExecutionEvidence
+            || self.result_kind != RuntimeResultKind::AgentMessage
+            || !is_bounded_identifier(&self.project_id)
+            || !is_bounded_identifier(&self.mission_id)
+            || self.runtime_generation == 0
+            || !is_sha256(&self.runtime_instance_digest)
+            || self.runtime_commit != OPENINTERPRETER_COMMIT
+            || self.runtime_release != OPENINTERPRETER_RELEASE
+            || !is_sha256(&self.mapping_digest)
+            || !is_sha256(&self.runtime_thread_id_digest)
+            || !is_sha256(&self.runtime_turn_id_digest)
+            || self.app_server_schema_digest != format!("sha256:{APP_SERVER_SCHEMA_SHA256}")
+            || !is_sha256(&self.runtime_config_digest)
+            || !is_sha256(&self.catalog_digest)
+            || !is_sha256(&self.source_item_id_digest)
+            || !is_sha256(&self.source_event_digest)
+            || !is_sha256(&self.content_digest)
+            || self.content.is_empty()
+            || self.content.len() > MAX_AGENT_MESSAGE_BYTES
+            || self.content_byte_count != content_byte_count
+            || self.content_digest != digest_hex(self.content.as_bytes())
+        {
+            return Err(AdapterError::InvalidRuntimeResultPacket);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for RuntimeResultPacket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeResultPacket")
+            .field("schema", &self.schema)
+            .field("authority", &self.authority)
+            .field("result_kind", &self.result_kind)
+            .field("project_digest", &digest_hex(self.project_id.as_bytes()))
+            .field("mission_digest", &digest_hex(self.mission_id.as_bytes()))
+            .field("runtime_generation", &self.runtime_generation)
+            .field("runtime_instance_digest", &self.runtime_instance_digest)
+            .field("runtime_commit", &self.runtime_commit)
+            .field("runtime_release", &self.runtime_release)
+            .field("mapping_digest", &self.mapping_digest)
+            .field("runtime_thread_id_digest", &self.runtime_thread_id_digest)
+            .field("runtime_turn_id_digest", &self.runtime_turn_id_digest)
+            .field("app_server_schema_digest", &self.app_server_schema_digest)
+            .field("runtime_config_digest", &self.runtime_config_digest)
+            .field("catalog_digest", &self.catalog_digest)
+            .field("source_item_id_digest", &self.source_item_id_digest)
+            .field("source_event_digest", &self.source_event_digest)
+            .field("content_digest", &self.content_digest)
+            .field("content_byte_count", &self.content_byte_count)
+            .finish_non_exhaustive()
     }
 }
 
@@ -3761,6 +3924,8 @@ pub enum AdapterError {
     TurnSteerRejected { error_digest: String },
     #[error("runtime agent message has {byte_count} bytes; maximum is {maximum}")]
     AgentMessageTooLarge { byte_count: usize, maximum: usize },
+    #[error("runtime result packet is invalid")]
+    InvalidRuntimeResultPacket,
     #[error("runtime resumed a different thread ({expected_digest} != {actual_digest})")]
     ThreadIdentityMismatch {
         expected_digest: String,
@@ -3935,6 +4100,45 @@ mod tests {
         );
         assert_eq!(APP_SERVER_SCHEMA_SHA256.len(), 64);
         assert_eq!(AppServerContract::contract_subset_digest().len(), 64);
+    }
+
+    #[test]
+    fn result_packet_is_schema_bound_and_debug_redacts_content() {
+        let content = "private adopted result";
+        let mut packet = RuntimeResultPacket {
+            schema: RUNTIME_RESULT_PACKET_SCHEMA.to_owned(),
+            authority: RuntimeResultAuthority::LocalExecutionEvidence,
+            result_kind: RuntimeResultKind::AgentMessage,
+            project_id: "project-result-packet".to_owned(),
+            mission_id: "mission-result-packet".to_owned(),
+            runtime_generation: 1,
+            runtime_instance_digest: "a".repeat(64),
+            runtime_commit: OPENINTERPRETER_COMMIT.to_owned(),
+            runtime_release: OPENINTERPRETER_RELEASE.to_owned(),
+            mapping_digest: digest_hex(b"mapping"),
+            runtime_thread_id_digest: digest_hex(b"thread"),
+            runtime_turn_id_digest: digest_hex(b"turn"),
+            app_server_schema_digest: format!("sha256:{APP_SERVER_SCHEMA_SHA256}"),
+            runtime_config_digest: digest_hex(b"config"),
+            catalog_digest: digest_hex(b"catalog"),
+            source_item_id_digest: digest_hex(b"item"),
+            source_event_digest: digest_hex(b"event"),
+            content_digest: digest_hex(content.as_bytes()),
+            content_byte_count: content.len() as u64,
+            content: content.to_owned(),
+        };
+        packet.validate().expect("valid result packet");
+        let rendered = format!("{packet:?}");
+        assert!(!rendered.contains(content));
+        let wire = serde_json::to_value(&packet).expect("packet wire value");
+        assert_eq!(wire["authority"], "local_execution_evidence");
+        assert_eq!(wire["content"], content);
+
+        packet.content_digest = digest_hex(b"drifted-content");
+        assert!(matches!(
+            packet.validate(),
+            Err(AdapterError::InvalidRuntimeResultPacket)
+        ));
     }
 
     #[test]
