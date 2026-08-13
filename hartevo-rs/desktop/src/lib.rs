@@ -30,6 +30,7 @@ use zeroize::Zeroizing;
 
 mod agent_operations;
 pub mod data_plane;
+mod mission_lifecycle;
 mod runtime_plane;
 mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
@@ -43,6 +44,10 @@ use data_plane::{
     DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
     DesktopSnapshot, DesktopVm11OutcomeDecisionRequest, ProductEvidenceProjection,
     ProjectContextAccessProjection, ProjectContextAccessStatus, RecoveryKitDraft,
+};
+use mission_lifecycle::{
+    MissionDeepLink, MissionLifecycleError, MissionOpenTarget, recent_mission_for_project,
+    startup_deep_link,
 };
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 use runtime_subscription::{
@@ -143,7 +148,7 @@ enum ActiveOverlay {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SearchTarget {
     Project(ProjectId),
-    Mission(ProjectId, MissionId),
+    Mission(MissionOpenTarget),
 }
 
 impl ActiveOverlay {
@@ -335,6 +340,39 @@ impl std::fmt::Debug for SensitiveRecoveryInput {
 }
 
 impl UiFailure {
+    fn from_mission_lifecycle_error(error: MissionLifecycleError) -> Self {
+        let (code, message) = match error {
+            MissionLifecycleError::InvalidDeepLink => (
+                "INVALID_DEEP_LINK",
+                "Deep Link 格式或作用域无效；已回到当前 Project 的极简 Mission shell。",
+            ),
+            MissionLifecycleError::InvalidOperatorCommand => (
+                "INVALID_OPERATOR_COMMAND",
+                "Operator 命令格式无效；请输入 open mission <project>/<mission>。",
+            ),
+            MissionLifecycleError::ProjectNotFound => (
+                "STALE_SELECTION",
+                "目标 Project 不存在或已不可见；未启动 Runtime 或 Plugin。",
+            ),
+            MissionLifecycleError::MissionNotFound => (
+                "STALE_SELECTION",
+                "目标 Mission 不存在或已不可见；未启动 Runtime 或 Plugin。",
+            ),
+            MissionLifecycleError::CrossProjectMission => (
+                "STALE_SELECTION",
+                "Mission 不属于 Deep Link 指定的 Project；未读取正文或写入状态。",
+            ),
+            MissionLifecycleError::StaleRevision => (
+                "STALE_REVISION",
+                "目标 Project / Mission revision 已变化；未切换会话、启动 Runtime 或挂载 Plugin。",
+            ),
+        };
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
     fn from_runtime_subscription_error(_error: RuntimeSubscriptionError) -> Self {
         Self {
             code: "RUNTIME_SUBSCRIPTION_REJECTED".into(),
@@ -526,10 +564,8 @@ impl DesktopUiModel {
                     .any(|mission| &mission.mission_id == id)
             });
         if !existing_is_valid {
-            self.selected_mission_id = project
-                .missions
-                .last()
-                .map(|mission| mission.mission_id.clone());
+            self.selected_mission_id =
+                recent_mission_for_project(project).map(|target| target.mission_id().clone());
         }
     }
 
@@ -570,6 +606,28 @@ impl DesktopUiModel {
             self.selected_mission_id = None;
             self.notice = None;
         }
+    }
+
+    fn open_target(&mut self, target: &MissionOpenTarget) -> Result<(), MissionLifecycleError> {
+        let DesktopBackendState::Ready(snapshot) = &self.backend else {
+            return Err(MissionLifecycleError::ProjectNotFound);
+        };
+        let resolved = MissionDeepLink::from_target(target).resolve(&snapshot.inventory)?;
+        self.selected_project_id = Some(resolved.project_id().clone());
+        self.selected_mission_id = Some(resolved.mission_id().clone());
+        self.notice = None;
+        Ok(())
+    }
+
+    fn open_deep_link(&mut self, value: &str) -> Result<(), MissionLifecycleError> {
+        let link = MissionDeepLink::parse(value)?;
+        let target = {
+            let DesktopBackendState::Ready(snapshot) = &self.backend else {
+                return Err(MissionLifecycleError::ProjectNotFound);
+            };
+            link.resolve(&snapshot.inventory)?
+        };
+        self.open_target(&target)
     }
 
     fn current_project(&self) -> Option<&DesktopProjectProjection> {
@@ -887,6 +945,27 @@ pub fn App() -> Element {
     use_effect(move || desktop_context.set_zoom_level(visual_zoom));
     let mut surface = use_signal(initial_surface);
     let mut model = use_signal(DesktopUiModel::load);
+    let mut pending_deep_link = use_signal(|| startup_deep_link(std::env::args()));
+    use_effect(move || {
+        let Some(deep_link) = pending_deep_link.peek().clone() else {
+            return;
+        };
+        pending_deep_link.set(None);
+        let result = {
+            let mut current = model.write();
+            current.open_deep_link(&deep_link)
+        };
+        match result {
+            Ok(()) => surface.set(Surface::Orchestrator),
+            Err(error) => {
+                let failure = UiFailure::from_mission_lifecycle_error(error);
+                let mut current = model.write();
+                current.select_dispatcher();
+                current.notice = Some(failure);
+                surface.set(Surface::Orchestrator);
+            }
+        }
+    });
     let mut draft = use_signal(String::new);
     let mut catalog_manifest_id = use_signal(String::new);
     let mut catalog_mode = use_signal(String::new);
@@ -1512,7 +1591,18 @@ pub fn App() -> Element {
                 |project| format!("hartevo://project/{}", project.project_id),
             )
         },
-        |mission| format!("hartevo://mission/{}", mission.mission_id),
+        |mission| {
+            project.as_ref().map_or_else(
+                || "hartevo://dispatcher".to_owned(),
+                |project| {
+                    MissionDeepLink::from_ids(
+                        project.project_id.clone(),
+                        mission.mission_id.clone(),
+                    )
+                    .to_uri()
+                },
+            )
+        },
     );
     let notification_count = active_visual_notification_count();
     let visual_surface_variant = active_visual_surface_variant();
@@ -1829,11 +1919,13 @@ pub fn App() -> Element {
                         for item in running_missions.clone() {
                             {
                                 let mission_id = item.mission_id.clone();
+                                let project_id = item.project_id.clone();
                                 let selected = current_surface == Surface::Orchestrator
                                     && view.selected_mission_id.as_ref() == Some(&mission_id);
                                 rsx! {
                                     MissionNavRow {
                                         mission: item,
+                                        project_id,
                                         active: selected,
                                         menu_open: mission_menu_id.read().as_ref() == Some(&mission_id),
                                         onclick: move |_| {
@@ -1861,11 +1953,13 @@ pub fn App() -> Element {
                         for item in scheduled_missions.clone() {
                             {
                                 let mission_id = item.mission_id.clone();
+                                let project_id = item.project_id.clone();
                                 let selected = current_surface == Surface::Orchestrator
                                     && view.selected_mission_id.as_ref() == Some(&mission_id);
                                 rsx! {
                                     MissionNavRow {
                                         mission: item,
+                                        project_id,
                                         active: selected,
                                         menu_open: mission_menu_id.read().as_ref() == Some(&mission_id),
                                         onclick: move |_| {
@@ -3314,11 +3408,25 @@ pub fn App() -> Element {
                         active_overlay.set(ActiveOverlay::None);
                         surface.set(Surface::Current);
                     },
-                    on_mission: move |(project_id, mission_id)| {
-                        model.write().select_project(&project_id);
-                        model.write().select_mission(mission_id);
-                        active_overlay.set(ActiveOverlay::None);
-                        surface.set(Surface::Orchestrator);
+                    on_mission: move |target| {
+                        let result = {
+                            let mut current = model.write();
+                            current.open_target(&target)
+                        };
+                        match result {
+                            Ok(()) => {
+                                active_overlay.set(ActiveOverlay::None);
+                                surface.set(Surface::Orchestrator);
+                            }
+                            Err(error) => {
+                                let failure = UiFailure::from_mission_lifecycle_error(error);
+                                let mut current = model.write();
+                                current.select_dispatcher();
+                                current.notice = Some(failure);
+                                active_overlay.set(ActiveOverlay::None);
+                                surface.set(Surface::Orchestrator);
+                            }
+                        }
                     },
                 }
             }
@@ -3359,6 +3467,7 @@ fn NavButton(
 #[component]
 fn MissionNavRow(
     mission: MissionProjection,
+    project_id: ProjectId,
     active: bool,
     menu_open: bool,
     onclick: EventHandler<MouseEvent>,
@@ -3380,7 +3489,7 @@ fn MissionNavRow(
     let escape_mission_id = mission.mission_id.clone();
     let trigger_id = format!("mission-menu-trigger-{}", mission.mission_id.as_str());
     let escape_trigger_id = trigger_id.clone();
-    let deep_link = format!("hartevo://mission/{}", mission.mission_id);
+    let deep_link = MissionDeepLink::from_ids(project_id, mission.mission_id.clone()).to_uri();
     rsx! {
         div {
             class: if active { "prototype-mission-nav-row active" } else { "prototype-mission-nav-row" },
@@ -3446,18 +3555,23 @@ fn GlobalSearchOverlay(
     on_query: EventHandler<String>,
     on_close: EventHandler<()>,
     on_project: EventHandler<ProjectId>,
-    on_mission: EventHandler<(ProjectId, MissionId)>,
+    on_mission: EventHandler<MissionOpenTarget>,
 ) -> Element {
     let mut selected_index = use_signal(|| 0_usize);
     let normalized = query.trim().to_lowercase();
+    let operator_command = mission_lifecycle::parse_operator_command(&query);
     let mut project_results = Vec::new();
     let mut mission_results = Vec::new();
-    if let DesktopBackendState::Ready(snapshot) = backend {
-        for project in snapshot.inventory.projects {
+    let mut operator_target = None;
+    if let DesktopBackendState::Ready(snapshot) = &backend {
+        if let Ok(Some(link)) = &operator_command {
+            operator_target = link.resolve(&snapshot.inventory).ok();
+        }
+        for project in &snapshot.inventory.projects {
             if normalized.is_empty() || project.name.to_lowercase().contains(&normalized) {
                 project_results.push(project.clone());
             }
-            for mission in project.missions {
+            for mission in &project.missions {
                 if normalized.is_empty()
                     || mission.title.to_lowercase().contains(&normalized)
                     || mission
@@ -3467,22 +3581,32 @@ fn GlobalSearchOverlay(
                         .contains(&normalized)
                 {
                     mission_results.push((
-                        project.project_id.clone(),
+                        MissionOpenTarget::from_projection(project, mission),
                         project.name.clone(),
-                        mission,
+                        mission.clone(),
                     ));
                 }
             }
         }
     }
-    let result_count = project_results.len() + mission_results.len();
-    let mut targets = project_results
+    let operator_result_count = usize::from(operator_target.is_some());
+    let result_count = operator_result_count + project_results.len() + mission_results.len();
+    let mut targets = operator_target
         .iter()
-        .map(|project| SearchTarget::Project(project.project_id.clone()))
+        .cloned()
+        .map(SearchTarget::Mission)
         .collect::<Vec<_>>();
-    targets.extend(mission_results.iter().map(|(project_id, _, mission)| {
-        SearchTarget::Mission(project_id.clone(), mission.mission_id.clone())
-    }));
+    targets.extend(
+        project_results
+            .iter()
+            .map(|project| SearchTarget::Project(project.project_id.clone()))
+            .collect::<Vec<_>>(),
+    );
+    targets.extend(
+        mission_results
+            .iter()
+            .map(|(target, _, _)| SearchTarget::Mission(target.clone())),
+    );
     let active_index = if result_count == 0 {
         0
     } else {
@@ -3512,9 +3636,7 @@ fn GlobalSearchOverlay(
                         event.prevent_default();
                         match active_target.clone() {
                             Some(SearchTarget::Project(project_id)) => on_project.call(project_id),
-                            Some(SearchTarget::Mission(project_id, mission_id)) => {
-                                on_mission.call((project_id, mission_id));
-                            }
+                            Some(SearchTarget::Mission(target)) => on_mission.call(target),
                             None => {}
                         }
                     }
@@ -3545,8 +3667,22 @@ fn GlobalSearchOverlay(
             }
             div { class: "global-search-results",
                 if result_count == 0 {
+                    if operator_command.is_err() {
+                        div { class: "search-empty", span { class: "honesty-badge", "BLOCKED" } p { "Operator 命令无效；未切换 Project / Mission。" } }
+                    } else {
                     div { class: "search-empty", span { class: "honesty-badge", "EMPTY" } p { "当前持久 Inventory 中没有匹配结果。" } }
+                    }
                 } else {
+                    if let Some(target) = operator_target {
+                        h2 { "Operator" }
+                        button {
+                            class: if active_index == 0 { "search-result active" } else { "search-result" },
+                            onclick: move |_| on_mission.call(target.clone()),
+                            i { class: "mission-result-mark", UiIcon { name: UiIconName::Target, size: 14 } }
+                            span { strong { "打开精确 Mission 会话" } small { "Project / Mission revision fence" } }
+                            em { "Operator" }
+                        }
+                    }
                     if !project_results.is_empty() {
                         h2 { "项目" }
                         for (index, project) in project_results.into_iter().enumerate() {
@@ -3554,7 +3690,7 @@ fn GlobalSearchOverlay(
                                 let project_id = project.project_id.clone();
                                 rsx! {
                                     button {
-                                        class: if active_index == index { "search-result active" } else { "search-result" },
+                                        class: if active_index == operator_result_count + index { "search-result active" } else { "search-result" },
                                         onclick: move |_| on_project.call(project_id.clone()),
                                         i { class: "project-mark", "{project_initials(&project.name)}" }
                                         span { strong { "{project.name}" } small { "Project revision {project.revision} · {encryption_short_label(&project.encryption)}" } }
@@ -3566,13 +3702,12 @@ fn GlobalSearchOverlay(
                     }
                     if !mission_results.is_empty() {
                         h2 { "Mission" }
-                        for (index, (project_id, project_name, mission)) in mission_results.into_iter().enumerate() {
+                        for (index, (target, project_name, mission)) in mission_results.into_iter().enumerate() {
                             {
-                                let mission_id = mission.mission_id.clone();
                                 rsx! {
                                     button {
-                                        class: if active_index == project_result_count + index { "search-result active" } else { "search-result" },
-                                        onclick: move |_| on_mission.call((project_id.clone(), mission_id.clone())),
+                                        class: if active_index == operator_result_count + project_result_count + index { "search-result active" } else { "search-result" },
+                                        onclick: move |_| on_mission.call(target.clone()),
                                         i { class: "mission-result-mark", UiIcon { name: UiIconName::Target, size: 14 } }
                                         span { strong { "{mission.title}" } small { "{project_name} · {mission_stage_label(&mission.stage)} · revision {mission.revision}" } }
                                         em { "打开会话" }
@@ -3583,7 +3718,7 @@ fn GlobalSearchOverlay(
                     }
                 }
             }
-            footer { span { "↑ ↓ 选择" } span { "Enter 打开" } span { "结果来自持久 Application Projection" } }
+            footer { span { "↑ ↓ 选择" } span { "Enter 打开" } span { "open mission <project>/<mission> · 结果来自持久 Application Projection" } }
         }
     }
 }
