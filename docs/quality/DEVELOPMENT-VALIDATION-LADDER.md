@@ -38,6 +38,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 bash scripts/check-openinterpreter-schema.sh
+bash scripts/check-evidence-doc-truth.sh verify
+bash scripts/check-evidence-doc-truth.sh self-test
 cargo run -p hartevo-eval -- catalog validate
 cargo run -p hartevo-eval -- catalog export --output target/eval/catalog-v1.json
 cargo run -p hartevo-eval -- evidence baseline --commit "$(git rev-parse HEAD)" --output target/eval/release-baseline.json
@@ -45,6 +47,14 @@ cargo run -p hartevo-eval -- run --mission VS-01 --output target/eval/vs-01.json
 ```
 
 `VS-01` 仍是 Bootstrap replay，不对应 VM-00～VM-11 的 E3 声明。`release-baseline.json` 必须为 `passed: false`；它用于阻止机器合同被误报为已实现产品。
+
+### 3.1 Evidence/Docs truth gate
+
+- `EVDOC-EV03M-01`：`VERIFIED` commit-bound manifest 只授予 manifest integrity，不授予 Release 或 Mission evidence-level authority。
+- `EVDOC-B2-01` / `EVDOC-B2P-01`：Dioxus execution paint 与 exact Project/Mission private-text scope 是 `CODE_WIRED`，不是当前原生窗口 Journey 证据。
+- `EVDOC-GAPS-01`：native visual、native AX、真实进程 restart/reconnect 和 Release 均保持 `NOT_PROVEN`；Release `passed=false`、decision=`NOT_EVALUATED`，Mission E-level 不提升。
+
+`check-evidence-doc-truth.sh` 必须对固定 source/manifest Git object、B2/B2P commit scope 与上述文档投影失败关闭。它不运行也不替代 L3 原生窗口、辅助功能、真实进程恢复或 Release Evidence；这些证据未单独产出前，上述边界不得改写为 `PASS`、`PROVEN` 或更高 E-level。
 
 ## 4. L0 通过条件
 

@@ -1,11 +1,20 @@
 # Current Worktree Evidence
 
 状态：**开发机快照，不是 Release Evidence**
-观测时间：2026-08-12
+观测时间：2026-08-13
 Commit：以 `git rev-parse HEAD` 返回的 checkpoint commit 为准；文档不内嵌自身 SHA，避免自引用改变提交内容
-代码/机器事实基线：`204dd40c972b2f8b62689e595834b75d39dfa8f9`；该 clean repair 基线包含 SQLCipher v47 policy CHECK rebuild、EffectReadbackV2 typed persistence/generic-completion refusal 与 Application Handler Registry v8。本文档所在子提交不内嵌自身 SHA；Release Evidence schema 与 Mission evidence level 均未改变。
+代码/机器事实基线：`cc662d53d55216b32be43afdc61e0195f9e5659f`；该 published baseline 包含 EV-03M tracked manifest、UI-SUB-02B2 execution paint wiring 与 UI-SUB-02B2P exact Project/Mission render-scope protection。本文档所在子提交不内嵌自身 SHA；Release Evidence schema 与 Mission evidence level 均未改变。
 
-本文件区分两类事实：204dd40 基线可由合同/源码直接核验的 current code facts，以及下列绑定旧 checkpoint 的历史机器门禁。DOC-47 未运行 Cargo/dx，也未生成 repair 后 Catalog digest 或测试计数；旧数字不得继承为当前发布证据。机器生成的 Release baseline 仍是 `passed: false`，因此不得把任何本地通过解释为 Mission E3、Provider E4、GA 或 E5。
+本文件区分三类事实：由 `contracts/evidence/current-evidence-truth.v1.json` 与 `scripts/check-evidence-doc-truth.sh` 固定的 current truth、cc662d53 基线可由源码核验但尚无当前原生 Journey 的 code facts，以及下列绑定旧 checkpoint 的历史机器门禁。DOC-47 未运行 Cargo/dx，也未生成 repair 后 Catalog digest 或测试计数；旧数字不得继承为当前发布证据。机器生成的 Release baseline 仍是 `passed: false`，因此不得把任何本地通过解释为 Mission E3、Provider E4、GA 或 E5。
+
+## 当前 EV-03M、B2/B2P 真值（机器门禁）
+
+- `EVDOC-EV03M-01`：EV-03M 的 original materialization commit `d3b5fc1330d70774faee13249328781adca34bac` 把 source `752488888ab45596be242ecca3acae567ace2239` 的 manifest 物化为 tracked blob；`VERIFIED` 只证明 manifest integrity，Release decision 仍为 `NOT_EVALUATED`。
+- `EVDOC-B2-01`：UI-SUB-02B2 (`101ea1c01c70584e8f739395df76ab2197b4a03b`) 已把 durable Runtime execution paint、post-render acknowledgement 与 follow/unseen 协调接入 Dioxus；此声明的 authority 仅为 `CODE_WIRED`。
+- `EVDOC-B2P-01`：UI-SUB-02B2P (`721fff272b31ad77f8842534e8163c42df6d84a6`) 已把 Runtime private-text/error 投影限制到 exact Project/Mission scope；此声明的 authority 仅为 `CODE_WIRED`。
+- `EVDOC-GAPS-01`：当前 B2/B2P flow 的原生窗口 visual、原生 AX、真实 Desktop 进程退出后的 restart/reconnect 与 Release Evidence 均为 `NOT_PROVEN`；旧 visual/AX 资产、组件测试、bundle 或 `VERIFIED` manifest 均不可替代这些证据，Release `passed=false`，Mission E-level 未提升。
+
+执行 `bash scripts/check-evidence-doc-truth.sh verify` 会从 Git object 复核 EV-03M original child/source 关系和 raw manifest digest、从固定 source baseline 复核 B2/B2P commit/file/代码锚点，并要求以上 Claim ID 投影逐字存在。该门禁本身不执行 native visual、AX、真实进程 restart/reconnect 或 Release evaluation。
 
 ## 历史自动门禁（repair 后未重跑）
 
@@ -69,7 +78,7 @@ Commit：以 `git rev-parse HEAD` 返回的 checkpoint commit 为准；文档不
 - 两个真实 OpenInterpreter smoke 已在 v39 唯一启动副本路径上再次通过；退出后工作区与隔离 Home 均无 `.hartevo-runtime-launches` 子项。Runtime launch root 的首次并发创建改为原子 `create_dir`，`AlreadyExists` 后重新验证目录/拒绝 symlink；8 线程回归与两个并发 cleanup 测试通过。未固定 hash 的 Fake Runtime 仍只用于协议测试，不被声明为生产安全进程身份。
 - Runtime executable path、Thread/Turn 私有 ID 与草稿正文不进入 Domain Event/Outbox；测试明确检查 `/usr/bin/false` 和失败/成功正文均未出现在事件 JSON。
 
-这些证据仍是 Desktop/Application/SQLCipher/真实本地 Runtime/Scheduler 的 E2 切片，不是完整 Mission E3：总调度已能选择精确 executor，Human confirmation 有一个真实 VM-07 原子 handler，Application 有 VM-11 `event_ingest`、`normalize_dedupe_order`、`identity_chain`、`mission_specific_kpi`、`attribution_and_unattributed`、`refund_commission_payout_recalc`、`outcome_review` 与 `next_contract_or_valid_terminal` 八条 handler；前七条已有 Desktop-integrated Journey，第八条只有 Domain/Storage/Application 定向证据，没有 Desktop caller/UI wiring。Desktop 另有 exact Project/Mission-gated 的 Runtime private-text 只读投影与重启 replay；其余 44 条 Application route、Effect Broker/Browser handler、其余 Human Checkpoint、自动 handoff、OS/Cell 远程调度、redirect、新 Mission 首轮 execution-time subscription、真实高密度 process/artifact/capability 投影、十二条 Mission 的完整 UI Journey、真实 Provider readback/Verification 与跨平台安装证据仍然缺失。Release Evidence 继续为 `passed: false`，所有 Mission E-level 不变。
+这些证据仍是 Desktop/Application/SQLCipher/真实本地 Runtime/Scheduler 的 E2 切片，不是完整 Mission E3：总调度已能选择精确 executor，Human confirmation 有一个真实 VM-07 原子 handler，Application 有 VM-11 `event_ingest`、`normalize_dedupe_order`、`identity_chain`、`mission_specific_kpi`、`attribution_and_unattributed`、`refund_commission_payout_recalc`、`outcome_review` 与 `next_contract_or_valid_terminal` 八条 handler；前七条已有 Desktop-integrated Journey，第八条只有 Domain/Storage/Application 定向证据，没有 Desktop caller/UI wiring。Desktop 另有 exact Project/Mission-gated 的 Runtime private-text 只读投影；既有 component reopen/replay 不等于当前 B2/B2P flow 的真实 Desktop 进程 restart/reconnect 证据。其余 44 条 Application route、Effect Broker/Browser handler、其余 Human Checkpoint、自动 handoff、OS/Cell 远程调度、redirect、新 Mission 首轮 execution-time subscription、真实高密度 process/artifact/capability 投影、十二条 Mission 的完整 UI Journey、真实 Provider readback/Verification 与跨平台安装证据仍然缺失。Release Evidence 继续为 `passed: false`，所有 Mission E-level 不变。
 
 ## 环境阻塞与未覆盖项
 
