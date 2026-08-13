@@ -198,7 +198,7 @@ impl EvaluationEvidence {
     }
 
     #[cfg(test)]
-    fn synthetic(
+    pub(crate) fn synthetic(
         source_commit: &str,
         run_id: &str,
         evidence_digest: &str,
@@ -364,6 +364,10 @@ pub struct EvaluationEvaluator {
 }
 
 impl EvaluationEvaluator {
+    pub fn service_id(&self) -> &str {
+        &self.service_id
+    }
+
     pub fn evaluator_id(&self) -> &str {
         &self.evaluator_id
     }
@@ -618,6 +622,40 @@ impl<P: EvaluationResultProvider> EvaluationPluginService<P> {
 
     pub fn provider(&self) -> &P {
         &self.provider
+    }
+
+    pub(crate) fn validate_adoption_binding(
+        &self,
+        evaluator: &EvaluationEvaluator,
+        source_commit: &str,
+        revision: u64,
+        evidence_digest: &str,
+    ) -> Result<()> {
+        ensure!(
+            self.state == EvaluationPluginState::Mounted,
+            "evaluation plugin is not mounted"
+        );
+        let active = self
+            .active
+            .as_ref()
+            .context("evaluation plugin has no active evaluator")?;
+        ensure!(
+            active.evaluator == *evaluator,
+            "evaluation evaluator mount is stale or revoked"
+        );
+        ensure!(
+            evaluator.source_commit() == source_commit
+                && evaluator.mount_revision() == revision
+                && evaluator.evidence_digest() == evidence_digest,
+            "adoption decision is not bound to the active evaluator"
+        );
+        let evidence = self.provider.read_current(source_commit)?;
+        ensure!(
+            evidence.source_commit() == source_commit
+                && evidence.evidence_digest() == evidence_digest,
+            "adoption evidence is stale or changed"
+        );
+        Ok(())
     }
 
     pub fn mount(
