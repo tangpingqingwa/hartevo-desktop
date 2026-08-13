@@ -129,25 +129,32 @@ def validate_planned_scope_markers(records: list[object], expected_names: list[s
         steps = record.get("steps")
         if not isinstance(steps, list):
             raise ValueError(f"planned Rust scope child check has malformed steps: {expected_name}")
-        step_names = [
-            step.get("name")
+        step_entries = [
+            step
             for step in steps
-            if isinstance(step, dict) and isinstance(step.get("name"), str)
+            if isinstance(step, dict)
+            and isinstance(step.get("name"), str)
+            and isinstance(step.get("conclusion"), str)
         ]
-        if step_names.count(PLANNED_SCOPE_MARKER) != 1:
+        if len(step_entries) != len(steps):
+            raise ValueError(f"planned Rust scope child check has malformed step evidence: {expected_name}")
+        step_names = [step["name"] for step in step_entries]
+        marker_steps = [step for step in step_entries if step["name"] == PLANNED_SCOPE_MARKER]
+        if len(marker_steps) != 1 or marker_steps[0]["conclusion"] != "success":
             raise ValueError(f"planned Rust scope child check must run one marker: {expected_name}")
-        unexpected = [
-            name
-            for name in step_names
-            if name not in {"Set up job", PLANNED_SCOPE_MARKER, "Complete job"}
+        executed = [
+            step["name"]
+            for step in step_entries
+            if step["conclusion"] != "skipped"
         ]
-        if unexpected:
-            raise ValueError(f"planned Rust scope child check executed non-marker steps: {expected_name}: {unexpected}")
+        if executed != ["Set up job", PLANNED_SCOPE_MARKER, "Complete job"]:
+            raise ValueError(f"planned Rust scope child check executed non-marker steps: {expected_name}: {executed}")
         evidence.append(
             {
                 "name": expected_name,
                 "conclusion": record["conclusion"],
                 "stepNames": step_names,
+                "executedStepNames": executed,
                 "marker": PLANNED_SCOPE_MARKER,
             }
         )
@@ -245,9 +252,11 @@ def self_test() -> None:
             "status": "completed",
             "conclusion": "success",
             "steps": [
-                {"name": "Set up job"},
-                {"name": PLANNED_SCOPE_MARKER},
-                {"name": "Complete job"},
+                {"name": "Set up job", "conclusion": "success"},
+                {"name": PLANNED_SCOPE_MARKER, "conclusion": "success"},
+                {"name": "Checkout reviewed source", "conclusion": "skipped"},
+                {"name": "Cache Cargo and Rust toolchain", "conclusion": "skipped"},
+                {"name": "Complete job", "conclusion": "success"},
             ],
         }
         for name in marker_names
@@ -256,7 +265,18 @@ def self_test() -> None:
     assert marker_evidence["status"] == "PASS" and marker_evidence["jobCount"] == 5
     try:
         validate_planned_scope_markers(
-            marker_records[:-1] + [{**marker_records[-1], "steps": [{"name": "Set up job"}, {"name": "Checkout reviewed source"}]}],
+            marker_records[:-1]
+            + [
+                {
+                    **marker_records[-1],
+                    "steps": [
+                        {"name": "Set up job", "conclusion": "success"},
+                        {"name": PLANNED_SCOPE_MARKER, "conclusion": "success"},
+                        {"name": "Checkout reviewed source", "conclusion": "success"},
+                        {"name": "Complete job", "conclusion": "success"},
+                    ],
+                }
+            ],
             marker_names,
         )
     except ValueError:
