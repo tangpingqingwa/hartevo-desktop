@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.openinterpreter-native-capture-replay-acceptance/v1",
+  "title": "Hartevo OpenInterpreter native capture replay acceptance",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "documentType",
+    "authority",
+    "releaseDecision",
+    "sourceCommit",
+    "captureId",
+    "session",
+    "receipts",
+    "terminalReceipt",
+    "bundleRoot"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "hartevo.openinterpreter-native-capture-replay-acceptance/v1" },
+    "documentType": { "const": "openinterpreter_native_capture_replay" },
+    "authority": { "const": "openinterpreter_native_capture_replay_only" },
+    "releaseDecision": { "const": "NOT_EVALUATED" },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "captureId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "session": { "$ref": "native-acceptance.v1.json" },
+    "receipts": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "items": { "$ref": "#/$defs/captureReceipt" }
+    },
+    "terminalReceipt": { "$ref": "#/$defs/terminalReceipt" },
+    "bundleRoot": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  },
+  "$defs": {
+    "captureReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "sequence",
+        "sourceCommit",
+        "scope",
+        "modelDigest",
+        "providerDigest",
+        "occurredAt",
+        "payloadDigest",
+        "receiptDigest",
+        "exitCode",
+        "oldEvaluatorAccepted",
+        "oldDecisionPromotable"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "stream",
+            "tool_call",
+            "effect",
+            "effect_verification",
+            "result",
+            "adoption",
+            "stop",
+            "revoke",
+            "crash",
+            "relaunch"
+          ]
+        },
+        "sequence": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["projectId", "missionId", "scopeDigest"],
+          "properties": {
+            "projectId": { "type": "string", "minLength": 1 },
+            "missionId": { "type": "string", "minLength": 1 },
+            "scopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        },
+        "modelDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "providerDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "payloadDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "exitCode": { "const": 0 },
+        "oldEvaluatorAccepted": { "const": false },
+        "oldDecisionPromotable": { "const": false }
+      }
+    },
+    "terminalReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "sequence",
+        "sourceCommit",
+        "scope",
+        "modelDigest",
+        "providerDigest",
+        "occurredAt",
+        "exitCode",
+        "recoveryClosed",
+        "receiptDigest"
+      ],
+      "properties": {
+        "kind": { "const": "terminal" },
+        "sequence": { "const": 11 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["projectId", "missionId", "scopeDigest"],
+          "properties": {
+            "projectId": { "type": "string", "minLength": 1 },
+            "missionId": { "type": "string", "minLength": 1 },
+            "scopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        },
+        "modelDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "providerDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "exitCode": { "const": 0 },
+        "recoveryClosed": { "const": true },
+        "receiptDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  }
+}

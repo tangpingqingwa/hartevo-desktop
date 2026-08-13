@@ -1,3 +1,4 @@
+mod capture;
 mod digest;
 mod model;
 mod verifier;
@@ -7,10 +8,17 @@ use std::env;
 use anyhow::{Result, bail};
 use serde_json::json;
 
+use crate::capture::{
+    AUTHORITY as CAPTURE_AUTHORITY, CONTRACT_PATH as CAPTURE_CONTRACT_PATH,
+    RELEASE_DECISION as CAPTURE_RELEASE_DECISION,
+    REPORT_SCHEMA_VERSION as CAPTURE_REPORT_SCHEMA_VERSION,
+    contract_digest as capture_contract_digest, read_capture, validate_capture,
+    validate_contract as validate_capture_contract,
+};
 use crate::verifier::{
     APP_SERVER_CONTRACT_PATH, AUTHORITY, CONTRACT_PATH, RELEASE_DECISION, REPORT_SCHEMA_VERSION,
-    app_server_contract_digest, contract_digest, current_source_commit, read_capture,
-    validate_bundle, validate_contract,
+    app_server_contract_digest, contract_digest, current_source_commit,
+    read_capture as read_session, validate_bundle, validate_contract,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +55,7 @@ fn main() {
 
 fn run(arguments: &[String]) -> Result<CommandOutcome> {
     validate_contract()?;
+    validate_capture_contract()?;
     match arguments {
         [] => {
             print_missing_capture(&current_source_commit()?);
@@ -70,10 +79,26 @@ fn run(arguments: &[String]) -> Result<CommandOutcome> {
             );
             Ok(CommandOutcome::Success)
         }
+        [command] if command == "capture-validate-contract" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "schemaVersion": CAPTURE_REPORT_SCHEMA_VERSION,
+                    "authority": CAPTURE_AUTHORITY,
+                    "releaseDecision": CAPTURE_RELEASE_DECISION,
+                    "validatorStatus": "NOT_EVALUATED",
+                    "nativePass": false,
+                    "contractPath": CAPTURE_CONTRACT_PATH,
+                    "contractDigest": capture_contract_digest(),
+                    "contractValidated": true,
+                }))?
+            );
+            Ok(CommandOutcome::Success)
+        }
         [command, path] if command == "verify" => {
             let source_commit = current_source_commit()?;
-            let capture = read_capture(path)?;
-            let report = validate_bundle(&capture, &source_commit)?;
+            let session = read_session(path)?;
+            let report = validate_bundle(&session, &source_commit)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(if report.native_pass {
                 CommandOutcome::Success
@@ -83,11 +108,27 @@ fn run(arguments: &[String]) -> Result<CommandOutcome> {
                 CommandOutcome::NotEvaluated
             })
         }
+        [command, path] if command == "capture-verify" => {
+            let source_commit = current_source_commit()?;
+            let capture = read_capture(path)?;
+            let report = validate_capture(&capture, &source_commit)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(if report.native_pass {
+                CommandOutcome::Success
+            } else if report.validator_status == capture::CaptureValidatorStatus::BlockedEnv {
+                CommandOutcome::BlockedEnv
+            } else {
+                CommandOutcome::NotEvaluated
+            })
+        }
         [command] if command == "--help" || command == "-h" => {
             print_help();
             Ok(CommandOutcome::Success)
         }
-        _ => bail!("unsupported command; use --help, validate-contract, or verify <capture.json>"),
+        _ => bail!(
+            "unsupported command; use --help, validate-contract, verify <capture.json>, \
+             capture-validate-contract, or capture-verify <capture.json>"
+        ),
     }
 }
 
@@ -116,7 +157,9 @@ fn print_help() {
         "hartevo-openinterpreter-native-acceptance\n\n\
          Usage:\n  \
          hartevo-openinterpreter-native-acceptance validate-contract\n  \
-         hartevo-openinterpreter-native-acceptance verify <capture.json>\n\n\
+         hartevo-openinterpreter-native-acceptance verify <capture.json>\n  \
+         hartevo-openinterpreter-native-acceptance capture-validate-contract\n  \
+         hartevo-openinterpreter-native-acceptance capture-verify <capture.json>\n\n\
          With no input, missing credentials/runner are BLOCKED_ENV and exit non-zero.\n\
          Fixture and simulator captures never become native PASS."
     );
