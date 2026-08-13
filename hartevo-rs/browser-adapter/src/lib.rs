@@ -42,7 +42,9 @@ pub use chromium_host::{
     ChromiumTextInputDispatchEvidence, ManagedChromiumClickExecutor,
     ManagedChromiumFileUploadExecutor, ManagedChromiumHost, ManagedChromiumTextInputExecutor,
 };
-pub use consumer::{MissionBrowserWorkspaceConsumer, MissionBrowserWorkspaceState};
+pub use consumer::{
+    BrowserObservationResultLog, MissionBrowserWorkspaceConsumer, MissionBrowserWorkspaceState,
+};
 pub use fake_host::{
     BrowserActionResult, BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost,
     FakeBrowserPage,
@@ -56,7 +58,8 @@ pub use locator::{BrowserLocatorResolution, BrowserStableLocator};
 pub use navigation::{BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserNavigationTarget};
 pub use profile_dir::{BrowserExecutableIdentity, ManagedProfileDirectory};
 pub use provider::{
-    AuthenticatedChromiumProvider, BrowserProviderLifecycle, DurableBrowserObservation,
+    AuthenticatedChromiumProvider, BrowserObservationHost, BrowserObservationResult,
+    BrowserProviderLifecycle, DurableBrowserObservation,
 };
 pub use recipe::{
     BrowserRecipeActivation, BrowserRecipeActiveVersion, BrowserRecipeCandidate,
@@ -69,6 +72,7 @@ pub use recipe::{
 #[cfg(unix)]
 pub use scanner::{ProductionFileScanner, ScannerProcessLimits, ScannerReleasePin};
 pub use service::{
+    BrowserFrameScope, BrowserObservationCursor, BrowserObservationObjectiveRequest,
     BrowserWorkspaceCapability, BrowserWorkspaceMountRequest, BrowserWorkspaceScope,
     BrowserWorkspaceServiceDefinition,
 };
@@ -106,6 +110,10 @@ pub enum BrowserError {
     ControlLeaseLost,
     #[error("browser semantic snapshot is malformed")]
     InvalidSnapshot,
+    #[error("browser observation objective is malformed or outside the exact source scope")]
+    InvalidObservationObjective,
+    #[error("browser observation cursor is stale, cancelled, or bound to another generation")]
+    ObservationCursorInvalid,
     #[error("browser action is malformed")]
     InvalidAction,
     #[error("browser action batch is malformed or expired")]
@@ -250,6 +258,8 @@ impl BrowserError {
             Self::InvalidTabTransition => "BROWSER_INVALID_TAB_TRANSITION",
             Self::ControlLeaseLost => "BROWSER_CONTROL_LEASE_LOST",
             Self::InvalidSnapshot => "BROWSER_INVALID_SNAPSHOT",
+            Self::InvalidObservationObjective => "BROWSER_INVALID_OBSERVATION_OBJECTIVE",
+            Self::ObservationCursorInvalid => "BROWSER_OBSERVATION_CURSOR_INVALID",
             Self::InvalidAction => "BROWSER_INVALID_ACTION",
             Self::InvalidBatch => "BROWSER_INVALID_BATCH",
             Self::EffectBrokerRequired => "BROWSER_EFFECT_BROKER_REQUIRED",
