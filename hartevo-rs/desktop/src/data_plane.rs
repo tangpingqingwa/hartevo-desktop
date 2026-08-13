@@ -15,15 +15,16 @@ use hartevo_application::{
     AdoptRuntimeTurnDraft, AppendMissionConversationMessage, ApplicationError,
     ApplicationMissionCheckpointExecution, ApplicationService, CatalogMissionExecutionHandle,
     ConfirmHumanMissionCheckpoint, CreateProject, DecideVm11OutcomeReview,
-    DesktopInventoryProjection, DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
-    EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
-    FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn, KeyAdministrationAuthorization,
-    MissionCheckpointDispatchState, MissionRuntimeProjection, ObserveContextRuntimeTurn,
-    PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
-    ProvisionProjectEncryption, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
-    ResearchPacket, RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime,
-    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTurnDispatchDisposition,
-    StartCatalogMission, StartMission,
+    DesktopConnectionProjection, DesktopInventoryProjection, DesktopUnlockedProjectProjection,
+    DispatchContextRuntimeTurn, EnsureFailedLocalMissionRuntimeGenerationRetired,
+    ExecuteApplicationMissionCheckpoint, FenceOrphanedContextRuntimeTurn,
+    InterruptContextRuntimeTurn, KeyAdministrationAuthorization, MissionCheckpointDispatchState,
+    MissionRuntimeProjection, ObserveContextRuntimeTurn, PrepareLocalMissionRuntimeContext,
+    ProjectContextMaterialSession, ProjectEncryptionReadiness, ProvisionProjectEncryption,
+    RecoverContextWorkerRuntime, RecoverPersonalProjectDevice, ResearchPacket,
+    RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime, RuntimeTextSubscriptionBatch,
+    RuntimeTextSubscriptionCursor, RuntimeTurnDispatchDisposition, StartCatalogMission,
+    StartMission,
 };
 use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
@@ -77,6 +78,7 @@ pub struct ProductEvidenceProjection {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DesktopSnapshot {
     pub inventory: DesktopInventoryProjection,
+    pub connections: Vec<DesktopConnectionProjection>,
     pub context_access: Vec<ProjectContextAccessProjection>,
     pub runtime_reconciliation: RuntimeTurnStartupReconciliation,
     pub runtime: DesktopRuntimeProjection,
@@ -772,6 +774,42 @@ impl DesktopDataPlane {
     ) -> Result<DesktopSnapshot, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         self.start_mission_with(&secret_store, project_id, goal, now)
+    }
+
+    /// Revokes one exact project-scoped Connection through the existing
+    /// Application/Domain command, then returns a fresh projection. No
+    /// credential or callback material crosses this Desktop boundary.
+    pub fn revoke_connection_os(
+        &self,
+        project_id: &ProjectId,
+        connection_id: &hartevo_domain_kernel::ConnectionId,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.revoke_connection_with(&secret_store, project_id, connection_id, now)
+    }
+
+    pub fn revoke_connection_with(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        connection_id: &hartevo_domain_kernel::ConnectionId,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        self.revalidate_database_entry()?;
+        let database_secret = self.database_secret(secret_store)?;
+        let (service, runtime_reconciliation) =
+            self.open_application_from_secret(&database_secret, now)?;
+        let mut service = service;
+        service.revoke_connection(project_id, connection_id, now)?;
+        let product_evidence = load_product_evidence(now)?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
+            now,
+        )
     }
 
     /// Creates one durable Mission and, only when a release-pinned Runtime plus
@@ -2425,6 +2463,7 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<DesktopSnapshot, DesktopDataError> {
         let mut inventory = service.desktop_inventory()?;
+        let connections = service.desktop_connection_projections(now)?;
         let context_access = inventory
             .projects
             .iter_mut()
@@ -2432,6 +2471,7 @@ impl DesktopDataPlane {
             .collect();
         Ok(DesktopSnapshot {
             inventory,
+            connections,
             context_access,
             runtime_reconciliation,
             runtime: discover_runtime().projection,

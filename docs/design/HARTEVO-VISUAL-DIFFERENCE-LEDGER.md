@@ -31,7 +31,7 @@
 | Channels | `comparisons/channels-side-by-side.png` | shared topbar、hero、tabs、readiness、ranked rows、right rail 与源密度接近 | scheduler、publishing、inbox、outcome 真实 projection 未接线 |
 | Relationships / CRM | `comparisons/relationships-side-by-side.png` | Pipeline、Consent table 和 CRM IA 已恢复 | Person/Company/Conversation/Handoff 真实 projection 未接线 |
 | Partners / Creator Work | `comparisons/partners-side-by-side.png` | 六 tab 与供给表恢复；任务悬赏→申请/邀请→交付→review→权利→付款边界已落成 | Contract、File Broker、Review CAS、Stripe Connect payout 均未接线 |
-| Connections | `comparisons/connections-side-by-side.png` | need-next、统计、right rail、四步 wizard 与 policy 子视图完成 | 无实时 Probe 时保持 0 Connected/`BLOCKED_ENV`；OAuth/callback/revoke 未接线 |
+| Connections | `comparisons/connections-side-by-side.png` | need-next、真实 metadata rows、统计、right rail、四步 wizard、policy/activity 子视图与 revoke/error boundary 完成 | 无实时 Probe 时保持 0 Connected/`BLOCKED_ENV`；Connector SDK、OS deep-link、真实 OAuth/Provider audit 未接线 |
 | Outcomes | `comparisons/outcomes-side-by-side.png` | Ledger/Attribution/Next decision 页面结构完成且保留 0 Revenue | event ingest、FX/refund/commission/attribution reconcile 未接线 |
 | Capability Evidence | `comparisons/capability-evidence-side-by-side.png` | E0～E5 ledger 和 `release_passed=false` 清晰可见 | 原型采用对话/Workpad；独立页是产品 IA 投影，不声明像素同构 |
 | Settings | `comparisons/settings-side-by-side.png` | 52px topbar、242px rail、900px panel、58px outlined groups 与源值恢复 | 10 分区中只有部分为专有控件；Settings persistence 未接线 |
@@ -71,7 +71,7 @@
 
 1. `P0`：exact Project/Mission-gated Runtime delta 只读投影、稳定段落重组、重启 replay 与 follow-unseen 已实现；仍缺新 Catalog Mission 首轮 execution-time handle/subscription、durable pause/resume/reconnect cursor，以及真实高密度 process/artifact/capability 投影。
 2. `P0`：File Broker/附件扫描、语音、live Worker/Browser handoff/Inspector 尚未接线。
-3. `P0`：CRM、Creator contract/deliverable/review/payout、Provider/OAuth/Probe、Outcome 等真实 Application/Provider 闭环未完成。
+3. `P0`：CRM、Creator contract/deliverable/review/payout、Connector SDK/真实 Provider OAuth/Probe、Outcome 等真实 Application/Provider 闭环未完成；本分支只提供 provider-neutral authorization state 与 truthful metadata projection。
 4. `P0`：默认未接线路径仍有部分 compact `state-canvas`；完整中英 UI locale catalog 尚未实现。
 5. `P1/BLOCKED_ENV`：VoiceOver/Narrator、Windows、1600×1000、真实 configured Runtime 长任务 native canary 缺证。
 6. 真实 Provider、E3/E4/E5、420 Mission cases、180 cross-cutting cases 和长周期 cohort 均不属于本视觉 checkpoint 的完成证据。

@@ -130,6 +130,21 @@ impl ProjectStore {
         .map_err(|error| StorageError::DomainDecode(error.to_string()))
     }
 
+    pub fn list_connections(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<Connection>, StorageError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM connections WHERE project_id = ?1 ORDER BY id ASC")?;
+        let ids = statement
+            .query_map(params![project_id.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| self.load_connection(project_id, &ConnectionId::from_stable(id)))
+            .collect()
+    }
+
     pub fn create_consent_record(
         &mut self,
         record: &ConsentRecord,

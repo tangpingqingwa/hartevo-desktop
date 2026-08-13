@@ -542,6 +542,7 @@ fn fixture_snapshot(
 ) -> DesktopSnapshot {
     DesktopSnapshot {
         inventory: DesktopInventoryProjection { projects },
+        connections: Vec::new(),
         context_access: vec![ProjectContextAccessProjection {
             project_id,
             status: ProjectContextAccessStatus::Ready {
