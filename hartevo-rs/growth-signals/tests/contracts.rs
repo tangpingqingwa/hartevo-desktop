@@ -1,6 +1,19 @@
+use chrono::{TimeZone, Utc};
 use hartevo_connector_sdk::{
     ProviderAdapterOperation, ProviderAdapterRegistry, ProviderProvenanceClass,
 };
+use hartevo_domain_kernel::{ProjectId, TenantId};
+use hartevo_growth_signals::{
+    CalendarDateRange, LanguageCode, MarketCode, ReadScope,
+    dataforseo::DataForSeoDevice,
+    dataforseo::DataForSeoMode,
+    dataforseo::DataForSeoSearchRequest,
+    dataforseo::DataForSeoWorldScenario,
+    dataforseo::FakeDataForSeoTransport,
+    dataforseo_canary::{DataForSeoCanaryConfig, run_with_transport},
+    parse_date,
+};
+use rust_decimal::Decimal;
 use serde_json::Value;
 
 const PROVIDER_CATALOG: &str = include_str!("../../../contracts/providers/catalog.v1.json");
@@ -61,4 +74,64 @@ fn signal01_registry_is_e1_read_only_metadata_and_never_write_authority() {
             ));
         }
     }
+}
+
+#[test]
+fn signal02_canary_contract_binds_estimate_scope_evidence_and_replay_cost() {
+    let scope = ReadScope::new(
+        TenantId::from("tenant-contract"),
+        ProjectId::from("project-contract"),
+        MarketCode::new("DE").expect("market"),
+        LanguageCode::new("de").expect("language"),
+        CalendarDateRange::new(
+            parse_date("2026-08-01").expect("date"),
+            parse_date("2026-08-07").expect("date"),
+        )
+        .expect("window"),
+    );
+    let request = DataForSeoSearchRequest::new(
+        scope.clone(),
+        "contract canary",
+        2276,
+        DataForSeoDevice::Desktop,
+        10,
+        DataForSeoMode::Live,
+        Decimal::new(10, 2),
+        Some(Decimal::new(20, 2)),
+    )
+    .expect("request");
+    let config = DataForSeoCanaryConfig::new(
+        scope,
+        "dataforseo-account",
+        request,
+        2,
+        Utc.with_ymd_and_hms(2026, 8, 13, 0, 0, 0)
+            .single()
+            .expect("time"),
+    )
+    .expect("config");
+    let report = run_with_transport(
+        &config,
+        FakeDataForSeoTransport::new(DataForSeoWorldScenario::PaginatedResults),
+    )
+    .expect("report");
+    let value = serde_json::to_value(report).expect("report JSON");
+    assert_eq!(value["providerId"], "dataforseo");
+    assert_eq!(value["classification"], "provider_estimate");
+    assert_eq!(value["firstParty"], false);
+    assert_eq!(value["accountScope"]["accountId"], "dataforseo-account");
+    assert_eq!(value["chargedPageCount"], 1);
+    assert_eq!(value["pages"].as_array().expect("pages").len(), 2);
+    assert_eq!(
+        value["pages"][0]["rawEvidenceDigest"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
+    assert!(
+        value["pages"][0]["sourceRevision"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0
+    );
 }

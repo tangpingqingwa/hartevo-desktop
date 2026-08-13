@@ -9,8 +9,8 @@ use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_connector_sdk::{
-    ConnectorDescriptor, ConnectorError, ConnectorScope, ProviderProvenanceClass, ReadObservation,
-    SecretReference,
+    ConnectorDescriptor, ConnectorError, ConnectorScope, Cursor, ProviderProvenanceClass,
+    ReadObservation, SecretReference,
 };
 use reqwest::blocking::Client;
 use rust_decimal::Decimal;
@@ -30,6 +30,8 @@ use crate::common::{
 pub const DATAFORSEO_PROVIDER_ID: &str = "dataforseo";
 pub const DATAFORSEO_API_BASE_URL: &str = "https://api.dataforseo.com/";
 pub const DATAFORSEO_STANDARD_RESULT_MAX_AGE: Duration = Duration::days(30);
+pub const DATAFORSEO_MAX_DEPTH: u16 = 700;
+pub const DATAFORSEO_MAX_PAGE_SIZE: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,6 +144,7 @@ impl DataForSeoSearchRequest {
             || keyword.len() > 700
             || location_code == 0
             || depth == 0
+            || depth > DATAFORSEO_MAX_DEPTH
             || estimated_cost_usd.is_sign_negative()
             || cost_limit_usd.is_some_and(|limit| limit.is_sign_negative())
         {
@@ -366,6 +369,8 @@ pub struct DataForSeoSearchObservation {
     first_party: bool,
     receipt_reference: ProviderReceiptReference,
     response_digest: String,
+    raw_evidence_digest: String,
+    source_revision: u64,
     replayed: bool,
 }
 
@@ -417,6 +422,160 @@ impl DataForSeoSearchObservation {
     pub fn response_digest(&self) -> &str {
         &self.response_digest
     }
+
+    pub fn raw_evidence_digest(&self) -> &str {
+        &self.raw_evidence_digest
+    }
+
+    pub const fn source_revision(&self) -> u64 {
+        self.source_revision
+    }
+}
+
+/// A provider-specific durable page cursor backed by the merged Connector SDK
+/// cursor. The offset is intentionally kept next to the SDK cursor because
+/// DataForSEO returns a bounded SERP result, not a provider page token.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DataForSeoPageCursor {
+    scope_digest: String,
+    request_digest: String,
+    sequence: u64,
+    token_digest: String,
+    offset: usize,
+    page_size: usize,
+    source_revision: u64,
+}
+
+impl DataForSeoPageCursor {
+    fn new(
+        scope: &ConnectorScope,
+        request_digest: &str,
+        sequence: u64,
+        offset: usize,
+        page_size: usize,
+        source_revision: u64,
+    ) -> Result<Self, DataForSeoError> {
+        let token_digest = canonical_digest(&(request_digest, offset, page_size, source_revision));
+        let sdk_cursor = crate::sdk::cursor(scope, request_digest, sequence, &token_digest)
+            .map_err(DataForSeoError::Connector)?;
+        Ok(Self {
+            scope_digest: sdk_cursor.scope_digest().to_owned(),
+            request_digest: sdk_cursor.request_digest().to_owned(),
+            sequence: sdk_cursor.sequence(),
+            token_digest: sdk_cursor.token_digest().to_owned(),
+            offset,
+            page_size,
+            source_revision,
+        })
+    }
+
+    pub fn sdk_cursor(&self, scope: &ConnectorScope) -> Result<Cursor, DataForSeoError> {
+        if self.scope_digest != scope.digest() {
+            return Err(DataForSeoError::InvalidCursor);
+        }
+        crate::sdk::cursor(
+            scope,
+            &self.request_digest,
+            self.sequence,
+            &self.token_digest,
+        )
+        .map_err(DataForSeoError::Connector)
+    }
+
+    pub fn scope_digest(&self) -> &str {
+        &self.scope_digest
+    }
+
+    pub fn request_digest(&self) -> &str {
+        &self.request_digest
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn token_digest(&self) -> &str {
+        &self.token_digest
+    }
+
+    pub const fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub const fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    pub const fn source_revision(&self) -> u64 {
+        self.source_revision
+    }
+
+    fn validate(
+        &self,
+        scope: &ConnectorScope,
+        request_digest: &str,
+        page_size: usize,
+        source_revision: u64,
+    ) -> Result<(), DataForSeoError> {
+        let expected_token = canonical_digest(&(
+            request_digest,
+            self.offset,
+            self.page_size,
+            self.source_revision,
+        ));
+        if self.scope_digest != scope.digest()
+            || self.request_digest != request_digest
+            || self.token_digest != expected_token
+            || self.sequence == 0
+            || self.page_size != page_size
+            || self.source_revision != source_revision
+        {
+            return Err(DataForSeoError::InvalidCursor);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DataForSeoSearchPage {
+    observation: DataForSeoSearchObservation,
+    cursor: Option<DataForSeoPageCursor>,
+    next_cursor: Option<DataForSeoPageCursor>,
+    page_sequence: u64,
+    items: Vec<DataForSeoSerpItem>,
+    charged: bool,
+}
+
+impl DataForSeoSearchPage {
+    pub const fn observation(&self) -> &DataForSeoSearchObservation {
+        &self.observation
+    }
+
+    pub fn items(&self) -> &[DataForSeoSerpItem] {
+        &self.items
+    }
+
+    pub const fn cursor(&self) -> Option<&DataForSeoPageCursor> {
+        self.cursor.as_ref()
+    }
+
+    pub const fn next_cursor(&self) -> Option<&DataForSeoPageCursor> {
+        self.next_cursor.as_ref()
+    }
+
+    pub const fn page_sequence(&self) -> u64 {
+        self.page_sequence
+    }
+
+    pub const fn charged(&self) -> bool {
+        self.charged
+    }
+
+    pub const fn replayed(&self) -> bool {
+        self.observation.replayed()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -428,6 +587,7 @@ pub struct DataForSeoTaskReceipt {
     submitted_at: DateTime<Utc>,
     cost_usd: Decimal,
     rate_limit: DataForSeoRateLimit,
+    raw_evidence_digest: String,
     callback_mode: Option<DataForSeoCallbackMode>,
     charged: bool,
 }
@@ -459,6 +619,10 @@ impl DataForSeoTaskReceipt {
 
     pub const fn rate_limit(&self) -> &DataForSeoRateLimit {
         &self.rate_limit
+    }
+
+    pub fn raw_evidence_digest(&self) -> &str {
+        &self.raw_evidence_digest
     }
 }
 
@@ -551,6 +715,10 @@ pub enum DataForSeoError {
     CostLimitExceeded { estimated: Decimal, limit: Decimal },
     #[error("DataForSEO transport failed")]
     Transport,
+    #[error("DataForSEO page cursor is invalid")]
+    InvalidCursor,
+    #[error("Connector SDK rejected DataForSEO metadata: {0}")]
+    Connector(ConnectorError),
 }
 
 pub trait DataForSeoTransport: fmt::Debug {
@@ -614,15 +782,31 @@ pub struct DataForSeoHttpResponse {
     status: u16,
     headers: BTreeMap<String, String>,
     body: Value,
+    raw_evidence_digest: String,
 }
 
 impl DataForSeoHttpResponse {
     pub fn new(status: u16, headers: BTreeMap<String, String>, body: Value) -> Self {
+        let raw_evidence_digest = response_digest(&body);
+        Self::with_raw_evidence_digest(status, headers, body, raw_evidence_digest)
+    }
+
+    fn with_raw_evidence_digest(
+        status: u16,
+        headers: BTreeMap<String, String>,
+        body: Value,
+        raw_evidence_digest: String,
+    ) -> Self {
         Self {
             status,
             headers,
             body,
+            raw_evidence_digest,
         }
+    }
+
+    pub fn raw_evidence_digest(&self) -> &str {
+        &self.raw_evidence_digest
     }
 }
 
@@ -632,8 +816,8 @@ impl fmt::Debug for DataForSeoHttpResponse {
             .debug_struct("DataForSeoHttpResponse")
             .field("status", &self.status)
             .field("headers", &self.headers)
-            .field("bodyDigest", &response_digest(&self.body))
-            .finish()
+            .field("rawEvidenceDigest", &self.raw_evidence_digest)
+            .finish_non_exhaustive()
     }
 }
 
@@ -714,10 +898,16 @@ impl DataForSeoTransport for DataForSeoHttpTransport {
                     .map(|value| (name.as_str().to_ascii_lowercase(), value.to_owned()))
             })
             .collect::<BTreeMap<_, _>>();
-        let body = response
-            .json::<Value>()
+        let bytes = response.bytes().map_err(|_| DataForSeoError::Transport)?;
+        let raw_evidence_digest = format!("{:x}", Sha256::digest(&bytes));
+        let body = serde_json::from_slice::<Value>(&bytes)
             .map_err(|_| DataForSeoError::MalformedResponse)?;
-        Ok(DataForSeoHttpResponse::new(status, headers, body))
+        Ok(DataForSeoHttpResponse::with_raw_evidence_digest(
+            status,
+            headers,
+            body,
+            raw_evidence_digest,
+        ))
     }
 }
 
@@ -776,17 +966,57 @@ impl<T: DataForSeoTransport> DataForSeoClient<T> {
             crate::sdk::capability(DATAFORSEO_PROVIDER_ID, "search.measure")?,
             descriptor.identity().clone(),
             request_digest.to_owned(),
-            response_digest.clone(),
+            observation.raw_evidence_digest().to_owned(),
             response_digest,
             provenance,
             crate::sdk::freshness(
                 observation.freshness().observed_at(),
                 observation.freshness().valid_until(),
-                1,
+                observation.source_revision(),
             )?,
             1,
             u32::try_from(observation.items().len()).unwrap_or(u32::MAX),
             None,
+        )
+    }
+
+    pub fn sdk_read_page_observation(
+        &self,
+        page: &DataForSeoSearchPage,
+        provenance: ProviderProvenanceClass,
+    ) -> Result<ReadObservation, ConnectorError> {
+        let descriptor = Self::connector_descriptor()?;
+        let observation = page.observation();
+        let request_digest = observation.receipt_reference().request_digest();
+        ReadObservation::new(
+            format!(
+                "read-observation-{request_digest}-page-{}",
+                page.page_sequence()
+            ),
+            self.secret_reference.scope().clone(),
+            crate::sdk::capability(DATAFORSEO_PROVIDER_ID, "search.measure")?,
+            descriptor.identity().clone(),
+            request_digest.to_owned(),
+            observation.raw_evidence_digest().to_owned(),
+            observation.response_digest().to_owned(),
+            provenance,
+            crate::sdk::freshness(
+                observation.freshness().observed_at(),
+                observation.freshness().valid_until(),
+                observation.source_revision(),
+            )?,
+            page.page_sequence(),
+            u32::try_from(page.items().len()).unwrap_or(u32::MAX),
+            page.next_cursor()
+                .map(|cursor| {
+                    crate::sdk::cursor(
+                        self.secret_reference.scope(),
+                        cursor.request_digest(),
+                        cursor.sequence(),
+                        cursor.token_digest(),
+                    )
+                })
+                .transpose()?,
         )
     }
 
@@ -833,6 +1063,61 @@ impl<T: DataForSeoTransport> DataForSeoClient<T> {
         Ok(observation)
     }
 
+    pub fn read_live_page(
+        &mut self,
+        request: &DataForSeoSearchRequest,
+        page_size: usize,
+        cursor: Option<&DataForSeoPageCursor>,
+        observed_at: DateTime<Utc>,
+    ) -> Result<DataForSeoSearchPage, DataForSeoError> {
+        if request.mode != DataForSeoMode::Live
+            || page_size == 0
+            || page_size > DATAFORSEO_MAX_PAGE_SIZE
+        {
+            return Err(DataForSeoError::InvalidRequest);
+        }
+        let observation = self.read_live(request, observed_at)?;
+        let request_digest = request.request_digest();
+        let (offset, page_sequence) = if let Some(cursor) = cursor {
+            cursor.validate(
+                self.secret_reference.scope(),
+                &request_digest,
+                page_size,
+                observation.source_revision(),
+            )?;
+            (cursor.offset, cursor.sequence)
+        } else {
+            (0, 1)
+        };
+        if cursor.is_some() && offset >= observation.items.len() {
+            return Err(DataForSeoError::InvalidCursor);
+        }
+        let end = offset
+            .saturating_add(page_size)
+            .min(observation.items.len());
+        let items = observation.items[offset..end].to_vec();
+        let next_cursor = if end < observation.items.len() {
+            Some(DataForSeoPageCursor::new(
+                self.secret_reference.scope(),
+                &request_digest,
+                page_sequence.saturating_add(1),
+                end,
+                page_size,
+                observation.source_revision(),
+            )?)
+        } else {
+            None
+        };
+        Ok(DataForSeoSearchPage {
+            charged: !observation.replayed && offset == 0,
+            observation,
+            cursor: cursor.cloned(),
+            next_cursor,
+            page_sequence,
+            items,
+        })
+    }
+
     pub fn begin_standard(
         &mut self,
         request: &DataForSeoSearchRequest,
@@ -865,6 +1150,7 @@ impl<T: DataForSeoTransport> DataForSeoClient<T> {
             submitted_at,
             cost_usd: decimal_field(&task, "cost")?,
             rate_limit: rate,
+            raw_evidence_digest: response.raw_evidence_digest().to_owned(),
             callback_mode,
             charged: true,
         };
@@ -1047,6 +1333,8 @@ impl<T: DataForSeoTransport> DataForSeoClient<T> {
         let freshness = Freshness::new(completed_at, valid_until)
             .map_err(|_| DataForSeoError::MalformedResponse)?;
         let response_digest = response_digest(&task);
+        let raw_evidence_digest = response.raw_evidence_digest().to_owned();
+        let source_revision = source_revision_for(&raw_evidence_digest);
         let mut items = Vec::new();
         if let Some(results) = task.get("result").and_then(Value::as_array) {
             for result in results {
@@ -1078,6 +1366,8 @@ impl<T: DataForSeoTransport> DataForSeoClient<T> {
                 task_id_from(&task).ok().map(|id| id.as_str().to_owned()),
             ),
             response_digest,
+            raw_evidence_digest,
+            source_revision,
             replayed,
         })
     }
@@ -1086,6 +1376,7 @@ impl<T: DataForSeoTransport> DataForSeoClient<T> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataForSeoWorldScenario {
     Results,
+    PaginatedResults,
     EmptyResult,
     DelayedTask,
     StaleResult,
@@ -1194,11 +1485,7 @@ impl DataForSeoTransport for FakeDataForSeoTransport {
                         "status_code": 20000,
                         "cost": cost,
                         "completed_at": completed_at,
-                        "result": if self.scenario == DataForSeoWorldScenario::EmptyResult {
-                            json!([])
-                        } else {
-                            json!([{"items":[{"type":"organic","rank_absolute":1,"title":"Example","url":"https://example.com/"}]}])
-                        }
+                        "result": fake_result(self.scenario)
                     }]
                 })
             }
@@ -1210,11 +1497,7 @@ impl DataForSeoTransport for FakeDataForSeoTransport {
                     "status_code": 20000,
                     "cost": cost,
                     "completed_at": completed_at,
-                    "result": if self.scenario == DataForSeoWorldScenario::EmptyResult {
-                        json!([])
-                    } else {
-                        json!([{"items":[{"type":"organic","rank_absolute":1,"title":"Example","url":"https://example.com/"}]}])
-                    }
+                    "result": fake_result(self.scenario)
                 }]
             })
         };
@@ -1288,6 +1571,32 @@ fn header_u64(headers: &BTreeMap<String, String>, name: &str) -> Option<u64> {
     headers
         .get(name)
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn fake_result(scenario: DataForSeoWorldScenario) -> Value {
+    if scenario == DataForSeoWorldScenario::EmptyResult {
+        json!([])
+    } else if scenario == DataForSeoWorldScenario::PaginatedResults {
+        json!([{"items":[
+            {"type":"organic","rank_absolute":1,"title":"Example one","url":"https://example.com/one"},
+            {"type":"organic","rank_absolute":2,"title":"Example two","url":"https://example.com/two"},
+            {"type":"organic","rank_absolute":3,"title":"Example three","url":"https://example.com/three"}
+        ]}])
+    } else {
+        json!([{"items":[{"type":"organic","rank_absolute":1,"title":"Example","url":"https://example.com/"}]}])
+    }
+}
+
+fn source_revision_for(raw_evidence_digest: &str) -> u64 {
+    // DataForSEO does not expose a revision token for a SERP payload. Binding
+    // the SDK freshness revision to the first digest word makes the revision
+    // deterministic and changes it whenever the captured evidence changes.
+    u64::from_str_radix(
+        raw_evidence_digest.get(..16).unwrap_or(raw_evidence_digest),
+        16,
+    )
+    .unwrap_or(1)
+    .max(1)
 }
 
 pub fn dataforseo_scope(reference: &SecretReference) -> Result<&ConnectorScope, DataForSeoError> {
@@ -1392,6 +1701,40 @@ mod tests {
         assert!(!first.replayed());
         assert!(replayed.replayed());
         assert_eq!(client.replay_ledger().observation_count(), 1);
+    }
+
+    #[test]
+    fn page_cursor_round_trips_and_replays_the_billable_observation() {
+        let transport = FakeDataForSeoTransport::new(DataForSeoWorldScenario::PaginatedResults);
+        let mut client = DataForSeoClient::new(secret(), transport).expect("client");
+        let request = request(DataForSeoMode::Live);
+        let first = client
+            .read_live_page(&request, 2, None, now())
+            .expect("first page");
+        let cursor = first.next_cursor().expect("next cursor").clone();
+        let encoded = serde_json::to_string(&cursor).expect("cursor JSON");
+        let restored: DataForSeoPageCursor =
+            serde_json::from_str(&encoded).expect("durable cursor");
+        let second = client
+            .read_live_page(&request, 2, Some(&restored), now())
+            .expect("second page");
+        assert_eq!(second.page_sequence(), 2);
+        assert_eq!(second.items().len(), 1);
+        assert!(second.replayed());
+        assert!(!second.charged());
+        assert_eq!(client.replay_ledger().observation_count(), 1);
+        assert_eq!(restored.offset(), 2);
+        assert_eq!(
+            restored
+                .sdk_cursor(client.secret_reference().scope())
+                .expect("SDK cursor")
+                .sequence(),
+            2
+        );
+        assert_ne!(
+            first.observation().response_digest(),
+            first.observation().raw_evidence_digest()
+        );
     }
 
     #[test]
