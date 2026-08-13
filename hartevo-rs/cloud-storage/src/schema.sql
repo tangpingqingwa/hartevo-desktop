@@ -37,6 +37,71 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.projects (
     CHECK (created_at <= updated_at)
 );
 
+CREATE TABLE IF NOT EXISTS hartevo_cell.remote_worker_transport_registrations (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL CHECK (length(btrim(mission_id)) > 0),
+    registration_id TEXT NOT NULL CHECK (length(btrim(registration_id)) > 0),
+    dispatch_registration_id TEXT NOT NULL
+        CHECK (dispatch_registration_id ~ '^[0-9a-f]{64}$'),
+    worker_id TEXT NOT NULL CHECK (length(btrim(worker_id)) > 0),
+    plugin_id TEXT NOT NULL CHECK (length(btrim(plugin_id)) > 0),
+    service_id TEXT NOT NULL CHECK (length(btrim(service_id)) > 0),
+    service_version BIGINT NOT NULL CHECK (service_version > 0),
+    service_contract_digest TEXT NOT NULL
+        CHECK (service_contract_digest ~ '^[0-9a-f]{64}$'),
+    provider_id TEXT NOT NULL CHECK (length(btrim(provider_id)) > 0),
+    provider_version BIGINT NOT NULL CHECK (provider_version > 0),
+    provider_implementation_digest TEXT NOT NULL
+        CHECK (provider_implementation_digest ~ '^[0-9a-f]{64}$'),
+    consumer_id TEXT NOT NULL CHECK (length(btrim(consumer_id)) > 0),
+    consumer_min_service_version BIGINT NOT NULL
+        CHECK (consumer_min_service_version > 0),
+    consumer_descriptor_digest TEXT NOT NULL
+        CHECK (consumer_descriptor_digest ~ '^[0-9a-f]{64}$'),
+    idempotency_key TEXT NOT NULL CHECK (idempotency_key ~ '^[0-9a-f]{64}$'),
+    request_digest TEXT NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    state TEXT NOT NULL CHECK (state IN ('mounted', 'unmounted', 'revoked')),
+    mounted_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    unmounted_at TIMESTAMPTZ,
+    revoked_at TIMESTAMPTZ,
+    revocation_reason_digest TEXT
+        CHECK (revocation_reason_digest IS NULL
+            OR revocation_reason_digest ~ '^[0-9a-f]{64}$'),
+    revision BIGINT NOT NULL CHECK (revision > 0),
+    PRIMARY KEY (cell, tenant_id, project_id, mission_id, registration_id),
+    UNIQUE (cell, tenant_id, project_id, mission_id, idempotency_key),
+    FOREIGN KEY (cell, tenant_id, project_id)
+        REFERENCES hartevo_cell.projects (cell, tenant_id, project_id),
+    CHECK (mounted_at <= updated_at),
+    CHECK (state <> 'mounted' OR (unmounted_at IS NULL AND revoked_at IS NULL)),
+    CHECK (state <> 'unmounted' OR (unmounted_at IS NOT NULL AND revoked_at IS NULL)),
+    CHECK (state <> 'revoked' OR revoked_at IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.remote_worker_dispatch_registrations (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL CHECK (length(btrim(mission_id)) > 0),
+    registration_id TEXT NOT NULL CHECK (length(btrim(registration_id)) > 0),
+    dispatch_registration_id TEXT NOT NULL
+        CHECK (dispatch_registration_id ~ '^[0-9a-f]{64}$'),
+    worker_id TEXT NOT NULL CHECK (length(btrim(worker_id)) > 0),
+    registered_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    revision BIGINT NOT NULL CHECK (revision > 0),
+    PRIMARY KEY (cell, tenant_id, project_id, mission_id, dispatch_registration_id),
+    UNIQUE (cell, tenant_id, project_id, mission_id, registration_id,
+        dispatch_registration_id),
+    FOREIGN KEY (cell, tenant_id, project_id, mission_id, registration_id)
+        REFERENCES hartevo_cell.remote_worker_transport_registrations
+            (cell, tenant_id, project_id, mission_id, registration_id),
+    CHECK (registered_at <= updated_at)
+);
+
 CREATE TABLE IF NOT EXISTS hartevo_cell.sync_object_versions (
     cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
     tenant_id TEXT NOT NULL,
@@ -312,6 +377,9 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.remote_worker_mailbox_messages (
     deadline_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     revision BIGINT NOT NULL CHECK (revision > 0),
+    dispatch_registration_id TEXT
+        CHECK (dispatch_registration_id IS NULL
+            OR dispatch_registration_id ~ '^[0-9a-f]{64}$'),
     PRIMARY KEY (cell, tenant_id, project_id, task_id),
     UNIQUE (cell, tenant_id, project_id, idempotency_key),
     UNIQUE (cell, tenant_id, project_id, claim_idempotency_key),
@@ -381,6 +449,9 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.remote_worker_claims (
     lease_expires_at TIMESTAMPTZ NOT NULL,
     revision BIGINT NOT NULL CHECK (revision > 0),
     claimed_at TIMESTAMPTZ NOT NULL,
+    dispatch_registration_id TEXT
+        CHECK (dispatch_registration_id IS NULL
+            OR dispatch_registration_id ~ '^[0-9a-f]{64}$'),
     PRIMARY KEY (cell, tenant_id, project_id, claim_idempotency_key),
     UNIQUE (cell, tenant_id, project_id, task_id, lease_generation),
     FOREIGN KEY (cell, tenant_id, project_id, task_id)
@@ -917,6 +988,11 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.effect_rate_limit_decisions (
     )
 );
 
+ALTER TABLE hartevo_cell.remote_worker_mailbox_messages
+    ADD COLUMN IF NOT EXISTS dispatch_registration_id TEXT;
+ALTER TABLE hartevo_cell.remote_worker_claims
+    ADD COLUMN IF NOT EXISTS dispatch_registration_id TEXT;
+
 CREATE INDEX IF NOT EXISTS outbox_claim_idx
     ON hartevo_cell.outbox_messages
         (cell, tenant_id, status, available_at, sequence);
@@ -937,7 +1013,14 @@ CREATE INDEX IF NOT EXISTS sync_versions_replay_idx
         (cell, tenant_id, project_id, recorded_at, object_id, revision);
 CREATE INDEX IF NOT EXISTS remote_worker_claim_idx
     ON hartevo_cell.remote_worker_mailbox_messages
-        (cell, tenant_id, project_id, worker_id, status, enqueued_at, task_id);
+        (cell, tenant_id, project_id, mission_id, dispatch_registration_id,
+            worker_id, status, enqueued_at, task_id);
+CREATE INDEX IF NOT EXISTS remote_worker_transport_registration_scope_idx
+    ON hartevo_cell.remote_worker_transport_registrations
+        (cell, tenant_id, project_id, mission_id, state, service_id);
+CREATE INDEX IF NOT EXISTS remote_worker_dispatch_registration_scope_idx
+    ON hartevo_cell.remote_worker_dispatch_registrations
+        (cell, tenant_id, project_id, mission_id, dispatch_registration_id);
 CREATE INDEX IF NOT EXISTS device_handoff_target_idx
     ON hartevo_cell.device_handoff_grants
         (cell, tenant_id, project_id, target_device_id, expires_at);
@@ -955,6 +1038,10 @@ ALTER TABLE hartevo_cell.tenant_cells ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.tenant_cells FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.projects FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.remote_worker_transport_registrations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.remote_worker_transport_registrations FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.remote_worker_dispatch_registrations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.remote_worker_dispatch_registrations FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.sync_object_versions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.sync_object_versions FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.sync_object_heads ENABLE ROW LEVEL SECURITY;
@@ -1023,6 +1110,8 @@ BEGIN
     FOREACH scoped_table IN ARRAY ARRAY[
         'tenant_cells',
         'projects',
+        'remote_worker_transport_registrations',
+        'remote_worker_dispatch_registrations',
         'sync_object_versions',
         'sync_object_heads',
         'domain_events',

@@ -19,9 +19,18 @@ use thiserror::Error;
 use tokio_postgres::{Client, Row, Transaction};
 
 mod effect_ledger;
+mod remote_worker_plugin;
 mod scheduler;
 
 pub use effect_ledger::{CloudPermissionFenceMutation, CloudPermissionFenceResult};
+pub use remote_worker_plugin::{
+    CloudRemoteWorkerServiceDefinition, CloudRemoteWorkerTransportConsumer,
+    CloudRemoteWorkerTransportLifecycleResult, CloudRemoteWorkerTransportMount,
+    CloudRemoteWorkerTransportMountResult, CloudRemoteWorkerTransportProvider,
+    CloudRemoteWorkerTransportRegistration, CloudRemoteWorkerTransportRegistrationState,
+    REMOTE_WORKER_TRANSPORT_SCHEMA, REMOTE_WORKER_TRANSPORT_SERVICE_ID,
+    REMOTE_WORKER_TRANSPORT_SERVICE_VERSION,
+};
 pub use scheduler::{
     MAX_SCHEDULER_LEASE_SECONDS, SchedulerAttempt, SchedulerAttemptOutcome,
     SchedulerAttemptSurface, SchedulerBackpressure, SchedulerBackpressureState, SchedulerBudget,
@@ -31,7 +40,7 @@ pub use scheduler::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_CIPHERTEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REMOTE_WORKER_LEASE: Duration = Duration::seconds(15 * 60);
 const CLAIM_OUTBOX_SQL: &str = "WITH candidates AS (
@@ -76,7 +85,7 @@ const REMOTE_WORKER_TASK_COLUMNS: &str = "task_id, project_id, mission_id, worke
        lease_owner, lease_token_digest, claim_idempotency_key,
        claim_request_digest, lease_expires_at, heartbeat_at, result_digest,
        completion_idempotency_key, completion_request_digest, completed_at,
-       enqueued_at, deadline_at, updated_at, revision";
+       enqueued_at, deadline_at, updated_at, revision, dispatch_registration_id";
 
 pub const POSTGRES_L2_URL_ENV: &str = "HARTEVO_TEST_POSTGRES_URL";
 
@@ -310,6 +319,7 @@ pub struct CloudRemoteWorkerTask {
     pub mission_id: MissionId,
     pub task_id: TaskId,
     pub worker_id: WorkerId,
+    pub dispatch_registration_id: String,
     pub payload: EncryptedPayload,
     pub idempotency_key_digest: String,
     pub enqueued_at: DateTime<Utc>,
@@ -325,6 +335,7 @@ impl CloudRemoteWorkerTask {
             || self.task_id.as_str().trim().is_empty()
             || self.worker_id.as_str().trim().is_empty()
             || self.worker_id.as_str().len() > 256
+            || !is_sha256(&self.dispatch_registration_id)
             || !is_sha256(&self.idempotency_key_digest)
             || self.deadline_at <= self.enqueued_at
         {
@@ -341,6 +352,7 @@ impl CloudRemoteWorkerTask {
             "missionId": self.mission_id,
             "taskId": self.task_id,
             "workerId": self.worker_id,
+            "dispatchRegistrationId": self.dispatch_registration_id,
             "payload": self.payload,
             "enqueuedAt": self.enqueued_at,
             "deadlineAt": self.deadline_at,
@@ -364,6 +376,7 @@ pub struct CloudRemoteWorkerTaskLease {
     pub mission_id: MissionId,
     pub task_id: TaskId,
     pub worker_id: WorkerId,
+    pub dispatch_registration_id: String,
     pub lease_id: WorkerLeaseId,
     pub lease_generation: u64,
     pub lease_owner: String,
@@ -403,7 +416,9 @@ pub struct CloudRemoteWorkerTaskRecord {
 pub struct CloudRemoteWorkerCompletion {
     pub scope: CellScope,
     pub project_id: ProjectId,
+    pub mission_id: MissionId,
     pub task_id: TaskId,
+    pub dispatch_registration_id: String,
     pub lease_id: WorkerLeaseId,
     pub lease_generation: u64,
     pub lease_owner: String,
@@ -417,7 +432,9 @@ impl CloudRemoteWorkerCompletion {
     fn validate(&self, expected_cell: DataCell) -> Result<(), CloudStorageError> {
         self.scope.validate(expected_cell)?;
         if self.project_id.as_str().trim().is_empty()
+            || self.mission_id.as_str().trim().is_empty()
             || self.task_id.as_str().trim().is_empty()
+            || !is_sha256(&self.dispatch_registration_id)
             || self.lease_id.as_str().trim().is_empty()
             || self.lease_generation == 0
             || self.lease_owner.trim().is_empty()
@@ -436,7 +453,9 @@ impl CloudRemoteWorkerCompletion {
             "cell": self.scope.cell,
             "tenantId": self.scope.tenant_id,
             "projectId": self.project_id,
+            "missionId": self.mission_id,
             "taskId": self.task_id,
+            "dispatchRegistrationId": self.dispatch_registration_id,
             "leaseId": self.lease_id,
             "leaseGeneration": self.lease_generation,
             "leaseOwner": self.lease_owner,
@@ -589,7 +608,7 @@ impl PostgresCellStore {
         let transaction = client.transaction().await?;
         transaction
             .query_one(
-                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v5'))",
+                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v6'))",
                 &[],
             )
             .await?;
@@ -1692,6 +1711,15 @@ impl PostgresCellStore {
         ensure_database_cell(&transaction, self.cell).await?;
         ensure_remote_worker_project(&transaction, &task.scope, &task.project_id).await?;
         lock_project(&transaction, &task.scope, &task.project_id).await?;
+        remote_worker_plugin::ensure_remote_worker_dispatch_active(
+            &transaction,
+            &task.scope,
+            &task.project_id,
+            &task.mission_id,
+            &task.dispatch_registration_id,
+            &task.worker_id,
+        )
+        .await?;
 
         if let Some(existing) = transaction
             .query_opt(
@@ -1740,9 +1768,9 @@ impl PostgresCellStore {
                     payload_key_version, payload_nonce, payload_ciphertext,
                     payload_aad_digest, payload_content_digest, idempotency_key,
                     request_digest, status, enqueued_at, deadline_at, updated_at,
-                    revision)
+                    revision, dispatch_registration_id)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                         $13, 'pending', $14, $15, $14, 1)",
+                         $13, 'pending', $14, $15, $14, 1, $16)",
                 &[
                     &task.scope.cell.as_str(),
                     &task.scope.tenant_id.as_str(),
@@ -1759,6 +1787,7 @@ impl PostgresCellStore {
                     &request_digest,
                     &task.enqueued_at,
                     &task.deadline_at,
+                    &task.dispatch_registration_id,
                 ],
             )
             .await?;
@@ -1802,6 +1831,8 @@ impl PostgresCellStore {
         client: &mut Client,
         scope: &CellScope,
         project_id: &ProjectId,
+        mission_id: &MissionId,
+        dispatch_registration_id: &str,
         worker_id: &WorkerId,
         lease_owner: &str,
         lease_token_digest: &str,
@@ -1810,7 +1841,10 @@ impl PostgresCellStore {
         lease_for: Duration,
     ) -> Result<Option<CloudRemoteWorkerClaimResult>, CloudStorageError> {
         scope.validate(self.cell)?;
-        if project_id.as_str().trim().is_empty() {
+        if project_id.as_str().trim().is_empty()
+            || mission_id.as_str().trim().is_empty()
+            || !is_sha256(dispatch_registration_id)
+        {
             return Err(CloudStorageError::InvalidRemoteWorkerTask);
         }
         validate_remote_worker_claim_inputs(
@@ -1824,6 +1858,8 @@ impl PostgresCellStore {
             "cell": scope.cell,
             "tenantId": scope.tenant_id,
             "projectId": project_id,
+            "missionId": mission_id,
+            "dispatchRegistrationId": dispatch_registration_id,
             "workerId": worker_id,
             "leaseOwner": lease_owner,
             "leaseTokenDigest": lease_token_digest,
@@ -1834,6 +1870,15 @@ impl PostgresCellStore {
         set_scope(&transaction, scope).await?;
         ensure_database_cell(&transaction, self.cell).await?;
         ensure_remote_worker_project(&transaction, scope, project_id).await?;
+        remote_worker_plugin::ensure_remote_worker_dispatch_active(
+            &transaction,
+            scope,
+            project_id,
+            mission_id,
+            dispatch_registration_id,
+            worker_id,
+        )
+        .await?;
         lock_remote_worker_claim_key(
             &transaction,
             scope,
@@ -1864,6 +1909,12 @@ impl PostgresCellStore {
                 load_remote_worker_task_row_tx(&transaction, scope, project_id, &task_id, true)
                     .await?
                     .ok_or(CloudStorageError::RemoteWorkerTaskNotFound)?;
+            if row.mission_id != *mission_id
+                || row.dispatch_registration_id != dispatch_registration_id
+                || row.worker_id != *worker_id
+            {
+                return Err(CloudStorageError::RemoteWorkerDispatchNotRegistered);
+            }
             let attempts = u32::try_from(existing_claim.get::<_, i32>(6)).map_err(|_| {
                 CloudStorageError::StoredValueInvalid("remote worker attempts".into())
             })?;
@@ -1891,9 +1942,10 @@ impl PostgresCellStore {
                     "SELECT {REMOTE_WORKER_TASK_COLUMNS}
                      FROM hartevo_cell.remote_worker_mailbox_messages
                      WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
-                       AND worker_id = $4 AND enqueued_at <= $5 AND deadline_at > $5
+                       AND mission_id = $4 AND dispatch_registration_id = $5
+                       AND worker_id = $6 AND enqueued_at <= $7 AND deadline_at > $7
                        AND (status = 'pending'
-                            OR (status = 'leased' AND lease_expires_at <= $5))
+                            OR (status = 'leased' AND lease_expires_at <= $7))
                      ORDER BY enqueued_at ASC, task_id ASC
                      FOR UPDATE SKIP LOCKED
                      LIMIT 1"
@@ -1902,6 +1954,8 @@ impl PostgresCellStore {
                     &scope.cell.as_str(),
                     &scope.tenant_id.as_str(),
                     &project_id.as_str(),
+                    &mission_id.as_str(),
+                    &dispatch_registration_id,
                     &worker_id.as_str(),
                     &now,
                 ],
@@ -1957,11 +2011,11 @@ impl PostgresCellStore {
             .execute(
                 "INSERT INTO hartevo_cell.remote_worker_claims
                    (cell, tenant_id, project_id, task_id, claim_idempotency_key,
-                    claim_request_digest, lease_id, lease_generation, lease_owner,
-                    lease_token_digest, attempts, heartbeat_at, lease_expires_at,
-                    revision, claimed_at)
+                     claim_request_digest, lease_id, lease_generation, lease_owner,
+                     lease_token_digest, attempts, heartbeat_at, lease_expires_at,
+                    revision, claimed_at, dispatch_registration_id)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                         $13, $14, $15)",
+                         $13, $14, $15, $16)",
                 &[
                     &scope.cell.as_str(),
                     &scope.tenant_id.as_str(),
@@ -1978,6 +2032,7 @@ impl PostgresCellStore {
                     &lease.lease_expires_at,
                     &to_sql_u64(lease.revision)?,
                     &now,
+                    &lease.dispatch_registration_id,
                 ],
             )
             .await?;
@@ -1990,6 +2045,7 @@ impl PostgresCellStore {
 
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "heartbeat fencing requires every lease identity and the bounded clock extension"
     )]
     pub async fn heartbeat_remote_worker_task(
@@ -2022,6 +2078,15 @@ impl PostgresCellStore {
             load_remote_worker_task_row_tx(&transaction, scope, project_id, task_id, true)
                 .await?
                 .ok_or(CloudStorageError::RemoteWorkerTaskNotFound)?;
+        remote_worker_plugin::ensure_remote_worker_dispatch_active(
+            &transaction,
+            scope,
+            project_id,
+            &current.mission_id,
+            &current.dispatch_registration_id,
+            &current.worker_id,
+        )
+        .await?;
         require_current_remote_worker_lease(
             &current,
             lease_id,
@@ -2097,6 +2162,10 @@ impl PostgresCellStore {
         Ok(lease)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "completion keeps lease, registration and idempotency fences in one transaction"
+    )]
     pub async fn complete_remote_worker_task(
         &self,
         client: &mut Client,
@@ -2118,6 +2187,20 @@ impl PostgresCellStore {
         )
         .await?
         .ok_or(CloudStorageError::RemoteWorkerTaskNotFound)?;
+        if current.dispatch_registration_id != completion.dispatch_registration_id
+            || current.mission_id != completion.mission_id
+        {
+            return Err(CloudStorageError::RemoteWorkerDispatchNotRegistered);
+        }
+        remote_worker_plugin::ensure_remote_worker_dispatch_active(
+            &transaction,
+            &completion.scope,
+            &completion.project_id,
+            &current.mission_id,
+            &current.dispatch_registration_id,
+            &current.worker_id,
+        )
+        .await?;
         if current.status == CloudRemoteWorkerTaskStatus::Completed {
             if current.completion_idempotency_key.as_deref()
                 == Some(completion.idempotency_key_digest.as_str())
@@ -2494,6 +2577,7 @@ struct RemoteWorkerTaskRow {
     project_id: ProjectId,
     mission_id: MissionId,
     worker_id: WorkerId,
+    dispatch_registration_id: String,
     payload: EncryptedPayload,
     idempotency_key_digest: String,
     status: CloudRemoteWorkerTaskStatus,
@@ -2541,6 +2625,7 @@ impl RemoteWorkerTaskRow {
             mission_id: self.mission_id.clone(),
             task_id: self.task_id.clone(),
             worker_id: self.worker_id.clone(),
+            dispatch_registration_id: self.dispatch_registration_id.clone(),
             lease_id,
             lease_generation,
             lease_owner,
@@ -2571,6 +2656,7 @@ impl RemoteWorkerTaskRow {
             mission_id: self.mission_id,
             task_id: self.task_id,
             worker_id: self.worker_id,
+            dispatch_registration_id: self.dispatch_registration_id,
             lease_id: self
                 .lease_id
                 .ok_or(CloudStorageError::RemoteWorkerLeaseLost)?,
@@ -2609,6 +2695,7 @@ impl RemoteWorkerTaskRow {
             mission_id: self.mission_id.clone(),
             task_id: self.task_id.clone(),
             worker_id: self.worker_id.clone(),
+            dispatch_registration_id: self.dispatch_registration_id.clone(),
             payload: self.payload.clone(),
             idempotency_key_digest: self.idempotency_key_digest.clone(),
             enqueued_at: self.enqueued_at,
@@ -2673,7 +2760,13 @@ fn decode_remote_worker_task_row(
     };
     payload.validate()?;
     let request_digest = row.get::<_, String>(10);
-    if !is_sha256(&request_digest) || !is_sha256(&row.get::<_, String>(9)) {
+    let dispatch_registration_id = row
+        .get::<_, Option<String>>(29)
+        .ok_or(CloudStorageError::RemoteWorkerDispatchNotRegistered)?;
+    if !is_sha256(&request_digest)
+        || !is_sha256(&row.get::<_, String>(9))
+        || !is_sha256(&dispatch_registration_id)
+    {
         return Err(CloudStorageError::StoredValueInvalid(
             "remote worker request digest".into(),
         ));
@@ -2694,6 +2787,7 @@ fn decode_remote_worker_task_row(
             .unwrap_or_else(|| ProjectId::from_stable(row.get::<_, String>(1))),
         mission_id: MissionId::from_stable(row.get::<_, String>(2)),
         worker_id: WorkerId::from_stable(row.get::<_, String>(3)),
+        dispatch_registration_id,
         payload,
         idempotency_key_digest: row.get(9),
         status: decode_remote_worker_task_status(&row.get::<_, String>(11))?,
@@ -3592,6 +3686,18 @@ pub enum CloudStorageError {
     RemoteWorkerTaskAlreadyCompleted,
     #[error("remote Worker lease owner, token, generation, or expiry is no longer current")]
     RemoteWorkerLeaseLost,
+    #[error("remote Worker transport service/provider/consumer definition is invalid")]
+    InvalidRemoteWorkerTransportDefinition,
+    #[error(
+        "remote Worker transport service is already mounted in the exact Project/Mission scope"
+    )]
+    RemoteWorkerTransportAlreadyMounted,
+    #[error(
+        "remote Worker transport registration is not visible in the exact Project/Mission scope"
+    )]
+    RemoteWorkerTransportRegistrationNotFound,
+    #[error("remote Worker dispatch registration is not active in the exact Project/Mission scope")]
+    RemoteWorkerDispatchNotRegistered,
     #[error("device public key is not visible in the exact tenant/project/device scope")]
     DevicePublicKeyNotFound,
     #[error("device public-key revision is not the exact next transition")]
@@ -3909,6 +4015,7 @@ mod tests {
             mission_id: MissionId::from("mission-1"),
             task_id: TaskId::from("task-1"),
             worker_id: WorkerId::from("worker-1"),
+            dispatch_registration_id: "d".repeat(64),
             payload: payload(8),
             idempotency_key_digest: "d".repeat(64),
             enqueued_at: now(),
@@ -3968,7 +4075,9 @@ mod tests {
         let invalid_completion = CloudRemoteWorkerCompletion {
             scope: scope(DataCell::Us),
             project_id: ProjectId::from("project-1"),
+            mission_id: MissionId::from("mission-1"),
             task_id: TaskId::from("task-1"),
+            dispatch_registration_id: "d".repeat(64),
             lease_id: WorkerLeaseId::from("lease-1"),
             lease_generation: 1,
             lease_owner: "worker-process".into(),
@@ -3985,7 +4094,7 @@ mod tests {
 
     #[test]
     fn schema_contract_has_physical_cell_rls_ciphertext_and_append_only_versions() {
-        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(SCHEMA_VERSION, 6);
         assert!(SCHEMA.contains("FORCE ROW LEVEL SECURITY"));
         assert!(SCHEMA.contains("current_setting(''hartevo.tenant_id'', true)"));
         assert!(SCHEMA.contains("current_setting(''hartevo.cell'', true)"));
@@ -3994,6 +4103,9 @@ mod tests {
         assert!(SCHEMA.contains("sync_mutations"));
         assert!(SCHEMA.contains("remote_worker_mailbox_messages"));
         assert!(SCHEMA.contains("remote_worker_claims"));
+        assert!(SCHEMA.contains("remote_worker_transport_registrations"));
+        assert!(SCHEMA.contains("remote_worker_dispatch_registrations"));
+        assert!(SCHEMA.contains("state IN ('mounted', 'unmounted', 'revoked')"));
         assert!(SCHEMA.contains("claim_request_digest"));
         assert!(SCHEMA.contains("device_public_key_versions"));
         assert!(SCHEMA.contains("keyring_bootstrap_versions"));

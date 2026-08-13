@@ -2,7 +2,7 @@ use std::{error::Error, io};
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_cloud_storage::{CellScope, CloudRemoteWorkerCompletion, DataCell, PostgresCellStore};
-use hartevo_domain_kernel::{ProjectId, TaskId, TenantId, WorkerId, WorkerLeaseId};
+use hartevo_domain_kernel::{MissionId, ProjectId, TaskId, TenantId, WorkerId, WorkerLeaseId};
 use tokio_postgres::NoTls;
 
 type HarnessResult = Result<(), Box<dyn Error>>;
@@ -27,6 +27,8 @@ async fn claim() -> HarnessResult {
     let (mut client, _connection_task) = connect().await?;
     let scope = scope()?;
     let project_id = ProjectId::from_stable(required("HARTEVO_CELL_PROJECT")?);
+    let mission_id = MissionId::from_stable(required("HARTEVO_CELL_MISSION")?);
+    let dispatch_registration_id = required("HARTEVO_CELL_DISPATCH_REGISTRATION")?;
     let worker_id = WorkerId::from_stable(required("HARTEVO_CELL_WORKER")?);
     let owner = required("HARTEVO_CELL_LEASE_OWNER")?;
     let token_digest = required("HARTEVO_CELL_LEASE_TOKEN_DIGEST")?;
@@ -39,6 +41,8 @@ async fn claim() -> HarnessResult {
             &mut client,
             &scope,
             &project_id,
+            &mission_id,
+            &dispatch_registration_id,
             &worker_id,
             &owner,
             &token_digest,
@@ -67,7 +71,9 @@ async fn complete() -> HarnessResult {
     let (mut client, _connection_task) = connect().await?;
     let scope = scope()?;
     let project_id = ProjectId::from_stable(required("HARTEVO_CELL_PROJECT")?);
+    let mission_id = MissionId::from_stable(required("HARTEVO_CELL_MISSION")?);
     let task_id = TaskId::from_stable(required("HARTEVO_CELL_TASK")?);
+    let dispatch_registration_id = required("HARTEVO_CELL_DISPATCH_REGISTRATION")?;
     let lease_id = WorkerLeaseId::from_stable(required("HARTEVO_CELL_LEASE_ID")?);
     let lease_generation = required("HARTEVO_CELL_LEASE_GENERATION")?.parse::<u64>()?;
     let lease_owner = required("HARTEVO_CELL_LEASE_OWNER")?;
@@ -82,7 +88,9 @@ async fn complete() -> HarnessResult {
             &CloudRemoteWorkerCompletion {
                 scope,
                 project_id,
+                mission_id,
                 task_id,
+                dispatch_registration_id,
                 lease_id,
                 lease_generation,
                 lease_owner,
