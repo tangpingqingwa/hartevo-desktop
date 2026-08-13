@@ -14,6 +14,7 @@ from xml.sax.saxutils import escape
 
 TAXONOMY = ("PASS", "CODE_FAILURE", "INFRA_FAILURE", "CI_NOT_EXECUTED")
 GITHUB_RESULTS = {"success", "failure", "cancelled", "skipped", "neutral", "timed_out"}
+PLANNED_SCOPE_MARKER = "Planned scope skip marker"
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class Job:
     kind: str
     allowed_skip: bool = False
     no_steps: bool = False
+    planned_scope: bool = False
 
 
 def parse_mapping(values: list[str], label: str) -> dict[str, str]:
@@ -38,6 +40,8 @@ def parse_mapping(values: list[str], label: str) -> dict[str, str]:
 
 
 def classify(job: Job) -> str:
+    if (job.allowed_skip and job.result == "skipped") or (job.planned_scope and job.result == "success"):
+        return "PASS"
     if job.no_steps:
         return "CI_NOT_EXECUTED"
     if job.result == "success":
@@ -52,13 +56,14 @@ def classify(job: Job) -> str:
 def aggregate(jobs: list[Job]) -> tuple[str, list[dict[str, object]]]:
     entries: list[dict[str, object]] = []
     for job in jobs:
+        planned_skip = (job.allowed_skip and job.result == "skipped") or (job.planned_scope and job.result == "success")
         classification = classify(job)
-        reason = None
+        reason = "validated planned scope markers" if job.planned_scope and planned_skip else ("scope-allowed skip" if planned_skip else None)
         if classification == "CI_NOT_EXECUTED":
             if job.no_steps:
                 reason = "job did not execute: GitHub created no steps (runner/billing or hosted infrastructure gate)"
             else:
-                reason = "scope-allowed skip" if job.allowed_skip and job.result == "skipped" else "job did not execute"
+                reason = "job did not execute"
         entries.append(
             {
                 "name": job.name,
@@ -66,6 +71,8 @@ def aggregate(jobs: list[Job]) -> tuple[str, list[dict[str, object]]]:
                 "kind": job.kind,
                 "classification": classification,
                 "allowedSkip": job.allowed_skip,
+                "plannedSkip": planned_skip,
+                "plannedScope": job.planned_scope,
                 "noSteps": job.no_steps,
                 "reason": reason,
             }
@@ -77,7 +84,7 @@ def aggregate(jobs: list[Job]) -> tuple[str, list[dict[str, object]]]:
     elif "CODE_FAILURE" in classifications:
         overall = "CODE_FAILURE"
     elif any(
-        entry["classification"] == "CI_NOT_EXECUTED" and not entry["allowedSkip"]
+        entry["classification"] == "CI_NOT_EXECUTED" and not entry["plannedSkip"]
         for entry in entries
     ):
         overall = "CI_NOT_EXECUTED"
@@ -87,7 +94,7 @@ def aggregate(jobs: list[Job]) -> tuple[str, list[dict[str, object]]]:
 
 
 def write_junit(path: Path, workflow: str, overall: str, entries: list[dict[str, object]]) -> None:
-    failures = sum(entry["classification"] in {"CODE_FAILURE", "INFRA_FAILURE", "CI_NOT_EXECUTED"} and not entry["allowedSkip"] for entry in entries)
+    failures = sum(entry["classification"] in {"CODE_FAILURE", "INFRA_FAILURE", "CI_NOT_EXECUTED"} and not entry["plannedSkip"] for entry in entries)
     lines = [
         f'<testsuite name="{escape(workflow)}" tests="{len(entries)}" failures="{failures}" skipped="0">'
     ]
@@ -95,7 +102,7 @@ def write_junit(path: Path, workflow: str, overall: str, entries: list[dict[str,
         name = escape(str(entry["name"]))
         classification = str(entry["classification"])
         lines.append(f'  <testcase classname="ci" name="{name}">')
-        if classification != "PASS" and not entry["allowedSkip"]:
+        if classification != "PASS" and not entry["plannedSkip"]:
             detail = escape(str(entry.get("reason") or classification))
             lines.append(f"    <failure message=\"{classification}\">{detail}</failure>")
         lines.append("  </testcase>")
@@ -104,16 +111,75 @@ def write_junit(path: Path, workflow: str, overall: str, entries: list[dict[str,
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def validate_planned_scope_markers(records: list[object], expected_names: list[str]) -> dict[str, object]:
+    if len(expected_names) != 5 or len(set(expected_names)) != 5:
+        raise ValueError("planned Rust scope requires five unique child check names")
+    by_name = {
+        record.get("name"): record
+        for record in records
+        if isinstance(record, dict) and isinstance(record.get("name"), str)
+    }
+    evidence: list[dict[str, object]] = []
+    for expected_name in expected_names:
+        record = by_name.get(expected_name)
+        if not isinstance(record, dict):
+            raise ValueError(f"planned Rust scope child check is missing: {expected_name}")
+        if record.get("status") != "completed" or record.get("conclusion") != "success":
+            raise ValueError(f"planned Rust scope child check did not succeed: {expected_name}")
+        steps = record.get("steps")
+        if not isinstance(steps, list):
+            raise ValueError(f"planned Rust scope child check has malformed steps: {expected_name}")
+        step_entries = [
+            step
+            for step in steps
+            if isinstance(step, dict)
+            and isinstance(step.get("name"), str)
+            and isinstance(step.get("conclusion"), str)
+        ]
+        if len(step_entries) != len(steps):
+            raise ValueError(f"planned Rust scope child check has malformed step evidence: {expected_name}")
+        step_names = [step["name"] for step in step_entries]
+        marker_steps = [step for step in step_entries if step["name"] == PLANNED_SCOPE_MARKER]
+        if len(marker_steps) != 1 or marker_steps[0]["conclusion"] != "success":
+            raise ValueError(f"planned Rust scope child check must run one marker: {expected_name}")
+        executed = [
+            step["name"]
+            for step in step_entries
+            if step["conclusion"] != "skipped"
+        ]
+        if executed != ["Set up job", PLANNED_SCOPE_MARKER, "Complete job"]:
+            raise ValueError(f"planned Rust scope child check executed non-marker steps: {expected_name}: {executed}")
+        evidence.append(
+            {
+                "name": expected_name,
+                "conclusion": record["conclusion"],
+                "stepNames": step_names,
+                "executedStepNames": executed,
+                "marker": PLANNED_SCOPE_MARKER,
+            }
+        )
+    return {
+        "status": "PASS",
+        "marker": PLANNED_SCOPE_MARKER,
+        "jobCount": len(evidence),
+        "jobs": evidence,
+    }
+
+
 def run_aggregate(args: argparse.Namespace) -> int:
     results = parse_mapping(args.job, "--job")
     kinds = parse_mapping(args.kind, "--kind")
     names = parse_mapping(args.job_name, "--job-name")
     allowed = set(args.allow_skipped)
+    planned_scopes = set(args.planned_scope)
+    if planned_scopes - {"rust"}:
+        raise ValueError(f"unsupported planned scope: {sorted(planned_scopes - {'rust'})}")
     if set(results) != set(kinds):
         raise ValueError("every job must have exactly one --kind")
     if not set(names).issubset(results):
         raise ValueError("every --job-name alias must have a matching --job")
     no_steps: set[str] = set()
+    records: list[object] = []
     if args.github_jobs_json:
         payload = json.loads(args.github_jobs_json.read_text(encoding="utf-8"))
         records = payload.get("jobs") if isinstance(payload, dict) else payload
@@ -127,6 +193,9 @@ def run_aggregate(args: argparse.Namespace) -> int:
         no_steps = {
             alias for alias, github_name in names.items() if github_name in no_step_names
         }
+    planned_evidence: dict[str, object] = {}
+    if "rust" in planned_scopes:
+        planned_evidence["rust"] = validate_planned_scope_markers(records, args.planned_job_name)
     jobs = []
     for name in sorted(results):
         result = results[name]
@@ -134,7 +203,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
             raise ValueError(f"unsupported GitHub job result for {name}: {result}")
         if kinds[name] not in {"code", "infra"}:
             raise ValueError(f"unsupported job kind for {name}: {kinds[name]}")
-        jobs.append(Job(name, result, kinds[name], name in allowed, name in no_steps))
+        jobs.append(Job(name, result, kinds[name], name in allowed, name in no_steps, name in planned_scopes))
     overall, entries = aggregate(jobs)
     payload = {
         "schema": "hartevo-ci-result/v1",
@@ -145,6 +214,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
         "overall": overall,
         "allowedOverall": overall == "PASS",
         "jobs": entries,
+        "plannedScopes": planned_evidence,
         "taxonomy": list(TAXONOMY),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -160,7 +230,59 @@ def self_test() -> None:
         [Job("pass", "success", "code"), Job("scope", "skipped", "code", True)]
     )
     assert overall == "PASS"
-    assert {entry["classification"] for entry in entries} == {"PASS", "CI_NOT_EXECUTED"}
+    assert {entry["classification"] for entry in entries} == {"PASS"}
+    assert entries[1]["plannedSkip"] is True
+    planned_no_steps, planned_no_steps_entries = aggregate([Job("scope", "skipped", "code", True, True)])
+    assert planned_no_steps == "PASS"
+    assert planned_no_steps_entries[0]["classification"] == "PASS"
+    assert planned_no_steps_entries[0]["plannedSkip"] is True
+    planned_rust, planned_rust_entries = aggregate([Job("rust", "success", "code", planned_scope=True)])
+    assert planned_rust == "PASS"
+    assert planned_rust_entries[0]["plannedSkip"] is True
+    marker_names = [
+        "PR / Fast Rust matrix / PR / Fast Rust / fmt",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
+    ]
+    marker_records = [
+        {
+            "name": name,
+            "status": "completed",
+            "conclusion": "success",
+            "steps": [
+                {"name": "Set up job", "conclusion": "success"},
+                {"name": PLANNED_SCOPE_MARKER, "conclusion": "success"},
+                {"name": "Checkout reviewed source", "conclusion": "skipped"},
+                {"name": "Cache Cargo and Rust toolchain", "conclusion": "skipped"},
+                {"name": "Complete job", "conclusion": "success"},
+            ],
+        }
+        for name in marker_names
+    ]
+    marker_evidence = validate_planned_scope_markers(marker_records, marker_names)
+    assert marker_evidence["status"] == "PASS" and marker_evidence["jobCount"] == 5
+    try:
+        validate_planned_scope_markers(
+            marker_records[:-1]
+            + [
+                {
+                    **marker_records[-1],
+                    "steps": [
+                        {"name": "Set up job", "conclusion": "success"},
+                        {"name": PLANNED_SCOPE_MARKER, "conclusion": "success"},
+                        {"name": "Checkout reviewed source", "conclusion": "success"},
+                        {"name": "Complete job", "conclusion": "success"},
+                    ],
+                }
+            ],
+            marker_names,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("self-test accepted a planned scope child with non-marker steps")
     assert aggregate([Job("code", "failure", "code")])[0] == "CODE_FAILURE"
     assert aggregate([Job("runner", "timed_out", "infra")])[0] == "INFRA_FAILURE"
     assert aggregate([Job("never", "skipped", "code")])[0] == "CI_NOT_EXECUTED"
@@ -185,6 +307,8 @@ def parser() -> argparse.ArgumentParser:
     aggregate_parser.add_argument("--job-name", action="append", default=[])
     aggregate_parser.add_argument("--github-jobs-json", type=Path)
     aggregate_parser.add_argument("--allow-skipped", action="append", default=[])
+    aggregate_parser.add_argument("--planned-scope", action="append", default=[])
+    aggregate_parser.add_argument("--planned-job-name", action="append", default=[])
     sub.add_parser("self-test")
     return root
 

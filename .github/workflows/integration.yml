@@ -41,6 +41,7 @@ jobs:
     uses: ./.github/workflows/rust-reusable.yml
     with:
       check_prefix: Integration / Full Rust
+      run_rust: true
       full_workspace: true
       rust_packages: '["hartevo-application","hartevo-browser-adapter","hartevo-capability-gateway","hartevo-catalog","hartevo-cloud-storage","hartevo-commerce-connector","hartevo-connector-sdk","hartevo-context-fabric","hartevo-desktop","hartevo-domain-kernel","hartevo-effect-broker","hartevo-eval","hartevo-mission-scheduler","hartevo-runtime-adapter","hartevo-storage"]'
     permissions:
