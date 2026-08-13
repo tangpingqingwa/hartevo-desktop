@@ -485,12 +485,22 @@ pub fn validate_release_and_run_seam(
             == Some(&Value::String(RELEASE_EVIDENCE_SCHEMA_VERSION.to_owned()))
             && release_schema.pointer("/$defs/safetyEvidence/required")
                 == Some(&expected_safety_ids)
-            && release_schema.pointer("/properties/missingRequiredEvidence/contains/const")
+            && release_schema
+                .pointer("/allOf/1/then/properties/missingRequiredEvidence/contains/const")
                 == Some(&Value::String(
                     "evaluation_run_result_references".to_owned()
                 ))
             && release_schema.pointer("/properties/missingRequiredEvidence/minItems")
-                == Some(&Value::from(1)),
+                == Some(&Value::from(0))
+            && release_schema.pointer("/properties/evaluationRunResultReferences/$ref")
+                == Some(&Value::String(
+                    "#/$defs/evaluationRunResultReferences".to_owned()
+                ))
+            && release_schema
+                .pointer("/allOf/0/then/properties/evaluationRunResultReferences/$ref")
+                == Some(&Value::String(
+                    "#/$defs/eligibleEvaluationRunResultReferences".to_owned()
+                )),
         "Release Evidence 2.3 safety or missing-evaluation-run seam changed"
     );
     ensure!(
