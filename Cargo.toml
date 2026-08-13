@@ -10,6 +10,7 @@ members = [
   "hartevo-rs/effect-broker",
   "hartevo-rs/eval",
   "hartevo-rs/runtime-adapter",
+  "hartevo-rs/mission-scheduler",
   "hartevo-rs/storage",
 ]
 resolver = "3"
