@@ -26,6 +26,7 @@ use thiserror::Error;
 
 const ASSEMBLY_SCHEMA_VERSION: u32 = 2;
 const TOKENIZER_PROFILE_SCHEMA_VERSION: u32 = 1;
+const RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 1;
 const MAX_PROMPT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PROMPT_TOKENS: u64 = 4 * 1024 * 1024;
 const MAX_OPTIONAL_FRAMES: u32 = 512;
@@ -45,6 +46,112 @@ const CONTINUATION_ENTRY_KINDS: [ContinuationEntryKind; 8] = [
     ContinuationEntryKind::EffectUncertain,
     ContinuationEntryKind::HumanHandoff,
 ];
+
+/// The content-free runtime identity carried alongside a context projection.
+///
+/// This type binds a context assembly to the exact Provider / Model / Model revision /
+/// Harness / effort / service tier route that consumed it. It intentionally contains no
+/// credentials, prompt material, business facts, or external-effect state.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeIdentity {
+    pub schema_version: u32,
+    pub provider_id: String,
+    pub provider_revision: String,
+    pub model_id: String,
+    pub model_revision: String,
+    pub harness_id: String,
+    pub harness_revision: String,
+    pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
+    pub endpoint_class: String,
+    pub catalog_digest: String,
+    pub config_digest: String,
+}
+
+impl RuntimeIdentity {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        provider_id: impl Into<String>,
+        provider_revision: impl Into<String>,
+        model_id: impl Into<String>,
+        model_revision: impl Into<String>,
+        harness_id: impl Into<String>,
+        harness_revision: impl Into<String>,
+        reasoning_effort: Option<String>,
+        service_tier: Option<String>,
+        endpoint_class: impl Into<String>,
+        catalog_digest: impl Into<String>,
+        config_digest: impl Into<String>,
+    ) -> Result<Self, RuntimeIdentityError> {
+        let identity = Self {
+            schema_version: RUNTIME_IDENTITY_SCHEMA_VERSION,
+            provider_id: provider_id.into(),
+            provider_revision: provider_revision.into(),
+            model_id: model_id.into(),
+            model_revision: model_revision.into(),
+            harness_id: harness_id.into(),
+            harness_revision: harness_revision.into(),
+            reasoning_effort,
+            service_tier,
+            endpoint_class: endpoint_class.into(),
+            catalog_digest: catalog_digest.into(),
+            config_digest: config_digest.into(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub fn validate(&self) -> Result<(), RuntimeIdentityError> {
+        if self.schema_version != RUNTIME_IDENTITY_SCHEMA_VERSION
+            || !runtime_identity_component(&self.provider_id)
+            || !is_sha256(&self.provider_revision)
+            || !runtime_identity_component(&self.model_id)
+            || !is_sha256(&self.model_revision)
+            || !runtime_identity_component(&self.harness_id)
+            || !is_sha256(&self.harness_revision)
+            || self
+                .reasoning_effort
+                .as_deref()
+                .is_some_and(|value| !runtime_identity_component(value))
+            || self
+                .service_tier
+                .as_deref()
+                .is_some_and(|value| !runtime_identity_component(value))
+            || !runtime_identity_component(&self.endpoint_class)
+            || !is_sha256(&self.catalog_digest)
+            || !is_sha256(&self.config_digest)
+        {
+            return Err(RuntimeIdentityError::InvalidRuntimeIdentity);
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String, RuntimeIdentityError> {
+        self.validate()?;
+        Ok(digest(&serde_json::to_vec(self)?))
+    }
+}
+
+impl fmt::Debug for RuntimeIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeIdentity")
+            .field("schema_version", &self.schema_version)
+            .field("provider_digest", &digest(self.provider_id.as_bytes()))
+            .field("provider_revision", &self.provider_revision)
+            .field("model_digest", &digest(self.model_id.as_bytes()))
+            .field("model_revision", &self.model_revision)
+            .field("harness_id", &self.harness_id)
+            .field("harness_revision", &self.harness_revision)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("service_tier", &self.service_tier)
+            .field("endpoint_class", &self.endpoint_class)
+            .field("catalog_digest", &self.catalog_digest)
+            .field("config_digest", &self.config_digest)
+            .finish()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -1537,6 +1644,21 @@ fn is_bounded_tokenizer_identity(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+fn runtime_identity_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value == value.trim()
+        && !value.chars().any(char::is_control)
+}
+
+#[derive(Debug, Error)]
+pub enum RuntimeIdentityError {
+    #[error("runtime identity is invalid")]
+    InvalidRuntimeIdentity,
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
 #[derive(Debug, Error)]
 pub enum ContextAssemblyError {
     #[error(transparent)]
@@ -2471,5 +2593,40 @@ mod tests {
             ContextAssembler::assemble(&request, &fixture.resolver, &ByteTokenizer),
             Err(ContextAssemblyError::ScopeMismatch)
         ));
+    }
+}
+
+#[cfg(test)]
+mod runtime_identity_tests {
+    use super::*;
+
+    fn identity(model_revision: &str) -> RuntimeIdentity {
+        RuntimeIdentity::new(
+            "openai",
+            "a".repeat(64),
+            "gpt-5.6",
+            model_revision,
+            "native",
+            "e".repeat(64),
+            Some("medium".to_owned()),
+            Some("default".to_owned()),
+            "responses",
+            "b".repeat(64),
+            "c".repeat(64),
+        )
+        .expect("valid runtime identity")
+    }
+
+    #[test]
+    fn runtime_identity_digest_is_content_free_and_drift_sensitive() {
+        let first = identity(&"d".repeat(64));
+        let second = identity(&"e".repeat(64));
+        assert_ne!(
+            first.digest().expect("identity digest"),
+            second.digest().expect("identity digest")
+        );
+        let debug = format!("{first:?}");
+        assert!(!debug.contains("gpt-5.6"));
+        assert!(debug.contains("model_digest"));
     }
 }
