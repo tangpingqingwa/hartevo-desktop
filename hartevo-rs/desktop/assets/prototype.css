@@ -4606,6 +4606,17 @@ body.resizing-workpad {
   background: var(--red-soft);
 }
 
+.visual-runtime-state {
+  border-left-color: var(--gold-strong);
+  color: var(--ink-2);
+  background: var(--gold-soft);
+}
+
+.visual-runtime-state strong {
+  color: var(--gold-strong);
+  letter-spacing: 0.01em;
+}
+
 .runtime-stream-item + .runtime-stream-item {
   margin-top: 14px;
   padding-top: 14px;
@@ -4644,6 +4655,18 @@ body.resizing-workpad {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 7.5px;
   font-style: normal;
+}
+
+.runtime-transport-state {
+  padding: 2px 6px;
+  border: 1px solid var(--gold);
+  border-radius: 999px;
+  color: var(--gold-strong);
+  background: var(--gold-soft);
+  font-size: 7.5px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
 }
 
 .runtime-stream-turn.is-streaming .assistant-byline time { color: var(--gold-strong); }
