@@ -1656,7 +1656,8 @@ impl PostgresCellStore {
         let row = transaction
             .query_opt(
                 "SELECT h.object_kind, h.current_revision, v.key_version, v.nonce,
-                        v.ciphertext, v.aad_digest, v.content_digest, v.tombstone, v.recorded_at
+                        v.ciphertext, v.aad_digest, v.content_digest, v.tombstone, v.recorded_at,
+                        h.key_version, h.content_digest, h.tombstone, v.object_kind
                  FROM hartevo_cell.sync_object_heads h
                  JOIN hartevo_cell.sync_object_versions v
                    ON v.cell = h.cell AND v.tenant_id = h.tenant_id
@@ -1673,6 +1674,7 @@ impl PostgresCellStore {
             )
             .await?
             .ok_or(CloudStorageError::SyncObjectNotFound)?;
+        validate_sync_head_link(&row)?;
         let object = decode_sync_object(&row, scope, project_id, object_id)?;
         transaction.commit().await?;
         Ok(object)
@@ -2822,7 +2824,8 @@ async fn load_device_public_key_tx(
 ) -> Result<Option<DevicePublicKeyRegistration>, CloudStorageError> {
     let base = "SELECT v.revision, v.algorithm, v.public_key, v.public_key_digest,
                        v.authorized_by, v.authorization_evidence_digest,
-                       v.idempotency_key, v.registered_at, v.updated_at, v.revoked_at
+                       v.idempotency_key, v.registered_at, v.updated_at, v.revoked_at,
+                       h.public_key_digest, h.revoked_at
                 FROM hartevo_cell.device_public_key_heads h
                 JOIN hartevo_cell.device_public_key_versions v
                   ON v.cell = h.cell AND v.tenant_id = h.tenant_id
@@ -2865,6 +2868,13 @@ async fn load_device_public_key_tx(
         revoked_at: row.get(9),
     };
     registration.validate()?;
+    if row.get::<_, String>(10) != registration.public_key_digest
+        || row.get::<_, Option<DateTime<Utc>>>(11) != registration.revoked_at
+    {
+        return Err(CloudStorageError::StoredValueInvalid(
+            "device public key head/version fence".into(),
+        ));
+    }
     Ok(Some(registration))
 }
 
@@ -3392,6 +3402,19 @@ fn decode_sync_object(
         tombstone: row.get(7),
         recorded_at: row.get(8),
     })
+}
+
+fn validate_sync_head_link(row: &Row) -> Result<(), CloudStorageError> {
+    if row.get::<_, String>(0) != row.get::<_, String>(12)
+        || row.get::<_, i64>(2) != row.get::<_, i64>(9)
+        || row.get::<_, String>(6) != row.get::<_, String>(10)
+        || row.get::<_, bool>(7) != row.get::<_, bool>(11)
+    {
+        return Err(CloudStorageError::StoredValueInvalid(
+            "sync object head/version fence".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn decode_outbox_message(row: &Row) -> Result<CloudOutboxMessage, CloudStorageError> {
@@ -4087,7 +4110,7 @@ mod tests {
     async fn postgres_l2_contract_reports_blocked_or_executes_full_replay() {
         let Some(database_url) = std::env::var_os(POSTGRES_L2_URL_ENV) else {
             eprintln!(
-                "BLOCKED_ENV: {POSTGRES_L2_URL_ENV} is absent; PostgreSQL migration/RLS/recovery replay did not execute"
+                "NOT_RUN/BLOCKED_ENV: {POSTGRES_L2_URL_ENV} is absent; PostgreSQL migration/RLS/recovery replay did not execute"
             );
             return;
         };
