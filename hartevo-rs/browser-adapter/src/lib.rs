@@ -21,6 +21,7 @@ mod file_broker;
 mod locator;
 mod navigation;
 mod profile_dir;
+mod read_observation;
 #[cfg(test)]
 mod real_chromium_signed_recipe_test;
 mod recipe;
@@ -51,6 +52,9 @@ pub use file_broker::{
 pub use locator::{BrowserLocatorResolution, BrowserStableLocator};
 pub use navigation::{BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserNavigationTarget};
 pub use profile_dir::{BrowserExecutableIdentity, ManagedProfileDirectory};
+pub use read_observation::{
+    BrowserObservationClassification, BrowserReadObservation, BrowserReadObservationMedia,
+};
 pub use recipe::{
     BrowserRecipeActivation, BrowserRecipeActiveVersion, BrowserRecipeCandidate,
     BrowserRecipeEvaluationEvidence, BrowserRecipeExecutionAuthorization, BrowserRecipeKeyPurpose,
@@ -139,6 +143,20 @@ pub enum BrowserError {
     FileInputTargetInvalid,
     #[error("browser file selection readback did not change after the exact upload handle")]
     FileSelectionReadbackMismatch,
+    #[error("browser read observation is malformed or internally inconsistent")]
+    InvalidReadObservation,
+    #[error("browser read observation requires an exact public HTTPS target")]
+    ReadObservationPolicyRejected,
+    #[error("browser read observation request was blocked by the read-only policy")]
+    ReadObservationRequestBlocked,
+    #[error("browser read observation response is malformed or not the main document")]
+    ReadObservationResponseInvalid,
+    #[error("browser read observation body is unavailable, oversized, or cannot be decoded")]
+    ReadObservationBodyInvalid,
+    #[error("browser read observation media type is malformed or unavailable")]
+    ReadObservationMediaTypeInvalid,
+    #[error("browser read observation was tampered with or drifted before emission")]
+    ReadObservationTampered,
     #[error("browser Recipe manifest, action template, or validity window is invalid")]
     InvalidRecipe,
     #[error("browser Recipe trust key is malformed or invalid for this use and time")]
@@ -261,6 +279,13 @@ impl BrowserError {
             Self::TextReadbackMismatch => "BROWSER_TEXT_READBACK_MISMATCH",
             Self::FileInputTargetInvalid => "BROWSER_FILE_INPUT_TARGET_INVALID",
             Self::FileSelectionReadbackMismatch => "BROWSER_FILE_SELECTION_READBACK_MISMATCH",
+            Self::InvalidReadObservation => "BROWSER_INVALID_READ_OBSERVATION",
+            Self::ReadObservationPolicyRejected => "BROWSER_READ_OBSERVATION_POLICY_REJECTED",
+            Self::ReadObservationRequestBlocked => "BROWSER_READ_OBSERVATION_REQUEST_BLOCKED",
+            Self::ReadObservationResponseInvalid => "BROWSER_READ_OBSERVATION_RESPONSE_INVALID",
+            Self::ReadObservationBodyInvalid => "BROWSER_READ_OBSERVATION_BODY_INVALID",
+            Self::ReadObservationMediaTypeInvalid => "BROWSER_READ_OBSERVATION_MEDIA_TYPE_INVALID",
+            Self::ReadObservationTampered => "BROWSER_READ_OBSERVATION_TAMPERED",
             Self::InvalidRecipe => "BROWSER_INVALID_RECIPE",
             Self::InvalidRecipeKey => "BROWSER_INVALID_RECIPE_KEY",
             Self::RecipeKeyUnavailable => "BROWSER_RECIPE_KEY_UNAVAILABLE",
