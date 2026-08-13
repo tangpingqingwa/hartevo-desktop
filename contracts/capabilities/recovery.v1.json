@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/capabilities/recovery/v1",
+  "title": "Hartevo Capability Recovery v1",
+  "description": "Typed Hermes-inspired recovery disposition. Retry contracts preserve exact scope/generation/idempotency; uncertain external Effects are reconcile-only.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "type", "reason", "contract"],
+      "properties": {
+        "schema": {"const": "hartevo.capability-recovery/v1"},
+        "type": {"const": "retry_read"},
+        "reason": {"enum": ["truncated_output", "empty_result", "retryable_read"]},
+        "contract": {"$ref": "#/$defs/recoveryContract"}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "type", "reason", "contract"],
+      "properties": {
+        "schema": {"const": "hartevo.capability-recovery/v1"},
+        "type": {"const": "retry_local_mutation"},
+        "reason": {"enum": ["stale_locator_or_path", "retryable_local_mutation"]},
+        "contract": {"$ref": "#/$defs/recoveryContract"}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "type", "requestDigest", "resultDigest"],
+      "properties": {
+        "schema": {"const": "hartevo.capability-recovery/v1"},
+        "type": {"const": "duplicate_request"},
+        "requestDigest": {"$ref": "#/$defs/digest"},
+        "resultDigest": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/digest"}]}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "type", "effectDigest", "reconciliationDigest"],
+      "properties": {
+        "schema": {"const": "hartevo.capability-recovery/v1"},
+        "type": {"const": "uncertain_external_effect"},
+        "effectDigest": {"$ref": "#/$defs/digest"},
+        "reconciliationDigest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "type", "code"],
+      "properties": {
+        "schema": {"const": "hartevo.capability-recovery/v1"},
+        "type": {"const": "fail_closed"},
+        "code": {"enum": ["scope_drift", "authority_drift", "adapter_revoked", "payload_tampered", "budget_exceeded", "generation_stale", "untrusted_adapter"]}
+      }
+    }
+  ],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "recoveryContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifestDigest", "authorityDigest", "scopeDigest", "generation", "target", "attempt", "maxAttempts", "automatic", "preservesIdempotency"],
+      "properties": {
+        "manifestDigest": {"$ref": "#/$defs/digest"},
+        "authorityDigest": {"$ref": "#/$defs/digest"},
+        "scopeDigest": {"$ref": "#/$defs/digest"},
+        "generation": {"type": "integer", "minimum": 1},
+        "target": {"enum": ["read", "local_mutation"]},
+        "attempt": {"type": "integer", "minimum": 0},
+        "maxAttempts": {"type": "integer", "minimum": 1, "maximum": 8},
+        "automatic": {"type": "boolean"},
+        "preservesIdempotency": {"const": true}
+      }
+    }
+  }
+}

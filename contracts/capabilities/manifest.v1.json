@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/capabilities/manifest/v1",
+  "title": "Hartevo Capability Manifest v1",
+  "description": "Signed authority envelope for one Project/Mission generation. Payload bytes and Secret values are never authority fields.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "manifestVersion",
+    "schemaDigest",
+    "capabilityId",
+    "class",
+    "project",
+    "mission",
+    "data",
+    "network",
+    "secrets",
+    "budget",
+    "effect",
+    "adapter",
+    "revocation",
+    "provenance",
+    "issuedAt",
+    "expiresAt"
+  ],
+  "properties": {
+    "schema": {"const": "hartevo.capability-manifest/v1"},
+    "manifestVersion": {"type": "integer", "minimum": 1},
+    "schemaDigest": {"$ref": "#/$defs/digest"},
+    "capabilityId": {"type": "string", "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)*$"},
+    "class": {"enum": ["read", "local_mutation", "external_effect"]},
+    "project": {"$ref": "#/$defs/projectScope"},
+    "mission": {"$ref": "#/$defs/missionScope"},
+    "data": {"$ref": "#/$defs/dataAuthority"},
+    "network": {"$ref": "#/$defs/networkAuthority"},
+    "secrets": {"$ref": "#/$defs/secretAuthority"},
+    "budget": {"$ref": "#/$defs/budgetAuthority"},
+    "effect": {"$ref": "#/$defs/effectAuthority"},
+    "adapter": {"$ref": "#/$defs/adapterBinding"},
+    "revocation": {"$ref": "#/$defs/revocationBinding"},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "issuedAt": {"type": "string", "format": "date-time"},
+    "expiresAt": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "projectScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenantId", "projectId", "workspaceDigest", "resourceScopeDigest"],
+      "properties": {
+        "tenantId": {"$ref": "#/$defs/id"},
+        "projectId": {"$ref": "#/$defs/id"},
+        "workspaceDigest": {"$ref": "#/$defs/digest"},
+        "resourceScopeDigest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "missionScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenantId", "projectId", "missionId", "generation", "contractRevision", "scopeDigest"],
+      "properties": {
+        "tenantId": {"$ref": "#/$defs/id"},
+        "projectId": {"$ref": "#/$defs/id"},
+        "missionId": {"$ref": "#/$defs/id"},
+        "taskId": {"type": ["string", "null"]},
+        "workerId": {"type": ["string", "null"]},
+        "workerLeaseId": {"type": ["string", "null"]},
+        "contextWorkspaceId": {"type": ["string", "null"]},
+        "contextCapsuleId": {"type": ["string", "null"]},
+        "contextBranchId": {"type": ["string", "null"]},
+        "generation": {"type": "integer", "minimum": 1},
+        "contractRevision": {"type": "integer", "minimum": 1},
+        "scopeDigest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "dataAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maximumClass", "allowedResourceDigests"],
+      "properties": {
+        "maximumClass": {"enum": ["public", "business", "restricted"]},
+        "allowedResourceDigests": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/digest"}}
+      }
+    },
+    "networkAuthority": {
+      "oneOf": [
+        {"type": "string", "const": "none"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "origins"],
+          "properties": {
+            "type": {"const": "read_only"},
+            "origins": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^https://[^*/?#]+$"}}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "providers"],
+          "properties": {
+            "type": {"const": "effect_broker"},
+            "providers": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+          }
+        }
+      ]
+    },
+    "secretAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["references"],
+      "properties": {
+        "references": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/secretReference"}}
+      }
+    },
+    "secretReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "provider", "purpose", "scopeDigest", "version"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "provider": {"type": "string", "minLength": 1},
+        "purpose": {"type": "string", "minLength": 1},
+        "scopeDigest": {"$ref": "#/$defs/digest"},
+        "version": {"type": "integer", "minimum": 1}
+      }
+    },
+    "budgetAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxTokens", "maxCost", "maxRequestBytes", "maxResultBytes", "maxExternalEffects", "deadlineAt"],
+      "properties": {
+        "maxTokens": {"type": "integer", "minimum": 1},
+        "maxCost": {"$ref": "#/$defs/costLimit"},
+        "maxRequestBytes": {"type": "integer", "minimum": 1, "maximum": 1048576},
+        "maxResultBytes": {"type": "integer", "minimum": 1, "maximum": 1048576},
+        "maxExternalEffects": {"type": "integer", "minimum": 0},
+        "deadlineAt": {"type": "string", "format": "date-time"}
+      }
+    },
+    "costLimit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amountMinor", "currency"],
+      "properties": {
+        "amountMinor": {"type": "integer", "minimum": 0},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"}
+      }
+    },
+    "effectAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowedKinds", "allowedProviders", "approval", "uncertainPolicy", "maxCost", "brokerPolicyDigest"],
+      "properties": {
+        "allowedKinds": {"type": "array", "uniqueItems": true, "items": {"enum": ["external_write", "outreach", "spend", "payment"]}},
+        "allowedProviders": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "approval": {"const": "required"},
+        "uncertainPolicy": {"const": "reconcile_only"},
+        "maxCost": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/costLimit"}]},
+        "brokerPolicyDigest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "adapterBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapterId", "implementationId", "implementationDigest", "binaryDigest", "schemaDigest", "version", "revocationEpoch"],
+      "properties": {
+        "adapterId": {"$ref": "#/$defs/id"},
+        "implementationId": {"type": "string", "minLength": 1},
+        "implementationDigest": {"$ref": "#/$defs/digest"},
+        "binaryDigest": {"$ref": "#/$defs/digest"},
+        "schemaDigest": {"$ref": "#/$defs/digest"},
+        "version": {"type": "string", "minLength": 1},
+        "revocationEpoch": {"type": "integer", "minimum": 1}
+      }
+    },
+    "revocationBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["registryRevision", "revocationEpoch", "status", "recordDigest"],
+      "properties": {
+        "registryRevision": {"type": "integer", "minimum": 1},
+        "revocationEpoch": {"type": "integer", "minimum": 1},
+        "status": {"const": "active"},
+        "recordDigest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["issuer", "sourceDigest", "parentManifestDigest", "issuedForGeneration"],
+      "properties": {
+        "issuer": {"enum": ["application", "mission_compiler", "recovery_controller"]},
+        "sourceDigest": {"$ref": "#/$defs/digest"},
+        "parentManifestDigest": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/digest"}]},
+        "issuedForGeneration": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

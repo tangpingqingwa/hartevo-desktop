@@ -2273,6 +2273,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hartevo-capability-gateway"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hartevo-domain-kernel",
+ "proptest",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
 name = "hartevo-catalog"
 version = "0.1.0"
 dependencies = [
