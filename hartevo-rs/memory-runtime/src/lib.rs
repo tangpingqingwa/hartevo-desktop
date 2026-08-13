@@ -73,6 +73,8 @@ pub enum MemoryRuntimeError {
     InvalidConsent,
     #[error("memory candidate digest is invalid")]
     InvalidDigest,
+    #[error("memory candidate durable persistence failed")]
+    PersistenceFailure,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -565,8 +567,42 @@ impl MemoryLifecycleEvent {
         self.payload.as_ref()
     }
 
+    /// Returns the metadata-only form written to the public event spine.
+    /// Candidate bodies are held by the private-record provider instead.
+    #[must_use]
+    pub fn redacted_for_persistence(&self) -> Self {
+        let mut redacted = self.clone();
+        redacted.payload = None;
+        redacted
+    }
+
+    /// Reattaches a payload after the private-record provider has authenticated
+    /// and decrypted it.  Only proposal events may carry a body.
+    pub fn with_persisted_payload(
+        mut self,
+        payload: MemoryPayload,
+    ) -> Result<Self, MemoryRuntimeError> {
+        if self.kind != MemoryEventKind::Proposed
+            || payload.is_secret()
+            || payload.digest() != self.content_digest
+        {
+            return Err(MemoryRuntimeError::InvalidHistory);
+        }
+        self.payload = Some(payload);
+        self.validate_for_persistence()?;
+        Ok(self)
+    }
+
     pub fn target_mission_id(&self) -> Option<&MissionId> {
         self.target_mission_id.as_ref()
+    }
+
+    pub fn policy(&self) -> &MemoryPolicy {
+        &self.policy
+    }
+
+    pub fn plugin(&self) -> &MemoryPluginBinding {
+        &self.plugin
     }
 
     fn scope_digest(&self) -> Digest {
@@ -576,6 +612,24 @@ impl MemoryLifecycleEvent {
             &self.target_mission_id,
         ))
     }
+}
+
+/// Narrow persistence seam for the memory plugin.  Implementations may use
+/// SQLCipher metadata plus an encrypted/private-record backend, but they never
+/// receive raw ProjectStore or Effect authority through the plugin API.
+pub trait MemoryPersistence: fmt::Debug {
+    fn load_events(
+        &self,
+        binding: &MemoryPluginBinding,
+        policy: &MemoryPolicy,
+    ) -> Result<Vec<MemoryLifecycleEvent>, MemoryRuntimeError>;
+
+    fn append_events(
+        &mut self,
+        binding: &MemoryPluginBinding,
+        policy: &MemoryPolicy,
+        events: &[MemoryLifecycleEvent],
+    ) -> Result<(), MemoryRuntimeError>;
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -928,10 +982,7 @@ impl MemoryStore {
                         .ok_or(MemoryRuntimeError::InvalidHistory)?;
                     if !record.matches_event(event)
                         || event.reason.is_none()
-                        || matches!(
-                            record.status,
-                            MemoryCandidateStatus::Forgotten | MemoryCandidateStatus::Revoked
-                        )
+                        || record.status == MemoryCandidateStatus::Revoked
                     {
                         return Err(MemoryRuntimeError::InvalidHistory);
                     }
@@ -970,7 +1021,7 @@ impl MemoryStore {
             if event.sequence != expected {
                 return Err(MemoryRuntimeError::InvalidHistory);
             }
-            event.validate()?;
+            event.validate_for_persistence()?;
             expected = expected
                 .checked_add(1)
                 .ok_or(MemoryRuntimeError::InvalidHistory)?;
@@ -980,7 +1031,11 @@ impl MemoryStore {
 }
 
 impl MemoryLifecycleEvent {
-    fn validate(&self) -> Result<(), MemoryRuntimeError> {
+    /// Validates an event before a persistence provider accepts it.  The
+    /// provider boundary is intentionally public so a deserialized or
+    /// independently implemented provider cannot bypass lifecycle, digest,
+    /// scope, or generation checks.
+    pub fn validate_for_persistence(&self) -> Result<(), MemoryRuntimeError> {
         if self.sequence == 0
             || !valid_digest(&self.candidate_id)
             || !valid_digest(&self.source_event_digest)
@@ -1121,6 +1176,7 @@ pub struct MemoryCandidateService {
     policy: MemoryPolicy,
     lifecycle: MemoryPluginLifecycle,
     store: MemoryStore,
+    persistence: Option<Box<dyn MemoryPersistence>>,
 }
 
 impl fmt::Debug for MemoryCandidateService {
@@ -1156,7 +1212,21 @@ impl MemoryCandidateService {
             policy,
             lifecycle: MemoryPluginLifecycle::Mounted,
             store: MemoryStore::new(),
+            persistence: None,
         })
+    }
+
+    pub fn from_persistence(
+        scope: PluginScope,
+        binding: MemoryPluginBinding,
+        policy: MemoryPolicy,
+        persistence: Box<dyn MemoryPersistence>,
+    ) -> Result<Self, MemoryRuntimeError> {
+        let events = persistence.load_events(&binding, &policy)?;
+        let mut service = Self::new(scope, binding, policy)?;
+        service.store = MemoryStore::from_events(events)?;
+        service.persistence = Some(persistence);
+        service.revalidate_persisted_scope()
     }
 
     pub fn from_events(
@@ -1191,6 +1261,30 @@ impl MemoryCandidateService {
         Ok(service)
     }
 
+    fn revalidate_persisted_scope(mut self) -> Result<Self, MemoryRuntimeError> {
+        for event in self.store.events() {
+            if event.plugin != self.binding {
+                return Err(MemoryRuntimeError::PluginUpgradeRequiresMigration);
+            }
+            if event.policy != self.policy {
+                return Err(MemoryRuntimeError::PolicyMismatch);
+            }
+            if event.project_id != *self.scope.project_id()
+                || event.source_mission_id != *self.scope.mission_id()
+            {
+                return Err(MemoryRuntimeError::ScopeMismatch);
+            }
+            if event.kind == MemoryEventKind::Revoked {
+                self.lifecycle = match event.reason {
+                    Some(MemoryRevocationReason::Revoked) => MemoryPluginLifecycle::Revoked,
+                    Some(MemoryRevocationReason::Unmounted) => MemoryPluginLifecycle::Unmounted,
+                    None => return Err(MemoryRuntimeError::InvalidHistory),
+                };
+            }
+        }
+        Ok(self)
+    }
+
     pub fn scope(&self) -> &PluginScope {
         &self.scope
     }
@@ -1216,6 +1310,24 @@ impl MemoryCandidateService {
             return Err(MemoryRuntimeError::ScopeMismatch);
         }
         self.store.register_source(source)
+    }
+
+    fn commit_events(
+        &mut self,
+        next: MemoryStore,
+        additions: &[MemoryLifecycleEvent],
+    ) -> Result<(), MemoryRuntimeError> {
+        let committed = next
+            .events()
+            .len()
+            .checked_sub(additions.len())
+            .and_then(|start| next.events().get(start..))
+            .ok_or(MemoryRuntimeError::InvalidHistory)?;
+        if let Some(persistence) = self.persistence.as_mut() {
+            persistence.append_events(&self.binding, &self.policy, committed)?;
+        }
+        self.store = next;
+        Ok(())
     }
 
     pub fn propose(
@@ -1247,8 +1359,8 @@ impl MemoryCandidateService {
             draft,
             EventExtras::default(),
         );
-        next.append_batch(&[event])?;
-        self.store = next;
+        next.append_batch(std::slice::from_ref(&event))?;
+        self.commit_events(next, &[event])?;
         let sequence = self
             .store
             .events()
@@ -1304,8 +1416,8 @@ impl MemoryCandidateService {
             },
         );
         let mut next = self.store.clone();
-        next.append_batch(&[event])?;
-        self.store = next;
+        next.append_batch(std::slice::from_ref(&event))?;
+        self.commit_events(next, &[event])?;
         let sequence = self
             .store
             .events()
@@ -1338,8 +1450,8 @@ impl MemoryCandidateService {
             EventExtras::default(),
         );
         let mut next = self.store.clone();
-        next.append_batch(&[event])?;
-        self.store = next;
+        next.append_batch(std::slice::from_ref(&event))?;
+        self.commit_events(next, &[event])?;
         let sequence = self
             .store
             .events()
@@ -1458,7 +1570,9 @@ impl MemoryCandidateService {
             .filter(|record| {
                 matches!(
                     record.status,
-                    MemoryCandidateStatus::Proposed | MemoryCandidateStatus::Adopted
+                    MemoryCandidateStatus::Proposed
+                        | MemoryCandidateStatus::Adopted
+                        | MemoryCandidateStatus::Forgotten
                 )
             })
             .map(|record| {
@@ -1475,7 +1589,7 @@ impl MemoryCandidateService {
             .collect::<Vec<_>>();
         let mut next = self.store.clone();
         next.append_batch(&additions)?;
-        self.store = next;
+        self.commit_events(next, &additions)?;
         self.lifecycle = match reason {
             MemoryRevocationReason::Revoked => MemoryPluginLifecycle::Revoked,
             MemoryRevocationReason::Unmounted => MemoryPluginLifecycle::Unmounted,
@@ -1566,7 +1680,7 @@ impl MemoryQueryService<'_> {
         }
         let mut next = service.store.clone();
         next.append_batch(&additions)?;
-        service.store = next;
+        service.commit_events(next, &additions)?;
         let first = service
             .store
             .events()

@@ -2423,6 +2423,8 @@ dependencies = [
  "hartevo-context-fabric",
  "hartevo-domain-kernel",
  "hartevo-effect-broker",
+ "hartevo-memory-runtime",
+ "hartevo-plugin-runtime",
  "hex",
  "keyring-core",
  "linux-keyutils-keyring-store",

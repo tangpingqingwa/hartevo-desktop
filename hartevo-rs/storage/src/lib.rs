@@ -19,6 +19,7 @@ mod effect_ledger;
 mod identity_store;
 mod key_bootstrap_store;
 mod keyring_store;
+mod memory_record_store;
 mod mission_conversation_store;
 mod mission_recovery_store;
 mod mission_schedule_store;
@@ -49,6 +50,7 @@ pub use key_bootstrap_store::{
     KeyBootstrapPrepareOutcome, LocalKeyBootstrapOperation,
 };
 pub use keyring_store::{DeviceAttachmentPrepareOutcome, ProjectKeySecretReference};
+pub use memory_record_store::{FileMemoryPrivateRecordStore, SqlCipherMemoryPersistence};
 pub use outbox::{
     OutboxAcknowledgeTimes, OutboxMessage, OutboxRelease, OutboxReleaseTimes, OutboxStatus,
 };
