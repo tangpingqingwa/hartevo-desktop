@@ -3,6 +3,7 @@
 //! Runtime threads, model output, and provider responses are projections into this
 //! kernel. They are never accepted as business truth without a domain command.
 
+mod attribution_spine;
 mod connection;
 mod context;
 mod context_collaboration;
@@ -27,6 +28,16 @@ mod runtime_turn;
 mod truth;
 mod work_product;
 
+pub use attribution_spine::{
+    ATTRIBUTION_SPINE_EVENT_TYPE, ATTRIBUTION_SPINE_SCHEMA_VERSION, AttributionAssignment,
+    AttributionError, AttributionLedger, AttributionProjection, AttributionReason,
+    AttributionWindow, BatchIngestResult, ConnectorObservationSource, CorrectionKind,
+    CorrectionLineage, IngestDisposition, ObservationOrigin, ObservationProvenance,
+    OutcomeCandidate, OutcomeCandidateId, OutcomeKind, OutcomeVerification, ProviderCursor,
+    ProviderEntityRef, ProviderEventIdentity, SourceEntityKind, SourceEvent, SourceEventId,
+    SourceEventKind, SourceEventLinks, SourceObservationBatch, VerificationMethod, VerifiedOutcome,
+    VerifiedOutcomeId,
+};
 pub use context::{
     ContextBranch, ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleStatus,
     ContextDataClass, ContextDataPolicy, ContextError, ContextFactGrant, ContextInputRefs,
