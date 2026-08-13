@@ -1,7 +1,16 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod openinterpreter_mission_execution;
 mod runtime_text_subscription;
 
+pub use openinterpreter_mission_execution::{
+    MissionExecutionError, MissionExecutionObservation, MissionExecutionProvider,
+    MissionExecutionProviderFactory, MissionExecutionState, MissionExecutionWriteReceipt,
+    MissionRuntimeProviderIdentity, MissionRuntimeStreamPacket, OpenInterpreterMissionExecution,
+    OpenInterpreterMissionInvocation, OpenInterpreterMissionProjection,
+    OpenInterpreterMissionRuntimeSelection, OpenInterpreterRuntimeProviderFactory,
+    StartOpenInterpreterMission,
+};
 pub use runtime_text_subscription::{
     CatalogMissionExecutionHandle, CatalogMissionExecutionStart,
     RUNTIME_TEXT_SUBSCRIPTION_MAX_PAGE_SIZE, RuntimeTextSubscriptionBatch,
@@ -20950,6 +20959,8 @@ pub enum ApplicationError {
     RuntimeTurn(#[from] RuntimeTurnError),
     #[error(transparent)]
     RuntimeTextSubscription(#[from] RuntimeTextSubscriptionError),
+    #[error(transparent)]
+    MissionExecution(#[from] MissionExecutionError),
     #[error(transparent)]
     Browser(#[from] BrowserError),
     #[error(
