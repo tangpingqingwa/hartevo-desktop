@@ -38,6 +38,8 @@ pub const HUMAN_OPERATION_AUTHORITY_CONTRACT_VERSION: &str = "human-operation-au
 pub const PROVIDER_APPROVAL_AUTHORITY_CONTRACT_JSON: &str =
     include_str!("../../../contracts/providers/approval-authority.v1.json");
 
+const CHECKED_IN_APPROVAL_REGISTRY_REVISION: u64 = 1;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum ContractEvidenceLevel {
     #[serde(rename = "E1")]
@@ -1284,8 +1286,23 @@ struct ConnectedApprovalBinding {
 
 #[derive(Clone, Copy)]
 struct ApprovalRegistryView<'a> {
-    adapter_registry: &'a ProviderAdapterRegistry,
+    adapter_registry: ApprovalAdapterRegistrySnapshot<'a>,
     human_issuers: &'a [HumanAuthorityIssuerRegistration],
+}
+
+#[derive(Clone, Copy)]
+struct ApprovalAdapterRegistrySnapshot<'a> {
+    registry: &'a ProviderAdapterRegistry,
+    revision: u64,
+    minimum_accepted_revision: u64,
+    digest: &'a str,
+    revoked_at: Option<DateTime<Utc>>,
+}
+
+struct ValidatedProviderCapabilityMetadata {
+    version: String,
+    revision: u64,
+    digest: String,
 }
 
 impl ConnectedApprovalBinding {
@@ -1396,6 +1413,8 @@ pub struct ApprovalRequest {
     required_scopes: BTreeSet<String>,
     leased_scopes: Vec<String>,
     adapter_registry_version: String,
+    adapter_registry_revision: u64,
+    adapter_registry_digest: String,
     adapter: ProviderAdapterIdentity,
     credential_revision: u64,
     lease_revision: u64,
@@ -1491,6 +1510,8 @@ impl ApprovalRequest {
             hash_field(&mut digest, scope);
         }
         hash_field(&mut digest, &self.adapter_registry_version);
+        hash_field(&mut digest, &self.adapter_registry_revision.to_string());
+        hash_field(&mut digest, &self.adapter_registry_digest);
         hash_field(&mut digest, self.adapter.adapter_id());
         hash_field(&mut digest, &self.adapter.adapter_version().to_string());
         hash_field(&mut digest, &self.credential_revision.to_string());
@@ -1554,13 +1575,23 @@ impl ProviderApprovalAuthorityPolicy {
         let connected = provider.authorize(requested_at)?;
         let adapter_registry = ProviderAdapterRegistry::contract_baseline()
             .map_err(|_| ApprovalAuthorityError::InvalidAdapterRegistry)?;
+        let adapter_registry_digest = provider_approval_registry_digest(
+            &adapter_registry,
+            CHECKED_IN_APPROVAL_REGISTRY_REVISION,
+        );
         self.prepare_request_against_registries(
             context,
             approving_actor_id,
             human,
             &connected,
             ApprovalRegistryView {
-                adapter_registry: &adapter_registry,
+                adapter_registry: ApprovalAdapterRegistrySnapshot {
+                    registry: &adapter_registry,
+                    revision: CHECKED_IN_APPROVAL_REGISTRY_REVISION,
+                    minimum_accepted_revision: CHECKED_IN_APPROVAL_REGISTRY_REVISION,
+                    digest: &adapter_registry_digest,
+                    revoked_at: None,
+                },
                 human_issuers: &self.human_operation_authority.issuer_registrations,
             },
             requested_at,
@@ -1583,10 +1614,12 @@ impl ProviderApprovalAuthorityPolicy {
         } = human;
         let effect = validate_effect_context(context, requested_at)?;
         validate_connected_for_effect(connected, effect, requested_at)?;
-        let adapter_registry_version = validate_provider_capability_metadata(
+        let adapter_registry = validate_provider_capability_metadata(
             registries.adapter_registry,
             effect,
             &connected.adapter,
+            requested_at,
+            None,
         )?;
         validate_human_request_evidence(&HumanRequestValidation {
             actor_authorization,
@@ -1630,7 +1663,9 @@ impl ProviderApprovalAuthorityPolicy {
             capability_id: effect.capability.clone(),
             required_scopes: effect.required_scopes.clone(),
             leased_scopes: connected.leased_scopes.clone(),
-            adapter_registry_version,
+            adapter_registry_version: adapter_registry.version,
+            adapter_registry_revision: adapter_registry.revision,
+            adapter_registry_digest: adapter_registry.digest,
             adapter: connected.adapter.clone(),
             credential_revision: connected.credential_revision,
             lease_revision: connected.lease_revision,
@@ -1684,13 +1719,23 @@ impl ProviderApprovalAuthorityPolicy {
         let connected = provider.authorize(operation_at)?;
         let adapter_registry = ProviderAdapterRegistry::contract_baseline()
             .map_err(|_| ApprovalAuthorityError::InvalidAdapterRegistry)?;
+        let adapter_registry_digest = provider_approval_registry_digest(
+            &adapter_registry,
+            CHECKED_IN_APPROVAL_REGISTRY_REVISION,
+        );
         self.issue_against_registries(
             request,
             context,
             human,
             &connected,
             ApprovalRegistryView {
-                adapter_registry: &adapter_registry,
+                adapter_registry: ApprovalAdapterRegistrySnapshot {
+                    registry: &adapter_registry,
+                    revision: CHECKED_IN_APPROVAL_REGISTRY_REVISION,
+                    minimum_accepted_revision: CHECKED_IN_APPROVAL_REGISTRY_REVISION,
+                    digest: &adapter_registry_digest,
+                    revoked_at: None,
+                },
                 human_issuers: &self.human_operation_authority.issuer_registrations,
             },
             operation_at,
@@ -1717,10 +1762,12 @@ impl ProviderApprovalAuthorityPolicy {
         }
         let effect = validate_effect_context(context, operation_at)?;
         validate_connected_for_effect(connected, effect, operation_at)?;
-        let registry_version = validate_provider_capability_metadata(
+        let adapter_registry = validate_provider_capability_metadata(
             registries.adapter_registry,
             effect,
             &connected.adapter,
+            operation_at,
+            Some(request.adapter_registry_revision),
         )?;
         validate_request_against_live_context(&LiveRequestValidation {
             policy: self,
@@ -1728,7 +1775,7 @@ impl ProviderApprovalAuthorityPolicy {
             context,
             effect,
             connected,
-            registry_version: &registry_version,
+            adapter_registry: &adapter_registry,
             actor_authorization,
             actor_session,
         })?;
@@ -2125,16 +2172,41 @@ fn validate_connected_for_effect(
 }
 
 fn validate_provider_capability_metadata(
-    registry: &ProviderAdapterRegistry,
+    snapshot: ApprovalAdapterRegistrySnapshot<'_>,
     effect: &Effect,
     connected_adapter: &ProviderAdapterIdentity,
-) -> Result<String, ApprovalAuthorityError> {
-    registry
+    operation_at: DateTime<Utc>,
+    request_registry_revision: Option<u64>,
+) -> Result<ValidatedProviderCapabilityMetadata, ApprovalAuthorityError> {
+    snapshot
+        .registry
         .validate()
         .map_err(|_| ApprovalAuthorityError::InvalidAdapterRegistry)?;
+    if snapshot.revision == 0
+        || snapshot.minimum_accepted_revision == 0
+        || !is_sha256(snapshot.digest)
+    {
+        return Err(ApprovalAuthorityError::InvalidProviderRegistryState);
+    }
+    if snapshot.revision < snapshot.minimum_accepted_revision
+        || request_registry_revision.is_some_and(|revision| snapshot.revision < revision)
+    {
+        return Err(ApprovalAuthorityError::ProviderRegistryVersionRollback);
+    }
+    if snapshot
+        .revoked_at
+        .is_some_and(|revoked_at| revoked_at <= operation_at)
+    {
+        return Err(ApprovalAuthorityError::ProviderRegistryRevoked);
+    }
+    let registry_digest = provider_approval_registry_digest(snapshot.registry, snapshot.revision);
+    if snapshot.digest != registry_digest {
+        return Err(ApprovalAuthorityError::ProviderRegistryDigestMismatch);
+    }
     let key = ProviderCapabilityKey::new(effect.provider.clone(), effect.capability.clone())
         .map_err(|_| ApprovalAuthorityError::InvalidProviderCapabilityKey)?;
-    let registration = registry
+    let registration = snapshot
+        .registry
         .registrations()
         .iter()
         .find(|registration| registration.key() == &key)
@@ -2150,7 +2222,95 @@ fn validate_provider_capability_metadata(
     if !supports_production_preparation {
         return Err(ApprovalAuthorityError::ProviderCapabilitySurfaceMismatch);
     }
-    Ok(registry.registry_version().to_owned())
+    Ok(ValidatedProviderCapabilityMetadata {
+        version: snapshot.registry.registry_version().to_owned(),
+        revision: snapshot.revision,
+        digest: registry_digest,
+    })
+}
+
+fn provider_approval_registry_digest(registry: &ProviderAdapterRegistry, revision: u64) -> String {
+    let mut digest = Sha256::new();
+    hash_field(
+        &mut digest,
+        "hartevo-provider-approval-registry-snapshot/v1",
+    );
+    hash_field(&mut digest, PROVIDER_ADAPTER_CONTRACT_SCHEMA_VERSION);
+    hash_field(&mut digest, PROVIDER_ADAPTER_CONTRACT_VERSION);
+    hash_field(&mut digest, registry.registry_version());
+    hash_field(&mut digest, &revision.to_string());
+    let mut registrations = registry.registrations().iter().collect::<Vec<_>>();
+    registrations.sort_by(|left, right| left.key().cmp(right.key()));
+    hash_field(&mut digest, "registrations");
+    hash_field(&mut digest, &registrations.len().to_string());
+    for registration in registrations {
+        hash_field(&mut digest, "registration");
+        hash_field(&mut digest, registration.key().provider_id());
+        hash_field(&mut digest, registration.key().capability_id());
+        hash_field(&mut digest, registration.adapter().adapter_id());
+        hash_field(
+            &mut digest,
+            &registration.adapter().adapter_version().to_string(),
+        );
+        let mut evidence_support = registration.evidence_support().iter().collect::<Vec<_>>();
+        evidence_support.sort_unstable();
+        hash_field(&mut digest, "evidence_support");
+        hash_field(&mut digest, &evidence_support.len().to_string());
+        for support in evidence_support {
+            hash_field(&mut digest, "support");
+            hash_field(
+                &mut digest,
+                provider_adapter_operation_name(support.operation()),
+            );
+            hash_field(
+                &mut digest,
+                provider_evidence_class_name(support.evidence_class()),
+            );
+            hash_field(
+                &mut digest,
+                provider_provenance_class_name(support.provenance_class()),
+            );
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+
+const fn provider_adapter_operation_name(operation: ProviderAdapterOperation) -> &'static str {
+    match operation {
+        ProviderAdapterOperation::Probe => "probe",
+        ProviderAdapterOperation::BeginAuth => "begin_auth",
+        ProviderAdapterOperation::Refresh => "refresh",
+        ProviderAdapterOperation::Read => "read",
+        ProviderAdapterOperation::PrepareEffect => "prepare_effect",
+        ProviderAdapterOperation::Execute => "execute",
+        ProviderAdapterOperation::Reconcile => "reconcile",
+        ProviderAdapterOperation::Verify => "verify",
+        ProviderAdapterOperation::HandleWebhook => "handle_webhook",
+        ProviderAdapterOperation::Revoke => "revoke",
+    }
+}
+
+const fn provider_evidence_class_name(evidence_class: ProviderEvidenceClass) -> &'static str {
+    match evidence_class {
+        ProviderEvidenceClass::ProbeObservation => "probe_observation",
+        ProviderEvidenceClass::Authentication => "authentication",
+        ProviderEvidenceClass::ReadObservation => "read_observation",
+        ProviderEvidenceClass::PreparedEffect => "prepared_effect",
+        ProviderEvidenceClass::ReceiptCandidate => "receipt_candidate",
+        ProviderEvidenceClass::ReconciliationObservation => "reconciliation_observation",
+        ProviderEvidenceClass::VerificationObservation => "verification_observation",
+        ProviderEvidenceClass::WebhookObservation => "webhook_observation",
+        ProviderEvidenceClass::RevocationObservation => "revocation_observation",
+    }
+}
+
+const fn provider_provenance_class_name(provenance_class: ProviderProvenanceClass) -> &'static str {
+    match provenance_class {
+        ProviderProvenanceClass::Fixture => "fixture",
+        ProviderProvenanceClass::ComponentHarness => "component_harness",
+        ProviderProvenanceClass::ControlledProvider => "controlled_provider",
+        ProviderProvenanceClass::ProductionProvider => "production_provider",
+    }
 }
 
 struct HumanRequestValidation<'a, 'context> {
@@ -2278,7 +2438,7 @@ struct LiveRequestValidation<'a, 'context> {
     context: &'a ProviderEffectApprovalContext<'context>,
     effect: &'a Effect,
     connected: &'a ConnectedApprovalBinding,
-    registry_version: &'a str,
+    adapter_registry: &'a ValidatedProviderCapabilityMetadata,
     actor_authorization: &'a HumanActorAuthorization,
     actor_session: &'a HumanActorSession,
 }
@@ -2291,7 +2451,7 @@ fn validate_request_against_live_context(
     let context = live.context;
     let effect = live.effect;
     let connected = live.connected;
-    let registry_version = live.registry_version;
+    let adapter_registry = live.adapter_registry;
     let actor_authorization = live.actor_authorization;
     let actor_session = live.actor_session;
     let permission_evidence_digest = context.permission_evidence.digest(effect)?;
@@ -2318,7 +2478,9 @@ fn validate_request_against_live_context(
         || request.capability_id != effect.capability
         || request.required_scopes != effect.required_scopes
         || request.leased_scopes != connected.leased_scopes
-        || request.adapter_registry_version != registry_version
+        || request.adapter_registry_version != adapter_registry.version
+        || request.adapter_registry_revision != adapter_registry.revision
+        || request.adapter_registry_digest != adapter_registry.digest
         || request.adapter != connected.adapter
         || request.credential_revision != connected.credential_revision
         || request.lease_revision != connected.lease_revision
@@ -2595,6 +2757,14 @@ pub enum ApprovalAuthorityError {
     ProviderAuth(#[from] ProviderAuthProbeError),
     #[error("Provider adapter registry is invalid")]
     InvalidAdapterRegistry,
+    #[error("Provider approval registry revision/digest state is invalid")]
+    InvalidProviderRegistryState,
+    #[error("Provider approval registry digest does not match its canonical snapshot")]
+    ProviderRegistryDigestMismatch,
+    #[error("Provider approval registry revision is revoked")]
+    ProviderRegistryRevoked,
+    #[error("Provider approval registry revision rolled back")]
+    ProviderRegistryVersionRollback,
     #[error("Provider/capability key is invalid")]
     InvalidProviderCapabilityKey,
     #[error("Provider/capability is not registered")]
@@ -2668,6 +2838,10 @@ mod tests {
         actor_session: HumanActorSession,
         connected: ConnectedApprovalBinding,
         adapter_registry: ProviderAdapterRegistry,
+        adapter_registry_revision: u64,
+        adapter_registry_minimum_revision: u64,
+        adapter_registry_digest: String,
+        adapter_registry_revoked_at: Option<DateTime<Utc>>,
         human_issuers: Vec<HumanAuthorityIssuerRegistration>,
     }
 
@@ -2676,6 +2850,9 @@ mod tests {
         let effect_policy = synthetic_effect_policy();
         let permission_evidence = synthetic_permission_evidence();
         let (connected, adapter_registry) = synthetic_provider_registry();
+        let adapter_registry_revision = 7;
+        let adapter_registry_digest =
+            provider_approval_registry_digest(&adapter_registry, adapter_registry_revision);
         let (actor_authorization, actor_session, human_issuers) =
             synthetic_human_authority(&mission, &effect_id);
         SyntheticState {
@@ -2687,6 +2864,10 @@ mod tests {
             actor_session,
             connected,
             adapter_registry,
+            adapter_registry_revision,
+            adapter_registry_minimum_revision: adapter_registry_revision,
+            adapter_registry_digest,
+            adapter_registry_revoked_at: None,
             human_issuers,
         }
     }
@@ -2789,13 +2970,10 @@ mod tests {
             opaque_chain_digest: "f".repeat(64),
             observed_valid_until: now() + Duration::seconds(90),
         };
-        let support = ProviderEvidenceSupport::new(
-            ProviderAdapterOperation::PrepareEffect,
-            ProviderEvidenceClass::PreparedEffect,
-            ProviderProvenanceClass::ProductionProvider,
+        (
+            connected,
+            synthetic_capability_registry([production_prepare_support()]),
         )
-        .expect("support");
-        (connected, synthetic_capability_registry([support]))
     }
 
     fn synthetic_capability_registry(
@@ -2808,6 +2986,58 @@ mod tests {
         )
         .expect("registration");
         ProviderAdapterRegistry::new("synthetic-a3-registry-v1", [registration]).expect("registry")
+    }
+
+    fn production_prepare_support() -> ProviderEvidenceSupport {
+        ProviderEvidenceSupport::new(
+            ProviderAdapterOperation::PrepareEffect,
+            ProviderEvidenceClass::PreparedEffect,
+            ProviderProvenanceClass::ProductionProvider,
+        )
+        .expect("production prepare support")
+    }
+
+    fn drifted_production_prepare_surfaces() -> [ProviderEvidenceSupport; 3] {
+        [
+            ProviderEvidenceSupport::new(
+                ProviderAdapterOperation::Read,
+                ProviderEvidenceClass::ReadObservation,
+                ProviderProvenanceClass::ProductionProvider,
+            )
+            .expect("operation drift"),
+            ProviderEvidenceSupport::new(
+                ProviderAdapterOperation::Verify,
+                ProviderEvidenceClass::VerificationObservation,
+                ProviderProvenanceClass::ProductionProvider,
+            )
+            .expect("evidence drift"),
+            ProviderEvidenceSupport::new(
+                ProviderAdapterOperation::PrepareEffect,
+                ProviderEvidenceClass::PreparedEffect,
+                ProviderProvenanceClass::ControlledProvider,
+            )
+            .expect("provenance drift"),
+        ]
+    }
+
+    fn synthetic_registry_view(state: &SyntheticState) -> ApprovalRegistryView<'_> {
+        ApprovalRegistryView {
+            adapter_registry: ApprovalAdapterRegistrySnapshot {
+                registry: &state.adapter_registry,
+                revision: state.adapter_registry_revision,
+                minimum_accepted_revision: state.adapter_registry_minimum_revision,
+                digest: &state.adapter_registry_digest,
+                revoked_at: state.adapter_registry_revoked_at,
+            },
+            human_issuers: &state.human_issuers,
+        }
+    }
+
+    fn refresh_synthetic_registry_digest(state: &mut SyntheticState) {
+        state.adapter_registry_digest = provider_approval_registry_digest(
+            &state.adapter_registry,
+            state.adapter_registry_revision,
+        );
     }
 
     fn synthetic_human_authority(
@@ -2901,10 +3131,7 @@ mod tests {
                     intent,
                 ),
                 &state.connected,
-                ApprovalRegistryView {
-                    adapter_registry: &state.adapter_registry,
-                    human_issuers: &state.human_issuers,
-                },
+                synthetic_registry_view(state),
                 now(),
             )
             .expect("synthetic request")
@@ -2946,10 +3173,7 @@ mod tests {
                 assertion,
             ),
             &state.connected,
-            ApprovalRegistryView {
-                adapter_registry: &state.adapter_registry,
-                human_issuers: &state.human_issuers,
-            },
+            synthetic_registry_view(state),
             operation_at,
         )
     }
@@ -3361,24 +3585,10 @@ mod tests {
     #[test]
     fn matching_key_and_adapter_without_exact_production_prepare_surface_fail_closed() {
         let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
-        let unsupported_surfaces = [
-            ProviderEvidenceSupport::new(
-                ProviderAdapterOperation::Read,
-                ProviderEvidenceClass::ReadObservation,
-                ProviderProvenanceClass::ProductionProvider,
-            )
-            .expect("read support"),
-            ProviderEvidenceSupport::new(
-                ProviderAdapterOperation::PrepareEffect,
-                ProviderEvidenceClass::PreparedEffect,
-                ProviderProvenanceClass::ControlledProvider,
-            )
-            .expect("controlled prepare support"),
-        ];
-
-        for support in unsupported_surfaces {
+        for support in drifted_production_prepare_surfaces() {
             let mut state = synthetic_state();
             state.adapter_registry = synthetic_capability_registry([support]);
+            refresh_synthetic_registry_digest(&mut state);
             assert_prepare_rejected(&policy, &state, ApprovalAuthorityErrorKind::Surface);
         }
     }
@@ -3394,6 +3604,7 @@ mod tests {
             ProviderProvenanceClass::ProductionProvider,
         )
         .expect("read support")]);
+        refresh_synthetic_registry_digest(&mut state);
 
         assert!(matches!(
             issue_synthetic(&policy, &state, request, now() + Duration::seconds(2)),
@@ -3401,9 +3612,168 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn prepare_rejects_registry_digest_revocation_and_version_rollback() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+
+        let mut digest_drift = synthetic_state();
+        digest_drift.adapter_registry = synthetic_capability_registry([
+            production_prepare_support(),
+            ProviderEvidenceSupport::new(
+                ProviderAdapterOperation::Read,
+                ProviderEvidenceClass::ReadObservation,
+                ProviderProvenanceClass::ProductionProvider,
+            )
+            .expect("additional read support"),
+        ]);
+        assert_prepare_rejected(
+            &policy,
+            &digest_drift,
+            ApprovalAuthorityErrorKind::RegistryDigest,
+        );
+
+        let mut revoked = synthetic_state();
+        revoked.adapter_registry_revoked_at = Some(now());
+        assert_prepare_rejected(
+            &policy,
+            &revoked,
+            ApprovalAuthorityErrorKind::RegistryRevoked,
+        );
+
+        let mut rollback = synthetic_state();
+        rollback.adapter_registry_revision -= 1;
+        refresh_synthetic_registry_digest(&mut rollback);
+        assert_prepare_rejected(
+            &policy,
+            &rollback,
+            ApprovalAuthorityErrorKind::RegistryRollback,
+        );
+
+        for state in [&digest_drift, &revoked, &rollback] {
+            assert_eq!(
+                state
+                    .mission
+                    .effect(&state.effect_id)
+                    .expect("effect")
+                    .status,
+                EffectStatus::Proposed
+            );
+        }
+    }
+
+    #[test]
+    fn issue_rejects_operation_evidence_and_provenance_drift() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+        for support in drifted_production_prepare_surfaces() {
+            let mut state = synthetic_state();
+            let request = synthetic_request(&policy, &state);
+            state.adapter_registry = synthetic_capability_registry([support]);
+            refresh_synthetic_registry_digest(&mut state);
+            assert!(matches!(
+                issue_synthetic(&policy, &state, request, now() + Duration::seconds(2)),
+                Err(ApprovalAuthorityError::ProviderCapabilitySurfaceMismatch)
+            ));
+            assert_eq!(
+                state
+                    .mission
+                    .effect(&state.effect_id)
+                    .expect("effect")
+                    .status,
+                EffectStatus::Proposed
+            );
+        }
+    }
+
+    #[test]
+    fn issue_rejects_registry_digest_revocation_and_version_rollback() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+
+        let mut digest_drift = synthetic_state();
+        let digest_request = synthetic_request(&policy, &digest_drift);
+        digest_drift.adapter_registry_digest = "9".repeat(64);
+        assert!(matches!(
+            issue_synthetic(
+                &policy,
+                &digest_drift,
+                digest_request,
+                now() + Duration::seconds(2),
+            ),
+            Err(ApprovalAuthorityError::ProviderRegistryDigestMismatch)
+        ));
+
+        let mut revoked = synthetic_state();
+        let revoked_request = synthetic_request(&policy, &revoked);
+        revoked.adapter_registry_revoked_at = Some(now() + Duration::seconds(1));
+        assert!(matches!(
+            issue_synthetic(
+                &policy,
+                &revoked,
+                revoked_request,
+                now() + Duration::seconds(2),
+            ),
+            Err(ApprovalAuthorityError::ProviderRegistryRevoked)
+        ));
+
+        let mut rollback = synthetic_state();
+        let rollback_request = synthetic_request(&policy, &rollback);
+        rollback.adapter_registry_revision -= 1;
+        rollback.adapter_registry_minimum_revision = 1;
+        refresh_synthetic_registry_digest(&mut rollback);
+        assert!(matches!(
+            issue_synthetic(
+                &policy,
+                &rollback,
+                rollback_request,
+                now() + Duration::seconds(2),
+            ),
+            Err(ApprovalAuthorityError::ProviderRegistryVersionRollback)
+        ));
+
+        for state in [&digest_drift, &revoked, &rollback] {
+            assert_eq!(
+                state
+                    .mission
+                    .effect(&state.effect_id)
+                    .expect("effect")
+                    .status,
+                EffectStatus::Proposed
+            );
+        }
+    }
+
+    #[test]
+    fn issue_binds_full_registry_digest_when_required_surface_remains_present() {
+        let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
+        let mut state = synthetic_state();
+        let request = synthetic_request(&policy, &state);
+        state.adapter_registry = synthetic_capability_registry([
+            production_prepare_support(),
+            ProviderEvidenceSupport::new(
+                ProviderAdapterOperation::Read,
+                ProviderEvidenceClass::ReadObservation,
+                ProviderProvenanceClass::ProductionProvider,
+            )
+            .expect("additional read support"),
+        ]);
+        refresh_synthetic_registry_digest(&mut state);
+
+        assert!(matches!(
+            issue_synthetic(&policy, &state, request, now() + Duration::seconds(2)),
+            Err(ApprovalAuthorityError::RequestContextChanged)
+        ));
+        assert_eq!(
+            state
+                .mission
+                .effect(&state.effect_id)
+                .expect("effect")
+                .status,
+            EffectStatus::Proposed
+        );
+    }
+
     proptest! {
         #[test]
-        fn any_single_request_field_tamper_breaks_its_original_digest(field in 0usize..19) {
+        fn any_single_request_field_tamper_breaks_its_original_digest(field in 0usize..22) {
             let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
             let state = synthetic_state();
             let mut request = synthetic_request(&policy, &state);
@@ -3421,7 +3791,7 @@ mod tests {
         }
 
         #[test]
-        fn rehashed_single_request_field_drift_hits_live_context_closure(field in 0usize..19) {
+        fn rehashed_single_request_field_drift_hits_live_context_closure(field in 0usize..22) {
             let policy = ProviderApprovalAuthorityPolicy::contract_baseline().expect("contract");
             let state = synthetic_state();
             let mut request = synthetic_request(&policy, &state);
@@ -3691,6 +4061,9 @@ mod tests {
             15 => request.policy_digest = "5".repeat(64),
             16 => request.permission_evidence_digest = "6".repeat(64),
             17 => request.permission_authorization_digest = "7".repeat(64),
+            18 => request.adapter_registry_version = "synthetic-a3-registry-v0".into(),
+            19 => request.adapter_registry_revision -= 1,
+            20 => request.adapter_registry_digest = "8".repeat(64),
             _ => request.provider_probe_expires_at += Duration::seconds(1),
         }
     }
@@ -3833,6 +4206,9 @@ mod tests {
         ProviderScope,
         Adapter,
         Surface,
+        RegistryDigest,
+        RegistryRevoked,
+        RegistryRollback,
     }
 
     fn assert_prepare_rejected(
@@ -3868,10 +4244,7 @@ mod tests {
                 intent,
             ),
             &state.connected,
-            ApprovalRegistryView {
-                adapter_registry: &state.adapter_registry,
-                human_issuers: &state.human_issuers,
-            },
+            synthetic_registry_view(state),
             now(),
         );
         match expected {
@@ -3886,6 +4259,18 @@ mod tests {
             ApprovalAuthorityErrorKind::Surface => assert!(matches!(
                 result,
                 Err(ApprovalAuthorityError::ProviderCapabilitySurfaceMismatch)
+            )),
+            ApprovalAuthorityErrorKind::RegistryDigest => assert!(matches!(
+                result,
+                Err(ApprovalAuthorityError::ProviderRegistryDigestMismatch)
+            )),
+            ApprovalAuthorityErrorKind::RegistryRevoked => assert!(matches!(
+                result,
+                Err(ApprovalAuthorityError::ProviderRegistryRevoked)
+            )),
+            ApprovalAuthorityErrorKind::RegistryRollback => assert!(matches!(
+                result,
+                Err(ApprovalAuthorityError::ProviderRegistryVersionRollback)
             )),
         }
     }
