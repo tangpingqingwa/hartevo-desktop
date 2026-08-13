@@ -345,6 +345,18 @@ impl ProductionFileScanner {
         let execution = execute_bounded_process(&mut command, self.limits, &launch);
         let run_directory_removed = run_directory.close().is_ok();
         let executable_after = self.verify_runtime_boundary();
+        if execution.is_err() {
+            note_process_boundary_stage("run-execute-boundary");
+        }
+        if !run_directory_removed {
+            note_process_boundary_stage("run-directory-close");
+        }
+        if !matches!(
+            executable_after.as_ref(),
+            Ok(identity) if identity == &executable_before
+        ) {
+            note_process_boundary_stage("run-executable-revalidation");
+        }
         if execution.is_err()
             || !run_directory_removed
             || !matches!(
@@ -1386,6 +1398,14 @@ enum ProcessExecution {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProcessBoundaryUncertain;
 
+#[cfg(test)]
+fn note_process_boundary_stage(stage: &'static str) {
+    eprintln!("scanner-boundary-stage={stage}");
+}
+
+#[cfg(not(test))]
+fn note_process_boundary_stage(_stage: &'static str) {}
+
 type OutputReader = JoinHandle<std::io::Result<BoundedOutput>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1450,11 +1470,9 @@ fn execute_bounded_process(
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
         }
-        // Keep the leader status in GroupChild's lifecycle cache while it
-        // observes the Unix process group. Mixing a direct std::process::Child
-        // reap with GroupChild::kill/try_wait leaves teardown racing its own
-        // cached state on macOS.
-        match child.try_wait() {
+        // Poll only the exact leader here. GroupChild::try_wait also reaps
+        // descendants and can lose the leader status on a later call.
+        match child.inner().try_wait() {
             Ok(Some(status)) => break ProcessStop::Exited(status),
             Ok(None) => {}
             Err(_) => break ProcessStop::WaitFailure,
@@ -1472,11 +1490,20 @@ fn execute_bounded_process(
     let cleanup = terminate_process_group(&mut child, exited_status);
     let stdout = join_output_reader(stdout_reader);
     let stderr = join_output_reader(stderr_reader);
-    if cleanup.is_err()
-        || matches!(stdout, Err(OutputReaderJoinFailure::Deadline))
-        || matches!(stderr, Err(OutputReaderJoinFailure::Deadline))
-        || child.id() != identity.process_id
-    {
+    if cleanup.is_err() {
+        note_process_boundary_stage("process-cleanup");
+        return Err(ProcessBoundaryUncertain);
+    }
+    if matches!(stdout, Err(OutputReaderJoinFailure::Deadline)) {
+        note_process_boundary_stage("stdout-reader-deadline");
+        return Err(ProcessBoundaryUncertain);
+    }
+    if matches!(stderr, Err(OutputReaderJoinFailure::Deadline)) {
+        note_process_boundary_stage("stderr-reader-deadline");
+        return Err(ProcessBoundaryUncertain);
+    }
+    if child.id() != identity.process_id {
+        note_process_boundary_stage("leader-identity");
         return Err(ProcessBoundaryUncertain);
     }
     let cleanup = cleanup.map_err(|_| ProcessBoundaryUncertain)?;
@@ -1488,10 +1515,22 @@ fn execute_bounded_process(
         ProcessStop::Exited(_)
             if !cleanup.had_live_group_after_leader && !stdout.overflowed && !stderr.overflowed => {
         }
-        ProcessStop::Exited(_)
-        | ProcessStop::Timeout
-        | ProcessStop::OutputViolation
-        | ProcessStop::WaitFailure => return Ok(ProcessExecution::ContainedFailure),
+        ProcessStop::Exited(_) => {
+            note_process_boundary_stage("process-exit-rejected");
+            return Ok(ProcessExecution::ContainedFailure);
+        }
+        ProcessStop::Timeout => {
+            note_process_boundary_stage("process-timeout");
+            return Ok(ProcessExecution::ContainedFailure);
+        }
+        ProcessStop::OutputViolation => {
+            note_process_boundary_stage("process-output-violation");
+            return Ok(ProcessExecution::ContainedFailure);
+        }
+        ProcessStop::WaitFailure => {
+            note_process_boundary_stage("process-wait-failure");
+            return Ok(ProcessExecution::ContainedFailure);
+        }
     }
     Ok(ProcessExecution::Completed(Box::new(ProcessObservation {
         identity,
@@ -1516,7 +1555,11 @@ fn contain_spawned_process(
             reader_cleanup_uncertain = true;
         }
     }
-    if cleanup.is_err() || reader_cleanup_uncertain {
+    if cleanup.is_err() {
+        note_process_boundary_stage("spawn-cleanup");
+        Err(ProcessBoundaryUncertain)
+    } else if reader_cleanup_uncertain {
+        note_process_boundary_stage("spawn-reader-deadline");
         Err(ProcessBoundaryUncertain)
     } else {
         Ok(ProcessExecution::ContainedFailure)
@@ -1552,14 +1595,18 @@ fn terminate_process_group(
     };
 
     loop {
-        // Preserve the leader's exact status independently of group teardown;
-        // GroupChild::try_wait returns its cached status after the first reap.
-        match child.try_wait() {
+        // Preserve the leader's exact status independently of group teardown.
+        // Do not call GroupChild::try_wait after the exact leader is reaped:
+        // that wrapper also consumes descendant statuses.
+        match child.inner().try_wait() {
             Ok(Some(observed)) => {
                 status.get_or_insert(observed);
             }
             Ok(None) => {}
-            Err(_) => return Err(BrowserError::FileScanUnavailable),
+            Err(_) => {
+                note_process_boundary_stage("cleanup-leader-wait");
+                return Err(BrowserError::FileScanUnavailable);
+            }
         }
         if status.is_some() && group_absent {
             break;
@@ -1568,11 +1615,18 @@ fn terminate_process_group(
             group_absent = !kill_process_group(child)?;
         }
         if Instant::now() >= deadline {
+            note_process_boundary_stage("cleanup-deadline");
             return Err(BrowserError::FileScanUnavailable);
         }
         thread::sleep(PROCESS_POLL_INTERVAL);
     }
-    let status = status.ok_or(BrowserError::FileScanUnavailable)?;
+    let status = match status {
+        Some(status) => status,
+        None => {
+            note_process_boundary_stage("cleanup-leader-status-missing");
+            return Err(BrowserError::FileScanUnavailable);
+        }
+    };
     Ok(ProcessCleanup {
         status,
         had_live_group_after_leader,
@@ -1583,7 +1637,10 @@ fn kill_process_group(child: &mut GroupChild) -> Result<bool, BrowserError> {
     match child.kill() {
         Ok(()) => Ok(true),
         Err(error) if process_group_is_absent(&error) => Ok(false),
-        Err(_) => Err(BrowserError::FileScanUnavailable),
+        Err(_) => {
+            note_process_boundary_stage("cleanup-group-kill");
+            Err(BrowserError::FileScanUnavailable)
+        }
     }
 }
 
