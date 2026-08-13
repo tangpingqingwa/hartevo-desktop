@@ -19,8 +19,10 @@ from typing import Iterable, Sequence
 PACKAGES = {
     "application": "hartevo-application",
     "browser-adapter": "hartevo-browser-adapter",
+    "capability-gateway": "hartevo-capability-gateway",
     "catalog": "hartevo-catalog",
     "cloud-storage": "hartevo-cloud-storage",
+    "commerce-connector": "hartevo-commerce-connector",
     "connector-sdk": "hartevo-connector-sdk",
     "context-fabric": "hartevo-context-fabric",
     "desktop": "hartevo-desktop",
@@ -174,6 +176,14 @@ def self_test() -> None:
     mission_scheduler = plan_for_files(["hartevo-rs/mission-scheduler/src/lib.rs"])
     assert mission_scheduler["full"] is False
     assert mission_scheduler["packages"] == ["hartevo-mission-scheduler"]
+
+    capability = plan_for_files(["hartevo-rs/capability-gateway/src/lib.rs"])
+    assert capability["full"] is False
+    assert capability["packages"] == ["hartevo-capability-gateway"]
+
+    commerce = plan_for_files(["hartevo-rs/commerce-connector/src/lib.rs"])
+    assert commerce["full"] is False
+    assert commerce["packages"] == ["hartevo-commerce-connector"]
 
     docs = plan_for_files(["docs/quality/example.md"])
     assert docs["full"] is False and docs["rust"] is False and docs["docs"] is True

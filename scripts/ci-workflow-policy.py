@@ -210,7 +210,7 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing a required integration contract")
     elif path.name == "release-promotion.yml":
-        required = ("workflow_dispatch:", "environment: release-promotion", "id-token: write", "source_commit", "refs/heads/main", "release-baseline", "passed", "sha256", "rollback", "release: false", "ci-distribution-hook.sh", "ci-oidc-interface")
+        required = ("workflow_dispatch:", "environment: release-promotion", "id-token: write", "source_commit", "refs/heads/main", "release-baseline", "releaseCommit", "passed", "sha256", "rollback", "release: false", "ci-distribution-hook.sh", "ci-oidc-interface")
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing a release fence")
         forbidden_deploy = ("kubectl apply", "helm upgrade", "aws deploy", "vercel --prod", "gh release create")

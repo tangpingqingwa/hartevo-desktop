@@ -176,7 +176,9 @@ jobs:
           artifact="target/ci/release/hartevo-desktop-$TAG.tar.gz"
           expected_digest="$(jq -r '.artifactSha256' target/ci/release/build-receipt.json)"
           test -f "$artifact"
-          jq -e '.passed == true' target/ci/release/release-baseline.json
+          jq -e --arg commit "$SOURCE_COMMIT" \
+            '.passed == true and .releaseCommit == $commit' \
+            target/ci/release/release-baseline.json
           test "$(shasum -a 256 "$artifact" | awk '{print $1}')" = "$expected_digest"
           rollback_args=()
           if [[ -n "$ROLLBACK_OF" ]]; then

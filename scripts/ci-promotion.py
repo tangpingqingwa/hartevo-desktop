@@ -33,7 +33,7 @@ def semver(tag: str) -> tuple[int, int, int, str]:
     return int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4) or "~stable"
 
 
-def evidence_status(path: Path) -> tuple[str, bool]:
+def evidence_status(path: Path, expected_commit: str) -> tuple[str, bool]:
     if not path.exists():
         return "NOT_IMPLEMENTED", False
     if path.is_symlink() or not path.is_file():
@@ -41,6 +41,8 @@ def evidence_status(path: Path) -> tuple[str, bool]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or not isinstance(value.get("passed"), bool):
         raise ValueError("release evidence must contain a boolean passed field")
+    if value.get("releaseCommit") != expected_commit:
+        raise ValueError("release evidence is not bound to the source commit")
     return "PASS" if value["passed"] else "FAIL", value["passed"]
 
 
@@ -58,15 +60,18 @@ def validate(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("promotion kind must be forward or rollback")
     if args.promotion_kind == "rollback" and not args.rollback_of:
         raise ValueError("rollback promotions require rollback_of and a new tag")
-    if args.rollback_of and args.rollback_of == args.tag:
-        raise ValueError("rollback must be a new promotion tag, never the old tag")
+    if args.rollback_of:
+        if not TAG.fullmatch(args.rollback_of):
+            raise ValueError("rollback_of must be an immutable semver tag")
+        if args.rollback_of == args.tag:
+            raise ValueError("rollback must be a new promotion tag, never the old tag")
     artifact = Path(args.artifact)
     if artifact.is_symlink() or not artifact.is_file():
         raise ValueError("promotion artifact must be a regular file")
     actual_digest = sha256(artifact)
     if not SHA256.fullmatch(args.expected_digest) or actual_digest != args.expected_digest:
         raise ValueError("promotion artifact digest does not match the build receipt")
-    status, passed = evidence_status(Path(args.release_evidence))
+    status, passed = evidence_status(Path(args.release_evidence), args.source_commit)
     if not passed:
         raise ValueError("release evidence is not passed; promotion is blocked")
     if not args.rollback_of:
@@ -109,7 +114,7 @@ def self_test() -> None:
         artifact = root / "artifact.bin"
         artifact.write_bytes(b"fixture artifact")
         evidence = root / "release.json"
-        evidence.write_text(json.dumps({"passed": True}), encoding="utf-8")
+        evidence.write_text(json.dumps({"passed": True, "releaseCommit": "a" * 40}), encoding="utf-8")
         args = argparse.Namespace(
             source_commit="a" * 40,
             current_main="a" * 40,

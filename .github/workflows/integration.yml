@@ -42,7 +42,7 @@ jobs:
     with:
       check_prefix: Integration / Full Rust
       full_workspace: true
-      rust_packages: '["hartevo-application","hartevo-browser-adapter","hartevo-catalog","hartevo-cloud-storage","hartevo-connector-sdk","hartevo-context-fabric","hartevo-desktop","hartevo-domain-kernel","hartevo-effect-broker","hartevo-eval","hartevo-mission-scheduler","hartevo-runtime-adapter","hartevo-storage"]'
+      rust_packages: '["hartevo-application","hartevo-browser-adapter","hartevo-capability-gateway","hartevo-catalog","hartevo-cloud-storage","hartevo-commerce-connector","hartevo-connector-sdk","hartevo-context-fabric","hartevo-desktop","hartevo-domain-kernel","hartevo-effect-broker","hartevo-eval","hartevo-mission-scheduler","hartevo-runtime-adapter","hartevo-storage"]'
     permissions:
       contents: read
 
