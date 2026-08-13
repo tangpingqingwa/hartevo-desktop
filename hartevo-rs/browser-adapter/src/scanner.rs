@@ -27,9 +27,9 @@ use crate::file_broker::{FileSafetyScanner, FileScanDecision, FileScanReport, Fi
 use crate::workspace::{digest, digest_json, is_bounded_identifier, is_sha256};
 use crate::{BrowserError, BrowserFileType};
 
-const SCANNER_PROTOCOL: &str = "hartevo-file-scanner-process/v1";
-const VERSION_OPERATION: &str = "version-v1";
-const SCAN_OPERATION: &str = "scan-v1";
+const SCANNER_PROTOCOL: &str = "hartevo-file-scanner-process/v2";
+const VERSION_OPERATION: &str = "version-v2";
+const SCAN_OPERATION: &str = "scan-v2";
 const SCANNER_INPUT_FD: i32 = 3;
 const MAX_PROCESS_TIMEOUT: Duration = Duration::from_mins(5);
 const MIN_OUTPUT_BYTES: usize = 64;
@@ -175,6 +175,10 @@ pub struct ProductionFileScanner {
     release_pin: ScannerReleasePin,
     limits: ScannerProcessLimits,
     version_probe_evidence_digest: String,
+    process_generation: u64,
+    last_launch_digest: String,
+    active_launch_digest: Option<String>,
+    process_boundary_poisoned: bool,
 }
 
 impl ProductionFileScanner {
@@ -216,6 +220,13 @@ impl ProductionFileScanner {
             return Err(BrowserError::InvalidExecutable);
         }
 
+        let executable_identity_digest = executable_identity.evidence_digest()?;
+        let lifecycle_root_digest = digest_json(&serde_json::json!({
+            "protocol": SCANNER_PROTOCOL,
+            "lifecycle": "scanner-process-root",
+            "releaseDigest": release_pin.release_digest,
+            "executableIdentityDigest": executable_identity_digest,
+        }))?;
         let mut scanner = Self {
             runtime_directory,
             canonical_runtime_directory,
@@ -224,28 +235,30 @@ impl ProductionFileScanner {
             release_pin,
             limits,
             version_probe_evidence_digest: digest(b"pending-scanner-version-probe"),
+            process_generation: 0,
+            last_launch_digest: lifecycle_root_digest,
+            active_launch_digest: None,
+            process_boundary_poisoned: false,
         };
         let probe = scanner.run_process(ProcessOperation::Version)?;
         if !probe.status.success() {
             return Err(BrowserError::FileScanUnavailable);
         }
-        let version: VersionResponse = parse_exact_json(&probe.stdout.retained)?;
-        if version.schema_version != 1
-            || version.scanner_id != scanner.release_pin.scanner_id
-            || version.scanner_version != scanner.release_pin.scanner_version
-        {
-            return Err(BrowserError::FileScanUnavailable);
-        }
+        let version: VersionResponse = scanner.parse_process_response(&probe.stdout.retained)?;
+        scanner.validate_response_identity(&probe.identity.launch, version.identity())?;
         scanner.version_probe_evidence_digest = digest_json(&serde_json::json!({
             "protocol": SCANNER_PROTOCOL,
             "operation": VERSION_OPERATION,
             "releaseDigest": scanner.release_pin.release_digest,
             "executableIdentityDigest": scanner.executable_identity.evidence_digest()?,
+            "launchIdentityDigest": probe.identity.launch.evidence_digest()?,
             "processObservationDigest": probe.evidence_digest()?,
             "response": {
                 "schemaVersion": version.schema_version,
                 "scannerId": version.scanner_id,
                 "scannerVersion": version.scanner_version,
+                "executableSha256": version.executable_sha256,
+                "launchDigest": version.launch_digest,
             },
         }))?;
         Ok(scanner)
@@ -268,10 +281,16 @@ impl ProductionFileScanner {
     }
 
     fn run_process(
-        &self,
+        &mut self,
         operation: ProcessOperation<'_, '_>,
     ) -> Result<ProcessObservation, BrowserError> {
-        let executable_before = self.verify_runtime_boundary()?;
+        if self.process_boundary_poisoned || self.active_launch_digest.is_some() {
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        let Ok(executable_before) = self.verify_runtime_boundary() else {
+            self.poison_process_boundary();
+            return Err(BrowserError::FileScanUnavailable);
+        };
         let run_directory = TempBuilder::new()
             .prefix("run-")
             .tempdir_in(&self.canonical_runtime_directory)?;
@@ -283,13 +302,17 @@ impl ProductionFileScanner {
         set_private_directory(&home_directory)?;
         set_private_directory(&temp_directory)?;
 
+        let operation_name = operation.name();
         let mut command = Command::new(&self.executable_path);
+
+        let launch = self.begin_process_launch(operation_name)?;
         configure_clean_process(
             &mut command,
             run_directory.path(),
             &home_directory,
             &temp_directory,
-            operation.name(),
+            &self.release_pin,
+            &launch,
         );
 
         if let ProcessOperation::Scan { request, input } = operation {
@@ -305,21 +328,115 @@ impl ProductionFileScanner {
                     "HARTEVO_SCANNER_OBSERVED_AT",
                     request.observed_at.to_rfc3339(),
                 );
-            command
+            if command
                 .fd_mappings(vec![FdMapping {
                     parent_fd: OwnedFd::from(input),
                     child_fd: SCANNER_INPUT_FD,
                 }])
-                .map_err(|_| BrowserError::FileScanUnavailable)?;
+                .is_err()
+            {
+                let run_directory_removed = run_directory.close().is_ok();
+                let launch_finished = self.finish_process_launch(&launch).is_ok();
+                if !run_directory_removed || !launch_finished {
+                    self.poison_process_boundary();
+                }
+                return Err(BrowserError::FileScanUnavailable);
+            }
         }
 
-        let observation = execute_bounded_process(&mut command, self.limits);
-        drop(run_directory);
-        let executable_after = self.verify_runtime_boundary()?;
-        if executable_after != executable_before {
+        let execution = execute_bounded_process(&mut command, self.limits, &launch);
+        let run_directory_removed = run_directory.close().is_ok();
+        let executable_after = self.verify_runtime_boundary();
+        if execution.is_err()
+            || !run_directory_removed
+            || !matches!(
+                executable_after.as_ref(),
+                Ok(identity) if identity == &executable_before
+            )
+        {
+            self.poison_process_boundary();
             return Err(BrowserError::FileScanUnavailable);
         }
-        observation
+        let execution = execution.map_err(|_| BrowserError::FileScanUnavailable)?;
+        match execution {
+            ProcessExecution::Completed(observation) => {
+                if !observation.identity.matches_launch(&launch) {
+                    self.poison_process_boundary();
+                    return Err(BrowserError::FileScanUnavailable);
+                }
+                self.finish_process_launch(&launch)?;
+                Ok(*observation)
+            }
+            ProcessExecution::ContainedFailure => {
+                self.finish_process_launch(&launch)?;
+                Err(BrowserError::FileScanUnavailable)
+            }
+        }
+    }
+
+    fn begin_process_launch(
+        &mut self,
+        operation: &'static str,
+    ) -> Result<ScannerProcessLaunch, BrowserError> {
+        if self.process_boundary_poisoned || self.active_launch_digest.is_some() {
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        let generation = self
+            .process_generation
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        let launch = ScannerProcessLaunch::new(
+            generation,
+            operation,
+            &self.release_pin.release_digest,
+            &self.executable_identity.evidence_digest()?,
+            &self.last_launch_digest,
+        )?;
+        self.process_generation = generation;
+        self.last_launch_digest.clone_from(&launch.launch_digest);
+        self.active_launch_digest = Some(launch.launch_digest.clone());
+        Ok(launch)
+    }
+
+    fn finish_process_launch(&mut self, launch: &ScannerProcessLaunch) -> Result<(), BrowserError> {
+        if self.active_launch_digest.as_deref() != Some(launch.launch_digest.as_str()) {
+            self.poison_process_boundary();
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        self.active_launch_digest = None;
+        Ok(())
+    }
+
+    fn parse_process_response<T: for<'de> Deserialize<'de>>(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<T, BrowserError> {
+        let Ok(response) = parse_exact_json(bytes) else {
+            self.poison_process_boundary();
+            return Err(BrowserError::FileScanUnavailable);
+        };
+        Ok(response)
+    }
+
+    fn validate_response_identity(
+        &mut self,
+        launch: &ScannerProcessLaunch,
+        response: ScannerResponseIdentity<'_>,
+    ) -> Result<(), BrowserError> {
+        if response.schema_version != 2
+            || response.scanner_id != self.release_pin.scanner_id
+            || response.scanner_version != self.release_pin.scanner_version
+            || response.executable_sha256 != self.release_pin.executable_sha256
+            || response.launch_digest != launch.launch_digest
+        {
+            self.poison_process_boundary();
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        Ok(())
+    }
+
+    fn poison_process_boundary(&mut self) {
+        self.process_boundary_poisoned = true;
     }
 }
 
@@ -345,12 +462,21 @@ impl fmt::Debug for ProductionFileScanner {
                 "version_probe_evidence_digest",
                 &self.version_probe_evidence_digest,
             )
+            .field("process_generation", &self.process_generation)
+            .field("process_boundary_poisoned", &self.process_boundary_poisoned)
+            .field(
+                "process_launch_active",
+                &self.active_launch_digest.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl FileSafetyScanner for ProductionFileScanner {
     fn scan(&mut self, request: &FileScanRequest<'_>) -> Result<FileScanReport, BrowserError> {
+        if self.process_boundary_poisoned || self.active_launch_digest.is_some() {
+            return Err(BrowserError::FileScanUnavailable);
+        }
         self.release_pin.validate()?;
         self.limits.validate()?;
         if !is_sha256(request.content_digest) || request.byte_count == 0 {
@@ -376,10 +502,8 @@ impl FileSafetyScanner for ProductionFileScanner {
         if !process.status.success() {
             return Err(BrowserError::FileScanUnavailable);
         }
-        let response: ScanResponse = parse_exact_json(&process.stdout.retained)?;
-        if response.schema_version != 1 {
-            return Err(BrowserError::FileScanUnavailable);
-        }
+        let response: ScanResponse = self.parse_process_response(&process.stdout.retained)?;
+        self.validate_response_identity(&process.identity.launch, response.identity())?;
         let decision = match response.decision {
             ScannerDecision::Clean => FileScanDecision::Clean,
             ScannerDecision::Rejected => FileScanDecision::Rejected,
@@ -390,6 +514,7 @@ impl FileSafetyScanner for ProductionFileScanner {
             "releaseDigest": self.release_pin.release_digest,
             "versionProbeEvidenceDigest": self.version_probe_evidence_digest,
             "executableIdentityDigest": self.executable_identity.evidence_digest()?,
+            "launchIdentityDigest": process.identity.launch.evidence_digest()?,
             "request": {
                 "contentDigest": request.content_digest,
                 "byteCount": request.byte_count,
@@ -428,12 +553,103 @@ impl ProcessOperation<'_, '_> {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScannerProcessLaunch {
+    generation: u64,
+    operation: &'static str,
+    release_digest: String,
+    executable_identity_digest: String,
+    previous_launch_digest: String,
+    launch_digest: String,
+}
+
+impl ScannerProcessLaunch {
+    fn new(
+        generation: u64,
+        operation: &'static str,
+        release_digest: &str,
+        executable_identity_digest: &str,
+        previous_launch_digest: &str,
+    ) -> Result<Self, BrowserError> {
+        let launch_digest = digest_json(&serde_json::json!({
+            "protocol": SCANNER_PROTOCOL,
+            "generation": generation.to_string(),
+            "operation": operation,
+            "releaseDigest": release_digest,
+            "executableIdentityDigest": executable_identity_digest,
+            "previousLaunchDigest": previous_launch_digest,
+        }))?;
+        Ok(Self {
+            generation,
+            operation,
+            release_digest: release_digest.to_owned(),
+            executable_identity_digest: executable_identity_digest.to_owned(),
+            previous_launch_digest: previous_launch_digest.to_owned(),
+            launch_digest,
+        })
+    }
+
+    fn evidence_digest(&self) -> Result<String, BrowserError> {
+        digest_json(&serde_json::json!({
+            "protocol": SCANNER_PROTOCOL,
+            "generation": self.generation.to_string(),
+            "operation": self.operation,
+            "releaseDigest": self.release_digest,
+            "executableIdentityDigest": self.executable_identity_digest,
+            "previousLaunchDigest": self.previous_launch_digest,
+            "launchDigest": self.launch_digest,
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedScannerProcessIdentity {
+    process_id: u32,
+    launch: ScannerProcessLaunch,
+}
+
+impl ObservedScannerProcessIdentity {
+    fn matches_launch(&self, launch: &ScannerProcessLaunch) -> bool {
+        self.process_id != 0 && &self.launch == launch
+    }
+
+    fn evidence_digest(&self) -> Result<String, BrowserError> {
+        digest_json(&serde_json::json!({
+            "processId": self.process_id.to_string(),
+            "launchIdentityDigest": self.launch.evidence_digest()?,
+        }))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct VersionResponse {
     schema_version: u32,
     scanner_id: String,
     scanner_version: String,
+    executable_sha256: String,
+    launch_digest: String,
+}
+
+#[derive(Clone, Copy)]
+struct ScannerResponseIdentity<'response> {
+    schema_version: u32,
+    scanner_id: &'response str,
+    scanner_version: &'response str,
+    executable_sha256: &'response str,
+    launch_digest: &'response str,
+}
+
+impl VersionResponse {
+    fn identity(&self) -> ScannerResponseIdentity<'_> {
+        ScannerResponseIdentity {
+            schema_version: self.schema_version,
+            scanner_id: &self.scanner_id,
+            scanner_version: &self.scanner_version,
+            executable_sha256: &self.executable_sha256,
+            launch_digest: &self.launch_digest,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -447,7 +663,23 @@ enum ScannerDecision {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ScanResponse {
     schema_version: u32,
+    scanner_id: String,
+    scanner_version: String,
+    executable_sha256: String,
+    launch_digest: String,
     decision: ScannerDecision,
+}
+
+impl ScanResponse {
+    fn identity(&self) -> ScannerResponseIdentity<'_> {
+        ScannerResponseIdentity {
+            schema_version: self.schema_version,
+            scanner_id: &self.scanner_id,
+            scanner_version: &self.scanner_version,
+            executable_sha256: &self.executable_sha256,
+            launch_digest: &self.launch_digest,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -700,7 +932,8 @@ fn configure_clean_process(
     working_directory: &Path,
     home_directory: &Path,
     temp_directory: &Path,
-    operation: &str,
+    release_pin: &ScannerReleasePin,
+    launch: &ScannerProcessLaunch,
 ) {
     command
         .current_dir(working_directory)
@@ -710,7 +943,22 @@ fn configure_clean_process(
         .env("HOME", home_directory)
         .env("TMPDIR", temp_directory)
         .env("HARTEVO_SCANNER_PROTOCOL", SCANNER_PROTOCOL)
-        .env("HARTEVO_SCANNER_OPERATION", operation)
+        .env("HARTEVO_SCANNER_OPERATION", launch.operation)
+        .env("HARTEVO_SCANNER_ID", &release_pin.scanner_id)
+        .env("HARTEVO_SCANNER_VERSION", &release_pin.scanner_version)
+        .env(
+            "HARTEVO_SCANNER_EXECUTABLE_SHA256",
+            &release_pin.executable_sha256,
+        )
+        .env(
+            "HARTEVO_SCANNER_RELEASE_DIGEST",
+            &release_pin.release_digest,
+        )
+        .env(
+            "HARTEVO_SCANNER_PROCESS_GENERATION",
+            launch.generation.to_string(),
+        )
+        .env("HARTEVO_SCANNER_LAUNCH_DIGEST", &launch.launch_digest)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -787,6 +1035,7 @@ impl ExitObservation {
 }
 
 struct ProcessObservation {
+    identity: ObservedScannerProcessIdentity,
     status: ExitObservation,
     stdout: BoundedOutput,
     stderr: BoundedOutput,
@@ -795,6 +1044,7 @@ struct ProcessObservation {
 impl ProcessObservation {
     fn evidence_digest(&self) -> Result<String, BrowserError> {
         digest_json(&serde_json::json!({
+            "processIdentityDigest": self.identity.evidence_digest()?,
             "exit": {
                 "code": self.status.code,
                 "signal": self.status.signal,
@@ -810,6 +1060,10 @@ impl fmt::Debug for ProcessObservation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProcessObservation")
+            .field(
+                "process_identity_digest",
+                &self.identity.evidence_digest().ok(),
+            )
             .field("status", &self.status)
             .field("stdout", &self.stdout)
             .field("stderr", &self.stderr)
@@ -824,26 +1078,38 @@ enum ProcessStop {
     WaitFailure,
 }
 
+enum ProcessExecution {
+    Completed(Box<ProcessObservation>),
+    ContainedFailure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessBoundaryUncertain;
+
+type OutputReader = JoinHandle<std::io::Result<BoundedOutput>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputReaderJoinFailure {
+    Deadline,
+    JoinedFailure,
+}
+
 fn execute_bounded_process(
     command: &mut Command,
     limits: ScannerProcessLimits,
-) -> Result<ProcessObservation, BrowserError> {
-    let mut child = command
-        .group_spawn()
-        .map_err(|_| BrowserError::FileScanUnavailable)?;
-    let stdout = child
-        .inner()
-        .stdout
-        .take()
-        .ok_or(BrowserError::FileScanUnavailable);
-    let stderr = child
-        .inner()
-        .stderr
-        .take()
-        .ok_or(BrowserError::FileScanUnavailable);
+    launch: &ScannerProcessLaunch,
+) -> Result<ProcessExecution, ProcessBoundaryUncertain> {
+    let Ok(mut child) = command.group_spawn() else {
+        return Ok(ProcessExecution::ContainedFailure);
+    };
+    let identity = ObservedScannerProcessIdentity {
+        process_id: child.id(),
+        launch: launch.clone(),
+    };
+    let stdout = child.inner().stdout.take().ok_or(ProcessBoundaryUncertain);
+    let stderr = child.inner().stderr.take().ok_or(ProcessBoundaryUncertain);
     let (Ok(stdout), Ok(stderr)) = (stdout, stderr) else {
-        terminate_process_group(&mut child, None)?;
-        return Err(BrowserError::FileScanUnavailable);
+        return contain_spawned_process(&mut child, []);
     };
 
     let (event_sender, event_receiver) = bounded(4);
@@ -862,20 +1128,20 @@ fn execute_bounded_process(
     let (stdout_reader, stderr_reader) = match (stdout_reader, stderr_reader) {
         (Ok(stdout_reader), Ok(stderr_reader)) => (stdout_reader, stderr_reader),
         (stdout_reader, stderr_reader) => {
-            terminate_process_group(&mut child, None)?;
+            let mut readers = Vec::with_capacity(2);
             if let Ok(reader) = stdout_reader {
-                let _ = join_output_reader(reader);
+                readers.push(reader);
             }
             if let Ok(reader) = stderr_reader {
-                let _ = join_output_reader(reader);
+                readers.push(reader);
             }
-            return Err(BrowserError::FileScanUnavailable);
+            return contain_spawned_process(&mut child, readers);
         }
     };
 
-    let deadline = Instant::now()
-        .checked_add(limits.timeout)
-        .ok_or(BrowserError::FileScanUnavailable)?;
+    let Some(deadline) = Instant::now().checked_add(limits.timeout) else {
+        return contain_spawned_process(&mut child, [stdout_reader, stderr_reader]);
+    };
     let stop = loop {
         match event_receiver.try_recv() {
             Ok(ReaderEvent::Overflow(stream) | ReaderEvent::Failed(stream)) => {
@@ -901,9 +1167,20 @@ fn execute_bounded_process(
         ProcessStop::Exited(status) => Some(status),
         ProcessStop::Timeout | ProcessStop::OutputViolation | ProcessStop::WaitFailure => None,
     };
-    let cleanup = terminate_process_group(&mut child, exited_status)?;
-    let stdout = join_output_reader(stdout_reader)?;
-    let stderr = join_output_reader(stderr_reader)?;
+    let cleanup = terminate_process_group(&mut child, exited_status);
+    let stdout = join_output_reader(stdout_reader);
+    let stderr = join_output_reader(stderr_reader);
+    if cleanup.is_err()
+        || matches!(stdout, Err(OutputReaderJoinFailure::Deadline))
+        || matches!(stderr, Err(OutputReaderJoinFailure::Deadline))
+        || child.id() != identity.process_id
+    {
+        return Err(ProcessBoundaryUncertain);
+    }
+    let cleanup = cleanup.map_err(|_| ProcessBoundaryUncertain)?;
+    let (Ok(stdout), Ok(stderr)) = (stdout, stderr) else {
+        return Ok(ProcessExecution::ContainedFailure);
+    };
 
     match stop {
         ProcessStop::Exited(_)
@@ -912,13 +1189,35 @@ fn execute_bounded_process(
         ProcessStop::Exited(_)
         | ProcessStop::Timeout
         | ProcessStop::OutputViolation
-        | ProcessStop::WaitFailure => return Err(BrowserError::FileScanUnavailable),
+        | ProcessStop::WaitFailure => return Ok(ProcessExecution::ContainedFailure),
     }
-    Ok(ProcessObservation {
+    Ok(ProcessExecution::Completed(Box::new(ProcessObservation {
+        identity,
         status: ExitObservation::from_status(cleanup.status),
         stdout,
         stderr,
-    })
+    })))
+}
+
+fn contain_spawned_process(
+    child: &mut GroupChild,
+    readers: impl IntoIterator<Item = OutputReader>,
+) -> Result<ProcessExecution, ProcessBoundaryUncertain> {
+    let cleanup = terminate_process_group(child, None);
+    let mut reader_cleanup_uncertain = false;
+    for reader in readers {
+        if matches!(
+            join_output_reader(reader),
+            Err(OutputReaderJoinFailure::Deadline)
+        ) {
+            reader_cleanup_uncertain = true;
+        }
+    }
+    if cleanup.is_err() || reader_cleanup_uncertain {
+        Err(ProcessBoundaryUncertain)
+    } else {
+        Ok(ProcessExecution::ContainedFailure)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1012,7 +1311,7 @@ fn read_bounded_output(
     let mut byte_count = 0_u64;
     let mut hasher = Sha256::new();
     let mut overflowed = false;
-    let mut buffer = vec![0_u8; 8 * 1024].into_boxed_slice();
+    let mut buffer = Zeroizing::new(vec![0_u8; 8 * 1024]);
     loop {
         let read = match reader.read(&mut buffer) {
             Ok(read) => read,
@@ -1041,22 +1340,20 @@ fn read_bounded_output(
     })
 }
 
-fn join_output_reader(
-    reader: JoinHandle<std::io::Result<BoundedOutput>>,
-) -> Result<BoundedOutput, BrowserError> {
-    let deadline = Instant::now()
-        .checked_add(READER_CLEANUP_TIMEOUT)
-        .ok_or(BrowserError::FileScanUnavailable)?;
+fn join_output_reader(reader: OutputReader) -> Result<BoundedOutput, OutputReaderJoinFailure> {
+    let Some(deadline) = Instant::now().checked_add(READER_CLEANUP_TIMEOUT) else {
+        return Err(OutputReaderJoinFailure::Deadline);
+    };
     while !reader.is_finished() {
         if Instant::now() >= deadline {
-            return Err(BrowserError::FileScanUnavailable);
+            return Err(OutputReaderJoinFailure::Deadline);
         }
         thread::sleep(PROCESS_POLL_INTERVAL);
     }
     reader
         .join()
-        .map_err(|_| BrowserError::FileScanUnavailable)?
-        .map_err(|_| BrowserError::FileScanUnavailable)
+        .map_err(|_| OutputReaderJoinFailure::JoinedFailure)?
+        .map_err(|_| OutputReaderJoinFailure::JoinedFailure)
 }
 
 #[cfg(test)]
@@ -1217,9 +1514,31 @@ set -eu
 if [ "${{HARTEVO_SCANNER_PROTOCOL-}}" != "{SCANNER_PROTOCOL}" ]; then
   exit 80
 fi
+emit_version() {{
+  printf '{{"schemaVersion":2,"scannerId":"%s","scannerVersion":"%s","executableSha256":"%s","launchDigest":"%s"}}\n' \
+    "{FIXTURE_SCANNER_ID}" "{FIXTURE_SCANNER_VERSION}" \
+    "$HARTEVO_SCANNER_EXECUTABLE_SHA256" "$HARTEVO_SCANNER_LAUNCH_DIGEST"
+}}
+emit_scan_with_identity() {{
+  printf '{{"schemaVersion":2,"scannerId":"%s","scannerVersion":"%s","executableSha256":"%s","launchDigest":"%s","decision":"%s"}}\n' \
+    "$1" "$2" "$3" "$4" "$5"
+}}
+emit_scan() {{
+  emit_scan_with_identity "{FIXTURE_SCANNER_ID}" "{FIXTURE_SCANNER_VERSION}" \
+    "$HARTEVO_SCANNER_EXECUTABLE_SHA256" "$HARTEVO_SCANNER_LAUNCH_DIGEST" "$1"
+}}
+emit_scan_with_launch() {{
+  emit_scan_with_identity "{FIXTURE_SCANNER_ID}" "{FIXTURE_SCANNER_VERSION}" \
+    "$HARTEVO_SCANNER_EXECUTABLE_SHA256" "$2" "$1"
+}}
+emit_scan_unknown() {{
+  printf '{{"schemaVersion":2,"scannerId":"%s","scannerVersion":"%s","executableSha256":"%s","launchDigest":"%s","decision":"%s","unknown":true}}\n' \
+    "{FIXTURE_SCANNER_ID}" "{FIXTURE_SCANNER_VERSION}" \
+    "$HARTEVO_SCANNER_EXECUTABLE_SHA256" "$HARTEVO_SCANNER_LAUNCH_DIGEST" "$1"
+}}
 case "${{HARTEVO_SCANNER_OPERATION-}}" in
   {VERSION_OPERATION})
-    printf '%s\n' '{{"schemaVersion":1,"scannerId":"{FIXTURE_SCANNER_ID}","scannerVersion":"{FIXTURE_SCANNER_VERSION}"}}'
+    emit_version
     ;;
   {SCAN_OPERATION})
 {scan_body}
@@ -1276,7 +1595,25 @@ esac
         command
             .env("PATH", "/ambient/path-must-not-survive")
             .env("HARTEVO_AMBIENT_SECRET", "must-not-survive");
-        configure_clean_process(&mut command, &working, &home, &temporary, SCAN_OPERATION);
+        let release_pin =
+            ScannerReleasePin::new(FIXTURE_SCANNER_ID, FIXTURE_SCANNER_VERSION, sha('5'))
+                .expect("release pin");
+        let launch = ScannerProcessLaunch::new(
+            7,
+            SCAN_OPERATION,
+            release_pin.release_digest(),
+            &sha('6'),
+            &sha('7'),
+        )
+        .expect("launch identity");
+        configure_clean_process(
+            &mut command,
+            &working,
+            &home,
+            &temporary,
+            &release_pin,
+            &launch,
+        );
         let environment = command
             .get_envs()
             .map(|(key, value)| {
@@ -1289,8 +1626,14 @@ esac
         assert_eq!(
             environment.keys().map(String::as_str).collect::<Vec<_>>(),
             vec![
+                "HARTEVO_SCANNER_EXECUTABLE_SHA256",
+                "HARTEVO_SCANNER_ID",
+                "HARTEVO_SCANNER_LAUNCH_DIGEST",
                 "HARTEVO_SCANNER_OPERATION",
+                "HARTEVO_SCANNER_PROCESS_GENERATION",
                 "HARTEVO_SCANNER_PROTOCOL",
+                "HARTEVO_SCANNER_RELEASE_DIGEST",
+                "HARTEVO_SCANNER_VERSION",
                 "HOME",
                 "LANG",
                 "LC_ALL",
@@ -1304,6 +1647,14 @@ esac
         assert_eq!(
             environment["HARTEVO_SCANNER_PROTOCOL"].as_deref(),
             Some(SCANNER_PROTOCOL)
+        );
+        assert_eq!(
+            environment["HARTEVO_SCANNER_LAUNCH_DIGEST"].as_deref(),
+            Some(launch.launch_digest.as_str())
+        );
+        assert_eq!(
+            environment["HARTEVO_SCANNER_PROCESS_GENERATION"].as_deref(),
+            Some("7")
         );
         assert_eq!(command.get_current_dir(), Some(working.as_path()));
         assert!(!environment.contains_key("PATH"));
@@ -1325,7 +1676,7 @@ esac
     IFS= read -r content <&3 || true
     [ "$content" = '{"customer":"private@example.com","status":"ready"}' ] || exit 97
     printf '%s' 'private-scanner-diagnostic' >&2
-    printf '%s\n' '{"schemaVersion":1,"decision":"clean"}'"#;
+    emit_scan clean"#;
         let (mut scanner, source_executable) =
             scanner_with_limits(&fixture, clean_body, default_limits());
 
@@ -1360,11 +1711,8 @@ esac
     fn typed_rejected_verdict_creates_no_grant_or_staged_residue() {
         let fixture = ScannerFixture::new();
         let source = fixture.source("rejected.json", br#"{"status":"blocked"}"#);
-        let (mut scanner, _) = scanner_with_limits(
-            &fixture,
-            r#"    printf '%s\n' '{"schemaVersion":1,"decision":"rejected"}'"#,
-            default_limits(),
-        );
+        let (mut scanner, _) =
+            scanner_with_limits(&fixture, "    emit_scan rejected", default_limits());
         let mut broker = fixture.broker();
         let grant_id = BrowserFileGrantId::from("grant-production-scanner-rejected");
         let result = fixture.prepare(&mut broker, &mut scanner, grant_id.as_str(), &source);
@@ -1378,7 +1726,7 @@ esac
     #[test]
     fn release_version_and_private_executable_drift_fail_closed() {
         let fixture = ScannerFixture::new();
-        let body = r#"    printf '%s\n' '{"schemaVersion":1,"decision":"clean"}'"#;
+        let body = "    emit_scan clean";
         let (path, executable_digest) = write_scanner_fixture(&fixture.scanner_root, body);
         let wrong_pin =
             ScannerReleasePin::new(FIXTURE_SCANNER_ID, FIXTURE_SCANNER_VERSION, sha('9'))
@@ -1430,9 +1778,9 @@ esac
     #[test]
     fn malformed_unknown_nonzero_and_signaled_protocols_fail_closed() {
         let cases = [
-            r#"    printf '%s\n' '{"schemaVersion":1,"decision":"clean","unknown":true}'"#,
+            "    emit_scan_unknown clean",
             r"    printf '%s\n' '{'",
-            r#"    printf '%s\n' '{"schemaVersion":1,"decision":"unavailable"}'"#,
+            "    emit_scan unavailable",
             "    exit 23",
             "    kill -9 $$",
         ];
@@ -1467,12 +1815,12 @@ esac
       printf x >&2
       count=$((count + 1))
     done
-    printf '%s\n' '{"schemaVersion":1,"decision":"clean"}'"#,
+    emit_scan clean"#,
         ];
         for (index, body) in cases.into_iter().enumerate() {
             let fixture = ScannerFixture::new();
             let source = fixture.source(&format!("overflow-{index}.json"), b"{}");
-            let limits = ScannerProcessLimits::new(Duration::from_secs(1), 256, 256)
+            let limits = ScannerProcessLimits::new(Duration::from_secs(2), 512, 512)
                 .expect("small bounded outputs");
             let (mut scanner, _) = scanner_with_limits(&fixture, body, limits);
             let mut broker = fixture.broker();
@@ -1493,16 +1841,18 @@ esac
         let fixture = ScannerFixture::new();
         let first_marker = fixture.temp.path().join("first-scan.marker");
         let body = format!(
-            r#"    if [ ! -f {marker} ]; then
+            r"    if [ ! -f {marker} ]; then
       printf first > {marker}
+      printf '%s' 'private-partial-stdout'
+      printf '%s' 'private-partial-stderr' >&2
       /bin/sleep 30 &
       wait
     fi
-    printf '%s\n' '{{"schemaVersion":1,"decision":"clean"}}'"#,
+    emit_scan clean",
             marker = shell_quote(&first_marker),
         );
-        let limits = ScannerProcessLimits::new(Duration::from_millis(500), 4096, 4096)
-            .expect("timeout limits");
+        let limits =
+            ScannerProcessLimits::new(Duration::from_secs(2), 4096, 4096).expect("timeout limits");
         let (mut scanner, _) = scanner_with_limits(&fixture, &body, limits);
         let mut broker = fixture.broker();
         let first_source = fixture.source("timeout-first.json", b"{}");
@@ -1514,7 +1864,12 @@ esac
             &first_source,
         );
         assert!(matches!(first, Err(BrowserError::FileScanUnavailable)));
-        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert_eq!(scanner.process_generation, 2);
+        assert!(!scanner.process_boundary_poisoned);
+        assert!(scanner.active_launch_digest.is_none());
+        assert!(!format!("{scanner:?}").contains("private-partial"));
+        assert_no_run_directory_residue(&scanner);
 
         let second_source = fixture.source("timeout-second.json", b"{}");
         let second = fixture
@@ -1526,15 +1881,203 @@ esac
             )
             .expect("fresh scanner process after timeout");
         assert_eq!(second.scan_report.decision, FileScanDecision::Clean);
+        assert_eq!(scanner.process_generation, 3);
+        assert!(!scanner.process_boundary_poisoned);
+        assert_no_run_directory_residue(&scanner);
+    }
+
+    #[test]
+    fn every_result_revalidates_scanner_identity_digest_and_version_before_restart() {
+        let cases = [
+            (
+                "scanner-id",
+                format!(
+                    "    emit_scan_with_identity fixture-impostor {FIXTURE_SCANNER_VERSION} \"$HARTEVO_SCANNER_EXECUTABLE_SHA256\" \"$HARTEVO_SCANNER_LAUNCH_DIGEST\" clean"
+                ),
+            ),
+            (
+                "scanner-version",
+                format!(
+                    "    emit_scan_with_identity {FIXTURE_SCANNER_ID} fixture-v9 \"$HARTEVO_SCANNER_EXECUTABLE_SHA256\" \"$HARTEVO_SCANNER_LAUNCH_DIGEST\" clean"
+                ),
+            ),
+            (
+                "executable-digest",
+                format!(
+                    "    emit_scan_with_identity {FIXTURE_SCANNER_ID} {FIXTURE_SCANNER_VERSION} {} \"$HARTEVO_SCANNER_LAUNCH_DIGEST\" clean",
+                    sha('9')
+                ),
+            ),
+        ];
+        for (index, (name, response)) in cases.into_iter().enumerate() {
+            let fixture = ScannerFixture::new();
+            let launched = fixture.temp.path().join(format!("{name}.launched"));
+            let body = format!(
+                "    printf launched > {}\n{response}",
+                shell_quote(&launched)
+            );
+            let (mut scanner, _) = scanner_with_limits(&fixture, &body, default_limits());
+            let mut broker = fixture.broker();
+            let first_source = fixture.source(&format!("identity-{index}-first.json"), b"{}");
+            assert!(matches!(
+                fixture.prepare(
+                    &mut broker,
+                    &mut scanner,
+                    &format!("grant-identity-{index}-first"),
+                    &first_source
+                ),
+                Err(BrowserError::FileScanUnavailable)
+            ));
+            assert!(launched.exists());
+            assert_eq!(scanner.process_generation, 2);
+            assert!(scanner.process_boundary_poisoned);
+            assert!(scanner.active_launch_digest.is_none());
+            fs::remove_file(&launched).expect("remove first launch marker");
+
+            let second_source = fixture.source(&format!("identity-{index}-second.json"), b"{}");
+            assert!(matches!(
+                fixture.prepare(
+                    &mut broker,
+                    &mut scanner,
+                    &format!("grant-identity-{index}-second"),
+                    &second_source
+                ),
+                Err(BrowserError::FileScanUnavailable)
+            ));
+            assert!(!launched.exists(), "poisoned {name} boundary relaunched");
+            assert_eq!(scanner.process_generation, 2);
+            assert_no_run_directory_residue(&scanner);
+        }
+    }
+
+    #[test]
+    fn stale_launch_result_is_rejected_and_poisoned_generation_never_restarts() {
+        let fixture = ScannerFixture::new();
+        let count = fixture.temp.path().join("launch-count.marker");
+        let first_launch = fixture.temp.path().join("first-launch-digest.marker");
+        let body = format!(
+            r#"    launch_count=0
+    if [ -f {count} ]; then
+      IFS= read -r launch_count < {count}
+    fi
+    launch_count=$((launch_count + 1))
+    printf '%s\n' "$launch_count" > {count}
+    if [ "$launch_count" -eq 1 ]; then
+      printf '%s\n' "$HARTEVO_SCANNER_LAUNCH_DIGEST" > {first_launch}
+      emit_scan clean
+    else
+      stale_launch=''
+      IFS= read -r stale_launch < {first_launch}
+      emit_scan_with_launch clean "$stale_launch"
+    fi"#,
+            count = shell_quote(&count),
+            first_launch = shell_quote(&first_launch),
+        );
+        let (mut scanner, _) = scanner_with_limits(&fixture, &body, default_limits());
+        let mut broker = fixture.broker();
+
+        let first_source = fixture.source("fresh-launch.json", b"{}");
+        let first = fixture
+            .prepare(
+                &mut broker,
+                &mut scanner,
+                "grant-fresh-launch",
+                &first_source,
+            )
+            .expect("fresh launch response");
+        assert_eq!(first.scan_report.decision, FileScanDecision::Clean);
+        let accepted_launch_digest = scanner.last_launch_digest.clone();
+        assert_eq!(scanner.process_generation, 2);
+
+        let second_source = fixture.source("stale-launch.json", b"{}");
+        assert!(matches!(
+            fixture.prepare(
+                &mut broker,
+                &mut scanner,
+                "grant-stale-launch",
+                &second_source
+            ),
+            Err(BrowserError::FileScanUnavailable)
+        ));
+        assert_ne!(scanner.last_launch_digest, accepted_launch_digest);
+        assert_eq!(scanner.process_generation, 3);
+        assert!(scanner.process_boundary_poisoned);
+        assert_eq!(fs::read_to_string(&count).expect("launch count"), "2\n");
+
+        let third_source = fixture.source("poisoned-launch.json", b"{}");
+        assert!(matches!(
+            fixture.prepare(
+                &mut broker,
+                &mut scanner,
+                "grant-poisoned-launch",
+                &third_source
+            ),
+            Err(BrowserError::FileScanUnavailable)
+        ));
+        assert_eq!(
+            fs::read_to_string(&count).expect("stable launch count"),
+            "2\n"
+        );
+        assert_eq!(scanner.process_generation, 3);
+        assert_no_run_directory_residue(&scanner);
+    }
+
+    #[test]
+    fn overflowed_partial_output_is_drained_before_a_revalidated_restart() {
+        let fixture = ScannerFixture::new();
+        let first_marker = fixture.temp.path().join("overflow-first.marker");
+        let body = format!(
+            r#"    if [ ! -f {marker} ]; then
+      printf first > {marker}
+      count=0
+      while [ "$count" -lt 4096 ]; do
+        printf x
+        count=$((count + 1))
+      done
+    else
+      emit_scan clean
+    fi"#,
+            marker = shell_quote(&first_marker),
+        );
+        let limits = ScannerProcessLimits::new(Duration::from_secs(2), 512, 512)
+            .expect("small bounded outputs");
+        let (mut scanner, _) = scanner_with_limits(&fixture, &body, limits);
+        let mut broker = fixture.broker();
+        let first_source = fixture.source("overflow-restart-first.json", b"{}");
+        assert!(matches!(
+            fixture.prepare(
+                &mut broker,
+                &mut scanner,
+                "grant-overflow-restart-first",
+                &first_source
+            ),
+            Err(BrowserError::FileScanUnavailable)
+        ));
+        assert_eq!(scanner.process_generation, 2);
+        assert!(!scanner.process_boundary_poisoned);
+        assert_no_run_directory_residue(&scanner);
+
+        let second_source = fixture.source("overflow-restart-second.json", b"{}");
+        let second = fixture
+            .prepare(
+                &mut broker,
+                &mut scanner,
+                "grant-overflow-restart-second",
+                &second_source,
+            )
+            .expect("restart after drained overflow");
+        assert_eq!(second.scan_report.decision, FileScanDecision::Clean);
+        assert_eq!(scanner.process_generation, 3);
+        assert_no_run_directory_residue(&scanner);
     }
 
     #[test]
     fn a_clean_leader_with_a_live_descendant_is_rejected_and_contained() {
         let fixture = ScannerFixture::new();
         let source = fixture.source("descendant.json", b"{}");
-        let body = r#"    /bin/sleep 30 &
-    printf '%s\n' '{"schemaVersion":1,"decision":"clean"}'
-    exit 0"#;
+        let body = r"    /bin/sleep 30 &
+    emit_scan clean
+    exit 0";
         let limits = ScannerProcessLimits::new(Duration::from_secs(5), 4096, 4096)
             .expect("descendant limits");
         let (mut scanner, _) = scanner_with_limits(&fixture, body, limits);
@@ -1551,9 +2094,9 @@ esac
             let fixture = ScannerFixture::new();
             let marker = fixture.temp.path().join("scanner-dispatched.marker");
             let body = format!(
-                r#"    printf dispatched > {marker}
+                r"    printf dispatched > {marker}
     /bin/sleep 1
-    printf '%s\n' '{{"schemaVersion":1,"decision":"clean"}}'"#,
+    emit_scan clean",
                 marker = shell_quote(&marker),
             );
             let (mut scanner, _) = scanner_with_limits(&fixture, &body, default_limits());
@@ -1610,7 +2153,7 @@ esac
         let source = fixture.source("self-mutating-scanner.json", b"{}");
         let body = r#"    /bin/chmod 700 "$0"
     printf '%s\n' '#!/bin/sh' > "$0"
-    printf '%s\n' '{"schemaVersion":1,"decision":"clean"}'"#;
+    emit_scan clean"#;
         let (mut scanner, _) = scanner_with_limits(&fixture, body, default_limits());
         let mut broker = fixture.broker();
         assert!(matches!(
@@ -1622,6 +2165,21 @@ esac
             ),
             Err(BrowserError::FileScanUnavailable)
         ));
+    }
+
+    fn assert_no_run_directory_residue(scanner: &ProductionFileScanner) {
+        for entry in
+            fs::read_dir(&scanner.canonical_runtime_directory).expect("scanner runtime directory")
+        {
+            let entry = entry.expect("scanner runtime entry");
+            assert!(
+                !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("run-")),
+                "scanner run directory residue remained"
+            );
+        }
     }
 
     fn wait_for_path(path: &Path) {
