@@ -10,8 +10,8 @@ use chrono::{DateTime, Duration, Utc};
 use hartevo_domain_kernel::{
     ActorId, DeviceHandoffClaim, DeviceHandoffConsumption, DeviceHandoffGrant, DeviceHandoffId,
     DeviceHandoffRevocation, DeviceId, DeviceKeyAgreementAlgorithm, DevicePublicKeyRegistration,
-    KeyManagementError, KeyRecipient, ProjectEncryptionMode, ProjectId, ProjectKeyringBootstrap,
-    TenantId,
+    KeyManagementError, KeyRecipient, MissionId, ProjectEncryptionMode, ProjectId,
+    ProjectKeyringBootstrap, TaskId, TenantId, WorkerId, WorkerLeaseId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,6 +33,7 @@ pub use scheduler::{
 const SCHEMA: &str = include_str!("schema.sql");
 const SCHEMA_VERSION: i64 = 5;
 const MAX_CIPHERTEXT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REMOTE_WORKER_LEASE: Duration = Duration::seconds(15 * 60);
 const CLAIM_OUTBOX_SQL: &str = "WITH candidates AS (
        SELECT sequence FROM hartevo_cell.outbox_messages
        WHERE cell = $1 AND tenant_id = $2
@@ -68,6 +69,14 @@ const RELEASE_OUTBOX_SQL: &str = "UPDATE hartevo_cell.outbox_messages
      WHERE cell = $1 AND tenant_id = $2 AND sequence = $3
        AND status = 'leased' AND lease_owner = $4
        AND lease_generation = $5 AND lease_expires_at > $8";
+const REMOTE_WORKER_TASK_COLUMNS: &str = "task_id, project_id, mission_id, worker_id,
+       payload_key_version, payload_nonce, payload_ciphertext,
+       payload_aad_digest, payload_content_digest, idempotency_key,
+       request_digest, status, attempts, lease_id, lease_generation,
+       lease_owner, lease_token_digest, claim_idempotency_key,
+       claim_request_digest, lease_expires_at, heartbeat_at, result_digest,
+       completion_idempotency_key, completion_request_digest, completed_at,
+       enqueued_at, deadline_at, updated_at, revision";
 
 pub const POSTGRES_L2_URL_ENV: &str = "HARTEVO_TEST_POSTGRES_URL";
 
@@ -291,6 +300,158 @@ pub struct EncryptedSyncObject {
     pub payload: EncryptedPayload,
     pub tombstone: bool,
     pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudRemoteWorkerTask {
+    pub scope: CellScope,
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub task_id: TaskId,
+    pub worker_id: WorkerId,
+    pub payload: EncryptedPayload,
+    pub idempotency_key_digest: String,
+    pub enqueued_at: DateTime<Utc>,
+    pub deadline_at: DateTime<Utc>,
+}
+
+impl CloudRemoteWorkerTask {
+    fn validate(&self, expected_cell: DataCell) -> Result<(), CloudStorageError> {
+        self.scope.validate(expected_cell)?;
+        self.payload.validate()?;
+        if self.project_id.as_str().trim().is_empty()
+            || self.mission_id.as_str().trim().is_empty()
+            || self.task_id.as_str().trim().is_empty()
+            || self.worker_id.as_str().trim().is_empty()
+            || self.worker_id.as_str().len() > 256
+            || !is_sha256(&self.idempotency_key_digest)
+            || self.deadline_at <= self.enqueued_at
+        {
+            return Err(CloudStorageError::InvalidRemoteWorkerTask);
+        }
+        Ok(())
+    }
+
+    fn request_digest(&self) -> Result<String, CloudStorageError> {
+        canonical_digest(&serde_json::json!({
+            "cell": self.scope.cell,
+            "tenantId": self.scope.tenant_id,
+            "projectId": self.project_id,
+            "missionId": self.mission_id,
+            "taskId": self.task_id,
+            "workerId": self.worker_id,
+            "payload": self.payload,
+            "enqueuedAt": self.enqueued_at,
+            "deadlineAt": self.deadline_at,
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudRemoteWorkerTaskStatus {
+    Pending,
+    Leased,
+    Completed,
+    DeadLetter,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudRemoteWorkerTaskLease {
+    pub scope: CellScope,
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub task_id: TaskId,
+    pub worker_id: WorkerId,
+    pub lease_id: WorkerLeaseId,
+    pub lease_generation: u64,
+    pub lease_owner: String,
+    pub lease_token_digest: String,
+    pub attempts: u32,
+    pub payload: EncryptedPayload,
+    pub enqueued_at: DateTime<Utc>,
+    pub heartbeat_at: DateTime<Utc>,
+    pub lease_expires_at: DateTime<Utc>,
+    pub deadline_at: DateTime<Utc>,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudRemoteWorkerClaimResult {
+    pub lease: CloudRemoteWorkerTaskLease,
+    pub duplicate: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudRemoteWorkerTaskMutationResult {
+    pub task_id: TaskId,
+    pub duplicate: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudRemoteWorkerTaskRecord {
+    pub task: CloudRemoteWorkerTask,
+    pub status: CloudRemoteWorkerTaskStatus,
+    pub lease: Option<CloudRemoteWorkerTaskLease>,
+    pub result_digest: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudRemoteWorkerCompletion {
+    pub scope: CellScope,
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub lease_id: WorkerLeaseId,
+    pub lease_generation: u64,
+    pub lease_owner: String,
+    pub lease_token_digest: String,
+    pub result_digest: String,
+    pub idempotency_key_digest: String,
+    pub completed_at: DateTime<Utc>,
+}
+
+impl CloudRemoteWorkerCompletion {
+    fn validate(&self, expected_cell: DataCell) -> Result<(), CloudStorageError> {
+        self.scope.validate(expected_cell)?;
+        if self.project_id.as_str().trim().is_empty()
+            || self.task_id.as_str().trim().is_empty()
+            || self.lease_id.as_str().trim().is_empty()
+            || self.lease_generation == 0
+            || self.lease_owner.trim().is_empty()
+            || self.lease_owner.len() > 256
+            || !is_sha256(&self.lease_token_digest)
+            || !is_sha256(&self.result_digest)
+            || !is_sha256(&self.idempotency_key_digest)
+        {
+            return Err(CloudStorageError::InvalidRemoteWorkerCompletion);
+        }
+        Ok(())
+    }
+
+    fn request_digest(&self) -> Result<String, CloudStorageError> {
+        canonical_digest(&serde_json::json!({
+            "cell": self.scope.cell,
+            "tenantId": self.scope.tenant_id,
+            "projectId": self.project_id,
+            "taskId": self.task_id,
+            "leaseId": self.lease_id,
+            "leaseGeneration": self.lease_generation,
+            "leaseOwner": self.lease_owner,
+            "leaseTokenDigest": self.lease_token_digest,
+            "resultDigest": self.result_digest,
+            "completedAt": self.completed_at,
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudRemoteWorkerCompletionResult {
+    pub task_id: TaskId,
+    pub result_digest: String,
+    pub duplicate: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1517,6 +1678,516 @@ impl PostgresCellStore {
         Ok(object)
     }
 
+    pub async fn enqueue_remote_worker_task(
+        &self,
+        client: &mut Client,
+        task: &CloudRemoteWorkerTask,
+    ) -> Result<CloudRemoteWorkerTaskMutationResult, CloudStorageError> {
+        task.validate(self.cell)?;
+        let request_digest = task.request_digest()?;
+        let transaction = client.transaction().await?;
+        set_scope(&transaction, &task.scope).await?;
+        ensure_database_cell(&transaction, self.cell).await?;
+        ensure_remote_worker_project(&transaction, &task.scope, &task.project_id).await?;
+        lock_project(&transaction, &task.scope, &task.project_id).await?;
+
+        if let Some(existing) = transaction
+            .query_opt(
+                "SELECT task_id, request_digest
+                 FROM hartevo_cell.remote_worker_mailbox_messages
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                   AND idempotency_key = $4",
+                &[
+                    &task.scope.cell.as_str(),
+                    &task.scope.tenant_id.as_str(),
+                    &task.project_id.as_str(),
+                    &task.idempotency_key_digest,
+                ],
+            )
+            .await?
+        {
+            ensure_request_digest(&existing.get::<_, String>(1), &request_digest)?;
+            transaction.commit().await?;
+            return Ok(CloudRemoteWorkerTaskMutationResult {
+                task_id: task.task_id.clone(),
+                duplicate: true,
+            });
+        }
+        if transaction
+            .query_opt(
+                "SELECT 1 FROM hartevo_cell.remote_worker_mailbox_messages
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND task_id = $4",
+                &[
+                    &task.scope.cell.as_str(),
+                    &task.scope.tenant_id.as_str(),
+                    &task.project_id.as_str(),
+                    &task.task_id.as_str(),
+                ],
+            )
+            .await?
+            .is_some()
+        {
+            return Err(CloudStorageError::RemoteWorkerTaskAlreadyExists);
+        }
+
+        let payload_key_version = to_sql_u64(task.payload.key_version)?;
+        transaction
+            .execute(
+                "INSERT INTO hartevo_cell.remote_worker_mailbox_messages
+                   (cell, tenant_id, project_id, mission_id, task_id, worker_id,
+                    payload_key_version, payload_nonce, payload_ciphertext,
+                    payload_aad_digest, payload_content_digest, idempotency_key,
+                    request_digest, status, enqueued_at, deadline_at, updated_at,
+                    revision)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                         $13, 'pending', $14, $15, $14, 1)",
+                &[
+                    &task.scope.cell.as_str(),
+                    &task.scope.tenant_id.as_str(),
+                    &task.project_id.as_str(),
+                    &task.mission_id.as_str(),
+                    &task.task_id.as_str(),
+                    &task.worker_id.as_str(),
+                    &payload_key_version,
+                    &task.payload.nonce,
+                    &task.payload.ciphertext,
+                    &task.payload.aad_digest,
+                    &task.payload.content_digest,
+                    &task.idempotency_key_digest,
+                    &request_digest,
+                    &task.enqueued_at,
+                    &task.deadline_at,
+                ],
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(CloudRemoteWorkerTaskMutationResult {
+            task_id: task.task_id.clone(),
+            duplicate: false,
+        })
+    }
+
+    pub async fn load_remote_worker_task(
+        &self,
+        client: &mut Client,
+        scope: &CellScope,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+    ) -> Result<CloudRemoteWorkerTaskRecord, CloudStorageError> {
+        scope.validate(self.cell)?;
+        if project_id.as_str().trim().is_empty() || task_id.as_str().trim().is_empty() {
+            return Err(CloudStorageError::InvalidRemoteWorkerTask);
+        }
+        let transaction = client.transaction().await?;
+        set_scope(&transaction, scope).await?;
+        ensure_database_cell(&transaction, self.cell).await?;
+        ensure_project_exists(&transaction, scope, project_id).await?;
+        let row = load_remote_worker_task_row_tx(&transaction, scope, project_id, task_id, false)
+            .await?
+            .ok_or(CloudStorageError::RemoteWorkerTaskNotFound)?;
+        let record = row.into_record(scope.clone())?;
+        transaction.commit().await?;
+        Ok(record)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the bounded worker claim keeps owner, token, idempotency, clock, and lease duration explicit"
+    )]
+    pub async fn claim_remote_worker_task(
+        &self,
+        client: &mut Client,
+        scope: &CellScope,
+        project_id: &ProjectId,
+        worker_id: &WorkerId,
+        lease_owner: &str,
+        lease_token_digest: &str,
+        claim_idempotency_key_digest: &str,
+        now: DateTime<Utc>,
+        lease_for: Duration,
+    ) -> Result<Option<CloudRemoteWorkerClaimResult>, CloudStorageError> {
+        scope.validate(self.cell)?;
+        if project_id.as_str().trim().is_empty() {
+            return Err(CloudStorageError::InvalidRemoteWorkerTask);
+        }
+        validate_remote_worker_claim_inputs(
+            worker_id,
+            lease_owner,
+            lease_token_digest,
+            claim_idempotency_key_digest,
+            lease_for,
+        )?;
+        let claim_request_digest = canonical_digest(&serde_json::json!({
+            "cell": scope.cell,
+            "tenantId": scope.tenant_id,
+            "projectId": project_id,
+            "workerId": worker_id,
+            "leaseOwner": lease_owner,
+            "leaseTokenDigest": lease_token_digest,
+            "now": now,
+            "leaseForSeconds": lease_for.num_seconds(),
+        }))?;
+        let transaction = client.transaction().await?;
+        set_scope(&transaction, scope).await?;
+        ensure_database_cell(&transaction, self.cell).await?;
+        ensure_remote_worker_project(&transaction, scope, project_id).await?;
+        lock_remote_worker_claim_key(
+            &transaction,
+            scope,
+            project_id,
+            claim_idempotency_key_digest,
+        )
+        .await?;
+        let existing_claim = transaction
+            .query_opt(
+                "SELECT task_id, claim_request_digest, lease_id, lease_generation,
+                        lease_owner, lease_token_digest, attempts, heartbeat_at,
+                        lease_expires_at, revision
+                 FROM hartevo_cell.remote_worker_claims
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                   AND claim_idempotency_key = $4",
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &project_id.as_str(),
+                    &claim_idempotency_key_digest,
+                ],
+            )
+            .await?;
+        if let Some(existing_claim) = existing_claim {
+            ensure_request_digest(&existing_claim.get::<_, String>(1), &claim_request_digest)?;
+            let task_id = TaskId::from_stable(existing_claim.get::<_, String>(0));
+            let row =
+                load_remote_worker_task_row_tx(&transaction, scope, project_id, &task_id, true)
+                    .await?
+                    .ok_or(CloudStorageError::RemoteWorkerTaskNotFound)?;
+            let attempts = u32::try_from(existing_claim.get::<_, i32>(6)).map_err(|_| {
+                CloudStorageError::StoredValueInvalid("remote worker attempts".into())
+            })?;
+            let lease = row.historical_lease(
+                scope.clone(),
+                WorkerLeaseId::from_stable(existing_claim.get::<_, String>(2)),
+                from_sql_u64(existing_claim.get(3), "remote worker lease generation")?,
+                existing_claim.get(4),
+                existing_claim.get(5),
+                attempts,
+                existing_claim.get(7),
+                existing_claim.get(8),
+                from_sql_u64(existing_claim.get(9), "remote worker revision")?,
+            )?;
+            transaction.commit().await?;
+            return Ok(Some(CloudRemoteWorkerClaimResult {
+                lease,
+                duplicate: true,
+            }));
+        }
+
+        let candidate = transaction
+            .query_opt(
+                &format!(
+                    "SELECT {REMOTE_WORKER_TASK_COLUMNS}
+                     FROM hartevo_cell.remote_worker_mailbox_messages
+                     WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                       AND worker_id = $4 AND enqueued_at <= $5 AND deadline_at > $5
+                       AND (status = 'pending'
+                            OR (status = 'leased' AND lease_expires_at <= $5))
+                     ORDER BY enqueued_at ASC, task_id ASC
+                     FOR UPDATE SKIP LOCKED
+                     LIMIT 1"
+                ),
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &project_id.as_str(),
+                    &worker_id.as_str(),
+                    &now,
+                ],
+            )
+            .await?;
+        let Some(candidate) = candidate else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        let candidate = decode_remote_worker_task_row(&candidate, scope, None)?;
+        let lease_expires_at =
+            bounded_remote_worker_lease_expiry(now, lease_for, candidate.deadline_at)?;
+        let lease_id = WorkerLeaseId::new();
+        let lease_generation = candidate
+            .lease_generation
+            .checked_add(1)
+            .ok_or(CloudStorageError::RevisionOverflow)?;
+        let updated = transaction
+            .query_one(
+                &format!(
+                    "UPDATE hartevo_cell.remote_worker_mailbox_messages
+                     SET status = 'leased', attempts = attempts + 1, lease_id = $5,
+                         lease_generation = $6, lease_owner = $7,
+                         lease_token_digest = $8, claim_idempotency_key = $9,
+                         claim_request_digest = $10, lease_expires_at = $11,
+                         heartbeat_at = $12, updated_at = $12, revision = revision + 1
+                     WHERE cell = $1 AND tenant_id = $2 AND task_id = $3
+                       AND project_id = $4
+                     RETURNING {REMOTE_WORKER_TASK_COLUMNS}"
+                ),
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &candidate.task_id.as_str(),
+                    &candidate.project_id.as_str(),
+                    &lease_id.as_str(),
+                    &to_sql_u64(lease_generation)?,
+                    &lease_owner,
+                    &lease_token_digest,
+                    &claim_idempotency_key_digest,
+                    &claim_request_digest,
+                    &lease_expires_at,
+                    &now,
+                ],
+            )
+            .await?;
+        let lease = decode_remote_worker_task_row(&updated, scope, None)?
+            .into_lease(scope.clone())?
+            .ok_or(CloudStorageError::RemoteWorkerLeaseLost)?;
+        let attempts =
+            i32::try_from(lease.attempts).map_err(|_| CloudStorageError::RevisionOverflow)?;
+        transaction
+            .execute(
+                "INSERT INTO hartevo_cell.remote_worker_claims
+                   (cell, tenant_id, project_id, task_id, claim_idempotency_key,
+                    claim_request_digest, lease_id, lease_generation, lease_owner,
+                    lease_token_digest, attempts, heartbeat_at, lease_expires_at,
+                    revision, claimed_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                         $13, $14, $15)",
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &project_id.as_str(),
+                    &lease.task_id.as_str(),
+                    &claim_idempotency_key_digest,
+                    &claim_request_digest,
+                    &lease.lease_id.as_str(),
+                    &to_sql_u64(lease.lease_generation)?,
+                    &lease.lease_owner,
+                    &lease.lease_token_digest,
+                    &attempts,
+                    &lease.heartbeat_at,
+                    &lease.lease_expires_at,
+                    &to_sql_u64(lease.revision)?,
+                    &now,
+                ],
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(Some(CloudRemoteWorkerClaimResult {
+            lease,
+            duplicate: false,
+        }))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "heartbeat fencing requires every lease identity and the bounded clock extension"
+    )]
+    pub async fn heartbeat_remote_worker_task(
+        &self,
+        client: &mut Client,
+        scope: &CellScope,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        lease_id: &WorkerLeaseId,
+        lease_generation: u64,
+        lease_owner: &str,
+        lease_token_digest: &str,
+        now: DateTime<Utc>,
+        lease_for: Duration,
+    ) -> Result<CloudRemoteWorkerTaskLease, CloudStorageError> {
+        scope.validate(self.cell)?;
+        validate_remote_worker_lease_inputs(
+            task_id,
+            lease_id,
+            lease_generation,
+            lease_owner,
+            lease_token_digest,
+            lease_for,
+        )?;
+        let transaction = client.transaction().await?;
+        set_scope(&transaction, scope).await?;
+        ensure_database_cell(&transaction, self.cell).await?;
+        ensure_remote_worker_project(&transaction, scope, project_id).await?;
+        let current =
+            load_remote_worker_task_row_tx(&transaction, scope, project_id, task_id, true)
+                .await?
+                .ok_or(CloudStorageError::RemoteWorkerTaskNotFound)?;
+        require_current_remote_worker_lease(
+            &current,
+            lease_id,
+            lease_generation,
+            lease_owner,
+            lease_token_digest,
+            now,
+        )?;
+        let lease_expires_at =
+            bounded_remote_worker_lease_expiry(now, lease_for, current.deadline_at)?;
+        let updated = transaction
+            .execute(
+                "UPDATE hartevo_cell.remote_worker_mailbox_messages
+                 SET heartbeat_at = $5, lease_expires_at = $6,
+                     updated_at = $5, revision = revision + 1
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                   AND task_id = $4 AND status = 'leased'
+                   AND lease_id = $7 AND lease_generation = $8
+                   AND lease_owner = $9 AND lease_token_digest = $10
+                   AND lease_expires_at > $5",
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &project_id.as_str(),
+                    &task_id.as_str(),
+                    &now,
+                    &lease_expires_at,
+                    &lease_id.as_str(),
+                    &to_sql_u64(lease_generation)?,
+                    &lease_owner,
+                    &lease_token_digest,
+                ],
+            )
+            .await?;
+        if updated != 1 {
+            return Err(CloudStorageError::RemoteWorkerLeaseLost);
+        }
+        let refreshed =
+            load_remote_worker_task_row_tx(&transaction, scope, project_id, task_id, false)
+                .await?
+                .ok_or(CloudStorageError::RemoteWorkerTaskNotFound)?;
+        let claim_idempotency_key = refreshed
+            .claim_idempotency_key
+            .clone()
+            .ok_or(CloudStorageError::RemoteWorkerLeaseLost)?;
+        let lease = refreshed
+            .into_lease(scope.clone())?
+            .ok_or(CloudStorageError::RemoteWorkerLeaseLost)?;
+        let updated_claim = transaction
+            .execute(
+                "UPDATE hartevo_cell.remote_worker_claims
+                 SET heartbeat_at = $6, lease_expires_at = $7, revision = $8
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                   AND task_id = $4 AND claim_idempotency_key = $5
+                   AND lease_generation = $9",
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &project_id.as_str(),
+                    &task_id.as_str(),
+                    &claim_idempotency_key,
+                    &lease.heartbeat_at,
+                    &lease.lease_expires_at,
+                    &to_sql_u64(lease.revision)?,
+                    &to_sql_u64(lease.lease_generation)?,
+                ],
+            )
+            .await?;
+        if updated_claim != 1 {
+            return Err(CloudStorageError::RemoteWorkerLeaseLost);
+        }
+        transaction.commit().await?;
+        Ok(lease)
+    }
+
+    pub async fn complete_remote_worker_task(
+        &self,
+        client: &mut Client,
+        completion: &CloudRemoteWorkerCompletion,
+    ) -> Result<CloudRemoteWorkerCompletionResult, CloudStorageError> {
+        completion.validate(self.cell)?;
+        let request_digest = completion.request_digest()?;
+        let transaction = client.transaction().await?;
+        set_scope(&transaction, &completion.scope).await?;
+        ensure_database_cell(&transaction, self.cell).await?;
+        ensure_remote_worker_project(&transaction, &completion.scope, &completion.project_id)
+            .await?;
+        let current = load_remote_worker_task_row_tx(
+            &transaction,
+            &completion.scope,
+            &completion.project_id,
+            &completion.task_id,
+            true,
+        )
+        .await?
+        .ok_or(CloudStorageError::RemoteWorkerTaskNotFound)?;
+        if current.status == CloudRemoteWorkerTaskStatus::Completed {
+            if current.completion_idempotency_key.as_deref()
+                == Some(completion.idempotency_key_digest.as_str())
+                && current.completion_request_digest.as_deref() == Some(request_digest.as_str())
+            {
+                transaction.commit().await?;
+                return Ok(CloudRemoteWorkerCompletionResult {
+                    task_id: completion.task_id.clone(),
+                    result_digest: completion.result_digest.clone(),
+                    duplicate: true,
+                });
+            }
+            return Err(CloudStorageError::RemoteWorkerTaskAlreadyCompleted);
+        }
+        require_current_remote_worker_lease(
+            &current,
+            &completion.lease_id,
+            completion.lease_generation,
+            &completion.lease_owner,
+            &completion.lease_token_digest,
+            completion.completed_at,
+        )?;
+        let lease_expires_at = current
+            .lease_expires_at
+            .ok_or(CloudStorageError::RemoteWorkerLeaseLost)?;
+        let heartbeat_at = current
+            .heartbeat_at
+            .ok_or(CloudStorageError::RemoteWorkerLeaseLost)?;
+        if completion.completed_at < heartbeat_at || completion.completed_at >= lease_expires_at {
+            return Err(CloudStorageError::RemoteWorkerLeaseLost);
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE hartevo_cell.remote_worker_mailbox_messages
+                 SET status = 'completed', result_digest = $5,
+                     completion_idempotency_key = $6,
+                     completion_request_digest = $7, completed_at = $8,
+                     lease_id = NULL, lease_owner = NULL,
+                     lease_token_digest = NULL, lease_expires_at = NULL,
+                     heartbeat_at = NULL, updated_at = $8, revision = revision + 1
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                   AND task_id = $4 AND status = 'leased'
+                   AND lease_id = $9 AND lease_generation = $10
+                   AND lease_owner = $11 AND lease_token_digest = $12
+                   AND lease_expires_at > $8",
+                &[
+                    &completion.scope.cell.as_str(),
+                    &completion.scope.tenant_id.as_str(),
+                    &completion.project_id.as_str(),
+                    &completion.task_id.as_str(),
+                    &completion.result_digest,
+                    &completion.idempotency_key_digest,
+                    &request_digest,
+                    &completion.completed_at,
+                    &completion.lease_id.as_str(),
+                    &to_sql_u64(completion.lease_generation)?,
+                    &completion.lease_owner,
+                    &completion.lease_token_digest,
+                ],
+            )
+            .await?;
+        if updated != 1 {
+            return Err(CloudStorageError::RemoteWorkerLeaseLost);
+        }
+        transaction.commit().await?;
+        Ok(CloudRemoteWorkerCompletionResult {
+            task_id: completion.task_id.clone(),
+            result_digest: completion.result_digest.clone(),
+            duplicate: false,
+        })
+    }
+
     pub async fn claim_outbox(
         &self,
         client: &mut Client,
@@ -1765,6 +2436,381 @@ async fn load_project_mode(
         .ok_or(CloudStorageError::ProjectNotFound)?
         .get::<_, String>(0);
     decode_encryption_mode(&value)
+}
+
+async fn ensure_remote_worker_project(
+    transaction: &Transaction<'_>,
+    scope: &CellScope,
+    project_id: &ProjectId,
+) -> Result<(), CloudStorageError> {
+    let Some(row) = transaction
+        .query_opt(
+            "SELECT encryption_mode, remote_execution_opt_in
+             FROM hartevo_cell.projects
+             WHERE cell = $1 AND tenant_id = $2 AND project_id = $3",
+            &[
+                &scope.cell.as_str(),
+                &scope.tenant_id.as_str(),
+                &project_id.as_str(),
+            ],
+        )
+        .await?
+    else {
+        return Err(CloudStorageError::ProjectNotFound);
+    };
+    if row.get::<_, String>(0) != "team_envelope" || !row.get::<_, bool>(1) {
+        return Err(CloudStorageError::RemoteEffectExecutionNotAllowed);
+    }
+    Ok(())
+}
+
+async fn lock_remote_worker_claim_key(
+    transaction: &Transaction<'_>,
+    scope: &CellScope,
+    project_id: &ProjectId,
+    claim_idempotency_key_digest: &str,
+) -> Result<(), CloudStorageError> {
+    let lock_scope = format!(
+        "{}:{}:{}:{}",
+        scope.cell,
+        scope.tenant_id.as_str(),
+        project_id.as_str(),
+        claim_idempotency_key_digest
+    );
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&lock_scope],
+        )
+        .await?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct RemoteWorkerTaskRow {
+    task_id: TaskId,
+    project_id: ProjectId,
+    mission_id: MissionId,
+    worker_id: WorkerId,
+    payload: EncryptedPayload,
+    idempotency_key_digest: String,
+    status: CloudRemoteWorkerTaskStatus,
+    attempts: u32,
+    lease_id: Option<WorkerLeaseId>,
+    lease_generation: u64,
+    lease_owner: Option<String>,
+    lease_token_digest: Option<String>,
+    claim_idempotency_key: Option<String>,
+    claim_request_digest: Option<String>,
+    lease_expires_at: Option<DateTime<Utc>>,
+    heartbeat_at: Option<DateTime<Utc>>,
+    result_digest: Option<String>,
+    completion_idempotency_key: Option<String>,
+    completion_request_digest: Option<String>,
+    completed_at: Option<DateTime<Utc>>,
+    enqueued_at: DateTime<Utc>,
+    deadline_at: DateTime<Utc>,
+    revision: u64,
+}
+
+impl RemoteWorkerTaskRow {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "historical claim replay keeps every immutable lease fence field explicit"
+    )]
+    fn historical_lease(
+        &self,
+        scope: CellScope,
+        lease_id: WorkerLeaseId,
+        lease_generation: u64,
+        lease_owner: String,
+        lease_token_digest: String,
+        attempts: u32,
+        heartbeat_at: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+        revision: u64,
+    ) -> Result<CloudRemoteWorkerTaskLease, CloudStorageError> {
+        if lease_generation == 0 || lease_expires_at <= heartbeat_at {
+            return Err(CloudStorageError::RemoteWorkerLeaseLost);
+        }
+        Ok(CloudRemoteWorkerTaskLease {
+            scope,
+            project_id: self.project_id.clone(),
+            mission_id: self.mission_id.clone(),
+            task_id: self.task_id.clone(),
+            worker_id: self.worker_id.clone(),
+            lease_id,
+            lease_generation,
+            lease_owner,
+            lease_token_digest,
+            attempts,
+            payload: self.payload.clone(),
+            enqueued_at: self.enqueued_at,
+            heartbeat_at,
+            lease_expires_at,
+            deadline_at: self.deadline_at,
+            revision,
+        })
+    }
+
+    fn into_lease(
+        self,
+        scope: CellScope,
+    ) -> Result<Option<CloudRemoteWorkerTaskLease>, CloudStorageError> {
+        if self.status != CloudRemoteWorkerTaskStatus::Leased {
+            return Ok(None);
+        }
+        if self.claim_idempotency_key.is_none() || self.claim_request_digest.is_none() {
+            return Err(CloudStorageError::RemoteWorkerLeaseLost);
+        }
+        let lease = CloudRemoteWorkerTaskLease {
+            scope,
+            project_id: self.project_id,
+            mission_id: self.mission_id,
+            task_id: self.task_id,
+            worker_id: self.worker_id,
+            lease_id: self
+                .lease_id
+                .ok_or(CloudStorageError::RemoteWorkerLeaseLost)?,
+            lease_generation: self.lease_generation,
+            lease_owner: self
+                .lease_owner
+                .ok_or(CloudStorageError::RemoteWorkerLeaseLost)?,
+            lease_token_digest: self
+                .lease_token_digest
+                .ok_or(CloudStorageError::RemoteWorkerLeaseLost)?,
+            attempts: self.attempts,
+            payload: self.payload,
+            enqueued_at: self.enqueued_at,
+            heartbeat_at: self
+                .heartbeat_at
+                .ok_or(CloudStorageError::RemoteWorkerLeaseLost)?,
+            lease_expires_at: self
+                .lease_expires_at
+                .ok_or(CloudStorageError::RemoteWorkerLeaseLost)?,
+            deadline_at: self.deadline_at,
+            revision: self.revision,
+        };
+        if lease.lease_generation == 0 || lease.lease_expires_at <= lease.heartbeat_at {
+            return Err(CloudStorageError::RemoteWorkerLeaseLost);
+        }
+        Ok(Some(lease))
+    }
+
+    fn into_record(
+        self,
+        scope: CellScope,
+    ) -> Result<CloudRemoteWorkerTaskRecord, CloudStorageError> {
+        let task = CloudRemoteWorkerTask {
+            scope: scope.clone(),
+            project_id: self.project_id.clone(),
+            mission_id: self.mission_id.clone(),
+            task_id: self.task_id.clone(),
+            worker_id: self.worker_id.clone(),
+            payload: self.payload.clone(),
+            idempotency_key_digest: self.idempotency_key_digest.clone(),
+            enqueued_at: self.enqueued_at,
+            deadline_at: self.deadline_at,
+        };
+        task.validate(scope.cell)?;
+        let lease = self.clone().into_lease(scope)?;
+        Ok(CloudRemoteWorkerTaskRecord {
+            task,
+            status: self.status,
+            lease,
+            result_digest: self.result_digest,
+            completed_at: self.completed_at,
+            revision: self.revision,
+        })
+    }
+}
+
+async fn load_remote_worker_task_row_tx(
+    transaction: &Transaction<'_>,
+    scope: &CellScope,
+    project_id: &ProjectId,
+    task_id: &TaskId,
+    lock: bool,
+) -> Result<Option<RemoteWorkerTaskRow>, CloudStorageError> {
+    let base = format!(
+        "SELECT {REMOTE_WORKER_TASK_COLUMNS}
+         FROM hartevo_cell.remote_worker_mailbox_messages
+         WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND task_id = $4"
+    );
+    let sql = if lock {
+        format!("{base} FOR UPDATE")
+    } else {
+        base
+    };
+    transaction
+        .query_opt(
+            &sql,
+            &[
+                &scope.cell.as_str(),
+                &scope.tenant_id.as_str(),
+                &project_id.as_str(),
+                &task_id.as_str(),
+            ],
+        )
+        .await?
+        .map(|row| decode_remote_worker_task_row(&row, scope, None))
+        .transpose()
+}
+
+fn decode_remote_worker_task_row(
+    row: &Row,
+    _scope: &CellScope,
+    project_override: Option<ProjectId>,
+) -> Result<RemoteWorkerTaskRow, CloudStorageError> {
+    let payload = EncryptedPayload {
+        key_version: from_sql_u64(row.get(4), "remote worker payload key version")?,
+        nonce: row.get(5),
+        ciphertext: row.get(6),
+        aad_digest: row.get(7),
+        content_digest: row.get(8),
+    };
+    payload.validate()?;
+    let request_digest = row.get::<_, String>(10);
+    if !is_sha256(&request_digest) || !is_sha256(&row.get::<_, String>(9)) {
+        return Err(CloudStorageError::StoredValueInvalid(
+            "remote worker request digest".into(),
+        ));
+    }
+    let lease_generation = from_sql_u64(row.get(14), "remote worker lease generation")?;
+    let attempts = u32::try_from(row.get::<_, i32>(12))
+        .map_err(|_| CloudStorageError::StoredValueInvalid("remote worker attempts".into()))?;
+    let enqueued_at = row.get::<_, DateTime<Utc>>(25);
+    let updated_at = row.get::<_, DateTime<Utc>>(27);
+    if updated_at < enqueued_at {
+        return Err(CloudStorageError::StoredValueInvalid(
+            "remote worker updated timestamp".into(),
+        ));
+    }
+    Ok(RemoteWorkerTaskRow {
+        task_id: TaskId::from_stable(row.get::<_, String>(0)),
+        project_id: project_override
+            .unwrap_or_else(|| ProjectId::from_stable(row.get::<_, String>(1))),
+        mission_id: MissionId::from_stable(row.get::<_, String>(2)),
+        worker_id: WorkerId::from_stable(row.get::<_, String>(3)),
+        payload,
+        idempotency_key_digest: row.get(9),
+        status: decode_remote_worker_task_status(&row.get::<_, String>(11))?,
+        attempts,
+        lease_id: row
+            .get::<_, Option<String>>(13)
+            .map(WorkerLeaseId::from_stable),
+        lease_generation,
+        lease_owner: row.get(15),
+        lease_token_digest: row.get(16),
+        claim_idempotency_key: row.get(17),
+        claim_request_digest: row.get(18),
+        lease_expires_at: row.get(19),
+        heartbeat_at: row.get(20),
+        result_digest: row.get(21),
+        completion_idempotency_key: row.get(22),
+        completion_request_digest: row.get(23),
+        completed_at: row.get(24),
+        enqueued_at,
+        deadline_at: row.get(26),
+        revision: from_sql_u64(row.get(28), "remote worker revision")?,
+    })
+}
+
+fn decode_remote_worker_task_status(
+    value: &str,
+) -> Result<CloudRemoteWorkerTaskStatus, CloudStorageError> {
+    match value {
+        "pending" => Ok(CloudRemoteWorkerTaskStatus::Pending),
+        "leased" => Ok(CloudRemoteWorkerTaskStatus::Leased),
+        "completed" => Ok(CloudRemoteWorkerTaskStatus::Completed),
+        "dead_letter" => Ok(CloudRemoteWorkerTaskStatus::DeadLetter),
+        other => Err(CloudStorageError::StoredValueInvalid(format!(
+            "remote worker task status {other}"
+        ))),
+    }
+}
+
+fn validate_remote_worker_claim_inputs(
+    worker_id: &WorkerId,
+    lease_owner: &str,
+    lease_token_digest: &str,
+    claim_idempotency_key_digest: &str,
+    lease_for: Duration,
+) -> Result<(), CloudStorageError> {
+    if worker_id.as_str().trim().is_empty()
+        || lease_owner.trim().is_empty()
+        || lease_owner.len() > 256
+        || !is_sha256(lease_token_digest)
+        || !is_sha256(claim_idempotency_key_digest)
+        || lease_for <= Duration::zero()
+        || lease_for > MAX_REMOTE_WORKER_LEASE
+    {
+        return Err(CloudStorageError::InvalidRemoteWorkerTask);
+    }
+    Ok(())
+}
+
+fn validate_remote_worker_lease_inputs(
+    task_id: &TaskId,
+    lease_id: &WorkerLeaseId,
+    lease_generation: u64,
+    lease_owner: &str,
+    lease_token_digest: &str,
+    lease_for: Duration,
+) -> Result<(), CloudStorageError> {
+    if task_id.as_str().trim().is_empty()
+        || lease_id.as_str().trim().is_empty()
+        || lease_generation == 0
+        || lease_owner.trim().is_empty()
+        || lease_owner.len() > 256
+        || !is_sha256(lease_token_digest)
+        || lease_for <= Duration::zero()
+        || lease_for > MAX_REMOTE_WORKER_LEASE
+    {
+        return Err(CloudStorageError::InvalidRemoteWorkerTask);
+    }
+    Ok(())
+}
+
+fn bounded_remote_worker_lease_expiry(
+    now: DateTime<Utc>,
+    lease_for: Duration,
+    deadline_at: DateTime<Utc>,
+) -> Result<DateTime<Utc>, CloudStorageError> {
+    if lease_for <= Duration::zero() || lease_for > MAX_REMOTE_WORKER_LEASE {
+        return Err(CloudStorageError::InvalidRemoteWorkerTask);
+    }
+    let requested_expiry = now
+        .checked_add_signed(lease_for)
+        .ok_or(CloudStorageError::InvalidRemoteWorkerTask)?;
+    let lease_expires_at = requested_expiry.min(deadline_at);
+    if lease_expires_at <= now {
+        return Err(CloudStorageError::RemoteWorkerLeaseLost);
+    }
+    Ok(lease_expires_at)
+}
+
+fn require_current_remote_worker_lease(
+    current: &RemoteWorkerTaskRow,
+    lease_id: &WorkerLeaseId,
+    lease_generation: u64,
+    lease_owner: &str,
+    lease_token_digest: &str,
+    now: DateTime<Utc>,
+) -> Result<(), CloudStorageError> {
+    if current.status != CloudRemoteWorkerTaskStatus::Leased
+        || current.lease_id.as_ref() != Some(lease_id)
+        || current.lease_generation != lease_generation
+        || current.lease_owner.as_deref() != Some(lease_owner)
+        || current.lease_token_digest.as_deref() != Some(lease_token_digest)
+        || current.heartbeat_at.is_none_or(|heartbeat| now < heartbeat)
+        || current
+            .lease_expires_at
+            .is_none_or(|expires| now >= expires)
+    {
+        return Err(CloudStorageError::RemoteWorkerLeaseLost);
+    }
+    Ok(())
 }
 
 async fn load_device_public_key_tx(
@@ -2505,12 +3551,24 @@ pub enum CloudStorageError {
     InvalidProjectRegistration,
     #[error("encrypted sync mutation or precondition is invalid")]
     InvalidSyncMutation,
+    #[error("remote Worker task or bounded lease request is invalid")]
+    InvalidRemoteWorkerTask,
+    #[error("remote Worker completion or result is invalid")]
+    InvalidRemoteWorkerCompletion,
     #[error("tenant has not been registered in this Cell")]
     TenantNotRegistered,
     #[error("project already exists and the request is not an idempotent replay")]
     ProjectAlreadyExists,
     #[error("project is not visible in the exact tenant and Cell scope")]
     ProjectNotFound,
+    #[error("remote Worker task identity already exists")]
+    RemoteWorkerTaskAlreadyExists,
+    #[error("remote Worker task is not visible in the exact tenant/project scope")]
+    RemoteWorkerTaskNotFound,
+    #[error("remote Worker task already has a different terminal completion")]
+    RemoteWorkerTaskAlreadyCompleted,
+    #[error("remote Worker lease owner, token, generation, or expiry is no longer current")]
+    RemoteWorkerLeaseLost,
     #[error("device public key is not visible in the exact tenant/project/device scope")]
     DevicePublicKeyNotFound,
     #[error("device public-key revision is not the exact next transition")]
@@ -2821,6 +3879,88 @@ mod tests {
     }
 
     #[test]
+    fn remote_worker_contract_binds_encrypted_task_and_bounds_recovery_lease() {
+        let task = CloudRemoteWorkerTask {
+            scope: scope(DataCell::Us),
+            project_id: ProjectId::from("project-1"),
+            mission_id: MissionId::from("mission-1"),
+            task_id: TaskId::from("task-1"),
+            worker_id: WorkerId::from("worker-1"),
+            payload: payload(8),
+            idempotency_key_digest: "d".repeat(64),
+            enqueued_at: now(),
+            deadline_at: now() + Duration::minutes(20),
+        };
+        task.validate(DataCell::Us).expect("valid remote task");
+        let request_digest = task.request_digest().expect("task digest");
+        let mut changed_payload = task.clone();
+        changed_payload.payload = payload(9);
+        assert_ne!(
+            request_digest,
+            changed_payload.request_digest().expect("payload digest")
+        );
+        let mut changed_deadline = task.clone();
+        changed_deadline.deadline_at += Duration::seconds(1);
+        assert_ne!(
+            request_digest,
+            changed_deadline.request_digest().expect("deadline digest")
+        );
+
+        let lease_now = now() + Duration::seconds(1);
+        assert_eq!(
+            bounded_remote_worker_lease_expiry(
+                lease_now,
+                Duration::minutes(15),
+                now() + Duration::minutes(20)
+            )
+            .expect("bounded lease"),
+            lease_now + Duration::minutes(15)
+        );
+        assert_eq!(
+            bounded_remote_worker_lease_expiry(
+                lease_now,
+                Duration::minutes(15),
+                lease_now + Duration::minutes(5)
+            )
+            .expect("deadline-capped lease"),
+            lease_now + Duration::minutes(5)
+        );
+        assert!(matches!(
+            bounded_remote_worker_lease_expiry(
+                lease_now,
+                Duration::minutes(15) + Duration::seconds(1),
+                now() + Duration::minutes(20)
+            ),
+            Err(CloudStorageError::InvalidRemoteWorkerTask)
+        ));
+        assert!(matches!(
+            bounded_remote_worker_lease_expiry(
+                now() + Duration::minutes(21),
+                Duration::minutes(1),
+                now() + Duration::minutes(20)
+            ),
+            Err(CloudStorageError::RemoteWorkerLeaseLost)
+        ));
+
+        let invalid_completion = CloudRemoteWorkerCompletion {
+            scope: scope(DataCell::Us),
+            project_id: ProjectId::from("project-1"),
+            task_id: TaskId::from("task-1"),
+            lease_id: WorkerLeaseId::from("lease-1"),
+            lease_generation: 1,
+            lease_owner: "worker-process".into(),
+            lease_token_digest: "e".repeat(64),
+            result_digest: "f".repeat(63),
+            idempotency_key_digest: "1".repeat(64),
+            completed_at: now(),
+        };
+        assert!(matches!(
+            invalid_completion.validate(DataCell::Us),
+            Err(CloudStorageError::InvalidRemoteWorkerCompletion)
+        ));
+    }
+
+    #[test]
     fn schema_contract_has_physical_cell_rls_ciphertext_and_append_only_versions() {
         assert_eq!(SCHEMA_VERSION, 5);
         assert!(SCHEMA.contains("FORCE ROW LEVEL SECURITY"));
@@ -2829,6 +3969,9 @@ mod tests {
         assert!(SCHEMA.contains("sync_object_versions"));
         assert!(SCHEMA.contains("payload_ciphertext BYTEA"));
         assert!(SCHEMA.contains("sync_mutations"));
+        assert!(SCHEMA.contains("remote_worker_mailbox_messages"));
+        assert!(SCHEMA.contains("remote_worker_claims"));
+        assert!(SCHEMA.contains("claim_request_digest"));
         assert!(SCHEMA.contains("device_public_key_versions"));
         assert!(SCHEMA.contains("keyring_bootstrap_versions"));
         assert!(SCHEMA.contains("device_handoff_grants"));
