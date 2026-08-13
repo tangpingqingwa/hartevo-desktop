@@ -1,21 +1,17 @@
 //! Mission-conversation projection for the Runtime service-provider plugin.
 //!
 //! This is a consumer boundary. It owns no Runtime process, Effect authority, Mission state, or
-//! storage write. A provider session can produce a command-capable node; the existing Desktop
-//! read model produces a deliberately non-commandable recovery node until Application exposes the
-//! durable provider projection and typed command port.
+//! storage write. A provider session can produce a command-capable node, while Mission-shell
+//! rendering requires an exact durable Application projection and matching selected scope.
 
 use std::fmt;
 
-use hartevo_application::MissionRuntimeProjection;
-use hartevo_domain_kernel::{MissionId, ProjectId, RuntimeProcessClaimStatus, RuntimeTurnStatus};
+use hartevo_domain_kernel::{MissionId, ProjectId};
 use hartevo_runtime_adapter::{
     DurableModelVisibleEvent, DurableModelVisibleEventKind, RuntimePluginMountState,
     RuntimePluginScope, RuntimeProviderSession, RuntimeProviderStreamEvent, RuntimeRecoveryAction,
     RuntimeTurnCompletionStatus,
 };
-
-use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
 const SHORT_DIGEST_LENGTH: usize = 8;
 
@@ -148,6 +144,24 @@ pub struct RuntimeProviderRecovery {
     pub action: RuntimeRecoveryAction,
 }
 
+/// Exact Application-owned provider projection required before an inline node can be rendered.
+/// The projection must already contain a durable model-visible event and its signed cursor; the
+/// Desktop consumer never derives these values from environment discovery or Runtime health.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeProviderProjection {
+    pub scope: RuntimePluginScope,
+    pub identity: RuntimeProviderIdentity,
+    pub runtime_generation: u64,
+    pub cursor_digest: String,
+    pub revision: u64,
+    pub status: RuntimeProviderNodeStatus,
+    pub delta_count: usize,
+    pub last_event_digest: String,
+    pub last_sequence: u64,
+    pub result_digest: Option<String>,
+    pub recovery: Option<RuntimeProviderRecovery>,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct RuntimeProviderInlineNode {
     project_id: ProjectId,
@@ -241,73 +255,41 @@ impl RuntimeProviderInlineNode {
         })
     }
 
-    /// The current Application read model has runtime health but not provider session identity.
-    /// This fallback is therefore explicitly recovery-only and never exposes local commands.
-    pub fn from_desktop_read_models(
-        project_id: &ProjectId,
-        mission_id: &MissionId,
-        runtime: Option<&DesktopRuntimeProjection>,
-        activity: &MissionRuntimeProjection,
-    ) -> Self {
-        let provider_id = runtime
-            .and_then(|projection| projection.provider.clone())
-            .unwrap_or_else(|| "provider-unavailable".to_owned());
-        let model_id = runtime
-            .and_then(|projection| projection.model.clone())
-            .unwrap_or_else(|| "model-unavailable".to_owned());
-        let status = if matches!(
-            runtime.map(|projection| projection.status),
-            Some(
-                DesktopRuntimeAvailabilityStatus::BlockedEnvironment
-                    | DesktopRuntimeAvailabilityStatus::IntegrityError
-                    | DesktopRuntimeAvailabilityStatus::EvidenceMissing
-                    | DesktopRuntimeAvailabilityStatus::NotConfigured
-                    | DesktopRuntimeAvailabilityStatus::ConfigurationRequired
-                    | DesktopRuntimeAvailabilityStatus::UnsupportedHost,
-            ) | None
-        ) || activity.recovery_status.is_some()
-            || matches!(
-                activity.process_claim_status,
-                Some(RuntimeProcessClaimStatus::Blocked)
-            ) {
-            RuntimeProviderNodeStatus::RecoveryRequired
-        } else {
-            match activity.turn_status {
-                Some(RuntimeTurnStatus::Completed) => RuntimeProviderNodeStatus::Completed,
-                Some(RuntimeTurnStatus::Interrupted) => RuntimeProviderNodeStatus::Interrupted,
-                Some(RuntimeTurnStatus::Failed) => RuntimeProviderNodeStatus::Failed,
-                _ => RuntimeProviderNodeStatus::Unknown,
-            }
-        };
-        Self {
-            project_id: project_id.clone(),
-            mission_id: mission_id.clone(),
-            binding: None,
-            identity: RuntimeProviderIdentity {
-                provider_id,
-                provider_revision: runtime.map_or_else(
-                    || "unknown".to_owned(),
-                    |projection| projection.release.clone(),
-                ),
-                model_id,
-                model_revision: "unknown".to_owned(),
-                harness_id: "not-exposed-by-read-model".to_owned(),
-                harness_revision: "unknown".to_owned(),
-                manifest_digest: String::new(),
-                config_digest: String::new(),
-                catalog_digest: String::new(),
-                policy_digest: String::new(),
-            },
-            status,
-            delta_count: activity.turn_evidence_count,
-            last_event_digest: None,
-            last_sequence: 0,
-            result_digest: None,
-            recovery: Some(RuntimeProviderRecovery {
-                code: "RUNTIME_PROVIDER_PROJECTION_UNAVAILABLE",
-                action: RuntimeRecoveryAction::UserReview,
-            }),
+    /// Build a renderable node only from the exact durable Application projection.
+    pub fn from_projection(projection: RuntimeProviderProjection) -> Result<Self, &'static str> {
+        if projection.runtime_generation == 0
+            || projection.revision == 0
+            || !is_digest(&projection.cursor_digest)
+            || !is_digest(&projection.last_event_digest)
+            || projection.last_sequence == 0
+            || projection
+                .result_digest
+                .as_deref()
+                .is_some_and(|digest| !is_digest(digest))
+        {
+            return Err("runtime provider projection is not exact");
         }
+        projection
+            .scope
+            .validate()
+            .map_err(|_| "runtime scope is invalid")?;
+        Ok(Self {
+            project_id: ProjectId::from(projection.scope.project_id.as_str()),
+            mission_id: MissionId::from(projection.scope.mission_id.as_str()),
+            binding: Some(RuntimeProviderCommandBinding {
+                scope: projection.scope,
+                runtime_generation: projection.runtime_generation,
+                cursor_digest: projection.cursor_digest,
+                revision: projection.revision,
+            }),
+            identity: projection.identity,
+            status: projection.status,
+            delta_count: projection.delta_count,
+            last_event_digest: Some(projection.last_event_digest),
+            last_sequence: projection.last_sequence,
+            result_digest: projection.result_digest,
+            recovery: projection.recovery,
+        })
     }
 
     pub fn is_visible_for(&self, project_id: &ProjectId, mission_id: &MissionId) -> bool {
@@ -458,6 +440,19 @@ impl RuntimeProviderInlineNode {
     }
 }
 
+/// Convert an optional Application projection into a node only when the projection is exact and
+/// still belongs to the selected Mission. Missing, malformed, or cross-scope projections are
+/// intentionally absent from the minimal Mission shell.
+pub fn node_for_selected_scope(
+    projection: Option<RuntimeProviderProjection>,
+    selected_project: &ProjectId,
+    selected_mission: &MissionId,
+) -> Option<RuntimeProviderInlineNode> {
+    let node = RuntimeProviderInlineNode::from_projection(projection?).ok()?;
+    node.is_visible_for(selected_project, selected_mission)
+        .then_some(node)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeProviderProjectionError {
     BindingUnavailable,
@@ -503,77 +498,82 @@ mod tests {
         }
     }
 
-    fn activity(
-        project_id: ProjectId,
-        mission_id: MissionId,
-        turn_status: Option<RuntimeTurnStatus>,
-    ) -> MissionRuntimeProjection {
-        MissionRuntimeProjection {
-            project_id,
-            mission_id,
-            process_claim_status: None,
-            process_cleanup_attempt_count: 0,
-            recovery_status: None,
-            recovery_failure_count: 0,
-            recovery_process_attempt: None,
-            turn_status,
-            turn_failure_count: 0,
-            turn_evidence_count: 2,
-            last_updated_at: None,
-            requires_reconciliation: false,
+    fn exact_projection(project_id: &str, mission_id: &str) -> RuntimeProviderProjection {
+        RuntimeProviderProjection {
+            scope: RuntimePluginScope::new(project_id, mission_id, "session-a").expect("scope"),
+            identity: RuntimeProviderIdentity {
+                provider_id: "openinterpreter".into(),
+                provider_revision: "provider-revision".into(),
+                model_id: "model".into(),
+                model_revision: "model-revision".into(),
+                harness_id: "harness".into(),
+                harness_revision: "harness-revision".into(),
+                manifest_digest: "a".repeat(64),
+                config_digest: "b".repeat(64),
+                catalog_digest: "c".repeat(64),
+                policy_digest: "d".repeat(64),
+            },
+            runtime_generation: 3,
+            cursor_digest: "e".repeat(64),
+            revision: 7,
+            status: RuntimeProviderNodeStatus::Streaming,
+            delta_count: 1,
+            last_event_digest: "f".repeat(64),
+            last_sequence: 1,
+            result_digest: None,
+            recovery: None,
         }
     }
 
     #[test]
-    fn read_model_provider_node_is_contextual_and_non_commandable() {
+    fn unavailable_application_projection_is_hidden_from_minimal_shell() {
         let project_id = ProjectId::from("project-a");
         let mission_id = MissionId::from("mission-a");
-        let projection = RuntimeProviderInlineNode::from_desktop_read_models(
-            &project_id,
-            &mission_id,
-            None,
-            &activity(
-                project_id.clone(),
-                mission_id.clone(),
-                Some(RuntimeTurnStatus::Running),
-            ),
-        );
-        assert_eq!(
-            projection.status(),
-            RuntimeProviderNodeStatus::RecoveryRequired
-        );
-        assert!(projection.is_visible_for(&project_id, &mission_id));
-        assert!(!projection.is_visible_for(&project_id, &MissionId::from("mission-b")));
-        assert!(!projection.command_available(RuntimeProviderSurfaceAction::Continue));
-        assert!(!format!("{projection:?}").contains("project-a"));
+        assert!(node_for_selected_scope(None, &project_id, &mission_id).is_none());
     }
 
     #[test]
-    fn provider_surface_does_not_render_without_runtime_activity() {
+    fn exact_application_projection_is_visible_only_for_matching_scope() {
         let project_id = ProjectId::from("project-a");
         let mission_id = MissionId::from("mission-a");
-        let node = RuntimeProviderInlineNode::from_desktop_read_models(
-            &project_id,
-            &mission_id,
-            None,
-            &activity(project_id.clone(), mission_id.clone(), None),
+        let projection = exact_projection(project_id.as_str(), mission_id.as_str());
+        assert!(
+            node_for_selected_scope(Some(projection.clone()), &project_id, &mission_id).is_some()
         );
-        assert!(node.recovery().is_some());
-        assert_eq!(node.delta_count(), 2);
+        assert!(
+            node_for_selected_scope(
+                Some(projection.clone()),
+                &project_id,
+                &MissionId::from("mission-b")
+            )
+            .is_none()
+        );
+        assert!(
+            node_for_selected_scope(Some(projection), &ProjectId::from("project-b"), &mission_id)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn provider_surface_source_has_no_internal_fallback_copy_or_fake_controls() {
+        let source = include_str!("lib.rs");
+        let unavailable = ["RUNTIME", "_PROVIDER", "_PROJECTION", "_UNAVAILABLE"].concat();
+        assert!(!source.contains(&unavailable));
+        let internal_copy = ["当前没有本地", "伪造按钮"].concat();
+        assert!(!source.contains(&internal_copy));
+        assert!(!source.contains("RuntimeProviderInlineNodeSurface"));
     }
 
     #[test]
     fn stream_content_requires_a_durable_event_receipt() {
-        let mut node = RuntimeProviderInlineNode::from_desktop_read_models(
-            &ProjectId::from("project-a"),
-            &MissionId::from("mission-a"),
-            None,
-            &activity(
-                ProjectId::from("project-a"),
-                MissionId::from("mission-a"),
-                Some(RuntimeTurnStatus::Running),
-            ),
-        );
+        let project_id = ProjectId::from("project-a");
+        let mission_id = MissionId::from("mission-a");
+        let mut node = node_for_selected_scope(
+            Some(exact_projection(project_id.as_str(), mission_id.as_str())),
+            &project_id,
+            &mission_id,
+        )
+        .expect("exact projection");
         let event = RuntimeProviderStreamEvent::AgentMessageDelta {
             event_digest: "event".into(),
             item_id_digest: "item".into(),
@@ -590,36 +590,12 @@ mod tests {
     fn command_port_receives_only_exact_selected_scope() {
         let project_id = ProjectId::from("project-a");
         let mission_id = MissionId::from("mission-a");
-        let scope = RuntimePluginScope::new(project_id.as_str(), mission_id.as_str(), "session-a")
-            .expect("scope");
-        let node = RuntimeProviderInlineNode {
-            project_id: project_id.clone(),
-            mission_id: mission_id.clone(),
-            binding: Some(RuntimeProviderCommandBinding {
-                scope,
-                runtime_generation: 3,
-                cursor_digest: "a".repeat(64),
-                revision: 7,
-            }),
-            identity: RuntimeProviderIdentity {
-                provider_id: "openinterpreter".into(),
-                provider_revision: "provider-revision".into(),
-                model_id: "model".into(),
-                model_revision: "model-revision".into(),
-                harness_id: "harness".into(),
-                harness_revision: "harness-revision".into(),
-                manifest_digest: String::new(),
-                config_digest: String::new(),
-                catalog_digest: String::new(),
-                policy_digest: String::new(),
-            },
-            status: RuntimeProviderNodeStatus::Streaming,
-            delta_count: 1,
-            last_event_digest: None,
-            last_sequence: 0,
-            result_digest: None,
-            recovery: None,
-        };
+        let node = node_for_selected_scope(
+            Some(exact_projection(project_id.as_str(), mission_id.as_str())),
+            &project_id,
+            &mission_id,
+        )
+        .expect("exact projection");
         let mut port = RecordingCommandPort::default();
         assert_eq!(
             node.dispatch(
