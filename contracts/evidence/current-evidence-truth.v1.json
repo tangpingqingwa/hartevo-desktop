@@ -1,0 +1,115 @@
+{
+  "schemaVersion": "hartevo.current-evidence-truth/v1",
+  "contractId": "ev-doc-runtime-render-b2-v1",
+  "source": {
+    "objectFormat": "sha1",
+    "commit": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+    "tree": "f33a9ca2e2ab62c11aa1312371c99f7d0e7be340"
+  },
+  "commitBoundManifest": {
+    "claimId": "EVDOC-EV03M-01",
+    "path": "artifacts/evidence/commit-bound/752488888ab45596be242ecca3acae567ace2239.json",
+    "sourceCommit": "752488888ab45596be242ecca3acae567ace2239",
+    "materializationCommit": "d3b5fc1330d70774faee13249328781adca34bac",
+    "rawSha256": "a0bc4540453ab6836b0a75da243c16471e3023ae4c8e08050b2d3008a8b94958",
+    "bytes": 3611,
+    "verifier": {
+      "path": "scripts/check-evidence-manifest.sh",
+      "mode": "100755",
+      "rawSha256": "4b15612b78f61d4f39bafa9c176376170c2c276c74aee832e9e452de8c5af784",
+      "bytes": 66442
+    },
+    "expectedVerification": {
+      "code": "COMMIT_BOUND_MANIFEST_VERIFIED",
+      "verificationStatus": "VERIFIED",
+      "releaseDecision": "NOT_EVALUATED",
+      "testMode": false,
+      "artifactCount": 3,
+      "claimCount": 2,
+      "requiredClaimCount": 1,
+      "authority": "MANIFEST_INTEGRITY_ONLY"
+    }
+  },
+  "runtimeRender": {
+    "implementationStatus": "CODE_WIRED",
+    "b2": {
+      "claimId": "EVDOC-B2-01",
+      "commit": "101ea1c01c70584e8f739395df76ab2197b4a03b",
+      "parent": "752488888ab45596be242ecca3acae567ace2239",
+      "changedFiles": [
+        "hartevo-rs/desktop/src/lib.rs",
+        "hartevo-rs/desktop/src/runtime_subscription.rs"
+      ],
+      "requiredAnchors": {
+        "hartevo-rs/desktop/src/lib.rs": [
+          "fn PersistedRuntimeAwaitingTurn()",
+          "fn begin_catalog_runtime_execution_after_paint(",
+          "fn post_render_ack_is_the_only_runtime_resume_dispatch_gate()"
+        ],
+        "hartevo-rs/desktop/src/runtime_subscription.rs": [
+          "struct DesktopRuntimeExecutionPaintState",
+          "fn acknowledge_rendered_paint(",
+          "fn execution_launch_requires_exact_post_render_ack_before_runtime_return()"
+        ]
+      }
+    },
+    "b2p": {
+      "claimId": "EVDOC-B2P-01",
+      "commit": "721fff272b31ad77f8842534e8163c42df6d84a6",
+      "parent": "101ea1c01c70584e8f739395df76ab2197b4a03b",
+      "changedFiles": [
+        "hartevo-rs/desktop/src/lib.rs"
+      ],
+      "requiredAnchors": {
+        "hartevo-rs/desktop/src/lib.rs": [
+          "fn initial_runtime_projection_derives_exact_scope_without_fixture_bypass()",
+          "fn runtime_render_scope_gate_allows_only_exact_fallback_and_scoped_error()",
+          "fn runtime_render_scope_gate_hides_missing_same_project_and_cross_project_selection()",
+          "fn runtime_render_scope_gate_rejects_projection_identity_drift_but_keeps_scoped_error()",
+          "fn runtime_render_scope_gate_requires_scope_recovery_when_returning_to_old_mission()",
+          "fn runtime_render_scope_gate_prioritizes_exact_selected_paint_projection()"
+        ]
+      }
+    }
+  },
+  "unprovenEvidence": {
+    "claimId": "EVDOC-GAPS-01",
+    "scope": "CURRENT_B2_B2P_FLOW",
+    "nativeVisual": "NOT_PROVEN",
+    "nativeAccessibility": "NOT_PROVEN",
+    "processRestart": "NOT_PROVEN",
+    "releaseEvidence": "NOT_PROVEN",
+    "releasePassed": false,
+    "releaseDecision": "NOT_EVALUATED",
+    "missionEvidenceLevelPromoted": false,
+    "legacyVisualOrAccessibilityMaySatisfy": false
+  },
+  "documents": [
+    {
+      "path": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md",
+      "requiredLines": [
+        "- `EVDOC-EV03M-01`：EV-03M 的 original materialization commit `d3b5fc1330d70774faee13249328781adca34bac` 把 source `752488888ab45596be242ecca3acae567ace2239` 的 manifest 物化为 tracked blob；`VERIFIED` 只证明 manifest integrity，Release decision 仍为 `NOT_EVALUATED`。",
+        "- `EVDOC-B2-01`：UI-SUB-02B2 (`101ea1c01c70584e8f739395df76ab2197b4a03b`) 已把 durable Runtime execution paint、post-render acknowledgement 与 follow/unseen 协调接入 Dioxus；此声明的 authority 仅为 `CODE_WIRED`。",
+        "- `EVDOC-B2P-01`：UI-SUB-02B2P (`721fff272b31ad77f8842534e8163c42df6d84a6`) 已把 Runtime private-text/error 投影限制到 exact Project/Mission scope；此声明的 authority 仅为 `CODE_WIRED`。",
+        "- `EVDOC-GAPS-01`：当前 B2/B2P flow 的原生窗口 visual、原生 AX、真实 Desktop 进程退出后的 restart/reconnect 与 Release Evidence 均为 `NOT_PROVEN`；旧 visual/AX 资产、组件测试、bundle 或 `VERIFIED` manifest 均不可替代这些证据，Release `passed=false`，Mission E-level 未提升。"
+      ]
+    },
+    {
+      "path": "docs/quality/DEVELOPMENT-VALIDATION-LADDER.md",
+      "requiredLines": [
+        "- `EVDOC-EV03M-01`：`VERIFIED` commit-bound manifest 只授予 manifest integrity，不授予 Release 或 Mission evidence-level authority。",
+        "- `EVDOC-B2-01` / `EVDOC-B2P-01`：Dioxus execution paint 与 exact Project/Mission private-text scope 是 `CODE_WIRED`，不是当前原生窗口 Journey 证据。",
+        "- `EVDOC-GAPS-01`：native visual、native AX、真实进程 restart/reconnect 和 Release 均保持 `NOT_PROVEN`；Release `passed=false`、decision=`NOT_EVALUATED`，Mission E-level 不提升。"
+      ]
+    }
+  ],
+  "gate": {
+    "command": "bash scripts/check-evidence-doc-truth.sh verify",
+    "selfTestCommand": "bash scripts/check-evidence-doc-truth.sh self-test",
+    "successCode": "EVIDENCE_DOC_TRUTH_VERIFIED",
+    "successStatus": "VERIFIED",
+    "releaseDecision": "NOT_EVALUATED",
+    "releasePassed": false,
+    "missionEvidenceLevelPromoted": false
+  }
+}
