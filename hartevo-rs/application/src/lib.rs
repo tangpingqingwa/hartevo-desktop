@@ -27893,6 +27893,58 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn checkpoint_bound_health_timeout_runtime_command(
+        workspace: &Path,
+        thread_id: &str,
+    ) -> RuntimeCommand {
+        let canonical_workspace = workspace.canonicalize().expect("canonical workspace");
+        let first_process_marker = workspace.join(".hartevo-first-health-timeout");
+        let initialize_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {}
+        })
+        .to_string();
+        let thread_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "thread": {"id": thread_id},
+                "cwd": canonical_workspace,
+                "model": "fixture-model",
+                "modelProvider": "fixture-provider",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandbox": "workspace-write"
+            }
+        })
+        .to_string();
+        let mut command = RuntimeCommand::new(PathBuf::from("/bin/sh"), canonical_workspace);
+        command.args = vec![
+            "-c".into(),
+            "IFS= read -r _
+if (set -C; : > \"$1\") 2>/dev/null; then
+  IFS= read -r _
+else
+  printf '%s\\n' \"$2\"
+  IFS= read -r _
+  printf '%s\\n' \"$3\"
+  sleep 30
+fi"
+            .into(),
+            "hartevo-checkpoint-bound-runtime".into(),
+            first_process_marker.to_string_lossy().into_owned(),
+            initialize_response,
+            thread_response,
+        ];
+        command
+            .environment
+            .insert("PATH".into(), "/usr/bin:/bin".into());
+        command.shutdown_grace = StdDuration::from_millis(50);
+        command
+    }
+
+    #[cfg(unix)]
     #[allow(
         clippy::too_many_lines,
         reason = "the bounded fixture spells out every exact protocol frame used by the lifecycle replay"
@@ -29134,8 +29186,10 @@ sleep 30"#
     fn runtime_recovery_is_checkpoint_bound_retryable_and_thread_redacted() {
         let mut fixture = runtime_recovery_fixture();
         let runtime_thread_id = "private-runtime-thread-recovery";
-        let runtime_command =
-            delayed_fake_runtime_command(fixture.workspace.path(), runtime_thread_id, "0.20");
+        let runtime_command = checkpoint_bound_health_timeout_runtime_command(
+            fixture.workspace.path(),
+            runtime_thread_id,
+        );
         let recovery_id = RuntimeRecoveryAttemptId::from("recovery-runtime-health-timeout");
         let first_result = fixture.service.recover_context_worker_runtime(
             RecoverContextWorkerRuntime {
