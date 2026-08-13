@@ -1,0 +1,248 @@
+# Release: false. This first scaffolding PR is a dry-run promotion plan only.
+# release: false is the only supported mode until hosted release controls and #82 are available.
+# All artifact fences use SHA-256 digests (sha256).
+name: Release / Promotion (dry-run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full SHA of the reviewed current main commit.
+        required: true
+        type: string
+      tag:
+        description: New immutable semver tag for this promotion plan.
+        required: true
+        type: string
+      promotion_kind:
+        description: A rollback is a new promotion and never overwrites an old tag.
+        required: true
+        default: forward
+        type: choice
+        options: [forward, rollback]
+      rollback_of:
+        description: Existing release being rolled back, when promotion_kind is rollback.
+        required: false
+        type: string
+      release:
+        description: Must remain false until hosted release controls and #82 are available.
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hartevo-release-promotion
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_TARGET_DIR: target/ci-cargo
+
+jobs:
+  source-fence:
+    name: Release / Current-main fence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      current_main: ${{ steps.fence.outputs.current_main }}
+    steps:
+      - name: Checkout reviewed main history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - id: fence
+        name: Require current reviewed main and a new monotonic tag
+        env:
+          INPUT_SOURCE_COMMIT: ${{ inputs.source_commit }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_RELEASE: ${{ inputs.release }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$INPUT_RELEASE" = "false"
+          current_main="$(git rev-parse refs/remotes/origin/main)"
+          test "$INPUT_SOURCE_COMMIT" = "$current_main"
+          test -z "$(git status --porcelain=v1)"
+          [[ "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]
+          if git ls-remote --exit-code origin "refs/tags/$INPUT_TAG" >/dev/null 2>&1; then
+            echo "tag already exists; promotion must use a new tag" >&2
+            exit 1
+          fi
+          printf 'current_main=%s\n' "$current_main" >> "$GITHUB_OUTPUT"
+
+  build-once:
+    name: Release / Build exact artifact once
+    needs: source-fence
+    if: needs.source-fence.result == 'success'
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the fenced source commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Cache Cargo and Rust toolchain
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains/1.95.0-*
+            ~/.rustup/update
+            target/ci-cargo
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-release-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}
+      - name: Build the immutable application artifact once
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain=v1)"
+          rustup component add clippy rustfmt rust-src --toolchain 1.95.0
+          cargo build -p hartevo-desktop --release --locked
+          test -f target/release/hartevo-desktop
+          mkdir -p target/ci/release
+          tar -czf "target/ci/release/hartevo-desktop-$TAG.tar.gz" \
+            -C target/release hartevo-desktop
+          artifact="target/ci/release/hartevo-desktop-$TAG.tar.gz"
+          digest="$(shasum -a 256 "$artifact" | awk '{print $1}')"
+          jq -n --arg commit "$SOURCE_COMMIT" --arg tag "$TAG" --arg artifact "$artifact" --arg digest "$digest" \
+            '{schema:"hartevo-ci-build-receipt/v1",sourceCommit:$commit,tag:$tag,artifactPath:$artifact,artifactSha256:$digest,release:false,deployment:false}' \
+            > target/ci/release/build-receipt.json
+      - name: Generate the current-commit release baseline and future #82 hook receipt
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          cargo run -p hartevo-eval --locked -- evidence baseline \
+            --commit "$SOURCE_COMMIT" \
+            --output target/ci/release/release-baseline.json
+          artifact="target/ci/release/hartevo-desktop-${{ inputs.tag }}.tar.gz"
+          bash scripts/ci-distribution-hook.sh \
+            --artifact "$artifact" \
+            --output target/ci/release/distribution-hook.json
+          python3 scripts/ci-oidc-interface.py \
+            --output target/ci/release/oidc-interface.json
+      - name: Upload exact build artifact and commit-bound receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-build-${{ github.run_id }}
+          path: target/ci/release
+          if-no-files-found: error
+          retention-days: 30
+
+  promotion-preview:
+    name: Release / Promote exact artifact (disabled)
+    needs: [source-fence, build-once]
+    if: needs.source-fence.result == 'success' && needs.build-once.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release-promotion
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - name: Checkout promotion verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download the exact build-once artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-build-${{ github.run_id }}
+          path: target/ci/release
+      - name: Verify source, release evidence, tag, digest, rollback and Release=false fences
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          CURRENT_MAIN: ${{ needs.source-fence.outputs.current_main }}
+          TAG: ${{ inputs.tag }}
+          RELEASE: ${{ inputs.release }}
+          PROMOTION_KIND: ${{ inputs.promotion_kind }}
+          ROLLBACK_OF: ${{ inputs.rollback_of }}
+        run: |
+          artifact="target/ci/release/hartevo-desktop-$TAG.tar.gz"
+          expected_digest="$(jq -r '.artifactSha256' target/ci/release/build-receipt.json)"
+          test -f "$artifact"
+          jq -e '.passed == true' target/ci/release/release-baseline.json
+          test "$(shasum -a 256 "$artifact" | awk '{print $1}')" = "$expected_digest"
+          rollback_args=()
+          if [[ -n "$ROLLBACK_OF" ]]; then
+            rollback_args+=(--rollback-of "$ROLLBACK_OF")
+          fi
+          python3 scripts/ci-promotion.py validate \
+            --source-commit "$SOURCE_COMMIT" \
+            --current-main "$CURRENT_MAIN" \
+            --tag "$TAG" \
+            --release "$RELEASE" \
+            --promotion-kind "$PROMOTION_KIND" \
+            "${rollback_args[@]}" \
+            --artifact "$artifact" \
+            --expected-digest "$expected_digest" \
+            --release-evidence target/ci/release/release-baseline.json \
+            --output target/ci/release/promotion-plan.json
+          jq -e --arg digest "$expected_digest" \
+            '.release == false and .deployment == false and .artifactSha256 == $digest' \
+            target/ci/release/promotion-plan.json
+      - name: Upload dry-run promotion plan
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-promotion-plan-${{ github.run_id }}
+          path: target/ci/release/promotion-plan.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  result:
+    name: Release / Result taxonomy
+    if: always()
+    needs: [source-fence, build-once, promotion-preview]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout result verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Classify manual promotion execution
+        run: |
+          mkdir -p target/ci
+          python3 scripts/ci-result.py aggregate \
+            --workflow "$GITHUB_WORKFLOW" \
+            --run-id "$GITHUB_RUN_ID" \
+            --commit "$GITHUB_SHA" \
+            --event "$GITHUB_EVENT_NAME" \
+            --output target/ci/result.json \
+            --junit target/ci/result.xml \
+            --job "source-fence=${{ needs.source-fence.result }}" \
+            --job "build-once=${{ needs.build-once.result }}" \
+            --job "promotion-preview=${{ needs.promotion-preview.result }}" \
+            --kind source-fence=infra \
+            --kind build-once=code \
+            --kind promotion-preview=infra
+      - name: Upload dry-run CI result and JUnit envelope
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-ci-result-${{ github.run_id }}
+          path: |
+            target/ci/result.json
+            target/ci/result.xml
+          if-no-files-found: warn
+          retention-days: 30

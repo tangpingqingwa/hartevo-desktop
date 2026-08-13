@@ -1,0 +1,64 @@
+{
+  "schemaVersion": "hartevo-github-branch-ruleset-policy/v1",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "hostedEnforcement": "not_claimed_unavailable_current_plan",
+  "observedHostedStatus": {
+    "branchProtectionApi": "HTTP_403_PRIVATE_REPOSITORY_PLAN",
+    "rulesetApi": "HTTP_403_PRIVATE_REPOSITORY_PLAN",
+    "verifiedAt": "2026-08-13"
+  },
+  "verification": {
+    "localCommand": "python3 scripts/ci-branch-policy.py verify",
+    "hostedCommand": "python3 scripts/ci-branch-policy.py probe --repo tangpingqingwa/hartevo-desktop",
+    "applyWhenSupported": "re-run hosted probe, apply this document through the GitHub API, then re-verify"
+  },
+  "branches": [
+    {
+      "name": "bootstrap/macos-r0",
+      "requirePullRequest": true,
+      "requiredApprovingReviews": 1,
+      "requireCodeOwnerReview": true,
+      "dismissStaleReviews": true,
+      "requireConversationResolution": true,
+      "allowForcePushes": false,
+      "allowDeletions": false,
+      "requiredStatusChecks": [
+        "PR / Workflow policy",
+        "PR / Scope plan",
+        "PR / Fast Rust / fmt",
+        "PR / Fast Rust / clippy (ubuntu-24.04)",
+        "PR / Fast Rust / clippy (macos-15)",
+        "PR / Fast Rust / test (ubuntu-24.04)",
+        "PR / Fast Rust / test (macos-15)",
+        "PR / Result taxonomy"
+      ]
+    },
+    {
+      "name": "main",
+      "requirePullRequest": true,
+      "requiredApprovingReviews": 1,
+      "requireCodeOwnerReview": true,
+      "dismissStaleReviews": true,
+      "requireConversationResolution": true,
+      "allowForcePushes": false,
+      "allowDeletions": false,
+      "requiredStatusChecks": [
+        "PR / Workflow policy",
+        "PR / Scope plan",
+        "PR / Fast Rust / fmt",
+        "PR / Fast Rust / clippy (ubuntu-24.04)",
+        "PR / Fast Rust / clippy (macos-15)",
+        "PR / Fast Rust / test (ubuntu-24.04)",
+        "PR / Fast Rust / test (macos-15)",
+        "PR / Result taxonomy"
+      ]
+    }
+  ],
+  "releaseEnvironment": {
+    "name": "release-promotion",
+    "manualApprovalRequired": true,
+    "oidcOnly": true,
+    "longLivedCredentialsAllowed": false,
+    "releaseEnabledInThisPr": false
+  }
+}
