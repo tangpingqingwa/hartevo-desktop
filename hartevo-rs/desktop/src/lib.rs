@@ -28,12 +28,14 @@ use hartevo_domain_kernel::{
 use rust_decimal::Decimal;
 use zeroize::Zeroizing;
 
+mod agent_operations;
 pub mod data_plane;
 mod runtime_plane;
 mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
 mod visual_fixture;
 
+use agent_operations::{AgentOperationsWorkbenchProjection, OperationsStatus};
 use data_plane::{
     DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane,
     DesktopHumanCheckpointConfirmationRequest, DesktopLoadState, DesktopMissionContinuationRequest,
@@ -1438,6 +1440,43 @@ pub fn App() -> Element {
         DesktopBackendState::Ready(snapshot) => Some(snapshot.runtime.clone()),
         DesktopBackendState::Uninitialized(_) | DesktopBackendState::Failed(_) => None,
     };
+    let operations_projection = AgentOperationsWorkbenchProjection::from_parts(
+        project.as_ref(),
+        mission.as_ref(),
+        runtime_activity.as_ref(),
+        runtime_projection.as_ref(),
+    );
+    let operations_interrupt_available = runtime_busy && runtime_stop_available;
+    let operations_interrupt_requested = runtime_stop_requested();
+    let request_operations_interrupt = move |()| {
+        let selected = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.selected_mission_id.clone())
+        };
+        let disposition = runtime_execution_paint.read().request_stop_for_selection(
+            selected
+                .as_ref()
+                .map(|(project_id, mission_id)| (project_id, mission_id)),
+        );
+        match disposition {
+            DesktopRuntimeStopDisposition::Requested
+            | DesktopRuntimeStopDisposition::AlreadyRequested => {
+                runtime_stop_requested.set(true);
+            }
+            DesktopRuntimeStopDisposition::ScopeMismatch
+            | DesktopRuntimeStopDisposition::NoActiveCommand => {
+                request_desktop_runtime_stop(
+                    runtime_cancellation.read().clone(),
+                    runtime_stop_requested,
+                    runtime_progress,
+                    visual_streaming_fixture,
+                );
+            }
+        }
+    };
     let runtime_chip = runtime_projection.as_ref().map_or_else(
         || "Runtime · 数据层未就绪".to_owned(),
         |runtime| format!("Runtime · {}", runtime_availability_label(runtime.status)),
@@ -2017,6 +2056,9 @@ pub fn App() -> Element {
                                 runtime_follow_latest: rendered_runtime_follow_latest,
                                 runtime_has_unseen: rendered_runtime_has_unseen,
                                 context_access: context_access.clone(),
+                                operations: operations_projection.clone(),
+                                interrupt_available: operations_interrupt_available,
+                                interrupt_requested: operations_interrupt_requested,
                                 on_initialize: move |_| {
                                     match DesktopDataPlane::discover().and_then(|plane| plane.initialize_os(Utc::now())) {
                                         Ok(snapshot) => model.write().set_ready(snapshot, false),
@@ -2027,6 +2069,11 @@ pub fn App() -> Element {
                                 on_error: move |error| model.write().set_notice(&error),
                                 on_select_mission: move |mission_id| model.write().select_mission(mission_id),
                                 on_open_workpad: move |()| workpad_open.set(true),
+                                on_quick_entry: move |()| {
+                                    composer_expanded.set(true);
+                                    restore_ui_focus("mission-composer-input");
+                                },
+                                on_interrupt: request_operations_interrupt,
                                 on_runtime_scroll: move |near_bottom| {
                                     let selected = {
                                         let current = model.read();
@@ -4610,6 +4657,281 @@ fn ProjectDispatcherSurface(
 }
 
 #[component]
+fn AgentOperationsWorkbench(
+    projection: AgentOperationsWorkbenchProjection,
+    interrupt_available: bool,
+    interrupt_requested: bool,
+    on_quick_entry: EventHandler<()>,
+    on_interrupt: EventHandler<()>,
+) -> Element {
+    let recovery_required = projection.recovery.status == OperationsStatus::RecoveryRequired;
+    let interrupt_disabled = !interrupt_available || interrupt_requested || recovery_required;
+    let interrupt_label = if recovery_required {
+        "先恢复再中断"
+    } else if interrupt_requested {
+        "等待中断回执"
+    } else if interrupt_available {
+        "Interrupt 当前 turn"
+    } else {
+        "没有可中断 turn"
+    };
+    rsx! {
+        article {
+            class: "agent-operations-workbench",
+            aria_label: "Agent Operations Workbench",
+            tabindex: "-1",
+            header { class: "operations-header",
+                div {
+                    span { class: "operations-eyebrow", "AGENT OPERATIONS" }
+                    h2 { "{projection.project_name}" }
+                    p { "Mission Control · Runtime · Worker Graph · Work Product" }
+                }
+                span {
+                    class: format!("operations-status {}", projection.mission.status.tone()),
+                    role: "status",
+                    aria_live: "polite",
+                    {projection.mission.status.code()}
+                }
+            }
+
+            section { class: "operations-section operations-mission-control", aria_label: "Mission Control",
+                header { class: "operations-section-header",
+                    div {
+                        span { class: "operations-eyebrow", "MISSION CONTROL" }
+                        h3 { "当前 Mission" }
+                    }
+                    span { class: "operations-section-state", "{projection.mission.stage}" }
+                }
+                div { class: "operations-objective",
+                    small { "Objective" }
+                    p { "{projection.mission.objective}" }
+                }
+                div { class: "operations-fact-grid",
+                    div { class: "operations-fact",
+                        small { "Current gate" }
+                        strong { "{projection.mission.current_gate}" }
+                    }
+                    div { class: "operations-fact",
+                        small { "Next todos" }
+                        ul {
+                            for todo in projection.mission.next_todos.iter() {
+                                li { "{todo}" }
+                            }
+                        }
+                    }
+                    div { class: "operations-fact",
+                        small { "Quota" }
+                        strong { "{projection.mission.quota.used} / {projection.mission.quota.limit}" }
+                        span { "{projection.mission.quota.detail}" }
+                    }
+                    div { class: "operations-fact",
+                        small { "Evidence changes" }
+                        strong { "{projection.mission.evidence.evidence_count} evidence · {projection.mission.evidence.work_product_count} artifacts" }
+                        span { "{projection.mission.evidence.verified_effect_count} verified effects" }
+                    }
+                }
+                div { class: "operations-claims",
+                    h4 { "Active claims" }
+                    if projection.mission.active_claims.is_empty() {
+                        p { class: "operations-empty", "没有 active claim；这里不从页面动画推导 worker ownership。" }
+                    } else {
+                        for claim in projection.mission.active_claims.iter() {
+                            div { class: "operations-claim",
+                                span { class: format!("operations-status-dot {}", claim.status.tone()) }
+                                div {
+                                    strong { "{claim.title}" }
+                                    span { "{claim.detail}" }
+                                }
+                                em { "{claim.status.code()}" }
+                            }
+                        }
+                    }
+                }
+            }
+
+            section { class: "operations-section operations-runtime-grid", aria_label: "Runtime configuration and Worker Graph",
+                div { class: "operations-card operations-runtime-card",
+                    header { class: "operations-card-header",
+                        div {
+                            span { class: "operations-eyebrow", "RUNTIME CONFIGURATION" }
+                            h3 { "Provider / Model / Harness" }
+                        }
+                        span { class: format!("operations-status {}", projection.runtime.status.tone()), "{projection.runtime.status.code()}" }
+                    }
+                    div { class: "operations-definition-grid",
+                        div { small { "Provider" } strong { "{projection.runtime.provider}" } }
+                        div { small { "Model" } strong { "{projection.runtime.model}" } }
+                        div { small { "Harness" } strong { "{projection.runtime.harness}" } }
+                        div { small { "Reasoning effort" } strong { "{projection.runtime.reasoning_effort}" } }
+                        div { small { "Service tier" } strong { "{projection.runtime.service_tier}" } }
+                        div { small { "Data boundary" } strong { "{projection.runtime.data_boundary}" } }
+                        div { small { "Pinned release" } strong { "{projection.runtime.pinned_release}" } }
+                    }
+                }
+                div { class: "operations-card operations-workers-card",
+                    header { class: "operations-card-header",
+                        div {
+                            span { class: "operations-eyebrow", "WORKER GRAPH" }
+                            h3 { "Worker state" }
+                        }
+                        span { class: "operations-section-state", "{projection.workers.len()} worker" }
+                    }
+                    if projection.workers.is_empty() {
+                        p { class: "operations-empty", "选择真实 Mission 后显示 worker graph。" }
+                    } else {
+                        for worker in projection.workers.iter() {
+                            div { class: "operations-worker",
+                                div { class: "operations-worker-heading",
+                                    strong { "{worker.worker_type}" }
+                                    span { class: format!("operations-status {}", worker.status.tone()), "{worker.status.code()}" }
+                                }
+                                p { "{worker.task}" }
+                                div { class: "operations-worker-facts",
+                                    span { small { "Lease" } "{worker.lease}" }
+                                    span { small { "Generation" } "{worker.generation}" }
+                                    span { small { "Progress" } "{worker.progress}" }
+                                    span { small { "Budget" } "{worker.budget}" }
+                                    span { small { "Handoff" } "{worker.handoff}" }
+                                    span { small { "Recovery" } "{worker.recovery}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            section { class: "operations-section operations-review-grid", aria_label: "Artifacts approvals browser and recovery",
+                div { class: "operations-card operations-artifacts-card",
+                    header { class: "operations-card-header",
+                        div {
+                            span { class: "operations-eyebrow", "WORK PRODUCT / ARTIFACTS" }
+                            h3 { "Preview and lineage" }
+                        }
+                        span { class: "operations-section-state", "{projection.artifacts.len()} artifacts" }
+                    }
+                    if projection.artifacts.is_empty() {
+                        p { class: "operations-empty", "当前 Mission 尚无持久 Work Product。" }
+                    } else {
+                        for artifact in projection.artifacts.iter() {
+                            article { class: "operations-artifact",
+                                div { class: "operations-artifact-heading",
+                                    div {
+                                        strong { "{artifact.title}" }
+                                        small { "{artifact.kind} · {artifact.revision}" }
+                                    }
+                                    span { class: format!("operations-status {}", artifact.status.tone()), "{artifact.status.code()}" }
+                                }
+                                p { class: "operations-lineage", "{artifact.lineage}" }
+                                pre { class: "operations-preview", "{artifact.preview}" }
+                                div { class: "operations-artifact-actions", aria_label: "Artifact actions",
+                                    button {
+                                        disabled: artifact.actions.diff != OperationsStatus::Ready,
+                                        aria_label: "查看 Artifact diff",
+                                        title: "等待 Artifact owner API",
+                                        "Diff · {artifact.actions.diff.code()}"
+                                    }
+                                    button {
+                                        disabled: artifact.actions.adopt != OperationsStatus::Ready,
+                                        aria_label: "采用 Artifact",
+                                        title: "等待 Artifact owner API",
+                                        "Adopt · {artifact.actions.adopt.code()}"
+                                    }
+                                    button {
+                                        disabled: artifact.actions.reject != OperationsStatus::Ready,
+                                        aria_label: "拒绝 Artifact",
+                                        title: "等待 Artifact owner API",
+                                        "Reject · {artifact.actions.reject.code()}"
+                                    }
+                                    button {
+                                        disabled: artifact.actions.rollback != OperationsStatus::Ready,
+                                        aria_label: "回滚 Artifact",
+                                        title: "等待 Artifact owner API",
+                                        "Rollback · {artifact.actions.rollback.code()}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "operations-card operations-approval-card",
+                    header { class: "operations-card-header",
+                        div {
+                            span { class: "operations-eyebrow", "APPROVAL / EFFECT" }
+                            h3 { "外部动作边界" }
+                        }
+                    }
+                    div { class: "operations-definition-grid",
+                        div { small { "External Effect approvals" } strong { "{projection.approvals.external_approval_count}" } span { "{projection.approvals.external_status.code()}" } }
+                        div { small { "Verified effects" } strong { "{projection.approvals.verified_effect_count}" } span { "不会由本地 Runtime 状态代替" } }
+                        div { small { "Local Runtime approval" } strong { "{projection.approvals.local_runtime_status.code()}" } span { "{projection.approvals.local_runtime_detail}" } }
+                    }
+                }
+                div { class: "operations-card operations-browser-card",
+                    header { class: "operations-card-header",
+                        div {
+                            span { class: "operations-eyebrow", "BROWSER WORKSPACE" }
+                            h3 { "Identity and takeover" }
+                        }
+                        span { class: format!("operations-status {}", projection.browser.status.tone()), "{projection.browser.status.code()}" }
+                    }
+                    div { class: "operations-definition-grid",
+                        div { small { "Identity" } strong { "{projection.browser.identity}" } }
+                        div { small { "Control owner" } strong { "{projection.browser.control_owner}" } }
+                        div { small { "Next action" } strong { "{projection.browser.next_action}" } }
+                    }
+                    div { class: "operations-artifact-actions",
+                        button { disabled: true, aria_label: "接管 Browser Workspace", title: "等待 BW-01 owner API", "Take over · NOT_IMPLEMENTED" }
+                        button { disabled: true, aria_label: "继续 Browser Workspace", title: "等待 BW-01 owner API", "Continue · NOT_IMPLEMENTED" }
+                    }
+                }
+                div { class: "operations-card operations-recovery-card",
+                    header { class: "operations-card-header",
+                        div {
+                            span { class: "operations-eyebrow", "RECOVERY" }
+                            h3 { "Runtime steering" }
+                        }
+                        span { class: format!("operations-status {}", projection.recovery.status.tone()), "{projection.recovery.status.code()}" }
+                    }
+                    p { "{projection.recovery.detail}" }
+                    strong { "{projection.recovery.next_action}" }
+                }
+            }
+
+            footer { class: "operations-quick-entry",
+                div {
+                    span { class: "operations-eyebrow", "QUICK ENTRY" }
+                    p { "{projection.quick_entry.hint}" }
+                }
+                div { class: "operations-quick-entry-actions",
+                    button {
+                        class: "primary-button",
+                        id: "agent-operations-quick-entry",
+                        onclick: move |_| on_quick_entry.call(()),
+                        "Open Quick Entry"
+                    }
+                    button {
+                        class: "quiet-button",
+                        disabled: interrupt_disabled,
+                        aria_label: "中断当前 Runtime turn",
+                        onclick: move |_| on_interrupt.call(()),
+                        "{interrupt_label}"
+                    }
+                    span { class: "operations-live-region", role: "status", aria_live: "polite",
+                        if interrupt_requested {
+                            "停止请求已提交；等待 exact Runtime 回执。"
+                        } else if recovery_required {
+                            "Uncertain 状态已设 recovery fence；不会自动重放。"
+                        } else {
+                            "仅展示持久 projection；此面板不创建 Agent loop。"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn OrchestratorSurface(
     backend: DesktopBackendState,
     project: Option<DesktopProjectProjection>,
@@ -4625,11 +4947,16 @@ fn OrchestratorSurface(
     runtime_follow_latest: bool,
     runtime_has_unseen: bool,
     context_access: Option<ProjectContextAccessProjection>,
+    operations: AgentOperationsWorkbenchProjection,
+    interrupt_available: bool,
+    interrupt_requested: bool,
     on_initialize: EventHandler<MouseEvent>,
     on_ready: EventHandler<DesktopSnapshot>,
     on_error: EventHandler<DesktopDataError>,
     on_select_mission: EventHandler<MissionId>,
     on_open_workpad: EventHandler<()>,
+    on_quick_entry: EventHandler<()>,
+    on_interrupt: EventHandler<()>,
     on_runtime_scroll: EventHandler<bool>,
     on_follow_latest: EventHandler<()>,
 ) -> Element {
@@ -4712,6 +5039,13 @@ fn OrchestratorSurface(
             let Some(mission) = mission else {
                 return rsx! {
                     div { class: "surface-scroll",
+                        AgentOperationsWorkbench {
+                            projection: operations.clone(),
+                            interrupt_available: false,
+                            interrupt_requested: false,
+                            on_quick_entry,
+                            on_interrupt,
+                        }
                         ProjectDispatcherSurface { project, on_select_mission }
                     }
                 };
@@ -4829,6 +5163,13 @@ fn OrchestratorSurface(
                         ) - event.data.scroll_top();
                         on_runtime_scroll.call(remaining <= 96.0);
                     },
+                    AgentOperationsWorkbench {
+                        projection: operations,
+                        interrupt_available,
+                        interrupt_requested,
+                        on_quick_entry,
+                        on_interrupt,
+                    }
                     PersistedConversationMessages {
                         mission: mission.clone(),
                         runtime_text_stream: runtime_text_stream.clone(),
