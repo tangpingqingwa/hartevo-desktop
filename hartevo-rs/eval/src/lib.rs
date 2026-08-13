@@ -4,6 +4,7 @@ extern crate self as hartevo_eval;
 
 #[path = "../examples/hartevo-browser-contract/digest.rs"]
 mod digest;
+mod harness_lab;
 #[path = "../examples/hartevo-browser-contract/model.rs"]
 mod model;
 mod release_reference;
@@ -11,6 +12,35 @@ mod run_receipt;
 #[path = "../examples/hartevo-browser-contract/verifier.rs"]
 mod verifier;
 
+pub use harness_lab::{
+    CandidateIdentity as HarnessCandidateIdentity, CaseObservation as HarnessCaseObservation,
+    ComparisonRole as HarnessComparisonRole, CrossLaneLeakageFlags as HarnessCrossLaneLeakageFlags,
+    DecisionStatus as HarnessDecisionStatus, EvaluationInput as HarnessEvaluationInput,
+    EvaluationLane as HarnessEvaluationLane, EvidenceKind as HarnessEvidenceKind,
+    GateThresholds as HarnessGateThresholds, GoalFlags as HarnessGoalFlags, HarnessFamily,
+    HarnessLabReport, LAB_AUTHORITY as HARNESS_LAB_AUTHORITY,
+    LAB_DOCUMENT_TYPE as HARNESS_LAB_DOCUMENT_TYPE,
+    LAB_SCHEMA_VERSION as HARNESS_LAB_SCHEMA_VERSION, LabPlan as HarnessLabPlan,
+    LaneSummary as HarnessLaneSummary, LeakageCheck as HarnessLeakageCheck,
+    MatrixEntry as HarnessMatrixEntry, MetricSnapshot as HarnessMetricSnapshot,
+    OutcomeFlags as HarnessOutcomeFlags, PlanInputs as HarnessPlanInputs,
+    PrivateLeakageFlags as HarnessPrivateLeakageFlags, ProcessFlags as HarnessProcessFlags,
+    PromotionAction as HarnessPromotionAction, PromotionDecision as HarnessPromotionDecision,
+    PromotionKey as HarnessPromotionKey, ProviderMode as HarnessProviderMode,
+    RELEASE_DECISION as HARNESS_LAB_RELEASE_DECISION, RUN_AUTHORITY as HARNESS_LAB_RUN_AUTHORITY,
+    ReplayPack as HarnessReplayPack, RunResult as HarnessRunResult,
+    RunnerDisposition as HarnessRunnerDisposition,
+    SAFETY_INVARIANT_IDS as HARNESS_LAB_SAFETY_INVARIANT_IDS,
+    SignedPromotionRecord as HarnessSignedPromotionRecord, WorkspaceScope as HarnessWorkspaceScope,
+    build_frozen_plan as build_harness_lab_plan, build_run_result as build_harness_lab_run_result,
+    contract_digest as harness_lab_contract_digest,
+    current_source_commit as harness_lab_source_commit, evaluate as evaluate_harness_lab,
+    promotion_payload_digest as harness_lab_promotion_payload_digest,
+    promotion_signing_bytes as harness_lab_promotion_signing_bytes,
+    validate_plan as validate_harness_lab_plan,
+    validate_plan_with_bindings as validate_harness_lab_plan_with_bindings,
+    verify_signed_record as verify_harness_lab_signature,
+};
 pub use release_reference::{
     BrowserEvaluationPayload, validate_evaluation_run_and_browser_result_references,
     validate_evaluation_run_result_references,
