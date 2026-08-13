@@ -18,6 +18,7 @@ mod action;
 mod chromium_host;
 mod fake_host;
 mod file_broker;
+mod handoff;
 mod locator;
 mod navigation;
 mod profile_dir;
@@ -47,6 +48,13 @@ pub use file_broker::{
     BrowserFileGrant, BrowserFileGrantState, BrowserFileType, FileBroker, FileBrokerReconciliation,
     FileClaimPlan, FileSafetyScanner, FileScanDecision, FileScanReport, FileScanRequest,
     FileTerminalPlan, FileUploadHandle,
+};
+pub use handoff::{
+    BrowserHandoffCapability, BrowserHandoffConsumerState, BrowserHandoffEvent,
+    BrowserHandoffFrameBinding, BrowserHandoffHost, BrowserHandoffLog, BrowserHandoffProviderState,
+    BrowserHandoffScope, BrowserHandoffServiceDefinition, BrowserHandoffSnapshot,
+    BrowserResumeReceipt, BrowserTakeoverOffer, BrowserTakeoverReceipt,
+    BrowserWorkspaceHandoffProvider, MissionBrowserHandoffConsumer,
 };
 pub use locator::{BrowserLocatorResolution, BrowserStableLocator};
 pub use navigation::{BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserNavigationTarget};
@@ -95,6 +103,12 @@ pub enum BrowserError {
     ControlLeaseLost,
     #[error("browser semantic snapshot is malformed")]
     InvalidSnapshot,
+    #[error("browser human-takeover offer is malformed or outside the exact workspace scope")]
+    InvalidHandoffOffer,
+    #[error("browser human-takeover receipt is malformed, stale, or not explicit")]
+    InvalidHandoffReceipt,
+    #[error("browser human-takeover host is detached, crashed, or unavailable")]
+    HandoffHostUnavailable,
     #[error("browser action is malformed")]
     InvalidAction,
     #[error("browser action batch is malformed or expired")]
@@ -239,6 +253,9 @@ impl BrowserError {
             Self::InvalidTabTransition => "BROWSER_INVALID_TAB_TRANSITION",
             Self::ControlLeaseLost => "BROWSER_CONTROL_LEASE_LOST",
             Self::InvalidSnapshot => "BROWSER_INVALID_SNAPSHOT",
+            Self::InvalidHandoffOffer => "BROWSER_INVALID_HANDOFF_OFFER",
+            Self::InvalidHandoffReceipt => "BROWSER_INVALID_HANDOFF_RECEIPT",
+            Self::HandoffHostUnavailable => "BROWSER_HANDOFF_HOST_UNAVAILABLE",
             Self::InvalidAction => "BROWSER_INVALID_ACTION",
             Self::InvalidBatch => "BROWSER_INVALID_BATCH",
             Self::EffectBrokerRequired => "BROWSER_EFFECT_BROKER_REQUIRED",
