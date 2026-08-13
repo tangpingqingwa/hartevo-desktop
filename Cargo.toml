@@ -4,6 +4,7 @@ members = [
   "hartevo-rs/browser-adapter",
   "hartevo-rs/catalog",
   "hartevo-rs/cloud-storage",
+  "hartevo-rs/connector-sdk",
   "hartevo-rs/context-fabric",
   "hartevo-rs/desktop",
   "hartevo-rs/domain-kernel",
