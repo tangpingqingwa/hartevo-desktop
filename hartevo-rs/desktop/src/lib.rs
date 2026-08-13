@@ -31,6 +31,7 @@ use zeroize::Zeroizing;
 mod agent_operations;
 pub mod data_plane;
 mod runtime_plane;
+pub mod runtime_provider_surface;
 mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
 mod visual_fixture;
@@ -45,6 +46,7 @@ use data_plane::{
     ProjectContextAccessProjection, ProjectContextAccessStatus, RecoveryKitDraft,
 };
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
+use runtime_provider_surface::{RuntimeProviderInlineNode, RuntimeProviderSurfaceAction};
 use runtime_subscription::{
     DESKTOP_RUNTIME_SUBSCRIPTION_PAGE_SIZE, DesktopRuntimeCommandIdentity,
     DesktopRuntimeCompletionDisposition, DesktopRuntimeExecutionLaunch,
@@ -2046,6 +2048,7 @@ pub fn App() -> Element {
                                 project: project.clone(),
                                 mission: mission.clone(),
                                 runtime_activity: runtime_activity.clone(),
+                                runtime_projection: runtime_projection.clone(),
                                 runtime_text_stream: rendered_runtime_text_stream.clone(),
                                 runtime_waiting_for_turn,
                                 runtime_text_error: rendered_runtime_text_error.clone(),
@@ -4937,6 +4940,7 @@ fn OrchestratorSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
     runtime_activity: Option<MissionRuntimeProjection>,
+    runtime_projection: Option<DesktopRuntimeProjection>,
     runtime_text_stream: Option<DesktopRuntimeTextStreamProjection>,
     runtime_waiting_for_turn: bool,
     runtime_text_error: Option<UiFailure>,
@@ -4960,6 +4964,20 @@ fn OrchestratorSurface(
     on_runtime_scroll: EventHandler<bool>,
     on_follow_latest: EventHandler<()>,
 ) -> Element {
+    let runtime_provider_node =
+        project
+            .as_ref()
+            .zip(mission.as_ref())
+            .and_then(|(project, mission)| {
+                runtime_activity.as_ref().map(|activity| {
+                    RuntimeProviderInlineNode::from_desktop_read_models(
+                        &project.project_id,
+                        &mission.mission_id,
+                        runtime_projection.as_ref(),
+                        activity,
+                    )
+                })
+            });
     match backend {
         DesktopBackendState::Uninitialized(evidence) => rsx! {
             div { class: "surface-scroll",
@@ -5175,6 +5193,9 @@ fn OrchestratorSurface(
                         runtime_text_stream: runtime_text_stream.clone(),
                         replayed_message_sequence,
                     }
+                    if let Some(provider_node) = runtime_provider_node {
+                        RuntimeProviderInlineNodeSurface { node: provider_node }
+                    }
                     if let Some((state, copy)) = runtime_fixture_copy {
                         div {
                             class: "persisted-system-notice visual-runtime-state",
@@ -5337,6 +5358,47 @@ fn PersistedConversationMessages(
                 }
             }
         }
+    }
+}
+
+#[component]
+fn RuntimeProviderInlineNodeSurface(node: RuntimeProviderInlineNode) -> Element {
+    let identity = node.identity();
+    let status = node.status();
+    let recovery = node.recovery();
+    let stop_available = node.command_available(RuntimeProviderSurfaceAction::Stop);
+    let continue_available = node.command_available(RuntimeProviderSurfaceAction::Continue);
+    rsx! {
+        article { class: "persisted-system-notice runtime-provider-inline-node", role: "status",
+            UiIcon { name: UiIconName::Plug, size: 13 }
+            div {
+                strong { class: format!("operations-status {}", status.tone()), "Runtime Provider · {status.label()}" }
+                small { "{identity.provider_id} · {identity.model_id} · {identity.harness_id}" }
+                small { "provider {identity.provider_revision} · model {identity.model_revision} · harness {identity.harness_revision}" }
+                small { "{node.delta_count()} 个持久增量 · 当前作用域仅绑定所选 Mission" }
+                if let Some(result_digest) = node.result_digest() {
+                    small { "结果摘要 {short_digest(result_digest)}" }
+                }
+                if let Some(recovery) = recovery {
+                    small { "{recovery.code} · {runtime_recovery_action_label(recovery.action)}" }
+                    small { "Stop / Continue 需要 Application 提供 exact Runtime command；当前没有本地伪造按钮。" }
+                } else if stop_available || continue_available {
+                    small { "Stop / Continue 将通过 exact Runtime command port 执行。" }
+                }
+            }
+        }
+    }
+}
+
+fn runtime_recovery_action_label(
+    action: hartevo_runtime_adapter::RuntimeRecoveryAction,
+) -> &'static str {
+    match action {
+        hartevo_runtime_adapter::RuntimeRecoveryAction::ReconcileBeforeRetry => {
+            "RECONCILE_BEFORE_RETRY"
+        }
+        hartevo_runtime_adapter::RuntimeRecoveryAction::RebuildContext => "REBUILD_CONTEXT",
+        hartevo_runtime_adapter::RuntimeRecoveryAction::UserReview => "USER_REVIEW",
     }
 }
 
