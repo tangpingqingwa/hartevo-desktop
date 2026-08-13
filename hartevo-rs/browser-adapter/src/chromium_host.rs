@@ -495,6 +495,7 @@ struct CdpFrameIdentity {
 struct CdpFrameTreeSnapshot {
     root: CdpFrameIdentity,
     frames: BTreeMap<String, CdpFrameIdentity>,
+    lifecycle_revisions: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -529,6 +530,8 @@ struct CdpTabSession {
     latest_snapshot: Option<SemanticSnapshot>,
     locator_map: BTreeMap<String, AxLocatorCandidate>,
     latest_frame_tree: Option<CdpFrameTreeSnapshot>,
+    generation_frame_tree: Option<CdpFrameTreeSnapshot>,
+    frame_lifecycle_revisions: BTreeMap<String, u64>,
     current_frame_id: Option<String>,
     current_loader_id: Option<String>,
     current_url_digest: Option<String>,
@@ -559,6 +562,17 @@ impl fmt::Debug for CdpTabSession {
                     .latest_frame_tree
                     .as_ref()
                     .map(|snapshot| snapshot.frames.len()),
+            )
+            .field(
+                "generation_frame_count",
+                &self
+                    .generation_frame_tree
+                    .as_ref()
+                    .map(|snapshot| snapshot.frames.len()),
+            )
+            .field(
+                "frame_lifecycle_revision_count",
+                &self.frame_lifecycle_revisions.len(),
             )
             .field(
                 "current_frame_id_digest",
@@ -802,6 +816,8 @@ impl ManagedChromiumHost {
                 latest_snapshot: None,
                 locator_map: BTreeMap::new(),
                 latest_frame_tree: None,
+                generation_frame_tree: None,
+                frame_lifecycle_revisions: BTreeMap::new(),
                 current_frame_id: None,
                 current_loader_id: None,
                 current_url_digest: None,
@@ -946,6 +962,8 @@ impl ManagedChromiumHost {
             tab.latest_snapshot = None;
             tab.locator_map.clear();
             tab.latest_frame_tree = None;
+            tab.generation_frame_tree = None;
+            tab.frame_lifecycle_revisions.clear();
             tab.lifecycle_events.clear();
             tab.current_frame_id = None;
             tab.current_loader_id = None;
@@ -999,10 +1017,16 @@ impl ManagedChromiumHost {
             Some(&session_id),
             guard,
         )?;
-        let frame_tree =
+        let mut frame_tree =
             parse_frame_tree_snapshot(&frame_tree).map_err(|_| BrowserError::NavigationFailed)?;
+        frame_tree.lifecycle_revisions = self
+            .tabs
+            .get(tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .frame_lifecycle_revisions
+            .clone();
         validate_frame_tree_navigation_scope(&frame_tree, policy)?;
-        let frame_identity = frame_tree.root;
+        let frame_identity = frame_tree.root.clone();
         if frame_identity.frame_id != frame_id || frame_identity.loader_id != loader_id {
             return Err(BrowserError::NavigationFailed);
         }
@@ -1050,6 +1074,7 @@ impl ManagedChromiumHost {
         self.workspace
             .validate_agent_lease(guard.proof, guard.observed_at()?)?;
         let tab = self.tabs.get_mut(tab_id).ok_or(BrowserError::TabNotFound)?;
+        tab.generation_frame_tree = Some(frame_tree);
         tab.current_frame_id = Some(frame_identity.frame_id);
         tab.current_loader_id = Some(frame_identity.loader_id);
         tab.current_url_digest = Some(digest(final_url.as_bytes()));
@@ -1090,18 +1115,25 @@ impl ManagedChromiumHost {
         tab_id: &BrowserTabId,
         session_id: &str,
         guard: &OperationLeaseGuard<'_>,
-    ) -> Result<CdpFrameTreeSnapshot, BrowserError> {
+    ) -> Result<(CdpFrameTreeSnapshot, u64), BrowserError> {
         let policy = self
             .tabs
             .get(tab_id)
             .ok_or(BrowserError::TabNotFound)?
             .navigation_policy
             .clone();
-        let snapshot = self.read_frame_tree_snapshot(session_id, guard)?;
+        let mut snapshot = self.read_frame_tree_snapshot(session_id, guard)?;
+        snapshot.lifecycle_revisions = self
+            .tabs
+            .get(tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .frame_lifecycle_revisions
+            .clone();
+        let document_generation = self.sync_frame_tree_identity(tab_id, &snapshot)?;
         if let Some(policy) = policy.as_ref() {
             validate_frame_tree_navigation_scope(&snapshot, policy)?;
         }
-        Ok(snapshot)
+        Ok((snapshot, document_generation))
     }
 
     fn revalidate_input_target_binding(
@@ -1111,13 +1143,13 @@ impl ManagedChromiumHost {
         guard: &OperationLeaseGuard<'_>,
     ) -> Result<(), BrowserError> {
         let target_url = self.read_target_url(&binding.target_id, guard)?;
-        let current = self.read_scoped_frame_tree_snapshot(tab_id, &binding.session_id, guard)?;
+        let (current, _) =
+            self.read_scoped_frame_tree_snapshot(tab_id, &binding.session_id, guard)?;
         if validate_bound_frame_tree(&binding.frame_tree, &current).is_err()
             || current.root != binding.frame
             || target_url != binding.target_url
             || target_url != current.root.url
         {
-            self.sync_frame_identity(tab_id, &current.root)?;
             return Err(BrowserError::StaleSnapshot);
         }
         Ok(())
@@ -1167,39 +1199,29 @@ impl ManagedChromiumHost {
         Ok(url.to_owned())
     }
 
-    fn sync_frame_identity(
+    fn sync_frame_tree_identity(
         &mut self,
         tab_id: &BrowserTabId,
-        identity: &CdpFrameIdentity,
+        snapshot: &CdpFrameTreeSnapshot,
     ) -> Result<u64, BrowserError> {
         let tab = self.tabs.get_mut(tab_id).ok_or(BrowserError::TabNotFound)?;
-        let prior_shape = (
-            tab.current_frame_id.as_ref(),
-            tab.current_loader_id.as_ref(),
-            tab.current_url_digest.as_ref(),
-        );
-        let changed = match prior_shape {
-            (None, None, None) => false,
-            (Some(frame_id), Some(loader_id), Some(url_digest)) => {
-                frame_id != &identity.frame_id
-                    || loader_id != &identity.loader_id
-                    || url_digest != &digest(identity.url.as_bytes())
-            }
-            _ => return Err(self.poison()),
-        };
+        let next_generation = next_frame_document_generation(
+            tab.document_generation,
+            tab.generation_frame_tree.as_ref(),
+            snapshot,
+        )?;
+        let changed = next_generation != tab.document_generation;
         if changed {
-            tab.document_generation = tab
-                .document_generation
-                .checked_add(1)
-                .ok_or(BrowserError::CounterOverflow)?;
+            tab.document_generation = next_generation;
             tab.latest_snapshot = None;
             tab.locator_map.clear();
             tab.latest_frame_tree = None;
             tab.lifecycle_events.clear();
         }
-        tab.current_frame_id = Some(identity.frame_id.clone());
-        tab.current_loader_id = Some(identity.loader_id.clone());
-        tab.current_url_digest = Some(digest(identity.url.as_bytes()));
+        tab.generation_frame_tree = Some(snapshot.clone());
+        tab.current_frame_id = Some(snapshot.root.frame_id.clone());
+        tab.current_loader_id = Some(snapshot.root.loader_id.clone());
+        tab.current_url_digest = Some(digest(snapshot.root.url.as_bytes()));
         Ok(tab.document_generation)
     }
 
@@ -1217,22 +1239,22 @@ impl ManagedChromiumHost {
             (tab.target_id.clone(), tab.session_id.clone())
         };
         let target_url_before = self.read_target_url(&target_id, &guard)?;
-        let frame_tree_before =
+        let (frame_tree_before, document_generation) =
             self.read_scoped_frame_tree_snapshot(tab_id, &session_id, &guard)?;
         let frame_before = frame_tree_before.root.clone();
-        let document_generation = self.sync_frame_identity(tab_id, &frame_before)?;
         if target_url_before != frame_before.url {
             return Err(BrowserError::StaleSnapshot);
         }
         let tree = self.read_root_ax_tree(&session_id, &frame_before, &guard)?;
-        let frame_tree_after = self.read_scoped_frame_tree_snapshot(tab_id, &session_id, &guard)?;
-        let frame_after = frame_tree_after.root.clone();
         let target_url_after = self.read_target_url(&target_id, &guard)?;
-        if validate_bound_frame_tree(&frame_tree_before, &frame_tree_after).is_err()
+        let (frame_tree_after, generation_after) =
+            self.read_scoped_frame_tree_snapshot(tab_id, &session_id, &guard)?;
+        let frame_after = frame_tree_after.root.clone();
+        if generation_after != document_generation
+            || validate_bound_frame_tree(&frame_tree_before, &frame_tree_after).is_err()
             || frame_after != frame_before
             || target_url_after != frame_after.url
         {
-            self.sync_frame_identity(tab_id, &frame_after)?;
             return Err(BrowserError::StaleSnapshot);
         }
         self.workspace
@@ -1677,10 +1699,9 @@ impl ManagedChromiumHost {
         }
 
         let target_url = self.read_target_url(&target_id, guard)?;
-        let current_frame_tree =
+        let (current_frame_tree, document_generation) =
             self.read_scoped_frame_tree_snapshot(&resolution.tab_id, &session_id, guard)?;
         let frame = current_frame_tree.root.clone();
-        let document_generation = self.sync_frame_identity(&resolution.tab_id, &frame)?;
         let current_origin_digest = policy
             .permitted_origin_digest(&target_url)
             .ok_or(BrowserError::NavigationRequestBlocked)?;
@@ -2585,6 +2606,13 @@ impl ManagedChromiumHost {
                     envelope.params.as_ref(),
                 )?;
             }
+            "Page.frameAttached" | "Page.frameDetached" | "Page.frameNavigated" => {
+                self.record_frame_lifecycle_revision(
+                    envelope.session_id.as_deref(),
+                    &method,
+                    envelope.params.as_ref(),
+                )?;
+            }
             "Page.javascriptDialogOpening" | "Page.fileChooserOpened" => {
                 if let Some(tab_id) = self.tab_for_session(envelope.session_id.as_deref()) {
                     let tab = self
@@ -2727,6 +2755,39 @@ impl ManagedChromiumHost {
         }
         tab.lifecycle_events
             .insert((name.to_owned(), frame_id.to_owned(), loader_id.to_owned()));
+        Ok(())
+    }
+
+    fn record_frame_lifecycle_revision(
+        &mut self,
+        session_id: Option<&str>,
+        method: &str,
+        params: Option<&Value>,
+    ) -> Result<(), BrowserError> {
+        let tab_id = self
+            .tab_for_session(session_id)
+            .ok_or_else(|| self.poison())?;
+        let frame_id =
+            parse_frame_lifecycle_event_frame_id(method, params).map_err(|_| self.poison())?;
+        let at_capacity = {
+            let revisions = &self
+                .tabs
+                .get(&tab_id)
+                .ok_or(BrowserError::TabNotFound)?
+                .frame_lifecycle_revisions;
+            !revisions.contains_key(&frame_id) && revisions.len() >= MAX_FRAME_TREE_NODES
+        };
+        if at_capacity {
+            return Err(self.poison());
+        }
+        let tab = self
+            .tabs
+            .get_mut(&tab_id)
+            .ok_or(BrowserError::TabNotFound)?;
+        let revision = tab.frame_lifecycle_revisions.entry(frame_id).or_default();
+        *revision = revision
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
         Ok(())
     }
 
@@ -3447,6 +3508,28 @@ impl AxLocatorAccumulator {
     }
 }
 
+fn parse_frame_lifecycle_event_frame_id(
+    method: &str,
+    params: Option<&Value>,
+) -> Result<String, BrowserError> {
+    let params = params
+        .and_then(Value::as_object)
+        .ok_or(BrowserError::ProtocolPoisoned)?;
+    let frame_id = match method {
+        "Page.frameAttached" | "Page.frameDetached" => params.get("frameId"),
+        "Page.frameNavigated" => params
+            .get("frame")
+            .and_then(Value::as_object)
+            .and_then(|frame| frame.get("id")),
+        _ => return Err(BrowserError::ProtocolPoisoned),
+    };
+    frame_id
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 4_096)
+        .map(str::to_owned)
+        .ok_or(BrowserError::ProtocolPoisoned)
+}
+
 fn parse_frame_identity(
     frame: &serde_json::Map<String, Value>,
 ) -> Result<CdpFrameIdentity, BrowserError> {
@@ -3548,7 +3631,11 @@ fn parse_frame_tree_snapshot(result: &Value) -> Result<CdpFrameTreeSnapshot, Bro
     }
 
     let root = root.ok_or(BrowserError::ProtocolPoisoned)?;
-    Ok(CdpFrameTreeSnapshot { root, frames })
+    Ok(CdpFrameTreeSnapshot {
+        root,
+        frames,
+        lifecycle_revisions: BTreeMap::new(),
+    })
 }
 
 fn is_inherited_blank_frame_url(url: &str) -> bool {
@@ -3616,14 +3703,41 @@ fn validate_bound_frame_tree(
     {
         return Err(BrowserError::ProtocolPoisoned);
     }
-    if bound
-        .frames
-        .iter()
-        .any(|(frame_id, identity)| current.frames.get(frame_id) != Some(identity))
-    {
+    if bound.frames.iter().any(|(frame_id, identity)| {
+        current.frames.get(frame_id) != Some(identity)
+            || bound.lifecycle_revisions.get(frame_id) != current.lifecycle_revisions.get(frame_id)
+    }) {
         return Err(BrowserError::StaleSnapshot);
     }
     Ok(())
+}
+
+fn frame_tree_generation_changed(
+    prior: &CdpFrameTreeSnapshot,
+    current: &CdpFrameTreeSnapshot,
+) -> Result<bool, BrowserError> {
+    match validate_bound_frame_tree(prior, current) {
+        Ok(()) => {}
+        Err(BrowserError::StaleSnapshot) => return Ok(true),
+        Err(error) => return Err(error),
+    }
+    Ok(prior
+        .lifecycle_revisions
+        .iter()
+        .any(|(frame_id, revision)| current.lifecycle_revisions.get(frame_id) != Some(revision)))
+}
+
+fn next_frame_document_generation(
+    document_generation: u64,
+    prior: Option<&CdpFrameTreeSnapshot>,
+    current: &CdpFrameTreeSnapshot,
+) -> Result<u64, BrowserError> {
+    match prior {
+        Some(prior) if frame_tree_generation_changed(prior, current)? => document_generation
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow),
+        _ => Ok(document_generation),
+    }
 }
 
 fn validate_exact_navigation_target_origin(
@@ -4894,6 +5008,7 @@ mod tests {
         CdpFrameTreeSnapshot {
             frames: BTreeMap::from([(root.frame_id.clone(), root.clone())]),
             root,
+            lifecycle_revisions: BTreeMap::new(),
         }
     }
 
@@ -4989,6 +5104,30 @@ mod tests {
             contract.expected_partitions
         );
         (tree, parsed)
+    }
+
+    fn lifecycle_frame_tree_snapshot() -> CdpFrameTreeSnapshot {
+        let (_, mut frame_tree) =
+            ax_readback_tree_with_duplicate_child_backend(&AxFrameFixtureContract {
+                root_frame_id: "frame-root",
+                root_loader_id: "loader-root",
+                root_url: "https://example.test/root",
+                root_security_origin: "https://example.test",
+                child_frame_id: "frame-oopif",
+                child_loader_id: "loader-oopif",
+                child_url: "https://other.test/child",
+                child_security_origin: "https://other.test",
+                child_parent_frame_id: "frame-root",
+                expected_partitions: [
+                    AxFramePartition::Root,
+                    AxFramePartition::Root,
+                    AxFramePartition::Other,
+                    AxFramePartition::Other,
+                ],
+            });
+        frame_tree.lifecycle_revisions =
+            BTreeMap::from([("frame-root".into(), 1), ("frame-oopif".into(), 1)]);
+        frame_tree
     }
 
     struct TestHttpServer {
@@ -5462,6 +5601,152 @@ mod tests {
         );
         validate_bound_frame_tree(&bound, &inserted)
             .expect("new child alone does not stale an unrelated root target");
+    }
+
+    #[test]
+    fn frame_lifecycle_event_contract_extracts_exact_frame_identity() {
+        assert_eq!(
+            parse_frame_lifecycle_event_frame_id(
+                "Page.frameAttached",
+                Some(&json!({"frameId": "frame-oopif", "parentFrameId": "frame-root"})),
+            )
+            .expect("attached frame id"),
+            "frame-oopif"
+        );
+        assert_eq!(
+            parse_frame_lifecycle_event_frame_id(
+                "Page.frameDetached",
+                Some(&json!({"frameId": "frame-oopif", "reason": "swap"})),
+            )
+            .expect("detached frame id"),
+            "frame-oopif"
+        );
+        assert_eq!(
+            parse_frame_lifecycle_event_frame_id(
+                "Page.frameNavigated",
+                Some(&json!({"frame": {"id": "frame-root", "loaderId": "loader-next"}})),
+            )
+            .expect("navigated frame id"),
+            "frame-root"
+        );
+        assert!(matches!(
+            parse_frame_lifecycle_event_frame_id(
+                "Page.frameNavigated",
+                Some(&json!({"frame": {"loaderId": "loader-next"}})),
+            ),
+            Err(BrowserError::ProtocolPoisoned)
+        ));
+    }
+
+    #[test]
+    fn oopif_detach_reattach_advances_generation_without_rejecting_new_child() {
+        let bound = lifecycle_frame_tree_snapshot();
+        let mut detached = bound.clone();
+        detached.frames.remove("frame-oopif");
+        detached.lifecycle_revisions.insert("frame-oopif".into(), 2);
+        assert_eq!(
+            next_frame_document_generation(7, Some(&bound), &detached).expect("detach generation"),
+            8
+        );
+
+        let mut reattached = bound.clone();
+        reattached
+            .lifecycle_revisions
+            .insert("frame-oopif".into(), 3);
+        assert_eq!(
+            next_frame_document_generation(8, Some(&detached), &reattached)
+                .expect("reattach generation"),
+            9
+        );
+
+        let mut inserted = bound.clone();
+        inserted.frames.insert(
+            "frame-new".into(),
+            CdpFrameIdentity {
+                frame_id: "frame-new".into(),
+                parent_frame_id: Some("frame-root".into()),
+                loader_id: "loader-new".into(),
+                url: "https://example.test/new".into(),
+                security_origin: "https://example.test".into(),
+                unreachable_url: None,
+            },
+        );
+        inserted.lifecycle_revisions.insert("frame-new".into(), 1);
+        assert_eq!(
+            next_frame_document_generation(9, Some(&bound), &inserted)
+                .expect("unrelated insertion"),
+            9
+        );
+    }
+
+    #[test]
+    fn same_frame_new_loader_and_unreachable_recovery_advance_generation() {
+        let before = lifecycle_frame_tree_snapshot();
+        let mut new_loader = before.clone();
+        new_loader.root.loader_id = "loader-root-next".into();
+        new_loader
+            .frames
+            .insert(new_loader.root.frame_id.clone(), new_loader.root.clone());
+        new_loader
+            .lifecycle_revisions
+            .insert("frame-root".into(), 2);
+        assert_eq!(
+            next_frame_document_generation(11, Some(&before), &new_loader)
+                .expect("same frame, new loader"),
+            12
+        );
+
+        let mut unreachable = new_loader.clone();
+        unreachable
+            .frames
+            .get_mut("frame-oopif")
+            .expect("bound oopif")
+            .unreachable_url = Some("https://other.test/unreachable".into());
+        unreachable
+            .lifecycle_revisions
+            .insert("frame-oopif".into(), 2);
+        assert_eq!(
+            next_frame_document_generation(12, Some(&new_loader), &unreachable)
+                .expect("unreachable transition"),
+            13
+        );
+        let policy =
+            BrowserNavigationPolicy::https_only(["https://example.test", "https://other.test"])
+                .expect("two exact origins");
+        assert!(matches!(
+            validate_frame_tree_navigation_scope(&unreachable, &policy),
+            Err(BrowserError::NavigationFailed)
+        ));
+
+        let mut recovered = new_loader;
+        recovered
+            .lifecycle_revisions
+            .insert("frame-oopif".into(), 3);
+        assert_eq!(
+            next_frame_document_generation(13, Some(&unreachable), &recovered)
+                .expect("recovery transition"),
+            14
+        );
+        validate_frame_tree_navigation_scope(&recovered, &policy)
+            .expect("reachable recovery is scoped");
+    }
+
+    #[test]
+    fn frame_tree_ax_cross_read_aba_is_stale_even_when_identity_matches() {
+        let before = lifecycle_frame_tree_snapshot();
+        let mut after = before.clone();
+        after.lifecycle_revisions.insert("frame-oopif".into(), 3);
+        assert_eq!(before.root, after.root);
+        assert_eq!(before.frames, after.frames);
+        assert!(matches!(
+            validate_bound_frame_tree(&before, &after),
+            Err(BrowserError::StaleSnapshot)
+        ));
+        assert_eq!(
+            next_frame_document_generation(21, Some(&before), &after)
+                .expect("detach and exact reattach across AX read"),
+            22
+        );
     }
 
     #[test]
