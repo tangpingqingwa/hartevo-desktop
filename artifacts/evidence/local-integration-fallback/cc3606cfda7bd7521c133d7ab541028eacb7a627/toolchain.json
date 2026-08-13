@@ -1,0 +1,72 @@
+{
+  "schemaVersion": "hartevo.local-integration-fallback-toolchain/v1",
+  "receiptId": "ev-05-toolchain-cc3606cfda7bd7521c133d7ab541028eacb7a627",
+  "capturedAt": "2026-08-13T06:33:34Z",
+  "sourceCommit": "cc3606cfda7bd7521c133d7ab541028eacb7a627",
+  "platform": {
+    "operatingSystem": "macOS",
+    "productVersion": "26.5.1",
+    "buildVersion": "25F80",
+    "architecture": "aarch64"
+  },
+  "tools": [
+    {
+      "id": "bash",
+      "version": "GNU bash 3.2.57(1)-release arm64-apple-darwin25"
+    },
+    {
+      "id": "cargo",
+      "version": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+      "commit": "f2d3ce0bd7f24a49f8f72d9000448f8838c4e850",
+      "host": "aarch64-apple-darwin"
+    },
+    {
+      "id": "git",
+      "version": "git version 2.50.1 (Apple Git-155)"
+    },
+    {
+      "id": "jq",
+      "version": "jq-1.7.1-apple"
+    },
+    {
+      "id": "python3",
+      "version": "Python 3.9.6"
+    },
+    {
+      "id": "rustc",
+      "version": "rustc 1.95.0 (59807616e 2026-04-14)",
+      "commit": "59807616e1fa2540724bfbac14d7976d7e4a3860",
+      "host": "aarch64-apple-darwin",
+      "llvmVersion": "22.1.2"
+    }
+  ],
+  "sourcePins": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "mode": "100644",
+      "gitBlobOid": "b6ebba9f9e8031253e991272394ac4170dc47705",
+      "bytes": 3691,
+      "sha256": "6f41c94cf8091bcae154deb7189e70abbea6d83533cf177f2a965ce5ad58dc52"
+    },
+    {
+      "path": "Cargo.lock",
+      "mode": "100644",
+      "gitBlobOid": "0c520e08b2a5f96108df344f1c68255d7dbab067",
+      "bytes": 174395,
+      "sha256": "fcebf20f7b08bc9f97925363eba2b2931174387ecd791019528584279d0475b6"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "mode": "100644",
+      "gitBlobOid": "2661ca822ef2c05ea2afb3bbc6bfcc56cae66f30",
+      "bytes": 98,
+      "sha256": "30cf0fdaf648cec58e1f618fe36f29b6e2b9d97beca36e0560602ab055a9ff5b"
+    }
+  ],
+  "redaction": {
+    "containsUserName": false,
+    "containsHostName": false,
+    "containsHomeOrAbsolutePath": false,
+    "containsCredential": false
+  }
+}

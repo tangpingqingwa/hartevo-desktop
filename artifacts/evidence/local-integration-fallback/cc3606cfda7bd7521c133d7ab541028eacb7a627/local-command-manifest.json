@@ -1,0 +1,135 @@
+{
+  "schemaVersion": "hartevo.local-integration-fallback-command-manifest/v1",
+  "manifestId": "ev-05-local-fallback-cc3606cfda7bd7521c133d7ab541028eacb7a627",
+  "authority": "LOCAL_INTEGRATION_FALLBACK_ONLY",
+  "source": {
+    "repository": "tangpingqingwa/hartevo-desktop",
+    "headCommit": "cc3606cfda7bd7521c133d7ab541028eacb7a627",
+    "baseCommit": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
+    "workflowPath": ".github/workflows/ci.yml",
+    "workflowSha256": "6f41c94cf8091bcae154deb7189e70abbea6d83533cf177f2a965ce5ad58dc52"
+  },
+  "coverage": {
+    "cloudRequiredJobs": [
+      "PostgreSQL 18 Cell contract",
+      "Rust workspace"
+    ],
+    "locallySubstitutedJobs": [
+      "Rust workspace"
+    ],
+    "notLocallySubstitutedJobs": [
+      "PostgreSQL 18 Cell contract"
+    ],
+    "fullWorkflowEquivalent": false,
+    "ciPassAuthority": false,
+    "releaseAuthority": false,
+    "missionEvidenceLevelAuthority": false
+  },
+  "commands": [
+    {
+      "sequence": 1,
+      "id": "rust-format",
+      "workingDirectory": ".",
+      "argv": ["cargo", "fmt", "--all", "--", "--check"],
+      "expectedExitCode": 0,
+      "resultArtifactIds": []
+    },
+    {
+      "sequence": 2,
+      "id": "rust-clippy",
+      "workingDirectory": ".",
+      "argv": ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"],
+      "expectedExitCode": 0,
+      "resultArtifactIds": []
+    },
+    {
+      "sequence": 3,
+      "id": "workspace-tests",
+      "workingDirectory": ".",
+      "argv": ["cargo", "test", "--workspace", "--all-features", "--locked"],
+      "expectedExitCode": 0,
+      "resultArtifactIds": []
+    },
+    {
+      "sequence": 4,
+      "id": "catalog-validate",
+      "workingDirectory": ".",
+      "argv": ["cargo", "run", "-p", "hartevo-eval", "--locked", "--", "catalog", "validate"],
+      "expectedExitCode": 0,
+      "resultArtifactIds": []
+    },
+    {
+      "sequence": 5,
+      "id": "catalog-export",
+      "workingDirectory": ".",
+      "argv": ["cargo", "run", "-p", "hartevo-eval", "--locked", "--", "catalog", "export", "--output", "target/eval/catalog-ev05-cc3606cfda7bd7521c133d7ab541028eacb7a627.json"],
+      "expectedExitCode": 0,
+      "resultArtifactIds": ["catalog-snapshot"]
+    },
+    {
+      "sequence": 6,
+      "id": "release-baseline",
+      "workingDirectory": ".",
+      "argv": ["cargo", "run", "-p", "hartevo-eval", "--locked", "--", "evidence", "baseline", "--commit", "cc3606cfda7bd7521c133d7ab541028eacb7a627", "--output", "target/eval/release-baseline-ev05-cc3606cfda7bd7521c133d7ab541028eacb7a627.json"],
+      "expectedExitCode": 0,
+      "resultArtifactIds": ["release-baseline"]
+    },
+    {
+      "sequence": 7,
+      "id": "desktop-check",
+      "workingDirectory": ".",
+      "argv": ["cargo", "check", "-p", "hartevo-desktop", "--all-features", "--locked"],
+      "expectedExitCode": 0,
+      "resultArtifactIds": []
+    },
+    {
+      "sequence": 8,
+      "id": "openinterpreter-schema",
+      "workingDirectory": ".",
+      "argv": ["bash", "scripts/check-openinterpreter-schema.sh"],
+      "expectedExitCode": 0,
+      "resultArtifactIds": []
+    },
+    {
+      "sequence": 9,
+      "id": "controlled-mission-vs01",
+      "workingDirectory": ".",
+      "argv": ["cargo", "run", "-p", "hartevo-eval", "--locked", "--", "run", "--mission", "VS-01", "--output", "target/eval/vs-01-ev05-cc3606cfda7bd7521c133d7ab541028eacb7a627.json"],
+      "expectedExitCode": 0,
+      "resultArtifactIds": ["controlled-mission-vs01"]
+    },
+    {
+      "sequence": 10,
+      "id": "ev04-integration-provenance-verify",
+      "workingDirectory": ".",
+      "argv": ["bash", "scripts/check-integration-build-provenance.sh", "verify"],
+      "expectedExitCode": 0,
+      "resultArtifactIds": []
+    },
+    {
+      "sequence": 11,
+      "id": "ev04-integration-provenance-self-test",
+      "workingDirectory": ".",
+      "argv": ["bash", "scripts/check-integration-build-provenance.sh", "self-test"],
+      "expectedExitCode": 0,
+      "resultArtifactIds": []
+    }
+  ],
+  "resultArtifacts": [
+    {
+      "id": "catalog-snapshot",
+      "kind": "DIGEST_ONLY",
+      "path": "target/eval/catalog-ev05-cc3606cfda7bd7521c133d7ab541028eacb7a627.json"
+    },
+    {
+      "id": "controlled-mission-vs01",
+      "kind": "DIGEST_ONLY",
+      "path": "target/eval/vs-01-ev05-cc3606cfda7bd7521c133d7ab541028eacb7a627.json"
+    },
+    {
+      "id": "release-baseline",
+      "kind": "DIGEST_ONLY",
+      "path": "target/eval/release-baseline-ev05-cc3606cfda7bd7521c133d7ab541028eacb7a627.json"
+    }
+  ]
+}

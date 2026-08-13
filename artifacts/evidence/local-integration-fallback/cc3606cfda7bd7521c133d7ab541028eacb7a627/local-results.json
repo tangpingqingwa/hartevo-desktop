@@ -1,0 +1,88 @@
+{
+  "schemaVersion": "hartevo.local-integration-fallback-result/v1",
+  "resultId": "ev-05-local-result-cc3606cfda7bd7521c133d7ab541028eacb7a627",
+  "capturedAt": "2026-08-13T06:33:34Z",
+  "authority": "LOCAL_INTEGRATION_FALLBACK_ONLY",
+  "sourceCommit": "cc3606cfda7bd7521c133d7ab541028eacb7a627",
+  "githubActionsExecutionState": "NOT_EXECUTED_EXTERNAL",
+  "localFallbackExecutionState": "EXECUTED_SUCCESS",
+  "fullWorkflowEquivalent": false,
+  "ciPassed": false,
+  "releaseDecision": "NOT_EVALUATED",
+  "releasePassed": false,
+  "missionEvidenceLevelPromoted": false,
+  "commands": [
+    {"sequence": 1, "id": "rust-format", "executionState": "EXECUTED_SUCCESS", "exitCode": 0},
+    {"sequence": 2, "id": "rust-clippy", "executionState": "EXECUTED_SUCCESS", "exitCode": 0},
+    {"sequence": 3, "id": "workspace-tests", "executionState": "EXECUTED_SUCCESS", "exitCode": 0},
+    {"sequence": 4, "id": "catalog-validate", "executionState": "EXECUTED_SUCCESS", "exitCode": 0},
+    {"sequence": 5, "id": "catalog-export", "executionState": "EXECUTED_SUCCESS", "exitCode": 0},
+    {"sequence": 6, "id": "release-baseline", "executionState": "EXECUTED_SUCCESS", "exitCode": 0},
+    {"sequence": 7, "id": "desktop-check", "executionState": "EXECUTED_SUCCESS", "exitCode": 0},
+    {"sequence": 8, "id": "openinterpreter-schema", "executionState": "EXECUTED_SUCCESS", "exitCode": 0},
+    {"sequence": 9, "id": "controlled-mission-vs01", "executionState": "EXECUTED_SUCCESS", "exitCode": 0},
+    {"sequence": 10, "id": "ev04-integration-provenance-verify", "executionState": "EXECUTED_SUCCESS", "exitCode": 0},
+    {"sequence": 11, "id": "ev04-integration-provenance-self-test", "executionState": "EXECUTED_SUCCESS", "exitCode": 0}
+  ],
+  "resultArtifacts": [
+    {
+      "id": "catalog-snapshot",
+      "kind": "DIGEST_ONLY",
+      "path": "target/eval/catalog-ev05-cc3606cfda7bd7521c133d7ab541028eacb7a627.json",
+      "sha256": "23f98efb6ddcd09c68b58b6f5a33547c1a1f0f7ab19977cf1ada92e4f1962563",
+      "bytes": 653554,
+      "semanticStatus": "VALIDATED",
+      "catalogDigest": "92350eaca40631c738882116ee2c2f9789b054d4406b5ae8d6fcfba619458a89"
+    },
+    {
+      "id": "controlled-mission-vs01",
+      "kind": "DIGEST_ONLY",
+      "path": "target/eval/vs-01-ev05-cc3606cfda7bd7521c133d7ab541028eacb7a627.json",
+      "sha256": "b10a1e3f2d30b276497cd42828a6807cf18c1fe5ebc0821368c7faddbe900a17",
+      "bytes": 2375,
+      "semanticStatus": "CONTROLLED_SIMULATOR_PASSED",
+      "catalogDigest": null
+    },
+    {
+      "id": "release-baseline",
+      "kind": "DIGEST_ONLY",
+      "path": "target/eval/release-baseline-ev05-cc3606cfda7bd7521c133d7ab541028eacb7a627.json",
+      "sha256": "645a3b3640a287127a437ff9246321345d88c3ed1aa26154e202d222e351399d",
+      "bytes": 14424,
+      "semanticStatus": "RELEASE_NOT_PASSED",
+      "catalogDigest": "92350eaca40631c738882116ee2c2f9789b054d4406b5ae8d6fcfba619458a89"
+    }
+  ],
+  "summaries": {
+    "workspaceTests": {
+      "passed": 738,
+      "failed": 0,
+      "ignored": 5
+    },
+    "catalog": {
+      "missions": 12,
+      "capabilities": 48,
+      "providers": 39,
+      "implementedApplicationHandlers": 8,
+      "applicationRoutes": 52,
+      "notImplementedApplicationRoutes": 44,
+      "datasetCases": 420,
+      "crossCuttingCases": 180
+    },
+    "releaseBaseline": {
+      "passed": false,
+      "traceabilityComplete": false,
+      "missingRequiredEvidence": [
+        "evaluation_run_result_references",
+        "stage_application_route_scope"
+      ]
+    },
+    "unsubstitutedCloudJobs": [
+      {
+        "name": "PostgreSQL 18 Cell contract",
+        "executionState": "NOT_EXECUTED_EXTERNAL",
+        "localSubstituteExecuted": false
+      }
+    ]
+  }
+}
