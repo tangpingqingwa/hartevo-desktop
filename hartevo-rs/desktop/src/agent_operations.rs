@@ -70,6 +70,42 @@ pub struct MissionControlProjection {
     pub quota: QuotaProjection,
     pub evidence: EvidenceChangeProjection,
     pub stage: String,
+    pub revision_fence: Option<OperationsRevisionFence>,
+}
+
+/// Content-free optimistic-concurrency material held by the Desktop command
+/// surface. It intentionally carries revisions only; Mission/Project IDs stay
+/// in the selected read model and are never rendered as implementation IDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationsRevisionFence {
+    pub mission: u64,
+    pub checkpoint: Option<u64>,
+    pub conversation: Option<u64>,
+}
+
+impl OperationsRevisionFence {
+    pub fn from_mission(mission: &MissionProjection) -> Self {
+        Self {
+            mission: mission.revision,
+            checkpoint: mission.current_checkpoint_revision,
+            conversation: mission.conversation_revision,
+        }
+    }
+
+    pub fn matches_mission(self, mission: &MissionProjection) -> bool {
+        self == Self::from_mission(mission)
+    }
+
+    pub fn label(self) -> String {
+        format!(
+            "Mission r{} · Checkpoint {} · Conversation {}",
+            self.mission,
+            self.checkpoint
+                .map_or_else(|| "—".into(), |revision| format!("r{revision}")),
+            self.conversation
+                .map_or_else(|| "—".into(), |revision| format!("r{revision}")),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,6 +161,7 @@ pub struct ArtifactActionsProjection {
     pub diff: OperationsStatus,
     pub adopt: OperationsStatus,
     pub reject: OperationsStatus,
+    pub reopen: OperationsStatus,
     pub rollback: OperationsStatus,
 }
 
@@ -250,6 +287,7 @@ fn mission_control_projection(
                 detail: "选择 Mission 后读取持久证据变化".into(),
             },
             stage: "未选择".into(),
+            revision_fence: None,
         };
     };
     let status = mission_status(mission);
@@ -274,6 +312,7 @@ fn mission_control_projection(
                 .into(),
         },
         stage: mission_stage_label(&mission.stage),
+        revision_fence: Some(OperationsRevisionFence::from_mission(mission)),
     }
 }
 
@@ -538,6 +577,7 @@ fn artifact_projection(product: &WorkProductProjection) -> ArtifactProjection {
             diff: OperationsStatus::NotImplemented,
             adopt: OperationsStatus::NotImplemented,
             reject: OperationsStatus::NotImplemented,
+            reopen: OperationsStatus::NotImplemented,
             rollback: OperationsStatus::NotImplemented,
         },
     }
@@ -694,6 +734,80 @@ mod tests {
     }
 
     #[test]
+    fn revision_fence_changes_when_any_persisted_revision_changes() {
+        let mut mission = mission_projection_for_test();
+        let fence = OperationsRevisionFence::from_mission(&mission);
+        assert!(fence.matches_mission(&mission));
+
+        mission.revision = mission.revision.saturating_add(1);
+        assert!(!fence.matches_mission(&mission));
+        mission.revision = fence.mission;
+
+        mission.current_checkpoint_revision =
+            Some(fence.checkpoint.unwrap_or_default().saturating_add(1));
+        assert!(!fence.matches_mission(&mission));
+        mission.current_checkpoint_revision = fence.checkpoint;
+
+        mission.conversation_revision =
+            Some(fence.conversation.unwrap_or_default().saturating_add(1));
+        assert!(!fence.matches_mission(&mission));
+    }
+
+    #[test]
+    fn revision_fence_label_is_content_free() {
+        let mission = mission_projection_for_test();
+        let label = OperationsRevisionFence::from_mission(&mission).label();
+        assert!(label.contains("Mission r"));
+        assert!(label.contains("Checkpoint r"));
+        assert!(label.contains("Conversation r"));
+        assert!(!label.contains(mission.project_id.as_str()));
+        assert!(!label.contains(mission.mission_id.as_str()));
+        assert!(!label.contains(mission.goal.as_str()));
+    }
+
+    fn mission_projection_for_test() -> MissionProjection {
+        MissionProjection {
+            surface: "test".into(),
+            project_id: "private-project-id".into(),
+            mission_id: "private-mission-id".into(),
+            title: "Private title".into(),
+            goal: "Private goal".into(),
+            manifest_id: Some("VM-07".into()),
+            manifest_version: Some(1),
+            catalog_digest: Some("catalog-digest".into()),
+            current_checkpoint_id: Some("evidence_plan".into()),
+            current_checkpoint_status: Some(
+                hartevo_domain_kernel::MissionCheckpointStatus::Running,
+            ),
+            current_checkpoint_revision: Some(5),
+            current_checkpoint_capability_id: Some("market.evidence".into()),
+            current_checkpoint_executor: Some(
+                hartevo_domain_kernel::MissionCheckpointExecutor::Runtime,
+            ),
+            current_checkpoint_application_handler_status: None,
+            current_checkpoint_application_handler_id: None,
+            current_checkpoint_oracle_ids: std::collections::BTreeSet::default(),
+            current_checkpoint_completion_policy: None,
+            completed_checkpoint_count: 1,
+            checkpoint_count: 8,
+            cycle: 0,
+            schedule: None,
+            conversation_id: Some("private-conversation-id".into()),
+            conversation_revision: Some(7),
+            conversation_messages: Vec::new(),
+            stage: MissionStage::Running,
+            revision: 9,
+            evidence_count: 2,
+            work_product_count: 0,
+            work_products: Vec::new(),
+            pending_approval_count: 0,
+            verified_effect_count: 0,
+            outcome_summary: None,
+            vm11_outcome_review: None,
+        }
+    }
+
+    #[test]
     fn checkpoint_ids_are_not_normal_product_language() {
         assert_eq!(
             humanize_checkpoint("go_no_go_need_more_evidence"),
@@ -769,6 +883,7 @@ mod tests {
         let artifact = artifact_projection(&product);
         assert_eq!(artifact.actions.adopt, OperationsStatus::NotImplemented);
         assert_eq!(artifact.actions.reject, OperationsStatus::NotImplemented);
+        assert_eq!(artifact.actions.reopen, OperationsStatus::NotImplemented);
         assert_eq!(artifact.actions.rollback, OperationsStatus::NotImplemented);
     }
 

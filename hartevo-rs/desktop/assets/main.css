@@ -2281,6 +2281,41 @@ textarea:focus-visible {
   line-height: 1.45;
 }
 
+.operations-revision-fence {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 10px;
+  align-items: baseline;
+  padding: 8px 10px;
+  color: #607268;
+  background: #f8fbf7;
+  border: 1px dashed #cbd9ce;
+  border-radius: 8px;
+  font-size: 8px;
+}
+
+.operations-revision-fence small {
+  color: #6d8074;
+  font-size: 7px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.operations-revision-fence code {
+  min-width: 0;
+  color: #375747;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 8px;
+  overflow-wrap: anywhere;
+}
+
+.operations-revision-fence span {
+  grid-column: 2;
+  color: #7a8980;
+  line-height: 1.45;
+}
+
 .operations-fact-grid,
 .operations-definition-grid {
   display: grid;
@@ -2502,6 +2537,12 @@ textarea:focus-visible {
   cursor: not-allowed;
 }
 
+.operations-artifact-actions button:focus-visible,
+.operations-quick-entry-actions button:focus-visible {
+  outline: 2px solid #4e8b65;
+  outline-offset: 2px;
+}
+
 .operations-approval-card,
 .operations-browser-card,
 .operations-recovery-card {
@@ -2583,6 +2624,14 @@ textarea:focus-visible {
 
   .operations-quick-entry-actions {
     justify-content: flex-start;
+  }
+
+  .operations-revision-fence {
+    grid-template-columns: 1fr;
+  }
+
+  .operations-revision-fence span {
+    grid-column: auto;
   }
 
   .operations-live-region {

@@ -35,7 +35,9 @@ mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
 mod visual_fixture;
 
-use agent_operations::{AgentOperationsWorkbenchProjection, OperationsStatus};
+use agent_operations::{
+    AgentOperationsWorkbenchProjection, OperationsRevisionFence, OperationsStatus,
+};
 use data_plane::{
     DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane,
     DesktopHumanCheckpointConfirmationRequest, DesktopLoadState, DesktopMissionContinuationRequest,
@@ -918,6 +920,7 @@ pub fn App() -> Element {
     let mut runtime_follow_latest = use_signal(move || visual_runtime_follow_latest);
     let mut runtime_has_unseen = use_signal(move || visual_runtime_has_unseen);
     let mut composer_expanded = use_signal(|| false);
+    let mut operations_continue_fence = use_signal(|| None::<OperationsRevisionFence>);
     let mut composer_guidance_dismissed = use_signal(|| false);
     let mut human_work_product_selection = use_signal(BTreeSet::<WorkProductId>::new);
     let mut vm11_outcome_action = use_signal(|| None::<(MissionId, OutcomeDecision)>);
@@ -944,6 +947,7 @@ pub fn App() -> Element {
         };
         let scope_changed = runtime_text_scope.peek().as_ref() != selected_scope.as_ref();
         if scope_changed {
+            operations_continue_fence.set(None);
             runtime_text_scope.set(selected_scope.clone());
             runtime_text_stream.set(None);
             runtime_text_error.set(None);
@@ -1448,6 +1452,24 @@ pub fn App() -> Element {
     );
     let operations_interrupt_available = runtime_busy && runtime_stop_available;
     let operations_interrupt_requested = runtime_stop_requested();
+    let request_operations_continue = move |fence: OperationsRevisionFence| {
+        let current_mission = model.read().current_mission().cloned();
+        if current_mission
+            .as_ref()
+            .is_none_or(|mission| !fence.matches_mission(mission))
+        {
+            model.write().notice = Some(UiFailure {
+                code: "STALE_SELECTION".into(),
+                message: "Continue 请求对应的 Mission revision 已变化，请刷新后重试；未写入状态。"
+                    .into(),
+            });
+            operations_continue_fence.set(None);
+            return;
+        }
+        operations_continue_fence.set(Some(fence));
+        composer_expanded.set(true);
+        restore_ui_focus("mission-composer-input");
+    };
     let request_operations_interrupt = move |()| {
         let selected = {
             let current = model.read();
@@ -2073,6 +2095,7 @@ pub fn App() -> Element {
                                     composer_expanded.set(true);
                                     restore_ui_focus("mission-composer-input");
                                 },
+                                on_continue: request_operations_continue,
                                 on_interrupt: request_operations_interrupt,
                                 on_runtime_scroll: move |near_bottom| {
                                     let selected = {
@@ -3002,6 +3025,20 @@ pub fn App() -> Element {
                                                 id: "mission-composer-send",
                                                 aria_label: "续写当前持久 Mission Conversation",
                                                 onclick: move |_| {
+                                                    let requested_fence = operations_continue_fence();
+                                                    let current_mission = model.read().current_mission().cloned();
+                                                    if requested_fence.is_some_and(|fence| {
+                                                        current_mission
+                                                            .as_ref()
+                                                            .is_none_or(|mission| !fence.matches_mission(mission))
+                                                    }) {
+                                                        model.write().notice = Some(UiFailure {
+                                                            code: "STALE_SELECTION".into(),
+                                                            message: "Continue 请求对应的 Mission revision 已变化，请刷新后重试；未写入状态。".into(),
+                                                        });
+                                                        operations_continue_fence.set(None);
+                                                        return;
+                                                    }
                                                     let selection = {
                                                         let model = model.read();
                                                         model.selected_project_id.clone().zip(
@@ -3029,6 +3066,7 @@ pub fn App() -> Element {
                                                         body: draft(),
                                                         expected_conversation_revision: expected_revision,
                                                     };
+                                                    operations_continue_fence.set(None);
                                                     let cancellation = DesktopRuntimeCancellation::default();
                                                     runtime_cancellation.set(Some(cancellation.clone()));
                                                     runtime_stop_requested.set(false);
@@ -4662,6 +4700,7 @@ fn AgentOperationsWorkbench(
     interrupt_available: bool,
     interrupt_requested: bool,
     on_quick_entry: EventHandler<()>,
+    on_continue: EventHandler<OperationsRevisionFence>,
     on_interrupt: EventHandler<()>,
 ) -> Element {
     let recovery_required = projection.recovery.status == OperationsStatus::RecoveryRequired;
@@ -4674,6 +4713,14 @@ fn AgentOperationsWorkbench(
         "Interrupt 当前 turn"
     } else {
         "没有可中断 turn"
+    };
+    let continue_fence = projection.mission.revision_fence;
+    let continue_available =
+        continue_fence.is_some() && projection.mission.status.is_actionable() && !recovery_required;
+    let continue_label = if continue_available {
+        "Continue · READY"
+    } else {
+        "Continue · BLOCKED"
     };
     rsx! {
         article {
@@ -4705,6 +4752,16 @@ fn AgentOperationsWorkbench(
                 div { class: "operations-objective",
                     small { "Objective" }
                     p { "{projection.mission.objective}" }
+                }
+                div { class: "operations-revision-fence", aria_label: "Exact Mission command revision fence",
+                    small { "Exact command fence" }
+                    if let Some(fence) = continue_fence {
+                        code { "{fence.label()}" }
+                        span { "旧 revision、Checkpoint 或 Conversation 变化时会 fail closed。" }
+                    } else {
+                        code { "NOT_READY" }
+                        span { "尚未读取可用于命令的持久 revision。" }
+                    }
                 }
                 div { class: "operations-fact-grid",
                     div { class: "operations-fact",
@@ -4843,6 +4900,12 @@ fn AgentOperationsWorkbench(
                                         "Reject · {artifact.actions.reject.code()}"
                                     }
                                     button {
+                                        disabled: artifact.actions.reopen != OperationsStatus::Ready,
+                                        aria_label: "重新打开 Artifact",
+                                        title: "等待 Work Product owner API；不会伪造新的 revision。",
+                                        "Reopen · {artifact.actions.reopen.code()}"
+                                    }
+                                    button {
                                         disabled: artifact.actions.rollback != OperationsStatus::Ready,
                                         aria_label: "回滚 Artifact",
                                         title: "等待 Artifact owner API",
@@ -4904,6 +4967,19 @@ fn AgentOperationsWorkbench(
                 }
                 div { class: "operations-quick-entry-actions",
                     button {
+                        class: "quiet-button",
+                        id: "mission-operations-continue",
+                        disabled: !continue_available,
+                        aria_label: if continue_available { "按 exact revision 继续当前 Mission" } else { "当前 Mission 暂不能继续" },
+                        title: if continue_available { "继续会先打开同一 Mission Conversation，并在提交时再次校验 exact revision。" } else { "等待持久 Mission revision 或恢复边界。" },
+                        onclick: move |_| {
+                            if let Some(fence) = continue_fence {
+                                on_continue.call(fence);
+                            }
+                        },
+                        "{continue_label}"
+                    }
+                    button {
                         class: "primary-button",
                         id: "agent-operations-quick-entry",
                         onclick: move |_| on_quick_entry.call(()),
@@ -4911,7 +4987,16 @@ fn AgentOperationsWorkbench(
                     }
                     button {
                         class: "quiet-button",
+                        id: "mission-operations-takeover",
+                        disabled: true,
+                        aria_label: "接管当前 Browser Workspace（尚未实现）",
+                        title: "Browser takeover 需要 Browser Workspace owner API；不会伪造接管成功。",
+                        "Take over · NOT_IMPLEMENTED"
+                    }
+                    button {
+                        class: "quiet-button",
                         disabled: interrupt_disabled,
+                        id: "mission-operations-interrupt",
                         aria_label: "中断当前 Runtime turn",
                         onclick: move |_| on_interrupt.call(()),
                         "{interrupt_label}"
@@ -4956,6 +5041,7 @@ fn OrchestratorSurface(
     on_select_mission: EventHandler<MissionId>,
     on_open_workpad: EventHandler<()>,
     on_quick_entry: EventHandler<()>,
+    on_continue: EventHandler<OperationsRevisionFence>,
     on_interrupt: EventHandler<()>,
     on_runtime_scroll: EventHandler<bool>,
     on_follow_latest: EventHandler<()>,
@@ -5044,6 +5130,7 @@ fn OrchestratorSurface(
                             interrupt_available: false,
                             interrupt_requested: false,
                             on_quick_entry,
+                            on_continue,
                             on_interrupt,
                         }
                         ProjectDispatcherSurface { project, on_select_mission }
@@ -5168,6 +5255,7 @@ fn OrchestratorSurface(
                         interrupt_available,
                         interrupt_requested,
                         on_quick_entry,
+                        on_continue,
                         on_interrupt,
                     }
                     PersistedConversationMessages {
