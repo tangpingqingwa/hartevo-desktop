@@ -8,6 +8,7 @@ mod connection;
 mod context;
 mod context_collaboration;
 mod context_foundation;
+mod creator_fulfillment;
 mod creator_hiring;
 mod creator_work;
 mod deletion;
@@ -165,6 +166,15 @@ pub const DOMAIN_SCHEMA_VERSION: &str = "hartevo-domain/v1";
 pub use connection::{
     Connection, ConnectionError, ConnectionProbe, ConnectionSnapshot, ConnectionStatus,
     ProbeOutcome,
+};
+pub use creator_fulfillment::{
+    CREATOR_WORK_MAX_OUTPUT_BYTES, CreatorWorkDeliverableReference, CreatorWorkExecutionRequest,
+    CreatorWorkFulfillment, CreatorWorkFulfillmentError, CreatorWorkFulfillmentService,
+    CreatorWorkFulfillmentStatus, CreatorWorkMissionConsumer, CreatorWorkOutcomeHandoff,
+    CreatorWorkPayoutIntent, CreatorWorkProvider, CreatorWorkProviderError,
+    CreatorWorkProviderRegistration, CreatorWorkProviderRegistry, CreatorWorkProviderResult,
+    CreatorWorkProviderStatus, CreatorWorkSettlementStatus, CreatorWorkWorkerLease,
+    CreatorWorkWorkerStatus,
 };
 pub use creator_hiring::{
     CreatorApplication, CreatorApplicationInput, CreatorApplicationOrigin,
