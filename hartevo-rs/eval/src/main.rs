@@ -9,6 +9,7 @@ use hartevo_eval::{
     VERTICAL_SLICE_ID, catalog_snapshot, evaluate_harness_lab, finalize_evaluation_run,
     harness_lab_source_commit, run_vertical_slice, validate_evaluation_run,
     wave_zero_release_evidence,
+    validate_progress_trace_example,
 };
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,12 @@ fn run_standard_command(arguments: &[String]) -> Result<()> {
                 snapshot.summary.dataset_case_count,
                 snapshot.summary.cross_cutting_case_count
             );
+        }
+        [progress_trace, command]
+            if progress_trace == "progress-trace" && command == "validate-example" =>
+        {
+            let report = validate_progress_trace_example()?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         [catalog, command, output_flag, output]
             if catalog == "catalog" && command == "export" && output_flag == "--output" =>
@@ -180,6 +187,7 @@ fn print_help() {
          hartevo-eval catalog validate\n  \
          hartevo-eval catalog export --output <path>\n  \
          hartevo-eval evidence baseline --commit <sha> --output <path>\n  \
+         hartevo-eval progress-trace validate-example\n  \
          hartevo-eval evaluation-run finalize --run-dir <path>\n  \
          hartevo-eval evaluation-run validate --run-dir <path>\n  \
          hartevo-eval harness-lab validate --plan <plan.json> --results <results.json> [--keys <keys.json>] [--promotion <record.json>]\n  \
