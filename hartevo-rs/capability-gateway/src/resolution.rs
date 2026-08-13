@@ -496,7 +496,7 @@ impl CapabilityCompositionSnapshot {
         self.lifecycle == CapabilityCompositionLifecycle::Mounted
     }
 
-    fn validate(&self) -> Result<(), CapabilityResolutionError> {
+    pub(crate) fn validate(&self) -> Result<(), CapabilityResolutionError> {
         self.validate_without_digest()?;
         if self.composition_digest != self.computed_digest() {
             return Err(CapabilityResolutionError::InvalidComposition);
@@ -719,6 +719,13 @@ impl CapabilityBinding {
         self.composition_revision
     }
 
+    /// The mounted provider generation is the Project/Mission generation
+    /// captured by this binding. Invocation consumers must re-check it before
+    /// using the provider again.
+    pub const fn provider_generation(&self) -> u64 {
+        self.scope.generation
+    }
+
     fn computed_digest(&self) -> Digest {
         digest_serialized(&(
             CAPABILITY_RESOLUTION_SCHEMA,
@@ -737,7 +744,7 @@ impl CapabilityBinding {
         ))
     }
 
-    fn validate(&self) -> Result<(), CapabilityResolutionError> {
+    pub(crate) fn validate(&self) -> Result<(), CapabilityResolutionError> {
         validate_digest_set([
             &self.service_id_digest,
             &self.provider_id_digest,
@@ -869,7 +876,7 @@ impl CapabilityResolutionReceipt {
         ))
     }
 
-    fn validate(&self) -> Result<(), CapabilityResolutionError> {
+    pub(crate) fn validate(&self) -> Result<(), CapabilityResolutionError> {
         validate_digest_set([
             &self.query_digest,
             &self.binding_digest,
@@ -1503,6 +1510,44 @@ impl<'a> CapabilityResolver<'a> {
             CapabilityResolutionLease::new(binding, receipt, permit),
             query,
         ))
+    }
+
+    pub(crate) fn validate_binding_for_invocation(
+        &self,
+        binding: &CapabilityBinding,
+        receipt: &CapabilityResolutionReceipt,
+        composition: &CapabilityCompositionSnapshot,
+        signed_manifest: &SignedCapabilityManifest,
+        request: &CapabilityRequest,
+        now: DateTime<Utc>,
+    ) -> Result<CapabilityResolutionLease, CapabilityResolutionError> {
+        binding.validate()?;
+        receipt.validate()?;
+        composition.validate()?;
+        let selector = CapabilityResolutionSelector::new(
+            binding.consumer_id_digest().clone(),
+            binding.service_id_digest().clone(),
+            binding.version(),
+        )?;
+        let (current, _query) =
+            self.build_lease(composition, signed_manifest, request, &selector, now)?;
+        if current.binding() != binding || current.receipt() != receipt {
+            return Err(CapabilityResolutionError::ReopenMismatch);
+        }
+        Ok(current)
+    }
+
+    pub(crate) fn rebuild_resolution_lease(
+        &self,
+        composition: &CapabilityCompositionSnapshot,
+        signed_manifest: &SignedCapabilityManifest,
+        request: &CapabilityRequest,
+        selector: &CapabilityResolutionSelector,
+        now: DateTime<Utc>,
+    ) -> Result<CapabilityResolutionLease, CapabilityResolutionError> {
+        let (lease, _query) =
+            self.build_lease(composition, signed_manifest, request, selector, now)?;
+        Ok(lease)
     }
 }
 

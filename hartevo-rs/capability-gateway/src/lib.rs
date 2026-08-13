@@ -9,7 +9,17 @@
 
 #![forbid(unsafe_code)]
 
+mod invocation;
 mod resolution;
+pub use invocation::{
+    CapabilityInvocationCloseReason, CapabilityInvocationContext,
+    CapabilityInvocationEffectReceipt, CapabilityInvocationError, CapabilityInvocationEvent,
+    CapabilityInvocationEventKind, CapabilityInvocationLease, CapabilityInvocationLog,
+    CapabilityInvocationLogError, CapabilityInvocationLogReference, CapabilityInvocationReceipt,
+    CapabilityInvocationReleaseReceipt, CapabilityInvocationResult, CapabilityInvocationVisibility,
+    InvocationLease, MAX_INVOCATION_ATTEMPTS, MemoryCapabilityInvocationLog,
+    ResolvedCapabilityBinding,
+};
 pub use resolution::{
     CapabilityBinding, CapabilityCompositionLifecycle, CapabilityCompositionScope,
     CapabilityCompositionSnapshot, CapabilityConsumerDefinition, CapabilityProviderDefinition,
