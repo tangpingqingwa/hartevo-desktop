@@ -1,6 +1,7 @@
 //! Local-first, project-scoped persistence with encrypted files and atomic outbox writes.
 
 mod aggregate;
+mod attribution_evidence_query_store;
 mod attribution_spine_store;
 mod authorization;
 mod browser_file_store;
