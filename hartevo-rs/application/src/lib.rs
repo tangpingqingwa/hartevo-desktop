@@ -1,7 +1,17 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod plugin_invocation_timeline;
 mod runtime_text_subscription;
 
+pub use plugin_invocation_timeline::{
+    PLUGIN_INVOCATION_TIMELINE_MAX_PAGE_SIZE, PluginInvocationTimeline,
+    PluginInvocationTimelineAuditPage, PluginInvocationTimelineCursor,
+    PluginInvocationTimelineEntry, PluginInvocationTimelineError,
+    PluginInvocationTimelineInlineNode, PluginInvocationTimelineInlinePage,
+    PluginInvocationTimelineLifecycle, PluginInvocationTimelineMissionShellConsumer,
+    PluginInvocationTimelineNodeStatus, PluginInvocationTimelineProvider,
+    PluginInvocationTimelineScope, PluginInvocationTimelineStage,
+};
 pub use runtime_text_subscription::{
     CatalogMissionExecutionHandle, CatalogMissionExecutionStart,
     RUNTIME_TEXT_SUBSCRIPTION_MAX_PAGE_SIZE, RuntimeTextSubscriptionBatch,
