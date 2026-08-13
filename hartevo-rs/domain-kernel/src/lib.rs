@@ -29,10 +29,11 @@ mod truth;
 mod work_product;
 
 pub use attribution_spine::{
-    ATTRIBUTION_SPINE_EVENT_TYPE, ATTRIBUTION_SPINE_SCHEMA_VERSION, AttributionAssignment,
-    AttributionError, AttributionLedger, AttributionProjection, AttributionReason,
-    AttributionWindow, BatchIngestResult, ConnectorObservationSource, CorrectionKind,
-    CorrectionLineage, IngestDisposition, ObservationOrigin, ObservationProvenance,
+    ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE, ATTRIBUTION_SPINE_EVENT_TYPE,
+    ATTRIBUTION_SPINE_SCHEMA_VERSION, ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
+    AttributionAssignment, AttributionError, AttributionLedger, AttributionProjection,
+    AttributionReason, AttributionWindow, BatchIngestResult, ConnectorObservationSource,
+    CorrectionKind, CorrectionLineage, IngestDisposition, ObservationOrigin, ObservationProvenance,
     OutcomeCandidate, OutcomeCandidateId, OutcomeKind, OutcomeVerification, ProviderCursor,
     ProviderEntityRef, ProviderEventIdentity, SourceEntityKind, SourceEvent, SourceEventId,
     SourceEventKind, SourceEventLinks, SourceObservationBatch, VerificationMethod, VerifiedOutcome,
