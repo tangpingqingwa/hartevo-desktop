@@ -1,0 +1,38 @@
+{
+  "schema": "hartevo.runtime-steering-service/v1",
+  "service": "typed-runtime-steering",
+  "providerMethod": "turn/steer",
+  "durableOrder": [
+    "queued",
+    "provider-dispatch",
+    "accepted",
+    "applied-or-terminal"
+  ],
+  "phases": [
+    "queued",
+    "accepted",
+    "applied",
+    "terminal",
+    "uncertain"
+  ],
+  "exactFence": [
+    "projectId",
+    "missionId",
+    "sessionId",
+    "runtimeThreadId",
+    "runtimeTurnId",
+    "runtimeGeneration",
+    "cursor",
+    "revision",
+    "mappingDigest"
+  ],
+  "idempotency": "client-steering-id-is-consumed-before-provider-dispatch-and-is-never-replayed",
+  "uncertainty": "fail-closed; restart-and-explicit-continue-required; no-automatic-replay",
+  "lifecycle": [
+    "interrupt-terminal",
+    "unmount-terminal",
+    "revoke-terminal",
+    "crash-or-unknown-uncertain"
+  ],
+  "modelVisibleInput": "durable-session-log-before-dispatch"
+}
