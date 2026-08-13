@@ -18,6 +18,7 @@ mod action;
 mod chromium_host;
 mod fake_host;
 mod file_broker;
+mod form_draft;
 mod locator;
 mod navigation;
 mod profile_dir;
@@ -47,6 +48,14 @@ pub use file_broker::{
     BrowserFileGrant, BrowserFileGrantState, BrowserFileType, FileBroker, FileBrokerReconciliation,
     FileClaimPlan, FileSafetyScanner, FileScanDecision, FileScanReport, FileScanRequest,
     FileTerminalPlan, FileUploadHandle,
+};
+pub use form_draft::{
+    BrowserFormActionIntent, BrowserFormActionKind, BrowserFormActionPlan, BrowserFormApproval,
+    BrowserFormDispatchLease, BrowserFormDispatchReceipt, BrowserFormDraft, BrowserFormDraftLog,
+    BrowserFormDraftService, BrowserFormFieldKind, BrowserFormFieldObservation,
+    BrowserFormFieldPolicy, BrowserFormFrameObservation, BrowserFormFrameSnapshot, BrowserFormHost,
+    BrowserFormObservation, BrowserFormScope, BrowserFormSecretClass, BrowserFormServiceState,
+    UnavailableBrowserFormHost,
 };
 pub use locator::{BrowserLocatorResolution, BrowserStableLocator};
 pub use navigation::{BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserNavigationTarget};
@@ -195,6 +204,30 @@ pub enum BrowserError {
     NavigationFailed,
     #[error("browser navigation attempted to produce a download outside the File Broker")]
     NavigationDownloadBlocked,
+    #[error("browser form draft or action plan is malformed")]
+    InvalidFormDraft,
+    #[error("browser form scope does not match the exact Mission, profile, workspace, or tab")]
+    FormScopeMismatch,
+    #[error("browser form frame, navigation, DOM, or snapshot changed before pre-dispatch")]
+    FormSnapshotStale,
+    #[error("browser form sensitive-field classification changed before pre-dispatch")]
+    FormSecretDrift,
+    #[error("browser form draft or approval was duplicated")]
+    FormDraftDuplicate,
+    #[error("browser form draft, approval, or dispatch lease was reopened")]
+    FormDraftReopened,
+    #[error("browser form requires explicit human approval and takeover")]
+    FormApprovalRequired,
+    #[error("browser form approval does not match the exact takeover generation")]
+    FormApprovalMismatch,
+    #[error("browser form single-use dispatch lease is unavailable or already consumed")]
+    FormDispatchLeaseUnavailable,
+    #[error("browser form service was revoked")]
+    FormProviderRevoked,
+    #[error("browser form service was restarted and its old cursor is invalid")]
+    FormProviderRestarted,
+    #[error("browser form dispatch is not performed by the draft service")]
+    FormDispatchRejected,
     #[error("browser file is outside every canonical project root or crosses a symlink")]
     FileOutsideProject,
     #[error("browser file is empty or exceeds the configured size boundary")]
@@ -291,6 +324,18 @@ impl BrowserError {
             Self::NavigationRequestBlocked => "BROWSER_NAVIGATION_REQUEST_BLOCKED",
             Self::NavigationFailed => "BROWSER_NAVIGATION_FAILED",
             Self::NavigationDownloadBlocked => "BROWSER_NAVIGATION_DOWNLOAD_BLOCKED",
+            Self::InvalidFormDraft => "BROWSER_INVALID_FORM_DRAFT",
+            Self::FormScopeMismatch => "BROWSER_FORM_SCOPE_MISMATCH",
+            Self::FormSnapshotStale => "BROWSER_FORM_SNAPSHOT_STALE",
+            Self::FormSecretDrift => "BROWSER_FORM_SECRET_DRIFT",
+            Self::FormDraftDuplicate => "BROWSER_FORM_DRAFT_DUPLICATE",
+            Self::FormDraftReopened => "BROWSER_FORM_DRAFT_REOPENED",
+            Self::FormApprovalRequired => "BROWSER_FORM_APPROVAL_REQUIRED",
+            Self::FormApprovalMismatch => "BROWSER_FORM_APPROVAL_MISMATCH",
+            Self::FormDispatchLeaseUnavailable => "BROWSER_FORM_DISPATCH_LEASE_UNAVAILABLE",
+            Self::FormProviderRevoked => "BROWSER_FORM_PROVIDER_REVOKED",
+            Self::FormProviderRestarted => "BROWSER_FORM_PROVIDER_RESTARTED",
+            Self::FormDispatchRejected => "BROWSER_FORM_DISPATCH_REJECTED",
             Self::FileOutsideProject => "BROWSER_FILE_OUTSIDE_PROJECT",
             Self::FileSizeRejected => "BROWSER_FILE_SIZE_REJECTED",
             Self::FileTypeRejected => "BROWSER_FILE_TYPE_REJECTED",
