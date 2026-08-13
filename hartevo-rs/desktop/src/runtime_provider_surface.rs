@@ -69,6 +69,77 @@ pub struct RuntimeProviderIdentity {
     policy_digest: String,
 }
 
+/// Application-facing constructor material for an exact provider identity. Digest fields remain
+/// private on the identity itself so Debug and downstream render code cannot substitute them.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RuntimeProviderIdentityParts {
+    pub provider_id: String,
+    pub provider_revision: String,
+    pub model_id: String,
+    pub model_revision: String,
+    pub harness_id: String,
+    pub harness_revision: String,
+    pub manifest_digest: String,
+    pub config_digest: String,
+    pub catalog_digest: String,
+    pub policy_digest: String,
+}
+
+impl fmt::Debug for RuntimeProviderIdentityParts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeProviderIdentityParts")
+            .field("provider_id", &self.provider_id)
+            .field("provider_revision", &self.provider_revision)
+            .field("model_id", &self.model_id)
+            .field("model_revision", &self.model_revision)
+            .field("harness_id", &self.harness_id)
+            .field("harness_revision", &self.harness_revision)
+            .field("manifest_digest", &short_digest(&self.manifest_digest))
+            .field("config_digest", &short_digest(&self.config_digest))
+            .field("catalog_digest", &short_digest(&self.catalog_digest))
+            .field("policy_digest", &short_digest(&self.policy_digest))
+            .finish()
+    }
+}
+
+impl RuntimeProviderIdentity {
+    pub fn from_parts(parts: RuntimeProviderIdentityParts) -> Result<Self, &'static str> {
+        let identifiers = [
+            parts.provider_id.as_str(),
+            parts.provider_revision.as_str(),
+            parts.model_id.as_str(),
+            parts.model_revision.as_str(),
+            parts.harness_id.as_str(),
+            parts.harness_revision.as_str(),
+        ];
+        if identifiers.iter().any(|value| value.trim().is_empty())
+            || [
+                parts.manifest_digest.as_str(),
+                parts.config_digest.as_str(),
+                parts.catalog_digest.as_str(),
+                parts.policy_digest.as_str(),
+            ]
+            .iter()
+            .any(|digest| !is_digest(digest))
+        {
+            return Err("runtime provider identity is not exact");
+        }
+        Ok(Self {
+            provider_id: parts.provider_id,
+            provider_revision: parts.provider_revision,
+            model_id: parts.model_id,
+            model_revision: parts.model_revision,
+            harness_id: parts.harness_id,
+            harness_revision: parts.harness_revision,
+            manifest_digest: parts.manifest_digest,
+            config_digest: parts.config_digest,
+            catalog_digest: parts.catalog_digest,
+            policy_digest: parts.policy_digest,
+        })
+    }
+}
+
 impl fmt::Debug for RuntimeProviderIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

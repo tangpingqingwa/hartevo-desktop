@@ -31,6 +31,7 @@ use zeroize::Zeroizing;
 mod agent_operations;
 pub mod data_plane;
 mod runtime_plane;
+pub mod runtime_provider_execution_surface;
 pub mod runtime_provider_surface;
 mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
@@ -46,6 +47,9 @@ use data_plane::{
     ProjectContextAccessProjection, ProjectContextAccessStatus, RecoveryKitDraft,
 };
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
+use runtime_provider_execution_surface::{
+    RuntimeProviderExecutionInlineSurface, RuntimeProviderExecutionLogProjection,
+};
 use runtime_subscription::{
     DESKTOP_RUNTIME_SUBSCRIPTION_PAGE_SIZE, DesktopRuntimeCommandIdentity,
     DesktopRuntimeCompletionDisposition, DesktopRuntimeExecutionLaunch,
@@ -1129,6 +1133,10 @@ pub fn App() -> Element {
         .as_ref()
         .zip(mission.as_ref())
         .map(|(project, mission)| (&project.project_id, &mission.mission_id));
+    // Application does not yet expose the exact provider execution projection on this branch.
+    // Keep the consumer mounted behind an Option so a future typed read model can opt in without
+    // deriving provider identity from DesktopRuntimeProjection or Runtime health.
+    let runtime_provider_execution: Option<RuntimeProviderExecutionLogProjection> = None;
     let selected_runtime_execution_paint =
         selected_runtime_scope.and_then(|(project_id, mission_id)| {
             runtime_execution_paint
@@ -2047,6 +2055,7 @@ pub fn App() -> Element {
                                 project: project.clone(),
                                 mission: mission.clone(),
                                 runtime_activity: runtime_activity.clone(),
+                                runtime_provider_execution: runtime_provider_execution.clone(),
                                 runtime_text_stream: rendered_runtime_text_stream.clone(),
                                 runtime_waiting_for_turn,
                                 runtime_text_error: rendered_runtime_text_error.clone(),
@@ -4938,6 +4947,7 @@ fn OrchestratorSurface(
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
     runtime_activity: Option<MissionRuntimeProjection>,
+    runtime_provider_execution: Option<RuntimeProviderExecutionLogProjection>,
     runtime_text_stream: Option<DesktopRuntimeTextStreamProjection>,
     runtime_waiting_for_turn: bool,
     runtime_text_error: Option<UiFailure>,
@@ -5175,6 +5185,12 @@ fn OrchestratorSurface(
                         mission: mission.clone(),
                         runtime_text_stream: runtime_text_stream.clone(),
                         replayed_message_sequence,
+                    }
+                    if let Some(log) = runtime_provider_execution {
+                        RuntimeProviderExecutionInlineSurface {
+                            log,
+                            on_open_result: move |_| on_open_workpad.call(()),
+                        }
                     }
                     if let Some((state, copy)) = runtime_fixture_copy {
                         div {
