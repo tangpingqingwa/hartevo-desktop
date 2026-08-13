@@ -213,6 +213,7 @@ impl DeterministicMarketplaceWorld {
             estimated_units: Some(420),
             estimated_revenue: Some(CanonicalMoney::new(42_000, usd.clone())),
             observed_at: CanonicalTime::from_datetime(observed_at),
+            response_digest: "b".repeat(64),
             provenance: request_provenance,
         };
         let first_party = FirstPartyWorld {

@@ -20,6 +20,8 @@ use crate::canonical::{
 pub const SORFTIME_PROVIDER_ID: &str = "sorftime";
 pub const SORFTIME_API_HOST: &str = "open.sorftime.com";
 pub const SORFTIME_ESTIMATE_AUTHORITY: &str = "estimate_only";
+pub const SORFTIME_ESTIMATE_EVIDENCE_LEVEL: &str = "E1";
+pub const SORFTIME_LIVE_VALIDATION_STATUS: &str = "BLOCKED_ENV";
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -34,6 +36,119 @@ impl SorftimeAccountId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SorftimeCredentialReference(String);
+
+impl SorftimeCredentialReference {
+    /// Store only a vault/keychain reference; never put Sorftime secrets in the adapter model.
+    pub fn parse(value: impl Into<String>) -> Result<Self, SorftimeError> {
+        let value = value.into();
+        validate_token(&value, "Sorftime credential reference")?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SorftimeAuthStatus {
+    Disconnected,
+    BlockedEnv,
+    CredentialReferenceOnly,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SorftimeBlockedEnvReason {
+    CredentialsUnavailable,
+    NetworkUnavailable,
+    ProviderUnavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SorftimeAuthState {
+    Disconnected {
+        observed_at: CanonicalTime,
+    },
+    BlockedEnv {
+        observed_at: CanonicalTime,
+        reason: SorftimeBlockedEnvReason,
+    },
+    CredentialReferenceOnly {
+        observed_at: CanonicalTime,
+        credential: SorftimeCredentialReference,
+    },
+}
+
+impl SorftimeAuthState {
+    pub fn disconnected(observed_at: DateTime<Utc>) -> Self {
+        Self::Disconnected {
+            observed_at: CanonicalTime::from_datetime(observed_at),
+        }
+    }
+
+    pub fn no_credentials(observed_at: DateTime<Utc>) -> Self {
+        Self::blocked_env(
+            observed_at,
+            SorftimeBlockedEnvReason::CredentialsUnavailable,
+        )
+    }
+
+    pub fn blocked_env(observed_at: DateTime<Utc>, reason: SorftimeBlockedEnvReason) -> Self {
+        Self::BlockedEnv {
+            observed_at: CanonicalTime::from_datetime(observed_at),
+            reason,
+        }
+    }
+
+    pub fn credential_reference_only(
+        observed_at: DateTime<Utc>,
+        credential: SorftimeCredentialReference,
+    ) -> Self {
+        Self::CredentialReferenceOnly {
+            observed_at: CanonicalTime::from_datetime(observed_at),
+            credential,
+        }
+    }
+
+    pub fn status(&self) -> SorftimeAuthStatus {
+        match self {
+            Self::Disconnected { .. } => SorftimeAuthStatus::Disconnected,
+            Self::BlockedEnv { .. } => SorftimeAuthStatus::BlockedEnv,
+            Self::CredentialReferenceOnly { .. } => SorftimeAuthStatus::CredentialReferenceOnly,
+        }
+    }
+
+    pub fn observed_at(&self) -> &CanonicalTime {
+        match self {
+            Self::Disconnected { observed_at }
+            | Self::BlockedEnv { observed_at, .. }
+            | Self::CredentialReferenceOnly { observed_at, .. } => observed_at,
+        }
+    }
+
+    pub fn credential(&self) -> Option<&SorftimeCredentialReference> {
+        match self {
+            Self::CredentialReferenceOnly { credential, .. } => Some(credential),
+            Self::Disconnected { .. } | Self::BlockedEnv { .. } => None,
+        }
+    }
+
+    /// A reference alone is not a live credential and cannot establish a connected state.
+    pub const fn can_issue_live_read(&self) -> bool {
+        false
+    }
+
+    pub const fn grants_connected_authority(&self) -> bool {
+        false
     }
 }
 
@@ -140,6 +255,8 @@ impl SorftimeRequestCost {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SorftimeRequestProvenance {
     pub provider_id: String,
+    pub authority: SorftimeEvidenceAuthority,
+    pub evidence_level: String,
     pub request_id: String,
     pub account: SorftimeAccountId,
     pub market: SorftimeMarket,
@@ -167,6 +284,8 @@ impl SorftimeRequestProvenance {
         }
         Ok(Self {
             provider_id: SORFTIME_PROVIDER_ID.into(),
+            authority: SorftimeEvidenceAuthority::EstimateOnly,
+            evidence_level: SORFTIME_ESTIMATE_EVIDENCE_LEVEL.into(),
             request_id,
             account,
             market,
@@ -175,6 +294,31 @@ impl SorftimeRequestProvenance {
             request_digest,
             request_cost,
         })
+    }
+
+    pub fn validate(&self) -> Result<(), SorftimeError> {
+        if self.provider_id != SORFTIME_PROVIDER_ID
+            || !matches!(self.authority, SorftimeEvidenceAuthority::EstimateOnly)
+            || self.evidence_level != SORFTIME_ESTIMATE_EVIDENCE_LEVEL
+            || self.request_id.trim().is_empty()
+            || self.request_digest.len() != 64
+            || !self
+                .request_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(SorftimeError::InvalidRequestProvenance);
+        }
+        if self.request_cost.units == 0 || self.request_cost.pricing_source.trim().is_empty() {
+            return Err(SorftimeError::InvalidCostProvenance);
+        }
+        Ok(())
+    }
+
+    pub fn is_estimate_only(&self) -> bool {
+        self.provider_id == SORFTIME_PROVIDER_ID
+            && matches!(self.authority, SorftimeEvidenceAuthority::EstimateOnly)
+            && self.evidence_level == SORFTIME_ESTIMATE_EVIDENCE_LEVEL
     }
 }
 
@@ -307,6 +451,18 @@ pub struct SorftimeResponse {
 }
 
 impl SorftimeResponse {
+    fn validate_metadata(&self) -> Result<(), SorftimeError> {
+        validate_token(&self.request_id, "Sorftime response request id")?;
+        if self.cost_source.trim().is_empty() {
+            return Err(SorftimeError::InvalidCostProvenance);
+        }
+        Ok(())
+    }
+
+    fn body_digest(&self) -> Result<String, SorftimeError> {
+        digest_value(&self.body)
+    }
+
     fn cost(&self, observed_at: DateTime<Utc>) -> Result<SorftimeRequestCost, SorftimeError> {
         if !(200..300).contains(&self.status) {
             return Err(SorftimeError::HttpStatus(self.status));
@@ -334,12 +490,35 @@ pub struct SorftimeEstimateObservation {
     pub estimated_units: Option<u64>,
     pub estimated_revenue: Option<CanonicalMoney>,
     pub observed_at: CanonicalTime,
+    pub response_digest: String,
     pub provenance: SorftimeRequestProvenance,
 }
 
 impl SorftimeEstimateObservation {
     pub fn is_estimate_only(&self) -> bool {
         matches!(self.authority, SorftimeEvidenceAuthority::EstimateOnly)
+    }
+
+    pub fn validate(&self) -> Result<(), SorftimeError> {
+        if !self.is_estimate_only()
+            || self.response_digest.len() != 64
+            || !self
+                .response_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.provenance.request_cost.observed_at != self.observed_at
+        {
+            return Err(SorftimeError::InvalidResponseProvenance);
+        }
+        self.provenance.validate()?;
+        if self.provenance.authority != self.authority {
+            return Err(SorftimeError::InvalidResponseProvenance);
+        }
+        Ok(())
+    }
+
+    pub const fn grants_first_party_authority(&self) -> bool {
+        false
     }
 }
 
@@ -395,6 +574,8 @@ fn estimate_from_response(
     request_digest: String,
     observed_at: DateTime<Utc>,
 ) -> Result<SorftimeEstimateObservation, SorftimeError> {
+    response.validate_metadata()?;
+    let response_digest = response.body_digest()?;
     let cost = response.cost(observed_at)?;
     let payload = serde_json::from_value::<EstimatePayload>(response.body)
         .map_err(|error| SorftimeError::MalformedResponse(error.to_string()))?;
@@ -427,7 +608,12 @@ fn estimate_from_response(
         estimated_units: payload.estimated_units,
         estimated_revenue,
         observed_at: CanonicalTime::from_datetime(observed_at),
+        response_digest,
         provenance,
+    })
+    .and_then(|observation| {
+        observation.validate()?;
+        Ok(observation)
     })
 }
 
@@ -453,6 +639,8 @@ pub enum SorftimeError {
     InvalidCostProvenance,
     #[error("Sorftime request provenance is missing or invalid")]
     InvalidRequestProvenance,
+    #[error("Sorftime response provenance is missing or invalid")]
+    InvalidResponseProvenance,
     #[error("Sorftime transport failed: {0}")]
     Transport(String),
     #[error("malformed Sorftime response: {0}")]
@@ -489,6 +677,13 @@ fn digest_request(
         "payload": payload,
     });
     let bytes = serde_json::to_vec(&value).map_err(|_| SorftimeError::InvalidRequestProvenance)?;
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn digest_value(value: &Value) -> Result<String, SorftimeError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| SorftimeError::InvalidResponseProvenance)?;
     let mut digest = Sha256::new();
     digest.update(bytes);
     Ok(format!("{:x}", digest.finalize()))
@@ -553,8 +748,9 @@ mod tests {
 
     #[test]
     fn estimate_carries_cost_and_can_never_become_first_party_in_this_module() {
+        let observed_at = Utc::now();
         let cost =
-            SorftimeRequestCost::new(3, None, "fixture-price-list/v1", Utc::now()).expect("cost");
+            SorftimeRequestCost::new(3, None, "fixture-price-list/v1", observed_at).expect("cost");
         let provenance = SorftimeRequestProvenance::new(
             "request-1".into(),
             SorftimeAccountId::parse("account").expect("account"),
@@ -575,10 +771,13 @@ mod tests {
             target_asin: Some(Asin::parse("B0C0MERC01").expect("asin")),
             estimated_units: Some(10),
             estimated_revenue: None,
-            observed_at: CanonicalTime::from_datetime(Utc::now()),
+            observed_at: CanonicalTime::from_datetime(observed_at),
+            response_digest: "b".repeat(64),
             provenance,
         };
         assert!(estimate.is_estimate_only());
+        estimate.validate().expect("valid estimate");
+        assert!(!estimate.grants_first_party_authority());
         assert_eq!(estimate.provenance.request_cost.units, 3);
     }
 }
