@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -172,6 +172,9 @@ impl LoopbackHttpServer {
             while !stop_for_thread.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
                         if let Ok((request_line, body)) = read_http_request(&mut stream) {
                             requests_for_thread
                                 .lock()
@@ -256,14 +259,19 @@ impl LoopbackShopifyFulfillmentProvider {
         stream
             .write_all(request.as_bytes())
             .map_err(|error| ShopifyFulfillmentProviderError::Unavailable(error.to_string()))?;
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
+        let response = read_http_response(&mut stream)
             .map_err(|error| ShopifyFulfillmentProviderError::Unavailable(error.to_string()))?;
         let separator = find_subsequence(&response, b"\r\n\r\n").ok_or_else(|| {
             ShopifyFulfillmentProviderError::Unavailable("missing HTTP response body".to_owned())
         })?;
-        let value: Value = serde_json::from_slice(&response[separator + 4..])
+        let content_length = http_content_length(&response[..separator]).ok_or_else(|| {
+            ShopifyFulfillmentProviderError::Unavailable(
+                "missing HTTP response content length".to_owned(),
+            )
+        })?;
+        let body_start = separator + 4;
+        let body_end = body_start + content_length;
+        let value: Value = serde_json::from_slice(&response[body_start..body_end])
             .map_err(|error| ShopifyFulfillmentProviderError::Unavailable(error.to_string()))?;
         if value.get("errors").is_some() {
             return Err(ShopifyFulfillmentProviderError::Rejected(
@@ -408,6 +416,48 @@ impl ShopifyFulfillmentProvider for LoopbackShopifyFulfillmentProvider {
     }
 }
 
+fn read_http_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    stream.set_read_timeout(Some(StdDuration::from_secs(1)))?;
+    let mut bytes = Vec::new();
+    let body_end = loop {
+        let mut chunk = [0_u8; 2048];
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated HTTP response headers or body",
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        let Some(header_end) = find_subsequence(&bytes, b"\r\n\r\n") else {
+            continue;
+        };
+        let content_length = http_content_length(&bytes[..header_end]).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing HTTP response content length",
+            )
+        })?;
+        let body_end = header_end + 4 + content_length;
+        if bytes.len() >= body_end {
+            break body_end;
+        }
+    };
+    while bytes.len() < body_end {
+        let mut chunk = [0_u8; 2048];
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated HTTP response body",
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    bytes.truncate(body_end);
+    Ok(bytes)
+}
+
 fn read_http_request(stream: &mut TcpStream) -> std::io::Result<(String, String)> {
     stream.set_read_timeout(Some(StdDuration::from_secs(1)))?;
     let mut bytes = Vec::new();
@@ -419,13 +469,7 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<(String, String)
         }
         bytes.extend_from_slice(&chunk[..read]);
         if let Some(header_end) = find_subsequence(&bytes, b"\r\n\r\n") {
-            let header = String::from_utf8_lossy(&bytes[..header_end]);
-            let content_length = header.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            });
+            let content_length = http_content_length(&bytes[..header_end]);
             if bytes.len() >= header_end + 4 + content_length.unwrap_or_default() {
                 break;
             }
@@ -438,15 +482,7 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<(String, String)
         )
     })?;
     let header = String::from_utf8_lossy(&bytes[..header_end]);
-    let content_length = header
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
-        })
-        .unwrap_or_default();
+    let content_length = http_content_length(&bytes[..header_end]).unwrap_or_default();
     let body_start = header_end + 4;
     if bytes.len() < body_start + content_length {
         return Err(std::io::Error::new(
@@ -460,14 +496,24 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<(String, String)
     Ok((request_line, body))
 }
 
+fn http_content_length(header: &[u8]) -> Option<usize> {
+    String::from_utf8_lossy(header).lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    })
+}
+
 fn write_http_response(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
-    write!(
-        stream,
+    let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
-    )?;
-    stream.flush()
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()?;
+    stream.shutdown(Shutdown::Write)
 }
 
 fn loopback_response(request_body: &str) -> String {
