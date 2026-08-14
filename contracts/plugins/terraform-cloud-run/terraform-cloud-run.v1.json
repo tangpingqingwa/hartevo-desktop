@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.terraform-cloud-run/v1",
+  "title": "Hartevo Layer 1 HCP Terraform run and policy-result contract",
+  "schemaVersion": "hartevo.terraform-cloud-run/v1",
+  "contractVersion": "EXT-TFC-01-L1/v1",
+  "layer": 1,
+  "status": "read_proposal_and_recording_only",
+  "plugin": {
+    "id": "hartevo.terraform-cloud-run",
+    "version": "1.0.0",
+    "registration": {
+      "versionBound": true,
+      "contractDigestBound": true,
+      "adapterRevisionBound": true,
+      "capabilitySnapshotBound": true,
+      "scopeDigestBound": true,
+      "opaqueSecretReferenceOnly": true,
+      "reversible": true,
+      "revocable": true
+    }
+  },
+  "service": {
+    "id": "TerraformCloudRunService",
+    "provider": "TerraformCloudRunProvider",
+    "consumer": "MissionTerraformRunConsumer",
+    "operations": [
+      "describe_workspace",
+      "read_run_evidence",
+      "compile_configuration_proposal",
+      "compile_run_proposal",
+      "compile_apply_proposal",
+      "record_run_receipt",
+      "verify_run_result",
+      "mission_run_result_proposal",
+      "registration",
+      "revocation"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "durableReadback": false,
+    "kernelAuthority": false
+  },
+  "provider": {
+    "id": "terraform-cloud-run",
+    "version": "1.0.0",
+    "officialApi": "HCP Terraform JSON:API",
+    "officialApiBaseUrl": "https://app.terraform.io/api/v2",
+    "authentication": {
+      "secretReferenceOnly": true,
+      "bearerTokenSerialized": false,
+      "signedUploadUrlSerialized": false,
+      "providerCredentialSerialized": false
+    },
+    "transport": {
+      "readMethods": ["GET"],
+      "nativeHttpIsTransportSeam": true,
+      "fixtureEvidence": "recording_only",
+      "loopbackEvidence": "recording_only",
+      "blockedEnvEvidence": "not_connected"
+    },
+    "capabilities": [
+      "workspace_description",
+      "bounded_run_evidence",
+      "configuration_upload_proposal",
+      "run_create_proposal",
+      "apply_proposal",
+      "run_receipt_recording",
+      "run_result_fingerprint_verification",
+      "reversible_registration"
+    ],
+    "authorizationObscured404": "not_found_or_unauthorized",
+    "nativeStatus": "BLOCKED_ENV",
+    "connectedEvidence": false
+  },
+  "scope": {
+    "required": [
+      "https_hostname",
+      "organization",
+      "terraform_project",
+      "workspace",
+      "workspace_revision",
+      "workspace_lock_identity",
+      "hartevo_project",
+      "mission",
+      "work_product"
+    ],
+    "optionalResourceFences": [
+      "configuration_version",
+      "run",
+      "plan",
+      "apply",
+      "policy_evaluation",
+      "policy_set"
+    ],
+    "proposalBinding": [
+      "archive_digest",
+      "configuration_version_id",
+      "source_and_commit_sha",
+      "mission_revision",
+      "work_product_revision",
+      "consent_revision",
+      "policy_revision",
+      "idempotency_fingerprint"
+    ],
+    "pathIsNeverIdentity": true
+  },
+  "evidence": {
+    "boundedMetadataOnly": true,
+    "required": [
+      "provider_request_identifier",
+      "resource_ids",
+      "status_transitions",
+      "timestamps",
+      "has_changes",
+      "speculative",
+      "auto_apply",
+      "plan_terminal_state",
+      "apply_terminal_state",
+      "policy_evaluation_result",
+      "policy_set_digest",
+      "cost_availability",
+      "cost_summary_digest"
+    ],
+    "rawConfigurationArchive": false,
+    "rawState": false,
+    "rawPlan": false,
+    "variables": false,
+    "sensitiveLogs": false,
+    "authority": "below_truth_consent_effect_receipt_verification_outcome"
+  },
+  "semantics": {
+    "authorizationObscured404": "preserve_not_found_or_unauthorized",
+    "unknownProviderStates": "typed_provider_unknown",
+    "ambiguousCreate": "fail_closed_and_reconcile",
+    "staleWorkspaceOrConfiguration": "fail_closed",
+    "applyRequires": [
+      "non_speculative_run",
+      "consent_granted",
+      "policy_passed",
+      "cost_available",
+      "exact_registration",
+      "exact_run_fingerprint"
+    ],
+    "fixtureLoopbackBlockedEnvNeverConnected": true
+  },
+  "forbiddenAuthorities": [
+    "store",
+    "keyring",
+    "browser_profile",
+    "kernel_truth",
+    "kernel_consent",
+    "kernel_effect",
+    "kernel_receipt",
+    "kernel_verification",
+    "kernel_outcome",
+    "configuration_upload",
+    "run_create",
+    "run_cancel",
+    "run_discard",
+    "apply",
+    "policy_override",
+    "workspace_mutation",
+    "variable_mutation",
+    "state_mutation",
+    "raw_state_retention",
+    "raw_plan_retention"
+  ],
+  "nativeGaps": [
+    "native_token_resolution",
+    "configuration_version_creation_and_upload",
+    "durable_configuration_and_run_ids",
+    "explicit_apply_effect_and_kernel_receipt",
+    "bounded_terminal_reconciliation",
+    "policy_and_cost_native_readback",
+    "verified_run_result_adoption",
+    "ambiguous_create_reconciliation"
+  ]
+}
