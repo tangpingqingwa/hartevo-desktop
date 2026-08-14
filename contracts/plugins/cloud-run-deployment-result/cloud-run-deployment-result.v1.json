@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.cloud-run-deployment-result/v1",
+  "title": "Hartevo Layer 1 Google Cloud Run deployment-result contract",
+  "schemaVersion": "hartevo.cloud-run-deployment-result/v1",
+  "contractVersion": "EXT-CLOUDRUN-01-L1/v1",
+  "layer": 1,
+  "status": "read_proposal_and_recording_only",
+  "plugin": {
+    "id": "hartevo.cloud-run-deployment-result",
+    "version": "1.0.0",
+    "registration": {
+      "versionBound": true,
+      "contractDigestBound": true,
+      "providerBound": true,
+      "permissionSnapshotBound": true,
+      "adapterRevisionBound": true,
+      "scopeDigestBound": true,
+      "opaqueSecretReferenceOnly": true,
+      "reversible": true,
+      "revocable": true,
+      "failClosedDrift": true
+    }
+  },
+  "service": {
+    "id": "CloudRunDeploymentResultService",
+    "provider": "CloudRunProvider",
+    "consumer": "MissionCloudRunDeploymentConsumer",
+    "operations": [
+      "describe_service",
+      "read_deployment_evidence",
+      "compile_deployment_result_proposal",
+      "record_deployment_receipt",
+      "verify_deployment_result",
+      "mission_deployment_result_proposal",
+      "registration",
+      "revocation"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "durableReadback": false,
+    "kernelAuthority": false
+  },
+  "provider": {
+    "id": "cloud-run",
+    "version": "1.0.0",
+    "officialApi": "Google Cloud Run v2 REST",
+    "officialApiBaseUrl": "https://run.googleapis.com/apis/run.googleapis.com/v2",
+    "authentication": {
+      "secretReferenceOnly": true,
+      "oauthBearerSerialized": false,
+      "serviceAccountSerialized": false,
+      "environmentExport": false
+    },
+    "transport": {
+      "readMethods": ["GET"],
+      "boundedRevisionPagination": true,
+      "nativeHttpsIsTransportSeam": true,
+      "fixtureEvidence": "recording_only",
+      "fakeEvidence": "recording_only",
+      "loopbackEvidence": "recording_only",
+      "blockedEnvEvidence": "not_connected"
+    },
+    "capabilities": [
+      "describe_service",
+      "read_service_iam",
+      "bounded_revision_list",
+      "read_traffic_status",
+      "readiness_evidence",
+      "deployment_result_proposal",
+      "receipt_recording",
+      "result_fingerprint_verification",
+      "reversible_registration"
+    ],
+    "authorizationObscured404": "not_found_or_unauthorized",
+    "nativeStatus": "BLOCKED_ENV",
+    "connectedEvidence": false
+  },
+  "scope": {
+    "required": [
+      "google_project_id",
+      "location",
+      "service_name",
+      "revision_name",
+      "source_image_and_digest",
+      "traffic_targets",
+      "generation",
+      "hartevo_project_id",
+      "mission_id",
+      "work_product_id",
+      "mission_revision",
+      "work_product_revision"
+    ],
+    "permissionRegistration": [
+      "get_service",
+      "list_revisions",
+      "get_revision",
+      "read_traffic",
+      "get_iam_policy"
+    ],
+    "pathIsNeverIdentity": false
+  },
+  "evidence": {
+    "boundedMetadataOnly": true,
+    "required": [
+      "service_uid",
+      "service_generation",
+      "observed_generation",
+      "revision_name",
+      "revision_uid",
+      "source_image_digest",
+      "traffic_targets",
+      "readiness_state",
+      "iam_policy_digest",
+      "uri_metadata",
+      "provider_provenance",
+      "evidence_digest"
+    ],
+    "maxRevisionPages": 8,
+    "maxRevisions": 128,
+    "rawLogs": false,
+    "secretMaterial": false,
+    "rawIamPolicy": false,
+    "authority": "below_truth_consent_effect_receipt_verification_outcome"
+  },
+  "semantics": {
+    "authorizationObscured404": "preserve_not_found_or_unauthorized",
+    "unknownProviderStates": "typed_provider_unknown",
+    "observedGeneration": "exact_generation_required",
+    "sameNameReplacement": "uid_mismatch_fails_closed",
+    "trafficDrift": "allocation_and_tag_mismatch_fails_closed",
+    "boundedPagination": "page_and_item_limits_are_hard_fences",
+    "fixtureFakeLoopbackBlockedEnvNeverConnected": true,
+    "tamperAndTruncation": "digest_and_receipt_fences_fail_closed"
+  },
+  "forbiddenAuthorities": [
+    "store",
+    "keyring",
+    "browser_profile",
+    "kernel_truth",
+    "kernel_consent",
+    "kernel_effect",
+    "kernel_receipt",
+    "kernel_verification",
+    "kernel_outcome",
+    "service_create",
+    "service_patch",
+    "service_delete",
+    "traffic_mutation",
+    "iam_mutation",
+    "secret_export",
+    "environment_export",
+    "raw_logs",
+    "unbounded_revision_listing",
+    "connected_claim",
+    "native_claim",
+    "generic_hosting_registry",
+    "generic_iac_registry"
+  ],
+  "nativeGaps": [
+    "native_oauth_resolution",
+    "native_service_account_resolution",
+    "live_cloud_run_https_reads",
+    "consented_service_create_patch_delete",
+    "consented_traffic_effects",
+    "iam_mutation",
+    "durable_operation_receipts",
+    "independent_url_readback",
+    "verified_work_product_adoption",
+    "connected_or_first_party_evidence"
+  ],
+  "nonOverlap": [
+    "vercel_delivery_is_provider_specific",
+    "pulumi_deployment_is_provider_specific",
+    "terraform_cloud_run_is_provider_specific",
+    "kubernetes_rollout_is_provider_specific"
+  ]
+}
