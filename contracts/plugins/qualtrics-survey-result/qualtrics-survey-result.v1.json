@@ -1,0 +1,255 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/qualtrics-survey-result/qualtrics-survey-result.v1.json",
+  "title": "Hartevo Qualtrics survey-result Layer-1 contract",
+  "description": "A consented, read-only, bounded survey-feedback evidence seam. It is not a Qualtrics connector, respondent registry, survey editor, or Truth authority.",
+  "schemaVersion": "hartevo.qualtrics-survey-result-contract/v1",
+  "contractVersion": "qualtrics-survey-result/v1",
+  "pluginVersion": "0.1.0",
+  "layer": 1,
+  "service": {
+    "id": "qualtrics.survey-result",
+    "implementation": "QualtricsSurveyResultService",
+    "operation": "bounded_survey_feedback_result_proposal",
+    "readOnly": true,
+    "liveExecution": false,
+    "proposalOnly": true
+  },
+  "provider": {
+    "id": "qualtrics.rest",
+    "implementation": "QualtricsProvider",
+    "apiVersion": "v3",
+    "method": "GET",
+    "operations": [
+      "survey_metadata",
+      "question_metadata",
+      "response_metadata",
+      "response_status",
+      "bounded_numeric_choice_answers",
+      "response_export_progress_proposal"
+    ],
+    "transportProvenance": ["recording", "fixture", "loopback", "BLOCKED_ENV"],
+    "native": false,
+    "connected": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "id": "mission.qualtrics-survey-result",
+    "implementation": "MissionQualtricsSurveyConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "consentBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "datacenter",
+      "organization",
+      "division",
+      "survey",
+      "question",
+      "response",
+      "distribution",
+      "mission",
+      "project",
+      "consent"
+    ],
+    "revisionFences": [
+      "surveyRevision",
+      "questionRevision",
+      "responseRevision",
+      "distributionRevision",
+      "missionRevision",
+      "projectRevision",
+      "consentRevision",
+      "permissionDigest",
+      "consentDigest"
+    ],
+    "secret": "opaque_secret_reference_only"
+  },
+  "getAllowlist": {
+    "baseUrl": "https://{datacenter}.qualtrics.com/API/v3",
+    "requests": [
+      {
+        "operation": "survey_metadata",
+        "method": "GET",
+        "path": "/surveys/{surveyId}",
+        "query": false,
+        "writes": false
+      },
+      {
+        "operation": "question_metadata",
+        "method": "GET",
+        "path": "/surveys/{surveyId}/questions/{questionId}",
+        "query": false,
+        "writes": false
+      },
+      {
+        "operation": "response_metadata",
+        "method": "GET",
+        "path": "/surveys/{surveyId}/responses/{responseId}",
+        "query": false,
+        "writes": false
+      },
+      {
+        "operation": "response_status",
+        "method": "GET",
+        "path": "/surveys/{surveyId}/responses/{responseId}/status",
+        "query": false,
+        "writes": false
+      },
+      {
+        "operation": "bounded_numeric_choice_answers",
+        "method": "GET",
+        "path": "/surveys/{surveyId}/responses/{responseId}/questions/{questionId}",
+        "query": false,
+        "writes": false
+      },
+      {
+        "operation": "response_export_progress_proposal",
+        "method": "GET",
+        "path": "/responseexports/{opaqueExportReference}",
+        "query": false,
+        "download": false,
+        "proposalOnly": true,
+        "writes": false
+      }
+    ],
+    "arbitraryQuery": false,
+    "postPutPatchDelete": false,
+    "exportStart": false,
+    "exportFileDownload": false
+  },
+  "answers": {
+    "allow": ["numeric", "choice"],
+    "deny": ["free_text", "embedded_data", "name", "email", "location", "respondent_identity"],
+    "choiceRepresentation": "opaque_choice_id",
+    "numericRepresentation": "bounded_scaled_integer"
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxAnswers": 256,
+    "maxPages": 8,
+    "maxPageSize": 64,
+    "maxPathBytes": 512,
+    "maxRetryAttempts": 3,
+    "maxBackoffMilliseconds": 30000,
+    "maxIdentifierBytes": 128
+  },
+  "projections": {
+    "states": [
+      "completed",
+      "in_progress",
+      "partial",
+      "expired",
+      "consent_blocked",
+      "access_lost",
+      "provider_unknown"
+    ],
+    "missingResponseIsPopulationSentiment": false,
+    "lowScoreIsCausalProof": false,
+    "providerUnknownIsSuccess": false
+  },
+  "registration": {
+    "boundFields": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerVersion",
+      "providerDigest",
+      "datacenter",
+      "survey",
+      "scopeDigest",
+      "missionRevision",
+      "projectRevision",
+      "consentRevision",
+      "secretReferenceDigest",
+      "credentialRevision"
+    ],
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "datacenterBound": true,
+    "surveyBound": true,
+    "scopeDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": [
+      "plugin_version",
+      "contract_version",
+      "contract_digest",
+      "provider_version",
+      "provider_digest",
+      "datacenter",
+      "survey",
+      "question",
+      "response",
+      "distribution",
+      "mission_revision",
+      "project_revision",
+      "consent_revision",
+      "permission_digest",
+      "consent_digest",
+      "credential_revision",
+      "registration_revocation"
+    ]
+  },
+  "redaction": {
+    "secretReferenceOpaque": true,
+    "rawApiTokenSerialized": false,
+    "rawFreeTextSerialized": false,
+    "rawPiiSerialized": false,
+    "rawLocationSerialized": false,
+    "rawEmbeddedDataSerialized": false,
+    "rawExportBytesSerialized": false,
+    "rawProviderPayloadSerialized": false,
+    "rawRequestBodySerialized": false,
+    "receipts": "request-and-result-digests-only"
+  },
+  "authority": {
+    "connected": false,
+    "nativeProvider": false,
+    "externalWrites": false,
+    "durableNativeReceipt": false,
+    "verification": false,
+    "adoptedOutcome": false,
+    "truthAuthority": false,
+    "populationSentimentInference": false,
+    "causalInference": false,
+    "genericResearchRegistry": false
+  },
+  "forbidden": [
+    "survey_mutation",
+    "question_mutation",
+    "distribution_mutation",
+    "response_import",
+    "response_export_start",
+    "response_export_file_download",
+    "contact_directory_write",
+    "respondent_reidentification",
+    "arbitrary_query",
+    "raw_free_text",
+    "raw_pii",
+    "raw_location",
+    "raw_embedded_data",
+    "raw_export_bytes",
+    "generic_research_registry",
+    "kernel_authority",
+    "native_connected_claim"
+  ],
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_qualtrics_and_connected",
+    "deferred": [
+      "native_secret_resolution",
+      "bounded_https_transport",
+      "durable_provider_receipt",
+      "independent_readback",
+      "consented_survey_effects",
+      "verified_work_product_adoption"
+    ],
+    "blockedEnvironmentIsNative": false
+  }
+}
