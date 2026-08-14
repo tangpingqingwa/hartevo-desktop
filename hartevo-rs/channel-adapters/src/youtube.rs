@@ -17,7 +17,7 @@ use crate::transport::{
     ProviderResponse, ReadOperation, ScopeName, provider_code, retry_after,
 };
 
-pub const DATA_API_BASE_URL: &str = "https://www.googleapis.com/youtube/v3/";
+pub const DATA_API_BASE_URL: &str = "https://www.googleapis.com/youtube/v3";
 pub const ANALYTICS_API_BASE_URL: &str = "https://youtubeanalytics.googleapis.com/v2/reports";
 pub const YOUTUBE_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/youtube.readonly";
 pub const YOUTUBE_MANAGE_SCOPE: &str = "https://www.googleapis.com/auth/youtube";
