@@ -234,6 +234,10 @@ impl Connection {
         &self.account_id
     }
 
+    pub fn expected_external_account_id(&self) -> &str {
+        &self.expected_external_account_id
+    }
+
     pub fn last_probe(&self) -> Option<&ConnectionProbe> {
         self.last_probe.as_ref()
     }

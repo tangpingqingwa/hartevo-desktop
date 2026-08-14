@@ -141,10 +141,11 @@ pub use relationship::{
     StageTransition, SuppressionReason, WebhookAttestation,
 };
 pub use relationship_projection::{
-    CanonicalRelationshipRecord, InboxItemProjection, InboxProjection, RelationshipProjectionError,
-    RelationshipSourceCursor, RelationshipSourceKey, RelationshipSourceRef,
-    RelationshipSourceStream, canonical_relationship_id, digest_relationship_value,
-    relationship_source_scope_digest,
+    CanonicalRelationshipRecord, ConversationSourceProjection, ConversationSourceState,
+    InboxItemProjection, InboxProjection, RelationshipProjectionError, RelationshipSourceCursor,
+    RelationshipSourceEvent, RelationshipSourceKey, RelationshipSourceRef,
+    RelationshipSourceStream, canonical_conversation_id, canonical_relationship_id,
+    digest_relationship_value, relationship_source_scope_digest,
 };
 pub use runtime_process::{
     RuntimeProcessClaim, RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition,

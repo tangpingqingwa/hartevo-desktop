@@ -17,7 +17,7 @@ use hartevo_application::{
 };
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_domain_kernel::{
-    CadenceTriggerKind, ConversationState, KpiContract, KpiDirection,
+    CadenceTriggerKind, ConversationSourceState, ConversationState, KpiContract, KpiDirection,
     MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointStatus,
     MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
     MissionId, MissionScheduleStatus, MissionStage, Money, OperatingMode, OutcomeDecision,
@@ -6630,6 +6630,7 @@ fn RelationshipsSurface(
     let inbox = project.inbox.as_ref();
     let relationship_count = inbox.map_or(0, |projection| projection.relationships.len());
     let inbox_count = inbox.map_or(0, |projection| projection.items.len());
+    let provider_thread_count = inbox.map_or(0, |projection| projection.conversation_sources.len());
     let waiting_human_count = inbox.map_or(0, |projection| {
         projection
             .items
@@ -6663,6 +6664,7 @@ fn RelationshipsSurface(
                 }
                 div { class: "readiness-stat", b { "{relationship_count}" } small { "已读关系" } }
                 div { class: "readiness-stat", b { "{inbox_count}" } small { "Inbox 会话" } }
+                div { class: "readiness-stat", b { "{provider_thread_count}" } small { "Provider threads" } }
                 div { class: "readiness-stat", b { "{waiting_human_count}" } small { "等待人工" } }
             }
             div { class: "relationship-layout",
@@ -6678,7 +6680,7 @@ fn RelationshipsSurface(
                     }
                     if active_tab() == "inbox" {
                         if let Some(projection) = inbox {
-                            if projection.items.is_empty() {
+                            if projection.items.is_empty() && projection.conversation_sources.is_empty() {
                                 div { class: "state-canvas",
                                     UiIcon { name: UiIconName::Message, size: 22 }
                                     span { class: "honesty-badge", "READ-ONLY" }
@@ -6696,10 +6698,21 @@ fn RelationshipsSurface(
                                             small { "Person {item.person_id} · Account {item.account_id} · control generation {item.control_generation}" }
                                             small { "delivery boundary: {message_delivery_label(item.latest_message_delivery.as_ref())}" }
                                             small { "latest message digest: {item.latest_message_digest.as_deref().unwrap_or(\"none\")}" }
+                                            }
+                                        }
+                                    }
+                                    for source in projection.conversation_sources.iter() {
+                                        article { class: "relationship-record",
+                                            div { class: "relationship-record-head",
+                                                strong { "{source.source.provider} · {source.source.external_id}" }
+                                                span { class: "honesty-badge", "{conversation_source_state_label(source.source_state)}" }
+                                            }
+                                            small { "source conversation {source.conversation_id} · Account {source.source.account_id}" }
+                                            small { "source revision: {source.source_revision} · revision digest: {source.source_revision_digest}" }
+                                            small { "Provider observation only; message body is not projected." }
                                         }
                                     }
                                 }
-                            }
                         } else {
                             div { class: "state-canvas",
                                 UiIcon { name: UiIconName::Message, size: 22 }
@@ -6771,6 +6784,15 @@ fn conversation_state_label(state: &ConversationState) -> &'static str {
         ConversationState::Resolved => "RESOLVED",
         ConversationState::Closed => "CLOSED",
         ConversationState::DeadLetter => "DEAD LETTER",
+    }
+}
+
+fn conversation_source_state_label(state: ConversationSourceState) -> &'static str {
+    match state {
+        ConversationSourceState::Open => "SOURCE OPEN",
+        ConversationSourceState::Closed => "SOURCE CLOSED",
+        ConversationSourceState::Archived => "SOURCE ARCHIVED",
+        ConversationSourceState::Unknown => "SOURCE UNKNOWN",
     }
 }
 

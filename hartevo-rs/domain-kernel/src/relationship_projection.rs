@@ -194,6 +194,8 @@ pub struct CanonicalRelationshipRecord {
     pub source_revision: String,
     pub display_name_digest: String,
     pub value_digests: BTreeSet<String>,
+    #[serde(default)]
+    pub deleted: bool,
     pub observed_at: DateTime<Utc>,
     pub revision: u64,
 }
@@ -216,6 +218,86 @@ impl CanonicalRelationshipRecord {
         self.source.key() == other.source.key()
             && self.source.external_id == other.source.external_id
             && self.source_revision == other.source_revision
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationSourceState {
+    Open,
+    Closed,
+    Archived,
+    Unknown,
+}
+
+/// Content-free provider conversation metadata. This is deliberately separate
+/// from `InboxItemProjection`: provider observations cannot change the local
+/// Conversation's draft, approval, or human-takeover state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSourceProjection {
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub conversation_id: ConversationId,
+    pub person_id: Option<PersonId>,
+    pub source: RelationshipSourceRef,
+    pub source_revision: String,
+    pub source_revision_digest: String,
+    pub source_state: ConversationSourceState,
+    pub archived: bool,
+    #[serde(default)]
+    pub deleted: bool,
+    pub latest_activity_at: Option<DateTime<Utc>>,
+    pub latest_received_at: Option<DateTime<Utc>>,
+    pub latest_sent_at: Option<DateTime<Utc>>,
+    pub observed_at: DateTime<Utc>,
+    pub revision: u64,
+}
+
+impl ConversationSourceProjection {
+    pub fn validate(&self) -> Result<(), RelationshipProjectionError> {
+        self.source.validate()?;
+        if self.tenant_id.as_str().trim().is_empty()
+            || self.project_id.as_str().trim().is_empty()
+            || self.conversation_id.as_str().trim().is_empty()
+            || self.source.stream != RelationshipSourceStream::Conversations
+            || self.source_revision.trim().is_empty()
+            || !is_sha256(&self.source_revision_digest)
+            || self.revision == 0
+        {
+            return Err(RelationshipProjectionError::InvalidConversationSource);
+        }
+        Ok(())
+    }
+}
+
+/// Provider event identity used only for durable webhook deduplication. The
+/// raw webhook body and property values never cross this domain boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationshipSourceEvent {
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub source: RelationshipSourceRef,
+    pub event_id: String,
+    pub event_digest: String,
+    pub occurred_at: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
+    pub revision: u64,
+}
+
+impl RelationshipSourceEvent {
+    pub fn validate(&self) -> Result<(), RelationshipProjectionError> {
+        self.source.validate()?;
+        if self.tenant_id.as_str().trim().is_empty()
+            || self.project_id.as_str().trim().is_empty()
+            || self.event_id.trim().is_empty()
+            || !is_sha256(&self.event_digest)
+            || self.revision == 0
+        {
+            return Err(RelationshipProjectionError::InvalidSourceEvent);
+        }
+        Ok(())
     }
 }
 
@@ -303,7 +385,11 @@ pub struct InboxProjection {
     pub revision: u64,
     pub items: Vec<InboxItemProjection>,
     pub relationships: Vec<CanonicalRelationshipRecord>,
+    #[serde(default)]
+    pub conversation_sources: Vec<ConversationSourceProjection>,
     pub source_cursors: Vec<RelationshipSourceCursor>,
+    #[serde(default)]
+    pub source_events: Vec<RelationshipSourceEvent>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -315,7 +401,9 @@ impl InboxProjection {
             revision: 1,
             items: Vec::new(),
             relationships: Vec::new(),
+            conversation_sources: Vec::new(),
             source_cursors: Vec::new(),
+            source_events: Vec::new(),
             updated_at: now,
         }
     }
@@ -329,18 +417,42 @@ impl InboxProjection {
                     || item.tenant_id != self.tenant_id
                     || item.project_id != self.project_id
             })
-            || self
-                .relationships
-                .iter()
-                .any(|record| record.validate().is_err())
+            || self.relationships.iter().any(|record| {
+                record.validate().is_err()
+                    || record.canonical_id
+                        != canonical_relationship_id(
+                            &self.tenant_id,
+                            &self.project_id,
+                            &record.source,
+                        )
+            })
+            || self.conversation_sources.iter().any(|source| {
+                source.validate().is_err()
+                    || source.tenant_id != self.tenant_id
+                    || source.project_id != self.project_id
+                    || source.conversation_id.as_str()
+                        != canonical_conversation_id(
+                            &self.tenant_id,
+                            &self.project_id,
+                            &source.source,
+                        )
+            })
             || self.source_cursors.iter().any(|cursor| {
                 cursor.validate().is_err()
                     || cursor.tenant_id != self.tenant_id
                     || cursor.project_id != self.project_id
             })
+            || self.source_events.iter().any(|event| {
+                event.validate().is_err()
+                    || event.tenant_id != self.tenant_id
+                    || event.project_id != self.project_id
+            })
             || unique_conversation_count(&self.items) != self.items.len()
             || unique_relationship_count(&self.relationships) != self.relationships.len()
+            || unique_conversation_source_count(&self.conversation_sources)
+                != self.conversation_sources.len()
             || unique_cursor_count(&self.source_cursors) != self.source_cursors.len()
+            || unique_source_event_count(&self.source_events) != self.source_events.len()
         {
             return Err(RelationshipProjectionError::InvalidInboxProjection);
         }
@@ -411,7 +523,7 @@ impl InboxProjection {
                     return Err(RelationshipProjectionError::CanonicalIdentityConflict);
                 }
                 if existing.source_revision == record.source_revision {
-                    if existing != &record {
+                    if !same_relationship_observation(existing, &record) {
                         return Err(RelationshipProjectionError::SourceRevisionConflict);
                     }
                     false
@@ -441,6 +553,152 @@ impl InboxProjection {
             self.bump_revision(now)?;
         }
         Ok(changed)
+    }
+
+    pub fn upsert_conversation_source(
+        &mut self,
+        source: ConversationSourceProjection,
+    ) -> Result<bool, RelationshipProjectionError> {
+        source.validate()?;
+        if source.tenant_id != self.tenant_id || source.project_id != self.project_id {
+            return Err(RelationshipProjectionError::ScopeMismatch);
+        }
+        let key = (source.source.key(), source.source.external_id.clone());
+        let changed = match self.conversation_sources.iter().position(|existing| {
+            (existing.source.key(), existing.source.external_id.clone()) == key
+        }) {
+            None => {
+                self.conversation_sources.push(source);
+                self.conversation_sources.sort_by(|left, right| {
+                    (
+                        left.source.provider.as_str(),
+                        left.source.account_id.as_str(),
+                        left.source.external_id.as_str(),
+                    )
+                        .cmp(&(
+                            right.source.provider.as_str(),
+                            right.source.account_id.as_str(),
+                            right.source.external_id.as_str(),
+                        ))
+                });
+                true
+            }
+            Some(index) => {
+                let existing = &self.conversation_sources[index];
+                if existing.conversation_id != source.conversation_id {
+                    return Err(RelationshipProjectionError::CanonicalIdentityConflict);
+                }
+                if existing.source_revision == source.source_revision {
+                    if !same_conversation_source_observation(existing, &source) {
+                        return Err(RelationshipProjectionError::SourceRevisionConflict);
+                    }
+                    false
+                } else if source_revision_order(&source.source_revision)
+                    .zip(source_revision_order(&existing.source_revision))
+                    .is_some_and(|(incoming, stored)| incoming <= stored)
+                {
+                    return Err(RelationshipProjectionError::StaleSourceRevision);
+                } else {
+                    let mut source = source;
+                    source.revision = existing
+                        .revision
+                        .checked_add(1)
+                        .ok_or(RelationshipProjectionError::RevisionOverflow)?;
+                    self.conversation_sources[index] = source;
+                    true
+                }
+            }
+        };
+        if changed {
+            let now = self
+                .conversation_sources
+                .iter()
+                .map(|entry| entry.observed_at)
+                .max()
+                .ok_or(RelationshipProjectionError::InvalidInboxProjection)?;
+            self.bump_revision(now)?;
+        }
+        Ok(changed)
+    }
+
+    pub fn upsert_source_event(
+        &mut self,
+        event: RelationshipSourceEvent,
+    ) -> Result<bool, RelationshipProjectionError> {
+        event.validate()?;
+        if event.tenant_id != self.tenant_id || event.project_id != self.project_id {
+            return Err(RelationshipProjectionError::ScopeMismatch);
+        }
+        let observed_at = event.observed_at;
+        let key = (
+            event.source.key(),
+            event.source.external_id.clone(),
+            event.event_id.clone(),
+            event.event_digest.clone(),
+        );
+        let changed = match self.source_events.iter().position(|existing| {
+            (
+                existing.source.key(),
+                existing.source.external_id.clone(),
+                existing.event_id.clone(),
+                existing.event_digest.clone(),
+            ) == key
+        }) {
+            None => {
+                self.source_events.push(event);
+                self.source_events.sort_by(|left, right| {
+                    (
+                        left.source.provider.as_str(),
+                        left.source.account_id.as_str(),
+                        left.source.stream,
+                        left.source.external_id.as_str(),
+                        left.event_id.as_str(),
+                        left.event_digest.as_str(),
+                    )
+                        .cmp(&(
+                            right.source.provider.as_str(),
+                            right.source.account_id.as_str(),
+                            right.source.stream,
+                            right.source.external_id.as_str(),
+                            right.event_id.as_str(),
+                            right.event_digest.as_str(),
+                        ))
+                });
+                true
+            }
+            Some(_) => false,
+        };
+        if changed {
+            self.bump_revision(observed_at)?;
+        }
+        Ok(changed)
+    }
+
+    pub fn conversation_source(
+        &self,
+        provider: &str,
+        account_id: &AccountId,
+        external_id: &str,
+    ) -> Option<&ConversationSourceProjection> {
+        self.conversation_sources.iter().find(|source| {
+            source.source.provider == provider
+                && source.source.account_id == *account_id
+                && source.source.external_id == external_id
+        })
+    }
+
+    pub fn source_event(
+        &self,
+        source: &RelationshipSourceRef,
+        event_id: &str,
+        event_digest: &str,
+    ) -> Option<&RelationshipSourceEvent> {
+        self.source_events.iter().find(|event| {
+            event.source.key() == source.key()
+                && event.source.external_id == source.external_id
+                && event.event_id == event_id
+                && event.event_digest == event_digest
+        })
     }
 
     pub fn upsert_source_cursor(
@@ -548,6 +806,23 @@ pub fn canonical_relationship_id(
     format!("relationship:{:x}", Sha256::digest(scope.as_bytes()))
 }
 
+pub fn canonical_conversation_id(
+    tenant_id: &TenantId,
+    project_id: &ProjectId,
+    source: &RelationshipSourceRef,
+) -> String {
+    let scope = format!(
+        "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{:?}\u{0}{}",
+        tenant_id.as_str(),
+        project_id.as_str(),
+        source.provider,
+        source.account_id.as_str(),
+        source.stream,
+        source.external_id,
+    );
+    format!("conversation:{:x}", Sha256::digest(scope.as_bytes()))
+}
+
 pub fn digest_relationship_value(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.trim().as_bytes()))
 }
@@ -560,6 +835,10 @@ pub enum RelationshipProjectionError {
     InvalidSourceCursor,
     #[error("canonical relationship record is invalid")]
     InvalidRelationshipRecord,
+    #[error("conversation source projection is invalid")]
+    InvalidConversationSource,
+    #[error("relationship source event is invalid")]
+    InvalidSourceEvent,
     #[error("Inbox item projection is invalid")]
     InvalidInboxItem,
     #[error("Inbox projection is invalid")]
@@ -592,6 +871,37 @@ fn unique_conversation_count(items: &[InboxItemProjection]) -> usize {
         .len()
 }
 
+fn same_relationship_observation(
+    left: &CanonicalRelationshipRecord,
+    right: &CanonicalRelationshipRecord,
+) -> bool {
+    left.canonical_id == right.canonical_id
+        && left.source == right.source
+        && left.source_revision == right.source_revision
+        && left.display_name_digest == right.display_name_digest
+        && left.value_digests == right.value_digests
+        && left.deleted == right.deleted
+}
+
+fn same_conversation_source_observation(
+    left: &ConversationSourceProjection,
+    right: &ConversationSourceProjection,
+) -> bool {
+    left.tenant_id == right.tenant_id
+        && left.project_id == right.project_id
+        && left.conversation_id == right.conversation_id
+        && left.person_id == right.person_id
+        && left.source == right.source
+        && left.source_revision == right.source_revision
+        && left.source_revision_digest == right.source_revision_digest
+        && left.source_state == right.source_state
+        && left.archived == right.archived
+        && left.deleted == right.deleted
+        && left.latest_activity_at == right.latest_activity_at
+        && left.latest_received_at == right.latest_received_at
+        && left.latest_sent_at == right.latest_sent_at
+}
+
 fn unique_relationship_count(records: &[CanonicalRelationshipRecord]) -> usize {
     records
         .iter()
@@ -600,10 +910,33 @@ fn unique_relationship_count(records: &[CanonicalRelationshipRecord]) -> usize {
         .len()
 }
 
+fn unique_conversation_source_count(sources: &[ConversationSourceProjection]) -> usize {
+    sources
+        .iter()
+        .map(|source| (source.source.key(), source.source.external_id.clone()))
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
 fn unique_cursor_count(cursors: &[RelationshipSourceCursor]) -> usize {
     cursors
         .iter()
         .map(RelationshipSourceCursor::key)
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn unique_source_event_count(events: &[RelationshipSourceEvent]) -> usize {
+    events
+        .iter()
+        .map(|event| {
+            (
+                event.source.key(),
+                event.source.external_id.clone(),
+                event.event_id.clone(),
+                event.event_digest.clone(),
+            )
+        })
         .collect::<BTreeSet<_>>()
         .len()
 }
