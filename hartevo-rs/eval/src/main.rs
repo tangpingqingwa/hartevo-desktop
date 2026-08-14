@@ -8,8 +8,7 @@ use hartevo_eval::{
     HarnessEvaluationInput, HarnessLabPlan, HarnessPromotionKey, HarnessSignedPromotionRecord,
     VERTICAL_SLICE_ID, catalog_snapshot, evaluate_harness_lab, finalize_evaluation_run,
     harness_lab_source_commit, run_vertical_slice, validate_evaluation_run,
-    wave_zero_release_evidence,
-    validate_progress_trace_example,
+    validate_progress_trace_example, wave_zero_release_evidence,
 };
 use serde::{Deserialize, Serialize};
 
