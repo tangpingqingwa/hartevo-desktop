@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/azure-document-intelligence-result/azure-document-intelligence-result.v1.json",
+  "title": "Hartevo Azure Document Intelligence result Layer-1 contract",
+  "description": "A local-first, read-only, redacted Azure Document Intelligence projection seam. It is not a native connector, generic OCR registry, provider receipt, kernel authority, or Work Product adoption authority.",
+  "schemaVersion": "hartevo.azure-document-intelligence-result.contract/v1",
+  "contractVersion": "azure-document-intelligence-result/v1",
+  "pluginVersion": "0.1.0",
+  "layer": "Layer-1",
+  "serviceId": "hartevo.azure.document-intelligence.result",
+  "providerId": "azure.document-intelligence",
+  "consumerId": "mission.document-intelligence",
+  "scope": [
+    "tenant_id",
+    "resource_name",
+    "region",
+    "allowlisted_model",
+    "document_id",
+    "source_sha256_digest",
+    "inclusive_page_range",
+    "project_id_and_revision",
+    "mission_id_and_revision",
+    "work_product_id_and_revision",
+    "consent_id_and_revision_and_purpose",
+    "document_intelligence_read_permission"
+  ],
+  "allowlistedModels": [
+    "prebuilt-read",
+    "prebuilt-layout"
+  ],
+  "operations": [
+    "describe_capabilities",
+    "register",
+    "revoke_registration",
+    "compile_analysis_request",
+    "begin_analysis_seam",
+    "poll_analysis_seam",
+    "project_redacted_result",
+    "consume_mission_projection"
+  ],
+  "provenance": [
+    "recording",
+    "fixture",
+    "loopback",
+    "BLOCKED_ENV"
+  ],
+  "typedSeams": {
+    "operationLocation": "opaque sha256 digest; provider URL is never retained or serialized",
+    "status": [
+      "not_started",
+      "running",
+      "succeeded",
+      "failed",
+      "canceled",
+      "BLOCKED_ENV"
+    ],
+    "result": "allowlisted prebuilt-read/prebuilt-layout pages, text, tables, field metadata, confidence and geometry summaries"
+  },
+  "registration": {
+    "versionBound": true,
+    "contractBound": true,
+    "providerBound": true,
+    "permissionBound": true,
+    "scopeBound": true,
+    "sourceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "version_drift",
+      "contract_digest_drift",
+      "provider_revision_drift",
+      "permission_drift",
+      "scope_drift",
+      "source_digest_drift",
+      "registration_tamper",
+      "registration_revocation"
+    ]
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxPageNumber": 2000,
+    "maxOutputPages": 64,
+    "maxParagraphs": 128,
+    "maxTables": 32,
+    "maxTableCells": 512,
+    "maxFields": 128,
+    "maxTextPreviewBytes": 512
+  },
+  "redaction": {
+    "default": "digest_only",
+    "optional": "bounded_prefix",
+    "rawBytesRetained": false,
+    "rawPiiRetained": false,
+    "sasOrUiLinksRetained": false
+  },
+  "authority": {
+    "externalWrites": false,
+    "uploads": false,
+    "modelTraining": false,
+    "connected": false,
+    "native": false,
+    "durableProviderReceipt": false,
+    "independentReadBack": false,
+    "kernelTruth": false,
+    "kernelReceipt": false,
+    "kernelVerification": false,
+    "kernelOutcome": false,
+    "verifiedWorkProductAdoption": false,
+    "dashboard": false,
+    "genericOcrRegistry": false
+  },
+  "forbidden": [
+    "secret_serialization",
+    "raw_document_bytes",
+    "raw_pii_text_retention",
+    "sas_url_retention",
+    "ui_link_retention",
+    "document_upload",
+    "model_training",
+    "external_mutation",
+    "generic_ocr_registry",
+    "dashboard_or_ui_surface",
+    "kernel_truth_receipt_verification_or_outcome_authority",
+    "native_connected_claim"
+  ],
+  "layer2Gaps": [
+    "native_credential_resolution",
+    "native_document_submission",
+    "native_operation_polling",
+    "durable_provider_receipt",
+    "independent_result_readback",
+    "verified_work_product_adoption"
+  ],
+  "honestNativeGap": "BLOCKED_ENV is the only native environment status in this root. Credential resolution, document submission/polling, durable provider receipt, independent readback, and verified Work Product adoption remain explicit Layer-2 gaps."
+}
