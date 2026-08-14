@@ -7,6 +7,7 @@
 
 mod model_tokenizer;
 mod plugin_session;
+mod plugin_session_resume;
 
 pub use model_tokenizer::{
     ConservativeByteBudgetTokenizer, PinnedModelTokenizer, PinnedTokenizerSpec,
@@ -16,6 +17,12 @@ pub use plugin_session::{
     PluginSessionEvent, PluginSessionEventKind, PluginSessionEventStatus, PluginSessionFence,
     PluginSessionJournal, PluginSessionLifecycle, PluginSessionPosition, PluginSessionProvider,
     PluginSessionReceipt, PluginSessionScope, PluginSessionService,
+};
+pub use plugin_session_resume::{
+    PluginSessionResumeCancelReason, PluginSessionResumeError, PluginSessionResumeEvent,
+    PluginSessionResumeEventKind, PluginSessionResumeEventStatus, PluginSessionResumeFence,
+    PluginSessionResumeReceipt, PluginSessionResumeService, PluginSessionRuntimeLease,
+    PluginSessionRuntimeLeaseInput, plugin_resume_digest,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

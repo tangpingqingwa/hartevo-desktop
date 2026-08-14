@@ -92,6 +92,18 @@ impl ProjectStore {
         })
     }
 
+    pub fn terminal_plugin_session(
+        &mut self,
+        fence: &PluginSessionFence,
+        recorded_at: &str,
+    ) -> Result<Vec<PluginSessionReceipt>, StorageError> {
+        self.mutate_plugin_session(fence, |service| {
+            service
+                .terminal(fence, recorded_at)
+                .map_err(StorageError::from)
+        })
+    }
+
     pub fn plugin_session_events(
         &self,
         fence: &PluginSessionFence,
