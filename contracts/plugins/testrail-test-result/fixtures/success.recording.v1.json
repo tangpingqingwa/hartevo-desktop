@@ -1,0 +1,20 @@
+{
+  "fixtureVersion": "testrail-test-result-recording/v1",
+  "provenance": "recording",
+  "native": false,
+  "connected": false,
+  "verified": false,
+  "redaction": {
+    "comments": "digest_only",
+    "defects": "digest_only",
+    "version": "digest_only",
+    "attachments": false,
+    "screenshots": false
+  },
+  "allowlistedOperations": [
+    "GET /api/v2/get_run/{run_id}",
+    "GET /api/v2/get_tests/{run_id}",
+    "GET /api/v2/get_results_for_run/{run_id}"
+  ],
+  "evidence": "bounded redacted fixture only"
+}
