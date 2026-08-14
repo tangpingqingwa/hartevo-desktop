@@ -4491,6 +4491,131 @@ body.resizing-workpad {
   }
 }
 
+/* Mission-local plugin approval: mounted only when the durable Application
+ * projection is pending for the selected Project/Mission. */
+.pending-plugin-approval-node {
+  display: grid;
+  gap: 10px;
+  margin: 8px 0 12px;
+  padding: 13px 14px 12px;
+  border: 1px solid #eadfca;
+  border-radius: 12px;
+  background: #fffdf8;
+  box-shadow: 0 8px 24px rgba(83, 69, 44, 0.06);
+}
+
+.pending-plugin-approval-head,
+.pending-plugin-approval-foot {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.pending-plugin-approval-head > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.pending-plugin-approval-icon {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 9px;
+  color: #9b6e2b;
+  background: #fff3d9;
+}
+
+.pending-plugin-approval-head strong {
+  color: #494035;
+  font-size: 11px;
+  font-weight: 680;
+}
+
+.pending-plugin-approval-head small,
+.pending-plugin-approval-grid small,
+.pending-plugin-approval-grid span,
+.pending-plugin-approval-foot span,
+.pending-plugin-approval-foot small {
+  color: #8d877d;
+  font-size: 8.5px;
+  line-height: 1.45;
+}
+
+.pending-plugin-approval-head em {
+  margin-left: auto;
+  color: #a9782f;
+  font-size: 8px;
+  font-style: normal;
+  letter-spacing: 0.08em;
+}
+
+.pending-plugin-approval-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.pending-plugin-approval-grid > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  padding: 8px 9px;
+  border: 1px solid #eee9de;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.8);
+}
+
+.pending-plugin-approval-grid strong {
+  overflow: hidden;
+  color: #4f4a43;
+  font-size: 9.5px;
+  font-weight: 630;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-plugin-approval-foot {
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+
+.pending-plugin-approval-foot > span {
+  flex: 1 1 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-plugin-approval-action {
+  min-height: 26px;
+  padding: 0 11px;
+  border: 1px solid #dfd8cb;
+  border-radius: 7px;
+  color: #5e5548;
+  background: #fff;
+  cursor: pointer;
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.pending-plugin-approval-action.primary {
+  border-color: #2b2925;
+  color: #fff;
+  background: #2b2925;
+}
+
+.pending-plugin-approval-action:hover {
+  border-color: #aa8855;
+}
+
+@media (max-width: 720px) {
+  .pending-plugin-approval-grid { grid-template-columns: 1fr; }
+  .pending-plugin-approval-foot { align-items: stretch; flex-direction: column; }
+  .pending-plugin-approval-action { width: 100%; }
+}
+
 /* --------------------------------------------------------------------------
  * Persisted Mission Conversation. Unlike the fixture-only selectors above,
  * every visible body here comes from the context-gated SQLCipher projection.

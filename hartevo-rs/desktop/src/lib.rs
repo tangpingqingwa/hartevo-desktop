@@ -30,6 +30,7 @@ use zeroize::Zeroizing;
 
 mod agent_operations;
 pub mod data_plane;
+mod pending_plugin_approval_surface;
 mod runtime_plane;
 mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
@@ -43,6 +44,10 @@ use data_plane::{
     DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
     DesktopSnapshot, DesktopVm11OutcomeDecisionRequest, ProductEvidenceProjection,
     ProjectContextAccessProjection, ProjectContextAccessStatus, RecoveryKitDraft,
+};
+use pending_plugin_approval_surface::{
+    PendingPluginApprovalAction, PendingPluginApprovalSurfaceProjection,
+    project_pending_plugin_approval,
 };
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 use runtime_subscription::{
@@ -915,6 +920,7 @@ pub fn App() -> Element {
     let mut runtime_text_scope = use_signal(move || initial_runtime_text_scope);
     let mut runtime_text_stream = use_signal(move || initial_visual_runtime_text_stream);
     let mut runtime_text_error = use_signal(move || initial_visual_runtime_error);
+    let mut pending_plugin_approval = use_signal(|| None::<PendingPluginApprovalSurfaceProjection>);
     let mut runtime_follow_latest = use_signal(move || visual_runtime_follow_latest);
     let mut runtime_has_unseen = use_signal(move || visual_runtime_has_unseen);
     let mut composer_expanded = use_signal(|| false);
@@ -1047,6 +1053,54 @@ pub fn App() -> Element {
                     }));
                 }
             }
+        });
+    });
+    use_effect(move || {
+        if visual_fixture_mode {
+            pending_plugin_approval.set(None);
+            return;
+        }
+        let selected = {
+            let current = model.read();
+            current.current_project().and_then(|project| {
+                current.selected_mission_id.clone().map(|mission_id| {
+                    (
+                        project.tenant_id.clone(),
+                        project.project_id.clone(),
+                        mission_id,
+                    )
+                })
+            })
+        };
+        let Some((tenant_id, project_id, mission_id)) = selected else {
+            pending_plugin_approval.set(None);
+            return;
+        };
+        pending_plugin_approval.set(None);
+        spawn(async move {
+            let query_project_id = project_id.clone();
+            let query_mission_id = mission_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::discover().and_then(|plane| {
+                    plane.pending_plugin_approval_os(
+                        &query_project_id,
+                        &query_mission_id,
+                        Utc::now(),
+                    )
+                })
+            })
+            .await;
+            if !desktop_scope_is_selected(model, &project_id, &mission_id) {
+                return;
+            }
+            let Some(Ok(projections)) = result.ok() else {
+                return;
+            };
+            let selected_scope = Some((&tenant_id, &project_id, &mission_id));
+            let visible = projections
+                .into_iter()
+                .find_map(|projection| project_pending_plugin_approval(selected_scope, projection));
+            pending_plugin_approval.set(visible);
         });
     });
     // Dioxus runs this effect after committing the render that consumed the
@@ -2055,6 +2109,7 @@ pub fn App() -> Element {
                                 runtime_stream_is_fixture: visual_persisted_stream_fixture,
                                 runtime_follow_latest: rendered_runtime_follow_latest,
                                 runtime_has_unseen: rendered_runtime_has_unseen,
+                                pending_plugin_approval: pending_plugin_approval(),
                                 context_access: context_access.clone(),
                                 operations: operations_projection.clone(),
                                 interrupt_available: operations_interrupt_available,
@@ -4946,6 +5001,7 @@ fn OrchestratorSurface(
     runtime_stream_is_fixture: bool,
     runtime_follow_latest: bool,
     runtime_has_unseen: bool,
+    pending_plugin_approval: Option<PendingPluginApprovalSurfaceProjection>,
     context_access: Option<ProjectContextAccessProjection>,
     operations: AgentOperationsWorkbenchProjection,
     interrupt_available: bool,
@@ -5175,6 +5231,12 @@ fn OrchestratorSurface(
                         runtime_text_stream: runtime_text_stream.clone(),
                         replayed_message_sequence,
                     }
+                    if let Some(approval) = pending_plugin_approval {
+                        PendingPluginApprovalNode {
+                            approval,
+                            on_action: None,
+                        }
+                    }
                     if let Some((state, copy)) = runtime_fixture_copy {
                         div {
                             class: "persisted-system-notice visual-runtime-state",
@@ -5254,6 +5316,80 @@ fn OrchestratorSurface(
                             "回到最新"
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn PendingPluginApprovalNode(
+    approval: PendingPluginApprovalSurfaceProjection,
+    on_action: Option<EventHandler<PendingPluginApprovalAction>>,
+) -> Element {
+    let approval_for_approve = approval.clone();
+    let approval_for_deny = approval.clone();
+    let consent_revision_label = approval
+        .revisions()
+        .consent_revision()
+        .map_or_else(|| "—".to_owned(), |revision| revision.to_string());
+    let scope_label = approval.scope_label();
+    let action_port_available = on_action.is_some();
+    let approve_handler = on_action;
+    let deny_handler = on_action;
+    rsx! {
+        article {
+            class: "pending-plugin-approval-node",
+            role: "status",
+            aria_label: "当前 Mission 的待确认插件动作",
+            header { class: "pending-plugin-approval-head",
+                span { class: "pending-plugin-approval-icon", UiIcon { name: UiIconName::Shield, size: 14 } }
+                div {
+                    strong { "插件动作需要你的确认" }
+                    small { "Application 持久 Pending Approval · 当前 Mission" }
+                }
+                em { "PENDING" }
+            }
+            div { class: "pending-plugin-approval-grid",
+                div {
+                    small { "插件 / 版本" }
+                    strong { "{approval.plugin_id()} · {approval.plugin_version()}" }
+                }
+                div {
+                    small { "精确作用域" }
+                    strong { "{scope_label} · Project / Mission" }
+                }
+                div {
+                    small { "能力与影响" }
+                    strong { "由 Application typed approval contract 决定" }
+                    span { "Desktop 不从 plugin ID 或 digest 推断能力、金额或可逆性。" }
+                }
+                div {
+                    small { "Revision fence" }
+                    strong { "Mission {approval.revisions().mission_revision()} · Effect {approval.revisions().effect_revision()}" }
+                    span { "Invocation {approval.revisions().invocation_revision()} · Consent {consent_revision_label}" }
+                }
+            }
+            footer { class: "pending-plugin-approval-foot",
+                span {
+                    "plugin {approval.plugin_digest_label()} · request {approval.request_digest_label()} · effect {approval.effect_digest_label()} · invocation {approval.invocation_digest_label()} · projection {approval.projection_digest_label()} · event #{approval.request_event_sequence()}"
+                }
+                if let Some(on_action) = approve_handler {
+                    button {
+                        class: "pending-plugin-approval-action primary",
+                        onclick: move |_| on_action.call(PendingPluginApprovalAction::approve(approval_for_approve.clone())),
+                        "Approve"
+                    }
+                }
+                if let Some(on_action) = deny_handler {
+                    button {
+                        class: "pending-plugin-approval-action",
+                        onclick: move |_| on_action.call(PendingPluginApprovalAction::deny(approval_for_deny.clone())),
+                        "Deny"
+                    }
+                }
+                if !action_port_available {
+                    small { "Application decision port 未接入；当前没有本地批准、拒绝或 Effect 写入。" }
                 }
             }
         }
