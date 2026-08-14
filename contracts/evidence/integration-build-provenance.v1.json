@@ -10,6 +10,15 @@
     "rawArtifactSha256": "3a867cb5bcad7acb0e76eda1ca0eb235d1a5d621262499f61c1a278bab68280a",
     "rawArtifactBytes": 17927
   },
+  "currentBaseline": {
+    "ref": "origin/bootstrap/macos-r0",
+    "commit": "b63cff014be0aa1ccd7ad19705993c33d895ed71",
+    "tree": "f2692f76228ab8b01542a95ec30d2302bbd56985",
+    "requireExactCheckout": true,
+    "artifactStatus": "HISTORICAL_STALE",
+    "historicalArtifactHead": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
+    "staleReason": "The tracked manifest and raw observation predate the published bootstrap baseline; no current CI run is asserted or fabricated."
+  },
   "source": {
     "repository": "tangpingqingwa/hartevo-desktop",
     "branch": "bootstrap/macos-r0",
@@ -71,7 +80,9 @@
     "CI_RUN_POLICY_MISMATCH",
     "CI_STATUS_NOT_COMPLETED",
     "CONTRACT_DIGEST_MISMATCH",
+    "CURRENT_COMMIT_MISMATCH",
     "HEAD_NOT_DESCENDANT",
+    "HISTORICAL_ARTIFACT_STALE",
     "INTEGRATION_HEAD_MISMATCH",
     "MANIFEST_DIGEST_MISMATCH",
     "MANIFEST_SOURCE_MISMATCH",

@@ -44,7 +44,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 SCHEMA = "hartevo.integration-build-provenance-verification/v1"
 AUTHORITY = "INTEGRATION_BUILD_PROVENANCE_ONLY"
 CONTRACT_REL = "contracts/evidence/integration-build-provenance.v1.json"
-CONTRACT_SHA256 = "7e8dc63ec75a70242991c63499e4d51095fa021c4ecbcc3cf7f5b859cde24a3d"
+CONTRACT_SHA256 = "038ae9002812ce536ed8c51379c604a035e7ec4f5b0a5a15de4caf392d9f03b6"
 EXPECTED_FAIL_CODES = [
     "CI_CONCLUSION_NOT_SUCCESS",
     "CI_HEAD_MISMATCH",
@@ -54,7 +54,9 @@ EXPECTED_FAIL_CODES = [
     "CI_RUN_POLICY_MISMATCH",
     "CI_STATUS_NOT_COMPLETED",
     "CONTRACT_DIGEST_MISMATCH",
+    "CURRENT_COMMIT_MISMATCH",
     "HEAD_NOT_DESCENDANT",
+    "HISTORICAL_ARTIFACT_STALE",
     "INTEGRATION_HEAD_MISMATCH",
     "MANIFEST_DIGEST_MISMATCH",
     "MANIFEST_SOURCE_MISMATCH",
@@ -193,7 +195,7 @@ def read_regular(relative: str, missing_code: str) -> bytes:
 def validate_contract(contract: Mapping[str, Any]) -> None:
     exact_keys(
         contract,
-        ("schemaVersion", "contractId", "authority", "currentInstance", "source", "pullRequestPolicy", "integrationHistoryPolicy", "ciPolicy", "resultPolicy", "failClosedCodes", "gate"),
+        ("schemaVersion", "contractId", "authority", "currentInstance", "currentBaseline", "source", "pullRequestPolicy", "integrationHistoryPolicy", "ciPolicy", "resultPolicy", "failClosedCodes", "gate"),
         "contract",
     )
     require(contract["schemaVersion"] == "hartevo.integration-build-provenance-contract/v1", "CONTRACT_SCHEMA_MISMATCH", "unexpected contract schema")
@@ -209,6 +211,22 @@ def validate_contract(contract: Mapping[str, Any]) -> None:
     safe_relative_path(instance["rawArtifactPath"], "currentInstance.rawArtifactPath")
     digest(instance["rawArtifactSha256"], "currentInstance.rawArtifactSha256")
     positive_int(instance["rawArtifactBytes"], "currentInstance.rawArtifactBytes")
+
+    baseline = contract["currentBaseline"]
+    require(isinstance(baseline, dict), "SCHEMA_TYPE_MISMATCH", "currentBaseline must be an object")
+    exact_keys(
+        baseline,
+        ("ref", "commit", "tree", "requireExactCheckout", "artifactStatus", "historicalArtifactHead", "staleReason"),
+        "currentBaseline",
+    )
+    require(baseline["ref"] == "origin/bootstrap/macos-r0", "CURRENT_COMMIT_MISMATCH", "current baseline ref differs")
+    git_id(baseline["commit"], "currentBaseline.commit")
+    git_id(baseline["tree"], "currentBaseline.tree")
+    require(baseline["requireExactCheckout"] is True, "CURRENT_COMMIT_MISMATCH", "current baseline must require exact checkout")
+    require(baseline["artifactStatus"] == "HISTORICAL_STALE", "HISTORICAL_ARTIFACT_STALE", "artifact status must remain historical stale")
+    git_id(baseline["historicalArtifactHead"], "currentBaseline.historicalArtifactHead")
+    require(baseline["historicalArtifactHead"] == contract["source"]["headCommit"], "HISTORICAL_ARTIFACT_STALE", "historical artifact head must match source head")
+    nonempty_string(baseline["staleReason"], "currentBaseline.staleReason")
 
     source = contract["source"]
     require(isinstance(source, dict), "SCHEMA_TYPE_MISMATCH", "source must be an object")
@@ -418,6 +436,40 @@ def validate_observation(observation: Mapping[str, Any]) -> None:
     require(isinstance(observation["pullRequests"], list), "PR_MERGE_CHAIN_MISMATCH", "raw observation pullRequests must be an array")
 
 
+def verify_current_baseline(contract: Mapping[str, Any]) -> None:
+    baseline = contract["currentBaseline"]
+    ref = baseline["ref"]
+    ref_commit_result = run(("git", "rev-parse", "--verify", f"{ref}^{{commit}}"), check=False)
+    require(
+        ref_commit_result.returncode == 0,
+        "CURRENT_COMMIT_MISMATCH",
+        f"current baseline ref is unavailable: {ref}",
+    )
+    observed_ref_commit = ref_commit_result.stdout.decode("utf-8", errors="strict").strip()
+    require(
+        observed_ref_commit == baseline["commit"],
+        "CURRENT_COMMIT_MISMATCH",
+        f"current baseline ref commit differs: expected {baseline['commit']}, got {observed_ref_commit}",
+    )
+    observed_ref_tree = git_text("rev-parse", f"{ref}^{{tree}}")
+    require(
+        observed_ref_tree == baseline["tree"],
+        "CURRENT_COMMIT_MISMATCH",
+        f"current baseline tree differs: expected {baseline['tree']}, got {observed_ref_tree}",
+    )
+    observed_head = git_text("rev-parse", "HEAD")
+    require(
+        observed_head == baseline["commit"],
+        "CURRENT_COMMIT_MISMATCH",
+        f"current checkout is not the exact published baseline: expected {baseline['commit']}, got {observed_head}",
+    )
+    require(
+        contract["source"]["headCommit"] == baseline["commit"],
+        "HISTORICAL_ARTIFACT_STALE",
+        f"tracked artifact source {contract['source']['headCommit']} predates current baseline {baseline['commit']}",
+    )
+
+
 def verify_records(contract: Mapping[str, Any], manifest: Mapping[str, Any], observation: Mapping[str, Any]) -> None:
     source = contract["source"]
     require(git_text("rev-parse", "--show-object-format") == source["objectFormat"], "MANIFEST_SOURCE_MISMATCH", "repository object format differs")
@@ -551,10 +603,18 @@ def verify_records(contract: Mapping[str, Any], manifest: Mapping[str, Any], obs
             require(created_at <= started_at <= completed_at <= updated_at, "RAW_ARTIFACT_TIME_MISMATCH", f"PR #{number} job chronology differs")
 
 
-def verify_all(contract: Mapping[str, Any], manifest: Mapping[str, Any], observation: Mapping[str, Any]) -> None:
+def verify_all(
+    contract: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    observation: Mapping[str, Any],
+    *,
+    require_current_baseline: bool = False,
+) -> None:
     validate_contract(contract)
     validate_manifest(contract, manifest)
     validate_observation(observation)
+    if require_current_baseline:
+        verify_current_baseline(contract)
     verify_records(contract, manifest, observation)
 
 
@@ -575,20 +635,22 @@ def emit(payload: Mapping[str, Any]) -> None:
 try:
     contract_raw, contract_data = load_contract()
     manifest_raw, manifest_data, observation_raw, observation_data = load_instance(contract_data)
-    verify_all(contract_data, manifest_data, observation_data)
 
     if MODE == "verify":
+        verify_all(contract_data, manifest_data, observation_data, require_current_baseline=True)
         count = len(manifest_data["featurePullRequests"])
         result = contract_data["resultPolicy"]
         emit(
             {
                 "activeFeaturePullRequestCount": manifest_data["summary"]["activeFeaturePullRequestCount"],
                 "actionsRunCount": count,
+                "artifactStatus": contract_data["currentBaseline"]["artifactStatus"],
                 "authority": AUTHORITY,
                 "code": result["verificationCode"],
                 "contractSha256": CONTRACT_SHA256,
                 "featurePullRequestCount": count,
                 "integrationHead": contract_data["source"]["headCommit"],
+                "currentBaselineCommit": contract_data["currentBaseline"]["commit"],
                 "manifestSha256": contract_data["currentInstance"]["manifestSha256"],
                 "missionEvidenceLevelPromoted": result["missionEvidenceLevelPromoted"],
                 "rawArtifactSha256": contract_data["currentInstance"]["rawArtifactSha256"],
@@ -602,7 +664,25 @@ try:
             }
         )
     else:
-        checks: List[str] = ["positive-current-instance"]
+        verify_all(contract_data, manifest_data, observation_data, require_current_baseline=False)
+        checks: List[str] = ["historical-instance-validated"]
+        expect_error(
+            checks,
+            "current-checkout-mismatch",
+            "CURRENT_COMMIT_MISMATCH",
+            lambda: verify_current_baseline(contract_data),
+        )
+
+        current_head_baseline = copy.deepcopy(contract_data)
+        current_head_baseline["currentBaseline"]["ref"] = "HEAD"
+        current_head_baseline["currentBaseline"]["commit"] = git_text("rev-parse", "HEAD")
+        current_head_baseline["currentBaseline"]["tree"] = git_text("rev-parse", "HEAD^{tree}")
+        expect_error(
+            checks,
+            "historical-artifact-source-mismatch",
+            "HISTORICAL_ARTIFACT_STALE",
+            lambda: verify_current_baseline(current_head_baseline),
+        )
 
         duplicate_raw = observation_raw.replace(b"{", b'{"schemaVersion":"duplicate",', 1)
         expect_error(checks, "raw-duplicate-object-key", "DUPLICATE_OBJECT_KEY", lambda: load_json(duplicate_raw, "duplicate raw observation"))
@@ -686,6 +766,7 @@ try:
         emit(
             {
                 "authority": AUTHORITY,
+                "artifactStatus": contract_data["currentBaseline"]["artifactStatus"],
                 "checks": checks,
                 "checksPassed": len(checks),
                 "code": "INTEGRATION_BUILD_PROVENANCE_SELF_TEST_VERIFIED",
@@ -701,8 +782,11 @@ try:
 except GateError as error:
     emit(
         {
+            "artifactStatus": contract_data.get("currentBaseline", {}).get("artifactStatus", "UNKNOWN"),
             "authority": AUTHORITY,
             "code": error.code,
+            "currentBaselineCommit": contract_data.get("currentBaseline", {}).get("commit"),
+            "integrationHead": contract_data.get("source", {}).get("headCommit"),
             "message": sanitize(error.message),
             "missionEvidenceLevelPromoted": False,
             "releaseDecision": "NOT_EVALUATED",
@@ -716,8 +800,11 @@ except GateError as error:
 except Exception as error:  # Fail closed on unexpected parser, Git, or filesystem failures.
     emit(
         {
+            "artifactStatus": contract_data.get("currentBaseline", {}).get("artifactStatus", "UNKNOWN"),
             "authority": AUTHORITY,
             "code": "INTERNAL_ERROR",
+            "currentBaselineCommit": contract_data.get("currentBaseline", {}).get("commit"),
+            "integrationHead": contract_data.get("source", {}).get("headCommit"),
             "message": sanitize(str(error)),
             "missionEvidenceLevelPromoted": False,
             "releaseDecision": "NOT_EVALUATED",
