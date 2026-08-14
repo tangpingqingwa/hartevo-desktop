@@ -1,0 +1,83 @@
+{
+  "schemaVersion": "hartevo-connector-authenticated-read/v1",
+  "contractVersion": "connector-authenticated-read-e1/v1",
+  "authority": "authenticated_read_evidence_only",
+  "secretMaterial": "opaque_reference_only",
+  "statuses": [
+    "connected",
+    "degraded",
+    "expired",
+    "revoked",
+    "blocked_env"
+  ],
+  "operations": [
+    "tenant_account_probe",
+    "authenticated_read",
+    "checkpoint"
+  ],
+  "providerErrorKinds": [
+    "authentication",
+    "authorization",
+    "rate_limited",
+    "quota_exceeded",
+    "expired",
+    "invalid_request",
+    "not_found",
+    "transient",
+    "unavailable",
+    "unknown"
+  ],
+  "bindingFields": [
+    "provider_id",
+    "adapter_id",
+    "adapter_version",
+    "implementation_digest",
+    "schema_digest",
+    "binary_digest"
+  ],
+  "evidenceFields": [
+    "scope_digest",
+    "provenance_class",
+    "probe_digest",
+    "request_digest",
+    "response_digest",
+    "content_digest",
+    "source_revision",
+    "cursor_sequence",
+    "observed_at",
+    "freshness_deadline",
+    "quota_remaining",
+    "rate_limit_remaining",
+    "cost_minor"
+  ],
+  "pluginSeam": {
+    "serviceDefinition": "connector_service_definition",
+    "providerRegistration": "effect_broker_provider_registry",
+    "missionConsumer": "evidence_only_mission_consumer",
+    "lifecycle": [
+      "mount",
+      "unmount",
+      "revoke"
+    ],
+    "recoveryResources": [
+      "probe",
+      "cursor",
+      "webhook",
+      "effect"
+    ],
+    "scopeBindings": [
+      "project_scope",
+      "mission_scope_digest",
+      "account_scope"
+    ],
+    "digestBindings": [
+      "provider_registry",
+      "adapter_version",
+      "implementation",
+      "schema",
+      "binary",
+      "mission_consumer"
+    ]
+  },
+  "registrations": []
+}
