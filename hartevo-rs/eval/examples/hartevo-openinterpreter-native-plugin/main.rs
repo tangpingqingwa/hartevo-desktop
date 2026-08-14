@@ -174,24 +174,49 @@ fn run_command(output: Option<PathBuf>, oracle_output: Option<&PathBuf>) -> Resu
 }
 
 fn required_environment() -> Vec<String> {
-    [
-        "HARTEVO_OPENINTERPRETER_BIN",
-        "HARTEVO_TEST_OPENINTERPRETER_HOME",
-        "HARTEVO_RUNTIME_PROVIDER",
-        "HARTEVO_RUNTIME_MODEL",
-        "HARTEVO_RUNTIME_SECRET_ENV",
-        "HARTEVO_NATIVE_PROJECT_ID",
-        "HARTEVO_NATIVE_MISSION_ID",
-        "HARTEVO_NATIVE_SESSION_ID",
-    ]
-    .iter()
-    .filter(|name| {
-        env::var(name)
-            .ok()
+    required_environment_with(|name| env::var(name).ok())
+}
+
+const REQUIRED_ENVIRONMENT: &[&str] = &[
+    "HARTEVO_OPENINTERPRETER_BIN",
+    "HARTEVO_TEST_OPENINTERPRETER_HOME",
+    "HARTEVO_RUNTIME_PROVIDER",
+    "HARTEVO_RUNTIME_MODEL",
+    "HARTEVO_RUNTIME_SECRET_ENV",
+    "HARTEVO_NATIVE_PROJECT_ID",
+    "HARTEVO_NATIVE_MISSION_ID",
+    "HARTEVO_NATIVE_SESSION_ID",
+];
+
+fn required_environment_with<F>(mut get: F) -> Vec<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut missing = REQUIRED_ENVIRONMENT
+        .iter()
+        .filter_map(|name| {
+            if get(name)
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                Some((*name).to_owned())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(secret_environment) =
+        get("HARTEVO_RUNTIME_SECRET_ENV").filter(|value| !value.trim().is_empty())
+        && get(&secret_environment)
+            .as_deref()
             .is_none_or(|value| value.trim().is_empty())
-    })
-    .map(|name| (*name).to_owned())
-    .collect()
+        && !missing.iter().any(|name| name == &secret_environment)
+    {
+        missing.push(secret_environment);
+    }
+
+    missing
 }
 
 struct EnvironmentSecretResolver {
@@ -850,4 +875,54 @@ fn atomic_write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::rename(&temporary, path)?;
     OpenOptions::new().read(true).open(parent)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::required_environment_with;
+
+    #[test]
+    fn missing_secret_reference_environment_is_blocked_before_native_launch() {
+        let mut values = BTreeMap::new();
+        for name in [
+            "HARTEVO_OPENINTERPRETER_BIN",
+            "HARTEVO_TEST_OPENINTERPRETER_HOME",
+            "HARTEVO_RUNTIME_PROVIDER",
+            "HARTEVO_RUNTIME_MODEL",
+            "HARTEVO_RUNTIME_SECRET_ENV",
+            "HARTEVO_NATIVE_PROJECT_ID",
+            "HARTEVO_NATIVE_MISSION_ID",
+            "HARTEVO_NATIVE_SESSION_ID",
+        ] {
+            values.insert(name, name.to_owned());
+        }
+        values.insert("HARTEVO_RUNTIME_SECRET_ENV", "OPENAI_API_KEY".to_owned());
+
+        let missing = required_environment_with(|name| values.get(name).cloned());
+
+        assert_eq!(missing, vec!["OPENAI_API_KEY"]);
+    }
+
+    #[test]
+    fn populated_secret_reference_environment_is_not_reported_missing() {
+        let mut values = BTreeMap::new();
+        for name in [
+            "HARTEVO_OPENINTERPRETER_BIN",
+            "HARTEVO_TEST_OPENINTERPRETER_HOME",
+            "HARTEVO_RUNTIME_PROVIDER",
+            "HARTEVO_RUNTIME_MODEL",
+            "HARTEVO_RUNTIME_SECRET_ENV",
+            "HARTEVO_NATIVE_PROJECT_ID",
+            "HARTEVO_NATIVE_MISSION_ID",
+            "HARTEVO_NATIVE_SESSION_ID",
+        ] {
+            values.insert(name, name.to_owned());
+        }
+        values.insert("HARTEVO_RUNTIME_SECRET_ENV", "OPENAI_API_KEY".to_owned());
+        values.insert("OPENAI_API_KEY", "redacted-test-secret".to_owned());
+
+        assert!(required_environment_with(|name| values.get(name).cloned()).is_empty());
+    }
 }
