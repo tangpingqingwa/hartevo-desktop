@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "hartevo.semgrep-security-result/v1",
+  "artifactKind": "proposal",
+  "artifactDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "evidenceDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "proposalDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "registrationDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "scopeDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "disposition": "fresh",
+  "durable": false,
+  "connected": false,
+  "native": false,
+  "firstParty": false,
+  "receiptDigest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+}
