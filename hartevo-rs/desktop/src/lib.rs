@@ -29,6 +29,7 @@ use rust_decimal::Decimal;
 use zeroize::Zeroizing;
 
 mod agent_operations;
+pub mod browser_handoff_surface;
 pub mod data_plane;
 mod runtime_plane;
 mod runtime_subscription;
@@ -36,6 +37,10 @@ mod runtime_subscription;
 mod visual_fixture;
 
 use agent_operations::{AgentOperationsWorkbenchProjection, OperationsStatus};
+use browser_handoff_surface::{
+    BrowserHandoffAction, BrowserHandoffSurfaceError, BrowserHandoffSurfaceProjection,
+    BrowserHandoffSurfaceState, BrowserMissionHandoffScope,
+};
 use data_plane::{
     DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane,
     DesktopHumanCheckpointConfirmationRequest, DesktopLoadState, DesktopMissionContinuationRequest,
@@ -335,6 +340,35 @@ impl std::fmt::Debug for SensitiveRecoveryInput {
 }
 
 impl UiFailure {
+    fn from_browser_handoff_error(error: BrowserHandoffSurfaceError) -> Self {
+        let (code, message) = match error {
+            BrowserHandoffSurfaceError::InvalidOffer => (
+                "BROWSER_HANDOFF_INVALID_OFFER",
+                "Browser takeover Offer 未通过 typed 完整性校验；未显示或启动 Browser。",
+            ),
+            BrowserHandoffSurfaceError::InvalidReceipt => (
+                "BROWSER_HANDOFF_INVALID_RECEIPT",
+                "Browser handoff receipt 不完整；未改变 Agent 或 Browser 状态。",
+            ),
+            BrowserHandoffSurfaceError::ScopeMismatch => (
+                "STALE_SELECTION",
+                "Browser handoff 与当前 Project / Mission 不一致；surface 已隐藏。",
+            ),
+            BrowserHandoffSurfaceError::StaleRevision => (
+                "STALE_REVISION",
+                "Browser handoff revision 已变化；请重新读取当前 Mission 的 Offer。",
+            ),
+            BrowserHandoffSurfaceError::InvalidTransition => (
+                "WAITING_USER",
+                "当前 Browser handoff 尚未取得所需的 provider receipt；未伪造控制结果。",
+            ),
+        };
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
     fn from_runtime_subscription_error(_error: RuntimeSubscriptionError) -> Self {
         Self {
             code: "RUNTIME_SUBSCRIPTION_REJECTED".into(),
@@ -917,6 +951,7 @@ pub fn App() -> Element {
     let mut runtime_text_error = use_signal(move || initial_visual_runtime_error);
     let mut runtime_follow_latest = use_signal(move || visual_runtime_follow_latest);
     let mut runtime_has_unseen = use_signal(move || visual_runtime_has_unseen);
+    let mut browser_handoff_surface = use_signal(BrowserHandoffSurfaceState::default);
     let mut composer_expanded = use_signal(|| false);
     let mut composer_guidance_dismissed = use_signal(|| false);
     let mut human_work_product_selection = use_signal(BTreeSet::<WorkProductId>::new);
@@ -1128,6 +1163,20 @@ pub fn App() -> Element {
         .as_ref()
         .zip(mission.as_ref())
         .map(|(project, mission)| (&project.project_id, &mission.mission_id));
+    let browser_handoff_projection =
+        project
+            .as_ref()
+            .zip(mission.as_ref())
+            .and_then(|(project, mission)| {
+                let scope = BrowserMissionHandoffScope {
+                    tenant_id: &project.tenant_id,
+                    project_id: &project.project_id,
+                    mission_id: &mission.mission_id,
+                    project_revision: project.revision,
+                    mission_revision: mission.revision,
+                };
+                browser_handoff_surface.read().projection_for(&scope)
+            });
     let selected_runtime_execution_paint =
         selected_runtime_scope.and_then(|(project_id, mission_id)| {
             runtime_execution_paint
@@ -2057,6 +2106,7 @@ pub fn App() -> Element {
                                 runtime_has_unseen: rendered_runtime_has_unseen,
                                 context_access: context_access.clone(),
                                 operations: operations_projection.clone(),
+                                browser_handoff: browser_handoff_projection.clone(),
                                 interrupt_available: operations_interrupt_available,
                                 interrupt_requested: operations_interrupt_requested,
                                 on_initialize: move |_| {
@@ -2074,6 +2124,36 @@ pub fn App() -> Element {
                                     restore_ui_focus("mission-composer-input");
                                 },
                                 on_interrupt: request_operations_interrupt,
+                                on_browser_handoff_action: move |action| {
+                                    let selected = {
+                                        let current = model.read();
+                                        current
+                                            .current_project()
+                                            .zip(current.current_mission())
+                                            .map(|(project, mission)| {
+                                                (
+                                                    project.tenant_id.clone(),
+                                                    project.project_id.clone(),
+                                                    mission.mission_id.clone(),
+                                                    project.revision,
+                                                    mission.revision,
+                                                )
+                                            })
+                                    };
+                                    let Some((tenant_id, project_id, mission_id, project_revision, mission_revision)) = selected else {
+                                        return;
+                                    };
+                                    let scope = BrowserMissionHandoffScope {
+                                        tenant_id: &tenant_id,
+                                        project_id: &project_id,
+                                        mission_id: &mission_id,
+                                        project_revision,
+                                        mission_revision,
+                                    };
+                                    if let Err(error) = browser_handoff_surface.write().dispatch(action, &scope) {
+                                        model.write().notice = Some(UiFailure::from_browser_handoff_error(error));
+                                    }
+                                },
                                 on_runtime_scroll: move |near_bottom| {
                                     let selected = {
                                         let current = model.read();
@@ -4948,6 +5028,7 @@ fn OrchestratorSurface(
     runtime_has_unseen: bool,
     context_access: Option<ProjectContextAccessProjection>,
     operations: AgentOperationsWorkbenchProjection,
+    browser_handoff: Option<BrowserHandoffSurfaceProjection>,
     interrupt_available: bool,
     interrupt_requested: bool,
     on_initialize: EventHandler<MouseEvent>,
@@ -4957,6 +5038,7 @@ fn OrchestratorSurface(
     on_open_workpad: EventHandler<()>,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
+    on_browser_handoff_action: EventHandler<BrowserHandoffAction>,
     on_runtime_scroll: EventHandler<bool>,
     on_follow_latest: EventHandler<()>,
 ) -> Element {
@@ -5175,6 +5257,12 @@ fn OrchestratorSurface(
                         runtime_text_stream: runtime_text_stream.clone(),
                         replayed_message_sequence,
                     }
+                    if let Some(handoff) = browser_handoff {
+                        BrowserHandoffInlineSurface {
+                            projection: handoff,
+                            on_action: on_browser_handoff_action,
+                        }
+                    }
                     if let Some((state, copy)) = runtime_fixture_copy {
                         div {
                             class: "persisted-system-notice visual-runtime-state",
@@ -5252,6 +5340,83 @@ fn OrchestratorSurface(
                             if runtime_has_unseen { span { "有新内容" } }
                             UiIcon { name: UiIconName::ArrowUp, size: 12 }
                             "回到最新"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn BrowserHandoffInlineSurface(
+    projection: BrowserHandoffSurfaceProjection,
+    on_action: EventHandler<BrowserHandoffAction>,
+) -> Element {
+    let phase_label = match projection.phase {
+        browser_handoff_surface::BrowserHandoffPhase::Offered => "需要你接管",
+        browser_handoff_surface::BrowserHandoffPhase::Paused => "Agent 已暂停",
+        browser_handoff_surface::BrowserHandoffPhase::TakeoverRequested => "等待接管回执",
+        browser_handoff_surface::BrowserHandoffPhase::UserControlled => "人工控制中",
+    };
+    let can_pause = projection.phase == browser_handoff_surface::BrowserHandoffPhase::Offered;
+    let can_take_over = matches!(
+        projection.phase,
+        browser_handoff_surface::BrowserHandoffPhase::Offered
+            | browser_handoff_surface::BrowserHandoffPhase::Paused
+    );
+    let can_resume =
+        projection.phase == browser_handoff_surface::BrowserHandoffPhase::UserControlled;
+    rsx! {
+        article {
+            class: "assistant-turn persisted-state-turn browser-handoff-inline",
+            aria_label: "当前 Mission 的 Browser 人工接管",
+            header { class: "assistant-byline",
+                UiIcon { name: UiIconName::Handshake, size: 14 }
+                strong { "Browser handoff" }
+                time { "按需显示" }
+            }
+            div { class: "assistant-copy",
+                div { class: "evidence-summary",
+                    span { strong { "{phase_label}" } small { "Control state" } }
+                    span { strong { "{projection.profile_revision}" } small { "Profile revision" } }
+                    span { strong { "{projection.workspace_revision}" } small { "Workspace revision" } }
+                    span { strong { "{projection.lease_generation}" } small { "Lease generation" } }
+                }
+                if !projection.origin_summary.is_empty() {
+                    p { "目标 origin：{projection.origin_summary}" }
+                    p { "Frame：{projection.frame_summary}" }
+                }
+                if let Some(receipt) = &projection.resume_receipt {
+                    div { class: "persisted-system-notice", role: "status",
+                        UiIcon { name: UiIconName::Check, size: 13 }
+                        span {
+                            strong { "Agent 已恢复" }
+                            small { "新 snapshot receipt · generation {receipt.lease_generation} → {receipt.new_lease_generation} · snapshot {receipt.snapshot_digest_short} · evidence {receipt.evidence_digest_short}" }
+                        }
+                    }
+                }
+                if projection.origin_summary.is_empty() {
+                    p { "Handoff surface 已收起；新的 snapshot receipt 已保留在当前 Mission Conversation。" }
+                } else {
+                    div { class: "mission-actions",
+                        button {
+                            class: "quiet-button",
+                            disabled: !can_pause,
+                            onclick: move |_| on_action.call(BrowserHandoffAction::PauseAgent),
+                            "Pause agent"
+                        }
+                        button {
+                            class: "primary-button",
+                            disabled: !can_take_over,
+                            onclick: move |_| on_action.call(BrowserHandoffAction::TakeOver),
+                            "Take over"
+                        }
+                        button {
+                            class: "quiet-button",
+                            disabled: !can_resume,
+                            onclick: move |_| on_action.call(BrowserHandoffAction::Resume),
+                            "Resume"
                         }
                     }
                 }
