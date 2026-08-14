@@ -149,8 +149,42 @@ pub trait ImpactHttpExecutor: Clone + Send + Sync + 'static {
     ) -> Result<ImpactHttpResponse, ImpactApiError>;
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub struct UreqImpactHttpExecutor {
+    loopback_base_url: Option<String>,
+}
+
+#[cfg(not(test))]
 #[derive(Clone, Debug, Default)]
 pub struct UreqImpactHttpExecutor;
+
+impl UreqImpactHttpExecutor {
+    #[cfg(test)]
+    fn loopback(base_url: impl Into<String>) -> Result<Self, ImpactApiError> {
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
+        if !base_url.starts_with("http://127.0.0.1:")
+            || base_url.contains(['?', '#'])
+            || base_url.ends_with(':')
+        {
+            return Err(ImpactApiError::Unavailable);
+        }
+        Ok(Self {
+            loopback_base_url: Some(base_url),
+        })
+    }
+
+    #[cfg(test)]
+    fn request_url(&self, official_url: &str) -> Result<String, ImpactApiError> {
+        let Some(base_url) = &self.loopback_base_url else {
+            return Ok(official_url.to_owned());
+        };
+        let suffix = official_url
+            .strip_prefix(IMPACT_PARTNER_API_BASE)
+            .ok_or(ImpactApiError::Unavailable)?;
+        Ok(format!("{base_url}{suffix}"))
+    }
+}
 
 impl ImpactHttpExecutor for UreqImpactHttpExecutor {
     fn get(
@@ -158,12 +192,16 @@ impl ImpactHttpExecutor for UreqImpactHttpExecutor {
         url: &str,
         credentials: &ImpactCredentials,
     ) -> Result<ImpactHttpResponse, ImpactApiError> {
+        #[cfg(test)]
+        let request_url = self.request_url(url)?;
+        #[cfg(not(test))]
+        let request_url = url.to_owned();
         let basic = BASE64.encode(format!(
             "{}:{}",
             credentials.account_sid(),
             credentials.auth_token()
         ));
-        let response = ureq::get(url)
+        let response = ureq::get(&request_url)
             .set("Accept", "application/json")
             .set("Authorization", &format!("Basic {basic}"))
             .call();
@@ -212,6 +250,9 @@ impl<R: ImpactCredentialResolver> ImpactHttpApi<R, UreqImpactHttpExecutor> {
     pub fn new(resolver: R) -> Self {
         Self {
             resolver,
+            #[cfg(test)]
+            executor: UreqImpactHttpExecutor::default(),
+            #[cfg(not(test))]
             executor: UreqImpactHttpExecutor,
         }
     }
@@ -777,5 +818,336 @@ impl<C: ImpactApi> TypedPartnerNetworkAdapter for ImpactAdapter<C> {
 
     fn accepted_callbacks(&self) -> Vec<crate::CallbackEvent> {
         self.inner.accepted_callbacks()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::{self, JoinHandle};
+
+    use chrono::{Duration, TimeZone};
+    use hartevo_connector_sdk::{
+        BeginAuthRequest, ConnectorAdapter, ConnectorAuth, ConnectorWorker, ProbeRequest,
+        ProviderAdapterRegistry, ProviderProvenanceClass, SecretReference,
+    };
+    use hartevo_domain_kernel::{Mission, MissionContract, MissionId, ProjectId, TenantId};
+
+    use super::*;
+    use crate::{
+        ConnectorAdapterBridge, DurablePartnerReadCursor, ImpactProgramReadRequest,
+        ImpactProgramReadServiceDefinition, NetworkAccountId, NetworkResource, PartnerReadBudget,
+        PartnerReadClassification, PartnerReadScope, ProgramId,
+    };
+
+    #[derive(Clone, Debug, Default)]
+    struct LoopbackImpactCredentialResolver;
+
+    impl ImpactCredentialResolver for LoopbackImpactCredentialResolver {
+        fn resolve(
+            &self,
+            _authorization: &OpaqueSecretReference,
+            _account_id: &NetworkAccountId,
+        ) -> Result<ImpactCredentials, ImpactApiError> {
+            ImpactCredentials::new("impact-account-1", "test-only-token")
+        }
+    }
+
+    struct LoopbackServer {
+        base_url: String,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl LoopbackServer {
+        fn start(expected_requests: usize) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+            let port = listener.local_addr().expect("loopback address").port();
+            let join = thread::spawn(move || {
+                for _ in 0..expected_requests {
+                    let (mut stream, _) = listener.accept().expect("loopback request");
+                    let request = read_http_request(&mut stream);
+                    let body = loopback_response(&request);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("loopback response");
+                    stream.flush().expect("loopback flush");
+                }
+            });
+            Self {
+                base_url: format!("http://127.0.0.1:{port}"),
+                join: Some(join),
+            }
+        }
+
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        fn finish(mut self) {
+            self.join
+                .take()
+                .expect("loopback join handle")
+                .join()
+                .expect("loopback server");
+        }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer).expect("loopback request bytes");
+            assert!(count > 0, "loopback request ended before headers");
+            bytes.extend_from_slice(&buffer[..count]);
+            assert!(
+                bytes.len() <= 16 * 1024,
+                "loopback request headers too large"
+            );
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(bytes).expect("loopback request utf8")
+    }
+
+    fn loopback_response(request: &str) -> String {
+        let mut lines = request.split("\r\n");
+        let request_line = lines.next().expect("loopback request line");
+        let mut request_parts = request_line.split_whitespace();
+        assert_eq!(request_parts.next(), Some("GET"));
+        let target = request_parts.next().expect("loopback target");
+        assert_eq!(request_parts.next(), Some("HTTP/1.1"));
+        let (path, query) = target.split_once('?').expect("loopback query");
+        assert_eq!(path, "/Mediapartners/impact-account-1/Campaigns");
+
+        let headers = lines
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        let expected_authorization = format!(
+            "Basic {}",
+            BASE64.encode("impact-account-1:test-only-token")
+        );
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some(expected_authorization.as_str())
+        );
+        assert_eq!(
+            headers.get("accept").map(String::as_str),
+            Some("application/json")
+        );
+
+        let query = query
+            .split('&')
+            .filter_map(|part| part.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(query.get("PageSize").map(String::as_str), Some("100"));
+        let page = query
+            .get("Page")
+            .expect("loopback page")
+            .parse::<u64>()
+            .expect("loopback page integer");
+        assert!((1..=2).contains(&page));
+
+        match page {
+            1 => serde_json::json!({
+                "@page": "1",
+                "@numpages": "2",
+                "@nextpageuri": "/Mediapartners/impact-account-1/Campaigns?Page=2&PageSize=100",
+                "Campaigns": [{"CampaignId": "impact-program-1", "State": "ACTIVE"}]
+            }),
+            2 => serde_json::json!({
+                "@page": "2",
+                "@numpages": "2",
+                "Campaigns": [{"CampaignId": "impact-program-1", "State": "ACTIVE"}]
+            }),
+            _ => unreachable!("loopback page is bounded above"),
+        }
+        .to_string()
+    }
+
+    fn observed_at() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(2026, 8, 14, 8, 0, 0)
+            .single()
+            .expect("valid loopback timestamp")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn official_http_loopback_mission_pages_reconcile_exactly_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let at = observed_at();
+        let server = LoopbackServer::start(5);
+        let executor =
+            UreqImpactHttpExecutor::loopback(server.base_url()).expect("valid loopback transport");
+        let api = ImpactHttpApi::with_executor(LoopbackImpactCredentialResolver, executor);
+        let account_id = NetworkAccountId::from_stable("impact-account-1");
+        let program_id = ProgramId::from_stable("impact-program-1");
+        let read_scope = PartnerReadScope::new(
+            "tenant-impact-loopback",
+            "project-impact-loopback",
+            "mission-impact-loopback",
+            account_id,
+            Some(program_id),
+        )?;
+        let sdk_scope = read_scope.connector_scope()?;
+        let bridge = ConnectorAdapterBridge::new(ImpactAdapter::new(api.clone()))?;
+        let descriptor = bridge.descriptor().clone();
+        let registry = ProviderAdapterRegistry::new(
+            "partner-impact-loopback-read-1",
+            descriptor.registrations().to_vec(),
+        )?;
+        let definition = ImpactProgramReadServiceDefinition::new(at)?;
+        assert_eq!(
+            definition.connection_state(&registry),
+            crate::PartnerReadConnectionState::Registered
+        );
+        let mut worker = ConnectorWorker::new(
+            "worker-impact-loopback-read",
+            bridge,
+            registry,
+            sdk_scope.clone(),
+            at,
+            at + Duration::minutes(5),
+        )?;
+        let secret = SecretReference::new("secret-ref-impact-loopback", sdk_scope.clone(), 1)?;
+        let lease = ConnectorAuth::issue_credential_lease(
+            &secret,
+            descriptor.identity().clone(),
+            "credential-lease-impact-loopback",
+            1,
+            at,
+            at + Duration::minutes(5),
+        )?;
+        let dispatch = worker.dispatch_fence();
+        let session = worker.begin_auth(BeginAuthRequest {
+            dispatch: dispatch.clone(),
+            scope: sdk_scope.clone(),
+            secret_reference: secret.clone(),
+            credential_lease: lease.clone(),
+            auth_revision: 1,
+            issued_at: at,
+            expires_at: at + Duration::minutes(5),
+        })?;
+        let probe = worker.probe(ProbeRequest {
+            dispatch,
+            scope: sdk_scope,
+            secret_reference: secret,
+            credential_lease: lease,
+            session,
+            probe_revision: 1,
+            result_id: "probe-result-impact-loopback".to_owned(),
+            at: at + Duration::seconds(1),
+        })?;
+        assert_eq!(
+            probe.provenance_class(),
+            ProviderProvenanceClass::ProductionProvider
+        );
+
+        let mission = Mission::compile(
+            TenantId::from("tenant-impact-loopback"),
+            MissionId::from("mission-impact-loopback"),
+            ProjectId::from("project-impact-loopback"),
+            "reconcile Impact loopback program pages",
+            MissionContract::bootstrap(
+                "read Impact partner programs",
+                [crate::read::PARTNER_PROGRAM_READ_MISSION_CAPABILITY.to_owned()],
+                at,
+            ),
+            at,
+        )?;
+        let budget = || PartnerReadBudget::new(3, at + Duration::minutes(1), 3, 3);
+        let first_request =
+            ImpactProgramReadRequest::new(read_scope.clone(), at + Duration::seconds(1))?
+                .with_budget(budget()?);
+        let first = definition.read_mission(&mut worker, &mission, &probe, &first_request)?;
+        first.validate()?;
+        assert_eq!(
+            first.classification,
+            PartnerReadClassification::ProductionAuthenticated
+        );
+        assert_eq!(first.scope.account_id.as_str(), "impact-account-1");
+        assert_eq!(
+            first.scope.program_id.as_ref().map(ProgramId::as_str),
+            Some("impact-program-1")
+        );
+        assert!(first.source_uri.starts_with(IMPACT_PARTNER_API_BASE));
+        let cursor = first.next_cursor.clone().expect("first page cursor");
+        let persisted_cursor: DurablePartnerReadCursor =
+            serde_json::from_slice(&serde_json::to_vec(&cursor)?)?;
+        let request_digest = first.request_digest.clone();
+        persisted_cursor.validate_for(&definition.service_id, &read_scope, &request_digest)?;
+
+        let second_request = first_request
+            .clone()
+            .with_cursor(persisted_cursor.clone())
+            .with_budget(budget()?);
+        let second = definition.read_mission(&mut worker, &mission, &probe, &second_request)?;
+        second.validate()?;
+        assert_eq!(second.page_sequence, 2);
+        assert!(second.next_cursor.is_none());
+
+        let second_replay = definition.read_mission(
+            &mut worker,
+            &mission,
+            &probe,
+            &second_request.with_budget(budget()?),
+        )?;
+        second_replay.validate()?;
+        let first_replay = definition.read_mission(
+            &mut worker,
+            &mission,
+            &probe,
+            &first_request.with_budget(budget()?),
+        )?;
+        first_replay.validate()?;
+        assert_eq!(first_replay.receipt_digest, first.receipt_digest);
+        assert_eq!(second_replay.receipt_digest, second.receipt_digest);
+
+        let mut accepted = BTreeMap::new();
+        for receipt in [second, first, second_replay, first_replay] {
+            if let Some(previous_digest) =
+                accepted.insert(receipt.page_sequence, receipt.receipt_digest.clone())
+            {
+                assert_eq!(previous_digest, receipt.receipt_digest);
+            }
+        }
+        assert_eq!(accepted.keys().copied().collect::<Vec<_>>(), [1, 2]);
+
+        let mut rolled_back = persisted_cursor;
+        rolled_back.page = 1;
+        assert_eq!(
+            rolled_back.validate_for(&definition.service_id, &read_scope, &request_digest),
+            Err(crate::PartnerReadError::InvalidCursor)
+        );
+
+        let authorization = OpaqueSecretReference::new("secret-ref-impact-loopback", 1)?;
+        for resource in [
+            NetworkResource::Actions,
+            NetworkResource::Conversions,
+            NetworkResource::Reports,
+        ] {
+            assert!(matches!(
+                api.read(
+                    &authorization,
+                    &NetworkReadRequest::new(read_scope.network_scope()?, resource, at),
+                ),
+                Err(ImpactApiError::BlockedEnv(
+                    BlockedEnvironmentReason::OfficialApiCapabilityNotEnabled
+                ))
+            ));
+        }
+        server.finish();
+        Ok(())
     }
 }
