@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.dev/contracts/distribution/release-evidence-plugin.schema.v1.json",
+  "title": "Hartevo typed distribution ReleaseEvidence plugin contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "pluginId",
+    "provider",
+    "providerVersion",
+    "consumer",
+    "releaseDecision",
+    "release",
+    "productionEvidence",
+    "supportedTargets",
+    "sbom",
+    "attestation",
+    "provenance",
+    "signature",
+    "validity",
+    "verificationReceipt",
+    "statuses",
+    "releaseGate"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-distribution-release-evidence-plugin/v1"},
+    "pluginId": {"const": "DIST-SBOM-TARGET-02"},
+    "provider": {"const": "hartevo-distribution-verifier-provider"},
+    "providerVersion": {"const": "1.0.0"},
+    "consumer": {"const": "release-promotion-eval-gate"},
+    "releaseDecision": {"const": "NOT_EVALUATED"},
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "deployment"],
+      "properties": {"passed": {"const": false}, "deployment": {"const": false}}
+    },
+    "productionEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "acceptedOrigin",
+        "generatedOrigin",
+        "fixtureOrigin",
+        "privateSigningMaterialAllowed"
+      ],
+      "properties": {
+        "required": {"const": true},
+        "acceptedOrigin": {"const": "EXTERNAL_SIGNED"},
+        "generatedOrigin": {"const": "UNSIGNED_GENERATED"},
+        "fixtureOrigin": {"const": "TEST_FIXTURE_ONLY"},
+        "privateSigningMaterialAllowed": {"const": false}
+      }
+    },
+    "supportedTargets": {
+      "type": "array",
+      "const": [
+        {"platform": "macos-aarch64", "targetTriple": "aarch64-apple-darwin"},
+        {"platform": "macos-x86_64", "targetTriple": "x86_64-apple-darwin"}
+      ]
+    },
+    "sbom": {"$ref": "#/$defs/sbomPolicy"},
+    "attestation": {"$ref": "#/$defs/attestationPolicy"},
+    "provenance": {"$ref": "#/$defs/provenancePolicy"},
+    "signature": {"$ref": "#/$defs/signaturePolicy"},
+    "validity": {"$ref": "#/$defs/validityPolicy"},
+    "verificationReceipt": {"$ref": "#/$defs/receiptPolicy"},
+    "statuses": {
+      "type": "array",
+      "const": ["VERIFIED", "CODE_FAILURE", "BLOCKED_ENV", "NOT_IMPLEMENTED"]
+    },
+    "releaseGate": {"$ref": "#/$defs/releaseGate"}
+  },
+  "$defs": {
+    "booleanPolicy": {"type": "boolean", "const": true},
+    "digestPolicy": {"type": "string", "const": "sha256"},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "targetTriple"],
+      "properties": {
+        "platform": {"enum": ["macos-aarch64", "macos-x86_64"]},
+        "targetTriple": {
+          "enum": ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+        }
+      }
+    },
+    "sbomPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "formats",
+        "digestAlgorithm",
+        "versionRequired",
+        "platformBindingRequired",
+        "artifactDigestBindingRequired",
+        "sourceCommitBindingRequired",
+        "lockfileDigestBindingRequired"
+      ],
+      "properties": {
+        "formats": {"const": ["cyclonedx", "spdx"]},
+        "digestAlgorithm": {"$ref": "#/$defs/digestPolicy"},
+        "versionRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "platformBindingRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "artifactDigestBindingRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "sourceCommitBindingRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "lockfileDigestBindingRequired": {"$ref": "#/$defs/booleanPolicy"}
+      }
+    },
+    "attestationPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "predicateType",
+        "digestAlgorithm",
+        "versionRequired",
+        "platformBindingRequired",
+        "artifactDigestBindingRequired",
+        "sbomDigestBindingRequired",
+        "sourceCommitBindingRequired",
+        "toolchainDigestBindingRequired",
+        "buildManifestDigestBindingRequired"
+      ],
+      "properties": {
+        "predicateType": {"const": "https://slsa.dev/provenance/v1"},
+        "digestAlgorithm": {"$ref": "#/$defs/digestPolicy"},
+        "versionRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "platformBindingRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "artifactDigestBindingRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "sbomDigestBindingRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "sourceCommitBindingRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "toolchainDigestBindingRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "buildManifestDigestBindingRequired": {"$ref": "#/$defs/booleanPolicy"}
+      }
+    },
+    "provenancePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requiredBindings", "digestAlgorithm"],
+      "properties": {
+        "requiredBindings": {
+          "const": [
+            "sourceCommit",
+            "cargoLockDigest",
+            "toolchainVersion",
+            "toolchainDigest",
+            "buildManifestDigest",
+            "artifactDigest",
+            "sbomDigest",
+            "attestationDigest",
+            "dependencyEvidenceDigest"
+          ]
+        },
+        "digestAlgorithm": {"$ref": "#/$defs/digestPolicy"}
+      }
+    },
+    "signaturePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "detached",
+        "keyReferenceRequired",
+        "signatureDigestRequired",
+        "publicKeyInEvidence",
+        "privateKeyInEvidence",
+        "signaturePayloadDomain"
+      ],
+      "properties": {
+        "algorithm": {"const": "ed25519"},
+        "detached": {"const": true},
+        "keyReferenceRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "signatureDigestRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "publicKeyInEvidence": {"const": false},
+        "privateKeyInEvidence": {"const": false},
+        "signaturePayloadDomain": {
+          "const": "hartevo-distribution-release-evidence/v1"
+        }
+      }
+    },
+    "validityPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issuedAtRequired",
+        "expiresAtRequired",
+        "revocationStatusRequired",
+        "expiredDisposition",
+        "revokedDisposition",
+        "unknownRegistryDisposition",
+        "failClosed"
+      ],
+      "properties": {
+        "issuedAtRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "expiresAtRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "revocationStatusRequired": {"$ref": "#/$defs/booleanPolicy"},
+        "expiredDisposition": {"const": "CODE_FAILURE"},
+        "revokedDisposition": {"const": "CODE_FAILURE"},
+        "unknownRegistryDisposition": {"const": "BLOCKED_ENV"},
+        "failClosed": {"$ref": "#/$defs/booleanPolicy"}
+      }
+    },
+    "receiptPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "contentFree", "digestAlgorithm", "mustBindEvidence"],
+      "properties": {
+        "required": {"$ref": "#/$defs/booleanPolicy"},
+        "contentFree": {"$ref": "#/$defs/booleanPolicy"},
+        "digestAlgorithm": {"$ref": "#/$defs/digestPolicy"},
+        "mustBindEvidence": {"$ref": "#/$defs/booleanPolicy"}
+      }
+    },
+    "releaseGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "releaseMustRemainFalse",
+        "deploymentMustRemainFalse",
+        "promotionRequiresVerifiedEvidence",
+        "promotionRequiresExternalSignedOrigin",
+        "consumerMustNotPromoteFixtures"
+      ],
+      "properties": {
+        "releaseMustRemainFalse": {"$ref": "#/$defs/booleanPolicy"},
+        "deploymentMustRemainFalse": {"$ref": "#/$defs/booleanPolicy"},
+        "promotionRequiresVerifiedEvidence": {"$ref": "#/$defs/booleanPolicy"},
+        "promotionRequiresExternalSignedOrigin": {"$ref": "#/$defs/booleanPolicy"},
+        "consumerMustNotPromoteFixtures": {"$ref": "#/$defs/booleanPolicy"}
+      }
+    }
+  }
+}
