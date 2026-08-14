@@ -1,0 +1,239 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.sagemaker-endpoint-result/v1",
+  "title": "Hartevo Layer 1 Amazon SageMaker endpoint deployment-result contract",
+  "schemaVersion": "hartevo.sagemaker-endpoint-result/v1",
+  "contractVersion": "EXT-SAGEMAKER-01-L1/v1",
+  "layer": 1,
+  "status": "read_proposal_and_recording_only",
+  "plugin": {
+    "id": "hartevo.sagemaker-endpoint-result",
+    "version": "1.0.0",
+    "registration": {
+      "versionBound": true,
+      "contractDigestBound": true,
+      "providerBound": true,
+      "permissionSnapshotBound": true,
+      "adapterRevisionBound": true,
+      "scopeDigestBound": true,
+      "opaqueSigV4SecretReferenceOnly": true,
+      "reversible": true,
+      "revocable": true,
+      "failClosedDrift": true
+    }
+  },
+  "service": {
+    "id": "SageMakerEndpointResultService",
+    "provider": "SageMakerProvider",
+    "consumer": "MissionSageMakerDeploymentConsumer",
+    "operations": [
+      "describe_endpoint",
+      "describe_endpoint_config",
+      "read_deployment_evidence",
+      "compile_model_deployment_proposal",
+      "record_deployment_receipt",
+      "verify_deployment_result",
+      "mission_deployment_proposal",
+      "registration",
+      "revocation"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "durableReceipts": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "id": "sagemaker",
+    "version": "1.0.0",
+    "officialApis": [
+      "DescribeEndpoint",
+      "DescribeEndpointConfig",
+      "ProductionVariantStatus"
+    ],
+    "officialReferences": [
+      "https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_DescribeEndpoint.html",
+      "https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_DescribeEndpointConfig.html",
+      "https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_ProductionVariantStatus.html"
+    ],
+    "authentication": {
+      "sigV4": true,
+      "secretReferenceOnly": true,
+      "serializedCredentials": false,
+      "environmentExport": false
+    },
+    "transport": {
+      "readMethods": [
+        "DescribeEndpoint",
+        "DescribeEndpointConfig"
+      ],
+      "endpointDiscovery": "exact_scope_only",
+      "boundedResponse": true,
+      "fixtureEvidence": "recording_only",
+      "fakeEvidence": "recording_only",
+      "loopbackEvidence": "recording_only",
+      "blockedEnvEvidence": "not_connected"
+    },
+    "capabilities": [
+      "describe_endpoint_metadata",
+      "describe_endpoint_config_metadata",
+      "read_endpoint_status",
+      "read_production_variant_status",
+      "read_traffic_weights",
+      "read_model_image_and_revision_digests",
+      "read_failure_reason",
+      "deployment_verification_proposal",
+      "receipt_recording",
+      "endpoint_config_variant_registration",
+      "result_fingerprint_verification",
+      "reversible_registration"
+    ],
+    "nativeStatus": "BLOCKED_ENV",
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false
+  },
+  "scope": {
+    "required": [
+      "aws_partition",
+      "aws_account_id",
+      "aws_region",
+      "endpoint_name",
+      "endpoint_arn_digest",
+      "endpoint_config_name",
+      "endpoint_config_arn_digest",
+      "production_variant_name",
+      "model_name",
+      "model_revision",
+      "image_reference_digest",
+      "model_code_digest",
+      "endpoint_config_digest",
+      "traffic_snapshot",
+      "deployment_verification_objective",
+      "hartevo_project_id",
+      "mission_id",
+      "work_product_id",
+      "mission_revision",
+      "work_product_revision"
+    ],
+    "permissionRegistration": [
+      "sagemaker:DescribeEndpoint",
+      "sagemaker:DescribeEndpointConfig"
+    ],
+    "identityFence": [
+      "account_and_region",
+      "endpoint_arn_digest",
+      "endpoint_config_arn_digest",
+      "production_variant_name",
+      "model_revision",
+      "mission_revision",
+      "work_product_revision"
+    ]
+  },
+  "evidence": {
+    "boundedMetadataOnly": true,
+    "required": [
+      "endpoint_status",
+      "endpoint_config_metadata",
+      "production_variant_status",
+      "traffic_snapshot",
+      "model_name",
+      "model_revision",
+      "image_reference_digest",
+      "model_code_digest",
+      "endpoint_config_digest",
+      "failure_reason_projection",
+      "provider_provenance",
+      "evidence_digest"
+    ],
+    "rawJson": false,
+    "rawLogs": false,
+    "rawModelPayload": false,
+    "rawContainerOrImageReference": false,
+    "rawConfigSecrets": false,
+    "dataCapturePayload": false,
+    "secretMaterial": false,
+    "authority": "below_truth_consent_effect_receipt_verification_outcome"
+  },
+  "statusSemantics": {
+    "endpoint": [
+      "Creating",
+      "InService",
+      "Updating",
+      "SystemUpdating",
+      "RollingBack",
+      "OutOfService",
+      "Deleting",
+      "Failed",
+      "UpdateRollbackFailed",
+      "ProviderUnknown"
+    ],
+    "productionVariant": [
+      "Creating",
+      "Deleting",
+      "Updating",
+      "ActivatingTraffic",
+      "Baking",
+      "Stable",
+      "ProviderUnknown"
+    ],
+    "unknownProviderStates": "typed_provider_unknown",
+    "failureReasons": "bounded_and_redacted"
+  },
+  "semantics": {
+    "sameNameReplacement": "endpoint_or_config_arn_digest_mismatch_fails_closed",
+    "endpointConfigDrift": "config_identity_or_digest_mismatch_fails_closed",
+    "variantDrift": "variant_model_image_revision_and_digest_mismatch_fails_closed",
+    "trafficDrift": "current_weight_snapshot_mismatch_is_non_adoptable",
+    "statusDrift": "variant_status_mismatch_is_non_adoptable",
+    "authorizationObscured404": "preserve_not_found_without_disclosing_authorization",
+    "duplicateReplay": "same_evidence_is_idempotent; divergent_identity_is_rejected",
+    "fixtureFakeLoopbackBlockedEnvNeverConnectedNativeOrFirstParty": true,
+    "tamperAndTruncation": "digest_and_receipt_fences_fail_closed"
+  },
+  "forbiddenAuthorities": [
+    "store",
+    "keyring",
+    "browser_profile",
+    "kernel_truth",
+    "kernel_consent",
+    "kernel_effect",
+    "kernel_receipt",
+    "kernel_verification",
+    "kernel_outcome",
+    "CreateEndpoint",
+    "UpdateEndpoint",
+    "DeleteEndpoint",
+    "UpdateEndpointWeightsAndCapacities",
+    "traffic_mutation",
+    "capacity_mutation",
+    "InvokeEndpoint",
+    "raw_sigv4_credentials",
+    "raw_model_payload",
+    "raw_container_or_image_secret",
+    "raw_endpoint_config_secret",
+    "logs",
+    "data_capture_payload",
+    "arbitrary_endpoint_discovery",
+    "connected_claim",
+    "native_claim",
+    "first_party_claim",
+    "Outcome_adoption"
+  ],
+  "nonOverlap": [
+    "bedrock_inference_provider_owns_model_inference",
+    "huggingface_inference_provider_owns_model_inference",
+    "lambda_invocation_provider_owns_serverless_invocation",
+    "cloud_run_provider_owns_container_deployment"
+  ],
+  "nativeGaps": [
+    "native_sigv4_credential_resolution",
+    "live_sagemaker_https_reads",
+    "durable_receipts",
+    "independent_endpoint_and_config_readback",
+    "verified_work_product_adoption",
+    "connected_native_or_first_party_evidence"
+  ]
+}
