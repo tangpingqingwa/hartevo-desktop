@@ -23,6 +23,8 @@ pub const PLUGIN_RECEIPT_SCHEMA: &str = "hartevo.plugin-registration-receipt/v1"
 pub const PLUGIN_INSPECTION_SCHEMA: &str = "hartevo.plugin-inspection/v1";
 pub const MAX_IDENTIFIER_BYTES: usize = 128;
 
+pub mod skill_invocation;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginErrorCode {
