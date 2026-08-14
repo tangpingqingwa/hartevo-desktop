@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "f70271f21724042f369ec6e3b45c8eb791c5d4a9",
+  "baseCommit": "c678b1391f0b81b19cd2435e2e440f6d0be9f036",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-clarity-ux-result-01",
-      "headCommit": "08d31e22e463b7e91607ee854bdf5a81a74d917c",
-      "number": 489
+      "headBranch": "codex/issue-512-ext-aws-config-compliance-01",
+      "headCommit": "7fda311c031621be0af3a69fdfae146b7f864a3d",
+      "number": 533
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-mux-media-result-01",
-      "headCommit": "b143e49af68c57211bd6a056d4e37e04821c859f",
-      "number": 490
+      "headBranch": "codex/aws-organizations-governance-result",
+      "headCommit": "d44ae127e2333d1ca0f87dec88a7a1c95a7fa238",
+      "number": 534
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-algolia-search-result-01",
-      "headCommit": "920f2dc8777fcc48e25aa9338d686ed1413be3f2",
-      "number": 492
+      "headBranch": "codex/issue-514-ext-sailpoint-certification-result-01",
+      "headCommit": "7b713ffcf9e077cbeda894b8a854c423ca706343",
+      "number": 535
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-honeycomb-trace-result-01",
-      "headCommit": "669da28ac7b9d9eb6263cefe54138eb844e875f2",
-      "number": 493
+      "headBranch": "codex/issue-521-ext-aws-backup-recovery-result-01",
+      "headCommit": "e31c9e97ca5c2fe3e384f44669838129b262e828",
+      "number": 536
     }
   ],
-  "createdAt": "2026-08-14T17:21:43Z",
+  "createdAt": "2026-08-14T18:41:59Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-0121"
+  "trainBranch": "merge-train/20260815-024134"
 }
