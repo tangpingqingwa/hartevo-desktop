@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "114abe2bc04d77d1eca4efea64092b37a0b0fb06",
+  "baseCommit": "dd8ab55c99b93481e1a63e58dd788b37eeadda5a",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/paid-social-meta-instagram-read-ps01",
-      "headCommit": "a202bdf1303a795af25b75010ca48b065bfccd4a",
-      "number": 274
+      "headBranch": "codex/ext-datadog-slo-outcome-01",
+      "headCommit": "2d95a9dc24284a8006dd8f70223a056e5d8ba705",
+      "number": 358
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/scheduler-plugin-dispatch-receipt-02",
-      "headCommit": "4df7412f6fb8cdc7ab4aa6f84a23db91f9925e84",
-      "number": 229
+      "headBranch": "codex/ext-bigquery-outcome-01",
+      "headCommit": "24025dd23c9a70e2bfd68e99838a63df657347d0",
+      "number": 359
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/shopify-draft-fulfillment-effect-01",
-      "headCommit": "1747bf0ff7011d5e4b94c5a6d6b370648e620216",
-      "number": 213
+      "headBranch": "codex/ext-azure-devops-work-01",
+      "headCommit": "653979735d779cda2987b3f15eaffdcb09149e12",
+      "number": 360
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/attribution-outcome-adoption-01",
-      "headCommit": "271780e033750af0acc34b42c9b3d69718f64818",
-      "number": 198
+      "headBranch": "codex/ext-hf-01-huggingface-inference",
+      "headCommit": "4d88199291486acd7397f695c04c6fb19fb4ce1d",
+      "number": 361
     }
   ],
-  "createdAt": "2026-08-14T11:06:36Z",
+  "createdAt": "2026-08-14T12:52:30Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260814-1822"
+  "trainBranch": "merge-train/20260814-2050"
 }
