@@ -3,8 +3,6 @@ name: Integration / Bootstrap CI
 on:
   push:
     branches: [bootstrap/macos-r0]
-  pull_request_review:
-    types: [submitted]
   workflow_dispatch:
 
 permissions:
@@ -22,7 +20,6 @@ env:
 jobs:
   review-gate:
     name: Integration / Reviewed gate
-    if: github.event_name != 'pull_request_review' || github.event.review.state == 'approved'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -42,6 +39,7 @@ jobs:
     with:
       check_prefix: Integration / Full Rust
       run_rust: true
+      run_macos: true
       full_workspace: true
       rust_packages: '["hartevo-application","hartevo-browser-adapter","hartevo-capability-gateway","hartevo-catalog","hartevo-cloud-storage","hartevo-commerce-connector","hartevo-connector-sdk","hartevo-context-fabric","hartevo-desktop","hartevo-domain-kernel","hartevo-effect-broker","hartevo-eval","hartevo-mission-scheduler","hartevo-runtime-adapter","hartevo-storage"]'
     permissions:

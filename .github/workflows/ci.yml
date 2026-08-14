@@ -2,13 +2,15 @@ name: PR / Fast CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened]
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
 
 concurrency:
-  group: hartevo-pr-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: hartevo-pr-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -58,15 +60,25 @@ jobs:
       - id: plan
         name: Plan conservative changed scope
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           mkdir -p target/ci
-          python3 scripts/ci-scope.py \
-            --base "$BASE_SHA" \
-            --head "$HEAD_SHA" \
-            --github-output "$GITHUB_OUTPUT" \
-            | tee target/ci/scope.json
+          if [[ "$GITHUB_EVENT_NAME" == merge_group ]]; then
+            echo 'full=true' >> "$GITHUB_OUTPUT"
+            echo 'rust=true' >> "$GITHUB_OUTPUT"
+            echo 'packages=[]' >> "$GITHUB_OUTPUT"
+            echo 'plan={"mode":"merge_group_full","full":true,"rust":true,"packages":[]}' >> "$GITHUB_OUTPUT"
+            printf '%s\n' \
+              '{"schema":"hartevo-ci-scope/v1","mode":"merge_group_full","full":true,"rust":true,"packages":[]}' \
+              > target/ci/scope.json
+          else
+            python3 scripts/ci-scope.py \
+              --base "$BASE_SHA" \
+              --head "$HEAD_SHA" \
+              --github-output "$GITHUB_OUTPUT" \
+              | tee target/ci/scope.json
+          fi
       - name: Upload redacted scope evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -83,7 +95,8 @@ jobs:
     with:
       check_prefix: PR / Fast Rust
       run_rust: ${{ needs.scope.outputs.rust == 'true' }}
-      full_workspace: ${{ needs.scope.outputs.full == 'true' }}
+      run_macos: ${{ github.event_name == 'merge_group' }}
+      full_workspace: ${{ github.event_name == 'merge_group' || needs.scope.outputs.full == 'true' }}
       rust_packages: ${{ needs.scope.outputs.packages }}
     permissions:
       contents: read
@@ -117,6 +130,7 @@ jobs:
       - name: Classify job outcomes
         env:
           RUST_SCOPE: ${{ needs.scope.outputs.rust }}
+          RUN_MACOS: ${{ github.event_name == 'merge_group' }}
         run: |
           mkdir -p target/ci
           planned=()
@@ -126,6 +140,10 @@ jobs:
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)")
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)")
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)")
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)")
+          elif [[ "$RUN_MACOS" != true ]]; then
+            planned+=(--planned-scope macos)
+            planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)")
             planned+=(--planned-job-name "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)")
           fi
           python3 scripts/ci-result.py aggregate \

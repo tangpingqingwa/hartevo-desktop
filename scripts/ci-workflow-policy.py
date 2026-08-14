@@ -198,16 +198,23 @@ RUST_REUSABLE_CHECK_SUFFIXES = (
 )
 
 
-def reusable_rust_scope_plan(check_prefix: str, run_rust: bool) -> list[dict[str, object]]:
+def reusable_rust_scope_plan(
+    check_prefix: str, run_rust: bool, run_macos: bool = True
+) -> list[dict[str, object]]:
     """Model the stable child checks and their planned scope behavior for policy tests."""
-    return [
-        {
-            "name": f"{check_prefix} / {suffix}",
-            "plannedSkip": not run_rust,
-            "executesRust": run_rust,
-        }
-        for suffix in RUST_REUSABLE_CHECK_SUFFIXES
-    ]
+    result: list[dict[str, object]] = []
+    for suffix in RUST_REUSABLE_CHECK_SUFFIXES:
+        macos_check = suffix.endswith("(macos-15)")
+        executes_rust = run_rust and (not macos_check or run_macos)
+        result.append(
+            {
+                "name": f"{check_prefix} / {suffix}",
+                "plannedSkip": not executes_rust,
+                "executesRust": executes_rust,
+                "runner": "macos-15" if macos_check and run_macos else "ubuntu-24.04",
+            }
+        )
+    return result
 
 
 def validate_reusable_scope_contract(path: Path, text: str) -> None:
@@ -215,13 +222,14 @@ def validate_reusable_scope_contract(path: Path, text: str) -> None:
         return
     required = (
         "run_rust:\n",
+        "run_macos:\n",
         "type: boolean",
         "name: ${{ inputs.check_prefix }} / fmt",
         "name: ${{ inputs.check_prefix }} / clippy (${{ matrix.os }})",
         "name: ${{ inputs.check_prefix }} / test (${{ matrix.os }})",
         "os: [ubuntu-24.04, macos-15]",
         "name: Planned scope skip marker",
-        "if: ${{ !inputs.run_rust }}",
+        "runs-on: ${{ matrix.os == 'macos-15' && !inputs.run_macos && 'ubuntu-24.04' || matrix.os }}",
     )
     if any(item not in text for item in required):
         raise PolicyError(f"{path} is missing the scope-aware stable Rust check contract")
@@ -251,8 +259,17 @@ def validate_reusable_scope_contract(path: Path, text: str) -> None:
             r"(?ms)^      - name: Planned scope skip marker\s*\n.*?(?=^      - name:|\Z)",
             block,
         )
-        if not marker or not re.search(r"^        if:\s*\$\{\{\s*!inputs\.run_rust\s*\}\}\s*$", marker.group(0), re.MULTILINE):
-            raise PolicyError(f"{path} {job_name} marker must be the run_rust=false path")
+        marker_condition = (
+            r"!inputs\.run_rust"
+            if job_name == "fmt"
+            else r"!inputs\.run_rust\s*\|\|\s*\(matrix\.os\s*==\s*'macos-15'\s*&&\s*!inputs\.run_macos\)"
+        )
+        if not marker or not re.search(
+            rf"^        if:\s*\$\{{\{{\s*{marker_condition}\s*\}}\}}\s*$",
+            marker.group(0),
+            re.MULTILINE,
+        ):
+            raise PolicyError(f"{path} {job_name} marker must cover its planned runner path")
         for step_name in heavy_steps:
             step = re.search(
                 rf"(?ms)^      - name: {re.escape(step_name)}\s*\n.*?(?=^      - name:|\Z)",
@@ -267,6 +284,8 @@ def validate_reusable_scope_contract(path: Path, text: str) -> None:
                     raise PolicyError(f"{path} {job_name} heavy step is not guarded by inputs.run_rust: {step_name}")
         if job_name in {"clippy", "test"} and any(item not in block for item in ("strategy:", "matrix:", "os: [ubuntu-24.04, macos-15]")):
             raise PolicyError(f"{path} {job_name} must retain the two-platform matrix")
+        if job_name in {"clippy", "test"} and "!inputs.run_macos && 'ubuntu-24.04' || matrix.os" not in block:
+            raise PolicyError(f"{path} {job_name} must map planned macOS contexts onto Ubuntu")
 
 
 def validate_actions(path: Path, text: str, pins: dict[str, str]) -> list[str]:
@@ -336,10 +355,13 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
     if path.name == "ci.yml":
         required = (
             "pull_request:",
+            "merge_group:",
             "scripts/ci-scope.py",
             "rust-reusable.yml",
             "run_rust: ${{ needs.scope.outputs.rust == 'true' }}",
+            "run_macos: ${{ github.event_name == 'merge_group' }}",
             "--planned-scope rust",
+            "--planned-scope macos",
             "--planned-job-name",
             "scripts/ci-workflow-policy.py",
             "scripts/ci-result.py",
@@ -349,12 +371,16 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             raise PolicyError(f"{path} is missing a required fast-PR contract")
         if re.search(r"^\s+if:\s+needs\.scope\.outputs\.rust\s*==\s*['\"]true['\"]\s*$", text, re.MULTILINE):
             raise PolicyError(f"{path} must always call the reusable Rust workflow")
+        if "ready_for_review" in text:
+            raise PolicyError(f"{path} must reuse same-SHA checks when a Draft becomes ready")
         if "branches: [main]" in text or "branches: [bootstrap/macos-r0]" in text:
             raise PolicyError(f"{path} must not run the integration push tier")
     elif path.name == "integration.yml":
-        required = ("bootstrap/macos-r0", "pull_request_review:", "run_rust: true", "HARTEVO_TEST_POSTGRES_URL", "postgres:18.4", "check-evidence-doc-truth.sh", "check-openinterpreter-schema.sh", "check-dioxus-toolchain.sh", "catalog export", "evidence baseline", "Integration / Result taxonomy")
+        required = ("bootstrap/macos-r0", "workflow_dispatch:", "run_rust: true", "run_macos: true", "HARTEVO_TEST_POSTGRES_URL", "postgres:18.4", "check-evidence-doc-truth.sh", "check-openinterpreter-schema.sh", "check-dioxus-toolchain.sh", "catalog export", "evidence baseline", "Integration / Result taxonomy")
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing a required integration contract")
+        if "pull_request_review:" in text:
+            raise PolicyError(f"{path} must not run the full Integration matrix on review events")
         validate_dependency_audit_contract(path, text)
         validate_dioxus_artifact_contract(path, text)
     elif path.name == "release-promotion.yml":
@@ -443,6 +469,17 @@ def self_test() -> None:
     else:
         raise AssertionError("self-test accepted a PR workflow without cancellation")
 
+    ci_fixture = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
+    validate_required_workflow_contract(Path("ci.yml"), ci_fixture)
+    try:
+        validate_required_workflow_contract(
+            Path("ci.yml"), ci_fixture.replace("types: [opened, synchronize, reopened]", "types: [opened, synchronize, reopened, ready_for_review]")
+        )
+    except PolicyError:
+        pass
+    else:
+        raise AssertionError("self-test accepted a duplicate same-SHA ready-for-review run")
+
     reusable_fixture = """\
 concurrency:
   group: hartevo-rust-reusable-${{ inputs.check_prefix }}-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
@@ -474,6 +511,10 @@ on:
         description: Scope gate
         required: true
         type: boolean
+      run_macos:
+        description: macOS gate
+        required: true
+        type: boolean
 jobs:
   fmt:
     name: ${{ inputs.check_prefix }} / fmt
@@ -498,48 +539,50 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os == 'macos-15' && !inputs.run_macos && 'ubuntu-24.04' || matrix.os }}
     steps:
       - name: Planned scope skip marker
-        if: ${{ !inputs.run_rust }}
+        if: ${{ !inputs.run_rust || (matrix.os == 'macos-15' && !inputs.run_macos) }}
         run: echo planned
       - name: Checkout reviewed source
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - name: Install Ubuntu desktop development libraries
         if: inputs.run_rust && matrix.os == 'ubuntu-24.04'
         run: sudo apt-get update
       - name: Cache Cargo and Rust toolchain
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         uses: actions/cache@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - name: Install the locked Rust components
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         run: rustup component add clippy
       - name: Strict Clippy gate
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         run: cargo clippy --locked
   test:
     name: ${{ inputs.check_prefix }} / test (${{ matrix.os }})
     strategy:
       matrix:
         os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os == 'macos-15' && !inputs.run_macos && 'ubuntu-24.04' || matrix.os }}
     steps:
       - name: Planned scope skip marker
-        if: ${{ !inputs.run_rust }}
+        if: ${{ !inputs.run_rust || (matrix.os == 'macos-15' && !inputs.run_macos) }}
         run: echo planned
       - name: Checkout reviewed source
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - name: Install Ubuntu desktop development libraries
         if: inputs.run_rust && matrix.os == 'ubuntu-24.04'
         run: sudo apt-get update
       - name: Cache Cargo and Rust toolchain
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         uses: actions/cache@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - name: Install the locked Rust components
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         run: rustup component add clippy
       - name: Locked Rust test gate
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         run: cargo test --locked
 """
     validate_reusable_scope_contract(Path("rust-reusable.yml"), scope_fixture)
@@ -553,6 +596,12 @@ jobs:
     ]
     assert all(item["plannedSkip"] is True and item["executesRust"] is False for item in scope_skip_plan)
     assert all(item["plannedSkip"] is False and item["executesRust"] is True for item in reusable_rust_scope_plan("PR / Fast Rust", True))
+    pr_plan = reusable_rust_scope_plan("PR / Fast Rust", True, run_macos=False)
+    assert [item["name"] for item in pr_plan if item["plannedSkip"]] == [
+        "PR / Fast Rust / clippy (macos-15)",
+        "PR / Fast Rust / test (macos-15)",
+    ]
+    assert all(item["runner"] == "ubuntu-24.04" for item in pr_plan)
     try:
         validate_reusable_scope_contract(
             Path("rust-reusable.yml"), scope_fixture.replace("  fmt:\n    name:", "  fmt:\n    if: inputs.run_rust\n    name:")
