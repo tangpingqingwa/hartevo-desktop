@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-waf-posture-result/aws-waf-posture-result.v1.json",
+  "title": "Hartevo AWS WAF posture result Layer-1 contract",
+  "description": "A bounded AWS WAF read/proposal/record/verify seam for a Mission security and deployment decision. It is not a WAF mutation authority, certification authority, or Hartevo kernel outcome authority.",
+  "schemaVersion": "hartevo.aws-waf-posture-result.contract/v1",
+  "contractVersion": "EXT-AWS-WAF-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "layer": "Layer-1",
+  "officialReferences": [
+    "https://docs.aws.amazon.com/waf/latest/APIReference/API_ListWebACLs.html",
+    "https://docs.aws.amazon.com/waf/latest/APIReference/API_GetWebACL.html",
+    "https://docs.aws.amazon.com/waf/latest/APIReference/API_ListResourcesForWebACL.html"
+  ],
+  "service": {
+    "id": "aws.waf.posture.result",
+    "implementation": "AwsWafPostureService",
+    "version": "1.0.0",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "read_bounded",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "liveExecution": false,
+    "externalWrites": false
+  },
+  "provider": {
+    "id": "aws.waf.posture.result.recording",
+    "implementation": "AwsWafProvider",
+    "version": "1.0.0",
+    "apiVersion": "2019-04-23",
+    "apiRevision": "waf-list-web-acls-get-web-acl-list-resources-for-web-acl-r1",
+    "allowlistedOperations": [
+      "ListWebACLs",
+      "GetWebACL",
+      "ListResourcesForWebACL"
+    ],
+    "acceptedTransports": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "allowlistedMethods": ["POST"],
+    "native": false,
+    "connected": false,
+    "firstParty": false,
+    "externalWrites": false,
+    "secretReference": "opaque_non_serializing_sigv4_reference_only",
+    "providerReceipt": false
+  },
+  "consumer": {
+    "id": "mission.aws-waf-posture.consumer",
+    "implementation": "MissionAwsWafConsumer",
+    "version": "1.0.0",
+    "scope": [
+      "missionIdAndRevision",
+      "projectIdAndRevision",
+      "workProductIdAndRevision",
+      "accountId",
+      "region",
+      "scopeKind",
+      "webAclAllowlist",
+      "resourceAllowlist",
+      "permissionDigest",
+      "registrationDigest"
+    ],
+    "producesDecisionProposal": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "effectiveAuthorization": false,
+    "deploymentAuthority": false
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "cloudFrontOrRegionalScope",
+      "webAclIdAndArnAllowlist",
+      "webAclRevisionAndLockTokenFence",
+      "resourceArnAllowlist",
+      "resourceRevisionFence",
+      "missionIdAndRevision",
+      "projectIdAndRevision",
+      "workProductIdAndRevision",
+      "permissionRevisionAndDigest",
+      "opaqueSecretReferenceDigest",
+      "scopeRevisionAndDigest"
+    ],
+    "target": "one_or_more_explicit_web_acls_and_resources",
+    "resourceAllowlist": true,
+    "webAclAllowlist": true,
+    "rawRuleStatements": false,
+    "rawIpSets": false,
+    "rawRequestBodies": false,
+    "rawSampledRequests": false
+  },
+  "registration": {
+    "versionBound": true,
+    "providerIdBound": true,
+    "providerVersionBound": true,
+    "apiRevisionBound": true,
+    "providerDigestBound": true,
+    "apiDigestBound": true,
+    "contractVersionBound": true,
+    "contractDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "evidenceDigestBound": true,
+    "secretReferenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "plugin_version_drift",
+      "provider_or_api_revision_drift",
+      "provider_or_contract_digest_drift",
+      "permission_or_scope_digest_drift",
+      "web_acl_or_resource_revision_drift",
+      "lock_token_drift",
+      "pagination_loop_or_cursor_replay",
+      "partial_or_unknown_evidence",
+      "access_loss_or_throttle_or_timeout",
+      "evidence_tamper",
+      "recording_replay_conflict",
+      "secret_reference_revocation",
+      "registration_revocation"
+    ]
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxPagesPerOperation": 4,
+    "pageSize": 100,
+    "maxRequestsPerRead": 12,
+    "maxWebAcls": 32,
+    "maxResources": 128,
+    "maxRuleSummaries": 256,
+    "opaqueCursor": true
+  },
+  "reads": {
+    "ListWebACLs": {
+      "method": "POST",
+      "filter": "scopeKindAndAclAllowlistProjection",
+      "retain": "allowlistedAclIdentityDigestOnly"
+    },
+    "GetWebACL": {
+      "method": "POST",
+      "filter": "exactAclAllowlistAndRevisionFence",
+      "retain": [
+        "defaultActionClass",
+        "ruleActionClassSummaries",
+        "lockTokenDigest",
+        "revisionDigest"
+      ]
+    },
+    "ListResourcesForWebACL": {
+      "method": "POST",
+      "filter": "exactResourceArnAllowlistAndRevisionFence",
+      "retain": [
+        "associationIdentityDigest",
+        "resourceDigest",
+        "resourceRevisionDigest"
+      ]
+    },
+    "pagination": {
+      "cursorOpaque": true,
+      "cursorDigestOnly": true,
+      "cursorBoundTo": [
+        "scopeDigest",
+        "operation",
+        "pageNumber",
+        "requestDigest"
+      ],
+      "loopsRejected": true,
+      "replayRejected": true,
+      "partialIsNonAdoptable": true
+    }
+  },
+  "evidence": {
+    "states": [
+      "complete",
+      "no_matching_acl",
+      "partial",
+      "access_loss",
+      "throttled",
+      "timeout",
+      "provider_unknown",
+      "scope_drift",
+      "revision_drift",
+      "registration_revoked"
+    ],
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "registrationDigest",
+      "secretReferenceDigest",
+      "paginationDigest",
+      "listDigest",
+      "getDigest",
+      "associationDigest",
+      "evidenceDigest"
+    ],
+    "retained": [
+      "defaultActionClass",
+      "ruleActionClassSummaries",
+      "associationIdentityDigest",
+      "webAclDigest",
+      "resourceDigest",
+      "lockTokenDigest",
+      "webAclRevisionDigest",
+      "resourceRevisionDigest",
+      "paginationCompleteness"
+    ],
+    "notRetained": [
+      "ruleStatements",
+      "ipSets",
+      "requestBodies",
+      "sampledRequests",
+      "rawProviderPayload",
+      "rawNextToken",
+      "secretMaterial",
+      "unboundedWafLogs"
+    ],
+    "missingOrInsufficientDataFailsClosed": true,
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "canBeAdopted": false
+  },
+  "redaction": {
+    "ruleStatements": false,
+    "ipSets": false,
+    "requestBodies": false,
+    "sampledRequests": false,
+    "rawProviderPayload": false,
+    "rawNextToken": false,
+    "secretMaterial": false,
+    "unboundedLogs": false
+  },
+  "provenance": {
+    "fixture": {
+      "connected": false,
+      "native": false,
+      "firstParty": false
+    },
+    "recording": {
+      "connected": false,
+      "native": false,
+      "firstParty": false
+    },
+    "loopback": {
+      "connected": false,
+      "native": false,
+      "firstParty": false
+    },
+    "blockedEnv": {
+      "connected": false,
+      "native": false,
+      "firstParty": false
+    }
+  },
+  "authorityBoundary": {
+    "truth": false,
+    "consent": false,
+    "effect": false,
+    "receipt": false,
+    "verification": false,
+    "outcome": false,
+    "credentialResolution": false,
+    "nativeSigV4": false,
+    "liveHttps": false,
+    "wafMutation": false,
+    "sampledRequestRead": false
+  },
+  "layer2Gaps": [
+    "host_owned_native_sigv4_and_credential_resolution",
+    "live_https_transport_and_independent_native_readback",
+    "durable_provider_receipt",
+    "explicit_consent_and_effect_authority",
+    "CreateWebACL_UpdateWebACL_DeleteWebACL",
+    "AssociateWebACL_DisassociateWebACL",
+    "rule_group_and_ip_set_mutation",
+    "sampled_request_or_request_body_read",
+    "verified_work_product_adoption"
+  ],
+  "forbidden": [
+    "CreateWebACL",
+    "UpdateWebACL",
+    "DeleteWebACL",
+    "AssociateWebACL",
+    "DisassociateWebACL",
+    "mutate_rule_group_or_ip_set",
+    "read_rule_statements",
+    "read_ip_sets",
+    "read_request_bodies",
+    "read_sampled_requests",
+    "resolve_live_credentials",
+    "claim_connected",
+    "claim_native",
+    "claim_first_party",
+    "adopt_truth",
+    "adopt_consent",
+    "adopt_effect",
+    "adopt_receipt",
+    "adopt_verification",
+    "adopt_outcome",
+    "adopt_work_product"
+  ]
+}
