@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "hartevo-servicenow-change-contract/v1",
+  "contractVersion": "servicenow-change-01-readonly/v1",
+  "pluginId": "servicenow.change",
+  "layer": "layer_1",
+  "readOnly": true,
+  "capabilities": [
+    "describe_capabilities",
+    "probe_registration",
+    "describe_schema_mapping",
+    "read_change",
+    "read_approvals",
+    "read_audit",
+    "compile_change_proposal",
+    "compile_approval_proposal",
+    "compile_change_result_proposal"
+  ],
+  "mutations": {
+    "create": false,
+    "update": false,
+    "close": false,
+    "approve": false,
+    "reject": false,
+    "journal": false,
+    "attachment": false,
+    "flow": false,
+    "webhook": false
+  },
+  "provenanceClasses": ["recording", "fake", "blocked_env"],
+  "connected": false,
+  "nativeEvidence": false,
+  "firstPartyEvidence": false,
+  "kernelAuthority": ["truth", "consent", "effect", "receipt", "verification", "outcome"],
+  "bounds": {
+    "maxPageSize": 100,
+    "maxPages": 16,
+    "maxItems": 256,
+    "maxResponseBytes": 1048576
+  },
+  "futureWriteGate": {
+    "requiresConfiguredCorrelation": true,
+    "requiresExactReadback": true,
+    "ambiguousResponseFailsClosed": true
+  }
+}
