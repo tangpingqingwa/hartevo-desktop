@@ -1540,6 +1540,21 @@ pub struct MissionScheduleSnapshot {
     pub late_wake_receipts: Vec<LateWakeReceipt>,
     pub revoked_plugins: Vec<PluginManifest>,
     pub clock_epoch: u64,
+    #[serde(default)]
+    pub provider_epoch: u64,
+    #[serde(default)]
+    pub wake_uncertainty: Option<WakeStateUncertainty>,
+}
+
+/// Durable fail-closed marker for a provider wake transition whose external
+/// state could not be restored after a rejected snapshot write.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeStateUncertainty {
+    pub operation: String,
+    pub schedule_id_digest: Option<String>,
+    pub store_error: String,
+    pub compensation_error: String,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -1767,6 +1782,7 @@ pub struct MissionScheduleService<P, C, S = MemoryMissionScheduleStore> {
     dispatch_receipts: BTreeMap<String, MissionCapabilityDispatchReceipt>,
     late_wake_receipts: Vec<LateWakeReceipt>,
     revoked_plugins: BTreeSet<PluginManifest>,
+    wake_uncertainty: Option<WakeStateUncertainty>,
 }
 
 pub type ScheduledMissionScheduleService<P, C, S = MemoryMissionScheduleStore> =
@@ -1795,6 +1811,7 @@ where
             return Err(RecurringScheduleError::InvalidProvider);
         }
         let snapshot = store.load()?;
+        let wake_uncertainty = snapshot.wake_uncertainty.clone();
         let mut schedules = BTreeMap::new();
         let mut clock_epoch = snapshot.clock_epoch;
         for schedule in snapshot.schedules {
@@ -1839,6 +1856,7 @@ where
             dispatch_receipts,
             late_wake_receipts: snapshot.late_wake_receipts,
             revoked_plugins: snapshot.revoked_plugins.into_iter().collect(),
+            wake_uncertainty,
         })
     }
 
@@ -1889,7 +1907,13 @@ where
             late_wake_receipts: self.late_wake_receipts.clone(),
             revoked_plugins: self.revoked_plugins.iter().cloned().collect(),
             clock_epoch: self.clock_epoch,
+            provider_epoch: self.provider_epoch,
+            wake_uncertainty: self.wake_uncertainty.clone(),
         }
+    }
+
+    pub fn wake_uncertainty(&self) -> Option<&WakeStateUncertainty> {
+        self.wake_uncertainty.as_ref()
     }
 
     /// Persist a new exact conversation-authored schedule and arm its first
@@ -1900,6 +1924,8 @@ where
         draft: &MissionScheduleDraft,
         observed_at: DateTime<Utc>,
     ) -> Result<MissionScheduleModelReceipt, RecurringScheduleError> {
+        self.ensure_wake_state_known()?;
+        let before = self.snapshot();
         draft.validate()?;
         if draft.lease.expires_at <= observed_at {
             return Err(RecurringScheduleError::LeaseExpired);
@@ -1943,7 +1969,7 @@ where
             MissionScheduleEvent::Created,
             observed_at,
         )?;
-        self.insert_record(record, receipt.clone())?;
+        self.insert_record(record, receipt.clone(), &before)?;
         Ok(receipt)
     }
 
@@ -1955,6 +1981,7 @@ where
         token: &DispatchWakeToken,
         woke_at: DateTime<Utc>,
     ) -> Result<WakePreparation, RecurringScheduleError> {
+        self.ensure_wake_state_known()?;
         let record = self
             .schedules
             .get(&token.schedule_id_digest)
@@ -2031,6 +2058,7 @@ where
         &mut self,
         preparation: &WakePreparation,
     ) -> Result<MissionScheduleWakeOutcome, RecurringScheduleError> {
+        self.ensure_wake_state_known()?;
         let current = self
             .schedules
             .get(&preparation.schedule_id_digest)
@@ -2074,12 +2102,13 @@ where
             reserved.last_observed_at = preparation.woke_at;
             reserved.last_woke_at = Some(preparation.woke_at);
             reserved.updated_at = preparation.woke_at;
+            let before_reservation = self.snapshot();
             if let Some(receipt) = &current.armed_receipt {
                 self.provider
                     .disarm_wake(receipt)
                     .map_err(|error| RecurringScheduleError::Provider(error.to_string()))?;
             }
-            self.replace_schedule(reserved.clone())?;
+            self.replace_schedule(reserved.clone(), &before_reservation)?;
             (reservation, reserved)
         };
 
@@ -2100,11 +2129,12 @@ where
             .next_occurrence
             .clone_from(&preparation.next_occurrence);
         completed.pending_dispatch = None;
+        let before_completion = self.snapshot();
         if completed.status == MissionScheduleStatus::Active {
             self.arm_record(&mut completed)?;
         }
         completed.updated_at = ack.requested_at;
-        self.complete_dispatch(completed, &receipt)?;
+        self.complete_dispatch(completed, &receipt, &before_completion)?;
         Ok(MissionScheduleWakeOutcome::Dispatched(receipt))
     }
 
@@ -2113,6 +2143,7 @@ where
         token: &DispatchWakeToken,
         woke_at: DateTime<Utc>,
     ) -> Result<MissionScheduleWakeOutcome, RecurringScheduleError> {
+        self.ensure_wake_state_known()?;
         if let Some(existing) = self.dispatch_receipts.values().find(|receipt| {
             receipt.wake_token_digest == token.token_digest
                 && receipt.schedule_id_digest == token.schedule_id_digest
@@ -2151,6 +2182,7 @@ where
         expected_lease_revision: u64,
         observed_at: DateTime<Utc>,
     ) -> Result<ScheduleLifecycleResult, RecurringScheduleError> {
+        self.ensure_wake_state_known()?;
         let current = self
             .schedules
             .get(schedule_id_digest)
@@ -2171,6 +2203,8 @@ where
         let next = current
             .recurrence
             .first_after(after, &current.timezone, current.dst_policy)?;
+        let before = self.snapshot();
+        let old_receipt = current.armed_receipt.clone();
         let mut resumed = current;
         resumed.schedule_revision = resumed
             .schedule_revision
@@ -2188,6 +2222,11 @@ where
         resumed.armed_receipt = None;
         resumed.last_observed_at = observed_at;
         resumed.updated_at = observed_at;
+        if let Some(receipt) = old_receipt.as_ref() {
+            self.provider
+                .disarm_wake(receipt)
+                .map_err(|error| RecurringScheduleError::Provider(error.to_string()))?;
+        }
         if resumed.status == MissionScheduleStatus::Active {
             self.arm_record(&mut resumed)?;
         }
@@ -2196,7 +2235,7 @@ where
             MissionScheduleEvent::Resumed,
             observed_at,
         )?;
-        self.replace_with_receipt(resumed.clone(), receipt)?;
+        self.replace_with_receipt(resumed.clone(), receipt, &before)?;
         Ok(lifecycle_result(&resumed))
     }
 
@@ -2221,6 +2260,7 @@ where
         &mut self,
         command: ScheduleRescheduleCommand,
     ) -> Result<ScheduleLifecycleResult, RecurringScheduleError> {
+        self.ensure_wake_state_known()?;
         command.recurrence.validate()?;
         command.timezone.validate()?;
         command.dst_policy.validate()?;
@@ -2261,6 +2301,7 @@ where
         let next = command
             .recurrence
             .first_after(after, &command.timezone, command.dst_policy)?;
+        let before = self.snapshot();
         if let Some(receipt) = &current.armed_receipt {
             self.provider
                 .disarm_wake(receipt)
@@ -2295,7 +2336,7 @@ where
             MissionScheduleEvent::Rescheduled,
             command.observed_at,
         )?;
-        self.replace_with_receipt(next_record.clone(), receipt)?;
+        self.replace_with_receipt(next_record.clone(), receipt, &before)?;
         Ok(lifecycle_result(&next_record))
     }
 
@@ -2306,6 +2347,7 @@ where
         new_provider_epoch: u64,
         observed_at: DateTime<Utc>,
     ) -> Result<(), RecurringScheduleError> {
+        self.ensure_wake_state_known()?;
         if new_provider_epoch == 0
             || new_provider_epoch <= self.provider_epoch
             || self.provider.provider_epoch() != new_provider_epoch
@@ -2319,6 +2361,7 @@ where
         {
             return Err(RecurringScheduleError::DispatchReserved);
         }
+        let before = self.snapshot();
         self.provider_epoch = new_provider_epoch;
         self.clock_epoch = self
             .clock_epoch
@@ -2344,9 +2387,9 @@ where
             if record.status == MissionScheduleStatus::Active {
                 self.arm_record(&mut record)?;
             }
-            self.replace_schedule(record)?;
+            self.schedules.insert(id, record);
         }
-        self.sync_store()
+        self.persist_wake_transition(&before, "rebind_provider_epoch")
     }
 
     pub fn revoke_plugin(
@@ -2354,7 +2397,9 @@ where
         plugin: &PluginManifest,
         observed_at: DateTime<Utc>,
     ) -> Result<Vec<ScheduleLifecycleResult>, RecurringScheduleError> {
+        self.ensure_wake_state_known()?;
         plugin.validate()?;
+        let before = self.snapshot();
         self.revoked_plugins.insert(plugin.clone());
         let ids = self.schedules.keys().cloned().collect::<Vec<_>>();
         let mut results = Vec::new();
@@ -2375,6 +2420,7 @@ where
                 continue;
             }
             if current.status == MissionScheduleStatus::Dispatching {
+                self.restore_memory(&before);
                 return Err(RecurringScheduleError::DispatchReserved);
             }
             if let Some(receipt) = &current.armed_receipt {
@@ -2398,9 +2444,10 @@ where
                 observed_at,
             )?;
             results.push(lifecycle_result(&revoked));
-            self.replace_with_receipt(revoked, receipt)?;
+            self.schedules.insert(id, revoked);
+            self.model_receipts.push(receipt);
         }
-        self.sync_store()?;
+        self.persist_wake_transition(&before, "revoke_plugin")?;
         Ok(results)
     }
 
@@ -2508,6 +2555,7 @@ where
         preparation: &WakePreparation,
         rejection: LateWakeRejection,
     ) -> Result<MissionScheduleWakeOutcome, RecurringScheduleError> {
+        let before = self.snapshot();
         let receipt = LateWakeReceipt::new(
             &current.schedule_id_digest,
             current.schedule_revision,
@@ -2548,7 +2596,7 @@ where
             preparation.woke_at,
         )?;
         self.late_wake_receipts.push(receipt.clone());
-        self.replace_with_receipt(next, model)?;
+        self.replace_with_receipt(next, model, &before)?;
         Ok(MissionScheduleWakeOutcome::LateRejected(receipt))
     }
 
@@ -2561,6 +2609,7 @@ where
         event: MissionScheduleEvent,
         observed_at: DateTime<Utc>,
     ) -> Result<ScheduleLifecycleResult, RecurringScheduleError> {
+        self.ensure_wake_state_known()?;
         let current = self
             .schedules
             .get(schedule_id_digest)
@@ -2585,6 +2634,7 @@ where
         if !valid {
             return Err(status_error(current.status));
         }
+        let before = self.snapshot();
         if let Some(receipt) = &current.armed_receipt {
             self.provider
                 .disarm_wake(receipt)
@@ -2601,7 +2651,7 @@ where
         next.armed_receipt = None;
         next.updated_at = observed_at;
         let receipt = MissionScheduleModelReceipt::from_record(&next, event, observed_at)?;
-        self.replace_with_receipt(next.clone(), receipt)?;
+        self.replace_with_receipt(next.clone(), receipt, &before)?;
         Ok(lifecycle_result(&next))
     }
 
@@ -2719,6 +2769,7 @@ where
         &mut self,
         record: MissionScheduleRecord,
         receipt: MissionScheduleModelReceipt,
+        before: &MissionScheduleSnapshot,
     ) -> Result<(), RecurringScheduleError> {
         if self
             .schedules
@@ -2728,86 +2779,185 @@ where
             return Err(RecurringScheduleError::ScheduleConflict);
         }
         self.model_receipts.push(receipt);
-        if let Err(error) = self.sync_store() {
-            self.schedules.pop_last();
-            self.model_receipts.pop();
-            return Err(error);
-        }
-        Ok(())
+        self.persist_wake_transition(before, "create")
     }
 
     fn replace_with_receipt(
         &mut self,
         record: MissionScheduleRecord,
         receipt: MissionScheduleModelReceipt,
+        before: &MissionScheduleSnapshot,
     ) -> Result<(), RecurringScheduleError> {
-        let old_record = self
-            .schedules
+        self.schedules
             .insert(record.schedule_id_digest.clone(), record);
-        let old_receipt_len = self.model_receipts.len();
         self.model_receipts.push(receipt);
-        if let Err(error) = self.sync_store() {
-            if let Some(old_record) = old_record {
-                self.schedules
-                    .insert(old_record.schedule_id_digest.clone(), old_record);
-            }
-            self.model_receipts.truncate(old_receipt_len);
-            return Err(error);
-        }
-        Ok(())
+        self.persist_wake_transition(before, "replace_schedule")
     }
 
     fn replace_schedule(
         &mut self,
         record: MissionScheduleRecord,
+        before: &MissionScheduleSnapshot,
     ) -> Result<(), RecurringScheduleError> {
-        let old = self
-            .schedules
+        self.schedules
             .insert(record.schedule_id_digest.clone(), record);
-        if let Err(error) = self.sync_store() {
-            if let Some(old) = old {
-                self.schedules.insert(old.schedule_id_digest.clone(), old);
-            }
-            return Err(error);
-        }
-        Ok(())
+        self.persist_wake_transition(before, "replace_schedule")
     }
 
     fn complete_dispatch(
         &mut self,
         record: MissionScheduleRecord,
         receipt: &MissionCapabilityDispatchReceipt,
+        before: &MissionScheduleSnapshot,
     ) -> Result<(), RecurringScheduleError> {
         let id = record.schedule_id_digest.clone();
-        let old_record = self.schedules.insert(id.clone(), record);
-        let old_receipt = self
-            .dispatch_receipts
+        self.schedules.insert(id, record);
+        self.dispatch_receipts
             .insert(receipt.dispatch_id_digest.clone(), receipt.clone());
-        if let Err(error) = self.sync_store() {
-            match old_record {
-                Some(old) => {
-                    self.schedules.insert(id, old);
-                }
-                None => {
-                    self.schedules.remove(&id);
-                }
-            }
-            if let Some((dispatch_id, old)) =
-                old_receipt.map(|old| (old.dispatch_id_digest.clone(), old))
-            {
-                self.dispatch_receipts.insert(dispatch_id, old);
-            } else {
-                self.dispatch_receipts
-                    .retain(|_, value| value.receipt_digest != receipt.receipt_digest);
-            }
-            return Err(error);
+        self.persist_wake_transition(before, "complete_dispatch")
+    }
+
+    fn ensure_wake_state_known(&self) -> Result<(), RecurringScheduleError> {
+        if let Some(uncertainty) = &self.wake_uncertainty {
+            return Err(RecurringScheduleError::WakeStateUncertain {
+                operation: uncertainty.operation.clone(),
+            });
         }
         Ok(())
     }
 
-    fn sync_store(&mut self) -> Result<(), RecurringScheduleError> {
-        self.store.save(&self.snapshot())?;
+    fn restore_memory(&mut self, snapshot: &MissionScheduleSnapshot) {
+        self.schedules = snapshot
+            .schedules
+            .iter()
+            .cloned()
+            .map(|record| (record.schedule_id_digest.clone(), record))
+            .collect();
+        self.model_receipts.clone_from(&snapshot.model_receipts);
+        self.dispatch_receipts = snapshot
+            .dispatch_receipts
+            .iter()
+            .cloned()
+            .map(|receipt| (receipt.dispatch_id_digest.clone(), receipt))
+            .collect();
+        self.late_wake_receipts
+            .clone_from(&snapshot.late_wake_receipts);
+        self.revoked_plugins = snapshot.revoked_plugins.iter().cloned().collect();
+        self.clock_epoch = snapshot.clock_epoch;
+        if snapshot.provider_epoch != 0 {
+            self.provider_epoch = snapshot.provider_epoch;
+        }
+        self.wake_uncertainty.clone_from(&snapshot.wake_uncertainty);
+    }
+
+    fn wake_bindings(
+        snapshot: &MissionScheduleSnapshot,
+    ) -> BTreeMap<String, (ScheduleWakeRequest, ScheduleWakeReceipt)> {
+        snapshot
+            .schedules
+            .iter()
+            .filter_map(|record| {
+                Some((
+                    record.schedule_id_digest.clone(),
+                    (record.armed_wake.clone()?, record.armed_receipt.clone()?),
+                ))
+            })
+            .collect()
+    }
+
+    fn compensate_provider_wakes(
+        &mut self,
+        before: &MissionScheduleSnapshot,
+        after: &MissionScheduleSnapshot,
+    ) -> Result<(), String> {
+        let previous = Self::wake_bindings(before);
+        let current = Self::wake_bindings(after);
+        for (schedule_id, (_, receipt)) in &current {
+            if previous.get(schedule_id) != Some(&current[schedule_id]) {
+                self.provider
+                    .disarm_wake(receipt)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        for (schedule_id, (request, _)) in &previous {
+            if current.get(schedule_id) == previous.get(schedule_id) {
+                continue;
+            }
+            if request.provider_epoch != self.provider.provider_epoch() {
+                return Err(format!(
+                    "provider epoch {} cannot restore wake epoch {}",
+                    self.provider.provider_epoch(),
+                    request.provider_epoch
+                ));
+            }
+            let receipt = self
+                .provider
+                .arm_wake(request)
+                .map_err(|error| error.to_string())?;
+            receipt
+                .validate_for(request)
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
+    }
+
+    fn persist_wake_transition(
+        &mut self,
+        before: &MissionScheduleSnapshot,
+        operation: &str,
+    ) -> Result<(), RecurringScheduleError> {
+        let after = self.snapshot();
+        match self.store.save(&after) {
+            Ok(()) => Ok(()),
+            Err(save_error) => {
+                let save_message = save_error.to_string();
+                match self.compensate_provider_wakes(before, &after) {
+                    Ok(()) => match self.store.save(before) {
+                        Ok(()) => {
+                            self.restore_memory(before);
+                            Err(RecurringScheduleError::Store(save_error))
+                        }
+                        Err(restore_error) => Err(self.enter_wake_uncertainty(
+                            operation,
+                            &save_message,
+                            &format!("durable rollback failed: {restore_error}"),
+                            before
+                                .schedules
+                                .first()
+                                .map(|record| record.schedule_id_digest.clone()),
+                        )),
+                    },
+                    Err(compensation_error) => Err(self.enter_wake_uncertainty(
+                        operation,
+                        &save_message,
+                        &compensation_error,
+                        before
+                            .schedules
+                            .first()
+                            .map(|record| record.schedule_id_digest.clone()),
+                    )),
+                }
+            }
+        }
+    }
+
+    fn enter_wake_uncertainty(
+        &mut self,
+        operation: &str,
+        store_error: &str,
+        compensation_error: &str,
+        schedule_id_digest: Option<String>,
+    ) -> RecurringScheduleError {
+        self.wake_uncertainty = Some(WakeStateUncertainty {
+            operation: operation.to_owned(),
+            schedule_id_digest,
+            store_error: store_error.to_owned(),
+            compensation_error: compensation_error.to_owned(),
+        });
+        let _ = self.store.save(&self.snapshot());
+        RecurringScheduleError::WakeStateUncertain {
+            operation: operation.to_owned(),
+        }
     }
 }
 
@@ -2917,6 +3067,8 @@ pub enum RecurringScheduleError {
     ProviderEpochLost,
     #[error("recurring schedule provider failed: {0}")]
     Provider(String),
+    #[error("recurring schedule wake state is uncertain; automatic retry is disabled: {operation}")]
+    WakeStateUncertain { operation: String },
     #[error("recurring schedule consumer failed: {0}")]
     Consumer(String),
     #[error("recurring schedule ID is already bound to a different draft")]
@@ -3052,6 +3204,7 @@ mod tests {
         armed: BTreeMap<String, ScheduleWakeReceipt>,
         arm_calls: usize,
         disarm_calls: usize,
+        fail_disarm: bool,
     }
 
     impl RecordingWakeProvider {
@@ -3105,6 +3258,9 @@ mod tests {
             receipt: &ScheduleWakeReceipt,
         ) -> Result<(), MissionScheduleProviderError> {
             self.disarm_calls += 1;
+            if self.fail_disarm {
+                return Err(MissionScheduleProviderError::Backend);
+            }
             self.armed.remove(&receipt.token_digest);
             Ok(())
         }
@@ -3582,6 +3738,70 @@ mod tests {
             service.dispatch_receipt(&receipt.dispatch_id_digest),
             Some(&receipt)
         );
+    }
+
+    #[test]
+    fn create_save_failure_compensates_wake_before_retry() {
+        let observed_at = utc(2026, 8, 14, 8, 0);
+        let draft = daily_draft(
+            b'c',
+            local(2026, 8, 14, 9, 0),
+            ScheduleTimezone::utc(),
+            LateWakePolicy::FailClosed,
+        );
+        let mut service = MissionScheduleService::with_store(
+            RecordingWakeProvider::new(digest(b'p')),
+            RecordingConsumer::new(digest(b'c')),
+            FailOnceStore::new(1),
+        )
+        .expect("service");
+        assert_eq!(
+            service.create(&draft, observed_at),
+            Err(RecurringScheduleError::Store(
+                MissionScheduleStoreError::WriteRejected,
+            ))
+        );
+        assert!(service.provider().armed.is_empty());
+        assert!(service.schedule(&draft.schedule_id_digest).is_none());
+
+        service.create(&draft, observed_at).expect("retry");
+        assert_eq!(service.provider().armed.len(), 1);
+        assert_eq!(service.provider().arm_calls, 2);
+    }
+
+    #[test]
+    fn create_compensation_failure_is_typed_uncertain_and_blocks_replay() {
+        let observed_at = utc(2026, 8, 14, 8, 0);
+        let draft = daily_draft(
+            b'u',
+            local(2026, 8, 14, 9, 0),
+            ScheduleTimezone::utc(),
+            LateWakePolicy::FailClosed,
+        );
+        let mut service = MissionScheduleService::with_store(
+            RecordingWakeProvider::new(digest(b'p')),
+            RecordingConsumer::new(digest(b'c')),
+            FailOnceStore::new(1),
+        )
+        .expect("service");
+        service.provider_mut().fail_disarm = true;
+
+        assert_eq!(
+            service.create(&draft, observed_at),
+            Err(RecurringScheduleError::WakeStateUncertain {
+                operation: "create".to_owned(),
+            })
+        );
+        assert!(service.wake_uncertainty().is_some());
+        assert_eq!(service.provider().armed.len(), 1);
+        assert_eq!(service.provider().arm_calls, 1);
+        assert_eq!(
+            service.create(&draft, observed_at),
+            Err(RecurringScheduleError::WakeStateUncertain {
+                operation: "create".to_owned(),
+            })
+        );
+        assert_eq!(service.provider().arm_calls, 1);
     }
 
     fn token_for_fail_once_store(

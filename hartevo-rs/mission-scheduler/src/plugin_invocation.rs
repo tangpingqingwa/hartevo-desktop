@@ -925,6 +925,19 @@ pub struct PluginInvocationSnapshot {
     pub revoked_plugins: Vec<PluginManifest>,
     pub receipts: Vec<TriggerReceipt>,
     pub dispatches: Vec<PluginInvocationDispatch>,
+    #[serde(default)]
+    pub wake_uncertainty: Option<WakeStateUncertainty>,
+}
+
+/// Durable fail-closed marker for a provider wake transition whose external
+/// state could not be restored after a rejected snapshot write.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeStateUncertainty {
+    pub operation: String,
+    pub request_id_digest: Option<String>,
+    pub store_error: String,
+    pub compensation_error: String,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -1132,10 +1145,27 @@ pub struct PluginInvocationService<P, S = MemoryPluginInvocationStore> {
     revoked_plugins: BTreeSet<PluginManifest>,
     receipts: BTreeMap<PluginInvocationKey, TriggerReceipt>,
     dispatches: BTreeMap<PluginInvocationKey, PluginInvocationDispatch>,
+    wake_uncertainty: Option<WakeStateUncertainty>,
 }
 
 pub type ScheduledPluginInvocationService<P, S = MemoryPluginInvocationStore> =
     PluginInvocationService<P, S>;
+
+#[derive(Clone, Debug)]
+struct PluginInvocationStateSnapshot {
+    durable: PluginInvocationSnapshot,
+    state: ProviderState,
+    scope: Option<MissionScope>,
+    provider_epoch: u64,
+    requests: BTreeMap<String, DurablePluginWakeRequest>,
+    latest_by_schedule: BTreeMap<ScheduleSlot, String>,
+    armed: BTreeMap<String, ProviderWakeReceipt>,
+    cancelled: BTreeSet<ScheduleRevisionKey>,
+    revoked_plugins: BTreeSet<PluginManifest>,
+    receipts: BTreeMap<PluginInvocationKey, TriggerReceipt>,
+    dispatches: BTreeMap<PluginInvocationKey, PluginInvocationDispatch>,
+    wake_uncertainty: Option<WakeStateUncertainty>,
+}
 
 fn corrupt_store() -> PluginInvocationError {
     PluginInvocationError::Store(PluginInvocationStoreError::Corrupt)
@@ -1290,6 +1320,7 @@ where
             return Err(PluginInvocationError::InvalidProvider);
         }
         let snapshot = store.load().map_err(PluginInvocationError::Store)?;
+        let wake_uncertainty = snapshot.wake_uncertainty.clone();
         let (requests, request_epoch) = load_requests(snapshot.requests, &provider_id_digest)?;
         let cancelled = load_cancelled(snapshot.cancelled)?;
         let revoked_plugins = load_revoked(snapshot.revoked_plugins)?;
@@ -1314,6 +1345,7 @@ where
             revoked_plugins,
             receipts,
             dispatches,
+            wake_uncertainty,
         })
     }
 
@@ -1340,7 +1372,12 @@ where
             revoked_plugins: self.revoked_plugins.iter().cloned().collect(),
             receipts: self.receipts.values().cloned().collect(),
             dispatches: self.dispatches.values().cloned().collect(),
+            wake_uncertainty: self.wake_uncertainty.clone(),
         }
+    }
+
+    pub fn wake_uncertainty(&self) -> Option<&WakeStateUncertainty> {
+        self.wake_uncertainty.as_ref()
     }
 
     pub fn latest_request(&self, schedule_id_digest: &str) -> Option<&DurablePluginWakeRequest> {
@@ -1378,6 +1415,196 @@ where
         self.store
             .save(&snapshot)
             .map_err(PluginInvocationError::Store)
+    }
+
+    fn state_snapshot(&self) -> PluginInvocationStateSnapshot {
+        PluginInvocationStateSnapshot {
+            durable: self.snapshot(),
+            state: self.state,
+            scope: self.scope.clone(),
+            provider_epoch: self.provider_epoch,
+            requests: self.requests.clone(),
+            latest_by_schedule: self.latest_by_schedule.clone(),
+            armed: self.armed.clone(),
+            cancelled: self.cancelled.clone(),
+            revoked_plugins: self.revoked_plugins.clone(),
+            receipts: self.receipts.clone(),
+            dispatches: self.dispatches.clone(),
+            wake_uncertainty: self.wake_uncertainty.clone(),
+        }
+    }
+
+    fn restore_state(
+        &mut self,
+        snapshot: &PluginInvocationStateSnapshot,
+        armed: BTreeMap<String, ProviderWakeReceipt>,
+    ) {
+        self.state = snapshot.state;
+        self.scope.clone_from(&snapshot.scope);
+        self.provider_epoch = snapshot.provider_epoch;
+        self.requests = snapshot.requests.clone();
+        self.latest_by_schedule = snapshot.latest_by_schedule.clone();
+        self.armed = armed;
+        self.cancelled.clone_from(&snapshot.cancelled);
+        self.revoked_plugins.clone_from(&snapshot.revoked_plugins);
+        self.receipts = snapshot.receipts.clone();
+        self.dispatches = snapshot.dispatches.clone();
+        self.wake_uncertainty.clone_from(&snapshot.wake_uncertainty);
+    }
+
+    fn ensure_wake_state_known(&self) -> Result<(), PluginInvocationError> {
+        if let Some(uncertainty) = &self.wake_uncertainty {
+            return Err(PluginInvocationError::WakeStateUncertain {
+                operation: uncertainty.operation.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn compensate_provider_state(
+        &mut self,
+        before: &PluginInvocationStateSnapshot,
+        after: &PluginInvocationStateSnapshot,
+        observed_at: Option<DateTime<Utc>>,
+    ) -> Result<BTreeMap<String, ProviderWakeReceipt>, String> {
+        for (request_id, receipt) in &after.armed {
+            if before.armed.get(request_id) != Some(receipt) {
+                self.provider
+                    .disarm_wake(receipt)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+
+        if before.state != after.state || before.provider_epoch != after.provider_epoch {
+            match (before.state, after.state) {
+                (ProviderState::Unmounted, ProviderState::Mounted) => {
+                    let observed_at = observed_at
+                        .ok_or_else(|| "provider lifecycle rollback lacks a clock".to_owned())?;
+                    let next_epoch = after
+                        .provider_epoch
+                        .checked_add(1)
+                        .filter(|epoch| *epoch != 0)
+                        .ok_or_else(|| {
+                            "provider epoch exhausted during unmount rollback".to_owned()
+                        })?;
+                    let scope = after
+                        .scope
+                        .clone()
+                        .ok_or_else(|| "mounted provider has no scope".to_owned())?;
+                    let transition = ProviderLifecycleTransition {
+                        provider_id_digest: self.provider_id_digest.clone(),
+                        scope,
+                        previous_epoch: after.provider_epoch,
+                        next_epoch,
+                        event: ProviderLifecycleEvent::Unmounted,
+                        observed_at,
+                    };
+                    self.provider
+                        .unmount(&transition)
+                        .map_err(|error| error.to_string())?;
+                }
+                (ProviderState::Mounted, ProviderState::Unmounted) => {
+                    let observed_at = observed_at
+                        .ok_or_else(|| "provider lifecycle rollback lacks a clock".to_owned())?;
+                    let scope = before
+                        .scope
+                        .clone()
+                        .ok_or_else(|| "mounted provider has no scope".to_owned())?;
+                    let request = ProviderMountRequest {
+                        provider_id_digest: self.provider_id_digest.clone(),
+                        scope,
+                        provider_epoch: before.provider_epoch,
+                        observed_at,
+                    };
+                    self.provider
+                        .mount(&request)
+                        .map_err(|error| error.to_string())?;
+                }
+                _ => {
+                    return Err(format!(
+                        "provider lifecycle rollback is unsupported ({:?} -> {:?})",
+                        before.state, after.state
+                    ));
+                }
+            }
+        }
+
+        let mut restored = before.armed.clone();
+        for (request_id, receipt) in &before.armed {
+            if after.armed.get(request_id) == Some(receipt) {
+                continue;
+            }
+            let request = before
+                .requests
+                .get(request_id)
+                .ok_or_else(|| format!("missing durable request {request_id}"))?;
+            if request.provider_epoch != before.provider_epoch {
+                return Err("request/provider epoch cannot be restored".to_owned());
+            }
+            let replacement = self
+                .provider
+                .arm_wake(request)
+                .map_err(|error| error.to_string())?;
+            replacement
+                .validate_for(request)
+                .map_err(|error| error.to_string())?;
+            restored.insert(request_id.clone(), replacement);
+        }
+        Ok(restored)
+    }
+
+    fn persist_after_provider_change(
+        &mut self,
+        before: &PluginInvocationStateSnapshot,
+        operation: &str,
+        observed_at: Option<DateTime<Utc>>,
+    ) -> Result<(), PluginInvocationError> {
+        let after = self.state_snapshot();
+        match self.store.save(&after.durable) {
+            Ok(()) => Ok(()),
+            Err(save_error) => {
+                let save_message = save_error.to_string();
+                match self.compensate_provider_state(before, &after, observed_at) {
+                    Ok(restored_armed) => match self.store.save(&before.durable) {
+                        Ok(()) => {
+                            self.restore_state(before, restored_armed);
+                            Err(PluginInvocationError::Store(save_error))
+                        }
+                        Err(restore_error) => Err(self.enter_wake_uncertainty(
+                            operation,
+                            &save_message,
+                            &format!("durable rollback failed: {restore_error}"),
+                            after.armed.keys().next().cloned(),
+                        )),
+                    },
+                    Err(compensation_error) => Err(self.enter_wake_uncertainty(
+                        operation,
+                        &save_message,
+                        &compensation_error,
+                        after.armed.keys().next().cloned(),
+                    )),
+                }
+            }
+        }
+    }
+
+    fn enter_wake_uncertainty(
+        &mut self,
+        operation: &str,
+        store_error: &str,
+        compensation_error: &str,
+        request_id_digest: Option<String>,
+    ) -> PluginInvocationError {
+        self.wake_uncertainty = Some(WakeStateUncertainty {
+            operation: operation.to_owned(),
+            request_id_digest,
+            store_error: store_error.to_owned(),
+            compensation_error: compensation_error.to_owned(),
+        });
+        let _ = self.store.save(&self.snapshot());
+        PluginInvocationError::WakeStateUncertain {
+            operation: operation.to_owned(),
+        }
     }
 
     fn current_scope(&self) -> Result<&MissionScope, PluginInvocationError> {
@@ -1642,6 +1869,7 @@ where
         scope: MissionScope,
         observed_at: DateTime<Utc>,
     ) -> Result<u64, PluginInvocationError> {
+        self.ensure_wake_state_known()?;
         scope.validate()?;
         if matches!(self.state, ProviderState::Mounted | ProviderState::Sleeping) {
             return Err(PluginInvocationError::ProviderAlreadyMounted);
@@ -1649,6 +1877,7 @@ where
         if self.state == ProviderState::Revoked {
             return Err(PluginInvocationError::ProviderRevoked);
         }
+        let before = self.state_snapshot();
         let provider_epoch = self.next_epoch()?;
         let request = ProviderMountRequest {
             provider_id_digest: self.provider_id_digest.clone(),
@@ -1664,7 +1893,7 @@ where
         self.provider_epoch = provider_epoch;
         self.state = ProviderState::Mounted;
         self.refresh_pending_requests(observed_at)?;
-        self.sync_store()?;
+        self.persist_after_provider_change(&before, "mount_provider", Some(observed_at))?;
         Ok(provider_epoch)
     }
 
@@ -1673,6 +1902,8 @@ where
         provider_epoch: u64,
         observed_at: DateTime<Utc>,
     ) -> Result<(), PluginInvocationError> {
+        self.ensure_wake_state_known()?;
+        let before = self.state_snapshot();
         if !matches!(self.state, ProviderState::Mounted | ProviderState::Sleeping) {
             return Err(self.state_error());
         }
@@ -1683,7 +1914,7 @@ where
             observed_at,
             ProviderState::Unmounted,
         )?;
-        self.sync_store()
+        self.persist_after_provider_change(&before, "unmount_provider", Some(observed_at))
     }
 
     pub fn revoke_provider(
@@ -1691,6 +1922,8 @@ where
         provider_epoch: u64,
         observed_at: DateTime<Utc>,
     ) -> Result<(), PluginInvocationError> {
+        self.ensure_wake_state_known()?;
+        let before = self.state_snapshot();
         if self.state == ProviderState::Revoked {
             return Ok(());
         }
@@ -1704,7 +1937,7 @@ where
             observed_at,
             ProviderState::Revoked,
         )?;
-        self.sync_store()
+        self.persist_after_provider_change(&before, "revoke_provider", Some(observed_at))
     }
 
     pub fn provider_crash(
@@ -1712,6 +1945,8 @@ where
         provider_epoch: u64,
         observed_at: DateTime<Utc>,
     ) -> Result<(), PluginInvocationError> {
+        self.ensure_wake_state_known()?;
+        let before = self.state_snapshot();
         if !matches!(self.state, ProviderState::Mounted | ProviderState::Sleeping) {
             return Err(self.state_error());
         }
@@ -1722,7 +1957,7 @@ where
             observed_at,
             ProviderState::Crashed,
         )?;
-        self.sync_store()
+        self.persist_after_provider_change(&before, "provider_crash", Some(observed_at))
     }
 
     pub fn os_sleep(
@@ -1730,6 +1965,8 @@ where
         provider_epoch: u64,
         observed_at: DateTime<Utc>,
     ) -> Result<(), PluginInvocationError> {
+        self.ensure_wake_state_known()?;
+        let before = self.state_snapshot();
         if self.state != ProviderState::Mounted {
             return Err(self.state_error());
         }
@@ -1739,7 +1976,7 @@ where
             observed_at,
             ProviderState::Sleeping,
         )?;
-        self.sync_store()
+        self.persist_after_provider_change(&before, "os_sleep", Some(observed_at))
     }
 
     pub fn os_wake(
@@ -1747,6 +1984,8 @@ where
         provider_epoch: u64,
         woke_at: DateTime<Utc>,
     ) -> Result<Vec<TriggerReceipt>, PluginInvocationError> {
+        self.ensure_wake_state_known()?;
+        let before = self.state_snapshot();
         if self.state != ProviderState::Sleeping {
             return Err(self.state_error());
         }
@@ -1760,7 +1999,7 @@ where
         )?;
         self.refresh_pending_requests(woke_at)?;
         let receipts = self.collect_due_triggers(woke_at)?;
-        self.sync_store()?;
+        self.persist_after_provider_change(&before, "os_wake", Some(woke_at))?;
         Ok(receipts)
     }
 
@@ -1769,10 +2008,12 @@ where
         provider_epoch: u64,
         woke_at: DateTime<Utc>,
     ) -> Result<Vec<TriggerReceipt>, PluginInvocationError> {
+        self.ensure_wake_state_known()?;
+        let before = self.state_snapshot();
         self.ensure_mounted(provider_epoch)?;
         self.refresh_pending_requests(woke_at)?;
         let receipts = self.collect_due_triggers(woke_at)?;
-        self.sync_store()?;
+        self.persist_after_provider_change(&before, "cell_wake", Some(woke_at))?;
         Ok(receipts)
     }
 
@@ -1781,6 +2022,7 @@ where
         input: PluginInvocationInput,
         observed_at: DateTime<Utc>,
     ) -> Result<DurablePluginWakeRequest, PluginInvocationError> {
+        self.ensure_wake_state_known()?;
         input.validate()?;
         self.ensure_mounted(self.provider_epoch)?;
         self.ensure_scope(&input.scope)?;
@@ -1795,6 +2037,7 @@ where
             .map_err(PluginInvocationError::Provider)?;
         let objective_digest = scheduler_digest(input.objective.as_bytes());
         let slot = ScheduleSlot::new(&input.scope, &input.schedule.schedule_id_digest);
+        let before = self.state_snapshot();
         if let Some(existing_id) = self.latest_by_schedule.get(&slot).cloned() {
             let existing = self
                 .requests
@@ -1836,7 +2079,7 @@ where
             .insert(slot, request.request_id_digest.clone());
         self.armed
             .insert(request.request_id_digest.clone(), receipt);
-        self.sync_store()?;
+        self.persist_after_provider_change(&before, "schedule_invocation", Some(observed_at))?;
         Ok(request)
     }
 
@@ -1846,6 +2089,7 @@ where
         observed_at: DateTime<Utc>,
         max_coalesced_ticks: u64,
     ) -> Result<CoalescedWake, PluginInvocationError> {
+        self.ensure_wake_state_known()?;
         if max_coalesced_ticks == 0 || max_coalesced_ticks > DEFAULT_MAX_COALESCED_TICKS {
             return Err(PluginInvocationError::InvalidCoalescingLimit);
         }
@@ -1861,10 +2105,11 @@ where
         }
         let coalesced_ticks = due_ticks.min(max_coalesced_ticks);
         let next = current.with_coalesced_ticks(coalesced_ticks)?;
+        let before = self.state_snapshot();
         self.replace_armed_request(&current.request_id_digest, &next)?;
         self.requests
             .insert(next.request_id_digest.clone(), next.clone());
-        self.sync_store()?;
+        self.persist_after_provider_change(&before, "coalesce_missed_ticks", Some(observed_at))?;
         Ok(CoalescedWake {
             request: next,
             due_ticks,
@@ -1878,6 +2123,7 @@ where
         request: &DurablePluginWakeRequest,
         woke_at: DateTime<Utc>,
     ) -> Result<TriggerReceipt, PluginInvocationError> {
+        self.ensure_wake_state_known()?;
         self.ensure_mounted(request.provider_epoch)?;
         let current = self.request_for_exact_record(request)?.clone();
         if current.wake.wake_at > woke_at {
@@ -1890,6 +2136,7 @@ where
         if let Some(existing) = self.receipts.get(&key) {
             return Ok(existing.clone());
         }
+        let before = self.state_snapshot();
         if let Some(armed) = self.armed.remove(&current.request_id_digest) {
             self.provider
                 .disarm_wake(&armed)
@@ -1897,7 +2144,7 @@ where
         }
         let receipt = TriggerReceipt::from_request(&current, woke_at)?;
         self.receipts.insert(key, receipt.clone());
-        self.sync_store()?;
+        self.persist_after_provider_change(&before, "observe_wake", Some(woke_at))?;
         Ok(receipt)
     }
 
@@ -1905,8 +2152,9 @@ where
         &mut self,
         schedule_id_digest: &str,
         schedule_revision: u64,
-        _observed_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
     ) -> Result<(), PluginInvocationError> {
+        self.ensure_wake_state_known()?;
         self.ensure_mounted(self.provider_epoch)?;
         let scope = self.current_scope()?.clone();
         let slot = ScheduleSlot::new(&scope, schedule_id_digest);
@@ -1923,18 +2171,21 @@ where
             return Err(PluginInvocationError::StaleSchedule);
         }
         let key = request.key()?;
+        let before = self.state_snapshot();
         if let Some(armed) = self.armed.remove(&request_id) {
             self.provider
                 .disarm_wake(&armed)
                 .map_err(PluginInvocationError::Provider)?;
         }
         self.cancelled.insert(key.schedule);
-        self.sync_store()
+        self.persist_after_provider_change(&before, "cancel_schedule", Some(observed_at))
     }
 
     pub fn revoke_plugin(&mut self, plugin: &PluginManifest) -> Result<(), PluginInvocationError> {
+        self.ensure_wake_state_known()?;
         plugin.validate()?;
         self.ensure_mounted(self.provider_epoch)?;
+        let before = self.state_snapshot();
         self.provider
             .revoke_plugin(plugin)
             .map_err(PluginInvocationError::Provider)?;
@@ -1958,7 +2209,7 @@ where
                     .map_err(PluginInvocationError::Provider)?;
             }
         }
-        self.sync_store()
+        self.persist_after_provider_change(&before, "revoke_plugin", None)
     }
 
     pub fn consume_trigger(
@@ -1968,6 +2219,7 @@ where
         invocation: &PluginInvocation,
         receipt: &TriggerReceipt,
     ) -> Result<ConsumeResult, PluginInvocationError> {
+        self.ensure_wake_state_known()?;
         self.ensure_mounted(self.provider_epoch)?;
         receipt.validate()?;
         self.ensure_scope(scope)?;
@@ -2604,6 +2856,8 @@ pub enum PluginInvocationError {
     Store(#[from] PluginInvocationStoreError),
     #[error("plugin invocation provider failed")]
     Provider(#[from] SchedulingProviderError),
+    #[error("plugin invocation wake state is uncertain; automatic retry is disabled: {operation}")]
+    WakeStateUncertain { operation: String },
     #[error("plugin invocation OS lifecycle failed")]
     Lifecycle(#[from] WakeSleepError),
     #[error("plugin invocation serialization failed: {0}")]
@@ -2667,6 +2921,7 @@ mod tests {
         armed: BTreeMap<String, ProviderWakeReceipt>,
         arm_calls: usize,
         disarm_calls: usize,
+        fail_disarm: bool,
     }
 
     impl RecordingProvider {
@@ -2808,7 +3063,47 @@ mod tests {
                 return Err(SchedulingProviderError::EpochLost);
             }
             self.disarm_calls += 1;
+            if self.fail_disarm {
+                return Err(SchedulingProviderError::Backend);
+            }
             self.armed.remove(&receipt.request_id_digest);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailOnceInvocationStore {
+        snapshot: PluginInvocationSnapshot,
+        saves: usize,
+        fail_at: usize,
+    }
+
+    impl FailOnceInvocationStore {
+        fn new(fail_at: usize) -> Self {
+            Self {
+                snapshot: PluginInvocationSnapshot::default(),
+                saves: 0,
+                fail_at,
+            }
+        }
+    }
+
+    impl PluginInvocationStore for FailOnceInvocationStore {
+        fn load(&self) -> Result<PluginInvocationSnapshot, PluginInvocationStoreError> {
+            Ok(self.snapshot.clone())
+        }
+
+        fn save(
+            &mut self,
+            snapshot: &PluginInvocationSnapshot,
+        ) -> Result<(), PluginInvocationStoreError> {
+            self.saves += 1;
+            if self.saves == self.fail_at {
+                return Err(PluginInvocationStoreError::Sqlite(
+                    "deterministic write rejection".to_owned(),
+                ));
+            }
+            self.snapshot = snapshot.clone();
             Ok(())
         }
     }
@@ -3195,6 +3490,77 @@ mod tests {
             service.observe_wake(&revoked, time + Duration::minutes(2)),
             Err(PluginInvocationError::PluginRevoked)
         );
+    }
+
+    #[test]
+    fn schedule_save_failure_compensates_wake_before_retry() {
+        let scope = scope(11);
+        let composition = composition(&scope, "1.2.0", b'c');
+        let invocation = invocation();
+        let plugin = composition.plugin("brief-plugin").expect("plugin").clone();
+        let mut service = PluginInvocationService::with_store(
+            RecordingProvider::new(digest(b'p'), vec![plugin]),
+            FailOnceInvocationStore::new(2),
+        )
+        .expect("service");
+        let mounted = service.mount_provider(scope.clone(), now()).expect("mount");
+        assert_eq!(mounted, 1);
+        let consumer =
+            PluginInvocationConsumer::new(scope, composition, invocation).expect("consumer");
+        let scheduled = schedule(b'q', 1, now() + Duration::minutes(1));
+        assert_eq!(
+            consumer.schedule(&mut service, "compensate", scheduled.clone(), now()),
+            Err(PluginInvocationError::Store(
+                PluginInvocationStoreError::Sqlite("deterministic write rejection".to_owned())
+            ))
+        );
+        assert!(service.provider().armed.is_empty());
+        assert!(
+            service
+                .latest_request(&scheduled.schedule_id_digest)
+                .is_none()
+        );
+
+        consumer
+            .schedule(&mut service, "compensate", scheduled, now())
+            .expect("retry");
+        assert_eq!(service.provider().armed.len(), 1);
+        assert_eq!(service.provider().arm_calls, 2);
+    }
+
+    #[test]
+    fn schedule_compensation_failure_is_typed_uncertain_and_blocks_replay() {
+        let scope = scope(12);
+        let composition = composition(&scope, "1.2.0", b'd');
+        let invocation = invocation();
+        let plugin = composition.plugin("brief-plugin").expect("plugin").clone();
+        let mut service = PluginInvocationService::with_store(
+            RecordingProvider::new(digest(b'p'), vec![plugin]),
+            FailOnceInvocationStore::new(2),
+        )
+        .expect("service");
+        service.mount_provider(scope.clone(), now()).expect("mount");
+        service.provider_mut().fail_disarm = true;
+        let consumer =
+            PluginInvocationConsumer::new(scope, composition, invocation).expect("consumer");
+        let scheduled = schedule(b'w', 1, now() + Duration::minutes(1));
+
+        assert_eq!(
+            consumer.schedule(&mut service, "uncertain", scheduled.clone(), now()),
+            Err(PluginInvocationError::WakeStateUncertain {
+                operation: "schedule_invocation".to_owned(),
+            })
+        );
+        assert!(service.wake_uncertainty().is_some());
+        assert_eq!(service.provider().armed.len(), 1);
+        assert_eq!(service.provider().arm_calls, 1);
+        assert_eq!(
+            consumer.schedule(&mut service, "uncertain", scheduled, now()),
+            Err(PluginInvocationError::WakeStateUncertain {
+                operation: "schedule_invocation".to_owned(),
+            })
+        );
+        assert_eq!(service.provider().arm_calls, 1);
     }
 
     #[test]
