@@ -716,6 +716,18 @@ impl AwinHttpTransport {
         })
     }
 
+    #[cfg(test)]
+    fn loopback(base_url: impl Into<String>) -> Result<Self, AwinError> {
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
+        if !base_url.starts_with("http://127.0.0.1:") || base_url.contains('?') {
+            return Err(AwinError::InvalidTransportBaseUrl);
+        }
+        Ok(Self {
+            base_url,
+            agent: Agent::new(),
+        })
+    }
+
     fn get_json(
         &self,
         token: &AwinAccessToken,
@@ -1478,7 +1490,7 @@ impl AwinPageDelivery {
             && at >= envelope.observed_at
             && at < envelope.valid_until
             && envelope.valid_until > envelope.observed_at
-            && envelope.source_uri.starts_with(AWIN_API_BASE_URL)
+            && is_provider_source_uri(&envelope.source_uri)
             && is_sha256(&envelope.source_digest)
             && is_sha256(&envelope.content_digest)
             && is_sha256(&envelope.result_digest)
@@ -1616,7 +1628,7 @@ impl AwinPageDelivery {
             && self.program_id == scope.program_id().cloned()
             && self.sequence > 0
             && self.observed_at < self.valid_until
-            && self.source_uri.starts_with(AWIN_API_BASE_URL)
+            && is_provider_source_uri(&self.source_uri)
             && is_sha256(&self.source_digest)
             && is_sha256(&self.content_digest)
             && is_sha256(&self.result_digest)
@@ -3611,6 +3623,19 @@ fn valid_hartevo_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn is_provider_source_uri(value: &str) -> bool {
+    value.starts_with(AWIN_API_BASE_URL) || {
+        #[cfg(test)]
+        {
+            value.starts_with("http://127.0.0.1:")
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
 fn valid_region(value: &str) -> bool {
     matches!(
         value,
@@ -3782,8 +3807,153 @@ mod tests {
     use super::*;
     use hartevo_connector_sdk::ConnectorAuth;
     use hartevo_domain_kernel::{Mission, MissionContract, MissionId, ProjectId, TenantId};
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::{self, JoinHandle};
 
     const NOW: &str = "2026-08-14T00:00:00Z";
+
+    struct LoopbackServer {
+        base_url: String,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl LoopbackServer {
+        fn start(expected_requests: usize) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+            let port = listener.local_addr().expect("loopback address").port();
+            let join = thread::spawn(move || {
+                for _ in 0..expected_requests {
+                    let (mut stream, _) = listener.accept().expect("loopback request");
+                    let request = read_http_request(&mut stream);
+                    let body = loopback_response(&request);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("loopback response");
+                    stream.flush().expect("loopback flush");
+                }
+            });
+            Self {
+                base_url: format!("http://127.0.0.1:{port}"),
+                join: Some(join),
+            }
+        }
+
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        fn finish(mut self) {
+            self.join
+                .take()
+                .expect("loopback join handle")
+                .join()
+                .expect("loopback server");
+        }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer).expect("loopback request bytes");
+            assert!(count > 0, "loopback request ended before headers");
+            bytes.extend_from_slice(&buffer[..count]);
+            assert!(
+                bytes.len() <= 16 * 1024,
+                "loopback request headers too large"
+            );
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(bytes).expect("loopback request utf8")
+    }
+
+    fn loopback_response(request: &str) -> String {
+        let mut lines = request.split("\r\n");
+        let request_line = lines.next().expect("loopback request line");
+        let mut request_parts = request_line.split_whitespace();
+        assert_eq!(request_parts.next(), Some("GET"));
+        let target = request_parts.next().expect("loopback target");
+        assert_eq!(request_parts.next(), Some("HTTP/1.1"));
+        let (path, query) = target.split_once('?').expect("loopback query");
+
+        let headers = lines
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer fixture-token")
+        );
+        assert_eq!(
+            headers.get("accept").map(String::as_str),
+            Some("application/json")
+        );
+
+        let query = form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect::<BTreeMap<_, _>>();
+        match path {
+            "/publishers/123/programmedetails" => {
+                assert_eq!(query.len(), 2);
+                assert_eq!(query.get("advertiserId").map(String::as_str), Some("100"));
+                assert_eq!(query.get("relationship").map(String::as_str), Some("any"));
+                serde_json::json!({
+                    "programmes": [{
+                        "advertiserId": 100,
+                        "publisherId": 123,
+                        "programId": 100
+                    }]
+                })
+            }
+            "/publishers/123/transactions/" => {
+                assert_eq!(query.len(), 5);
+                assert_eq!(query.get("advertiserId").map(String::as_str), Some("100"));
+                assert_eq!(query.get("timezone").map(String::as_str), Some("UTC"));
+                assert_eq!(
+                    query.get("showBasketProducts").map(String::as_str),
+                    Some("false")
+                );
+                let start = DateTime::parse_from_rfc3339(
+                    query.get("startDate").expect("transaction start"),
+                )
+                .expect("transaction start timestamp")
+                .with_timezone(&Utc);
+                let end =
+                    DateTime::parse_from_rfc3339(query.get("endDate").expect("transaction end"))
+                        .expect("transaction end timestamp")
+                        .with_timezone(&Utc);
+                assert_eq!(end - start, Duration::days(31));
+                let sequence = if start == now() {
+                    1
+                } else if start == now() + Duration::days(31) {
+                    2
+                } else {
+                    panic!("unexpected Awin transaction window: {start}");
+                };
+                serde_json::json!({
+                    "data": [{
+                        "advertiserId": 100,
+                        "publisherId": 123,
+                        "programId": 100,
+                        "transactionId": format!("awin-loopback-{sequence}"),
+                        "window": sequence
+                    }]
+                })
+            }
+            _ => panic!("unexpected Awin loopback path: {path}"),
+        }
+        .to_string()
+    }
 
     #[derive(Debug)]
     struct ContractTransport {
@@ -4201,6 +4371,163 @@ mod tests {
             .expect("exact mission binding");
         assert_eq!(receipt.provider_id, AWIN_PROVIDER_ID);
         assert_eq!(receipt.credential_revision, 7);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn official_http_loopback_transaction_windows_reconcile_exactly_once() {
+        let server = LoopbackServer::start(3);
+        assert!(matches!(
+            AwinHttpTransport::new(server.base_url()),
+            Err(AwinError::InvalidTransportBaseUrl)
+        ));
+        let transport = AwinHttpTransport::loopback(server.base_url()).expect("loopback transport");
+        let mut service = AwinService::new(
+            "worker-awin-loopback",
+            scope(),
+            plan(),
+            transport,
+            ContractResolver { available: true },
+            now(),
+            now() + Duration::minutes(10),
+            budget(),
+        )
+        .expect("loopback service");
+        let (secret, lease) = auth_material(service.scope());
+        service
+            .begin_auth(secret, lease, 1, now(), now() + Duration::minutes(5))
+            .expect("loopback auth");
+        let probe = service
+            .probe(1, "probe-result-awin-loopback", now())
+            .expect("loopback probe");
+        assert_eq!(
+            probe.observation.classification,
+            AwinObservationClassification::FirstParty
+        );
+        assert!(
+            probe
+                .observation
+                .source_uri
+                .starts_with("http://127.0.0.1:")
+        );
+
+        let first = service
+            .read(None, 100, now())
+            .expect("loopback first transaction window");
+        let first_cursor = first.envelope.cursor.clone().expect("loopback cursor");
+        let second = service
+            .read(Some(&first_cursor), 100, now())
+            .expect("loopback second transaction window");
+        assert_eq!(first.envelope.publisher_id, *service.scope().publisher_id());
+        assert_eq!(
+            first.envelope.advertiser_id,
+            service.scope().advertiser_id().cloned()
+        );
+        assert_eq!(
+            first.envelope.program_id,
+            service.scope().program_id().cloned()
+        );
+        assert_eq!(
+            first
+                .envelope
+                .cursor
+                .as_ref()
+                .map(AwinDurableCursor::sequence),
+            Some(1)
+        );
+        assert!(second.envelope.cursor.is_none());
+        assert_eq!(service.budget().cost_used_units(), AWIN_READ_COST_UNITS * 2);
+        assert_eq!(first.envelope.cost.cost_units, AWIN_READ_COST_UNITS);
+        assert_eq!(second.envelope.cost.cost_units, AWIN_READ_COST_UNITS);
+
+        let generation =
+            AwinProviderGeneration::from_probe(service.scope(), &probe).expect("generation");
+        let input_cursor = AwinReconcileCursor::from_durable(
+            first_cursor,
+            service.scope(),
+            service.plan(),
+            &generation,
+        )
+        .expect("reconcile cursor");
+        let first_delivery = AwinPageDelivery::from_read(
+            service.scope(),
+            service.plan(),
+            &generation,
+            None,
+            &first,
+            now(),
+        )
+        .expect("first delivery");
+        let second_delivery = AwinPageDelivery::from_read(
+            service.scope(),
+            service.plan(),
+            &generation,
+            Some(&input_cursor),
+            &second,
+            now(),
+        )
+        .expect("second delivery");
+        let mut session = service.reconcile_session(&probe).expect("session");
+        assert!(matches!(
+            session.accept(second_delivery.clone(), now()),
+            Ok(AwinReconcileOutcome::OutOfOrder(_))
+        ));
+        assert!(matches!(
+            session.accept(first_delivery.clone(), now()),
+            Ok(AwinReconcileOutcome::Applied(_))
+        ));
+        assert!(matches!(
+            session.accept(first_delivery, now()),
+            Ok(AwinReconcileOutcome::Duplicate(_))
+        ));
+        assert!(matches!(
+            session.accept(second_delivery.clone(), now()),
+            Ok(AwinReconcileOutcome::Applied(_))
+        ));
+        assert!(matches!(
+            session.accept(second_delivery, now()),
+            Ok(AwinReconcileOutcome::Duplicate(_))
+        ));
+        let root = session.close_evidence(now()).expect("closed evidence");
+        assert!(root.is_closed());
+        assert_eq!(root.nodes().len(), 2);
+
+        let mission = Mission::compile(
+            TenantId::from("tenant-awin"),
+            MissionId::from("mission-awin-loopback"),
+            ProjectId::from("project-awin"),
+            "Reconcile Awin loopback transactions",
+            MissionContract::bootstrap(
+                "Reconcile Awin loopback transactions",
+                [AWIN_MISSION_CAPABILITY.to_owned()],
+                now(),
+            ),
+            now(),
+        )
+        .expect("loopback mission");
+        let expected = AwinMissionReconcileExpectation {
+            base: AwinMissionReadExpectation {
+                mission_id: mission.id.as_str().to_owned(),
+                mission_revision: mission.revision,
+                provider_id: AWIN_PROVIDER_ID.to_owned(),
+                publisher_id: scope().publisher_id().clone(),
+                advertiser_id: scope().advertiser_id().cloned(),
+                program_id: scope().program_id().cloned(),
+                credential_revision: probe.credential_revision,
+                probe_revision: probe.connector_result.probe_revision(),
+                source_revision: first.envelope.source_revision,
+                capability: first.envelope.resource.capability().to_owned(),
+            },
+            generation_digest: generation.digest().to_owned(),
+            provider_generation: generation.provider_generation(),
+        };
+        let result = AwinMissionConsumer
+            .consume_reconciled(&mission, service.scope(), &session, &expected, now())
+            .expect("loopback Mission result");
+        assert_eq!(result.page_count, 2);
+        assert_eq!(result.provider_id, AWIN_PROVIDER_ID);
+        assert_eq!(result.publisher_id, *service.scope().publisher_id());
+        server.finish();
     }
 
     #[test]
