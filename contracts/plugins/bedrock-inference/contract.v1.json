@@ -1,0 +1,85 @@
+{
+  "schemaVersion": "hartevo-bedrock-inference-contract/v1",
+  "contractVersion": "bedrock-inference/v1",
+  "pluginVersion": "bedrock-inference-plugin/v1",
+  "layer": 1,
+  "mode": "proposal_recording_only",
+  "provider": "amazon-bedrock-runtime",
+  "operation": "Converse",
+  "streaming": false,
+  "service": "bedrock-runtime",
+  "scope": [
+    "aws_partition",
+    "aws_account_id",
+    "source_region",
+    "runtime_service",
+    "model_or_inference_profile",
+    "routing_geography_digest",
+    "guardrail_id_version",
+    "project_id",
+    "mission_id",
+    "mission_revision",
+    "budget_policy_revision"
+  ],
+  "registrationBinding": [
+    "plugin_version",
+    "contract_version",
+    "contract_digest",
+    "adapter_revision",
+    "capability_snapshot_digest",
+    "scope_digest",
+    "temporary_role_session_secret_reference"
+  ],
+  "inferenceConfig": [
+    "max_tokens_required_and_policy_bounded",
+    "temperature",
+    "top_p",
+    "stop_sequence_digests",
+    "service_tier"
+  ],
+  "stopReasons": [
+    "end_turn",
+    "tool_use",
+    "max_tokens",
+    "stop_sequence",
+    "guardrail_intervened",
+    "content_filtered",
+    "unknown"
+  ],
+  "receipts": [
+    "request_digest",
+    "usage_digest",
+    "latency_ms",
+    "aws_request_id",
+    "model_identity",
+    "stop_reason",
+    "safety_projection",
+    "result_digest"
+  ],
+  "provenance": {
+    "fixture": "never_connected_native_or_first_party",
+    "recording": "never_connected_native_or_first_party",
+    "loopback": "never_connected_native_or_first_party",
+    "blocked_env": "never_connected_native_or_first_party"
+  },
+  "forbidden": [
+    "live_bedrock_invocation",
+    "invoke_model",
+    "mantle",
+    "responses_api",
+    "agents",
+    "agent_core",
+    "knowledge_bases",
+    "streaming",
+    "resource_creation",
+    "tool_execution",
+    "long_lived_iam_user_credentials",
+    "raw_prompts",
+    "raw_outputs",
+    "raw_documents",
+    "raw_tool_inputs",
+    "hidden_reasoning",
+    "guardrail_pii",
+    "outcome_adoption"
+  ]
+}
