@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schemaVersion": "hartevo.airbyte-sync-result-contract/v1",
+  "contractVersion": "airbyte-sync-result-01-layer-1/v1",
+  "pluginId": "airbyte.sync-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.airbyte-sync-result-contract/v1|layer=1|service=airbyte.sync-result.read|provider=airbyte.cloud.sync-result.recording|consumer=mission.airbyte-sync-result.consumer",
+  "contractDigest": "c3196fdf965431a8de0a91385f7beb7262b3dbb2c633900391be7234dc0aee0f",
+  "service": {
+    "type": "AirbyteSyncResultService",
+    "id": "airbyte.sync-result.read",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "register_scope",
+      "read_connection_stream_catalog",
+      "read_sync_attempt",
+      "compile_sync_result_proposal",
+      "record_sync_result"
+    ]
+  },
+  "provider": {
+    "type": "AirbyteCloudProvider",
+    "id": "airbyte.cloud.sync-result.recording",
+    "apiRevision": "cloud-sync-result-read-1",
+    "operations": [
+      "read_connection_stream_catalog",
+      "read_sync_attempt"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fake",
+      "loopback",
+      "blocked_env"
+    ],
+    "httpClassification": {
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true
+    },
+    "mutations": {
+      "triggerSync": false,
+      "cancelSync": false,
+      "mutateConnection": false,
+      "mutateCredential": false
+    }
+  },
+  "consumer": {
+    "type": "MissionAirbyteSyncConsumer",
+    "id": "mission.airbyte-sync-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": ["missionId", "projectId", "workProductId"]
+  },
+  "credentials": {
+    "boundary": "opaque SecretReference",
+    "kinds": ["oauth", "service_token"],
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "workspaceId",
+      "workspaceHttpsHost",
+      "workspaceRevision",
+      "sourceId",
+      "sourceRevision",
+      "destinationId",
+      "destinationRevision",
+      "connectionId",
+      "connectionRevision",
+      "streamNamespace",
+      "streamName",
+      "streamRevision",
+      "streamSchemaDigest",
+      "jobId",
+      "jobRevision",
+      "attemptId",
+      "attemptRevision",
+      "missionId",
+      "projectId",
+      "workProductId"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "permissions": [
+      "workspace.read",
+      "source.read",
+      "destination.read",
+      "connection.read",
+      "stream.read",
+      "job.read",
+      "attempt.read",
+      "schema.read"
+    ],
+    "forbiddenPermissions": [
+      "connection.write",
+      "credential.write",
+      "sync.trigger",
+      "sync.cancel"
+    ]
+  },
+  "catalogBounds": {
+    "maxPageSize": 100,
+    "maxPages": 16,
+    "maxEntries": 256,
+    "maxOpaquePageTokenBytes": 512,
+    "maxResponseBytes": 1048576,
+    "repeatedPageToken": "fail_closed",
+    "outOfScopeEntry": "fail_closed"
+  },
+  "attemptEvidence": {
+    "statuses": [
+      "queued",
+      "running",
+      "succeeded",
+      "failed",
+      "cancelled",
+      "incomplete",
+      "provider_unknown"
+    ],
+    "boundedFields": [
+      "recordsRead",
+      "recordsWritten",
+      "bytesRead",
+      "bytesWritten",
+      "sourceSchemaDigest",
+      "destinationSchemaDigest",
+      "providerRequestIdDigest"
+    ],
+    "rawRecordRetention": false,
+    "unboundedExport": false,
+    "truncationIsNonAdoptable": true,
+    "schemaMismatchIsExplicit": true
+  },
+  "adversarialEvidence": [
+    "workspace-drift",
+    "source-drift",
+    "destination-drift",
+    "connection-drift",
+    "stream-drift",
+    "job-drift",
+    "attempt-drift",
+    "schema-mismatch",
+    "replayed-attempt",
+    "idempotency-conflict",
+    "repeated-page-token",
+    "pagination-limit",
+    "unauthorized-401",
+    "forbidden-403",
+    "not-found-404",
+    "conflict-409",
+    "rate-limit-429",
+    "timeout",
+    "server-5xx",
+    "access-loss",
+    "tamper",
+    "truncation",
+    "secret-revocation"
+  ],
+  "provenance": {
+    "recording": "non_native_non_connected",
+    "fake": "non_native_non_connected",
+    "loopback": "non_native_non_connected",
+    "blocked_env": "non_native_non_connected",
+    "nativeConnectedClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed Airbyte service/provider/consumer",
+      "bounded catalog projection",
+      "one sync-attempt read projection",
+      "proposal digest",
+      "recording idempotency seam"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "live sync trigger",
+      "live sync cancellation",
+      "connection mutation",
+      "credential mutation",
+      "native credential resolution",
+      "raw record retention",
+      "unbounded export",
+      "kernel authority"
+    ]
+  },
+  "nonOverlap": {
+    "dbtCloudIssue": "#353 owns transformation/model/test results",
+    "snowflakeIssue": "#316 owns Snowflake warehouse/query/job evidence",
+    "bigQueryIssue": "#339 owns BigQuery warehouse/query/job evidence",
+    "databricksIssue": "#333 owns Databricks warehouse/query/job evidence",
+    "airbyteOwns": "source-to-destination sync-attempt evidence only"
+  },
+  "honestNativeGap": "Native Airbyte OAuth or service-token resolution, HTTPS catalog/readback, live sync effects, durable provider receipts, independent read-back, terminal reconciliation, and Mission/Outcome adoption remain Layer-2 work; recording, fake, loopback, and BLOCKED_ENV never claim Connected or native."
+}
