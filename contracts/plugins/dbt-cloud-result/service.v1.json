@@ -1,0 +1,379 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/dbt-cloud-result/service.v1.json",
+  "title": "Hartevo dbt Cloud transformation-result Layer-1 service",
+  "description": "Standalone read, proposal, and recording contract. It is not a catalog, manifest, scheduler, SQL engine, or data-truth authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "serviceId",
+    "providerId",
+    "layer",
+    "operations",
+    "scope",
+    "registration",
+    "projections",
+    "bounds",
+    "honesty",
+    "layer2Gaps"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "hartevo.dbt-cloud-result/v1"
+    },
+    "serviceId": {
+      "const": "transformation.dbt-cloud.result.read"
+    },
+    "providerId": {
+      "const": "dbt-cloud"
+    },
+    "layer": {
+      "const": 1
+    },
+    "operations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "describe_job",
+          "read_run_evidence",
+          "read_run_results",
+          "compile_transformation_proposal",
+          "record_run_receipt",
+          "verify_data_product_result"
+        ]
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "apiVersion",
+        "apiHost",
+        "accountId",
+        "dbtProjectId",
+        "environmentId",
+        "jobId",
+        "repository",
+        "commitSha",
+        "modelSelectors",
+        "testSelectors",
+        "artifactAllowlist",
+        "projectMissionWorkProduct",
+        "permissions"
+      ],
+      "properties": {
+        "apiVersion": {
+          "enum": [
+            "v2",
+            "v3"
+          ]
+        },
+        "apiHost": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "accountId": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "dbtProjectId": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "environmentId": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "jobId": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "repository": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "provider",
+            "owner",
+            "name",
+            "url"
+          ],
+          "properties": {
+            "provider": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "owner": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "url": {
+              "type": "string",
+              "maxLength": 256
+            }
+          }
+        },
+        "commitSha": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{40}([A-Fa-f0-9]{24})?$"
+        },
+        "modelSelectors": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "maxLength": 512
+          }
+        },
+        "testSelectors": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "maxLength": 512
+          }
+        },
+        "artifactAllowlist": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 256
+          }
+        },
+        "projectMissionWorkProduct": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "projectId",
+            "missionId",
+            "workProductId",
+            "projectRevision",
+            "missionRevision",
+            "workProductRevision",
+            "policyDigest",
+            "consentDigest"
+          ],
+          "properties": {
+            "projectId": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "missionId": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "workProductId": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "projectRevision": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "missionRevision": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "workProductRevision": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "policyDigest": {
+              "$ref": "#/$defs/digest"
+            },
+            "consentDigest": {
+              "$ref": "#/$defs/digest"
+            }
+          }
+        },
+        "permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "job:read",
+              "run:read",
+              "run-results:read",
+              "artifact-metadata:read"
+            ]
+          }
+        }
+      }
+    },
+    "registration": {
+      "type": "object",
+      "description": "The SecretReference itself is opaque and is never serialized; only this credential digest is recordable.",
+      "additionalProperties": false,
+      "required": [
+        "versionDigest",
+        "accountDigest",
+        "projectDigest",
+        "environmentDigest",
+        "jobDigest",
+        "repositoryDigest",
+        "commitDigest",
+        "selectorDigest",
+        "permissionDigest",
+        "scopeDigest",
+        "credentialDigest",
+        "registrationDigest",
+        "reversible",
+        "revocable"
+      ],
+      "properties": {
+        "versionDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "accountDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "projectDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "environmentDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "jobDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "repositoryDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "commitDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "selectorDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "permissionDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "scopeDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "credentialDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "registrationDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "reversible": {
+          "const": true
+        },
+        "revocable": {
+          "const": true
+        }
+      }
+    },
+    "projections": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "queued",
+          "running",
+          "success",
+          "error",
+          "cancelled",
+          "partial",
+          "expired",
+          "access_loss",
+          "provider_unknown"
+        ]
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxResponseBytes",
+        "maxPageItems",
+        "maxPages",
+        "maxEvidenceItems",
+        "maxArtifactMetadataBytes"
+      ],
+      "properties": {
+        "maxResponseBytes": {
+          "const": 2097152
+        },
+        "maxPageItems": {
+          "const": 256
+        },
+        "maxPages": {
+          "const": 32
+        },
+        "maxEvidenceItems": {
+          "const": 4096
+        },
+        "maxArtifactMetadataBytes": {
+          "const": 16384
+        }
+      }
+    },
+    "honesty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connected",
+        "native",
+        "recordingOnly",
+        "rawTokenSerialized",
+        "rawLogsRetained",
+        "unboundedArtifactBodiesRetained",
+        "kernelOutcomeAdopted"
+      ],
+      "properties": {
+        "connected": {
+          "const": false
+        },
+        "native": {
+          "const": false
+        },
+        "recordingOnly": {
+          "const": true
+        },
+        "rawTokenSerialized": {
+          "const": false
+        },
+        "rawLogsRetained": {
+          "const": false
+        },
+        "unboundedArtifactBodiesRetained": {
+          "const": false
+        },
+        "kernelOutcomeAdopted": {
+          "const": false
+        }
+      }
+    },
+    "layer2Gaps": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "native_token_resolution",
+          "bounded_https_reads",
+          "consented_trigger",
+          "consented_cancel",
+          "durable_native_run_receipt",
+          "terminal_reconciliation",
+          "independent_artifact_readback",
+          "verified_work_product_adoption"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}
