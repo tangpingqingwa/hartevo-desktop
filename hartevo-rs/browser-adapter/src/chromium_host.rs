@@ -28,11 +28,11 @@ use crate::workspace::{digest, digest_json};
 use crate::{
     BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionRisk, BrowserActionSurface,
     BrowserControlHost, BrowserElementRef, BrowserError, BrowserFileGrant, BrowserFileType,
-    BrowserLeaseProof, BrowserLocatorResolution, BrowserNavigationPolicy, BrowserNavigationReceipt,
-    BrowserNavigationTarget, BrowserProfile, BrowserPromptRisk,
-    BrowserRecipeExecutionAuthorization, BrowserRecipePreparedPlan, BrowserRecipeRegistry,
-    BrowserRecipeTrustStore, BrowserStableLocator, BrowserTextInput, BrowserWorkspace,
-    FileUploadHandle, SemanticSnapshot,
+    BrowserFrameScope, BrowserLeaseProof, BrowserLocatorResolution, BrowserNavigationPolicy,
+    BrowserNavigationReceipt, BrowserNavigationTarget, BrowserObservationHost, BrowserProfile,
+    BrowserPromptRisk, BrowserRecipeExecutionAuthorization, BrowserRecipePreparedPlan,
+    BrowserRecipeRegistry, BrowserRecipeTrustStore, BrowserStableLocator, BrowserTextInput,
+    BrowserWorkspace, FileUploadHandle, SemanticSnapshot,
 };
 
 const DEFAULT_MAX_FRAME_BYTES: usize = 8 * 1_024 * 1_024;
@@ -1560,6 +1560,37 @@ impl ManagedChromiumHost {
         tab.latest_frame_tree = Some(frame_tree_after);
         tab.latest_execution_context = Some(execution_context);
         Ok(snapshot)
+    }
+
+    pub fn observe_root_frame_scope(
+        &mut self,
+        tab_id: &BrowserTabId,
+        proof: &BrowserLeaseProof,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserFrameScope, BrowserError> {
+        self.workspace.validate_agent_lease(proof, now)?;
+        let guard = OperationLeaseGuard::new(proof, now);
+        let (target_id, session_id) = {
+            let tab = self.tabs.get(tab_id).ok_or(BrowserError::TabNotFound)?;
+            (tab.target_id.clone(), tab.session_id.clone())
+        };
+        let target_url = self.read_target_url(&target_id, &guard)?;
+        let (frame_tree, document_generation) =
+            self.read_scoped_frame_tree_snapshot(tab_id, &session_id, &guard)?;
+        if target_url != frame_tree.root.url
+            || frame_tree.root.unreachable_url.is_some()
+            || frame_tree.root.frame_id.is_empty()
+            || frame_tree.root.loader_id.is_empty()
+        {
+            return Err(BrowserError::StaleSnapshot);
+        }
+        BrowserFrameScope::from_verified(
+            tab_id.clone(),
+            &frame_tree.root.frame_id,
+            &frame_tree.root.loader_id,
+            &frame_tree.root.url,
+            document_generation,
+        )
     }
 
     pub fn resolve_stable_locator(
@@ -3661,6 +3692,31 @@ impl BrowserControlHost for ManagedChromiumHost {
             tab.latest_execution_context = None;
         }
         Ok(())
+    }
+}
+
+impl BrowserObservationHost for ManagedChromiumHost {
+    fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
+        <Self as BrowserControlHost>::sync_workspace(self, workspace)
+    }
+
+    fn observe_root_frame_scope(
+        &mut self,
+        tab_id: &BrowserTabId,
+        proof: &BrowserLeaseProof,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserFrameScope, BrowserError> {
+        ManagedChromiumHost::observe_root_frame_scope(self, tab_id, proof, now)
+    }
+
+    fn observe_ax(
+        &mut self,
+        tab_id: &BrowserTabId,
+        proof: &BrowserLeaseProof,
+        snapshot_id: BrowserSnapshotId,
+        now: DateTime<Utc>,
+    ) -> Result<SemanticSnapshot, BrowserError> {
+        ManagedChromiumHost::observe_ax(self, tab_id, proof, snapshot_id, now)
     }
 }
 

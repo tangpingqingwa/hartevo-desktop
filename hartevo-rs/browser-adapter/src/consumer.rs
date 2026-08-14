@@ -1,19 +1,17 @@
-use std::collections::BTreeMap;
 use std::fmt;
 
 use chrono::{DateTime, Utc};
 use hartevo_domain_kernel::{BrowserSnapshotId, BrowserTabId, Mission};
+use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+use crate::ChromiumLaunchConfig;
 use crate::workspace::{digest_json, is_bounded_identifier};
 use crate::{
-    AuthenticatedChromiumProvider, BrowserError, BrowserProfile, BrowserProfileSource,
-    BrowserProfileStatus, BrowserWorkspace, BrowserWorkspaceServiceDefinition,
-    DurableBrowserObservation,
-};
-#[cfg(unix)]
-use crate::{
-    BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserNavigationTarget,
-    ChromiumLaunchConfig,
+    AuthenticatedChromiumProvider, BrowserError, BrowserObservationObjectiveRequest,
+    BrowserObservationResult, BrowserProfile, BrowserProfileSource, BrowserProfileStatus,
+    BrowserProviderLifecycle, BrowserWorkspace, BrowserWorkspaceScope,
+    BrowserWorkspaceServiceDefinition, DurableBrowserObservation,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +22,94 @@ pub enum MissionBrowserWorkspaceState {
     TakenOverByUser,
     Unmounted,
     Revoked,
+    Crashed,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserObservationResultLog {
+    pub schema_version: u32,
+    pub scope: BrowserWorkspaceScope,
+    pub entries: Vec<BrowserObservationResult>,
+    pub log_digest: String,
+}
+
+impl BrowserObservationResultLog {
+    fn new(scope: BrowserWorkspaceScope) -> Result<Self, BrowserError> {
+        scope.validate()?;
+        let log = Self {
+            schema_version: 1,
+            scope,
+            entries: Vec::new(),
+            log_digest: String::new(),
+        };
+        let log_digest = log.unsigned_digest()?;
+        Ok(Self { log_digest, ..log })
+    }
+
+    fn append(&mut self, result: BrowserObservationResult) -> Result<(), BrowserError> {
+        result.validate()?;
+        if result.observation.workspace_id != self.scope.workspace_id
+            || result.observation.profile_id != self.scope.profile_id
+            || result.observation.mission_id != self.scope.mission_id
+            || result.observation.project_id != self.scope.project_id
+            || result.observation.tenant_id != self.scope.tenant_id
+        {
+            return Err(BrowserError::ScopeMismatch);
+        }
+        if let Some(existing) = self.entries.iter().find(|existing| {
+            existing.objective_id == result.objective_id
+                || existing.cursor_id == result.cursor_id
+                || existing.observation.observation_id == result.observation.observation_id
+        }) {
+            if existing == &result {
+                return Ok(());
+            }
+            return Err(BrowserError::InvalidObservationObjective);
+        }
+        self.entries.push(result);
+        self.log_digest = self.unsigned_digest()?;
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), BrowserError> {
+        self.scope.validate()?;
+        if self.schema_version != 1 || self.log_digest != self.unsigned_digest()? {
+            return Err(BrowserError::InvalidObservationObjective);
+        }
+        let mut objectives = std::collections::BTreeSet::new();
+        let mut cursors = std::collections::BTreeSet::new();
+        for result in &self.entries {
+            result.validate()?;
+            if !objectives.insert(result.objective_id.clone())
+                || !cursors.insert(result.cursor_id.clone())
+            {
+                return Err(BrowserError::InvalidObservationObjective);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String, BrowserError> {
+        self.validate()?;
+        Ok(self.log_digest.clone())
+    }
+
+    fn unsigned_digest(&self) -> Result<String, BrowserError> {
+        digest_json(&(&self.schema_version, &self.scope, &self.entries))
+    }
+}
+
+impl fmt::Debug for BrowserObservationResultLog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrowserObservationResultLog")
+            .field("schema_version", &self.schema_version)
+            .field("scope", &self.scope)
+            .field("entry_count", &self.entries.len())
+            .field("log_digest", &self.log_digest)
+            .finish()
+    }
 }
 
 pub struct MissionBrowserWorkspaceConsumer {
@@ -33,7 +119,7 @@ pub struct MissionBrowserWorkspaceConsumer {
     selected_profile: Option<BrowserProfile>,
     selected_workspace: Option<BrowserWorkspace>,
     provider: Option<AuthenticatedChromiumProvider>,
-    observations: BTreeMap<BrowserSnapshotId, DurableBrowserObservation>,
+    result_log: Option<BrowserObservationResultLog>,
     state: MissionBrowserWorkspaceState,
 }
 
@@ -52,7 +138,7 @@ impl MissionBrowserWorkspaceConsumer {
             selected_profile: None,
             selected_workspace: None,
             provider: None,
-            observations: BTreeMap::new(),
+            result_log: None,
             state: MissionBrowserWorkspaceState::Unselected,
         })
     }
@@ -80,11 +166,12 @@ impl MissionBrowserWorkspaceConsumer {
     ) -> Result<(), BrowserError> {
         self.validate_selection(&profile, &workspace)?;
         if self.provider.is_some() {
-            self.unmount()?;
+            return Err(BrowserError::InvalidControlTransition);
         }
-        self.observations.clear();
+        let scope = BrowserWorkspaceScope::bind(&profile, &workspace)?;
         self.selected_profile = Some(profile);
         self.selected_workspace = Some(workspace);
+        self.result_log = Some(BrowserObservationResultLog::new(scope)?);
         self.state = MissionBrowserWorkspaceState::Selected;
         Ok(())
     }
@@ -93,7 +180,12 @@ impl MissionBrowserWorkspaceConsumer {
         &mut self,
         profile: BrowserProfile,
         workspace: BrowserWorkspace,
+        evidence_digest: String,
+        now: DateTime<Utc>,
     ) -> Result<(), BrowserError> {
+        if self.provider.is_some() {
+            self.unmount(evidence_digest, now)?;
+        }
         self.select_profile(profile, workspace)
     }
 
@@ -143,6 +235,8 @@ impl MissionBrowserWorkspaceConsumer {
     pub(crate) fn mount_contract_for_test(
         &mut self,
         definition: BrowserWorkspaceServiceDefinition,
+        frame_scope: crate::BrowserFrameScope,
+        snapshot: crate::SemanticSnapshot,
         now: DateTime<Utc>,
     ) -> Result<(), BrowserError> {
         if self.provider.is_some()
@@ -163,25 +257,17 @@ impl MissionBrowserWorkspaceConsumer {
             .ok_or(BrowserError::ScopeMismatch)?;
         let request = definition.mount_request(&profile, &workspace, now)?;
         let provider = AuthenticatedChromiumProvider::mount_contract_for_test(
-            definition, request, profile, workspace, now,
+            definition,
+            request,
+            profile,
+            workspace,
+            frame_scope,
+            snapshot,
+            now,
         )?;
         self.provider = Some(provider);
         self.state = MissionBrowserWorkspaceState::MountedAgent;
         Ok(())
-    }
-
-    #[cfg(unix)]
-    pub fn navigate_allowlisted(
-        &mut self,
-        tab_id: &BrowserTabId,
-        policy: &BrowserNavigationPolicy,
-        target: &BrowserNavigationTarget,
-        now: DateTime<Utc>,
-    ) -> Result<BrowserNavigationReceipt, BrowserError> {
-        self.provider
-            .as_mut()
-            .ok_or(BrowserError::ControlLeaseLost)?
-            .navigate_allowlisted(tab_id, policy, target, now)
     }
 
     #[cfg(unix)]
@@ -192,12 +278,23 @@ impl MissionBrowserWorkspaceConsumer {
         source_uri: impl AsRef<str>,
         now: DateTime<Utc>,
     ) -> Result<DurableBrowserObservation, BrowserError> {
-        let observation = self
+        if self
             .provider
-            .as_mut()
+            .as_ref()
             .ok_or(BrowserError::ControlLeaseLost)?
-            .observe_public_source(tab_id, snapshot_id, source_uri, now)?;
-        self.record_observation(observation)
+            .workspace()
+            .active_tab_id
+            != *tab_id
+        {
+            return Err(BrowserError::ScopeMismatch);
+        }
+        let request =
+            self.request_observation(snapshot_id.clone(), snapshot_id, source_uri, now)?;
+        let result = self.observe_objective(&request, now)?;
+        if result.observation.tab_id != *tab_id {
+            return Err(BrowserError::ScopeMismatch);
+        }
+        Ok(result.observation)
     }
 
     #[cfg(test)]
@@ -207,39 +304,93 @@ impl MissionBrowserWorkspaceConsumer {
         source_uri: impl AsRef<str>,
         now: DateTime<Utc>,
     ) -> Result<DurableBrowserObservation, BrowserError> {
-        let observation = self
+        let request =
+            self.request_observation(snapshot.id.clone(), snapshot.id.clone(), source_uri, now)?;
+        Ok(self.observe_objective(&request, now)?.observation)
+    }
+
+    pub fn request_observation(
+        &mut self,
+        objective_id: BrowserSnapshotId,
+        observation_id: BrowserSnapshotId,
+        source_uri: impl AsRef<str>,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserObservationObjectiveRequest, BrowserError> {
+        let result = self
             .provider
             .as_mut()
             .ok_or(BrowserError::ControlLeaseLost)?
-            .record_snapshot_for_test(snapshot, source_uri, now)?;
-        self.record_observation(observation)
+            .request_observation(objective_id, observation_id, source_uri, now);
+        self.propagate_provider_crash();
+        result
     }
 
-    fn record_observation(
+    pub fn observe_objective(
         &mut self,
-        observation: DurableBrowserObservation,
-    ) -> Result<DurableBrowserObservation, BrowserError> {
-        if let Some(existing) = self.observations.get(&observation.observation_id) {
-            if existing != &observation {
-                return Err(BrowserError::RealActionRejected);
-            }
-            return Ok(existing.clone());
+        request: &BrowserObservationObjectiveRequest,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserObservationResult, BrowserError> {
+        let validation = self
+            .provider
+            .as_ref()
+            .ok_or(BrowserError::ControlLeaseLost)?
+            .validate_observation_request(request, now);
+        if let Err(error) = validation {
+            self.propagate_provider_crash();
+            return Err(error);
         }
-        self.observations
-            .insert(observation.observation_id.clone(), observation.clone());
-        Ok(observation)
+        if let Some(log) = self.result_log.as_ref()
+            && let Some(existing) = log
+                .entries
+                .iter()
+                .find(|result| result.objective_id == request.objective_id)
+        {
+            if existing.request_digest == request.request_digest {
+                return Ok(existing.clone());
+            }
+            return Err(BrowserError::InvalidObservationObjective);
+        }
+        let result = self
+            .provider
+            .as_mut()
+            .ok_or(BrowserError::ControlLeaseLost)?
+            .observe_objective(request, now);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.propagate_provider_crash();
+                return Err(error);
+            }
+        };
+        self.result_log
+            .as_mut()
+            .ok_or(BrowserError::ScopeMismatch)?
+            .append(result.clone())?;
+        Ok(result)
     }
 
     pub fn observation(&self, id: &BrowserSnapshotId) -> Option<&DurableBrowserObservation> {
-        self.observations.get(id)
+        self.result_log.as_ref()?.entries.iter().find_map(|result| {
+            (result.observation.observation_id == *id).then_some(&result.observation)
+        })
     }
 
     pub fn observations(&self) -> impl Iterator<Item = &DurableBrowserObservation> {
-        self.observations.values()
+        self.result_log
+            .as_ref()
+            .into_iter()
+            .flat_map(|log| log.entries.iter().map(|result| &result.observation))
     }
 
     pub fn observation_digest(&self) -> Result<String, BrowserError> {
-        digest_json(&self.observations.values().collect::<Vec<_>>())
+        self.result_log
+            .as_ref()
+            .ok_or(BrowserError::ScopeMismatch)?
+            .digest()
+    }
+
+    pub fn result_log(&self) -> Option<&BrowserObservationResultLog> {
+        self.result_log.as_ref()
     }
 
     pub fn takeover_user(
@@ -251,6 +402,7 @@ impl MissionBrowserWorkspaceConsumer {
             .as_mut()
             .ok_or(BrowserError::ControlLeaseLost)?
             .takeover_user(evidence_digest, now)?;
+        self.sync_selected_workspace_from_provider()?;
         self.state = MissionBrowserWorkspaceState::TakenOverByUser;
         Ok(())
     }
@@ -265,16 +417,49 @@ impl MissionBrowserWorkspaceConsumer {
             .as_mut()
             .ok_or(BrowserError::ControlLeaseLost)?
             .return_to_agent(lease_expires_at, evidence_digest, now)?;
+        self.sync_selected_workspace_from_provider()?;
         self.state = MissionBrowserWorkspaceState::MountedAgent;
         Ok(())
     }
 
-    pub fn unmount(&mut self) -> Result<(), BrowserError> {
+    pub fn mark_host_crashed(
+        &mut self,
+        evidence_digest: String,
+        now: DateTime<Utc>,
+    ) -> Result<(), BrowserError> {
+        let result = self
+            .provider
+            .as_mut()
+            .ok_or(BrowserError::ControlLeaseLost)
+            .and_then(|provider| provider.mark_host_crashed(evidence_digest, now));
+        if let Err(error) = result {
+            self.propagate_provider_crash();
+            return Err(error);
+        }
+        self.sync_selected_workspace_from_provider()?;
+        self.provider = None;
+        self.state = MissionBrowserWorkspaceState::Crashed;
+        Ok(())
+    }
+
+    pub fn unmount(
+        &mut self,
+        evidence_digest: String,
+        now: DateTime<Utc>,
+    ) -> Result<(), BrowserError> {
         if self.state == MissionBrowserWorkspaceState::Revoked {
             return Err(BrowserError::InvalidControlTransition);
         }
-        if let Some(provider) = self.provider.as_mut() {
-            provider.unmount()?;
+        let unmount_result = self
+            .provider
+            .as_mut()
+            .map(|provider| provider.unmount(evidence_digest, now));
+        if let Some(Err(error)) = unmount_result {
+            self.propagate_provider_crash();
+            return Err(error);
+        }
+        if let Some(provider) = self.provider.as_ref() {
+            self.selected_workspace = Some(provider.workspace().clone());
         }
         self.provider = None;
         self.state = if self.selected_profile.is_some() {
@@ -295,7 +480,13 @@ impl MissionBrowserWorkspaceConsumer {
             match provider.revoke(expected_revision, evidence_digest.clone(), now) {
                 Ok(profile) => profile,
                 Err(error) => {
-                    self.provider = Some(provider);
+                    if provider.lifecycle() == BrowserProviderLifecycle::Crashed {
+                        self.selected_workspace = Some(provider.workspace().clone());
+                        self.provider = None;
+                        self.state = MissionBrowserWorkspaceState::Crashed;
+                    } else {
+                        self.provider = Some(provider);
+                    }
                     return Err(error);
                 }
             }
@@ -309,7 +500,7 @@ impl MissionBrowserWorkspaceConsumer {
         };
         self.selected_profile = None;
         self.selected_workspace = None;
-        self.observations.clear();
+        self.result_log = None;
         self.state = MissionBrowserWorkspaceState::Revoked;
         Ok(revoked)
     }
@@ -335,6 +526,31 @@ impl MissionBrowserWorkspaceConsumer {
         }
         Ok(())
     }
+
+    fn sync_selected_workspace_from_provider(&mut self) -> Result<(), BrowserError> {
+        let workspace = self
+            .provider
+            .as_ref()
+            .ok_or(BrowserError::ControlLeaseLost)?
+            .workspace()
+            .clone();
+        self.selected_workspace = Some(workspace);
+        Ok(())
+    }
+
+    fn propagate_provider_crash(&mut self) {
+        if self
+            .provider
+            .as_ref()
+            .is_some_and(|provider| provider.lifecycle() == BrowserProviderLifecycle::Crashed)
+        {
+            if let Some(provider) = self.provider.as_ref() {
+                self.selected_workspace = Some(provider.workspace().clone());
+            }
+            self.provider = None;
+            self.state = MissionBrowserWorkspaceState::Crashed;
+        }
+    }
 }
 
 impl fmt::Debug for MissionBrowserWorkspaceConsumer {
@@ -347,7 +563,10 @@ impl fmt::Debug for MissionBrowserWorkspaceConsumer {
             .field("selected_profile", &self.selected_profile)
             .field("selected_workspace", &self.selected_workspace)
             .field("provider", &self.provider)
-            .field("observation_count", &self.observations.len())
+            .field(
+                "observation_count",
+                &self.result_log.as_ref().map_or(0, |log| log.entries.len()),
+            )
             .field("observation_digest", &self.observation_digest())
             .field("state", &self.state)
             .finish()
@@ -444,6 +663,17 @@ mod tests {
         .expect("snapshot")
     }
 
+    fn frame_scope(workspace: &BrowserWorkspace) -> crate::BrowserFrameScope {
+        crate::BrowserFrameScope::from_test_values(
+            workspace.active_tab_id.clone(),
+            "frame-root",
+            "loader-root",
+            "https://example.test/germany",
+            1,
+        )
+        .expect("frame scope")
+    }
+
     #[test]
     fn mount_observe_takeover_and_return_fence_the_old_generation() {
         let (mission, profile, workspace) = fixture();
@@ -454,7 +684,12 @@ mod tests {
         let definition = BrowserWorkspaceServiceDefinition::authenticated_chromium("provider-test")
             .expect("service");
         consumer
-            .mount_contract_for_test(definition, now())
+            .mount_contract_for_test(
+                definition,
+                frame_scope(&workspace),
+                snapshot(&workspace, "observation-1"),
+                now(),
+            )
             .expect("mount");
         let observation = consumer
             .observe_contract_snapshot_for_test(
@@ -505,6 +740,69 @@ mod tests {
     }
 
     #[test]
+    fn objective_cursor_result_log_is_exact_and_restart_cancels_old_cursor() {
+        let (mission, profile, workspace) = fixture();
+        let mut consumer = MissionBrowserWorkspaceConsumer::new(&mission).expect("consumer");
+        consumer
+            .select_profile(profile, workspace.clone())
+            .expect("select");
+        consumer
+            .mount_contract_for_test(
+                BrowserWorkspaceServiceDefinition::authenticated_chromium("provider-test")
+                    .expect("service"),
+                frame_scope(&workspace),
+                snapshot(&workspace, "objective-observation"),
+                now(),
+            )
+            .expect("mount");
+        let request = consumer
+            .request_observation(
+                BrowserSnapshotId::from("objective-1"),
+                BrowserSnapshotId::from("objective-observation"),
+                "https://example.test/germany",
+                now() + Duration::seconds(1),
+            )
+            .expect("objective request");
+        let result = consumer
+            .observe_objective(&request, now() + Duration::seconds(2))
+            .expect("observation result");
+        assert_eq!(result.objective_id, BrowserSnapshotId::from("objective-1"));
+        assert_eq!(consumer.result_log().expect("log").entries.len(), 1);
+        consumer
+            .observe_objective(&request, now() + Duration::seconds(3))
+            .expect("idempotent same cursor");
+
+        let mut tampered = request.clone();
+        tampered.cursor.cursor_id = "tampered-cursor".into();
+        assert!(matches!(
+            consumer
+                .observe_objective(&tampered, now() + Duration::seconds(3))
+                .expect_err("tampered cursor must fail closed"),
+            BrowserError::InvalidObservationObjective | BrowserError::ObservationCursorInvalid
+        ));
+
+        // A host restart is terminal for this mounted provider. The paused
+        // workspace and incremented epoch make every pre-restart cursor stale.
+        consumer
+            .mark_host_crashed(sha('9'), now() + Duration::seconds(4))
+            .expect("restart cancellation");
+        assert_eq!(consumer.state(), MissionBrowserWorkspaceState::Crashed);
+        assert!(matches!(
+            consumer
+                .observe_objective(&request, now() + Duration::seconds(5))
+                .expect_err("old cursor after crash"),
+            BrowserError::ControlLeaseLost
+        ));
+        assert_eq!(
+            consumer
+                .selected_workspace()
+                .expect("cancelled workspace")
+                .control_state,
+            crate::BrowserControlState::PausedAgent
+        );
+    }
+
+    #[test]
     fn reselect_cleans_provider_and_observations_while_unmount_retains_result() {
         let (mission, profile, workspace) = fixture();
         let mut consumer = MissionBrowserWorkspaceConsumer::new(&mission).expect("consumer");
@@ -515,23 +813,37 @@ mod tests {
             .mount_contract_for_test(
                 BrowserWorkspaceServiceDefinition::authenticated_chromium("provider-test")
                     .expect("service"),
+                frame_scope(&workspace),
+                snapshot(&workspace, "observation-2"),
                 now(),
             )
             .expect("mount");
-        consumer
-            .observe_contract_snapshot_for_test(
-                &snapshot(&workspace, "observation-2"),
+        let old_cursor_request = consumer
+            .request_observation(
+                BrowserSnapshotId::from("objective-unmount"),
+                BrowserSnapshotId::from("observation-2"),
                 "https://example.test/germany",
                 now() + Duration::seconds(1),
             )
+            .expect("objective request");
+        consumer
+            .observe_objective(&old_cursor_request, now() + Duration::seconds(2))
             .expect("observe");
         let before = consumer.observation_digest().expect("digest");
-        consumer.unmount().expect("unmount");
+        consumer
+            .unmount(sha('6'), now() + Duration::seconds(3))
+            .expect("unmount");
         assert_eq!(consumer.state(), MissionBrowserWorkspaceState::Unmounted);
         assert_eq!(consumer.observation_digest().expect("digest"), before);
+        assert!(matches!(
+            consumer
+                .observe_objective(&old_cursor_request, now() + Duration::seconds(4))
+                .expect_err("unmounted cursor must fail closed"),
+            BrowserError::ControlLeaseLost
+        ));
 
         consumer
-            .reselect_profile(profile, workspace)
+            .reselect_profile(profile, workspace, sha('7'), now() + Duration::seconds(5))
             .expect("reselect");
         assert_eq!(consumer.state(), MissionBrowserWorkspaceState::Selected);
         assert_eq!(consumer.observations().count(), 0);
@@ -543,14 +855,26 @@ mod tests {
         let (mission, profile, workspace) = fixture();
         let revision = profile.revision;
         let mut consumer = MissionBrowserWorkspaceConsumer::new(&mission).expect("consumer");
-        consumer.select_profile(profile, workspace).expect("select");
+        consumer
+            .select_profile(profile, workspace.clone())
+            .expect("select");
         consumer
             .mount_contract_for_test(
                 BrowserWorkspaceServiceDefinition::authenticated_chromium("provider-test")
                     .expect("service"),
+                frame_scope(&workspace),
+                snapshot(&workspace, "observation-3"),
                 now(),
             )
             .expect("mount");
+        let old_cursor_request = consumer
+            .request_observation(
+                BrowserSnapshotId::from("objective-revoke"),
+                BrowserSnapshotId::from("observation-3"),
+                "https://example.test/germany",
+                now() + Duration::seconds(1),
+            )
+            .expect("objective request");
         let revoked = consumer
             .revoke_selected_profile(revision, sha('8'), now() + Duration::seconds(1))
             .expect("revoke");
@@ -558,6 +882,12 @@ mod tests {
         assert_eq!(consumer.state(), MissionBrowserWorkspaceState::Revoked);
         assert!(consumer.selected_profile().is_none());
         assert_eq!(consumer.observations().count(), 0);
+        assert!(matches!(
+            consumer
+                .observe_objective(&old_cursor_request, now() + Duration::seconds(2))
+                .expect_err("revoked cursor must fail closed"),
+            BrowserError::ControlLeaseLost
+        ));
         assert!(matches!(
             consumer
                 .revoke_selected_profile(revision + 1, sha('9'), now() + Duration::seconds(2))
@@ -614,7 +944,9 @@ mod tests {
                     now() + Duration::seconds(2),
                 )
                 .expect("return");
-            consumer.unmount().expect("unmount");
+            consumer
+                .unmount(sha('8'), now() + Duration::seconds(3))
+                .expect("unmount");
         }
         #[cfg(not(target_os = "macos"))]
         panic!("BLOCKED_ENV: reason=macos_required");
