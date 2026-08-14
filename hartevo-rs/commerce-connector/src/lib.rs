@@ -8,6 +8,7 @@
 //! models, read transports, and deterministic test worlds.
 
 pub mod amazon;
+pub mod amazon_insight;
 mod canonical;
 pub mod shopify;
 pub mod sorftime;
