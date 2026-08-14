@@ -1,0 +1,301 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schemaVersion": "hartevo.snyk-security-result-contract/v1",
+  "contractVersion": "snyk-security-result-01-layer-1/v1",
+  "pluginId": "snyk.security-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.snyk-security-result-contract/v1|layer=1|service=snyk.security-result.read|provider=snyk.security-result.recording|consumer=mission.snyk-security-result.consumer",
+  "contractDigest": "2f8d404d9f3af3449fe704c73542de43cc77cfb9472d6951f06e9390e80c389c",
+  "service": {
+    "type": "SnykSecurityResultService",
+    "id": "snyk.security-result.read",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "register_scope",
+      "read_project_snapshot",
+      "compile_security_result_proposal",
+      "record_security_result"
+    ],
+    "forbiddenOperations": [
+      "ignore",
+      "unignore",
+      "remediate",
+      "import_project",
+      "delete_project",
+      "export_source",
+      "read_raw_dependency_graph"
+    ]
+  },
+  "provider": {
+    "type": "SnykProvider",
+    "id": "snyk.security-result.recording",
+    "apiRevision": "snyk-security-result-read-1",
+    "operations": [
+      "read_project_snapshot"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fake",
+      "loopback",
+      "blocked_env"
+    ],
+    "httpClassification": {
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true,
+      "accessLoss": true
+    },
+    "mutations": {
+      "ignore": false,
+      "unignore": false,
+      "remediate": false,
+      "importProject": false,
+      "deleteProject": false,
+      "exportSource": false,
+      "retainRawDependencyGraph": false
+    }
+  },
+  "consumer": {
+    "type": "MissionSnykSecurityConsumer",
+    "id": "mission.snyk-security-result.consumer",
+    "authority": "redacted_proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "outcomeAdoption": false
+  },
+  "credentials": {
+    "boundary": "opaque SecretReference",
+    "kinds": [
+      "api_token",
+      "oauth"
+    ],
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "regionId",
+      "regionHttpsHost",
+      "regionRevision",
+      "organizationId",
+      "organizationRevision",
+      "groupId",
+      "groupRevision",
+      "targetId",
+      "targetRevision",
+      "snykProjectId",
+      "snykProjectRevision",
+      "snapshotId",
+      "snapshotRevision",
+      "issueId",
+      "issueRevision",
+      "packageId",
+      "packageRevision",
+      "pathId",
+      "pathRevision",
+      "commitId",
+      "commitRevision",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "secretRevision",
+      "registrationRevision"
+    ]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": [
+      "active"
+    ],
+    "terminalStatuses": [
+      "revoked",
+      "reversed"
+    ],
+    "permissions": [
+      "region.read",
+      "organization.read",
+      "group.read",
+      "target.read",
+      "project.read",
+      "snapshot.read",
+      "issue.read",
+      "package.read",
+      "path.read",
+      "commit.read",
+      "vulnerability.read",
+      "license.read",
+      "iac.read",
+      "evidence.read"
+    ],
+    "forbiddenPermissions": [
+      "ignore.write",
+      "unignore.write",
+      "remediation.write",
+      "project.import",
+      "project.delete",
+      "source.export",
+      "dependency.graph.read",
+      "security.registry.write"
+    ]
+  },
+  "snapshotBounds": {
+    "maxPageSize": 100,
+    "maxPages": 16,
+    "maxEvidenceItems": 256,
+    "maxOpaquePageTokenBytes": 512,
+    "maxResponseBytes": 1048576,
+    "repeatedPageToken": "fail_closed",
+    "truncatedProjection": "review_only"
+  },
+  "evidence": {
+    "allowlistedKinds": [
+      "vulnerability",
+      "license",
+      "iac"
+    ],
+    "findingStatuses": [
+      "open",
+      "fixed",
+      "ignored",
+      "introduced",
+      "unknown"
+    ],
+    "vulnerabilityFields": [
+      "issueId",
+      "packageId",
+      "pathId",
+      "commitId",
+      "vulnerabilityId",
+      "titleDigest",
+      "severity",
+      "status",
+      "fixAvailability",
+      "fixedVersionDigest",
+      "remediationPathDigest"
+    ],
+    "licenseFields": [
+      "issueId",
+      "packageId",
+      "pathId",
+      "commitId",
+      "licenseId",
+      "licenseNameDigest",
+      "risk",
+      "status"
+    ],
+    "iacFields": [
+      "issueId",
+      "pathId",
+      "commitId",
+      "ruleId",
+      "resourceTypeDigest",
+      "messageDigest",
+      "severity",
+      "status",
+      "fixAvailability"
+    ],
+    "redactedText": true,
+    "rawDependencyGraph": false,
+    "arbitrarySourceExport": false
+  },
+  "adversarialEvidence": [
+    "open-status",
+    "fixed-status",
+    "ignored-status",
+    "introduced-status",
+    "unknown-status",
+    "available-fix",
+    "unavailable-fix",
+    "unknown-fix",
+    "snapshot-drift",
+    "regional-host-drift",
+    "stale-mission-revision",
+    "duplicate-registration",
+    "replayed-recording",
+    "idempotency-conflict",
+    "repeated-page-token",
+    "pagination-limit",
+    "unauthorized-401",
+    "forbidden-403",
+    "not-found-404",
+    "conflict-409",
+    "rate-limit-429",
+    "timeout",
+    "server-5xx",
+    "access-loss",
+    "tamper",
+    "redaction",
+    "truncation",
+    "secret-revocation"
+  ],
+  "provenance": {
+    "recording": "non_native_non_connected",
+    "fake": "non_native_non_connected",
+    "loopback": "non_native_non_connected",
+    "blocked_env": "non_native_non_connected",
+    "nativeConnectedClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed SnykSecurityResultService/SnykProvider/MissionSnykSecurityConsumer",
+      "exact Snyk and Mission/Project/Work Product scope",
+      "bounded project snapshot projection",
+      "allowlisted vulnerability/license/IaC evidence",
+      "redacted proposal digest",
+      "recording idempotency seam"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "generic security registry",
+      "ignore or remediation authority",
+      "project import or deletion",
+      "raw dependency graph",
+      "arbitrary source export",
+      "native credential resolution",
+      "live HTTPS transport",
+      "durable provider receipts",
+      "kernel authority"
+    ]
+  },
+  "nonOverlap": {
+    "sentry": "runtime error and event evidence",
+    "datadog": "runtime and SLO evidence",
+    "deliveryPlugins": "CircleCI/Buildkite/Pulumi/Cloud Run delivery evidence",
+    "snykOwns": "project and immutable snapshot security evidence only"
+  },
+  "honestNativeGap": "Native API-token or OAuth resolution, live regional HTTPS project/snapshot reads, durable provider receipts, independent snapshot/read-back reconciliation, terminal verification, and Mission/Work Product adoption remain Layer-2 work; recording, fake, loopback, and BLOCKED_ENV never claim Connected, native, or first-party evidence."
+}
