@@ -1,4 +1,7 @@
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -15,6 +18,9 @@ use crate::{
 /// fulfillment. The File Broker remains the artifact boundary; this limit is
 /// only for the provider's result metadata and evidence handoff.
 pub const CREATOR_WORK_MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
+pub const CREATOR_WORK_PROVIDER_PROTOCOL_VERSION: u16 = 1;
+pub const CREATOR_WORK_HTTP_PATH: &str = "/creator-work/v1/execute";
+pub const CREATOR_WORK_SOURCE_COMMIT_HEX_LEN: usize = 40;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -144,6 +150,14 @@ pub trait CreatorWorkProvider: std::fmt::Debug {
         &self,
         request: &CreatorWorkExecutionRequest,
     ) -> Result<CreatorWorkProviderResult, CreatorWorkProviderError>;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreatorWorkExecutionStatus {
+    Started,
+    ResultRecorded,
+    Revoked,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -399,6 +413,10 @@ pub struct CreatorWorkExecutionRequest {
     pub contract_revision: u64,
     pub task_state_revision: u64,
     pub mission_revision: u64,
+    pub protocol_version: u16,
+    pub objective: String,
+    pub capability: String,
+    pub source_commit: String,
     pub provider_id: String,
     pub connection_id: ConnectionId,
     pub account_id: AccountId,
@@ -414,7 +432,43 @@ pub struct CreatorWorkExecutionRequest {
 
 impl CreatorWorkExecutionRequest {
     pub fn request_digest(&self) -> String {
-        self.effect_approval_digest.clone()
+        digest_fields([
+            "creator_work.request.v1",
+            self.tenant_id.as_str(),
+            self.project_id.as_str(),
+            self.mission_id.as_str(),
+            self.creator_id.as_str(),
+            self.task_id.as_str(),
+            &self.contract_revision.to_string(),
+            &self.task_state_revision.to_string(),
+            &self.mission_revision.to_string(),
+            &self.protocol_version.to_string(),
+            &self.objective,
+            &self.capability,
+            &self.source_commit,
+            &self.input_digest,
+            &self.provider_id,
+            self.connection_id.as_str(),
+            self.account_id.as_str(),
+            &self.provider_generation.to_string(),
+            self.effect_id.as_str(),
+            &self.effect_approval_digest,
+            self.worker.worker_id.as_str(),
+            &self.worker.generation.to_string(),
+            &self.worker.token_digest,
+            &self.payout_intent.intent_digest,
+        ])
+    }
+
+    pub fn composition_digest(&self) -> String {
+        digest_fields([
+            "creator_work.composition.v1",
+            &self.protocol_version.to_string(),
+            &self.objective,
+            &self.capability,
+            &self.source_commit,
+            &self.input_digest,
+        ])
     }
 }
 
@@ -441,6 +495,12 @@ pub struct CreatorWorkProviderResult {
     pub contract_revision: u64,
     pub task_state_revision: u64,
     pub mission_revision: u64,
+    pub protocol_version: u16,
+    pub objective: String,
+    pub capability: String,
+    pub source_commit: String,
+    pub input_digest: String,
+    pub request_digest: String,
     pub provider_id: String,
     pub provider_generation: u64,
     pub effect_id: EffectId,
@@ -468,6 +528,12 @@ impl CreatorWorkProviderResult {
             &self.contract_revision.to_string(),
             &self.task_state_revision.to_string(),
             &self.mission_revision.to_string(),
+            &self.protocol_version.to_string(),
+            &self.objective,
+            &self.capability,
+            &self.source_commit,
+            &self.input_digest,
+            &self.request_digest,
             &self.provider_id,
             &self.provider_generation.to_string(),
             self.effect_id.as_str(),
@@ -498,6 +564,329 @@ impl CreatorWorkProviderResult {
             &self.payout_intent.intent_digest,
         ])
     }
+}
+
+/// Durable, Mission-scoped execution state for a provider request. The
+/// request is retained verbatim so restart/replay never reconstructs scope
+/// from a newer task or Mission projection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatorWorkExecutionReceipt {
+    pub request: CreatorWorkExecutionRequest,
+    pub status: CreatorWorkExecutionStatus,
+    pub result_id: Option<String>,
+    pub result_digest: Option<String>,
+    pub provider_receipt_id: Option<crate::ReceiptId>,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub receipt_digest: String,
+}
+
+impl CreatorWorkExecutionReceipt {
+    pub fn started(
+        request: CreatorWorkExecutionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<Self, CreatorWorkFulfillmentError> {
+        request.worker.validate_current(now)?;
+        if request.requested_at > now {
+            return Err(CreatorWorkFulfillmentError::InvalidExecutionRequest);
+        }
+        let mut receipt = Self {
+            request,
+            status: CreatorWorkExecutionStatus::Started,
+            result_id: None,
+            result_digest: None,
+            provider_receipt_id: None,
+            started_at: now,
+            updated_at: now,
+            receipt_digest: String::new(),
+        };
+        receipt.receipt_digest = receipt.expected_digest();
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn record_result(
+        &self,
+        result: &CreatorWorkProviderResult,
+        now: DateTime<Utc>,
+    ) -> Result<Self, CreatorWorkFulfillmentError> {
+        if self.status != CreatorWorkExecutionStatus::Started
+            || result.request_digest != self.request.request_digest()
+        {
+            return Err(CreatorWorkFulfillmentError::ResultBindingMismatch);
+        }
+        let mut recorded = Self {
+            request: self.request.clone(),
+            status: CreatorWorkExecutionStatus::ResultRecorded,
+            result_id: Some(result.result_id.clone()),
+            result_digest: Some(result.result_digest()),
+            provider_receipt_id: Some(result.receipt.id.clone()),
+            started_at: self.started_at,
+            updated_at: now,
+            receipt_digest: String::new(),
+        };
+        recorded.receipt_digest = recorded.expected_digest();
+        recorded.validate()?;
+        Ok(recorded)
+    }
+
+    pub fn revoke(&self, now: DateTime<Utc>) -> Result<Self, CreatorWorkFulfillmentError> {
+        if self.status != CreatorWorkExecutionStatus::Started {
+            return Err(CreatorWorkFulfillmentError::ExecutionAlreadyTerminal);
+        }
+        let mut revoked = Self {
+            request: self.request.clone(),
+            status: CreatorWorkExecutionStatus::Revoked,
+            result_id: None,
+            result_digest: None,
+            provider_receipt_id: None,
+            started_at: self.started_at,
+            updated_at: now,
+            receipt_digest: String::new(),
+        };
+        revoked.receipt_digest = revoked.expected_digest();
+        revoked.validate()?;
+        Ok(revoked)
+    }
+
+    pub fn validate(&self) -> Result<(), CreatorWorkFulfillmentError> {
+        if !is_source_commit(&self.request.source_commit)
+            || self.request.protocol_version != CREATOR_WORK_PROVIDER_PROTOCOL_VERSION
+            || self.request.objective.trim().is_empty()
+            || self.request.capability.trim().is_empty()
+            || !is_sha256(&self.request.input_digest)
+            || self.request.request_digest().trim().is_empty()
+            || self.started_at > self.updated_at
+            || self.receipt_digest != self.expected_digest()
+        {
+            return Err(CreatorWorkFulfillmentError::InvalidExecutionReceipt);
+        }
+        match self.status {
+            CreatorWorkExecutionStatus::Started | CreatorWorkExecutionStatus::Revoked => {
+                if self.result_id.is_some()
+                    || self.result_digest.is_some()
+                    || self.provider_receipt_id.is_some()
+                {
+                    return Err(CreatorWorkFulfillmentError::InvalidExecutionReceipt);
+                }
+            }
+            CreatorWorkExecutionStatus::ResultRecorded => {
+                if self.result_id.as_deref().is_none_or(str::is_empty)
+                    || self
+                        .result_digest
+                        .as_deref()
+                        .is_none_or(|digest| !is_sha256(digest))
+                    || self
+                        .provider_receipt_id
+                        .as_ref()
+                        .is_none_or(|id| id.as_str().trim().is_empty())
+                {
+                    return Err(CreatorWorkFulfillmentError::InvalidExecutionReceipt);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn follows(&self, next: &Self) -> bool {
+        self.request.request_digest() == next.request.request_digest()
+            && match (&self.status, &next.status) {
+                (
+                    CreatorWorkExecutionStatus::Started,
+                    CreatorWorkExecutionStatus::ResultRecorded
+                    | CreatorWorkExecutionStatus::Revoked,
+                ) => true,
+                _ => self == next,
+            }
+    }
+
+    fn expected_digest(&self) -> String {
+        digest_fields([
+            "creator_work.execution_receipt.v1",
+            &self.request.request_digest(),
+            execution_status_name(&self.status),
+            self.result_id.as_deref().unwrap_or(""),
+            self.result_digest.as_deref().unwrap_or(""),
+            self.provider_receipt_id
+                .as_ref()
+                .map_or("", crate::ReceiptId::as_str),
+            &self.started_at.to_rfc3339(),
+            &self.updated_at.to_rfc3339(),
+        ])
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatorWorkHttpRequest {
+    pub protocol_version: u16,
+    pub request: CreatorWorkExecutionRequest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatorWorkHttpResponse {
+    pub protocol_version: u16,
+    pub request_digest: String,
+    pub result: CreatorWorkProviderResult,
+}
+
+/// Loopback-only HTTP provider transport. This is a controlled provider
+/// boundary for deterministic local execution; it is never a first-party
+/// external-network credential adapter.
+#[derive(Clone, Debug)]
+pub struct CreatorWorkHttpProvider {
+    provider_id: String,
+    endpoint: SocketAddr,
+    connect_timeout: StdDuration,
+    io_timeout: StdDuration,
+}
+
+impl CreatorWorkHttpProvider {
+    pub fn new(
+        provider_id: impl Into<String>,
+        endpoint: SocketAddr,
+    ) -> Result<Self, CreatorWorkProviderError> {
+        let provider_id = provider_id.into();
+        if provider_id.trim().is_empty() {
+            return Err(CreatorWorkProviderError::InvalidResponse(
+                "provider id is empty".into(),
+            ));
+        }
+        if !endpoint.ip().is_loopback() {
+            return Err(CreatorWorkProviderError::Disconnected);
+        }
+        Ok(Self {
+            provider_id,
+            endpoint,
+            connect_timeout: StdDuration::from_secs(2),
+            io_timeout: StdDuration::from_secs(5),
+        })
+    }
+
+    pub fn with_timeouts(
+        mut self,
+        connect_timeout: StdDuration,
+        io_timeout: StdDuration,
+    ) -> Result<Self, CreatorWorkProviderError> {
+        if connect_timeout.is_zero() || io_timeout.is_zero() {
+            return Err(CreatorWorkProviderError::InvalidResponse(
+                "provider timeouts must be positive".into(),
+            ));
+        }
+        self.connect_timeout = connect_timeout;
+        self.io_timeout = io_timeout;
+        Ok(self)
+    }
+}
+
+impl CreatorWorkProvider for CreatorWorkHttpProvider {
+    fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    fn execute_bounded(
+        &self,
+        request: &CreatorWorkExecutionRequest,
+    ) -> Result<CreatorWorkProviderResult, CreatorWorkProviderError> {
+        if request.provider_id != self.provider_id {
+            return Err(CreatorWorkProviderError::InvalidResponse(
+                "request provider does not match loopback provider".into(),
+            ));
+        }
+        if request.protocol_version != CREATOR_WORK_PROVIDER_PROTOCOL_VERSION
+            || !is_source_commit(&request.source_commit)
+        {
+            return Err(CreatorWorkProviderError::InvalidResponse(
+                "request protocol or source commit is invalid".into(),
+            ));
+        }
+        let envelope = CreatorWorkHttpRequest {
+            protocol_version: CREATOR_WORK_PROVIDER_PROTOCOL_VERSION,
+            request: request.clone(),
+        };
+        let body = serde_json::to_vec(&envelope)
+            .map_err(|error| CreatorWorkProviderError::ExecutionFailed(error.to_string()))?;
+        let mut stream = TcpStream::connect_timeout(&self.endpoint, self.connect_timeout)
+            .map_err(|error| CreatorWorkProviderError::ExecutionFailed(error.to_string()))?;
+        stream
+            .set_read_timeout(Some(self.io_timeout))
+            .and_then(|()| stream.set_write_timeout(Some(self.io_timeout)))
+            .map_err(|error| CreatorWorkProviderError::ExecutionFailed(error.to_string()))?;
+        let host = self.endpoint.to_string();
+        let headers = format!(
+            "POST {CREATOR_WORK_HTTP_PATH} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .and_then(|()| stream.write_all(&body))
+            .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
+            .map_err(|error| CreatorWorkProviderError::ExecutionFailed(error.to_string()))?;
+        let response_body = read_http_response_body(&mut stream, CREATOR_WORK_MAX_OUTPUT_BYTES)
+            .map_err(CreatorWorkProviderError::InvalidResponse)?;
+        let response: CreatorWorkHttpResponse = serde_json::from_slice(&response_body)
+            .map_err(|error| CreatorWorkProviderError::InvalidResponse(error.to_string()))?;
+        if response.protocol_version != CREATOR_WORK_PROVIDER_PROTOCOL_VERSION
+            || response.request_digest != request.request_digest()
+        {
+            return Err(CreatorWorkProviderError::TamperedResponse);
+        }
+        Ok(response.result)
+    }
+}
+
+fn read_http_response_body(stream: &mut TcpStream, max_body_bytes: u64) -> Result<Vec<u8>, String> {
+    let max_wire_bytes = max_body_bytes
+        .checked_add(16 * 1024)
+        .ok_or_else(|| "response size limit overflowed".to_owned())?;
+    let max_wire_bytes = usize::try_from(max_wire_bytes)
+        .map_err(|_| "response size limit is not representable".to_owned())?;
+    let mut wire = Vec::new();
+    stream
+        .take(
+            u64::try_from(max_wire_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut wire)
+        .map_err(|error| error.to_string())?;
+    if wire.len() > max_wire_bytes {
+        return Err("HTTP response exceeded the bounded wire limit".into());
+    }
+    let header_end = wire
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "HTTP response headers are incomplete".to_owned())?;
+    let header = std::str::from_utf8(&wire[..header_end])
+        .map_err(|_| "HTTP response headers are not UTF-8".to_owned())?;
+    let mut lines = header.lines();
+    let status = lines
+        .next()
+        .ok_or_else(|| "HTTP response status is missing".to_owned())?;
+    if !status.starts_with("HTTP/1.1 200 ") {
+        return Err(format!("loopback provider returned {status}"));
+    }
+    let content_length = lines
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .ok_or_else(|| "HTTP response content length is missing".to_owned())?;
+    if u64::try_from(content_length).unwrap_or(u64::MAX) > max_body_bytes {
+        return Err("HTTP response body exceeded the bounded output limit".into());
+    }
+    let body_start = header_end + 4;
+    let body = wire
+        .get(body_start..)
+        .ok_or_else(|| "HTTP response body is missing".to_owned())?;
+    if body.len() != content_length {
+        return Err("HTTP response content length does not match its body".into());
+    }
+    Ok(body.to_vec())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -730,6 +1119,7 @@ impl CreatorWorkFulfillmentService {
         worker: &CreatorWorkWorkerLease,
         effect: &Effect,
         input_digest: impl Into<String>,
+        source_commit: impl Into<String>,
         max_output_bytes: u64,
         now: DateTime<Utc>,
     ) -> Result<CreatorWorkExecutionRequest, CreatorWorkFulfillmentError> {
@@ -767,7 +1157,18 @@ impl CreatorWorkFulfillmentService {
             return Err(CreatorWorkFulfillmentError::InvalidBoundedLimit);
         }
         let input_digest = input_digest.into();
+        let source_commit = source_commit.into();
+        let objective = mission.contract.goal.trim().to_owned();
+        let capability = effect.capability.trim().to_owned();
         if !is_sha256(&input_digest)
+            || !is_source_commit(&source_commit)
+            || objective.is_empty()
+            || capability.is_empty()
+            || !mission.contract.enabled_capabilities.contains(&capability)
+            || mission
+                .contract
+                .forbidden_capabilities
+                .contains(&capability)
             || effect.id.as_str().trim().is_empty()
             || effect.tenant_id != task.tenant_id
             || effect.project_id != task.project_id
@@ -801,6 +1202,10 @@ impl CreatorWorkFulfillmentService {
             contract_revision: task.contract_revision,
             task_state_revision: task.state_revision,
             mission_revision: mission.revision,
+            protocol_version: CREATOR_WORK_PROVIDER_PROTOCOL_VERSION,
+            objective,
+            capability,
+            source_commit,
             provider_id: registration.provider_id.clone(),
             connection_id: registration.connection_id.clone(),
             account_id: registration.account_id.clone(),
@@ -825,6 +1230,7 @@ impl CreatorWorkFulfillmentService {
         worker: &CreatorWorkWorkerLease,
         effect: &Effect,
         input_digest: impl Into<String>,
+        source_commit: impl Into<String>,
         max_output_bytes: u64,
         now: DateTime<Utc>,
     ) -> Result<CreatorWorkProviderResult, CreatorWorkFulfillmentError> {
@@ -836,6 +1242,7 @@ impl CreatorWorkFulfillmentService {
             worker,
             effect,
             input_digest,
+            source_commit,
             max_output_bytes,
             now,
         )?;
@@ -848,12 +1255,18 @@ impl CreatorWorkFulfillmentService {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum CreatorWorkProviderError {
-    #[error("provider is disconnected")]
+    #[error(
+        "BLOCKED_ENV: external-network creator provider credentials are unavailable; provider is disconnected"
+    )]
     Disconnected,
     #[error("provider is revoked")]
     Revoked,
     #[error("provider failed bounded execution: {0}")]
     ExecutionFailed(String),
+    #[error("provider returned an invalid HTTP response: {0}")]
+    InvalidResponse(String),
+    #[error("provider returned a tampered response")]
+    TamperedResponse,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -919,6 +1332,10 @@ pub enum CreatorWorkFulfillmentError {
     OutcomeBindingMismatch,
     #[error("CreatorWork provider execution failed: {0}")]
     ProviderExecutionFailed(CreatorWorkProviderError),
+    #[error("CreatorWork execution receipt is invalid")]
+    InvalidExecutionReceipt,
+    #[error("CreatorWork execution receipt is already terminal")]
+    ExecutionAlreadyTerminal,
     #[error("CreatorWork revision overflow")]
     RevisionOverflow,
 }
@@ -991,6 +1408,21 @@ fn validate_request_scope(
     if request.mission_revision != mission.revision {
         return Err(CreatorWorkFulfillmentError::MissionRevisionMismatch);
     }
+    if request.protocol_version != CREATOR_WORK_PROVIDER_PROTOCOL_VERSION
+        || request.objective != mission.contract.goal
+        || request.capability.trim().is_empty()
+        || !mission
+            .contract
+            .enabled_capabilities
+            .contains(&request.capability)
+        || mission
+            .contract
+            .forbidden_capabilities
+            .contains(&request.capability)
+        || !is_source_commit(&request.source_commit)
+    {
+        return Err(CreatorWorkFulfillmentError::InvalidExecutionRequest);
+    }
     if registry.status(&request.provider_id) != CreatorWorkProviderStatus::Registered {
         return match registry.status(&request.provider_id) {
             CreatorWorkProviderStatus::Disconnected => Err(
@@ -1060,6 +1492,12 @@ fn validate_result_scope(
         || result.effect_id != request.effect_id
         || result.worker_id != current_worker.worker_id
         || result.worker_generation != current_worker.generation
+        || result.protocol_version != request.protocol_version
+        || result.objective != request.objective
+        || result.capability != request.capability
+        || result.source_commit != request.source_commit
+        || result.input_digest != request.input_digest
+        || result.request_digest != request.request_digest()
     {
         return Err(CreatorWorkFulfillmentError::ResultBindingMismatch);
     }
@@ -1070,6 +1508,7 @@ fn validate_result_scope(
         || result.deliverable.size_bytes == 0
         || result.deliverable.size_bytes > request.max_output_bytes
         || !is_sha256(&result.deliverable.content_digest)
+        || !is_sha256(&result.request_digest)
         || result.output_size_bytes == 0
         || result.output_size_bytes > request.max_output_bytes
         || !is_sha256(&result.bounded_output_digest)
@@ -1145,6 +1584,21 @@ fn verification_status_name(status: &VerificationStatus) -> &'static str {
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_source_commit(value: &str) -> bool {
+    value.len() == CREATOR_WORK_SOURCE_COMMIT_HEX_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn execution_status_name(status: &CreatorWorkExecutionStatus) -> &'static str {
+    match status {
+        CreatorWorkExecutionStatus::Started => "started",
+        CreatorWorkExecutionStatus::ResultRecorded => "result_recorded",
+        CreatorWorkExecutionStatus::Revoked => "revoked",
+    }
 }
 
 fn digest_fields<'a>(fields: impl IntoIterator<Item = &'a str>) -> String {
@@ -1384,6 +1838,7 @@ mod tests {
                 worker,
                 &effect,
                 "1".repeat(64),
+                "0123456789abcdef0123456789abcdef01234567",
                 1024,
                 now(),
             )
@@ -1396,7 +1851,7 @@ mod tests {
             provider: request.provider_id.clone(),
             external_id: "provider-result-1".into(),
             accepted_at: request.requested_at,
-            request_digest: request.request_digest(),
+            request_digest: request.effect_approval_digest.clone(),
             response_digest: "2".repeat(64),
         };
         let verification = Verification {
@@ -1417,6 +1872,12 @@ mod tests {
             contract_revision: request.contract_revision,
             task_state_revision: request.task_state_revision,
             mission_revision: request.mission_revision,
+            protocol_version: request.protocol_version,
+            objective: request.objective.clone(),
+            capability: request.capability.clone(),
+            source_commit: request.source_commit.clone(),
+            input_digest: request.input_digest.clone(),
+            request_digest: request.request_digest(),
             provider_id: request.provider_id.clone(),
             provider_generation: request.provider_generation,
             effect_id: request.effect_id.clone(),
@@ -1528,6 +1989,7 @@ mod tests {
                 &worker,
                 &effect,
                 "1".repeat(64),
+                "0123456789abcdef0123456789abcdef01234567",
                 1024,
                 now(),
             )
@@ -1592,6 +2054,7 @@ mod tests {
                 &worker,
                 effect,
                 request.input_digest.clone(),
+                request.source_commit.clone(),
                 request.max_output_bytes,
                 now(),
             )
@@ -1659,6 +2122,7 @@ mod tests {
                 &worker,
                 &effect,
                 "1".repeat(64),
+                "0123456789abcdef0123456789abcdef01234567",
                 1024,
                 now(),
             )
@@ -1695,5 +2159,146 @@ mod tests {
         )
         .expect_err("old provider generation must be fenced");
         assert_eq!(error, CreatorWorkFulfillmentError::WorkerBindingMismatch);
+    }
+
+    fn loopback_server(
+        tamper_source_commit: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        use std::net::TcpListener;
+        use std::sync::atomic::Ordering;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let endpoint = listener.local_addr().expect("loopback address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("provider request");
+            calls.fetch_add(1, Ordering::SeqCst);
+            let mut wire = Vec::new();
+            stream.read_to_end(&mut wire).expect("request wire");
+            let header_end = wire
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("request headers");
+            let body = &wire[header_end + 4..];
+            let request: CreatorWorkHttpRequest = serde_json::from_slice(body).expect("request");
+            let mut result = result(&request.request);
+            if tamper_source_commit {
+                result.source_commit = "f".repeat(CREATOR_WORK_SOURCE_COMMIT_HEX_LEN);
+            }
+            let response = CreatorWorkHttpResponse {
+                protocol_version: CREATOR_WORK_PROVIDER_PROTOCOL_VERSION,
+                request_digest: request.request.request_digest(),
+                result,
+            };
+            let body = serde_json::to_vec(&response).expect("response");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .expect("response headers");
+            stream.write_all(&body).expect("response body");
+        });
+        (endpoint, handle)
+    }
+
+    #[test]
+    fn loopback_http_provider_composes_objective_capability_and_exact_request_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (task, mut mission) = task_and_mission();
+        let registry = registered_registry();
+        let worker = active_worker(&task, &mission);
+        let request = request(&task, &mut mission, &registry, &worker);
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let (endpoint, server) = loopback_server(false, calls.clone());
+        let provider = CreatorWorkHttpProvider::new("hartevo", endpoint).expect("provider");
+        let effect = mission
+            .effects
+            .iter()
+            .find(|effect| effect.id == request.effect_id)
+            .expect("effect");
+        let provider_result = CreatorWorkFulfillmentService
+            .execute_bounded(
+                &task,
+                &mission,
+                &registry,
+                &provider,
+                &worker,
+                effect,
+                request.input_digest.clone(),
+                request.source_commit.clone(),
+                request.max_output_bytes,
+                now(),
+            )
+            .expect("loopback result");
+        attach_effect(&mut mission, &request, &provider_result);
+        let fulfillment = CreatorWorkMissionConsumer::consume_result(
+            &task,
+            &mission,
+            &registry,
+            &request,
+            &worker,
+            &provider_result,
+            now(),
+        )
+        .expect("Mission consumer");
+        server.join().expect("server");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(request.objective, mission.contract.goal);
+        assert_eq!(request.capability, "creator.work.fulfillment");
+        assert_eq!(provider_result.request_digest, request.request_digest());
+        assert_eq!(fulfillment.result.source_commit, request.source_commit);
+    }
+
+    #[test]
+    fn loopback_http_provider_rejects_tampered_result_and_external_network() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (task, mut mission) = task_and_mission();
+        let registry = registered_registry();
+        let worker = active_worker(&task, &mission);
+        let request = request(&task, &mut mission, &registry, &worker);
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let (endpoint, server) = loopback_server(true, calls.clone());
+        let provider = CreatorWorkHttpProvider::new("hartevo", endpoint).expect("provider");
+        let effect = mission
+            .effects
+            .iter()
+            .find(|effect| effect.id == request.effect_id)
+            .expect("effect");
+        let tampered = CreatorWorkFulfillmentService
+            .execute_bounded(
+                &task,
+                &mission,
+                &registry,
+                &provider,
+                &worker,
+                effect,
+                request.input_digest.clone(),
+                request.source_commit.clone(),
+                request.max_output_bytes,
+                now(),
+            )
+            .expect("transport remains typed");
+        server.join().expect("server");
+        let error = CreatorWorkMissionConsumer::consume_result(
+            &task,
+            &mission,
+            &registry,
+            &request,
+            &worker,
+            &tampered,
+            now(),
+        )
+        .expect_err("tampered source commit must be rejected");
+        assert_eq!(error, CreatorWorkFulfillmentError::ResultBindingMismatch);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let external = "192.0.2.1:80".parse().expect("socket address");
+        assert_eq!(
+            CreatorWorkHttpProvider::new("hartevo", external).expect_err("external blocked"),
+            CreatorWorkProviderError::Disconnected
+        );
     }
 }

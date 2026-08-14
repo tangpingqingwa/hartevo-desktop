@@ -168,9 +168,12 @@ pub use connection::{
     ProbeOutcome,
 };
 pub use creator_fulfillment::{
-    CREATOR_WORK_MAX_OUTPUT_BYTES, CreatorWorkDeliverableReference, CreatorWorkExecutionRequest,
+    CREATOR_WORK_HTTP_PATH, CREATOR_WORK_MAX_OUTPUT_BYTES, CREATOR_WORK_PROVIDER_PROTOCOL_VERSION,
+    CREATOR_WORK_SOURCE_COMMIT_HEX_LEN, CreatorWorkDeliverableReference,
+    CreatorWorkExecutionReceipt, CreatorWorkExecutionRequest, CreatorWorkExecutionStatus,
     CreatorWorkFulfillment, CreatorWorkFulfillmentError, CreatorWorkFulfillmentService,
-    CreatorWorkFulfillmentStatus, CreatorWorkMissionConsumer, CreatorWorkOutcomeHandoff,
+    CreatorWorkFulfillmentStatus, CreatorWorkHttpProvider, CreatorWorkHttpRequest,
+    CreatorWorkHttpResponse, CreatorWorkMissionConsumer, CreatorWorkOutcomeHandoff,
     CreatorWorkPayoutIntent, CreatorWorkProvider, CreatorWorkProviderError,
     CreatorWorkProviderRegistration, CreatorWorkProviderRegistry, CreatorWorkProviderResult,
     CreatorWorkProviderStatus, CreatorWorkSettlementStatus, CreatorWorkWorkerLease,

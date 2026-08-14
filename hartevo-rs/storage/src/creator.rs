@@ -2,9 +2,10 @@ use chrono::{DateTime, Utc};
 use hartevo_domain_kernel::{
     ActorId, CreatorAcceptance, CreatorDeliverable, CreatorHiringAward, CreatorId,
     CreatorMilestone, CreatorMilestoneId, CreatorPayoutRecord, CreatorTask, CreatorTaskId,
-    CreatorWorkFulfillment, CreatorWorkWorkerLease, CreatorWorkWorkerStatus, CurrencyCode,
-    DeliverableAssessment, DeliverableId, DeliverableReview, Mission, MissionId, Money,
-    PayoutAuthorization, ProjectId, ReviewId, RightsAttestation, TenantId, UsageRights,
+    CreatorWorkExecutionReceipt, CreatorWorkExecutionStatus, CreatorWorkFulfillment,
+    CreatorWorkWorkerLease, CreatorWorkWorkerStatus, CurrencyCode, DeliverableAssessment,
+    DeliverableId, DeliverableReview, Mission, MissionId, Money, PayoutAuthorization, ProjectId,
+    ReviewId, RightsAttestation, TenantId, UsageRights,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::Serialize;
@@ -200,7 +201,7 @@ impl ProjectStore {
         mission_id: &MissionId,
         task_id: &CreatorTaskId,
     ) -> Result<Option<CreatorWorkWorkerLease>, StorageError> {
-        let mut latest = None;
+        let mut latest: Option<(i64, CreatorWorkWorkerLease)> = None;
         for event in self.events_for_mission(project_id, mission_id)? {
             if event.event_type != "creator_work.worker_lease" {
                 continue;
@@ -227,9 +228,183 @@ impl ProjectStore {
         Ok(latest.map(|(_, lease)| lease))
     }
 
+    /// Persists the immutable request receipt before provider execution. A
+    /// replayed start is idempotent; a different request under the same
+    /// execution digest is an immutable-record conflict.
+    pub fn save_creator_work_execution_receipt(
+        &mut self,
+        receipt: &CreatorWorkExecutionReceipt,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        receipt
+            .validate()
+            .map_err(|error| StorageError::DomainDecode(error.to_string()))?;
+        let task = self.load_creator_task(&receipt.request.project_id, &receipt.request.task_id)?;
+        let mission =
+            self.load_mission(&receipt.request.project_id, &receipt.request.mission_id)?;
+        validate_creator_work_execution_receipt_scope(&task, &mission, receipt)?;
+        if let Some(previous) = self.load_creator_work_execution_receipt(
+            &receipt.request.project_id,
+            &receipt.request.mission_id,
+            &receipt.request.task_id,
+            &receipt.request.request_digest(),
+        )? {
+            if previous == *receipt {
+                return Ok(());
+            }
+            if !previous.follows(receipt) {
+                return Err(StorageError::OptimisticConflict {
+                    aggregate: format!("creator_work_execution:{}", receipt.request.task_id),
+                    expected_revision: 1,
+                });
+            }
+        } else if receipt.status != CreatorWorkExecutionStatus::Started {
+            return Err(StorageError::ScopedRecordNotFound {
+                kind: "creator work execution receipt",
+                project_id: receipt.request.project_id.clone(),
+                id: receipt.request.request_digest(),
+            });
+        } else {
+            let current_worker = self
+                .load_creator_work_worker_lease(
+                    &receipt.request.project_id,
+                    &receipt.request.mission_id,
+                    &receipt.request.task_id,
+                )?
+                .ok_or_else(|| StorageError::ScopedRecordNotFound {
+                    kind: "creator work worker lease",
+                    project_id: receipt.request.project_id.clone(),
+                    id: receipt.request.task_id.to_string(),
+                })?;
+            if current_worker != receipt.request.worker
+                || current_worker.status != CreatorWorkWorkerStatus::Active
+            {
+                return Err(StorageError::OptimisticConflict {
+                    aggregate: format!("creator_work_worker:{}", receipt.request.task_id),
+                    expected_revision: current_worker.generation,
+                });
+            }
+        }
+        let payload = serde_json::to_value(receipt)?;
+        append_creator_work_event(
+            self,
+            &task,
+            "creator_work.execution_receipt",
+            &payload,
+            recorded_at,
+            "creator_work_execution",
+            &receipt.request.request_digest(),
+        )?;
+        Ok(())
+    }
+
+    pub fn load_creator_work_execution_receipt(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        task_id: &CreatorTaskId,
+        request_digest: &str,
+    ) -> Result<Option<CreatorWorkExecutionReceipt>, StorageError> {
+        let mut latest: Option<CreatorWorkExecutionReceipt> = None;
+        for event in self.events_for_mission(project_id, mission_id)? {
+            if event.event_type != "creator_work.execution_receipt" {
+                continue;
+            }
+            let receipt: CreatorWorkExecutionReceipt = decode_value(event.payload)?;
+            receipt
+                .validate()
+                .map_err(|error| StorageError::DomainDecode(error.to_string()))?;
+            if receipt.request.project_id != *project_id
+                || receipt.request.mission_id != *mission_id
+                || receipt.request.task_id != *task_id
+                || receipt.request.request_digest() != request_digest
+            {
+                continue;
+            }
+            if let Some(previous) = &latest
+                && !previous.follows(&receipt)
+            {
+                return Err(StorageError::ImmutableRecordMismatch {
+                    kind: "creator work execution receipt",
+                    id: request_digest.into(),
+                });
+            }
+            latest = Some(receipt);
+        }
+        Ok(latest)
+    }
+
+    /// Re-adopts an already durably recorded result without contacting the
+    /// provider. A started or revoked execution is deliberately not
+    /// replayable, and a missing linked fulfillment is treated as corruption.
+    pub fn adopt_creator_work_result(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        task_id: &CreatorTaskId,
+        request_digest: &str,
+    ) -> Result<Option<CreatorWorkFulfillment>, StorageError> {
+        let Some(receipt) = self.load_creator_work_execution_receipt(
+            project_id,
+            mission_id,
+            task_id,
+            request_digest,
+        )?
+        else {
+            return Ok(None);
+        };
+        if receipt.status != CreatorWorkExecutionStatus::ResultRecorded {
+            return Ok(None);
+        }
+        let result_id = receipt.result_id.as_deref().ok_or_else(|| {
+            StorageError::DomainDecode("recorded CreatorWork execution has no result id".into())
+        })?;
+        let fulfillment = self
+            .load_creator_work_fulfillment(project_id, mission_id, task_id, result_id)?
+            .ok_or_else(|| {
+                StorageError::DomainDecode(
+                    "recorded CreatorWork execution has no linked fulfillment".into(),
+                )
+            })?;
+        if fulfillment.result.request_digest != request_digest
+            || receipt.result_digest.as_deref() != Some(fulfillment.result.result_digest().as_str())
+        {
+            return Err(StorageError::ImmutableRecordMismatch {
+                kind: "creator work execution result link",
+                id: request_digest.into(),
+            });
+        }
+        Ok(Some(fulfillment))
+    }
+
+    pub fn revoke_creator_work_execution(
+        &mut self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        task_id: &CreatorTaskId,
+        request_digest: &str,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        let current = self
+            .load_creator_work_execution_receipt(project_id, mission_id, task_id, request_digest)?
+            .ok_or_else(|| StorageError::ScopedRecordNotFound {
+                kind: "creator work execution receipt",
+                project_id: project_id.clone(),
+                id: request_digest.into(),
+            })?;
+        let revoked = current
+            .revoke(recorded_at)
+            .map_err(|error| StorageError::DomainDecode(error.to_string()))?;
+        self.save_creator_work_execution_receipt(&revoked, recorded_at)
+    }
+
     /// Records one immutable provider result and its outcome handoff. A
     /// repeated result id with the same payload is idempotent; a reused id
     /// with different facts is rejected as an immutable-record conflict.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "CreatorWork result and execution receipt share one atomic local transaction"
+    )]
     pub fn save_creator_work_fulfillment(
         &mut self,
         fulfillment: &CreatorWorkFulfillment,
@@ -251,13 +426,8 @@ impl ProjectStore {
             })?;
         if current_worker.status != CreatorWorkWorkerStatus::Active
             || fulfillment.worker.status != CreatorWorkWorkerStatus::Active
+            || current_worker != fulfillment.worker
         {
-            return Err(StorageError::OptimisticConflict {
-                aggregate: format!("creator_work_worker:{}", fulfillment.task_id),
-                expected_revision: current_worker.generation,
-            });
-        }
-        if current_worker != fulfillment.worker {
             return Err(StorageError::OptimisticConflict {
                 aggregate: format!("creator_work_worker:{}", fulfillment.task_id),
                 expected_revision: current_worker.generation,
@@ -277,16 +447,79 @@ impl ProjectStore {
                 id: fulfillment.result.result_id.clone(),
             });
         }
-        let payload = serde_json::to_value(fulfillment)?;
-        append_creator_work_event(
-            self,
-            &task,
-            "creator_work.fulfillment_recorded",
-            &payload,
+        let execution = self
+            .load_creator_work_execution_receipt(
+                &fulfillment.project_id,
+                &fulfillment.mission_id,
+                &fulfillment.task_id,
+                &fulfillment.result.request_digest,
+            )?
+            .ok_or_else(|| StorageError::ScopedRecordNotFound {
+                kind: "creator work execution receipt",
+                project_id: fulfillment.project_id.clone(),
+                id: fulfillment.result.request_digest.clone(),
+            })?;
+        if fulfillment.result.protocol_version != execution.request.protocol_version
+            || fulfillment.result.objective != execution.request.objective
+            || fulfillment.result.capability != execution.request.capability
+            || fulfillment.result.source_commit != execution.request.source_commit
+            || fulfillment.result.input_digest != execution.request.input_digest
+            || fulfillment.outcome_handoff.result_digest != fulfillment.result.result_digest()
+        {
+            return Err(StorageError::ImmutableRecordMismatch {
+                kind: "creator work execution result",
+                id: fulfillment.result.result_id.clone(),
+            });
+        }
+        let completed = execution
+            .record_result(&fulfillment.result, recorded_at)
+            .map_err(|error| StorageError::DomainDecode(error.to_string()))?;
+        let execution_payload = serde_json::to_string(&completed)?;
+        let fulfillment_payload = serde_json::to_string(fulfillment)?;
+        let transaction = self.connection.transaction()?;
+        ensure_project_and_mission(
+            &transaction,
+            &task.tenant_id,
+            &task.project_id,
+            &task.mission_id,
+        )?;
+        append_domain_event(
+            &transaction,
+            &task.tenant_id,
+            &task.project_id,
+            &task.mission_id,
+            "creator_work.execution_receipt",
+            &execution_payload,
             recorded_at,
+        )?;
+        append_creator_work_outbox(
+            &transaction,
+            &task,
+            "creator_work_execution",
+            &fulfillment.result.request_digest,
+            "creator_work.execution_receipt",
+            &execution_payload,
+            recorded_at,
+        )?;
+        append_domain_event(
+            &transaction,
+            &task.tenant_id,
+            &task.project_id,
+            &task.mission_id,
+            "creator_work.fulfillment_recorded",
+            &fulfillment_payload,
+            recorded_at,
+        )?;
+        append_creator_work_outbox(
+            &transaction,
+            &task,
             "creator_work_fulfillment",
             &fulfillment.result.result_id,
+            "creator_work.fulfillment_recorded",
+            &fulfillment_payload,
+            recorded_at,
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1186,6 +1419,52 @@ fn validate_creator_work_fulfillment_scope(
     Ok(())
 }
 
+fn validate_creator_work_execution_receipt_scope(
+    task: &CreatorTask,
+    mission: &Mission,
+    receipt: &CreatorWorkExecutionReceipt,
+) -> Result<(), StorageError> {
+    let request = &receipt.request;
+    if request.tenant_id != task.tenant_id
+        || request.project_id != task.project_id
+        || request.mission_id != task.mission_id
+        || request.creator_id != task.creator_id
+        || request.task_id != task.id
+        || request.contract_revision != task.contract_revision
+        || request.task_state_revision != task.state_revision
+        || request.mission_revision != mission.revision
+        || request.objective != mission.contract.goal.trim()
+        || request.capability.trim().is_empty()
+        || !mission
+            .contract
+            .enabled_capabilities
+            .contains(&request.capability)
+        || mission
+            .contract
+            .forbidden_capabilities
+            .contains(&request.capability)
+        || request.worker.tenant_id != task.tenant_id
+        || request.worker.project_id != task.project_id
+        || request.worker.mission_id != task.mission_id
+        || request.worker.creator_id != task.creator_id
+        || request.worker.task_id != task.id
+        || request.worker.contract_revision != task.contract_revision
+        || request.worker.task_state_revision != task.state_revision
+        || request.worker.mission_revision != mission.revision
+        || request.worker.provider_generation != request.provider_generation
+        || request.payout_intent.tenant_id != task.tenant_id
+        || request.payout_intent.project_id != task.project_id
+        || request.payout_intent.mission_id != task.mission_id
+        || request.payout_intent.creator_id != task.creator_id
+        || request.payout_intent.task_id != task.id
+        || request.payout_intent.contract_revision != task.contract_revision
+        || request.payout_intent.contract_digest != task.contract_digest()
+    {
+        return Err(StorageError::TenantScopeMismatch);
+    }
+    Ok(())
+}
+
 fn same_creator_work_worker_identity(
     previous: &CreatorWorkWorkerLease,
     next: &CreatorWorkWorkerLease,
@@ -1260,7 +1539,8 @@ mod tests {
     use hartevo_domain_kernel::{
         AccountId, CreatorAcceptance, CreatorApplicationId, CreatorHiringAward, CreatorMilestone,
         CreatorMilestoneId, CreatorMilestoneStatus, CreatorTaskStatus,
-        CreatorWorkDeliverableReference, CreatorWorkFulfillment, CreatorWorkFulfillmentStatus,
+        CreatorWorkDeliverableReference, CreatorWorkExecutionReceipt, CreatorWorkExecutionRequest,
+        CreatorWorkExecutionStatus, CreatorWorkFulfillment, CreatorWorkFulfillmentStatus,
         CreatorWorkOutcomeHandoff, CreatorWorkPayoutIntent, CreatorWorkProviderResult,
         CreatorWorkSettlementStatus, CreatorWorkWorkerLease, CreatorWorkWorkerStatus, CurrencyCode,
         EffectId, FundingReservation, MissionContract, Money, Project, StorageMode, UsageRights,
@@ -1284,6 +1564,7 @@ mod tests {
         Mission,
         CreatorTask,
         CreatorWorkWorkerLease,
+        CreatorWorkExecutionReceipt,
         CreatorWorkFulfillment,
     ) {
         let now = now();
@@ -1427,6 +1708,33 @@ mod tests {
             status: CreatorWorkSettlementStatus::Pending,
             intent_digest: "1".repeat(64),
         };
+        let request = CreatorWorkExecutionRequest {
+            tenant_id: task.tenant_id.clone(),
+            project_id: task.project_id.clone(),
+            mission_id: task.mission_id.clone(),
+            creator_id: task.creator_id.clone(),
+            task_id: task.id.clone(),
+            contract_revision: task.contract_revision,
+            task_state_revision: task.state_revision,
+            mission_revision: mission.revision,
+            protocol_version: hartevo_domain_kernel::CREATOR_WORK_PROVIDER_PROTOCOL_VERSION,
+            objective: mission.contract.goal.clone(),
+            capability: "creator.work.fulfillment".into(),
+            source_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            provider_id: "hartevo".into(),
+            connection_id: hartevo_domain_kernel::ConnectionId::from("connection-storage"),
+            account_id: AccountId::from("account-storage"),
+            provider_generation: 1,
+            effect_id: EffectId::from("effect-storage"),
+            effect_approval_digest: "2".repeat(64),
+            input_digest: "c".repeat(64),
+            max_output_bytes: hartevo_domain_kernel::CREATOR_WORK_MAX_OUTPUT_BYTES,
+            worker: worker.clone(),
+            payout_intent: payout_intent.clone(),
+            requested_at: now,
+        };
+        let execution_receipt =
+            CreatorWorkExecutionReceipt::started(request.clone(), now).expect("execution receipt");
         let receipt = hartevo_domain_kernel::Receipt {
             id: hartevo_domain_kernel::ReceiptId::from("receipt-storage"),
             provider: "hartevo".into(),
@@ -1444,7 +1752,7 @@ mod tests {
             evidence_digest: "4".repeat(64),
             receipt_id: receipt.id.clone(),
         };
-        let result = CreatorWorkProviderResult {
+        let mut result = CreatorWorkProviderResult {
             tenant_id: task.tenant_id.clone(),
             project_id: task.project_id.clone(),
             mission_id: task.mission_id.clone(),
@@ -1453,6 +1761,12 @@ mod tests {
             contract_revision: task.contract_revision,
             task_state_revision: task.state_revision,
             mission_revision: mission.revision,
+            protocol_version: request.protocol_version,
+            objective: request.objective.clone(),
+            capability: request.capability.clone(),
+            source_commit: request.source_commit.clone(),
+            input_digest: request.input_digest.clone(),
+            request_digest: request.request_digest(),
             provider_id: "hartevo".into(),
             provider_generation: 1,
             effect_id: EffectId::from("effect-storage"),
@@ -1493,6 +1807,28 @@ mod tests {
                 handoff_digest: "8".repeat(64),
             },
         };
+        let result_digest = result.result_digest();
+        result.outcome_handoff = CreatorWorkOutcomeHandoff::new(
+            result.tenant_id.clone(),
+            result.project_id.clone(),
+            result.mission_id.clone(),
+            result.creator_id.clone(),
+            result.task_id.clone(),
+            result.contract_revision,
+            result.task_state_revision,
+            result.mission_revision,
+            result.result_id.clone(),
+            result.deliverable.deliverable_id.clone(),
+            result.deliverable.content_digest.clone(),
+            result_digest,
+            result.evidence_digest.clone(),
+            result.receipt.id.clone(),
+            result.verification.id.clone(),
+            result.payout_intent.intent_digest.clone(),
+            "creator_work.result_ready",
+        )
+        .expect("outcome handoff");
+        let result_outcome_handoff = result.outcome_handoff.clone();
         let fulfillment = CreatorWorkFulfillment {
             tenant_id: task.tenant_id.clone(),
             project_id: task.project_id.clone(),
@@ -1510,39 +1846,27 @@ mod tests {
             worker: worker.clone(),
             result,
             payout_intent,
-            outcome_handoff: CreatorWorkOutcomeHandoff {
-                tenant_id: task.tenant_id.clone(),
-                project_id: task.project_id.clone(),
-                mission_id: task.mission_id.clone(),
-                creator_id: task.creator_id.clone(),
-                task_id: task.id.clone(),
-                contract_revision: task.contract_revision,
-                task_state_revision: task.state_revision,
-                mission_revision: mission.revision,
-                result_id: "result-storage".into(),
-                deliverable_id: DeliverableId::from("deliverable-storage"),
-                deliverable_digest: "a".repeat(64),
-                result_digest: "7".repeat(64),
-                evidence_digest: "6".repeat(64),
-                receipt_id: hartevo_domain_kernel::ReceiptId::from("receipt-storage"),
-                verification_id: hartevo_domain_kernel::VerificationId::from(
-                    "verification-storage",
-                ),
-                payout_intent_digest: "1".repeat(64),
-                outcome_key: "creator_work.result_ready".into(),
-                handoff_digest: "8".repeat(64),
-            },
+            outcome_handoff: result_outcome_handoff,
             status: CreatorWorkFulfillmentStatus::OutcomeReady,
             recorded_at: now,
         };
-        (project, mission, task, worker, fulfillment)
+        (
+            project,
+            mission,
+            task,
+            worker,
+            execution_receipt,
+            fulfillment,
+        )
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn creator_work_events_replay_after_restart_and_fence_old_generation() {
         let directory = tempfile::tempdir().expect("directory");
         let database = directory.path().join("creator-work.sqlite3");
-        let (project, mission, task, mut worker, fulfillment) = fixture(directory.path().into());
+        let (project, mission, task, mut worker, execution_receipt, fulfillment) =
+            fixture(directory.path().into());
         {
             let mut store = ProjectStore::open(&database, &DatabaseKey::new([7; 32]).expect("key"))
                 .expect("store");
@@ -1563,11 +1887,25 @@ mod tests {
                 .save_creator_work_worker_lease(&worker, now())
                 .expect("idempotent lease");
             store
+                .save_creator_work_execution_receipt(&execution_receipt, now())
+                .expect("execution receipt");
+            store
+                .save_creator_work_execution_receipt(&execution_receipt, now())
+                .expect("idempotent execution receipt");
+            store
                 .save_creator_work_fulfillment(&fulfillment, now())
                 .expect("fulfillment");
             store
                 .save_creator_work_fulfillment(&fulfillment, now())
                 .expect("idempotent fulfillment");
+            let mut tampered = fulfillment.clone();
+            tampered.result.source_commit = "f".repeat(40);
+            assert!(
+                store
+                    .save_creator_work_fulfillment(&tampered, now())
+                    .is_err(),
+                "tampered result replay must not overwrite the durable result"
+            );
         }
         {
             let mut reopened =
@@ -1583,6 +1921,31 @@ mod tests {
                 .expect("fulfillment read")
                 .expect("fulfillment");
             assert_eq!(loaded_fulfillment, fulfillment);
+            let loaded_execution = reopened
+                .load_creator_work_execution_receipt(
+                    &project.id,
+                    &mission.id,
+                    &task.id,
+                    &execution_receipt.request.request_digest(),
+                )
+                .expect("execution receipt read")
+                .expect("execution receipt");
+            assert_eq!(
+                loaded_execution.status,
+                CreatorWorkExecutionStatus::ResultRecorded
+            );
+            assert_eq!(
+                reopened
+                    .adopt_creator_work_result(
+                        &project.id,
+                        &mission.id,
+                        &task.id,
+                        &execution_receipt.request.request_digest(),
+                    )
+                    .expect("adopt result")
+                    .expect("adoptable result"),
+                fulfillment
+            );
             assert_eq!(
                 reopened
                     .creator_work_fulfillments_for_task(&project.id, &mission.id, &task.id)
@@ -1621,6 +1984,51 @@ mod tests {
                 "old worker result must be fenced by storage"
             );
             assert_eq!(current.status, CreatorWorkWorkerStatus::Active);
+
+            let next_request = CreatorWorkExecutionRequest {
+                worker: recovered.clone(),
+                requested_at: now() + Duration::seconds(2),
+                ..execution_receipt.request.clone()
+            };
+            let next_receipt = CreatorWorkExecutionReceipt::started(
+                next_request.clone(),
+                now() + Duration::seconds(2),
+            )
+            .expect("next execution receipt");
+            reopened
+                .save_creator_work_execution_receipt(&next_receipt, now() + Duration::seconds(2))
+                .expect("next execution");
+            reopened
+                .revoke_creator_work_execution(
+                    &project.id,
+                    &mission.id,
+                    &task.id,
+                    &next_request.request_digest(),
+                    now() + Duration::seconds(3),
+                )
+                .expect("revoke execution");
+            let revoked = reopened
+                .load_creator_work_execution_receipt(
+                    &project.id,
+                    &mission.id,
+                    &task.id,
+                    &next_request.request_digest(),
+                )
+                .expect("revoked receipt read")
+                .expect("revoked receipt");
+            assert_eq!(revoked.status, CreatorWorkExecutionStatus::Revoked);
+            assert!(
+                reopened
+                    .adopt_creator_work_result(
+                        &project.id,
+                        &mission.id,
+                        &task.id,
+                        &next_request.request_digest(),
+                    )
+                    .expect("revoked adoption")
+                    .is_none(),
+                "revoked execution must not become adoptable"
+            );
         }
     }
 }
