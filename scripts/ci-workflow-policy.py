@@ -357,6 +357,7 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             "pull_request:",
             "merge_group:",
             "startsWith(github.head_ref, 'merge-train/')",
+            "ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}",
             "scripts/ci-scope.py",
             "scripts/ci-merge-train.py verify-hosted",
             "repository_merge_train_full",

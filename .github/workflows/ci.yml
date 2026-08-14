@@ -61,6 +61,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          # pull_request defaults to GitHub's temporary merge ref. Scope and
+          # merge-train proof must instead bind the exact reviewed head SHA.
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
       - id: plan
         name: Plan conservative changed scope
         env:
