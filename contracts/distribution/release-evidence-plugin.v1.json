@@ -1,0 +1,103 @@
+{
+  "schemaVersion": "hartevo-distribution-release-evidence-plugin/v1",
+  "pluginId": "DIST-SBOM-TARGET-02",
+  "provider": "hartevo-distribution-verifier-provider",
+  "providerVersion": "1.0.0",
+  "consumer": "release-promotion-eval-gate",
+  "releaseDecision": "NOT_EVALUATED",
+  "release": {
+    "passed": false,
+    "deployment": false
+  },
+  "productionEvidence": {
+    "required": true,
+    "acceptedOrigin": "EXTERNAL_SIGNED",
+    "generatedOrigin": "UNSIGNED_GENERATED",
+    "fixtureOrigin": "TEST_FIXTURE_ONLY",
+    "privateSigningMaterialAllowed": false
+  },
+  "supportedTargets": [
+    {
+      "platform": "macos-aarch64",
+      "targetTriple": "aarch64-apple-darwin"
+    },
+    {
+      "platform": "macos-x86_64",
+      "targetTriple": "x86_64-apple-darwin"
+    }
+  ],
+  "sbom": {
+    "formats": [
+      "cyclonedx",
+      "spdx"
+    ],
+    "digestAlgorithm": "sha256",
+    "versionRequired": true,
+    "platformBindingRequired": true,
+    "artifactDigestBindingRequired": true,
+    "sourceCommitBindingRequired": true,
+    "lockfileDigestBindingRequired": true
+  },
+  "attestation": {
+    "predicateType": "https://slsa.dev/provenance/v1",
+    "digestAlgorithm": "sha256",
+    "versionRequired": true,
+    "platformBindingRequired": true,
+    "artifactDigestBindingRequired": true,
+    "sbomDigestBindingRequired": true,
+    "sourceCommitBindingRequired": true,
+    "toolchainDigestBindingRequired": true,
+    "buildManifestDigestBindingRequired": true
+  },
+  "provenance": {
+    "requiredBindings": [
+      "sourceCommit",
+      "cargoLockDigest",
+      "toolchainVersion",
+      "toolchainDigest",
+      "buildManifestDigest",
+      "artifactDigest",
+      "sbomDigest",
+      "attestationDigest",
+      "dependencyEvidenceDigest"
+    ],
+    "digestAlgorithm": "sha256"
+  },
+  "signature": {
+    "algorithm": "ed25519",
+    "detached": true,
+    "keyReferenceRequired": true,
+    "signatureDigestRequired": true,
+    "publicKeyInEvidence": false,
+    "privateKeyInEvidence": false,
+    "signaturePayloadDomain": "hartevo-distribution-release-evidence/v1"
+  },
+  "validity": {
+    "issuedAtRequired": true,
+    "expiresAtRequired": true,
+    "revocationStatusRequired": true,
+    "expiredDisposition": "CODE_FAILURE",
+    "revokedDisposition": "CODE_FAILURE",
+    "unknownRegistryDisposition": "BLOCKED_ENV",
+    "failClosed": true
+  },
+  "verificationReceipt": {
+    "required": true,
+    "contentFree": true,
+    "digestAlgorithm": "sha256",
+    "mustBindEvidence": true
+  },
+  "statuses": [
+    "VERIFIED",
+    "CODE_FAILURE",
+    "BLOCKED_ENV",
+    "NOT_IMPLEMENTED"
+  ],
+  "releaseGate": {
+    "releaseMustRemainFalse": true,
+    "deploymentMustRemainFalse": true,
+    "promotionRequiresVerifiedEvidence": true,
+    "promotionRequiresExternalSignedOrigin": true,
+    "consumerMustNotPromoteFixtures": true
+  }
+}
