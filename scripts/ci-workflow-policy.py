@@ -356,10 +356,14 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
         required = (
             "pull_request:",
             "merge_group:",
+            "startsWith(github.head_ref, 'merge-train/')",
+            "ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}",
             "scripts/ci-scope.py",
+            "scripts/ci-merge-train.py verify-hosted",
+            "repository_merge_train_full",
             "rust-reusable.yml",
             "run_rust: ${{ needs.scope.outputs.rust == 'true' }}",
-            "run_macos: ${{ github.event_name == 'merge_group' }}",
+            "run_macos: ${{ github.event_name == 'merge_group' || startsWith(github.head_ref, 'merge-train/') }}",
             "--planned-scope rust",
             "--planned-scope macos",
             "--planned-job-name",
@@ -403,6 +407,8 @@ def verify(root: Path) -> dict[str, object]:
     files = workflow_files(root)
     if {path.name for path in files} != {"ci.yml", "integration.yml", "release-promotion.yml", "rust-reusable.yml"}:
         raise PolicyError("workflow set must be exactly the PR, integration, release, and reusable workflows")
+    if not (root / "scripts/ci-merge-train.py").is_file():
+        raise PolicyError("repository merge-train verifier is missing")
     all_actions: list[str] = []
     names: list[str] = []
     for path in files:

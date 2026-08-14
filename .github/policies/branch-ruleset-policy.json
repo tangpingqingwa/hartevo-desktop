@@ -1,6 +1,7 @@
 {
   "schemaVersion": "hartevo-github-branch-ruleset-policy/v1",
   "repository": "tangpingqingwa/hartevo-desktop",
+  "defaultBranch": "bootstrap/macos-r0",
   "hostedEnforcement": "active",
   "observedHostedStatus": {
     "branchProtectionApi": "NOT_REQUIRED_RULESET_IS_AUTHORITATIVE",
@@ -14,7 +15,7 @@
     "localCommand": "python3 scripts/ci-branch-policy.py verify",
     "hostedCommand": "python3 scripts/ci-branch-policy.py probe --repo tangpingqingwa/hartevo-desktop",
     "applyCommand": "python3 scripts/ci-branch-policy.py apply --repo tangpingqingwa/hartevo-desktop",
-    "applySemantics": "idempotently create or update the named active ruleset; never bypass or delete it"
+    "applySemantics": "idempotently enforce the default Integration branch and protected ruleset; apply hosted merge queue only when GitHub reports an eligible Organization owner; never bypass or delete protection"
   },
   "branches": [
     {
@@ -64,13 +65,17 @@
     "reason": "PR and required checks remain mandatory, but a solo maintainer is not required to approve their own pull request."
   },
   "mergeQueue": {
-    "hostedEnforcement": "desired_active_not_yet_applied",
+    "hostedEnforcement": "blocked_owner_type",
     "observedHostedStatus": {
-      "rulesetApi": "NOT_APPLIED_AT_CHECKIN",
+      "rulesetApi": "UNAVAILABLE_PERSONAL_ACCOUNT_OWNER",
       "rulesetId": null,
       "rulesetName": "Hartevo bootstrap merge queue",
-      "verifiedAt": null
+      "ownerType": "User",
+      "requiredOwnerType": "Organization",
+      "apiError": "Invalid rule merge_queue",
+      "verifiedAt": "2026-08-14T04:27:01Z"
     },
+    "availabilityDocumentation": "https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/merging-a-pull-request-with-a-merge-queue#who-can-use-this-feature",
     "buildConcurrency": 4,
     "minimumGroupSize": 1,
     "maximumGroupSize": 4,
@@ -106,6 +111,28 @@
       ],
       "bypass_actors": []
     }
+  },
+  "repositoryMergeTrain": {
+    "enforcement": "active",
+    "reason": "GitHub hosted merge queue is unavailable to a public repository owned by a personal account.",
+    "branchPrefix": "merge-train/",
+    "manifestPath": ".github/merge-train/current.json",
+    "baseBranch": "bootstrap/macos-r0",
+    "maximumCandidateCount": 4,
+    "candidateRequirements": [
+      "open",
+      "ready",
+      "root-bootstrap-base",
+      "exact-current-head",
+      "required-checks-success"
+    ],
+    "compositeRequirements": [
+      "exact-first-parent-history",
+      "exact-reconstructed-tree",
+      "full-ubuntu-macos-matrix",
+      "normal-protected-pull-request-merge",
+      "no-bypass"
+    ]
   },
   "ruleset": {
     "name": "Hartevo protected integration branches",
