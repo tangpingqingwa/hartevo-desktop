@@ -10,7 +10,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: hartevo-pr-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
+  # A personal-account public repository cannot use GitHub's hosted merge
+  # queue. Serialize the repository-owned composite train while ordinary PRs
+  # retain independent cancellation domains.
+  group: ${{ startsWith(github.head_ref, 'merge-train/') && 'hartevo-merge-train' || format('hartevo-pr-{0}-{1}', github.workflow, github.event.pull_request.number || github.event.merge_group.head_sha || github.ref) }}
   cancel-in-progress: true
 
 env:
@@ -46,6 +49,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      pull-requests: read
     outputs:
       full: ${{ steps.plan.outputs.full }}
       rust: ${{ steps.plan.outputs.rust }}
@@ -62,6 +66,9 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          HEAD_REF: ${{ github.head_ref }}
+          IS_MERGE_TRAIN: ${{ startsWith(github.head_ref, 'merge-train/') }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p target/ci
           if [[ "$GITHUB_EVENT_NAME" == merge_group ]]; then
@@ -71,6 +78,20 @@ jobs:
             echo 'plan={"mode":"merge_group_full","full":true,"rust":true,"packages":[]}' >> "$GITHUB_OUTPUT"
             printf '%s\n' \
               '{"schema":"hartevo-ci-scope/v1","mode":"merge_group_full","full":true,"rust":true,"packages":[]}' \
+              > target/ci/scope.json
+          elif [[ "$IS_MERGE_TRAIN" == true ]]; then
+            python3 scripts/ci-merge-train.py verify-hosted \
+              --repo "$GITHUB_REPOSITORY" \
+              --manifest .github/merge-train/current.json \
+              --base "$BASE_SHA" \
+              --head "$HEAD_SHA" \
+              --branch "$HEAD_REF"
+            echo 'full=true' >> "$GITHUB_OUTPUT"
+            echo 'rust=true' >> "$GITHUB_OUTPUT"
+            echo 'packages=[]' >> "$GITHUB_OUTPUT"
+            echo 'plan={"mode":"repository_merge_train_full","full":true,"rust":true,"packages":[]}' >> "$GITHUB_OUTPUT"
+            printf '%s\n' \
+              '{"schema":"hartevo-ci-scope/v1","mode":"repository_merge_train_full","full":true,"rust":true,"packages":[]}' \
               > target/ci/scope.json
           else
             python3 scripts/ci-scope.py \
@@ -95,8 +116,8 @@ jobs:
     with:
       check_prefix: PR / Fast Rust
       run_rust: ${{ needs.scope.outputs.rust == 'true' }}
-      run_macos: ${{ github.event_name == 'merge_group' }}
-      full_workspace: ${{ github.event_name == 'merge_group' || needs.scope.outputs.full == 'true' }}
+      run_macos: ${{ github.event_name == 'merge_group' || startsWith(github.head_ref, 'merge-train/') }}
+      full_workspace: ${{ github.event_name == 'merge_group' || startsWith(github.head_ref, 'merge-train/') || needs.scope.outputs.full == 'true' }}
       rust_packages: ${{ needs.scope.outputs.packages }}
     permissions:
       contents: read
@@ -130,7 +151,7 @@ jobs:
       - name: Classify job outcomes
         env:
           RUST_SCOPE: ${{ needs.scope.outputs.rust }}
-          RUN_MACOS: ${{ github.event_name == 'merge_group' }}
+          RUN_MACOS: ${{ github.event_name == 'merge_group' || startsWith(github.head_ref, 'merge-train/') }}
         run: |
           mkdir -p target/ci
           planned=()

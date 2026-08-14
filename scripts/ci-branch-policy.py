@@ -21,8 +21,12 @@ POLICY = Path(".github/policies/branch-ruleset-policy.json")
 REQUIRED_BRANCHES = {"main", "bootstrap/macos-r0"}
 UNAPPLIED = "desired_active_not_yet_applied"
 ACTIVE = "active"
+BLOCKED_OWNER = "blocked_owner_type"
+DEFAULT_BRANCH = "bootstrap/macos-r0"
 RULESET_NAME = "Hartevo protected integration branches"
 MERGE_QUEUE_RULESET_NAME = "Hartevo bootstrap merge queue"
+MERGE_TRAIN_BRANCH_PREFIX = "merge-train/"
+MERGE_TRAIN_MANIFEST = ".github/merge-train/current.json"
 GITHUB_ACTIONS_INTEGRATION_ID = 15368
 EXPECTED_STATUS_CHECKS = (
     "PR / Workflow policy",
@@ -157,6 +161,8 @@ def verify(path: Path = POLICY) -> dict[str, object]:
         raise ValueError("branch policy schema drift")
     if policy.get("repository") != "tangpingqingwa/hartevo-desktop":
         raise ValueError("branch policy repository drift")
+    if policy.get("defaultBranch") != DEFAULT_BRANCH:
+        raise ValueError("bootstrap/macos-r0 must remain the repository default branch")
     hosted_enforcement = policy.get("hostedEnforcement")
     if hosted_enforcement not in {UNAPPLIED, ACTIVE}:
         raise ValueError("hosted enforcement must be desired-active or active")
@@ -187,19 +193,57 @@ def verify(path: Path = POLICY) -> dict[str, object]:
     if not isinstance(merge_queue, dict):
         raise ValueError("merge queue policy must be an object")
     merge_queue_enforcement = merge_queue.get("hostedEnforcement")
-    if merge_queue_enforcement not in {UNAPPLIED, ACTIVE}:
-        raise ValueError("merge queue hosted enforcement must be desired-active or active")
+    if merge_queue_enforcement not in {UNAPPLIED, ACTIVE, BLOCKED_OWNER}:
+        raise ValueError("merge queue hosted enforcement must be desired-active, active, or owner-blocked")
     merge_queue_observed = merge_queue.get("observedHostedStatus")
     if not isinstance(merge_queue_observed, dict):
         raise ValueError("merge queue hosted observation must be recorded")
     if merge_queue_enforcement == ACTIVE:
         if merge_queue_observed.get("rulesetApi") != "ACTIVE" or not isinstance(merge_queue_observed.get("rulesetId"), int) or merge_queue_observed.get("rulesetId", 0) <= 0:
             raise ValueError("active merge queue policy must record a verified hosted ruleset id")
-    elif merge_queue_observed.get("rulesetApi") != "NOT_APPLIED_AT_CHECKIN":
+    elif merge_queue_enforcement == UNAPPLIED and merge_queue_observed.get("rulesetApi") != "NOT_APPLIED_AT_CHECKIN":
         raise ValueError("unapplied merge queue policy must record that hosted application is pending")
+    elif merge_queue_enforcement == BLOCKED_OWNER:
+        if (
+            merge_queue_observed.get("rulesetApi") != "UNAVAILABLE_PERSONAL_ACCOUNT_OWNER"
+            or merge_queue_observed.get("rulesetId") is not None
+            or merge_queue_observed.get("ownerType") != "User"
+            or merge_queue_observed.get("requiredOwnerType") != "Organization"
+        ):
+            raise ValueError("owner-blocked merge queue must record GitHub's personal-account limitation")
     merge_queue_ruleset = merge_queue.get("ruleset")
     if not isinstance(merge_queue_ruleset, dict) or merge_queue_ruleset != desired_merge_queue_ruleset(policy):
         raise ValueError("checked-in merge queue ruleset payload drifted from the throughput policy")
+    merge_train = policy.get("repositoryMergeTrain")
+    if not isinstance(merge_train, dict):
+        raise ValueError("repository merge-train fallback is missing")
+    expected_train = {
+        "enforcement": "active",
+        "branchPrefix": MERGE_TRAIN_BRANCH_PREFIX,
+        "manifestPath": MERGE_TRAIN_MANIFEST,
+        "baseBranch": DEFAULT_BRANCH,
+        "maximumCandidateCount": 4,
+    }
+    if any(merge_train.get(key) != value for key, value in expected_train.items()):
+        raise ValueError("repository merge-train fallback drifted")
+    candidate_requirements = merge_train.get("candidateRequirements")
+    composite_requirements = merge_train.get("compositeRequirements")
+    if not isinstance(candidate_requirements, list) or set(candidate_requirements) != {
+        "open",
+        "ready",
+        "root-bootstrap-base",
+        "exact-current-head",
+        "required-checks-success",
+    }:
+        raise ValueError("repository merge-train candidate requirements drifted")
+    if not isinstance(composite_requirements, list) or set(composite_requirements) != {
+        "exact-first-parent-history",
+        "exact-reconstructed-tree",
+        "full-ubuntu-macos-matrix",
+        "normal-protected-pull-request-merge",
+        "no-bypass",
+    }:
+        raise ValueError("repository merge-train composite requirements drifted")
     release = policy.get("releaseEnvironment")
     if not isinstance(release, dict) or release.get("name") != "release-promotion" or release.get("oidcOnly") is not True or release.get("longLivedCredentialsAllowed") is not False or release.get("releaseEnabledInThisPr") is not False:
         raise ValueError("release environment must be OIDC-only and disabled in this PR")
@@ -207,12 +251,20 @@ def verify(path: Path = POLICY) -> dict[str, object]:
         "schema": "hartevo-ci-branch-policy/v1",
         "status": "VERIFIED",
         "hostedEnforcement": "ACTIVE" if hosted_enforcement == ACTIVE else "DESIRED_ACTIVE",
+        "defaultBranch": DEFAULT_BRANCH,
         "branches": sorted(REQUIRED_BRANCHES),
         "requiredChecks": list(EXPECTED_STATUS_CHECKS),
         "mergeQueue": {
-            "hostedEnforcement": "ACTIVE" if merge_queue_enforcement == ACTIVE else "DESIRED_ACTIVE",
+            "hostedEnforcement": (
+                "ACTIVE"
+                if merge_queue_enforcement == ACTIVE
+                else "BLOCKED_ENV"
+                if merge_queue_enforcement == BLOCKED_OWNER
+                else "DESIRED_ACTIVE"
+            ),
             "buildConcurrency": 4,
             "maximumGroupSize": 4,
+            "fallback": "ACTIVE_REPOSITORY_MERGE_TRAIN",
         },
         "releaseEnabled": False,
     }
@@ -288,23 +340,48 @@ def ruleset_matches(actual: object, desired: dict[str, object]) -> bool:
     return {item.get("context") for item in actual_checks if isinstance(item, dict)} == {item.get("context") for item in desired_checks if isinstance(item, dict)}
 
 
+def hosted_repository(repo: str) -> dict[str, object]:
+    response = gh_api(f"repos/{repo}")
+    if not isinstance(response, dict):
+        raise ValueError("GitHub repository response must be an object")
+    owner = response.get("owner")
+    if not isinstance(owner, dict) or owner.get("type") not in {"User", "Organization"}:
+        raise ValueError("GitHub repository owner type is unavailable")
+    if not isinstance(response.get("default_branch"), str):
+        raise ValueError("GitHub repository default branch is unavailable")
+    return response
+
+
 def probe(repo: str) -> int:
     local = verify()
     policy = load()
     try:
+        repository = hosted_repository(repo)
         response = gh_api(f"repos/{repo}/rulesets?per_page=100")
     except ValueError as error:
         message = str(error)
         status = "BLOCKED_ENV" if "403" in message or "forbidden" in message.lower() else "FAIL"
         print(json.dumps({**local, "status": status, "code": "HOSTED_RULESET_API_UNAVAILABLE", "message": message}, sort_keys=True))
         return 2 if status == "BLOCKED_ENV" else 1
+    if repository.get("default_branch") != DEFAULT_BRANCH:
+        print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_DEFAULT_BRANCH_MISMATCH", "observedDefaultBranch": repository.get("default_branch")}, sort_keys=True))
+        return 1
     if not isinstance(response, list):
         print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_LIST_INVALID"}, sort_keys=True))
         return 1
+    owner = repository.get("owner")
+    assert isinstance(owner, dict)
+    owner_type = owner.get("type")
     protected = policy.get("ruleset")
     merge_queue = policy.get("mergeQueue")
     queue_desired = merge_queue.get("ruleset") if isinstance(merge_queue, dict) else None
-    desired_rulesets = [protected, queue_desired]
+    merge_queue_enforcement = merge_queue.get("hostedEnforcement") if isinstance(merge_queue, dict) else None
+    if merge_queue_enforcement == BLOCKED_OWNER and owner_type != "User":
+        print(json.dumps({**local, "status": "FAIL", "code": "MERGE_QUEUE_OWNER_POLICY_STALE", "observedOwnerType": owner_type}, sort_keys=True))
+        return 1
+    desired_rulesets = [protected]
+    if merge_queue_enforcement != BLOCKED_OWNER:
+        desired_rulesets.append(queue_desired)
     observed_rulesets: list[dict[str, object]] = []
     pending: list[str] = []
     for desired in desired_rulesets:
@@ -312,7 +389,7 @@ def probe(repo: str) -> int:
             print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_PAYLOAD_MISSING"}, sort_keys=True))
             return 1
         named = [item for item in response if isinstance(item, dict) and item.get("name") == desired["name"]]
-        if not named and desired["name"] == MERGE_QUEUE_RULESET_NAME and isinstance(merge_queue, dict) and merge_queue.get("hostedEnforcement") == UNAPPLIED:
+        if not named and desired["name"] == MERGE_QUEUE_RULESET_NAME and merge_queue_enforcement == UNAPPLIED:
             pending.append(str(desired["name"]))
             continue
         if len(named) != 1:
@@ -333,6 +410,13 @@ def probe(repo: str) -> int:
             print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_MISMATCH", "hostedRuleset": observed}, sort_keys=True))
             return 1
         observed_rulesets.append({"id": observed.get("id"), "name": observed.get("name"), "enforcement": observed.get("enforcement")})
+    if merge_queue_enforcement == BLOCKED_OWNER:
+        hosted_queue = [item for item in response if isinstance(item, dict) and item.get("name") == MERGE_QUEUE_RULESET_NAME]
+        if hosted_queue:
+            print(json.dumps({**local, "status": "FAIL", "code": "UNEXPECTED_HOSTED_MERGE_QUEUE_RULESET", "hostedQueueRulesets": len(hosted_queue)}, sort_keys=True))
+            return 1
+        print(json.dumps({**local, "status": "VERIFIED", "code": "HOSTED_MERGE_QUEUE_BLOCKED_FALLBACK_ACTIVE", "observedOwnerType": owner_type, "hostedRulesets": observed_rulesets, "repositoryMergeTrain": "ACTIVE"}, sort_keys=True))
+        return 0
     if pending:
         print(json.dumps({**local, "status": "DESIRED_ACTIVE", "code": "HOSTED_MERGE_QUEUE_NOT_APPLIED", "pendingRulesets": pending, "hostedRulesets": observed_rulesets}, sort_keys=True))
         return 2
@@ -343,10 +427,25 @@ def probe(repo: str) -> int:
 def apply(repo: str) -> int:
     policy = load()
     local = verify()
+    repository = hosted_repository(repo)
+    owner = repository.get("owner")
+    assert isinstance(owner, dict)
+    owner_type = owner.get("type")
+    if repository.get("default_branch") != DEFAULT_BRANCH:
+        repository = gh_api(f"repos/{repo}", "PATCH", {"default_branch": DEFAULT_BRANCH})
+        if not isinstance(repository, dict) or repository.get("default_branch") != DEFAULT_BRANCH:
+            raise ValueError("failed to enforce bootstrap/macos-r0 as the repository default branch")
     protected = policy.get("ruleset")
     merge_queue = policy.get("mergeQueue")
     queue_desired = merge_queue.get("ruleset") if isinstance(merge_queue, dict) else None
-    desired_rulesets = [protected, queue_desired]
+    merge_queue_enforcement = merge_queue.get("hostedEnforcement") if isinstance(merge_queue, dict) else None
+    if merge_queue_enforcement == BLOCKED_OWNER and owner_type != "User":
+        raise ValueError("owner-blocked merge queue policy is stale for a non-User repository owner")
+    if merge_queue_enforcement != BLOCKED_OWNER and owner_type != "Organization":
+        raise ValueError("GitHub hosted merge queue requires an Organization-owned repository")
+    desired_rulesets = [protected]
+    if merge_queue_enforcement != BLOCKED_OWNER:
+        desired_rulesets.append(queue_desired)
     if not all(isinstance(desired, dict) for desired in desired_rulesets):
         raise ValueError("protected or merge queue ruleset payload is missing")
     response = gh_api(f"repos/{repo}/rulesets?per_page=100")
@@ -370,7 +469,7 @@ def apply(repo: str) -> int:
         if not isinstance(applied, dict) or not isinstance(applied.get("id"), int):
             raise ValueError("GitHub ruleset apply response has no numeric id")
         operations.append({"operation": operation, "rulesetId": applied["id"], "rulesetName": applied.get("name")})
-    print(json.dumps({**local, "status": "APPLIED", "operations": operations}, sort_keys=True))
+    print(json.dumps({**local, "status": "APPLIED", "operations": operations, "observedOwnerType": owner_type, "nativeMergeQueue": "BLOCKED_ENV" if merge_queue_enforcement == BLOCKED_OWNER else "ACTIVE", "repositoryMergeTrain": "ACTIVE"}, sort_keys=True))
     return 0
 
 
@@ -408,6 +507,22 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("self-test accepted an unclaimed merge queue enforcement state")
+    mutated = json.loads(json.dumps(policy))
+    mutated["repositoryMergeTrain"]["maximumCandidateCount"] = 5
+    try:
+        verify_policy_value(mutated)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("self-test accepted a repository merge train above four candidates")
+    mutated = json.loads(json.dumps(policy))
+    mutated["defaultBranch"] = "main"
+    try:
+        verify_policy_value(mutated)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("self-test accepted main as the default development branch")
     print(json.dumps({"schema": "hartevo-ci-branch-policy-self-test/v1", "status": "PASS"}, sort_keys=True))
 
 
