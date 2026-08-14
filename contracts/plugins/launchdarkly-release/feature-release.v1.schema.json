@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo://contracts/plugins/launchdarkly-release/feature-release.v1.schema.json",
+  "title": "Hartevo LaunchDarkly Layer 1 feature-release contract",
+  "description": "Read, semantic-patch proposal, approval/audit evidence, and recording-only result seam. It never grants write, Connected, native, first-party, Effect, Receipt, Verification, Truth, Consent, or Outcome authority.",
+  "type": "object",
+  "required": ["schemaVersion", "capability", "scope", "registration", "evidence", "boundaries"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": "hartevo.launchdarkly-release/v1" },
+    "capability": {
+      "type": "object",
+      "required": ["serviceId", "providerId", "consumerId", "operations", "mode"],
+      "additionalProperties": false,
+      "properties": {
+        "serviceId": { "const": "feature-release" },
+        "providerId": { "const": "launchdarkly-release" },
+        "consumerId": { "const": "mission-feature-release" },
+        "mode": { "const": "read_proposal_record" },
+        "operations": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "describe_release",
+              "read_flag_evidence",
+              "compile_release_proposal",
+              "record_release_receipt",
+              "verify_release_result"
+            ]
+          },
+          "minItems": 5,
+          "maxItems": 5,
+          "uniqueItems": true
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "required": [
+        "accountId",
+        "baseUrl",
+        "projectKey",
+        "environmentKey",
+        "flagKey",
+        "flagVersion",
+        "allowedVariationPaths",
+        "allowedTargetingPaths",
+        "approvalPolicy",
+        "missionId",
+        "projectId",
+        "workProductId",
+        "consentRevision",
+        "policyRevision",
+        "scopeDigest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "accountId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "baseUrl": { "type": "string", "format": "uri", "maxLength": 512 },
+        "projectKey": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "environmentKey": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "environmentId": { "type": ["string", "null"], "maxLength": 128 },
+        "flagKey": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "flagVersion": { "type": "integer", "minimum": 1 },
+        "allowedVariationPaths": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^/", "maxLength": 256 },
+          "uniqueItems": true
+        },
+        "allowedTargetingPaths": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^/", "maxLength": 256 },
+          "uniqueItems": true
+        },
+        "approvalPolicy": {
+          "type": "object",
+          "required": ["policyId", "revision", "required"],
+          "additionalProperties": false,
+          "properties": {
+            "policyId": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "revision": { "type": "integer", "minimum": 1 },
+            "required": { "type": "boolean" }
+          }
+        },
+        "missionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "projectId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "workProductId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "consentRevision": { "type": "integer", "minimum": 1 },
+        "policyRevision": { "type": "integer", "minimum": 1 },
+        "scopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "registration": {
+      "type": "object",
+      "required": [
+        "pluginId",
+        "pluginVersion",
+        "contractDigest",
+        "adapterRevision",
+        "apiRevision",
+        "permissionSnapshotDigest",
+        "scopeDigest",
+        "registrationDigest",
+        "lifecycle"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "pluginId": { "const": "launchdarkly-release" },
+        "pluginVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "contractDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "adapterRevision": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "apiRevision": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "permissionSnapshotDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "approvalPolicyRevision": { "type": "integer", "minimum": 1 },
+        "scopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "registrationDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "lifecycle": { "enum": ["active", "revoked", "unregistered"] },
+        "secretMaterial": { "const": "opaque_reference_only" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["flag", "approval", "audit", "claims"],
+      "additionalProperties": false,
+      "properties": {
+        "flag": {
+          "type": "object",
+          "required": ["projectKey", "environmentKey", "flagKey", "version", "variationDigest", "targetingDigest", "semanticDigest"],
+          "additionalProperties": false,
+          "properties": {
+            "projectKey": { "type": "string" },
+            "environmentKey": { "type": "string" },
+            "flagKey": { "type": "string" },
+            "version": { "type": "integer", "minimum": 1 },
+            "variationDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "targetingDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "semanticDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        },
+        "approval": { "type": "array", "maxItems": 8 },
+        "audit": { "type": "array", "maxItems": 16 },
+        "claims": {
+          "type": "object",
+          "required": ["connected", "native", "firstParty", "writeEffect", "outcomeAuthority"],
+          "additionalProperties": false,
+          "properties": {
+            "connected": { "const": false },
+            "native": { "const": false },
+            "firstParty": { "const": false },
+            "writeEffect": { "const": false },
+            "outcomeAuthority": { "const": false }
+          }
+        }
+      }
+    },
+    "boundaries": {
+      "type": "object",
+      "required": ["forbiddenOperations", "forbiddenAuthorities", "blockedEnvironmentStatus"],
+      "additionalProperties": false,
+      "properties": {
+        "forbiddenOperations": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 10
+        },
+        "forbiddenAuthorities": {
+          "type": "array",
+          "items": { "enum": ["Truth", "Consent", "Effect", "Receipt", "Verification", "Outcome"] },
+          "minItems": 6,
+          "uniqueItems": true
+        },
+        "blockedEnvironmentStatus": { "const": "BLOCKED_ENV" },
+        "auditDescription": { "const": "digest_only_bounded" },
+        "targeting": { "const": "digest_only_no_context_attributes" },
+        "secretMaterial": { "const": "never_serialized" }
+      }
+    }
+  }
+}
