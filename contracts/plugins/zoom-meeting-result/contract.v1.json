@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo://contracts/plugins/zoom-meeting-result/contract.v1",
+  "schema": "hartevo.zoom-meeting-result/contract",
+  "contractVersion": "1.0.0",
+  "pluginId": "hartevo.zoom-meeting-result",
+  "service": {
+    "id": "zoom.meeting-result.service",
+    "operations": [
+      "describe_capabilities",
+      "probe_meeting_occurrence",
+      "list_decision_artifacts",
+      "compile_adoption_proposal",
+      "verify_artifact_projection"
+    ]
+  },
+  "provider": {
+    "id": "zoom.meeting-result.provider",
+    "modes": ["recording", "fake", "blocked_env"],
+    "lifecycle": ["active", "revoked"],
+    "provenance": {
+      "recording": "controlled_recording",
+      "fake": "fixture",
+      "blocked_env": "blocked_environment"
+    }
+  },
+  "oauthCapabilities": {
+    "requirements": [
+      {
+        "capabilityId": "meeting_occurrence_metadata.read",
+        "allowedZoomScopes": ["meeting:read", "meeting:read:admin"],
+        "readOnly": true,
+        "contentBytesRequested": false
+      },
+      {
+        "capabilityId": "cloud_recording_metadata.read",
+        "allowedZoomScopes": ["recording:read", "recording:read:admin"],
+        "readOnly": true,
+        "contentBytesRequested": false
+      },
+      {
+        "capabilityId": "transcript_metadata.read",
+        "allowedZoomScopes": ["recording:read", "recording:read:admin"],
+        "readOnly": true,
+        "contentBytesRequested": false
+      },
+      {
+        "capabilityId": "meeting_summary_metadata.read",
+        "allowedZoomScopes": ["meeting_summary:read", "meeting_summary:read:admin"],
+        "readOnly": true,
+        "contentBytesRequested": false
+      }
+    ],
+    "writeScopesRequested": [],
+    "contentScopesRequested": []
+  },
+  "consumer": {
+    "id": "mission.zoom-meeting-result.consumer",
+    "scope": "mission_project_consent_bound",
+    "mutates_external_state": false,
+    "adopts_work_product": false
+  },
+  "scope": {
+    "required": [
+      "account_id",
+      "user_id",
+      "host_id",
+      "meeting_id",
+      "occurrence_uuid",
+      "selected_recording_file_ids",
+      "selected_transcript_file_ids",
+      "project_id",
+      "mission_id",
+      "mission_revision",
+      "consent_reference"
+    ],
+    "meeting_id_and_occurrence_uuid_are_distinct": true,
+    "scope_digest_algorithm": "sha256(canonical-json)"
+  },
+  "credential_boundary": {
+    "type": "oauth_secret_reference",
+    "reference_only": true,
+    "token_serialized": false,
+    "token_logged": false,
+    "signed_download_url_serialized": false,
+    "transcript_serialized": false,
+    "participant_pii_serialized": false,
+    "media_bytes_serialized": false
+  },
+  "projection": {
+    "bounded": true,
+    "metadata_fields": [
+      "file_id",
+      "file_type",
+      "recording_type",
+      "status",
+      "start_at_millis",
+      "end_at_millis",
+      "size_bytes",
+      "provider_updated_at_millis",
+      "retention_state",
+      "auto_delete_at_millis",
+      "download_url_expires_at_millis",
+      "metadata_fingerprint"
+    ],
+    "content_bytes_read": false,
+    "content_byte_verification": "not_performed"
+  },
+  "truthful_states": [
+    "available",
+    "processing",
+    "partial",
+    "deleted",
+    "retention_expired",
+    "permission_denied",
+    "not_found",
+    "rate_limited",
+    "cursor_expired",
+    "occurrence_ambiguous",
+    "url_expired",
+    "blocked_env"
+  ],
+  "registration": {
+    "version_bound": true,
+    "contract_digest_bound": true,
+    "provider_revision_bound": true,
+    "scope_bound": true,
+    "reversible": true,
+    "revocable": true,
+    "fail_closed_on_consent_permission_retention_or_resource_drift": true
+  },
+  "forbidden_layer_1_effects": [
+    "schedule_meeting",
+    "update_meeting",
+    "start_meeting",
+    "join_meeting",
+    "delete_meeting",
+    "download_recording_bytes",
+    "download_transcript_bytes",
+    "invoke_live_webhook",
+    "change_retention",
+    "expose_participant_pii",
+    "adopt_work_product"
+  ]
+}
