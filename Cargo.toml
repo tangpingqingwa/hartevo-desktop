@@ -11,6 +11,7 @@ members = [
   "hartevo-rs/desktop",
   "hartevo-rs/domain-kernel",
   "hartevo-rs/effect-broker",
+  "hartevo-rs/growth-signals",
   "hartevo-rs/eval",
   "hartevo-rs/runtime-adapter",
   "hartevo-rs/mission-scheduler",
