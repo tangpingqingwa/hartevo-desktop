@@ -1,0 +1,106 @@
+{
+  "schemaVersion": "hartevo-mongodb-atlas-backup-result-contract/v1",
+  "contractVersion": "mongodb-atlas-backup-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "mongodb.atlas.backup-result",
+    "type": "MongoDbAtlasBackupResultService",
+    "readOnly": true,
+    "liveExecution": false,
+    "atlasApi": "Atlas Admin API v2",
+    "operations": [
+      {
+        "id": "list-backup-snapshots",
+        "method": "GET",
+        "path": "/api/atlas/v2/groups/{groupId}/clusters/{clusterName}/backup/snapshots"
+      },
+      {
+        "id": "get-process-measurements",
+        "method": "GET",
+        "path": "/api/atlas/v2/groups/{groupId}/processes/{processId}/measurements"
+      },
+      {
+        "id": "get-cluster-metadata",
+        "method": "GET",
+        "path": "/api/atlas/v2/groups/{groupId}/clusters/{clusterName}"
+      }
+    ]
+  },
+  "provider": {
+    "id": "mongodb-atlas.backup-health.v2",
+    "type": "MongoDbAtlasProvider",
+    "version": "2.0.0",
+    "native": false,
+    "connected": false,
+    "transports": ["recording", "fixture", "loopback", "BLOCKED_ENV"]
+  },
+  "consumer": {
+    "id": "mission.mongodb-atlas.backup-result.consumer",
+    "type": "MissionMongoDbAtlasConsumer",
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "capabilities": [
+    "mongodb.atlas.backup-snapshot.read",
+    "mongodb.atlas.process-measurement.read",
+    "mongodb.atlas.cluster-metadata.read"
+  ],
+  "scope": {
+    "required": ["organization", "project", "cluster", "process", "mission", "projectRevision", "consent"],
+    "databaseDocuments": false,
+    "hostNamesInEvidence": false,
+    "boundedSnapshotPages": 8,
+    "boundedMeasurementWindow": "P7D"
+  },
+  "registration": {
+    "boundFields": ["serviceVersion", "contractVersion", "providerId", "providerVersion", "providerDigest", "capabilityDigest", "organizationId", "projectId", "clusterName", "processDigest", "scopeDigest", "consentDigest", "registrationRevision", "missionRevision", "projectRevision"],
+    "reversible": true,
+    "revocable": true,
+    "staleEvidenceRejected": true,
+    "tamperedEvidenceRejected": true
+  },
+  "secretReference": {
+    "type": "opaque",
+    "serializable": false,
+    "debugRedacted": true,
+    "nativeCredentialResolution": false
+  },
+  "consent": {
+    "required": true,
+    "capabilityScoped": true,
+    "revocable": true,
+    "nativeCredentialResolution": false
+  },
+  "effect": {
+    "layer1": "read-only-proposal-recording",
+    "allowed": ["typed-read-request-proposal", "redacted-request-receipt", "redacted-result-receipt"],
+    "denied": ["create-snapshot", "delete-snapshot", "restore-cluster", "mutate-atlas", "query-database", "read-database-documents"],
+    "effectAuthority": "layer2-required"
+  },
+  "receipt": {
+    "requestAndResult": true,
+    "redacted": true,
+    "durableNativeReceipt": false,
+    "readBack": "layer2-required"
+  },
+  "states": ["queued", "in_progress", "completed", "expired", "failed", "partial", "retention_gap", "access_loss", "provider_unknown"],
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "durableReceipt": false,
+    "restoreAuthority": false,
+    "rpoRtoCompliance": false,
+    "blockedEnvironmentIsNative": false,
+    "fixtureIsConnected": false,
+    "loopbackIsNative": false
+  },
+  "honestyBoundary": [
+    "snapshot existence is not restore success",
+    "Layer 1 does not resolve native credentials",
+    "Layer 1 does not create, delete, or restore snapshots or clusters",
+    "Layer 1 does not read database documents or execute database queries",
+    "Layer 1 does not claim RPO/RTO compliance",
+    "Layer 1 does not adopt a Hartevo Outcome"
+  ]
+}
