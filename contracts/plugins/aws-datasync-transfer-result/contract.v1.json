@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/aws-datasync-transfer-result/contract.v1.json",
+  "schemaVersion": "hartevo.aws-datasync-transfer-result/v1",
+  "contractVersion": "EXT-AWS-DATASYNC-01-L1/v1",
+  "pluginId": "aws.datasync.transfer-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.aws-datasync-transfer-result/v1|layer=1|service=aws.datasync.transfer-result.read|provider=aws.datasync.transfer-result.recording|consumer=mission.aws-datasync-transfer-result.consumer",
+  "contractDigest": "ceabc8364a08fc80bc121ce235d726d9c477b33db8283e9dd36a7c76a0909a10",
+  "service": {
+    "id": "aws.datasync.transfer-result.read",
+    "version": "1.0.0",
+    "operations": [
+      "DescribeTask",
+      "DescribeTaskExecution",
+      "ListTasks",
+      "ListTaskExecutions",
+      "proposal",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "externalWrites": false,
+    "mutations": []
+  },
+  "provider": {
+    "id": "aws.datasync.transfer-result.recording",
+    "apiRevision": "datasync-describe-task-describe-task-execution-list-tasks-list-task-executions-1",
+    "operations": [
+      "datasync:DescribeTask",
+      "datasync:DescribeTaskExecution",
+      "datasync:ListTasks",
+      "datasync:ListTaskExecutions"
+    ],
+    "acceptedProvenance": ["recording", "fixture", "loopback", "blocked_env"],
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "durableProviderReceipt": false
+  },
+  "consumer": {
+    "id": "mission.aws-datasync-transfer-result.consumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "account",
+      "region",
+      "task",
+      "sourceLocation",
+      "destinationLocation",
+      "mission",
+      "project",
+      "workProduct"
+    ],
+    "secret": "opaque_non_serializing_sigv4_reference",
+    "fences": [
+      "accountDigest",
+      "regionDigest",
+      "taskDigest",
+      "sourceLocationDigest",
+      "destinationLocationDigest",
+      "executionDigest",
+      "missionDigest",
+      "projectDigest",
+      "workProductDigest"
+    ]
+  },
+  "evidence": {
+    "states": [
+      "QUEUED",
+      "LAUNCHING",
+      "PREPARING",
+      "TRANSFERRING",
+      "VERIFYING",
+      "SUCCESS",
+      "ERROR",
+      "CANCELLING"
+    ],
+    "boundedCounters": true,
+    "transferReport": "digest_only",
+    "rawPaths": false,
+    "rawObjectNames": false,
+    "rawReports": false,
+    "rawLogs": false,
+    "pii": false
+  },
+  "pagination": {
+    "opaqueCursor": true,
+    "maxPageSize": 100,
+    "maxPages": 4,
+    "rawTokenRetained": false
+  },
+  "receipts": {
+    "requestDigest": true,
+    "responseDigest": true,
+    "pathDigest": true,
+    "status": true,
+    "responseBytes": true,
+    "providerRevision": true,
+    "rawPayload": false,
+    "rawReport": false,
+    "rawLogs": false,
+    "credentialMaterial": false
+  },
+  "registration": {
+    "providerApiContractVersionBound": true,
+    "permissionBound": true,
+    "scopeBound": true,
+    "taskBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "durableReceipt": false,
+    "destinationReadback": false,
+    "consentedTransferEffect": false,
+    "adoptedOutcome": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "native_sigv4_credential_resolution",
+    "native_https_transport",
+    "durable_provider_receipt",
+    "independent_destination_readback",
+    "consented_transfer_effects",
+    "byte_level_destination_correctness",
+    "kernel_outcome_adoption",
+    "raw_reports_and_cloudwatch_logs"
+  ]
+}
