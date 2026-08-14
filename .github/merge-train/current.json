@@ -1,34 +1,16 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "dd8ab55c99b93481e1a63e58dd788b37eeadda5a",
-  "candidateCount": 4,
+  "baseCommit": "edbf24666c8eed40bffc7e3736dad36342643643",
+  "candidateCount": 1,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-datadog-slo-outcome-01",
-      "headCommit": "2d95a9dc24284a8006dd8f70223a056e5d8ba705",
-      "number": 358
-    },
-    {
-      "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-bigquery-outcome-01",
-      "headCommit": "24025dd23c9a70e2bfd68e99838a63df657347d0",
-      "number": 359
-    },
-    {
-      "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-azure-devops-work-01",
-      "headCommit": "653979735d779cda2987b3f15eaffdcb09149e12",
-      "number": 360
-    },
-    {
-      "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-hf-01-huggingface-inference",
-      "headCommit": "4d88199291486acd7397f695c04c6fb19fb4ce1d",
-      "number": 361
+      "headBranch": "codex/ci-runtime-adapter-etxtbsy-fix",
+      "headCommit": "feb9c5c2d9ef02a24ea32eb8631bca5b9d4b3a0f",
+      "number": 394
     }
   ],
-  "createdAt": "2026-08-14T12:52:30Z",
+  "createdAt": "2026-08-14T13:51:55Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +21,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260814-2050"
+  "trainBranch": "merge-train/20260814-1351"
 }
