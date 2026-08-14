@@ -1,4 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::{self, JoinHandle};
+use std::time::Duration as StdDuration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -41,6 +49,242 @@ impl ShopifyAdminTransport for FakeShopifyTransport {
             .pop_front()
             .ok_or_else(|| ShopifyTransportError::Failed("fixture response exhausted".into()))
     }
+}
+
+#[derive(Debug)]
+struct LoopbackHttpServer {
+    address: SocketAddr,
+    requests: Arc<Mutex<Vec<(String, Value)>>>,
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl LoopbackHttpServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking loopback listener");
+        let address = listener.local_addr().expect("loopback address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests_for_thread = Arc::clone(&requests);
+        let stop_for_thread = Arc::clone(&stop);
+        let join = thread::spawn(move || {
+            while !stop_for_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        if let Ok((request_line, body)) = read_http_request(&mut stream)
+                            && let Ok(body) = serde_json::from_str::<Value>(&body)
+                        {
+                            requests_for_thread
+                                .lock()
+                                .expect("loopback request state")
+                                .push((request_line, body.clone()));
+                            let response = loopback_read_response(&body);
+                            let _ = write_http_response(&mut stream, &response);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(StdDuration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            address,
+            requests,
+            stop,
+            join: Some(join),
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn requests(&self) -> Vec<(String, Value)> {
+        self.requests
+            .lock()
+            .expect("loopback request state")
+            .clone()
+    }
+}
+
+impl Drop for LoopbackHttpServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.address);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LoopbackShopifyTransport {
+    address: SocketAddr,
+}
+
+impl LoopbackShopifyTransport {
+    fn new(address: SocketAddr) -> Self {
+        Self { address }
+    }
+}
+
+impl ShopifyAdminTransport for LoopbackShopifyTransport {
+    fn execute(
+        &mut self,
+        request: ShopifyGraphqlRequest,
+    ) -> Result<ShopifyGraphqlResponse, ShopifyTransportError> {
+        let payload = request.json_body().to_string();
+        let path = format!("/admin/api/{}/graphql.json", request.api_version.as_str());
+        let http_request = format!(
+            "POST {path} HTTP/1.1\r\nHost: loopback.shopify.test\r\nContent-Type: application/json\r\nX-Shopify-Access-Token: loopback-test-only\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        let mut stream = TcpStream::connect(self.address)
+            .map_err(|error| ShopifyTransportError::Failed(error.to_string()))?;
+        stream
+            .set_read_timeout(Some(StdDuration::from_secs(1)))
+            .map_err(|error| ShopifyTransportError::Failed(error.to_string()))?;
+        stream
+            .set_write_timeout(Some(StdDuration::from_secs(1)))
+            .map_err(|error| ShopifyTransportError::Failed(error.to_string()))?;
+        stream
+            .write_all(http_request.as_bytes())
+            .map_err(|error| ShopifyTransportError::Failed(error.to_string()))?;
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .map_err(|error| ShopifyTransportError::Failed(error.to_string()))?;
+        let separator = find_subsequence(&response, b"\r\n\r\n").ok_or_else(|| {
+            ShopifyTransportError::Failed("missing loopback HTTP response body".into())
+        })?;
+        let body = serde_json::from_slice(&response[separator + 4..])
+            .map_err(|error| ShopifyTransportError::Failed(error.to_string()))?;
+        Ok(ShopifyGraphqlResponse {
+            status: 200,
+            body,
+            headers: BTreeMap::new(),
+        })
+    }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> std::io::Result<(String, String)> {
+    stream.set_read_timeout(Some(StdDuration::from_secs(1)))?;
+    let mut bytes = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 2048];
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if let Some(header_end) = find_subsequence(&bytes, b"\r\n\r\n") {
+            let header = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = header.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            });
+            if bytes.len() >= header_end + 4 + content_length.unwrap_or_default() {
+                break;
+            }
+        }
+    }
+    let header_end = find_subsequence(&bytes, b"\r\n\r\n").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing loopback HTTP request headers",
+        )
+    })?;
+    let header = String::from_utf8_lossy(&bytes[..header_end]);
+    let content_length = header
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or_default();
+    let body_start = header_end + 4;
+    if bytes.len() < body_start + content_length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "truncated loopback HTTP request body",
+        ));
+    }
+    let request_line = header.lines().next().unwrap_or_default().to_owned();
+    let body =
+        String::from_utf8_lossy(&bytes[body_start..body_start + content_length]).into_owned();
+    Ok((request_line, body))
+}
+
+fn write_http_response(stream: &mut TcpStream, body: &Value) -> std::io::Result<()> {
+    let body = body.to_string();
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )?;
+    stream.flush()
+}
+
+fn loopback_read_response(request: &Value) -> Value {
+    let after = request.pointer("/variables/after").and_then(Value::as_str);
+    if request["operationName"] != "ShopifyCursorOrdersPage" {
+        return json!({ "errors": [{ "message": "unexpected loopback operation" }] });
+    }
+    let (order_id, updated_at, edge_cursor, has_next_page, end_cursor) = if after.is_none() {
+        (
+            "gid://shopify/Order/41",
+            "2026-08-14T00:59:00Z",
+            "loopback-edge-1",
+            true,
+            Some("loopback-cursor-1"),
+        )
+    } else {
+        (
+            "gid://shopify/Order/42",
+            "2026-08-14T01:00:00Z",
+            "loopback-edge-2",
+            false,
+            None,
+        )
+    };
+    json!({
+        "data": {
+            "orders": {
+                "edges": [{
+                    "cursor": edge_cursor,
+                    "node": {"id": order_id, "updatedAt": updated_at}
+                }],
+                "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor}
+            }
+        },
+        "extensions": {
+            "cost": {
+                "requestedQueryCost": 10,
+                "actualQueryCost": 8,
+                "throttleStatus": {
+                    "maximumAvailable": 1000,
+                    "currentlyAvailable": 992,
+                    "restoreRate": 50.0
+                }
+            }
+        }
+    })
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn at() -> DateTime<Utc> {
@@ -159,6 +403,14 @@ fn consumer(
     provenance: ProviderProvenanceClass,
     store: ShopifyCursorStore,
 ) -> hartevo_commerce_connector::shopify::ShopifyDurableCursorConsumer<FakeShopifyTransport> {
+    consumer_with_transport(transport, provenance, store)
+}
+
+fn consumer_with_transport<T: ShopifyAdminTransport>(
+    transport: T,
+    provenance: ProviderProvenanceClass,
+    store: ShopifyCursorStore,
+) -> hartevo_commerce_connector::shopify::ShopifyDurableCursorConsumer<T> {
     hartevo_commerce_connector::shopify::ShopifyDurableCursorConsumer::new(
         transport,
         tenant_scope(),
@@ -171,6 +423,14 @@ fn consumer(
 }
 
 fn webhook_for_order(updated_at: &str, delivery_id: &str) -> ShopifyWebhookCheckpoint {
+    webhook_for_order_mission("mission-orders", updated_at, delivery_id)
+}
+
+fn webhook_for_order_mission(
+    mission_id: &str,
+    updated_at: &str,
+    delivery_id: &str,
+) -> ShopifyWebhookCheckpoint {
     let raw_body = format!(
         r#"{{"admin_graphql_api_id":"gid://shopify/Order/42","updated_at":"{updated_at}"}}"#
     );
@@ -191,13 +451,88 @@ fn webhook_for_order(updated_at: &str, delivery_id: &str) -> ShopifyWebhookCheck
         client_secret,
         &tenant_scope(),
         ShopifyCursorStream::Orders,
-        "mission-orders",
+        mission_id,
         1,
         Some("event-orders-1".into()),
         at(),
         at() + Duration::seconds(1),
     )
     .expect("verified webhook checkpoint")
+}
+
+#[test]
+fn loopback_shopify_read_pagination_and_webhook_reconcile_use_real_http() {
+    let server = LoopbackHttpServer::start();
+    let mut consumer = consumer_with_transport(
+        LoopbackShopifyTransport::new(server.address()),
+        ProviderProvenanceClass::ControlledProvider,
+        ShopifyCursorStore::new(),
+    );
+
+    let first = consumer
+        .read_next(
+            "mission-loopback-orders",
+            ShopifyCursorStream::Orders,
+            2,
+            at(),
+        )
+        .expect("loopback first page");
+    assert_eq!(first.page_sequence, 1);
+    assert_eq!(first.next_cursor.as_deref(), Some("loopback-cursor-1"));
+    assert_eq!(first.live_validation_status, "BLOCKED_ENV");
+    consumer.commit(&first).expect("commit loopback first page");
+
+    let second = consumer
+        .read_next(
+            "mission-loopback-orders",
+            ShopifyCursorStream::Orders,
+            2,
+            at(),
+        )
+        .expect("loopback second page");
+    assert_eq!(second.page_sequence, 2);
+    assert_eq!(second.page_cursor.as_deref(), Some("loopback-cursor-1"));
+    assert_eq!(second.next_cursor, None);
+
+    let webhook = webhook_for_order_mission(
+        "mission-loopback-orders",
+        "2026-08-14T01:00:00Z",
+        "delivery-loopback-1",
+    );
+    assert_eq!(
+        consumer.ingest_webhook(webhook.clone()),
+        Ok(ShopifyWebhookCommitOutcome::Committed)
+    );
+    assert_eq!(
+        consumer.reconcile_webhook(&second, &webhook),
+        Ok(ShopifyPollReconcile::Exact {
+            delivery_id: "delivery-loopback-1".into(),
+            resource_id: "gid://shopify/Order/42".into(),
+        })
+    );
+    assert_eq!(
+        consumer.commit(&second),
+        Ok(ShopifyCommitOutcome::Committed)
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|(request_line, _)| {
+        request_line.starts_with("POST /admin/api/") && request_line.ends_with("HTTP/1.1")
+    }));
+    assert_eq!(requests[0].1["operationName"], "ShopifyCursorOrdersPage");
+    assert!(requests[0].1["variables"]["after"].is_null());
+    assert_eq!(
+        requests[1].1["variables"]["after"].as_str(),
+        Some("loopback-cursor-1")
+    );
+    assert_eq!(consumer.store().checkpoints()[0].page_sequence(), 2);
+    assert_eq!(
+        consumer.store().checkpoints()[0]
+            .webhook_checkpoints()
+            .len(),
+        1
+    );
 }
 
 #[test]
