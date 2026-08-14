@@ -5,6 +5,7 @@ extern crate self as hartevo_eval;
 #[path = "../examples/hartevo-browser-contract/digest.rs"]
 mod digest;
 mod distribution;
+mod distribution_verify;
 mod harness_lab;
 #[path = "../examples/hartevo-browser-contract/model.rs"]
 mod model;
@@ -15,6 +16,9 @@ mod verifier;
 
 pub use distribution::{
     export_public_key, generate_keypair, sign_file, validate_gate, verify_file,
+};
+pub use distribution_verify::{
+    DistributionVerificationPaths, DistributionVerificationReceipt, verify_distribution,
 };
 pub use harness_lab::{
     CandidateIdentity as HarnessCandidateIdentity, CaseObservation as HarnessCaseObservation,

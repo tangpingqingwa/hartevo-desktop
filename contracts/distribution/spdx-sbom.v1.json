@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/distribution/spdx-sbom/1.0.0",
+  "title": "Hartevo SPDX 2.3 dependency SBOM",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["spdxVersion", "dataLicense", "SPDXID", "name", "documentNamespace", "creationInfo", "packages", "relationships"],
+  "properties": {
+    "spdxVersion": {"const": "SPDX-2.3"},
+    "dataLicense": {"const": "CC0-1.0"},
+    "SPDXID": {"const": "SPDXRef-DOCUMENT"},
+    "name": {"type": "string", "minLength": 1},
+    "documentNamespace": {"type": "string", "pattern": "^https://"},
+    "creationInfo": {"type": "object", "additionalProperties": false, "required": ["created", "creators"], "properties": {"created": {"type": "string", "format": "date-time"}, "creators": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}}},
+    "packages": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["SPDXID", "name", "versionInfo", "downloadLocation", "filesAnalyzed", "licenseConcluded", "licenseDeclared", "copyrightText"], "properties": {"SPDXID": {"type": "string", "pattern": "^SPDXRef-Package-[A-Za-z0-9.-]+$"}, "name": {"type": "string", "minLength": 1}, "versionInfo": {"type": "string", "minLength": 1}, "downloadLocation": {"const": "NOASSERTION"}, "filesAnalyzed": {"const": false}, "licenseConcluded": {"const": "NOASSERTION"}, "licenseDeclared": {"type": "string", "minLength": 1}, "copyrightText": {"const": "NOASSERTION"}}}},
+    "relationships": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["spdxElementId", "relationshipType", "relatedSpdxElement"], "properties": {"spdxElementId": {"type": "string", "minLength": 1}, "relationshipType": {"enum": ["DESCRIBES", "DEPENDS_ON"]}, "relatedSpdxElement": {"type": "string", "minLength": 1}}}}
+  }
+}

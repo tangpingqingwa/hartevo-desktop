@@ -34,11 +34,17 @@ RELEASE_DECISION = "NOT_EVALUATED"
 CONTRACT_DIR = Path("contracts/distribution")
 CONTRACTS = {
     "manifest": CONTRACT_DIR / "build-manifest.v1.json",
+    "local_manifest": CONTRACT_DIR / "local-build-manifest.v1.json",
     "sbom": CONTRACT_DIR / "sbom.v1.json",
+    "spdx": CONTRACT_DIR / "spdx-sbom.v1.json",
+    "checksums": CONTRACT_DIR / "checksums.v1.json",
+    "provenance": CONTRACT_DIR / "provenance.v1.json",
     "update": CONTRACT_DIR / "update-metadata.v1.json",
     "telemetry": CONTRACT_DIR / "telemetry.v1.json",
+    "telemetry_v2": CONTRACT_DIR / "telemetry.v2.json",
     "restore": CONTRACT_DIR / "restore-drill.v1.json",
     "gate": CONTRACT_DIR / "gate.v1.json",
+    "verification": CONTRACT_DIR / "verification.v1.json",
 }
 UPDATE_ROLE_NAMES = ("root", "targets", "snapshot", "timestamp", "rollback")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -221,11 +227,17 @@ def tool_version(repo: Path, command: str, args: Sequence[str]) -> str:
 def ensure_contracts(repo: Path) -> None:
     expected_versions = {
         "manifest": "hartevo-build-manifest/v1",
+        "local_manifest": "hartevo-local-build-manifest/v1",
         "sbom": "hartevo-sbom/v1",
+        "spdx": None,
+        "checksums": "hartevo-distribution-checksums/v1",
+        "provenance": "hartevo-distribution-provenance/v1",
         "update": "hartevo-update-metadata/v1",
         "telemetry": "hartevo-operational-telemetry/v1",
+        "telemetry_v2": "hartevo-operational-telemetry/v2",
         "restore": "hartevo-restore-drill/v1",
         "gate": "hartevo-distribution-gate/v1",
+        "verification": "hartevo-distribution-verification/v1",
     }
     for name, relative in CONTRACTS.items():
         path = repo / relative
@@ -233,8 +245,11 @@ def ensure_contracts(repo: Path) -> None:
         contract = load_json(path, str(relative))
         require(contract.get("type") == "object", "CONTRACT_NOT_OBJECT", f"{relative} must define an object schema")
         require(contract.get("additionalProperties") is False, "CONTRACT_NOT_STRICT", f"{relative} must reject unknown fields")
-        version = contract.get("properties", {}).get("schemaVersion", {}).get("const")
-        require(version == expected_versions[name], "CONTRACT_VERSION_MISMATCH", f"{relative} has unexpected schemaVersion")
+        if name == "spdx":
+            require(contract.get("properties", {}).get("spdxVersion", {}).get("const") == "SPDX-2.3", "CONTRACT_VERSION_MISMATCH", f"{relative} has unexpected SPDX version")
+        else:
+            version = contract.get("properties", {}).get("schemaVersion", {}).get("const")
+            require(version == expected_versions[name], "CONTRACT_VERSION_MISMATCH", f"{relative} has unexpected schemaVersion")
 
 
 def catalog_snapshot(repo: Path, temporary: Path) -> dict[str, Any]:
@@ -510,6 +525,223 @@ def build_manifest(
     }
     write_json(output, manifest)
     return manifest
+
+
+def build_spdx_sbom(repo: Path, output: Path, source: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = run(
+        ("cargo", "metadata", "--locked", "--format-version", "1"),
+        repo,
+        env={"CARGO_TERM_COLOR": "never"},
+        timeout=240,
+    )
+    document = json.loads(metadata.stdout.decode("utf-8"))
+    packages = document.get("packages")
+    require(isinstance(packages, list) and packages, "CARGO_METADATA_INVALID", "cargo metadata returned no packages")
+    refs_by_id: dict[str, str] = {}
+    spdx_packages: list[dict[str, Any]] = []
+    for package in packages:
+        name = package.get("name")
+        version = package.get("version")
+        package_id = package.get("id")
+        require(isinstance(name, str) and name, "CARGO_PACKAGE_INVALID", "package name is missing")
+        require(isinstance(version, str) and version, "CARGO_PACKAGE_INVALID", f"package {name} has no version")
+        require(isinstance(package_id, str) and package_id, "CARGO_PACKAGE_INVALID", f"package {name} has no id")
+        package_digest = sha256_bytes(f"{package_id}:{name}:{version}".encode("utf-8"))
+        spdx_id = f"SPDXRef-Package-{package_digest[:24]}"
+        refs_by_id[package_id] = spdx_id
+        license_value = package.get("license")
+        if not isinstance(license_value, str) or not license_value.strip():
+            license_value = "NOASSERTION"
+        spdx_packages.append(
+            {
+                "SPDXID": spdx_id,
+                "name": name,
+                "versionInfo": version,
+                "downloadLocation": "NOASSERTION",
+                "filesAnalyzed": False,
+                "licenseConcluded": "NOASSERTION",
+                "licenseDeclared": license_value,
+                "copyrightText": "NOASSERTION",
+            }
+        )
+    spdx_packages.sort(key=lambda package: (package["name"], package["versionInfo"], package["SPDXID"]))
+    relationships: list[dict[str, str]] = [
+        {
+            "spdxElementId": "SPDXRef-DOCUMENT",
+            "relationshipType": "DESCRIBES",
+            "relatedSpdxElement": package["SPDXID"],
+        }
+        for package in spdx_packages
+    ]
+    resolve = document.get("resolve")
+    resolved_nodes = resolve.get("nodes", []) if isinstance(resolve, dict) else []
+    if isinstance(resolved_nodes, list):
+        for node in resolved_nodes:
+            if not isinstance(node, dict) or not isinstance(node.get("id"), str):
+                continue
+            source_ref = refs_by_id.get(node["id"])
+            if source_ref is None:
+                continue
+            dependency_ids = {
+                dependency.get("pkg")
+                for dependency in node.get("dependencies", [])
+                if isinstance(dependency, dict) and isinstance(dependency.get("pkg"), str)
+            }
+            for dependency_id in sorted(dependency_ids):
+                target_ref = refs_by_id.get(dependency_id)
+                if target_ref is not None:
+                    relationships.append(
+                        {
+                            "spdxElementId": source_ref,
+                            "relationshipType": "DEPENDS_ON",
+                            "relatedSpdxElement": target_ref,
+                        }
+                    )
+    relationships.sort(key=lambda relationship: (relationship["spdxElementId"], relationship["relationshipType"], relationship["relatedSpdxElement"]))
+    spdx = {
+        "spdxVersion": "SPDX-2.3",
+        "dataLicense": "CC0-1.0",
+        "SPDXID": "SPDXRef-DOCUMENT",
+        "name": "hartevo-desktop dependencies",
+        "documentNamespace": f"https://hartevo.example/spdx/{source['commit']}/{source['treeSha256']}",
+        "creationInfo": {
+            "created": iso_at(source["sourceDateEpoch"]),
+            "creators": ["Tool: hartevo DIST-02 local distribution gate"],
+        },
+        "packages": spdx_packages,
+        "relationships": relationships,
+    }
+    write_json(output, spdx)
+    return spdx
+
+
+def hook_record(repo: Path, name: str, status: str, evidence_environment: str) -> dict[str, Any]:
+    record: dict[str, Any] = {"status": status, "hook": name}
+    if status == "PASS":
+        evidence_value = os.environ.get(evidence_environment)
+        require(evidence_value, "SIGNING_EVIDENCE_MISSING", f"{name} PASS requires {evidence_environment}")
+        evidence_path = Path(evidence_value).expanduser().resolve()
+        require(evidence_path.is_file() and not evidence_path.is_symlink(), "SIGNING_EVIDENCE_MISSING", f"{name} evidence must be a regular file")
+        record["evidencePath"] = repo_relative(repo, evidence_path)
+        record["evidenceSha256"] = sha256_file(evidence_path)
+    return record
+
+
+def signing_hook_records(repo: Path, statuses: tuple[str, str, str]) -> dict[str, Any]:
+    return {
+        "macosSigning": hook_record(repo, "codesign", statuses[0], "HARTEVO_MACOS_SIGNING_EVIDENCE"),
+        "macosNotarization": hook_record(repo, "notarytool-stapler", statuses[1], "HARTEVO_MACOS_NOTARIZATION_EVIDENCE"),
+        "windowsSigning": hook_record(repo, "signtool", statuses[2], "HARTEVO_WINDOWS_SIGNING_EVIDENCE"),
+    }
+
+
+def build_local_manifest(
+    repo: Path,
+    output: Path,
+    sbom_path: Path,
+    sbom: Mapping[str, Any],
+    spdx_path: Path,
+    spdx: Mapping[str, Any],
+    source: Mapping[str, Any],
+    profile: str,
+    artifact_path: Path | None,
+    signing_hooks: Mapping[str, Any],
+    checksums_path: Path,
+    provenance_path: Path,
+    telemetry_path: Path,
+) -> dict[str, Any]:
+    rustc = tool_version(repo, "rustc", ("--version",))
+    cargo = tool_version(repo, "cargo", ("--version",))
+    target = rust_target(repo)
+    toolchain = {"rustc": rustc, "cargo": cargo, "target": target}
+    artifacts = [
+        artifact_record(repo, sbom_path, "cyclonedx-sbom", "SBOM", "LOCAL_CONTRACT", source["commit"]),
+        artifact_record(repo, spdx_path, "spdx-sbom", "SBOM", "LOCAL_CONTRACT", source["commit"]),
+    ]
+    if artifact_path is not None:
+        artifacts.append(artifact_record(repo, artifact_path, "desktop-application", "APPLICATION", "BLOCKED_ENV", source["commit"]))
+    manifest = {
+        "schemaVersion": "hartevo-local-build-manifest/v1",
+        "manifestId": f"commit-{source['commit']}",
+        "releaseDecision": RELEASE_DECISION,
+        "releaseReady": False,
+        "source": dict(source),
+        "toolchain": toolchain,
+        "build": {
+            "profile": profile,
+            "target": target,
+            "reproducible": True,
+            "cargoLockSha256": sha256_file(repo / "Cargo.lock"),
+            "commands": [
+                {"id": "cargo-metadata", "argv": ["cargo", "metadata", "--locked", "--format-version", "1"]},
+                {"id": "catalog-validate", "argv": ["cargo", "run", "-p", "hartevo-eval", "--locked", "--", "catalog", "validate"]},
+                {"id": "distribution-verify", "argv": ["cargo", "run", "-p", "hartevo-eval", "--locked", "--", "distribution", "verify"]},
+            ],
+            "environment": {
+                "sourceDateEpoch": source["sourceDateEpoch"],
+                "networkPolicy": "offline" if os.environ.get("HARTEVO_DISTRIBUTION_OFFLINE") == "1" else "locked-network",
+            },
+        },
+        "artifacts": artifacts,
+        "sbom": {
+            "cycloneDx": {"path": repo_relative(repo, sbom_path), "sha256": sha256_file(sbom_path), "byteCount": sbom_path.stat().st_size},
+            "spdx": {"path": repo_relative(repo, spdx_path), "sha256": sha256_file(spdx_path), "byteCount": spdx_path.stat().st_size},
+        },
+        "checksums": {"path": repo_relative(repo, checksums_path)},
+        "provenance": {"path": repo_relative(repo, provenance_path)},
+        "telemetry": {"path": repo_relative(repo, telemetry_path)},
+        "signingHooks": dict(signing_hooks),
+        "nativeEvidence": {"status": "NOT_PROVEN", "requiredForRelease": True, "releaseEligible": False},
+    }
+    require(len(spdx["packages"]) > 0, "SPDX_EMPTY", "SPDX SBOM has no packages")
+    write_json(output, manifest)
+    return manifest
+
+
+def build_checksums(
+    repo: Path,
+    output: Path,
+    source: Mapping[str, Any],
+    toolchain: Mapping[str, Any],
+    records: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    checksums = {
+        "schemaVersion": "hartevo-distribution-checksums/v1",
+        "algorithm": "SHA-256",
+        "sourceCommit": source["commit"],
+        "toolchain": dict(toolchain),
+        "artifacts": list(records),
+    }
+    write_json(output, checksums)
+    return checksums
+
+
+def build_provenance(
+    repo: Path,
+    output: Path,
+    source: Mapping[str, Any],
+    toolchain: Mapping[str, Any],
+    checksums_path: Path,
+    records: Sequence[dict[str, Any]],
+    signing_hooks: Mapping[str, Any],
+) -> dict[str, Any]:
+    provenance = {
+        "schemaVersion": "hartevo-distribution-provenance/v1",
+        "source": dict(source),
+        "toolchain": dict(toolchain),
+        "checksumManifest": {
+            "path": repo_relative(repo, checksums_path),
+            "sha256": sha256_file(checksums_path),
+            "byteCount": checksums_path.stat().st_size,
+        },
+        "artifacts": list(records),
+        "signingHooks": dict(signing_hooks),
+        "nativeEvidence": {"status": "NOT_PROVEN", "requiredForRelease": True, "releaseEligible": False},
+        "releaseDecision": RELEASE_DECISION,
+        "releaseReady": False,
+    }
+    write_json(output, provenance)
+    return provenance
 
 
 def crypto(repo: Path, operation: str, **paths: Path) -> None:
@@ -871,6 +1103,14 @@ def telemetry_event(source: Mapping[str, Any], manifest_sha: str, opt_in: bool) 
     }
 
 
+def telemetry_event_v2(source: Mapping[str, Any], manifest_sha: str, opt_in: bool) -> dict[str, Any]:
+    value = telemetry_event(source, manifest_sha, opt_in)
+    value["schemaVersion"] = "hartevo-operational-telemetry/v2"
+    value["policy"]["contentFree"] = True
+    value["event"]["schemaVersion"] = "hartevo-operational-telemetry/v2"
+    return value
+
+
 def validate_telemetry(value: Mapping[str, Any]) -> None:
     require(value.get("schemaVersion") == "hartevo-operational-telemetry/v1", "TELEMETRY_SCHEMA", "telemetry schema mismatch")
     policy = value.get("policy")
@@ -909,6 +1149,19 @@ def validate_telemetry(value: Mapping[str, Any]) -> None:
     encoded = json.dumps(event, ensure_ascii=False, sort_keys=True).lower()
     for term in FORBIDDEN_TELEMETRY_TERMS:
         require(term not in encoded, "TELEMETRY_FORBIDDEN_CONTENT", f"telemetry payload contains forbidden lexical marker {term}")
+
+
+def validate_telemetry_v2(value: Mapping[str, Any]) -> None:
+    require(value.get("schemaVersion") == "hartevo-operational-telemetry/v2", "TELEMETRY_V2_SCHEMA", "telemetry v2 schema mismatch")
+    policy = value.get("policy")
+    require(isinstance(policy, dict) and policy.get("contentFree") is True, "TELEMETRY_V2_POLICY", "telemetry v2 must declare contentFree=true")
+    event = value.get("event")
+    require(isinstance(event, dict), "TELEMETRY_V2_EVENT", "telemetry v2 event is missing")
+    shadow = copy.deepcopy(value)
+    shadow["schemaVersion"] = "hartevo-operational-telemetry/v1"
+    shadow["policy"].pop("contentFree", None)
+    shadow["event"]["schemaVersion"] = "hartevo-operational-telemetry/v1"
+    validate_telemetry(shadow)
 
 
 def restore_drill(
@@ -1044,16 +1297,40 @@ def gate(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
     ci_status = args.ci_status
     sbom_path = output_dir / "sbom.json"
     manifest_path = output_dir / "build-manifest.json"
+    spdx_path = output_dir / "spdx-sbom.json"
+    local_manifest_path = output_dir / "local-build-manifest.json"
+    checksums_path = output_dir / "checksums.json"
+    provenance_path = output_dir / "provenance.json"
     update_dir = output_dir / "update"
     update_path = update_dir / "update-metadata.json"
     telemetry_path = output_dir / "telemetry.json"
+    telemetry_v2_path = output_dir / "telemetry-v2.json"
     restore_path = output_dir / "restore-drill.json"
     release_path = output_dir / "release-baseline.json"
+    verification_path = output_dir / "verification.json"
     with tempfile.TemporaryDirectory(prefix="hartevo-distribution-gate-") as temporary_name:
         temporary = Path(temporary_name)
         sbom = build_sbom(repo, sbom_path, source, ci_status)
         artifact_path = Path(args.artifact).resolve() if args.artifact else None
         manifest = build_manifest(repo, manifest_path, sbom_path, sbom, source, ci_status, args.profile, artifact_path)
+        spdx = build_spdx_sbom(repo, spdx_path, source)
+        hook_statuses = (manifest["platform"]["macosSigning"], manifest["platform"]["macosNotarization"], manifest["platform"]["windowsSigning"])
+        signing_hooks = signing_hook_records(repo, hook_statuses)
+        local_manifest = build_local_manifest(
+            repo,
+            local_manifest_path,
+            sbom_path,
+            sbom,
+            spdx_path,
+            spdx,
+            source,
+            args.profile,
+            artifact_path,
+            signing_hooks,
+            checksums_path,
+            provenance_path,
+            telemetry_v2_path,
+        )
         signer_bundle = prepare_signers(repo, temporary / "signers")
         update_metadata(
             repo,
@@ -1089,10 +1366,23 @@ def gate(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
         telemetry = telemetry_event(source, sha256_file(manifest_path), args.telemetry_opt_in)
         validate_telemetry(telemetry)
         write_json(telemetry_path, telemetry)
+        telemetry_v2 = telemetry_event_v2(source, sha256_file(local_manifest_path), args.telemetry_opt_in)
+        validate_telemetry_v2(telemetry_v2)
+        write_json(telemetry_v2_path, telemetry_v2)
         restore = restore_drill(repo, restore_path, source, sha256_file(manifest_path), ci_status, True)
         validate_manifest(repo, manifest, source)
         validate_sbom(sbom, source)
         validate_restore(restore, source, sha256_file(manifest_path))
+        checksum_records = [
+            artifact_record(repo, local_manifest_path, "local-build-manifest", "MANIFEST", "LOCAL_CONTRACT", source["commit"]),
+            artifact_record(repo, sbom_path, "cyclonedx-sbom", "SBOM", "LOCAL_CONTRACT", source["commit"]),
+            artifact_record(repo, spdx_path, "spdx-sbom", "SBOM", "LOCAL_CONTRACT", source["commit"]),
+            artifact_record(repo, telemetry_v2_path, "operational-telemetry", "TELEMETRY", "LOCAL_CONTRACT", source["commit"]),
+        ]
+        if artifact_path is not None:
+            checksum_records.append(artifact_record(repo, artifact_path, "desktop-application", "APPLICATION", "BLOCKED_ENV", source["commit"]))
+        build_checksums(repo, checksums_path, source, local_manifest["toolchain"], checksum_records)
+        build_provenance(repo, provenance_path, source, local_manifest["toolchain"], checksums_path, checksum_records, signing_hooks)
         run(
             ("cargo", "run", "-p", "hartevo-eval", "--locked", "--", "evidence", "baseline", "--commit", source["commit"], "--output", str(release_path)),
             repo,
@@ -1164,7 +1454,24 @@ def gate(args: argparse.Namespace, repo: Path) -> dict[str, Any]:
         env={"CARGO_TERM_COLOR": "never"},
         timeout=240,
     )
-    print(json.dumps({"status": "PASS", "releaseReady": False, "releaseDecision": RELEASE_DECISION, "gate": repo_relative(repo, gate_path)}, sort_keys=True))
+    run(
+        (
+            "cargo", "run", "-p", "hartevo-eval", "--locked", "--", "distribution", "verify",
+            "--root", str(repo),
+            "--manifest", str(local_manifest_path),
+            "--cyclonedx", str(spdx_path.parent / "sbom.json"),
+            "--spdx", str(spdx_path),
+            "--checksums", str(checksums_path),
+            "--provenance", str(provenance_path),
+            "--telemetry", str(telemetry_v2_path),
+            "--commit", source["commit"],
+            "--output", str(verification_path),
+        ),
+        repo,
+        env={"CARGO_TERM_COLOR": "never"},
+        timeout=240,
+    )
+    print(json.dumps({"status": "PASS", "releaseReady": False, "releaseDecision": RELEASE_DECISION, "gate": repo_relative(repo, gate_path), "verification": repo_relative(repo, verification_path)}, sort_keys=True))
     return result
 
 
@@ -1202,6 +1509,8 @@ def self_test(repo: Path) -> None:
         verify_update(repo, update_dir, "alpha", platform.machine(), 3, token, source["commit"])
         telemetry = telemetry_event(source, sha256_file(manifest), False)
         validate_telemetry(telemetry)
+        telemetry_v2 = telemetry_event_v2(source, sha256_file(manifest), False)
+        validate_telemetry_v2(telemetry_v2)
         poisoned = copy.deepcopy(telemetry)
         poisoned["event"]["attributes"] = {"prompt": "do not serialize"}
         try:
@@ -1210,6 +1519,20 @@ def self_test(repo: Path) -> None:
             require(error.code in {"TELEMETRY_FORBIDDEN_FIELD", "TELEMETRY_FORBIDDEN_CONTENT", "TELEMETRY_ATTRIBUTES"}, "SELF_TEST_TELEMETRY", "telemetry redaction test failed")
         else:
             fail("SELF_TEST_TELEMETRY", "telemetry redaction accepted a forbidden field")
+        poisoned_v2 = copy.deepcopy(telemetry_v2)
+        poisoned_v2["event"]["attributes"] = {"prompt": "do not serialize"}
+        try:
+            validate_telemetry_v2(poisoned_v2)
+        except GateError as error:
+            require(error.code in {"TELEMETRY_FORBIDDEN_FIELD", "TELEMETRY_FORBIDDEN_CONTENT", "TELEMETRY_ATTRIBUTES"}, "SELF_TEST_TELEMETRY_V2", "telemetry v2 redaction test failed")
+        else:
+            fail("SELF_TEST_TELEMETRY_V2", "telemetry v2 redaction accepted a forbidden field")
+        try:
+            hook_record(repo, "self-test-signing-hook", "PASS", "HARTEVO_SELF_TEST_NO_SIGNING_EVIDENCE")
+        except GateError as error:
+            require(error.code == "SIGNING_EVIDENCE_MISSING", "SELF_TEST_SIGNING_HOOK", "signing hook PASS was not evidence-bound")
+        else:
+            fail("SELF_TEST_SIGNING_HOOK", "signing hook PASS was accepted without evidence")
         restore_path = temporary / "restore.json"
         restore = restore_drill(repo, restore_path, source, sha256_file(manifest), "LOCAL_SCOPED", True)
         validate_restore(restore, source, sha256_file(manifest))

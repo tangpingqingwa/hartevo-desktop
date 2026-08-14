@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use hartevo_eval::{
-    HarnessEvaluationInput, HarnessLabPlan, HarnessPromotionKey, HarnessSignedPromotionRecord,
-    VERTICAL_SLICE_ID, catalog_snapshot, evaluate_harness_lab, export_public_key,
-    finalize_evaluation_run, generate_keypair, harness_lab_source_commit, run_vertical_slice,
-    sign_file, validate_evaluation_run, validate_gate, verify_file, wave_zero_release_evidence,
+    DistributionVerificationPaths, HarnessEvaluationInput, HarnessLabPlan, HarnessPromotionKey,
+    HarnessSignedPromotionRecord, VERTICAL_SLICE_ID, catalog_snapshot, evaluate_harness_lab,
+    export_public_key, finalize_evaluation_run, generate_keypair, harness_lab_source_commit,
+    run_vertical_slice, sign_file, validate_evaluation_run, validate_gate, verify_distribution,
+    verify_file, wave_zero_release_evidence,
 };
 use serde::{Deserialize, Serialize};
 
@@ -146,6 +147,9 @@ fn run_harness_command(arguments: &[String]) -> Result<()> {
 }
 
 fn run_distribution(arguments: &[String]) -> Result<()> {
+    if arguments.get(1).is_some_and(|command| command == "verify") {
+        return run_distribution_verify(arguments);
+    }
     match arguments {
         [distribution, validate, gate_flag, gate, commit_flag, commit]
             if distribution == "distribution"
@@ -236,6 +240,68 @@ fn run_distribution(arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn run_distribution_verify(arguments: &[String]) -> Result<()> {
+    ensure!(
+        arguments.len() >= 2 && arguments[0] == "distribution" && arguments[1] == "verify",
+        "invalid distribution verify command"
+    );
+    let mut root = None;
+    let mut manifest = None;
+    let mut cyclonedx = None;
+    let mut spdx = None;
+    let mut checksums = None;
+    let mut provenance = None;
+    let mut telemetry = None;
+    let mut commit = None;
+    let mut output = None;
+    let mut index = 2;
+    while index < arguments.len() {
+        ensure!(
+            index + 1 < arguments.len(),
+            "distribution verify option has no value"
+        );
+        let value = arguments[index + 1].as_str();
+        let slot = match arguments[index].as_str() {
+            "--root" => &mut root,
+            "--manifest" => &mut manifest,
+            "--cyclonedx" => &mut cyclonedx,
+            "--spdx" => &mut spdx,
+            "--checksums" => &mut checksums,
+            "--provenance" => &mut provenance,
+            "--telemetry" => &mut telemetry,
+            "--commit" => &mut commit,
+            "--output" => &mut output,
+            option => bail!("unknown distribution verify option {option}"),
+        };
+        ensure!(slot.is_none(), "duplicate distribution verify option");
+        *slot = Some(value);
+        index += 2;
+    }
+    let root = root.context("distribution verify requires --root")?;
+    let manifest = manifest.context("distribution verify requires --manifest")?;
+    let cyclonedx = cyclonedx.context("distribution verify requires --cyclonedx")?;
+    let spdx = spdx.context("distribution verify requires --spdx")?;
+    let checksums = checksums.context("distribution verify requires --checksums")?;
+    let provenance = provenance.context("distribution verify requires --provenance")?;
+    let telemetry = telemetry.context("distribution verify requires --telemetry")?;
+    let commit = commit.context("distribution verify requires --commit")?;
+    let receipt = verify_distribution(&DistributionVerificationPaths {
+        root: PathBuf::from(root),
+        manifest: PathBuf::from(manifest),
+        cyclonedx: PathBuf::from(cyclonedx),
+        spdx: PathBuf::from(spdx),
+        checksums: PathBuf::from(checksums),
+        provenance: PathBuf::from(provenance),
+        telemetry: PathBuf::from(telemetry),
+        expected_commit: commit.to_string(),
+    })?;
+    if let Some(output) = output {
+        write_json(&PathBuf::from(output), &receipt)?;
+    } else {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+    }
+    Ok(())
+}
 fn run(mission: &str, output: Option<PathBuf>) -> Result<()> {
     if mission != VERTICAL_SLICE_ID {
         bail!("unknown Mission fixture {mission}; available: {VERTICAL_SLICE_ID}");
@@ -276,6 +342,7 @@ fn print_help() {
          hartevo-eval evaluation-run validate --run-dir <path>\n  \
          hartevo-eval harness-lab validate --plan <plan.json> --results <results.json> [--keys <keys.json>] [--promotion <record.json>]\n  \
          hartevo-eval distribution validate --gate <path> --commit <sha>\n  \
+         hartevo-eval distribution verify --root <repo> --manifest <path> --cyclonedx <path> --spdx <path> --checksums <path> --provenance <path> --telemetry <path> --commit <sha> [--output <path>]\n  \
          hartevo-eval distribution crypto keygen --private-key <path> --public-key <path>\n  \
          hartevo-eval distribution crypto public-key --private-key <path> --public-key <path>\n  \
          hartevo-eval distribution crypto sign --private-key <path> --input <path> --output <path>\n  \
