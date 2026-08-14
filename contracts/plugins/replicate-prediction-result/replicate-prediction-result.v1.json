@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.replicate-prediction-result/v1",
+  "title": "Hartevo Layer-1 Replicate prediction-result contract",
+  "schemaVersion": "hartevo.replicate-prediction-result/v1",
+  "contractVersion": "EXT-REPLICATE-01-L1/v1",
+  "layer": 1,
+  "childLayer": false,
+  "status": "read_proposal_and_recording_only",
+  "evidenceLevel": "L1",
+  "plugin": {
+    "id": "hartevo.replicate-prediction-result",
+    "version": "1.0.0",
+    "registration": {
+      "versionBound": true,
+      "contractDigestBound": true,
+      "implementationDigestBound": true,
+      "providerDigestBound": true,
+      "apiDigestBound": true,
+      "modelDigestBound": true,
+      "versionOrDeploymentDigestBound": true,
+      "permissionDigestBound": true,
+      "scopeDigestBound": true,
+      "revisionDigestBound": true,
+      "opaqueApiTokenSecretReferenceOnly": true,
+      "reversible": true,
+      "revocable": true,
+      "failClosedDrift": true
+    }
+  },
+  "service": {
+    "id": "ReplicatePredictionResultService",
+    "provider": "ReplicateProvider",
+    "consumer": "MissionReplicateResultConsumer",
+    "operations": [
+      "get_prediction",
+      "list_predictions_bounded",
+      "record_prediction",
+      "proposal",
+      "mission_result",
+      "registration",
+      "revocation"
+    ],
+    "httpReadSurface": [
+      "GET /v1/predictions/{prediction_id}",
+      "GET /v1/predictions"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "durableReceipts": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "id": "replicate",
+    "version": "1.0.0",
+    "officialHost": "https://api.replicate.com",
+    "officialReferences": [
+      "https://replicate.com/docs/reference/http",
+      "https://replicate.com/docs/topics/predictions",
+      "https://replicate.com/docs/topics/webhooks/"
+    ],
+    "authentication": {
+      "authorization": "Bearer API token",
+      "secretReferenceOnly": true,
+      "serializedCredentials": false,
+      "environmentExport": false
+    },
+    "transport": {
+      "getMethod": "GET",
+      "getPath": "/v1/predictions/{prediction_id}",
+      "listMethod": "GET",
+      "listPath": "/v1/predictions",
+      "boundedRead": true,
+      "outputDownload": false,
+      "webhookIngestion": false,
+      "fixtureEvidence": "recording_only",
+      "fakeEvidence": "recording_only",
+      "loopbackEvidence": "recording_only",
+      "blockedEnvEvidence": "not_connected_or_native"
+    },
+    "capabilities": [
+      "read_prediction_metadata",
+      "read_prediction_status",
+      "read_model_version_or_deployment_binding",
+      "read_runtime_metrics",
+      "read_output_url_expiry",
+      "read_data_removed_flag",
+      "record_output_content_digest",
+      "bounded_prediction_listing",
+      "rate_limit_backoff_evidence",
+      "reversible_registration"
+    ],
+    "nativeStatus": "BLOCKED_ENV",
+    "connectedEvidence": false,
+    "nativeEvidence": false
+  },
+  "scope": {
+    "exactBindings": [
+      "api_host",
+      "account_id",
+      "model_id",
+      "version_or_deployment",
+      "prediction_id",
+      "expected_status",
+      "metric_scope",
+      "output_url_expiry_scope",
+      "project_id",
+      "project_revision",
+      "mission_id",
+      "mission_revision",
+      "work_product_id",
+      "work_product_revision"
+    ],
+    "permissionRegistration": [
+      "predictions.read",
+      "predictions.list_optional"
+    ],
+    "digestFences": [
+      "provider_digest",
+      "api_digest",
+      "model_digest",
+      "version_or_deployment_digest",
+      "permission_digest",
+      "scope_digest",
+      "revision_digest",
+      "registration_digest",
+      "proposal_digest",
+      "response_digest",
+      "output_content_digest",
+      "output_url_digest"
+    ]
+  },
+  "statusSemantics": {
+    "providerStatuses": [
+      "starting",
+      "processing",
+      "succeeded",
+      "failed",
+      "canceled"
+    ],
+    "projectStatuses": [
+      "starting",
+      "processing",
+      "succeeded",
+      "failed",
+      "canceled",
+      "data_removed",
+      "provider_unknown"
+    ],
+    "monotonicity": "starting_to_processing_to_one_terminal_status; data_removed_is_terminal_overlay; regressions_fail_closed",
+    "unknownProviderStates": "provider_unknown",
+    "modelVersionDeploymentDrift": "reject_as_non_adoptable_provider_unknown_evidence",
+    "malformedOrPartial": "reject_as_non_adoptable_provider_unknown_evidence"
+  },
+  "evidence": {
+    "boundedMetadataOnly": true,
+    "required": [
+      "account_id",
+      "model_id",
+      "version_or_deployment_digest",
+      "prediction_id",
+      "status",
+      "runtime_metrics",
+      "output_url_expiry",
+      "data_removed",
+      "output_content_digest",
+      "provider_provenance",
+      "provider_digest",
+      "api_digest",
+      "permission_digest",
+      "scope_digest",
+      "revision_digest",
+      "evidence_digest"
+    ],
+    "rawInputPrompt": false,
+    "rawLogs": false,
+    "rawErrorText": false,
+    "rawOutput": false,
+    "outputDownload": false,
+    "outputContentDigestOnly": true,
+    "secrets": false,
+    "authority": "below_truth_consent_effect_receipt_outcome"
+  },
+  "errorSemantics": {
+    "http": [401, 403, 404, 409, 429],
+    "retryable": [429, "timeout", "5xx"],
+    "nonRetryable": [401, 403, 404, 409, "malformed", "partial"],
+    "backoff": "bounded_recorded_exponential_without_network_sleep",
+    "redaction": "provider_error_text_is_replaced_by_a_bounded_label_and_digest"
+  },
+  "replayAndSafety": {
+    "sameResponseReplay": "idempotent",
+    "divergentResponseReplay": "reject",
+    "tamperedProposal": "reject",
+    "staleMissionRevision": "reject",
+    "revokedRegistration": "reject",
+    "expiringOutput": "flag_only_no_download",
+    "removedOutput": "data_removed_status_and_no_payload",
+    "urlContentDigestMismatch": "reject"
+  },
+  "fixtureProvenance": [
+    "fixture",
+    "recording",
+    "loopback",
+    "BLOCKED_ENV"
+  ],
+  "forbiddenAuthorities": [
+    "CreatePrediction",
+    "CancelPrediction",
+    "output_download",
+    "prompt_retention",
+    "raw_log_retention",
+    "webhook_mutation",
+    "model_mutation",
+    "deployment_mutation",
+    "generic_model_registry",
+    "store",
+    "keyring",
+    "browser_profile",
+    "kernel_truth",
+    "kernel_consent",
+    "kernel_effect",
+    "kernel_receipt",
+    "kernel_outcome",
+    "connected_claim",
+    "native_claim"
+  ],
+  "nonOverlap": [
+    "openai_batch_result_issue_405",
+    "bedrock_inference_issue_326",
+    "huggingface_inference_issue_351",
+    "sagemaker_endpoint_result_issue_393",
+    "heygen_video_result_issue_315",
+    "elevenlabs_audio_result_issue_388"
+  ],
+  "nativeGaps": [
+    "native_api_token_resolution",
+    "live_replicate_https_reads",
+    "durable_receipts",
+    "output_byte_acquisition",
+    "verified_work_product_adoption",
+    "connected_or_native_evidence"
+  ]
+}
