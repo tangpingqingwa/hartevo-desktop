@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/vanta-compliance-result/vanta-compliance-result.v1.json",
+  "title": "Hartevo Vanta compliance-audit result Layer-1 contract",
+  "description": "A bounded, read/proposal/recording-only Vanta audit-readiness seam. It is not a certification authority, evidence uploader, control mutator, or compliance dashboard.",
+  "schemaVersion": "hartevo.vanta-compliance-result.contract/v1",
+  "contractVersion": "vanta-compliance-result/v1",
+  "pluginVersion": "1.0.0",
+  "layer": "Layer-1",
+  "service": {
+    "id": "hartevo.vanta.compliance-result",
+    "implementation": "VantaComplianceResultService",
+    "version": "1.0.0",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "read_bounded_status",
+      "compile_readiness_proposal",
+      "record_proposal"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "liveExecution": false
+  },
+  "provider": {
+    "id": "vanta.compliance-audit",
+    "implementation": "VantaProvider",
+    "version": "1.0.0",
+    "apiFamilies": ["manage_v1", "audit_v1"],
+    "allowlistedMethods": ["GET"],
+    "allowlistedReads": [
+      "list_audits",
+      "list_controls",
+      "list_tests",
+      "list_issues",
+      "list_information_requests"
+    ],
+    "acceptedTransports": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "native": false,
+    "connected": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "id": "mission.vanta-compliance-result",
+    "implementation": "MissionVantaComplianceConsumer",
+    "version": "1.0.0",
+    "missionBound": true,
+    "projectBound": true,
+    "consentBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "certificationAuthority": false
+  },
+  "scope": {
+    "required": [
+      "tenant",
+      "region",
+      "api_family",
+      "audit_id_and_revision",
+      "framework_id",
+      "allowlisted_control_ids",
+      "control_revision_fences",
+      "allowlisted_test_ids",
+      "test_revision_fences",
+      "allowlisted_issue_ids",
+      "issue_revision_fences",
+      "allowlisted_information_request_ids",
+      "information_request_revision_fences",
+      "compliance_objective_id_and_revision",
+      "mission_id_and_revision",
+      "project_id_and_revision",
+      "consent_id_and_revision",
+      "permission_digest",
+      "scope_digest"
+    ],
+    "secret": "opaque_secret_reference_only",
+    "tenantBound": true,
+    "auditBound": true,
+    "frameworkBound": true,
+    "missionBound": true,
+    "projectBound": true,
+    "consentBound": true
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "auditDigestBound": true,
+    "scopeDigestBound": true,
+    "permissionDigestBound": true,
+    "consentDigestBound": true,
+    "secretReferenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "plugin_version_drift",
+      "contract_version_or_digest_drift",
+      "provider_revision_or_digest_drift",
+      "audit_or_framework_revision_drift",
+      "scope_or_permission_digest_drift",
+      "consent_revision_or_digest_drift",
+      "registration_tamper",
+      "registration_revocation",
+      "secret_reference_revocation"
+    ]
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxPages": 4,
+    "pageSize": 50,
+    "maxRequestsPerMinute": 5,
+    "maxAudits": 16,
+    "maxControls": 128,
+    "maxTests": 256,
+    "maxIssues": 128,
+    "maxInformationRequests": 128,
+    "maxIdentifierBytes": 128
+  },
+  "projections": {
+    "states": [
+      "complete",
+      "open",
+      "overdue",
+      "blocked",
+      "partial",
+      "retention_gap",
+      "access_loss",
+      "provider_unknown"
+    ],
+    "noIssuesIsCertification": false,
+    "certificationClaim": false,
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "outcomeAuthority": false
+  },
+  "redaction": {
+    "owners": false,
+    "evidenceUrls": false,
+    "comments": false,
+    "documentBodies": false,
+    "rawProviderPayload": false,
+    "credentialMaterial": false
+  },
+  "authority": {
+    "readOnly": true,
+    "proposalOnly": true,
+    "externalWrites": false,
+    "evidenceUpload": false,
+    "informationRequestAcceptance": false,
+    "controlOrPolicyMutation": false,
+    "auditApproval": false,
+    "mcp": false,
+    "certification": false,
+    "dashboard": false,
+    "connected": false,
+    "native": false,
+    "durableReceipt": false,
+    "verification": false,
+    "kernelOutcomeAdoption": false
+  },
+  "honesty": {
+    "nativeStatus": "BLOCKED_ENV",
+    "blockedEnvironmentIsNative": false,
+    "recordingIsNative": false,
+    "fixtureIsNative": false,
+    "loopbackIsNative": false,
+    "absenceOfIssuesIsCertification": false,
+    "layer1Boundary": "Layer 1 does not resolve native OAuth/client credentials, upload or accept evidence, edit controls/policies, approve audits, read raw owners/evidence URLs/comments/document bodies, claim SOC/ISO certification, invoke MCP, or adopt kernel Outcome authority."
+  },
+  "layer2Gaps": [
+    "native_vanta_oauth_or_client_credential_resolution",
+    "consented_authenticated_vanta_reads",
+    "durable_provider_receipts",
+    "independent_readback",
+    "verified_mission_adoption",
+    "host_owned_effect_and_verification_authority"
+  ],
+  "forbidden": [
+    "evidence_upload",
+    "information_request_acceptance_or_flagging",
+    "control_or_policy_mutation",
+    "audit_approval",
+    "mcp_invocation",
+    "auditor_pii",
+    "raw_owner_serialization",
+    "evidence_url_serialization",
+    "comment_serialization",
+    "document_body_serialization",
+    "certification_claim",
+    "generic_compliance_dashboard"
+  ]
+}
