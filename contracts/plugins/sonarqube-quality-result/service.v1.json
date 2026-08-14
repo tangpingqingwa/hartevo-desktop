@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schemaVersion": "hartevo.sonarqube-quality-result/v1",
+  "contractVersion": "sonarqube-quality-result-01-layer-1/v1",
+  "pluginId": "sonarqube.quality-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.sonarqube-quality-result/v1|layer=1|service=quality.sonarqube.result.read|provider=sonarqube.quality-result.recording|consumer=mission.sonarqube-quality-result.consumer",
+  "contractDigest": "9a0748ccf2f19de4579641ab8f914767217605d5144c3a952d68c52f5ed70ecc",
+  "officialReferences": [
+    "https://docs.sonarsource.com/sonarqube-server/extension-guide/web-api",
+    "https://docs.sonarsource.com/sonarqube-server/quality-standards-administration/managing-quality-gates/introduction-to-quality-gates",
+    "https://next.sonarqube.com/sonarqube/web_api/api/qualitygates/get_by_project"
+  ],
+  "service": {
+    "type": "SonarQubeQualityResultService",
+    "id": "quality.sonarqube.result.read",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "read_project_analyses",
+      "read_quality_gate_status",
+      "read_component_measures",
+      "compile_quality_result_proposal",
+      "record_quality_result"
+    ]
+  },
+  "provider": {
+    "type": "SonarQubeProvider",
+    "id": "sonarqube.quality-result.recording",
+    "apiRevision": "sonarqube-web-api-read-1",
+    "operations": [
+      "read_project_analyses",
+      "read_quality_gate_status",
+      "read_component_measures"
+    ],
+    "allowedEndpoints": [
+      "/api/project_analyses/search",
+      "/api/qualitygates/project_status",
+      "/api/measures/component"
+    ],
+    "allowedTransportProvenance": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "mutations": {
+      "executeAnalysis": false,
+      "mutateIssues": false,
+      "mutateQualityGates": false,
+      "createWebhooks": false,
+      "exportSource": false,
+      "arbitraryQueryDsl": false,
+      "resolveBearerSecret": false,
+      "adoptOutcome": false
+    },
+    "httpClassification": {
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true
+    }
+  },
+  "consumer": {
+    "type": "MissionSonarQubeQualityConsumer",
+    "id": "mission.sonarqube-quality-result.consumer",
+    "authority": "below-kernel-proposal-and-recording",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsKernelOutcome": false
+  },
+  "credentials": {
+    "boundary": "opaque SecretReference",
+    "kind": "bearer",
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "hostOrigin",
+      "organizationId",
+      "sonarProjectKey",
+      "branchOrPullRequest",
+      "analysisKey",
+      "analysisDate",
+      "sourceRevision",
+      "qualityGateId",
+      "qualityGateName",
+      "measureSelectors",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "capabilityDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ]
+  },
+  "permissions": {
+    "required": [
+      "project:read",
+      "analysis:read",
+      "quality_gate:read",
+      "measure:read"
+    ],
+    "writePermissions": false
+  },
+  "registration": {
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "unmountedStatuses": ["unmounted"],
+    "terminalStatuses": ["revoked"]
+  },
+  "bounds": {
+    "maxAnalysisPages": 8,
+    "maxPageSize": 50,
+    "maxAnalyses": 128,
+    "maxMetricKeys": 32,
+    "maxMeasures": 64,
+    "maxConditions": 128,
+    "maxResponseBytes": 1048576,
+    "repeatedPage": "fail_closed",
+    "duplicateAnalysis": "fail_closed",
+    "outOfScopeMeasure": "fail_closed"
+  },
+  "projections": [
+    "pass",
+    "error",
+    "warn",
+    "no_analysis",
+    "stale",
+    "partial",
+    "access_loss",
+    "provider_unknown"
+  ],
+  "evidence": {
+    "qualityGateConditions": true,
+    "newCodeMeasures": true,
+    "overallMeasures": true,
+    "analysisRevisionFence": true,
+    "qualityGateDigest": true,
+    "measureDigest": true,
+    "redactionDigest": true,
+    "registrationDigest": true,
+    "rawProviderPayload": false,
+    "rawSource": false,
+    "rawBearerToken": false,
+    "truncatedEvidenceIsAdoptable": false
+  },
+  "provenance": {
+    "fixture": "non_native_non_connected",
+    "recording": "non_native_non_connected",
+    "loopback": "non_native_non_connected",
+    "BLOCKED_ENV": "non_native_non_connected",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "durableProviderReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed SonarQube service/provider/consumer",
+      "exact host/organization/project/branch-or-pull-request/analysis/quality-gate/measure/Mission/Project/Work Product scope",
+      "bounded allowlisted analysis, quality-gate, and measure reads",
+      "version/provider/API/capability/permission/scope/registration digests",
+      "redacted proposal and local recording",
+      "reversible registration and revocation fencing"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "native credential resolution",
+      "analysis execution",
+      "issue or quality-gate mutation",
+      "webhooks",
+      "source export",
+      "arbitrary query DSL",
+      "dashboard or UI",
+      "generic security registry",
+      "release approval"
+    ]
+  },
+  "honestNativeGap": "Native bearer resolution, live HTTPS reads, durable provider receipts, independent read-back/reconciliation, verified Work Product adoption, and release approval remain Layer-2 work; fixture, recording, loopback, and BLOCKED_ENV never claim Connected or native."
+}
