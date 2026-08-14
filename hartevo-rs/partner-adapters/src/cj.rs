@@ -618,6 +618,18 @@ impl CjHttpTransport {
         })
     }
 
+    #[cfg(test)]
+    fn loopback(base_url: impl Into<String>) -> Result<Self, CjError> {
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
+        if !base_url.starts_with("http://127.0.0.1:") || base_url.contains('?') {
+            return Err(CjError::InvalidTransportBaseUrl);
+        }
+        Ok(Self {
+            base_url,
+            agent: Agent::new(),
+        })
+    }
+
     fn get_xml(
         &self,
         token: &CjAccessToken,
@@ -1144,7 +1156,7 @@ where
             || !response.advertiser_ids.contains(self.scope.advertiser_id())
             || response.source_revision == 0
             || !is_sha256(&response.source_digest)
-            || !response.source_uri.starts_with("https://")
+            || !is_provider_source_uri(&response.source_uri)
         {
             return Err(CjProviderError::ScopeDrift);
         }
@@ -1162,7 +1174,7 @@ where
             || page.source_revision == 0
             || !is_sha256(&page.source_digest)
             || page.source_digest != sha256_hex(&page.payload)
-            || !page.source_uri.starts_with("https://")
+            || !is_provider_source_uri(&page.source_uri)
         {
             return Err(CjProviderError::ScopeDrift);
         }
@@ -2140,6 +2152,19 @@ fn valid_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn is_provider_source_uri(value: &str) -> bool {
+    value.starts_with("https://") || {
+        #[cfg(test)]
+        {
+            value.starts_with("http://127.0.0.1:")
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
 fn extract_xml_values(body: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -2212,8 +2237,122 @@ mod tests {
     use hartevo_connector_sdk::ConnectorAuth;
     use hartevo_connector_sdk::{ProviderAdapterIdentity, WebhookObservation, WebhookSigningKey};
     use hartevo_domain_kernel::{Mission, MissionContract, MissionId, ProjectId, TenantId};
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::{self, JoinHandle};
 
     const NOW: &str = "2026-08-14T00:00:00Z";
+
+    struct LoopbackServer {
+        base_url: String,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl LoopbackServer {
+        fn start(expected_requests: usize) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+            let port = listener.local_addr().expect("loopback address").port();
+            let join = thread::spawn(move || {
+                for _ in 0..expected_requests {
+                    let (mut stream, _) = listener.accept().expect("loopback request");
+                    let request = read_http_request(&mut stream);
+                    let body = loopback_response(&request);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("loopback response");
+                    stream.flush().expect("loopback flush");
+                }
+            });
+            Self {
+                base_url: format!("http://127.0.0.1:{port}/v2/advertiser-lookup"),
+                join: Some(join),
+            }
+        }
+
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        fn finish(mut self) {
+            self.join
+                .take()
+                .expect("loopback join handle")
+                .join()
+                .expect("loopback server");
+        }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer).expect("loopback request bytes");
+            assert!(count > 0, "loopback request ended before headers");
+            bytes.extend_from_slice(&buffer[..count]);
+            assert!(
+                bytes.len() <= 16 * 1024,
+                "loopback request headers too large"
+            );
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(bytes).expect("loopback request utf8")
+    }
+
+    fn loopback_response(request: &str) -> String {
+        let mut lines = request.split("\r\n");
+        let request_line = lines.next().expect("loopback request line");
+        let mut request_parts = request_line.split_whitespace();
+        assert_eq!(request_parts.next(), Some("GET"));
+        let target = request_parts.next().expect("loopback target");
+        assert_eq!(request_parts.next(), Some("HTTP/1.1"));
+        let (path, query) = target.split_once('?').expect("loopback query");
+        assert_eq!(path, "/v2/advertiser-lookup");
+
+        let headers = lines
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer contract-cj-token")
+        );
+        assert_eq!(
+            headers.get("accept").map(String::as_str),
+            Some("application/xml")
+        );
+
+        let query = form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            query.get("requestor-cid").map(String::as_str),
+            Some("12345")
+        );
+        assert_eq!(
+            query.get("advertiser-ids").map(String::as_str),
+            Some("98765")
+        );
+        assert_eq!(query.get("relationship").map(String::as_str), Some("all"));
+        assert_eq!(query.get("records-per-page").map(String::as_str), Some("1"));
+        let page = query
+            .get("page-number")
+            .expect("loopback page number")
+            .parse::<u32>()
+            .expect("loopback page number integer");
+        assert!((1..=2).contains(&page));
+        format!(
+            "<cj-api><advertiser-lookup><total-matched>2</total-matched><records-returned>1</records-returned><page-number>{page}</page-number><advertiser><advertiser-id>98765</advertiser-id><program-id>555</program-id><program-name>CJ Loopback Program {page}</program-name></advertiser></advertiser-lookup></cj-api>"
+        )
+    }
 
     #[derive(Debug)]
     struct ContractTransport {
@@ -2643,6 +2782,143 @@ mod tests {
             CjMissionConsumer.consume(&mission, service.scope(), &probe, &result, &tampered, now()),
             Err(CjError::MissionBinding)
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn official_http_loopback_pagination_reconciles_exactly_once() {
+        let server = LoopbackServer::start(3);
+        assert!(matches!(
+            CjHttpTransport::new(server.base_url()),
+            Err(CjError::InvalidTransportBaseUrl)
+        ));
+        let transport = CjHttpTransport::loopback(server.base_url()).expect("loopback transport");
+        let mut service = CjService::new(
+            "worker-cj-loopback",
+            scope(),
+            plan(),
+            transport,
+            ContractResolver { available: true },
+            now(),
+            now() + Duration::minutes(10),
+            budget(),
+        )
+        .expect("loopback service");
+        let (secret, lease) = auth_material(service.scope());
+        service
+            .begin_auth(secret, lease, 1, now(), now() + Duration::minutes(5))
+            .expect("loopback auth");
+        let probe = service
+            .probe(1, "probe-result-cj-loopback", now())
+            .expect("loopback probe");
+        assert_eq!(
+            probe.observation.classification,
+            CjObservationClassification::FirstParty
+        );
+        assert!(
+            probe
+                .observation
+                .source_uri
+                .starts_with("http://127.0.0.1:")
+        );
+
+        let first = service.read(None, now()).expect("loopback first page");
+        let cursor = first.envelope.cursor.clone().expect("loopback cursor");
+        let second = service
+            .read(Some(&cursor), now())
+            .expect("loopback second page");
+        assert_eq!(first.envelope.data.page_number, 1);
+        assert_eq!(second.envelope.data.page_number, 2);
+        assert!(second.envelope.cursor.is_none());
+        assert_eq!(first.envelope.cost.cost_used_units, 1);
+        assert_eq!(second.envelope.cost.cost_used_units, 2);
+
+        let mut session = service
+            .reconcile_session(&probe, CjProgramId::new("555").expect("program"), 2)
+            .expect("loopback reconcile session");
+        let page_one = page_delivery(&session, &first, None);
+        let page_two = page_delivery(&session, &second, page_one.next_cursor());
+        assert!(matches!(
+            session.accept_page(page_two.clone(), now()),
+            Ok(CjReconcileOutcome::OutOfOrder(_))
+        ));
+        assert!(matches!(
+            session.accept_page(page_one.clone(), now()),
+            Ok(CjReconcileOutcome::Applied(_))
+        ));
+        assert!(matches!(
+            session.accept_page(page_one, now()),
+            Ok(CjReconcileOutcome::Duplicate(_))
+        ));
+        assert!(matches!(
+            session.accept_page(page_two.clone(), now()),
+            Ok(CjReconcileOutcome::Applied(_))
+        ));
+        assert!(matches!(
+            session.accept_page(page_two, now()),
+            Ok(CjReconcileOutcome::Duplicate(_))
+        ));
+
+        let key = WebhookSigningKey::new(b"cj-loopback-webhook-key").expect("webhook key");
+        let webhook_two = webhook_delivery(&session, 2, &key);
+        let webhook_one = webhook_delivery(&session, 1, &key);
+        assert!(matches!(
+            session.accept_webhook(webhook_two, now()),
+            Ok(CjReconcileOutcome::OutOfOrder(_))
+        ));
+        session
+            .accept_webhook(webhook_one.clone(), now())
+            .expect("loopback webhook one");
+        assert!(matches!(
+            session.accept_webhook(webhook_one, now()),
+            Ok(CjReconcileOutcome::Duplicate(_))
+        ));
+        let webhook_two = webhook_delivery(&session, 2, &key);
+        session
+            .accept_webhook(webhook_two.clone(), now())
+            .expect("loopback webhook two");
+        assert!(matches!(
+            session.accept_webhook(webhook_two, now()),
+            Ok(CjReconcileOutcome::Duplicate(_))
+        ));
+
+        let result = session
+            .close_result(now())
+            .expect("loopback mission result");
+        assert_eq!(result.page_count, 2);
+        assert_eq!(result.webhook_count, 2);
+        assert!(result.evidence_root.is_closed());
+        let mission = Mission::compile(
+            TenantId::from("tenant-cj"),
+            MissionId::from("mission-cj-loopback"),
+            ProjectId::from("project-cj"),
+            "Reconcile CJ loopback delivery",
+            MissionContract::bootstrap(
+                "Reconcile CJ loopback delivery",
+                [CJ_RECONCILE_MISSION_CAPABILITY.to_owned()],
+                now(),
+            ),
+            now(),
+        )
+        .expect("loopback mission");
+        let expected = CjMissionReconcileExpectation {
+            mission_id: mission.id.as_str().to_owned(),
+            mission_revision: mission.revision,
+            provider_id: CJ_PROVIDER_ID.to_owned(),
+            publisher_id: scope().publisher_id().clone(),
+            advertiser_id: scope().advertiser_id().clone(),
+            program_id: CjProgramId::new("555").expect("program"),
+            credential_revision: probe.credential_revision,
+            probe_revision: probe.connector_result.probe_revision(),
+            provider_generation: session.generation().provider_generation(),
+            generation_digest: session.generation().digest().to_owned(),
+            evidence_root_digest: result.evidence_root_digest.clone(),
+        };
+        let receipt = CjMissionReconcileConsumer
+            .consume(&mission, session.scope(), &result, &expected, now())
+            .expect("loopback Mission receipt");
+        assert_eq!(receipt.result_digest, result.result_digest);
+        server.finish();
     }
 
     fn reconcile_fixture() -> (

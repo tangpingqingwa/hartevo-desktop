@@ -609,7 +609,7 @@ impl CjPageDelivery {
             && at >= envelope.observed_at
             && at < envelope.valid_until
             && envelope.valid_until > envelope.observed_at
-            && envelope.source_uri.starts_with("https://")
+            && super::is_provider_source_uri(&envelope.source_uri)
             && is_sha256(&envelope.source_digest)
             && is_sha256(&envelope.content_digest)
             && is_sha256(&envelope.result_digest)
@@ -787,7 +787,7 @@ impl CjPageDelivery {
             && self.program_id == *scope.program_id()
             && self.sequence > 0
             && self.observed_at < self.valid_until
-            && self.source_uri.starts_with("https://")
+            && super::is_provider_source_uri(&self.source_uri)
             && !self.source_bytes.is_empty()
             && is_sha256(&self.source_digest)
             && is_sha256(&self.content_digest)
