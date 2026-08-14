@@ -1,16 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "edbf24666c8eed40bffc7e3736dad36342643643",
-  "candidateCount": 1,
+  "baseCommit": "f70271f21724042f369ec6e3b45c8eb791c5d4a9",
+  "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ci-runtime-adapter-etxtbsy-fix",
-      "headCommit": "feb9c5c2d9ef02a24ea32eb8631bca5b9d4b3a0f",
-      "number": 394
+      "headBranch": "codex/issue-clarity-ux-result-01",
+      "headCommit": "08d31e22e463b7e91607ee854bdf5a81a74d917c",
+      "number": 489
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/issue-mux-media-result-01",
+      "headCommit": "b143e49af68c57211bd6a056d4e37e04821c859f",
+      "number": 490
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/issue-algolia-search-result-01",
+      "headCommit": "920f2dc8777fcc48e25aa9338d686ed1413be3f2",
+      "number": 492
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/issue-honeycomb-trace-result-01",
+      "headCommit": "669da28ac7b9d9eb6263cefe54138eb844e875f2",
+      "number": 493
     }
   ],
-  "createdAt": "2026-08-14T13:51:55Z",
+  "createdAt": "2026-08-14T17:21:43Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -21,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260814-1351"
+  "trainBranch": "merge-train/20260815-0121"
 }
