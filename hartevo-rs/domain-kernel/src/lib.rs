@@ -13,6 +13,7 @@ mod creator_work;
 mod deletion;
 mod identity;
 mod identity_bootstrap;
+mod identity_plugin;
 mod ids;
 mod key_management;
 mod market_evidence;
@@ -77,6 +78,10 @@ pub use identity_bootstrap::{
     KEYCLOAK_PROVIDER_ID, OIDC_ACCESS_TOKEN_PURPOSE, OIDC_REFRESH_TOKEN_PURPOSE,
     OidcAuthorizationAttempt, OidcAuthorizationCallback, OidcAuthorizationRequest,
     OidcIdentityProvider, OidcProviderConfiguration, OidcTokenSet, PkceCodeVerifier,
+};
+pub use identity_plugin::{
+    IdentityPluginConsumer, IdentityPluginError, IdentityPluginHandle, IdentityPluginMountRequest,
+    IdentityPluginProvider, IdentityPluginScope, IdentityPluginService, IdentityPluginSessionFacts,
 };
 pub use ids::{
     AccountId, ActorId, ApprovalId, AttributionId, BrowserActionBatchId, BrowserControlLeaseId,
