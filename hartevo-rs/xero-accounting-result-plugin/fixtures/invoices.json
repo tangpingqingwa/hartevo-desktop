@@ -1,0 +1,31 @@
+{
+  "Invoices": [
+    {
+      "InvoiceID": "invoice-1",
+      "InvoiceNumber": "INV-1001",
+      "Type": "ACCREC",
+      "Status": "AUTHORISED",
+      "Date": "2026-08-01",
+      "DueDate": "2026-08-31",
+      "Contact": {
+        "ContactID": "contact-1",
+        "Name": "Example Customer",
+        "ContactStatus": "ACTIVE"
+      },
+      "CurrencyCode": "USD",
+      "SubTotal": 100.0,
+      "TotalTax": 20.0,
+      "Total": 120.0,
+      "AmountDue": 20.0,
+      "AmountPaid": 100.0,
+      "AmountCredited": 0.0,
+      "UpdatedDateUTC": "2026-08-10T12:00:00Z",
+      "LineItems": [
+        {
+          "Description": "fixture-only field is ignored",
+          "AccountCode": "400"
+        }
+      ]
+    }
+  ]
+}

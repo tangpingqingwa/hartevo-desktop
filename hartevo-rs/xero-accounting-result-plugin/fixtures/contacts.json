@@ -1,0 +1,12 @@
+{
+  "Contacts": [
+    {
+      "ContactID": "contact-1",
+      "Name": "Example Customer",
+      "ContactStatus": "ACTIVE",
+      "UpdatedDateUTC": "2026-08-10T12:00:00Z",
+      "EmailAddress": "must never be projected",
+      "BankAccountDetails": "must never be projected"
+    }
+  ]
+}
