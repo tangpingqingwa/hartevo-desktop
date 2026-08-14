@@ -1,0 +1,106 @@
+{
+  "schemaVersion": "hartevo.okta-entitlement/v1",
+  "contractVersion": "okta-entitlement-layer1/v1",
+  "pluginId": "hartevo.okta.entitlement-evidence",
+  "providerId": "okta",
+  "providerApiRevision": "okta-system-log-and-entitlement/v1",
+  "evidenceLevel": "external-entitlement-evidence-layer1",
+  "readOnly": true,
+  "connected": false,
+  "native": false,
+  "effectAuthority": false,
+  "outcomeAuthority": false,
+  "operations": [
+    "describe_capabilities",
+    "probe_registration",
+    "read_entitlement_snapshot",
+    "read_system_log_window",
+    "compile_access_change_proposal",
+    "verify_entitlement_evidence"
+  ],
+  "authentication": {
+    "scheme": "oauth2_service_app_private_key_jwt",
+    "secretMaterial": "opaque_secret_reference_only",
+    "liveTokenMint": false,
+    "sswsConstruction": false,
+    "privateJwkInReceipts": false,
+    "jwtAssertionInReceipts": false,
+    "accessTokenInReceipts": false
+  },
+  "scope": {
+    "exact": [
+      "org_id",
+      "custom_domain",
+      "service_app_client_id",
+      "granted_oauth_scopes",
+      "admin_resource_set_digest",
+      "project_id",
+      "mission_id",
+      "mission_revision",
+      "consent_reference"
+    ],
+    "immutableProviderIds": [
+      "user_id",
+      "group_id",
+      "application_id"
+    ]
+  },
+  "registration": {
+    "bindings": [
+      "plugin_version",
+      "contract_digest",
+      "provider_api_revision",
+      "capability_digest",
+      "grant_digest",
+      "scope_digest"
+    ],
+    "states": ["active", "reversed", "revoked"],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "systemLog": {
+    "historicalOnly": true,
+    "boundedWindow": true,
+    "pollingSinceDistinctFromProviderAfter": true,
+    "opaqueAfterProviderGenerated": true,
+    "retentionGapStatus": "unavailable",
+    "currentStateSolelyFromLogs": false
+  },
+  "evidence": {
+    "directReadAuthoritativeForCurrentState": true,
+    "systemLogSupplementalOnly": true,
+    "rawProfiles": false,
+    "pii": false,
+    "rawSystemLogPayload": false,
+    "fixtureConnectedClaim": false,
+    "recordingConnectedClaim": false,
+    "loopbackConnectedClaim": false,
+    "blockedEnvConnectedClaim": false
+  },
+  "bounds": {
+    "maxPageSize": 100,
+    "maxPages": 100,
+    "maxItems": 10000,
+    "maxResponseBytes": 2097152,
+    "maxSystemLogWindowSeconds": 86400
+  },
+  "forbiddenLayer1Actions": [
+    "mint_live_token",
+    "create_user",
+    "update_user",
+    "suspend_user",
+    "deactivate_user",
+    "create_group",
+    "update_group",
+    "create_application",
+    "update_application",
+    "assign_access",
+    "unassign_access",
+    "reset_credentials",
+    "revoke_sessions_or_tokens",
+    "invoke_workflows",
+    "accept_event_hooks",
+    "adopt_outcome"
+  ]
+}
