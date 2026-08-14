@@ -1,0 +1,387 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/airflow-dag-result/service.v1.json",
+  "title": "Hartevo Airflow DAG-run result Layer-1 service",
+  "description": "Standalone bounded read and proposal contract for Airflow DAG-run and task-instance evidence. It is not an Airflow scheduler, UI, worker kernel, materialization authority, or generic orchestration controller.",
+  "schemaVersion": "hartevo.airflow-dag-result/v1",
+  "contractVersion": "EXT-AIRFLOW-01-L1/v1",
+  "serviceId": "AirflowDagResultService",
+  "providerId": "AirflowProvider",
+  "consumerId": "MissionAirflowRunConsumer",
+  "layer": 1,
+  "honesty": {
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "recordingOnly": true,
+    "rawBearerSerialized": false,
+    "rawOidcSerialized": false,
+    "rawHeadersRetained": false,
+    "rawLogsRetained": false,
+    "rawXcomRetained": false,
+    "schedulerAuthority": false,
+    "kernelAuthority": false,
+    "providerReceipt": false,
+    "workProductAdopted": false
+  },
+  "service": {
+    "id": "AirflowDagResultService",
+    "provider": "AirflowProvider",
+    "consumer": "MissionAirflowRunConsumer",
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "schedulerAuthority": false,
+    "kernelAuthority": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "id": "AirflowProvider",
+    "apiRevision": "stable-rest-api-v1",
+    "stableRestGetOnly": true,
+    "connectedEvidence": false,
+    "nativeStatus": "BLOCKED_ENV",
+    "authentication": {
+      "bearerOrOidcReferenceOnly": true,
+      "serializedCredentials": false,
+      "environmentExport": false
+    },
+    "forbiddenResources": ["variables", "connections", "logs", "xcom"]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "serviceId",
+    "providerId",
+    "consumerId",
+    "layer",
+    "operations",
+    "scope",
+    "registration",
+    "projections",
+    "bounds",
+    "honesty",
+    "forbiddenEffects",
+    "layer2Gaps"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo.airflow-dag-result/v1"},
+    "contractVersion": {"const": "EXT-AIRFLOW-01-L1/v1"},
+    "serviceId": {"const": "AirflowDagResultService"},
+    "providerId": {"const": "AirflowProvider"},
+    "consumerId": {"const": "MissionAirflowRunConsumer"},
+    "layer": {"const": 1},
+    "operations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "describe_host",
+          "describe_tenant",
+          "describe_dag",
+          "read_dag_run",
+          "read_task_instances",
+          "compile_run_result_proposal",
+          "verify_run_evidence",
+          "register",
+          "unmount",
+          "remount",
+          "revoke",
+          "reverse"
+        ]
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host",
+        "tenant",
+        "dag",
+        "run",
+        "task",
+        "logicalDate",
+        "commitOrRelease",
+        "mission",
+        "permissions"
+      ],
+      "properties": {
+        "host": {"$ref": "#/$defs/host"},
+        "tenant": {"$ref": "#/$defs/revisionedName"},
+        "dag": {"$ref": "#/$defs/revisionedName"},
+        "run": {"$ref": "#/$defs/revisionedName"},
+        "task": {"$ref": "#/$defs/revisionedName"},
+        "logicalDate": {"$ref": "#/$defs/logicalDate"},
+        "commitOrRelease": {"$ref": "#/$defs/commitOrRelease"},
+        "mission": {"$ref": "#/$defs/mission"},
+        "permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "host:read",
+              "tenant:read",
+              "dag:read",
+              "dag-run:read",
+              "task-instance:read",
+              "logical-date:read",
+              "commit:read",
+              "mission:scope"
+            ]
+          }
+        }
+      }
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "versionDigest",
+        "contractDigest",
+        "providerDigest",
+        "apiDigest",
+        "hostDigest",
+        "tenantDigest",
+        "dagDigest",
+        "runDigest",
+        "taskDigest",
+        "logicalDateDigest",
+        "commitOrReleaseDigest",
+        "missionDigest",
+        "permissionDigest",
+        "revisionDigest",
+        "scopeDigest",
+        "credentialDigest",
+        "registrationDigest",
+        "reversible",
+        "revocable"
+      ],
+      "properties": {
+        "status": {"enum": ["active", "unmounted", "revoked", "reversed"]},
+        "versionDigest": {"$ref": "#/$defs/digest"},
+        "contractDigest": {"$ref": "#/$defs/digest"},
+        "providerDigest": {"$ref": "#/$defs/digest"},
+        "apiDigest": {"$ref": "#/$defs/digest"},
+        "hostDigest": {"$ref": "#/$defs/digest"},
+        "tenantDigest": {"$ref": "#/$defs/digest"},
+        "dagDigest": {"$ref": "#/$defs/digest"},
+        "runDigest": {"$ref": "#/$defs/digest"},
+        "taskDigest": {"$ref": "#/$defs/digest"},
+        "logicalDateDigest": {"$ref": "#/$defs/digest"},
+        "commitOrReleaseDigest": {"$ref": "#/$defs/digest"},
+        "missionDigest": {"$ref": "#/$defs/digest"},
+        "permissionDigest": {"$ref": "#/$defs/digest"},
+        "revisionDigest": {"$ref": "#/$defs/digest"},
+        "scopeDigest": {"$ref": "#/$defs/digest"},
+        "credentialDigest": {"$ref": "#/$defs/digest"},
+        "registrationDigest": {"$ref": "#/$defs/digest"},
+        "reversible": {"const": true},
+        "revocable": {"const": true}
+      }
+    },
+    "projections": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "queued",
+          "running",
+          "success",
+          "failed",
+          "upstream_failed",
+          "skipped",
+          "deferred",
+          "partial",
+          "stale",
+          "access_loss",
+          "provider_unknown"
+        ]
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxResponseBytes",
+        "maxPageItems",
+        "maxPages",
+        "maxTaskInstances",
+        "maxMetadataBytes",
+        "rawLogsRetained",
+        "rawXcomRetained"
+      ],
+      "properties": {
+        "maxResponseBytes": {"const": 2097152},
+        "maxPageItems": {"const": 256},
+        "maxPages": {"const": 32},
+        "maxTaskInstances": {"const": 4096},
+        "maxMetadataBytes": {"const": 16384},
+        "rawLogsRetained": {"const": false},
+        "rawXcomRetained": {"const": false}
+      }
+    },
+    "honesty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connected",
+        "native",
+        "firstParty",
+        "recordingOnly",
+        "rawBearerSerialized",
+        "rawOidcSerialized",
+        "rawHeadersRetained",
+        "rawLogsRetained",
+        "rawXcomRetained",
+        "schedulerAuthority",
+        "kernelAuthority",
+        "providerReceipt",
+        "workProductAdopted"
+      ],
+      "properties": {
+        "connected": {"const": false},
+        "native": {"const": false},
+        "firstParty": {"const": false},
+        "recordingOnly": {"const": true},
+        "rawBearerSerialized": {"const": false},
+        "rawOidcSerialized": {"const": false},
+        "rawHeadersRetained": {"const": false},
+        "rawLogsRetained": {"const": false},
+        "rawXcomRetained": {"const": false},
+        "schedulerAuthority": {"const": false},
+        "kernelAuthority": {"const": false},
+        "providerReceipt": {"const": false},
+        "workProductAdopted": {"const": false}
+      }
+    },
+    "forbiddenEffects": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "trigger_dag",
+          "clear_task_instance",
+          "retry_task_instance",
+          "read_variables",
+          "read_connections",
+          "read_raw_logs",
+          "read_xcom",
+          "control_scheduler",
+          "control_ui",
+          "resolve_native_secret",
+          "retain_raw_payload",
+          "retain_unbounded_tasks",
+          "adopt_kernel_truth",
+          "adopt_work_product"
+        ]
+      }
+    },
+    "layer2Gaps": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "native_bearer_or_oidc_resolution",
+          "bounded_https_get_reads",
+          "durable_provider_receipt",
+          "independent_dag_run_readback",
+          "independent_task_readback",
+          "verified_work_product_adoption"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001f/?:#]+$"
+    },
+    "revisionedName": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "revision"],
+      "properties": {
+        "name": {"$ref": "#/$defs/text"},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "hostId", "apiRevision", "revision"],
+      "properties": {
+        "origin": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^https?://"
+        },
+        "hostId": {"$ref": "#/$defs/text"},
+        "apiRevision": {"$ref": "#/$defs/text"},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "logicalDate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "revision"],
+      "properties": {
+        "value": {
+          "type": "string",
+          "minLength": 20,
+          "maxLength": 64,
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T"
+        },
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "commitOrRelease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value", "revision"],
+      "properties": {
+        "kind": {"enum": ["commit", "release"]},
+        "value": {"$ref": "#/$defs/text"},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "mission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectId",
+        "missionId",
+        "workProductId",
+        "projectRevision",
+        "missionRevision",
+        "workProductRevision",
+        "policyDigest",
+        "consentDigest"
+      ],
+      "properties": {
+        "projectId": {"$ref": "#/$defs/text"},
+        "missionId": {"$ref": "#/$defs/text"},
+        "workProductId": {"$ref": "#/$defs/text"},
+        "projectRevision": {"$ref": "#/$defs/revision"},
+        "missionRevision": {"$ref": "#/$defs/revision"},
+        "workProductRevision": {"$ref": "#/$defs/revision"},
+        "policyDigest": {"$ref": "#/$defs/digest"},
+        "consentDigest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  }
+}
