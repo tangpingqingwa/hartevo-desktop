@@ -139,6 +139,143 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.sync_object_heads (
             (cell, tenant_id, project_id, object_id, revision)
 );
 
+CREATE TABLE IF NOT EXISTS hartevo_cell.device_sync_registrations (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    region TEXT NOT NULL CHECK (region IN ('us', 'eu')),
+    mission_scope_digest TEXT NOT NULL CHECK (mission_scope_digest ~ '^[0-9a-f]{64}$'),
+    device_id TEXT NOT NULL CHECK (length(btrim(device_id)) > 0),
+    project_key_generation BIGINT NOT NULL CHECK (project_key_generation > 0),
+    keyring_manifest_digest TEXT NOT NULL
+        CHECK (keyring_manifest_digest ~ '^[0-9a-f]{64}$'),
+    registration_version BIGINT NOT NULL CHECK (registration_version > 0),
+    registration_digest TEXT NOT NULL CHECK (registration_digest ~ '^[0-9a-f]{64}$'),
+    device_public_key_digest TEXT NOT NULL
+        CHECK (device_public_key_digest ~ '^[0-9a-f]{64}$'),
+    service_id TEXT NOT NULL CHECK (length(btrim(service_id)) > 0),
+    service_version BIGINT NOT NULL CHECK (service_version > 0),
+    service_contract_digest TEXT NOT NULL
+        CHECK (service_contract_digest ~ '^[0-9a-f]{64}$'),
+    provider_id TEXT NOT NULL CHECK (length(btrim(provider_id)) > 0),
+    provider_region TEXT NOT NULL CHECK (provider_region IN ('us', 'eu')),
+    provider_version BIGINT NOT NULL CHECK (provider_version > 0),
+    provider_implementation_digest TEXT NOT NULL
+        CHECK (provider_implementation_digest ~ '^[0-9a-f]{64}$'),
+    consumer_id TEXT NOT NULL CHECK (length(btrim(consumer_id)) > 0),
+    consumer_min_service_version BIGINT NOT NULL CHECK (consumer_min_service_version > 0),
+    consumer_descriptor_digest TEXT NOT NULL
+        CHECK (consumer_descriptor_digest ~ '^[0-9a-f]{64}$'),
+    idempotency_key TEXT NOT NULL CHECK (idempotency_key ~ '^[0-9a-f]{64}$'),
+    request_digest TEXT NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    state TEXT NOT NULL CHECK (state IN ('attached', 'unmounted', 'revoked')),
+    attached_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    released_at TIMESTAMPTZ,
+    release_reason_digest TEXT
+        CHECK (release_reason_digest IS NULL OR release_reason_digest ~ '^[0-9a-f]{64}$'),
+    revision BIGINT NOT NULL CHECK (revision > 0),
+    PRIMARY KEY (cell, tenant_id, project_id, device_id, registration_version),
+    UNIQUE (cell, tenant_id, project_id, registration_digest),
+    UNIQUE (cell, tenant_id, project_id, idempotency_key),
+    FOREIGN KEY (cell, tenant_id, project_id)
+        REFERENCES hartevo_cell.projects (cell, tenant_id, project_id),
+    CHECK (region = cell AND provider_region = region),
+    CHECK (attached_at <= updated_at),
+    CHECK (
+        (state = 'attached' AND revision = 1 AND released_at IS NULL
+            AND release_reason_digest IS NULL)
+        OR (state IN ('unmounted', 'revoked') AND revision = 2
+            AND released_at = updated_at AND release_reason_digest IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.device_sync_document_versions (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    document_id TEXT NOT NULL CHECK (length(btrim(document_id)) > 0),
+    object_kind TEXT NOT NULL CHECK (length(btrim(object_kind)) > 0),
+    revision BIGINT NOT NULL CHECK (revision > 0),
+    project_key_generation BIGINT NOT NULL CHECK (project_key_generation > 0),
+    keyring_manifest_digest TEXT NOT NULL
+        CHECK (keyring_manifest_digest ~ '^[0-9a-f]{64}$'),
+    registration_version BIGINT NOT NULL CHECK (registration_version > 0),
+    registration_digest TEXT NOT NULL CHECK (registration_digest ~ '^[0-9a-f]{64}$'),
+    key_version BIGINT NOT NULL CHECK (key_version > 0),
+    nonce BYTEA NOT NULL CHECK (octet_length(nonce) = 12),
+    ciphertext BYTEA NOT NULL
+        CHECK (octet_length(ciphertext) BETWEEN 16 AND 16777216),
+    aad_digest TEXT NOT NULL CHECK (aad_digest ~ '^[0-9a-f]{64}$'),
+    content_digest TEXT NOT NULL CHECK (content_digest ~ '^[0-9a-f]{64}$'),
+    tombstone BOOLEAN NOT NULL DEFAULT FALSE,
+    recorded_at TIMESTAMPTZ NOT NULL,
+    request_digest TEXT NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    head_digest TEXT NOT NULL CHECK (head_digest ~ '^[0-9a-f]{64}$'),
+    PRIMARY KEY (cell, tenant_id, project_id, document_id, revision),
+    FOREIGN KEY (cell, tenant_id, project_id)
+        REFERENCES hartevo_cell.projects (cell, tenant_id, project_id),
+    CHECK (tombstone = FALSE OR revision > 1)
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.device_sync_document_heads (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    document_id TEXT NOT NULL CHECK (length(btrim(document_id)) > 0),
+    object_kind TEXT NOT NULL CHECK (length(btrim(object_kind)) > 0),
+    current_revision BIGINT NOT NULL CHECK (current_revision > 0),
+    project_key_generation BIGINT NOT NULL CHECK (project_key_generation > 0),
+    keyring_manifest_digest TEXT NOT NULL
+        CHECK (keyring_manifest_digest ~ '^[0-9a-f]{64}$'),
+    registration_version BIGINT NOT NULL CHECK (registration_version > 0),
+    registration_digest TEXT NOT NULL CHECK (registration_digest ~ '^[0-9a-f]{64}$'),
+    key_version BIGINT NOT NULL CHECK (key_version > 0),
+    content_digest TEXT NOT NULL CHECK (content_digest ~ '^[0-9a-f]{64}$'),
+    tombstone BOOLEAN NOT NULL DEFAULT FALSE,
+    head_digest TEXT NOT NULL CHECK (head_digest ~ '^[0-9a-f]{64}$'),
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (cell, tenant_id, project_id, document_id),
+    FOREIGN KEY (cell, tenant_id, project_id, document_id, current_revision)
+        REFERENCES hartevo_cell.device_sync_document_versions
+            (cell, tenant_id, project_id, document_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.device_sync_event_log (
+    sequence BIGSERIAL PRIMARY KEY,
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'attached', 'head_advanced', 'unmounted', 'revoked', 'crash_reclaimed',
+        'stale_generation_reclaimed')),
+    resource_id TEXT NOT NULL CHECK (length(btrim(resource_id)) > 0),
+    device_id TEXT NOT NULL CHECK (length(btrim(device_id)) > 0),
+    mission_scope_digest TEXT NOT NULL CHECK (mission_scope_digest ~ '^[0-9a-f]{64}$'),
+    project_key_generation BIGINT NOT NULL CHECK (project_key_generation > 0),
+    keyring_manifest_digest TEXT NOT NULL
+        CHECK (keyring_manifest_digest ~ '^[0-9a-f]{64}$'),
+    registration_version BIGINT NOT NULL CHECK (registration_version > 0),
+    registration_digest TEXT NOT NULL CHECK (registration_digest ~ '^[0-9a-f]{64}$'),
+    document_id TEXT,
+    result_revision BIGINT CHECK (result_revision IS NULL OR result_revision > 0),
+    result_head_digest TEXT
+        CHECK (result_head_digest IS NULL OR result_head_digest ~ '^[0-9a-f]{64}$'),
+    operation_id_digest TEXT NOT NULL CHECK (operation_id_digest ~ '^[0-9a-f]{64}$'),
+    request_digest TEXT NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    recorded_at TIMESTAMPTZ NOT NULL,
+    event_digest TEXT NOT NULL CHECK (event_digest ~ '^[0-9a-f]{64}$'),
+    UNIQUE (cell, tenant_id, project_id, operation_id_digest),
+    FOREIGN KEY (cell, tenant_id, project_id)
+        REFERENCES hartevo_cell.projects (cell, tenant_id, project_id),
+    CHECK (
+        (event_type = 'head_advanced' AND document_id IS NOT NULL
+            AND result_revision IS NOT NULL AND result_head_digest IS NOT NULL)
+        OR (event_type <> 'head_advanced' AND document_id IS NULL
+            AND result_revision IS NULL AND result_head_digest IS NULL)
+    )
+);
+
 CREATE TABLE IF NOT EXISTS hartevo_cell.domain_events (
     sequence BIGSERIAL PRIMARY KEY,
     cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
@@ -1211,6 +1348,19 @@ CREATE INDEX IF NOT EXISTS remote_worker_work_claim_idx
 CREATE INDEX IF NOT EXISTS remote_worker_work_log_task_idx
     ON hartevo_cell.remote_worker_work_log
         (cell, tenant_id, project_id, task_id, sequence);
+CREATE UNIQUE INDEX IF NOT EXISTS device_sync_active_registration_idx
+    ON hartevo_cell.device_sync_registrations
+        (cell, tenant_id, project_id, device_id)
+        WHERE state = 'attached';
+CREATE INDEX IF NOT EXISTS device_sync_registration_scope_idx
+    ON hartevo_cell.device_sync_registrations
+        (cell, tenant_id, project_id, device_id, state, project_key_generation);
+CREATE INDEX IF NOT EXISTS device_sync_document_head_scope_idx
+    ON hartevo_cell.device_sync_document_heads
+        (cell, tenant_id, project_id, updated_at, document_id);
+CREATE INDEX IF NOT EXISTS device_sync_event_resource_idx
+    ON hartevo_cell.device_sync_event_log
+        (cell, tenant_id, project_id, resource_id, sequence);
 CREATE INDEX IF NOT EXISTS device_handoff_target_idx
     ON hartevo_cell.device_handoff_grants
         (cell, tenant_id, project_id, target_device_id, expires_at);
@@ -1264,6 +1414,14 @@ ALTER TABLE hartevo_cell.remote_worker_result_receipts ENABLE ROW LEVEL SECURITY
 ALTER TABLE hartevo_cell.remote_worker_result_receipts FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.remote_worker_work_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.remote_worker_work_log FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.device_sync_registrations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.device_sync_registrations FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.device_sync_document_versions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.device_sync_document_versions FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.device_sync_document_heads ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.device_sync_document_heads FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.device_sync_event_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.device_sync_event_log FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.device_public_key_versions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.device_public_key_versions FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.device_public_key_heads ENABLE ROW LEVEL SECURITY;
@@ -1324,6 +1482,10 @@ BEGIN
         'remote_worker_work_requests',
         'remote_worker_result_receipts',
         'remote_worker_work_log',
+        'device_sync_registrations',
+        'device_sync_document_versions',
+        'device_sync_document_heads',
+        'device_sync_event_log',
         'device_public_key_versions',
         'device_public_key_heads',
         'keyring_bootstrap_versions',
