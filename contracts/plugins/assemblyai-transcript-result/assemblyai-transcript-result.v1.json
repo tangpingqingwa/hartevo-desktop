@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.assemblyai-transcript-result/v1",
+  "title": "Hartevo Layer-1 AssemblyAI transcript-result contract",
+  "schemaVersion": "hartevo.assemblyai-transcript-result/v1",
+  "contractVersion": "EXT-ASSEMBLYAI-01-L1/v1",
+  "contractDigestInput": "hartevo.assemblyai-transcript-result/v1|layer=1|service=AssemblyAiTranscriptResultService|provider=AssemblyAiProvider|consumer=MissionTranscriptResultConsumer",
+  "contractDigest": "39de9b885997882419b227b70910ddc0ccedb6a9a54fe9c90654bd830eeebb40",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "plugin": {
+    "id": "assemblyai.transcript-result",
+    "version": "1.0.0",
+    "reversible": true,
+    "scopeBound": true,
+    "digestBound": true
+  },
+  "service": {
+    "type": "AssemblyAiTranscriptResultService",
+    "id": "assemblyai.transcript-result.read",
+    "access": "read_proposal_recording_only",
+    "operations": [
+      "describe_capabilities",
+      "register_scope",
+      "read_transcript_result",
+      "compile_work_product_proposal",
+      "record_work_product_proposal",
+      "verify_transcript_result"
+    ],
+    "forbiddenOperations": [
+      "upload_audio",
+      "fetch_arbitrary_media",
+      "submit_transcript",
+      "poll_transcript_job",
+      "retain_raw_audio",
+      "export_raw_transcript",
+      "mutate_speaker_identity",
+      "train_model",
+      "external_write",
+      "adopt_outcome",
+      "adopt_work_product",
+      "kernel_authority"
+    ]
+  },
+  "provider": {
+    "type": "AssemblyAiProvider",
+    "id": "assemblyai.transcript-result.recording",
+    "apiRevision": "assemblyai-transcript-result-read-1",
+    "allowedTransportProvenance": [
+      "fake",
+      "recording",
+      "loopback",
+      "blocked_env"
+    ],
+    "httpClassification": {
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true,
+      "accessLoss": true,
+      "malformedResponse": true,
+      "partialResponse": true
+    },
+    "mutations": {
+      "audioUpload": false,
+      "transcriptSubmission": false,
+      "transcriptPolling": false,
+      "speakerIdentity": false,
+      "modelTraining": false,
+      "externalWrite": false
+    }
+  },
+  "credentials": {
+    "boundary": "opaque SecretReference",
+    "kind": "api_key",
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "exactFields": [
+      "host",
+      "accountId",
+      "sourceId",
+      "sourceRevision",
+      "transcriptId",
+      "transcriptRevision",
+      "modelRevision",
+      "modelConfiguration",
+      "segmentRevision",
+      "segmentPageSize",
+      "segmentMaxPages",
+      "segmentMaxCount",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision",
+      "permissionRevision",
+      "permissionSnapshotDigest"
+    ],
+    "revisionFences": [
+      "source",
+      "transcript",
+      "model",
+      "configuration",
+      "segment",
+      "mission",
+      "project",
+      "workProduct",
+      "permission"
+    ]
+  },
+  "bounds": {
+    "maxPageSize": 100,
+    "maxPages": 16,
+    "maxSegments": 512,
+    "maxChapters": 32,
+    "maxSummaryMetadataBytes": 256,
+    "maxIdentifierBytes": 128,
+    "maxDigestBytes": 64,
+    "maxResponseBytes": 1048576,
+    "repeatedPageToken": "fail_closed",
+    "truncatedProjection": "review_only"
+  },
+  "statusProjection": [
+    "queued",
+    "processing",
+    "completed",
+    "error",
+    "canceled",
+    "expired",
+    "provider_unknown"
+  ],
+  "evidence": {
+    "transcriptMetadata": true,
+    "language": true,
+    "speakerLabels": true,
+    "utteranceEvidence": true,
+    "confidenceSummary": true,
+    "chapterMetadata": true,
+    "summaryMetadata": true,
+    "boundedContentDigest": true,
+    "rawTranscriptBody": false,
+    "rawAudio": false,
+    "unredactedText": false,
+    "speakerIdentityMutation": false
+  },
+  "redaction": {
+    "rawApiKey": false,
+    "rawSecretReference": false,
+    "rawAudio": false,
+    "rawTranscriptBody": false,
+    "unredactedWords": false,
+    "unredactedUtterances": false,
+    "providerErrorText": false,
+    "speakerNames": false,
+    "opaquePageToken": false
+  },
+  "digests": [
+    "status",
+    "segment",
+    "content",
+    "registration",
+    "permission",
+    "proposal"
+  ],
+  "registration": {
+    "reversible": true,
+    "revocable": true,
+    "versionFenced": true,
+    "contractFenced": true,
+    "providerFenced": true,
+    "permissionFenced": true,
+    "scopeFenced": true,
+    "requiredReadPermissions": [
+      "account.read",
+      "transcript.read",
+      "utterance.read",
+      "speaker.read",
+      "metadata.read",
+      "redacted_content_digest.read"
+    ],
+    "forbiddenPermissions": [
+      "audio.upload",
+      "transcript.submit",
+      "transcript.poll",
+      "audio.fetch",
+      "transcript.raw.read",
+      "speaker.identity.write",
+      "model.training.write",
+      "external.write"
+    ]
+  },
+  "consumer": {
+    "type": "MissionTranscriptResultConsumer",
+    "id": "mission.assemblyai-transcript-result.consumer",
+    "authority": "redacted_proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "proposalRequiresNextMissionDecision": true,
+    "outcomeAdoption": false,
+    "verifiedWorkProductAdoption": false
+  },
+  "authority": {
+    "kernel": false,
+    "externalWrite": false,
+    "audioUpload": false,
+    "arbitraryMediaFetch": false,
+    "transcriptSubmission": false,
+    "transcriptPolling": false,
+    "rawAudioRetention": false,
+    "rawTranscriptExport": false,
+    "speakerIdentityMutation": false,
+    "modelTraining": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false,
+    "durableProviderReceipt": false,
+    "independentReadback": false
+  },
+  "provenance": {
+    "fake": "non_native_non_connected_non_first_party",
+    "recording": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blocked_env": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "durableProviderReceipt": false,
+    "independentReadback": false
+  },
+  "nonOverlap": {
+    "heygen": "generated video artifacts",
+    "documentProviders": "document and artifact results",
+    "assemblyai": "bounded redacted transcription evidence only"
+  },
+  "layer2Gaps": [
+    "native API-key resolution",
+    "live AssemblyAI HTTPS reads",
+    "transcript submission and polling",
+    "durable provider receipts",
+    "independent transcript readback",
+    "verified Work Product adoption"
+  ],
+  "officialReferences": [
+    "https://www.assemblyai.com/docs/api-reference/overview/",
+    "https://www.assemblyai.com/docs/api-reference/transcripts/list",
+    "https://www.assemblyai.com/docs/api-reference/transcripts/get"
+  ]
+}
