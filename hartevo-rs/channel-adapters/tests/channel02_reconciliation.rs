@@ -1,19 +1,17 @@
 use chrono::Duration;
 
 use hartevo_channel_adapters::identity::{
-    ChannelIdentity, ProviderId, WebhookEventId, YoutubeChannelId, YoutubeChannelIdentity,
-    YoutubeVideoId,
+    ProviderId, WebhookEventId, YoutubeChannelId, YoutubeChannelIdentity, YoutubeEtag,
+    YoutubePlaylistId, YoutubeVideoId,
 };
 use hartevo_channel_adapters::testkit::{
-    fixed_now, youtube_channel_response, youtube_uploads_response, youtube_video_response,
+    fixed_now, youtube_uploads_response, youtube_video_response,
 };
 use hartevo_channel_adapters::transport::{
     ChannelAdapterError, CredentialReference, ProviderReadRequest, ProviderResponse,
     ReadOnlyTransport, TransportError,
 };
-use hartevo_channel_adapters::youtube::{
-    YoutubeReadTarget, parse_channel_identity, parse_read_response,
-};
+use hartevo_channel_adapters::youtube::{YoutubeReadTarget, parse_read_response};
 use hartevo_channel_adapters::youtube_sync::{
     YoutubeCursorDisposition, YoutubeDurableCursor, YoutubeFreshnessPolicy, YoutubeRealReadGate,
     YoutubeReconciliationDisposition, YoutubeReconciliationLedger, YoutubeReconciliationSource,
@@ -25,11 +23,11 @@ fn credential(name: &str) -> CredentialReference {
 }
 
 fn channel() -> YoutubeChannelIdentity {
-    let observations = parse_channel_identity(&youtube_channel_response()).expect("channel parses");
-    let ChannelIdentity::Youtube(channel) = observations[0].channel().clone() else {
-        panic!("fixture channel must be a YouTube identity");
-    };
-    channel
+    YoutubeChannelIdentity::new(
+        YoutubeChannelId::new("UCchannel01").expect("fixture channel id is valid"),
+        YoutubeEtag::new("channel-etag-1").expect("fixture channel etag is valid"),
+        Some(YoutubePlaylistId::new("UUchannel01").expect("fixture playlist id is valid")),
+    )
 }
 
 fn video_target() -> YoutubeReadTarget {
