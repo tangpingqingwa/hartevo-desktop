@@ -11,6 +11,7 @@ pub mod amazon;
 mod canonical;
 pub mod shopify;
 pub mod sorftime;
+pub mod sorftime_plugin;
 pub mod world;
 
 pub use canonical::{
