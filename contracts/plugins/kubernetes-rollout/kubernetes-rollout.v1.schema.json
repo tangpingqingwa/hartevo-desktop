@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/blob/bootstrap/macos-r0/contracts/plugins/kubernetes-rollout/kubernetes-rollout.v1.schema.json",
+  "title": "Hartevo Kubernetes verified rollout result plugin",
+  "description": "Layer-1 read, proposal, dry-run evidence, and recording contract. It never executes a Kubernetes write or adopts a kernel result.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contractVersion",
+    "layer",
+    "service",
+    "provider",
+    "missionConsumer",
+    "registration",
+    "scopeFence",
+    "receiptFence",
+    "provenanceFence",
+    "forbiddenOperations",
+    "nativeGap"
+  ],
+  "properties": {
+    "contractVersion": { "const": "kubernetes-rollout/v1" },
+    "layer": { "const": 1 },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "access", "operations", "writesAllowed"],
+      "properties": {
+        "id": { "const": "kubernetes.rollout.read" },
+        "access": { "const": "read_only" },
+        "operations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "describe_rollout",
+              "read_rollout_evidence",
+              "compile_apply_proposal",
+              "compile_dry_run_proposal",
+              "record_rollout_receipt",
+              "verify_rollout_result"
+            ]
+          }
+        },
+        "writesAllowed": { "const": false }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "apiRevision", "transport", "nativeConnectedClaim"],
+      "properties": {
+        "id": { "const": "kubernetes.api.rollout" },
+        "apiRevision": { "const": "apps/v1" },
+        "transport": { "const": "typed_https_api_seam" },
+        "nativeConnectedClaim": { "const": false }
+      }
+    },
+    "missionConsumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "authority", "outcomeAdoption"],
+      "properties": {
+        "id": { "const": "mission.kubernetes.rollout.result" },
+        "authority": { "const": "mission_result_proposal" },
+        "outcomeAdoption": { "const": false }
+      }
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pluginVersion",
+        "contractDigest",
+        "adapterRevision",
+        "kubernetesApiRevision",
+        "rbacCapabilitySnapshotDigest",
+        "scopeDigest",
+        "reversible",
+        "revocable",
+        "failClosedDrift"
+      ],
+      "properties": {
+        "pluginVersion": { "type": "string", "minLength": 1 },
+        "contractDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "adapterRevision": { "type": "string", "minLength": 1 },
+        "kubernetesApiRevision": { "const": "apps/v1" },
+        "rbacCapabilitySnapshotDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "scopeDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "reversible": { "const": true },
+        "revocable": { "const": true },
+        "failClosedDrift": { "const": true }
+      }
+    },
+    "scopeFence": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "https_api_server",
+          "cluster_ca_spki_sha256",
+          "cluster_identity",
+          "namespace",
+          "deployment_name",
+          "deployment_uid",
+          "field_manager",
+          "allowed_container_image_digests",
+          "mission_id",
+          "project_id",
+          "work_product_id",
+          "consent_revision",
+          "policy_revision",
+          "rbac_capability_snapshot"
+        ]
+      }
+    },
+    "receiptFence": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "object_uid",
+          "resource_version",
+          "generation",
+          "observed_generation",
+          "spec_fingerprint",
+          "template_fingerprint",
+          "exact_image_digests",
+          "conditions",
+          "replica_counts",
+          "replicaset_revisions",
+          "dry_run_is_not_write_receipt",
+          "idempotency_fingerprint"
+        ]
+      }
+    },
+    "provenanceFence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixture", "recording", "loopback", "blockedEnv", "connectedNative"],
+      "properties": {
+        "fixture": { "const": "never_connected_or_native" },
+        "recording": { "const": "never_connected_or_native" },
+        "loopback": { "const": "never_connected_or_native" },
+        "blockedEnv": { "const": "never_connected_or_native" },
+        "connectedNative": { "const": false }
+      }
+    },
+    "forbiddenOperations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "live_apply",
+          "live_patch",
+          "live_delete",
+          "live_scale",
+          "live_rollback",
+          "live_restart",
+          "namespace_mutation",
+          "secret_mutation",
+          "rbac_mutation",
+          "pod_exec",
+          "raw_pod_logs",
+          "unbounded_watch",
+          "outcome_adoption"
+        ]
+      }
+    },
+    "nativeGap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "deferredTo", "failClosedCases"],
+      "properties": {
+        "status": { "const": "BLOCKED_ENV" },
+        "deferredTo": { "const": "optional_layer_2_draft" },
+        "failClosedCases": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "missing_exact_image_digest",
+              "missing_object_receipt",
+              "object_uid_replacement",
+              "ambiguous_apply",
+              "unobserved_generation",
+              "trust_or_rbac_drift"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
