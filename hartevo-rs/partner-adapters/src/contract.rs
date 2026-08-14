@@ -1050,6 +1050,8 @@ pub enum PartnerNetworkError {
     CallbackScopeMismatch,
     #[error("partner network provider transport is unavailable")]
     ProviderUnavailable,
+    #[error("partner network provider rate limit is exhausted")]
+    ProviderRateLimited,
     #[error("partner network identity is duplicated in one response")]
     DuplicateIdentity,
     #[error("partner network settlement period is invalid")]
