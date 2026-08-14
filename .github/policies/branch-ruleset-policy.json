@@ -63,6 +63,50 @@
     "bypassActors": [],
     "reason": "PR and required checks remain mandatory, but a solo maintainer is not required to approve their own pull request."
   },
+  "mergeQueue": {
+    "hostedEnforcement": "desired_active_not_yet_applied",
+    "observedHostedStatus": {
+      "rulesetApi": "NOT_APPLIED_AT_CHECKIN",
+      "rulesetId": null,
+      "rulesetName": "Hartevo bootstrap merge queue",
+      "verifiedAt": null
+    },
+    "buildConcurrency": 4,
+    "minimumGroupSize": 1,
+    "maximumGroupSize": 4,
+    "minimumGroupWaitMinutes": 5,
+    "requiredCheckTimeoutMinutes": 120,
+    "groupingStrategy": "HEADGREEN",
+    "mergeMethod": "MERGE",
+    "ruleset": {
+      "name": "Hartevo bootstrap merge queue",
+      "target": "branch",
+      "enforcement": "active",
+      "conditions": {
+        "ref_name": {
+          "include": [
+            "refs/heads/bootstrap/macos-r0"
+          ],
+          "exclude": []
+        }
+      },
+      "rules": [
+        {
+          "type": "merge_queue",
+          "parameters": {
+            "check_response_timeout_minutes": 120,
+            "grouping_strategy": "HEADGREEN",
+            "max_entries_to_build": 4,
+            "max_entries_to_merge": 4,
+            "merge_method": "MERGE",
+            "min_entries_to_merge": 1,
+            "min_entries_to_merge_wait_minutes": 5
+          }
+        }
+      ],
+      "bypass_actors": []
+    }
+  },
   "ruleset": {
     "name": "Hartevo protected integration branches",
     "target": "branch",

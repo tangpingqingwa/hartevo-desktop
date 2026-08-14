@@ -13,6 +13,10 @@ on:
         description: Instantiate and execute Rust gates for this changed scope.
         required: true
         type: boolean
+      run_macos:
+        description: Execute the macOS matrix instead of emitting Ubuntu planned-skip contexts.
+        required: true
+        type: boolean
       full_workspace:
         description: Run the full workspace instead of package-local scope.
         required: true
@@ -79,16 +83,24 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
-    runs-on: ${{ matrix.os }}
+    # Pull-request heads keep the stable required macOS check name but consume
+    # an Ubuntu runner for the auditable planned-skip marker. Merge-group and
+    # Integration callers opt into the real macOS runner explicitly.
+    runs-on: ${{ matrix.os == 'macos-15' && !inputs.run_macos && 'ubuntu-24.04' || matrix.os }}
     timeout-minutes: 60
     permissions:
       contents: read
     steps:
       - name: Planned scope skip marker
-        if: ${{ !inputs.run_rust }}
-        run: echo "Rust scope is empty; planned Rust checks are not executed."
+        if: ${{ !inputs.run_rust || (matrix.os == 'macos-15' && !inputs.run_macos) }}
+        run: |
+          if [[ "${{ inputs.run_rust }}" != true ]]; then
+            echo "Rust scope is empty; planned Rust checks are not executed."
+          else
+            echo "macOS is reserved for merge-group and Integration runs; this required context is an Ubuntu planned skip."
+          fi
       - name: Checkout reviewed source
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -114,7 +126,7 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev
       - name: Cache Cargo and Rust toolchain
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -125,10 +137,10 @@ jobs:
             target/ci-cargo
           key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}
       - name: Install the locked Rust components
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         run: rustup component add clippy rustfmt rust-src --toolchain 1.95.0
       - name: Strict Clippy gate
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         run: |
           bash scripts/ci-rust-gate.sh clippy \
             ${{ inputs.full_workspace && '--full' || '' }} \
@@ -140,16 +152,21 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-15' && !inputs.run_macos && 'ubuntu-24.04' || matrix.os }}
     timeout-minutes: 75
     permissions:
       contents: read
     steps:
       - name: Planned scope skip marker
-        if: ${{ !inputs.run_rust }}
-        run: echo "Rust scope is empty; planned Rust checks are not executed."
+        if: ${{ !inputs.run_rust || (matrix.os == 'macos-15' && !inputs.run_macos) }}
+        run: |
+          if [[ "${{ inputs.run_rust }}" != true ]]; then
+            echo "Rust scope is empty; planned Rust checks are not executed."
+          else
+            echo "macOS is reserved for merge-group and Integration runs; this required context is an Ubuntu planned skip."
+          fi
       - name: Checkout reviewed source
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -175,7 +192,7 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev
       - name: Cache Cargo and Rust toolchain
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -186,10 +203,10 @@ jobs:
             target/ci-cargo
           key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}
       - name: Install the locked Rust components
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         run: rustup component add clippy rustfmt rust-src --toolchain 1.95.0
       - name: Locked Rust test gate
-        if: inputs.run_rust
+        if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         run: |
           bash scripts/ci-rust-gate.sh test \
             ${{ inputs.full_workspace && '--full' || '' }} \

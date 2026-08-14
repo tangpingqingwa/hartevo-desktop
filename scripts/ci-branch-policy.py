@@ -22,6 +22,7 @@ REQUIRED_BRANCHES = {"main", "bootstrap/macos-r0"}
 UNAPPLIED = "desired_active_not_yet_applied"
 ACTIVE = "active"
 RULESET_NAME = "Hartevo protected integration branches"
+MERGE_QUEUE_RULESET_NAME = "Hartevo bootstrap merge queue"
 GITHUB_ACTIONS_INTEGRATION_ID = 15368
 EXPECTED_STATUS_CHECKS = (
     "PR / Workflow policy",
@@ -107,6 +108,49 @@ def desired_ruleset(policy: dict[str, object]) -> dict[str, object]:
     }
 
 
+def desired_merge_queue_ruleset(policy: dict[str, object]) -> dict[str, object]:
+    merge_queue = policy.get("mergeQueue")
+    if not isinstance(merge_queue, dict):
+        raise ValueError("merge queue policy is missing")
+    expected = {
+        "buildConcurrency": 4,
+        "minimumGroupSize": 1,
+        "maximumGroupSize": 4,
+        "minimumGroupWaitMinutes": 5,
+        "requiredCheckTimeoutMinutes": 120,
+        "groupingStrategy": "HEADGREEN",
+        "mergeMethod": "MERGE",
+    }
+    if any(merge_queue.get(key) != value for key, value in expected.items()):
+        raise ValueError("merge queue throughput settings drifted")
+    return {
+        "name": MERGE_QUEUE_RULESET_NAME,
+        "target": "branch",
+        "enforcement": "active",
+        "conditions": {
+            "ref_name": {
+                "include": ["refs/heads/bootstrap/macos-r0"],
+                "exclude": [],
+            }
+        },
+        "rules": [
+            {
+                "type": "merge_queue",
+                "parameters": {
+                    "check_response_timeout_minutes": expected["requiredCheckTimeoutMinutes"],
+                    "grouping_strategy": expected["groupingStrategy"],
+                    "max_entries_to_build": expected["buildConcurrency"],
+                    "max_entries_to_merge": expected["maximumGroupSize"],
+                    "merge_method": expected["mergeMethod"],
+                    "min_entries_to_merge": expected["minimumGroupSize"],
+                    "min_entries_to_merge_wait_minutes": expected["minimumGroupWaitMinutes"],
+                },
+            }
+        ],
+        "bypass_actors": [],
+    }
+
+
 def verify(path: Path = POLICY) -> dict[str, object]:
     policy = load(path)
     if policy.get("schemaVersion") != "hartevo-github-branch-ruleset-policy/v1":
@@ -139,6 +183,23 @@ def verify(path: Path = POLICY) -> dict[str, object]:
     ruleset = policy.get("ruleset")
     if not isinstance(ruleset, dict) or ruleset != desired_ruleset(policy):
         raise ValueError("checked-in ruleset payload drifted from the branch policy")
+    merge_queue = policy.get("mergeQueue")
+    if not isinstance(merge_queue, dict):
+        raise ValueError("merge queue policy must be an object")
+    merge_queue_enforcement = merge_queue.get("hostedEnforcement")
+    if merge_queue_enforcement not in {UNAPPLIED, ACTIVE}:
+        raise ValueError("merge queue hosted enforcement must be desired-active or active")
+    merge_queue_observed = merge_queue.get("observedHostedStatus")
+    if not isinstance(merge_queue_observed, dict):
+        raise ValueError("merge queue hosted observation must be recorded")
+    if merge_queue_enforcement == ACTIVE:
+        if merge_queue_observed.get("rulesetApi") != "ACTIVE" or not isinstance(merge_queue_observed.get("rulesetId"), int) or merge_queue_observed.get("rulesetId", 0) <= 0:
+            raise ValueError("active merge queue policy must record a verified hosted ruleset id")
+    elif merge_queue_observed.get("rulesetApi") != "NOT_APPLIED_AT_CHECKIN":
+        raise ValueError("unapplied merge queue policy must record that hosted application is pending")
+    merge_queue_ruleset = merge_queue.get("ruleset")
+    if not isinstance(merge_queue_ruleset, dict) or merge_queue_ruleset != desired_merge_queue_ruleset(policy):
+        raise ValueError("checked-in merge queue ruleset payload drifted from the throughput policy")
     release = policy.get("releaseEnvironment")
     if not isinstance(release, dict) or release.get("name") != "release-promotion" or release.get("oidcOnly") is not True or release.get("longLivedCredentialsAllowed") is not False or release.get("releaseEnabledInThisPr") is not False:
         raise ValueError("release environment must be OIDC-only and disabled in this PR")
@@ -148,6 +209,11 @@ def verify(path: Path = POLICY) -> dict[str, object]:
         "hostedEnforcement": "ACTIVE" if hosted_enforcement == ACTIVE else "DESIRED_ACTIVE",
         "branches": sorted(REQUIRED_BRANCHES),
         "requiredChecks": list(EXPECTED_STATUS_CHECKS),
+        "mergeQueue": {
+            "hostedEnforcement": "ACTIVE" if merge_queue_enforcement == ACTIVE else "DESIRED_ACTIVE",
+            "buildConcurrency": 4,
+            "maximumGroupSize": 4,
+        },
         "releaseEnabled": False,
     }
 
@@ -192,6 +258,17 @@ def ruleset_matches(actual: object, desired: dict[str, object]) -> bool:
 
     actual_rules = {rule.get("type"): rule for rule in actual.get("rules", []) if isinstance(rule, dict)}
     desired_rules = {rule.get("type"): rule for rule in desired.get("rules", []) if isinstance(rule, dict)}
+    if desired.get("name") == MERGE_QUEUE_RULESET_NAME:
+        if set(actual_rules) != {"merge_queue"} or set(desired_rules) != {"merge_queue"}:
+            return False
+        actual_parameters = actual_rules["merge_queue"].get("parameters", {})
+        desired_parameters = desired_rules["merge_queue"].get("parameters", {})
+        return (
+            isinstance(actual_parameters, dict)
+            and isinstance(desired_parameters, dict)
+            and all(actual_parameters.get(key) == value for key, value in desired_parameters.items())
+            and actual.get("bypass_actors", []) == desired.get("bypass_actors", [])
+        )
     if not {"deletion", "non_fast_forward", "pull_request", "required_status_checks"}.issubset(actual_rules):
         return False
     pull_parameters = actual_rules["pull_request"].get("parameters", {})
@@ -213,6 +290,7 @@ def ruleset_matches(actual: object, desired: dict[str, object]) -> bool:
 
 def probe(repo: str) -> int:
     local = verify()
+    policy = load()
     try:
         response = gh_api(f"repos/{repo}/rulesets?per_page=100")
     except ValueError as error:
@@ -220,51 +298,79 @@ def probe(repo: str) -> int:
         status = "BLOCKED_ENV" if "403" in message or "forbidden" in message.lower() else "FAIL"
         print(json.dumps({**local, "status": status, "code": "HOSTED_RULESET_API_UNAVAILABLE", "message": message}, sort_keys=True))
         return 2 if status == "BLOCKED_ENV" else 1
-    desired = load().get("ruleset")
-    named = [item for item in response if isinstance(item, dict) and item.get("name") == RULESET_NAME] if isinstance(response, list) else []
-    if len(named) != 1 or not isinstance(desired, dict):
-        print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_MISMATCH", "matchingRulesets": len(named), "hostedResponse": response}, sort_keys=True))
+    if not isinstance(response, list):
+        print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_LIST_INVALID"}, sort_keys=True))
         return 1
-    ruleset_id = named[0].get("id")
-    if not isinstance(ruleset_id, int) or not ruleset_matches(named[0], desired):
-        try:
-            observed = gh_api(f"repos/{repo}/rulesets/{ruleset_id}")
-        except ValueError as error:
-            print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_DETAIL_UNAVAILABLE", "message": str(error)}, sort_keys=True))
+    protected = policy.get("ruleset")
+    merge_queue = policy.get("mergeQueue")
+    queue_desired = merge_queue.get("ruleset") if isinstance(merge_queue, dict) else None
+    desired_rulesets = [protected, queue_desired]
+    observed_rulesets: list[dict[str, object]] = []
+    pending: list[str] = []
+    for desired in desired_rulesets:
+        if not isinstance(desired, dict) or not isinstance(desired.get("name"), str):
+            print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_PAYLOAD_MISSING"}, sort_keys=True))
             return 1
-    else:
+        named = [item for item in response if isinstance(item, dict) and item.get("name") == desired["name"]]
+        if not named and desired["name"] == MERGE_QUEUE_RULESET_NAME and isinstance(merge_queue, dict) and merge_queue.get("hostedEnforcement") == UNAPPLIED:
+            pending.append(str(desired["name"]))
+            continue
+        if len(named) != 1:
+            print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_MISMATCH", "rulesetName": desired["name"], "matchingRulesets": len(named)}, sort_keys=True))
+            return 1
+        ruleset_id = named[0].get("id")
+        if not isinstance(ruleset_id, int):
+            print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_ID_INVALID", "rulesetName": desired["name"]}, sort_keys=True))
+            return 1
         observed = named[0]
-    if not ruleset_matches(observed, desired):
-        print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_MISMATCH", "hostedRuleset": observed}, sort_keys=True))
-        return 1
-    print(json.dumps({**local, "status": "VERIFIED", "hostedRuleset": {"id": observed.get("id"), "name": observed.get("name"), "enforcement": observed.get("enforcement")}}, sort_keys=True))
+        if not ruleset_matches(observed, desired):
+            try:
+                observed = gh_api(f"repos/{repo}/rulesets/{ruleset_id}")
+            except ValueError as error:
+                print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_DETAIL_UNAVAILABLE", "message": str(error)}, sort_keys=True))
+                return 1
+        if not ruleset_matches(observed, desired):
+            print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_MISMATCH", "hostedRuleset": observed}, sort_keys=True))
+            return 1
+        observed_rulesets.append({"id": observed.get("id"), "name": observed.get("name"), "enforcement": observed.get("enforcement")})
+    if pending:
+        print(json.dumps({**local, "status": "DESIRED_ACTIVE", "code": "HOSTED_MERGE_QUEUE_NOT_APPLIED", "pendingRulesets": pending, "hostedRulesets": observed_rulesets}, sort_keys=True))
+        return 2
+    print(json.dumps({**local, "status": "VERIFIED", "hostedRulesets": observed_rulesets}, sort_keys=True))
     return 0
 
 
 def apply(repo: str) -> int:
     policy = load()
     local = verify()
-    desired = policy.get("ruleset")
-    if not isinstance(desired, dict):
-        raise ValueError("ruleset payload is missing")
+    protected = policy.get("ruleset")
+    merge_queue = policy.get("mergeQueue")
+    queue_desired = merge_queue.get("ruleset") if isinstance(merge_queue, dict) else None
+    desired_rulesets = [protected, queue_desired]
+    if not all(isinstance(desired, dict) for desired in desired_rulesets):
+        raise ValueError("protected or merge queue ruleset payload is missing")
     response = gh_api(f"repos/{repo}/rulesets?per_page=100")
     if not isinstance(response, list):
         raise ValueError("GitHub ruleset list response must be an array")
-    matches = [item for item in response if isinstance(item, dict) and item.get("name") == desired.get("name")]
-    if len(matches) > 1:
-        raise ValueError(f"multiple rulesets named {desired.get('name')!r} exist; refusing ambiguous update")
-    if matches:
-        ruleset_id = matches[0].get("id")
-        if not isinstance(ruleset_id, int) or ruleset_id <= 0:
-            raise ValueError("existing ruleset has no valid numeric id")
-        applied = gh_api(f"repos/{repo}/rulesets/{ruleset_id}", "PUT", desired)
-        operation = "updated"
-    else:
-        applied = gh_api(f"repos/{repo}/rulesets", "POST", desired)
-        operation = "created"
-    if not isinstance(applied, dict) or not isinstance(applied.get("id"), int):
-        raise ValueError("GitHub ruleset apply response has no numeric id")
-    print(json.dumps({**local, "status": "APPLIED", "operation": operation, "rulesetId": applied["id"], "rulesetName": applied.get("name")}, sort_keys=True))
+    operations: list[dict[str, object]] = []
+    for desired in desired_rulesets:
+        assert isinstance(desired, dict)
+        matches = [item for item in response if isinstance(item, dict) and item.get("name") == desired.get("name")]
+        if len(matches) > 1:
+            raise ValueError(f"multiple rulesets named {desired.get('name')!r} exist; refusing ambiguous update")
+        if matches:
+            ruleset_id = matches[0].get("id")
+            if not isinstance(ruleset_id, int) or ruleset_id <= 0:
+                raise ValueError("existing ruleset has no valid numeric id")
+            applied = gh_api(f"repos/{repo}/rulesets/{ruleset_id}", "PUT", desired)
+            operation = "updated"
+        else:
+            applied = gh_api(f"repos/{repo}/rulesets", "POST", desired)
+            operation = "created"
+        if not isinstance(applied, dict) or not isinstance(applied.get("id"), int):
+            raise ValueError("GitHub ruleset apply response has no numeric id")
+        operations.append({"operation": operation, "rulesetId": applied["id"], "rulesetName": applied.get("name")})
+    print(json.dumps({**local, "status": "APPLIED", "operations": operations}, sort_keys=True))
     return 0
 
 
@@ -286,6 +392,22 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("self-test accepted a solo-maintainer approval deadlock")
+    mutated = json.loads(json.dumps(policy))
+    mutated["mergeQueue"]["buildConcurrency"] = 5
+    try:
+        verify_policy_value(mutated)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("self-test accepted merge queue build concurrency above four")
+    mutated = json.loads(json.dumps(policy))
+    mutated["mergeQueue"]["hostedEnforcement"] = "unclaimed"
+    try:
+        verify_policy_value(mutated)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("self-test accepted an unclaimed merge queue enforcement state")
     print(json.dumps({"schema": "hartevo-ci-branch-policy-self-test/v1", "status": "PASS"}, sort_keys=True))
 
 

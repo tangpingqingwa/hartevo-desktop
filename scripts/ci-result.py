@@ -111,9 +111,11 @@ def write_junit(path: Path, workflow: str, overall: str, entries: list[dict[str,
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def validate_planned_scope_markers(records: list[object], expected_names: list[str]) -> dict[str, object]:
-    if len(expected_names) != 5 or len(set(expected_names)) != 5:
-        raise ValueError("planned Rust scope requires five unique child check names")
+def validate_planned_scope_markers(
+    records: list[object], expected_names: list[str], *, scope: str = "rust"
+) -> dict[str, object]:
+    if not expected_names or len(expected_names) != len(set(expected_names)):
+        raise ValueError(f"planned {scope} scope requires unique child check names")
     by_name = {
         record.get("name"): record
         for record in records
@@ -123,12 +125,12 @@ def validate_planned_scope_markers(records: list[object], expected_names: list[s
     for expected_name in expected_names:
         record = by_name.get(expected_name)
         if not isinstance(record, dict):
-            raise ValueError(f"planned Rust scope child check is missing: {expected_name}")
+            raise ValueError(f"planned {scope} scope child check is missing: {expected_name}")
         if record.get("status") != "completed" or record.get("conclusion") != "success":
-            raise ValueError(f"planned Rust scope child check did not succeed: {expected_name}")
+            raise ValueError(f"planned {scope} scope child check did not succeed: {expected_name}")
         steps = record.get("steps")
         if not isinstance(steps, list):
-            raise ValueError(f"planned Rust scope child check has malformed steps: {expected_name}")
+            raise ValueError(f"planned {scope} scope child check has malformed steps: {expected_name}")
         step_entries = [
             step
             for step in steps
@@ -137,18 +139,18 @@ def validate_planned_scope_markers(records: list[object], expected_names: list[s
             and isinstance(step.get("conclusion"), str)
         ]
         if len(step_entries) != len(steps):
-            raise ValueError(f"planned Rust scope child check has malformed step evidence: {expected_name}")
+            raise ValueError(f"planned {scope} scope child check has malformed step evidence: {expected_name}")
         step_names = [step["name"] for step in step_entries]
         marker_steps = [step for step in step_entries if step["name"] == PLANNED_SCOPE_MARKER]
         if len(marker_steps) != 1 or marker_steps[0]["conclusion"] != "success":
-            raise ValueError(f"planned Rust scope child check must run one marker: {expected_name}")
+            raise ValueError(f"planned {scope} scope child check must run one marker: {expected_name}")
         executed = [
             step["name"]
             for step in step_entries
             if step["conclusion"] != "skipped"
         ]
         if executed != ["Set up job", PLANNED_SCOPE_MARKER, "Complete job"]:
-            raise ValueError(f"planned Rust scope child check executed non-marker steps: {expected_name}: {executed}")
+            raise ValueError(f"planned {scope} scope child check executed non-marker steps: {expected_name}: {executed}")
         evidence.append(
             {
                 "name": expected_name,
@@ -172,8 +174,11 @@ def run_aggregate(args: argparse.Namespace) -> int:
     names = parse_mapping(args.job_name, "--job-name")
     allowed = set(args.allow_skipped)
     planned_scopes = set(args.planned_scope)
-    if planned_scopes - {"rust"}:
-        raise ValueError(f"unsupported planned scope: {sorted(planned_scopes - {'rust'})}")
+    supported_planned_scopes = {"rust", "macos"}
+    if planned_scopes - supported_planned_scopes:
+        raise ValueError(f"unsupported planned scope: {sorted(planned_scopes - supported_planned_scopes)}")
+    if len(planned_scopes) > 1:
+        raise ValueError("planned rust and macos scopes are mutually exclusive")
     if set(results) != set(kinds):
         raise ValueError("every job must have exactly one --kind")
     if not set(names).issubset(results):
@@ -195,7 +200,17 @@ def run_aggregate(args: argparse.Namespace) -> int:
         }
     planned_evidence: dict[str, object] = {}
     if "rust" in planned_scopes:
-        planned_evidence["rust"] = validate_planned_scope_markers(records, args.planned_job_name)
+        if len(args.planned_job_name) != 5:
+            raise ValueError("planned rust scope requires five child check names")
+        planned_evidence["rust"] = validate_planned_scope_markers(
+            records, args.planned_job_name, scope="rust"
+        )
+    if "macos" in planned_scopes:
+        if len(args.planned_job_name) != 2 or any("(macos-15)" not in name for name in args.planned_job_name):
+            raise ValueError("planned macos scope requires the two macOS child check names")
+        planned_evidence["macos"] = validate_planned_scope_markers(
+            records, args.planned_job_name, scope="macos"
+        )
     jobs = []
     for name in sorted(results):
         result = results[name]
@@ -263,6 +278,10 @@ def self_test() -> None:
     ]
     marker_evidence = validate_planned_scope_markers(marker_records, marker_names)
     assert marker_evidence["status"] == "PASS" and marker_evidence["jobCount"] == 5
+    macos_names = [name for name in marker_names if "(macos-15)" in name]
+    macos_records = [record for record in marker_records if record["name"] in macos_names]
+    macos_evidence = validate_planned_scope_markers(macos_records, macos_names, scope="macos")
+    assert macos_evidence["status"] == "PASS" and macos_evidence["jobCount"] == 2
     try:
         validate_planned_scope_markers(
             marker_records[:-1]
