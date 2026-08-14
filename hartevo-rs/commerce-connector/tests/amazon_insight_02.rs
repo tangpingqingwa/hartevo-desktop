@@ -1,17 +1,27 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::{self, JoinHandle};
+use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use hartevo_commerce_connector::amazon::{
-    AmazonAccountIdentity, AmazonAccountScope, AmazonLwaAuthState, AmazonNotificationCursor,
-    AmazonOperation, AmazonReport, AmazonReportStatus, AmazonRole, LwaAccessTokenObservation,
+    AmazonAccountIdentity, AmazonAccountScope, AmazonError, AmazonLwaAuthState,
+    AmazonNotificationCursor, AmazonOperation, AmazonReport, AmazonReportStatus, AmazonRole,
+    AmazonSpApiRequest, AmazonSpApiResponse, AmazonSpApiTransport, AmazonTransportError,
+    LwaAccessTokenObservation, list_reports_request, parse_notification_subscriptions_page_read,
+    parse_report_read, parse_reports_page_read,
 };
 use hartevo_commerce_connector::amazon_insight::{
     AMAZON_INSIGHT_CAPABILITY_ID, AMAZON_INSIGHT_LIVE_VALIDATION_STATUS,
     AMAZON_REPORT_CREATION_POLICY, AmazonDocumentCursor, AmazonFreshnessEvidence,
     AmazonInsightClassification, AmazonInsightCursor, AmazonInsightDurableStore,
-    AmazonInsightError, AmazonInsightProviderError, AmazonInsightReadRequest, AmazonInsightSource,
-    AmazonNotificationEvent, AmazonNotificationFeed, AmazonNotificationPage,
+    AmazonInsightError, AmazonInsightProviderError, AmazonInsightReadRequest, AmazonInsightRecord,
+    AmazonInsightSource, AmazonNotificationEvent, AmazonNotificationFeed, AmazonNotificationPage,
     AmazonNotificationPageRequest, AmazonNotificationType, AmazonPreauthorizedReportJob,
     AmazonProviderGeneration, AmazonQuotaCostEvidence, AmazonReportDocumentId,
     AmazonReportDocumentPage, AmazonReportDocumentPageRequest, AmazonReportStatusPage,
@@ -20,8 +30,528 @@ use hartevo_commerce_connector::amazon_insight::{
     report_document_sp_api_request, report_status_sp_api_request,
 };
 use hartevo_connector_sdk::{ConnectorScope, ProviderProvenanceClass, SecretReference};
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 const NOW_YEAR: i32 = 2026;
+
+#[derive(Clone, Debug)]
+struct LoopbackHttpRequest {
+    request_line: String,
+    headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+struct LoopbackHttpServer {
+    address: SocketAddr,
+    requests: Arc<Mutex<Vec<LoopbackHttpRequest>>>,
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl LoopbackHttpServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("Amazon loopback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("Amazon loopback nonblocking listener");
+        let address = listener.local_addr().expect("Amazon loopback address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests_for_thread = Arc::clone(&requests);
+        let stop_for_thread = Arc::clone(&stop);
+        let join = thread::spawn(move || {
+            while !stop_for_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        if let Ok(request) = read_loopback_request(&mut stream) {
+                            requests_for_thread
+                                .lock()
+                                .expect("Amazon loopback request state")
+                                .push(request.clone());
+                            let response = loopback_response(&request.request_line);
+                            let _ = write_loopback_response(&mut stream, &response);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(StdDuration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            address,
+            requests,
+            stop,
+            join: Some(join),
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn requests(&self) -> Vec<LoopbackHttpRequest> {
+        self.requests
+            .lock()
+            .expect("Amazon loopback request state")
+            .clone()
+    }
+}
+
+impl Drop for LoopbackHttpServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.address);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LoopbackAmazonSpApiTransport {
+    address: SocketAddr,
+}
+
+impl LoopbackAmazonSpApiTransport {
+    fn new(address: SocketAddr) -> Self {
+        Self { address }
+    }
+
+    fn execute_path(
+        &mut self,
+        path: &str,
+        token_digest: &str,
+    ) -> Result<AmazonSpApiResponse, AmazonTransportError> {
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: loopback.amazon.test\r\nAccept: application/json\r\nX-Amz-Access-Token: {token_digest}\r\nConnection: close\r\n\r\n"
+        );
+        let mut stream = TcpStream::connect(self.address)
+            .map_err(|error| AmazonTransportError::Failed(error.to_string()))?;
+        stream
+            .set_read_timeout(Some(StdDuration::from_secs(1)))
+            .map_err(|error| AmazonTransportError::Failed(error.to_string()))?;
+        stream
+            .set_write_timeout(Some(StdDuration::from_secs(1)))
+            .map_err(|error| AmazonTransportError::Failed(error.to_string()))?;
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|error| AmazonTransportError::Failed(error.to_string()))?;
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .map_err(|error| AmazonTransportError::Failed(error.to_string()))?;
+        parse_loopback_response(&response)
+    }
+
+    fn read_document_content(
+        &mut self,
+        url: &str,
+        cursor: Option<&AmazonDocumentCursor>,
+        token_digest: &str,
+    ) -> Result<AmazonSpApiResponse, AmazonTransportError> {
+        let prefix = "https://loopback.amazon.test";
+        let mut path = url
+            .strip_prefix(prefix)
+            .ok_or_else(|| AmazonTransportError::Failed("unexpected document URL host".into()))?
+            .to_owned();
+        if let Some(cursor) = cursor {
+            path.push_str("?cursor=");
+            path.push_str(cursor.as_str());
+        }
+        self.execute_path(&path, token_digest)
+    }
+}
+
+impl AmazonSpApiTransport for LoopbackAmazonSpApiTransport {
+    fn execute(
+        &mut self,
+        request: AmazonSpApiRequest,
+    ) -> Result<AmazonSpApiResponse, AmazonTransportError> {
+        request
+            .endpoint()
+            .map_err(|error| AmazonTransportError::Failed(error.to_string()))?;
+        let query = request
+            .query
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let path = if query.is_empty() {
+            request.path
+        } else {
+            format!("{}?{query}", request.path)
+        };
+        self.execute_path(&path, &request.access_token.token_digest)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoopbackReportDocumentDescriptor {
+    report_document_id: String,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoopbackDocumentPagePayload {
+    report_document_id: String,
+    records: Vec<LoopbackDocumentRecord>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoopbackDocumentRecord {
+    record_id: String,
+    content_digest: String,
+    observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct LoopbackAmazonInsightAdapter {
+    transport: LoopbackAmazonSpApiTransport,
+}
+
+impl LoopbackAmazonInsightAdapter {
+    fn new(address: SocketAddr) -> Self {
+        Self {
+            transport: LoopbackAmazonSpApiTransport::new(address),
+        }
+    }
+
+    fn quota(
+        request: &AmazonSpApiRequest,
+        response: &AmazonSpApiResponse,
+    ) -> Result<AmazonQuotaCostEvidence, AmazonInsightProviderError> {
+        let metadata = response
+            .metadata()
+            .map_err(|error| AmazonInsightProviderError::Malformed(error.to_string()))?;
+        AmazonQuotaCostEvidence::new(
+            request.operation,
+            metadata.rate_limit,
+            None,
+            1,
+            metadata.request_id,
+        )
+        .map_err(|error| AmazonInsightProviderError::Malformed(error.to_string()))
+    }
+
+    fn freshness(
+        at: DateTime<Utc>,
+        generation: AmazonProviderGeneration,
+    ) -> Result<AmazonFreshnessEvidence, AmazonInsightProviderError> {
+        AmazonFreshnessEvidence::new(at, at + Duration::seconds(60), generation.value())
+            .map_err(|error| AmazonInsightProviderError::Malformed(error.to_string()))
+    }
+
+    fn amazon_error(error: &AmazonError) -> AmazonInsightProviderError {
+        AmazonInsightProviderError::Malformed(error.to_string())
+    }
+}
+
+impl AmazonSpApiInsightAdapter for LoopbackAmazonInsightAdapter {
+    fn read_report_status(
+        &mut self,
+        request: AmazonReportStatusRequest,
+    ) -> Result<AmazonReportStatusPage, AmazonInsightProviderError> {
+        let http_request =
+            report_status_sp_api_request(&request).map_err(|error| Self::amazon_error(&error))?;
+        let response = self
+            .transport
+            .execute(http_request.clone())
+            .map_err(|error| AmazonInsightProviderError::Transport(error.to_string()))?;
+        let report = parse_report_read(&http_request, &response, request.at)
+            .map_err(|error| Self::amazon_error(&error))?;
+        Ok(AmazonReportStatusPage {
+            report: report.value,
+            quota: Self::quota(&http_request, &response)?,
+            freshness: Self::freshness(request.at, request.provider_generation)?,
+        })
+    }
+
+    fn read_report_document_page(
+        &mut self,
+        request: AmazonReportDocumentPageRequest,
+    ) -> Result<AmazonReportDocumentPage, AmazonInsightProviderError> {
+        let http_request =
+            report_document_sp_api_request(&request).map_err(|error| Self::amazon_error(&error))?;
+        let requested_cursor = request.requested_cursor.clone();
+        let descriptor_response = self
+            .transport
+            .execute(http_request.clone())
+            .map_err(|error| AmazonInsightProviderError::Transport(error.to_string()))?;
+        let descriptor = descriptor_response
+            .payload::<LoopbackReportDocumentDescriptor>()
+            .map_err(|error| Self::amazon_error(&error))?;
+        if descriptor.report_document_id != request.document_id.as_str() {
+            return Err(AmazonInsightProviderError::ScopeDrift);
+        }
+        let content_response = self
+            .transport
+            .read_document_content(
+                &descriptor.url,
+                requested_cursor.as_ref(),
+                &request.access_token.token_digest,
+            )
+            .map_err(|error| AmazonInsightProviderError::Transport(error.to_string()))?;
+        let page = content_response
+            .json::<LoopbackDocumentPagePayload>()
+            .map_err(|error| Self::amazon_error(&error))?;
+        if page.report_document_id != request.document_id.as_str() {
+            return Err(AmazonInsightProviderError::ScopeDrift);
+        }
+        let records = page
+            .records
+            .into_iter()
+            .map(|record| {
+                AmazonInsightRecord::new(
+                    record.record_id,
+                    record.content_digest,
+                    record.observed_at,
+                )
+                .map_err(|error| AmazonInsightProviderError::Malformed(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = page
+            .next_cursor
+            .map(AmazonDocumentCursor::parse)
+            .transpose()
+            .map_err(|error| AmazonInsightProviderError::Malformed(error.to_string()))?;
+        let page_sequence = if requested_cursor.is_some() { 2 } else { 1 };
+        Ok(AmazonReportDocumentPage {
+            document_id: request.document_id,
+            document_url_digest: digest(&descriptor.url),
+            document_url_expires_at: request.at + Duration::seconds(300),
+            requested_cursor,
+            page_sequence,
+            next_cursor,
+            records,
+            observed_at: request.at,
+            quota: Self::quota(&http_request, &content_response)?,
+            freshness: Self::freshness(request.at, request.provider_generation)?,
+        })
+    }
+
+    fn read_notification_page(
+        &mut self,
+        request: AmazonNotificationPageRequest,
+    ) -> Result<AmazonNotificationPage, AmazonInsightProviderError> {
+        let http_request = notification_cursor_sp_api_request(&request)
+            .map_err(|error| Self::amazon_error(&error))?;
+        let requested_cursor = request.requested_cursor.clone();
+        let response = self
+            .transport
+            .execute(http_request.clone())
+            .map_err(|error| AmazonInsightProviderError::Transport(error.to_string()))?;
+        let subscriptions =
+            parse_notification_subscriptions_page_read(&http_request, &response, request.at)
+                .map_err(|error| Self::amazon_error(&error))?
+                .value;
+        let events = subscriptions
+            .subscriptions
+            .into_iter()
+            .map(|subscription| {
+                let sequence = subscription
+                    .subscription_id
+                    .rsplit('-')
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        AmazonInsightProviderError::Malformed(
+                            "loopback notification sequence".into(),
+                        )
+                    })?;
+                AmazonNotificationEvent::new(
+                    subscription.subscription_id.clone(),
+                    sequence,
+                    request.feed.notification_type.clone(),
+                    request.at,
+                    digest(&subscription.subscription_id),
+                )
+                .map_err(|error| AmazonInsightProviderError::Malformed(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AmazonNotificationPage {
+            notification_type: request.feed.notification_type.clone(),
+            requested_cursor,
+            page_sequence: if request.requested_cursor.is_some() {
+                2
+            } else {
+                1
+            },
+            next_cursor: subscriptions.next_cursor,
+            events,
+            observed_at: request.at,
+            quota: Self::quota(&http_request, &response)?,
+            freshness: Self::freshness(request.at, request.provider_generation)?,
+        })
+    }
+}
+
+fn read_loopback_request(stream: &mut TcpStream) -> std::io::Result<LoopbackHttpRequest> {
+    stream.set_read_timeout(Some(StdDuration::from_secs(1)))?;
+    let mut bytes = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 2048];
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if find_subsequence(&bytes, b"\r\n\r\n").is_some() {
+            break;
+        }
+    }
+    let header_end = find_subsequence(&bytes, b"\r\n\r\n").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing loopback HTTP request headers",
+        )
+    })?;
+    let header = String::from_utf8_lossy(&bytes[..header_end]);
+    let mut lines = header.lines();
+    let request_line = lines.next().unwrap_or_default().to_owned();
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+        .collect();
+    Ok(LoopbackHttpRequest {
+        request_line,
+        headers,
+    })
+}
+
+fn write_loopback_response(stream: &mut TcpStream, body: &Value) -> std::io::Result<()> {
+    let body = body.to_string();
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nx-amzn-RequestId: loopback-request-{}\r\nx-amzn-RateLimit-Limit: 0.5\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        digest(&body)[..12].to_owned(),
+        body
+    )?;
+    stream.flush()
+}
+
+fn parse_loopback_response(bytes: &[u8]) -> Result<AmazonSpApiResponse, AmazonTransportError> {
+    let separator = find_subsequence(bytes, b"\r\n\r\n")
+        .ok_or_else(|| AmazonTransportError::Failed("missing loopback response body".into()))?;
+    let header = String::from_utf8_lossy(&bytes[..separator]);
+    let mut lines = header.lines();
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| AmazonTransportError::Failed("invalid loopback HTTP status".into()))?;
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_owned(), value.trim().to_owned()))
+        .collect();
+    let body = serde_json::from_slice(&bytes[separator + 4..])
+        .map_err(|error| AmazonTransportError::Failed(error.to_string()))?;
+    Ok(AmazonSpApiResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn loopback_response(request_line: &str) -> Value {
+    let path = request_line.split_whitespace().nth(1).unwrap_or_default();
+    if path == "/reports/2021-06-30/reports" || path.starts_with("/reports/2021-06-30/reports?") {
+        let second_page = path.contains("nextToken=reports-cursor-2");
+        return json!({
+            "reports": if second_page {
+                json!([{
+                    "reportId": "report-2",
+                    "reportType": "GET_MERCHANT_LISTINGS_ALL_DATA",
+                    "processingStatus": "DONE",
+                    "createdTime": "2026-08-14T05:00:00Z",
+                    "reportDocumentId": "DOC-2"
+                }])
+            } else {
+                json!([{
+                    "reportId": "report-1",
+                    "reportType": "GET_MERCHANT_LISTINGS_ALL_DATA",
+                    "processingStatus": "DONE",
+                    "createdTime": "2026-08-14T05:00:00Z",
+                    "reportDocumentId": "DOC-1"
+                }])
+            },
+            "nextToken": if second_page { Value::Null } else { json!("reports-cursor-2") }
+        });
+    }
+    if path == "/reports/2021-06-30/reports/report-1" {
+        return json!({
+            "payload": {
+                "reportId": "report-1",
+                "reportType": "GET_MERCHANT_LISTINGS_ALL_DATA",
+                "processingStatus": "DONE",
+                "createdTime": "2026-08-14T05:00:00Z",
+                "processingEndTime": "2026-08-14T05:01:00Z",
+                "reportDocumentId": "DOC-1"
+            }
+        });
+    }
+    if path == "/reports/2021-06-30/documents/DOC-1" {
+        return json!({
+            "payload": {
+                "reportDocumentId": "DOC-1",
+                "url": "https://loopback.amazon.test/document-content/DOC-1"
+            }
+        });
+    }
+    if path.starts_with("/document-content/DOC-1") {
+        let second_page = path.contains("cursor=document-cursor-2");
+        return json!({
+            "reportDocumentId": "DOC-1",
+            "records": if second_page {
+                json!([{
+                    "recordId": "row-2",
+                    "contentDigest": digest("row-2"),
+                    "observedAt": "2026-08-14T05:00:00Z"
+                }])
+            } else {
+                json!([{
+                    "recordId": "row-1",
+                    "contentDigest": digest("row-1"),
+                    "observedAt": "2026-08-14T05:00:00Z"
+                }])
+            },
+            "nextCursor": if second_page { Value::Null } else { json!("document-cursor-2") }
+        });
+    }
+    if path.starts_with("/notifications/v1/subscriptions") {
+        let second_page = path.contains("nextToken=notification-cursor-2");
+        return json!({
+            "payload": {
+                "subscriptions": if second_page {
+                    json!([
+                        {"subscriptionId": "delivery-2", "payloadVersion": "1.0", "destinationId": "destination-2"},
+                        {"subscriptionId": "delivery-3", "payloadVersion": "1.0", "destinationId": "destination-3"}
+                    ])
+                } else {
+                    json!([
+                        {"subscriptionId": "delivery-1", "payloadVersion": "1.0", "destinationId": "destination-1"},
+                        {"subscriptionId": "delivery-2", "payloadVersion": "1.0", "destinationId": "destination-2"}
+                    ])
+                },
+                "nextToken": if second_page { Value::Null } else { json!("notification-cursor-2") }
+            }
+        });
+    }
+    json!({"errors": [{"message": "unexpected loopback Amazon path"}]})
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
 
 #[derive(Clone, Debug)]
 struct FakeAmazonState {
@@ -380,6 +910,228 @@ fn new_store(
     secret_reference: &SecretReference,
 ) -> AmazonInsightDurableStore {
     AmazonInsightDurableStore::new(scope, secret_reference, generation()).expect("durable store")
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn loopback_sp_api_http_reads_paginate_and_reconcile_durably() {
+    let server = LoopbackHttpServer::start();
+    let address = server.address();
+    let scope = seller_scope();
+    let token_digest = match auth_state() {
+        AmazonLwaAuthState::TokenObserved { token, .. } => token.token_digest,
+        AmazonLwaAuthState::Disconnected { .. } | AmazonLwaAuthState::BlockedEnv { .. } => {
+            panic!("loopback token observation")
+        }
+    };
+
+    let mut list_transport = LoopbackAmazonSpApiTransport::new(address);
+    let first_list_request = list_reports_request(
+        scope.clone(),
+        LwaAccessTokenObservation::from_raw_token(
+            b"controlled-token-only",
+            now() - Duration::seconds(10),
+            600,
+        )
+        .expect("list token"),
+        None,
+    )
+    .expect("first reports list request");
+    let first_list_response = list_transport
+        .execute(first_list_request.clone())
+        .expect("first reports list response");
+    let first_list = parse_reports_page_read(&first_list_request, &first_list_response, now())
+        .expect("first reports list page");
+    assert_eq!(first_list.value.reports.len(), 1);
+    assert_eq!(first_list.value.reports[0].report_id, "report-1");
+    assert_eq!(
+        first_list.value.next_token.as_deref(),
+        Some("reports-cursor-2")
+    );
+    let second_list_request = list_reports_request(
+        scope.clone(),
+        LwaAccessTokenObservation::from_raw_token(
+            b"controlled-token-only",
+            now() - Duration::seconds(10),
+            600,
+        )
+        .expect("list token"),
+        first_list.value.next_token,
+    )
+    .expect("second reports list request");
+    let second_list_response = list_transport
+        .execute(second_list_request.clone())
+        .expect("second reports list response");
+    let second_list = parse_reports_page_read(&second_list_request, &second_list_response, now())
+        .expect("second reports list page");
+    assert_eq!(second_list.value.reports[0].report_id, "report-2");
+    assert_eq!(second_list.value.next_token, None);
+
+    let report_read_request = report_request(&scope);
+    let report_secret = secret(&scope);
+    let mut report_service = CommerceInsightReadService::new(
+        LoopbackAmazonInsightAdapter::new(address),
+        report_secret.clone(),
+        scope.clone(),
+        generation(),
+        auth_state(),
+        ProviderProvenanceClass::ControlledProvider,
+        new_store(&scope, &report_secret),
+    )
+    .expect("loopback report service");
+    let first_report = report_service
+        .read(&report_read_request, now())
+        .expect("first report document page");
+    assert_eq!(first_report.page_sequence, 1);
+    assert_eq!(first_report.items[0].item_id, "row-1");
+    assert!(matches!(
+        first_report.next_cursor,
+        AmazonInsightCursor::Report(Some(_))
+    ));
+    assert_eq!(first_report.scope_digest, amazon_scope_digest(&scope));
+    assert_eq!(first_report.provider_generation, generation());
+    assert_eq!(
+        first_report.provider_request_id,
+        first_report.quota.request_id
+    );
+    assert_eq!(
+        first_report
+            .quota
+            .rate_limit
+            .as_ref()
+            .expect("loopback report rate")
+            .raw,
+        "0.5"
+    );
+    assert_eq!(
+        first_report.live_validation_status,
+        AMAZON_INSIGHT_LIVE_VALIDATION_STATUS
+    );
+    assert!(!first_report.is_first_party());
+    assert!(first_report.is_mission_adoptable());
+
+    let restored_store: AmazonInsightDurableStore = serde_json::from_slice(
+        &serde_json::to_vec(report_service.store()).expect("report checkpoint JSON"),
+    )
+    .expect("reopened report checkpoint");
+    let mut restarted_report_service = CommerceInsightReadService::new(
+        LoopbackAmazonInsightAdapter::new(address),
+        report_secret,
+        scope.clone(),
+        generation(),
+        auth_state(),
+        ProviderProvenanceClass::ControlledProvider,
+        restored_store,
+    )
+    .expect("restarted loopback report service");
+    let second_report = restarted_report_service
+        .read(&report_read_request, now() + Duration::seconds(1))
+        .expect("second report document page after restart");
+    assert_eq!(second_report.page_sequence, 2);
+    assert_eq!(second_report.items[0].item_id, "row-2");
+    assert_eq!(second_report.next_cursor, AmazonInsightCursor::Report(None));
+    assert!(matches!(
+        restarted_report_service.read(&report_read_request, now() + Duration::seconds(2)),
+        Err(AmazonInsightError::ResearchComplete)
+    ));
+
+    let notification_read_request = notification_request(scope.clone());
+    let notification_secret = secret(&scope);
+    let mut notification_service = CommerceInsightReadService::new(
+        LoopbackAmazonInsightAdapter::new(address),
+        notification_secret.clone(),
+        scope.clone(),
+        generation(),
+        auth_state(),
+        ProviderProvenanceClass::ControlledProvider,
+        new_store(&scope, &notification_secret),
+    )
+    .expect("loopback notification service");
+    let first_notification = notification_service
+        .read(&notification_read_request, now())
+        .expect("first notification page");
+    assert_eq!(first_notification.items.len(), 2);
+    let second_notification = notification_service
+        .read(&notification_read_request, now() + Duration::seconds(1))
+        .expect("second notification page");
+    assert_eq!(second_notification.items.len(), 1);
+    assert_eq!(second_notification.items[0].item_id, "delivery-3");
+    assert_eq!(
+        second_notification
+            .quota
+            .rate_limit
+            .as_ref()
+            .expect("loopback notification rate")
+            .raw,
+        "0.5"
+    );
+    assert!(!second_notification.is_first_party());
+    assert_eq!(
+        notification_service.store().checkpoints()[&notification_read_request.research_id]
+            .seen_delivery_identities
+            .len(),
+        3
+    );
+    assert!(matches!(
+        notification_service.read(&notification_read_request, now() + Duration::seconds(2)),
+        Err(AmazonInsightError::ResearchComplete)
+    ));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 9);
+    assert!(requests.iter().all(|request| {
+        request
+            .headers
+            .get("x-amz-access-token")
+            .is_some_and(|value| value == &token_digest)
+    }));
+    assert_eq!(
+        requests[0].request_line,
+        "GET /reports/2021-06-30/reports HTTP/1.1"
+    );
+    assert!(
+        requests[1]
+            .request_line
+            .contains("nextToken=reports-cursor-2")
+    );
+    assert_eq!(
+        requests[2].request_line,
+        "GET /reports/2021-06-30/reports/report-1 HTTP/1.1"
+    );
+    assert!(
+        requests[3]
+            .request_line
+            .starts_with("GET /reports/2021-06-30/documents/DOC-1 HTTP/1.1")
+    );
+    assert_eq!(
+        requests[4].request_line,
+        "GET /document-content/DOC-1 HTTP/1.1"
+    );
+    assert!(
+        requests[5]
+            .request_line
+            .starts_with("GET /reports/2021-06-30/documents/DOC-1 HTTP/1.1")
+    );
+    assert!(
+        requests[6]
+            .request_line
+            .contains("/document-content/DOC-1?cursor=document-cursor-2")
+    );
+    assert!(
+        requests[7]
+            .request_line
+            .contains("/notifications/v1/subscriptions")
+    );
+    assert!(
+        requests[7]
+            .request_line
+            .contains("notificationTypes=ORDER_CHANGE")
+    );
+    assert!(
+        requests[8]
+            .request_line
+            .contains("nextToken=notification-cursor-2")
+    );
 }
 
 #[test]
