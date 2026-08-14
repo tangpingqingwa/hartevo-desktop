@@ -19,11 +19,12 @@ use hartevo_application::{
     EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
     FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn, KeyAdministrationAuthorization,
     MissionCheckpointDispatchState, MissionRuntimeProjection, ObserveContextRuntimeTurn,
-    PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
-    ProvisionProjectEncryption, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
-    ResearchPacket, RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime,
-    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTurnDispatchDisposition,
-    StartCatalogMission, StartMission,
+    PendingPluginApprovalProjection, PrepareLocalMissionRuntimeContext,
+    ProjectContextMaterialSession, ProjectEncryptionReadiness, ProvisionProjectEncryption,
+    RecoverContextWorkerRuntime, RecoverPersonalProjectDevice, ResearchPacket,
+    RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime, RuntimeTextSubscriptionBatch,
+    RuntimeTextSubscriptionCursor, RuntimeTurnDispatchDisposition, StartCatalogMission,
+    StartMission,
 };
 use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
@@ -675,6 +676,40 @@ impl DesktopDataPlane {
     ) -> Result<Option<DesktopRuntimeTextStreamProjection>, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         self.runtime_text_stream_with(&secret_store, project_id, mission_id, now)
+    }
+
+    /// Reads the durable pending plugin approvals for one exact Mission.
+    ///
+    /// This is a projection-only path: it opens the encrypted store without
+    /// startup reconciliation, proves the current Project context, and reads
+    /// Application's exact request services. It never constructs an
+    /// EffectBroker or performs a decision.
+    pub fn pending_plugin_approval_os(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<PendingPluginApprovalProjection>, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.pending_plugin_approval_with(&secret_store, project_id, mission_id, now)
+    }
+
+    pub fn pending_plugin_approval_with(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<PendingPluginApprovalProjection>, DesktopDataError> {
+        self.revalidate_database_entry()?;
+        let database_secret = self.database_secret(secret_store)?;
+        let service = self.open_read_application_from_secret(&database_secret)?;
+        self.require_project_context_access(&service, secret_store, project_id, now)?;
+        let services = service.pending_plugin_approval_services(project_id, mission_id)?;
+        services
+            .iter()
+            .map(|approval| approval.provider(&service).read().map_err(Into::into))
+            .collect()
     }
 
     /// Creates the installation SQLCipher key only after an explicit Desktop
