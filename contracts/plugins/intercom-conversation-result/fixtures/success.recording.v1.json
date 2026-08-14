@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "hartevo.intercom-conversation-result/v1",
+  "contractVersion": "EXT-INTERCOM-01-L1/v1",
+  "transport": "recording",
+  "connected": false,
+  "native": false,
+  "firstParty": false,
+  "rawPiiRetained": false,
+  "rawMessageBodiesRetained": false,
+  "conversationState": "closed",
+  "parts": "digest-only",
+  "effects": []
+}
