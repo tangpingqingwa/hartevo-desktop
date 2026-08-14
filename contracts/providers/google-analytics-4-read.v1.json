@@ -1,0 +1,109 @@
+{
+  "schemaVersion": "hartevo-provider-adapter-contract/v1",
+  "contractVersion": "provider-adapter-e1/v1",
+  "registryVersion": "google-analytics-4-read-2026-08-14/v1",
+  "evidenceLevel": "E1",
+  "secretMaterial": "forbidden",
+  "validationAuthority": "metadata_binding_only",
+  "claimAuthority": {
+    "connected": false,
+    "providerExecution": false,
+    "providerReceipt": false,
+    "businessVerification": false,
+    "e4": false
+  },
+  "identifierRules": {
+    "providerId": "1..64 lowercase ASCII letters, digits, or internal hyphens",
+    "capabilityId": "2..96 lowercase dot-separated segments using letters, digits, hyphens, or underscores",
+    "adapterId": "2..96 lowercase dot-separated segments using letters, digits, hyphens, or underscores",
+    "adapterVersion": "positive integer",
+    "evidenceDigest": "64 lowercase hexadecimal characters"
+  },
+  "operations": [
+    "probe",
+    "begin_auth",
+    "refresh",
+    "read",
+    "prepare_effect",
+    "execute",
+    "reconcile",
+    "verify",
+    "handle_webhook",
+    "revoke"
+  ],
+  "evidenceClasses": [
+    "probe_observation",
+    "authentication",
+    "read_observation",
+    "prepared_effect",
+    "receipt_candidate",
+    "reconciliation_observation",
+    "verification_observation",
+    "webhook_observation",
+    "revocation_observation"
+  ],
+  "provenanceClasses": [
+    "fixture",
+    "component_harness",
+    "controlled_provider",
+    "production_provider"
+  ],
+  "operationEvidenceBindings": {
+    "probe": "probe_observation",
+    "begin_auth": "authentication",
+    "refresh": "authentication",
+    "read": "read_observation",
+    "prepare_effect": "prepared_effect",
+    "execute": "receipt_candidate",
+    "reconcile": "reconciliation_observation",
+    "verify": "verification_observation",
+    "handle_webhook": "webhook_observation",
+    "revoke": "revocation_observation"
+  },
+  "registrations": [
+    {
+      "key": {
+        "providerId": "google-analytics-4",
+        "capabilityId": "connection.probe"
+      },
+      "adapter": {
+        "adapterId": "google-analytics-4.data-api",
+        "adapterVersion": 1
+      },
+      "evidenceSupport": [
+        {
+          "operation": "probe",
+          "evidenceClass": "probe_observation",
+          "provenanceClass": "controlled_provider"
+        },
+        {
+          "operation": "probe",
+          "evidenceClass": "probe_observation",
+          "provenanceClass": "production_provider"
+        }
+      ]
+    },
+    {
+      "key": {
+        "providerId": "google-analytics-4",
+        "capabilityId": "analytics.report"
+      },
+      "adapter": {
+        "adapterId": "google-analytics-4.data-api",
+        "adapterVersion": 1
+      },
+      "evidenceSupport": [
+        {
+          "operation": "read",
+          "evidenceClass": "read_observation",
+          "provenanceClass": "controlled_provider"
+        },
+        {
+          "operation": "read",
+          "evidenceClass": "read_observation",
+          "provenanceClass": "production_provider"
+        }
+      ]
+    }
+  ]
+}
