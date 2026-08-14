@@ -20,6 +20,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 pub mod os;
+pub mod plugin_dispatch;
 pub mod plugin_invocation;
 pub mod recurring_schedule;
 
