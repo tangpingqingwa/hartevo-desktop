@@ -1533,6 +1533,7 @@ impl RecipeAuthority {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn restore_from_json(&self) -> Self {
         let trust_json = must(
             serde_json::to_string(&self.trust.snapshot()),
@@ -1701,6 +1702,7 @@ struct PreparedExecution {
 }
 
 impl PreparedExecution {
+    #[cfg(target_os = "macos")]
     fn restore_from_json(&self) -> Self {
         Self {
             plan: round_trip_json(&self.plan, "prepared_plan_restore"),
@@ -1710,6 +1712,7 @@ impl PreparedExecution {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn round_trip_json<T>(value: &T, label: &'static str) -> T
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
@@ -2021,6 +2024,7 @@ fn must<T, E>(result: Result<T, E>, label: &'static str) -> T {
     result.unwrap_or_else(|_| fail(label))
 }
 
+#[cfg(target_os = "macos")]
 fn must_browser<T>(result: Result<T, crate::BrowserError>, label: &'static str) -> T {
     result.unwrap_or_else(|error| {
         panic!(
