@@ -1,0 +1,334 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.confluent-stream-result/v1",
+  "title": "Hartevo Confluent Cloud stream-result Layer-1 contract",
+  "description": "A bounded Confluent Cloud connector-status, consumer-group lag, and Metrics API time-series read/proposal/recording seam. It is not a Kafka data path, native provider, event registry, or kernel authority.",
+  "schemaVersion": "hartevo.confluent-stream-result-contract/v1",
+  "contractVersion": "confluent-stream-result-01-layer-1/v1",
+  "pluginId": "confluent.stream-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.confluent-stream-result-contract/v1|layer=1|service=confluent.stream-result.read|provider=confluent.cloud.stream-result|consumer=mission.confluent-stream-result.consumer",
+  "contractDigest": "b1762e12b736e94d1978756127d0a7725143b2430b4144eaef718a4ee6a8b0a4",
+  "service": {
+    "type": "ConfluentStreamResultService",
+    "id": "confluent.stream-result.read",
+    "version": "1.0.0",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "register_scope",
+      "read_connector_status",
+      "read_consumer_group_lag",
+      "read_metric_window",
+      "compile_stream_result_proposal",
+      "record_stream_result",
+      "revoke_registration"
+    ]
+  },
+  "provider": {
+    "type": "ConfluentProvider",
+    "id": "confluent.cloud.stream-result",
+    "apiRevision": "cloud-connect-v1-kafka-v3-metrics-v2",
+    "operations": [
+      "cloud_rest_connector_status_get",
+      "kafka_rest_consumer_group_lag_get",
+      "metrics_api_allowlisted_time_series_get"
+    ],
+    "endpointFamilies": {
+      "connectorStatus": "GET /connect/v1/environments/{environment_id}/clusters/{cluster_id}/connectors/{connector_id}/status",
+      "consumerGroupLag": "GET /kafka/v3/clusters/{cluster_id}/consumer-groups/{consumer_group_id}/lags",
+      "metrics": "GET https://api.telemetry.confluent.cloud/v2/metrics/cloud/query"
+    },
+    "allowedTransportProvenance": [
+      "fixture",
+      "recording",
+      "loopback",
+      "blocked_env"
+    ],
+    "httpClassification": {
+      "badRequest": 400,
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true,
+      "malformed": true,
+      "partial": true,
+      "backoffRequired": true
+    },
+    "mutations": {
+      "produce": false,
+      "consume": false,
+      "topicMutation": false,
+      "aclMutation": false,
+      "connectorMutation": false,
+      "consumerGroupMutation": false,
+      "metricMutation": false
+    }
+  },
+  "consumer": {
+    "type": "MissionConfluentStreamConsumer",
+    "id": "mission.confluent-stream-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "staleMissionRevision": "fail_closed"
+  },
+  "credentials": {
+    "boundary": "opaque resource-scoped API-key SecretReference",
+    "kind": "resource_scoped_api_key",
+    "resourceScope": "cloud_resource_management_or_exact_organization_scope",
+    "serialized": false,
+    "rawKeyMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "organizationId",
+      "organizationRevision",
+      "environmentId",
+      "environmentRevision",
+      "clusterId",
+      "clusterRevision",
+      "topicName",
+      "topicRevision",
+      "connectorId",
+      "connectorRevision",
+      "consumerGroupId",
+      "consumerGroupRevision",
+      "partitionId",
+      "partitionRevision",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "observationWindow",
+      "policyRevision"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "revisionDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ],
+    "drift": [
+      "organization",
+      "environment",
+      "cluster",
+      "topic",
+      "connector",
+      "consumerGroup",
+      "partition",
+      "project",
+      "mission",
+      "workProduct"
+    ]
+  },
+  "permissions": {
+    "requiredReadOnly": [
+      "organization.read",
+      "environment.read",
+      "cluster.read",
+      "topic.read",
+      "connector.read",
+      "connector.status.read",
+      "consumer_group.read",
+      "consumer_group.lag.read",
+      "metrics.read"
+    ],
+    "forbidden": [
+      "topic.write",
+      "topic.produce",
+      "topic.consume",
+      "acl.write",
+      "connector.write",
+      "connector.pause",
+      "connector.restart",
+      "consumer_group.write",
+      "metric.query.arbitrary"
+    ],
+    "digestBound": true
+  },
+  "projections": {
+    "connectorStates": [
+      "provisioning",
+      "running",
+      "failed",
+      "degraded",
+      "paused",
+      "restarting",
+      "provider_unknown"
+    ],
+    "taskStates": [
+      "running",
+      "stopped",
+      "unassigned",
+      "restarting",
+      "system_error",
+      "user_actionable_error"
+    ],
+    "consumerGroupStates": [
+      "stable",
+      "empty",
+      "dead",
+      "unknown"
+    ],
+    "boundedFields": [
+      "connectorStatus",
+      "taskStatus",
+      "consumerGroupStatus",
+      "lagDigest",
+      "throughputDigest",
+      "latencyDigest",
+      "timestamps",
+      "completeness"
+    ],
+    "rawKafkaRecords": false,
+    "rawProviderPayloads": false,
+    "rawMetricValues": false,
+    "arbitraryMetricQueries": false,
+    "metricWindowCompleteness": "explicit"
+  },
+  "bounds": {
+    "maxPageSize": 100,
+    "maxPages": 16,
+    "maxPartitions": 256,
+    "maxMetricPoints": 512,
+    "maxTimestampCount": 512,
+    "maxObservationWindowSeconds": 86400,
+    "maxResponseBytes": 1048576,
+    "maxOpaquePageTokenBytes": 512,
+    "repeatedPageToken": "fail_closed",
+    "monotonicRevision": "fail_closed",
+    "rateLimitRetry": "surface_bounded_backoff_only"
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "apiDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "revisionDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "registration_tamper",
+      "registration_revocation",
+      "secret_revocation",
+      "provider_drift",
+      "api_drift",
+      "permission_drift",
+      "scope_drift",
+      "revision_drift",
+      "stale_mission_revision"
+    ]
+  },
+  "adversarialEvidence": [
+    "connector_revision_regression",
+    "task_revision_regression",
+    "consumer_group_revision_regression",
+    "organization_drift",
+    "environment_drift",
+    "cluster_drift",
+    "topic_drift",
+    "connector_drift",
+    "consumer_group_drift",
+    "partition_drift",
+    "permission_drift",
+    "stale_mission_revision",
+    "metric_window_mismatch",
+    "metric_window_partial",
+    "repeated_page_token",
+    "pagination_limit",
+    "bad_request_400",
+    "unauthorized_401",
+    "forbidden_403",
+    "not_found_404",
+    "conflict_409",
+    "rate_limit_429",
+    "timeout",
+    "server_5xx",
+    "backoff_required",
+    "malformed_response",
+    "partial_response",
+    "secret_redaction",
+    "response_tamper",
+    "request_tamper",
+    "recording_replay",
+    "recording_replay_conflict",
+    "revoked_registration"
+  ],
+  "provenance": {
+    "fixture": "non_native_non_connected",
+    "recording": "non_native_non_connected",
+    "loopback": "non_native_non_connected",
+    "blocked_env": "non_native_non_connected",
+    "nativeConnectedClaim": false,
+    "providerReceipt": false,
+    "durableReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed Confluent service/provider/consumer",
+      "connector/task status projection",
+      "consumer-group lag projection",
+      "bounded metric digest projection",
+      "proposal digest",
+      "recording idempotency seam",
+      "reversible registration metadata"
+    ],
+    "doesNotOwn": [
+      "Kafka records",
+      "Kafka produce",
+      "Kafka consume",
+      "topic mutation",
+      "ACL mutation",
+      "connector provisioning or lifecycle mutation",
+      "generic event registry",
+      "Hartevo kernel authority",
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "native API-key resolution",
+      "durable provider receipts",
+      "independent lag reconciliation"
+    ]
+  },
+  "nonOverlap": {
+    "airbyteIssue": "#354 owns source-to-destination Airbyte sync-attempt evidence; Confluent owns Cloud connector/task, Kafka consumer-group lag, and bounded metrics projections.",
+    "fivetranIssue": "#411 owns Fivetran connector sync evidence; it does not own Confluent Cloud connector or Kafka REST projections.",
+    "datadogIssue": "#337 owns Datadog SLO outcome evidence; it does not own Confluent Metrics API resource-scoped time-series digests.",
+    "grafanaIssue": "#421 owns Grafana alert/result evidence; it does not own Confluent Cloud or Kafka consumer-group state.",
+    "confluentOwns": "Confluent Cloud connector/task status plus one exact Kafka topic/partition and consumer-group lag, with bounded Metrics API throughput/latency/lag digests only."
+  },
+  "layer2Gaps": [
+    "native resource-scoped API-key resolution and HTTPS transport",
+    "consented stream effects",
+    "durable provider request and cost receipts",
+    "independent lag reconciliation",
+    "native closed-window metric completeness verification",
+    "verified Mission/Outcome adoption"
+  ],
+  "honestNativeGap": "Layer 1 has no HTTP client or credential resolver. Fixture, recording, loopback, and BLOCKED_ENV never report Connected or native. Layer 2 may add consented stream effects, durable receipts, and independent lag reconciliation only under a separate authority boundary."
+}
