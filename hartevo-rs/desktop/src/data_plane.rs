@@ -930,6 +930,16 @@ impl DesktopDataPlane {
         self.adopt_work_product_with(&secret_store, request, now)
     }
 
+    #[cfg(feature = "native-journey")]
+    pub(crate) fn adopt_work_product_native(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopWorkProductAdoptionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        self.adopt_work_product_with(secret_store, request, now)
+    }
+
     fn adopt_work_product_with(
         &self,
         secret_store: &impl SecretStore,
@@ -981,7 +991,6 @@ impl DesktopDataPlane {
             load_product_evidence(now)?,
             now,
         )
-    }
     }
 
     /// Starts an explicitly confirmed VM-00..VM-11 Mission from the machine
