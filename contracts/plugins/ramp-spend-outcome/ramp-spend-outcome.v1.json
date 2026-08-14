@@ -1,0 +1,399 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.ramp-spend-outcome/v1",
+  "title": "Hartevo Ramp spend outcome-evidence plugin contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "layer",
+    "authority",
+    "service",
+    "provider",
+    "consumer",
+    "reads",
+    "scope",
+    "bounds",
+    "registration",
+    "projections",
+    "transport",
+    "honesty",
+    "nonGoals",
+    "layer2Gaps"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "hartevo.ramp-spend-outcome/v1" },
+    "layer": { "const": "ramp_spend_outcome_layer_1" },
+    "authority": { "const": "read_only_observational_spend_evidence" },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "access", "contractDigest"],
+      "properties": {
+        "id": { "const": "ramp.spend-outcome-evidence.read" },
+        "version": { "const": "1.0.0" },
+        "access": { "const": "read_only" },
+        "contractDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "serviceId",
+        "version",
+        "implementation",
+        "scope",
+        "authentication",
+        "permissions",
+        "transport",
+        "reversible",
+        "revocable"
+      ],
+      "properties": {
+        "id": { "const": "ramp.spend.outcome" },
+        "serviceId": { "const": "ramp.spend-outcome-evidence.read" },
+        "version": { "const": "1.0.0" },
+        "implementation": { "const": "RampProvider" },
+        "scope": {
+          "const": [
+            "business_id_digest",
+            "entity_id_digest",
+            "spend_program_id_digest",
+            "card_id_digest",
+            "vendor_id_digest",
+            "transaction_id_digest",
+            "audit_event_id_digest",
+            "date_window",
+            "project_id",
+            "project_revision",
+            "mission_id",
+            "mission_revision",
+            "work_product_id",
+            "work_product_revision",
+            "deployment_id",
+            "deployment_revision",
+            "release_id",
+            "release_revision",
+            "policy_revision",
+            "requested_read_scopes",
+            "permission_digest",
+            "secret_reference_digest",
+            "registration_digest"
+          ]
+        },
+        "authentication": {
+          "const": ["oauth_secret_reference", "client_credentials_secret_reference"]
+        },
+        "permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "business:read",
+              "entities:read",
+              "spend_programs:read",
+              "funds:read",
+              "cards:read",
+              "merchants:read",
+              "vendors:read",
+              "transactions:read",
+              "audit_logs:read"
+            ]
+          },
+          "contains": { "const": "transactions:read" },
+          "minContains": 1
+        },
+        "transport": {
+          "const": ["official_api_parser", "recording", "fixture", "loopback", "blocked_env"]
+        },
+        "reversible": { "const": true },
+        "revocable": { "const": true }
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "serviceId", "version", "kind", "binding"],
+      "properties": {
+        "id": { "const": "mission.ramp-spend-outcome.consumer" },
+        "serviceId": { "const": "ramp.spend-outcome-evidence.read" },
+        "version": { "const": "1.0.0" },
+        "kind": { "const": "mission_non_mutating_evidence_adoption_proposal" },
+        "binding": {
+          "const": [
+            "project_id",
+            "project_revision",
+            "mission_id",
+            "mission_revision",
+            "work_product_id",
+            "work_product_revision",
+            "scope_digest",
+            "registration_digest",
+            "provider_digest",
+            "contract_digest",
+            "evidence_digest",
+            "policy_revision"
+          ]
+        }
+      }
+    },
+    "reads": {
+      "type": "array",
+      "const": [
+        "describe_capabilities",
+        "read_transactions",
+        "read_merchants",
+        "read_audit_logs",
+        "compile_outcome_proposal",
+        "record_evidence_receipt",
+        "verify_evidence"
+      ]
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "businessBound",
+        "entityBound",
+        "spendProgramBound",
+        "cardBound",
+        "vendorBound",
+        "transactionBound",
+        "auditEventBound",
+        "dateWindowBound",
+        "projectMissionWorkProductBound",
+        "revisionBound",
+        "requestedReadScopesBound",
+        "providerContractEvidenceDigestsBound"
+      ],
+      "properties": {
+        "businessBound": { "const": true },
+        "entityBound": { "const": true },
+        "spendProgramBound": { "const": true },
+        "cardBound": { "const": true },
+        "vendorBound": { "const": true },
+        "transactionBound": { "const": true },
+        "auditEventBound": { "const": true },
+        "dateWindowBound": { "const": true },
+        "projectMissionWorkProductBound": { "const": true },
+        "revisionBound": { "const": true },
+        "requestedReadScopesBound": { "const": true },
+        "providerContractEvidenceDigestsBound": { "const": true }
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxDateWindowSeconds",
+        "maxPageSize",
+        "maxPages",
+        "maxTransactions",
+        "maxMerchants",
+        "maxAuditEvents",
+        "maxCursorBytes",
+        "maxIdentifierBytes",
+        "maxEventTypeBytes"
+      ],
+      "properties": {
+        "maxDateWindowSeconds": { "const": 7776000 },
+        "maxPageSize": { "const": 100 },
+        "maxPages": { "const": 100 },
+        "maxTransactions": { "const": 1000 },
+        "maxMerchants": { "const": 500 },
+        "maxAuditEvents": { "const": 1000 },
+        "maxCursorBytes": { "const": 512 },
+        "maxIdentifierBytes": { "const": 256 },
+        "maxEventTypeBytes": { "const": 128 }
+      }
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "providerBound",
+        "implementationBound",
+        "versionBound",
+        "contractDigestBound",
+        "scopeDigestBound",
+        "permissionDigestBound",
+        "registrationDigest",
+        "reversible",
+        "revocable",
+        "failClosedOnDrift"
+      ],
+      "properties": {
+        "providerBound": { "const": true },
+        "implementationBound": { "const": true },
+        "versionBound": { "const": true },
+        "contractDigestBound": { "const": true },
+        "scopeDigestBound": { "const": true },
+        "permissionDigestBound": { "const": true },
+        "registrationDigest": { "const": true },
+        "reversible": { "const": true },
+        "revocable": { "const": true },
+        "failClosedOnDrift": {
+          "const": [
+            "business",
+            "entity",
+            "spend_program",
+            "card",
+            "vendor",
+            "transaction",
+            "audit_event",
+            "date_window",
+            "requested_scope",
+            "provider",
+            "contract",
+            "implementation",
+            "version",
+            "permission",
+            "high_water_mark",
+            "retention"
+          ]
+        }
+      }
+    },
+    "projections": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "states",
+        "refundTransitionsExplicit",
+        "auditProvenanceExplicit",
+        "emptyIsNotEvidence",
+        "partialIsNotSuccess",
+        "providerUnknownIsNotSuccess"
+      ],
+      "properties": {
+        "states": {
+          "const": [
+            "complete",
+            "partial",
+            "retention_gap",
+            "access_lost",
+            "tampered",
+            "provider_unknown"
+          ]
+        },
+        "refundTransitionsExplicit": { "const": true },
+        "auditProvenanceExplicit": { "const": true },
+        "emptyIsNotEvidence": { "const": true },
+        "partialIsNotSuccess": { "const": true },
+        "providerUnknownIsNotSuccess": { "const": true }
+      }
+    },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "officialRampDeveloperApi",
+        "secretReference",
+        "rawSecretSerialized",
+        "rawCardDataSerialized",
+        "rawBankDataSerialized",
+        "rawEmployeePiiSerialized",
+        "rawVendorPiiSerialized",
+        "rawReceiptSerialized",
+        "rawMemoSerialized",
+        "writes",
+        "approvals",
+        "declines",
+        "transactionEdits",
+        "receiptUpload",
+        "cardFundPurchaseOrderCreation",
+        "reimbursements",
+        "transfers",
+        "webhookSetup",
+        "pageResponders"
+      ],
+      "properties": {
+        "officialRampDeveloperApi": { "const": true },
+        "secretReference": { "const": true },
+        "rawSecretSerialized": { "const": false },
+        "rawCardDataSerialized": { "const": false },
+        "rawBankDataSerialized": { "const": false },
+        "rawEmployeePiiSerialized": { "const": false },
+        "rawVendorPiiSerialized": { "const": false },
+        "rawReceiptSerialized": { "const": false },
+        "rawMemoSerialized": { "const": false },
+        "writes": { "const": false },
+        "approvals": { "const": false },
+        "declines": { "const": false },
+        "transactionEdits": { "const": false },
+        "receiptUpload": { "const": false },
+        "cardFundPurchaseOrderCreation": { "const": false },
+        "reimbursements": { "const": false },
+        "transfers": { "const": false },
+        "webhookSetup": { "const": false },
+        "pageResponders": { "const": false }
+      }
+    },
+    "honesty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "readOnly",
+        "proposalOnly",
+        "fixtureNative",
+        "recordingNative",
+        "loopbackNative",
+        "blockedEnvNative",
+        "fixtureConnected",
+        "recordingConnected",
+        "loopbackConnected",
+        "blockedEnvConnected",
+        "webhookChangeSignalOnly",
+        "nativeHttpsLayer"
+      ],
+      "properties": {
+        "readOnly": { "const": true },
+        "proposalOnly": { "const": true },
+        "fixtureNative": { "const": false },
+        "recordingNative": { "const": false },
+        "loopbackNative": { "const": false },
+        "blockedEnvNative": { "const": false },
+        "fixtureConnected": { "const": false },
+        "recordingConnected": { "const": false },
+        "loopbackConnected": { "const": false },
+        "blockedEnvConnected": { "const": false },
+        "webhookChangeSignalOnly": { "const": true },
+        "nativeHttpsLayer": { "const": "layer_2_gap" }
+      }
+    },
+    "nonGoals": {
+      "type": "array",
+      "const": [
+        "approve_or_decline",
+        "edit_transaction_or_memo",
+        "upload_or_attach_receipt",
+        "create_card_fund_or_purchase_order",
+        "submit_reimbursement",
+        "initiate_transfer",
+        "configure_webhook",
+        "finance_dashboard",
+        "financial_advice",
+        "kernel_truth_authority",
+        "kernel_consent_authority",
+        "kernel_effect_authority",
+        "kernel_receipt_authority",
+        "kernel_verification_authority",
+        "kernel_outcome_authority"
+      ]
+    },
+    "layer2Gaps": {
+      "type": "array",
+      "const": [
+        "native_oauth_and_client_credential_resolution",
+        "host_store_or_keyring_wiring",
+        "native_https_transactions_merchants_audit_reads",
+        "durable_provider_receipts",
+        "independent_transaction_and_audit_readback",
+        "signed_webhook_subscription",
+        "verified_work_product_and_outcome_adoption"
+      ]
+    }
+  }
+}
