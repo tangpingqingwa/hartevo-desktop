@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Duration, Utc};
 use hartevo_connector_sdk::{
-    BeginAuthRequest, ConnectorAdapter, ConnectorAuth, ConnectorDescriptor, ConnectorError,
-    ConnectorScope, ConnectorWorker, DispatchBudget, ExecuteRequest, FreshnessWindow,
-    LiveProbeFence, PrepareEffectRequest, PreparedEffect, ProbeObservation, ProbeRequest,
-    ProbeStatus, ProviderAdapterIdentity, ProviderAdapterOperation, ProviderAdapterRegistry,
-    ProviderCapabilityKey, ProviderCapabilitySupport, ProviderEvidenceClass,
-    ProviderProvenanceClass, ReadObservation, ReadRequest, ReceiptCandidate,
+    AuthSession, BeginAuthRequest, ConnectorAdapter, ConnectorAuth, ConnectorDescriptor,
+    ConnectorError, ConnectorScope, ConnectorWorker, CredentialLease, DispatchBudget,
+    ExecuteRequest, FreshnessWindow, LiveProbeFence, PrepareEffectRequest, PreparedEffect,
+    ProbeObservation, ProbeRequest, ProbeStatus, ProviderAdapterIdentity, ProviderAdapterOperation,
+    ProviderAdapterRegistry, ProviderCapabilityKey, ProviderCapabilitySupport,
+    ProviderEvidenceClass, ProviderProvenanceClass, ReadObservation, ReadRequest, ReceiptCandidate,
     ReceiptCandidateStatus, ReconcileRequest, ReconciliationObservation, ReconciliationStatus,
     RefreshAuthRequest, RevokeRequest, SecretReference, VerificationObservation,
     VerificationStatus, VerifyRequest, WebhookObservation, WebhookRequest,
@@ -1919,6 +1919,9 @@ where
     connection: GithubPagesConnection,
     secret: SecretReference,
     worker: ConnectorWorker<GithubPagesAdapter<T, R>>,
+    credential_lease: CredentialLease,
+    auth_session: AuthSession,
+    probe_revision: u64,
     live_probe: LiveProbeFence,
     state: Arc<AdapterState>,
     connected_at: DateTime<Utc>,
@@ -1988,8 +1991,8 @@ where
             dispatch,
             scope,
             secret_reference: secret.clone(),
-            credential_lease: lease,
-            session,
+            credential_lease: lease.clone(),
+            session: session.clone(),
             probe_revision: 1,
             result_id: format!("probe-result-{}", &connection.registration_digest[..24]),
             at: now,
@@ -2006,6 +2009,9 @@ where
             connection,
             secret,
             worker,
+            credential_lease: lease,
+            auth_session: session,
+            probe_revision: 1,
             live_probe,
             state,
             connected_at: now,
@@ -2032,11 +2038,46 @@ where
         self.connection.revoke(revoked_at)
     }
 
+    /// Refresh the connector probe before a long-running Pages build or
+    /// readback crosses the SDK's bounded probe TTL. This renews only the
+    /// provider-health fence; it never mints Effect approval or execution
+    /// authority and it reuses the existing opaque credential lease/session.
+    fn refresh_live_probe(&mut self, at: DateTime<Utc>) -> Result<(), WebPublicationError> {
+        if at < self.live_probe.observed_valid_until() - Duration::seconds(15) {
+            return Ok(());
+        }
+        self.worker.set_now(at);
+        self.probe_revision = self.probe_revision.saturating_add(1);
+        let probe = self
+            .worker
+            .probe(ProbeRequest {
+                dispatch: self.worker.dispatch_fence(),
+                scope: self.connection.scope()?,
+                secret_reference: self.secret.clone(),
+                credential_lease: self.credential_lease.clone(),
+                session: self.auth_session.clone(),
+                probe_revision: self.probe_revision,
+                result_id: format!(
+                    "probe-result-{}-{}",
+                    &self.connection.registration_digest[..24],
+                    self.probe_revision
+                ),
+                at,
+            })
+            .map_err(|error| provider_error_from_state(&self.state, &error))?;
+        self.live_probe = self
+            .worker
+            .authorize_probe(&probe, at)
+            .map_err(|error| provider_error_from_state(&self.state, &error))?;
+        Ok(())
+    }
+
     pub fn read_current(
         &mut self,
         now: DateTime<Utc>,
     ) -> Result<GithubPagesProviderRead, WebPublicationError> {
         self.connection.validate_at(&self.secret, now)?;
+        self.refresh_live_probe(now)?;
         self.worker.set_now(now);
         let query_digest = digest_parts([
             self.connection.registration_digest.as_str(),
@@ -2086,6 +2127,7 @@ where
         expires_at: DateTime<Utc>,
     ) -> Result<PreparedEffect, WebPublicationError> {
         self.connection.validate_at(&self.secret, prepared_at)?;
+        self.refresh_live_probe(prepared_at)?;
         self.worker.set_now(prepared_at);
         let prepared = self.worker.prepare_effect(PrepareEffectRequest {
             dispatch: self.worker.dispatch_fence(),
@@ -2148,6 +2190,7 @@ where
             });
         }
         self.connection.validate_at(&self.secret, at)?;
+        self.refresh_live_probe(at)?;
         self.state
             .store_payload(prepared_effect.effect_digest().to_owned(), payload);
         self.worker.set_now(at);
@@ -2187,6 +2230,7 @@ where
             });
         }
         self.connection.validate_at(&self.secret, at)?;
+        self.refresh_live_probe(at)?;
         self.state.store_payload(effect_digest.to_owned(), payload);
         self.worker.set_now(at);
         let observation = self
@@ -2225,6 +2269,7 @@ where
             });
         }
         self.connection.validate_at(&self.secret, at)?;
+        self.refresh_live_probe(at)?;
         self.state.store_payload(effect_digest.to_owned(), payload);
         self.worker.set_now(at);
         let observation = self

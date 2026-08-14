@@ -20,8 +20,8 @@ use crate::{
     GithubPagesConnection, GithubPagesEnvironment, GithubPagesHttpTransport, GithubPagesProvider,
     GithubPagesProviderError, GithubPagesTransportError, MissionPublicationProposalResult,
     PublicationAction, PublicationAuditEntry, PublicationDurableLog,
-    PublicationExecutionAuthorization, PublicationOperation, PublicationProposalInput, Site,
-    SiteFile, SiteId, SitePublicationService, WebPublicationError,
+    PublicationExecutionAuthorization, PublicationOperation, PublicationProposalInput,
+    PublicationRollbackInput, Site, SiteFile, SiteId, SitePublicationService, WebPublicationError,
 };
 
 const TOKEN: &str = "controlled-test-token";
@@ -31,6 +31,9 @@ const INDEX_SHA: &str = "cccccccccccccccccccccccccccccccccccccccc";
 const OLD_SHA: &str = "dddddddddddddddddddddddddddddddddddddddd";
 const PUBLISHED_HEAD_SHA: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const PUBLISHED_TREE_SHA: &str = "ffffffffffffffffffffffffffffffffffffffff";
+const NATIVE_BASELINE_INDEX: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Hartevo WEB-01 e2e</title></head><body>Hartevo WEB-01 baseline</body></html>";
+const NATIVE_INDEX: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Hartevo WEB-01 native</title></head><body>Hartevo WEB-01 native journey</body></html>";
+const NATIVE_MARKER: &str = "hartevo-web-publication-native-journey";
 
 #[derive(Clone, Debug)]
 struct ControlledPublicationState {
@@ -452,7 +455,7 @@ impl GithubCredentialResolver for ControlledCredentialResolver {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 struct MemoryPublicationLog {
     entries: Vec<PublicationAuditEntry>,
 }
@@ -468,6 +471,10 @@ fn now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0)
         .single()
         .expect("valid test time")
+}
+
+fn native_required_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn controlled_sha(bytes: &[u8]) -> String {
@@ -582,6 +589,26 @@ fn approve_proposal(
     domain: &Domain,
     at: DateTime<Utc>,
 ) -> PublicationExecutionAuthorization {
+    approve_proposal_with_scope(
+        mission,
+        proposal,
+        domain,
+        at,
+        scope(),
+        "approval-1",
+        &"e".repeat(64),
+    )
+}
+
+fn approve_proposal_with_scope(
+    mission: &mut Mission,
+    proposal: &MissionPublicationProposalResult,
+    domain: &Domain,
+    at: DateTime<Utc>,
+    execution_scope: ConnectorScope,
+    approval_id: &str,
+    permission_digest: &str,
+) -> PublicationExecutionAuthorization {
     let effect_id = proposal.prepared_effect.effect_spec.id.clone();
     mission
         .propose_effect(proposal.prepared_effect.effect_spec.clone(), at)
@@ -589,29 +616,28 @@ fn approve_proposal(
     let valid_until = mission
         .approval_valid_until(&effect_id, at)
         .expect("approval window");
-    let permission_digest = "e".repeat(64);
     mission
         .approve_effect(
             &effect_id,
             Approval {
-                id: hartevo_domain_kernel::ApprovalId::from_stable("approval-1"),
+                id: hartevo_domain_kernel::ApprovalId::from_stable(approval_id),
                 decision: ApprovalDecision::Approved,
-                decided_by: ActorId::from_stable("actor-1"),
+                decided_by: proposal.prepared_effect.effect_spec.actor_id.clone(),
                 decided_at: at,
                 valid_until,
                 scope_digest: mission
                     .effect(&effect_id)
                     .expect("proposed effect")
                     .approval_digest(),
-                permission_digest: permission_digest.clone(),
+                permission_digest: permission_digest.to_owned(),
             },
         )
         .expect("effect approved");
     let effect = mission.effect(&effect_id).expect("approved effect").clone();
     let execution_context = EffectExecutionContext::from_broker(
-        scope(),
+        execution_scope,
         proposal.prepared_effect.connector_effect.effect_digest(),
-        permission_digest,
+        permission_digest.to_owned(),
         valid_until,
     )
     .expect("broker execution capsule");
@@ -1298,6 +1324,456 @@ fn real_github_authenticated_probe_is_env_gated_and_never_uses_a_fixture() {
             crate::GithubPagesConnectionState::Connected
         );
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn real_github_native_approve_publish_receipt_readback_rollback_journey() {
+    if env::var("HARTEVO_GITHUB_NATIVE_JOURNEY").ok().as_deref() != Some("1") {
+        return;
+    }
+    if env::var("HARTEVO_GITHUB_TOKEN").is_err() {
+        println!(
+            "HARTEVO_NATIVE_GITHUB_PAGES_EVIDENCE {}",
+            serde_json::json!({
+                "journey": "approve_publish_receipt_readback_rollback",
+                "status": "BLOCKED_ENV",
+                "missing": "HARTEVO_GITHUB_TOKEN"
+            })
+        );
+        return;
+    }
+    let Some(owner) = native_required_env("HARTEVO_GITHUB_REAL_OWNER") else {
+        println!(
+            "HARTEVO_NATIVE_GITHUB_PAGES_EVIDENCE {}",
+            serde_json::json!({"journey": "approve_publish_receipt_readback_rollback", "status": "BLOCKED_ENV", "missing": "HARTEVO_GITHUB_REAL_OWNER"})
+        );
+        return;
+    };
+    let Some(repository) = native_required_env("HARTEVO_GITHUB_REAL_REPOSITORY") else {
+        println!(
+            "HARTEVO_NATIVE_GITHUB_PAGES_EVIDENCE {}",
+            serde_json::json!({"journey": "approve_publish_receipt_readback_rollback", "status": "BLOCKED_ENV", "missing": "HARTEVO_GITHUB_REAL_REPOSITORY"})
+        );
+        return;
+    };
+    let Some(git_ref) = native_required_env("HARTEVO_GITHUB_REAL_REF") else {
+        println!(
+            "HARTEVO_NATIVE_GITHUB_PAGES_EVIDENCE {}",
+            serde_json::json!({"journey": "approve_publish_receipt_readback_rollback", "status": "BLOCKED_ENV", "missing": "HARTEVO_GITHUB_REAL_REF"})
+        );
+        return;
+    };
+    let Some(pages_url) = native_required_env("HARTEVO_GITHUB_REAL_PAGES_URL") else {
+        println!(
+            "HARTEVO_NATIVE_GITHUB_PAGES_EVIDENCE {}",
+            serde_json::json!({"journey": "approve_publish_receipt_readback_rollback", "status": "BLOCKED_ENV", "missing": "HARTEVO_GITHUB_REAL_PAGES_URL"})
+        );
+        return;
+    };
+    let Some(domain_hostname) = native_required_env("HARTEVO_GITHUB_REAL_DOMAIN") else {
+        println!(
+            "HARTEVO_NATIVE_GITHUB_PAGES_EVIDENCE {}",
+            serde_json::json!({"journey": "approve_publish_receipt_readback_rollback", "status": "BLOCKED_ENV", "missing": "HARTEVO_GITHUB_REAL_DOMAIN"})
+        );
+        return;
+    };
+    let Some(environment_name) = native_required_env("HARTEVO_GITHUB_REAL_ENVIRONMENT") else {
+        println!(
+            "HARTEVO_NATIVE_GITHUB_PAGES_EVIDENCE {}",
+            serde_json::json!({"journey": "approve_publish_receipt_readback_rollback", "status": "BLOCKED_ENV", "missing": "HARTEVO_GITHUB_REAL_ENVIRONMENT"})
+        );
+        return;
+    };
+    let environment = match environment_name.as_str() {
+        "staging" => GithubPagesEnvironment::Staging,
+        "production" => panic!("CODE_FAILURE: native e2e selector refuses production"),
+        other => panic!("CODE_FAILURE: unsupported native environment {other}"),
+    };
+    let account = native_required_env("HARTEVO_GITHUB_REAL_ACCOUNT")
+        .unwrap_or_else(|| "github-pages-native-e2e".to_owned());
+    let expected_pages_url = format!("https://{owner}.github.io/{repository}");
+    let expected_domain = format!("{owner}.github.io");
+    assert_eq!(
+        owner, "tangpingqingwa",
+        "CODE_FAILURE: owner is not the disposable e2e owner"
+    );
+    assert_eq!(
+        repository, "hartevo-web-publication-e2e",
+        "CODE_FAILURE: repository is not the disposable e2e repository"
+    );
+    assert_eq!(
+        git_ref, "gh-pages",
+        "CODE_FAILURE: native journey must use gh-pages"
+    );
+    assert_eq!(
+        pages_url, expected_pages_url,
+        "CODE_FAILURE: Pages URL is not the exact disposable site"
+    );
+    assert_eq!(
+        domain_hostname, expected_domain,
+        "CODE_FAILURE: domain is not the exact Pages host"
+    );
+
+    let at = Utc::now();
+    let tenant_id = TenantId::from_stable("tenant-native-e2e");
+    let project_id = ProjectId::from_stable("project-native-e2e");
+    let mission_id = MissionId::from_stable("mission-native-e2e");
+    let native_scope = ConnectorScope::new(
+        tenant_id.as_str(),
+        project_id.as_str(),
+        "github",
+        account.as_str(),
+        GITHUB_PAGES_REQUIRED_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_owned()),
+    )
+    .expect("valid native connector scope");
+    let real_secret = SecretReference::new("secret-ref-native-e2e", native_scope.clone(), 1)
+        .expect("valid native SecretReference");
+    let connection = GithubPagesConnection::new(
+        tenant_id.clone(),
+        project_id.clone(),
+        mission_id.clone(),
+        hartevo_domain_kernel::ConnectionId::from_stable("connection-native-e2e"),
+        hartevo_domain_kernel::AccountId::from_stable(account.clone()),
+        owner.clone(),
+        repository.clone(),
+        git_ref.clone(),
+        pages_url.clone(),
+        environment,
+        &real_secret,
+    )
+    .unwrap_or_else(|error| panic!("CODE_FAILURE: invalid native connection: {error}"));
+    let registration_digest = connection.registration_digest.clone();
+    let scope_digest = connection.scope_digest.clone();
+    let plugin_version = connection.plugin_version.clone();
+    let registry_version = connection.registry_version.clone();
+    let adapter_id = connection.adapter.adapter_id().to_owned();
+    let adapter_version = connection.adapter.adapter_version();
+    let provider = GithubPagesProvider::connect(
+        connection,
+        real_secret,
+        crate::UreqGithubPagesTransport::new("https://api.github.com")
+            .unwrap_or_else(|error| panic!("CODE_FAILURE: invalid GitHub API transport: {error}")),
+        Arc::new(EnvironmentGithubCredentialResolver::default()),
+        at,
+    )
+    .unwrap_or_else(|error| {
+        panic!("CODE_FAILURE: authenticated GitHub Pages probe failed: {error}")
+    });
+    let mut service = SitePublicationService::new(provider, MemoryPublicationLog::default());
+
+    let mut mission = Mission::compile(
+        tenant_id.clone(),
+        mission_id,
+        project_id.clone(),
+        "Publish the selected disposable GitHub Pages site",
+        MissionContract::bootstrap(
+            "native GitHub Pages approve publish rollback journey",
+            ["publication.publish".to_owned()],
+            at,
+        ),
+        at,
+    )
+    .expect("valid native mission");
+    mission
+        .start_research([], at + Duration::seconds(1))
+        .expect("native mission starts");
+    let work_product_id = WorkProductId::from_stable("work-product-native-e2e");
+    let work_product = WorkProduct::draft(
+        work_product_id.clone(),
+        "Native GitHub Pages e2e work product",
+        "Disposable content-free receipt journey",
+        [],
+    );
+    let source_work_product_digest = work_product.content_digest.clone();
+    mission
+        .record_work_product(work_product, at + Duration::seconds(2))
+        .expect("native work product recorded");
+    let site = Site::new(
+        tenant_id.clone(),
+        project_id.clone(),
+        SiteId::from_stable("site-native-e2e-publish"),
+        1,
+        [
+            SiteFile::text("index.html", NATIVE_INDEX).expect("native index"),
+            SiteFile::text("native-journey.txt", NATIVE_MARKER).expect("native marker"),
+        ],
+        work_product_id.clone(),
+        1,
+        source_work_product_digest.clone(),
+    )
+    .expect("valid native target site");
+    let domain = Domain::new(
+        tenant_id.clone(),
+        project_id.clone(),
+        crate::DomainId::from_stable("domain-native-e2e"),
+        domain_hostname,
+    )
+    .expect("valid native domain");
+    let proposal = service
+        .propose(
+            &mission,
+            &site,
+            &domain,
+            PublicationProposalInput::new(
+                crate::PublicationId::from_stable("publication-native-e2e-publish"),
+                ActorId::from_stable("actor-native-e2e"),
+                EffectId::from_stable("effect-native-e2e-publish"),
+                "policy-web-publication-native-e2e-v1",
+                at + Duration::seconds(3),
+                at + Duration::minutes(10),
+            ),
+        )
+        .unwrap_or_else(|error| panic!("CODE_FAILURE: native canonical proposal failed: {error}"));
+    let pre_snapshot = proposal.publication_read.snapshot.clone();
+    assert_eq!(
+        pre_snapshot.files.len(),
+        1,
+        "CODE_FAILURE: disposable Pages repository is not at its one-file baseline"
+    );
+    let baseline_file = pre_snapshot
+        .files
+        .iter()
+        .find(|file| file.path == "index.html")
+        .expect("native baseline index");
+    assert_eq!(
+        baseline_file.content_digest,
+        crate::digest_bytes(NATIVE_BASELINE_INDEX.as_bytes()),
+        "CODE_FAILURE: disposable Pages repository baseline drifted"
+    );
+    assert!(
+        !proposal.canonical_diff.is_empty(),
+        "CODE_FAILURE: native proposal has no diff"
+    );
+    let publish_approval = approve_proposal_with_scope(
+        &mut mission,
+        &proposal,
+        &domain,
+        at + Duration::seconds(4),
+        native_scope.clone(),
+        "approval-native-e2e-publish",
+        &"f".repeat(64),
+    );
+    let published = match service.publish(
+        &mission,
+        &site,
+        &domain,
+        &proposal,
+        &publish_approval,
+        Utc::now(),
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let mut last_error = error.to_string();
+            let mut adopted = None;
+            for _ in 0..12 {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                match service.reconcile(&mission, &site, &domain, &proposal, Utc::now()) {
+                    Ok(reconciled) => {
+                        let disposition = format!("{:?}", reconciled.disposition);
+                        if let Some(result) = reconciled.adoptable_result {
+                            adopted = Some(result);
+                            break;
+                        }
+                        last_error = format!("reconcile disposition {disposition}");
+                    }
+                    Err(reconcile_error) => last_error = reconcile_error.to_string(),
+                }
+            }
+            adopted.unwrap_or_else(|| {
+                panic!("CODE_FAILURE: native publish/readback reconciliation failed: {last_error}")
+            })
+        }
+    };
+    assert!(
+        published.adoptable,
+        "CODE_FAILURE: native publish was not adoptable"
+    );
+    assert_eq!(published.receipt.base_head_sha, pre_snapshot.head_sha);
+    assert!(
+        published
+            .verification
+            .readback
+            .authenticated_content_matches
+    );
+    assert!(published.verification.readback.public_content_matches);
+    assert!(published.verification.observation.independent());
+
+    let rollback_site = Site::new(
+        tenant_id,
+        project_id,
+        SiteId::from_stable("site-native-e2e-rollback"),
+        2,
+        pre_snapshot.files.clone(),
+        work_product_id,
+        1,
+        source_work_product_digest,
+    )
+    .expect("valid native rollback site");
+    let rollback_input = PublicationRollbackInput {
+        proposal: PublicationProposalInput::new(
+            crate::PublicationId::from_stable("publication-native-e2e-rollback"),
+            ActorId::from_stable("actor-native-e2e-rollback"),
+            EffectId::from_stable("effect-native-e2e-rollback"),
+            "policy-web-publication-native-e2e-v1",
+            Utc::now(),
+            Utc::now() + Duration::minutes(10),
+        ),
+        rollback_site: rollback_site.clone(),
+        expected_current_head_sha: published.receipt.commit_sha.clone(),
+        expected_current_content_digest: published
+            .verification
+            .readback
+            .expected_content_digest
+            .clone(),
+    };
+    let rollback_proposal = service
+        .propose_rollback(&mission, &domain, &rollback_input)
+        .unwrap_or_else(|error| panic!("CODE_FAILURE: native rollback proposal failed: {error}"));
+    assert_eq!(
+        rollback_proposal.canonical_diff.base_head_sha,
+        published.receipt.commit_sha
+    );
+    let rollback_approval = approve_proposal_with_scope(
+        &mut mission,
+        &rollback_proposal,
+        &domain,
+        Utc::now(),
+        native_scope,
+        "approval-native-e2e-rollback",
+        &"a".repeat(64),
+    );
+    let rolled_back = match service.rollback(
+        &mission,
+        &rollback_site,
+        &domain,
+        &rollback_proposal,
+        &rollback_approval,
+        Utc::now(),
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let mut last_error = error.to_string();
+            let mut adopted = None;
+            for _ in 0..12 {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                match service.reconcile(
+                    &mission,
+                    &rollback_site,
+                    &domain,
+                    &rollback_proposal,
+                    Utc::now(),
+                ) {
+                    Ok(reconciled) => {
+                        let disposition = format!("{:?}", reconciled.disposition);
+                        if let Some(result) = reconciled.adoptable_result {
+                            adopted = Some(result);
+                            break;
+                        }
+                        last_error = format!("reconcile disposition {disposition}");
+                    }
+                    Err(reconcile_error) => last_error = reconcile_error.to_string(),
+                }
+            }
+            adopted.unwrap_or_else(|| {
+                panic!("CODE_FAILURE: native rollback/readback reconciliation failed: {last_error}")
+            })
+        }
+    };
+    assert!(
+        rolled_back.adoptable,
+        "CODE_FAILURE: native rollback was not adoptable"
+    );
+    assert_eq!(
+        rolled_back.receipt.action,
+        crate::GithubPagesPublicationAction::Rollback
+    );
+    assert_eq!(
+        rolled_back.receipt.base_head_sha,
+        published.receipt.commit_sha
+    );
+    assert_ne!(rolled_back.receipt.commit_sha, published.receipt.commit_sha);
+    assert_eq!(
+        rolled_back
+            .verification
+            .readback
+            .authenticated_snapshot
+            .head_sha,
+        rolled_back.receipt.commit_sha
+    );
+    assert!(
+        rolled_back
+            .verification
+            .readback
+            .authenticated_content_matches
+    );
+    assert!(rolled_back.verification.readback.public_content_matches);
+    assert_eq!(
+        rolled_back.verification.readback.expected_content_digest,
+        pre_snapshot.content_digest
+    );
+    let durable_log = serde_json::to_string(service.durable_log()).expect("native durable log");
+    assert!(!durable_log.contains(NATIVE_MARKER));
+    assert!(!durable_log.contains("Authorization"));
+    let contract: serde_json::Value =
+        serde_json::from_str(crate::GITHUB_PAGES_CONTRACT_JSON).expect("native contract");
+    assert_eq!(
+        contract["mutationModel"], "non_force_git_data_commit_and_ref_update",
+        "CODE_FAILURE: native journey contract is not non-force"
+    );
+    println!(
+        "HARTEVO_NATIVE_GITHUB_PAGES_EVIDENCE {}",
+        serde_json::json!({
+            "journey": "approve_publish_receipt_readback_rollback",
+            "status": "PASS",
+            "provenance": "native_github_authenticated_api_and_public_https",
+            "owner": owner,
+            "repository": repository,
+            "ref": git_ref,
+            "pages_url": pages_url,
+            "domain": expected_domain,
+            "environment": environment.as_str(),
+            "account": account,
+            "connection_registration_digest": registration_digest,
+            "connection_scope_digest": scope_digest,
+            "plugin_version": plugin_version,
+            "registry_version": registry_version,
+            "adapter_id": adapter_id,
+            "adapter_version": adapter_version,
+            "source_work_product_id": "work-product-native-e2e",
+            "source_work_product_revision": 1,
+            "source_work_product_digest": site.source_work_product_digest,
+            "pre_commit": pre_snapshot.head_sha,
+            "pre_content_digest": pre_snapshot.content_digest,
+            "proposal_digest": proposal.proposal_digest,
+            "publish_effect_digest": published.receipt.effect_digest,
+            "publish_approval_binding_digest": published.approval_binding_digest,
+            "published_commit": published.receipt.commit_sha,
+            "published_tree": published.receipt.tree_sha,
+            "published_readback": {
+                "authenticated": published.verification.readback.authenticated_content_matches,
+                "public": published.verification.readback.public_content_matches,
+                "evidence_digest": published.verification.readback.evidence_digest,
+            },
+            "rollback_proposal_digest": rollback_proposal.proposal_digest,
+            "rollback_effect_digest": rolled_back.receipt.effect_digest,
+            "rollback_approval_binding_digest": rolled_back.approval_binding_digest,
+            "rollback_base_commit": rolled_back.receipt.base_head_sha,
+            "rollback_commit": rolled_back.receipt.commit_sha,
+            "rollback_tree": rolled_back.receipt.tree_sha,
+            "rollback_readback": {
+                "authenticated": rolled_back.verification.readback.authenticated_content_matches,
+                "public": rolled_back.verification.readback.public_content_matches,
+                "evidence_digest": rolled_back.verification.readback.evidence_digest,
+            },
+            "publish_attempts": 1,
+            "rollback_attempts": 1,
+            "force_update": false,
+            "durable_receipts_content_free": true,
+        })
+    );
 }
 
 #[test]
