@@ -1,34 +1,16 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "c678b1391f0b81b19cd2435e2e440f6d0be9f036",
-  "candidateCount": 4,
+  "baseCommit": "a77572e05d170b2a6496d7c0453eaba596ae50d3",
+  "candidateCount": 1,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-512-ext-aws-config-compliance-01",
-      "headCommit": "7fda311c031621be0af3a69fdfae146b7f864a3d",
-      "number": 533
-    },
-    {
-      "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/aws-organizations-governance-result",
-      "headCommit": "d44ae127e2333d1ca0f87dec88a7a1c95a7fa238",
-      "number": 534
-    },
-    {
-      "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-514-ext-sailpoint-certification-result-01",
-      "headCommit": "7b713ffcf9e077cbeda894b8a854c423ca706343",
-      "number": 535
-    },
-    {
-      "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-521-ext-aws-backup-recovery-result-01",
-      "headCommit": "e31c9e97ca5c2fe3e384f44669838129b262e828",
-      "number": 536
+      "headBranch": "codex/issue-620-ext-aws-cloudfront-01",
+      "headCommit": "5efe40ac875cd33b977365cbe575068538ce5d08",
+      "number": 639
     }
   ],
-  "createdAt": "2026-08-14T18:41:59Z",
+  "createdAt": "2026-08-14T22:02:36Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +21,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-024134"
+  "trainBranch": "merge-train/20260814-220216"
 }
