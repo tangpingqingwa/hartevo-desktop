@@ -34,6 +34,8 @@ pub const MAX_WORKER_LEASE_TTL_SECONDS: i64 = 900;
 pub const DEFAULT_PAGE_SIZE: u32 = 100;
 pub const MAX_PAGE_SIZE: u32 = 1_000;
 
+pub mod meta;
+
 /// A tenant/project/provider/account scope.  The scope contains identifiers,
 /// never a secret or a provider payload.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -201,7 +203,7 @@ impl SecretReference {
         self.scope.validate()
     }
 
-    fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
         self.revoked_at.is_some_and(|revoked_at| revoked_at <= now)
     }
 }
@@ -315,7 +317,7 @@ impl CredentialLease {
         Ok(())
     }
 
-    fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
         self.revoked_at.is_some_and(|revoked_at| revoked_at <= now)
     }
 }
@@ -1012,7 +1014,7 @@ impl ConnectorTask {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FreshnessWindow {
     observed_at: DateTime<Utc>,
