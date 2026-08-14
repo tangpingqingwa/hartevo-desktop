@@ -971,7 +971,12 @@ mod tests {
             ResultStatus::Completed,
             AdoptionDecision::Adopt,
         );
-        value.result.result_digest.replace_range(..1, "0");
+        let replacement = if value.result.result_digest.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        value.result.result_digest.replace_range(..1, replacement);
         assert!(validate_session(&value, &commit).is_err());
 
         let mut value = session(
@@ -981,7 +986,15 @@ mod tests {
             ResultStatus::Completed,
             AdoptionDecision::Adopt,
         );
-        value.adoption.decision_digest.replace_range(..1, "0");
+        let replacement = if value.adoption.decision_digest.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        value
+            .adoption
+            .decision_digest
+            .replace_range(..1, replacement);
         assert!(validate_session(&value, &commit).is_err());
     }
 }
