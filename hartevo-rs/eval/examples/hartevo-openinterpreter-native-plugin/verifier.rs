@@ -22,6 +22,7 @@ pub const VALIDATION_SCHEMA: &str = "hartevo.openinterpreter-native-plugin-valid
 const MODEL_VISIBLE_EVENT_SCHEMA: &str = "hartevo.runtime-model-visible-event/v1";
 const EXPECTED_STAGE_COUNT: usize = 11;
 const EXPECTED_ORACLE_CONSUMER: &str = "hartevo-plugin-native-journey-oracle";
+const MAX_PROVIDER_ID_BYTES: usize = 1_024;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -360,10 +361,18 @@ fn validate_selection(receipt: &NativePluginReceipt) -> Result<()> {
     }
     ensure!(receipt.selection.service_id == "runtime.execution");
     ensure!(receipt.selection.service_revision == "v1");
-    ensure!(receipt.selection.provider_id == "openinterpreter");
+    ensure!(valid_provider_id(&receipt.selection.provider_id));
     ensure!(receipt.result.runtime_config_digest == receipt.selection.config_digest);
     ensure!(receipt.result.catalog_digest == receipt.selection.catalog_digest);
     Ok(())
+}
+
+fn valid_provider_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PROVIDER_ID_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
 }
 
 fn validate_process(receipt: &NativePluginReceipt) -> Result<()> {
@@ -641,8 +650,8 @@ pub fn not_evaluated_report(reason: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocked_env_report, not_evaluated_report, stage_digest, validate_contract_bytes,
-        validate_receipt_bytes,
+        blocked_env_report, not_evaluated_report, stage_digest, valid_provider_id,
+        validate_contract_bytes, validate_receipt_bytes,
     };
     use crate::model::StageName;
 
@@ -689,5 +698,14 @@ mod tests {
             stage_digest(1, StageName::Initialize, &scope, &commit),
             stage_digest(2, StageName::Initialize, &scope, &commit)
         );
+    }
+
+    #[test]
+    fn provider_identity_accepts_observed_local_ids_without_allowing_spoofed_shapes() {
+        assert!(valid_provider_id("ollama"));
+        assert!(valid_provider_id("local-compatible.provider_v1"));
+        assert!(!valid_provider_id("OpenAI"));
+        assert!(!valid_provider_id("openai/provider"));
+        assert!(!valid_provider_id(""));
     }
 }

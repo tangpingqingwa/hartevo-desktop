@@ -883,6 +883,9 @@ impl StdioRuntime {
         &mut self,
         timeout: Duration,
     ) -> Result<RuntimeCapabilities, AdapterError> {
+        if let Some(capabilities) = &self.negotiated_capabilities {
+            return Ok(capabilities.clone());
+        }
         let health = self.health_check(timeout)?;
         let provider_request = AppServerContract::provider_list(self.next_request_id()?, true);
         let provider_catalog =
@@ -901,7 +904,7 @@ impl StdioRuntime {
         } else {
             false
         };
-        Ok(RuntimeCapabilities {
+        let capabilities = RuntimeCapabilities {
             protocol_version: super::PROTOCOL_VERSION.to_owned(),
             schema_digest: health.schema_digest,
             provider_catalog,
@@ -920,7 +923,9 @@ impl StdioRuntime {
                 .any(|method| method == "turn/steer"),
             bounded_stream: true,
             typed_tool_recovery: true,
-        })
+        };
+        self.negotiated_capabilities = Some(capabilities.clone());
+        Ok(capabilities)
     }
 
     pub fn discover_runtime_catalog(

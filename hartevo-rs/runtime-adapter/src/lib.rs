@@ -1645,6 +1645,7 @@ pub struct StdioRuntime {
     program_sha256: String,
     program_integrity_pinned: bool,
     last_control_plane_provider_id: Option<String>,
+    negotiated_capabilities: Option<RuntimeCapabilities>,
     poisoned: bool,
 }
 
@@ -1858,6 +1859,7 @@ impl StdioRuntime {
             program_sha256: validated.program_sha256,
             program_integrity_pinned: config.expected_program_sha256.is_some(),
             last_control_plane_provider_id: None,
+            negotiated_capabilities: None,
             poisoned: false,
         })
     }
@@ -4374,11 +4376,16 @@ while IFS= read -r request; do
     case "$request" in
         *'"method":"initialize"'*)
             if [ "$OPENAI_API_KEY" != "fake-secret" ]; then exit 42; fi
-            printf '%s\n' '{"jsonrpc":"2.0","id":'"$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"',"result":{"serverInfo":{"name":"fake-runtime"}}}'
+            INITIALIZE_COUNT=$((INITIALIZE_COUNT + 1))
+            if [ "$INITIALIZE_COUNT" -gt 1 ]; then
+                printf '%s\n' '{"jsonrpc":"2.0","id":'"$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"',"error":{"code":"already_initialized","message":"initialize may only be sent once"}}'
+            else
+                printf '%s\n' '{"jsonrpc":"2.0","id":'"$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"',"result":{"serverInfo":{"name":"fake-runtime"}}}'
+            fi
             ;;
         *'"method":"interpreter/provider/list"'*)
             case "$request" in
-                *'"id":2,'*|*'"id":6,'*|*'"id":9,'*)
+                *'"id":2,'*|*'"id":5,'*)
                     printf '%s\n' '{"jsonrpc":"2.0","id":'"$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"',"result":{"data":[{"id":"openai","wireApi":"responses","envKey":"OPENAI_API_KEY","configured":true}]}}'
                     ;;
             esac

@@ -182,7 +182,6 @@ const REQUIRED_ENVIRONMENT: &[&str] = &[
     "HARTEVO_TEST_OPENINTERPRETER_HOME",
     "HARTEVO_RUNTIME_PROVIDER",
     "HARTEVO_RUNTIME_MODEL",
-    "HARTEVO_RUNTIME_SECRET_ENV",
     "HARTEVO_NATIVE_PROJECT_ID",
     "HARTEVO_NATIVE_MISSION_ID",
     "HARTEVO_NATIVE_SESSION_ID",
@@ -206,8 +205,13 @@ where
         })
         .collect::<Vec<_>>();
 
-    if let Some(secret_environment) =
-        get("HARTEVO_RUNTIME_SECRET_ENV").filter(|value| !value.trim().is_empty())
+    let local_provider =
+        get("HARTEVO_RUNTIME_OSS_PROVIDER").filter(|value| !value.trim().is_empty());
+    let secret_environment =
+        get("HARTEVO_RUNTIME_SECRET_ENV").filter(|value| !value.trim().is_empty());
+    if local_provider.is_none() && secret_environment.is_none() {
+        missing.push("HARTEVO_RUNTIME_SECRET_ENV".to_owned());
+    } else if let Some(secret_environment) = secret_environment
         && get(&secret_environment)
             .as_deref()
             .is_none_or(|value| value.trim().is_empty())
@@ -215,18 +219,28 @@ where
     {
         missing.push(secret_environment);
     }
+    if local_provider.is_some()
+        && get("HARTEVO_RUNTIME_MODEL_CATALOG")
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        missing.push("HARTEVO_RUNTIME_MODEL_CATALOG".to_owned());
+    }
 
     missing
 }
 
 struct EnvironmentSecretResolver {
-    environment_key: String,
+    environment_key: Option<String>,
 }
 
 impl SecretResolver for EnvironmentSecretResolver {
     fn resolve(&self, _reference: &SecretReference) -> Result<ResolvedSecret, AdapterError> {
-        let value =
-            env::var(&self.environment_key).map_err(|_| AdapterError::InvalidSecretMaterial)?;
+        let environment_key = self
+            .environment_key
+            .as_deref()
+            .ok_or(AdapterError::InvalidSecretMaterial)?;
+        let value = env::var(environment_key).map_err(|_| AdapterError::InvalidSecretMaterial)?;
         ResolvedSecret::new(value)
     }
 }
@@ -238,7 +252,9 @@ struct NativeInputs {
     provider_id: String,
     model_id: String,
     harness_id: Option<String>,
-    secret_environment_key: String,
+    local_provider: Option<String>,
+    model_catalog_path: Option<PathBuf>,
+    secret_environment_key: Option<String>,
     workspace_root: PathBuf,
     runtime_home: PathBuf,
     program: PathBuf,
@@ -259,7 +275,16 @@ fn native_inputs() -> Result<NativeInputs> {
         provider_id: value("HARTEVO_RUNTIME_PROVIDER")?,
         model_id: value("HARTEVO_RUNTIME_MODEL")?,
         harness_id: env::var("HARTEVO_RUNTIME_HARNESS").ok(),
-        secret_environment_key: value("HARTEVO_RUNTIME_SECRET_ENV")?,
+        local_provider: env::var("HARTEVO_RUNTIME_OSS_PROVIDER")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        model_catalog_path: env::var("HARTEVO_RUNTIME_MODEL_CATALOG")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from),
+        secret_environment_key: env::var("HARTEVO_RUNTIME_SECRET_ENV")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
         workspace_root,
         runtime_home: PathBuf::from(value("HARTEVO_TEST_OPENINTERPRETER_HOME")?),
         program: PathBuf::from(value("HARTEVO_OPENINTERPRETER_BIN")?),
@@ -336,7 +361,10 @@ fn build_mount_plan() -> Result<NativeMountPlan> {
     let credential = SecretReference::new(
         inputs.provider_id.clone(),
         "native-acceptance",
-        format!("env:{}", inputs.secret_environment_key),
+        inputs.secret_environment_key.as_deref().map_or_else(
+            || "local:no-credential".to_owned(),
+            |key| format!("env:{key}"),
+        ),
         scope.scope_digest.clone(),
         1,
     )?;
@@ -741,12 +769,9 @@ fn discover_catalog(
     inputs: &NativeInputs,
     resolver: &dyn SecretResolver,
 ) -> Result<RuntimeCatalog> {
-    let command = artifact.runtime_command(&inputs.workspace_root, &inputs.runtime_home)?;
+    let command = configured_runtime_command(artifact, inputs)?;
     let mut runtime = StdioRuntime::spawn_with_secret_resolver(&command, resolver)?;
-    let result = (|| {
-        runtime.negotiate_capabilities(RUN_TIMEOUT)?;
-        runtime.discover_runtime_catalog("native-acceptance-probe", RUN_TIMEOUT)
-    })();
+    let result = runtime.discover_runtime_catalog("native-acceptance-probe", RUN_TIMEOUT);
     let shutdown = runtime.shutdown();
     let catalog = result?;
     shutdown?;
@@ -792,12 +817,62 @@ fn configured_command(
     config: &RuntimeExecutionConfig,
     credential: SecretReference,
 ) -> Result<RuntimeCommand> {
-    let mut command = artifact.runtime_command(&inputs.workspace_root, &inputs.runtime_home)?;
-    let environment_key = catalog
+    let mut command = configured_runtime_command(artifact, inputs)?;
+    if let Some(environment_key) = catalog
         .provider(&config.provider_id)
         .and_then(|provider| provider.credential_environment_key.clone())
-        .context("native provider did not expose a credential environment binding")?;
-    command.add_secret_binding(environment_key, credential)?;
+    {
+        ensure!(
+            inputs.secret_environment_key.as_deref() == Some(environment_key.as_str()),
+            "configured secret environment does not match the provider catalog"
+        );
+        command.add_secret_binding(environment_key, credential)?;
+    }
+    Ok(command)
+}
+
+fn configured_runtime_command(
+    artifact: &VerifiedRuntimeArtifact,
+    inputs: &NativeInputs,
+) -> Result<RuntimeCommand> {
+    let mut command = artifact.runtime_command(&inputs.workspace_root, &inputs.runtime_home)?;
+    command.environment.insert(
+        "HOME".to_owned(),
+        inputs.runtime_home.to_string_lossy().into_owned(),
+    );
+    if let Some(local_provider) = inputs.local_provider.as_deref() {
+        ensure!(
+            !local_provider.trim().is_empty(),
+            "local provider selection must not be empty"
+        );
+        ensure!(
+            inputs.provider_id == local_provider,
+            "local provider must match the selected runtime provider"
+        );
+        command.args = vec![
+            "app-server".to_owned(),
+            "--stdio".to_owned(),
+            "-c".to_owned(),
+            format!("oss_provider=\"{local_provider}\""),
+            "-c".to_owned(),
+            format!("model_provider=\"{local_provider}\""),
+        ];
+        let model_catalog_path = inputs
+            .model_catalog_path
+            .as_deref()
+            .context("local provider requires an explicit model catalog path")?;
+        ensure!(
+            model_catalog_path.is_absolute() && model_catalog_path.is_file(),
+            "local model catalog path must be an existing absolute file"
+        );
+        command.args.extend([
+            "-c".to_owned(),
+            format!(
+                "model_catalog_json={}",
+                model_catalog_path.to_string_lossy()
+            ),
+        ]);
+    }
     Ok(command)
 }
 
@@ -924,5 +999,50 @@ mod tests {
         values.insert("OPENAI_API_KEY", "redacted-test-secret".to_owned());
 
         assert!(required_environment_with(|name| values.get(name).cloned()).is_empty());
+    }
+
+    #[test]
+    fn local_provider_does_not_require_secret_material() {
+        let mut values = BTreeMap::new();
+        for name in [
+            "HARTEVO_OPENINTERPRETER_BIN",
+            "HARTEVO_TEST_OPENINTERPRETER_HOME",
+            "HARTEVO_RUNTIME_PROVIDER",
+            "HARTEVO_RUNTIME_MODEL",
+            "HARTEVO_NATIVE_PROJECT_ID",
+            "HARTEVO_NATIVE_MISSION_ID",
+            "HARTEVO_NATIVE_SESSION_ID",
+        ] {
+            values.insert(name, name.to_owned());
+        }
+        values.insert("HARTEVO_RUNTIME_OSS_PROVIDER", "ollama".to_owned());
+        values.insert(
+            "HARTEVO_RUNTIME_MODEL_CATALOG",
+            "/tmp/local-model-catalog.json".to_owned(),
+        );
+
+        assert!(required_environment_with(|name| values.get(name).cloned()).is_empty());
+    }
+
+    #[test]
+    fn local_provider_without_model_catalog_is_blocked() {
+        let mut values = BTreeMap::new();
+        for name in [
+            "HARTEVO_OPENINTERPRETER_BIN",
+            "HARTEVO_TEST_OPENINTERPRETER_HOME",
+            "HARTEVO_RUNTIME_PROVIDER",
+            "HARTEVO_RUNTIME_MODEL",
+            "HARTEVO_NATIVE_PROJECT_ID",
+            "HARTEVO_NATIVE_MISSION_ID",
+            "HARTEVO_NATIVE_SESSION_ID",
+        ] {
+            values.insert(name, name.to_owned());
+        }
+        values.insert("HARTEVO_RUNTIME_OSS_PROVIDER", "ollama".to_owned());
+
+        assert_eq!(
+            required_environment_with(|name| values.get(name).cloned()),
+            vec!["HARTEVO_RUNTIME_MODEL_CATALOG"]
+        );
     }
 }
