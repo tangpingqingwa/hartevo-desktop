@@ -37,8 +37,13 @@ class VerifyPluginTruthTests(unittest.TestCase):
         self.assertEqual(result["facts"]["provider_catalog_connected_count"], 0)
         self.assertTrue(result["facts"]["capability_adapter_symbol"])
         self.assertTrue(result["facts"]["capability_consumer_symbol"])
-        self.assertFalse(result["facts"]["plugin_composition_kernel"])
-        self.assertFalse(result["facts"]["plugin_reversible_lifecycle"])
+        self.assertTrue(result["facts"]["plugin_composition_kernel"])
+        self.assertTrue(result["facts"]["plugin_reversible_lifecycle"])
+        self.assertEqual(result["facts"]["desktop_plugin_runtime_wiring_count"], 0)
+        self.assertFalse(result["facts"]["plugin_durable_audit_log"])
+        self.assertFalse(result["facts"]["current_evidence_release_passed"])
+        self.assertEqual(result["facts"]["current_evidence_release_decision"], "NOT_EVALUATED")
+        self.assertFalse(result["facts"]["current_evidence_mission_evidence_level_promoted"])
 
     def test_positive_fixture_and_negation_scopes(self) -> None:
         config = CHECKER.validate_config(CHECKER.load_json(CONFIG_PATH))
@@ -59,7 +64,12 @@ class VerifyPluginTruthTests(unittest.TestCase):
             "contradictory": ("Provider registrations: 0; status: connected.", "CONTRADICTORY_CLAIM"),
             "surface": ("A fixed dashboard is the central cockpit.", "FIXED_DASHBOARD_OR_COCKPIT"),
             "native": ("Fixture evidence passed as native production proof.", "NON_NATIVE_EVIDENCE_ESCALATED"),
-            "lifecycle": ("Plugins are implemented with reversible mount/unmount lifecycle.", "PLUGIN_LIFECYCLE_UNPROVEN"),
+            "composition": ("Plugins are implemented and expose service and provider components.", "PLUGIN_COMPOSITION_INCOMPLETE"),
+            "irreversible": ("Plugin mount is implemented and cannot unmount.", "IRREVERSIBLE_PLUGIN_MOUNT"),
+            "parallel_registry": ("A second tool registry is implemented and available.", "PARALLEL_TOOL_REGISTRY"),
+            "model_visible": ("Model-visible plugin item is production available.", "MODEL_VISIBLE_WITHOUT_DURABLE_LOG"),
+            "provider_only": ("Provider-only capability is production available.", "PROVIDER_ONLY_AS_CAPABILITY"),
+            "ui_card": ("The UI card advertises an available capability.", "UI_CARD_AS_CAPABILITY"),
         }
         for label, (text, expected) in cases.items():
             with self.subTest(label=label):

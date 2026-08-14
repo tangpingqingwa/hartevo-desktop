@@ -176,9 +176,15 @@ def validate_config(config: Any) -> dict[str, Any]:
         "connected_status",
         "contradictory_connected",
         "fixed_surface",
+        "irreversible_lifecycle",
+        "model_visible_durable",
         "non_native_evidence",
+        "parallel_registry",
+        "plugin_components",
         "plugin_completion",
         "plugin_lifecycle",
+        "provider_only",
+        "ui_card_as_capability",
     }
     for claim in claims:
         ensure(isinstance(claim, dict), "CONFIG_SHAPE_MISMATCH", "claims")
@@ -200,6 +206,8 @@ def validate_config(config: Any) -> dict[str, Any]:
             "contradictionAny",
             "surfaceAny",
             "lifecycleAny",
+            "irreversibleAny",
+            "requiredAny",
             "qualifierAny",
         ):
             if key in claim:
@@ -212,6 +220,10 @@ def validate_config(config: Any) -> dict[str, Any]:
                 ensure(isinstance(condition, dict), "CONFIG_TYPE_INVALID", claim_id)
                 _exact_keys(condition, {"fact", "equals"}, claim_id)
                 ensure(condition["fact"] in fact_ids, "MISSING_AUTHORITY_FACT", claim_id)
+        if "requiredGroups" in claim:
+            ensure(isinstance(claim["requiredGroups"], list) and claim["requiredGroups"], "CONFIG_TYPE_INVALID", claim_id)
+            for group in claim["requiredGroups"]:
+                _string_list(group, claim_id)
         if claim["detector"] == "catalog_as_capability":
             ensure("matchAll" in claim and "assertionAny" in claim and "allowAny" in claim, "CONFIG_RULE_INCOMPLETE", claim_id)
         elif claim["detector"] == "connected_status":
@@ -220,8 +232,16 @@ def validate_config(config: Any) -> dict[str, Any]:
             ensure("matchAny" in claim and "contradictionAny" in claim and "negativeAny" in claim, "CONFIG_RULE_INCOMPLETE", claim_id)
         elif claim["detector"] == "fixed_surface":
             ensure("surfaceAny" in claim and "assertionAny" in claim and "negativeAny" in claim, "CONFIG_RULE_INCOMPLETE", claim_id)
+        elif claim["detector"] == "irreversible_lifecycle":
+            ensure("matchAny" in claim and "irreversibleAny" in claim and "assertionAny" in claim and "negativeAny" in claim, "CONFIG_RULE_INCOMPLETE", claim_id)
+        elif claim["detector"] == "model_visible_durable":
+            ensure("matchAny" in claim and "assertionAny" in claim and "negativeAny" in claim and "conditions" in claim, "CONFIG_RULE_INCOMPLETE", claim_id)
         elif claim["detector"] == "non_native_evidence":
             ensure("qualifierAny" in claim and "assertionAny" in claim and "allowAny" in claim, "CONFIG_RULE_INCOMPLETE", claim_id)
+        elif claim["detector"] == "parallel_registry":
+            ensure("matchAny" in claim and "assertionAny" in claim and "negativeAny" in claim, "CONFIG_RULE_INCOMPLETE", claim_id)
+        elif claim["detector"] == "plugin_components":
+            ensure("matchAny" in claim and "assertionAny" in claim and "requiredGroups" in claim and "allowAny" in claim and "conditions" in claim, "CONFIG_RULE_INCOMPLETE", claim_id)
         elif claim["detector"] == "plugin_completion":
             ensure(
                 "matchAny" in claim
@@ -231,6 +251,10 @@ def validate_config(config: Any) -> dict[str, Any]:
                 "CONFIG_RULE_INCOMPLETE",
                 claim_id,
             )
+        elif claim["detector"] == "provider_only":
+            ensure("matchAny" in claim and "assertionAny" in claim and "negativeAny" in claim, "CONFIG_RULE_INCOMPLETE", claim_id)
+        elif claim["detector"] == "ui_card_as_capability":
+            ensure("matchAll" in claim and "maxDistance" in claim and "assertionAny" in claim and "allowAny" in claim, "CONFIG_RULE_INCOMPLETE", claim_id)
         elif claim["detector"] == "plugin_lifecycle":
             ensure(
                 "matchAny" in claim
@@ -473,8 +497,34 @@ def scan_documents(config: Mapping[str, Any], facts: Mapping[str, Any], authorit
                 elif detector == "fixed_surface":
                     if any_term(line, claim["surfaceAny"]) and any_term(line, claim["assertionAny"]) and not any_term(line, claim["negativeAny"]):
                         drifts.append(drift_record(claim, document, line_number, authorities))
+                elif detector == "irreversible_lifecycle":
+                    if (
+                        any_term(line, claim["matchAny"])
+                        and any_term(line, claim["irreversibleAny"])
+                        and any_term(line, claim["assertionAny"])
+                        and not any_term(line, claim["negativeAny"])
+                    ):
+                        drifts.append(drift_record(claim, document, line_number, authorities))
+                elif detector == "model_visible_durable":
+                    if (
+                        any_term(line, claim["matchAny"])
+                        and any_term(line, claim["assertionAny"])
+                        and not any_term(line, claim["negativeAny"])
+                    ):
+                        drifts.append(drift_record(claim, document, line_number, authorities))
                 elif detector == "non_native_evidence":
                     if any_term(line, claim["qualifierAny"]) and any_term(line, claim["assertionAny"]) and not any_term(line, claim["allowAny"]):
+                        drifts.append(drift_record(claim, document, line_number, authorities))
+                elif detector == "parallel_registry":
+                    if any_term(line, claim["matchAny"]) and any_term(line, claim["assertionAny"]) and not any_term(line, claim["negativeAny"]):
+                        drifts.append(drift_record(claim, document, line_number, authorities))
+                elif detector == "plugin_components":
+                    if (
+                        any_term(line, claim["matchAny"])
+                        and any_term(line, claim["assertionAny"])
+                        and not any_term(line, claim["allowAny"])
+                        and not all(any_term(line, group) for group in claim["requiredGroups"])
+                    ):
                         drifts.append(drift_record(claim, document, line_number, authorities))
                 elif detector == "plugin_completion":
                     if any_term(line, claim["matchAny"]) and any_term(line, claim["assertionAny"]) and not any_term(line, claim["negativeAny"]):
@@ -485,6 +535,16 @@ def scan_documents(config: Mapping[str, Any], facts: Mapping[str, Any], authorit
                         and any_term(line, claim["lifecycleAny"])
                         and any_term(line, claim["assertionAny"])
                         and not any_term(line, claim["negativeAny"])
+                    ):
+                        drifts.append(drift_record(claim, document, line_number, authorities))
+                elif detector == "provider_only":
+                    if any_term(line, claim["matchAny"]) and any_term(line, claim["assertionAny"]) and not any_term(line, claim["negativeAny"]):
+                        drifts.append(drift_record(claim, document, line_number, authorities))
+                elif detector == "ui_card_as_capability":
+                    if (
+                        terms_near(line, claim["matchAll"], claim["maxDistance"])
+                        and any_term(line, claim["assertionAny"])
+                        and not any_term(line, claim["allowAny"])
                     ):
                         drifts.append(drift_record(claim, document, line_number, authorities))
     unique: dict[tuple[str, str, str, int], dict[str, Any]] = {}
@@ -527,12 +587,26 @@ def self_test(root: Path, config_path: Path) -> dict[str, Any]:
     baseline = verify(root, config_path)
     ensure(baseline["status"] == "VERIFIED", "SELF_TEST_BASELINE_DRIFT")
     facts, authorities = evaluate_facts(root, config)
+    ensure(facts["capability_catalog_entries"] == 48, "SELF_TEST_CURRENT_FACT_DRIFT")
+    ensure(facts["provider_adapter_registration_count"] == 0, "SELF_TEST_CURRENT_FACT_DRIFT")
+    ensure(facts["provider_catalog_connected_count"] == 0, "SELF_TEST_CURRENT_FACT_DRIFT")
+    ensure(facts["plugin_composition_kernel"] is True, "SELF_TEST_CURRENT_FACT_DRIFT")
+    ensure(facts["plugin_reversible_lifecycle"] is True, "SELF_TEST_CURRENT_FACT_DRIFT")
+    ensure(facts["desktop_plugin_runtime_wiring_count"] == 0, "SELF_TEST_CURRENT_FACT_DRIFT")
+    ensure(facts["plugin_durable_audit_log"] is False, "SELF_TEST_CURRENT_FACT_DRIFT")
+    ensure(facts["current_evidence_release_passed"] is False, "SELF_TEST_RELEASE_ESCALATION")
+    ensure(facts["current_evidence_release_decision"] == "NOT_EVALUATED", "SELF_TEST_RELEASE_ESCALATION")
+    ensure(facts["current_evidence_mission_evidence_level_promoted"] is False, "SELF_TEST_RELEASE_ESCALATION")
 
     accepted = [
         """```yaml\nfixture: self-test\nentryState:\n  website: connected\n```""",
         "No real Probe means do not show Connected.",
         "Plugin SDK target: design a reversible lifecycle; not implemented.",
         "BLOCKED_ENV remains not a native production proof.",
+        "Model-visible item is not durable and remains not proven.",
+        "A parallel tool registry is prohibited; only one registry exists.",
+        "Provider-only capability is not executable; it is contract-only.",
+        "The UI card is not a capability; it is only metadata.",
     ]
     for text in accepted:
         ensure(not scan_documents(config, facts, authorities, synthetic_documents(text)), "SELF_TEST_POSITIVE_FAILED")
@@ -545,7 +619,15 @@ def self_test(root: Path, config_path: Path) -> dict[str, Any]:
         ("Fixture native provider passed as production evidence.", {"NON_NATIVE_EVIDENCE_ESCALATED"}),
         ("An ignored test passed as native production proof.", {"NON_NATIVE_EVIDENCE_ESCALATED"}),
         ("BLOCKED_ENV implementation is production native and release-ready.", {"NON_NATIVE_EVIDENCE_ESCALATED"}),
-        ("Plugins are implemented and support a reversible mount/unmount lifecycle.", {"PLUGIN_KERNEL_COMPLETION_UNPROVEN", "PLUGIN_LIFECYCLE_UNPROVEN"}),
+        ("Plugins are implemented and support a reversible mount/unmount lifecycle.", {"PLUGIN_KERNEL_COMPLETION_UNPROVEN", "PLUGIN_COMPOSITION_INCOMPLETE"}),
+        ("Plugins are implemented with provider and consumer components.", {"PLUGIN_KERNEL_COMPLETION_UNPROVEN", "PLUGIN_COMPOSITION_INCOMPLETE"}),
+        ("Plugins are implemented with service and consumer components.", {"PLUGIN_KERNEL_COMPLETION_UNPROVEN", "PLUGIN_COMPOSITION_INCOMPLETE"}),
+        ("Plugins are implemented with service and provider components.", {"PLUGIN_KERNEL_COMPLETION_UNPROVEN", "PLUGIN_COMPOSITION_INCOMPLETE"}),
+        ("Plugin mount is implemented and cannot unmount.", {"PLUGIN_KERNEL_COMPLETION_UNPROVEN", "PLUGIN_COMPOSITION_INCOMPLETE", "IRREVERSIBLE_PLUGIN_MOUNT"}),
+        ("A second tool registry is implemented and available.", {"PARALLEL_TOOL_REGISTRY"}),
+        ("Model-visible plugin item is production available.", {"MODEL_VISIBLE_WITHOUT_DURABLE_LOG", "PLUGIN_KERNEL_COMPLETION_UNPROVEN", "PLUGIN_COMPOSITION_INCOMPLETE"}),
+        ("Provider-only capability is production available.", {"PROVIDER_ONLY_AS_CAPABILITY"}),
+        ("The UI card advertises an available capability.", {"UI_CARD_AS_CAPABILITY"}),
     ]
     checked: list[str] = []
     for text, expected_codes in cases:
