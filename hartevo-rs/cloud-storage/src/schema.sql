@@ -298,6 +298,10 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.region_transfer_receipts (
     ),
     status TEXT NOT NULL CHECK (status IN ('prepared', 'adopted', 'revoked', 'crashed')),
     adopted_revision BIGINT CHECK (adopted_revision IS NULL OR adopted_revision > 0),
+    -- v1 adoption is a single monotonic acknowledgment generation.  It is
+    -- intentionally structural so v6 receipt digests remain replayable while
+    -- a forged generation still fails receipt verification.
+    ack_generation BIGINT,
     receipt_digest TEXT NOT NULL CHECK (receipt_digest ~ '^[0-9a-f]{64}$'),
     recorded_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
@@ -310,8 +314,37 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.region_transfer_receipts (
         (status = 'adopted' AND adopted_revision IS NOT NULL)
         OR (status <> 'adopted' AND adopted_revision IS NULL)
     ),
+    CONSTRAINT region_transfer_receipts_ack_generation_ck CHECK (
+        (status = 'adopted' AND ack_generation = 1)
+        OR (status <> 'adopted' AND ack_generation IS NULL)
+    ),
     CHECK (recorded_at <= updated_at)
 );
+
+-- Upgrade databases created by the v6 root slice without changing their
+-- existing receipt digest contract.  Adopted v6 receipts are the single v1
+-- acknowledgment generation and therefore backfill to generation one.
+ALTER TABLE hartevo_cell.region_transfer_receipts
+    ADD COLUMN IF NOT EXISTS ack_generation BIGINT;
+UPDATE hartevo_cell.region_transfer_receipts
+SET ack_generation = 1
+WHERE status = 'adopted' AND ack_generation IS NULL;
+DO $hartevo_region_transfer_ack$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'hartevo_cell.region_transfer_receipts'::regclass
+          AND conname = 'region_transfer_receipts_ack_generation_ck'
+    ) THEN
+        ALTER TABLE hartevo_cell.region_transfer_receipts
+            ADD CONSTRAINT region_transfer_receipts_ack_generation_ck CHECK (
+                (status = 'adopted' AND ack_generation = 1)
+                OR (status <> 'adopted' AND ack_generation IS NULL)
+            );
+    END IF;
+END
+$hartevo_region_transfer_ack$;
 
 CREATE TABLE IF NOT EXISTS hartevo_cell.region_transfer_events (
     sequence BIGSERIAL PRIMARY KEY,
@@ -327,6 +360,75 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.region_transfer_events (
     FOREIGN KEY (cell, tenant_id, project_id, transfer_id)
         REFERENCES hartevo_cell.region_transfer_receipts
             (cell, tenant_id, project_id, transfer_id)
+);
+
+-- Verification is a target-Cell readback receipt.  The verification JSON is
+-- digest-only metadata: it never contains the encrypted bundle bytes,
+-- clear content, keys, Store handles, Worker authority, or Effect authority.
+CREATE TABLE IF NOT EXISTS hartevo_cell.region_transfer_verification_receipts (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL CHECK (length(btrim(project_id)) > 0),
+    transfer_id TEXT NOT NULL CHECK (length(btrim(transfer_id)) > 0),
+    mission_id TEXT NOT NULL CHECK (length(btrim(mission_id)) > 0),
+    source_cell TEXT NOT NULL CHECK (source_cell IN ('us', 'eu')),
+    target_cell TEXT NOT NULL CHECK (target_cell IN ('us', 'eu')),
+    request_digest TEXT NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    source_receipt_digest TEXT NOT NULL CHECK (source_receipt_digest ~ '^[0-9a-f]{64}$'),
+    target_receipt_digest TEXT NOT NULL CHECK (target_receipt_digest ~ '^[0-9a-f]{64}$'),
+    ciphertext_digest TEXT NOT NULL CHECK (ciphertext_digest ~ '^[0-9a-f]{64}$'),
+    sequence BIGINT NOT NULL CHECK (sequence > 0),
+    replay_nonce TEXT NOT NULL CHECK (length(btrim(replay_nonce)) > 0),
+    service_version BIGINT NOT NULL CHECK (service_version > 0),
+    service_digest TEXT NOT NULL CHECK (service_digest ~ '^[0-9a-f]{64}$'),
+    provider_id TEXT NOT NULL CHECK (length(btrim(provider_id)) > 0),
+    provider_version BIGINT NOT NULL CHECK (provider_version > 0),
+    provider_digest TEXT NOT NULL CHECK (provider_digest ~ '^[0-9a-f]{64}$'),
+    consumer_id TEXT NOT NULL CHECK (length(btrim(consumer_id)) > 0),
+    consumer_version BIGINT NOT NULL CHECK (consumer_version > 0),
+    consumer_digest TEXT NOT NULL CHECK (consumer_digest ~ '^[0-9a-f]{64}$'),
+    readback_provider_id TEXT NOT NULL CHECK (length(btrim(readback_provider_id)) > 0),
+    readback_provider_version BIGINT NOT NULL CHECK (readback_provider_version > 0),
+    readback_provider_digest TEXT NOT NULL CHECK (readback_provider_digest ~ '^[0-9a-f]{64}$'),
+    current_commit_digest TEXT NOT NULL CHECK (current_commit_digest ~ '^[0-9a-f]{64}$'),
+    rls_principal_digest TEXT NOT NULL CHECK (rls_principal_digest ~ '^[0-9a-f]{64}$'),
+    ack_generation BIGINT NOT NULL CHECK (ack_generation = 1),
+    verification_generation BIGINT NOT NULL CHECK (verification_generation > 0),
+    verification_status TEXT NOT NULL CHECK (verification_status IN ('verified', 'rejected')),
+    outcome_status TEXT NOT NULL CHECK (outcome_status IN ('adoptable', 'not_adoptable')),
+    verification_json JSONB NOT NULL CHECK (jsonb_typeof(verification_json) = 'object'),
+    verification_digest TEXT NOT NULL CHECK (verification_digest ~ '^[0-9a-f]{64}$'),
+    outcome_digest TEXT NOT NULL CHECK (outcome_digest ~ '^[0-9a-f]{64}$'),
+    recorded_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (cell, tenant_id, project_id, transfer_id, verification_generation),
+    UNIQUE (cell, tenant_id, project_id, transfer_id, verification_digest),
+    FOREIGN KEY (cell, tenant_id, project_id, transfer_id)
+        REFERENCES hartevo_cell.region_transfer_receipts
+            (cell, tenant_id, project_id, transfer_id),
+    CHECK (source_cell <> target_cell),
+    CHECK (
+        (verification_status = 'verified' AND outcome_status = 'adoptable')
+        OR (verification_status = 'rejected' AND outcome_status = 'not_adoptable')
+    ),
+    CHECK (recorded_at <= updated_at)
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.region_transfer_verification_events (
+    sequence BIGSERIAL PRIMARY KEY,
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    transfer_id TEXT NOT NULL,
+    verification_generation BIGINT NOT NULL CHECK (verification_generation > 0),
+    verification_status TEXT NOT NULL CHECK (verification_status IN ('verified', 'rejected')),
+    outcome_status TEXT NOT NULL CHECK (outcome_status IN ('adoptable', 'not_adoptable')),
+    verification_digest TEXT NOT NULL CHECK (verification_digest ~ '^[0-9a-f]{64}$'),
+    outcome_digest TEXT NOT NULL CHECK (outcome_digest ~ '^[0-9a-f]{64}$'),
+    observed_at TIMESTAMPTZ NOT NULL,
+    FOREIGN KEY (cell, tenant_id, project_id, transfer_id, verification_generation)
+        REFERENCES hartevo_cell.region_transfer_verification_receipts
+            (cell, tenant_id, project_id, transfer_id, verification_generation)
 );
 
 CREATE TABLE IF NOT EXISTS hartevo_cell.remote_worker_mailbox_messages (
@@ -989,6 +1091,12 @@ CREATE INDEX IF NOT EXISTS sync_versions_replay_idx
 CREATE INDEX IF NOT EXISTS region_transfer_event_lookup_idx
     ON hartevo_cell.region_transfer_events
         (cell, tenant_id, project_id, transfer_id, sequence);
+CREATE INDEX IF NOT EXISTS region_transfer_verification_lookup_idx
+    ON hartevo_cell.region_transfer_verification_receipts
+        (cell, tenant_id, project_id, transfer_id, verification_generation);
+CREATE INDEX IF NOT EXISTS region_transfer_verification_event_lookup_idx
+    ON hartevo_cell.region_transfer_verification_events
+        (cell, tenant_id, project_id, transfer_id, sequence);
 CREATE INDEX IF NOT EXISTS remote_worker_claim_idx
     ON hartevo_cell.remote_worker_mailbox_messages
         (cell, tenant_id, project_id, worker_id, status, enqueued_at, task_id);
@@ -1035,6 +1143,10 @@ ALTER TABLE hartevo_cell.region_transfer_receipts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.region_transfer_receipts FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.region_transfer_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.region_transfer_events FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.region_transfer_verification_receipts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.region_transfer_verification_receipts FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.region_transfer_verification_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.region_transfer_verification_events FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.remote_worker_mailbox_messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.remote_worker_mailbox_messages FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.remote_worker_claims ENABLE ROW LEVEL SECURITY;
@@ -1094,6 +1206,8 @@ BEGIN
         'sync_mutations',
         'region_transfer_receipts',
         'region_transfer_events',
+        'region_transfer_verification_receipts',
+        'region_transfer_verification_events',
         'remote_worker_mailbox_messages',
         'remote_worker_claims',
         'device_public_key_versions',

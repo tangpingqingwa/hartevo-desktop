@@ -24,6 +24,7 @@ pub const REGION_TRANSFER_SERVICE_VERSION: u64 = 1;
 
 const MAX_TRANSFER_ID_BYTES: usize = 256;
 const MAX_REPLAY_NONCE_BYTES: usize = 256;
+const REGION_TRANSFER_ACK_GENERATION: u64 = 1;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -266,6 +267,550 @@ impl RegionTransferConsumer {
             .adopt_region_transfer(client, target_scope, receipt, now)
             .await
     }
+
+    /// Read and verify the exact target-Cell adoption.  The readback provider
+    /// owns only a read-only evidence query plus a durable verification
+    /// receipt; it does not expose a Store, Worker, or Effect capability.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the typed consumer boundary keeps every scope, generation, and durable receipt input explicit"
+    )]
+    pub async fn verify_target_adoption(
+        &self,
+        store: &PostgresCellStore,
+        client: &mut Client,
+        target_scope: &super::CellScope,
+        readback_provider: &RegionTransferReadbackProvider,
+        adopted_receipt: &RegionTransferReceipt,
+        expected_ack_generation: u64,
+        verification_generation: u64,
+        now: DateTime<Utc>,
+    ) -> Result<RegionTransferVerificationReceipt, CloudStorageError> {
+        self.verify_adopted_receipt(adopted_receipt)?;
+        readback_provider
+            .read_and_verify_adoption(
+                store,
+                client,
+                target_scope,
+                self,
+                adopted_receipt,
+                expected_ack_generation,
+                verification_generation,
+                now,
+            )
+            .await
+    }
+
+    fn verify_adopted_receipt(
+        &self,
+        receipt: &RegionTransferReceipt,
+    ) -> Result<(), CloudStorageError> {
+        receipt.verify()?;
+        if receipt.status != RegionTransferStatus::Adopted {
+            return Err(status_error(&receipt.status));
+        }
+        if receipt.request.consumer != *self
+            || receipt.request.target_cell != self.region
+            || receipt.request.current_commit_digest != self.current_commit_digest
+        {
+            return Err(CloudStorageError::RegionTransferReceiptTampered);
+        }
+        Ok(())
+    }
+}
+
+/// The target-Cell provider is intentionally read-only with respect to the
+/// transferred Project/Mission.  Its only durable write is the verification
+/// receipt and append-only verification event produced after the readback.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegionTransferReadbackProvider {
+    pub provider_id: String,
+    pub region: DataCell,
+    pub version: u64,
+    pub implementation_digest: String,
+    pub current_commit_digest: String,
+    pub rls_principal_digest: String,
+}
+
+impl RegionTransferReadbackProvider {
+    #[must_use]
+    pub fn new(
+        provider_id: impl Into<String>,
+        region: DataCell,
+        version: u64,
+        implementation_digest: impl Into<String>,
+        current_commit_digest: impl Into<String>,
+        rls_principal_digest: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            region,
+            version,
+            implementation_digest: implementation_digest.into(),
+            current_commit_digest: current_commit_digest.into(),
+            rls_principal_digest: rls_principal_digest.into(),
+        }
+    }
+
+    /// Derive the non-secret RLS principal evidence bound into a verification
+    /// receipt.  The database role itself never enters a Project/Mission
+    /// receipt; only this exact scope-bound digest does.
+    #[must_use]
+    pub fn principal_digest(principal: &str, scope: &super::CellScope) -> String {
+        transfer_digest(
+            format!(
+                "hartevo.cloud.region-transfer.rls-principal:v1:{}:{}:{}",
+                scope.cell.as_str(),
+                scope.tenant_id.as_str(),
+                principal
+            )
+            .as_bytes(),
+        )
+    }
+
+    fn validate(&self, target_scope: &super::CellScope) -> Result<(), CloudStorageError> {
+        if self.provider_id.trim().is_empty()
+            || self.provider_id.len() > MAX_TRANSFER_ID_BYTES
+            || self.region != target_scope.cell
+            || self.version != REGION_TRANSFER_VERIFICATION_VERSION
+            || !is_sha256(&self.implementation_digest)
+            || !is_sha256(&self.current_commit_digest)
+            || !is_sha256(&self.rls_principal_digest)
+        {
+            return Err(CloudStorageError::InvalidRegionTransfer);
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the provider boundary keeps target scope, consumer identity, receipt, and generation fences explicit"
+    )]
+    pub async fn read_and_verify_adoption(
+        &self,
+        store: &PostgresCellStore,
+        client: &mut Client,
+        target_scope: &super::CellScope,
+        consumer: &RegionTransferConsumer,
+        adopted_receipt: &RegionTransferReceipt,
+        expected_ack_generation: u64,
+        verification_generation: u64,
+        now: DateTime<Utc>,
+    ) -> Result<RegionTransferVerificationReceipt, CloudStorageError> {
+        self.validate(target_scope)?;
+        store
+            .verify_region_transfer_adoption(
+                client,
+                target_scope,
+                consumer,
+                self,
+                adopted_receipt,
+                expected_ack_generation,
+                verification_generation,
+                now,
+            )
+            .await
+    }
+}
+
+pub const REGION_TRANSFER_VERIFICATION_VERSION: u64 = 1;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionTransferVerificationStatus {
+    Verified,
+    Rejected,
+}
+
+impl RegionTransferVerificationStatus {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionTransferOutcome {
+    Adoptable,
+    NotAdoptable,
+}
+
+impl RegionTransferOutcome {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Adoptable => "adoptable",
+            Self::NotAdoptable => "not_adoptable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptableRegionTransferResult {
+    pub source_scope: super::CellScope,
+    pub target_scope: super::CellScope,
+    pub transfer_id: String,
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub request_digest: String,
+    pub source_receipt_digest: String,
+    pub target_receipt_digest: String,
+    pub ciphertext_digest: String,
+    pub sequence: u64,
+    pub replay_nonce: String,
+    pub current_commit_digest: String,
+    pub ack_generation: u64,
+    pub verification_generation: u64,
+}
+
+impl AdoptableRegionTransferResult {
+    fn verify(&self) -> Result<(), CloudStorageError> {
+        if self.source_scope.tenant_id != self.target_scope.tenant_id
+            || self.source_scope.cell == self.target_scope.cell
+            || self.transfer_id.trim().is_empty()
+            || self.transfer_id.len() > MAX_TRANSFER_ID_BYTES
+            || self.project_id.as_str().trim().is_empty()
+            || self.mission_id.as_str().trim().is_empty()
+            || self.sequence == 0
+            || self.replay_nonce.trim().is_empty()
+            || !is_sha256(&self.request_digest)
+            || !is_sha256(&self.source_receipt_digest)
+            || !is_sha256(&self.target_receipt_digest)
+            || !is_sha256(&self.ciphertext_digest)
+            || !is_sha256(&self.current_commit_digest)
+            || self.ack_generation != REGION_TRANSFER_ACK_GENERATION
+            || self.verification_generation == 0
+        {
+            return Err(CloudStorageError::RegionTransferVerificationTampered);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegionTransferOutcomeReceipt {
+    pub verification_digest: String,
+    pub outcome: RegionTransferOutcome,
+    pub adoptable_result: Option<AdoptableRegionTransferResult>,
+    pub outcome_digest: String,
+}
+
+impl RegionTransferOutcomeReceipt {
+    fn new(
+        verification_digest: String,
+        outcome: RegionTransferOutcome,
+        adoptable_result: Option<AdoptableRegionTransferResult>,
+    ) -> Result<Self, CloudStorageError> {
+        let outcome_digest = canonical_digest(&serde_json::json!({
+            "verificationDigest": verification_digest,
+            "outcome": outcome,
+            "adoptableResult": adoptable_result,
+        }))?;
+        Ok(Self {
+            verification_digest,
+            outcome,
+            adoptable_result,
+            outcome_digest,
+        })
+    }
+
+    fn verify(&self, expected_verification_digest: &str) -> Result<(), CloudStorageError> {
+        if self.verification_digest != expected_verification_digest
+            || !is_sha256(&self.verification_digest)
+            || !is_sha256(&self.outcome_digest)
+        {
+            return Err(CloudStorageError::RegionTransferVerificationTampered);
+        }
+        match (&self.outcome, &self.adoptable_result) {
+            (RegionTransferOutcome::Adoptable, Some(result)) => result.verify()?,
+            (RegionTransferOutcome::NotAdoptable, None) => {}
+            _ => return Err(CloudStorageError::RegionTransferVerificationTampered),
+        }
+        let expected = canonical_digest(&serde_json::json!({
+            "verificationDigest": self.verification_digest,
+            "outcome": self.outcome,
+            "adoptableResult": self.adoptable_result,
+        }))
+        .map_err(|_| CloudStorageError::RegionTransferVerificationTampered)?;
+        if expected != self.outcome_digest {
+            return Err(CloudStorageError::RegionTransferVerificationTampered);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegionTransferVerificationReceipt {
+    pub source_scope: super::CellScope,
+    pub target_scope: super::CellScope,
+    pub transfer_id: String,
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub project_revision: u64,
+    pub project_metadata_digest: String,
+    pub project_encryption_mode: ProjectEncryptionMode,
+    pub mission_revision: u64,
+    pub key_generation: u64,
+    pub encrypted_bundle_root: String,
+    pub idempotency_key_digest: String,
+    pub request_digest: String,
+    pub source_receipt_digest: String,
+    pub target_receipt_digest: String,
+    pub ciphertext_digest: String,
+    pub sequence: u64,
+    pub replay_nonce: String,
+    pub service: RegionTransferServiceDefinition,
+    pub provider: RegionTransferProvider,
+    pub consumer: RegionTransferConsumer,
+    pub readback_provider: RegionTransferReadbackProvider,
+    pub current_commit_digest: String,
+    pub rls_principal_digest: String,
+    pub ack_generation: u64,
+    pub verification_generation: u64,
+    pub status: RegionTransferVerificationStatus,
+    pub outcome: RegionTransferOutcomeReceipt,
+    pub requested_at: DateTime<Utc>,
+    pub recorded_at: DateTime<Utc>,
+    pub verification_digest: String,
+}
+
+impl RegionTransferVerificationReceipt {
+    fn new(
+        source_receipt: &RegionTransferReceipt,
+        target_receipt: &RegionTransferReceipt,
+        readback_provider: &RegionTransferReadbackProvider,
+        expected_rls_principal_digest: String,
+        ack_generation: u64,
+        verification_generation: u64,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<Self, CloudStorageError> {
+        let request = &source_receipt.request;
+        let adoptable_result = AdoptableRegionTransferResult {
+            source_scope: request.source_scope.clone(),
+            target_scope: super::CellScope {
+                cell: request.target_cell,
+                tenant_id: request.source_scope.tenant_id.clone(),
+            },
+            transfer_id: request.transfer_id.clone(),
+            project_id: request.project_id.clone(),
+            mission_id: request.mission_id.clone(),
+            request_digest: source_receipt.request_digest.clone(),
+            source_receipt_digest: source_receipt.receipt_digest.clone(),
+            target_receipt_digest: target_receipt.receipt_digest.clone(),
+            ciphertext_digest: request.encrypted_bundle.content_digest.clone(),
+            sequence: request.sequence,
+            replay_nonce: request.replay_nonce.clone(),
+            current_commit_digest: request.current_commit_digest.clone(),
+            ack_generation,
+            verification_generation,
+        };
+        let verification_digest = verification_digest_for(
+            &request.source_scope,
+            &super::CellScope {
+                cell: request.target_cell,
+                tenant_id: request.source_scope.tenant_id.clone(),
+            },
+            &request.transfer_id,
+            &request.project_id,
+            &request.mission_id,
+            request.project_revision,
+            &request.project_metadata_digest,
+            &request.project_encryption_mode,
+            request.mission_revision,
+            request.key_generation,
+            &request.encrypted_bundle_root,
+            &request.idempotency_key_digest,
+            &source_receipt.request_digest,
+            &source_receipt.receipt_digest,
+            &target_receipt.receipt_digest,
+            &request.encrypted_bundle.content_digest,
+            request.sequence,
+            &request.replay_nonce,
+            &request.service,
+            &request.provider,
+            &request.consumer,
+            readback_provider,
+            &request.current_commit_digest,
+            &expected_rls_principal_digest,
+            ack_generation,
+            verification_generation,
+            &RegionTransferVerificationStatus::Verified,
+            &RegionTransferOutcome::Adoptable,
+            &adoptable_result,
+            request.requested_at,
+            recorded_at,
+        )?;
+        let outcome = RegionTransferOutcomeReceipt::new(
+            verification_digest.clone(),
+            RegionTransferOutcome::Adoptable,
+            Some(adoptable_result),
+        )?;
+        Ok(Self {
+            source_scope: request.source_scope.clone(),
+            target_scope: super::CellScope {
+                cell: request.target_cell,
+                tenant_id: request.source_scope.tenant_id.clone(),
+            },
+            transfer_id: request.transfer_id.clone(),
+            project_id: request.project_id.clone(),
+            mission_id: request.mission_id.clone(),
+            project_revision: request.project_revision,
+            project_metadata_digest: request.project_metadata_digest.clone(),
+            project_encryption_mode: request.project_encryption_mode.clone(),
+            mission_revision: request.mission_revision,
+            key_generation: request.key_generation,
+            encrypted_bundle_root: request.encrypted_bundle_root.clone(),
+            idempotency_key_digest: request.idempotency_key_digest.clone(),
+            request_digest: source_receipt.request_digest.clone(),
+            source_receipt_digest: source_receipt.receipt_digest.clone(),
+            target_receipt_digest: target_receipt.receipt_digest.clone(),
+            ciphertext_digest: request.encrypted_bundle.content_digest.clone(),
+            sequence: request.sequence,
+            replay_nonce: request.replay_nonce.clone(),
+            service: request.service.clone(),
+            provider: request.provider.clone(),
+            consumer: request.consumer.clone(),
+            readback_provider: readback_provider.clone(),
+            current_commit_digest: request.current_commit_digest.clone(),
+            rls_principal_digest: expected_rls_principal_digest,
+            ack_generation,
+            verification_generation,
+            status: RegionTransferVerificationStatus::Verified,
+            outcome,
+            requested_at: request.requested_at,
+            recorded_at,
+            verification_digest,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "receipt verification intentionally enumerates every Project, Mission, Cell, digest, and authority fence"
+    )]
+    pub fn verify(&self) -> Result<(), CloudStorageError> {
+        self.source_scope.validate(self.source_scope.cell)?;
+        self.target_scope.validate(self.target_scope.cell)?;
+        if self.source_scope.tenant_id != self.target_scope.tenant_id
+            || self.source_scope.cell == self.target_scope.cell
+            || self.target_scope.cell != self.consumer.region
+            || self.transfer_id.trim().is_empty()
+            || self.transfer_id.len() > MAX_TRANSFER_ID_BYTES
+            || self.project_id.as_str().trim().is_empty()
+            || self.mission_id.as_str().trim().is_empty()
+            || self.project_revision == 0
+            || !is_sha256(&self.project_metadata_digest)
+            || self.mission_revision == 0
+            || self.key_generation == 0
+            || !is_sha256(&self.encrypted_bundle_root)
+            || self.encrypted_bundle_root != self.ciphertext_digest
+            || !is_sha256(&self.idempotency_key_digest)
+            || self.request_digest
+                != self
+                    .outcome
+                    .adoptable_result
+                    .as_ref()
+                    .map_or_else(String::new, |result| result.request_digest.clone())
+            || self.ack_generation != REGION_TRANSFER_ACK_GENERATION
+            || self.verification_generation == 0
+            || !is_sha256(&self.request_digest)
+            || !is_sha256(&self.source_receipt_digest)
+            || !is_sha256(&self.target_receipt_digest)
+            || !is_sha256(&self.ciphertext_digest)
+            || !is_sha256(&self.current_commit_digest)
+            || !is_sha256(&self.rls_principal_digest)
+        {
+            return Err(CloudStorageError::RegionTransferVerificationTampered);
+        }
+        self.service.validate()?;
+        self.provider.validate(self.source_scope.cell)?;
+        self.consumer.validate(self.target_scope.cell)?;
+        self.readback_provider.validate(&self.target_scope)?;
+        if self.status != RegionTransferVerificationStatus::Verified
+            || self.outcome.outcome != RegionTransferOutcome::Adoptable
+            || self.provider.current_commit_digest != self.current_commit_digest
+            || self.consumer.current_commit_digest != self.current_commit_digest
+            || self.readback_provider.current_commit_digest != self.current_commit_digest
+            || self.readback_provider.rls_principal_digest != self.rls_principal_digest
+            || self.provider.provider_id != self.consumer.trusted_provider_id
+            || self.provider.implementation_digest != self.consumer.trusted_provider_digest
+        {
+            return Err(CloudStorageError::RegionTransferVerificationTampered);
+        }
+        let Some(adoptable_result) = self.outcome.adoptable_result.as_ref() else {
+            return Err(CloudStorageError::RegionTransferOutcomeNotAdoptable);
+        };
+        if adoptable_result.source_scope != self.source_scope
+            || adoptable_result.target_scope != self.target_scope
+            || adoptable_result.transfer_id != self.transfer_id
+            || adoptable_result.project_id != self.project_id
+            || adoptable_result.mission_id != self.mission_id
+            || adoptable_result.request_digest != self.request_digest
+            || adoptable_result.source_receipt_digest != self.source_receipt_digest
+            || adoptable_result.target_receipt_digest != self.target_receipt_digest
+            || adoptable_result.ciphertext_digest != self.ciphertext_digest
+            || adoptable_result.sequence != self.sequence
+            || adoptable_result.replay_nonce != self.replay_nonce
+            || adoptable_result.current_commit_digest != self.current_commit_digest
+            || adoptable_result.ack_generation != self.ack_generation
+            || adoptable_result.verification_generation != self.verification_generation
+        {
+            return Err(CloudStorageError::RegionTransferVerificationTampered);
+        }
+        let expected = verification_digest_for(
+            &self.source_scope,
+            &self.target_scope,
+            &self.transfer_id,
+            &self.project_id,
+            &self.mission_id,
+            self.project_revision,
+            &self.project_metadata_digest,
+            &self.project_encryption_mode,
+            self.mission_revision,
+            self.key_generation,
+            &self.encrypted_bundle_root,
+            &self.idempotency_key_digest,
+            &self.request_digest,
+            &self.source_receipt_digest,
+            &self.target_receipt_digest,
+            &self.ciphertext_digest,
+            self.sequence,
+            &self.replay_nonce,
+            &self.service,
+            &self.provider,
+            &self.consumer,
+            &self.readback_provider,
+            &self.current_commit_digest,
+            &self.rls_principal_digest,
+            self.ack_generation,
+            self.verification_generation,
+            &self.status,
+            &self.outcome.outcome,
+            adoptable_result,
+            self.requested_at,
+            self.recorded_at,
+        )?;
+        if expected != self.verification_digest {
+            return Err(CloudStorageError::RegionTransferVerificationTampered);
+        }
+        self.outcome.verify(&self.verification_digest)
+    }
+
+    /// Convert a verified receipt into a bounded adoption proof.  This is a
+    /// data result only; it grants no Store, Worker, Effect, or plaintext
+    /// authority and performs no mutation.
+    pub fn adoptable_result(&self) -> Result<AdoptableRegionTransferResult, CloudStorageError> {
+        self.verify()?;
+        self.outcome
+            .adoptable_result
+            .clone()
+            .ok_or(CloudStorageError::RegionTransferOutcomeNotAdoptable)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -392,6 +937,7 @@ pub struct RegionTransferReceipt {
     pub request_digest: String,
     pub status: RegionTransferStatus,
     pub adopted_revision: Option<u64>,
+    pub ack_generation: Option<u64>,
     pub receipt_digest: String,
 }
 
@@ -403,11 +949,14 @@ impl RegionTransferReceipt {
     ) -> Result<Self, CloudStorageError> {
         let request_digest = request.request_digest()?;
         let receipt_digest = receipt_digest(&request_digest, &status, adopted_revision)?;
+        let ack_generation =
+            (status == RegionTransferStatus::Adopted).then_some(REGION_TRANSFER_ACK_GENERATION);
         Ok(Self {
             request,
             request_digest,
             status,
             adopted_revision,
+            ack_generation,
             receipt_digest,
         })
     }
@@ -432,6 +981,9 @@ impl RegionTransferReceipt {
             || (self.status == RegionTransferStatus::Adopted
                 && self.adopted_revision != Some(self.request.mission_revision))
             || (self.status != RegionTransferStatus::Adopted && self.adopted_revision.is_some())
+            || (self.status == RegionTransferStatus::Adopted
+                && self.ack_generation != Some(REGION_TRANSFER_ACK_GENERATION))
+            || (self.status != RegionTransferStatus::Adopted && self.ack_generation.is_some())
         {
             return Err(CloudStorageError::RegionTransferReceiptTampered);
         }
@@ -519,7 +1071,7 @@ impl PostgresCellStore {
             .query_opt(
                 "SELECT transfer_id, project_id, mission_id, source_cell, target_cell,
                         request_json, request_digest, idempotency_key_digest, status,
-                        adopted_revision, receipt_digest
+                        adopted_revision, ack_generation, receipt_digest
                  FROM hartevo_cell.region_transfer_receipts
                  WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
                    AND transfer_id = $4",
@@ -611,6 +1163,234 @@ impl PostgresCellStore {
         Ok(adopted)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the PostgreSQL provider boundary keeps read-only evidence and generation fences in one atomic journey"
+    )]
+    pub async fn verify_region_transfer_adoption(
+        &self,
+        client: &mut Client,
+        target_scope: &super::CellScope,
+        consumer: &RegionTransferConsumer,
+        readback_provider: &RegionTransferReadbackProvider,
+        adopted_receipt: &RegionTransferReceipt,
+        expected_ack_generation: u64,
+        verification_generation: u64,
+        now: DateTime<Utc>,
+    ) -> Result<RegionTransferVerificationReceipt, CloudStorageError> {
+        adopted_receipt.verify()?;
+        if adopted_receipt.status != RegionTransferStatus::Adopted {
+            return Err(status_error(&adopted_receipt.status));
+        }
+        adopted_receipt.request.validate_target(target_scope)?;
+        consumer.validate(target_scope.cell)?;
+        readback_provider.validate(target_scope)?;
+        if adopted_receipt.request.consumer != *consumer
+            || adopted_receipt.request.current_commit_digest
+                != readback_provider.current_commit_digest
+            || adopted_receipt.ack_generation != Some(expected_ack_generation)
+            || expected_ack_generation != REGION_TRANSFER_ACK_GENERATION
+            || verification_generation == 0
+        {
+            return Err(CloudStorageError::RegionTransferVerificationTampered);
+        }
+
+        let target_read = client.transaction().await?;
+        set_scope(&target_read, target_scope).await?;
+        ensure_database_cell(&target_read, self.cell).await?;
+        target_read
+            .batch_execute("SET TRANSACTION READ ONLY")
+            .await?;
+        let principal: String = target_read
+            .query_one("SELECT current_user", &[])
+            .await?
+            .get(0);
+        let actual_rls_principal_digest =
+            RegionTransferReadbackProvider::principal_digest(&principal, target_scope);
+        if actual_rls_principal_digest != readback_provider.rls_principal_digest {
+            return Err(CloudStorageError::RegionTransferVerificationRlsMismatch);
+        }
+        let target_row = target_read
+            .query_opt(
+                &transfer_row_sql("transfer_id = $4"),
+                &[
+                    &target_scope.cell.as_str(),
+                    &target_scope.tenant_id.as_str(),
+                    &adopted_receipt.request.project_id.as_str(),
+                    &adopted_receipt.request.transfer_id,
+                ],
+            )
+            .await?
+            .ok_or(CloudStorageError::RegionTransferVerificationNotFound)?;
+        let target_receipt = decode_transfer_row(&target_row, target_scope)?;
+        if target_receipt.status != RegionTransferStatus::Adopted
+            || target_receipt.request != adopted_receipt.request
+            || target_receipt.request_digest != adopted_receipt.request_digest
+            || target_receipt.receipt_digest != adopted_receipt.receipt_digest
+            || target_receipt.ack_generation != adopted_receipt.ack_generation
+        {
+            return Err(CloudStorageError::RegionTransferVerificationTampered);
+        }
+
+        let head = target_read
+            .query_opt(
+                "SELECT current_revision, key_version, content_digest, object_kind, tombstone
+                 FROM hartevo_cell.sync_object_heads
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND object_id = $4",
+                &[
+                    &target_scope.cell.as_str(),
+                    &target_scope.tenant_id.as_str(),
+                    &adopted_receipt.request.project_id.as_str(),
+                    &adopted_receipt.request.mission_id.as_str(),
+                ],
+            )
+            .await?
+            .ok_or(CloudStorageError::RegionTransferVerificationNotFound)?;
+        let versions = target_read
+            .query_opt(
+                "SELECT revision, key_version, nonce, ciphertext, aad_digest,
+                        content_digest, tombstone
+                 FROM hartevo_cell.sync_object_versions
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                   AND object_id = $4 AND revision = $5",
+                &[
+                    &target_scope.cell.as_str(),
+                    &target_scope.tenant_id.as_str(),
+                    &adopted_receipt.request.project_id.as_str(),
+                    &adopted_receipt.request.mission_id.as_str(),
+                    &super::to_sql_u64(adopted_receipt.request.mission_revision)?,
+                ],
+            )
+            .await?
+            .ok_or(CloudStorageError::RegionTransferVerificationNotFound)?;
+        let actual_ciphertext: Vec<u8> = versions.get(3);
+        let actual_ciphertext_digest = format!("{:x}", Sha256::digest(&actual_ciphertext));
+        if head.get::<_, String>(3) != SyncObjectKind::Mission.as_str()
+            || head.get::<_, bool>(4)
+            || from_sql_u64(head.get(0), "region transfer verified head revision")?
+                != adopted_receipt.request.mission_revision
+            || from_sql_u64(head.get(1), "region transfer verified head key generation")?
+                != adopted_receipt.request.key_generation
+            || head.get::<_, String>(2) != adopted_receipt.request.encrypted_bundle.content_digest
+            || from_sql_u64(versions.get(0), "region transfer verified version")?
+                != adopted_receipt.request.mission_revision
+            || from_sql_u64(versions.get(1), "region transfer verified key generation")?
+                != adopted_receipt.request.key_generation
+            || versions.get::<_, Vec<u8>>(2) != adopted_receipt.request.encrypted_bundle.nonce
+            || versions.get::<_, String>(4) != adopted_receipt.request.encrypted_bundle.aad_digest
+            || versions.get::<_, String>(5)
+                != adopted_receipt.request.encrypted_bundle.content_digest
+            || versions.get::<_, bool>(6)
+            || actual_ciphertext_digest != adopted_receipt.request.encrypted_bundle.content_digest
+        {
+            return Err(CloudStorageError::RegionTransferVerificationTampered);
+        }
+        target_read.commit().await?;
+
+        let transaction = client.transaction().await?;
+        set_scope(&transaction, target_scope).await?;
+        ensure_database_cell(&transaction, self.cell).await?;
+        let generation_sql = super::to_sql_u64(verification_generation)?;
+        if let Some(row) = transaction
+            .query_opt(
+                "SELECT verification_json, verification_digest, outcome_digest,
+                        verification_status, outcome_status, ack_generation,
+                        verification_generation, source_cell, target_cell,
+                        request_digest, source_receipt_digest, target_receipt_digest,
+                        ciphertext_digest, sequence, replay_nonce, current_commit_digest,
+                        rls_principal_digest, recorded_at
+                 FROM hartevo_cell.region_transfer_verification_receipts
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                   AND transfer_id = $4 AND verification_generation = $5
+                 FOR UPDATE",
+                &[
+                    &target_scope.cell.as_str(),
+                    &target_scope.tenant_id.as_str(),
+                    &adopted_receipt.request.project_id.as_str(),
+                    &adopted_receipt.request.transfer_id,
+                    &generation_sql,
+                ],
+            )
+            .await?
+        {
+            let existing = decode_verification_row(&row, target_scope)?;
+            let expected = RegionTransferVerificationReceipt::new(
+                adopted_receipt,
+                &target_receipt,
+                readback_provider,
+                actual_rls_principal_digest,
+                expected_ack_generation,
+                verification_generation,
+                existing.recorded_at,
+            )?;
+            if expected == existing {
+                transaction.commit().await?;
+                return Ok(existing);
+            }
+            return Err(CloudStorageError::RegionTransferVerificationReplay);
+        }
+        let max_generation: i64 = transaction
+            .query_one(
+                "SELECT COALESCE(MAX(verification_generation), 0)
+                 FROM hartevo_cell.region_transfer_verification_receipts
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                   AND transfer_id = $4",
+                &[
+                    &target_scope.cell.as_str(),
+                    &target_scope.tenant_id.as_str(),
+                    &adopted_receipt.request.project_id.as_str(),
+                    &adopted_receipt.request.transfer_id,
+                ],
+            )
+            .await?
+            .get(0);
+        if max_generation
+            != i64::try_from(verification_generation)
+                .map_err(|_| CloudStorageError::RegionTransferVerificationStale)?
+                - 1
+        {
+            return Err(CloudStorageError::RegionTransferVerificationStale);
+        }
+        if transaction
+            .query_opt(
+                "SELECT 1
+                 FROM hartevo_cell.region_transfer_verification_receipts
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3
+                   AND transfer_id = $4 AND request_digest = $5
+                   AND source_receipt_digest = $6 AND target_receipt_digest = $7
+                 LIMIT 1",
+                &[
+                    &target_scope.cell.as_str(),
+                    &target_scope.tenant_id.as_str(),
+                    &adopted_receipt.request.project_id.as_str(),
+                    &adopted_receipt.request.transfer_id,
+                    &adopted_receipt.request_digest,
+                    &adopted_receipt.receipt_digest,
+                    &target_receipt.receipt_digest,
+                ],
+            )
+            .await?
+            .is_some()
+        {
+            return Err(CloudStorageError::RegionTransferVerificationReplay);
+        }
+        let verification = RegionTransferVerificationReceipt::new(
+            adopted_receipt,
+            &target_receipt,
+            readback_provider,
+            actual_rls_principal_digest,
+            expected_ack_generation,
+            verification_generation,
+            now,
+        )?;
+        verification.verify()?;
+        insert_verification_receipt(&transaction, target_scope, &verification).await?;
+        append_verification_event(&transaction, target_scope, &verification, now).await?;
+        transaction.commit().await?;
+        Ok(verification)
+    }
+
     async fn transition_region_transfer(
         &self,
         client: &mut Client,
@@ -656,9 +1436,10 @@ impl PostgresCellStore {
         transaction
             .execute(
                 "UPDATE hartevo_cell.region_transfer_receipts
-                 SET status = $5, adopted_revision = $6, receipt_digest = $7, updated_at = $8
+                 SET status = $5, adopted_revision = $6, ack_generation = $7,
+                     receipt_digest = $8, updated_at = $9
                  WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND transfer_id = $4
-                   AND status = 'prepared' AND receipt_digest = $9",
+                   AND status = 'prepared' AND receipt_digest = $10",
                 &[
                     &scope.cell.as_str(),
                     &scope.tenant_id.as_str(),
@@ -666,6 +1447,10 @@ impl PostgresCellStore {
                     &receipt.request.transfer_id,
                     &transitioned.status.as_str(),
                     &adopted_revision_sql,
+                    &transitioned
+                        .ack_generation
+                        .map(super::to_sql_u64)
+                        .transpose()?,
                     &transitioned.receipt_digest,
                     &now,
                     &receipt.receipt_digest,
@@ -775,7 +1560,7 @@ fn transfer_row_sql(predicate: &str) -> String {
     format!(
         "SELECT transfer_id, project_id, mission_id, source_cell, target_cell,
                 request_json, request_digest, idempotency_key_digest, status,
-                adopted_revision, receipt_digest
+                adopted_revision, ack_generation, receipt_digest
          FROM hartevo_cell.region_transfer_receipts
          WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND {predicate}"
     )
@@ -842,16 +1627,156 @@ fn decode_transfer_row(
         .get::<_, Option<i64>>(9)
         .map(|value| from_sql_u64(value, "region transfer adopted revision"))
         .transpose()?;
-    let receipt_digest: String = row.get(10);
+    let ack_generation = row
+        .get::<_, Option<i64>>(10)
+        .map(|value| from_sql_u64(value, "region transfer acknowledgment generation"))
+        .transpose()?;
+    let receipt_digest: String = row.get(11);
     let receipt = RegionTransferReceipt {
         request,
         request_digest,
         status,
         adopted_revision,
+        ack_generation,
         receipt_digest,
     };
     receipt.verify()?;
     Ok(receipt)
+}
+
+fn decode_verification_row(
+    row: &Row,
+    target_scope: &super::CellScope,
+) -> Result<RegionTransferVerificationReceipt, CloudStorageError> {
+    let receipt: RegionTransferVerificationReceipt = serde_json::from_value(row.get(0))
+        .map_err(|_| CloudStorageError::RegionTransferVerificationTampered)?;
+    receipt.verify()?;
+    if receipt.target_scope != *target_scope
+        || row.get::<_, String>(1) != receipt.verification_digest
+        || row.get::<_, String>(2) != receipt.outcome.outcome_digest
+        || row.get::<_, String>(3) != receipt.status.as_str()
+        || row.get::<_, String>(4) != receipt.outcome.outcome.as_str()
+        || from_sql_u64(
+            row.get(5),
+            "region transfer verification acknowledgment generation",
+        )? != receipt.ack_generation
+        || from_sql_u64(row.get(6), "region transfer verification generation")?
+            != receipt.verification_generation
+        || row.get::<_, String>(7) != receipt.source_scope.cell.as_str()
+        || row.get::<_, String>(8) != receipt.target_scope.cell.as_str()
+        || row.get::<_, String>(9) != receipt.request_digest
+        || row.get::<_, String>(10) != receipt.source_receipt_digest
+        || row.get::<_, String>(11) != receipt.target_receipt_digest
+        || row.get::<_, String>(12) != receipt.ciphertext_digest
+        || from_sql_u64(row.get(13), "region transfer verification sequence")? != receipt.sequence
+        || row.get::<_, String>(14) != receipt.replay_nonce
+        || row.get::<_, String>(15) != receipt.current_commit_digest
+        || row.get::<_, String>(16) != receipt.rls_principal_digest
+        || row.get::<_, DateTime<Utc>>(17) != receipt.recorded_at
+    {
+        return Err(CloudStorageError::RegionTransferVerificationTampered);
+    }
+    Ok(receipt)
+}
+
+async fn insert_verification_receipt(
+    transaction: &Transaction<'_>,
+    target_scope: &super::CellScope,
+    receipt: &RegionTransferVerificationReceipt,
+) -> Result<(), CloudStorageError> {
+    let verification_json = serde_json::to_value(receipt)?;
+    let sequence = super::to_sql_u64(receipt.sequence)?;
+    let service_version = super::to_sql_u64(receipt.service.version)?;
+    let provider_version = super::to_sql_u64(receipt.provider.version)?;
+    let consumer_version = super::to_sql_u64(receipt.consumer.version)?;
+    let readback_provider_version = super::to_sql_u64(receipt.readback_provider.version)?;
+    let ack_generation = super::to_sql_u64(receipt.ack_generation)?;
+    let verification_generation = super::to_sql_u64(receipt.verification_generation)?;
+    transaction
+        .execute(
+            "INSERT INTO hartevo_cell.region_transfer_verification_receipts
+               (cell, tenant_id, project_id, transfer_id, mission_id, source_cell,
+                target_cell, request_digest, source_receipt_digest, target_receipt_digest,
+                ciphertext_digest, sequence, replay_nonce, service_version, service_digest,
+                provider_id, provider_version, provider_digest, consumer_id, consumer_version,
+                consumer_digest, readback_provider_id, readback_provider_version,
+                readback_provider_digest, current_commit_digest, rls_principal_digest,
+                ack_generation, verification_generation, verification_status, outcome_status,
+                verification_json, verification_digest, outcome_digest, recorded_at, updated_at)
+             VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
+                $29, $30, $31, $32, $33, $34, $34)",
+            &[
+                &target_scope.cell.as_str(),
+                &target_scope.tenant_id.as_str(),
+                &receipt.project_id.as_str(),
+                &receipt.transfer_id,
+                &receipt.mission_id.as_str(),
+                &receipt.source_scope.cell.as_str(),
+                &receipt.target_scope.cell.as_str(),
+                &receipt.request_digest,
+                &receipt.source_receipt_digest,
+                &receipt.target_receipt_digest,
+                &receipt.ciphertext_digest,
+                &sequence,
+                &receipt.replay_nonce,
+                &service_version,
+                &receipt.service.contract_digest,
+                &receipt.provider.provider_id,
+                &provider_version,
+                &receipt.provider.implementation_digest,
+                &receipt.consumer.consumer_id,
+                &consumer_version,
+                &receipt.consumer.consumer_digest,
+                &receipt.readback_provider.provider_id,
+                &readback_provider_version,
+                &receipt.readback_provider.implementation_digest,
+                &receipt.current_commit_digest,
+                &receipt.rls_principal_digest,
+                &ack_generation,
+                &verification_generation,
+                &receipt.status.as_str(),
+                &receipt.outcome.outcome.as_str(),
+                &verification_json,
+                &receipt.verification_digest,
+                &receipt.outcome.outcome_digest,
+                &receipt.recorded_at,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn append_verification_event(
+    transaction: &Transaction<'_>,
+    target_scope: &super::CellScope,
+    receipt: &RegionTransferVerificationReceipt,
+    observed_at: DateTime<Utc>,
+) -> Result<(), CloudStorageError> {
+    let verification_generation = super::to_sql_u64(receipt.verification_generation)?;
+    transaction
+        .execute(
+            "INSERT INTO hartevo_cell.region_transfer_verification_events
+               (cell, tenant_id, project_id, transfer_id, verification_generation,
+                verification_status, outcome_status, verification_digest, outcome_digest,
+                observed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &target_scope.cell.as_str(),
+                &target_scope.tenant_id.as_str(),
+                &receipt.project_id.as_str(),
+                &receipt.transfer_id,
+                &verification_generation,
+                &receipt.status.as_str(),
+                &receipt.outcome.outcome.as_str(),
+                &receipt.verification_digest,
+                &receipt.outcome.outcome_digest,
+                &observed_at,
+            ],
+        )
+        .await?;
+    Ok(())
 }
 
 async fn insert_transfer_receipt(
@@ -865,13 +1790,14 @@ async fn insert_transfer_receipt(
         .adopted_revision
         .map(super::to_sql_u64)
         .transpose()?;
+    let ack_generation = receipt.ack_generation.map(super::to_sql_u64).transpose()?;
     transaction
         .execute(
             "INSERT INTO hartevo_cell.region_transfer_receipts
                (cell, tenant_id, project_id, transfer_id, mission_id, source_cell,
                 target_cell, request_json, request_digest, idempotency_key_digest,
-                status, adopted_revision, receipt_digest, recorded_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)",
+                status, adopted_revision, ack_generation, receipt_digest, recorded_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)",
             &[
                 &scope.cell.as_str(),
                 &scope.tenant_id.as_str(),
@@ -885,6 +1811,7 @@ async fn insert_transfer_receipt(
                 &receipt.request.idempotency_key_digest,
                 &receipt.status.as_str(),
                 &adopted_revision,
+                &ack_generation,
                 &receipt.receipt_digest,
                 &recorded_at,
             ],
@@ -1004,6 +1931,78 @@ fn receipt_digest(
     }))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the canonical digest deliberately binds every typed transfer evidence field"
+)]
+fn verification_digest_for(
+    source_scope: &super::CellScope,
+    target_scope: &super::CellScope,
+    transfer_id: &str,
+    project_id: &ProjectId,
+    mission_id: &MissionId,
+    project_revision: u64,
+    project_metadata_digest: &str,
+    project_encryption_mode: &ProjectEncryptionMode,
+    mission_revision: u64,
+    key_generation: u64,
+    encrypted_bundle_root: &str,
+    idempotency_key_digest: &str,
+    request_digest: &str,
+    source_receipt_digest: &str,
+    target_receipt_digest: &str,
+    ciphertext_digest: &str,
+    sequence: u64,
+    replay_nonce: &str,
+    service: &RegionTransferServiceDefinition,
+    provider: &RegionTransferProvider,
+    consumer: &RegionTransferConsumer,
+    readback_provider: &RegionTransferReadbackProvider,
+    current_commit_digest: &str,
+    rls_principal_digest: &str,
+    ack_generation: u64,
+    verification_generation: u64,
+    status: &RegionTransferVerificationStatus,
+    outcome: &RegionTransferOutcome,
+    adoptable_result: &AdoptableRegionTransferResult,
+    requested_at: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
+) -> Result<String, CloudStorageError> {
+    canonical_digest(&serde_json::json!({
+        "sourceScope": source_scope,
+        "targetScope": target_scope,
+        "transferId": transfer_id,
+        "projectId": project_id,
+        "missionId": mission_id,
+        "projectRevision": project_revision,
+        "projectMetadataDigest": project_metadata_digest,
+        "projectEncryptionMode": project_encryption_mode,
+        "missionRevision": mission_revision,
+        "keyGeneration": key_generation,
+        "encryptedBundleRoot": encrypted_bundle_root,
+        "idempotencyKeyDigest": idempotency_key_digest,
+        "requestDigest": request_digest,
+        "sourceReceiptDigest": source_receipt_digest,
+        "targetReceiptDigest": target_receipt_digest,
+        "ciphertextDigest": ciphertext_digest,
+        "sequence": sequence,
+        "replayNonce": replay_nonce,
+        "service": service,
+        "provider": provider,
+        "consumer": consumer,
+        "readbackProvider": readback_provider,
+        "currentCommitDigest": current_commit_digest,
+        "rlsPrincipalDigest": rls_principal_digest,
+        "ackGeneration": ack_generation,
+        "verificationGeneration": verification_generation,
+        "status": status,
+        "outcome": outcome,
+        "adoptableResult": adoptable_result,
+        "requestedAt": requested_at,
+        "recordedAt": recorded_at,
+    }))
+}
+
 fn status_error(status: &RegionTransferStatus) -> CloudStorageError {
     match status {
         RegionTransferStatus::Revoked => CloudStorageError::RegionTransferRevoked,
@@ -1026,8 +2025,9 @@ mod tests {
 
     use super::{
         EncryptedPayload, EncryptedRegionTransferRequest, RegionTransferConsumer,
-        RegionTransferProvider, RegionTransferReceipt, RegionTransferServiceDefinition,
-        RegionTransferStatus,
+        RegionTransferOutcome, RegionTransferProvider, RegionTransferReadbackProvider,
+        RegionTransferReceipt, RegionTransferServiceDefinition, RegionTransferStatus,
+        RegionTransferVerificationReceipt,
     };
     use crate::{CellScope, DataCell};
 
@@ -1117,5 +2117,54 @@ mod tests {
             adopted.request.consumer.verify_receipt(&adopted),
             Err(crate::CloudStorageError::RegionTransferAlreadyTerminal)
         ));
+    }
+
+    #[test]
+    fn verification_receipt_is_exact_and_adoptable_only_after_all_fences() {
+        let value = request();
+        let source =
+            RegionTransferReceipt::new(value.clone(), RegionTransferStatus::Adopted, Some(4))
+                .expect("source adopted receipt");
+        let target = RegionTransferReceipt::new(value, RegionTransferStatus::Adopted, Some(4))
+            .expect("target adopted receipt");
+        let readback = RegionTransferReadbackProvider::new(
+            "target-readback",
+            DataCell::Eu,
+            1,
+            digest("readback"),
+            digest("commit"),
+            digest("rls-principal"),
+        );
+        let receipt = RegionTransferVerificationReceipt::new(
+            &source,
+            &target,
+            &readback,
+            digest("rls-principal"),
+            1,
+            1,
+            Utc.with_ymd_and_hms(2026, 8, 14, 2, 3, 4).unwrap(),
+        )
+        .expect("verification receipt");
+        receipt.verify().expect("exact verification verifies");
+        assert_eq!(
+            receipt.outcome.outcome.clone(),
+            RegionTransferOutcome::Adoptable
+        );
+        receipt.adoptable_result().expect("adoptable proof");
+
+        let mut cross_mission = receipt.clone();
+        cross_mission.mission_id = MissionId::from("other-mission");
+        assert!(cross_mission.verify().is_err());
+
+        let mut replay = receipt.clone();
+        replay.outcome.adoptable_result.as_mut().unwrap().sequence = 2;
+        assert!(replay.verify().is_err());
+
+        let mut cross_cell = receipt;
+        cross_cell.target_scope = CellScope {
+            cell: DataCell::Us,
+            tenant_id: TenantId::from("tenant-1"),
+        };
+        assert!(cross_cell.verify().is_err());
     }
 }
