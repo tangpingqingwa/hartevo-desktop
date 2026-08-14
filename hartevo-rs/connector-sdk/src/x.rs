@@ -2337,7 +2337,11 @@ mod tests {
     use super::*;
     use crate::{ConnectorAuth, ProviderAdapterIdentity};
     use std::collections::VecDeque;
+    use std::io::Read as _;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::Mutex;
+    use std::thread::JoinHandle;
+    use std::time::Duration as IoDuration;
 
     #[derive(Debug)]
     struct MockTransport {
@@ -2380,6 +2384,157 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Err(XTransportError::InvalidResponse))
         }
+    }
+
+    #[derive(Debug)]
+    struct LoopbackHttpTransport {
+        address: SocketAddr,
+    }
+
+    impl XHttpTransport for LoopbackHttpTransport {
+        fn send(
+            &self,
+            request: &XHttpRequest,
+            token: &XAccessToken,
+        ) -> Result<XHttpResponse, XTransportError> {
+            let target = loopback_request_target(request)?;
+            let mut stream = TcpStream::connect(self.address).map_err(|_| XTransportError::Io)?;
+            stream
+                .set_read_timeout(Some(IoDuration::from_secs(2)))
+                .map_err(|_| XTransportError::Io)?;
+            let mut wire = format!(
+                "{} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\n",
+                request.method,
+                target,
+                token.expose()
+            );
+            for (name, value) in &request.headers {
+                let _ = writeln!(&mut wire, "{name}: {value}");
+            }
+            wire.push_str("Connection: close\r\n\r\n");
+            stream
+                .write_all(wire.as_bytes())
+                .map_err(|_| XTransportError::Io)?;
+            let mut bytes = Vec::new();
+            stream
+                .read_to_end(&mut bytes)
+                .map_err(|_| XTransportError::Io)?;
+            parse_loopback_response(&bytes)
+        }
+    }
+
+    #[derive(Default)]
+    struct LoopbackCapture {
+        request_lines: Vec<String>,
+        authenticated_requests: usize,
+    }
+
+    fn loopback_request_target(request: &XHttpRequest) -> Result<String, XTransportError> {
+        let url = request.url_with_query();
+        let authority = url
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .ok_or(XTransportError::InvalidResponse)?;
+        let slash = authority
+            .find('/')
+            .ok_or(XTransportError::InvalidResponse)?;
+        Ok(authority[slash..].to_owned())
+    }
+
+    fn read_loopback_headers(stream: &mut TcpStream) -> Result<Vec<u8>, XTransportError> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer).map_err(|_| XTransportError::Io)?;
+            if count == 0 {
+                return Err(XTransportError::InvalidResponse);
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(bytes);
+            }
+            if bytes.len() > 16 * 1024 {
+                return Err(XTransportError::InvalidResponse);
+            }
+        }
+    }
+
+    fn parse_loopback_response(bytes: &[u8]) -> Result<XHttpResponse, XTransportError> {
+        let separator = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or(XTransportError::InvalidResponse)?;
+        let header_end = separator + 4;
+        let header_text = String::from_utf8_lossy(&bytes[..separator]);
+        let mut lines = header_text.lines();
+        let status = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or(XTransportError::InvalidResponse)?;
+        let headers = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
+        Ok(XHttpResponse {
+            status,
+            headers,
+            body: bytes[header_end..].to_vec(),
+            received_at: Utc::now(),
+        })
+    }
+
+    fn loopback_server() -> (SocketAddr, Arc<Mutex<LoopbackCapture>>, JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+        let address = listener.local_addr().expect("loopback address");
+        let capture = Arc::new(Mutex::new(LoopbackCapture::default()));
+        let captured = Arc::clone(&capture);
+        let server = std::thread::spawn(move || {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().expect("loopback connection");
+                let request = read_loopback_headers(&mut stream).expect("loopback request");
+                let request_text = String::from_utf8_lossy(&request);
+                let request_line = request_text.lines().next().unwrap_or_default();
+                assert!(request_line.starts_with("GET "));
+                assert!(request_text.contains("Authorization: Bearer x-test-access-token"));
+                {
+                    let mut capture = captured.lock().expect("loopback capture");
+                    capture.request_lines.push(request_line.to_owned());
+                    capture.authenticated_requests += 1;
+                }
+                match index {
+                    0 => assert_eq!(request_line, "GET /2/users/me HTTP/1.1"),
+                    1 => {
+                        assert!(request_line.contains("GET /2/users/1234567890/tweets?"));
+                        assert!(!request_line.contains("pagination_token="));
+                    }
+                    2 => assert!(request_line.contains("pagination_token=next-token-1")),
+                    _ => unreachable!(),
+                }
+                let (body, request_id, remaining) = match index {
+                    0 => (r#"{"data":{"id":"1234567890"}}"#, "loopback-probe", "900"),
+                    1 => (
+                        r#"{"data":[{"id":"111","author_id":"1234567890","public_metrics":{"like_count":7}}],"meta":{"next_token":"next-token-1"}}"#,
+                        "loopback-page-1",
+                        "899",
+                    ),
+                    2 => (
+                        r#"{"data":[{"id":"222","author_id":"1234567890","public_metrics":{"like_count":8}}],"meta":{}}"#,
+                        "loopback-page-2",
+                        "898",
+                    ),
+                    _ => unreachable!(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nx-request-id: {request_id}\r\nx-rate-limit-limit: 900\r\nx-rate-limit-remaining: {remaining}\r\nx-rate-limit-reset: 4102444800\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("loopback response");
+            }
+        });
+        (address, capture, server)
     }
 
     fn response(body: &str, headers: &[(&str, &str)]) -> XHttpResponse {
@@ -2710,6 +2865,76 @@ mod tests {
                 .map(|(_, value)| value.as_str()),
             Some("next-token-1")
         );
+    }
+
+    #[test]
+    fn deterministic_loopback_http_proves_authenticated_pagination_and_rate_receipts() {
+        let (address, capture, server) = loopback_server();
+        let transport = Arc::new(LoopbackHttpTransport { address });
+        let adapter = XApiV2Adapter::new(XApiBinding::default(), transport).expect("adapter");
+        let now = Utc::now();
+        let mut service = XInsightReadService::new(
+            Arc::new(adapter),
+            DispatchBudget::new(8, now + Duration::hours(1), 8, 100).expect("budget"),
+            XReadPolicy::default(),
+        )
+        .expect("service");
+        let (scope, insight_scope, secret, lease, resolver) =
+            scope_and_auth(&["users.read", "tweet.read"]);
+        service
+            .probe_and_mount(
+                "mission-loopback",
+                &probe_request(
+                    scope.clone(),
+                    insight_scope.clone(),
+                    secret.clone(),
+                    lease.clone(),
+                ),
+                &resolver,
+            )
+            .expect("authenticated loopback probe");
+        let first_request = read_request(
+            scope.clone(),
+            insight_scope.clone(),
+            secret.clone(),
+            lease.clone(),
+        );
+        let first = service
+            .read("mission-loopback", &first_request, &resolver)
+            .expect("first loopback page");
+        assert_eq!(first.records[0].external_id, "111");
+        assert_eq!(first.rate_limit.remaining, Some(899));
+        assert_eq!(first.quota.provider_rate_limit.remaining, Some(899));
+        assert_eq!(
+            first.source.provider_request_id.as_deref(),
+            Some("loopback-page-1")
+        );
+        assert_eq!(first.cursor.sequence, 1);
+        assert_eq!(
+            first.cursor.durable_cursor.pagination_token(),
+            Some("next-token-1")
+        );
+
+        let second_request = first_request.with_cursor(first.cursor.durable_cursor.clone());
+        let second = service
+            .read("mission-loopback", &second_request, &resolver)
+            .expect("second loopback page");
+        assert_eq!(second.records[0].external_id, "222");
+        assert_eq!(second.rate_limit.remaining, Some(898));
+        assert_eq!(second.quota.provider_rate_limit.remaining, Some(898));
+        assert_eq!(
+            second.source.provider_request_id.as_deref(),
+            Some("loopback-page-2")
+        );
+        assert!(second.cursor.complete);
+        assert_eq!(service.observation_log().revision(), 2);
+
+        let capture = capture.lock().expect("loopback capture");
+        assert_eq!(capture.request_lines.len(), 3);
+        assert_eq!(capture.authenticated_requests, 3);
+        assert!(capture.request_lines[2].contains("pagination_token=next-token-1"));
+        drop(capture);
+        server.join().expect("loopback server");
     }
 
     #[test]
