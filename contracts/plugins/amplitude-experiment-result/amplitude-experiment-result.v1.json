@@ -1,0 +1,297 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/amplitude-experiment-result/amplitude-experiment-result.v1.json",
+  "title": "Hartevo Amplitude experiment-result Layer-1 contract",
+  "description": "A bounded, read-only Amplitude saved-chart experiment-result evidence seam. It is not an analytics engine, statistical authority, connector registry, or kernel outcome authority.",
+  "schemaVersion": "hartevo.amplitude-experiment-result/v1",
+  "contractVersion": "amplitude-experiment-result-e1/v1",
+  "pluginVersion": "0.1.0",
+  "layer": 1,
+  "authority": {
+    "readOnly": true,
+    "proposalOnly": true,
+    "connected": false,
+    "nativeProvider": false,
+    "durableNativeReceipt": false,
+    "kernelAuthority": false,
+    "genericAnalyticsEngine": false,
+    "statisticalClaimAuthority": false,
+    "outcomeAdoption": false,
+    "externalWrites": false
+  },
+  "typedSurface": {
+    "service": "AmplitudeExperimentResultService",
+    "provider": "AmplitudeProvider",
+    "consumer": "MissionAmplitudeExperimentConsumer",
+    "models": [
+      "AmplitudeExperimentScope",
+      "AmplitudeResultEvidence",
+      "AmplitudeExperimentResultProposal",
+      "AmplitudeReadConsent",
+      "AmplitudeEffectIntent",
+      "AmplitudeEffectReceipt",
+      "AmplitudeReadbackReceipt",
+      "AmplitudeRegistration",
+      "SecretReference"
+    ]
+  },
+  "service": {
+    "id": "amplitude.experiment-result",
+    "name": "AmplitudeExperimentResultService",
+    "version": "1.0.0",
+    "access": "read_only",
+    "operations": [
+      "issue_read_consent",
+      "read_saved_experiment_result",
+      "compile_experiment_result_proposal",
+      "record_experiment_result_observation",
+      "read_back_experiment_result",
+      "revoke_registration",
+      "restore_registration"
+    ],
+    "externalWrites": false
+  },
+  "provider": {
+    "id": "amplitude.experiment-result",
+    "name": "AmplitudeProvider",
+    "version": "1.0.0",
+    "apis": [
+      "amplitude_dashboard_rest_v1"
+    ],
+    "officialEndpoint": {
+      "method": "GET",
+      "path": "/api/3/chart/{chart_id}/csv",
+      "hostAllowlist": [
+        "https://amplitude.com",
+        "https://analytics.eu.amplitude.com"
+      ]
+    },
+    "scope": [
+      "project",
+      "experiment",
+      "variant",
+      "metric",
+      "exposure_window",
+      "segment",
+      "mission",
+      "work_product",
+      "api_digest",
+      "capability_digest",
+      "provider_digest",
+      "scope_digest",
+      "revision_digest",
+      "registration_digest"
+    ],
+    "authentication": [
+      "opaque_secret_reference"
+    ],
+    "permissions": [
+      "experiment_results_read",
+      "saved_chart_read"
+    ],
+    "capabilities": [
+      "amplitude.experiment-result.read"
+    ],
+    "transportProvenance": [
+      "fixture",
+      "recording",
+      "fake",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "reversible": true,
+    "revocable": true
+  },
+  "consumer": {
+    "id": "mission.amplitude-experiment-result",
+    "name": "MissionAmplitudeExperimentConsumer",
+    "kind": "mission_experiment_result_projection",
+    "scope": [
+      "project",
+      "experiment",
+      "variant",
+      "metric",
+      "exposure_window",
+      "segment",
+      "mission",
+      "work_product",
+      "mission_revision",
+      "work_product_revision",
+      "source_evidence_digest"
+    ],
+    "adoptsOutcome": false,
+    "kernelAuthority": false
+  },
+  "exactScope": [
+    "project",
+    "experiment",
+    "variant",
+    "metric",
+    "exposure_window",
+    "segment",
+    "mission",
+    "work_product"
+  ],
+  "allowlist": {
+    "reads": [
+      {
+        "operation": "read_saved_experiment_result",
+        "method": "GET",
+        "path": "/api/3/chart/{chart_id}/csv",
+        "bounded": true,
+        "maxPages": 8,
+        "maxPageSize": 100,
+        "maxResponseBytes": 1048576,
+        "arbitraryQuery": false,
+        "rawUserIdentifiers": false
+      }
+    ],
+    "writes": [],
+    "forbidden": [
+      "arbitrary_event_export",
+      "raw_user_identifier_read",
+      "raw_user_identifier_retention",
+      "generic_analytics_query_engine",
+      "experiment_start",
+      "experiment_stop",
+      "flag_mutation",
+      "event_ingestion",
+      "statistical_claim_authority",
+      "kernel_receipt",
+      "kernel_outcome_authority",
+      "verified_work_product_adoption"
+    ]
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxPages": 8,
+    "maxPageSize": 100,
+    "maxVariants": 32,
+    "maxMetrics": 16,
+    "maxSegments": 16,
+    "maxConfidenceMetadata": 4,
+    "maxIdentifierBytes": 256,
+    "maxDiagnosticBytes": 512
+  },
+  "normalization": {
+    "variantExposureCounts": true,
+    "metricValues": true,
+    "confidenceMetadata": "provider_reported_only",
+    "decisionMetadata": "provider_reported_only",
+    "freshness": true,
+    "incompleteData": true,
+    "rawProviderPayload": false,
+    "rawUserIdentifiers": false,
+    "emptyIsSuccess": false,
+    "states": [
+      "significant",
+      "inconclusive",
+      "insufficient_exposure",
+      "stale",
+      "partial",
+      "empty",
+      "access_lost",
+      "provider_unknown"
+    ]
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "capabilityDigestBound": true,
+    "scopeDigestBound": true,
+    "revisionDigestBound": true,
+    "registrationDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "project_drift",
+      "experiment_drift",
+      "variant_drift",
+      "metric_drift",
+      "exposure_window_drift",
+      "segment_drift",
+      "mission_stale",
+      "work_product_drift",
+      "provider_revision_drift",
+      "capability_drift",
+      "scope_tamper",
+      "registration_revocation"
+    ]
+  },
+  "authentication": {
+    "secretReference": "opaque_SecretReference",
+    "rawCredentialSerialized": false,
+    "rawCredentialDebug": false,
+    "rawCredentialReceipt": false,
+    "rawCredentialRequest": false
+  },
+  "consentEffectReceiptReadback": {
+    "consent": "AmplitudeReadConsent",
+    "effectIntent": "AmplitudeEffectIntent",
+    "effectReceipt": "AmplitudeEffectReceipt",
+    "readback": "AmplitudeReadbackReceipt",
+    "nativeEffectExecution": false,
+    "durableNativeReceipt": false,
+    "independentNativeReadback": false
+  },
+  "honesty": {
+    "fixtureNative": false,
+    "recordingNative": false,
+    "fakeNative": false,
+    "loopbackNative": false,
+    "blockedEnvNative": false,
+    "fixtureConnected": false,
+    "recordingConnected": false,
+    "fakeConnected": false,
+    "loopbackConnected": false,
+    "blockedEnvConnected": false,
+    "nativeHttpsLayer": "layer_2_gap",
+    "nativeCredentialResolution": "layer_2_gap",
+    "absenceIsSuccess": false,
+    "emptyIsSuccess": false
+  },
+  "distinction": {
+    "notPostHogOutcome": true,
+    "notLaunchDarklyFlagEvidence": true,
+    "notSentryRuntimeEvidence": true,
+    "notDatadogSloEvidence": true,
+    "neighboringIssueNumbers": {
+      "postHog": 288,
+      "launchDarkly": 335,
+      "sentry": 307,
+      "datadog": 337
+    },
+    "providerDomain": "Amplitude saved experiment-result/chart reads only"
+  },
+  "documentation": [
+    "https://www.amplitude.com/docs/apis/analytics/dashboard-rest",
+    "https://www.amplitude.com/docs/feature-experiment/analysis-view",
+    "https://www.amplitude.com/docs/apis"
+  ],
+  "errorHandling": [
+    "HTTP_401",
+    "HTTP_403",
+    "HTTP_404",
+    "HTTP_429",
+    "HTTP_5XX",
+    "TIMEOUT",
+    "BLOCKED_ENV",
+    "MALFORMED_RESPONSE",
+    "PARTIAL_RESPONSE",
+    "REDACTION",
+    "REPLAY",
+    "TAMPER",
+    "REVOCATION"
+  ],
+  "layer2Gaps": [
+    "native_secret_resolution",
+    "native_amplitude_https_transport",
+    "durable_native_provider_receipts",
+    "independent_native_readback",
+    "experiment_lifecycle_mutation",
+    "event_ingestion_or_export",
+    "kernel_outcome_persistence",
+    "verified_work_product_adoption"
+  ]
+}
