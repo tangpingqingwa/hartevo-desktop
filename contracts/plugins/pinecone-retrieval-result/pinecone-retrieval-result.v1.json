@@ -1,0 +1,277 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.pinecone-retrieval-result/v1",
+  "title": "Hartevo Layer 1 governed Pinecone retrieval-result contract",
+  "schemaVersion": "hartevo.pinecone-retrieval-result/v1",
+  "contractVersion": "EXT-PINECONE-01-L1/v1",
+  "layer": 1,
+  "contractDigestInput": "hartevo.pinecone-retrieval-result/v1|layer=1|service=search.pinecone.retrieval.result|provider=pinecone.retrieval.recording|consumer=mission.pinecone.retrieval",
+  "contractDigest": "5f5d9080db719267d7662e4669d394e645a6045863330349fb5f6e81b84042e8",
+  "plugin": {
+    "id": "pinecone.retrieval.result",
+    "version": "1.0.0",
+    "registration": {
+      "versioned": true,
+      "contractDigestBound": true,
+      "scopeBound": true,
+      "reversible": true,
+      "revocable": true,
+      "permissions": [
+        "describe_index",
+        "query",
+        "fetch"
+      ],
+      "revocation": "registration_digest_rotation"
+    }
+  },
+  "service": {
+    "type": "PineconeRetrievalResultService",
+    "id": "search.pinecone.retrieval.result",
+    "operations": [
+      "describe_capabilities",
+      "describe_index",
+      "compile_bounded_query_proposal",
+      "query",
+      "fetch",
+      "create_receipt_candidate",
+      "verify_read_projection",
+      "propose_retrieval_evidence"
+    ],
+    "effectAuthority": "bounded_read_and_proposal_only",
+    "liveExternalIo": false,
+    "kernelAuthority": false
+  },
+  "provider": {
+    "type": "PineconeProvider",
+    "id": "pinecone.retrieval.recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_index",
+      "query",
+      "fetch",
+      "revoke",
+      "reactivate"
+    ],
+    "transportSeam": [
+      "api_key_secret_reference",
+      "service_account_secret_reference",
+      "recording",
+      "fake",
+      "loopback",
+      "blocked_env"
+    ],
+    "nativeStatus": "BLOCKED_ENV",
+    "connected": false,
+    "native": false,
+    "rawResponseBodies": false,
+    "rawSecrets": false,
+    "upsert": false,
+    "delete": false,
+    "namespaceMutation": false
+  },
+  "authentication": {
+    "boundary": "opaque SecretReference",
+    "supportedSchemes": [
+      "api_key_via_secret_reference",
+      "service_account_via_secret_reference"
+    ],
+    "serialized": false,
+    "debugged": false,
+    "resolvedByLayer": 2,
+    "rawApiKeys": false,
+    "rawServiceAccountCredentials": false
+  },
+  "scope": {
+    "exactFields": [
+      "cloud",
+      "region",
+      "project",
+      "index",
+      "host",
+      "namespace",
+      "indexRevision",
+      "missionScope",
+      "consent"
+    ],
+    "scopeBound": true,
+    "crossCloud": false,
+    "crossRegion": false,
+    "wildcardIndex": false,
+    "namespaceMutation": false
+  },
+  "queryPolicy": {
+    "representation": "typed_bounded_query",
+    "query": "typed_query_only",
+    "model": "allowlisted_exact_model",
+    "vector": {
+      "bounded": true,
+      "maxDimensions": 1536,
+      "finiteValues": true
+    },
+    "filter": {
+      "representation": "typed_bounded_filter_ast",
+      "arbitraryDsl": false,
+      "maxDepth": 4,
+      "maxClauses": 32
+    },
+    "maxTopK": 100,
+    "maxFetchIds": 100,
+    "maxMetadataFields": 64,
+    "maxMetadataValueBytes": 4096,
+    "maxReadUnits": 10000,
+    "metric": "registration_bound",
+    "readiness": "typed_ready_not_ready_unknown",
+    "rawFilterDsl": false,
+    "unboundedVectors": false,
+    "unboundedMetadata": false
+  },
+  "evidence": {
+    "queryFields": [
+      "id",
+      "score",
+      "metadata",
+      "values"
+    ],
+    "fetchFields": [
+      "id",
+      "metadata",
+      "values"
+    ],
+    "fenceFields": [
+      "scopeDigest",
+      "requestDigest",
+      "replayFence",
+      "revision",
+      "readUnits",
+      "responseDigest",
+      "providerManifestDigest"
+    ],
+    "usageFields": [
+      "readUnits",
+      "revision",
+      "consistency",
+      "pagination",
+      "truncated"
+    ],
+    "statuses": [
+      "present",
+      "empty",
+      "partial",
+      "access_loss",
+      "deleted",
+      "provider_unknown"
+    ],
+    "rawProviderBodies": false,
+    "tamperChecked": true,
+    "replayChecked": true,
+    "revisionChecked": true,
+    "readUnitsBounded": true,
+    "ranked": true,
+    "ranking": "response_order_descending_score",
+    "paginationBounded": true,
+    "consistencyFenced": true,
+    "truncationExplicit": true,
+    "workProductBound": true,
+    "adopted": false,
+    "kernelVerified": false
+  },
+  "receiptAndVerification": {
+    "proposal": true,
+    "receiptCandidate": true,
+    "durableNativeReceipt": false,
+    "readVerification": true,
+    "independentReadBack": false,
+    "durableAdoption": false,
+    "layer2Gaps": [
+      "native_https_transport",
+      "api_key_or_service_account_resolution",
+      "durable_native_receipt",
+      "independent_read_back",
+      "durable_work_product_adoption"
+    ]
+  },
+  "testSeams": {
+    "fixture": "BLOCKED_ENV",
+    "recording": "BLOCKED_ENV",
+    "fake": "BLOCKED_ENV",
+    "loopback": "BLOCKED_ENV",
+    "connected": false,
+    "native": false,
+    "adversarial": [
+      "read_unit_budget",
+      "ready_not_ready",
+      "empty_partial_ranked",
+      "index_namespace_drift",
+      "dimension_metric_mismatch",
+      "revision_mismatch",
+      "tamper",
+      "replay",
+      "bounded_vector",
+      "bounded_metadata",
+      "bounded_ids",
+      "filter_allowlist",
+      "registration_revocation"
+    ]
+  },
+  "authority": {
+    "externalRead": "typed_seam_only",
+    "externalWrite": false,
+    "upsert": false,
+    "delete": false,
+    "namespaceMutation": false,
+    "durableReceipt": false,
+    "durableMemory": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAuthority": false,
+    "genericCatalog": false,
+    "connected": false,
+    "native": false
+  },
+  "native": {
+    "status": "BLOCKED_ENV",
+    "httpsTransport": "BLOCKED_ENV",
+    "apiKeyResolution": "BLOCKED_ENV",
+    "serviceAccountResolution": "BLOCKED_ENV",
+    "durableReceipt": "BLOCKED_ENV",
+    "readBack": "BLOCKED_ENV",
+    "adoption": "BLOCKED_ENV"
+  },
+  "layer2": {
+    "externalRead": "typed_seam_only",
+    "apiKeyOrServiceAccountResolution": "typed_seam_only",
+    "durableNativeReceipt": "not_implemented",
+    "independentReadBack": "not_implemented",
+    "workProductAdoption": "not_implemented"
+  },
+  "semanticSeparation": {
+    "opensearchRetrieval": "separate_contract_and_provider",
+    "zoteroEvidence": "separate_contract_and_provider"
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "$id",
+    "schemaVersion",
+    "contractVersion",
+    "layer",
+    "contractDigestInput",
+    "contractDigest",
+    "plugin",
+    "service",
+    "provider",
+    "authentication",
+    "scope",
+    "queryPolicy",
+    "evidence",
+    "receiptAndVerification",
+    "testSeams",
+    "authority",
+    "native",
+    "layer2",
+    "semanticSeparation"
+  ]
+}
