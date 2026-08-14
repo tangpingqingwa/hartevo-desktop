@@ -1971,10 +1971,14 @@ impl StdioRuntime {
         let Some((stream, message)) = selected else {
             return Err(AdapterError::NextEventTimedOut);
         };
-        Ok(match message {
+        let event = match message {
             Ok(message) => self.handle_reader_message(stream, message),
             Err(_) => self.handle_reader_disconnect(stream),
-        })
+        };
+        if matches!(&event, RuntimeEvent::StderrClosed) {
+            return self.prioritize_stdout_before_stderr_closed(deadline, event);
+        }
+        Ok(event)
     }
 
     pub fn health_check(&mut self, timeout: Duration) -> Result<RuntimeHealth, AdapterError> {
@@ -2546,6 +2550,42 @@ impl StdioRuntime {
             model,
             model_provider,
         })
+    }
+
+    fn prioritize_stdout_before_stderr_closed(
+        &mut self,
+        deadline: Instant,
+        stderr_closed: RuntimeEvent,
+    ) -> Result<RuntimeEvent, AdapterError> {
+        if let Some(event) = self.try_ready_event() {
+            self.defer_event(stderr_closed)?;
+            return Ok(event);
+        }
+        let Some(stdout_rx) = self.stdout_rx.clone() else {
+            return Ok(stderr_closed);
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(stderr_closed);
+        }
+        let event = match stdout_rx.recv_timeout(remaining) {
+            Ok(message) => self.handle_reader_message(RuntimeStream::Stdout, message),
+            Err(RecvTimeoutError::Disconnected) => {
+                self.handle_reader_disconnect(RuntimeStream::Stdout)
+            }
+            Err(RecvTimeoutError::Timeout) => return Ok(stderr_closed),
+        };
+        self.defer_event(stderr_closed)?;
+        Ok(event)
+    }
+
+    fn defer_event(&mut self, event: RuntimeEvent) -> Result<(), AdapterError> {
+        if self.deferred.len() >= self.deferred_capacity {
+            self.poisoned = true;
+            return Err(AdapterError::DeferredEventOverflow);
+        }
+        self.deferred.push_back(event);
+        Ok(())
     }
 
     fn try_ready_event(&mut self) -> Option<RuntimeEvent> {
@@ -4777,13 +4817,16 @@ printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"approved":%s}}\n' 
         let event = runtime
             .next_event(Duration::from_secs(1))
             .expect("completion notification");
-        assert!(matches!(
-            event,
-            RuntimeEvent::Notification {
-                kind: RuntimeEventKind::TurnCompleted,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                event,
+                RuntimeEvent::Notification {
+                    kind: RuntimeEventKind::TurnCompleted,
+                    ..
+                }
+            ),
+            "unexpected event after approval response: {event:?}"
+        );
         runtime.shutdown().expect("shutdown");
     }
 
