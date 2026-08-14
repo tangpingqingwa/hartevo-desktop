@@ -752,6 +752,52 @@ pub struct LinkedInCursorReceipt {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinkedInReadBinding {
+    pub scope_digest: String,
+    pub credential_reference_digest: String,
+    pub credential_revision: u64,
+    pub lease_revision: u64,
+    pub token_generation_digest: String,
+    pub adapter_id: String,
+    pub adapter_version: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinkedInWindowReceipt {
+    pub since: DateTime<Utc>,
+    pub until: DateTime<Utc>,
+    pub digest: String,
+}
+
+impl LinkedInWindowReceipt {
+    fn new(since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Self, LinkedInConnectorError> {
+        if until <= since {
+            return Err(LinkedInConnectorError::InvalidRequest);
+        }
+        let digest = digest_serializable(&(since, until))?;
+        Ok(Self {
+            since,
+            until,
+            digest,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinkedInPageReceipt {
+    pub page_index: u64,
+    pub target_index: Option<u64>,
+    pub window_index: Option<u64>,
+    pub target_digest: String,
+    pub query_digest: String,
+    pub source_digest: String,
+    pub page_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LinkedInDigestReceipt {
     pub request_digest: String,
     pub response_digest: String,
@@ -768,6 +814,38 @@ pub struct LinkedInPaginationCursor {
     start: u64,
     token_digest: String,
     complete: bool,
+    #[serde(default)]
+    plan_digest: Option<String>,
+    #[serde(default)]
+    page_index: Option<u64>,
+    #[serde(default)]
+    target_index: Option<u64>,
+    #[serde(default)]
+    window_index: Option<u64>,
+    #[serde(default)]
+    window_digest: Option<String>,
+    #[serde(default)]
+    target_digest: Option<String>,
+    #[serde(default)]
+    query_digest: Option<String>,
+    #[serde(default)]
+    page_digest: Option<String>,
+    #[serde(default)]
+    source_digest: Option<String>,
+    #[serde(default)]
+    credential_reference_digest: Option<String>,
+    #[serde(default)]
+    credential_revision: Option<u64>,
+    #[serde(default)]
+    lease_revision: Option<u64>,
+    #[serde(default)]
+    token_generation_digest: Option<String>,
+    #[serde(default)]
+    adapter_id: Option<String>,
+    #[serde(default)]
+    adapter_version: Option<u32>,
+    #[serde(default)]
+    previous_digest: Option<String>,
 }
 
 impl LinkedInPaginationCursor {
@@ -785,6 +863,109 @@ impl LinkedInPaginationCursor {
             start,
             token_digest: digest_bytes(start.to_string().as_bytes()),
             complete,
+            plan_digest: None,
+            page_index: None,
+            target_index: None,
+            window_index: None,
+            window_digest: None,
+            target_digest: None,
+            query_digest: None,
+            page_digest: None,
+            source_digest: None,
+            credential_reference_digest: None,
+            credential_revision: None,
+            lease_revision: None,
+            token_generation_digest: None,
+            adapter_id: None,
+            adapter_version: None,
+            previous_digest: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_plan(
+        scope: &LinkedInInsightScope,
+        plan_digest: &str,
+        request_digest: &str,
+        sequence: u64,
+        page_index: u64,
+        target_index: u64,
+        window_index: u64,
+        window_digest: &str,
+        target_digest: &str,
+        query_digest: &str,
+        page_digest: &str,
+        source_digest: &str,
+        binding: &LinkedInReadBinding,
+        complete: bool,
+        previous_digest: Option<String>,
+    ) -> Self {
+        let token_digest = digest_material([
+            binding.token_generation_digest.clone(),
+            page_index.to_string(),
+        ]);
+        Self {
+            scope_digest: digest_material([scope.member_id.clone(), scope.digest_material()]),
+            request_digest: request_digest.to_owned(),
+            sequence,
+            start: page_index,
+            token_digest,
+            complete,
+            plan_digest: Some(plan_digest.to_owned()),
+            page_index: Some(page_index),
+            target_index: Some(target_index),
+            window_index: Some(window_index),
+            window_digest: Some(window_digest.to_owned()),
+            target_digest: Some(target_digest.to_owned()),
+            query_digest: Some(query_digest.to_owned()),
+            page_digest: Some(page_digest.to_owned()),
+            source_digest: Some(source_digest.to_owned()),
+            credential_reference_digest: Some(binding.credential_reference_digest.clone()),
+            credential_revision: Some(binding.credential_revision),
+            lease_revision: Some(binding.lease_revision),
+            token_generation_digest: Some(binding.token_generation_digest.clone()),
+            adapter_id: Some(binding.adapter_id.clone()),
+            adapter_version: Some(binding.adapter_version),
+            previous_digest,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_poll(
+        scope: &LinkedInInsightScope,
+        request_digest: &str,
+        sequence: u64,
+        start: u64,
+        source: &LinkedInRequestEvidence,
+        binding: &LinkedInReadBinding,
+        complete: bool,
+        previous_digest: Option<String>,
+    ) -> Self {
+        let token_digest =
+            digest_material([binding.token_generation_digest.clone(), start.to_string()]);
+        Self {
+            scope_digest: digest_material([scope.member_id.clone(), scope.digest_material()]),
+            request_digest: request_digest.to_owned(),
+            sequence,
+            start,
+            token_digest,
+            complete,
+            plan_digest: None,
+            page_index: None,
+            target_index: None,
+            window_index: None,
+            window_digest: None,
+            target_digest: None,
+            query_digest: Some(source.query_digest.clone()),
+            page_digest: None,
+            source_digest: Some(source.response_digest.clone()),
+            credential_reference_digest: Some(binding.credential_reference_digest.clone()),
+            credential_revision: Some(binding.credential_revision),
+            lease_revision: Some(binding.lease_revision),
+            token_generation_digest: Some(binding.token_generation_digest.clone()),
+            adapter_id: Some(binding.adapter_id.clone()),
+            adapter_version: Some(binding.adapter_version),
+            previous_digest,
         }
     }
 
@@ -800,6 +981,42 @@ impl LinkedInPaginationCursor {
         &self.token_digest
     }
 
+    pub fn plan_digest(&self) -> Option<&str> {
+        self.plan_digest.as_deref()
+    }
+
+    pub fn page_index(&self) -> Option<u64> {
+        self.page_index
+    }
+
+    pub fn target_index(&self) -> Option<u64> {
+        self.target_index
+    }
+
+    pub fn window_index(&self) -> Option<u64> {
+        self.window_index
+    }
+
+    pub fn query_digest(&self) -> Option<&str> {
+        self.query_digest.as_deref()
+    }
+
+    pub fn page_digest(&self) -> Option<&str> {
+        self.page_digest.as_deref()
+    }
+
+    pub fn source_digest(&self) -> Option<&str> {
+        self.source_digest.as_deref()
+    }
+
+    pub fn previous_digest(&self) -> Option<&str> {
+        self.previous_digest.as_deref()
+    }
+
+    pub fn token_generation_digest(&self) -> Option<&str> {
+        self.token_generation_digest.as_deref()
+    }
+
     pub const fn complete(&self) -> bool {
         self.complete
     }
@@ -813,6 +1030,130 @@ impl LinkedInPaginationCursor {
             || self.request_digest != request_digest
             || self.sequence == 0
             || self.token_digest != digest_bytes(self.start.to_string().as_bytes())
+            || self.plan_digest.is_some()
+        {
+            return Err(LinkedInConnectorError::CursorMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_plan(
+        &self,
+        plan: &LinkedInInsightReadPlan,
+        binding: &LinkedInReadBinding,
+    ) -> Result<(), LinkedInConnectorError> {
+        let page_index = self
+            .page_index
+            .ok_or(LinkedInConnectorError::CursorMismatch)?;
+        let target_index = self
+            .target_index
+            .ok_or(LinkedInConnectorError::CursorMismatch)?;
+        let window_index = self
+            .window_index
+            .ok_or(LinkedInConnectorError::CursorMismatch)?;
+        let page = plan
+            .page_at(page_index)?
+            .ok_or(LinkedInConnectorError::CursorMismatch)?;
+        let next_page = page_index
+            .checked_add(1)
+            .map(|value| plan.page_at(value))
+            .transpose()?
+            .flatten();
+        let expected_request_digest = plan_request(plan, &page).request_digest();
+        let expected_window_digest = digest_serializable(&(page.since, page.until))?;
+        let expected_target_digest = digest_serializable(&page.target)?;
+        if self.scope_digest
+            != digest_material([
+                plan.insight_scope.member_id.clone(),
+                plan.insight_scope.digest_material(),
+            ])
+            || self.plan_digest.as_deref() != Some(plan.plan_digest().as_str())
+            || self.request_digest != expected_request_digest
+            || self.sequence == 0
+            || self.sequence != page_index.saturating_add(1)
+            || self.start != page_index
+            || self.token_digest
+                != digest_material([
+                    binding.token_generation_digest.clone(),
+                    page_index.to_string(),
+                ])
+            || self.target_index != Some(target_index)
+            || self.window_index != Some(window_index)
+            || self
+                .window_digest
+                .as_deref()
+                .is_none_or(|value| !is_digest(value))
+            || self.window_digest.as_deref() != Some(expected_window_digest.as_str())
+            || self
+                .target_digest
+                .as_deref()
+                .is_none_or(|value| !is_digest(value))
+            || self.target_digest.as_deref() != Some(expected_target_digest.as_str())
+            || self
+                .query_digest
+                .as_deref()
+                .is_none_or(|value| !is_digest(value))
+            || self
+                .page_digest
+                .as_deref()
+                .is_none_or(|value| !is_digest(value))
+            || self
+                .source_digest
+                .as_deref()
+                .is_none_or(|value| !is_digest(value))
+            || self.credential_reference_digest.as_deref()
+                != Some(binding.credential_reference_digest.as_str())
+            || self.credential_revision != Some(binding.credential_revision)
+            || self.lease_revision != Some(binding.lease_revision)
+            || self.token_generation_digest.as_deref()
+                != Some(binding.token_generation_digest.as_str())
+            || self.adapter_id.as_deref() != Some(binding.adapter_id.as_str())
+            || self.adapter_version != Some(binding.adapter_version)
+            || (page_index == 0 && self.previous_digest.is_some())
+            || (page_index > 0
+                && self
+                    .previous_digest
+                    .as_deref()
+                    .is_none_or(|value| !is_digest(value)))
+            || self.complete != next_page.is_none()
+        {
+            return Err(LinkedInConnectorError::CursorMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_poll(
+        &self,
+        scope: &LinkedInInsightScope,
+        request_digest: &str,
+        binding: &LinkedInReadBinding,
+    ) -> Result<(), LinkedInConnectorError> {
+        if self.plan_digest.is_some()
+            || self.scope_digest
+                != digest_material([scope.member_id.clone(), scope.digest_material()])
+            || self.request_digest != request_digest
+            || self.sequence == 0
+            || self.token_digest
+                != digest_material([
+                    binding.token_generation_digest.clone(),
+                    self.start.to_string(),
+                ])
+            || self
+                .query_digest
+                .as_deref()
+                .is_none_or(|value| !is_digest(value))
+            || self
+                .source_digest
+                .as_deref()
+                .is_none_or(|value| !is_digest(value))
+            || self.credential_reference_digest.as_deref()
+                != Some(binding.credential_reference_digest.as_str())
+            || self.credential_revision != Some(binding.credential_revision)
+            || self.lease_revision != Some(binding.lease_revision)
+            || self.token_generation_digest.as_deref()
+                != Some(binding.token_generation_digest.as_str())
+            || self.adapter_id.as_deref() != Some(binding.adapter_id.as_str())
+            || self.adapter_version != Some(binding.adapter_version)
         {
             return Err(LinkedInConnectorError::CursorMismatch);
         }
@@ -844,7 +1185,10 @@ pub struct LinkedInInsightObservation {
     pub mission_id: String,
     pub scope: LinkedInInsightScope,
     pub connector_scope_digest: String,
+    pub binding: LinkedInReadBinding,
     pub target: LinkedInInsightTarget,
+    pub window: LinkedInWindowReceipt,
+    pub page: LinkedInPageReceipt,
     pub requested_at: DateTime<Utc>,
     pub observed_at: DateTime<Utc>,
     pub source: LinkedInRequestEvidence,
@@ -860,13 +1204,23 @@ pub struct LinkedInInsightObservation {
     pub digests: LinkedInDigestReceipt,
     pub provenance: ProviderProvenanceClass,
     pub causal_status: LinkedInCausalStatus,
+    #[serde(default)]
+    pub reconcile: Option<LinkedInReconcileReceipt>,
 }
 
 impl LinkedInInsightObservation {
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), LinkedInConnectorError> {
+        self.scope.validate(None)?;
+        self.scope.validate_target(&self.target)?;
         if self.schema_version != LINKEDIN_INSIGHT_READ_SCHEMA
             || self.observation_id.is_empty()
             || !is_digest(&self.connector_scope_digest)
+            || self.binding.scope_digest != self.connector_scope_digest
+            || self.binding.adapter_id != LINKEDIN_ADAPTER_ID
+            || self.binding.adapter_version != LINKEDIN_ADAPTER_VERSION
+            || !is_digest(&self.binding.credential_reference_digest)
+            || !is_digest(&self.binding.token_generation_digest)
             || !is_digest(&self.source.query_digest)
             || !is_digest(&self.source.response_digest)
             || !is_digest(&self.digests.request_digest)
@@ -876,6 +1230,16 @@ impl LinkedInInsightObservation {
             || !is_digest(&self.cursor.durable_checkpoint_digest)
             || !self.cursor.current_digest.as_deref().is_none_or(is_digest)
             || !self.cursor.next_digest.as_deref().is_none_or(is_digest)
+            || self.window.until <= self.window.since
+            || !is_digest(&self.window.digest)
+            || self.window.digest != digest_serializable(&(self.window.since, self.window.until))?
+            || !is_digest(&self.page.target_digest)
+            || !is_digest(&self.page.query_digest)
+            || !is_digest(&self.page.source_digest)
+            || !is_digest(&self.page.page_digest)
+            || self.page.target_digest != digest_serializable(&self.target)?
+            || self.page.query_digest != self.source.query_digest
+            || self.page.source_digest != self.source.response_digest
             || self.source.status / 100 != 2
             || self.source.method != "GET"
             || self.source.response_digest != self.digests.response_digest
@@ -897,6 +1261,23 @@ impl LinkedInInsightObservation {
         {
             return Err(LinkedInConnectorError::InvalidObservation);
         }
+        let expected_token_generation = token_generation_digest(
+            &self.binding.credential_reference_digest,
+            self.binding.credential_revision,
+            self.binding.lease_revision,
+        );
+        if self.binding.token_generation_digest != expected_token_generation {
+            return Err(LinkedInConnectorError::InvalidObservation);
+        }
+        let expected_page_digest = page_digest(
+            &self.target,
+            &self.window,
+            &self.source,
+            &self.digests.content_digest,
+        );
+        if self.page.page_digest != expected_page_digest {
+            return Err(LinkedInConnectorError::InvalidObservation);
+        }
         let expected_cursor_scope =
             digest_material([self.scope.member_id.clone(), self.scope.digest_material()]);
         if self.cursor.durable_cursor.scope_digest != expected_cursor_scope
@@ -904,6 +1285,72 @@ impl LinkedInInsightObservation {
             || self.cursor.durable_cursor.sequence != self.cursor.sequence
             || self.cursor.durable_cursor.complete() != self.cursor.complete
             || self.cursor.durable_cursor.digest() != self.cursor.durable_checkpoint_digest
+        {
+            return Err(LinkedInConnectorError::InvalidObservation);
+        }
+        if let Some(plan_digest) = self.cursor.durable_cursor.plan_digest() {
+            let plan_page_index = self
+                .cursor
+                .durable_cursor
+                .page_index()
+                .ok_or(LinkedInConnectorError::InvalidObservation)?;
+            if !is_digest(plan_digest)
+                || self.cursor.durable_cursor.target_index() != self.page.target_index
+                || self.cursor.durable_cursor.window_index() != self.page.window_index
+                || self.cursor.durable_cursor.window_digest.as_deref()
+                    != Some(self.window.digest.as_str())
+                || self.cursor.durable_cursor.target_digest.as_deref()
+                    != Some(self.page.target_digest.as_str())
+                || self.cursor.durable_cursor.query_digest.as_deref()
+                    != Some(self.page.query_digest.as_str())
+                || self.cursor.durable_cursor.source_digest.as_deref()
+                    != Some(self.page.source_digest.as_str())
+                || self.cursor.durable_cursor.page_digest.as_deref()
+                    != Some(self.page.page_digest.as_str())
+                || self.cursor.durable_cursor.token_generation_digest()
+                    != Some(self.binding.token_generation_digest.as_str())
+                || self.cursor.durable_cursor.token_digest
+                    != digest_material([
+                        self.binding.token_generation_digest.clone(),
+                        plan_page_index.to_string(),
+                    ])
+                || self.cursor.current_digest
+                    != self
+                        .cursor
+                        .durable_cursor
+                        .previous_digest()
+                        .map(str::to_owned)
+                || (plan_page_index == 0 && self.cursor.current_digest.is_some())
+                || (plan_page_index > 0 && self.cursor.current_digest.is_none())
+            {
+                return Err(LinkedInConnectorError::InvalidObservation);
+            }
+        }
+        if let Some(plan_cursor) = &self.reconcile {
+            if plan_cursor.model != self.classification.attribution.model
+                || plan_cursor.cursor_digest != self.cursor.durable_checkpoint_digest
+                || plan_cursor.page_digest != self.page.page_digest
+                || !is_digest(&plan_cursor.delivery_digest)
+                || !is_digest(&plan_cursor.payload_digest)
+                || !is_digest(&plan_cursor.source_digest)
+                || plan_cursor.causal_status != LinkedInCausalStatus::NotClaimed
+            {
+                return Err(LinkedInConnectorError::InvalidObservation);
+            }
+            plan_cursor.validate()?;
+        }
+        if let Some(reconcile) = &self.reconcile
+            && let Some(poll_cursor) = &reconcile.poll_cursor
+            && (poll_cursor.plan_digest().is_some()
+                || poll_cursor.scope_digest != expected_cursor_scope
+                || poll_cursor.credential_reference_digest.as_deref()
+                    != Some(self.binding.credential_reference_digest.as_str())
+                || poll_cursor.credential_revision != Some(self.binding.credential_revision)
+                || poll_cursor.lease_revision != Some(self.binding.lease_revision)
+                || poll_cursor.token_generation_digest()
+                    != Some(self.binding.token_generation_digest.as_str())
+                || poll_cursor.adapter_id.as_deref() != Some(LINKEDIN_ADAPTER_ID)
+                || poll_cursor.adapter_version != Some(LINKEDIN_ADAPTER_VERSION))
         {
             return Err(LinkedInConnectorError::InvalidObservation);
         }
@@ -997,6 +1444,453 @@ impl LinkedInInsightReadRequest {
     fn request_digest(&self) -> String {
         digest_serializable(&(self.target.clone(), self.since, self.until, self.page_size))
             .expect("read request serialization")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkedInInsightReadPlan {
+    pub mission_id: String,
+    pub scope: ConnectorScope,
+    pub insight_scope: LinkedInInsightScope,
+    pub secret_reference: SecretReference,
+    pub lease: CredentialLease,
+    pub targets: Vec<LinkedInInsightTarget>,
+    pub since: DateTime<Utc>,
+    pub until: DateTime<Utc>,
+    pub window: Duration,
+    pub page_size: u32,
+    pub cursor: Option<LinkedInPaginationCursor>,
+    pub requested_at: DateTime<Utc>,
+    pub provenance: ProviderProvenanceClass,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LinkedInPlannedPage {
+    page_index: u64,
+    target_index: u64,
+    window_index: u64,
+    target: LinkedInInsightTarget,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+}
+
+impl LinkedInInsightReadPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mission_id: impl Into<String>,
+        scope: ConnectorScope,
+        insight_scope: LinkedInInsightScope,
+        secret_reference: SecretReference,
+        lease: CredentialLease,
+        targets: Vec<LinkedInInsightTarget>,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        window: Duration,
+        page_size: u32,
+        requested_at: DateTime<Utc>,
+        provenance: ProviderProvenanceClass,
+    ) -> Result<Self, LinkedInConnectorError> {
+        let plan = Self {
+            mission_id: mission_id.into(),
+            scope,
+            insight_scope,
+            secret_reference,
+            lease,
+            targets,
+            since,
+            until,
+            window,
+            page_size,
+            cursor: None,
+            requested_at,
+            provenance,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    #[must_use]
+    pub fn with_cursor(mut self, cursor: LinkedInPaginationCursor) -> Self {
+        self.cursor = Some(cursor);
+        self
+    }
+
+    pub fn plan_digest(&self) -> String {
+        digest_serializable(&(
+            &self.mission_id,
+            self.scope.digest(),
+            self.insight_scope.digest(&self.scope),
+            digest_bytes(self.secret_reference.reference_id().as_bytes()),
+            self.secret_reference.credential_revision(),
+            self.lease.lease_revision(),
+            LINKEDIN_ADAPTER_ID,
+            LINKEDIN_ADAPTER_VERSION,
+            &self.targets,
+            self.since,
+            self.until,
+            self.window,
+            self.page_size,
+            self.provenance,
+        ))
+        .expect("LinkedIn read plan serialization")
+    }
+
+    pub fn target_count(&self) -> usize {
+        self.targets.len()
+    }
+
+    fn validate(&self) -> Result<(), LinkedInConnectorError> {
+        validate_mission_id(&self.mission_id)?;
+        self.insight_scope.validate(Some(&self.scope))?;
+        validate_linkedin_credentials(
+            &self.scope,
+            &self.secret_reference,
+            &self.lease,
+            self.requested_at,
+        )?;
+        if self.targets.is_empty() || self.targets.len() > 128 {
+            return Err(LinkedInConnectorError::InvalidRequest);
+        }
+        let mut target_digests = BTreeSet::new();
+        for target in &self.targets {
+            self.insight_scope.validate_target(target)?;
+            if !target_digests.insert(digest_serializable(target)?) {
+                return Err(LinkedInConnectorError::InvalidRequest);
+            }
+        }
+        if self.until <= self.since
+            || self.until - self.since > Duration::days(31)
+            || self.window <= Duration::zero()
+            || self.window.num_seconds() <= 0
+            || self.window > Duration::days(31)
+            || self.page_size == 0
+            || self.page_size > 1_000
+        {
+            return Err(LinkedInConnectorError::InvalidRequest);
+        }
+        if let Some(cursor) = &self.cursor {
+            let binding = read_binding(&self.scope, &self.secret_reference, &self.lease);
+            cursor.validate_plan(self, &binding)?;
+        }
+        if self.page_at(0)?.is_none() {
+            return Err(LinkedInConnectorError::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    fn page_at(
+        &self,
+        requested_page_index: u64,
+    ) -> Result<Option<LinkedInPlannedPage>, LinkedInConnectorError> {
+        let window_seconds = self.window.num_seconds();
+        let total_seconds = (self.until - self.since).num_seconds();
+        let window_count = u64::try_from((total_seconds + window_seconds - 1) / window_seconds)
+            .map_err(|_| LinkedInConnectorError::InvalidRequest)?;
+        let mut page_index = 0_u64;
+        for (target_index, target) in self.targets.iter().enumerate() {
+            let target_index =
+                u64::try_from(target_index).map_err(|_| LinkedInConnectorError::InvalidRequest)?;
+            let target_window_count =
+                if target.kind() == LinkedInInsightTargetKind::OrganizationPost {
+                    1
+                } else {
+                    window_count
+                };
+            for window_index in 0..target_window_count {
+                if page_index == requested_page_index {
+                    let (since, until) =
+                        if target.kind() == LinkedInInsightTargetKind::OrganizationPost {
+                            (self.since, self.until)
+                        } else {
+                            let offset = window_index
+                                .checked_mul(
+                                    u64::try_from(window_seconds)
+                                        .map_err(|_| LinkedInConnectorError::InvalidRequest)?,
+                                )
+                                .ok_or(LinkedInConnectorError::InvalidRequest)?;
+                            let since = self
+                                .since
+                                .checked_add_signed(Duration::seconds(
+                                    i64::try_from(offset)
+                                        .map_err(|_| LinkedInConnectorError::InvalidRequest)?,
+                                ))
+                                .ok_or(LinkedInConnectorError::InvalidRequest)?;
+                            let candidate_until = since
+                                .checked_add_signed(self.window)
+                                .ok_or(LinkedInConnectorError::InvalidRequest)?;
+                            (since, candidate_until.min(self.until))
+                        };
+                    return Ok(Some(LinkedInPlannedPage {
+                        page_index,
+                        target_index,
+                        window_index,
+                        target: target.clone(),
+                        since,
+                        until,
+                    }));
+                }
+                page_index = page_index
+                    .checked_add(1)
+                    .ok_or(LinkedInConnectorError::InvalidRequest)?;
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkedInReconcileSource {
+    Webhook,
+    Poll,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinkedInWebhookNotification {
+    pub notification_id: u64,
+    pub organizational_entity: String,
+    pub action: String,
+    pub last_modified_at_ms: i64,
+    pub source_post: Option<String>,
+    pub generated_activity: Option<String>,
+}
+
+impl LinkedInWebhookNotification {
+    fn validate(&self) -> Result<(), LinkedInConnectorError> {
+        if self.notification_id == 0
+            || !self
+                .organizational_entity
+                .starts_with("urn:li:organization:")
+            || self
+                .organizational_entity
+                .strip_prefix("urn:li:organization:")
+                .is_none_or(str::is_empty)
+            || !linked_in_notification_action(&self.action)
+            || self.last_modified_at_ms < 0
+            || self
+                .source_post
+                .as_deref()
+                .is_some_and(|value| value.chars().any(char::is_control))
+            || self
+                .generated_activity
+                .as_deref()
+                .is_some_and(|value| value.chars().any(char::is_control))
+        {
+            return Err(LinkedInConnectorError::InvalidReconcile);
+        }
+        Ok(())
+    }
+
+    fn delivery_digest(&self) -> Result<String, LinkedInConnectorError> {
+        digest_serializable(&(self.notification_id, self.last_modified_at_ms))
+    }
+
+    fn organization_id(&self) -> &str {
+        self.organizational_entity
+            .strip_prefix("urn:li:organization:")
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinkedInWebhookEvent {
+    pub event_type: String,
+    pub notifications: Vec<LinkedInWebhookNotification>,
+    pub payload_digest: String,
+    pub received_at: DateTime<Utc>,
+}
+
+impl LinkedInWebhookEvent {
+    pub fn new(
+        notifications: Vec<LinkedInWebhookNotification>,
+        received_at: DateTime<Utc>,
+    ) -> Result<Self, LinkedInConnectorError> {
+        let payload_digest = digest_serializable(&notifications)?;
+        let event = Self {
+            event_type: "ORGANIZATION_SOCIAL_ACTION_NOTIFICATIONS".to_owned(),
+            notifications,
+            payload_digest,
+            received_at,
+        };
+        event.validate()?;
+        Ok(event)
+    }
+
+    fn validate(&self) -> Result<(), LinkedInConnectorError> {
+        if self.event_type != "ORGANIZATION_SOCIAL_ACTION_NOTIFICATIONS"
+            || self.notifications.is_empty()
+            || self.notifications.len() > 10
+            || !is_digest(&self.payload_digest)
+        {
+            return Err(LinkedInConnectorError::InvalidReconcile);
+        }
+        let mut seen = BTreeSet::new();
+        for notification in &self.notifications {
+            notification.validate()?;
+            if !seen.insert(notification.delivery_digest()?) {
+                return Err(LinkedInConnectorError::DuplicateDelivery);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkedInReconcilePollRequest {
+    pub scope: ConnectorScope,
+    pub insight_scope: LinkedInInsightScope,
+    pub secret_reference: SecretReference,
+    pub lease: CredentialLease,
+    pub organization_id: String,
+    pub since: DateTime<Utc>,
+    pub until: DateTime<Utc>,
+    pub page_size: u32,
+    pub cursor: Option<LinkedInPaginationCursor>,
+    pub requested_at: DateTime<Utc>,
+    pub provenance: ProviderProvenanceClass,
+}
+
+impl LinkedInReconcilePollRequest {
+    fn validate(&self) -> Result<(), LinkedInConnectorError> {
+        self.insight_scope.validate(Some(&self.scope))?;
+        validate_provider_id(&self.organization_id)?;
+        if self.insight_scope.organization_id() != Some(self.organization_id.as_str())
+            && self.insight_scope.page_id() != Some(self.organization_id.as_str())
+        {
+            return Err(LinkedInConnectorError::ScopeMismatch);
+        }
+        validate_linkedin_credentials(
+            &self.scope,
+            &self.secret_reference,
+            &self.lease,
+            self.requested_at,
+        )?;
+        if self.until <= self.since
+            || self.until - self.since > Duration::days(60)
+            || self.page_size == 0
+            || self.page_size > 1_000
+        {
+            return Err(LinkedInConnectorError::InvalidRequest);
+        }
+        if let Some(cursor) = &self.cursor {
+            cursor.validate_poll(
+                &self.insight_scope,
+                &self.request_digest(),
+                &read_binding(&self.scope, &self.secret_reference, &self.lease),
+            )?;
+            if cursor.complete() {
+                return Err(LinkedInConnectorError::CursorComplete);
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn with_cursor(mut self, cursor: LinkedInPaginationCursor) -> Self {
+        self.cursor = Some(cursor);
+        self
+    }
+
+    fn request_digest(&self) -> String {
+        digest_serializable(&(
+            &self.organization_id,
+            self.since,
+            self.until,
+            self.page_size,
+        ))
+        .expect("LinkedIn reconcile poll serialization")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LinkedInReconcileBatch {
+    pub source: LinkedInRequestEvidence,
+    pub notifications: Vec<LinkedInWebhookNotification>,
+    pub next_start: Option<u64>,
+    pub rate_limit: LinkedInRateLimit,
+    pub permission: LinkedInPermissionObservation,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinkedInReconcileReceipt {
+    pub source: LinkedInReconcileSource,
+    pub delivery_digest: String,
+    pub notification_digests: Vec<String>,
+    pub notification_ids: Vec<u64>,
+    pub organization_id: String,
+    pub max_last_modified_at_ms: i64,
+    pub observed_at: DateTime<Utc>,
+    pub payload_digest: String,
+    pub source_digest: String,
+    pub poll_source: Option<LinkedInRequestEvidence>,
+    pub rate_limit: LinkedInRateLimit,
+    pub cost_minor: i64,
+    pub poll_cursor: Option<LinkedInPaginationCursor>,
+    pub cursor_digest: String,
+    pub page_digest: String,
+    pub model: String,
+    pub causal_status: LinkedInCausalStatus,
+}
+
+impl LinkedInReconcileReceipt {
+    fn validate(&self) -> Result<(), LinkedInConnectorError> {
+        if !is_digest(&self.delivery_digest)
+            || self.notification_digests.is_empty()
+            || self
+                .notification_digests
+                .iter()
+                .any(|value| !is_digest(value))
+            || self.notification_ids.is_empty()
+            || self.notification_ids.len() != self.notification_digests.len()
+            || self.organization_id.is_empty()
+            || self.max_last_modified_at_ms < 0
+            || !is_digest(&self.payload_digest)
+            || !is_digest(&self.source_digest)
+            || self.cost_minor < 0
+            || !is_digest(&self.cursor_digest)
+            || !is_digest(&self.page_digest)
+            || self.model.is_empty()
+            || self.causal_status != LinkedInCausalStatus::NotClaimed
+        {
+            return Err(LinkedInConnectorError::InvalidObservation);
+        }
+        if let Some(cursor) = &self.poll_cursor
+            && (cursor.sequence() == 0
+                || !is_digest(cursor.token_generation_digest().unwrap_or_default()))
+        {
+            return Err(LinkedInConnectorError::InvalidObservation);
+        }
+        let mut delivery_digests = self.notification_digests.clone();
+        delivery_digests.sort();
+        if self.delivery_digest != digest_serializable(&delivery_digests)? {
+            return Err(LinkedInConnectorError::InvalidObservation);
+        }
+        match (&self.source, &self.poll_source, &self.poll_cursor) {
+            (LinkedInReconcileSource::Webhook, Some(_), _)
+            | (LinkedInReconcileSource::Webhook, None, Some(_))
+            | (LinkedInReconcileSource::Poll, None, _)
+            | (LinkedInReconcileSource::Poll, _, None) => {
+                return Err(LinkedInConnectorError::InvalidObservation);
+            }
+            (LinkedInReconcileSource::Poll, Some(source), Some(cursor))
+                if source.method != "GET"
+                    || source.status / 100 != 2
+                    || !is_digest(&source.query_digest)
+                    || !is_digest(&source.response_digest)
+                    || source.response_digest != self.source_digest
+                    || cursor.query_digest() != Some(source.query_digest.as_str())
+                    || cursor.source_digest() != Some(source.response_digest.as_str()) =>
+            {
+                return Err(LinkedInConnectorError::InvalidObservation);
+            }
+            (LinkedInReconcileSource::Webhook, None, None)
+            | (LinkedInReconcileSource::Poll, Some(_), Some(_)) => {}
+        }
+        Ok(())
     }
 }
 
@@ -1147,6 +2041,25 @@ impl DurableObservationLog {
         observation: LinkedInInsightObservation,
     ) -> Result<(), LinkedInConnectorError> {
         observation.validate()?;
+        if let Some(previous) = self.entries.last()
+            && previous.mission_id == observation.mission_id
+            && previous.cursor.durable_cursor.plan_digest()
+                == observation.cursor.durable_cursor.plan_digest()
+            && observation.cursor.durable_cursor.plan_digest().is_some()
+        {
+            let expected_page_index = previous
+                .cursor
+                .durable_cursor
+                .page_index()
+                .and_then(|value| value.checked_add(1))
+                .ok_or(LinkedInConnectorError::CursorRollback)?;
+            if observation.cursor.durable_cursor.page_index() != Some(expected_page_index)
+                || observation.cursor.current_digest
+                    != Some(previous.cursor.durable_checkpoint_digest.clone())
+            {
+                return Err(LinkedInConnectorError::CursorRollback);
+            }
+        }
         self.revision = self
             .revision
             .checked_add(1)
@@ -1167,8 +2080,26 @@ impl DurableObservationLog {
         {
             return Err(LinkedInConnectorError::InvalidObservation);
         }
-        for entry in &log.entries {
+        for (index, entry) in log.entries.iter().enumerate() {
             entry.validate()?;
+            if let Some(previous) = index
+                .checked_sub(1)
+                .and_then(|value| log.entries.get(value))
+                && previous.mission_id == entry.mission_id
+                && previous.cursor.durable_cursor.plan_digest()
+                    == entry.cursor.durable_cursor.plan_digest()
+                && entry.cursor.durable_cursor.plan_digest().is_some()
+                && (entry.cursor.durable_cursor.page_index()
+                    != previous
+                        .cursor
+                        .durable_cursor
+                        .page_index()
+                        .and_then(|value| value.checked_add(1))
+                    || entry.cursor.current_digest
+                        != Some(previous.cursor.durable_checkpoint_digest.clone()))
+            {
+                return Err(LinkedInConnectorError::CursorRollback);
+            }
         }
         Ok(log)
     }
@@ -1214,7 +2145,14 @@ pub enum LinkedInConnectorError {
     Revoked,
     RefreshDrift,
     CursorMismatch,
+    CursorRollback,
     CursorComplete,
+    DuplicateDelivery,
+    OutOfOrderDelivery,
+    InvalidReconcile,
+    NoReconcileEvent,
+    AttributionModelDrift,
+    LateResponse,
     MissionMismatch,
     WritesDisabled,
     BlockedEnv {
@@ -1264,7 +2202,24 @@ impl fmt::Display for LinkedInConnectorError {
                 formatter.write_str("LinkedIn refresh drifted from mounted scope")
             }
             Self::CursorMismatch => formatter.write_str("LinkedIn pagination cursor mismatch"),
+            Self::CursorRollback => formatter.write_str("LinkedIn cursor attempted to roll back"),
             Self::CursorComplete => formatter.write_str("LinkedIn pagination cursor is complete"),
+            Self::DuplicateDelivery => {
+                formatter.write_str("LinkedIn reconcile delivery was already durably accepted")
+            }
+            Self::OutOfOrderDelivery => {
+                formatter.write_str("LinkedIn reconcile delivery arrived out of order")
+            }
+            Self::InvalidReconcile => formatter.write_str("invalid LinkedIn reconcile event"),
+            Self::NoReconcileEvent => {
+                formatter.write_str("LinkedIn poll returned no reconcile event")
+            }
+            Self::AttributionModelDrift => {
+                formatter.write_str("LinkedIn attribution model drifted from the target contract")
+            }
+            Self::LateResponse => {
+                formatter.write_str("LinkedIn provider response arrived after session drift")
+            }
             Self::MissionMismatch => formatter.write_str("LinkedIn Mission binding mismatch"),
             Self::WritesDisabled => {
                 formatter.write_str("LinkedIn insight adapter writes are disabled")
@@ -1292,6 +2247,15 @@ pub trait LinkedInInsightProvider: fmt::Debug + Send + Sync {
         request: &LinkedInInsightReadRequest,
         resolver: &dyn LinkedInCredentialResolver,
     ) -> Result<LinkedInProviderPage, LinkedInConnectorError>;
+
+    fn poll_reconcile(
+        &self,
+        request: &LinkedInReconcilePollRequest,
+        resolver: &dyn LinkedInCredentialResolver,
+    ) -> Result<LinkedInReconcileBatch, LinkedInConnectorError> {
+        let _ = (request, resolver);
+        Err(LinkedInConnectorError::InvalidRequest)
+    }
 
     fn prepare_effect(&self, _operation: &str) -> Result<(), LinkedInConnectorError> {
         Err(LinkedInConnectorError::WritesDisabled)
@@ -1560,6 +2524,14 @@ impl LinkedInInsightProvider for LinkedInMarketingOrganizationAdapter {
         let token = resolver.resolve(&request.secret_reference)?;
         let (http_request, classification, model, parameters) = self.read_plan(request);
         let (value, response, rate_limit) = self.execute_json(&http_request, &token)?;
+        if let Some(provider_model) = value
+            .get("attributionModel")
+            .or_else(|| value.get("model"))
+            .and_then(serde_json::Value::as_str)
+            && provider_model != model
+        {
+            return Err(LinkedInConnectorError::AttributionModelDrift);
+        }
         if provider_reports_more_pages(&value) {
             return Err(LinkedInConnectorError::PaginationUnsupported);
         }
@@ -1581,9 +2553,39 @@ impl LinkedInInsightProvider for LinkedInMarketingOrganizationAdapter {
             observed_at: response.received_at,
         })
     }
+
+    fn poll_reconcile(
+        &self,
+        request: &LinkedInReconcilePollRequest,
+        resolver: &dyn LinkedInCredentialResolver,
+    ) -> Result<LinkedInReconcileBatch, LinkedInConnectorError> {
+        request.validate()?;
+        let permission = LinkedInPermissionObservation::for_scope(
+            &request.scope,
+            request.insight_scope.required_scopes(),
+        );
+        if !permission.missing_scopes.is_empty() {
+            return Err(LinkedInConnectorError::MissingPermission);
+        }
+        let token = resolver.resolve(&request.secret_reference)?;
+        let query = notification_query(request);
+        let http_request = self.request("/rest/organizationalEntityNotifications", query);
+        let (value, response, rate_limit) = self.execute_json(&http_request, &token)?;
+        let notifications = parse_notifications(&value, &request.organization_id)?;
+        let next_start = provider_next_start(&value);
+        Ok(LinkedInReconcileBatch {
+            source: request_evidence(&http_request, &response),
+            notifications,
+            next_start,
+            rate_limit,
+            permission,
+            observed_at: response.received_at,
+        })
+    }
 }
 
 impl LinkedInMarketingOrganizationAdapter {
+    #[allow(clippy::too_many_arguments)]
     fn read_plan(
         &self,
         request: &LinkedInInsightReadRequest,
@@ -1633,6 +2635,30 @@ impl LinkedInMarketingOrganizationAdapter {
     }
 }
 
+struct LinkedInReadExecution {
+    page: LinkedInProviderPage,
+    before: BudgetSnapshot,
+    after: BudgetSnapshot,
+    attempts: u8,
+    last_retry_after: Option<u64>,
+}
+
+struct LinkedInPendingReconcile {
+    source: LinkedInReconcileSource,
+    delivery_digest: String,
+    notification_digests: Vec<String>,
+    notification_ids: Vec<u64>,
+    organization_id: String,
+    max_last_modified_at_ms: i64,
+    observed_at: DateTime<Utc>,
+    payload_digest: String,
+    source_digest: String,
+    poll_source: Option<LinkedInRequestEvidence>,
+    rate_limit: LinkedInRateLimit,
+    cost_minor: i64,
+    poll_cursor: Option<LinkedInPaginationCursor>,
+}
+
 pub struct PaidSocialInsightReadService {
     provider: Arc<dyn LinkedInInsightProvider>,
     budget: DispatchBudget,
@@ -1640,6 +2666,10 @@ pub struct PaidSocialInsightReadService {
     state: LinkedInConnectionState,
     mount: Option<LinkedInMount>,
     cursor: Option<LinkedInPaginationCursor>,
+    plan_cursor: Option<LinkedInPaginationCursor>,
+    poll_cursor: Option<LinkedInPaginationCursor>,
+    reconcile_seen: BTreeSet<String>,
+    reconcile_watermarks: BTreeMap<String, i64>,
     observation_log: DurableObservationLog,
 }
 
@@ -1653,6 +2683,20 @@ impl fmt::Debug for PaidSocialInsightReadService {
             .field(
                 "cursor",
                 &self.cursor.as_ref().map(LinkedInPaginationCursor::digest),
+            )
+            .field(
+                "plan_cursor",
+                &self
+                    .plan_cursor
+                    .as_ref()
+                    .map(LinkedInPaginationCursor::digest),
+            )
+            .field(
+                "poll_cursor",
+                &self
+                    .poll_cursor
+                    .as_ref()
+                    .map(LinkedInPaginationCursor::digest),
             )
             .field("observation_log_revision", &self.observation_log.revision())
             .finish_non_exhaustive()
@@ -1675,6 +2719,10 @@ impl PaidSocialInsightReadService {
             state: LinkedInConnectionState::Unmounted,
             mount: None,
             cursor: None,
+            plan_cursor: None,
+            poll_cursor: None,
+            reconcile_seen: BTreeSet::new(),
+            reconcile_watermarks: BTreeMap::new(),
             observation_log: DurableObservationLog::default(),
         })
     }
@@ -1701,6 +2749,31 @@ impl PaidSocialInsightReadService {
 
     pub fn restore_observation_log(&mut self, bytes: &[u8]) -> Result<(), LinkedInConnectorError> {
         self.observation_log = DurableObservationLog::from_checkpoint(bytes)?;
+        self.cursor = None;
+        self.plan_cursor = None;
+        self.poll_cursor = None;
+        self.reconcile_seen.clear();
+        self.reconcile_watermarks.clear();
+        for observation in &self.observation_log.entries {
+            if observation.cursor.durable_cursor.plan_digest().is_some() {
+                self.plan_cursor = Some(observation.cursor.durable_cursor.clone());
+            } else {
+                self.cursor = Some(observation.cursor.durable_cursor.clone());
+            }
+            if let Some(receipt) = &observation.reconcile {
+                self.reconcile_seen
+                    .extend(receipt.notification_digests.iter().cloned());
+                self.reconcile_watermarks
+                    .entry(receipt.organization_id.clone())
+                    .and_modify(|value| {
+                        *value = (*value).max(receipt.max_last_modified_at_ms);
+                    })
+                    .or_insert(receipt.max_last_modified_at_ms);
+                if let Some(poll_cursor) = &receipt.poll_cursor {
+                    self.poll_cursor = Some(poll_cursor.clone());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1751,12 +2824,21 @@ impl PaidSocialInsightReadService {
             .generation
             .checked_add(1)
             .ok_or(LinkedInConnectorError::RefreshDrift)?;
+        self.cursor = None;
+        self.plan_cursor = None;
+        self.poll_cursor = None;
+        self.reconcile_seen.clear();
+        self.reconcile_watermarks.clear();
         Ok(())
     }
 
     pub fn unmount(&mut self) {
         self.mount = None;
         self.cursor = None;
+        self.plan_cursor = None;
+        self.poll_cursor = None;
+        self.reconcile_seen.clear();
+        self.reconcile_watermarks.clear();
         if self.state != LinkedInConnectionState::Revoked {
             self.state = LinkedInConnectionState::Unmounted;
         }
@@ -1765,7 +2847,656 @@ impl PaidSocialInsightReadService {
     pub fn revoke(&mut self) {
         self.mount = None;
         self.cursor = None;
+        self.plan_cursor = None;
+        self.poll_cursor = None;
+        self.reconcile_seen.clear();
+        self.reconcile_watermarks.clear();
         self.state = LinkedInConnectionState::Revoked;
+    }
+
+    pub fn read_plan_page(
+        &mut self,
+        mission_id: &str,
+        plan: &LinkedInInsightReadPlan,
+        resolver: &dyn LinkedInCredentialResolver,
+    ) -> Result<LinkedInInsightObservation, LinkedInConnectorError> {
+        self.read_plan_page_with_reconcile(mission_id, plan, resolver, None)
+    }
+
+    pub fn reconcile_webhook(
+        &mut self,
+        mission_id: &str,
+        plan: &LinkedInInsightReadPlan,
+        event: &LinkedInWebhookEvent,
+        resolver: &dyn LinkedInCredentialResolver,
+    ) -> Result<LinkedInInsightObservation, LinkedInConnectorError> {
+        event.validate()?;
+        let planned_page = self.next_plan_page(plan)?.0;
+        Self::validate_reconcile_target(&planned_page.target, &event.notifications)?;
+        let source_digest =
+            digest_serializable(&(&event.event_type, &event.notifications, event.received_at))?;
+        let pending = self.prepare_reconcile(
+            LinkedInReconcileSource::Webhook,
+            &event.notifications,
+            event.notifications[0].organization_id(),
+            event.payload_digest.clone(),
+            source_digest,
+            event.received_at,
+            None,
+            LinkedInRateLimit::default(),
+            0,
+            None,
+        )?;
+        self.read_plan_page_with_reconcile(mission_id, plan, resolver, Some(pending))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn reconcile_poll(
+        &mut self,
+        mission_id: &str,
+        plan: &LinkedInInsightReadPlan,
+        request: &LinkedInReconcilePollRequest,
+        resolver: &dyn LinkedInCredentialResolver,
+    ) -> Result<LinkedInInsightObservation, LinkedInConnectorError> {
+        request.validate()?;
+        let planned_page = self.next_plan_page(plan)?.0;
+        Self::validate_reconcile_target(
+            &planned_page.target,
+            &[LinkedInWebhookNotification {
+                notification_id: 1,
+                organizational_entity: format!("urn:li:organization:{}", request.organization_id),
+                action: "SHARE".to_owned(),
+                last_modified_at_ms: 0,
+                source_post: None,
+                generated_activity: None,
+            }],
+        )?;
+        let poll_cursor = self.poll_cursor.clone();
+        if let Some(cursor) = &poll_cursor {
+            cursor.validate_poll(
+                &request.insight_scope,
+                &request.request_digest(),
+                &read_binding(&request.scope, &request.secret_reference, &request.lease),
+            )?;
+            if cursor.complete() {
+                return Err(LinkedInConnectorError::CursorComplete);
+            }
+            if let Some(supplied) = &request.cursor {
+                if supplied.sequence() < cursor.sequence() {
+                    return Err(LinkedInConnectorError::CursorRollback);
+                }
+                if supplied != cursor {
+                    return Err(LinkedInConnectorError::CursorMismatch);
+                }
+            }
+        } else if let Some(cursor) = &request.cursor {
+            cursor.validate_poll(
+                &request.insight_scope,
+                &request.request_digest(),
+                &read_binding(&request.scope, &request.secret_reference, &request.lease),
+            )?;
+        }
+        let mut provider_request = request.clone();
+        if provider_request.cursor.is_none() {
+            provider_request.cursor.clone_from(&poll_cursor);
+        }
+        let generation = self.mount_generation()?;
+        self.ensure_mount(mission_id, &plan_request(plan, &planned_page))?;
+        let batch = self.poll_provider_with_retry(&provider_request, resolver)?;
+        self.ensure_session_unchanged(mission_id, &plan_request(plan, &planned_page), generation)?;
+        if batch.permission.missing_scopes.iter().next().is_some() {
+            self.state = LinkedInConnectionState::Stale;
+            return Err(LinkedInConnectorError::MissingPermission);
+        }
+        if batch.notifications.is_empty() {
+            return Err(LinkedInConnectorError::NoReconcileEvent);
+        }
+        let sequence = poll_cursor
+            .as_ref()
+            .map_or(1, |cursor| cursor.sequence().saturating_add(1));
+        let start = batch.next_start.unwrap_or_else(|| {
+            provider_request
+                .cursor
+                .as_ref()
+                .map_or(0, LinkedInPaginationCursor::start)
+        });
+        let next_poll_cursor = LinkedInPaginationCursor::new_poll(
+            &request.insight_scope,
+            &request.request_digest(),
+            sequence,
+            start,
+            &batch.source,
+            &read_binding(&request.scope, &request.secret_reference, &request.lease),
+            batch.next_start.is_none(),
+            poll_cursor.as_ref().map(LinkedInPaginationCursor::digest),
+        );
+        let payload_digest = digest_serializable(&batch.notifications)?;
+        let pending = self.prepare_reconcile(
+            LinkedInReconcileSource::Poll,
+            &batch.notifications,
+            &request.organization_id,
+            payload_digest,
+            batch.source.response_digest.clone(),
+            batch.observed_at,
+            Some(batch.source.clone()),
+            batch.rate_limit.clone(),
+            self.policy.cost_minor,
+            Some(next_poll_cursor),
+        )?;
+        self.read_plan_page_with_reconcile(mission_id, plan, resolver, Some(pending))
+    }
+
+    fn read_plan_page_with_reconcile(
+        &mut self,
+        mission_id: &str,
+        plan: &LinkedInInsightReadPlan,
+        resolver: &dyn LinkedInCredentialResolver,
+        pending_reconcile: Option<LinkedInPendingReconcile>,
+    ) -> Result<LinkedInInsightObservation, LinkedInConnectorError> {
+        validate_mission_id(mission_id)?;
+        if plan.mission_id != mission_id {
+            return Err(LinkedInConnectorError::MissionMismatch);
+        }
+        let (planned_page, previous_cursor) = self.next_plan_page(plan)?;
+        let request = plan_request(plan, &planned_page);
+        request.validate()?;
+        self.ensure_mount(mission_id, &request)?;
+        let generation = self.mount_generation()?;
+        let execution = self.read_provider_with_retry(&request, resolver)?;
+        self.ensure_session_unchanged(mission_id, &request, generation)?;
+        if execution
+            .page
+            .permission
+            .missing_scopes
+            .iter()
+            .next()
+            .is_some()
+        {
+            self.state = LinkedInConnectionState::Stale;
+            return Err(LinkedInConnectorError::MissingPermission);
+        }
+        let expected_model = expected_attribution_model(planned_page.target.kind());
+        if execution.page.attribution.model != expected_model {
+            return Err(LinkedInConnectorError::AttributionModelDrift);
+        }
+        let content_digest = digest_serializable(&execution.page.records)?;
+        let window = LinkedInWindowReceipt::new(planned_page.since, planned_page.until)?;
+        let target_digest = digest_serializable(&planned_page.target)?;
+        let page_digest = page_digest(
+            &planned_page.target,
+            &window,
+            &execution.page.source,
+            &content_digest,
+        );
+        let page_count = plan.page_at(planned_page.page_index + 1)?.is_some();
+        let sequence = previous_cursor
+            .as_ref()
+            .map_or(1, |cursor| cursor.sequence().saturating_add(1));
+        let binding = read_binding(&request.scope, &request.secret_reference, &request.lease);
+        let durable_cursor = LinkedInPaginationCursor::new_plan(
+            &request.insight_scope,
+            &plan.plan_digest(),
+            &request.request_digest(),
+            sequence,
+            planned_page.page_index,
+            planned_page.target_index,
+            planned_page.window_index,
+            &window.digest,
+            &target_digest,
+            &execution.page.source.query_digest,
+            &page_digest,
+            &execution.page.source.response_digest,
+            &binding,
+            !page_count,
+            previous_cursor
+                .as_ref()
+                .map(LinkedInPaginationCursor::digest),
+        );
+        let observation = self.finish_observation(
+            mission_id,
+            &request,
+            execution,
+            durable_cursor.clone(),
+            previous_cursor,
+            window,
+            LinkedInPageReceipt {
+                page_index: planned_page.page_index,
+                target_index: Some(planned_page.target_index),
+                window_index: Some(planned_page.window_index),
+                target_digest,
+                query_digest: durable_cursor.query_digest().unwrap_or_default().to_owned(),
+                source_digest: durable_cursor
+                    .source_digest()
+                    .unwrap_or_default()
+                    .to_owned(),
+                page_digest,
+            },
+            pending_reconcile,
+        )?;
+        self.observation_log.append(observation.clone())?;
+        self.plan_cursor = Some(durable_cursor);
+        if let Some(reconcile) = &observation.reconcile {
+            self.commit_reconcile(reconcile);
+        }
+        Ok(observation)
+    }
+
+    fn next_plan_page(
+        &self,
+        plan: &LinkedInInsightReadPlan,
+    ) -> Result<(LinkedInPlannedPage, Option<LinkedInPaginationCursor>), LinkedInConnectorError>
+    {
+        plan.validate()?;
+        let binding = read_binding(&plan.scope, &plan.secret_reference, &plan.lease);
+        let previous_cursor = if let Some(cursor) = &self.plan_cursor {
+            cursor.validate_plan(plan, &binding)?;
+            if let Some(supplied) = &plan.cursor {
+                supplied.validate_plan(plan, &binding)?;
+                if supplied.sequence() < cursor.sequence() {
+                    return Err(LinkedInConnectorError::CursorRollback);
+                }
+                if supplied != cursor {
+                    return Err(LinkedInConnectorError::CursorMismatch);
+                }
+            }
+            Some(cursor.clone())
+        } else if let Some(cursor) = &plan.cursor {
+            cursor.validate_plan(plan, &binding)?;
+            Some(cursor.clone())
+        } else {
+            None
+        };
+        let next_page_index = match &previous_cursor {
+            Some(cursor) if cursor.complete() => {
+                return Err(LinkedInConnectorError::CursorComplete);
+            }
+            Some(cursor) => cursor
+                .page_index()
+                .and_then(|value| value.checked_add(1))
+                .ok_or(LinkedInConnectorError::CursorMismatch)?,
+            None => 0,
+        };
+        let page = plan
+            .page_at(next_page_index)?
+            .ok_or(LinkedInConnectorError::CursorComplete)?;
+        Ok((page, previous_cursor))
+    }
+
+    fn mount_generation(&self) -> Result<u64, LinkedInConnectorError> {
+        self.mount
+            .as_ref()
+            .map(|mount| mount.generation)
+            .ok_or(LinkedInConnectorError::NotMounted)
+    }
+
+    fn ensure_session_unchanged(
+        &self,
+        mission_id: &str,
+        request: &LinkedInInsightReadRequest,
+        generation: u64,
+    ) -> Result<(), LinkedInConnectorError> {
+        let mount = self
+            .mount
+            .as_ref()
+            .ok_or(LinkedInConnectorError::LateResponse)?;
+        if self.state != LinkedInConnectionState::Mounted
+            || mount.generation != generation
+            || mount.mission_id != mission_id
+            || mount.scope_digest != request.scope.digest()
+            || mount.credential_reference_digest
+                != digest_bytes(request.secret_reference.reference_id().as_bytes())
+            || mount.credential_revision != request.secret_reference.credential_revision()
+            || mount.lease_revision != request.lease.lease_revision()
+        {
+            return Err(LinkedInConnectorError::LateResponse);
+        }
+        Ok(())
+    }
+
+    fn read_provider_with_retry(
+        &mut self,
+        request: &LinkedInInsightReadRequest,
+        resolver: &dyn LinkedInCredentialResolver,
+    ) -> Result<LinkedInReadExecution, LinkedInConnectorError> {
+        let before = BudgetSnapshot::capture(&self.budget);
+        self.budget
+            .admit(request.requested_at, self.policy.cost_minor)
+            .map_err(LinkedInConnectorError::Budget)?;
+        let after = BudgetSnapshot::capture(&self.budget);
+        let mut attempts = 0_u8;
+        let mut last_retry_after = None;
+        let page = loop {
+            attempts = attempts.saturating_add(1);
+            match self.provider.read(request, resolver) {
+                Ok(page) => break page,
+                Err(LinkedInConnectorError::RateLimited { rate_limit, .. })
+                    if attempts < self.policy.max_attempts
+                        && rate_limit.retry_after_seconds.is_some_and(|seconds| {
+                            seconds <= self.policy.max_retry_delay_seconds
+                        }) =>
+                {
+                    last_retry_after = rate_limit.retry_after_seconds;
+                    if let Some(seconds) = last_retry_after
+                        && seconds > 0
+                    {
+                        thread::sleep(std::time::Duration::from_secs(seconds));
+                    }
+                }
+                Err(
+                    error @ (LinkedInConnectorError::Unauthorized { .. }
+                    | LinkedInConnectorError::PermissionDenied
+                    | LinkedInConnectorError::MissingPermission),
+                ) => {
+                    self.state = LinkedInConnectionState::Stale;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if page.next_start.is_some() {
+            return Err(LinkedInConnectorError::PaginationUnsupported);
+        }
+        Ok(LinkedInReadExecution {
+            page,
+            before,
+            after,
+            attempts,
+            last_retry_after,
+        })
+    }
+
+    fn poll_provider_with_retry(
+        &mut self,
+        request: &LinkedInReconcilePollRequest,
+        resolver: &dyn LinkedInCredentialResolver,
+    ) -> Result<LinkedInReconcileBatch, LinkedInConnectorError> {
+        self.budget
+            .admit(request.requested_at, self.policy.cost_minor)
+            .map_err(LinkedInConnectorError::Budget)?;
+        let mut attempts = 0_u8;
+        loop {
+            attempts = attempts.saturating_add(1);
+            match self.provider.poll_reconcile(request, resolver) {
+                Ok(batch) => return Ok(batch),
+                Err(LinkedInConnectorError::RateLimited { rate_limit, .. })
+                    if attempts < self.policy.max_attempts
+                        && rate_limit.retry_after_seconds.is_some_and(|seconds| {
+                            seconds <= self.policy.max_retry_delay_seconds
+                        }) =>
+                {
+                    if let Some(seconds) = rate_limit.retry_after_seconds
+                        && seconds > 0
+                    {
+                        thread::sleep(std::time::Duration::from_secs(seconds));
+                    }
+                }
+                Err(
+                    error @ (LinkedInConnectorError::Unauthorized { .. }
+                    | LinkedInConnectorError::PermissionDenied
+                    | LinkedInConnectorError::MissingPermission),
+                ) => {
+                    self.state = LinkedInConnectionState::Stale;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+    fn finish_observation(
+        &self,
+        mission_id: &str,
+        request: &LinkedInInsightReadRequest,
+        execution: LinkedInReadExecution,
+        durable_cursor: LinkedInPaginationCursor,
+        previous_cursor: Option<LinkedInPaginationCursor>,
+        window: LinkedInWindowReceipt,
+        page: LinkedInPageReceipt,
+        pending_reconcile: Option<LinkedInPendingReconcile>,
+    ) -> Result<LinkedInInsightObservation, LinkedInConnectorError> {
+        let expected_model = expected_attribution_model(request.target.kind());
+        if execution.page.attribution.model != expected_model {
+            return Err(LinkedInConnectorError::AttributionModelDrift);
+        }
+        if execution
+            .page
+            .permission
+            .missing_scopes
+            .iter()
+            .next()
+            .is_some()
+        {
+            return Err(LinkedInConnectorError::MissingPermission);
+        }
+        let valid_until = execution
+            .page
+            .observed_at
+            .checked_add_signed(self.policy.freshness_ttl)
+            .ok_or(LinkedInConnectorError::InvalidObservation)?;
+        FreshnessWindow::new(
+            execution.page.observed_at,
+            valid_until,
+            durable_cursor.sequence(),
+        )
+        .map_err(|_| LinkedInConnectorError::InvalidObservation)?
+        .validate_at(execution.page.observed_at)
+        .map_err(|_| LinkedInConnectorError::InvalidObservation)?;
+        let content_digest = digest_serializable(&execution.page.records)?;
+        let binding = read_binding(&request.scope, &request.secret_reference, &request.lease);
+        let observation_digest = digest_serializable(&(
+            &request.scope,
+            &request.insight_scope,
+            &request.target,
+            &window,
+            &page,
+            &binding,
+            &execution.page.source,
+            &content_digest,
+            pending_reconcile
+                .as_ref()
+                .map(|value| &value.delivery_digest),
+            execution.page.observed_at,
+        ))?;
+        let reconcile = pending_reconcile.map(|pending| LinkedInReconcileReceipt {
+            source: pending.source,
+            delivery_digest: pending.delivery_digest,
+            notification_digests: pending.notification_digests,
+            notification_ids: pending.notification_ids,
+            organization_id: pending.organization_id,
+            max_last_modified_at_ms: pending.max_last_modified_at_ms,
+            observed_at: pending.observed_at,
+            payload_digest: pending.payload_digest,
+            source_digest: pending.source_digest,
+            poll_source: pending.poll_source,
+            rate_limit: pending.rate_limit,
+            cost_minor: pending.cost_minor,
+            poll_cursor: pending.poll_cursor,
+            cursor_digest: durable_cursor.digest(),
+            page_digest: page.page_digest.clone(),
+            model: execution.page.attribution.model.clone(),
+            causal_status: LinkedInCausalStatus::NotClaimed,
+        });
+        if let Some(receipt) = &reconcile {
+            receipt.validate()?;
+        }
+        let cursor = LinkedInCursorReceipt {
+            sequence: durable_cursor.sequence(),
+            current_digest: previous_cursor.map(|value| value.digest()),
+            next_digest: Some(durable_cursor.digest()),
+            durable_checkpoint_digest: durable_cursor.digest(),
+            complete: durable_cursor.complete(),
+            durable_cursor: durable_cursor.clone(),
+        };
+        let observation = LinkedInInsightObservation {
+            schema_version: LINKEDIN_INSIGHT_READ_SCHEMA.to_owned(),
+            observation_id: format!("linkedin-observation-{observation_digest}"),
+            mission_id: mission_id.to_owned(),
+            scope: request.insight_scope.clone(),
+            connector_scope_digest: request.scope.digest(),
+            binding,
+            target: request.target.clone(),
+            window,
+            page,
+            requested_at: request.requested_at,
+            observed_at: execution.page.observed_at,
+            source: execution.page.source.clone(),
+            records: execution.page.records,
+            permission: execution.page.permission.clone(),
+            rate_limit: execution.page.rate_limit.clone(),
+            retry: LinkedInRetryReceipt {
+                attempts: execution.attempts,
+                retried: execution.attempts > 1,
+                last_retry_after_seconds: execution.last_retry_after,
+                exhausted: false,
+            },
+            freshness: LinkedInFreshnessReceipt {
+                observed_at: execution.page.observed_at,
+                valid_until,
+                ttl_seconds: self.policy.freshness_ttl.num_seconds(),
+                fresh_at_observation: true,
+            },
+            quota: LinkedInQuotaReceipt {
+                configured_limit: execution.before.quota_limit,
+                used_before: execution.before.quota_used,
+                used_after: execution.after.quota_used,
+                rate_remaining_before: execution.before.rate_remaining,
+                rate_remaining_after: execution.after.rate_remaining,
+                provider_rate_limit: execution.page.rate_limit.clone(),
+            },
+            cost: LinkedInCostReceipt {
+                configured_limit_minor: execution.before.cost_limit_minor,
+                charged_minor: self.policy.cost_minor,
+                used_before_minor: execution.before.cost_used_minor,
+                used_after_minor: execution.after.cost_used_minor,
+            },
+            cursor,
+            classification: LinkedInClassification {
+                kind: execution.page.classification,
+                attribution: execution.page.attribution,
+                review_state: execution.page.permission.review_state,
+                provenance: request.provenance,
+                causal_status: LinkedInCausalStatus::NotClaimed,
+            },
+            digests: LinkedInDigestReceipt {
+                request_digest: request.request_digest(),
+                response_digest: execution.page.source.response_digest.clone(),
+                content_digest,
+                observation_digest,
+            },
+            provenance: request.provenance,
+            causal_status: LinkedInCausalStatus::NotClaimed,
+            reconcile,
+        };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_reconcile(
+        &self,
+        source: LinkedInReconcileSource,
+        notifications: &[LinkedInWebhookNotification],
+        organization_id: &str,
+        payload_digest: String,
+        source_digest: String,
+        observed_at: DateTime<Utc>,
+        poll_source: Option<LinkedInRequestEvidence>,
+        rate_limit: LinkedInRateLimit,
+        cost_minor: i64,
+        poll_cursor: Option<LinkedInPaginationCursor>,
+    ) -> Result<LinkedInPendingReconcile, LinkedInConnectorError> {
+        if notifications.is_empty()
+            || !is_digest(&payload_digest)
+            || !is_digest(&source_digest)
+            || cost_minor < 0
+        {
+            return Err(LinkedInConnectorError::InvalidReconcile);
+        }
+        let watermark = self
+            .reconcile_watermarks
+            .get(organization_id)
+            .copied()
+            .unwrap_or(-1);
+        let mut previous_modified = None;
+        let mut notification_digests = Vec::with_capacity(notifications.len());
+        let mut notification_ids = Vec::with_capacity(notifications.len());
+        for notification in notifications {
+            notification.validate()?;
+            if notification.organization_id() != organization_id {
+                return Err(LinkedInConnectorError::ScopeMismatch);
+            }
+            let digest = notification.delivery_digest()?;
+            if self.reconcile_seen.contains(&digest) {
+                return Err(LinkedInConnectorError::DuplicateDelivery);
+            }
+            if notification.last_modified_at_ms < watermark
+                || previous_modified.is_some_and(|value| notification.last_modified_at_ms < value)
+            {
+                return Err(LinkedInConnectorError::OutOfOrderDelivery);
+            }
+            previous_modified = Some(notification.last_modified_at_ms);
+            notification_digests.push(digest);
+            notification_ids.push(notification.notification_id);
+        }
+        let mut sorted_digests = notification_digests.clone();
+        sorted_digests.sort();
+        let delivery_digest = digest_serializable(&sorted_digests)?;
+        let max_last_modified_at_ms = notifications
+            .iter()
+            .map(|notification| notification.last_modified_at_ms)
+            .max()
+            .ok_or(LinkedInConnectorError::InvalidReconcile)?;
+        Ok(LinkedInPendingReconcile {
+            source,
+            delivery_digest,
+            notification_digests,
+            notification_ids,
+            organization_id: organization_id.to_owned(),
+            max_last_modified_at_ms,
+            observed_at,
+            payload_digest,
+            source_digest,
+            poll_source,
+            rate_limit,
+            cost_minor,
+            poll_cursor,
+        })
+    }
+
+    fn commit_reconcile(&mut self, receipt: &LinkedInReconcileReceipt) {
+        self.reconcile_seen
+            .extend(receipt.notification_digests.iter().cloned());
+        self.reconcile_watermarks
+            .entry(receipt.organization_id.clone())
+            .and_modify(|value| {
+                *value = (*value).max(receipt.max_last_modified_at_ms);
+            })
+            .or_insert(receipt.max_last_modified_at_ms);
+        if let Some(cursor) = &receipt.poll_cursor {
+            self.poll_cursor = Some(cursor.clone());
+        }
+    }
+
+    fn validate_reconcile_target(
+        target: &LinkedInInsightTarget,
+        notifications: &[LinkedInWebhookNotification],
+    ) -> Result<(), LinkedInConnectorError> {
+        let expected_page = match target {
+            LinkedInInsightTarget::OrganizationPage { page_id, .. }
+            | LinkedInInsightTarget::OrganizationPost { page_id, .. } => page_id,
+            LinkedInInsightTarget::AdAccount { .. } => {
+                return Err(LinkedInConnectorError::InvalidReconcile);
+            }
+        };
+        if notifications
+            .iter()
+            .any(|notification| notification.organization_id() != expected_page)
+        {
+            return Err(LinkedInConnectorError::ScopeMismatch);
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1878,6 +3609,19 @@ impl PaidSocialInsightReadService {
             &content_digest,
             page.observed_at,
         ))?;
+        let binding = read_binding(&request.scope, &request.secret_reference, &request.lease);
+        let window = LinkedInWindowReceipt::new(request.since, request.until)?;
+        let target_digest = digest_serializable(&request.target)?;
+        let page_digest = page_digest(&request.target, &window, &page.source, &content_digest);
+        let page_receipt = LinkedInPageReceipt {
+            page_index: durable_cursor.start(),
+            target_index: None,
+            window_index: None,
+            target_digest,
+            query_digest: page.source.query_digest.clone(),
+            source_digest: page.source.response_digest.clone(),
+            page_digest,
+        };
         let cursor = LinkedInCursorReceipt {
             sequence: durable_cursor.sequence(),
             current_digest: provider_request
@@ -1895,7 +3639,10 @@ impl PaidSocialInsightReadService {
             mission_id: mission_id.to_owned(),
             scope: request.insight_scope.clone(),
             connector_scope_digest: request.scope.digest(),
+            binding,
             target: request.target.clone(),
+            window,
+            page: page_receipt,
             requested_at: request.requested_at,
             observed_at: page.observed_at,
             source: page.source.clone(),
@@ -1944,6 +3691,7 @@ impl PaidSocialInsightReadService {
             },
             provenance: request.provenance,
             causal_status: LinkedInCausalStatus::NotClaimed,
+            reconcile: None,
         };
         let mut observation = observation;
         observation.quota.provider_rate_limit = observation.rate_limit.clone();
@@ -1959,6 +3707,7 @@ impl PaidSocialInsightReadService {
         request: &LinkedInProbeRequest,
         observation: &LinkedInProbeObservation,
     ) -> Result<(), LinkedInConnectorError> {
+        let replacing_existing_mount = self.mount.is_some();
         observation.validate()?;
         if observation.scope != request.insight_scope
             || observation.connector_scope_digest != request.scope.digest()
@@ -1980,7 +3729,13 @@ impl PaidSocialInsightReadService {
             generation: 1,
         });
         self.state = LinkedInConnectionState::Mounted;
-        self.cursor = None;
+        if replacing_existing_mount {
+            self.cursor = None;
+            self.plan_cursor = None;
+            self.poll_cursor = None;
+            self.reconcile_seen.clear();
+            self.reconcile_watermarks.clear();
+        }
         Ok(())
     }
 
@@ -2127,6 +3882,110 @@ impl MissionPaidSocialInsightConsumer {
             observation,
             durable_log_revision: self.service.observation_log.revision(),
         })
+    }
+
+    pub fn read_plan_page(
+        &mut self,
+        mission_id: &str,
+        plan: &LinkedInInsightReadPlan,
+        resolver: &dyn LinkedInCredentialResolver,
+    ) -> Result<MissionInsightResult, LinkedInConnectorError> {
+        self.ensure_capability(mission_id)?;
+        let observation = match self.service.read_plan_page(mission_id, plan, resolver) {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.mark_stale_on_error(&error);
+                return Err(error);
+            }
+        };
+        Ok(MissionInsightResult {
+            mission_id: mission_id.to_owned(),
+            capability: MissionCapability::PaidSocialInsightRead,
+            observation,
+            durable_log_revision: self.service.observation_log.revision(),
+        })
+    }
+
+    pub fn reconcile_webhook(
+        &mut self,
+        mission_id: &str,
+        plan: &LinkedInInsightReadPlan,
+        event: &LinkedInWebhookEvent,
+        resolver: &dyn LinkedInCredentialResolver,
+    ) -> Result<MissionInsightResult, LinkedInConnectorError> {
+        self.ensure_capability(mission_id)?;
+        let observation = match self
+            .service
+            .reconcile_webhook(mission_id, plan, event, resolver)
+        {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.mark_stale_on_error(&error);
+                return Err(error);
+            }
+        };
+        Ok(MissionInsightResult {
+            mission_id: mission_id.to_owned(),
+            capability: MissionCapability::PaidSocialInsightRead,
+            observation,
+            durable_log_revision: self.service.observation_log.revision(),
+        })
+    }
+
+    pub fn reconcile_poll(
+        &mut self,
+        mission_id: &str,
+        plan: &LinkedInInsightReadPlan,
+        request: &LinkedInReconcilePollRequest,
+        resolver: &dyn LinkedInCredentialResolver,
+    ) -> Result<MissionInsightResult, LinkedInConnectorError> {
+        self.ensure_capability(mission_id)?;
+        let observation = match self
+            .service
+            .reconcile_poll(mission_id, plan, request, resolver)
+        {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.mark_stale_on_error(&error);
+                return Err(error);
+            }
+        };
+        Ok(MissionInsightResult {
+            mission_id: mission_id.to_owned(),
+            capability: MissionCapability::PaidSocialInsightRead,
+            observation,
+            durable_log_revision: self.service.observation_log.revision(),
+        })
+    }
+
+    fn ensure_capability(&self, mission_id: &str) -> Result<(), LinkedInConnectorError> {
+        let grant = self
+            .capability
+            .as_ref()
+            .ok_or(LinkedInConnectorError::NotMounted)?;
+        if grant.mission_id != mission_id {
+            return Err(LinkedInConnectorError::MissionMismatch);
+        }
+        if grant.connection_state == LinkedInConnectionState::Stale {
+            return Err(LinkedInConnectorError::ProbeStale);
+        }
+        if grant.connection_state != LinkedInConnectionState::Mounted {
+            return Err(LinkedInConnectorError::MissionMismatch);
+        }
+        Ok(())
+    }
+
+    fn mark_stale_on_error(&mut self, error: &LinkedInConnectorError) {
+        if matches!(
+            error,
+            LinkedInConnectorError::Unauthorized { .. }
+                | LinkedInConnectorError::PermissionDenied
+                | LinkedInConnectorError::MissingPermission
+        ) && self.service.state() == LinkedInConnectionState::Stale
+            && let Some(capability) = self.capability.as_mut()
+        {
+            capability.connection_state = LinkedInConnectionState::Stale;
+        }
     }
 
     pub fn unmount(&mut self) {
@@ -2554,12 +4413,221 @@ fn is_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn token_generation_digest(
+    credential_reference_digest: &str,
+    credential_revision: u64,
+    lease_revision: u64,
+) -> String {
+    digest_material([
+        credential_reference_digest.to_owned(),
+        credential_revision.to_string(),
+        lease_revision.to_string(),
+        LINKEDIN_ADAPTER_ID.to_owned(),
+        LINKEDIN_ADAPTER_VERSION.to_string(),
+    ])
+}
+
+fn read_binding(
+    scope: &ConnectorScope,
+    secret_reference: &SecretReference,
+    lease: &CredentialLease,
+) -> LinkedInReadBinding {
+    let credential_reference_digest = digest_bytes(secret_reference.reference_id().as_bytes());
+    LinkedInReadBinding {
+        scope_digest: scope.digest(),
+        credential_reference_digest: credential_reference_digest.clone(),
+        credential_revision: secret_reference.credential_revision(),
+        lease_revision: lease.lease_revision(),
+        token_generation_digest: token_generation_digest(
+            &credential_reference_digest,
+            secret_reference.credential_revision(),
+            lease.lease_revision(),
+        ),
+        adapter_id: LINKEDIN_ADAPTER_ID.to_owned(),
+        adapter_version: LINKEDIN_ADAPTER_VERSION,
+    }
+}
+
+fn validate_linkedin_credentials(
+    scope: &ConnectorScope,
+    secret_reference: &SecretReference,
+    lease: &CredentialLease,
+    requested_at: DateTime<Utc>,
+) -> Result<(), LinkedInConnectorError> {
+    if secret_reference.scope() != scope
+        || lease.scope() != scope
+        || lease.adapter().adapter_id() != LINKEDIN_ADAPTER_ID
+        || lease.adapter().adapter_version() != LINKEDIN_ADAPTER_VERSION
+    {
+        return Err(LinkedInConnectorError::CredentialLeaseInvalid);
+    }
+    lease
+        .validate(secret_reference, requested_at)
+        .map_err(|_| LinkedInConnectorError::CredentialLeaseInvalid)?;
+    lease
+        .validate(secret_reference, Utc::now())
+        .map_err(|_| LinkedInConnectorError::CredentialLeaseInvalid)
+}
+
+fn plan_request(
+    plan: &LinkedInInsightReadPlan,
+    page: &LinkedInPlannedPage,
+) -> LinkedInInsightReadRequest {
+    LinkedInInsightReadRequest {
+        scope: plan.scope.clone(),
+        insight_scope: plan.insight_scope.clone(),
+        secret_reference: plan.secret_reference.clone(),
+        lease: plan.lease.clone(),
+        target: page.target.clone(),
+        since: page.since,
+        until: page.until,
+        page_size: plan.page_size,
+        cursor: None,
+        requested_at: plan.requested_at,
+        provenance: plan.provenance,
+    }
+}
+
+fn expected_attribution_model(kind: LinkedInInsightTargetKind) -> &'static str {
+    match kind {
+        LinkedInInsightTargetKind::OrganizationPage
+        | LinkedInInsightTargetKind::OrganizationPost => "linkedin_organization_share_statistics",
+        LinkedInInsightTargetKind::AdAccount => "linkedin_ad_analytics",
+    }
+}
+
+fn page_digest(
+    target: &LinkedInInsightTarget,
+    window: &LinkedInWindowReceipt,
+    source: &LinkedInRequestEvidence,
+    content_digest: &str,
+) -> String {
+    digest_material([
+        digest_serializable(target).expect("target serialization"),
+        window.digest.clone(),
+        source.query_digest.clone(),
+        source.response_digest.clone(),
+        content_digest.to_owned(),
+    ])
+}
+
+fn linked_in_notification_action(action: &str) -> bool {
+    matches!(
+        action,
+        "LIKE"
+            | "COMMENT"
+            | "SHARE"
+            | "SHARE_MENTION"
+            | "ADMIN_COMMENT"
+            | "COMMENT_EDIT"
+            | "COMMENT_DELETE"
+    )
+}
+
+fn notification_query(request: &LinkedInReconcilePollRequest) -> Vec<(String, String)> {
+    vec![
+        ("q".to_owned(), "criteria".to_owned()),
+        (
+            "actions".to_owned(),
+            "List(LIKE,COMMENT,SHARE,SHARE_MENTION,ADMIN_COMMENT,COMMENT_EDIT,COMMENT_DELETE)"
+                .to_owned(),
+        ),
+        (
+            "organizationalEntity".to_owned(),
+            format!("urn:li:organization:{}", request.organization_id),
+        ),
+        (
+            "timeRange.start".to_owned(),
+            request.since.timestamp_millis().to_string(),
+        ),
+        (
+            "timeRange.end".to_owned(),
+            request.until.timestamp_millis().to_string(),
+        ),
+        ("count".to_owned(), request.page_size.to_string()),
+        (
+            "start".to_owned(),
+            request
+                .cursor
+                .as_ref()
+                .map_or(0, LinkedInPaginationCursor::start)
+                .to_string(),
+        ),
+    ]
+}
+
+fn parse_notifications(
+    value: &serde_json::Value,
+    expected_organization_id: &str,
+) -> Result<Vec<LinkedInWebhookNotification>, LinkedInConnectorError> {
+    let elements = value
+        .get("elements")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(LinkedInConnectorError::InvalidProviderResponse { status: 200 })?;
+    let mut notifications = Vec::with_capacity(elements.len());
+    for element in elements {
+        let notification_id = element
+            .get("notificationId")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(LinkedInConnectorError::InvalidProviderResponse { status: 200 })?;
+        let organizational_entity = element
+            .get("organizationalEntity")
+            .and_then(value_as_string)
+            .ok_or(LinkedInConnectorError::InvalidProviderResponse { status: 200 })?;
+        let action = element
+            .get("action")
+            .and_then(value_as_string)
+            .ok_or(LinkedInConnectorError::InvalidProviderResponse { status: 200 })?;
+        let last_modified_at_ms = element
+            .get("lastModifiedAt")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or(LinkedInConnectorError::InvalidProviderResponse { status: 200 })?;
+        let notification = LinkedInWebhookNotification {
+            notification_id,
+            organizational_entity,
+            action,
+            last_modified_at_ms,
+            source_post: element.get("sourcePost").and_then(value_as_string),
+            generated_activity: element.get("generatedActivity").and_then(value_as_string),
+        };
+        notification.validate()?;
+        if notification.organization_id() != expected_organization_id {
+            return Err(LinkedInConnectorError::ScopeMismatch);
+        }
+        notifications.push(notification);
+    }
+    Ok(notifications)
+}
+
+fn provider_next_start(value: &serde_json::Value) -> Option<u64> {
+    let paging = value.get("paging")?;
+    let start = paging.get("start").and_then(serde_json::Value::as_u64)?;
+    let count = paging.get("count").and_then(serde_json::Value::as_u64)?;
+    if paging
+        .get("links")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|links| {
+            links
+                .iter()
+                .any(|link| link.get("rel").and_then(serde_json::Value::as_str) == Some("next"))
+        })
+    {
+        start.checked_add(count)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ConnectorAuth, ProviderAdapterIdentity};
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::io::Read as _;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::Duration as IoDuration;
 
     #[derive(Debug)]
     struct MockTransport {
@@ -2605,6 +4673,206 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Err(LinkedInTransportError::InvalidResponse))
         }
+    }
+
+    #[derive(Debug)]
+    struct LoopbackHttpTransport {
+        address: SocketAddr,
+    }
+
+    impl LinkedInHttpTransport for LoopbackHttpTransport {
+        fn send(
+            &self,
+            request: &LinkedInHttpRequest,
+            token: &LinkedInAccessToken,
+        ) -> Result<LinkedInHttpResponse, LinkedInTransportError> {
+            let target = loopback_request_target(request)?;
+            let mut stream =
+                TcpStream::connect(self.address).map_err(|_| LinkedInTransportError::Io)?;
+            stream
+                .set_read_timeout(Some(IoDuration::from_secs(2)))
+                .map_err(|_| LinkedInTransportError::Io)?;
+            let mut wire = format!(
+                "{} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\n",
+                request.method,
+                target,
+                token.expose()
+            );
+            for (name, value) in &request.headers {
+                let _ = writeln!(&mut wire, "{name}: {value}");
+            }
+            wire.push_str("Connection: close\r\n\r\n");
+            stream
+                .write_all(wire.as_bytes())
+                .map_err(|_| LinkedInTransportError::Io)?;
+            let mut bytes = Vec::new();
+            stream
+                .read_to_end(&mut bytes)
+                .map_err(|_| LinkedInTransportError::Io)?;
+            parse_loopback_response(&bytes)
+        }
+    }
+
+    #[derive(Default)]
+    struct LoopbackCapture {
+        request_lines: Vec<String>,
+        authenticated_requests: usize,
+    }
+
+    fn loopback_request_target(
+        request: &LinkedInHttpRequest,
+    ) -> Result<String, LinkedInTransportError> {
+        let url = request.url_with_query();
+        let authority = url
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .ok_or(LinkedInTransportError::InvalidResponse)?;
+        let slash = authority
+            .find('/')
+            .ok_or(LinkedInTransportError::InvalidResponse)?;
+        Ok(authority[slash..].to_owned())
+    }
+
+    fn read_loopback_headers(stream: &mut TcpStream) -> Result<Vec<u8>, LinkedInTransportError> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream
+                .read(&mut buffer)
+                .map_err(|_| LinkedInTransportError::Io)?;
+            if count == 0 {
+                return Err(LinkedInTransportError::InvalidResponse);
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(bytes);
+            }
+            if bytes.len() > 16 * 1024 {
+                return Err(LinkedInTransportError::InvalidResponse);
+            }
+        }
+    }
+
+    fn parse_loopback_response(
+        bytes: &[u8],
+    ) -> Result<LinkedInHttpResponse, LinkedInTransportError> {
+        let separator = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or(LinkedInTransportError::InvalidResponse)?;
+        let header_end = separator + 4;
+        let header_text = String::from_utf8_lossy(&bytes[..separator]);
+        let mut lines = header_text.lines();
+        let status = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or(LinkedInTransportError::InvalidResponse)?;
+        let headers = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
+        Ok(LinkedInHttpResponse {
+            status,
+            headers,
+            body: bytes[header_end..].to_vec(),
+            received_at: Utc::now(),
+        })
+    }
+
+    fn loopback_server() -> (SocketAddr, Arc<Mutex<LoopbackCapture>>, JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+        let address = listener.local_addr().expect("loopback address");
+        let capture = Arc::new(Mutex::new(LoopbackCapture::default()));
+        let captured = Arc::clone(&capture);
+        let server = std::thread::spawn(move || {
+            for index in 0..8 {
+                let (mut stream, _) = listener.accept().expect("loopback connection");
+                let request = read_loopback_headers(&mut stream).expect("loopback request");
+                let request_text = String::from_utf8_lossy(&request);
+                let request_line = request_text.lines().next().unwrap_or_default();
+                assert_eq!(request_line.split_whitespace().next(), Some("GET"));
+                assert!(request_text.contains("Authorization: Bearer linkedin-test-token"));
+                assert!(request_text.contains("Linkedin-Version: 202606"));
+                assert!(request_text.contains("X-Restli-Protocol-Version: 2.0.0"));
+                {
+                    let mut capture = captured.lock().expect("loopback capture");
+                    capture.request_lines.push(request_line.to_owned());
+                    capture.authenticated_requests += 1;
+                }
+                let (body, request_id, remaining) = match index {
+                    0 => {
+                        assert_eq!(request_line, "GET /v2/userinfo HTTP/1.1");
+                        (r#"{"id":"member-1"}"#, "loopback-member", "99")
+                    }
+                    1 => {
+                        assert_eq!(request_line, "GET /rest/organizations/org-1 HTTP/1.1");
+                        (r#"{"id":"org-1"}"#, "loopback-org", "98")
+                    }
+                    2 => {
+                        assert_eq!(request_line, "GET /rest/organizations/page-1 HTTP/1.1");
+                        (r#"{"id":"page-1"}"#, "loopback-page", "97")
+                    }
+                    3 => {
+                        assert_eq!(request_line, "GET /rest/adAccounts/ad-1 HTTP/1.1");
+                        (r#"{"id":"ad-1"}"#, "loopback-ad", "96")
+                    }
+                    4 => {
+                        assert!(
+                            request_line.contains("GET /rest/organizationalEntityNotifications?")
+                        );
+                        assert!(request_line.contains("start=0"));
+                        assert!(request_line.contains("count=1"));
+                        (
+                            r#"{"elements":[{"notificationId":77,"organizationalEntity":"urn:li:organization:page-1","action":"SHARE","lastModifiedAt":200,"sourcePost":"urn:li:share:post-1"}],"paging":{"start":0,"count":1,"links":[{"rel":"next","href":"/rest/organizationalEntityNotifications?start=1"}]}}"#,
+                            "loopback-poll-1",
+                            "95",
+                        )
+                    }
+                    5 => {
+                        assert!(
+                            request_line.contains("GET /rest/organizationalEntityShareStatistics?")
+                        );
+                        (
+                            r#"{"elements":[{"id":"share-1","impressions":8}]}"#,
+                            "loopback-read-1",
+                            "94",
+                        )
+                    }
+                    6 => {
+                        assert!(
+                            request_line.contains("GET /rest/organizationalEntityNotifications?")
+                        );
+                        assert!(request_line.contains("start=1"));
+                        assert!(request_line.contains("count=1"));
+                        (
+                            r#"{"elements":[{"notificationId":78,"organizationalEntity":"urn:li:organization:page-1","action":"COMMENT","lastModifiedAt":201,"sourcePost":"urn:li:share:post-2"}],"paging":{"start":1,"count":1}}"#,
+                            "loopback-poll-2",
+                            "93",
+                        )
+                    }
+                    7 => {
+                        assert!(
+                            request_line.contains("GET /rest/organizationalEntityShareStatistics?")
+                        );
+                        (
+                            r#"{"elements":[{"id":"share-2","impressions":9}]}"#,
+                            "loopback-read-2",
+                            "92",
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nx-li-request-id: {request_id}\r\nx-ratelimit-limit: 100\r\nx-ratelimit-remaining: {remaining}\r\nx-ratelimit-reset: 4102444800\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("loopback response");
+            }
+        });
+        (address, capture, server)
     }
 
     fn response(body: &str, headers: &[(&str, &str)]) -> LinkedInHttpResponse {
@@ -2698,6 +4966,48 @@ mod tests {
             cursor: None,
             requested_at: now,
             provenance: ProviderProvenanceClass::ComponentHarness,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_plan(
+        scope: ConnectorScope,
+        insight_scope: LinkedInInsightScope,
+        secret_reference: SecretReference,
+        lease: CredentialLease,
+        targets: Vec<LinkedInInsightTarget>,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        window: Duration,
+    ) -> LinkedInInsightReadPlan {
+        LinkedInInsightReadPlan::new(
+            "mission-linkedin-1",
+            scope,
+            insight_scope,
+            secret_reference,
+            lease,
+            targets,
+            since,
+            until,
+            window,
+            2,
+            until,
+            ProviderProvenanceClass::ComponentHarness,
+        )
+        .expect("read plan")
+    }
+
+    fn webhook_notification(
+        notification_id: u64,
+        last_modified_at_ms: i64,
+    ) -> LinkedInWebhookNotification {
+        LinkedInWebhookNotification {
+            notification_id,
+            organizational_entity: "urn:li:organization:page-1".to_owned(),
+            action: "SHARE".to_owned(),
+            last_modified_at_ms,
+            source_post: Some("urn:li:share:post-1".to_owned()),
+            generated_activity: None,
         }
     }
 
@@ -3047,6 +5357,538 @@ mod tests {
                 .read("mission-linkedin-1", &request, &resolver)
                 .expect_err("complete provider cursor"),
             LinkedInConnectorError::CursorComplete
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn plan_cursor_walks_targets_and_windows_and_restores_without_duplicates() {
+        let now = Utc::now();
+        let page_target = LinkedInInsightTarget::OrganizationPage {
+            organization_id: "org-1".to_owned(),
+            page_id: "page-1".to_owned(),
+        };
+        let ad_target = LinkedInInsightTarget::AdAccount {
+            ad_account_id: "ad-1".to_owned(),
+        };
+        let (scope, insight_scope, secret, lease, resolver) = scope_and_auth(&[
+            "openid",
+            "profile",
+            "rw_organization_admin",
+            "r_organization_social",
+            "r_ads",
+            "r_ads_reporting",
+        ]);
+        let probe = probe_request(
+            scope.clone(),
+            insight_scope.clone(),
+            secret.clone(),
+            lease.clone(),
+        );
+        let plan = read_plan(
+            scope.clone(),
+            insight_scope.clone(),
+            secret.clone(),
+            lease.clone(),
+            vec![page_target, ad_target],
+            now - Duration::days(2),
+            now,
+            Duration::days(1),
+        );
+        let read_responses = [
+            r#"{"elements":[{"id":"page-day-1","impressions":1}]}"#,
+            r#"{"elements":[{"id":"page-day-2","impressions":2}]}"#,
+            r#"{"elements":[{"id":"ad-day-1","impressions":3}]}"#,
+            r#"{"elements":[{"id":"ad-day-2","impressions":4}]}"#,
+        ];
+        let transport = Arc::new(MockTransport::new(
+            probe_responses()
+                .into_iter()
+                .chain(read_responses.iter().map(|body| response(body, &[]))),
+        ));
+        let mut consumer = MissionPaidSocialInsightConsumer::new(service(
+            transport.clone(),
+            LinkedInReadPolicy::default(),
+        ));
+        consumer
+            .attach("mission-linkedin-1", &probe, &resolver)
+            .expect("attach");
+        let first = consumer
+            .read_plan_page("mission-linkedin-1", &plan, &resolver)
+            .expect("first page");
+        assert_eq!(first.observation.page.page_index, 0);
+        assert_eq!(first.observation.page.target_index, Some(0));
+        assert_eq!(first.observation.page.window_index, Some(0));
+        assert_eq!(
+            first.observation.cursor.durable_cursor.plan_digest(),
+            Some(plan.plan_digest().as_str())
+        );
+        let second = consumer
+            .read_plan_page("mission-linkedin-1", &plan, &resolver)
+            .expect("second page");
+        assert_eq!(second.observation.page.page_index, 1);
+        assert_eq!(second.observation.page.target_index, Some(0));
+        assert_eq!(second.observation.page.window_index, Some(1));
+        assert!(!second.observation.cursor.complete);
+        let first_cursor = first.observation.cursor.durable_cursor.clone();
+        let checkpoint = consumer
+            .service()
+            .observation_log_checkpoint()
+            .expect("checkpoint");
+        assert_eq!(consumer.service().observation_log().revision(), 2);
+
+        let restored_transport =
+            Arc::new(MockTransport::new(probe_responses().into_iter().chain(
+                read_responses[2..].iter().map(|body| response(body, &[])),
+            )));
+        let mut restored = MissionPaidSocialInsightConsumer::new(service(
+            restored_transport.clone(),
+            LinkedInReadPolicy::default(),
+        ));
+        restored
+            .service_mut()
+            .restore_observation_log(&checkpoint)
+            .expect("restore cursor before attach");
+        restored
+            .attach("mission-linkedin-1", &probe, &resolver)
+            .expect("reattach");
+        let third = restored
+            .read_plan_page("mission-linkedin-1", &plan, &resolver)
+            .expect("third page");
+        let fourth = restored
+            .read_plan_page("mission-linkedin-1", &plan, &resolver)
+            .expect("fourth page");
+        assert_eq!(third.observation.page.page_index, 2);
+        assert_eq!(third.observation.page.target_index, Some(1));
+        assert_eq!(third.observation.page.window_index, Some(0));
+        assert_eq!(fourth.observation.page.page_index, 3);
+        assert_eq!(fourth.observation.page.target_index, Some(1));
+        assert_eq!(fourth.observation.page.window_index, Some(1));
+        assert!(fourth.observation.cursor.complete);
+        assert_eq!(restored.service().observation_log().revision(), 4);
+        assert_eq!(
+            restored.service().observation_log().entries[0]
+                .page
+                .page_index,
+            0
+        );
+        assert_eq!(
+            restored.service().observation_log().entries[1]
+                .page
+                .page_index,
+            1
+        );
+        assert_eq!(
+            restored.service().observation_log().entries[2]
+                .page
+                .page_index,
+            2
+        );
+        assert_eq!(
+            restored.service().observation_log().entries[3]
+                .page
+                .page_index,
+            3
+        );
+
+        let mut rollback_plan = plan.clone().with_cursor(first_cursor);
+        assert_eq!(
+            restored
+                .read_plan_page("mission-linkedin-1", &rollback_plan, &resolver)
+                .expect_err("cursor rollback"),
+            LinkedInConnectorError::CursorRollback
+        );
+        rollback_plan.cursor = None;
+        restored.unmount();
+        assert_eq!(
+            restored
+                .read_plan_page("mission-linkedin-1", &rollback_plan, &resolver)
+                .expect_err("unmounted plan"),
+            LinkedInConnectorError::NotMounted
+        );
+        let requests = restored_transport.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 6);
+        assert!(
+            requests[4]
+                .query
+                .iter()
+                .any(|(name, value)| { name == "dateRange" && value.contains("start:(year:") })
+        );
+        assert!(
+            requests[5]
+                .query
+                .iter()
+                .any(|(name, value)| { name == "dateRange" && value.contains("start:(year:") })
+        );
+    }
+
+    #[test]
+    fn webhook_reconcile_is_durable_and_deduplicates_out_of_order_delivery() {
+        let now = Utc::now();
+        let transport = Arc::new(MockTransport::new(probe_responses().into_iter().chain([
+            response(
+                r#"{"elements":[{"id":"share-1","impressions":8}]}"#,
+                &[("x-li-request-id", "webhook-read")],
+            ),
+        ])));
+        let (scope, insight_scope, secret, lease, resolver) = scope_and_auth(&[
+            "openid",
+            "profile",
+            "rw_organization_admin",
+            "r_organization_social",
+            "r_ads",
+            "r_ads_reporting",
+        ]);
+        let probe = probe_request(
+            scope.clone(),
+            insight_scope.clone(),
+            secret.clone(),
+            lease.clone(),
+        );
+        let plan = read_plan(
+            scope,
+            insight_scope,
+            secret,
+            lease,
+            vec![LinkedInInsightTarget::OrganizationPage {
+                organization_id: "org-1".to_owned(),
+                page_id: "page-1".to_owned(),
+            }],
+            now - Duration::days(2),
+            now,
+            Duration::days(1),
+        );
+        let event = LinkedInWebhookEvent::new(vec![webhook_notification(42, 100)], now)
+            .expect("webhook event");
+        let mut consumer = MissionPaidSocialInsightConsumer::new(service(
+            transport.clone(),
+            LinkedInReadPolicy::default(),
+        ));
+        consumer
+            .attach("mission-linkedin-1", &probe, &resolver)
+            .expect("attach");
+        let result = consumer
+            .reconcile_webhook("mission-linkedin-1", &plan, &event, &resolver)
+            .expect("webhook reconcile");
+        let receipt = result
+            .observation
+            .reconcile
+            .as_ref()
+            .expect("reconcile receipt");
+        assert_eq!(receipt.source, LinkedInReconcileSource::Webhook);
+        assert_eq!(receipt.notification_ids, vec![42]);
+        assert_eq!(receipt.organization_id, "page-1");
+        assert_eq!(receipt.model, "linkedin_organization_share_statistics");
+        assert_eq!(
+            result.observation.causal_status,
+            LinkedInCausalStatus::NotClaimed
+        );
+        assert_eq!(result.durable_log_revision, 1);
+        assert_eq!(
+            consumer
+                .reconcile_webhook("mission-linkedin-1", &plan, &event, &resolver)
+                .expect_err("duplicate webhook"),
+            LinkedInConnectorError::DuplicateDelivery
+        );
+        let late_event = LinkedInWebhookEvent::new(vec![webhook_notification(43, 99)], now)
+            .expect("late webhook event");
+        assert_eq!(
+            consumer
+                .reconcile_webhook("mission-linkedin-1", &plan, &late_event, &resolver)
+                .expect_err("out of order webhook"),
+            LinkedInConnectorError::OutOfOrderDelivery
+        );
+        assert_eq!(consumer.service().observation_log().revision(), 1);
+        assert_eq!(transport.requests.lock().expect("requests").len(), 5);
+    }
+
+    #[test]
+    fn poll_reconcile_uses_authenticated_pull_cursor_and_binds_the_result() {
+        let now = Utc::now();
+        let poll = response(
+            r#"{"elements":[{"notificationId":77,"organizationalEntity":"urn:li:organization:page-1","action":"SHARE","lastModifiedAt":200,"sourcePost":"urn:li:share:post-1"}],"paging":{"start":0,"count":1}}"#,
+            &[("x-li-request-id", "poll-1")],
+        );
+        let read = response(
+            r#"{"elements":[{"id":"share-2","impressions":9}]}"#,
+            &[("x-li-request-id", "poll-read")],
+        );
+        let transport = Arc::new(MockTransport::new(
+            probe_responses().into_iter().chain([poll, read]),
+        ));
+        let (scope, insight_scope, secret, lease, resolver) = scope_and_auth(&[
+            "openid",
+            "profile",
+            "rw_organization_admin",
+            "r_organization_social",
+            "r_ads",
+            "r_ads_reporting",
+        ]);
+        let probe = probe_request(
+            scope.clone(),
+            insight_scope.clone(),
+            secret.clone(),
+            lease.clone(),
+        );
+        let plan = read_plan(
+            scope.clone(),
+            insight_scope.clone(),
+            secret.clone(),
+            lease.clone(),
+            vec![LinkedInInsightTarget::OrganizationPage {
+                organization_id: "org-1".to_owned(),
+                page_id: "page-1".to_owned(),
+            }],
+            now - Duration::days(1),
+            now,
+            Duration::days(1),
+        );
+        let poll_request = LinkedInReconcilePollRequest {
+            scope,
+            insight_scope,
+            secret_reference: secret,
+            lease,
+            organization_id: "page-1".to_owned(),
+            since: now - Duration::days(1),
+            until: now,
+            page_size: 2,
+            cursor: None,
+            requested_at: now,
+            provenance: ProviderProvenanceClass::ComponentHarness,
+        };
+        let mut consumer = MissionPaidSocialInsightConsumer::new(service(
+            transport.clone(),
+            LinkedInReadPolicy::default(),
+        ));
+        consumer
+            .attach("mission-linkedin-1", &probe, &resolver)
+            .expect("attach");
+        let result = consumer
+            .reconcile_poll("mission-linkedin-1", &plan, &poll_request, &resolver)
+            .expect("poll reconcile");
+        let receipt = result.observation.reconcile.as_ref().expect("poll receipt");
+        assert_eq!(receipt.source, LinkedInReconcileSource::Poll);
+        assert_eq!(receipt.notification_ids, vec![77]);
+        assert!(
+            receipt
+                .poll_cursor
+                .as_ref()
+                .is_some_and(LinkedInPaginationCursor::complete)
+        );
+        assert_eq!(receipt.organization_id, "page-1");
+        assert_eq!(
+            result.observation.source.provider_request_id.as_deref(),
+            Some("poll-read")
+        );
+        let requests = transport.requests.lock().expect("requests");
+        assert_eq!(
+            requests[4].path().expect("poll path"),
+            "/rest/organizationalEntityNotifications"
+        );
+        assert!(requests[4].query.iter().any(|(name, value)| {
+            name == "organizationalEntity" && value == "urn:li:organization:page-1"
+        }));
+        assert!(
+            requests[4]
+                .query
+                .iter()
+                .any(|(name, value)| { name == "timeRange.start" && value.parse::<i64>().is_ok() })
+        );
+        assert_eq!(
+            requests[5].path().expect("insight path"),
+            "/rest/organizationalEntityShareStatistics"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn deterministic_loopback_http_proves_authenticated_pagination_and_reconcile_receipts() {
+        let (address, capture, server) = loopback_server();
+        let (scope, insight_scope, secret, lease, resolver) = scope_and_auth(&[
+            "openid",
+            "profile",
+            "rw_organization_admin",
+            "r_organization_social",
+            "r_ads",
+            "r_ads_reporting",
+        ]);
+        let now = Utc::now();
+        let probe = probe_request(
+            scope.clone(),
+            insight_scope.clone(),
+            secret.clone(),
+            lease.clone(),
+        );
+        let plan = read_plan(
+            scope.clone(),
+            insight_scope.clone(),
+            secret.clone(),
+            lease.clone(),
+            vec![LinkedInInsightTarget::OrganizationPage {
+                organization_id: "org-1".to_owned(),
+                page_id: "page-1".to_owned(),
+            }],
+            now - Duration::days(2),
+            now,
+            Duration::days(1),
+        );
+        let poll_request = LinkedInReconcilePollRequest {
+            scope,
+            insight_scope,
+            secret_reference: secret,
+            lease,
+            organization_id: "page-1".to_owned(),
+            since: now - Duration::days(2),
+            until: now,
+            page_size: 1,
+            cursor: None,
+            requested_at: now,
+            provenance: ProviderProvenanceClass::ComponentHarness,
+        };
+        let transport = Arc::new(LoopbackHttpTransport { address });
+        let service = PaidSocialInsightReadService::new(
+            Arc::new(
+                LinkedInMarketingOrganizationAdapter::new(
+                    LinkedInMarketingConfig {
+                        api_base_url: format!("https://127.0.0.1:{}", address.port()),
+                        ..LinkedInMarketingConfig::default()
+                    },
+                    transport,
+                )
+                .expect("loopback adapter"),
+            ),
+            DispatchBudget::new(4, now + Duration::hours(1), 4, 100).expect("budget"),
+            LinkedInReadPolicy::default(),
+        )
+        .expect("loopback service");
+        let mut consumer = MissionPaidSocialInsightConsumer::new(service);
+        consumer
+            .attach("mission-linkedin-1", &probe, &resolver)
+            .expect("authenticated loopback probe");
+
+        let first = consumer
+            .reconcile_poll("mission-linkedin-1", &plan, &poll_request, &resolver)
+            .expect("first loopback poll reconcile");
+        let first_receipt = first
+            .observation
+            .reconcile
+            .as_ref()
+            .expect("first reconcile receipt");
+        assert_eq!(first_receipt.source, LinkedInReconcileSource::Poll);
+        assert_eq!(first_receipt.notification_ids, vec![77]);
+        assert_eq!(first_receipt.rate_limit.remaining, Some(95));
+        assert_eq!(
+            first_receipt
+                .poll_cursor
+                .as_ref()
+                .map(LinkedInPaginationCursor::start),
+            Some(1)
+        );
+        assert!(
+            !first_receipt
+                .poll_cursor
+                .as_ref()
+                .is_some_and(LinkedInPaginationCursor::complete)
+        );
+        assert_eq!(
+            first.observation.source.provider_request_id.as_deref(),
+            Some("loopback-read-1")
+        );
+        assert_eq!(first.observation.rate_limit.remaining, Some(94));
+        assert_eq!(
+            first.observation.quota.provider_rate_limit.remaining,
+            Some(94)
+        );
+        assert_eq!(first.observation.cost.charged_minor, 1);
+        assert_eq!(first.durable_log_revision, 1);
+        assert_eq!(
+            first.observation.causal_status,
+            LinkedInCausalStatus::NotClaimed
+        );
+
+        let second = consumer
+            .reconcile_poll("mission-linkedin-1", &plan, &poll_request, &resolver)
+            .expect("second loopback poll reconcile");
+        let second_receipt = second
+            .observation
+            .reconcile
+            .as_ref()
+            .expect("second reconcile receipt");
+        assert_eq!(second_receipt.notification_ids, vec![78]);
+        assert_eq!(second_receipt.rate_limit.remaining, Some(93));
+        assert!(
+            second_receipt
+                .poll_cursor
+                .as_ref()
+                .is_some_and(LinkedInPaginationCursor::complete)
+        );
+        assert_eq!(second.observation.page.page_index, 1);
+        assert_eq!(
+            second.observation.source.provider_request_id.as_deref(),
+            Some("loopback-read-2")
+        );
+        assert_eq!(second.observation.rate_limit.remaining, Some(92));
+        assert_eq!(second.observation.cost.charged_minor, 1);
+        assert_eq!(second.durable_log_revision, 2);
+        assert_eq!(
+            second.observation.causal_status,
+            LinkedInCausalStatus::NotClaimed
+        );
+        let checkpoint = consumer
+            .service()
+            .observation_log_checkpoint()
+            .expect("durable loopback checkpoint");
+        let checkpoint_text = String::from_utf8(checkpoint).expect("checkpoint utf8");
+        assert!(checkpoint_text.contains("loopback-read-1"));
+        assert!(checkpoint_text.contains("loopback-read-2"));
+        assert!(!checkpoint_text.contains("linkedin-test-token"));
+
+        let capture = capture.lock().expect("loopback capture");
+        assert_eq!(capture.request_lines.len(), 8);
+        assert_eq!(capture.authenticated_requests, 8);
+        assert!(capture.request_lines[4].contains("start=0"));
+        assert!(capture.request_lines[6].contains("start=1"));
+        assert!(capture.request_lines[5].contains("/rest/organizationalEntityShareStatistics?"));
+        assert!(capture.request_lines[7].contains("/rest/organizationalEntityShareStatistics?"));
+        drop(capture);
+        server.join().expect("loopback server");
+    }
+
+    #[test]
+    fn provider_model_drift_is_typed_and_never_adopted() {
+        let transport = Arc::new(MockTransport::new([response(
+            r#"{"model":"linkedin_ad_analytics","elements":[]}"#,
+            &[],
+        )]));
+        let adapter = LinkedInMarketingOrganizationAdapter::new(
+            LinkedInMarketingConfig {
+                api_base_url: "https://linkedin.example.test".to_owned(),
+                ..LinkedInMarketingConfig::default()
+            },
+            transport,
+        )
+        .expect("adapter");
+        let (scope, insight_scope, secret, lease, resolver) = scope_and_auth(&[
+            "openid",
+            "profile",
+            "rw_organization_admin",
+            "r_organization_social",
+            "r_ads",
+            "r_ads_reporting",
+        ]);
+        let request = read_request(
+            scope,
+            insight_scope,
+            secret,
+            lease,
+            LinkedInInsightTarget::OrganizationPage {
+                organization_id: "org-1".to_owned(),
+                page_id: "page-1".to_owned(),
+            },
+        );
+        assert_eq!(
+            adapter.read(&request, &resolver).expect_err("model drift"),
+            LinkedInConnectorError::AttributionModelDrift
         );
     }
 
