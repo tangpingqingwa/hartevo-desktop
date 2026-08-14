@@ -460,6 +460,189 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.remote_worker_claims (
     CHECK (lease_expires_at > heartbeat_at)
 );
 
+CREATE TABLE IF NOT EXISTS hartevo_cell.remote_worker_work_requests (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL CHECK (length(btrim(mission_id)) > 0),
+    task_id TEXT NOT NULL CHECK (length(btrim(task_id)) > 0),
+    worker_id TEXT NOT NULL CHECK (length(btrim(worker_id)) > 0),
+    dispatch_registration_id TEXT NOT NULL
+        CHECK (dispatch_registration_id ~ '^[0-9a-f]{64}$'),
+    project_key_generation BIGINT NOT NULL CHECK (project_key_generation > 0),
+    mission_generation BIGINT NOT NULL CHECK (mission_generation > 0),
+    mission_version BIGINT NOT NULL CHECK (mission_version > 0),
+    mission_digest TEXT NOT NULL CHECK (mission_digest ~ '^[0-9a-f]{64}$'),
+    input_key_version BIGINT NOT NULL CHECK (input_key_version > 0),
+    input_nonce BYTEA NOT NULL CHECK (octet_length(input_nonce) = 12),
+    input_ciphertext BYTEA NOT NULL
+        CHECK (octet_length(input_ciphertext) BETWEEN 16 AND 524288),
+    input_aad_digest TEXT NOT NULL CHECK (input_aad_digest ~ '^[0-9a-f]{64}$'),
+    input_content_digest TEXT NOT NULL CHECK (input_content_digest ~ '^[0-9a-f]{64}$'),
+    idempotency_key TEXT NOT NULL CHECK (idempotency_key ~ '^[0-9a-f]{64}$'),
+    request_digest TEXT NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'leased', 'completed', 'cancelled',
+                          'uncertain', 'dead_letter')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    lease_id TEXT,
+    lease_generation BIGINT NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
+    lease_owner TEXT,
+    lease_token_digest TEXT,
+    claim_idempotency_key TEXT,
+    claim_request_digest TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    heartbeat_at TIMESTAMPTZ,
+    completion_idempotency_key TEXT,
+    completion_request_digest TEXT,
+    completed_at TIMESTAMPTZ,
+    terminal_idempotency_key TEXT,
+    terminal_request_digest TEXT,
+    terminal_reason_digest TEXT,
+    terminal_at TIMESTAMPTZ,
+    enqueued_at TIMESTAMPTZ NOT NULL,
+    deadline_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    revision BIGINT NOT NULL CHECK (revision > 0),
+    PRIMARY KEY (cell, tenant_id, project_id, task_id),
+    UNIQUE (cell, tenant_id, project_id, idempotency_key),
+    FOREIGN KEY (cell, tenant_id, project_id)
+        REFERENCES hartevo_cell.projects (cell, tenant_id, project_id),
+    CHECK (enqueued_at < deadline_at AND enqueued_at <= updated_at),
+    CHECK (lease_token_digest IS NULL OR lease_token_digest ~ '^[0-9a-f]{64}$'),
+    CHECK (claim_idempotency_key IS NULL OR claim_idempotency_key ~ '^[0-9a-f]{64}$'),
+    CHECK (claim_request_digest IS NULL OR claim_request_digest ~ '^[0-9a-f]{64}$'),
+    CHECK (completion_idempotency_key IS NULL
+        OR completion_idempotency_key ~ '^[0-9a-f]{64}$'),
+    CHECK (completion_request_digest IS NULL
+        OR completion_request_digest ~ '^[0-9a-f]{64}$'),
+    CHECK (terminal_idempotency_key IS NULL
+        OR terminal_idempotency_key ~ '^[0-9a-f]{64}$'),
+    CHECK (terminal_request_digest IS NULL
+        OR terminal_request_digest ~ '^[0-9a-f]{64}$'),
+    CHECK (terminal_reason_digest IS NULL
+        OR terminal_reason_digest ~ '^[0-9a-f]{64}$'),
+    CHECK (
+        (status = 'pending'
+            AND attempts = 0 AND lease_id IS NULL AND lease_generation = 0
+            AND lease_owner IS NULL AND lease_token_digest IS NULL
+            AND claim_idempotency_key IS NULL AND claim_request_digest IS NULL
+            AND lease_expires_at IS NULL AND heartbeat_at IS NULL
+            AND completion_idempotency_key IS NULL AND completion_request_digest IS NULL
+            AND completed_at IS NULL AND terminal_idempotency_key IS NULL
+            AND terminal_request_digest IS NULL AND terminal_reason_digest IS NULL
+            AND terminal_at IS NULL)
+        OR (status = 'leased'
+            AND attempts > 0 AND lease_id IS NOT NULL AND lease_generation > 0
+            AND lease_owner IS NOT NULL AND length(btrim(lease_owner)) > 0
+            AND lease_token_digest IS NOT NULL AND claim_idempotency_key IS NOT NULL
+            AND claim_request_digest IS NOT NULL AND lease_expires_at IS NOT NULL
+            AND heartbeat_at IS NOT NULL AND lease_expires_at > heartbeat_at
+            AND completion_idempotency_key IS NULL AND completion_request_digest IS NULL
+            AND completed_at IS NULL AND terminal_idempotency_key IS NULL
+            AND terminal_request_digest IS NULL AND terminal_reason_digest IS NULL
+            AND terminal_at IS NULL)
+        OR (status = 'completed'
+            AND attempts > 0 AND lease_id IS NULL AND lease_generation = 0
+            AND lease_owner IS NULL AND lease_token_digest IS NULL
+            AND claim_idempotency_key IS NOT NULL AND claim_request_digest IS NOT NULL
+            AND lease_expires_at IS NULL AND heartbeat_at IS NULL
+            AND completion_idempotency_key IS NOT NULL
+            AND completion_request_digest IS NOT NULL AND completed_at IS NOT NULL
+            AND terminal_idempotency_key IS NULL AND terminal_request_digest IS NULL
+            AND terminal_reason_digest IS NULL AND terminal_at IS NULL)
+        OR (status IN ('cancelled', 'uncertain', 'dead_letter')
+            AND lease_id IS NULL AND lease_generation = 0
+            AND lease_owner IS NULL AND lease_token_digest IS NULL
+            AND lease_expires_at IS NULL AND heartbeat_at IS NULL
+            AND completion_idempotency_key IS NULL AND completion_request_digest IS NULL
+            AND completed_at IS NULL AND terminal_idempotency_key IS NOT NULL
+            AND terminal_request_digest IS NOT NULL AND terminal_reason_digest IS NOT NULL
+            AND terminal_at IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.remote_worker_result_receipts (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL CHECK (length(btrim(mission_id)) > 0),
+    task_id TEXT NOT NULL,
+    project_key_generation BIGINT NOT NULL CHECK (project_key_generation > 0),
+    mission_generation BIGINT NOT NULL CHECK (mission_generation > 0),
+    mission_version BIGINT NOT NULL CHECK (mission_version > 0),
+    mission_digest TEXT NOT NULL CHECK (mission_digest ~ '^[0-9a-f]{64}$'),
+    dispatch_registration_id TEXT NOT NULL
+        CHECK (dispatch_registration_id ~ '^[0-9a-f]{64}$'),
+    lease_id TEXT NOT NULL CHECK (length(btrim(lease_id)) > 0),
+    lease_generation BIGINT NOT NULL CHECK (lease_generation > 0),
+    lease_owner TEXT NOT NULL CHECK (length(btrim(lease_owner)) > 0),
+    provider_id TEXT NOT NULL CHECK (length(btrim(provider_id)) > 0),
+    provider_implementation_digest TEXT NOT NULL
+        CHECK (provider_implementation_digest ~ '^[0-9a-f]{64}$'),
+    service_contract_digest TEXT NOT NULL CHECK (service_contract_digest ~ '^[0-9a-f]{64}$'),
+    current_commit_digest TEXT NOT NULL CHECK (current_commit_digest ~ '^[0-9a-f]{64}$'),
+    output_key_version BIGINT NOT NULL CHECK (output_key_version > 0),
+    output_nonce BYTEA NOT NULL CHECK (octet_length(output_nonce) = 12),
+    output_ciphertext BYTEA NOT NULL
+        CHECK (octet_length(output_ciphertext) BETWEEN 16 AND 2097152),
+    output_aad_digest TEXT NOT NULL CHECK (output_aad_digest ~ '^[0-9a-f]{64}$'),
+    output_content_digest TEXT NOT NULL CHECK (output_content_digest ~ '^[0-9a-f]{64}$'),
+    evidence_digest TEXT NOT NULL CHECK (evidence_digest ~ '^[0-9a-f]{64}$'),
+    effect_receipt_digest TEXT
+        CHECK (effect_receipt_digest IS NULL OR effect_receipt_digest ~ '^[0-9a-f]{64}$'),
+    outcome_link_digest TEXT
+        CHECK (outcome_link_digest IS NULL OR outcome_link_digest ~ '^[0-9a-f]{64}$'),
+    request_digest TEXT NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    result_digest TEXT NOT NULL CHECK (result_digest ~ '^[0-9a-f]{64}$'),
+    receipt_digest TEXT NOT NULL CHECK (receipt_digest ~ '^[0-9a-f]{64}$'),
+    completion_idempotency_key TEXT NOT NULL CHECK (completion_idempotency_key ~ '^[0-9a-f]{64}$'),
+    completed_at TIMESTAMPTZ NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL,
+    revision BIGINT NOT NULL CHECK (revision > 0),
+    PRIMARY KEY (cell, tenant_id, project_id, task_id),
+    UNIQUE (cell, tenant_id, project_id, receipt_digest),
+    FOREIGN KEY (cell, tenant_id, project_id, task_id)
+        REFERENCES hartevo_cell.remote_worker_work_requests
+            (cell, tenant_id, project_id, task_id),
+    CHECK (completed_at <= recorded_at)
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.remote_worker_work_log (
+    sequence BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL CHECK (length(btrim(mission_id)) > 0),
+    task_id TEXT NOT NULL,
+    operation_id_digest TEXT NOT NULL CHECK (operation_id_digest ~ '^[0-9a-f]{64}$'),
+    request_digest TEXT NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'enqueued', 'claimed', 'takeover', 'heartbeat', 'completed',
+        'cancelled', 'uncertain', 'dead_letter')),
+    project_key_generation BIGINT NOT NULL CHECK (project_key_generation > 0),
+    mission_generation BIGINT NOT NULL CHECK (mission_generation > 0),
+    mission_version BIGINT NOT NULL CHECK (mission_version > 0),
+    mission_digest TEXT NOT NULL CHECK (mission_digest ~ '^[0-9a-f]{64}$'),
+    lease_id TEXT,
+    lease_generation BIGINT NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
+    lease_owner TEXT,
+    lease_token_digest TEXT
+        CHECK (lease_token_digest IS NULL OR lease_token_digest ~ '^[0-9a-f]{64}$'),
+    lease_expires_at TIMESTAMPTZ,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    revision BIGINT NOT NULL CHECK (revision >= 0),
+    reason_digest TEXT CHECK (reason_digest IS NULL OR reason_digest ~ '^[0-9a-f]{64}$'),
+    result_receipt_digest TEXT
+        CHECK (result_receipt_digest IS NULL OR result_receipt_digest ~ '^[0-9a-f]{64}$'),
+    recorded_at TIMESTAMPTZ NOT NULL,
+    event_digest TEXT NOT NULL CHECK (event_digest ~ '^[0-9a-f]{64}$'),
+    UNIQUE (cell, tenant_id, project_id, operation_id_digest),
+    FOREIGN KEY (cell, tenant_id, project_id, task_id)
+        REFERENCES hartevo_cell.remote_worker_work_requests
+            (cell, tenant_id, project_id, task_id)
+);
+
 CREATE TABLE IF NOT EXISTS hartevo_cell.device_public_key_versions (
     cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
     tenant_id TEXT NOT NULL,
@@ -1021,6 +1204,13 @@ CREATE INDEX IF NOT EXISTS remote_worker_transport_registration_scope_idx
 CREATE INDEX IF NOT EXISTS remote_worker_dispatch_registration_scope_idx
     ON hartevo_cell.remote_worker_dispatch_registrations
         (cell, tenant_id, project_id, mission_id, dispatch_registration_id);
+CREATE INDEX IF NOT EXISTS remote_worker_work_claim_idx
+    ON hartevo_cell.remote_worker_work_requests
+        (cell, tenant_id, project_id, mission_id, dispatch_registration_id,
+            worker_id, status, enqueued_at, deadline_at, task_id);
+CREATE INDEX IF NOT EXISTS remote_worker_work_log_task_idx
+    ON hartevo_cell.remote_worker_work_log
+        (cell, tenant_id, project_id, task_id, sequence);
 CREATE INDEX IF NOT EXISTS device_handoff_target_idx
     ON hartevo_cell.device_handoff_grants
         (cell, tenant_id, project_id, target_device_id, expires_at);
@@ -1068,6 +1258,12 @@ ALTER TABLE hartevo_cell.remote_worker_mailbox_messages ENABLE ROW LEVEL SECURIT
 ALTER TABLE hartevo_cell.remote_worker_mailbox_messages FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.remote_worker_claims ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.remote_worker_claims FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.remote_worker_work_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.remote_worker_work_requests FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.remote_worker_result_receipts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.remote_worker_result_receipts FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.remote_worker_work_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.remote_worker_work_log FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.device_public_key_versions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.device_public_key_versions FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.device_public_key_heads ENABLE ROW LEVEL SECURITY;
@@ -1125,6 +1321,9 @@ BEGIN
         'sync_mutations',
         'remote_worker_mailbox_messages',
         'remote_worker_claims',
+        'remote_worker_work_requests',
+        'remote_worker_result_receipts',
+        'remote_worker_work_log',
         'device_public_key_versions',
         'device_public_key_heads',
         'keyring_bootstrap_versions',

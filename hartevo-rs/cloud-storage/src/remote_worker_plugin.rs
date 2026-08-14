@@ -37,7 +37,14 @@ impl CloudRemoteWorkerServiceDefinition {
                 "schema": REMOTE_WORKER_TRANSPORT_SCHEMA,
                 "serviceId": REMOTE_WORKER_TRANSPORT_SERVICE_ID,
                 "version": REMOTE_WORKER_TRANSPORT_SERVICE_VERSION,
-                "operations": ["enqueue", "claim", "heartbeat", "complete"],
+                "operations": [
+                    "enqueue",
+                    "claim",
+                    "heartbeat",
+                    "complete",
+                    "cancel",
+                    "mark_uncertain"
+                ],
             }))
             .expect("static Remote Worker service definition serializes"),
         }
@@ -522,6 +529,27 @@ impl PostgresCellStore {
                 ],
             )
             .await?;
+        let typed_terminal_state = match state {
+            CloudRemoteWorkerTransportRegistrationState::Unmounted => {
+                super::remote_worker_execution::CloudRemoteWorkerWorkStatus::Cancelled
+            }
+            CloudRemoteWorkerTransportRegistrationState::Revoked => {
+                super::remote_worker_execution::CloudRemoteWorkerWorkStatus::DeadLetter
+            }
+            CloudRemoteWorkerTransportRegistrationState::Mounted => {
+                return Err(CloudStorageError::InvalidRemoteWorkerTransportDefinition);
+            }
+        };
+        super::remote_worker_execution::cleanup_remote_worker_work_for_registration(
+            &transaction,
+            scope,
+            project_id,
+            mission_id,
+            &current.dispatch_registration_id,
+            typed_terminal_state,
+            terminated_at,
+        )
+        .await?;
         let removed_dispatches = transaction
             .execute(
                 "DELETE FROM hartevo_cell.remote_worker_dispatch_registrations

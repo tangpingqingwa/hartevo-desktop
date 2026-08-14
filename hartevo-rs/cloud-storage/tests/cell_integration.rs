@@ -3,9 +3,12 @@ use std::process::Command;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use hartevo_cloud_storage::{
     CellScope, CloudProjectRegistration, CloudRemoteWorkerCompletion,
-    CloudRemoteWorkerServiceDefinition, CloudRemoteWorkerTask, CloudRemoteWorkerTransportConsumer,
-    CloudRemoteWorkerTransportMount, CloudRemoteWorkerTransportProvider, CloudStorageError,
-    DataCell, EncryptedPayload, EncryptedSyncMutation, MutationPrecondition, POSTGRES_L2_URL_ENV,
+    CloudRemoteWorkerMissionFence, CloudRemoteWorkerServiceDefinition, CloudRemoteWorkerTask,
+    CloudRemoteWorkerTransportConsumer, CloudRemoteWorkerTransportMount,
+    CloudRemoteWorkerTransportProvider, CloudRemoteWorkerWorkCancel, CloudRemoteWorkerWorkClaim,
+    CloudRemoteWorkerWorkHeartbeat, CloudRemoteWorkerWorkRequest, CloudRemoteWorkerWorkResult,
+    CloudRemoteWorkerWorkStatus, CloudRemoteWorkerWorkUncertain, CloudStorageError, DataCell,
+    EncryptedPayload, EncryptedSyncMutation, MutationPrecondition, POSTGRES_L2_URL_ENV,
     PostgresCellStore, SyncObjectKind,
 };
 use hartevo_domain_kernel::{
@@ -1341,4 +1344,525 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         .expect("read unscoped Worker claims")
         .get(0);
     assert_eq!(unscoped_visible_rows, 0);
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the PostgreSQL journey keeps the typed Mission fence, takeover, receipt, uncertain, cancel, and revoke contract in one acceptance path"
+)]
+async fn postgres_typed_mission_remote_worker_execution_is_bounded_and_non_replayable() {
+    let Some(database_url) = std::env::var_os(POSTGRES_L2_URL_ENV) else {
+        eprintln!(
+            "NOT_RUN/BLOCKED_ENV: {POSTGRES_L2_URL_ENV} is absent; typed Mission Remote Worker PostgreSQL journey did not execute"
+        );
+        return;
+    };
+    let database_url = database_url
+        .into_string()
+        .expect("PostgreSQL test URL must be valid Unicode");
+    let (mut client, _connection_task) = connect().await;
+    let store = PostgresCellStore::new(DataCell::Us);
+    let timestamp = now() + Duration::days(1);
+    store
+        .migrate(&mut client, timestamp)
+        .await
+        .expect("migrate typed Remote Worker schema");
+    let scope = CellScope {
+        cell: DataCell::Us,
+        tenant_id: TenantId::new(),
+    };
+    let project_id = ProjectId::new();
+    let mission_id = MissionId::from("typed-remote-worker-mission");
+    let worker_id = WorkerId::from("typed-regional-worker");
+    store
+        .register_tenant(&mut client, &scope, timestamp)
+        .await
+        .expect("register typed Remote Worker tenant");
+    let metadata = payload(71);
+    store
+        .create_project(
+            &mut client,
+            &CloudProjectRegistration {
+                scope: scope.clone(),
+                project_id: project_id.clone(),
+                encryption_mode: ProjectEncryptionMode::TeamEnvelope,
+                remote_execution_opt_in: true,
+                metadata_digest: metadata.content_digest.clone(),
+                initial_payload: metadata,
+                idempotency_key_digest: digest("typed-remote-project"),
+                created_at: timestamp,
+            },
+        )
+        .await
+        .expect("create typed Remote Worker project");
+    let dispatch_registration_id = digest("typed-remote-dispatch");
+    let mounted = transport_mount(
+        &scope,
+        &project_id,
+        &mission_id,
+        dispatch_registration_id.clone(),
+        &worker_id,
+        digest("typed-remote-mount"),
+        timestamp + Duration::seconds(1),
+    );
+    let mount_result = store
+        .mount_remote_worker_transport(&mut client, &mounted)
+        .await
+        .expect("mount typed Remote Worker provider");
+    let fence = CloudRemoteWorkerMissionFence {
+        scope: scope.clone(),
+        project_id: project_id.clone(),
+        project_key_generation: 4,
+        mission_id: mission_id.clone(),
+        mission_generation: 2,
+        mission_version: 9,
+        mission_digest: digest("typed-mission-contract-v9"),
+    };
+
+    let first_request = CloudRemoteWorkerWorkRequest {
+        fence: fence.clone(),
+        task_id: TaskId::from("typed-work-takeover"),
+        worker_id: worker_id.clone(),
+        dispatch_registration_id: dispatch_registration_id.clone(),
+        input: payload(72),
+        idempotency_key_digest: digest("typed-work-takeover-request"),
+        enqueued_at: timestamp + Duration::seconds(2),
+        deadline_at: timestamp + Duration::minutes(10),
+    };
+    let first_request_result = store
+        .enqueue_remote_worker_work(&mut client, &first_request)
+        .await
+        .expect("enqueue typed encrypted Work request");
+    assert!(!first_request_result.duplicate);
+    assert!(
+        store
+            .enqueue_remote_worker_work(&mut client, &first_request)
+            .await
+            .expect("replay typed Work request")
+            .duplicate
+    );
+    let marker = b"MISSION-PLAINTEXT-MUST-NOT-REACH-CELL";
+    let inspection = client
+        .transaction()
+        .await
+        .expect("start typed ciphertext inspection");
+    set_sql_scope(&inspection, &scope).await;
+    let stored_input: Vec<u8> = inspection
+        .query_one(
+            "SELECT input_ciphertext
+             FROM hartevo_cell.remote_worker_work_requests
+             WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND task_id = $4",
+            &[
+                &scope.cell.as_str(),
+                &scope.tenant_id.as_str(),
+                &project_id.as_str(),
+                &first_request.task_id.as_str(),
+            ],
+        )
+        .await
+        .expect("inspect typed encrypted input")
+        .get(0);
+    assert!(
+        !stored_input
+            .windows(marker.len())
+            .any(|window| window == marker)
+    );
+    inspection
+        .commit()
+        .await
+        .expect("finish typed ciphertext inspection");
+
+    let first_claim = store
+        .claim_remote_worker_work(
+            &mut client,
+            &CloudRemoteWorkerWorkClaim {
+                fence: fence.clone(),
+                task_id: Some(first_request.task_id.clone()),
+                worker_id: worker_id.clone(),
+                dispatch_registration_id: dispatch_registration_id.clone(),
+                lease_owner: "typed-worker-old".into(),
+                lease_token_digest: digest("typed-old-token"),
+                claim_idempotency_key_digest: digest("typed-old-claim"),
+                now: timestamp + Duration::seconds(10),
+                lease_for: Duration::seconds(2),
+            },
+        )
+        .await
+        .expect("claim typed Work request")
+        .expect("typed Work request is available");
+    assert!(!first_claim.duplicate);
+    assert!(!first_claim.takeover);
+    assert_eq!(first_claim.lease.lease_generation, 1);
+    assert!(
+        store
+            .claim_remote_worker_work(
+                &mut client,
+                &CloudRemoteWorkerWorkClaim {
+                    fence: fence.clone(),
+                    task_id: Some(first_request.task_id.clone()),
+                    worker_id: worker_id.clone(),
+                    dispatch_registration_id: dispatch_registration_id.clone(),
+                    lease_owner: "typed-worker-old".into(),
+                    lease_token_digest: digest("typed-old-token"),
+                    claim_idempotency_key_digest: digest("typed-old-claim"),
+                    now: timestamp + Duration::seconds(10),
+                    lease_for: Duration::seconds(2),
+                },
+            )
+            .await
+            .expect("replay typed claim")
+            .expect("replayed typed claim")
+            .duplicate
+    );
+    let heartbeat = store
+        .heartbeat_remote_worker_work(
+            &mut client,
+            &CloudRemoteWorkerWorkHeartbeat {
+                fence: fence.clone(),
+                task_id: first_request.task_id.clone(),
+                worker_id: worker_id.clone(),
+                dispatch_registration_id: dispatch_registration_id.clone(),
+                lease_id: first_claim.lease.lease_id.clone(),
+                lease_generation: first_claim.lease.lease_generation,
+                lease_owner: first_claim.lease.lease_owner.clone(),
+                lease_token_digest: first_claim.lease.lease_token_digest.clone(),
+                heartbeat_idempotency_key_digest: digest("typed-old-heartbeat"),
+                now: timestamp + Duration::seconds(11),
+                lease_for: Duration::seconds(2),
+            },
+        )
+        .await
+        .expect("heartbeat typed Work lease");
+    assert!(!heartbeat.duplicate);
+    let takeover = store
+        .claim_remote_worker_work(
+            &mut client,
+            &CloudRemoteWorkerWorkClaim {
+                fence: fence.clone(),
+                task_id: Some(first_request.task_id.clone()),
+                worker_id: worker_id.clone(),
+                dispatch_registration_id: dispatch_registration_id.clone(),
+                lease_owner: "typed-worker-recovered".into(),
+                lease_token_digest: digest("typed-recovered-token"),
+                claim_idempotency_key_digest: digest("typed-recovered-claim"),
+                now: timestamp + Duration::seconds(14),
+                lease_for: Duration::seconds(30),
+            },
+        )
+        .await
+        .expect("take over expired typed Work lease")
+        .expect("typed Work takeover is available");
+    assert!(takeover.takeover);
+    assert_eq!(takeover.lease.lease_generation, 2);
+    assert!(matches!(
+        store
+            .heartbeat_remote_worker_work(
+                &mut client,
+                &CloudRemoteWorkerWorkHeartbeat {
+                    fence: fence.clone(),
+                    task_id: first_request.task_id.clone(),
+                    worker_id: worker_id.clone(),
+                    dispatch_registration_id: dispatch_registration_id.clone(),
+                    lease_id: first_claim.lease.lease_id.clone(),
+                    lease_generation: first_claim.lease.lease_generation,
+                    lease_owner: first_claim.lease.lease_owner.clone(),
+                    lease_token_digest: first_claim.lease.lease_token_digest.clone(),
+                    heartbeat_idempotency_key_digest: digest("typed-stale-heartbeat"),
+                    now: timestamp + Duration::seconds(15),
+                    lease_for: Duration::seconds(10),
+                },
+            )
+            .await,
+        Err(CloudStorageError::RemoteWorkerLeaseLost)
+    ));
+    let uncertain = store
+        .mark_remote_worker_work_uncertain(
+            &mut client,
+            &CloudRemoteWorkerWorkUncertain {
+                fence: fence.clone(),
+                task_id: first_request.task_id.clone(),
+                dispatch_registration_id: dispatch_registration_id.clone(),
+                lease_id: takeover.lease.lease_id.clone(),
+                lease_generation: takeover.lease.lease_generation,
+                lease_owner: takeover.lease.lease_owner.clone(),
+                lease_token_digest: takeover.lease.lease_token_digest.clone(),
+                reason_digest: digest("typed-provider-timeout"),
+                uncertain_idempotency_key_digest: digest("typed-uncertain"),
+                uncertain_at: timestamp + Duration::seconds(16),
+            },
+        )
+        .await
+        .expect("freeze typed uncertain Work");
+    assert!(!uncertain.duplicate);
+    assert_eq!(uncertain.status, CloudRemoteWorkerWorkStatus::Uncertain);
+    assert!(
+        store
+            .mark_remote_worker_work_uncertain(
+                &mut client,
+                &CloudRemoteWorkerWorkUncertain {
+                    fence: fence.clone(),
+                    task_id: first_request.task_id.clone(),
+                    dispatch_registration_id: dispatch_registration_id.clone(),
+                    lease_id: takeover.lease.lease_id.clone(),
+                    lease_generation: takeover.lease.lease_generation,
+                    lease_owner: takeover.lease.lease_owner.clone(),
+                    lease_token_digest: takeover.lease.lease_token_digest.clone(),
+                    reason_digest: digest("typed-provider-timeout"),
+                    uncertain_idempotency_key_digest: digest("typed-uncertain"),
+                    uncertain_at: timestamp + Duration::seconds(16),
+                },
+            )
+            .await
+            .expect("replay typed uncertain Work")
+            .duplicate
+    );
+    assert!(
+        store
+            .claim_remote_worker_work(
+                &mut client,
+                &CloudRemoteWorkerWorkClaim {
+                    fence: fence.clone(),
+                    task_id: Some(first_request.task_id.clone()),
+                    worker_id: worker_id.clone(),
+                    dispatch_registration_id: dispatch_registration_id.clone(),
+                    lease_owner: "typed-worker-no-replay".into(),
+                    lease_token_digest: digest("typed-no-replay-token"),
+                    claim_idempotency_key_digest: digest("typed-no-replay-claim"),
+                    now: timestamp + Duration::seconds(17),
+                    lease_for: Duration::seconds(30),
+                },
+            )
+            .await
+            .expect("query uncertain typed Work")
+            .is_none()
+    );
+
+    let completed_request = CloudRemoteWorkerWorkRequest {
+        task_id: TaskId::from("typed-work-completed"),
+        input: payload(73),
+        idempotency_key_digest: digest("typed-work-completed-request"),
+        enqueued_at: timestamp + Duration::seconds(20),
+        deadline_at: timestamp + Duration::minutes(10),
+        ..first_request.clone()
+    };
+    let completed_enqueue = store
+        .enqueue_remote_worker_work(&mut client, &completed_request)
+        .await
+        .expect("enqueue typed completed Work request");
+    let completed_claim = store
+        .claim_remote_worker_work(
+            &mut client,
+            &CloudRemoteWorkerWorkClaim {
+                fence: fence.clone(),
+                task_id: Some(completed_request.task_id.clone()),
+                worker_id: worker_id.clone(),
+                dispatch_registration_id: dispatch_registration_id.clone(),
+                lease_owner: "typed-worker-completer".into(),
+                lease_token_digest: digest("typed-completer-token"),
+                claim_idempotency_key_digest: digest("typed-completer-claim"),
+                now: timestamp + Duration::seconds(21),
+                lease_for: Duration::seconds(30),
+            },
+        )
+        .await
+        .expect("claim typed completed Work")
+        .expect("completed Work is available");
+    let completed_result = CloudRemoteWorkerWorkResult {
+        fence: fence.clone(),
+        task_id: completed_request.task_id.clone(),
+        worker_id: worker_id.clone(),
+        dispatch_registration_id: dispatch_registration_id.clone(),
+        request_digest: completed_enqueue.request_digest,
+        lease_id: completed_claim.lease.lease_id.clone(),
+        lease_generation: completed_claim.lease.lease_generation,
+        lease_owner: completed_claim.lease.lease_owner.clone(),
+        lease_token_digest: completed_claim.lease.lease_token_digest.clone(),
+        output: payload(74),
+        evidence_digest: digest("typed-result-evidence"),
+        effect_receipt_digest: None,
+        outcome_link_digest: None,
+        provider_id: mounted.provider.provider_id.clone(),
+        provider_implementation_digest: mounted.provider.implementation_digest.clone(),
+        service_contract_digest: mounted.service.contract_digest.clone(),
+        current_commit_digest: digest("typed-provider-commit"),
+        completion_idempotency_key_digest: digest("typed-completion"),
+        completed_at: timestamp + Duration::seconds(22),
+    };
+    let receipt = store
+        .complete_remote_worker_work(&mut client, &completed_result)
+        .await
+        .expect("commit encrypted typed result receipt");
+    assert!(!receipt.duplicate);
+    assert_eq!(receipt.receipt.result_digest.len(), 64);
+    let replayed_receipt = store
+        .complete_remote_worker_work(&mut client, &completed_result)
+        .await
+        .expect("replay typed result receipt");
+    assert!(replayed_receipt.duplicate);
+    assert_eq!(replayed_receipt.receipt, receipt.receipt);
+    let completed_record = store
+        .load_remote_worker_work(&mut client, &fence, &completed_request.task_id)
+        .await
+        .expect("load completed typed Work");
+    assert_eq!(
+        completed_record.status,
+        CloudRemoteWorkerWorkStatus::Completed
+    );
+    assert_eq!(
+        completed_record
+            .result_receipt
+            .as_ref()
+            .expect("durable result receipt")
+            .output
+            .content_digest,
+        completed_result.output.content_digest
+    );
+
+    let cancelled_request = CloudRemoteWorkerWorkRequest {
+        task_id: TaskId::from("typed-work-cancelled"),
+        input: payload(75),
+        idempotency_key_digest: digest("typed-work-cancelled-request"),
+        enqueued_at: timestamp + Duration::seconds(30),
+        deadline_at: timestamp + Duration::minutes(10),
+        ..first_request.clone()
+    };
+    store
+        .enqueue_remote_worker_work(&mut client, &cancelled_request)
+        .await
+        .expect("enqueue typed cancellable Work");
+    let cancellation = CloudRemoteWorkerWorkCancel {
+        fence: fence.clone(),
+        task_id: cancelled_request.task_id.clone(),
+        dispatch_registration_id: dispatch_registration_id.clone(),
+        reason_digest: digest("typed-user-cancel"),
+        cancel_idempotency_key_digest: digest("typed-cancel"),
+        cancelled_at: timestamp + Duration::seconds(31),
+    };
+    assert_eq!(
+        store
+            .cancel_remote_worker_work(&mut client, &cancellation)
+            .await
+            .expect("cancel typed Work")
+            .status,
+        CloudRemoteWorkerWorkStatus::Cancelled
+    );
+    assert!(
+        store
+            .cancel_remote_worker_work(&mut client, &cancellation)
+            .await
+            .expect("replay typed cancellation")
+            .duplicate
+    );
+
+    let revoked_request = CloudRemoteWorkerWorkRequest {
+        task_id: TaskId::from("typed-work-revoked"),
+        input: payload(76),
+        idempotency_key_digest: digest("typed-work-revoked-request"),
+        enqueued_at: timestamp + Duration::seconds(40),
+        deadline_at: timestamp + Duration::minutes(10),
+        ..first_request
+    };
+    store
+        .enqueue_remote_worker_work(&mut client, &revoked_request)
+        .await
+        .expect("enqueue typed revoke-cleanup Work");
+    store
+        .claim_remote_worker_work(
+            &mut client,
+            &CloudRemoteWorkerWorkClaim {
+                fence: fence.clone(),
+                task_id: Some(revoked_request.task_id.clone()),
+                worker_id: worker_id.clone(),
+                dispatch_registration_id: dispatch_registration_id.clone(),
+                lease_owner: "typed-worker-revoked".into(),
+                lease_token_digest: digest("typed-revoked-token"),
+                claim_idempotency_key_digest: digest("typed-revoked-claim"),
+                now: timestamp + Duration::seconds(41),
+                lease_for: Duration::seconds(30),
+            },
+        )
+        .await
+        .expect("claim revoke-cleanup Work")
+        .expect("revoke-cleanup Work is available");
+    store
+        .revoke_remote_worker_transport(
+            &mut client,
+            &scope,
+            &project_id,
+            &mission_id,
+            &mount_result.registration_id,
+            &digest("typed-revoke-reason"),
+            timestamp + Duration::seconds(42),
+        )
+        .await
+        .expect("revoke typed Remote Worker transport");
+    let revoked_record = store
+        .load_remote_worker_work(&mut client, &fence, &revoked_request.task_id)
+        .await
+        .expect("load revoke-cleaned typed Work");
+    assert_eq!(
+        revoked_record.status,
+        CloudRemoteWorkerWorkStatus::DeadLetter
+    );
+    assert_eq!(
+        revoked_record
+            .terminal_reason_digest
+            .expect("revoke cleanup reason")
+            .len(),
+        64
+    );
+
+    let log_inspection = client
+        .transaction()
+        .await
+        .expect("start typed durable log inspection");
+    set_sql_scope(&log_inspection, &scope).await;
+    let counts = log_inspection
+        .query_one(
+            "SELECT
+                (SELECT count(*) FROM hartevo_cell.remote_worker_work_log
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3),
+                (SELECT count(*) FROM hartevo_cell.remote_worker_result_receipts
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3)",
+            &[
+                &scope.cell.as_str(),
+                &scope.tenant_id.as_str(),
+                &project_id.as_str(),
+            ],
+        )
+        .await
+        .expect("inspect typed durable log and receipt");
+    let log_count: i64 = counts.get(0);
+    let receipt_count: i64 = counts.get(1);
+    assert!(log_count >= 10);
+    assert_eq!(receipt_count, 1);
+    log_inspection
+        .commit()
+        .await
+        .expect("finish typed durable log inspection");
+
+    let isolated_scope = CellScope {
+        cell: DataCell::Us,
+        tenant_id: TenantId::new(),
+    };
+    let isolated = client
+        .transaction()
+        .await
+        .expect("start typed cross-tenant RLS inspection");
+    set_sql_scope(&isolated, &isolated_scope).await;
+    let visible: i64 = isolated
+        .query_one(
+            "SELECT count(*) FROM hartevo_cell.remote_worker_work_requests",
+            &[],
+        )
+        .await
+        .expect("read typed RLS-isolated work table")
+        .get(0);
+    assert_eq!(visible, 0);
+    isolated
+        .commit()
+        .await
+        .expect("finish typed cross-tenant RLS inspection");
+    drop(database_url);
 }

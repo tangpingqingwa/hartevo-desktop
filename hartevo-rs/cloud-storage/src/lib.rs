@@ -19,10 +19,22 @@ use thiserror::Error;
 use tokio_postgres::{Client, Row, Transaction};
 
 mod effect_ledger;
+mod remote_worker_execution;
 mod remote_worker_plugin;
 mod scheduler;
 
 pub use effect_ledger::{CloudPermissionFenceMutation, CloudPermissionFenceResult};
+pub use remote_worker_execution::{
+    CloudRemoteWorkerDispatchAvailability, CloudRemoteWorkerDispatchDecision,
+    CloudRemoteWorkerMissionFence, CloudRemoteWorkerWorkCancel, CloudRemoteWorkerWorkCancelResult,
+    CloudRemoteWorkerWorkClaim, CloudRemoteWorkerWorkClaimResult, CloudRemoteWorkerWorkHeartbeat,
+    CloudRemoteWorkerWorkHeartbeatResult, CloudRemoteWorkerWorkLease, CloudRemoteWorkerWorkRecord,
+    CloudRemoteWorkerWorkRequest, CloudRemoteWorkerWorkRequestResult, CloudRemoteWorkerWorkResult,
+    CloudRemoteWorkerWorkResultCommit, CloudRemoteWorkerWorkResultReceipt,
+    CloudRemoteWorkerWorkStatus, CloudRemoteWorkerWorkUncertain,
+    CloudRemoteWorkerWorkUncertainResult, MAX_REMOTE_WORKER_INPUT_BYTES,
+    MAX_REMOTE_WORKER_OUTPUT_BYTES, REMOTE_WORKER_EXECUTION_SCHEMA,
+};
 pub use remote_worker_plugin::{
     CloudRemoteWorkerServiceDefinition, CloudRemoteWorkerTransportConsumer,
     CloudRemoteWorkerTransportLifecycleResult, CloudRemoteWorkerTransportMount,
@@ -40,7 +52,7 @@ pub use scheduler::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const MAX_CIPHERTEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REMOTE_WORKER_LEASE: Duration = Duration::seconds(15 * 60);
 const CLAIM_OUTBOX_SQL: &str = "WITH candidates AS (
@@ -608,7 +620,7 @@ impl PostgresCellStore {
         let transaction = client.transaction().await?;
         transaction
             .query_one(
-                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v6'))",
+                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v7'))",
                 &[],
             )
             .await?;
@@ -3670,8 +3682,12 @@ pub enum CloudStorageError {
     InvalidSyncMutation,
     #[error("remote Worker task or bounded lease request is invalid")]
     InvalidRemoteWorkerTask,
+    #[error("Mission-scoped remote Worker work request, lease, or fence is invalid")]
+    InvalidRemoteWorkerWorkRequest,
     #[error("remote Worker completion or result is invalid")]
     InvalidRemoteWorkerCompletion,
+    #[error("Mission-scoped remote Worker result or receipt is invalid")]
+    InvalidRemoteWorkerWorkResult,
     #[error("tenant has not been registered in this Cell")]
     TenantNotRegistered,
     #[error("project already exists and the request is not an idempotent replay")]
@@ -3684,6 +3700,16 @@ pub enum CloudStorageError {
     RemoteWorkerTaskNotFound,
     #[error("remote Worker task already has a different terminal completion")]
     RemoteWorkerTaskAlreadyCompleted,
+    #[error("Mission-scoped remote Worker work identity already exists")]
+    RemoteWorkerWorkAlreadyExists,
+    #[error("Mission-scoped remote Worker work is not visible in the exact scope")]
+    RemoteWorkerWorkNotFound,
+    #[error("Mission-scoped remote Worker work has a stale Project/Mission fence")]
+    RemoteWorkerWorkFenceLost,
+    #[error("Mission-scoped remote Worker work already has a terminal state")]
+    RemoteWorkerWorkAlreadyTerminal,
+    #[error("remote Worker provider identity does not match the mounted Cell transport")]
+    RemoteWorkerProviderMismatch,
     #[error("remote Worker lease owner, token, generation, or expiry is no longer current")]
     RemoteWorkerLeaseLost,
     #[error("remote Worker transport service/provider/consumer definition is invalid")]
@@ -4094,7 +4120,7 @@ mod tests {
 
     #[test]
     fn schema_contract_has_physical_cell_rls_ciphertext_and_append_only_versions() {
-        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(SCHEMA_VERSION, 7);
         assert!(SCHEMA.contains("FORCE ROW LEVEL SECURITY"));
         assert!(SCHEMA.contains("current_setting(''hartevo.tenant_id'', true)"));
         assert!(SCHEMA.contains("current_setting(''hartevo.cell'', true)"));
@@ -4103,6 +4129,9 @@ mod tests {
         assert!(SCHEMA.contains("sync_mutations"));
         assert!(SCHEMA.contains("remote_worker_mailbox_messages"));
         assert!(SCHEMA.contains("remote_worker_claims"));
+        assert!(SCHEMA.contains("remote_worker_work_requests"));
+        assert!(SCHEMA.contains("remote_worker_result_receipts"));
+        assert!(SCHEMA.contains("remote_worker_work_log"));
         assert!(SCHEMA.contains("remote_worker_transport_registrations"));
         assert!(SCHEMA.contains("remote_worker_dispatch_registrations"));
         assert!(SCHEMA.contains("state IN ('mounted', 'unmounted', 'revoked')"));
