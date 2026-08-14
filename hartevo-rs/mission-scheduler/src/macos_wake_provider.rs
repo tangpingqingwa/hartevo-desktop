@@ -36,6 +36,7 @@ pub const NATIVE_CANARY_ENV: &str = "HARTEVO_RUN_NATIVE_SCHEDULER_CANARY";
 pub const NATIVE_EXECUTABLE_ENV: &str = "HARTEVO_MACOS_SCHEDULER_EXECUTABLE";
 pub const NATIVE_ENTITLEMENT_ENV: &str = "HARTEVO_MACOS_SCHEDULER_ENTITLEMENT_PROOF";
 pub const NATIVE_DOMAIN_ENV: &str = "HARTEVO_MACOS_LAUNCHD_DOMAIN";
+pub const NATIVE_LAUNCH_AGENTS_DIR_ENV: &str = "HARTEVO_MACOS_LAUNCH_AGENTS_DIR";
 
 const MAX_PROVIDER_VERSION_BYTES: usize = 128;
 const MAX_LABEL_BYTES: usize = 128;
@@ -1077,9 +1078,6 @@ impl NativeMacOsLaunchdBackend {
     pub fn from_environment() -> Result<Self, MacOsLaunchdError> {
         Self::require_native_host()?;
         Self::require_canary_gate()?;
-        let home = env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| MacOsLaunchdError::BlockedEnv("HOME is unavailable".to_owned()))?;
         let executable = env::var_os(NATIVE_EXECUTABLE_ENV)
             .map(PathBuf::from)
             .ok_or_else(|| {
@@ -1097,11 +1095,23 @@ impl NativeMacOsLaunchdBackend {
                 "{NATIVE_DOMAIN_ENV} must be gui/<uid>"
             )));
         }
+        let launch_agents_dir = env::var_os(NATIVE_LAUNCH_AGENTS_DIR_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                MacOsLaunchdError::BlockedEnv(format!(
+                    "set {NATIVE_LAUNCH_AGENTS_DIR_ENV} to an isolated absolute directory"
+                ))
+            })?;
+        if !launch_agents_dir.is_absolute() {
+            return Err(MacOsLaunchdError::BlockedEnv(format!(
+                "{NATIVE_LAUNCH_AGENTS_DIR_ENV} must be absolute"
+            )));
+        }
         let backend = Self {
             launchctl: PathBuf::from("/bin/launchctl"),
             codesign: PathBuf::from("/usr/bin/codesign"),
             domain,
-            launch_agents_dir: home.join("Library/LaunchAgents"),
+            launch_agents_dir,
             executable,
         };
         backend.validate_paths()?;
