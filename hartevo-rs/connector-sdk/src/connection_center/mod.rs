@@ -6,11 +6,16 @@
 //! only a scoped, content-free repair result.
 
 mod events;
+mod plugin;
 mod repair;
 
 pub use events::{
     ConnectionRepairEvent, ConnectionRepairEventKind, ConnectionRepairEventLog,
     ConnectionRepairEventSink,
+};
+pub use plugin::{
+    MissionConnectionRepairPlugin, MissionConnectionRepairPluginError,
+    MissionConnectionRepairState, MissionConnectionRepairSurface,
 };
 pub use repair::{
     ConnectionRepairError, ConnectionRepairObservation, ConnectionRepairPlugin,
