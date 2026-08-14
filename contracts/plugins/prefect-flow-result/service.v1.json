@@ -1,0 +1,399 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/prefect-flow-result/service.v1.json",
+  "title": "Hartevo Prefect flow-run result Layer-1 service",
+  "description": "Standalone bounded Prefect read and result-proposal contract. It is not a flow runner, deployment controller, worker, workflow registry, kernel authority, raw-log/result reader, or Work Product authority.",
+  "schemaVersion": "hartevo.prefect-flow-result/v1",
+  "contractVersion": "EXT-PREFECT-01-L1/v1",
+  "serviceId": "PrefectFlowResultService",
+  "providerId": "PrefectProvider",
+  "consumerId": "MissionPrefectFlowConsumer",
+  "layer": 1,
+  "honesty": {
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "recordingOnly": true,
+    "rawApiKeySerialized": false,
+    "rawHeadersRetained": false,
+    "rawLogsRetained": false,
+    "rawResultsRetained": false,
+    "flowCreation": false,
+    "stateMutation": false,
+    "deploymentMutation": false,
+    "workerMutation": false,
+    "workflowRegistryAuthority": false,
+    "kernelAuthority": false,
+    "providerReceipt": false,
+    "workProductAdopted": false
+  },
+  "service": {
+    "id": "PrefectFlowResultService",
+    "provider": "PrefectProvider",
+    "consumer": "MissionPrefectFlowConsumer",
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "workflowRegistryAuthority": false,
+    "kernelAuthority": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "id": "PrefectProvider",
+    "apiRevision": "prefect-rest-api-v3",
+    "readOnlyRest": true,
+    "connectedEvidence": false,
+    "nativeStatus": "BLOCKED_ENV",
+    "authentication": {
+      "apiKeyReferenceOnly": true,
+      "serializedCredentials": false,
+      "environmentExport": false
+    },
+    "allowlistedOperations": [
+      "read_flow_run",
+      "read_task_runs",
+      "read_flow_run_history",
+      "filter_flow_runs"
+    ],
+    "forbiddenResources": [
+      "create_flow_run",
+      "set_flow_run_state",
+      "cancel_flow_run",
+      "deployments",
+      "workers",
+      "logs",
+      "results",
+      "workflow_registry"
+    ]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "serviceId",
+    "providerId",
+    "consumerId",
+    "layer",
+    "operations",
+    "scope",
+    "registration",
+    "projections",
+    "bounds",
+    "honesty",
+    "forbiddenEffects",
+    "layer2Gaps"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo.prefect-flow-result/v1"},
+    "contractVersion": {"const": "EXT-PREFECT-01-L1/v1"},
+    "serviceId": {"const": "PrefectFlowResultService"},
+    "providerId": {"const": "PrefectProvider"},
+    "consumerId": {"const": "MissionPrefectFlowConsumer"},
+    "layer": {"const": 1},
+    "operations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "describe_server_host",
+          "describe_account",
+          "describe_workspace",
+          "describe_flow",
+          "describe_deployment",
+          "read_flow_run",
+          "read_task_runs",
+          "read_state_history",
+          "filter_flow_runs",
+          "compile_flow_result_proposal",
+          "verify_flow_run_evidence",
+          "register",
+          "unmount",
+          "remount",
+          "revoke",
+          "reverse"
+        ]
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serverHost",
+        "account",
+        "workspace",
+        "flow",
+        "deployment",
+        "flowRun",
+        "taskRun",
+        "state",
+        "mission",
+        "permissions"
+      ],
+      "properties": {
+        "serverHost": {"$ref": "#/$defs/serverHost"},
+        "account": {"$ref": "#/$defs/revisionedName"},
+        "workspace": {"$ref": "#/$defs/revisionedName"},
+        "flow": {"$ref": "#/$defs/revisionedName"},
+        "deployment": {"$ref": "#/$defs/revisionedName"},
+        "flowRun": {"$ref": "#/$defs/revisionedName"},
+        "taskRun": {"$ref": "#/$defs/revisionedName"},
+        "state": {"$ref": "#/$defs/stateScope"},
+        "mission": {"$ref": "#/$defs/mission"},
+        "permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "server-host:read",
+              "account:read",
+              "workspace:read",
+              "flow:read",
+              "deployment:read",
+              "flow-run:read",
+              "task-run:read",
+              "state:read",
+              "mission:scope"
+            ]
+          }
+        }
+      }
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "versionDigest",
+        "contractDigest",
+        "providerDigest",
+        "apiDigest",
+        "serverHostDigest",
+        "accountDigest",
+        "workspaceDigest",
+        "flowDigest",
+        "deploymentDigest",
+        "flowRunDigest",
+        "taskRunDigest",
+        "stateDigest",
+        "missionDigest",
+        "permissionDigest",
+        "revisionDigest",
+        "scopeDigest",
+        "credentialDigest",
+        "registrationDigest",
+        "reversible",
+        "revocable"
+      ],
+      "properties": {
+        "status": {"enum": ["active", "unmounted", "revoked", "reversed"]},
+        "versionDigest": {"$ref": "#/$defs/digest"},
+        "contractDigest": {"$ref": "#/$defs/digest"},
+        "providerDigest": {"$ref": "#/$defs/digest"},
+        "apiDigest": {"$ref": "#/$defs/digest"},
+        "serverHostDigest": {"$ref": "#/$defs/digest"},
+        "accountDigest": {"$ref": "#/$defs/digest"},
+        "workspaceDigest": {"$ref": "#/$defs/digest"},
+        "flowDigest": {"$ref": "#/$defs/digest"},
+        "deploymentDigest": {"$ref": "#/$defs/digest"},
+        "flowRunDigest": {"$ref": "#/$defs/digest"},
+        "taskRunDigest": {"$ref": "#/$defs/digest"},
+        "stateDigest": {"$ref": "#/$defs/digest"},
+        "missionDigest": {"$ref": "#/$defs/digest"},
+        "permissionDigest": {"$ref": "#/$defs/digest"},
+        "revisionDigest": {"$ref": "#/$defs/digest"},
+        "scopeDigest": {"$ref": "#/$defs/digest"},
+        "credentialDigest": {"$ref": "#/$defs/digest"},
+        "registrationDigest": {"$ref": "#/$defs/digest"},
+        "reversible": {"const": true},
+        "revocable": {"const": true}
+      }
+    },
+    "projections": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "scheduled",
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "crashed",
+          "cancelled",
+          "paused",
+          "late",
+          "partial",
+          "stale",
+          "access_loss",
+          "provider_unknown"
+        ]
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxResponseBytes",
+        "maxPageItems",
+        "maxPages",
+        "maxTaskRuns",
+        "maxHistoryPoints",
+        "maxFilterValues",
+        "maxTimestampBytes",
+        "rawLogsRetained",
+        "rawResultsRetained"
+      ],
+      "properties": {
+        "maxResponseBytes": {"const": 2097152},
+        "maxPageItems": {"const": 256},
+        "maxPages": {"const": 32},
+        "maxTaskRuns": {"const": 4096},
+        "maxHistoryPoints": {"const": 4096},
+        "maxFilterValues": {"const": 16},
+        "maxTimestampBytes": {"const": 64},
+        "rawLogsRetained": {"const": false},
+        "rawResultsRetained": {"const": false}
+      }
+    },
+    "honesty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connected",
+        "native",
+        "firstParty",
+        "recordingOnly",
+        "rawApiKeySerialized",
+        "rawHeadersRetained",
+        "rawLogsRetained",
+        "rawResultsRetained",
+        "flowCreation",
+        "stateMutation",
+        "deploymentMutation",
+        "workerMutation",
+        "workflowRegistryAuthority",
+        "kernelAuthority",
+        "providerReceipt",
+        "workProductAdopted"
+      ],
+      "properties": {
+        "connected": {"const": false},
+        "native": {"const": false},
+        "firstParty": {"const": false},
+        "recordingOnly": {"const": true},
+        "rawApiKeySerialized": {"const": false},
+        "rawHeadersRetained": {"const": false},
+        "rawLogsRetained": {"const": false},
+        "rawResultsRetained": {"const": false},
+        "flowCreation": {"const": false},
+        "stateMutation": {"const": false},
+        "deploymentMutation": {"const": false},
+        "workerMutation": {"const": false},
+        "workflowRegistryAuthority": {"const": false},
+        "kernelAuthority": {"const": false},
+        "providerReceipt": {"const": false},
+        "workProductAdopted": {"const": false}
+      }
+    },
+    "forbiddenEffects": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "create_flow_run",
+          "set_flow_run_state",
+          "cancel_flow_run",
+          "mutate_deployment",
+          "mutate_worker",
+          "read_raw_logs",
+          "read_raw_results",
+          "read_arbitrary_filter_dsl",
+          "control_workflow_registry",
+          "resolve_native_secret",
+          "retain_raw_payload",
+          "adopt_kernel_truth",
+          "adopt_work_product"
+        ]
+      }
+    },
+    "layer2Gaps": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "native_api_key_resolution",
+          "bounded_live_https_reads",
+          "durable_provider_receipt",
+          "independent_flow_run_readback",
+          "independent_task_run_readback",
+          "verified_work_product_adoption"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "revision": {"type": "integer", "minimum": 1},
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001f/?:#]+$"
+    },
+    "revisionedName": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "revision"],
+      "properties": {
+        "name": {"$ref": "#/$defs/text"},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "serverHost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "hostId", "apiRevision", "revision"],
+      "properties": {
+        "origin": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^https?://"},
+        "hostId": {"$ref": "#/$defs/text"},
+        "apiRevision": {"$ref": "#/$defs/text"},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "stateScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowlistedStates", "revision"],
+      "properties": {
+        "allowlistedStates": {"type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true},
+        "revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "mission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectId",
+        "missionId",
+        "workProductId",
+        "projectRevision",
+        "missionRevision",
+        "workProductRevision",
+        "policyDigest",
+        "consentDigest"
+      ],
+      "properties": {
+        "projectId": {"$ref": "#/$defs/text"},
+        "missionId": {"$ref": "#/$defs/text"},
+        "workProductId": {"$ref": "#/$defs/text"},
+        "projectRevision": {"$ref": "#/$defs/revision"},
+        "missionRevision": {"$ref": "#/$defs/revision"},
+        "workProductRevision": {"$ref": "#/$defs/revision"},
+        "policyDigest": {"$ref": "#/$defs/digest"},
+        "consentDigest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  }
+}
