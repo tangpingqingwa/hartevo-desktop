@@ -1,0 +1,94 @@
+{
+  "schemaVersion": "hartevo.github-pr-ci-candidate-observation/v1",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "capturedAt": "2026-08-14T09:00:36Z",
+  "sourceApi": "github-rest-v3+local-git",
+  "observationStatus": "NOT_EXECUTED_EXTERNAL",
+  "baseline": {
+    "ref": "bootstrap/macos-r0",
+    "commit": "114abe2bc04d77d1eca4efea64092b37a0b0fb06",
+    "tree": "6a7914fcd147643b6957b92a3ac552650866e4ef"
+  },
+  "candidate": {
+    "number": 20,
+    "state": "OPEN",
+    "merged": false,
+    "draft": true,
+    "baseRef": "bootstrap/macos-r0",
+    "baseCommit": "114abe2bc04d77d1eca4efea64092b37a0b0fb06",
+    "headRef": "codex/evidence-integration-receipt-ev04",
+    "headCommit": "7724c5ca06425262508136ab610e63df534df939",
+    "headTree": "758c38b956b59b88fb478df46ae37017dda4bc9d",
+    "mergeCommit": null
+  },
+  "ci": {
+    "provider": "github-actions",
+    "workflowId": 333267489,
+    "workflowName": "ci",
+    "workflowPath": ".github/workflows/ci.yml",
+    "event": "pull_request",
+    "status": "NOT_EXECUTED_EXTERNAL",
+    "conclusion": "NOT_RUN",
+    "runId": null,
+    "runAttempt": null,
+    "headBranch": "codex/evidence-integration-receipt-ev04",
+    "headCommit": "7724c5ca06425262508136ab610e63df534df939",
+    "jobs": []
+  },
+  "protectedIntegrationRun": {
+    "provider": "github-actions",
+    "workflowId": 333787241,
+    "workflowName": "Integration / Bootstrap CI",
+    "workflowPath": ".github/workflows/integration.yml",
+    "event": "push",
+    "runId": 31782232735,
+    "runAttempt": 1,
+    "headCommit": "114abe2bc04d77d1eca4efea64092b37a0b0fb06",
+    "status": "queued",
+    "conclusion": null,
+    "jobs": []
+  },
+  "nativeEvidence": {
+    "path": "contracts/evidence/current-evidence-truth.v1.json",
+    "sourceCommit": "7724c5ca06425262508136ab610e63df534df939",
+    "sha256": "f5a5f6486b865311a79f1a6f162ee8c9fc3a7e95938904d487d3e800536ba30e",
+    "bytes": 5596,
+    "status": "NOT_PROVEN",
+    "nativeVisual": "NOT_PROVEN",
+    "nativeAccessibility": "NOT_PROVEN",
+    "processRestart": "NOT_PROVEN",
+    "releaseEvidence": "NOT_PROVEN",
+    "releasePassed": false,
+    "releaseDecision": "NOT_EVALUATED",
+    "missionEvidenceLevelPromoted": false
+  },
+  "evidenceRoles": {
+    "service": {
+      "id": "evidence-query",
+      "kind": "EVIDENCE_QUERY",
+      "path": "hartevo-rs/eval/src/lib.rs",
+      "symbol": "catalog_snapshot",
+      "sourceCommit": "7724c5ca06425262508136ab610e63df534df939",
+      "sha256": "ccbe9a6644acd017bf270d289f3d7e10a6a0652a517342958c57d3ebb842377e",
+      "bytes": 48982
+    },
+    "provider": {
+      "id": "evidence-producer",
+      "kind": "EVIDENCE_PRODUCER",
+      "path": "hartevo-rs/catalog/src/evidence.rs",
+      "symbol": "wave_zero_baseline",
+      "sourceCommit": "7724c5ca06425262508136ab610e63df534df939",
+      "sha256": "6c64c2fa18a011c4b6d856f4f40c238b210a46d88c1e585d6a7ae6ffeece4c37",
+      "bytes": 102229
+    },
+    "consumer": {
+      "id": "release-gate-consumer",
+      "kind": "RELEASE_GATE_CONSUMER",
+      "path": "hartevo-rs/catalog/src/evidence.rs",
+      "symbol": "validate_fail_closed",
+      "sourceCommit": "7724c5ca06425262508136ab610e63df534df939",
+      "sha256": "6c64c2fa18a011c4b6d856f4f40c238b210a46d88c1e585d6a7ae6ffeece4c37",
+      "bytes": 102229
+    }
+  }
+}

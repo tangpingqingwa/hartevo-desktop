@@ -44,8 +44,10 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 SCHEMA = "hartevo.integration-build-provenance-verification/v1"
 AUTHORITY = "INTEGRATION_BUILD_PROVENANCE_ONLY"
 CONTRACT_REL = "contracts/evidence/integration-build-provenance.v1.json"
-CONTRACT_SHA256 = "038ae9002812ce536ed8c51379c604a035e7ec4f5b0a5a15de4caf392d9f03b6"
+CONTRACT_SHA256 = "3fdfbf7749c35936f138b063b60ca824b16cd7e61b030dea7e7bbdd8a97d2580"
 EXPECTED_FAIL_CODES = [
+    "CANDIDATE_CI_HEAD_MISMATCH",
+    "CANDIDATE_CI_NOT_EXECUTED",
     "CI_CONCLUSION_NOT_SUCCESS",
     "CI_HEAD_MISMATCH",
     "CI_JOB_MISSING",
@@ -55,11 +57,13 @@ EXPECTED_FAIL_CODES = [
     "CI_STATUS_NOT_COMPLETED",
     "CONTRACT_DIGEST_MISMATCH",
     "CURRENT_COMMIT_MISMATCH",
+    "EVIDENCE_ROLE_MISSING",
     "HEAD_NOT_DESCENDANT",
     "HISTORICAL_ARTIFACT_STALE",
     "INTEGRATION_HEAD_MISMATCH",
     "MANIFEST_DIGEST_MISMATCH",
     "MANIFEST_SOURCE_MISMATCH",
+    "NATIVE_EVIDENCE_ESCALATION",
     "PR_BASE_ANCESTRY_MISMATCH",
     "PR_BASE_MISMATCH",
     "PR_DRAFT",
@@ -192,25 +196,29 @@ def read_regular(relative: str, missing_code: str) -> bytes:
     return absolute.read_bytes()
 
 
+def validate_instance_ref(instance: Mapping[str, Any], label: str) -> None:
+    require(isinstance(instance, dict), "SCHEMA_TYPE_MISMATCH", f"{label} must be an object")
+    exact_keys(instance, ("manifestPath", "manifestSha256", "manifestBytes", "rawArtifactPath", "rawArtifactSha256", "rawArtifactBytes"), label)
+    safe_relative_path(instance["manifestPath"], f"{label}.manifestPath")
+    digest(instance["manifestSha256"], f"{label}.manifestSha256")
+    positive_int(instance["manifestBytes"], f"{label}.manifestBytes")
+    safe_relative_path(instance["rawArtifactPath"], f"{label}.rawArtifactPath")
+    digest(instance["rawArtifactSha256"], f"{label}.rawArtifactSha256")
+    positive_int(instance["rawArtifactBytes"], f"{label}.rawArtifactBytes")
+
+
 def validate_contract(contract: Mapping[str, Any]) -> None:
     exact_keys(
         contract,
-        ("schemaVersion", "contractId", "authority", "currentInstance", "currentBaseline", "source", "pullRequestPolicy", "integrationHistoryPolicy", "ciPolicy", "resultPolicy", "failClosedCodes", "gate"),
+        ("schemaVersion", "contractId", "authority", "currentInstance", "historicalInstance", "currentBaseline", "candidatePolicy", "nativeEvidencePolicy", "evidenceRolePolicy", "source", "pullRequestPolicy", "integrationHistoryPolicy", "ciPolicy", "resultPolicy", "failClosedCodes", "gate"),
         "contract",
     )
     require(contract["schemaVersion"] == "hartevo.integration-build-provenance-contract/v1", "CONTRACT_SCHEMA_MISMATCH", "unexpected contract schema")
     require(contract["contractId"] == "ev-04-integration-build-provenance-v1", "CONTRACT_ID_MISMATCH", "unexpected contract id")
     require(contract["authority"] == AUTHORITY, "RELEASE_AUTHORITY_ESCALATION", "contract authority must remain integration provenance only")
 
-    instance = contract["currentInstance"]
-    require(isinstance(instance, dict), "SCHEMA_TYPE_MISMATCH", "currentInstance must be an object")
-    exact_keys(instance, ("manifestPath", "manifestSha256", "manifestBytes", "rawArtifactPath", "rawArtifactSha256", "rawArtifactBytes"), "currentInstance")
-    safe_relative_path(instance["manifestPath"], "currentInstance.manifestPath")
-    digest(instance["manifestSha256"], "currentInstance.manifestSha256")
-    positive_int(instance["manifestBytes"], "currentInstance.manifestBytes")
-    safe_relative_path(instance["rawArtifactPath"], "currentInstance.rawArtifactPath")
-    digest(instance["rawArtifactSha256"], "currentInstance.rawArtifactSha256")
-    positive_int(instance["rawArtifactBytes"], "currentInstance.rawArtifactBytes")
+    validate_instance_ref(contract["currentInstance"], "currentInstance")
+    validate_instance_ref(contract["historicalInstance"], "historicalInstance")
 
     baseline = contract["currentBaseline"]
     require(isinstance(baseline, dict), "SCHEMA_TYPE_MISMATCH", "currentBaseline must be an object")
@@ -223,7 +231,7 @@ def validate_contract(contract: Mapping[str, Any]) -> None:
     git_id(baseline["commit"], "currentBaseline.commit")
     git_id(baseline["tree"], "currentBaseline.tree")
     require(baseline["requireExactCheckout"] is True, "CURRENT_COMMIT_MISMATCH", "current baseline must require exact checkout")
-    require(baseline["artifactStatus"] == "HISTORICAL_STALE", "HISTORICAL_ARTIFACT_STALE", "artifact status must remain historical stale")
+    require(baseline["artifactStatus"] == "CURRENT_CANDIDATE_PENDING_CI", "HISTORICAL_ARTIFACT_STALE", "artifact status must remain current-candidate pending CI")
     git_id(baseline["historicalArtifactHead"], "currentBaseline.historicalArtifactHead")
     require(baseline["historicalArtifactHead"] == contract["source"]["headCommit"], "HISTORICAL_ARTIFACT_STALE", "historical artifact head must match source head")
     nonempty_string(baseline["staleReason"], "currentBaseline.staleReason")
@@ -278,7 +286,7 @@ def validate_contract(contract: Mapping[str, Any]) -> None:
     result = contract["resultPolicy"]
     require(isinstance(result, dict), "SCHEMA_TYPE_MISMATCH", "resultPolicy must be an object")
     exact_keys(result, ("verificationCode", "verificationStatus", "releaseDecision", "releasePassed", "missionEvidenceLevelPromoted", "maySatisfyReleaseEvidence", "mayPromoteMissionEvidenceLevel"), "resultPolicy")
-    require(result["verificationCode"] == "INTEGRATION_BUILD_PROVENANCE_VERIFIED" and result["verificationStatus"] == "VERIFIED", "RESULT_POLICY_MISMATCH", "verification result differs")
+    require(result["verificationCode"] == "INTEGRATION_BUILD_PROVENANCE_PENDING" and result["verificationStatus"] == "NOT_VERIFIED", "RESULT_POLICY_MISMATCH", "verification result differs")
     require(
         result["releaseDecision"] == "NOT_EVALUATED"
         and result["releasePassed"] is False
@@ -288,12 +296,94 @@ def validate_contract(contract: Mapping[str, Any]) -> None:
         "RELEASE_AUTHORITY_ESCALATION",
         "integration evidence must not grant Release or Mission evidence-level authority",
     )
+    validate_candidate_contract_sections(contract)
     require(contract["failClosedCodes"] == EXPECTED_FAIL_CODES, "CONTRACT_FAIL_CODES_MISMATCH", "fail-closed code set must be sorted and exact")
     gate = contract["gate"]
     require(isinstance(gate, dict), "SCHEMA_TYPE_MISMATCH", "gate must be an object")
     exact_keys(gate, ("verifyCommand", "selfTestCommand"), "gate")
     require(gate["verifyCommand"] == "bash scripts/check-integration-build-provenance.sh verify", "CONTRACT_GATE_MISMATCH", "verify command differs")
     require(gate["selfTestCommand"] == "bash scripts/check-integration-build-provenance.sh self-test", "CONTRACT_GATE_MISMATCH", "self-test command differs")
+
+
+def validate_candidate_policy(policy: Mapping[str, Any], contract: Mapping[str, Any]) -> None:
+    require(isinstance(policy, dict), "SCHEMA_TYPE_MISMATCH", "candidatePolicy must be an object")
+    exact_keys(policy, ("pullRequest", "ci", "protectedIntegrationRun"), "candidatePolicy")
+    candidate = policy["pullRequest"]
+    require(isinstance(candidate, dict), "SCHEMA_TYPE_MISMATCH", "candidatePolicy.pullRequest must be an object")
+    exact_keys(candidate, ("number", "state", "merged", "draft", "baseRef", "baseCommit", "headRef", "headCommit", "headTree", "mergeCommit"), "candidatePolicy.pullRequest")
+    positive_int(candidate["number"], "candidatePolicy.pullRequest.number")
+    git_id(candidate["baseCommit"], "candidatePolicy.pullRequest.baseCommit")
+    git_id(candidate["headCommit"], "candidatePolicy.pullRequest.headCommit")
+    git_id(candidate["headTree"], "candidatePolicy.pullRequest.headTree")
+    require(candidate["state"] == "OPEN" and candidate["merged"] is False and candidate["draft"] is True, "PR_POLICY_MISMATCH", "current candidate must remain open+draft+unmerged")
+    require(candidate["baseRef"] == contract["currentBaseline"]["ref"].removeprefix("origin/"), "PR_BASE_MISMATCH", "candidate base ref differs")
+    require(candidate["baseCommit"] == contract["currentBaseline"]["commit"], "PR_BASE_MISMATCH", "candidate base commit differs")
+    require(candidate["headRef"].startswith("codex/"), "PR_HEAD_MISMATCH", "candidate head ref is outside the feature namespace")
+    require(candidate["mergeCommit"] is None, "PR_MERGE_CHAIN_MISMATCH", "unmerged candidate must not have a merge commit")
+
+    ci = policy["ci"]
+    require(isinstance(ci, dict), "SCHEMA_TYPE_MISMATCH", "candidatePolicy.ci must be an object")
+    exact_keys(ci, ("provider", "workflowId", "workflowName", "workflowPath", "event", "requiredStatus", "requiredConclusion", "requiredJobs"), "candidatePolicy.ci")
+    require(ci["provider"] == "github-actions" and ci["workflowName"] == "ci" and ci["workflowPath"] == ".github/workflows/ci.yml" and ci["event"] == "pull_request", "CI_RUN_POLICY_MISMATCH", "candidate CI policy differs")
+    positive_int(ci["workflowId"], "candidatePolicy.ci.workflowId")
+    require(ci["requiredStatus"] == "completed" and ci["requiredConclusion"] == "success", "CI_RUN_POLICY_MISMATCH", "candidate CI terminal policy differs")
+    require(ci["requiredJobs"] == contract["ciPolicy"]["requiredJobs"], "CI_JOB_MISSING", "candidate CI required jobs differ")
+
+    protected = policy["protectedIntegrationRun"]
+    require(isinstance(protected, dict), "SCHEMA_TYPE_MISMATCH", "candidatePolicy.protectedIntegrationRun must be an object")
+    exact_keys(protected, ("provider", "workflowId", "workflowName", "workflowPath", "event", "runId", "runAttempt", "headCommit", "status", "conclusion", "requiredJobs"), "candidatePolicy.protectedIntegrationRun")
+    require(protected["provider"] == "github-actions" and protected["workflowName"] == "Integration / Bootstrap CI" and protected["workflowPath"] == ".github/workflows/integration.yml" and protected["event"] == "push", "CI_RUN_POLICY_MISMATCH", "protected integration workflow differs")
+    positive_int(protected["workflowId"], "candidatePolicy.protectedIntegrationRun.workflowId")
+    positive_int(protected["runId"], "candidatePolicy.protectedIntegrationRun.runId")
+    require(protected["runAttempt"] == 1 and protected["status"] == "queued" and protected["conclusion"] is None, "CI_STATUS_NOT_COMPLETED", "protected integration run must remain queued")
+    require(protected["headCommit"] == contract["currentBaseline"]["commit"], "CURRENT_COMMIT_MISMATCH", "protected integration run head differs")
+    require(protected["requiredJobs"] == [
+        "Integration / Catalog and evidence",
+        "Integration / Dependency and SBOM",
+        "Integration / Dioxus build and receipt",
+        "Integration / Full Rust matrix",
+        "Integration / OpenInterpreter contract",
+        "Integration / PostgreSQL 18 Cell",
+        "Integration / Result taxonomy",
+    ], "CI_JOB_MISSING", "protected integration required jobs differ")
+
+
+def validate_native_policy(policy: Mapping[str, Any]) -> None:
+    require(isinstance(policy, dict), "SCHEMA_TYPE_MISMATCH", "nativeEvidencePolicy must be an object")
+    exact_keys(policy, ("path", "sourceCommit", "sha256", "bytes", "status", "nativeVisual", "nativeAccessibility", "processRestart", "releaseEvidence", "releasePassed", "releaseDecision", "missionEvidenceLevelPromoted"), "nativeEvidencePolicy")
+    safe_relative_path(policy["path"], "nativeEvidencePolicy.path")
+    git_id(policy["sourceCommit"], "nativeEvidencePolicy.sourceCommit")
+    digest(policy["sha256"], "nativeEvidencePolicy.sha256")
+    positive_int(policy["bytes"], "nativeEvidencePolicy.bytes")
+    require(all(policy[key] == "NOT_PROVEN" for key in ("status", "nativeVisual", "nativeAccessibility", "processRestart", "releaseEvidence")), "NATIVE_EVIDENCE_ESCALATION", "native evidence must remain NOT_PROVEN")
+    require(policy["releasePassed"] is False and policy["releaseDecision"] == "NOT_EVALUATED" and policy["missionEvidenceLevelPromoted"] is False, "RELEASE_AUTHORITY_ESCALATION", "native evidence policy cannot grant Release authority")
+
+
+def validate_role_policy(policy: Mapping[str, Any], candidate_commit: str) -> None:
+    require(isinstance(policy, dict), "SCHEMA_TYPE_MISMATCH", "evidenceRolePolicy must be an object")
+    exact_keys(policy, ("service", "provider", "consumer"), "evidenceRolePolicy")
+    expected = {
+        "service": ("evidence-query", "EVIDENCE_QUERY", "catalog_snapshot"),
+        "provider": ("evidence-producer", "EVIDENCE_PRODUCER", "wave_zero_baseline"),
+        "consumer": ("release-gate-consumer", "RELEASE_GATE_CONSUMER", "validate_fail_closed"),
+    }
+    for name, (role_id, kind, symbol) in expected.items():
+        role = policy[name]
+        require(isinstance(role, dict), "SCHEMA_TYPE_MISMATCH", f"evidenceRolePolicy.{name} must be an object")
+        exact_keys(role, ("id", "kind", "path", "symbol", "sourceCommit", "sha256", "bytes"), f"evidenceRolePolicy.{name}")
+        require(role["id"] == role_id and role["kind"] == kind and role["symbol"] == symbol, "EVIDENCE_ROLE_MISSING", f"evidence role {name} identity differs")
+        safe_relative_path(role["path"], f"evidenceRolePolicy.{name}.path")
+        require(role["sourceCommit"] == candidate_commit, "EVIDENCE_ROLE_MISSING", f"evidence role {name} is not bound to candidate commit")
+        git_id(role["sourceCommit"], f"evidenceRolePolicy.{name}.sourceCommit")
+        digest(role["sha256"], f"evidenceRolePolicy.{name}.sha256")
+        positive_int(role["bytes"], f"evidenceRolePolicy.{name}.bytes")
+
+
+def validate_candidate_contract_sections(contract: Mapping[str, Any]) -> None:
+    candidate = contract["candidatePolicy"]["pullRequest"]
+    validate_candidate_policy(contract["candidatePolicy"], contract)
+    validate_native_policy(contract["nativeEvidencePolicy"])
+    validate_role_policy(contract["evidenceRolePolicy"], candidate["headCommit"])
 
 
 def load_contract() -> Tuple[bytes, Dict[str, Any]]:
@@ -304,23 +394,45 @@ def load_contract() -> Tuple[bytes, Dict[str, Any]]:
     return raw, contract
 
 
+def load_instance_ref(
+    instance: Mapping[str, Any],
+    *,
+    manifest_override: Optional[bytes] = None,
+    raw_override: Optional[bytes] = None,
+    manifest_missing_code: str = "MANIFEST_MISSING",
+    raw_missing_code: str = "RAW_ARTIFACT_MISSING",
+) -> Tuple[bytes, Dict[str, Any], bytes, Dict[str, Any]]:
+    manifest_raw = manifest_override if manifest_override is not None else read_regular(instance["manifestPath"], manifest_missing_code)
+    require(sha256(manifest_raw) == instance["manifestSha256"], "MANIFEST_DIGEST_MISMATCH", "manifest raw SHA-256 differs")
+    require(len(manifest_raw) == instance["manifestBytes"], "MANIFEST_DIGEST_MISMATCH", "manifest byte count differs")
+    manifest = load_json(manifest_raw, instance["manifestPath"])
+
+    raw_artifact = raw_override if raw_override is not None else read_regular(instance["rawArtifactPath"], raw_missing_code)
+    require(sha256(raw_artifact) == instance["rawArtifactSha256"], "RAW_ARTIFACT_DIGEST_MISMATCH", "raw artifact SHA-256 differs")
+    require(len(raw_artifact) == instance["rawArtifactBytes"], "RAW_ARTIFACT_DIGEST_MISMATCH", "raw artifact byte count differs")
+    observation = load_json(raw_artifact, instance["rawArtifactPath"])
+    return manifest_raw, manifest, raw_artifact, observation
+
+
 def load_instance(
     contract: Mapping[str, Any],
     *,
     manifest_override: Optional[bytes] = None,
     raw_override: Optional[bytes] = None,
 ) -> Tuple[bytes, Dict[str, Any], bytes, Dict[str, Any]]:
-    instance = contract["currentInstance"]
-    manifest_raw = manifest_override if manifest_override is not None else read_regular(instance["manifestPath"], "MANIFEST_MISSING")
-    require(sha256(manifest_raw) == instance["manifestSha256"], "MANIFEST_DIGEST_MISMATCH", "manifest raw SHA-256 differs")
-    require(len(manifest_raw) == instance["manifestBytes"], "MANIFEST_DIGEST_MISMATCH", "manifest byte count differs")
-    manifest = load_json(manifest_raw, instance["manifestPath"])
+    return load_instance_ref(
+        contract["historicalInstance"],
+        manifest_override=manifest_override,
+        raw_override=raw_override,
+    )
 
-    raw_artifact = raw_override if raw_override is not None else read_regular(instance["rawArtifactPath"], "RAW_ARTIFACT_MISSING")
-    require(sha256(raw_artifact) == instance["rawArtifactSha256"], "RAW_ARTIFACT_DIGEST_MISMATCH", "raw artifact SHA-256 differs")
-    require(len(raw_artifact) == instance["rawArtifactBytes"], "RAW_ARTIFACT_DIGEST_MISMATCH", "raw artifact byte count differs")
-    observation = load_json(raw_artifact, instance["rawArtifactPath"])
-    return manifest_raw, manifest, raw_artifact, observation
+
+def load_candidate_instance(contract: Mapping[str, Any]) -> Tuple[bytes, Dict[str, Any], bytes, Dict[str, Any]]:
+    return load_instance_ref(
+        contract["currentInstance"],
+        manifest_missing_code="CANDIDATE_MANIFEST_MISSING",
+        raw_missing_code="CANDIDATE_RAW_ARTIFACT_MISSING",
+    )
 
 
 def validate_manifest(contract: Mapping[str, Any], manifest: Mapping[str, Any]) -> None:
@@ -338,7 +450,7 @@ def validate_manifest(contract: Mapping[str, Any], manifest: Mapping[str, Any]) 
     raw_ref = manifest["rawArtifact"]
     require(isinstance(raw_ref, dict), "SCHEMA_TYPE_MISMATCH", "manifest.rawArtifact must be an object")
     exact_keys(raw_ref, ("kind", "path", "sha256", "bytes"), "manifest.rawArtifact")
-    instance = contract["currentInstance"]
+    instance = contract["historicalInstance"]
     require(raw_ref == {
         "kind": "GITHUB_PR_CI_OBSERVATION",
         "path": instance["rawArtifactPath"],
@@ -434,6 +546,197 @@ def validate_observation(observation: Mapping[str, Any]) -> None:
     require(observation["sourceApi"] == "github-rest-v3", "RAW_ARTIFACT_SCHEMA_MISMATCH", "raw observation source API differs")
     utc_time(observation["capturedAt"], "raw observation capturedAt")
     require(isinstance(observation["pullRequests"], list), "PR_MERGE_CHAIN_MISMATCH", "raw observation pullRequests must be an array")
+
+
+def validate_candidate_object(candidate: Mapping[str, Any], expected: Mapping[str, Any], label: str) -> None:
+    require(isinstance(candidate, dict), "SCHEMA_TYPE_MISMATCH", f"{label} must be an object")
+    exact_keys(candidate, ("number", "state", "merged", "draft", "baseRef", "baseCommit", "headRef", "headCommit", "headTree", "mergeCommit"), label)
+    require(candidate == dict(expected), "MANIFEST_SOURCE_MISMATCH", f"{label} differs from the pinned candidate policy")
+    positive_int(candidate["number"], f"{label}.number")
+    git_id(candidate["baseCommit"], f"{label}.baseCommit")
+    git_id(candidate["headCommit"], f"{label}.headCommit")
+    git_id(candidate["headTree"], f"{label}.headTree")
+    nonempty_string(candidate["baseRef"], f"{label}.baseRef")
+    nonempty_string(candidate["headRef"], f"{label}.headRef")
+    require(candidate["mergeCommit"] is None, "PR_MERGE_CHAIN_MISMATCH", f"{label}.mergeCommit must be null while unmerged")
+
+
+def validate_candidate_ci(ci: Mapping[str, Any], expected: Mapping[str, Any], label: str) -> None:
+    require(isinstance(ci, dict), "SCHEMA_TYPE_MISMATCH", f"{label} must be an object")
+    exact_keys(ci, ("provider", "workflowId", "workflowName", "workflowPath", "event", "status", "conclusion", "runId", "runAttempt", "headBranch", "headCommit", "jobs"), label)
+    require(ci["provider"] == expected["provider"] and ci["workflowId"] == expected["workflowId"] and ci["workflowName"] == expected["workflowName"] and ci["workflowPath"] == expected["workflowPath"] and ci["event"] == expected["event"], "CI_RUN_POLICY_MISMATCH", f"{label} workflow identity differs")
+    require(ci["status"] in {"NOT_EXECUTED_EXTERNAL", "queued", "in_progress", "completed"}, "CI_RUN_POLICY_MISMATCH", f"{label}.status is unknown")
+    require(ci["conclusion"] in {None, "NOT_RUN", "success", "failure", "cancelled"}, "CI_RUN_POLICY_MISMATCH", f"{label}.conclusion is unknown")
+    if ci["runId"] is not None:
+        positive_int(ci["runId"], f"{label}.runId")
+    if ci["runAttempt"] is not None:
+        positive_int(ci["runAttempt"], f"{label}.runAttempt")
+    nonempty_string(ci["headBranch"], f"{label}.headBranch")
+    git_id(ci["headCommit"], f"{label}.headCommit")
+    require(isinstance(ci["jobs"], list), "CI_JOB_MISSING", f"{label}.jobs must be an array")
+    if ci["status"] == "NOT_EXECUTED_EXTERNAL":
+        require(ci["runId"] is None and ci["runAttempt"] is None and ci["conclusion"] == "NOT_RUN" and ci["jobs"] == [], "CANDIDATE_CI_NOT_EXECUTED", f"{label} not-executed envelope must not contain a run or jobs")
+    elif ci["status"] == "completed":
+        require(ci["runId"] is not None and ci["runAttempt"] is not None and ci["conclusion"] in {"success", "failure", "cancelled"}, "CI_RUN_MISSING", f"{label} completed envelope is missing run identity")
+        names = []
+        for index, job in enumerate(ci["jobs"]):
+            require(isinstance(job, dict), "CI_JOB_MISSING", f"{label}.jobs[{index}] must be an object")
+            exact_keys(job, ("id", "name", "status", "conclusion", "runAttempt", "headCommit"), f"{label}.jobs[{index}]")
+            positive_int(job["id"], f"{label}.jobs[{index}].id")
+            names.append(nonempty_string(job["name"], f"{label}.jobs[{index}].name"))
+            require(job["status"] == "completed" and job["conclusion"] in {"success", "failure", "cancelled"}, "CI_JOB_NOT_SUCCESS", f"{label}.jobs[{index}] is not terminal")
+            positive_int(job["runAttempt"], f"{label}.jobs[{index}].runAttempt")
+            git_id(job["headCommit"], f"{label}.jobs[{index}].headCommit")
+            require(job["runAttempt"] == ci["runAttempt"] and job["headCommit"] == ci["headCommit"], "CANDIDATE_CI_HEAD_MISMATCH", f"{label}.jobs[{index}] is not bound to the run")
+        require(names == list(expected["requiredJobs"]), "CI_JOB_MISSING", f"{label} required job names differ")
+
+
+def validate_protected_run(run_record: Mapping[str, Any], expected: Mapping[str, Any], label: str) -> None:
+    require(isinstance(run_record, dict), "SCHEMA_TYPE_MISMATCH", f"{label} must be an object")
+    exact_keys(run_record, ("provider", "workflowId", "workflowName", "workflowPath", "event", "runId", "runAttempt", "headCommit", "status", "conclusion", "jobs"), label)
+    require(run_record["provider"] == expected["provider"] and run_record["workflowId"] == expected["workflowId"] and run_record["workflowName"] == expected["workflowName"] and run_record["workflowPath"] == expected["workflowPath"] and run_record["event"] == expected["event"], "CI_RUN_POLICY_MISMATCH", f"{label} workflow identity differs")
+    positive_int(run_record["runId"], f"{label}.runId")
+    positive_int(run_record["runAttempt"], f"{label}.runAttempt")
+    git_id(run_record["headCommit"], f"{label}.headCommit")
+    require(run_record["status"] in {"queued", "in_progress", "completed"}, "CI_RUN_POLICY_MISMATCH", f"{label}.status is unknown")
+    require(run_record["conclusion"] in {None, "success", "failure", "cancelled"}, "CI_RUN_POLICY_MISMATCH", f"{label}.conclusion is unknown")
+    require(isinstance(run_record["jobs"], list), "CI_JOB_MISSING", f"{label}.jobs must be an array")
+    if run_record["status"] != "completed":
+        require(run_record["conclusion"] is None and run_record["jobs"] == [], "CI_STATUS_NOT_COMPLETED", f"{label} incomplete run must not contain a conclusion or jobs")
+    else:
+        require(run_record["conclusion"] in {"success", "failure", "cancelled"}, "CI_CONCLUSION_NOT_SUCCESS", f"{label} completed run has no terminal conclusion")
+        names = []
+        for index, job in enumerate(run_record["jobs"]):
+            require(isinstance(job, dict), "CI_JOB_MISSING", f"{label}.jobs[{index}] must be an object")
+            exact_keys(job, ("id", "name", "status", "conclusion", "runAttempt", "headCommit"), f"{label}.jobs[{index}]")
+            positive_int(job["id"], f"{label}.jobs[{index}].id")
+            names.append(nonempty_string(job["name"], f"{label}.jobs[{index}].name"))
+            require(job["status"] == "completed" and job["conclusion"] in {"success", "failure", "cancelled"}, "CI_JOB_NOT_SUCCESS", f"{label}.jobs[{index}] is not terminal")
+            positive_int(job["runAttempt"], f"{label}.jobs[{index}].runAttempt")
+            git_id(job["headCommit"], f"{label}.jobs[{index}].headCommit")
+            require(job["runAttempt"] == run_record["runAttempt"] and job["headCommit"] == run_record["headCommit"], "CANDIDATE_CI_HEAD_MISMATCH", f"{label}.jobs[{index}] is not bound to the run")
+        require(names == list(expected["requiredJobs"]), "CI_JOB_MISSING", f"{label} required job names differ")
+
+
+def git_blob_bytes(commit: str, relative: str) -> bytes:
+    safe_relative_path(relative, "evidence role path")
+    tree_line = git_text("ls-tree", commit, "--", relative)
+    require(tree_line.startswith("100644 blob ") and tree_line.endswith(f"\t{relative}"), "EVIDENCE_ROLE_MISSING", f"evidence role is not a regular tracked blob: {relative}")
+    result = run(("git", "show", f"{commit}:{relative}"), check=False)
+    require(result.returncode == 0, "EVIDENCE_ROLE_MISSING", f"evidence role blob is unavailable: {relative}")
+    return result.stdout
+
+
+def validate_native_evidence(value: Mapping[str, Any], expected: Mapping[str, Any], label: str) -> None:
+    require(isinstance(value, dict), "SCHEMA_TYPE_MISMATCH", f"{label} must be an object")
+    exact_keys(value, ("path", "sourceCommit", "sha256", "bytes", "status", "nativeVisual", "nativeAccessibility", "processRestart", "releaseEvidence", "releasePassed", "releaseDecision", "missionEvidenceLevelPromoted"), label)
+    require(value == dict(expected), "NATIVE_EVIDENCE_ESCALATION", f"{label} differs from the pinned native-evidence policy")
+    safe_relative_path(value["path"], f"{label}.path")
+    git_id(value["sourceCommit"], f"{label}.sourceCommit")
+    digest(value["sha256"], f"{label}.sha256")
+    positive_int(value["bytes"], f"{label}.bytes")
+    require(value["status"] == "NOT_PROVEN" and value["releasePassed"] is False and value["releaseDecision"] == "NOT_EVALUATED" and value["missionEvidenceLevelPromoted"] is False, "NATIVE_EVIDENCE_ESCALATION", f"{label} cannot grant native or Release authority")
+
+
+def validate_evidence_roles(value: Mapping[str, Any], expected: Mapping[str, Any], candidate_commit: str, label: str) -> None:
+    require(isinstance(value, dict), "SCHEMA_TYPE_MISMATCH", f"{label} must be an object")
+    exact_keys(value, ("service", "provider", "consumer"), label)
+    for name in ("service", "provider", "consumer"):
+        role = value[name]
+        expected_role = expected[name]
+        require(isinstance(role, dict), "SCHEMA_TYPE_MISMATCH", f"{label}.{name} must be an object")
+        exact_keys(role, ("id", "kind", "path", "symbol", "sourceCommit", "sha256", "bytes"), f"{label}.{name}")
+        require(role == expected_role, "EVIDENCE_ROLE_MISSING", f"{label}.{name} differs from the pinned role")
+        require(role["sourceCommit"] == candidate_commit, "EVIDENCE_ROLE_MISSING", f"{label}.{name} is not candidate-bound")
+        blob = git_blob_bytes(candidate_commit, role["path"])
+        require(sha256(blob) == role["sha256"] and len(blob) == role["bytes"], "EVIDENCE_ROLE_MISSING", f"{label}.{name} blob digest differs")
+        require(role["symbol"].encode("utf-8") in blob, "EVIDENCE_ROLE_MISSING", f"{label}.{name} symbol is absent")
+
+
+def validate_candidate_manifest(contract: Mapping[str, Any], manifest: Mapping[str, Any], raw_artifact_path: str, raw_artifact_sha: str, raw_artifact_bytes: int) -> None:
+    exact_keys(manifest, ("schemaVersion", "manifestId", "authority", "baseline", "candidate", "rawArtifact", "ci", "protectedIntegrationRun", "nativeEvidence", "evidenceRoles", "result"), "candidate manifest")
+    require(manifest["schemaVersion"] == "hartevo.integration-build-candidate-manifest/v1", "MANIFEST_SCHEMA_MISMATCH", "candidate manifest schema differs")
+    expected_candidate = contract["candidatePolicy"]["pullRequest"]
+    require(manifest["manifestId"] == f"ev-04-candidate-{expected_candidate['headCommit']}", "MANIFEST_SOURCE_MISMATCH", "candidate manifest id is not source-bound")
+    require(manifest["authority"] == AUTHORITY, "RELEASE_AUTHORITY_ESCALATION", "candidate manifest authority must remain integration provenance only")
+    expected_baseline = {"ref": expected_candidate["baseRef"], "commit": contract["currentBaseline"]["commit"], "tree": contract["currentBaseline"]["tree"]}
+    require(manifest["baseline"] == expected_baseline, "MANIFEST_SOURCE_MISMATCH", "candidate baseline differs")
+    validate_candidate_object(manifest["candidate"], expected_candidate, "candidate manifest.candidate")
+    raw_ref = manifest["rawArtifact"]
+    require(isinstance(raw_ref, dict), "SCHEMA_TYPE_MISMATCH", "candidate manifest.rawArtifact must be an object")
+    exact_keys(raw_ref, ("kind", "path", "sha256", "bytes"), "candidate manifest.rawArtifact")
+    require(raw_ref == {"kind": "GITHUB_PR_CI_CANDIDATE_OBSERVATION", "path": raw_artifact_path, "sha256": raw_artifact_sha, "bytes": raw_artifact_bytes}, "RAW_ARTIFACT_DIGEST_MISMATCH", "candidate raw-artifact reference differs")
+    validate_candidate_ci(manifest["ci"], contract["candidatePolicy"]["ci"], "candidate manifest.ci")
+    require(manifest["ci"]["headBranch"] == expected_candidate["headRef"] and manifest["ci"]["headCommit"] == expected_candidate["headCommit"], "CANDIDATE_CI_HEAD_MISMATCH", "candidate manifest CI is not bound to the candidate head")
+    validate_protected_run(manifest["protectedIntegrationRun"], contract["candidatePolicy"]["protectedIntegrationRun"], "candidate manifest.protectedIntegrationRun")
+    require(manifest["protectedIntegrationRun"]["headCommit"] == contract["currentBaseline"]["commit"], "CANDIDATE_CI_HEAD_MISMATCH", "protected integration run is not bound to the protected base")
+    validate_native_evidence(manifest["nativeEvidence"], contract["nativeEvidencePolicy"], "candidate manifest.nativeEvidence")
+    validate_evidence_roles(manifest["evidenceRoles"], contract["evidenceRolePolicy"], expected_candidate["headCommit"], "candidate manifest.evidenceRoles")
+    result = manifest["result"]
+    require(isinstance(result, dict), "SCHEMA_TYPE_MISMATCH", "candidate manifest.result must be an object")
+    exact_keys(result, ("status", "verificationStatus", "releaseDecision", "releasePassed", "missionEvidenceLevelPromoted", "maySatisfyReleaseEvidence", "mayPromoteMissionEvidenceLevel"), "candidate manifest.result")
+    require(result == {"status": "NOT_EXECUTED_EXTERNAL", "verificationStatus": "NOT_VERIFIED", "releaseDecision": "NOT_EVALUATED", "releasePassed": False, "missionEvidenceLevelPromoted": False, "maySatisfyReleaseEvidence": False, "mayPromoteMissionEvidenceLevel": False}, "RELEASE_AUTHORITY_ESCALATION", "candidate manifest result must remain pending and non-release")
+
+
+def validate_candidate_observation(contract: Mapping[str, Any], observation: Mapping[str, Any], manifest: Mapping[str, Any]) -> None:
+    exact_keys(observation, ("schemaVersion", "repository", "capturedAt", "sourceApi", "observationStatus", "baseline", "candidate", "ci", "protectedIntegrationRun", "nativeEvidence", "evidenceRoles"), "candidate observation")
+    require(observation["schemaVersion"] == "hartevo.github-pr-ci-candidate-observation/v1", "RAW_ARTIFACT_SCHEMA_MISMATCH", "candidate observation schema differs")
+    require(observation["repository"] == "tangpingqingwa/hartevo-desktop" and observation["sourceApi"] == "github-rest-v3+local-git" and observation["observationStatus"] == "NOT_EXECUTED_EXTERNAL", "RAW_ARTIFACT_SCHEMA_MISMATCH", "candidate observation provenance differs")
+    utc_time(observation["capturedAt"], "candidate observation capturedAt")
+    expected_candidate = contract["candidatePolicy"]["pullRequest"]
+    expected_baseline = {"ref": expected_candidate["baseRef"], "commit": contract["currentBaseline"]["commit"], "tree": contract["currentBaseline"]["tree"]}
+    require(observation["baseline"] == expected_baseline and observation["baseline"] == manifest["baseline"], "MANIFEST_SOURCE_MISMATCH", "candidate observation baseline differs")
+    validate_candidate_object(observation["candidate"], expected_candidate, "candidate observation.candidate")
+    require(observation["candidate"] == manifest["candidate"], "PR_HEAD_MISMATCH", "candidate raw/manifest identity differs")
+    validate_candidate_ci(observation["ci"], contract["candidatePolicy"]["ci"], "candidate observation.ci")
+    require(observation["ci"] == manifest["ci"], "CANDIDATE_CI_HEAD_MISMATCH", "candidate raw/manifest CI differs")
+    validate_protected_run(observation["protectedIntegrationRun"], contract["candidatePolicy"]["protectedIntegrationRun"], "candidate observation.protectedIntegrationRun")
+    require(observation["protectedIntegrationRun"] == manifest["protectedIntegrationRun"], "CANDIDATE_CI_HEAD_MISMATCH", "protected raw/manifest run differs")
+    validate_native_evidence(observation["nativeEvidence"], contract["nativeEvidencePolicy"], "candidate observation.nativeEvidence")
+    require(observation["nativeEvidence"] == manifest["nativeEvidence"], "NATIVE_EVIDENCE_ESCALATION", "native raw/manifest provenance differs")
+    validate_evidence_roles(observation["evidenceRoles"], contract["evidenceRolePolicy"], expected_candidate["headCommit"], "candidate observation.evidenceRoles")
+    require(observation["evidenceRoles"] == manifest["evidenceRoles"], "EVIDENCE_ROLE_MISSING", "evidence raw/manifest roles differ")
+
+
+def verify_candidate_receipt(contract: Mapping[str, Any], manifest: Mapping[str, Any], observation: Mapping[str, Any], manifest_raw: bytes, raw_artifact: bytes) -> None:
+    instance = contract["currentInstance"]
+    require(sha256(manifest_raw) == instance["manifestSha256"] and len(manifest_raw) == instance["manifestBytes"], "MANIFEST_DIGEST_MISMATCH", "candidate manifest digest differs")
+    require(sha256(raw_artifact) == instance["rawArtifactSha256"] and len(raw_artifact) == instance["rawArtifactBytes"], "RAW_ARTIFACT_DIGEST_MISMATCH", "candidate raw artifact digest differs")
+    validate_candidate_manifest(contract, manifest, instance["rawArtifactPath"], instance["rawArtifactSha256"], instance["rawArtifactBytes"])
+    validate_candidate_observation(contract, observation, manifest)
+    baseline = contract["currentBaseline"]
+    observed_base = git_text("rev-parse", "origin/bootstrap/macos-r0")
+    require(observed_base == baseline["commit"] and git_text("rev-parse", "origin/bootstrap/macos-r0^{tree}") == baseline["tree"], "CURRENT_COMMIT_MISMATCH", "protected baseline ref/tree differs")
+    expected_candidate = contract["candidatePolicy"]["pullRequest"]
+    require(git_text("rev-parse", f"{expected_candidate['headCommit']}^{{tree}}") == expected_candidate["headTree"], "CURRENT_COMMIT_MISMATCH", "candidate source tree differs")
+    require(git_ancestor(expected_candidate["headCommit"], git_text("rev-parse", "HEAD")), "CURRENT_COMMIT_MISMATCH", "receipt checkout does not descend from candidate source")
+    changed_paths = set(git_text("diff", "--name-only", expected_candidate["headCommit"], "HEAD").splitlines())
+    allowed_paths = {
+        CONTRACT_REL,
+        "scripts/check-integration-build-provenance.sh",
+        contract["currentInstance"]["manifestPath"],
+        contract["currentInstance"]["rawArtifactPath"],
+    }
+    require(changed_paths <= allowed_paths, "CURRENT_COMMIT_MISMATCH", "candidate receipt checkout contains unrelated changes")
+    native_blob = git_blob_bytes(expected_candidate["headCommit"], contract["nativeEvidencePolicy"]["path"])
+    require(sha256(native_blob) == contract["nativeEvidencePolicy"]["sha256"] and len(native_blob) == contract["nativeEvidencePolicy"]["bytes"], "NATIVE_EVIDENCE_ESCALATION", "native evidence contract blob differs")
+    candidate = manifest["candidate"]
+    if candidate["draft"] is True:
+        raise GateError("PR_DRAFT", f"candidate PR #{candidate['number']} is draft")
+    if candidate["merged"] is not True or candidate["state"] != "CLOSED":
+        raise GateError("PR_NOT_MERGED", f"candidate PR #{candidate['number']} is not closed+merged")
+    ci = manifest["ci"]
+    if ci["status"] == "NOT_EXECUTED_EXTERNAL":
+        raise GateError("CANDIDATE_CI_NOT_EXECUTED", "candidate PR has no external CI run after rebase")
+    if ci["status"] != "completed":
+        raise GateError("CI_STATUS_NOT_COMPLETED", "candidate PR CI is not completed")
+    if ci["conclusion"] != "success":
+        raise GateError("CI_CONCLUSION_NOT_SUCCESS", "candidate PR CI conclusion is not success")
+    protected = manifest["protectedIntegrationRun"]
+    if protected["status"] != "completed":
+        raise GateError("CI_STATUS_NOT_COMPLETED", "protected integration run is not completed")
+    if protected["conclusion"] != "success":
+        raise GateError("CI_CONCLUSION_NOT_SUCCESS", "protected integration conclusion is not success")
 
 
 def verify_current_baseline(contract: Mapping[str, Any]) -> None:
@@ -632,37 +935,32 @@ def emit(payload: Mapping[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
 
+contract_data: Dict[str, Any] = {}
 try:
     contract_raw, contract_data = load_contract()
     manifest_raw, manifest_data, observation_raw, observation_data = load_instance(contract_data)
+    candidate_manifest_raw, candidate_manifest_data, candidate_raw, candidate_observation_data = load_candidate_instance(contract_data)
 
     if MODE == "verify":
-        verify_all(contract_data, manifest_data, observation_data, require_current_baseline=True)
-        count = len(manifest_data["featurePullRequests"])
+        verify_all(contract_data, manifest_data, observation_data, require_current_baseline=False)
+        verify_candidate_receipt(contract_data, candidate_manifest_data, candidate_observation_data, candidate_manifest_raw, candidate_raw)
         result = contract_data["resultPolicy"]
-        emit(
-            {
-                "activeFeaturePullRequestCount": manifest_data["summary"]["activeFeaturePullRequestCount"],
-                "actionsRunCount": count,
-                "artifactStatus": contract_data["currentBaseline"]["artifactStatus"],
-                "authority": AUTHORITY,
-                "code": result["verificationCode"],
-                "contractSha256": CONTRACT_SHA256,
-                "featurePullRequestCount": count,
-                "integrationHead": contract_data["source"]["headCommit"],
-                "currentBaselineCommit": contract_data["currentBaseline"]["commit"],
-                "manifestSha256": contract_data["currentInstance"]["manifestSha256"],
-                "missionEvidenceLevelPromoted": result["missionEvidenceLevelPromoted"],
-                "rawArtifactSha256": contract_data["currentInstance"]["rawArtifactSha256"],
-                "releaseDecision": result["releaseDecision"],
-                "releasePassed": result["releasePassed"],
-                "revertedFeaturePullRequestCount": manifest_data["summary"]["revertedFeaturePullRequestCount"],
-                "requiredJobCount": manifest_data["summary"]["requiredJobCount"],
-                "schema": SCHEMA,
-                "status": result["verificationStatus"],
-                "testMode": False,
-            }
-        )
+        emit({
+            "artifactStatus": contract_data["currentBaseline"]["artifactStatus"],
+            "authority": AUTHORITY,
+            "code": result["verificationCode"],
+            "contractSha256": CONTRACT_SHA256,
+            "currentBaselineCommit": contract_data["currentBaseline"]["commit"],
+            "candidateHead": contract_data["candidatePolicy"]["pullRequest"]["headCommit"],
+            "candidateManifestSha256": contract_data["currentInstance"]["manifestSha256"],
+            "candidateRawArtifactSha256": contract_data["currentInstance"]["rawArtifactSha256"],
+            "missionEvidenceLevelPromoted": result["missionEvidenceLevelPromoted"],
+            "releaseDecision": result["releaseDecision"],
+            "releasePassed": result["releasePassed"],
+            "schema": SCHEMA,
+            "status": result["verificationStatus"],
+            "testMode": False,
+        })
     else:
         verify_all(contract_data, manifest_data, observation_data, require_current_baseline=False)
         checks: List[str] = ["historical-instance-validated"]
@@ -682,6 +980,69 @@ try:
             "historical-artifact-source-mismatch",
             "HISTORICAL_ARTIFACT_STALE",
             lambda: verify_current_baseline(current_head_baseline),
+        )
+        expect_error(
+            checks,
+            "current-candidate-draft",
+            "PR_DRAFT",
+            lambda: verify_candidate_receipt(contract_data, candidate_manifest_data, candidate_observation_data, candidate_manifest_raw, candidate_raw),
+        )
+
+        candidate_not_draft = copy.deepcopy(candidate_manifest_data)
+        candidate_not_draft["candidate"]["draft"] = False
+        candidate_not_draft["candidate"]["merged"] = True
+        candidate_not_draft["candidate"]["state"] = "CLOSED"
+        candidate_not_draft["ci"]["status"] = "NOT_EXECUTED_EXTERNAL"
+        candidate_not_draft_observation = copy.deepcopy(candidate_observation_data)
+        candidate_not_draft_observation["candidate"]["draft"] = False
+        candidate_not_draft_observation["candidate"]["merged"] = True
+        candidate_not_draft_observation["candidate"]["state"] = "CLOSED"
+        candidate_not_draft_observation["ci"]["status"] = "NOT_EXECUTED_EXTERNAL"
+        candidate_pending_contract = copy.deepcopy(contract_data)
+        candidate_pending_contract["candidatePolicy"]["pullRequest"]["draft"] = False
+        candidate_pending_contract["candidatePolicy"]["pullRequest"]["merged"] = True
+        candidate_pending_contract["candidatePolicy"]["pullRequest"]["state"] = "CLOSED"
+        expect_error(
+            checks,
+            "current-candidate-ci-not-executed",
+            "CANDIDATE_CI_NOT_EXECUTED",
+            lambda: verify_candidate_receipt(candidate_pending_contract, candidate_not_draft, candidate_not_draft_observation, candidate_manifest_raw, candidate_raw),
+        )
+
+        candidate_head = copy.deepcopy(candidate_manifest_data)
+        candidate_head["candidate"]["headCommit"] = "0" * 40
+        expect_error(
+            checks,
+            "current-candidate-head-mismatch",
+            "MANIFEST_SOURCE_MISMATCH",
+            lambda: validate_candidate_manifest(contract_data, candidate_head, contract_data["currentInstance"]["rawArtifactPath"], contract_data["currentInstance"]["rawArtifactSha256"], contract_data["currentInstance"]["rawArtifactBytes"]),
+        )
+
+        candidate_role = copy.deepcopy(candidate_manifest_data)
+        candidate_role["evidenceRoles"]["consumer"]["sourceCommit"] = "0" * 40
+        expect_error(
+            checks,
+            "current-candidate-role-cross-commit",
+            "EVIDENCE_ROLE_MISSING",
+            lambda: validate_candidate_manifest(contract_data, candidate_role, contract_data["currentInstance"]["rawArtifactPath"], contract_data["currentInstance"]["rawArtifactSha256"], contract_data["currentInstance"]["rawArtifactBytes"]),
+        )
+
+        candidate_ci_head = copy.deepcopy(candidate_manifest_data)
+        candidate_ci_head["ci"]["headCommit"] = "0" * 40
+        expect_error(
+            checks,
+            "current-candidate-ci-head-mismatch",
+            "CANDIDATE_CI_HEAD_MISMATCH",
+            lambda: validate_candidate_manifest(contract_data, candidate_ci_head, contract_data["currentInstance"]["rawArtifactPath"], contract_data["currentInstance"]["rawArtifactSha256"], contract_data["currentInstance"]["rawArtifactBytes"]),
+        )
+
+        candidate_release = copy.deepcopy(candidate_manifest_data)
+        candidate_release["nativeEvidence"]["releasePassed"] = True
+        expect_error(
+            checks,
+            "current-candidate-native-release-escalation",
+            "NATIVE_EVIDENCE_ESCALATION",
+            lambda: validate_candidate_manifest(contract_data, candidate_release, contract_data["currentInstance"]["rawArtifactPath"], contract_data["currentInstance"]["rawArtifactSha256"], contract_data["currentInstance"]["rawArtifactBytes"]),
         )
 
         duplicate_raw = observation_raw.replace(b"{", b'{"schemaVersion":"duplicate",', 1)
@@ -787,6 +1148,7 @@ except GateError as error:
             "code": error.code,
             "currentBaselineCommit": contract_data.get("currentBaseline", {}).get("commit"),
             "integrationHead": contract_data.get("source", {}).get("headCommit"),
+            "candidateHead": contract_data.get("candidatePolicy", {}).get("pullRequest", {}).get("headCommit"),
             "message": sanitize(error.message),
             "missionEvidenceLevelPromoted": False,
             "releaseDecision": "NOT_EVALUATED",
@@ -805,6 +1167,7 @@ except Exception as error:  # Fail closed on unexpected parser, Git, or filesyst
             "code": "INTERNAL_ERROR",
             "currentBaselineCommit": contract_data.get("currentBaseline", {}).get("commit"),
             "integrationHead": contract_data.get("source", {}).get("headCommit"),
+            "candidateHead": contract_data.get("candidatePolicy", {}).get("pullRequest", {}).get("headCommit"),
             "message": sanitize(str(error)),
             "missionEvidenceLevelPromoted": False,
             "releaseDecision": "NOT_EVALUATED",
