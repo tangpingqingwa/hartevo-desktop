@@ -1,16 +1,22 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "330390edff38d0f9559137c2d238f2964f714901",
-  "candidateCount": 1,
+  "baseCommit": "b63cff014be0aa1ccd7ad19705993c33d895ed71",
+  "candidateCount": 2,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/connector-authenticated-probe-result-01",
-      "headCommit": "e5397b7b52e27e8644228b194c9accd1e9425ff9",
-      "number": 183
+      "headBranch": "codex/scheduler-conversation-recurring-01",
+      "headCommit": "26f909c6bf2d699806fae5fee75051782b3f6d12",
+      "number": 246
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/connectors-commerce-sorftime-plugin-01",
+      "headCommit": "a558fbfdfcbcfec97b0f45ac6c4a169c618af50c",
+      "number": 262
     }
   ],
-  "createdAt": "2026-08-14T05:26:49Z",
+  "createdAt": "2026-08-14T06:51:37Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -21,5 +27,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260814-183"
+  "trainBranch": "merge-train/scheduler-commerce-20260814"
 }
