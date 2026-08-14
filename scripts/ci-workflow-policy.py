@@ -371,6 +371,8 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             raise PolicyError(f"{path} is missing a required fast-PR contract")
         if re.search(r"^\s+if:\s+needs\.scope\.outputs\.rust\s*==\s*['\"]true['\"]\s*$", text, re.MULTILINE):
             raise PolicyError(f"{path} must always call the reusable Rust workflow")
+        if "ready_for_review" in text:
+            raise PolicyError(f"{path} must reuse same-SHA checks when a Draft becomes ready")
         if "branches: [main]" in text or "branches: [bootstrap/macos-r0]" in text:
             raise PolicyError(f"{path} must not run the integration push tier")
     elif path.name == "integration.yml":
@@ -466,6 +468,17 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("self-test accepted a PR workflow without cancellation")
+
+    ci_fixture = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
+    validate_required_workflow_contract(Path("ci.yml"), ci_fixture)
+    try:
+        validate_required_workflow_contract(
+            Path("ci.yml"), ci_fixture.replace("types: [opened, synchronize, reopened]", "types: [opened, synchronize, reopened, ready_for_review]")
+        )
+    except PolicyError:
+        pass
+    else:
+        raise AssertionError("self-test accepted a duplicate same-SHA ready-for-review run")
 
     reusable_fixture = """\
 concurrency:
