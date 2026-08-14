@@ -2,8 +2,9 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use hartevo_cloud_storage::{
     CellScope, CloudProjectRegistration, CloudStorageError, DataCell, EncryptedPayload,
     EncryptedRegionTransferRequest, EncryptedSyncMutation, MutationPrecondition,
-    POSTGRES_L2_URL_ENV, PostgresCellStore, RegionTransferConsumer, RegionTransferProvider,
-    RegionTransferServiceDefinition, RegionTransferStatus, SyncObjectKind,
+    POSTGRES_L2_URL_ENV, PostgresCellStore, RegionTransferConsumer, RegionTransferOutcome,
+    RegionTransferProvider, RegionTransferReadbackProvider, RegionTransferServiceDefinition,
+    RegionTransferStatus, RegionTransferVerificationStatus, SyncObjectKind,
 };
 use hartevo_domain_kernel::{MissionId, ProjectEncryptionMode, ProjectId, TenantId};
 use sha2::{Digest, Sha256};
@@ -311,6 +312,7 @@ async fn postgres_region_transfer_receipt_is_encrypted_scoped_and_fail_closed() 
         .expect("adopt encrypted Mission snapshot");
     assert_eq!(adopted.status, RegionTransferStatus::Adopted);
     assert_eq!(adopted.adopted_revision, Some(1));
+    assert_eq!(adopted.ack_generation, Some(1));
     let source_adopted = provider
         .acknowledge_adoption(
             &source_store,
@@ -323,6 +325,103 @@ async fn postgres_region_transfer_receipt_is_encrypted_scoped_and_fail_closed() 
         .await
         .expect("durably acknowledge target adoption");
     assert_eq!(source_adopted.status, RegionTransferStatus::Adopted);
+    assert_eq!(source_adopted.ack_generation, Some(1));
+    let target_principal: String = target_client
+        .query_one("SELECT current_user", &[])
+        .await
+        .expect("inspect target RLS principal")
+        .get(0);
+    let readback_provider = RegionTransferReadbackProvider::new(
+        "postgres-target-readback-provider",
+        DataCell::Eu,
+        1,
+        digest("region-transfer-readback-provider"),
+        digest("region-transfer-current-commit"),
+        RegionTransferReadbackProvider::principal_digest(&target_principal, &target_scope),
+    );
+    let verification = consumer
+        .verify_target_adoption(
+            &target_store,
+            &mut target_client,
+            &target_scope,
+            &readback_provider,
+            &source_adopted,
+            1,
+            1,
+            timestamp + Duration::seconds(4),
+        )
+        .await
+        .expect("read back and durably verify target adoption");
+    assert_eq!(
+        verification.status,
+        RegionTransferVerificationStatus::Verified
+    );
+    assert!(matches!(
+        verification.outcome.outcome,
+        RegionTransferOutcome::Adoptable
+    ));
+    verification
+        .verify()
+        .expect("verification receipt verifies");
+    assert_eq!(
+        verification
+            .adoptable_result()
+            .expect("adoptable result")
+            .ciphertext_digest,
+        mission_payload.content_digest
+    );
+    let reopened = consumer
+        .verify_target_adoption(
+            &target_store,
+            &mut target_client,
+            &target_scope,
+            &readback_provider,
+            &source_adopted,
+            1,
+            1,
+            timestamp + Duration::seconds(8),
+        )
+        .await
+        .expect("reopen exact durable verification");
+    assert_eq!(reopened, verification);
+    let mut tampered_verification = verification.clone();
+    tampered_verification.target_scope.cell = DataCell::Us;
+    assert!(matches!(
+        tampered_verification.verify(),
+        Err(CloudStorageError::RegionTransferVerificationTampered)
+    ));
+    let mut wrong_rls_provider = readback_provider.clone();
+    wrong_rls_provider.rls_principal_digest = digest("different-rls-principal");
+    assert!(matches!(
+        consumer
+            .verify_target_adoption(
+                &target_store,
+                &mut target_client,
+                &target_scope,
+                &wrong_rls_provider,
+                &source_adopted,
+                1,
+                2,
+                timestamp + Duration::seconds(9),
+            )
+            .await,
+        Err(CloudStorageError::RegionTransferVerificationRlsMismatch)
+    ));
+    assert!(matches!(
+        consumer
+            .verify_target_adoption(
+                &target_store,
+                &mut target_client,
+                &target_scope,
+                &readback_provider,
+                &source_adopted,
+                1,
+                2,
+                timestamp + Duration::seconds(10),
+            )
+            .await,
+        Err(CloudStorageError::RegionTransferVerificationReplay)
+    ));
     assert!(matches!(
         provider
             .revoke(
@@ -493,9 +592,37 @@ async fn postgres_region_transfer_receipt_is_encrypted_scoped_and_fail_closed() 
         .await
         .expect("count target transfer events")
         .get(0);
+    assert_eq!(target_events, 1);
+    let target_verifications: i64 = target_inspection
+        .query_one(
+            "SELECT count(*) FROM hartevo_cell.region_transfer_verification_receipts
+             WHERE cell = $1 AND tenant_id = $2 AND project_id = $3",
+            &[
+                &target_scope.cell.as_str(),
+                &target_scope.tenant_id.as_str(),
+                &project_id.as_str(),
+            ],
+        )
+        .await
+        .expect("count target verification receipts")
+        .get(0);
+    let target_verification_events: i64 = target_inspection
+        .query_one(
+            "SELECT count(*) FROM hartevo_cell.region_transfer_verification_events
+             WHERE cell = $1 AND tenant_id = $2 AND project_id = $3",
+            &[
+                &target_scope.cell.as_str(),
+                &target_scope.tenant_id.as_str(),
+                &project_id.as_str(),
+            ],
+        )
+        .await
+        .expect("count target verification events")
+        .get(0);
+    assert_eq!(target_verifications, 1);
+    assert_eq!(target_verification_events, 1);
     target_inspection
         .commit()
         .await
         .expect("finish target receipt inspection");
-    assert_eq!(target_events, 1);
 }
