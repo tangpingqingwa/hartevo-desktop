@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/vault-governance-result/vault-governance-result.v1.json",
+  "schemaVersion": "hartevo.vault-governance-result-contract/v1",
+  "contractVersion": "vault-governance-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "vault.governance.result",
+    "name": "VaultGovernanceResultService",
+    "version": "1.0.0",
+    "readOnly": true,
+    "native": false,
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "propose_governance_read",
+      "record_evidence",
+      "verify_evidence",
+      "consume_observation"
+    ]
+  },
+  "provider": {
+    "id": "vault.governance",
+    "name": "VaultProvider",
+    "version": "1.0.0",
+    "providerRevision": "vault-http-governance-r1",
+    "operations": [
+      "sys_health",
+      "auth_token_lookup_self",
+      "sys_capabilities_self_allowlisted",
+      "sys_leases_lookup_metadata"
+    ],
+    "acceptedProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "native": false,
+    "secretValuesRead": false,
+    "tokenMaterialRetained": false,
+    "login": false,
+    "policyMutation": false,
+    "leaseRenew": false,
+    "leaseRevoke": false,
+    "rootTokenPaths": false
+  },
+  "consumer": {
+    "id": "mission.vault-governance-result",
+    "name": "MissionVaultGovernanceConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "nativeConnected": false
+  },
+  "scope": {
+    "required": [
+      "namespace",
+      "mount",
+      "allowlistedPaths",
+      "policyDigest",
+      "leaseScopeDigest",
+      "missionIdAndRevision",
+      "projectIdAndRevision",
+      "secretReferenceDigest",
+      "credentialRevision"
+    ],
+    "rootNamespace": false,
+    "rootTokenPaths": false,
+    "pathTraversal": false
+  },
+  "evidence": {
+    "digests": [
+      "contract",
+      "provider",
+      "scope",
+      "registration",
+      "token",
+      "policy",
+      "path",
+      "lease",
+      "response",
+      "evidence"
+    ],
+    "retained": ["ttl", "status", "httpStatus", "boundedCapabilityClasses"],
+    "secretValues": false,
+    "rawProviderPayload": false,
+    "tokenMaterial": false,
+    "rawLeaseIdentifiers": false,
+    "rawPolicyNames": false,
+    "bounded": {
+      "maxResponseBytes": 1048576,
+      "maxAllowlistedPaths": 16,
+      "maxCapabilityClassesPerPath": 8,
+      "maxPolicyClasses": 16,
+      "maxReceipts": 4
+    }
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "scopeBound": true,
+    "secretReferenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "authority": {
+    "connected": false,
+    "nativeProvider": false,
+    "effect": false,
+    "receipt": false,
+    "verification": false,
+    "outcome": false,
+    "workProductAdoption": false
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_vault_auth_https_receipt_and_readback",
+    "failClosedCases": [
+      "missing_native_vault_authority",
+      "missing_short_lived_access_token",
+      "namespace_or_path_traversal",
+      "root_token_path_request",
+      "secret_value_request",
+      "policy_mutation_request",
+      "lease_renew_or_revoke_request",
+      "scope_or_revision_drift",
+      "provider_revision_drift",
+      "tampered_or_partial_evidence"
+    ]
+  },
+  "layer2Gaps": [
+    "consented_native_vault_https_transport",
+    "native_authentication_without_login_ownership",
+    "durable_provider_receipt",
+    "independent_policy_readback",
+    "verified_mission_or_work_product_adoption"
+  ],
+  "honestNativeGap": "Layer 1 is fixture, recording, loopback, or BLOCKED_ENV evidence only. It never claims Connected/native authority, never reads secret values, never serializes token material, never logs in, never mutates policy, and never renews or revokes leases. Native Vault authentication/HTTPS, durable provider receipts, independent policy readback, and verified adoption remain Layer-2 exits under Hartevo Consent/Effect/Receipt/Verification authority."
+}
