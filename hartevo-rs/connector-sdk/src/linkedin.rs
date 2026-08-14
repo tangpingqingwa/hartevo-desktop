@@ -4623,7 +4623,11 @@ mod tests {
     use super::*;
     use crate::{ConnectorAuth, ProviderAdapterIdentity};
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::io::Read as _;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::Duration as IoDuration;
 
     #[derive(Debug)]
     struct MockTransport {
@@ -4669,6 +4673,206 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Err(LinkedInTransportError::InvalidResponse))
         }
+    }
+
+    #[derive(Debug)]
+    struct LoopbackHttpTransport {
+        address: SocketAddr,
+    }
+
+    impl LinkedInHttpTransport for LoopbackHttpTransport {
+        fn send(
+            &self,
+            request: &LinkedInHttpRequest,
+            token: &LinkedInAccessToken,
+        ) -> Result<LinkedInHttpResponse, LinkedInTransportError> {
+            let target = loopback_request_target(request)?;
+            let mut stream =
+                TcpStream::connect(self.address).map_err(|_| LinkedInTransportError::Io)?;
+            stream
+                .set_read_timeout(Some(IoDuration::from_secs(2)))
+                .map_err(|_| LinkedInTransportError::Io)?;
+            let mut wire = format!(
+                "{} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\n",
+                request.method,
+                target,
+                token.expose()
+            );
+            for (name, value) in &request.headers {
+                let _ = writeln!(&mut wire, "{name}: {value}");
+            }
+            wire.push_str("Connection: close\r\n\r\n");
+            stream
+                .write_all(wire.as_bytes())
+                .map_err(|_| LinkedInTransportError::Io)?;
+            let mut bytes = Vec::new();
+            stream
+                .read_to_end(&mut bytes)
+                .map_err(|_| LinkedInTransportError::Io)?;
+            parse_loopback_response(&bytes)
+        }
+    }
+
+    #[derive(Default)]
+    struct LoopbackCapture {
+        request_lines: Vec<String>,
+        authenticated_requests: usize,
+    }
+
+    fn loopback_request_target(
+        request: &LinkedInHttpRequest,
+    ) -> Result<String, LinkedInTransportError> {
+        let url = request.url_with_query();
+        let authority = url
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .ok_or(LinkedInTransportError::InvalidResponse)?;
+        let slash = authority
+            .find('/')
+            .ok_or(LinkedInTransportError::InvalidResponse)?;
+        Ok(authority[slash..].to_owned())
+    }
+
+    fn read_loopback_headers(stream: &mut TcpStream) -> Result<Vec<u8>, LinkedInTransportError> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream
+                .read(&mut buffer)
+                .map_err(|_| LinkedInTransportError::Io)?;
+            if count == 0 {
+                return Err(LinkedInTransportError::InvalidResponse);
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(bytes);
+            }
+            if bytes.len() > 16 * 1024 {
+                return Err(LinkedInTransportError::InvalidResponse);
+            }
+        }
+    }
+
+    fn parse_loopback_response(
+        bytes: &[u8],
+    ) -> Result<LinkedInHttpResponse, LinkedInTransportError> {
+        let separator = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or(LinkedInTransportError::InvalidResponse)?;
+        let header_end = separator + 4;
+        let header_text = String::from_utf8_lossy(&bytes[..separator]);
+        let mut lines = header_text.lines();
+        let status = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or(LinkedInTransportError::InvalidResponse)?;
+        let headers = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
+        Ok(LinkedInHttpResponse {
+            status,
+            headers,
+            body: bytes[header_end..].to_vec(),
+            received_at: Utc::now(),
+        })
+    }
+
+    fn loopback_server() -> (SocketAddr, Arc<Mutex<LoopbackCapture>>, JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+        let address = listener.local_addr().expect("loopback address");
+        let capture = Arc::new(Mutex::new(LoopbackCapture::default()));
+        let captured = Arc::clone(&capture);
+        let server = std::thread::spawn(move || {
+            for index in 0..8 {
+                let (mut stream, _) = listener.accept().expect("loopback connection");
+                let request = read_loopback_headers(&mut stream).expect("loopback request");
+                let request_text = String::from_utf8_lossy(&request);
+                let request_line = request_text.lines().next().unwrap_or_default();
+                assert_eq!(request_line.split_whitespace().next(), Some("GET"));
+                assert!(request_text.contains("Authorization: Bearer linkedin-test-token"));
+                assert!(request_text.contains("Linkedin-Version: 202606"));
+                assert!(request_text.contains("X-Restli-Protocol-Version: 2.0.0"));
+                {
+                    let mut capture = captured.lock().expect("loopback capture");
+                    capture.request_lines.push(request_line.to_owned());
+                    capture.authenticated_requests += 1;
+                }
+                let (body, request_id, remaining) = match index {
+                    0 => {
+                        assert_eq!(request_line, "GET /v2/userinfo HTTP/1.1");
+                        (r#"{"id":"member-1"}"#, "loopback-member", "99")
+                    }
+                    1 => {
+                        assert_eq!(request_line, "GET /rest/organizations/org-1 HTTP/1.1");
+                        (r#"{"id":"org-1"}"#, "loopback-org", "98")
+                    }
+                    2 => {
+                        assert_eq!(request_line, "GET /rest/organizations/page-1 HTTP/1.1");
+                        (r#"{"id":"page-1"}"#, "loopback-page", "97")
+                    }
+                    3 => {
+                        assert_eq!(request_line, "GET /rest/adAccounts/ad-1 HTTP/1.1");
+                        (r#"{"id":"ad-1"}"#, "loopback-ad", "96")
+                    }
+                    4 => {
+                        assert!(
+                            request_line.contains("GET /rest/organizationalEntityNotifications?")
+                        );
+                        assert!(request_line.contains("start=0"));
+                        assert!(request_line.contains("count=1"));
+                        (
+                            r#"{"elements":[{"notificationId":77,"organizationalEntity":"urn:li:organization:page-1","action":"SHARE","lastModifiedAt":200,"sourcePost":"urn:li:share:post-1"}],"paging":{"start":0,"count":1,"links":[{"rel":"next","href":"/rest/organizationalEntityNotifications?start=1"}]}}"#,
+                            "loopback-poll-1",
+                            "95",
+                        )
+                    }
+                    5 => {
+                        assert!(
+                            request_line.contains("GET /rest/organizationalEntityShareStatistics?")
+                        );
+                        (
+                            r#"{"elements":[{"id":"share-1","impressions":8}]}"#,
+                            "loopback-read-1",
+                            "94",
+                        )
+                    }
+                    6 => {
+                        assert!(
+                            request_line.contains("GET /rest/organizationalEntityNotifications?")
+                        );
+                        assert!(request_line.contains("start=1"));
+                        assert!(request_line.contains("count=1"));
+                        (
+                            r#"{"elements":[{"notificationId":78,"organizationalEntity":"urn:li:organization:page-1","action":"COMMENT","lastModifiedAt":201,"sourcePost":"urn:li:share:post-2"}],"paging":{"start":1,"count":1}}"#,
+                            "loopback-poll-2",
+                            "93",
+                        )
+                    }
+                    7 => {
+                        assert!(
+                            request_line.contains("GET /rest/organizationalEntityShareStatistics?")
+                        );
+                        (
+                            r#"{"elements":[{"id":"share-2","impressions":9}]}"#,
+                            "loopback-read-2",
+                            "92",
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nx-li-request-id: {request_id}\r\nx-ratelimit-limit: 100\r\nx-ratelimit-remaining: {remaining}\r\nx-ratelimit-reset: 4102444800\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("loopback response");
+            }
+        });
+        (address, capture, server)
     }
 
     fn response(body: &str, headers: &[(&str, &str)]) -> LinkedInHttpResponse {
@@ -5494,6 +5698,160 @@ mod tests {
             requests[5].path().expect("insight path"),
             "/rest/organizationalEntityShareStatistics"
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn deterministic_loopback_http_proves_authenticated_pagination_and_reconcile_receipts() {
+        let (address, capture, server) = loopback_server();
+        let (scope, insight_scope, secret, lease, resolver) = scope_and_auth(&[
+            "openid",
+            "profile",
+            "rw_organization_admin",
+            "r_organization_social",
+            "r_ads",
+            "r_ads_reporting",
+        ]);
+        let now = Utc::now();
+        let probe = probe_request(
+            scope.clone(),
+            insight_scope.clone(),
+            secret.clone(),
+            lease.clone(),
+        );
+        let plan = read_plan(
+            scope.clone(),
+            insight_scope.clone(),
+            secret.clone(),
+            lease.clone(),
+            vec![LinkedInInsightTarget::OrganizationPage {
+                organization_id: "org-1".to_owned(),
+                page_id: "page-1".to_owned(),
+            }],
+            now - Duration::days(2),
+            now,
+            Duration::days(1),
+        );
+        let poll_request = LinkedInReconcilePollRequest {
+            scope,
+            insight_scope,
+            secret_reference: secret,
+            lease,
+            organization_id: "page-1".to_owned(),
+            since: now - Duration::days(2),
+            until: now,
+            page_size: 1,
+            cursor: None,
+            requested_at: now,
+            provenance: ProviderProvenanceClass::ComponentHarness,
+        };
+        let transport = Arc::new(LoopbackHttpTransport { address });
+        let service = PaidSocialInsightReadService::new(
+            Arc::new(
+                LinkedInMarketingOrganizationAdapter::new(
+                    LinkedInMarketingConfig {
+                        api_base_url: format!("https://127.0.0.1:{}", address.port()),
+                        ..LinkedInMarketingConfig::default()
+                    },
+                    transport,
+                )
+                .expect("loopback adapter"),
+            ),
+            DispatchBudget::new(4, now + Duration::hours(1), 4, 100).expect("budget"),
+            LinkedInReadPolicy::default(),
+        )
+        .expect("loopback service");
+        let mut consumer = MissionPaidSocialInsightConsumer::new(service);
+        consumer
+            .attach("mission-linkedin-1", &probe, &resolver)
+            .expect("authenticated loopback probe");
+
+        let first = consumer
+            .reconcile_poll("mission-linkedin-1", &plan, &poll_request, &resolver)
+            .expect("first loopback poll reconcile");
+        let first_receipt = first
+            .observation
+            .reconcile
+            .as_ref()
+            .expect("first reconcile receipt");
+        assert_eq!(first_receipt.source, LinkedInReconcileSource::Poll);
+        assert_eq!(first_receipt.notification_ids, vec![77]);
+        assert_eq!(first_receipt.rate_limit.remaining, Some(95));
+        assert_eq!(
+            first_receipt
+                .poll_cursor
+                .as_ref()
+                .map(LinkedInPaginationCursor::start),
+            Some(1)
+        );
+        assert!(
+            !first_receipt
+                .poll_cursor
+                .as_ref()
+                .is_some_and(LinkedInPaginationCursor::complete)
+        );
+        assert_eq!(
+            first.observation.source.provider_request_id.as_deref(),
+            Some("loopback-read-1")
+        );
+        assert_eq!(first.observation.rate_limit.remaining, Some(94));
+        assert_eq!(
+            first.observation.quota.provider_rate_limit.remaining,
+            Some(94)
+        );
+        assert_eq!(first.observation.cost.charged_minor, 1);
+        assert_eq!(first.durable_log_revision, 1);
+        assert_eq!(
+            first.observation.causal_status,
+            LinkedInCausalStatus::NotClaimed
+        );
+
+        let second = consumer
+            .reconcile_poll("mission-linkedin-1", &plan, &poll_request, &resolver)
+            .expect("second loopback poll reconcile");
+        let second_receipt = second
+            .observation
+            .reconcile
+            .as_ref()
+            .expect("second reconcile receipt");
+        assert_eq!(second_receipt.notification_ids, vec![78]);
+        assert_eq!(second_receipt.rate_limit.remaining, Some(93));
+        assert!(
+            second_receipt
+                .poll_cursor
+                .as_ref()
+                .is_some_and(LinkedInPaginationCursor::complete)
+        );
+        assert_eq!(second.observation.page.page_index, 1);
+        assert_eq!(
+            second.observation.source.provider_request_id.as_deref(),
+            Some("loopback-read-2")
+        );
+        assert_eq!(second.observation.rate_limit.remaining, Some(92));
+        assert_eq!(second.observation.cost.charged_minor, 1);
+        assert_eq!(second.durable_log_revision, 2);
+        assert_eq!(
+            second.observation.causal_status,
+            LinkedInCausalStatus::NotClaimed
+        );
+        let checkpoint = consumer
+            .service()
+            .observation_log_checkpoint()
+            .expect("durable loopback checkpoint");
+        let checkpoint_text = String::from_utf8(checkpoint).expect("checkpoint utf8");
+        assert!(checkpoint_text.contains("loopback-read-1"));
+        assert!(checkpoint_text.contains("loopback-read-2"));
+        assert!(!checkpoint_text.contains("linkedin-test-token"));
+
+        let capture = capture.lock().expect("loopback capture");
+        assert_eq!(capture.request_lines.len(), 8);
+        assert_eq!(capture.authenticated_requests, 8);
+        assert!(capture.request_lines[4].contains("start=0"));
+        assert!(capture.request_lines[6].contains("start=1"));
+        assert!(capture.request_lines[5].contains("/rest/organizationalEntityShareStatistics?"));
+        assert!(capture.request_lines[7].contains("/rest/organizationalEntityShareStatistics?"));
+        drop(capture);
+        server.join().expect("loopback server");
     }
 
     #[test]
