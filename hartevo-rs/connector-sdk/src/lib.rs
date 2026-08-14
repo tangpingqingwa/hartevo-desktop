@@ -24,6 +24,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+pub mod authenticated_probe;
+
 pub const CONNECTOR_SDK_SCHEMA_VERSION: &str = "hartevo-connector-sdk/v1";
 pub const MAX_CREDENTIAL_LEASE_TTL_SECONDS: i64 = 900;
 pub const MAX_AUTH_SESSION_TTL_SECONDS: i64 = 600;
