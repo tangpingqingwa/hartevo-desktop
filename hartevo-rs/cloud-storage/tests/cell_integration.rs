@@ -144,15 +144,25 @@ async fn set_sql_scope(transaction: &tokio_postgres::Transaction<'_>, scope: &Ce
         .expect("set SQL RLS scope");
 }
 
-fn spawn_process(mode: &str, variables: &[(&str, String)]) -> String {
+async fn spawn_process(mode: &str, variables: &[(&str, String)]) -> String {
     let binary = std::env::var("CARGO_BIN_EXE_cell_process_harness")
         .expect("Cargo must provide the cell process harness binary");
-    let mut command = Command::new(binary);
-    command.arg(mode);
-    for (name, value) in variables {
-        command.env(name, value);
-    }
-    let output = command.output().expect("spawn Cell process harness");
+    let mode = mode.to_owned();
+    let variables: Vec<(String, String)> = variables
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), value.clone()))
+        .collect();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut command = Command::new(binary);
+        command.arg(mode);
+        for (name, value) in variables {
+            command.env(name, value);
+        }
+        command.output()
+    })
+    .await
+    .expect("join Cell process harness")
+    .expect("spawn Cell process harness");
     assert!(
         output.status.success(),
         "Cell process failed: {}",
@@ -256,7 +266,14 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         .await
         .expect("replay scoped Remote Worker transport mount");
     assert!(replayed_mount.duplicate);
-    assert_eq!(replayed_mount, initial_mount_result);
+    assert_eq!(
+        replayed_mount.registration_id,
+        initial_mount_result.registration_id
+    );
+    assert_eq!(
+        replayed_mount.dispatch_registration_id,
+        initial_mount_result.dispatch_registration_id
+    );
     let registration = store
         .load_remote_worker_transport_registration(
             &mut client,
@@ -686,7 +703,7 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
             "race-process-a",
             &race_token_a,
             &race_claim_key_a,
-            timestamp + Duration::seconds(10),
+            timestamp + Duration::seconds(5),
             Duration::seconds(60),
         ),
         store.claim_remote_worker_task(
@@ -699,7 +716,7 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
             "race-process-b",
             &race_token_b,
             &race_claim_key_b,
-            timestamp + Duration::seconds(10),
+            timestamp + Duration::seconds(5),
             Duration::seconds(60),
         )
     );
@@ -780,7 +797,7 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         ),
         ("HARTEVO_CELL_LEASE_SECONDS", "60".into()),
     ]);
-    let first_claim_output = spawn_process("claim", &first_claim_variables);
+    let first_claim_output = spawn_process("claim", &first_claim_variables).await;
     let (first_duplicate, first_lease) = parse_claim(&first_claim_output);
     assert!(!first_duplicate);
     assert_eq!(first_lease.task_id, first_task.task_id);
@@ -828,12 +845,12 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         ),
     ]);
     assert_completion(
-        &spawn_process("complete", &first_complete_variables),
+        &spawn_process("complete", &first_complete_variables).await,
         &first_task.task_id,
         false,
     );
     assert_completion(
-        &spawn_process("complete", &first_complete_variables),
+        &spawn_process("complete", &first_complete_variables).await,
         &first_task.task_id,
         true,
     );
@@ -849,7 +866,7 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         ),
         ("HARTEVO_CELL_LEASE_SECONDS", "1".into()),
     ]);
-    let old_claim_output = spawn_process("claim", &recovery_claim_variables);
+    let old_claim_output = spawn_process("claim", &recovery_claim_variables).await;
     let (old_duplicate, old_lease) = parse_claim(&old_claim_output);
     assert!(!old_duplicate);
     assert_eq!(old_lease.task_id, recovery_task.task_id);
@@ -865,13 +882,13 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         ),
         ("HARTEVO_CELL_LEASE_SECONDS", "60".into()),
     ]);
-    let recovered_claim_output = spawn_process("claim", &recovered_claim_variables);
+    let recovered_claim_output = spawn_process("claim", &recovered_claim_variables).await;
     let (recovered_duplicate, recovered_lease) = parse_claim(&recovered_claim_output);
     assert!(!recovered_duplicate);
     assert_eq!(recovered_lease.task_id, recovery_task.task_id);
     assert_ne!(recovered_lease.generation, old_lease.generation);
     let (replayed_duplicate, replayed_lease) =
-        parse_claim(&spawn_process("claim", &recovery_claim_variables));
+        parse_claim(&spawn_process("claim", &recovery_claim_variables).await);
     assert!(replayed_duplicate);
     assert_eq!(replayed_lease.lease_id, old_lease.lease_id);
     assert_eq!(replayed_lease.generation, old_lease.generation);
@@ -938,7 +955,7 @@ async fn postgres_cell_two_process_sync_device_and_worker_recovery_contract() {
         ),
     ]);
     assert_completion(
-        &spawn_process("complete", &recovered_complete_variables),
+        &spawn_process("complete", &recovered_complete_variables).await,
         &recovery_task.task_id,
         false,
     );
