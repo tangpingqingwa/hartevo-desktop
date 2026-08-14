@@ -4,6 +4,26 @@
   "serviceId": "hartevo.browser-workspace.mission-batch",
   "provider": "managed_chromium_adapter_lease",
   "consumer": "mission_execution_result",
+  "providerBinding": {
+    "id": "managed_chromium_adapter_lease",
+    "version": "v1",
+    "durableCheckpointFields": [
+      "provider_id",
+      "provider_version",
+      "schema_version",
+      "scope_digest",
+      "plan_digest",
+      "batch_digest",
+      "result_prefix_digest",
+      "cursor_digest"
+    ]
+  },
+  "checkpoint": {
+    "durableLogBeforeModelAck": true,
+    "resumeValidation": "consumer_validates_provider_binding_then_explicit_resume",
+    "terminalCheckpoint": "persist_before_terminal_ack",
+    "crossProcessDurableProvider": "caller_owned_external_store_not_implemented_here"
+  },
   "maxActions": 64,
   "maxSessionBatchClaims": 1024,
   "claimPolicy": {

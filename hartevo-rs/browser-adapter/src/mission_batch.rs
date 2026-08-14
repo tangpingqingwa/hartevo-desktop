@@ -5,8 +5,11 @@
 //! [`BrowserActionBatch`]: a bounded claim, an exact result prefix, a
 //! serializable cursor/receipt, and a provider/consumer seam.  It does not
 //! persist application rows, create a Mission, or claim Provider/business
-//! completion.  A caller persists the content-free receipt in its own durable
-//! Mission result and supplies it again for explicit resume.
+//! completion.  A caller supplies the durable checkpoint implementation: the
+//! consumer logs the content-free receipt (including the exact provider
+//! binding) before exposing it to the Mission model and supplies it again for
+//! explicit resume.  This module does not claim a cross-process Store or
+//! durable replay implementation.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -31,6 +34,8 @@ const BATCH_SCHEMA_VERSION: u32 = 1;
 const MAX_BATCH_ACTIONS: usize = 64;
 const MAX_SESSION_BATCH_CLAIMS: usize = 1_024;
 const SERVICE_ID: &str = "hartevo.browser-workspace.mission-batch";
+const PROVIDER_ID: &str = "managed_chromium_adapter_lease";
+const PROVIDER_VERSION: &str = "v1";
 
 /// The immutable frame fence used by a Mission batch.  Frame/loader values are
 /// stored only as digests; no URL, AX name, account or prompt text is retained.
@@ -781,7 +786,9 @@ impl MissionBrowserBatchProviderFailure {
 
 /// Provider boundary.  `prepare` is validation/mount only; it must not claim
 /// a batch id or dispatch an action.  Every step is expected to revalidate the
-/// live managed lease and frame scope.
+/// live managed lease and frame scope.  The provider binding is included with
+/// every durable checkpoint so a resumed consumer cannot silently attach a
+/// receipt to a different adapter implementation or version.
 pub trait MissionBrowserBatchProvider {
     fn prepare(
         &mut self,
@@ -797,13 +804,37 @@ pub trait MissionBrowserBatchProvider {
         now: DateTime<Utc>,
     ) -> Result<MissionBrowserBatchProviderResult, MissionBrowserBatchProviderFailure>;
 
+    fn provider_id(&self) -> &'static str {
+        PROVIDER_ID
+    }
+
+    fn provider_version(&self) -> &'static str {
+        PROVIDER_VERSION
+    }
+
     fn unmount(&mut self);
 }
 
-/// Mission execution/result consumer.  Implementations should persist the
-/// receipt before acknowledging it to a caller.  The adapter never interprets
-/// a consumer acknowledgement as Provider/business verification.
+/// Mission execution/result consumer.  A checkpoint is durably logged before
+/// `on_step` or `on_terminal` makes it visible to the Mission model.  The
+/// consumer also validates the provider binding when a persisted receipt is
+/// supplied for explicit restart/resume.  The adapter never interprets a
+/// consumer acknowledgement as Provider/business verification.
 pub trait MissionBrowserBatchConsumer {
+    fn persist_checkpoint(
+        &mut self,
+        provider_id: &str,
+        provider_version: &str,
+        receipt: &MissionBrowserBatchReceipt,
+    ) -> Result<(), BrowserError>;
+
+    fn validate_resume_checkpoint(
+        &mut self,
+        provider_id: &str,
+        provider_version: &str,
+        receipt: &MissionBrowserBatchReceipt,
+    ) -> Result<(), BrowserError>;
+
     fn on_step(
         &mut self,
         result: &MissionBrowserBatchStepResult,
@@ -816,6 +847,24 @@ pub trait MissionBrowserBatchConsumer {
 }
 
 impl MissionBrowserBatchConsumer for () {
+    fn persist_checkpoint(
+        &mut self,
+        _provider_id: &str,
+        _provider_version: &str,
+        _receipt: &MissionBrowserBatchReceipt,
+    ) -> Result<(), BrowserError> {
+        Ok(())
+    }
+
+    fn validate_resume_checkpoint(
+        &mut self,
+        _provider_id: &str,
+        _provider_version: &str,
+        _receipt: &MissionBrowserBatchReceipt,
+    ) -> Result<(), BrowserError> {
+        Ok(())
+    }
+
     fn on_step(
         &mut self,
         _result: &MissionBrowserBatchStepResult,
@@ -1030,6 +1079,7 @@ pub struct MissionBrowserBatchService<
     consumer: C,
     terminal_notified: bool,
     cleaned_up: bool,
+    persisted_cursor_digest: Option<String>,
 }
 
 impl<P, C> fmt::Debug for MissionBrowserBatchService<P, C>
@@ -1050,6 +1100,10 @@ where
             .field("state", &self.cursor.state)
             .field("terminal_notified", &self.terminal_notified)
             .field("cleaned_up", &self.cleaned_up)
+            .field(
+                "has_persisted_cursor",
+                &self.persisted_cursor_digest.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1087,6 +1141,7 @@ where
             consumer,
             terminal_notified: false,
             cleaned_up: false,
+            persisted_cursor_digest: None,
         })
     }
 
@@ -1095,7 +1150,7 @@ where
         plan: MissionBrowserBatchPlan,
         receipt: &MissionBrowserBatchReceipt,
         mut provider: P,
-        consumer: C,
+        mut consumer: C,
         now: DateTime<Utc>,
     ) -> Result<Self, BrowserError> {
         claims.validate()?;
@@ -1104,6 +1159,14 @@ where
         }
         plan.validate_contract_at(now)?;
         receipt.validate_for_plan(&plan, &plan.scope)?;
+        if let Err(error) = consumer.validate_resume_checkpoint(
+            provider.provider_id(),
+            provider.provider_version(),
+            receipt,
+        ) {
+            provider.unmount();
+            return Err(error);
+        }
         if let Err(error) = provider.prepare(&plan, Some(receipt), now) {
             provider.unmount();
             return Err(error);
@@ -1116,6 +1179,7 @@ where
             consumer,
             terminal_notified: false,
             cleaned_up: false,
+            persisted_cursor_digest: None,
         })
     }
 
@@ -1217,6 +1281,9 @@ where
             .cursor
             .receipt()
             .or_else(|error| self.provider_rejection(error))?;
+        if let Err(error) = self.persist_checkpoint(&receipt) {
+            return self.consumer_failure(error);
+        }
         if let Err(error) = self.consumer.on_step(&result, &receipt) {
             return self.consumer_failure(error);
         }
@@ -1294,8 +1361,25 @@ where
             return Ok(());
         }
         let receipt = self.cursor.receipt()?;
+        self.persist_checkpoint(&receipt)?;
         self.consumer.on_terminal(&receipt)?;
         self.terminal_notified = true;
+        Ok(())
+    }
+
+    fn persist_checkpoint(
+        &mut self,
+        receipt: &MissionBrowserBatchReceipt,
+    ) -> Result<(), BrowserError> {
+        if self.persisted_cursor_digest.as_deref() == Some(receipt.cursor_digest.as_str()) {
+            return Ok(());
+        }
+        self.consumer.persist_checkpoint(
+            self.provider.provider_id(),
+            self.provider.provider_version(),
+            receipt,
+        )?;
+        self.persisted_cursor_digest = Some(receipt.cursor_digest.clone());
         Ok(())
     }
 }
@@ -1649,6 +1733,7 @@ mod tests {
         fail_at: Option<FailureMode>,
         uncertain_result: bool,
         unmounted: bool,
+        version_v2: bool,
     }
 
     enum FailureMode {
@@ -1717,6 +1802,14 @@ mod tests {
                 .map_err(MissionBrowserBatchProviderFailure::rejected)
         }
 
+        fn provider_version(&self) -> &'static str {
+            if self.version_v2 {
+                "v2"
+            } else {
+                PROVIDER_VERSION
+            }
+        }
+
         fn unmount(&mut self) {
             self.unmounted = true;
         }
@@ -1727,15 +1820,47 @@ mod tests {
         sequences: Vec<u32>,
         terminal: Option<MissionBrowserBatchState>,
         cleanup_count: Cell<u32>,
+        checkpoint_events: Vec<String>,
+        fail_checkpoint: bool,
     }
 
     impl MissionBrowserBatchConsumer for Consumer {
+        fn persist_checkpoint(
+            &mut self,
+            provider_id: &str,
+            provider_version: &str,
+            receipt: &MissionBrowserBatchReceipt,
+        ) -> Result<(), BrowserError> {
+            if self.fail_checkpoint {
+                return Err(BrowserError::InvalidBatchReceipt);
+            }
+            self.checkpoint_events.push(format!(
+                "persist:{provider_id}:{provider_version}:{}:{}",
+                receipt.state as u8, receipt.completed_action_count
+            ));
+            Ok(())
+        }
+
+        fn validate_resume_checkpoint(
+            &mut self,
+            provider_id: &str,
+            provider_version: &str,
+            _receipt: &MissionBrowserBatchReceipt,
+        ) -> Result<(), BrowserError> {
+            if provider_id != PROVIDER_ID || provider_version != PROVIDER_VERSION {
+                return Err(BrowserError::InvalidBatchReceipt);
+            }
+            Ok(())
+        }
+
         fn on_step(
             &mut self,
             result: &MissionBrowserBatchStepResult,
             _receipt: &MissionBrowserBatchReceipt,
         ) -> Result<(), BrowserError> {
             self.sequences.push(result.action_sequence);
+            self.checkpoint_events
+                .push(format!("model:{}", result.action_sequence));
             Ok(())
         }
 
@@ -1744,6 +1869,8 @@ mod tests {
             receipt: &MissionBrowserBatchReceipt,
         ) -> Result<(), BrowserError> {
             self.terminal = Some(receipt.state);
+            self.checkpoint_events
+                .push(format!("terminal:{}", receipt.state as u8));
             Ok(())
         }
 
@@ -1825,6 +1952,83 @@ mod tests {
         let receipt = service.receipt().expect("receipt");
         assert_eq!(receipt.state, MissionBrowserBatchState::Completed);
         assert_eq!(receipt.result_digests.len(), 3);
+        assert!(service.execute_next(now()).is_err());
+    }
+
+    #[test]
+    fn durable_checkpoint_precedes_model_ack_and_is_bound_to_provider_version() {
+        let (_, _, batch_plan) = plan(1);
+        let mut claims = MissionBrowserBatchClaimSet::new();
+        let mut service = MissionBrowserBatchService::begin(
+            &mut claims,
+            batch_plan,
+            Provider::default(),
+            Consumer::default(),
+            now(),
+        )
+        .expect("begin");
+        service.execute_next(now()).expect("step");
+
+        assert_eq!(
+            service.consumer.checkpoint_events,
+            vec![
+                format!("persist:{PROVIDER_ID}:{PROVIDER_VERSION}:1:1"),
+                "model:1".to_string(),
+                "terminal:1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_rejects_a_provider_version_swap_before_prepare() {
+        let (_, _, batch_plan) = plan(2);
+        let mut claims = MissionBrowserBatchClaimSet::new();
+        let mut service = MissionBrowserBatchService::begin(
+            &mut claims,
+            batch_plan.clone(),
+            Provider::default(),
+            Consumer::default(),
+            now(),
+        )
+        .expect("begin");
+        service.execute_next(now()).expect("prefix");
+        let takeover = service.takeover().expect("takeover");
+
+        assert!(
+            MissionBrowserBatchService::resume(
+                &claims,
+                batch_plan,
+                &takeover,
+                Provider {
+                    version_v2: true,
+                    ..Provider::default()
+                },
+                Consumer::default(),
+                now(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn checkpoint_failure_blocks_model_ack_and_suffix_execution() {
+        let (_, _, batch_plan) = plan(2);
+        let mut claims = MissionBrowserBatchClaimSet::new();
+        let mut service = MissionBrowserBatchService::begin(
+            &mut claims,
+            batch_plan,
+            Provider::default(),
+            Consumer {
+                fail_checkpoint: true,
+                ..Consumer::default()
+            },
+            now(),
+        )
+        .expect("begin");
+
+        assert!(service.execute_next(now()).is_err());
+        assert!(service.consumer.sequences.is_empty());
+        assert_eq!(service.provider.calls, vec![1]);
         assert!(service.execute_next(now()).is_err());
     }
 
