@@ -16,8 +16,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    AccountId, ActorId, ApprovalId, IdentitySessionId, MemberId, ProjectId, ProjectInviteEventId,
-    ProjectInviteId, ProjectInviteReceiptId, ProjectMembershipBindingId, TeamId, TenantId,
+    AccountId, ActorId, ApprovalId, IdentitySessionId, MemberId, ProjectId,
+    ProjectInviteDecisionReceiptId, ProjectInviteEventId, ProjectInviteId, ProjectInviteReceiptId,
+    ProjectInviteRevocationReceiptId, ProjectMembershipBindingId, TeamId, TenantId,
 };
 
 pub const DEFAULT_PROJECT_INVITE_TTL: Duration = Duration::days(7);
@@ -69,7 +70,16 @@ pub enum ProjectInviteStatus {
     Approved,
     Emitted,
     Accepted,
+    Declined,
+    Revoked,
     Expired,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectInviteDecision {
+    Accepted,
+    Declined,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -243,6 +253,7 @@ pub struct ProjectInviteSession {
     team_id: TeamId,
     account_id: AccountId,
     identity_digest: String,
+    identity_provider_digest: String,
     issued_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     revision: u64,
@@ -264,12 +275,42 @@ impl ProjectInviteSession {
         expires_at: DateTime<Utc>,
         revision: u64,
     ) -> Result<Self, ProjectInviteError> {
+        let identity_digest = identity_digest.into();
+        Self::new_with_identity_provider_digest(
+            session_id,
+            tenant_id,
+            team_id,
+            account_id,
+            identity_digest.clone(),
+            identity_provider_digest(&identity_digest),
+            issued_at,
+            expires_at,
+            revision,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "OIDC rehydration must bind the subject and provider digests to the session"
+    )]
+    pub fn new_with_identity_provider_digest(
+        session_id: IdentitySessionId,
+        tenant_id: TenantId,
+        team_id: TeamId,
+        account_id: AccountId,
+        identity_digest: impl Into<String>,
+        identity_provider_digest: impl Into<String>,
+        issued_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        revision: u64,
+    ) -> Result<Self, ProjectInviteError> {
         let session = Self {
             session_id,
             tenant_id,
             team_id,
             account_id,
             identity_digest: identity_digest.into(),
+            identity_provider_digest: identity_provider_digest.into(),
             issued_at,
             expires_at,
             revision,
@@ -299,6 +340,10 @@ impl ProjectInviteSession {
         &self.identity_digest
     }
 
+    pub fn identity_provider_digest(&self) -> &str {
+        &self.identity_provider_digest
+    }
+
     pub fn issued_at(&self) -> DateTime<Utc> {
         self.issued_at
     }
@@ -321,6 +366,7 @@ impl ProjectInviteSession {
             || self.team_id.as_str().trim().is_empty()
             || self.account_id.as_str().trim().is_empty()
             || !is_sha256(&self.identity_digest)
+            || !is_sha256(&self.identity_provider_digest)
             || self.issued_at.timestamp() < 0
             || self.expires_at <= self.issued_at
             || self.revision == 0
@@ -334,10 +380,12 @@ impl ProjectInviteSession {
 #[derive(Clone, Eq, PartialEq)]
 pub struct DraftInviteRequest {
     invite_id: ProjectInviteId,
+    invite_revision: u64,
     scope: ProjectInviteProjectScope,
     inviter_membership_id: MemberId,
     inviter_membership_revision: u64,
     invitee_identity_digest: String,
+    invitee_identity_provider_digest: String,
     role: ProjectInviteRole,
     scopes: BTreeSet<ProjectInviteScope>,
     created_at: DateTime<Utc>,
@@ -362,12 +410,49 @@ impl DraftInviteRequest {
         expires_at: DateTime<Utc>,
         idempotency_key: impl Into<String>,
     ) -> Result<Self, ProjectInviteError> {
+        let invitee_identity_digest = invitee_identity_digest.into();
+        Self::new_with_revision_and_provider_digest(
+            invite_id,
+            1,
+            scope,
+            inviter_membership_id,
+            inviter_membership_revision,
+            invitee_identity_digest.clone(),
+            identity_provider_digest(&invitee_identity_digest),
+            role,
+            scopes,
+            created_at,
+            expires_at,
+            idempotency_key,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "draft creation binds the invite revision and exact identity-provider projection"
+    )]
+    pub fn new_with_revision_and_provider_digest(
+        invite_id: ProjectInviteId,
+        invite_revision: u64,
+        scope: ProjectInviteProjectScope,
+        inviter_membership_id: MemberId,
+        inviter_membership_revision: u64,
+        invitee_identity_digest: impl Into<String>,
+        invitee_identity_provider_digest: impl Into<String>,
+        role: ProjectInviteRole,
+        scopes: BTreeSet<ProjectInviteScope>,
+        created_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        idempotency_key: impl Into<String>,
+    ) -> Result<Self, ProjectInviteError> {
         let request = Self {
             invite_id,
+            invite_revision,
             scope,
             inviter_membership_id,
             inviter_membership_revision,
             invitee_identity_digest: invitee_identity_digest.into(),
+            invitee_identity_provider_digest: invitee_identity_provider_digest.into(),
             role,
             scopes,
             created_at,
@@ -380,6 +465,10 @@ impl DraftInviteRequest {
 
     pub fn invite_id(&self) -> &ProjectInviteId {
         &self.invite_id
+    }
+
+    pub fn invite_revision(&self) -> u64 {
+        self.invite_revision
     }
 
     pub fn scope(&self) -> &ProjectInviteProjectScope {
@@ -396,6 +485,10 @@ impl DraftInviteRequest {
 
     pub fn invitee_identity_digest(&self) -> &str {
         &self.invitee_identity_digest
+    }
+
+    pub fn invitee_identity_provider_digest(&self) -> &str {
+        &self.invitee_identity_provider_digest
     }
 
     pub fn role(&self) -> ProjectInviteRole {
@@ -417,10 +510,12 @@ impl DraftInviteRequest {
     pub fn intent_digest(&self) -> String {
         draft_intent_digest(
             &self.invite_id,
+            self.invite_revision,
             &self.scope,
             &self.inviter_membership_id,
             self.inviter_membership_revision,
             &self.invitee_identity_digest,
+            &self.invitee_identity_provider_digest,
             self.role,
             &self.scopes,
             self.created_at,
@@ -438,9 +533,11 @@ impl DraftInviteRequest {
     fn validate(&self) -> Result<(), ProjectInviteError> {
         self.scope.validate()?;
         if self.invite_id.as_str().trim().is_empty()
+            || self.invite_revision == 0
             || self.inviter_membership_id.as_str().trim().is_empty()
             || self.inviter_membership_revision == 0
             || !is_sha256(&self.invitee_identity_digest)
+            || !is_sha256(&self.invitee_identity_provider_digest)
             || self.scopes.is_empty()
             || self.scopes.iter().any(|scope| !self.role.allows(*scope))
             || self.created_at.timestamp() < 0
@@ -459,6 +556,7 @@ impl fmt::Debug for DraftInviteRequest {
         formatter
             .debug_struct("DraftInviteRequest")
             .field("invite_id", &self.invite_id)
+            .field("invite_revision", &self.invite_revision)
             .field("scope", &self.scope)
             .field("inviter_membership_id", &self.inviter_membership_id)
             .field(
@@ -466,6 +564,10 @@ impl fmt::Debug for DraftInviteRequest {
                 &self.inviter_membership_revision,
             )
             .field("invitee_identity_digest", &self.invitee_identity_digest)
+            .field(
+                "invitee_identity_provider_digest",
+                &self.invitee_identity_provider_digest,
+            )
             .field("role", &self.role)
             .field("scopes", &self.scopes)
             .field("created_at", &self.created_at)
@@ -479,11 +581,13 @@ impl fmt::Debug for DraftInviteRequest {
 #[serde(rename_all = "camelCase")]
 pub struct DraftInvite {
     invite_id: ProjectInviteId,
+    invite_revision: u64,
     scope: ProjectInviteProjectScope,
     inviter_membership_id: MemberId,
     inviter_account_id: AccountId,
     inviter_membership_revision: u64,
     invitee_identity_digest: String,
+    invitee_identity_provider_digest: String,
     role: ProjectInviteRole,
     scopes: BTreeSet<ProjectInviteScope>,
     created_at: DateTime<Utc>,
@@ -499,11 +603,13 @@ impl DraftInvite {
     ) -> Result<Self, ProjectInviteError> {
         let draft = Self {
             invite_id: request.invite_id.clone(),
+            invite_revision: request.invite_revision,
             scope: request.scope.clone(),
             inviter_membership_id: request.inviter_membership_id.clone(),
             inviter_account_id,
             inviter_membership_revision: request.inviter_membership_revision,
             invitee_identity_digest: request.invitee_identity_digest.clone(),
+            invitee_identity_provider_digest: request.invitee_identity_provider_digest.clone(),
             role: request.role,
             scopes: request.scopes.clone(),
             created_at: request.created_at,
@@ -517,6 +623,10 @@ impl DraftInvite {
 
     pub fn invite_id(&self) -> &ProjectInviteId {
         &self.invite_id
+    }
+
+    pub fn invite_revision(&self) -> u64 {
+        self.invite_revision
     }
 
     pub fn scope(&self) -> &ProjectInviteProjectScope {
@@ -537,6 +647,10 @@ impl DraftInvite {
 
     pub fn invitee_identity_digest(&self) -> &str {
         &self.invitee_identity_digest
+    }
+
+    pub fn invitee_identity_provider_digest(&self) -> &str {
+        &self.invitee_identity_provider_digest
     }
 
     pub fn role(&self) -> ProjectInviteRole {
@@ -562,10 +676,12 @@ impl DraftInvite {
     fn validate(&self) -> Result<(), ProjectInviteError> {
         self.scope.validate()?;
         if self.invite_id.as_str().trim().is_empty()
+            || self.invite_revision == 0
             || self.inviter_membership_id.as_str().trim().is_empty()
             || self.inviter_account_id.as_str().trim().is_empty()
             || self.inviter_membership_revision == 0
             || !is_sha256(&self.invitee_identity_digest)
+            || !is_sha256(&self.invitee_identity_provider_digest)
             || self.scopes.is_empty()
             || self.scopes.iter().any(|scope| !self.role.allows(*scope))
             || self.created_at.timestamp() < 0
@@ -606,6 +722,7 @@ impl fmt::Debug for DraftInviteHandle {
 pub struct InviteApproval {
     approval_id: ApprovalId,
     invite_id: ProjectInviteId,
+    invite_revision: u64,
     approver_actor_id: ActorId,
     approver_membership_id: MemberId,
     approver_membership_revision: u64,
@@ -627,9 +744,36 @@ impl InviteApproval {
         evidence_digest: impl Into<String>,
         approved_at: DateTime<Utc>,
     ) -> Result<Self, ProjectInviteError> {
+        Self::new_with_invite_revision(
+            approval_id,
+            invite_id,
+            1,
+            approver_actor_id,
+            approver_membership_id,
+            approver_membership_revision,
+            evidence_digest,
+            approved_at,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "approval binds the exact invite revision and approver membership projection"
+    )]
+    pub fn new_with_invite_revision(
+        approval_id: ApprovalId,
+        invite_id: ProjectInviteId,
+        invite_revision: u64,
+        approver_actor_id: ActorId,
+        approver_membership_id: MemberId,
+        approver_membership_revision: u64,
+        evidence_digest: impl Into<String>,
+        approved_at: DateTime<Utc>,
+    ) -> Result<Self, ProjectInviteError> {
         let approval = Self {
             approval_id,
             invite_id,
+            invite_revision,
             approver_actor_id,
             approver_membership_id,
             approver_membership_revision,
@@ -646,6 +790,10 @@ impl InviteApproval {
 
     pub fn invite_id(&self) -> &ProjectInviteId {
         &self.invite_id
+    }
+
+    pub fn invite_revision(&self) -> u64 {
+        self.invite_revision
     }
 
     pub fn approver_actor_id(&self) -> &ActorId {
@@ -671,6 +819,7 @@ impl InviteApproval {
     fn validate(&self) -> Result<(), ProjectInviteError> {
         if self.approval_id.as_str().trim().is_empty()
             || self.invite_id.as_str().trim().is_empty()
+            || self.invite_revision == 0
             || self.approver_actor_id.as_str().trim().is_empty()
             || self.approver_membership_id.as_str().trim().is_empty()
             || self.approver_membership_revision == 0
@@ -710,8 +859,10 @@ impl ApprovedInvite {
 pub struct InviteReceipt {
     receipt_id: ProjectInviteReceiptId,
     invite_id: ProjectInviteId,
+    invite_revision: u64,
     scope: ProjectInviteProjectScope,
     invitee_identity_digest: String,
+    invitee_identity_provider_digest: String,
     role: ProjectInviteRole,
     scopes: BTreeSet<ProjectInviteScope>,
     inviter_membership_id: MemberId,
@@ -731,8 +882,10 @@ impl InviteReceipt {
         let receipt = Self {
             receipt_id: ProjectInviteReceiptId::new(),
             invite_id: draft.invite_id.clone(),
+            invite_revision: draft.invite_revision,
             scope: draft.scope.clone(),
             invitee_identity_digest: draft.invitee_identity_digest.clone(),
+            invitee_identity_provider_digest: draft.invitee_identity_provider_digest.clone(),
             role: draft.role,
             scopes: draft.scopes.clone(),
             inviter_membership_id: draft.inviter_membership_id.clone(),
@@ -754,12 +907,20 @@ impl InviteReceipt {
         &self.invite_id
     }
 
+    pub fn invite_revision(&self) -> u64 {
+        self.invite_revision
+    }
+
     pub fn scope(&self) -> &ProjectInviteProjectScope {
         &self.scope
     }
 
     pub fn invitee_identity_digest(&self) -> &str {
         &self.invitee_identity_digest
+    }
+
+    pub fn invitee_identity_provider_digest(&self) -> &str {
+        &self.invitee_identity_provider_digest
     }
 
     pub fn role(&self) -> ProjectInviteRole {
@@ -797,7 +958,9 @@ impl InviteReceipt {
     fn validate(&self) -> Result<(), ProjectInviteError> {
         if self.receipt_id.as_str().trim().is_empty()
             || self.invite_id.as_str().trim().is_empty()
+            || self.invite_revision == 0
             || !is_sha256(&self.invitee_identity_digest)
+            || !is_sha256(&self.invitee_identity_provider_digest)
             || self.scopes.is_empty()
             || self.scopes.iter().any(|scope| !self.role.allows(*scope))
             || self.inviter_membership_id.as_str().trim().is_empty()
@@ -815,14 +978,459 @@ impl InviteReceipt {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct InviteDecisionReceipt {
+    receipt_id: ProjectInviteDecisionReceiptId,
+    invite_id: ProjectInviteId,
+    invite_revision: u64,
+    scope: ProjectInviteProjectScope,
+    inviter_membership_id: MemberId,
+    inviter_membership_revision: u64,
+    invitee_identity_digest: String,
+    invitee_identity_provider_digest: String,
+    session_id: IdentitySessionId,
+    session_revision: u64,
+    decision: ProjectInviteDecision,
+    binding_id: Option<ProjectMembershipBindingId>,
+    membership_revision: Option<u64>,
+    decided_at: DateTime<Utc>,
+    provider_digest: String,
+}
+
+impl InviteDecisionReceipt {
+    fn issue(
+        invite: &InviteReceipt,
+        session: &ProjectInviteSession,
+        decision: ProjectInviteDecision,
+        binding: Option<&ProjectMembershipBinding>,
+        decided_at: DateTime<Utc>,
+    ) -> Result<Self, ProjectInviteError> {
+        let receipt = Self {
+            receipt_id: ProjectInviteDecisionReceiptId::new(),
+            invite_id: invite.invite_id.clone(),
+            invite_revision: invite.invite_revision,
+            scope: invite.scope.clone(),
+            inviter_membership_id: invite.inviter_membership_id.clone(),
+            inviter_membership_revision: invite.inviter_membership_revision,
+            invitee_identity_digest: invite.invitee_identity_digest.clone(),
+            invitee_identity_provider_digest: session.identity_provider_digest.clone(),
+            session_id: session.session_id.clone(),
+            session_revision: session.revision,
+            decision,
+            binding_id: binding.map(|value| value.binding_id.clone()),
+            membership_revision: binding.map(|value| value.membership_revision),
+            decided_at,
+            provider_digest: invite_decision_provider_digest(invite, session, decision, binding),
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn receipt_id(&self) -> &ProjectInviteDecisionReceiptId {
+        &self.receipt_id
+    }
+
+    pub fn invite_id(&self) -> &ProjectInviteId {
+        &self.invite_id
+    }
+
+    pub fn invite_revision(&self) -> u64 {
+        self.invite_revision
+    }
+
+    pub fn scope(&self) -> &ProjectInviteProjectScope {
+        &self.scope
+    }
+
+    pub fn inviter_membership_id(&self) -> &MemberId {
+        &self.inviter_membership_id
+    }
+
+    pub fn inviter_membership_revision(&self) -> u64 {
+        self.inviter_membership_revision
+    }
+
+    pub fn invitee_identity_digest(&self) -> &str {
+        &self.invitee_identity_digest
+    }
+
+    pub fn invitee_identity_provider_digest(&self) -> &str {
+        &self.invitee_identity_provider_digest
+    }
+
+    pub fn session_id(&self) -> &IdentitySessionId {
+        &self.session_id
+    }
+
+    pub fn session_revision(&self) -> u64 {
+        self.session_revision
+    }
+
+    pub fn decision(&self) -> ProjectInviteDecision {
+        self.decision
+    }
+
+    pub fn binding_id(&self) -> Option<&ProjectMembershipBindingId> {
+        self.binding_id.as_ref()
+    }
+
+    pub fn membership_revision(&self) -> Option<u64> {
+        self.membership_revision
+    }
+
+    pub fn decided_at(&self) -> DateTime<Utc> {
+        self.decided_at
+    }
+
+    pub fn provider_digest(&self) -> &str {
+        &self.provider_digest
+    }
+
+    fn validate(&self) -> Result<(), ProjectInviteError> {
+        self.scope.validate()?;
+        let decision_shape_is_valid = match self.decision {
+            ProjectInviteDecision::Accepted => {
+                self.binding_id.is_some() && self.membership_revision.is_some()
+            }
+            ProjectInviteDecision::Declined => {
+                self.binding_id.is_none() && self.membership_revision.is_none()
+            }
+        };
+        if self.receipt_id.as_str().trim().is_empty()
+            || self.invite_id.as_str().trim().is_empty()
+            || self.invite_revision == 0
+            || self.inviter_membership_id.as_str().trim().is_empty()
+            || self.inviter_membership_revision == 0
+            || !is_sha256(&self.invitee_identity_digest)
+            || !is_sha256(&self.invitee_identity_provider_digest)
+            || self.session_id.as_str().trim().is_empty()
+            || self.session_revision == 0
+            || !decision_shape_is_valid
+            || self
+                .membership_revision
+                .is_some_and(|revision| revision == 0)
+            || self.decided_at.timestamp() < 0
+            || !is_sha256(&self.provider_digest)
+        {
+            return Err(ProjectInviteError::InvalidInviteDecisionReceipt);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteAcceptance {
+    receipt: InviteDecisionReceipt,
+    binding: ProjectMembershipBinding,
+}
+
+impl InviteAcceptance {
+    pub fn receipt(&self) -> &InviteDecisionReceipt {
+        &self.receipt
+    }
+
+    pub fn binding(&self) -> &ProjectMembershipBinding {
+        &self.binding
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct InviteRevocationRequest {
+    invite_id: ProjectInviteId,
+    invite_revision: u64,
+    scope: ProjectInviteProjectScope,
+    owner_actor_id: ActorId,
+    owner_membership_id: MemberId,
+    owner_membership_revision: u64,
+    owner_session_id: IdentitySessionId,
+    owner_session_revision: u64,
+    evidence_digest: String,
+    revoked_at: DateTime<Utc>,
+    idempotency_key: String,
+}
+
+impl InviteRevocationRequest {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "revocation binds the exact invite, owner membership, owner session, and replay key"
+    )]
+    pub fn new(
+        invite_id: ProjectInviteId,
+        invite_revision: u64,
+        scope: ProjectInviteProjectScope,
+        owner_actor_id: ActorId,
+        owner_membership_id: MemberId,
+        owner_membership_revision: u64,
+        owner_session_id: IdentitySessionId,
+        owner_session_revision: u64,
+        evidence_digest: impl Into<String>,
+        revoked_at: DateTime<Utc>,
+        idempotency_key: impl Into<String>,
+    ) -> Result<Self, ProjectInviteError> {
+        let request = Self {
+            invite_id,
+            invite_revision,
+            scope,
+            owner_actor_id,
+            owner_membership_id,
+            owner_membership_revision,
+            owner_session_id,
+            owner_session_revision,
+            evidence_digest: evidence_digest.into(),
+            revoked_at,
+            idempotency_key: idempotency_key.into(),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn invite_id(&self) -> &ProjectInviteId {
+        &self.invite_id
+    }
+
+    pub fn invite_revision(&self) -> u64 {
+        self.invite_revision
+    }
+
+    pub fn scope(&self) -> &ProjectInviteProjectScope {
+        &self.scope
+    }
+
+    pub fn owner_actor_id(&self) -> &ActorId {
+        &self.owner_actor_id
+    }
+
+    pub fn owner_membership_id(&self) -> &MemberId {
+        &self.owner_membership_id
+    }
+
+    pub fn owner_membership_revision(&self) -> u64 {
+        self.owner_membership_revision
+    }
+
+    pub fn owner_session_id(&self) -> &IdentitySessionId {
+        &self.owner_session_id
+    }
+
+    pub fn owner_session_revision(&self) -> u64 {
+        self.owner_session_revision
+    }
+
+    pub fn evidence_digest(&self) -> &str {
+        &self.evidence_digest
+    }
+
+    pub fn revoked_at(&self) -> DateTime<Utc> {
+        self.revoked_at
+    }
+
+    pub fn intent_digest(&self) -> String {
+        invite_revocation_intent_digest(
+            &self.invite_id,
+            self.invite_revision,
+            &self.scope,
+            &self.owner_actor_id,
+            &self.owner_membership_id,
+            self.owner_membership_revision,
+            &self.owner_session_id,
+            self.owner_session_revision,
+            &self.evidence_digest,
+            self.revoked_at,
+        )
+    }
+
+    fn idempotency_key_digest(&self) -> String {
+        digest_fields([
+            b"hartevo.project-invite.revocation-idempotency-key.v1".to_vec(),
+            self.idempotency_key.as_bytes().to_vec(),
+        ])
+    }
+
+    fn validate(&self) -> Result<(), ProjectInviteError> {
+        self.scope.validate()?;
+        if self.invite_id.as_str().trim().is_empty()
+            || self.invite_revision == 0
+            || self.owner_actor_id.as_str().trim().is_empty()
+            || self.owner_membership_id.as_str().trim().is_empty()
+            || self.owner_membership_revision == 0
+            || self.owner_session_id.as_str().trim().is_empty()
+            || self.owner_session_revision == 0
+            || !is_sha256(&self.evidence_digest)
+            || self.revoked_at.timestamp() < 0
+            || self.idempotency_key.trim().is_empty()
+            || self.idempotency_key.chars().any(char::is_control)
+        {
+            return Err(ProjectInviteError::InvalidInviteRevocationRequest);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for InviteRevocationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InviteRevocationRequest")
+            .field("invite_id", &self.invite_id)
+            .field("invite_revision", &self.invite_revision)
+            .field("scope", &self.scope)
+            .field("owner_actor_id", &self.owner_actor_id)
+            .field("owner_membership_id", &self.owner_membership_id)
+            .field("owner_membership_revision", &self.owner_membership_revision)
+            .field("owner_session_id", &self.owner_session_id)
+            .field("owner_session_revision", &self.owner_session_revision)
+            .field("evidence_digest", &self.evidence_digest)
+            .field("revoked_at", &self.revoked_at)
+            .field("idempotency_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteRevocationReceipt {
+    receipt_id: ProjectInviteRevocationReceiptId,
+    invite_id: ProjectInviteId,
+    invite_revision: u64,
+    scope: ProjectInviteProjectScope,
+    owner_actor_id: ActorId,
+    owner_membership_id: MemberId,
+    owner_membership_revision: u64,
+    owner_session_id: IdentitySessionId,
+    owner_session_revision: u64,
+    owner_identity_provider_digest: String,
+    evidence_digest: String,
+    binding_id: Option<ProjectMembershipBindingId>,
+    membership_revision: Option<u64>,
+    revoked_at: DateTime<Utc>,
+    provider_digest: String,
+    idempotency_key_digest: String,
+}
+
+impl InviteRevocationReceipt {
+    fn issue(
+        request: &InviteRevocationRequest,
+        session: &ProjectInviteSession,
+        binding: Option<&ProjectMembershipBinding>,
+    ) -> Result<Self, ProjectInviteError> {
+        let receipt = Self {
+            receipt_id: ProjectInviteRevocationReceiptId::new(),
+            invite_id: request.invite_id.clone(),
+            invite_revision: request.invite_revision,
+            scope: request.scope.clone(),
+            owner_actor_id: request.owner_actor_id.clone(),
+            owner_membership_id: request.owner_membership_id.clone(),
+            owner_membership_revision: request.owner_membership_revision,
+            owner_session_id: request.owner_session_id.clone(),
+            owner_session_revision: request.owner_session_revision,
+            owner_identity_provider_digest: session.identity_provider_digest.clone(),
+            evidence_digest: request.evidence_digest.clone(),
+            binding_id: binding.map(|value| value.binding_id.clone()),
+            membership_revision: binding.map(|value| value.membership_revision),
+            revoked_at: request.revoked_at,
+            provider_digest: invite_revocation_provider_digest(request, session, binding),
+            idempotency_key_digest: request.idempotency_key_digest(),
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn receipt_id(&self) -> &ProjectInviteRevocationReceiptId {
+        &self.receipt_id
+    }
+
+    pub fn invite_id(&self) -> &ProjectInviteId {
+        &self.invite_id
+    }
+
+    pub fn invite_revision(&self) -> u64 {
+        self.invite_revision
+    }
+
+    pub fn scope(&self) -> &ProjectInviteProjectScope {
+        &self.scope
+    }
+
+    pub fn owner_actor_id(&self) -> &ActorId {
+        &self.owner_actor_id
+    }
+
+    pub fn owner_membership_id(&self) -> &MemberId {
+        &self.owner_membership_id
+    }
+
+    pub fn owner_membership_revision(&self) -> u64 {
+        self.owner_membership_revision
+    }
+
+    pub fn owner_session_id(&self) -> &IdentitySessionId {
+        &self.owner_session_id
+    }
+
+    pub fn owner_session_revision(&self) -> u64 {
+        self.owner_session_revision
+    }
+
+    pub fn owner_identity_provider_digest(&self) -> &str {
+        &self.owner_identity_provider_digest
+    }
+
+    pub fn evidence_digest(&self) -> &str {
+        &self.evidence_digest
+    }
+
+    pub fn binding_id(&self) -> Option<&ProjectMembershipBindingId> {
+        self.binding_id.as_ref()
+    }
+
+    pub fn membership_revision(&self) -> Option<u64> {
+        self.membership_revision
+    }
+
+    pub fn revoked_at(&self) -> DateTime<Utc> {
+        self.revoked_at
+    }
+
+    pub fn provider_digest(&self) -> &str {
+        &self.provider_digest
+    }
+
+    fn validate(&self) -> Result<(), ProjectInviteError> {
+        self.scope.validate()?;
+        if self.receipt_id.as_str().trim().is_empty()
+            || self.invite_id.as_str().trim().is_empty()
+            || self.invite_revision == 0
+            || self.owner_actor_id.as_str().trim().is_empty()
+            || self.owner_membership_id.as_str().trim().is_empty()
+            || self.owner_membership_revision == 0
+            || self.owner_session_id.as_str().trim().is_empty()
+            || self.owner_session_revision == 0
+            || !is_sha256(&self.owner_identity_provider_digest)
+            || !is_sha256(&self.evidence_digest)
+            || self
+                .membership_revision
+                .is_some_and(|revision| revision == 0)
+            || self.revoked_at.timestamp() < 0
+            || !is_sha256(&self.provider_digest)
+            || !is_sha256(&self.idempotency_key_digest)
+        {
+            return Err(ProjectInviteError::InvalidInviteRevocationReceipt);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectMembershipBinding {
     binding_id: ProjectMembershipBindingId,
     invite_id: ProjectInviteId,
+    invite_revision: u64,
     receipt_id: ProjectInviteReceiptId,
     member_id: MemberId,
     scope: ProjectInviteProjectScope,
     account_id: AccountId,
     identity_digest: String,
+    identity_provider_digest: String,
     role: ProjectInviteRole,
     scopes: BTreeSet<ProjectInviteScope>,
     inviter_membership_id: MemberId,
@@ -845,11 +1453,13 @@ impl ProjectMembershipBinding {
         let binding = Self {
             binding_id: ProjectMembershipBindingId::new(),
             invite_id: receipt.invite_id.clone(),
+            invite_revision: receipt.invite_revision,
             receipt_id: receipt.receipt_id.clone(),
             member_id: MemberId::new(),
             scope: receipt.scope.clone(),
             account_id: session.account_id.clone(),
             identity_digest: session.identity_digest.clone(),
+            identity_provider_digest: session.identity_provider_digest.clone(),
             role: receipt.role,
             scopes: receipt.scopes.clone(),
             inviter_membership_id: draft.inviter_membership_id.clone(),
@@ -873,6 +1483,10 @@ impl ProjectMembershipBinding {
         &self.invite_id
     }
 
+    pub fn invite_revision(&self) -> u64 {
+        self.invite_revision
+    }
+
     pub fn receipt_id(&self) -> &ProjectInviteReceiptId {
         &self.receipt_id
     }
@@ -891,6 +1505,10 @@ impl ProjectMembershipBinding {
 
     pub fn identity_digest(&self) -> &str {
         &self.identity_digest
+    }
+
+    pub fn identity_provider_digest(&self) -> &str {
+        &self.identity_provider_digest
     }
 
     pub fn role(&self) -> ProjectInviteRole {
@@ -933,10 +1551,12 @@ impl ProjectMembershipBinding {
         self.scope.validate()?;
         if self.binding_id.as_str().trim().is_empty()
             || self.invite_id.as_str().trim().is_empty()
+            || self.invite_revision == 0
             || self.receipt_id.as_str().trim().is_empty()
             || self.member_id.as_str().trim().is_empty()
             || self.account_id.as_str().trim().is_empty()
             || !is_sha256(&self.identity_digest)
+            || !is_sha256(&self.identity_provider_digest)
             || self.scopes.is_empty()
             || self.scopes.iter().any(|scope| !self.role.allows(*scope))
             || self.inviter_membership_id.as_str().trim().is_empty()
@@ -971,6 +1591,16 @@ pub enum ProjectInviteEvent {
         event_id: ProjectInviteEventId,
         receipt: InviteReceipt,
     },
+    InviteDecisionRecorded {
+        event_id: ProjectInviteEventId,
+        receipt: InviteDecisionReceipt,
+        binding: Option<ProjectMembershipBinding>,
+    },
+    InviteRevoked {
+        event_id: ProjectInviteEventId,
+        receipt: InviteRevocationReceipt,
+        binding: Option<ProjectMembershipBinding>,
+    },
     MembershipBindingCreated {
         event_id: ProjectInviteEventId,
         binding: ProjectMembershipBinding,
@@ -987,6 +1617,8 @@ impl ProjectInviteEvent {
             Self::DraftCreated { event_id, .. }
             | Self::DraftApproved { event_id, .. }
             | Self::InviteReceiptIssued { event_id, .. }
+            | Self::InviteDecisionRecorded { event_id, .. }
+            | Self::InviteRevoked { event_id, .. }
             | Self::MembershipBindingCreated { event_id, .. }
             | Self::MembershipBindingUpdated { event_id, .. } => event_id,
         }
@@ -999,11 +1631,23 @@ struct InviteProjection {
     handle: DraftInviteHandle,
     approval: Option<InviteApproval>,
     receipt: Option<InviteReceipt>,
+    decision: Option<InviteDecisionReceipt>,
+    revocation: Option<InviteRevocationReceipt>,
     binding: Option<ProjectMembershipBinding>,
 }
 
 impl InviteProjection {
     fn status(&self, now: DateTime<Utc>) -> ProjectInviteStatus {
+        if self.revocation.is_some() {
+            return ProjectInviteStatus::Revoked;
+        }
+        if self
+            .decision
+            .as_ref()
+            .is_some_and(|receipt| receipt.decision == ProjectInviteDecision::Declined)
+        {
+            return ProjectInviteStatus::Declined;
+        }
         if self.binding.is_some() {
             return ProjectInviteStatus::Accepted;
         }
@@ -1268,6 +1912,9 @@ impl ProjectInvitePluginService {
         if approval.invite_id() != &invite_id {
             return Err(ProjectInviteError::ApprovalInviteMismatch);
         }
+        if approval.invite_revision() != projection.draft.invite_revision() {
+            return Err(ProjectInviteError::StaleInvite);
+        }
         if let Some(existing) = projection.approval {
             if existing == approval {
                 return Ok(ApprovedInvite {
@@ -1277,6 +1924,12 @@ impl ProjectInvitePluginService {
                 });
             }
             return Err(ProjectInviteError::ApprovalConflict);
+        }
+        if projection.revocation.is_some() {
+            return Err(ProjectInviteError::InviteRevoked);
+        }
+        if projection.decision.is_some() {
+            return Err(ProjectInviteError::DecisionConflict);
         }
         self.validate_inviter_membership(&projection.draft, approval.approved_at())?;
         let approver = self
@@ -1327,6 +1980,12 @@ impl ProjectInvitePluginService {
         if let Some(receipt) = projection.receipt {
             return Ok(receipt);
         }
+        if projection.revocation.is_some() {
+            return Err(ProjectInviteError::InviteRevoked);
+        }
+        if projection.decision.is_some() {
+            return Err(ProjectInviteError::DecisionConflict);
+        }
         let approval = projection
             .approval
             .clone()
@@ -1350,6 +2009,49 @@ impl ProjectInvitePluginService {
         session: &ProjectInviteSession,
         now: DateTime<Utc>,
     ) -> Result<ProjectMembershipBinding, ProjectInviteError> {
+        Ok(self
+            .accept_invite_with_receipt(receipt, session, now)?
+            .binding)
+    }
+
+    pub fn accept_invite_with_receipt(
+        &mut self,
+        receipt: &InviteReceipt,
+        session: &ProjectInviteSession,
+        now: DateTime<Utc>,
+    ) -> Result<InviteAcceptance, ProjectInviteError> {
+        let decision_receipt =
+            self.respond_to_invite(receipt, session, ProjectInviteDecision::Accepted, now)?;
+        let binding_id = decision_receipt
+            .binding_id()
+            .ok_or(ProjectInviteError::BindingNotFound)?;
+        let binding = self
+            .bindings
+            .get(binding_id)
+            .cloned()
+            .ok_or(ProjectInviteError::BindingNotFound)?;
+        Ok(InviteAcceptance {
+            receipt: decision_receipt,
+            binding,
+        })
+    }
+
+    pub fn decline_invite(
+        &mut self,
+        receipt: &InviteReceipt,
+        session: &ProjectInviteSession,
+        now: DateTime<Utc>,
+    ) -> Result<InviteDecisionReceipt, ProjectInviteError> {
+        self.respond_to_invite(receipt, session, ProjectInviteDecision::Declined, now)
+    }
+
+    pub fn respond_to_invite(
+        &mut self,
+        receipt: &InviteReceipt,
+        session: &ProjectInviteSession,
+        decision: ProjectInviteDecision,
+        now: DateTime<Utc>,
+    ) -> Result<InviteDecisionReceipt, ProjectInviteError> {
         receipt.validate()?;
         let projection = self
             .invites
@@ -1359,33 +2061,153 @@ impl ProjectInvitePluginService {
         if projection.receipt.as_ref() != Some(receipt) {
             return Err(ProjectInviteError::ReceiptProjectionMismatch);
         }
-        if let Some(binding_id) = self.binding_by_invite.get(receipt.invite_id()) {
-            let binding = self
-                .bindings
-                .get(binding_id)
-                .cloned()
-                .ok_or(ProjectInviteError::BindingNotFound)?;
+        if projection.revocation.is_some() {
+            return Err(ProjectInviteError::InviteRevoked);
+        }
+        if let Some(existing) = projection.decision.clone() {
+            if existing.decision != decision {
+                return Err(ProjectInviteError::DecisionConflict);
+            }
+            self.validate_session_for_receipt(receipt, session, now)?;
+            if existing.session_id() != session.session_id()
+                || existing.session_revision() != session.revision()
+                || existing.invitee_identity_provider_digest() != session.identity_provider_digest()
+            {
+                return Err(ProjectInviteError::AcceptanceConflict);
+            }
+            if let Some(binding_id) = existing.binding_id() {
+                let binding = self
+                    .bindings
+                    .get(binding_id)
+                    .cloned()
+                    .ok_or(ProjectInviteError::BindingNotFound)?;
+                self.validate_binding(&binding, now)?;
+            }
+            return Ok(existing);
+        }
+        if let Some(binding) = projection.binding.clone() {
+            if decision == ProjectInviteDecision::Declined {
+                return Err(ProjectInviteError::DecisionConflict);
+            }
             self.validate_binding(&binding, now)?;
             self.validate_session_for_receipt(receipt, session, now)?;
             if binding.session_id() != session.session_id()
                 || binding.account_id() != session.account_id()
+                || binding.identity_provider_digest() != session.identity_provider_digest()
             {
                 return Err(ProjectInviteError::AcceptanceConflict);
             }
-            return Ok(binding);
+            let decision_receipt = InviteDecisionReceipt::issue(
+                receipt,
+                session,
+                ProjectInviteDecision::Accepted,
+                Some(&binding),
+                now,
+            )?;
+            self.record_event(ProjectInviteEvent::InviteDecisionRecorded {
+                event_id: ProjectInviteEventId::new(),
+                receipt: decision_receipt.clone(),
+                binding: Some(binding),
+            })?;
+            return Ok(decision_receipt);
         }
         if now >= receipt.expires_at() {
             return Err(ProjectInviteError::InviteExpired);
         }
         self.validate_inviter_membership(&projection.draft, now)?;
         self.validate_session_for_receipt(receipt, session, now)?;
-        let binding =
-            ProjectMembershipBinding::from_accept(receipt, &projection.draft, session, now)?;
-        self.record_event(ProjectInviteEvent::MembershipBindingCreated {
+        let binding = match decision {
+            ProjectInviteDecision::Accepted => Some(ProjectMembershipBinding::from_accept(
+                receipt,
+                &projection.draft,
+                session,
+                now,
+            )?),
+            ProjectInviteDecision::Declined => None,
+        };
+        let decision_receipt =
+            InviteDecisionReceipt::issue(receipt, session, decision, binding.as_ref(), now)?;
+        self.record_event(ProjectInviteEvent::InviteDecisionRecorded {
             event_id: ProjectInviteEventId::new(),
-            binding: binding.clone(),
+            receipt: decision_receipt.clone(),
+            binding,
         })?;
-        Ok(binding)
+        Ok(decision_receipt)
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the provider owns the revocation command at the durable boundary"
+    )]
+    pub fn revoke_invite(
+        &mut self,
+        request: InviteRevocationRequest,
+    ) -> Result<InviteRevocationReceipt, ProjectInviteError> {
+        request.validate()?;
+        let projection = self
+            .invites
+            .get(&request.invite_id)
+            .cloned()
+            .ok_or(ProjectInviteError::DraftNotFound)?;
+        if let Some(existing) = projection.revocation.clone() {
+            if revocation_matches_request(&existing, &request) {
+                return Ok(existing);
+            }
+            return Err(ProjectInviteError::RevocationConflict);
+        }
+        if projection.draft.scope != request.scope {
+            return Err(
+                if projection.draft.scope.team_id() == request.scope.team_id() {
+                    ProjectInviteError::ProjectScopeMismatch
+                } else {
+                    ProjectInviteError::CrossTeamScope
+                },
+            );
+        }
+        if projection.draft.invite_revision != request.invite_revision {
+            return Err(ProjectInviteError::StaleInvite);
+        }
+        if projection
+            .decision
+            .as_ref()
+            .is_some_and(|receipt| receipt.decision == ProjectInviteDecision::Declined)
+        {
+            return Err(ProjectInviteError::InviteAlreadyDeclined);
+        }
+        if request.revoked_at >= projection.draft.expires_at {
+            return Err(ProjectInviteError::InviteExpired);
+        }
+        let owner_session = self.validate_owner_for_revocation(&request, &projection.draft)?;
+        let revoked_binding = if let Some(binding) = projection.binding.as_ref() {
+            let current = self
+                .bindings
+                .get(binding.binding_id())
+                .ok_or(ProjectInviteError::BindingNotFound)?;
+            if current != binding {
+                return Err(ProjectInviteError::BindingStale);
+            }
+            if current.status() == ProjectMembershipBindingStatus::Revoked {
+                return Err(ProjectInviteError::BindingRevoked);
+            }
+            let mut revoked = current.clone();
+            revoked.status = ProjectMembershipBindingStatus::Revoked;
+            revoked.membership_revision = revoked
+                .membership_revision
+                .checked_add(1)
+                .ok_or(ProjectInviteError::RevisionOverflow)?;
+            revoked.validate()?;
+            Some(revoked)
+        } else {
+            None
+        };
+        let revocation =
+            InviteRevocationReceipt::issue(&request, &owner_session, revoked_binding.as_ref())?;
+        self.record_event(ProjectInviteEvent::InviteRevoked {
+            event_id: ProjectInviteEventId::new(),
+            receipt: revocation.clone(),
+            binding: revoked_binding,
+        })?;
+        Ok(revocation)
     }
 
     pub fn validate_binding(
@@ -1644,10 +2466,55 @@ impl ProjectInvitePluginService {
         if current.tenant_id() != receipt.scope.tenant_id()
             || current.team_id() != receipt.scope.team_id()
             || current.identity_digest() != receipt.invitee_identity_digest()
+            || current.identity_provider_digest() != receipt.invitee_identity_provider_digest()
         {
             return Err(ProjectInviteError::CrossTeamScope);
         }
         Ok(())
+    }
+
+    fn validate_owner_for_revocation(
+        &self,
+        request: &InviteRevocationRequest,
+        draft: &DraftInvite,
+    ) -> Result<ProjectInviteSession, ProjectInviteError> {
+        let membership = self
+            .team_memberships
+            .get(request.owner_membership_id())
+            .ok_or(ProjectInviteError::MembershipNotFound)?;
+        if membership.tenant_id() != draft.scope.tenant_id()
+            || membership.team_id() != draft.scope.team_id()
+        {
+            return Err(ProjectInviteError::CrossTeamScope);
+        }
+        if membership.status() != ProjectInviteMembershipStatus::Active {
+            return Err(ProjectInviteError::MembershipRevoked);
+        }
+        if membership.membership_revision() != request.owner_membership_revision() {
+            return Err(ProjectInviteError::StaleMembership);
+        }
+        if membership.role() != ProjectInviteRole::Owner {
+            return Err(ProjectInviteError::UnauthorizedOwner);
+        }
+        let session = self
+            .sessions
+            .get(request.owner_session_id())
+            .cloned()
+            .ok_or(ProjectInviteError::SessionNotFound)?;
+        if session.status() == ProjectInviteSessionStatus::Revoked {
+            return Err(ProjectInviteError::SessionRevoked);
+        }
+        if session.expires_at() <= request.revoked_at() {
+            return Err(ProjectInviteError::SessionExpired);
+        }
+        if session.revision() != request.owner_session_revision()
+            || session.tenant_id() != membership.tenant_id()
+            || session.team_id() != membership.team_id()
+            || session.account_id() != membership.account_id()
+        {
+            return Err(ProjectInviteError::StaleSession);
+        }
+        Ok(session)
     }
 
     fn validate_current_session_for_binding(
@@ -1668,10 +2535,104 @@ impl ProjectInvitePluginService {
         if session.revision() != binding.session_revision
             || session.account_id() != &binding.account_id
             || session.identity_digest() != binding.identity_digest
+            || session.identity_provider_digest() != binding.identity_provider_digest
             || session.tenant_id() != binding.scope.tenant_id()
             || session.team_id() != binding.scope.team_id()
         {
             return Err(ProjectInviteError::StaleSession);
+        }
+        Ok(())
+    }
+
+    fn validate_decision_binding(
+        &self,
+        projection: &InviteProjection,
+        receipt: &InviteDecisionReceipt,
+        binding: &ProjectMembershipBinding,
+    ) -> Result<(), ProjectInviteError> {
+        let invite_receipt = projection
+            .receipt
+            .as_ref()
+            .ok_or(ProjectInviteError::ReceiptNotFound)?;
+        binding.validate()?;
+        if receipt.decision != ProjectInviteDecision::Accepted
+            || receipt.binding_id != Some(binding.binding_id.clone())
+            || receipt.membership_revision != Some(binding.membership_revision)
+            || binding.invite_id != receipt.invite_id
+            || binding.invite_revision != receipt.invite_revision
+            || binding.receipt_id != invite_receipt.receipt_id
+            || binding.scope != receipt.scope
+            || binding.inviter_membership_id != receipt.inviter_membership_id
+            || binding.inviter_membership_revision != receipt.inviter_membership_revision
+            || binding.identity_digest != receipt.invitee_identity_digest
+            || binding.identity_provider_digest != receipt.invitee_identity_provider_digest
+            || binding.session_id != receipt.session_id
+            || binding.session_revision != receipt.session_revision
+            || binding.role != invite_receipt.role
+            || binding.scopes != invite_receipt.scopes
+            || binding.status != ProjectMembershipBindingStatus::Active
+        {
+            return Err(ProjectInviteError::DecisionBindingMismatch);
+        }
+        if let Some(existing_id) = self.binding_by_invite.get(binding.invite_id())
+            && self.bindings.get(existing_id) != Some(binding)
+        {
+            return Err(ProjectInviteError::AcceptanceConflict);
+        }
+        if let Some(existing) = self.bindings.get(binding.binding_id())
+            && existing != binding
+        {
+            return Err(ProjectInviteError::AcceptanceConflict);
+        }
+        Ok(())
+    }
+
+    fn validate_revocation_binding(
+        &self,
+        projection: &InviteProjection,
+        receipt: &InviteRevocationReceipt,
+        binding: Option<&ProjectMembershipBinding>,
+    ) -> Result<(), ProjectInviteError> {
+        match (projection.binding.as_ref(), binding) {
+            (None, None) => {
+                if receipt.binding_id.is_some() || receipt.membership_revision.is_some() {
+                    return Err(ProjectInviteError::RevocationBindingMismatch);
+                }
+            }
+            (Some(current), Some(revoked)) => {
+                if self.bindings.get(current.binding_id()) != Some(current) {
+                    return Err(ProjectInviteError::BindingStale);
+                }
+                let expected_membership_revision = current
+                    .membership_revision
+                    .checked_add(1)
+                    .ok_or(ProjectInviteError::RevisionOverflow)?;
+                if receipt.binding_id != Some(revoked.binding_id.clone())
+                    || receipt.membership_revision != Some(revoked.membership_revision)
+                    || revoked.binding_id != current.binding_id
+                    || revoked.invite_id != current.invite_id
+                    || revoked.invite_revision != current.invite_revision
+                    || revoked.member_id != current.member_id
+                    || revoked.scope != current.scope
+                    || revoked.account_id != current.account_id
+                    || revoked.identity_digest != current.identity_digest
+                    || revoked.identity_provider_digest != current.identity_provider_digest
+                    || revoked.role != current.role
+                    || revoked.scopes != current.scopes
+                    || revoked.inviter_membership_id != current.inviter_membership_id
+                    || revoked.inviter_membership_revision != current.inviter_membership_revision
+                    || revoked.role_revision != current.role_revision
+                    || revoked.session_id != current.session_id
+                    || revoked.session_revision != current.session_revision
+                    || revoked.status != ProjectMembershipBindingStatus::Revoked
+                    || revoked.membership_revision != expected_membership_revision
+                {
+                    return Err(ProjectInviteError::RevocationBindingMismatch);
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ProjectInviteError::RevocationBindingMismatch);
+            }
         }
         Ok(())
     }
@@ -1719,6 +2680,8 @@ impl ProjectInvitePluginService {
                         handle: handle.clone(),
                         approval: None,
                         receipt: None,
+                        decision: None,
+                        revocation: None,
                         binding: None,
                     },
                 );
@@ -1731,6 +2694,15 @@ impl ProjectInvitePluginService {
                 approval.validate()?;
                 if approval.invite_id() != invite_id {
                     return Err(ProjectInviteError::ApprovalInviteMismatch);
+                }
+                let draft = self
+                    .invites
+                    .get(invite_id)
+                    .ok_or(ProjectInviteError::DraftNotFound)?
+                    .draft
+                    .clone();
+                if approval.invite_revision() != draft.invite_revision() {
+                    return Err(ProjectInviteError::StaleInvite);
                 }
                 let projection = self
                     .invites
@@ -1767,7 +2739,162 @@ impl ProjectInvitePluginService {
                 {
                     return Err(ProjectInviteError::ApprovalRequired);
                 }
+                if receipt.invite_revision != projection.draft.invite_revision
+                    || receipt.scope != projection.draft.scope
+                    || receipt.invitee_identity_digest != projection.draft.invitee_identity_digest
+                    || receipt.invitee_identity_provider_digest
+                        != projection.draft.invitee_identity_provider_digest
+                    || receipt.role != projection.draft.role
+                    || receipt.scopes != projection.draft.scopes
+                    || receipt.inviter_membership_id != projection.draft.inviter_membership_id
+                    || receipt.inviter_membership_revision
+                        != projection.draft.inviter_membership_revision
+                    || receipt.expires_at != projection.draft.expires_at
+                    || projection.approval.as_ref().is_none_or(|approval| {
+                        receipt.provider_digest
+                            != invite_provider_digest(&projection.draft, approval)
+                    })
+                {
+                    return Err(ProjectInviteError::ReceiptProjectionMismatch);
+                }
                 projection.receipt = Some(receipt.clone());
+            }
+            ProjectInviteEvent::InviteDecisionRecorded {
+                receipt, binding, ..
+            } => {
+                receipt.validate()?;
+                let projection = self
+                    .invites
+                    .get(receipt.invite_id())
+                    .cloned()
+                    .ok_or(ProjectInviteError::DraftNotFound)?;
+                let invite_receipt = projection
+                    .receipt
+                    .as_ref()
+                    .ok_or(ProjectInviteError::ReceiptNotFound)?;
+                if receipt.invite_id != invite_receipt.invite_id
+                    || receipt.invite_revision != projection.draft.invite_revision
+                    || receipt.scope != invite_receipt.scope
+                    || receipt.invitee_identity_digest != invite_receipt.invitee_identity_digest
+                    || receipt.invitee_identity_provider_digest
+                        != invite_receipt.invitee_identity_provider_digest
+                    || receipt.invite_revision != invite_receipt.invite_revision
+                    || receipt.inviter_membership_id != invite_receipt.inviter_membership_id
+                    || receipt.inviter_membership_revision
+                        != invite_receipt.inviter_membership_revision
+                    || projection.revocation.is_some()
+                {
+                    return Err(ProjectInviteError::ReceiptProjectionMismatch);
+                }
+                let session = self
+                    .sessions
+                    .get(&receipt.session_id)
+                    .ok_or(ProjectInviteError::SessionNotFound)?;
+                if session.revision != receipt.session_revision
+                    || session.tenant_id != receipt.scope.tenant_id
+                    || session.team_id != receipt.scope.team_id
+                    || session.identity_digest != receipt.invitee_identity_digest
+                    || session.identity_provider_digest != receipt.invitee_identity_provider_digest
+                {
+                    return Err(ProjectInviteError::StaleSession);
+                }
+                if let Some(existing) = &projection.decision {
+                    if existing == receipt {
+                        return Err(ProjectInviteError::DuplicateDecision);
+                    }
+                    return Err(ProjectInviteError::DecisionConflict);
+                }
+                match (receipt.decision, binding) {
+                    (ProjectInviteDecision::Accepted, Some(binding)) => {
+                        self.validate_decision_binding(&projection, receipt, binding)?;
+                    }
+                    (ProjectInviteDecision::Declined, None) => {}
+                    _ => return Err(ProjectInviteError::DecisionBindingMismatch),
+                }
+                if receipt.provider_digest
+                    != invite_decision_provider_digest(
+                        invite_receipt,
+                        session,
+                        receipt.decision,
+                        binding.as_ref(),
+                    )
+                {
+                    return Err(ProjectInviteError::DecisionBindingMismatch);
+                }
+                let projection = self
+                    .invites
+                    .get_mut(receipt.invite_id())
+                    .ok_or(ProjectInviteError::DraftNotFound)?;
+                projection.decision = Some(receipt.clone());
+                if let Some(binding) = binding {
+                    projection.binding = Some(binding.clone());
+                    self.binding_by_invite
+                        .insert(binding.invite_id.clone(), binding.binding_id.clone());
+                    self.bindings
+                        .insert(binding.binding_id.clone(), binding.clone());
+                }
+            }
+            ProjectInviteEvent::InviteRevoked {
+                receipt, binding, ..
+            } => {
+                receipt.validate()?;
+                let projection = self
+                    .invites
+                    .get(receipt.invite_id())
+                    .cloned()
+                    .ok_or(ProjectInviteError::DraftNotFound)?;
+                if receipt.invite_revision != projection.draft.invite_revision
+                    || receipt.scope != projection.draft.scope
+                    || projection.revocation.is_some()
+                {
+                    return Err(ProjectInviteError::RevocationConflict);
+                }
+                if let Some(existing) = &projection.decision
+                    && existing.decision == ProjectInviteDecision::Declined
+                {
+                    return Err(ProjectInviteError::InviteAlreadyDeclined);
+                }
+                let owner_membership = self
+                    .team_memberships
+                    .get(&receipt.owner_membership_id)
+                    .ok_or(ProjectInviteError::MembershipNotFound)?;
+                if owner_membership.tenant_id != receipt.scope.tenant_id
+                    || owner_membership.team_id != receipt.scope.team_id
+                    || owner_membership.membership_revision != receipt.owner_membership_revision
+                    || owner_membership.status != ProjectInviteMembershipStatus::Active
+                    || owner_membership.role != ProjectInviteRole::Owner
+                {
+                    return Err(ProjectInviteError::UnauthorizedOwner);
+                }
+                let owner_session = self
+                    .sessions
+                    .get(&receipt.owner_session_id)
+                    .ok_or(ProjectInviteError::SessionNotFound)?;
+                if owner_session.revision != receipt.owner_session_revision
+                    || owner_session.tenant_id != receipt.scope.tenant_id
+                    || owner_session.team_id != receipt.scope.team_id
+                    || owner_session.identity_provider_digest
+                        != receipt.owner_identity_provider_digest
+                    || receipt.provider_digest
+                        != invite_revocation_provider_digest_from_receipt(
+                            receipt,
+                            owner_session,
+                            binding.as_ref(),
+                        )
+                {
+                    return Err(ProjectInviteError::RevocationBindingMismatch);
+                }
+                self.validate_revocation_binding(&projection, receipt, binding.as_ref())?;
+                let projection = self
+                    .invites
+                    .get_mut(receipt.invite_id())
+                    .ok_or(ProjectInviteError::DraftNotFound)?;
+                projection.revocation = Some(receipt.clone());
+                if let Some(binding) = binding {
+                    projection.binding = Some(binding.clone());
+                    self.bindings
+                        .insert(binding.binding_id.clone(), binding.clone());
+                }
             }
             ProjectInviteEvent::MembershipBindingCreated { binding, .. } => {
                 binding.validate()?;
@@ -1783,6 +2910,15 @@ impl ProjectInvitePluginService {
                     .ok_or(ProjectInviteError::DraftNotFound)?;
                 if projection.receipt.as_ref().map(InviteReceipt::receipt_id)
                     != Some(binding.receipt_id())
+                    || projection.receipt.as_ref().is_none_or(|receipt| {
+                        binding.invite_revision != receipt.invite_revision
+                            || binding.scope != receipt.scope
+                            || binding.identity_digest != receipt.invitee_identity_digest
+                            || binding.identity_provider_digest
+                                != receipt.invitee_identity_provider_digest
+                            || binding.role != receipt.role
+                            || binding.scopes != receipt.scopes
+                    })
                 {
                     return Err(ProjectInviteError::ReceiptProjectionMismatch);
                 }
@@ -1810,10 +2946,12 @@ impl ProjectInvitePluginService {
                     return Err(ProjectInviteError::StaleMembership);
                 }
                 if binding.invite_id != current.invite_id
+                    || binding.invite_revision != current.invite_revision
                     || binding.member_id != current.member_id
                     || binding.account_id != current.account_id
                     || binding.scope != current.scope
                     || binding.session_id != current.session_id
+                    || binding.identity_provider_digest != current.identity_provider_digest
                 {
                     return Err(ProjectInviteError::MembershipProjectionMismatch);
                 }
@@ -1877,6 +3015,25 @@ pub trait ProjectInviteProvider {
         now: DateTime<Utc>,
     ) -> Result<ProjectMembershipBinding, ProjectInviteError>;
 
+    fn accept_invite_with_receipt(
+        &mut self,
+        receipt: &InviteReceipt,
+        session: &ProjectInviteSession,
+        now: DateTime<Utc>,
+    ) -> Result<InviteAcceptance, ProjectInviteError>;
+
+    fn decline_invite(
+        &mut self,
+        receipt: &InviteReceipt,
+        session: &ProjectInviteSession,
+        now: DateTime<Utc>,
+    ) -> Result<InviteDecisionReceipt, ProjectInviteError>;
+
+    fn revoke_invite(
+        &mut self,
+        request: InviteRevocationRequest,
+    ) -> Result<InviteRevocationReceipt, ProjectInviteError>;
+
     fn validate_binding(
         &self,
         binding: &ProjectMembershipBinding,
@@ -1918,6 +3075,34 @@ pub trait ProjectInviteConsumer {
         session: &ProjectInviteSession,
         now: DateTime<Utc>,
     ) -> Result<ProjectMembershipBinding, ProjectInviteError>;
+
+    fn accept_project_invite_with_receipt(
+        &mut self,
+        provider: &mut dyn ProjectInviteProvider,
+        receipt: &InviteReceipt,
+        session: &ProjectInviteSession,
+        now: DateTime<Utc>,
+    ) -> Result<InviteAcceptance, ProjectInviteError> {
+        provider.accept_invite_with_receipt(receipt, session, now)
+    }
+
+    fn decline_project_invite(
+        &mut self,
+        provider: &mut dyn ProjectInviteProvider,
+        receipt: &InviteReceipt,
+        session: &ProjectInviteSession,
+        now: DateTime<Utc>,
+    ) -> Result<InviteDecisionReceipt, ProjectInviteError> {
+        provider.decline_invite(receipt, session, now)
+    }
+
+    fn revoke_project_invite(
+        &mut self,
+        provider: &mut dyn ProjectInviteProvider,
+        request: InviteRevocationRequest,
+    ) -> Result<InviteRevocationReceipt, ProjectInviteError> {
+        provider.revoke_invite(request)
+    }
 
     fn validate_project_membership(
         &mut self,
@@ -1964,6 +3149,31 @@ impl ProjectInviteProvider for ProjectInvitePluginService {
         ProjectInvitePluginService::accept_invite(self, receipt, session, now)
     }
 
+    fn accept_invite_with_receipt(
+        &mut self,
+        receipt: &InviteReceipt,
+        session: &ProjectInviteSession,
+        now: DateTime<Utc>,
+    ) -> Result<InviteAcceptance, ProjectInviteError> {
+        ProjectInvitePluginService::accept_invite_with_receipt(self, receipt, session, now)
+    }
+
+    fn decline_invite(
+        &mut self,
+        receipt: &InviteReceipt,
+        session: &ProjectInviteSession,
+        now: DateTime<Utc>,
+    ) -> Result<InviteDecisionReceipt, ProjectInviteError> {
+        ProjectInvitePluginService::decline_invite(self, receipt, session, now)
+    }
+
+    fn revoke_invite(
+        &mut self,
+        request: InviteRevocationRequest,
+    ) -> Result<InviteRevocationReceipt, ProjectInviteError> {
+        ProjectInvitePluginService::revoke_invite(self, request)
+    }
+
     fn validate_binding(
         &self,
         binding: &ProjectMembershipBinding,
@@ -1997,6 +3207,12 @@ pub enum ProjectInviteError {
     InvalidInviteApproval,
     #[error("invite receipt is invalid")]
     InvalidInviteReceipt,
+    #[error("invite decision receipt is invalid")]
+    InvalidInviteDecisionReceipt,
+    #[error("invite revocation request is invalid")]
+    InvalidInviteRevocationRequest,
+    #[error("invite revocation receipt is invalid")]
+    InvalidInviteRevocationReceipt,
     #[error("project membership binding is invalid")]
     InvalidMembershipBinding,
     #[error("project scope was not found")]
@@ -2011,8 +3227,12 @@ pub enum ProjectInviteError {
     MembershipRevoked,
     #[error("team membership revision is stale")]
     StaleMembership,
+    #[error("invite revision is stale")]
+    StaleInvite,
     #[error("team role cannot invite or approve")]
     InsufficientRole,
+    #[error("only an active project owner may revoke an invite")]
+    UnauthorizedOwner,
     #[error("team membership projection does not match")]
     MembershipProjectionMismatch,
     #[error("multiple active memberships make identity ambiguous")]
@@ -2047,6 +3267,20 @@ pub enum ProjectInviteError {
     ReceiptProjectionMismatch,
     #[error("invite receipt was duplicated")]
     DuplicateReceipt,
+    #[error("invite decision conflicts with an existing decision")]
+    DecisionConflict,
+    #[error("invite decision was duplicated")]
+    DuplicateDecision,
+    #[error("invite decision and binding do not match")]
+    DecisionBindingMismatch,
+    #[error("invite was already declined")]
+    InviteAlreadyDeclined,
+    #[error("invite was revoked")]
+    InviteRevoked,
+    #[error("invite revocation conflicts with an existing revocation")]
+    RevocationConflict,
+    #[error("invite revocation and binding do not match")]
+    RevocationBindingMismatch,
     #[error("acceptance conflicts with an existing binding")]
     AcceptanceConflict,
     #[error("membership binding was not found")]
@@ -2075,10 +3309,12 @@ pub enum ProjectInviteError {
 )]
 fn draft_intent_digest(
     invite_id: &ProjectInviteId,
+    invite_revision: u64,
     scope: &ProjectInviteProjectScope,
     inviter_membership_id: &MemberId,
     inviter_membership_revision: u64,
     invitee_identity_digest: &str,
+    invitee_identity_provider_digest: &str,
     role: ProjectInviteRole,
     scopes: &BTreeSet<ProjectInviteScope>,
     created_at: DateTime<Utc>,
@@ -2087,6 +3323,7 @@ fn draft_intent_digest(
     let mut fields = vec![
         b"hartevo.project-invite.intent.v1".to_vec(),
         invite_id.as_str().as_bytes().to_vec(),
+        invite_revision.to_be_bytes().to_vec(),
         scope.tenant_id.as_str().as_bytes().to_vec(),
         scope.team_id.as_str().as_bytes().to_vec(),
         scope.project_id.as_str().as_bytes().to_vec(),
@@ -2094,6 +3331,7 @@ fn draft_intent_digest(
         inviter_membership_id.as_str().as_bytes().to_vec(),
         inviter_membership_revision.to_be_bytes().to_vec(),
         invitee_identity_digest.as_bytes().to_vec(),
+        invitee_identity_provider_digest.as_bytes().to_vec(),
         role_tag(role).as_bytes().to_vec(),
         created_at.timestamp().to_be_bytes().to_vec(),
         created_at.timestamp_subsec_nanos().to_be_bytes().to_vec(),
@@ -2112,6 +3350,7 @@ fn invite_provider_digest(draft: &DraftInvite, approval: &InviteApproval) -> Str
     let mut fields = vec![
         b"hartevo.project-invite.provider.v1".to_vec(),
         draft.intent_digest.as_bytes().to_vec(),
+        draft.invitee_identity_provider_digest.as_bytes().to_vec(),
         approval.approval_id.as_str().as_bytes().to_vec(),
         approval.evidence_digest.as_bytes().to_vec(),
         approval.approved_at.timestamp().to_be_bytes().to_vec(),
@@ -2128,6 +3367,147 @@ fn invite_provider_digest(draft: &DraftInvite, approval: &InviteApproval) -> Str
             .map(|scope| scope_tag(*scope).as_bytes().to_vec()),
     );
     digest_fields(fields)
+}
+
+fn identity_provider_digest(identity_digest: &str) -> String {
+    digest_fields([
+        b"hartevo.project-invite.identity-provider.v1".to_vec(),
+        identity_digest.as_bytes().to_vec(),
+    ])
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the revocation intent digest binds every owner and invite revision"
+)]
+fn invite_revocation_intent_digest(
+    invite_id: &ProjectInviteId,
+    invite_revision: u64,
+    scope: &ProjectInviteProjectScope,
+    owner_actor_id: &ActorId,
+    owner_membership_id: &MemberId,
+    owner_membership_revision: u64,
+    owner_session_id: &IdentitySessionId,
+    owner_session_revision: u64,
+    evidence_digest: &str,
+    revoked_at: DateTime<Utc>,
+) -> String {
+    digest_fields([
+        b"hartevo.project-invite.revocation-intent.v1".to_vec(),
+        invite_id.as_str().as_bytes().to_vec(),
+        invite_revision.to_be_bytes().to_vec(),
+        scope.tenant_id.as_str().as_bytes().to_vec(),
+        scope.team_id.as_str().as_bytes().to_vec(),
+        scope.project_id.as_str().as_bytes().to_vec(),
+        scope.project_revision.to_be_bytes().to_vec(),
+        owner_actor_id.as_str().as_bytes().to_vec(),
+        owner_membership_id.as_str().as_bytes().to_vec(),
+        owner_membership_revision.to_be_bytes().to_vec(),
+        owner_session_id.as_str().as_bytes().to_vec(),
+        owner_session_revision.to_be_bytes().to_vec(),
+        evidence_digest.as_bytes().to_vec(),
+        revoked_at.timestamp().to_be_bytes().to_vec(),
+        revoked_at.timestamp_subsec_nanos().to_be_bytes().to_vec(),
+    ])
+}
+
+fn invite_decision_provider_digest(
+    invite: &InviteReceipt,
+    session: &ProjectInviteSession,
+    decision: ProjectInviteDecision,
+    binding: Option<&ProjectMembershipBinding>,
+) -> String {
+    let mut fields = vec![
+        b"hartevo.project-invite.decision.v1".to_vec(),
+        invite.provider_digest.as_bytes().to_vec(),
+        invite.invite_id.as_str().as_bytes().to_vec(),
+        invite.invite_revision.to_be_bytes().to_vec(),
+        invite.scope.tenant_id.as_str().as_bytes().to_vec(),
+        invite.scope.team_id.as_str().as_bytes().to_vec(),
+        invite.scope.project_id.as_str().as_bytes().to_vec(),
+        invite.scope.project_revision.to_be_bytes().to_vec(),
+        invite.invitee_identity_digest.as_bytes().to_vec(),
+        session.identity_provider_digest.as_bytes().to_vec(),
+        session.session_id.as_str().as_bytes().to_vec(),
+        session.revision.to_be_bytes().to_vec(),
+        match decision {
+            ProjectInviteDecision::Accepted => b"accepted".to_vec(),
+            ProjectInviteDecision::Declined => b"declined".to_vec(),
+        },
+    ];
+    if let Some(binding) = binding {
+        fields.push(binding.binding_id.as_str().as_bytes().to_vec());
+        fields.push(binding.membership_revision.to_be_bytes().to_vec());
+    }
+    digest_fields(fields)
+}
+
+fn invite_revocation_provider_digest(
+    request: &InviteRevocationRequest,
+    session: &ProjectInviteSession,
+    binding: Option<&ProjectMembershipBinding>,
+) -> String {
+    let mut fields = vec![
+        b"hartevo.project-invite.revocation.v1".to_vec(),
+        request.intent_digest().as_bytes().to_vec(),
+        session.identity_provider_digest.as_bytes().to_vec(),
+        request.owner_session_id.as_str().as_bytes().to_vec(),
+        request.owner_session_revision.to_be_bytes().to_vec(),
+    ];
+    if let Some(binding) = binding {
+        fields.push(binding.binding_id.as_str().as_bytes().to_vec());
+        fields.push(binding.membership_revision.to_be_bytes().to_vec());
+    }
+    digest_fields(fields)
+}
+
+fn invite_revocation_provider_digest_from_receipt(
+    receipt: &InviteRevocationReceipt,
+    session: &ProjectInviteSession,
+    binding: Option<&ProjectMembershipBinding>,
+) -> String {
+    let mut fields = vec![
+        b"hartevo.project-invite.revocation.v1".to_vec(),
+        invite_revocation_intent_digest(
+            &receipt.invite_id,
+            receipt.invite_revision,
+            &receipt.scope,
+            &receipt.owner_actor_id,
+            &receipt.owner_membership_id,
+            receipt.owner_membership_revision,
+            &receipt.owner_session_id,
+            receipt.owner_session_revision,
+            &receipt.evidence_digest,
+            receipt.revoked_at,
+        )
+        .as_bytes()
+        .to_vec(),
+        session.identity_provider_digest.as_bytes().to_vec(),
+        receipt.owner_session_id.as_str().as_bytes().to_vec(),
+        receipt.owner_session_revision.to_be_bytes().to_vec(),
+    ];
+    if let Some(binding) = binding {
+        fields.push(binding.binding_id.as_str().as_bytes().to_vec());
+        fields.push(binding.membership_revision.to_be_bytes().to_vec());
+    }
+    digest_fields(fields)
+}
+
+fn revocation_matches_request(
+    receipt: &InviteRevocationReceipt,
+    request: &InviteRevocationRequest,
+) -> bool {
+    receipt.invite_id == request.invite_id
+        && receipt.invite_revision == request.invite_revision
+        && receipt.scope == request.scope
+        && receipt.owner_actor_id == request.owner_actor_id
+        && receipt.owner_membership_id == request.owner_membership_id
+        && receipt.owner_membership_revision == request.owner_membership_revision
+        && receipt.owner_session_id == request.owner_session_id
+        && receipt.owner_session_revision == request.owner_session_revision
+        && receipt.evidence_digest == request.evidence_digest
+        && receipt.revoked_at == request.revoked_at
+        && receipt.idempotency_key_digest == request.idempotency_key_digest()
 }
 
 fn digest_fields(fields: impl IntoIterator<Item = Vec<u8>>) -> String {
@@ -2203,6 +3583,19 @@ mod tests {
         .expect("valid inviter membership")
     }
 
+    fn owner_membership() -> ProjectInviteTeamMembership {
+        ProjectInviteTeamMembership::active(
+            MemberId::from("member-owner"),
+            TenantId::from("tenant-growth"),
+            TeamId::from("team-growth"),
+            AccountId::from("account-owner"),
+            ProjectInviteRole::Owner,
+            7,
+            3,
+        )
+        .expect("valid owner membership")
+    }
+
     fn invitee_session(expires_at: DateTime<Utc>) -> ProjectInviteSession {
         ProjectInviteSession::new(
             IdentitySessionId::from("session-invitee"),
@@ -2215,6 +3608,20 @@ mod tests {
             1,
         )
         .expect("valid invitee session")
+    }
+
+    fn owner_session(expires_at: DateTime<Utc>) -> ProjectInviteSession {
+        ProjectInviteSession::new(
+            IdentitySessionId::from("session-owner"),
+            TenantId::from("tenant-growth"),
+            TeamId::from("team-growth"),
+            AccountId::from("account-owner"),
+            digest("owner-subject"),
+            now() - Duration::minutes(5),
+            expires_at,
+            2,
+        )
+        .expect("valid owner session")
     }
 
     fn invite_scopes() -> BTreeSet<ProjectInviteScope> {
@@ -2262,6 +3669,38 @@ mod tests {
             .register_session(invitee_session(session_expires_at))
             .expect("register invitee session");
         service
+    }
+
+    fn seeded_owner_service(session_expires_at: DateTime<Utc>) -> ProjectInvitePluginService {
+        let mut service = seeded_service(session_expires_at);
+        service
+            .register_team_membership(owner_membership())
+            .expect("register owner membership");
+        service
+            .register_session(owner_session(session_expires_at))
+            .expect("register owner session");
+        service
+    }
+
+    fn revocation_request(
+        invite_revision: u64,
+        revoked_at: DateTime<Utc>,
+        idempotency_key: &str,
+    ) -> InviteRevocationRequest {
+        InviteRevocationRequest::new(
+            ProjectInviteId::from("invite-alpha"),
+            invite_revision,
+            project_scope(),
+            ActorId::from("actor-owner"),
+            MemberId::from("member-owner"),
+            7,
+            IdentitySessionId::from("session-owner"),
+            2,
+            digest("revocation-evidence"),
+            revoked_at,
+            idempotency_key,
+        )
+        .expect("valid revocation request")
     }
 
     fn emitted_invite(
@@ -2702,6 +4141,468 @@ mod tests {
         assert_eq!(
             service.accept_invite(&receipt, &invitee_session(session_expiry), session_expiry,),
             Err(ProjectInviteError::SessionExpired)
+        );
+    }
+
+    #[test]
+    fn consumer_accept_and_decline_return_durable_decision_receipts() {
+        let expires_at = now() + Duration::hours(1);
+        let mut accepting_service = seeded_service(expires_at);
+        let (_, accepting_receipt) =
+            emitted_invite(&mut accepting_service, expires_at, "idem-consumer-accept");
+        let mut consumer = TestConsumer;
+        let acceptance = consumer
+            .accept_project_invite_with_receipt(
+                &mut accepting_service,
+                &accepting_receipt,
+                &invitee_session(expires_at),
+                now() + Duration::minutes(3),
+            )
+            .expect("consumer acceptance");
+        assert_eq!(
+            acceptance.receipt().decision(),
+            ProjectInviteDecision::Accepted
+        );
+        assert_eq!(
+            acceptance.receipt().invite_revision(),
+            accepting_receipt.invite_revision()
+        );
+        assert_eq!(
+            acceptance.receipt().invitee_identity_provider_digest(),
+            invitee_session(expires_at).identity_provider_digest()
+        );
+        assert_eq!(
+            acceptance.binding().identity_provider_digest(),
+            acceptance.receipt().invitee_identity_provider_digest()
+        );
+        assert_eq!(
+            accepting_service.status(
+                &accepting_service
+                    .handles
+                    .iter()
+                    .find_map(|(handle, invite_id)| {
+                        (invite_id == acceptance.binding().invite_id()).then_some(handle)
+                    })
+                    .cloned()
+                    .expect("acceptance handle"),
+                now() + Duration::minutes(3),
+            ),
+            Ok(ProjectInviteStatus::Accepted)
+        );
+
+        let mut declining_service = seeded_service(expires_at);
+        let (decline_handle, decline_receipt) =
+            emitted_invite(&mut declining_service, expires_at, "idem-consumer-decline");
+        let decline = consumer
+            .decline_project_invite(
+                &mut declining_service,
+                &decline_receipt,
+                &invitee_session(expires_at),
+                now() + Duration::minutes(3),
+            )
+            .expect("consumer decline");
+        assert_eq!(decline.decision(), ProjectInviteDecision::Declined);
+        assert_eq!(
+            declining_service.status(&decline_handle, now() + Duration::minutes(3)),
+            Ok(ProjectInviteStatus::Declined)
+        );
+        assert_eq!(
+            consumer
+                .decline_project_invite(
+                    &mut declining_service,
+                    &decline_receipt,
+                    &invitee_session(expires_at),
+                    now() + Duration::minutes(3),
+                )
+                .expect("idempotent consumer decline"),
+            decline
+        );
+        assert_eq!(
+            declining_service.accept_invite(
+                &decline_receipt,
+                &invitee_session(expires_at),
+                now() + Duration::minutes(3),
+            ),
+            Err(ProjectInviteError::DecisionConflict)
+        );
+    }
+
+    #[test]
+    fn owner_revoke_is_exactly_once_and_fences_pending_and_accepted_invites() {
+        let expires_at = now() + Duration::hours(1);
+        let mut pending = seeded_owner_service(expires_at);
+        let (pending_handle, pending_receipt) =
+            emitted_invite(&mut pending, expires_at, "idem-owner-revoke-pending");
+        let pending_event_count = pending.event_count();
+        let pending_request = revocation_request(
+            pending_receipt.invite_revision(),
+            now() + Duration::minutes(3),
+            "idem-owner-revoke-pending",
+        );
+        let pending_revocation = pending
+            .revoke_invite(pending_request.clone())
+            .expect("owner revokes pending invite");
+        assert_eq!(pending_revocation.binding_id(), None);
+        assert_eq!(pending.event_count(), pending_event_count + 1);
+        assert_eq!(
+            pending
+                .revoke_invite(pending_request)
+                .expect("idempotent owner revoke"),
+            pending_revocation
+        );
+        assert_eq!(
+            pending.status(&pending_handle, now() + Duration::minutes(3)),
+            Ok(ProjectInviteStatus::Revoked)
+        );
+        assert_eq!(
+            pending.accept_invite(
+                &pending_receipt,
+                &invitee_session(expires_at),
+                now() + Duration::minutes(3),
+            ),
+            Err(ProjectInviteError::InviteRevoked)
+        );
+
+        let mut accepted = seeded_owner_service(expires_at);
+        let (_, accepted_receipt) =
+            emitted_invite(&mut accepted, expires_at, "idem-owner-revoke-accepted");
+        let acceptance = accepted
+            .accept_invite_with_receipt(
+                &accepted_receipt,
+                &invitee_session(expires_at),
+                now() + Duration::minutes(3),
+            )
+            .expect("accept before owner revoke");
+        let revocation = accepted
+            .revoke_invite(revocation_request(
+                accepted_receipt.invite_revision(),
+                now() + Duration::minutes(4),
+                "idem-owner-revoke-accepted",
+            ))
+            .expect("owner revokes accepted binding");
+        assert_eq!(
+            revocation.binding_id(),
+            Some(acceptance.binding().binding_id())
+        );
+        assert_eq!(
+            revocation.membership_revision(),
+            Some(acceptance.binding().membership_revision() + 1)
+        );
+        assert_eq!(
+            accepted.validate_binding(&acceptance.binding().clone(), now() + Duration::minutes(4)),
+            Err(ProjectInviteError::BindingRevoked)
+        );
+    }
+
+    #[test]
+    fn owner_authority_expiry_and_cross_team_fences_fail_closed() {
+        let expires_at = now() + Duration::hours(1);
+        let mut unauthorized = seeded_owner_service(expires_at);
+        let (_, receipt) = emitted_invite(&mut unauthorized, expires_at, "idem-owner-auth");
+        let mut admin_request = revocation_request(
+            receipt.invite_revision(),
+            now() + Duration::minutes(3),
+            "idem-owner-auth",
+        );
+        admin_request.owner_membership_id = MemberId::from("member-inviter");
+        admin_request.owner_membership_revision = 4;
+        admin_request.owner_session_id = IdentitySessionId::from("session-invitee");
+        admin_request.owner_session_revision = 1;
+        assert_eq!(
+            unauthorized.revoke_invite(admin_request),
+            Err(ProjectInviteError::UnauthorizedOwner)
+        );
+
+        let mut stale_owner = seeded_owner_service(expires_at);
+        let (_, stale_receipt) =
+            emitted_invite(&mut stale_owner, expires_at, "idem-owner-stale-membership");
+        stale_owner
+            .change_team_membership_role(&MemberId::from("member-owner"), ProjectInviteRole::Admin)
+            .expect("owner role changes");
+        assert_eq!(
+            stale_owner.revoke_invite(revocation_request(
+                stale_receipt.invite_revision(),
+                now() + Duration::minutes(3),
+                "idem-owner-stale-membership",
+            )),
+            Err(ProjectInviteError::StaleMembership)
+        );
+
+        let mut cross_team = seeded_owner_service(expires_at);
+        let (_, cross_receipt) =
+            emitted_invite(&mut cross_team, expires_at, "idem-owner-cross-team");
+        let mut cross_request = revocation_request(
+            cross_receipt.invite_revision(),
+            now() + Duration::minutes(3),
+            "idem-owner-cross-team",
+        );
+        cross_request.scope = ProjectInviteProjectScope::new(
+            TenantId::from("tenant-growth"),
+            TeamId::from("team-other"),
+            ProjectId::from("project-alpha"),
+            3,
+        )
+        .expect("foreign revocation scope");
+        assert_eq!(
+            cross_team.revoke_invite(cross_request),
+            Err(ProjectInviteError::CrossTeamScope)
+        );
+
+        let short_expiry = now() + Duration::minutes(5);
+        let mut expired = seeded_owner_service(short_expiry);
+        let (_, expired_receipt) = emitted_invite(&mut expired, short_expiry, "idem-owner-expired");
+        assert_eq!(
+            expired.revoke_invite(revocation_request(
+                expired_receipt.invite_revision(),
+                short_expiry,
+                "idem-owner-expired",
+            )),
+            Err(ProjectInviteError::InviteExpired)
+        );
+    }
+
+    #[test]
+    fn accept_decline_and_revoke_events_replay_exactly_once_after_restart() {
+        let expires_at = now() + Duration::hours(1);
+        let mut original = seeded_owner_service(expires_at);
+        let (_, receipt) = emitted_invite(&mut original, expires_at, "idem-replay-accept");
+        let acceptance = original
+            .accept_invite_with_receipt(
+                &receipt,
+                &invitee_session(expires_at),
+                now() + Duration::minutes(3),
+            )
+            .expect("accept before restart");
+        let revocation_request = revocation_request(
+            receipt.invite_revision(),
+            now() + Duration::minutes(4),
+            "idem-replay-revoke",
+        );
+        let revocation = original
+            .revoke_invite(revocation_request.clone())
+            .expect("revoke before restart");
+        let events = original.events().to_vec();
+
+        let mut reopened = seeded_owner_service(expires_at);
+        for event in &events {
+            reopened
+                .replay_event(event.clone())
+                .expect("replay invite event");
+        }
+        assert_eq!(reopened.event_count(), events.len());
+        assert_eq!(
+            reopened.accept_invite_with_receipt(
+                &receipt,
+                &invitee_session(expires_at),
+                now() + Duration::minutes(4),
+            ),
+            Err(ProjectInviteError::InviteRevoked)
+        );
+        assert_eq!(
+            reopened
+                .revoke_invite(revocation_request)
+                .expect("idempotent replayed revoke"),
+            revocation
+        );
+        for event in events {
+            reopened
+                .replay_event(event)
+                .expect("duplicate invite event replay");
+        }
+        assert_eq!(reopened.event_count(), 5);
+        assert_eq!(
+            acceptance.receipt().decision(),
+            ProjectInviteDecision::Accepted
+        );
+    }
+
+    #[test]
+    fn invite_revision_and_identity_provider_digest_are_exactly_bound() {
+        let expires_at = now() + Duration::hours(1);
+        let identity_digest = digest(RAW_EMAIL);
+        let provider_digest = digest("keycloak-issuer-growth");
+        let session = ProjectInviteSession::new_with_identity_provider_digest(
+            IdentitySessionId::from("session-versioned-invitee"),
+            TenantId::from("tenant-growth"),
+            TeamId::from("team-growth"),
+            AccountId::from("account-invitee"),
+            identity_digest.clone(),
+            provider_digest.clone(),
+            now() - Duration::minutes(5),
+            expires_at,
+            11,
+        )
+        .expect("versioned invitee session");
+        let request = DraftInviteRequest::new_with_revision_and_provider_digest(
+            ProjectInviteId::from("invite-versioned"),
+            9,
+            project_scope(),
+            MemberId::from("member-inviter"),
+            4,
+            identity_digest,
+            provider_digest.clone(),
+            ProjectInviteRole::Member,
+            invite_scopes(),
+            now(),
+            expires_at,
+            "idem-versioned-invite",
+        )
+        .expect("versioned invite request");
+        let versioned_approval = InviteApproval::new_with_invite_revision(
+            ApprovalId::from("approval-versioned"),
+            ProjectInviteId::from("invite-versioned"),
+            9,
+            ActorId::from("actor-inviter"),
+            MemberId::from("member-inviter"),
+            4,
+            digest("versioned-approval"),
+            now() + Duration::minutes(1),
+        )
+        .expect("versioned approval");
+
+        let mut service = ProjectInvitePluginService::new();
+        service
+            .register_project_scope(project_scope())
+            .expect("register project");
+        service
+            .register_team_membership(inviter_membership())
+            .expect("register inviter");
+        service
+            .register_session(session.clone())
+            .expect("register versioned session");
+        let handle = service
+            .create_draft(request)
+            .expect("create versioned invite");
+        let draft = service.draft(&handle).expect("read versioned draft");
+        assert_eq!(draft.invite_revision(), 9);
+        assert_eq!(draft.invitee_identity_provider_digest(), provider_digest);
+        service
+            .approve_draft(&handle, versioned_approval)
+            .expect("approve versioned invite");
+        let receipt = service
+            .emit_invite_receipt(&handle, now() + Duration::minutes(2))
+            .expect("emit versioned receipt");
+        assert_eq!(receipt.invite_revision(), 9);
+        assert_eq!(
+            receipt.invitee_identity_provider_digest(),
+            session.identity_provider_digest()
+        );
+        let acceptance = service
+            .accept_invite_with_receipt(&receipt, &session, now() + Duration::minutes(3))
+            .expect("accept versioned invite");
+        assert_eq!(acceptance.binding().invite_revision(), 9);
+        assert_eq!(acceptance.receipt().session_revision(), 11);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the adversarial fixture covers receipt, session, and event tampering"
+    )]
+    fn tampered_receipts_sessions_and_persisted_events_fail_closed() {
+        let expires_at = now() + Duration::hours(1);
+        let mut service = seeded_service(expires_at);
+        let (_, receipt) = emitted_invite(&mut service, expires_at, "idem-tamper-receipt");
+        let mut tampered_receipt = receipt.clone();
+        tampered_receipt.invite_revision += 1;
+        assert_eq!(
+            service.accept_invite(
+                &tampered_receipt,
+                &invitee_session(expires_at),
+                now() + Duration::minutes(3),
+            ),
+            Err(ProjectInviteError::ReceiptProjectionMismatch)
+        );
+        let mut tampered_session = invitee_session(expires_at);
+        tampered_session.identity_provider_digest = digest("foreign-issuer");
+        assert_eq!(
+            service.decline_invite(&receipt, &tampered_session, now() + Duration::minutes(3),),
+            Err(ProjectInviteError::StaleSession)
+        );
+
+        let mut accepted = seeded_service(expires_at);
+        let (_, accepted_receipt) = emitted_invite(&mut accepted, expires_at, "idem-tamper-event");
+        accepted
+            .accept_invite_with_receipt(
+                &accepted_receipt,
+                &invitee_session(expires_at),
+                now() + Duration::minutes(3),
+            )
+            .expect("accept tamper fixture");
+        let events = accepted.events().to_vec();
+        let mut reopened = seeded_service(expires_at);
+        for event in events.iter().take(3) {
+            reopened
+                .replay_event(event.clone())
+                .expect("replay pre-decision event");
+        }
+        let tampered_event = events
+            .iter()
+            .find_map(|event| match event {
+                ProjectInviteEvent::InviteDecisionRecorded {
+                    event_id,
+                    receipt,
+                    binding,
+                } => {
+                    let mut tampered = receipt.clone();
+                    tampered.provider_digest = digest("tampered-decision-provider");
+                    Some(ProjectInviteEvent::InviteDecisionRecorded {
+                        event_id: event_id.clone(),
+                        receipt: tampered,
+                        binding: binding.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .expect("decision event");
+        assert_eq!(
+            reopened.replay_event(tampered_event),
+            Err(ProjectInviteError::DecisionBindingMismatch)
+        );
+
+        let mut revoked = seeded_owner_service(expires_at);
+        let (_, revoked_receipt) =
+            emitted_invite(&mut revoked, expires_at, "idem-tamper-revocation");
+        let revocation = revoked
+            .revoke_invite(revocation_request(
+                revoked_receipt.invite_revision(),
+                now() + Duration::minutes(3),
+                "idem-tamper-revocation",
+            ))
+            .expect("create revocation event");
+        let revoked_events = revoked.events().to_vec();
+        let mut revoked_reopened = seeded_owner_service(expires_at);
+        for event in revoked_events.iter().take(3) {
+            revoked_reopened
+                .replay_event(event.clone())
+                .expect("replay pre-revocation event");
+        }
+        let tampered_revocation = revoked_events
+            .iter()
+            .find_map(|event| match event {
+                ProjectInviteEvent::InviteRevoked {
+                    event_id,
+                    receipt,
+                    binding,
+                } => {
+                    let mut tampered = receipt.clone();
+                    tampered.provider_digest = digest("tampered-revocation-provider");
+                    Some(ProjectInviteEvent::InviteRevoked {
+                        event_id: event_id.clone(),
+                        receipt: tampered,
+                        binding: binding.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .expect("revocation event");
+        assert_eq!(
+            revoked_reopened.replay_event(tampered_revocation),
+            Err(ProjectInviteError::RevocationBindingMismatch)
+        );
+        assert_eq!(
+            revocation.invite_revision(),
+            revoked_receipt.invite_revision()
         );
     }
 }

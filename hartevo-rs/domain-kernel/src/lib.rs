@@ -70,11 +70,13 @@ pub use identity::{
 };
 pub use identity_project_invite::{
     ApprovedInvite, DEFAULT_PROJECT_INVITE_TTL, DraftInvite, DraftInviteHandle, DraftInviteRequest,
-    InviteApproval, InviteReceipt, ProjectInviteConsumer, ProjectInviteError, ProjectInviteEvent,
-    ProjectInviteMembershipStatus, ProjectInvitePluginService, ProjectInviteProjectScope,
-    ProjectInviteProvider, ProjectInviteRole, ProjectInviteScope, ProjectInviteService,
-    ProjectInviteSession, ProjectInviteSessionStatus, ProjectInviteStatus,
-    ProjectInviteTeamMembership, ProjectMembershipBinding, ProjectMembershipBindingStatus,
+    InviteAcceptance, InviteApproval, InviteDecisionReceipt, InviteReceipt,
+    InviteRevocationReceipt, InviteRevocationRequest, ProjectInviteConsumer, ProjectInviteDecision,
+    ProjectInviteError, ProjectInviteEvent, ProjectInviteMembershipStatus,
+    ProjectInvitePluginService, ProjectInviteProjectScope, ProjectInviteProvider,
+    ProjectInviteRole, ProjectInviteScope, ProjectInviteService, ProjectInviteSession,
+    ProjectInviteSessionStatus, ProjectInviteStatus, ProjectInviteTeamMembership,
+    ProjectMembershipBinding, ProjectMembershipBindingStatus,
 };
 pub use ids::{
     AccountId, ActorId, ApprovalId, AttributionId, BrowserActionBatchId, BrowserControlLeaseId,
@@ -88,10 +90,11 @@ pub use ids::{
     DeviceHandoffId, DeviceId, EffectId, EvidenceId, ExecutionAttemptId, FactId, IdentityLinkId,
     IdentitySessionId, KeyEnvelopeId, MemberId, MessageId, MissionConversationId,
     MissionConversationMessageId, MissionId, MissionScheduleId, OpportunityId, OrderId,
-    OutcomeEventId, PartnerId, PayoutId, PersonId, ProjectId, ProjectInviteEventId,
-    ProjectInviteId, ProjectInviteReceiptId, ProjectMembershipBindingId, ReceiptId, RefundId,
-    ReviewId, RuntimeRecoveryAttemptId, RuntimeTurnAttemptId, TaskId, TeamId, TenantId,
-    VerificationId, WorkProductId, WorkerId, WorkerLeaseId,
+    OutcomeEventId, PartnerId, PayoutId, PersonId, ProjectId, ProjectInviteDecisionReceiptId,
+    ProjectInviteEventId, ProjectInviteId, ProjectInviteReceiptId,
+    ProjectInviteRevocationReceiptId, ProjectMembershipBindingId, ReceiptId, RefundId, ReviewId,
+    RuntimeRecoveryAttemptId, RuntimeTurnAttemptId, TaskId, TeamId, TenantId, VerificationId,
+    WorkProductId, WorkerId, WorkerLeaseId,
 };
 pub use key_management::{
     DeviceAttachment, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffCiphertext,
