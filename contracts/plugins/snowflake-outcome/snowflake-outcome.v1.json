@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema": "hartevo.snowflake-outcome-plugin/v1",
+  "layer": 1,
+  "pluginVersion": "1.0.0",
+  "digestInput": "hartevo.snowflake-outcome-plugin/v1|layer=1|service=warehouse.snowflake.outcome.read|provider=snowflake.sql-api.recording|consumer=mission.outcome-evidence.snowflake",
+  "contractDigest": "3c3326864b3bfe297f83ad15f00346abb73db6a2eaeeca0d4c59c9497a15647f",
+  "authorityBoundary": {
+    "owns": [
+      "typed service definition",
+      "recording/fake/BLOCKED_ENV provider state machine",
+      "bounded query proposal",
+      "provider evidence projection"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "live statement execution",
+      "statement cancellation",
+      "native credential resolution",
+      "durable Work Product adoption"
+    ]
+  },
+  "service": {
+    "type": "SnowflakeOutcomeService",
+    "id": "warehouse.snowflake.outcome.read",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "compile_query_proposal",
+      "verify_result_projection"
+    ]
+  },
+  "provider": {
+    "type": "SnowflakeSqlApiProvider",
+    "id": "snowflake.sql-api.recording",
+    "operations": [
+      "submit_query",
+      "poll_statement",
+      "read_partitions",
+      "reconcile_ambiguous_submission"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fake",
+      "loopback",
+      "blocked_env"
+    ],
+    "httpClassification": {
+      "acceptedAsync": 202,
+      "throttled": 429,
+      "terminalFailure": 422
+    }
+  },
+  "consumer": {
+    "type": "MissionSnowflakeOutcomeConsumer",
+    "id": "mission.outcome-evidence.snowflake",
+    "authority": "provider_evidence_below_kernel_outcome"
+  },
+  "scope": {
+    "required": [
+      "organization",
+      "account",
+      "httpsHost",
+      "database",
+      "schema",
+      "warehouse",
+      "role",
+      "projectId",
+      "missionId"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractDigest",
+      "providerRevision",
+      "scopeDigest",
+      "reversibleRegistrationRevision"
+    ]
+  },
+  "credentials": {
+    "boundary": "opaque SecretReference",
+    "kinds": ["oauth", "private_key"],
+    "serialized": false,
+    "debugged": false,
+    "resolvedByLayer": 2
+  },
+  "queryPolicy": {
+    "allowedRoots": ["SELECT", "EXPLAIN SELECT"],
+    "requiresNamedTypedParameters": true,
+    "requiresLiteralBoundedLimit": true,
+    "rejects": [
+      "comments",
+      "multiple statements",
+      "unbound identifiers",
+      "DDL",
+      "DML",
+      "session mutation",
+      "unbounded row/byte/partition limits",
+      "scope-changing SQL"
+    ]
+  },
+  "resultEvidence": {
+    "includes": [
+      "requestId",
+      "statementHandle",
+      "partition order and completeness",
+      "schema and types",
+      "bounded row/chunk/result digests",
+      "truncation and limit decisions",
+      "provider request identifiers"
+    ],
+    "neverClaims": ["connected", "native", "first_party", "kernel_verified", "adopted_work_product"]
+  },
+  "honestNativeGap": "Native OAuth/private-key resolution, HTTPS submission/readback, durable request/statement receipts, and durable Outcome adoption remain an optional Layer-2 capability and are BLOCKED_ENV in Layer 1."
+}
