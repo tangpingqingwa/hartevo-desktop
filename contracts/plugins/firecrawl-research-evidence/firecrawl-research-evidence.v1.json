@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.firecrawl-research-evidence/v1",
+  "title": "Hartevo Layer 1 Firecrawl public research evidence and citation contract",
+  "schemaVersion": "hartevo.firecrawl-research-evidence/v1",
+  "contractVersion": "EXT-FIRECRAWL-01-L1/v1",
+  "layer": 1,
+  "plugin": {
+    "id": "firecrawl.research-evidence",
+    "version": "1.0.0",
+    "digestBound": true,
+    "scopeBound": true,
+    "registration": {
+      "versioned": true,
+      "permissionBound": true,
+      "reversible": true,
+      "revocation": "registration_digest_rotation"
+    }
+  },
+  "service": {
+    "id": "FirecrawlResearchEvidenceService",
+    "providerId": "FirecrawlProvider",
+    "consumerId": "MissionFirecrawlResearchConsumer",
+    "operations": [
+      "describe_url",
+      "describe_job",
+      "read_scrape_evidence",
+      "read_crawl_evidence",
+      "compile_research_proposal",
+      "record_research_receipt",
+      "verify_research_evidence"
+    ],
+    "effectAuthority": "read_proposal_and_local_recording_only",
+    "liveExternalIo": false
+  },
+  "api": {
+    "baseUrl": "https://api.firecrawl.dev",
+    "version": "v2",
+    "endpoints": {
+      "scrape": "/v2/scrape",
+      "crawl": "/v2/crawl",
+      "crawlStatus": "/v2/crawl/{jobId}"
+    },
+    "authentication": "opaque_api_key_secret_reference",
+    "officialReferences": [
+      "https://docs.firecrawl.dev/api-reference/endpoint/scrape",
+      "https://docs.firecrawl.dev/api-reference/endpoint/crawl-post",
+      "https://docs.firecrawl.dev/api-reference/endpoint/search"
+    ]
+  },
+  "scope": {
+    "exactFields": [
+      "project_id",
+      "project_revision",
+      "mission_id",
+      "mission_revision",
+      "work_product_id",
+      "work_product_revision",
+      "canonical_url",
+      "exact_host_allowlist",
+      "exact_url_allowlist",
+      "job_id",
+      "job_kind",
+      "options_digest",
+      "content_format",
+      "permission_revision",
+      "permission_digest",
+      "registration_digest"
+    ],
+    "missionRevisionFenced": true,
+    "projectRevisionFenced": true,
+    "workProductRevisionFenced": true,
+    "permissionFenced": true,
+    "registrationFenced": true,
+    "arbitraryUrlExpansion": false,
+    "subdomains": false,
+    "externalLinks": false
+  },
+  "jobs": {
+    "kinds": ["scrape", "crawl"],
+    "statuses": [
+      "queued",
+      "running",
+      "completed",
+      "failed",
+      "canceled",
+      "expired",
+      "provider_unknown"
+    ],
+    "idempotency": "request_digest_and_job_id",
+    "duplicateReplay": "fail_closed"
+  },
+  "bounds": {
+    "maxCrawlPages": 32,
+    "maxCrawlDepth": 4,
+    "maxTimeoutMs": 120000,
+    "maxCacheAgeMs": 604800000,
+    "maxMarkdownBytes": 65536,
+    "maxSnippetBytes": 2048,
+    "maxTitleBytes": 512,
+    "maxJobIdBytes": 128,
+    "maxAllowlistRules": 64,
+    "maxResponsePages": 32
+  },
+  "content": {
+    "formats": ["markdown"],
+    "allowedContentTypes": ["text/html", "application/xhtml+xml", "text/plain"],
+    "rawProviderBody": false,
+    "boundedMarkdownInObservation": true,
+    "unboundedMarkdown": false,
+    "base64Media": false,
+    "screenshotsAudioVideo": false,
+    "loginPages": false,
+    "contentDigestRequired": true,
+    "snippetDigestRequired": true,
+    "citationDigestRequired": true,
+    "extractionSchemaDigestRequired": true
+  },
+  "cache": {
+    "maxAgeBounded": true,
+    "staleCache": "refused",
+    "cacheAgeFence": "observed_at_minus_cached_at"
+  },
+  "responses": {
+    "acceptedHttpStatuses": [200, 202],
+    "typedErrors": [401, 403, 404, 409, 429, 500, 502, 503, 504],
+    "timeout": "typed",
+    "malformed": "typed",
+    "partial": "typed",
+    "providerUnknown": "typed"
+  },
+  "evidence": {
+    "requiredDigests": [
+      "scope_digest",
+      "permission_digest",
+      "registration_digest",
+      "request_digest",
+      "job_digest",
+      "page_digest",
+      "content_digest",
+      "citation_digest",
+      "extraction_schema_digest",
+      "response_digest"
+    ],
+    "receiptContainsRawMarkdown": false,
+    "proposalContainsRawMarkdown": false,
+    "adoption": false,
+    "independentNativeReadback": false
+  },
+  "authority": {
+    "externalWrite": false,
+    "scrapeExecution": false,
+    "crawlExecution": false,
+    "browserActions": false,
+    "arbitraryCode": false,
+    "genericSearchRegistry": false,
+    "durableNativeReceipt": false,
+    "truth": false,
+    "memory": false,
+    "kernelOutcome": false,
+    "workProductAdoption": false,
+    "store": false,
+    "keyring": false
+  },
+  "testSeams": {
+    "fixture": true,
+    "recording": true,
+    "fake": true,
+    "loopback": true,
+    "blockedEnv": true,
+    "connected": false,
+    "native": false,
+    "firstParty": false
+  },
+  "secretBoundary": {
+    "opaqueApiKeySecretReferenceOnly": true,
+    "rawApiKeyInScope": false,
+    "rawApiKeyInDebug": false,
+    "rawApiKeyInPlan": false,
+    "rawApiKeyInReceipt": false
+  },
+  "native": {
+    "status": "BLOCKED_ENV",
+    "nativeHttpsScrape": "BLOCKED_ENV",
+    "nativeHttpsCrawl": "BLOCKED_ENV",
+    "nativeCredentialResolution": "BLOCKED_ENV",
+    "nativeProviderReceipt": "BLOCKED_ENV",
+    "connectedClaim": false,
+    "firstPartyClaim": false
+  },
+  "layer2Gaps": [
+    "host-owned API-key resolution",
+    "native Firecrawl HTTPS scrape and crawl",
+    "native crawl status polling and cancellation",
+    "durable provider receipt",
+    "independent page and job read-back",
+    "verified Mission Work Product adoption",
+    "browser actions or login-page access",
+    "unbounded content, media, or attachment retention"
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "$id",
+    "schemaVersion",
+    "contractVersion",
+    "layer",
+    "plugin",
+    "service",
+    "api",
+    "scope",
+    "jobs",
+    "bounds",
+    "content",
+    "cache",
+    "responses",
+    "evidence",
+    "authority",
+    "testSeams",
+    "secretBoundary",
+    "native",
+    "layer2Gaps"
+  ],
+  "properties": {
+    "$schema": { "const": "https://json-schema.org/draft/2020-12/schema" },
+    "$id": { "const": "hartevo.firecrawl-research-evidence/v1" },
+    "schemaVersion": { "const": "hartevo.firecrawl-research-evidence/v1" },
+    "contractVersion": { "const": "EXT-FIRECRAWL-01-L1/v1" },
+    "layer": { "const": 1 },
+    "plugin": { "type": "object" },
+    "service": { "type": "object" },
+    "api": { "type": "object" },
+    "scope": { "type": "object" },
+    "jobs": { "type": "object" },
+    "bounds": { "type": "object" },
+    "content": { "type": "object" },
+    "cache": { "type": "object" },
+    "responses": { "type": "object" },
+    "evidence": { "type": "object" },
+    "authority": { "type": "object" },
+    "testSeams": { "type": "object" },
+    "secretBoundary": { "type": "object" },
+    "native": { "type": "object" },
+    "layer2Gaps": { "type": "array" }
+  }
+}
