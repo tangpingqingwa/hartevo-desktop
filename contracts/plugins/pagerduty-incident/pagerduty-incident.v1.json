@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo://contracts/plugins/pagerduty-incident/pagerduty-incident.v1.json",
+  "schemaVersion": "hartevo.pagerduty-incident.contract/v1",
+  "contractVersion": "pagerduty-incident-layer1/v1",
+  "pluginId": "hartevo.pagerduty-incident",
+  "layer": 1,
+  "provider": {
+    "id": "pagerduty-incident",
+    "serviceId": "pagerduty.incident",
+    "consumerId": "mission.pagerduty-incident",
+    "apiRegions": ["us", "eu"],
+    "hosts": {
+      "us": "api.pagerduty.com",
+      "eu": "api.eu.pagerduty.com"
+    },
+    "auth": ["api_token_secret_reference", "oauth_secret_reference"],
+    "webhookSignature": "v1_hmac_sha256_over_raw_body",
+    "webhookHeaderNames": [
+      "x-webhook-subscription",
+      "x-pagerduty-signature"
+    ]
+  },
+  "exactScope": [
+    "api_region",
+    "account_id",
+    "team_id",
+    "service_id",
+    "escalation_policy_id",
+    "incident_id",
+    "incident_number",
+    "mission_id",
+    "project_id",
+    "consent_reference",
+    "webhook_subscription_id"
+  ],
+  "operations": {
+    "describe_capabilities": "read_only",
+    "probe_registration": "read_only",
+    "read_incident": "bounded_read",
+    "read_incident_timeline": "bounded_read",
+    "compile_response_proposal": "non_mutating_proposal",
+    "verify_resolution_projection": "non_mutating_evidence_proposal",
+    "verify_webhook_envelope": "change_signal_only"
+  },
+  "projectionBounds": {
+    "maxIncidentItems": 1,
+    "maxAlertItems": 100,
+    "maxAssignmentItems": 100,
+    "maxTimelinePages": 20,
+    "maxTimelineItems": 500,
+    "maxResponseBytes": 1048576,
+    "maxTimelineWindowSeconds": 2592000
+  },
+  "stateModel": {
+    "incident": ["triggered", "acknowledged", "resolved", "retriggered", "reopened"],
+    "alert": ["triggered", "resolved"],
+    "emptyIncidentResult": "no_health_claim",
+    "alertsDoNotImplyIncidentResolution": true,
+    "webhooksRequireReadback": true
+  },
+  "registration": {
+    "binding": ["plugin_version", "contract_digest", "provider_revision", "exact_scope", "secret_reference"],
+    "lifecycle": ["register", "revoke", "restore"],
+    "failClosedOn": ["region_drift", "permission_drift", "service_drift", "registration_drift", "stale_revision"]
+  },
+  "provenance": {
+    "fixture": {"connected": false, "native": false, "firstParty": false},
+    "recording": {"connected": false, "native": false, "firstParty": false},
+    "loopback": {"connected": false, "native": false, "firstParty": false},
+    "blockedEnv": {"connected": false, "native": false, "firstParty": false}
+  },
+  "forbiddenLayer1Effects": [
+    "trigger",
+    "acknowledge",
+    "resolve",
+    "reassign",
+    "add_responder",
+    "add_note",
+    "run_workflow",
+    "create_webhook_subscription",
+    "accept_live_webhook",
+    "retain_responder_pii",
+    "retain_raw_notes",
+    "retain_raw_alert_bodies",
+    "adopt_outcome"
+  ],
+  "layer2NativeGap": [
+    "native_token_resolution",
+    "native_https_reads",
+    "verified_webhook_ingress",
+    "consented_mutation_effects",
+    "durable_mutation_receipts",
+    "bounded_reconciliation",
+    "exact_rest_readback"
+  ]
+}
