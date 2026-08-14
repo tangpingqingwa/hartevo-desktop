@@ -1,0 +1,277 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-lambda-invocation-result/contract.v1.json",
+  "title": "Hartevo AWS Lambda invocation-result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-lambda-invocation-result/v1",
+  "contractVersion": "EXT-AWSLAMBDA-01-L1/v1",
+  "pluginId": "aws.lambda.invocation-result",
+  "objectiveType": "deployment_verification",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-lambda-invocation-result/v1|layer=1|service=aws.lambda.invocation-result.read|provider=aws.lambda.invocation-result.recording|consumer=mission.aws-lambda-result.consumer",
+  "contractDigest": "7ddfdddd160398a4b93d843a26bb516b30cdef42860a3ed6b38095ca4331e127",
+  "service": {
+    "type": "AwsLambdaInvocationResultService",
+    "id": "aws.lambda.invocation-result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register_scope",
+      "read_function_metadata",
+      "compile_invocation_proposal",
+      "project_invocation_result",
+      "compile_execution_result_proposal",
+      "record_execution_result",
+      "verify_execution_result",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsLambdaProvider",
+    "id": "aws.lambda.invocation-result.recording",
+    "apiRevision": "lambda-invoke-get-function-read-1",
+    "operations": ["get_function_metadata", "invoke_result_projection"],
+    "allowedTransportProvenance": ["recording", "fake", "loopback", "blocked_env"],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "httpClassification": {
+      "badRequest": 400,
+      "unauthorized": 401,
+      "forbidden": 403,
+      "notFound": 404,
+      "conflict": 409,
+      "requestTimeout": 408,
+      "payloadTooLarge": 413,
+      "unsupportedMediaType": 415,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true
+    },
+    "mutations": {
+      "invokeLive": false,
+      "deployCode": false,
+      "mutateConfiguration": false,
+      "mutateAlias": false,
+      "eventSourceMapping": false,
+      "iam": false,
+      "cancel": false,
+      "executeArbitraryCode": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAwsLambdaResultConsumer",
+    "id": "mission.aws-lambda-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ]
+  },
+  "credentials": {
+    "boundary": "opaque SigV4 SecretReference",
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "functionArn",
+      "functionVersion",
+      "functionAlias",
+      "functionCodeSha256",
+      "functionRevision",
+      "invocationType",
+      "inputId",
+      "inputRevision",
+      "inputDigest",
+      "inputBytes",
+      "configId",
+      "configRevision",
+      "configDigest",
+      "retryRevision",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "permissions": [
+      "function.read",
+      "invocation.proposal",
+      "invocation.result.read",
+      "usage.read",
+      "mission.scope"
+    ],
+    "declaredAwsAction": "lambda:InvokeFunction",
+    "forbiddenPermissions": [
+      "function.deploy",
+      "function.configuration.write",
+      "alias.write",
+      "event-source-mapping.write",
+      "iam.write",
+      "logs.read",
+      "payload.readback",
+      "outcome.adopt"
+    ],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ]
+  },
+  "invocation": {
+    "types": ["RequestResponse", "Event"],
+    "dryRun": false,
+    "requestResponseMaxInputBytes": 6291456,
+    "eventMaxInputBytes": 1048576,
+    "maxResponseBytes": 6291456,
+    "functionErrorIsNotHttpFailure": true,
+    "httpAcceptance": {"RequestResponse": 200, "Event": 202},
+    "statuses": [
+      "accepted",
+      "queued",
+      "running",
+      "succeeded",
+      "function_error",
+      "throttled",
+      "timeout",
+      "partial",
+      "provider_unknown"
+    ],
+    "rawPayloadRetention": false,
+    "rawLogRetention": false,
+    "outputDigestRequiredForSynchronousSuccess": true,
+    "asynchronousResultReadback": "layer_2_gap"
+  },
+  "evidence": {
+    "boundedMetadataOnly": true,
+    "required": [
+      "requestDigest",
+      "outputDigest",
+      "errorDigest",
+      "usageDigest",
+      "registrationDigest",
+      "evidenceDigest",
+      "functionArn",
+      "functionVersion",
+      "functionAlias",
+      "functionCodeSha256",
+      "inputDigest",
+      "configDigest",
+      "retryDigest",
+      "missionRevision",
+      "projectRevision",
+      "workProductRevision",
+      "providerProvenance"
+    ],
+    "maxResponseBytes": 6291456,
+    "maxAttempts": 8,
+    "truncationIsNonAdoptable": true,
+    "malformedIsNonAdoptable": true,
+    "duplicateReplay": "same_key_same_digest_only"
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS Lambda scope and registration",
+      "bounded synchronous and asynchronous invocation proposals",
+      "function version, alias, code SHA, input, config, retry, Mission, Project, and Work Product fences",
+      "status, output/error/usage digest evidence",
+      "reversible registration",
+      "idempotent metadata-only recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "live SigV4 resolution",
+      "live Lambda Invoke or GetFunction HTTPS",
+      "code deployment",
+      "function configuration or alias mutation",
+      "event-source mapping",
+      "IAM control plane",
+      "raw invocation payload",
+      "raw execution logs",
+      "unbounded response retention",
+      "independent output readback",
+      "verified Work Product adoption",
+      "second worker kernel"
+    ]
+  },
+  "nonOverlap": {
+    "stepFunctions": "workflow orchestration remains Step Functions #305",
+    "modal": "managed FunctionCall remains Modal #372",
+    "cloudRun": "container deployment remains Cloud Run #369",
+    "bedrock": "model inference remains Bedrock #326"
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live HTTPS GetFunction and Invoke",
+    "durable provider receipt",
+    "independent output/readback reconciliation",
+    "verified Mission Work Product adoption",
+    "Connected/native/first-party evidence"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live Lambda metadata/invocation HTTPS, durable receipt, independent output readback and verified Mission adoption remain Layer-2 work; recording, fake, loopback, and BLOCKED_ENV never claim Connected, native, or first-party evidence."
+}
