@@ -767,7 +767,9 @@ pub struct XInsightObservation {
 impl XInsightObservation {
     pub fn validate(&self) -> Result<(), XConnectorError> {
         self.scope.validate(None)?;
+        self.scope.validate_target(&self.target)?;
         validate_mission_id(&self.mission_id)?;
+        let required_scopes = XInsightScope::required_scopes();
         if self.schema_version != X_INSIGHT_READ_SCHEMA
             || self.observation_id.is_empty()
             || !is_digest(&self.connector_scope_digest)
@@ -789,6 +791,8 @@ impl XInsightObservation {
             || self.freshness.ttl_seconds <= 0
             || !self.freshness.fresh_at_observation
             || self.freshness.observed_at != self.observed_at
+            || self.permission.required_scopes != required_scopes
+            || !required_scopes.is_subset(&self.permission.granted_scopes)
             || self.permission.missing_scopes.iter().next().is_some()
             || self.retry.attempts == 0
             || self.retry.retried != (self.retry.attempts > 1)
@@ -899,6 +903,7 @@ impl XInsightReadRequest {
 
     fn request_digest(&self) -> String {
         digest_serializable(&(
+            self.scope.digest(),
             self.insight_scope.clone(),
             self.target.clone(),
             x_timestamp(self.since),
@@ -932,6 +937,8 @@ pub struct XProbeObservation {
 
 impl XProbeObservation {
     pub fn validate(&self) -> Result<(), XConnectorError> {
+        self.scope.validate(None)?;
+        let required_scopes = XInsightScope::required_scopes();
         if self.schema_version != X_INSIGHT_READ_SCHEMA
             || self.source.is_empty()
             || self.status != ProbeStatus::Reachable
@@ -940,7 +947,11 @@ impl XProbeObservation {
             || !is_digest(&self.connector_scope_digest)
             || !is_digest(&self.credential_reference_digest)
             || !is_digest(&self.probe_digest)
+            || self.permission.required_scopes != required_scopes
+            || !required_scopes.is_subset(&self.permission.granted_scopes)
             || self.permission.missing_scopes.iter().next().is_some()
+            || self.classification.kind != XInsightTargetKind::UserAccountPosts
+            || self.classification.provenance != self.provenance
             || self.source.iter().any(|evidence| {
                 evidence.method != "GET"
                     || evidence.status / 100 != 2
@@ -1214,14 +1225,19 @@ pub struct XProviderPage {
 
 impl XProviderPage {
     fn validate(&self, request: &XInsightReadRequest) -> Result<(), XConnectorError> {
+        let required_scopes = XInsightScope::required_scopes();
         if self.source.method != "GET"
             || self.source.status / 100 != 2
             || !self.source.path.starts_with("/2/")
+            || !is_digest(&self.source.query_digest)
             || self.source.response_digest != self.response_digest
             || !is_digest(&self.response_digest)
+            || self.permission.required_scopes != required_scopes
+            || !required_scopes.is_subset(&self.permission.granted_scopes)
             || self.permission.missing_scopes.iter().next().is_some()
             || self.classification.kind != request.target.kind()
             || self.classification.provenance != request.provenance
+            || self.classification.attribution != self.attribution
             || self.attribution.causal_status != XCausalStatus::NotClaimed
             || self.classification.causal_status != XCausalStatus::NotClaimed
             || self
@@ -1295,10 +1311,20 @@ impl XApiV2Adapter {
                 status: response.status,
             });
         }
-        let value =
+        let value: serde_json::Value =
             serde_json::from_slice(&response.body).map_err(|_| XConnectorError::ResponseParse {
                 status: response.status,
             })?;
+        if value
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|errors| !errors.is_empty())
+            || value.get("error").is_some()
+        {
+            return Err(XConnectorError::InvalidProviderResponse {
+                status: response.status,
+            });
+        }
         Ok((value, response, rate_limit))
     }
 
@@ -1626,16 +1652,14 @@ impl XInsightReadService {
     }
 
     pub fn unmount(&mut self) {
-        self.mount = None;
-        self.cursor = None;
+        self.clear_session_state();
         if self.state != XConnectionState::Revoked {
             self.state = XConnectionState::Unmounted;
         }
     }
 
     pub fn revoke(&mut self) {
-        self.mount = None;
-        self.cursor = None;
+        self.clear_session_state();
         self.state = XConnectionState::Revoked;
     }
 
@@ -1697,8 +1721,7 @@ impl XInsightReadService {
                 }
                 Err(XConnectorError::Revoked) => {
                     self.state = XConnectionState::Revoked;
-                    self.mount = None;
-                    self.cursor = None;
+                    self.clear_session_state();
                     return Err(XConnectorError::Revoked);
                 }
                 Err(error) => return Err(error),
@@ -1835,6 +1858,13 @@ impl XInsightReadService {
         observation: &XProbeObservation,
     ) -> Result<(), XConnectorError> {
         observation.validate()?;
+        if self.observation_log.entries.iter().any(|entry| {
+            entry.mission_id != mission_id
+                || entry.scope != request.insight_scope
+                || entry.connector_scope_digest != request.scope.digest()
+        }) {
+            return Err(XConnectorError::RefreshDrift);
+        }
         if observation.scope != request.insight_scope
             || observation.connector_scope_digest != request.scope.digest()
             || observation.credential_revision != request.secret_reference.credential_revision()
@@ -1863,10 +1893,13 @@ impl XInsightReadService {
         mission_id: &str,
         request: &XInsightReadRequest,
     ) -> Result<(), XConnectorError> {
-        let mount = self.mount.as_ref().ok_or(XConnectorError::NotMounted)?;
         if self.state == XConnectionState::Revoked {
             return Err(XConnectorError::Revoked);
         }
+        if self.state == XConnectionState::Stale {
+            return Err(XConnectorError::ProbeStale);
+        }
+        let mount = self.mount.as_ref().ok_or(XConnectorError::NotMounted)?;
         if self.state != XConnectionState::Mounted
             || mount.mission_id != mission_id
             || mount.scope_digest != request.scope.digest()
@@ -1882,6 +1915,13 @@ impl XInsightReadService {
             return Err(XConnectorError::ProbeStale);
         }
         Ok(())
+    }
+
+    fn clear_session_state(&mut self) {
+        self.mount = None;
+        self.cursor = None;
+        self.seen_page_digests.clear();
+        self.seen_cursor_tokens.clear();
     }
 }
 
@@ -1943,10 +1983,16 @@ impl MissionXInsightConsumer {
         let observation = match self.service.read(mission_id, request, resolver) {
             Ok(observation) => observation,
             Err(error) => {
-                if self.service.state() == XConnectionState::Stale
-                    && let Some(capability) = self.capability.as_mut()
-                {
-                    capability.connection_state = XConnectionState::Stale;
+                if let Some(capability) = self.capability.as_mut() {
+                    match self.service.state() {
+                        XConnectionState::Stale => {
+                            capability.connection_state = XConnectionState::Stale;
+                        }
+                        XConnectionState::Revoked => {
+                            capability.connection_state = XConnectionState::Revoked;
+                        }
+                        XConnectionState::Unmounted | XConnectionState::Mounted => {}
+                    }
                 }
                 return Err(error);
             }
@@ -2505,6 +2551,26 @@ mod tests {
     }
 
     #[test]
+    fn provider_error_envelope_does_not_become_an_empty_success() {
+        let transport = Arc::new(MockTransport::new([response(
+            r#"{"errors":[{"title":"partial failure"}]}"#,
+            &[],
+        )]));
+        let adapter = XApiV2Adapter::new(XApiBinding::default(), transport).expect("adapter");
+        let (scope, insight_scope, secret, lease, resolver) =
+            scope_and_auth(&["users.read", "tweet.read"]);
+        assert_eq!(
+            adapter
+                .probe(
+                    &probe_request(scope, insight_scope, secret, lease),
+                    &resolver,
+                )
+                .expect_err("provider error envelope"),
+            XConnectorError::InvalidProviderResponse { status: 200 }
+        );
+    }
+
+    #[test]
     fn read_preserves_provider_metric_context_and_receipts() {
         let transport = Arc::new(MockTransport::new([
             response(r#"{"data":{"id":"1234567890"}}"#, &[]),
@@ -2852,6 +2918,60 @@ mod tests {
         service.revoke();
         assert_eq!(service.state(), XConnectionState::Revoked);
         assert!(service.mount().is_none());
+    }
+
+    #[test]
+    fn revoked_service_and_mission_capability_fail_closed() {
+        let transport = Arc::new(MockTransport::new([response(
+            r#"{"data":{"id":"1234567890"}}"#,
+            &[],
+        )]));
+        let mut consumer = MissionXInsightConsumer::new(service(transport));
+        let (scope, insight_scope, secret, lease, resolver) =
+            scope_and_auth(&["users.read", "tweet.read"]);
+        consumer
+            .attach(
+                "mission-x",
+                &probe_request(
+                    scope.clone(),
+                    insight_scope.clone(),
+                    secret.clone(),
+                    lease.clone(),
+                ),
+                &resolver,
+            )
+            .expect("attach");
+        consumer.service_mut().revoke();
+        let error = consumer
+            .read(
+                "mission-x",
+                &read_request(
+                    scope.clone(),
+                    insight_scope.clone(),
+                    secret.clone(),
+                    lease.clone(),
+                ),
+                &resolver,
+            )
+            .expect_err("revoked");
+        assert_eq!(error, XConnectorError::Revoked);
+        assert_eq!(
+            consumer
+                .capability()
+                .expect("capability state")
+                .connection_state,
+            XConnectionState::Revoked
+        );
+        assert_eq!(
+            consumer
+                .read(
+                    "mission-x",
+                    &read_request(scope, insight_scope, secret, lease,),
+                    &resolver,
+                )
+                .expect_err("revoked capability"),
+            XConnectorError::MissionMismatch
+        );
     }
 
     impl XInsightObservation {
