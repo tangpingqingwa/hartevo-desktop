@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/crowdin-localization-result/crowdin-localization-result.v1.json",
+  "schemaVersion": "hartevo-crowdin-localization-result-contract/v1",
+  "contractVersion": "crowdin-localization-result/v1",
+  "layer": 1,
+  "service": {
+    "id": "crowdin.localization-result",
+    "name": "CrowdinLocalizationResultService",
+    "version": "1.0.0",
+    "readOnly": true,
+    "nativeConnected": false,
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "read_project_metadata",
+      "read_language_coverage",
+      "read_source_file_metadata",
+      "read_translation_progress",
+      "read_translation_build_status",
+      "compile_localization_result_proposal",
+      "record_localization_result"
+    ]
+  },
+  "provider": {
+    "id": "crowdin.api-v2",
+    "name": "CrowdinProvider",
+    "version": "1.0.0",
+    "api": "Crowdin API v2",
+    "apiOrigin": "https://api.crowdin.com/api/v2",
+    "allowedGetPaths": [
+      "/projects/{projectId}",
+      "/projects/{projectId}/branches/{branchId}/languages/progress",
+      "/projects/{projectId}/files/{fileId}",
+      "/projects/{projectId}/files/{fileId}/languages/progress",
+      "/projects/{projectId}/bundles"
+    ],
+    "acceptedProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "native": false
+  },
+  "consumer": {
+    "id": "mission.crowdin-localization-result",
+    "name": "MissionCrowdinLocalizationConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "consentBound": true,
+    "adoptsOutcome": false,
+    "publicationAuthority": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "organization",
+      "crowdinProject",
+      "sourceBranch",
+      "sourceFile",
+      "targetLanguage",
+      "hartevoProject",
+      "mission",
+      "workProduct",
+      "consentScope"
+    ],
+    "secret": "opaque_secret_reference_only",
+    "fence": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "organization",
+      "crowdinProject",
+      "crowdinProjectRevision",
+      "sourceBranchIdAndRevision",
+      "sourceFileIdAndRevision",
+      "targetLanguage",
+      "sourceRevisionDigest",
+      "translationRevisionDigest",
+      "buildDigest",
+      "hartevoProjectIdAndRevision",
+      "missionIdAndRevision",
+      "workProductIdAndRevision",
+      "consentScopeAndDigest",
+      "secretReferenceDigest"
+    ]
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxPages": 4,
+    "pageSize": 50,
+    "maxRetries": 3,
+    "maxBackoffMs": 8000,
+    "maxWindowSeconds": 2678400
+  },
+  "redaction": {
+    "sourceText": true,
+    "translatedText": true,
+    "translatorIdentity": true,
+    "comments": true,
+    "screenshots": true,
+    "glossaryContent": true,
+    "rawApiBody": true,
+    "credentialMaterial": true,
+    "retained": ["boundedCounts", "languageMetadata", "contentDigests", "buildDigests"]
+  },
+  "authority": {
+    "externalWrites": false,
+    "sourceUpload": false,
+    "stringMutation": false,
+    "translationSubmission": false,
+    "approval": false,
+    "translationBuildTrigger": false,
+    "download": false,
+    "webhook": false,
+    "publication": false,
+    "cmsRegistry": false,
+    "connected": false,
+    "durableReceipt": false,
+    "verification": false,
+    "outcome": false,
+    "workProductAdoption": false
+  },
+  "registration": {
+    "versionBound": true,
+    "providerBound": true,
+    "digestBound": true,
+    "scopeBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "durableReceipt": false,
+    "adoptedOutcome": false,
+    "publication": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "host_owned_credential_resolution",
+    "consented_source_or_translation_effects",
+    "durable_provider_receipts",
+    "independent_artifact_readback",
+    "verified_work_product_adoption"
+  ],
+  "officialApiReferences": [
+    "https://support.crowdin.com/developer/api/v2/",
+    "https://developer.crowdin.com/",
+    "https://support.crowdin.com/developer/api/v2/#tag/Translations",
+    "https://support.crowdin.com/developer/api/v2/#tag/Source-Strings"
+  ]
+}
