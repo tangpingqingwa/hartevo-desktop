@@ -190,8 +190,10 @@ fn real_chromium_signed_recipe_crash_resume_smoke() {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -261,6 +263,8 @@ mod macos {
     struct SmokeResources {
         executable: PathBuf,
         temp: Option<TempDir>,
+        profile_root: PathBuf,
+        project_root: PathBuf,
         listener: Option<TcpListener>,
         server: Option<FixtureServer>,
         host: Option<ManagedChromiumHost>,
@@ -268,9 +272,14 @@ mod macos {
 
     impl SmokeResources {
         fn new(prerequisites: ExternalPrerequisites) -> Self {
+            let temp_path = prerequisites.temp.path().to_owned();
+            let profile_root = private_child(&temp_path, "profiles");
+            let project_root = private_child(&temp_path, "project");
             Self {
                 executable: prerequisites.executable,
                 temp: Some(prerequisites.temp),
+                profile_root,
+                project_root,
                 listener: Some(prerequisites.listener),
                 server: None,
                 host: None,
@@ -285,10 +294,12 @@ mod macos {
             self.server = Some(must(FixtureServer::start(listener), "fixture_thread_spawn"));
         }
 
-        fn temp_root(&self) -> &Path {
-            self.temp
-                .as_ref()
-                .map_or_else(|| fail("temp_root_missing"), TempDir::path)
+        fn profile_root(&self) -> &Path {
+            &self.profile_root
+        }
+
+        fn project_root(&self) -> &Path {
+            &self.project_root
         }
 
         fn server(&self) -> &FixtureServer {
@@ -303,19 +314,59 @@ mod macos {
                 .unwrap_or_else(|| fail("chromium_host_missing"))
         }
 
+        fn settle_click(
+            &mut self,
+            proof: &BrowserLeaseProof,
+            tab_id: &BrowserTabId,
+            expected_one: usize,
+            expected_two: usize,
+            label: &'static str,
+        ) {
+            let deadline = Instant::now() + WAIT_LIMIT;
+            let mut attempt = 0_u64;
+            loop {
+                let counts = self.server().counts();
+                if counts.clicks_one >= expected_one && counts.clicks_two >= expected_two {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "RECIPE_SMOKE_03_FAIL: step={label}_click_settle_timeout observed={counts:?}"
+                );
+                attempt = attempt.saturating_add(1);
+                let snapshot_id = BrowserSnapshotId::from_stable(format!(
+                    "recipe-crash-resume-{label}-click-settle-{attempt}"
+                ));
+                match self
+                    .host_mut()
+                    .observe_ax(tab_id, proof, snapshot_id, Utc::now())
+                {
+                    Ok(_) | Err(crate::BrowserError::StaleSnapshot) => {}
+                    Err(error) => panic!(
+                        "RECIPE_SMOKE_03_FAIL: step={label}_click_settle browser_error={}",
+                        error.code()
+                    ),
+                }
+            }
+        }
+
         fn spawn_host(&mut self, scope: &BrowserScope) {
             if self.host.is_some() {
                 fail("chromium_host_already_running");
             }
             let config = must(
-                ChromiumLaunchConfig::new(&self.executable, self.temp_root().to_path_buf(), true),
+                ChromiumLaunchConfig::new(
+                    &self.executable,
+                    self.profile_root().to_path_buf(),
+                    true,
+                ),
                 "launch_config_contract",
             );
             let config = must(
                 config.with_macos_mock_keychain_for_test(),
                 "mock_keychain_contract",
             );
-            self.host = Some(must(
+            self.host = Some(must_browser(
                 ManagedChromiumHost::spawn(scope.profile.clone(), scope.workspace.clone(), &config),
                 "chromium_host_spawn",
             ));
@@ -370,6 +421,14 @@ mod macos {
             }
             first_failure.map_or(Ok(()), Err)
         }
+    }
+
+    fn private_child(root: &Path, name: &str) -> PathBuf {
+        let path = root.join(name);
+        fs::create_dir(&path).unwrap_or_else(|_| fail("private_child_create"));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|_| fail("private_child_permissions"));
+        path
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -554,10 +613,37 @@ mod macos {
         }
 
         fn wait_for_clicks(&self, one: usize, two: usize) {
-            self.state.wait_until("fixture_click_timeout", || {
+            let deadline = Instant::now() + WAIT_LIMIT;
+            let mut guard = self
+                .state
+                .signal
+                .lock()
+                .unwrap_or_else(|_| fail("fixture_barrier_poisoned"));
+            loop {
                 let counts = self.state.counts();
-                counts.clicks_one >= one && counts.clicks_two >= two
-            });
+                if counts.clicks_one >= one && counts.clicks_two >= two {
+                    return;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "RECIPE_SMOKE_03_FAIL: step=fixture_click_timeout observed={counts:?}"
+                );
+                let (next_guard, timeout) = self
+                    .state
+                    .changed
+                    .wait_timeout(guard, remaining)
+                    .unwrap_or_else(|_| fail("fixture_barrier_poisoned"));
+                guard = next_guard;
+                if timeout.timed_out() {
+                    let observed = self.state.counts();
+                    assert!(
+                        observed.clicks_one >= one && observed.clicks_two >= two,
+                        "RECIPE_SMOKE_03_FAIL: step=fixture_click_timeout observed={observed:?}"
+                    );
+                    return;
+                }
+            }
         }
 
         fn assert_clicks_stable(&self, one: usize, two: usize, label: &'static str) {
@@ -752,7 +838,7 @@ mod macos {
     fn begin_first_generation(resources: &mut SmokeResources) -> FirstGeneration {
         resources.start_server();
         let started_at = Utc::now();
-        let scope = domain_scope(resources.temp_root(), started_at);
+        let scope = domain_scope(resources.project_root(), started_at);
         resources.spawn_host(&scope);
         let origin = resources.server().origin();
         let policy = must(
@@ -836,6 +922,7 @@ mod macos {
             &execution.effect,
             execution.batch.created_at,
         );
+        resources.settle_click(&scope.proof, &first_evidence.tab_id, 1, 0, "first_step");
         must(
             cursor.acknowledge_chromium_click(context, first_evidence.clone(), Utc::now()),
             "first_step_acknowledgement",
@@ -947,6 +1034,13 @@ mod macos {
             second_resolutions[1].clone(),
             &second.effect,
             rebound_at,
+        );
+        resources.settle_click(
+            &run.scope.proof,
+            &second_evidence.tab_id,
+            1,
+            1,
+            "second_step",
         );
         must(
             run.cursor.acknowledge_chromium_click(
@@ -1925,6 +2019,15 @@ fn sha(byte: char) -> String {
 
 fn must<T, E>(result: Result<T, E>, label: &'static str) -> T {
     result.unwrap_or_else(|_| fail(label))
+}
+
+fn must_browser<T>(result: Result<T, crate::BrowserError>, label: &'static str) -> T {
+    result.unwrap_or_else(|error| {
+        panic!(
+            "RECIPE_SMOKE_03_FAIL: step={label} browser_error={}",
+            error.code()
+        )
+    })
 }
 
 #[track_caller]

@@ -1046,6 +1046,8 @@ impl ManagedChromiumHost {
             return Err(error);
         }
         self.workspace.validate_agent_lease(proof, now)?;
+        let runtime_session_id = session_id.clone();
+        let target_id_for_cleanup = target_id.clone();
         self.tabs.insert(
             tab_id.clone(),
             CdpTabSession {
@@ -1072,6 +1074,21 @@ impl ManagedChromiumHost {
                 blocked_request_count: 0,
             },
         );
+        if let Err(error) = self.command(
+            CdpMethod::RuntimeEnable,
+            json!({}),
+            Some(&runtime_session_id),
+        ) {
+            self.tabs.remove(tab_id);
+            let _ = self.command(
+                CdpMethod::TargetCloseTarget,
+                json!({"targetId": target_id_for_cleanup}),
+                None,
+            );
+            return Err(error);
+        }
+        let tab = self.tabs.get_mut(tab_id).ok_or(BrowserError::TabNotFound)?;
+        tab.runtime_events = CdpRuntimeEvents::Enabled;
         Ok(())
     }
 
