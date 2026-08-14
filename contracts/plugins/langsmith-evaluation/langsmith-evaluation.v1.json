@@ -1,0 +1,236 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.langsmith-evaluation/v1",
+  "title": "Hartevo Layer 1 governed LangSmith evaluation-evidence contract",
+  "description": "A scoped, read/proposal/recording-only LangSmith evaluation seam. It is not a tracing bus, model registry, native connector, kernel receipt, or Outcome authority.",
+  "schemaVersion": "hartevo.langsmith-evaluation/v1",
+  "contractVersion": "EXT-LANGSMITH-01-L1/v1",
+  "pluginVersion": "0.1.0",
+  "layer": "Layer-1",
+  "contractDigestInput": "hartevo.langsmith-evaluation/v1|layer=1|service=hartevo.langsmith.evaluation|provider=langsmith.evaluation.read|consumer=mission.langsmith.evaluation|scope=host,workspace,project,run,trace,dataset,evaluator,experiment,mission",
+  "contractDigest": "38abe161e26fb582570b875b2bccb5e4bfc52b182fb4f35a8aff8e8187900a71",
+  "service": {
+    "type": "LangSmithEvaluationService",
+    "id": "hartevo.langsmith.evaluation",
+    "operations": [
+      "describe_capabilities",
+      "compile_bounded_read_proposal",
+      "read_run_summaries",
+      "read_trace_summary",
+      "read_dataset_revision",
+      "read_evaluator_revision",
+      "read_feedback_scores",
+      "read_experiment_evidence",
+      "paginate_bounded_evaluation",
+      "compile_evaluation_result_proposal",
+      "verify_evaluation_result_proposal"
+    ],
+    "effectAuthority": "bounded_read_and_proposal_only",
+    "liveExternalIo": false,
+    "kernelAuthority": false,
+    "telemetryAuthority": false,
+    "modelRegistryAuthority": false
+  },
+  "provider": {
+    "type": "LangSmithProvider",
+    "id": "langsmith.evaluation.read",
+    "readOperations": [
+      "read_run_summary",
+      "read_trace_summary",
+      "read_dataset_revision",
+      "read_evaluator_revision",
+      "read_feedback_scores",
+      "read_experiment_evidence"
+    ],
+    "mutations": [],
+    "transportSeams": [
+      "recording",
+      "fake",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "nativeStatus": "BLOCKED_ENV",
+    "connected": false,
+    "native": false,
+    "externalWrites": false,
+    "rawResponseBodies": false,
+    "rawSecrets": false,
+    "arbitraryTraceExport": false,
+    "toolExecution": false
+  },
+  "authentication": {
+    "boundary": "opaque SecretReference",
+    "supportedSchemes": [
+      "api_key_via_secret_reference",
+      "oauth_via_secret_reference"
+    ],
+    "serialized": false,
+    "debugged": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "exactFields": [
+      "host",
+      "workspace",
+      "project",
+      "projectRevision",
+      "run",
+      "trace",
+      "dataset",
+      "datasetRevision",
+      "evaluator",
+      "evaluatorRevision",
+      "experiment",
+      "experimentRevision",
+      "mission",
+      "missionRevision",
+      "modelDigest",
+      "workProductDigest",
+      "permissionRevision"
+    ],
+    "scopeBound": true,
+    "crossWorkspace": false,
+    "crossProject": false,
+    "arbitraryTraceExport": false
+  },
+  "evidence": {
+    "runSummaryFields": [
+      "runId",
+      "traceId",
+      "projectId",
+      "modelDigest",
+      "status",
+      "errorDigest",
+      "tokenUsage",
+      "cost",
+      "latency",
+      "inputDigest",
+      "outputDigest"
+    ],
+    "traceSummaryFields": [
+      "traceId",
+      "rootRunId",
+      "spanCount",
+      "maxDepth",
+      "status",
+      "errorCount",
+      "latency",
+      "traceDigest"
+    ],
+    "feedbackScoreFields": [
+      "feedbackIdDigest",
+      "runId",
+      "traceId",
+      "evaluatorId",
+      "evaluatorRevision",
+      "score",
+      "scoreDigest"
+    ],
+    "experimentFields": [
+      "experimentId",
+      "experimentRevision",
+      "datasetRevision",
+      "evaluatorRevision",
+      "runCount",
+      "completedCount",
+      "meanScore",
+      "cost",
+      "latency",
+      "experimentDigest"
+    ],
+    "rawPromptOutputPii": false,
+    "rawProviderBodies": false,
+    "bounded": true,
+    "redacted": true,
+    "staleResultsAreNonCurrent": true
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerBound": true,
+    "permissionBound": true,
+    "scopeBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "contract_drift",
+      "provider_drift",
+      "permission_drift",
+      "scope_drift",
+      "dataset_revision_drift",
+      "evaluator_revision_drift",
+      "experiment_revision_drift",
+      "registration_tamper",
+      "registration_revocation"
+    ]
+  },
+  "authority": {
+    "externalWrites": false,
+    "runCreation": false,
+    "datasetMutation": false,
+    "evaluatorMutation": false,
+    "traceExport": false,
+    "toolExecution": false,
+    "genericTelemetry": false,
+    "modelRegistry": false,
+    "durableNativeReceipt": false,
+    "independentReadBack": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAuthority": false,
+    "connected": false,
+    "native": false
+  },
+  "testSeams": {
+    "recording": "BLOCKED_ENV",
+    "fake": "BLOCKED_ENV",
+    "loopback": "BLOCKED_ENV",
+    "blockedEnv": "BLOCKED_ENV",
+    "connected": false,
+    "native": false,
+    "adversarial": [
+      "run_status_error_partial",
+      "pagination",
+      "dataset_revision_drift",
+      "evaluator_mismatch",
+      "feedback_score_bounds",
+      "http_401",
+      "http_403",
+      "http_404",
+      "http_409",
+      "http_429",
+      "timeout",
+      "server_5xx",
+      "tamper",
+      "redaction",
+      "truncation",
+      "stale_result",
+      "access_loss",
+      "revocation"
+    ]
+  },
+  "native": {
+    "status": "BLOCKED_ENV",
+    "secretResolution": "BLOCKED_ENV",
+    "boundedHttpsReads": "BLOCKED_ENV",
+    "durableReceipt": "BLOCKED_ENV",
+    "independentReadBack": "BLOCKED_ENV",
+    "verifiedAdoption": "BLOCKED_ENV"
+  },
+  "layer2Gaps": [
+    "native_opaque_secret_resolution",
+    "bounded_https_reads",
+    "durable_native_receipt",
+    "independent_result_reconciliation",
+    "verified_work_product_adoption"
+  ],
+  "nonOverlap": {
+    "observabilityAndSlo": ["PostHog#288", "Sentry#307", "Datadog#337"],
+    "inferenceAndRuntime": ["Bedrock#326", "HuggingFace#351", "OpenInterpreter#53"],
+    "langsmithOwns": "evaluation-run, dataset revision, evaluator revision, feedback, and experiment evidence only"
+  },
+  "type": "object",
+  "additionalProperties": false
+}
