@@ -1269,6 +1269,7 @@ mod tests {
         .expect("project");
         {
             let mut store = ProjectStore::open(&path, &key).expect("current store");
+            crate::downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store
                 .connection

@@ -732,6 +732,7 @@ mod tests {
         let key = DatabaseKey::new([41; 32]).expect("key");
         {
             let store = ProjectStore::open(&database_path, &key).expect("current store");
+            crate::downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store
                 .connection
                 .execute_batch(

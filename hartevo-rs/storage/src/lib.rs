@@ -17,6 +17,7 @@ mod creator_hiring_store;
 mod deletion_propagation;
 mod deletion_store;
 mod effect_ledger;
+mod identity_bootstrap_store;
 mod identity_store;
 mod key_bootstrap_store;
 mod keyring_store;
@@ -45,6 +46,7 @@ pub use context_material_store::{
 };
 pub use creator::PersistedMutation;
 pub use deletion_propagation::{DeletionPropagationJob, DeletionPropagationJobStatus};
+pub use identity_bootstrap_store::IdentitySessionSecretReferences;
 pub use key_bootstrap_store::{
     KeyBootstrapCell, KeyBootstrapOperationKind, KeyBootstrapOperationStatus,
     KeyBootstrapPrepareOutcome, LocalKeyBootstrapOperation,
@@ -83,7 +85,25 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 47;
+pub const STORAGE_SCHEMA_VERSION: i64 = 48;
+
+#[cfg(test)]
+pub(crate) fn downgrade_identity_bootstrap_schema_for_test(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP INDEX IF EXISTS identity_session_scope_idx;
+             DROP INDEX IF EXISTS identity_project_scope_idx;
+             DROP INDEX IF EXISTS identity_membership_scope_idx;
+             DROP TABLE IF EXISTS identity_sessions;
+             DROP TABLE IF EXISTS identity_devices;
+             DROP TABLE IF EXISTS identity_projects;
+             DROP TABLE IF EXISTS identity_memberships;
+             DROP TABLE IF EXISTS identity_teams;
+             DROP TABLE IF EXISTS identity_accounts;
+             DELETE FROM schema_migrations WHERE version >= 48;",
+        )
+        .expect("downgrade identity bootstrap schema");
+}
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4405,6 +4425,88 @@ impl ProjectStore {
             record_migration(&transaction, 47)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 48 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE identity_accounts (
+                   tenant_id TEXT NOT NULL,
+                   id TEXT NOT NULL CHECK (length(trim(id)) > 0),
+                   record_json TEXT NOT NULL CHECK (length(trim(record_json)) > 2),
+                   record_digest TEXT NOT NULL CHECK (length(record_digest) = 64),
+                   revision INTEGER NOT NULL CHECK (revision > 0),
+                   PRIMARY KEY (tenant_id, id)
+                 );
+                 CREATE TABLE identity_teams (
+                   tenant_id TEXT NOT NULL,
+                   id TEXT NOT NULL CHECK (length(trim(id)) > 0),
+                   record_json TEXT NOT NULL CHECK (length(trim(record_json)) > 2),
+                   record_digest TEXT NOT NULL CHECK (length(record_digest) = 64),
+                   revision INTEGER NOT NULL CHECK (revision > 0),
+                   PRIMARY KEY (tenant_id, id)
+                 );
+                 CREATE TABLE identity_memberships (
+                   tenant_id TEXT NOT NULL,
+                   id TEXT NOT NULL CHECK (length(trim(id)) > 0),
+                   team_id TEXT NOT NULL CHECK (length(trim(team_id)) > 0),
+                   account_id TEXT NOT NULL CHECK (length(trim(account_id)) > 0),
+                   record_json TEXT NOT NULL CHECK (length(trim(record_json)) > 2),
+                   record_digest TEXT NOT NULL CHECK (length(record_digest) = 64),
+                   revision INTEGER NOT NULL CHECK (revision > 0),
+                   PRIMARY KEY (tenant_id, id)
+                 );
+                 CREATE TABLE identity_projects (
+                   tenant_id TEXT NOT NULL,
+                   id TEXT NOT NULL CHECK (length(trim(id)) > 0),
+                   team_id TEXT NOT NULL CHECK (length(trim(team_id)) > 0),
+                   record_json TEXT NOT NULL CHECK (length(trim(record_json)) > 2),
+                   record_digest TEXT NOT NULL CHECK (length(record_digest) = 64),
+                   revision INTEGER NOT NULL CHECK (revision > 0),
+                   PRIMARY KEY (tenant_id, id)
+                 );
+                 CREATE TABLE identity_devices (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   id TEXT NOT NULL CHECK (length(trim(id)) > 0),
+                   account_id TEXT NOT NULL CHECK (length(trim(account_id)) > 0),
+                   record_json TEXT NOT NULL CHECK (length(trim(record_json)) > 2),
+                   record_digest TEXT NOT NULL CHECK (length(record_digest) = 64),
+                   binding_secret_reference_json TEXT NOT NULL
+                     CHECK (length(trim(binding_secret_reference_json)) > 2),
+                   revision INTEGER NOT NULL CHECK (revision > 0),
+                   PRIMARY KEY (project_id, id),
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE identity_sessions (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   id TEXT NOT NULL CHECK (length(trim(id)) > 0),
+                   account_id TEXT NOT NULL CHECK (length(trim(account_id)) > 0),
+                   team_id TEXT NOT NULL CHECK (length(trim(team_id)) > 0),
+                   member_id TEXT NOT NULL CHECK (length(trim(member_id)) > 0),
+                   device_id TEXT NOT NULL CHECK (length(trim(device_id)) > 0),
+                   session_json TEXT NOT NULL CHECK (length(trim(session_json)) > 2),
+                   record_digest TEXT NOT NULL CHECK (length(record_digest) = 64),
+                   access_secret_reference_json TEXT NOT NULL
+                     CHECK (length(trim(access_secret_reference_json)) > 2),
+                   refresh_secret_reference_json TEXT NOT NULL
+                     CHECK (length(trim(refresh_secret_reference_json)) > 2),
+                   status TEXT NOT NULL CHECK (
+                     status IN ('online', 'offline', 'expired', 'revoked')
+                   ),
+                   revision INTEGER NOT NULL CHECK (revision > 0),
+                   PRIMARY KEY (project_id, id),
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX identity_membership_scope_idx
+                   ON identity_memberships(tenant_id, team_id, account_id);
+                 CREATE INDEX identity_project_scope_idx
+                   ON identity_projects(tenant_id, team_id, id);
+                 CREATE INDEX identity_session_scope_idx
+                   ON identity_sessions(tenant_id, project_id, account_id, team_id, device_id, status);",
+            )?;
+            record_migration(&transaction, 48)?;
+            transaction.commit()?;
+        }
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
@@ -4605,6 +4707,14 @@ pub enum StorageError {
     InvalidKeyBootstrapOperationTransition,
     #[error("private key, recovery secret, token, or cookie cannot enter bootstrap persistence")]
     SensitiveKeyBootstrapPayload,
+    #[error(
+        "identity bootstrap records do not share one tenant, team, project, device, or session fence"
+    )]
+    IdentityBootstrapScopeMismatch,
+    #[error(
+        "identity bootstrap projection digest or scope columns do not match its private record"
+    )]
+    IdentityBootstrapProjectionMismatch,
     #[error(transparent)]
     WorkProductManifest(#[from] hartevo_domain_kernel::WorkProductManifestError),
     #[error(transparent)]
@@ -4686,7 +4796,12 @@ mod tests {
         DatabaseKey::new([7; 32]).expect("database key")
     }
 
+    fn downgrade_identity_bootstrap_schema(connection: &Connection) {
+        downgrade_identity_bootstrap_schema_for_test(connection);
+    }
+
     fn downgrade_runtime_delta_schema_to_v45(connection: &Connection) {
+        downgrade_identity_bootstrap_schema(connection);
         connection
             .execute_batch(
                 "BEGIN IMMEDIATE;
@@ -4761,6 +4876,7 @@ mod tests {
     }
 
     fn downgrade_checkpoint_policy_schema_to_v46(connection: &Connection) {
+        downgrade_identity_bootstrap_schema(connection);
         connection
             .execute_batch(
                 "BEGIN IMMEDIATE;
@@ -5334,8 +5450,11 @@ mod tests {
         }
 
         let mut migrated =
-            ProjectStore::open(&database, &database_key()).expect("migrate v46 to v47");
-        assert_eq!(migrated.schema_version().expect("v47 schema"), 47);
+            ProjectStore::open(&database, &database_key()).expect("migrate v46 to v48");
+        assert_eq!(
+            migrated.schema_version().expect("current schema"),
+            STORAGE_SCHEMA_VERSION
+        );
         assert!(checkpoint_policy_table_sql(&migrated.connection).contains("effect_readback_v2"));
         assert_eq!(
             migrated
@@ -5370,7 +5489,7 @@ mod tests {
             .expect("persist typed effect/readback Mission");
         drop(migrated);
 
-        let reopened = ProjectStore::open(&database, &database_key()).expect("reopen v47");
+        let reopened = ProjectStore::open(&database, &database_key()).expect("reopen current");
         assert_eq!(
             reopened
                 .load_mission(&project.id, &effect_readback.id)
@@ -5445,8 +5564,11 @@ mod tests {
             .connection
             .execute_batch("DROP TABLE mission_checkpoints_v47;")
             .expect("remove injected collision");
-        store.migrate().expect("retry v47 migration");
-        assert_eq!(store.schema_version().expect("retried schema"), 47);
+        store.migrate().expect("retry v47 and v48 migrations");
+        assert_eq!(
+            store.schema_version().expect("retried schema"),
+            STORAGE_SCHEMA_VERSION
+        );
         assert_eq!(
             store
                 .load_mission(&project.id, &legacy.id)
@@ -5809,6 +5931,7 @@ mod tests {
         let mission = mission(project.id.as_str(), "mission-definition-migration-legacy");
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("legacy mission");
             store
@@ -5914,6 +6037,7 @@ mod tests {
             .expect("legacy unbound route remains readable");
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&legacy).expect("legacy Mission");
             store
@@ -6035,6 +6159,7 @@ mod tests {
 
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&contracted).expect("contracted Mission");
             store
@@ -6828,6 +6953,7 @@ mod tests {
         let mission = mission(&project.id.to_string(), "mission-context-migration");
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("mission");
             store
@@ -6960,6 +7086,7 @@ mod tests {
         let mission = mission(&project.id.to_string(), "mission-deletion-migration");
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("mission");
             store
@@ -7082,6 +7209,7 @@ mod tests {
         );
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("mission");
             let tombstone = DeletionTombstone::create(
@@ -7246,6 +7374,7 @@ mod tests {
         );
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("mission");
             store
@@ -7361,6 +7490,7 @@ mod tests {
         );
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store
                 .connection
@@ -7590,6 +7720,7 @@ mod tests {
 
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store
                 .create_company(
@@ -7757,6 +7888,7 @@ mod tests {
         let database = directory.path().join("effect-rate-limit-v23.sqlite3");
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store
                 .save_project(&project(
                     "project-rate-limit-migration",
@@ -7871,6 +8003,7 @@ mod tests {
         let database = directory.path().join("effect-reconciliation-v24.sqlite3");
         {
             let store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store
                 .connection
                 .execute_batch(
@@ -7975,6 +8108,7 @@ mod tests {
         );
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("mission");
             store
@@ -8084,6 +8218,7 @@ mod tests {
         );
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("mission");
             store
@@ -8186,6 +8321,7 @@ mod tests {
         );
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("mission");
             store
@@ -8282,6 +8418,7 @@ mod tests {
         );
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("mission");
             store
@@ -8373,6 +8510,7 @@ mod tests {
         let mission = mission(&project.id.to_string(), "mission-runtime-turn-migration");
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("mission");
             store
@@ -8467,6 +8605,7 @@ mod tests {
         );
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("mission");
             store
@@ -8637,6 +8776,7 @@ mod tests {
 
         {
             let mut store = ProjectStore::open(&database, &database_key()).expect("current store");
+            downgrade_identity_bootstrap_schema_for_test(&store.connection);
             store.save_project(&project).expect("project");
             store.save_mission(&mission).expect("mission");
             store

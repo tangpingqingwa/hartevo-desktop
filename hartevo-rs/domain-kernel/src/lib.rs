@@ -13,6 +13,7 @@ mod creator_hiring;
 mod creator_work;
 mod deletion;
 mod identity;
+mod identity_bootstrap;
 mod ids;
 mod key_management;
 mod market_evidence;
@@ -79,6 +80,16 @@ pub use identity::{
     ExternalIdentity, IdentityError, IdentityLink, IdentityLinkDecision, IdentityLinkStatus,
     IdentitySubject, LegalBasis, Partner, PartnerSupplyClass, Person,
 };
+pub use identity_bootstrap::{
+    IDENTITY_DEVICE_BINDING_PURPOSE, IdentityAccessMode, IdentityAccount, IdentityAccountStatus,
+    IdentityBootstrapError, IdentityBootstrapSelection, IdentityBootstrapSnapshot,
+    IdentityBootstrapState, IdentityDevice, IdentityDeviceStatus, IdentityMembership,
+    IdentityMembershipStatus, IdentityProject, IdentityProviderError, IdentityProviderKind,
+    IdentityScopeFence, IdentitySession, IdentitySessionError, IdentitySessionStatus, IdentityTeam,
+    KEYCLOAK_PROVIDER_ID, OIDC_ACCESS_TOKEN_PURPOSE, OIDC_REFRESH_TOKEN_PURPOSE,
+    OidcAuthorizationAttempt, OidcAuthorizationCallback, OidcAuthorizationRequest,
+    OidcIdentityProvider, OidcProviderConfiguration, OidcTokenSet, PkceCodeVerifier,
+};
 pub use ids::{
     AccountId, ActorId, ApprovalId, AttributionId, BrowserActionBatchId, BrowserControlLeaseId,
     BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId, BrowserRecipeId, BrowserSnapshotId,
@@ -89,10 +100,11 @@ pub use ids::{
     ConversationId, CreatorApplicationId, CreatorHiringId, CreatorId, CreatorMilestoneId,
     CreatorTaskId, DeletionId, DeletionReceiptId, DeliverableId, DeviceAttachmentId,
     DeviceHandoffId, DeviceId, EffectId, EvidenceId, ExecutionAttemptId, FactId, IdentityLinkId,
-    KeyEnvelopeId, MemberId, MessageId, MissionConversationId, MissionConversationMessageId,
-    MissionId, MissionScheduleId, OpportunityId, OrderId, OutcomeEventId, PartnerId, PayoutId,
-    PersonId, ProjectId, ReceiptId, RefundId, ReviewId, RuntimeRecoveryAttemptId,
-    RuntimeTurnAttemptId, TaskId, TenantId, VerificationId, WorkProductId, WorkerId, WorkerLeaseId,
+    IdentitySessionId, KeyEnvelopeId, MemberId, MessageId, MissionConversationId,
+    MissionConversationMessageId, MissionId, MissionScheduleId, OpportunityId, OrderId,
+    OutcomeEventId, PartnerId, PayoutId, PersonId, ProjectId, ReceiptId, RefundId, ReviewId,
+    RuntimeRecoveryAttemptId, RuntimeTurnAttemptId, TaskId, TeamId, TenantId, VerificationId,
+    WorkProductId, WorkerId, WorkerLeaseId,
 };
 pub use key_management::{
     DeviceAttachment, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffCiphertext,

@@ -45,6 +45,7 @@ macro_rules! entity_id {
 
 entity_id!(ActorId);
 entity_id!(AccountId);
+entity_id!(IdentitySessionId);
 entity_id!(ApprovalId);
 entity_id!(AttributionId);
 entity_id!(BrowserActionBatchId);
@@ -109,6 +110,7 @@ entity_id!(RefundId);
 entity_id!(RuntimeRecoveryAttemptId);
 entity_id!(RuntimeTurnAttemptId);
 entity_id!(TaskId);
+entity_id!(TeamId);
 entity_id!(TenantId);
 entity_id!(VerificationId);
 entity_id!(WorkerLeaseId);

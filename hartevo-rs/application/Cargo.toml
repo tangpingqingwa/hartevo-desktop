@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+hex.workspace = true
 hartevo-browser-adapter = { path = "../browser-adapter" }
 hartevo-catalog = { path = "../catalog" }
 hartevo-domain-kernel = { path = "../domain-kernel" }
@@ -17,6 +18,7 @@ hartevo-effect-broker = { path = "../effect-broker" }
 hartevo-runtime-adapter = { path = "../runtime-adapter" }
 hartevo-storage = { path = "../storage" }
 rust_decimal.workspace = true
+ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -25,8 +27,6 @@ tokio-postgres.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-hex.workspace = true
-ring.workspace = true
 tempfile.workspace = true
 
 [lints]

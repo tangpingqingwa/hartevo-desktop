@@ -486,6 +486,84 @@ pub struct SecretReference {
 }
 
 impl SecretReference {
+    pub fn oidc_access_token(
+        tenant_id: TenantId,
+        project_id: ProjectId,
+        provider: impl Into<String>,
+        account_id: &str,
+        version: u64,
+    ) -> Result<Self, SecretStoreError> {
+        Self::identity_reference(
+            tenant_id,
+            project_id,
+            provider,
+            account_id,
+            hartevo_domain_kernel::OIDC_ACCESS_TOKEN_PURPOSE,
+            version,
+        )
+    }
+
+    pub fn oidc_refresh_token(
+        tenant_id: TenantId,
+        project_id: ProjectId,
+        provider: impl Into<String>,
+        account_id: &str,
+        version: u64,
+    ) -> Result<Self, SecretStoreError> {
+        Self::identity_reference(
+            tenant_id,
+            project_id,
+            provider,
+            account_id,
+            hartevo_domain_kernel::OIDC_REFRESH_TOKEN_PURPOSE,
+            version,
+        )
+    }
+
+    pub fn identity_device_binding(
+        tenant_id: TenantId,
+        project_id: ProjectId,
+        device_id: &str,
+        version: u64,
+    ) -> Result<Self, SecretStoreError> {
+        Self::identity_reference(
+            tenant_id,
+            project_id,
+            "hartevo",
+            device_id,
+            hartevo_domain_kernel::IDENTITY_DEVICE_BINDING_PURPOSE,
+            version,
+        )
+    }
+
+    fn identity_reference(
+        tenant_id: TenantId,
+        project_id: ProjectId,
+        provider: impl Into<String>,
+        scope_id: &str,
+        purpose: &str,
+        version: u64,
+    ) -> Result<Self, SecretStoreError> {
+        let provider = provider.into().trim().to_owned();
+        if provider.is_empty()
+            || scope_id.trim().is_empty()
+            || scope_id.chars().any(char::is_control)
+            || version == 0
+        {
+            return Err(SecretStoreError::InvalidReference);
+        }
+        let reference = Self {
+            tenant_id,
+            project_id,
+            provider,
+            account_scope: format!("identity:{scope_id}"),
+            purpose: purpose.into(),
+            version,
+        };
+        reference.credential_id()?;
+        Ok(reference)
+    }
+
     /// Creates the opaque OS-store reference for one Recipe root signing-key
     /// generation. Only scope and generation enter the reference; private key
     /// bytes remain exclusively in the selected [`SecretStore`] backend.
