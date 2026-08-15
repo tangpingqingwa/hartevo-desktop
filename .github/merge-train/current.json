@@ -1,16 +1,16 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "a77572e05d170b2a6496d7c0453eaba596ae50d3",
+  "baseCommit": "1bfdd3fa052db1fb412b79be0d16c7140165678d",
   "candidateCount": 1,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-620-ext-aws-cloudfront-01",
-      "headCommit": "5efe40ac875cd33b977365cbe575068538ce5d08",
-      "number": 639
+      "headBranch": "codex/issue-525-ext-aws-verified-permissions-result-01",
+      "headCommit": "5d7a9cfb23c798d81f75df280190660a3ad37a3c",
+      "number": 538
     }
   ],
-  "createdAt": "2026-08-14T22:02:36Z",
+  "createdAt": "2026-08-15T06:28:25Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -21,5 +21,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260814-220216"
+  "trainBranch": "merge-train/20260815-062745"
 }
