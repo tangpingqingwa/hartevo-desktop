@@ -1,0 +1,329 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/crowdstrike-detection-result/contract.v1.json",
+  "title": "Hartevo CrowdStrike Falcon detection-result Layer-1 contract",
+  "description": "Bounded, revision-fenced Falcon detection evidence below Hartevo Truth and response authority.",
+  "schemaVersion": "hartevo.crowdstrike-detection-result/v1",
+  "contractVersion": "EXT-CROWDSTRIKE-01-L1/v1",
+  "pluginId": "crowdstrike.detection.result",
+  "pluginVersion": "1.0.0",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_verification_only",
+  "digestInput": "hartevo.crowdstrike-detection-result/v1|layer=1|service=crowdstrike.detection.result.read|provider=crowdstrike.falcon.detection.result.recording|consumer=mission.crowdstrike.detection.consumer",
+  "contractDigest": "1d257ef69c20b53690ad6e5729818f38f66a29f174352a4f4b1cc58eca9e147f",
+  "authority": {
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "durableProviderReceipt": false,
+    "kernelAuthority": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAuthority": false,
+    "externalWrites": false
+  },
+  "typedSurface": {
+    "service": "CrowdStrikeDetectionResultService",
+    "provider": "CrowdStrikeFalconProvider",
+    "consumer": "MissionCrowdStrikeDetectionConsumer",
+    "models": [
+      "FalconOAuthClientSecretReference",
+      "CrowdStrikeDetectionScope",
+      "FalconHostGroupScope",
+      "FalconDetectionAlertScope",
+      "FalconSeverity",
+      "FalconDetectionStatus",
+      "FqlFilter",
+      "DetectionTimeWindow",
+      "ProjectScope",
+      "MissionScope",
+      "WorkProductScope",
+      "CrowdStrikeRegistration",
+      "CrowdStrikeDetectionEvidence",
+      "CrowdStrikeDetectionProposal"
+    ]
+  },
+  "service": {
+    "type": "CrowdStrikeDetectionResultService",
+    "id": "crowdstrike.detection.result.read",
+    "access": "read_proposal_recording_verification",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "restore_registration",
+      "reverse_registration",
+      "query_detects",
+      "get_detect_summaries",
+      "compile_proposal",
+      "record_observation",
+      "verify_evidence"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "liveExternalIo": false,
+    "kernelAuthority": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "CrowdStrikeFalconProvider",
+    "id": "crowdstrike.falcon.detection.result.recording",
+    "apiRevision": "falcon-detects-query-detects-get-detect-summaries-1",
+    "operations": [
+      "QueryDetects",
+      "GetDetectSummaries"
+    ],
+    "allowlistedPaths": [
+      "/detects/queries/detects/v1",
+      "/detects/entities/summaries/GET/v1"
+    ],
+    "requiredPermission": "alerts.read",
+    "authentication": {
+      "scheme": "falcon_oauth_client",
+      "secretReference": "opaque_only",
+      "regionAndCloudBound": true,
+      "rawCredentialMaterial": false,
+      "rawCredentialSerialized": false,
+      "nativeResolution": false
+    },
+    "allowedTransportProvenance": [
+      "fixture",
+      "recording",
+      "loopback",
+      "blocked_env"
+    ],
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "durableProviderReceipt": false,
+    "reversible": true,
+    "revocable": true
+  },
+  "consumer": {
+    "type": "MissionCrowdStrikeDetectionConsumer",
+    "id": "mission.crowdstrike.detection.consumer",
+    "authority": "mission_scoped_review_projection_below_kernel",
+    "scope": [
+      "customerId",
+      "cid",
+      "hostGroupDigest",
+      "detectionAlertDigest",
+      "severity",
+      "status",
+      "fqlFilterDigest",
+      "timeWindowDigest",
+      "projectRevision",
+      "missionRevision",
+      "workProductRevision",
+      "evidenceRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "consentAuthority": false
+  },
+  "scope": {
+    "required": [
+      "customerId",
+      "cid",
+      "hostIds",
+      "groupIds",
+      "detectionIds",
+      "alertIds",
+      "severity",
+      "status",
+      "fqlFilter",
+      "timeWindow",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "scopeRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "fqlRawInReceipt": false,
+    "fullHostIdentifiersInReceipt": false,
+    "maxIdentifierBytes": 256,
+    "maxFqlBytes": 2048,
+    "maxWindowDays": 31
+  },
+  "pagination": {
+    "queryDetects": {
+      "offset": "bounded_non_negative",
+      "maxOffset": 100000,
+      "pageSize": "1..100",
+      "maxPages": "1..8",
+      "cursor": "offset_and_request_digest_fenced",
+      "duplicatePageOrDetection": "tampered"
+    },
+    "getDetectSummaries": {
+      "offset": "same_scope_and_filter_fence",
+      "pageSize": "1..100",
+      "maxPages": "1..8"
+    }
+  },
+  "projection": {
+    "retained": [
+      "bounded detection and alert ids",
+      "severity and status enums",
+      "device and host/group digests",
+      "process image/command-line/parent digests",
+      "tactic and technique digests",
+      "bounded timestamps",
+      "deterministic detection/page/result/evidence digests"
+    ],
+    "rawProcessCommandLine": false,
+    "rawUserEmail": false,
+    "rawFullHostIdentifier": false,
+    "rawDevicePayload": false,
+    "rawTechniquePayload": false,
+    "rawJson": false
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "apiRevisionBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "projectRevisionBound": true,
+    "missionRevisionBound": true,
+    "workProductRevisionBound": true,
+    "evidenceRevisionBound": true,
+    "evidenceDigestBound": true,
+    "evidenceBindingDigestBound": true,
+    "secretReferenceDigestBound": true,
+    "registrationDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "version_drift",
+      "contract_drift",
+      "provider_drift",
+      "api_revision_drift",
+      "permission_drift",
+      "customer_or_cid_drift",
+      "host_or_group_drift",
+      "detection_or_alert_drift",
+      "severity_or_status_drift",
+      "fql_filter_drift",
+      "time_window_drift",
+      "project_revision_drift",
+      "mission_stale",
+      "work_product_revision_drift",
+      "evidence_revision_drift",
+      "secret_reference_drift",
+      "registration_revocation",
+      "replay",
+      "tamper"
+    ]
+  },
+  "receipts": {
+    "retry": [
+      "operation",
+      "attempts",
+      "retries",
+      "maxRetries",
+      "exhausted"
+    ],
+    "rateLimit": [
+      "limitPerMinute",
+      "remaining",
+      "retryAfterSeconds",
+      "throttled"
+    ],
+    "observation": true,
+    "failureEvidence": true,
+    "providerReceipt": false,
+    "durableNativeReceipt": false,
+    "rawHeaders": false,
+    "rawResponseBody": false
+  },
+  "states": [
+    "present",
+    "empty",
+    "partial",
+    "access_loss",
+    "provider_unknown",
+    "tampered",
+    "stale",
+    "revoked"
+  ],
+  "digests": {
+    "contract": true,
+    "provider": true,
+    "apiRevision": true,
+    "permission": true,
+    "scope": true,
+    "projectRevision": true,
+    "missionRevision": true,
+    "workProductRevision": true,
+    "evidenceRevision": true,
+    "detection": true,
+    "page": true,
+    "result": true,
+    "evidence": true,
+    "registration": true,
+    "evidenceBinding": true
+  },
+  "provenance": {
+    "fixture": "connected_false_native_false_first_party_false",
+    "recording": "connected_false_native_false_first_party_false",
+    "loopback": "connected_false_native_false_first_party_false",
+    "blockedEnv": "connected_false_native_false_first_party_false",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed customer/cid and host/group scope",
+      "typed detection/alert severity/status projection",
+      "allowlisted FQL and bounded time window",
+      "QueryDetects and GetDetectSummaries read seams",
+      "offset/page/retry/rate-limit fences",
+      "provider/api/contract/permission/scope/evidence registration digests",
+      "read proposal, local recording, and integrity verification"
+    ],
+    "doesNotOwn": [
+      "native Falcon OAuth resolution",
+      "native Falcon HTTPS",
+      "detection status updates",
+      "assignment, tags, or comments",
+      "host quarantine or response actions",
+      "remediation",
+      "raw process, device, technique, or user data",
+      "durable native provider receipt",
+      "independent native readback",
+      "verified Work Product adoption",
+      "Hartevo Truth/Consent/Effect/Receipt/Verification/Outcome authority",
+      "incident causality"
+    ]
+  },
+  "layer2Gaps": [
+    "native Falcon OAuth client-credential resolution",
+    "live QueryDetects/GetDetectSummaries HTTPS",
+    "durable first-party provider receipt",
+    "independent native readback and reconciliation",
+    "explicit consented remediation effects",
+    "verified Work Product adoption",
+    "Hartevo kernel authority"
+  ],
+  "honestNativeGap": "Layer 1 intentionally stops at bounded read/proposal/recording/verification evidence. Fixture, recording, loopback, and BLOCKED_ENV never claim Connected, native, or first-party status; native OAuth, HTTPS, provider receipts, independent readback, response effects, and verified adoption remain Layer-2 work."
+}
