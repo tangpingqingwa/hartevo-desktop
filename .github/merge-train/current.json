@@ -1,16 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "1bfdd3fa052db1fb412b79be0d16c7140165678d",
-  "candidateCount": 1,
+  "baseCommit": "ab16ab35649412805c6cb0ff175455d9ce58f7a0",
+  "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-525-ext-aws-verified-permissions-result-01",
-      "headCommit": "5d7a9cfb23c798d81f75df280190660a3ad37a3c",
-      "number": 538
+      "headBranch": "codex/ext-aws-security-hub-finding-result-01",
+      "headCommit": "a1c11520760c5b8836ef4fb2832b1e7b6b2e3810",
+      "number": 537
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/databricks-job-result-333",
+      "headCommit": "c6e331cdac0ce010b3f3e38245079bf3f44623f1",
+      "number": 347
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/ext-opensearch-retrieval-01",
+      "headCommit": "0a209bbb8c8a7394b4bf52402eb34630e21a5984",
+      "number": 364
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/ext-confluence-01",
+      "headCommit": "8bb266041d70b4af30ed1ea1ea806d5296af7587",
+      "number": 365
     }
   ],
-  "createdAt": "2026-08-15T06:28:25Z",
+  "createdAt": "2026-08-15T07:08:53Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -21,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-062745"
+  "trainBranch": "merge-train/20260815-070820"
 }
