@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "436376917c250343098444b32da9989fb92492f5",
+  "baseCommit": "779c0f1dfb1b0b695b0deb875f6be586aee5c1c7",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-692-ext-bigcommerce-order-01",
-      "headCommit": "9bafe6b9f3115dc454c0bce34cd0844085889abc",
-      "number": 710
+      "headBranch": "codex/issue-mistral-inference-result-01",
+      "headCommit": "e194144b1246c96c7020d244143ad0ff493ca0ca",
+      "number": 717
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-699-ext-crossref-research-result-01",
-      "headCommit": "afc4f7583f5f57f355acd9db3f827415d835da0a",
-      "number": 714
+      "headBranch": "codex/issue-statuspage-incident-result-01",
+      "headCommit": "80f36ef00b7a459f54d045014b455e63f375be3f",
+      "number": 718
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/tines-automation-result-705",
-      "headCommit": "a1e5ec878b006bc27c6cf0d71f15e516de064afa",
-      "number": 715
+      "headBranch": "codex/issue-lokalise-localization-result-01",
+      "headCommit": "38fd05df1df5360052e2b264c272f6bc6e056235",
+      "number": 719
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-newrelic-observability-result-01",
-      "headCommit": "ae53da512ce3fcc4515562bfa007471a85cc6e22",
-      "number": 716
+      "headBranch": "codex/issue-701-bamboohr-directory-result",
+      "headCommit": "d7674882f96a1f42f9324cd3e21d46e8b76320d4",
+      "number": 726
     }
   ],
-  "createdAt": "2026-08-15T15:53:17Z",
+  "createdAt": "2026-08-15T16:17:08Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-155500"
+  "trainBranch": "merge-train/20260815-162000"
 }
