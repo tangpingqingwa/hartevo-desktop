@@ -1,0 +1,390 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/meltano-pipeline-result/meltano-pipeline-result.v1.json",
+  "title": "Hartevo Meltano Cloud/Singer pipeline and job evidence Layer-1 contract",
+  "description": "Bounded Meltano Cloud pipeline, job, incremental Singer state, configuration digest, cursor, retry, and rate evidence for Mission review; not an execution, mutation, raw-data, or Outcome authority.",
+  "schemaVersion": "hartevo.meltano-pipeline-result/v1",
+  "contractVersion": "EXT-MELTANO-01-L1/v1",
+  "pluginId": "meltano.pipeline-result",
+  "pluginVersion": "1.0.0",
+  "objectiveType": "pipeline_job_state_evidence",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.meltano-pipeline-result/v1|layer=1|service=meltano.pipeline-result.read|provider=meltano.pipeline-result.recording|consumer=mission.meltano-pipeline-result.consumer",
+  "contractDigest": "5c94ac0a187c1feb056164c326365cbe67effc1218d56fbedfbb23e2797f40e3",
+  "service": {
+    "type": "MeltanoPipelineResultService",
+    "id": "meltano.pipeline-result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register_scope",
+      "list_pipelines",
+      "read_pipeline_metadata",
+      "list_jobs",
+      "read_job_metadata",
+      "read_state_metadata",
+      "read_config_digest",
+      "compile_pipeline_evidence_proposal",
+      "verify_pipeline_evidence",
+      "record_observation_receipt",
+      "revoke_registration",
+      "restore_registration",
+      "reverse_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "type": "MeltanoProvider",
+    "id": "meltano.pipeline-result.recording",
+    "apiRevision": "meltano-cloud-api-v1-pipeline-job-state-config-read-1",
+    "operations": [
+      "list_pipelines",
+      "read_pipeline_metadata",
+      "list_jobs",
+      "read_job_metadata",
+      "read_state_metadata",
+      "read_config_digest"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "api_token",
+      "secretReference": "opaque_only",
+      "serialized": false,
+      "debugRedacted": true,
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false,
+    "maxRequestsPerMinute": 60,
+    "maxResponseBytes": 1048576
+  },
+  "consumer": {
+    "type": "MissionMeltanoPipelineConsumer",
+    "id": "mission.meltano-pipeline-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "workspaceId",
+      "cloudProjectId",
+      "environmentId",
+      "pipelineId",
+      "jobId",
+      "pluginName",
+      "stateId",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "connected": false,
+    "native": false,
+    "firstParty": false
+  },
+  "credentials": {
+    "boundary": "opaque API-token SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "rawMaterialRetained": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "workspaceId",
+      "cloudProjectId",
+      "environmentId",
+      "pipelineId",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "scopeRevision"
+    ],
+    "optional": ["jobId", "pluginName", "stateId"],
+    "identifiersInEvidence": "digest_only_or_redacted",
+    "cursorInEvidence": "opaque_digest_only",
+    "pipelineConfiguration": "digest_only",
+    "incrementalState": "digest_and_revision_only",
+    "rawPipelineDefinition": false,
+    "rawConfigValues": false,
+    "rawLogs": false,
+    "rawRows": false,
+    "rawStateBlobs": false,
+    "rawSecrets": false,
+    "maxPageSize": 64,
+    "maxMetadataItems": 64,
+    "maxResponseBytes": 1048576
+  },
+  "allowlist": {
+    "reads": [
+      {
+        "operation": "list_pipelines",
+        "providerOperation": "pipeline_collection_read",
+        "aggregateOrMetadataOnly": true
+      },
+      {
+        "operation": "read_pipeline_metadata",
+        "providerOperation": "pipeline_metadata_read",
+        "aggregateOrMetadataOnly": true
+      },
+      {
+        "operation": "list_jobs",
+        "providerOperation": "job_collection_read",
+        "aggregateOrMetadataOnly": true
+      },
+      {
+        "operation": "read_job_metadata",
+        "providerOperation": "job_metadata_read",
+        "aggregateOrMetadataOnly": true
+      },
+      {
+        "operation": "read_state_metadata",
+        "providerOperation": "incremental_state_digest_read",
+        "aggregateOrMetadataOnly": true
+      },
+      {
+        "operation": "read_config_digest",
+        "providerOperation": "pipeline_config_digest_read",
+        "aggregateOrMetadataOnly": true
+      }
+    ],
+    "writes": [],
+    "forbidden": [
+      "execute_pipeline",
+      "cancel_pipeline",
+      "stop_job",
+      "delete_job",
+      "install_plugin",
+      "mutate_pipeline",
+      "mutate_environment",
+      "mutate_state",
+      "raw_log_read",
+      "raw_row_read",
+      "raw_state_blob_read",
+      "secret_export",
+      "kernel_receipt",
+      "verified_work_product_adoption",
+      "outcome_adoption"
+    ]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "evidenceDigestBound": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "evidenceDigest",
+      "registrationRevision"
+    ],
+    "permissions": [
+      "meltano:pipeline:read",
+      "meltano:pipeline:list",
+      "meltano:job:read",
+      "meltano:job:list",
+      "meltano:state:read",
+      "meltano:config:digest:read",
+      "meltano:pagination:read",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "meltano:pipeline:execute",
+      "meltano:job:stop",
+      "meltano:job:delete",
+      "meltano:plugin:install",
+      "meltano:state:write",
+      "meltano:logs:read",
+      "meltano:rows:read",
+      "secret.export",
+      "outcome.adopt"
+    ]
+  },
+  "revisionAndIdempotency": {
+    "scopeRevisionRequired": true,
+    "missionRevisionRequired": true,
+    "projectRevisionRequired": true,
+    "workProductRevisionRequired": true,
+    "registrationRevisionRequired": true,
+    "requestIdempotencyDigestOnly": true,
+    "recordingIdempotencyDigestOnly": true,
+    "cursorDigestOnly": true,
+    "sameKeyDifferentProposalRejected": true,
+    "staleRegistrationRejected": true,
+    "staleCursorRejected": true
+  },
+  "metadata": {
+    "bounded": true,
+    "pipeline": [
+      "pipelineDigest",
+      "nameDigest",
+      "status",
+      "scheduleDigest",
+      "timeoutSeconds",
+      "maxRetries",
+      "createdAt",
+      "lastModifiedAt",
+      "dataComponentCount",
+      "actionCount",
+      "configDigest",
+      "stateIdDigest"
+    ],
+    "job": [
+      "jobDigest",
+      "pipelineDigest",
+      "type",
+      "status",
+      "exitCode",
+      "createdAt",
+      "startTime",
+      "endTime",
+      "attempt",
+      "stateDigest",
+      "configDigest",
+      "taskCount"
+    ],
+    "state": [
+      "stateIdDigest",
+      "stateDigest",
+      "stateRevision",
+      "singerBookmarkCount",
+      "incremental",
+      "updatedAt"
+    ],
+    "config": [
+      "configDigest",
+      "settingCount",
+      "sensitiveSettingCount",
+      "pluginDigest",
+      "stateIdDigest",
+      "updatedAt"
+    ],
+    "rawPipelineDefinition": false,
+    "rawConfigValues": false,
+    "rawLogs": false,
+    "rawRows": false,
+    "rawStateBlobs": false,
+    "rawEnvironmentValues": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "pipelineDigest",
+      "jobDigest",
+      "pluginDigest",
+      "stateIdDigest",
+      "stateDigest",
+      "configDigest",
+      "cursorDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "queued",
+      "running",
+      "success",
+      "error",
+      "stopped",
+      "partial",
+      "rate_limited",
+      "expired",
+      "access_loss",
+      "blocked_env",
+      "provider_unknown",
+      "tamper",
+      "stale",
+      "revoked"
+    ],
+    "retryReceipt": true,
+    "rateLimitReceipt": true,
+    "redactedObservationReceipt": true,
+    "tamperRejected": true,
+    "staleRejected": true,
+    "revocationRejected": true,
+    "partialIsNonAdoptable": true,
+    "providerReceipt": false
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "durableProviderReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed workspace/project/environment/pipeline/job/plugin/state scope",
+      "bounded pipeline, job, list, state, and config-digest reads",
+      "opaque cursor and idempotency fences",
+      "incremental state and configuration digests",
+      "retry and rate-limit receipts",
+      "version/contract/provider/permission/scope/evidence digests",
+      "reversible digest-bound registration",
+      "redacted recording receipts"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live Meltano API",
+      "native API-token resolution",
+      "pipeline execution or job stop/delete",
+      "plugin installation",
+      "environment or state mutation",
+      "raw logs, rows, or Singer state blobs",
+      "verified Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native API-token resolution",
+    "live Meltano Cloud transport",
+    "durable provider receipt",
+    "independent terminal reread and reconciliation",
+    "consented execution effects",
+    "Connected/native/first-party evidence",
+    "environment/plugin/state mutation controls",
+    "Hartevo Outcome or verified Work Product adoption"
+  ],
+  "honestNativeGap": "Native API-token resolution, live Meltano Cloud transport, durable provider receipts, independent terminal reread, execution effects, and verified Mission adoption remain Layer-2 work; fixture, recording, loopback, and BLOCKED_ENV transports never claim Connected, native, or first-party evidence."
+}
