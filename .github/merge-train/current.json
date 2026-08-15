@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "145460c90f6b708b174267403d4b5f8e8db756fb",
+  "baseCommit": "3f6502a12471891246a9c2fc72e94161d858f818",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-649-ext-aws-ebs-01",
-      "headCommit": "633fbf4f1f4a5d1be147035d1986eea0f2e9fbd2",
-      "number": 663
+      "headBranch": "codex/issue-655-aws-s3-bucket-result-01",
+      "headCommit": "3166deac7bd15fb9534861c62a67429252396e4c",
+      "number": 674
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-646-aws-security-lake-result",
-      "headCommit": "a37a635694a92f71f7780ea06a3bd1f3d4bc14f9",
-      "number": 664
+      "headBranch": "codex/issue-665-slack-decision-result",
+      "headCommit": "456442ca5b0faff589a8482441b1b31b4778a964",
+      "number": 676
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-653-ext-aws-firewall-manager-01",
-      "headCommit": "003a39ad1ea9403ab5576068201a4b124c3e121a",
-      "number": 670
+      "headBranch": "codex/issue-659-aws-resilience-hub-result-01",
+      "headCommit": "4ddd4929fcca36fd0637c93fb1c965e201a81356",
+      "number": 677
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ci-scanner-process-group-repair",
-      "headCommit": "ccae33e279d65f2b67ba73f85838f123f3893393",
-      "number": 883
+      "headBranch": "codex/ext-openai-moderation-01",
+      "headCommit": "2541c5d76333b2d4156dee14d2ee2d2aa0e72c7d",
+      "number": 678
     }
   ],
-  "createdAt": "2026-08-15T12:44:46Z",
+  "createdAt": "2026-08-15T13:17:13Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-124500"
+  "trainBranch": "merge-train/20260815-131700"
 }
