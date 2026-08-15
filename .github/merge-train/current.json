@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "b4b83c2f4d92b97a49e0f5a2eff12994717cbb50",
+  "baseCommit": "773aef8973d50718de43d176249dd63100d14a67",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "issue-544-ext-github-codeql-result-01",
-      "headCommit": "a3889fa4221d4f9266866072f0f01acb43aee6d2",
-      "number": 557
+      "headBranch": "issue-541-ext-gcp-recommender-result-01",
+      "headCommit": "630781cd904c3bb5c73f8a9d67d265efc1b48b5a",
+      "number": 561
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "issue-542-ext-azure-policy-compliance-result-01",
-      "headCommit": "03547628a9bae785a73e3c8e8271c3f7718903dd",
-      "number": 558
+      "headBranch": "codex/issue-551-ext-aws-resource-explorer-01",
+      "headCommit": "a3948f3440438e2114720ddc5c668bab02709164",
+      "number": 563
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "issue-543-ext-azure-resource-graph-result-01",
-      "headCommit": "6d1bacd10099544fe2ee222edb3bbcfe3515e231",
-      "number": 559
+      "headBranch": "codex/issue-548-ext-github-actions-result-01",
+      "headCommit": "3dfaf47f6ed6b870d0e42e9a9a112393c07f42a9",
+      "number": 565
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "issue-540-ext-aws-trusted-advisor-result-01",
-      "headCommit": "cbca020ad16f3ead6b36120c465bfb0e0616ff4e",
-      "number": 560
+      "headBranch": "codex/issue-550-ext-gcp-workflows-execution-result-01",
+      "headCommit": "52b22ede8721892abc03b994c5bafa1759c6264d",
+      "number": 567
     }
   ],
-  "createdAt": "2026-08-15T19:59:48Z",
+  "createdAt": "2026-08-15T20:35:36Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-200000"
+  "trainBranch": "merge-train/20260815-203300"
 }
