@@ -1,0 +1,252 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-personalize-recommendation-result/aws-personalize-recommendation-result.v1.json",
+  "title": "Hartevo AWS Personalize recommendation result Layer-1 contract",
+  "description": "A bounded, read-only Amazon Personalize campaign/recommender recommendation evidence seam. It is not a profile, catalog, context, training, model-control, native connector, provider receipt, or adoption authority.",
+  "schemaVersion": "hartevo.aws-personalize-recommendation-result/v1",
+  "contractVersion": "EXT-AWS-PERSONALIZE-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "aws.personalize.recommendation-result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.aws-personalize-recommendation-result/v1|layer=1|service=aws.personalize.recommendation-result.read|provider=aws.personalize.recommendation-result.recording|consumer=mission.aws-personalize-recommendation.consumer|api=personalize-describe-campaign-describe-recommender-get-recommendations-get-personalized-ranking-2018-05-22-r1",
+  "contractDigest": "578f9339c556ab0cca2d32d449b38feb8d7d50c659b344655780cd4ee97cb6aa",
+  "service": {
+    "type": "AwsPersonalizeRecommendationService",
+    "id": "aws.personalize.recommendation-result.read",
+    "version": "1.0.0",
+    "operations": [
+      "DescribeCampaign",
+      "DescribeRecommender",
+      "GetRecommendations",
+      "GetPersonalizedRanking",
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "propose",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "liveExecution": false,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAuthority": false
+  },
+  "provider": {
+    "type": "AwsPersonalizeProvider",
+    "id": "aws.personalize.recommendation-result.recording",
+    "version": "1.0.0",
+    "apiRevision": "personalize-describe-campaign-describe-recommender-get-recommendations-get-personalized-ranking-2018-05-22-r1",
+    "apiVersion": "2018-05-22",
+    "allowlistedMethods": ["POST"],
+    "allowlistedTargets": [
+      "AmazonPersonalize.DescribeCampaign",
+      "AmazonPersonalize.DescribeRecommender",
+      "AmazonPersonalize.GetRecommendations",
+      "AmazonPersonalize.GetPersonalizedRanking"
+    ],
+    "acceptedTransports": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "requiredPermissions": [
+      "personalize:DescribeCampaign",
+      "personalize:DescribeRecommender",
+      "personalize:GetRecommendations",
+      "personalize:GetPersonalizedRanking",
+      "mission.scope"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false,
+    "training": false,
+    "profileRead": false,
+    "catalogRead": false,
+    "contextRead": false,
+    "modelMutation": false
+  },
+  "consumer": {
+    "type": "MissionAwsPersonalizeConsumer",
+    "id": "mission.aws-personalize-recommendation.consumer",
+    "version": "1.0.0",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "consentBound": true,
+    "exactScopeBound": true,
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false
+  },
+  "scope": {
+    "required": [
+      "account",
+      "region",
+      "domain",
+      "campaignDigest",
+      "recommenderDigest",
+      "solutionVersionDigest",
+      "filterDigest",
+      "userFingerprintDigest",
+      "itemFingerprintDigest",
+      "projectIdAndRevision",
+      "missionIdAndRevision",
+      "workProductIdAndRevision",
+      "consentDigest",
+      "permissionDigest",
+      "opaqueSecretReferenceDigest"
+    ],
+    "campaignOrRecommender": "at_least_one_exact_target",
+    "rawUserProfile": false,
+    "rawCatalog": false,
+    "rawContext": false,
+    "rawFilterExpression": false,
+    "rawCredentialMaterial": false
+  },
+  "allowlistedSeams": [
+    {
+      "operation": "DescribeCampaign",
+      "method": "POST",
+      "target": "AmazonPersonalize.DescribeCampaign",
+      "projection": ["campaignStatus", "modelRevisionDigest", "solutionVersionDigest"]
+    },
+    {
+      "operation": "DescribeRecommender",
+      "method": "POST",
+      "target": "AmazonPersonalize.DescribeRecommender",
+      "projection": ["recommenderStatus", "modelRevisionDigest", "solutionVersionDigest"]
+    },
+    {
+      "operation": "GetRecommendations",
+      "method": "POST",
+      "target": "AmazonPersonalize.GetRecommendations",
+      "projection": ["redactedItemOrActionDigest", "rank", "scoreBucket"]
+    },
+    {
+      "operation": "GetPersonalizedRanking",
+      "method": "POST",
+      "target": "AmazonPersonalize.GetPersonalizedRanking",
+      "projection": ["redactedItemDigest", "rank", "scoreBucket"]
+    }
+  ],
+  "bounds": {
+    "maxIdentifierBytes": 256,
+    "maxResults": 50,
+    "maxResponseBytes": 1048576,
+    "maxFailureReasonBytes": 256,
+    "maxPages": 1,
+    "pagination": false,
+    "scoreBuckets": ["missing", "zero", "very_low", "low", "medium", "high", "very_high"]
+  },
+  "digests": [
+    "pluginVersionDigest",
+    "contractDigest",
+    "providerDigest",
+    "apiDigest",
+    "permissionDigest",
+    "scopeDigest",
+    "registrationDigest",
+    "requestDigest",
+    "responseDigest",
+    "modelRevisionDigest",
+    "resultDigest",
+    "evidenceDigest",
+    "proposalDigest",
+    "recordingDigest"
+  ],
+  "registration": {
+    "versionBound": true,
+    "contractBound": true,
+    "providerBound": true,
+    "permissionBound": true,
+    "scopeBound": true,
+    "evidencePolicyBound": true,
+    "reversible": true,
+    "revocable": true,
+    "restoreRequiresExactDigest": true,
+    "failClosedOn": [
+      "version_drift",
+      "contract_drift",
+      "provider_drift",
+      "permission_drift",
+      "scope_drift",
+      "evidence_drift",
+      "consent_expiry_or_revocation",
+      "registration_revocation",
+      "request_or_result_tamper"
+    ]
+  },
+  "projections": {
+    "states": [
+      "ACTIVE",
+      "PENDING",
+      "FAILED",
+      "EXPIRED",
+      "PARTIAL",
+      "ACCESS_LOST",
+      "PROVIDER_UNKNOWN",
+      "TAMPERED",
+      "REVOKED"
+    ],
+    "modelRevision": "digest_only",
+    "identifiers": "sha256_digest_only",
+    "scores": "bucket_only",
+    "rawProviderBody": false,
+    "rawProviderReceipt": false
+  },
+  "transportProvenance": {
+    "fixture": {"connected": false, "native": false, "firstParty": false},
+    "recording": {"connected": false, "native": false, "firstParty": false},
+    "loopback": {"connected": false, "native": false, "firstParty": false},
+    "BLOCKED_ENV": {"connected": false, "native": false, "firstParty": false}
+  },
+  "authorityBoundary": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstPartyEvidence": false,
+    "durableProviderReceipt": false,
+    "kernelTruth": false,
+    "kernelConsent": false,
+    "effectExecution": false,
+    "independentVerification": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "forbiddenEffects": [
+    "create_or_update_or_delete_campaign",
+    "create_or_update_or_delete_recommender",
+    "train_or_import_model",
+    "read_user_profile",
+    "read_raw_catalog",
+    "read_raw_context",
+    "export_model_bytes",
+    "resolve_native_credentials",
+    "native_https",
+    "provider_receipt_claim",
+    "truth_or_consent_or_effect_or_outcome_authority"
+  ],
+  "layer2Gaps": [
+    "host-owned_credential_resolution",
+    "consented_native_transport",
+    "independent_provider_readback",
+    "durable_receipt_and_verification",
+    "verified_work_product_adoption"
+  ]
+}
