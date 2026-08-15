@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "601315d5fbc2a3d8a31d7a9f6e24d7ad0607e800",
+  "baseCommit": "af7829ba8032404966f92c363a0d92ec72a75055",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-redis-cloud-01",
-      "headCommit": "5b8f6ff7e286b155a184b7f8c3f9a407e0f81658",
-      "number": 875
+      "headBranch": "codex/shopify-fulfillment-receipt-readback-02",
+      "headCommit": "228a36bac962f99bf07d970376331365c1cc7a10",
+      "number": 223
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-859-ext-gcp-bigtable",
-      "headCommit": "6b1879d03410c8bbd6aeae39f39b76f6e2a3dc5c",
-      "number": 876
+      "headBranch": "codex/paid-social-meta-instagram-webhook-reconcile-ps02",
+      "headCommit": "77005cfedda7f58a4768213d40a34a1d6ae388a2",
+      "number": 277
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/gcp-cloud-sql-instance-result-842",
-      "headCommit": "0f16f55cdf19969b32d56a4e74d5ad77057c8e17",
-      "number": 877
+      "headBranch": "codex/issue-866-gcp-memorystore-result",
+      "headCommit": "8e1ebe946a9522b7f2cb641d82f48650e50b1217",
+      "number": 880
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-azure-event-hub-posture-result-864",
-      "headCommit": "f57e89808ff272de261816834740cc7b14367175",
-      "number": 878
+      "headBranch": "codex/ext-consul-01-consul-service-health-result",
+      "headCommit": "d93351bf5b61d75441891be99907deb9a9ee9656",
+      "number": 881
     }
   ],
-  "createdAt": "2026-08-15T09:30:34Z",
+  "createdAt": "2026-08-15T09:54:56Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-093100"
+  "trainBranch": "merge-train/20260815-100100"
 }
