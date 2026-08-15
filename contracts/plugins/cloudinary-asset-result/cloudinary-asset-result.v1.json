@@ -1,0 +1,350 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/cloudinary-asset-result/cloudinary-asset-result.v1.json",
+  "title": "Hartevo Cloudinary asset result Layer-1 contract",
+  "schemaVersion": "hartevo.cloudinary-asset-result/v1",
+  "contractVersion": "EXT-CLOUDINARY-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "cloudinary.asset.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.cloudinary-asset-result/v1|layer=1|service=cloudinary.asset.result.read|provider=cloudinary.asset.result.recording|consumer=mission.cloudinary-asset-result.consumer|api=cloudinary-admin-resource-usage-transformation-delivery-read-r1",
+  "contractDigest": "6220e88f553910863ed7cc67a50bde3d6363a557321bcc6f25ab5eeb36d79b98",
+  "service": {
+    "type": "CloudinaryAssetResultService",
+    "id": "cloudinary.asset.result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "read_resource_metadata",
+      "read_usage_metadata",
+      "read_transformation_metadata",
+      "read_delivery_metadata",
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "propose",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "CloudinaryProvider",
+    "id": "cloudinary.asset.result.recording",
+    "apiRevision": "cloudinary-admin-resource-usage-transformation-delivery-read-r1",
+    "operations": [
+      "resource_metadata_read",
+      "usage_metadata_read",
+      "transformation_metadata_read",
+      "delivery_metadata_read"
+    ],
+    "allowedTransports": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "cloudinary_api_key_or_signature",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "type": "MissionCloudinaryAssetConsumer",
+    "id": "mission.cloudinary-asset-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "cloudName",
+      "folder",
+      "assetId",
+      "publicId",
+      "version",
+      "transformation",
+      "delivery",
+      "projectId",
+      "missionId",
+      "workProductId"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque API-key/signature SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "cloudName",
+      "cloudRevision",
+      "folder",
+      "folderRevision",
+      "assetId",
+      "assetRevision",
+      "publicId",
+      "publicIdRevision",
+      "version",
+      "versionRevision",
+      "transformation",
+      "transformationRevision",
+      "delivery",
+      "deliveryRevision",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "rawMediaBytes": false,
+    "rawUrls": false,
+    "rawProviderPayload": false,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxResponseBytes": 1048576,
+    "maxCollectionItems": 64
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["reversed"],
+    "bindingDigests": [
+      "versionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "registrationDigest"
+    ],
+    "permissions": [
+      "cloudinary:resources.read",
+      "cloudinary:usage.read",
+      "cloudinary:transformations.read",
+      "cloudinary:delivery.metadata.read",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "cloudinary:upload",
+      "cloudinary:update",
+      "cloudinary:delete",
+      "cloudinary:transformation.create",
+      "cloudinary:signed_url.execute",
+      "cloudinary:raw_media.read",
+      "outcome.adopt"
+    ]
+  },
+  "paginationAndRetry": {
+    "markerOpaque": true,
+    "markerDigestOnly": true,
+    "maxAttempts": 3,
+    "maxBackoffSeconds": 30,
+    "cursorBoundTo": [
+      "cloud",
+      "folder",
+      "asset",
+      "pageSize",
+      "pageNumber",
+      "scopeDigest"
+    ],
+    "loopRejected": true,
+    "revisionDriftRejected": true,
+    "truncationIsNonAdoptable": true
+  },
+  "projection": {
+    "asset": [
+      "assetDigest",
+      "publicIdDigest",
+      "folderDigest",
+      "versionDigest",
+      "resourceType",
+      "state",
+      "bytes",
+      "width",
+      "height",
+      "formatDigest",
+      "derivedCount",
+      "metadataCount"
+    ],
+    "usage": [
+      "usageDigest",
+      "storageBytes",
+      "bandwidthBytes",
+      "requestCount",
+      "transformationCount"
+    ],
+    "transformation": [
+      "transformationDigest",
+      "componentCount",
+      "versionDigest"
+    ],
+    "delivery": [
+      "deliveryDigest",
+      "deliveryType",
+      "resourceType",
+      "formatDigest",
+      "versionDigest",
+      "signedUrlExecution",
+      "deliveryGuarantee"
+    ],
+    "rawMediaBytes": false,
+    "rawUrls": false,
+    "rawProviderPayload": false
+  },
+  "receipts": {
+    "request": {
+      "redacted": true,
+      "retain": [
+        "operation",
+        "requestDigest",
+        "pathDigest",
+        "scopeDigest",
+        "assetDigest",
+        "publicIdDigest",
+        "versionDigest",
+        "transformationDigest",
+        "deliveryDigest"
+      ],
+      "drop": [
+        "rawPathWithIdentifier",
+        "rawUrl",
+        "authorizationHeader",
+        "apiKey",
+        "signature",
+        "credentialMaterial"
+      ]
+    },
+    "cost": {
+      "redacted": true,
+      "retain": [
+        "responseBytes",
+        "boundedRequestUnits",
+        "costDigest"
+      ],
+      "estimateOnly": true,
+      "durableProviderReceipt": false
+    }
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "cloudDigest",
+      "folderDigest",
+      "assetDigest",
+      "publicIdDigest",
+      "versionDigest",
+      "transformationDigest",
+      "deliveryDigest",
+      "resourceDigest",
+      "usageDigest",
+      "transformationMetadataDigest",
+      "deliveryMetadataDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "present",
+      "deleted",
+      "invalid",
+      "partial",
+      "denied",
+      "rate_limited",
+      "access_loss",
+      "provider_unknown",
+      "tampered",
+      "registration_revoked"
+    ],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "partialIsNonAdoptable": true,
+    "deliveryGuarantee": false,
+    "signedUrlVerification": false
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "bounded resource, usage, transformation, and delivery metadata reads",
+      "digest-only Cloudinary asset evidence projection",
+      "scope, revision, retry, and idempotency fences",
+      "reversible and revocable registration",
+      "redacted request and cost receipts",
+      "Mission-scoped review-only proposal and recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "native Cloudinary credential resolution",
+      "live Cloudinary Admin or Delivery HTTPS",
+      "durable provider receipt",
+      "independent byte readback",
+      "signed URL execution or verification",
+      "upload, update, delete, or transformation creation",
+      "raw media or PII retention",
+      "production delivery certification",
+      "verified Work Product adoption"
+    ]
+  },
+  "forbiddenEffects": [
+    "upload",
+    "update",
+    "delete",
+    "create_transformation",
+    "execute_signed_url",
+    "verify_signed_url",
+    "download_raw_media",
+    "retain_pii",
+    "adopt_verified_work_product"
+  ],
+  "layer2Gaps": [
+    "native API-key/signature resolution and live Cloudinary HTTPS",
+    "durable Cloudinary provider receipt",
+    "independent media byte readback",
+    "signed URL execution and verification",
+    "consented upload/update/delete/transformation effects",
+    "raw media and PII handling",
+    "production delivery guarantee",
+    "verified Mission Work Product/Outcome adoption"
+  ],
+  "honestNativeGap": "Layer-1 uses only recording, fixture, loopback, and BLOCKED_ENV transports. None claims Connected, native, first-party, durable provider receipt, signed-URL verification, delivery guarantee, raw media access, or verified adoption. Native credential resolution, live Cloudinary Admin/Delivery HTTPS, independent byte readback, consented effects, and Work Product/Outcome adoption remain Layer-2 work."
+}
