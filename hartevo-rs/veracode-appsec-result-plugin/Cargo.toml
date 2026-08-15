@@ -3,7 +3,7 @@ members = ["."]
 resolver = "3"
 
 [package]
-name = "hartevo-veracode-result-plugin"
+name = "hartevo-veracode-appsec-result-plugin"
 description = "Standalone Layer-1 governed Veracode application-security evidence plugin"
 version = "0.1.0"
 edition = "2024"

@@ -62,8 +62,9 @@ pub const CONSUMER_ID: &str = "mission.veracode.result.consumer";
 pub const EVIDENCE_LEVEL: &str = "L1_PROVIDER_CONTRACT";
 pub const VERACODE_RESULTS_READ_PERMISSION: &str = "results.read";
 pub const RESULTS_READ_PERMISSION: &str = VERACODE_RESULTS_READ_PERMISSION;
-pub const CONTRACT_JSON: &str =
-    include_str!("../../../contracts/plugins/veracode-result/veracode-result.v1.json");
+pub const CONTRACT_JSON: &str = include_str!(
+    "../../../contracts/plugins/veracode-appsec-result/veracode-appsec-result.v1.json"
+);
 
 #[must_use]
 pub fn contract_digest() -> Digest {

@@ -204,7 +204,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hartevo-veracode-result-plugin"
+name = "hartevo-veracode-appsec-result-plugin"
 version = "0.1.0"
 dependencies = [
  "chrono",

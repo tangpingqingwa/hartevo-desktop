@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
-use hartevo_veracode_result_plugin::{
+use hartevo_veracode_appsec_result_plugin::{
     ApplicationProjection, BlockedEnvTransport, BuildProjection, BuildStatus, BusinessCriticality,
     Digest, EvidenceState, FindingProjection, FindingStatus, FixtureTransport, LoopbackTransport,
     MissionScope, MissionVeracodeResultConsumer, PermissionSnapshot, PolicyProjection,
@@ -33,7 +33,9 @@ fn scope() -> VeracodeScope {
     .expect("policy")
 }
 
-fn registration(scope: VeracodeScope) -> hartevo_veracode_result_plugin::VeracodeRegistration {
+fn registration(
+    scope: VeracodeScope,
+) -> hartevo_veracode_appsec_result_plugin::VeracodeRegistration {
     VeracodeResultService::new()
         .register(
             "registration-001",
@@ -135,9 +137,9 @@ fn resource_sets(scope: &VeracodeScope) -> ResourceSets {
 
 #[test]
 fn contract_and_secret_reference_are_opaque_and_non_native() {
-    assert!(!hartevo_veracode_result_plugin::Layer1Authority::connected());
-    assert!(!hartevo_veracode_result_plugin::Layer1Authority::native_provider());
-    assert!(!hartevo_veracode_result_plugin::Layer1Authority::first_party());
+    assert!(!hartevo_veracode_appsec_result_plugin::Layer1Authority::connected());
+    assert!(!hartevo_veracode_appsec_result_plugin::Layer1Authority::native_provider());
+    assert!(!hartevo_veracode_appsec_result_plugin::Layer1Authority::first_party());
     let secret =
         SecretReference::for_results_read("opaque-veracode-api-key", VeracodeRegion::Commercial)
             .expect("secret");
@@ -267,8 +269,9 @@ fn retries_and_rate_receipts_are_bounded_without_raw_headers() {
     let scope = scope();
     let registration = registration(scope.clone());
     let mut transport = RecordingTransport::for_scope(&scope).expect("recording");
-    let rate = hartevo_veracode_result_plugin::RateLimitReceipt::new(60, Some(0), Some(3), true)
-        .expect("rate receipt");
+    let rate =
+        hartevo_veracode_appsec_result_plugin::RateLimitReceipt::new(60, Some(0), Some(3), true)
+            .expect("rate receipt");
     for _ in 0..3 {
         transport.push_response(Err(
             VeracodeTransportError::from_status(429).with_rate_limit(rate.clone())
@@ -297,7 +300,7 @@ fn tamper_stale_revoked_and_reversible_registration_states_fail_closed() {
     let revoked = registration.revoke().expect("revoke");
     assert_eq!(
         revoked.new_status,
-        hartevo_veracode_result_plugin::RegistrationStatus::Revoked
+        hartevo_veracode_appsec_result_plugin::RegistrationStatus::Revoked
     );
     assert_ne!(registration.registration_digest(), &active_digest);
     registration.restore().expect("restore");

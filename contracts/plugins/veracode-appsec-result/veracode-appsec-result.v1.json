@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/veracode-result/veracode-result.v1.json",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/veracode-appsec-result/veracode-appsec-result.v1.json",
   "title": "Hartevo Veracode application-security result Layer-1 contract",
   "description": "Bounded, revision-fenced Veracode application, build, scan, finding, and policy evidence below Hartevo Truth and security-certification authority.",
   "schemaVersion": "hartevo.veracode-result/v1",
