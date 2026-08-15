@@ -1,0 +1,351 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/rudderstack-event-quality/contract.v1.json",
+  "title": "Hartevo RudderStack event-quality evidence Layer-1 contract",
+  "description": "Bounded, aggregate-only RudderStack source and tracking-plan governance evidence for Mission proposals.",
+  "schemaVersion": "hartevo-rudderstack-event-quality-contract/v1",
+  "contractVersion": "rudderstack-event-quality-e1/v1",
+  "pluginVersion": "1.0.0",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "authority": {
+    "readOnly": true,
+    "proposalOnly": true,
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "httpsTransport": false,
+    "durableReceipt": false,
+    "independentReadback": false,
+    "kernelAuthority": false,
+    "truthAuthority": false,
+    "outcomeAuthority": false,
+    "workProductAdoption": false,
+    "externalWrites": false,
+    "eventIngestion": false,
+    "eventTransformation": false,
+    "destinationMutation": false,
+    "trackingPlanMutation": false
+  },
+  "typedSurface": {
+    "service": "RudderStackEventQualityService",
+    "provider": "RudderStackProvider",
+    "consumer": "MissionRudderStackEventConsumer",
+    "models": [
+      "RudderStackScope",
+      "SecretReference",
+      "RudderStackPermissionSet",
+      "RudderStackRegistration",
+      "RudderStackSourceMetadata",
+      "RudderStackTrackingPlanVersion",
+      "RudderStackSchemaViolationAggregate",
+      "RudderStackDeliveryHealthAggregate",
+      "RudderStackGovernanceMetrics",
+      "CursorReceipt",
+      "RateLimitReceipt",
+      "RudderStackEventQualityEvidence",
+      "RudderStackEventQualityProposal"
+    ]
+  },
+  "service": {
+    "id": "rudderstack.event-quality.result",
+    "version": "1.0.0",
+    "operation": "bounded_event_quality_evidence_read_proposal",
+    "readOnly": true,
+    "proposalOnly": true,
+    "liveExecution": false,
+    "externalWrites": false,
+    "operations": [
+      "issue_read_consent",
+      "read_source_metadata",
+      "read_tracking_plan_versions",
+      "read_schema_violation_aggregates",
+      "read_delivery_health",
+      "read_governance_metrics",
+      "compile_event_quality_proposal",
+      "record_observation_receipt",
+      "verify_proposal",
+      "read_back_typed_proposal",
+      "revoke_registration",
+      "restore_registration"
+    ]
+  },
+  "provider": {
+    "id": "rudderstack.event-quality.read",
+    "version": "1.0.0",
+    "apiRevision": "rudderstack-event-quality-api-v1",
+    "origin": "https://api.rudderstack.com",
+    "method": "GET",
+    "operations": [
+      "source_metadata.read",
+      "tracking_plan_versions.read",
+      "schema_violations.read",
+      "delivery_health.read",
+      "governance_metrics.read"
+    ],
+    "allowlistedPaths": [
+      "/v1/sources/{sourceId}/metadata",
+      "/v1/tracking-plans/{trackingPlanId}/versions",
+      "/v1/sources/{sourceId}/schema-violations",
+      "/v1/destinations/{destinationId}/delivery-health",
+      "/v1/sources/{sourceId}/governance-metrics"
+    ],
+    "acceptedProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "authentication": "opaque_api_token_secret_reference_only",
+    "native": false,
+    "connected": false,
+    "firstParty": false,
+    "writes": false,
+    "rawCredentialSerialized": false,
+    "rawCredentialDebug": false,
+    "rawCredentialRequest": false,
+    "rawResponseBody": false
+  },
+  "consumer": {
+    "id": "mission.rudderstack.event-quality.consumer",
+    "kind": "mission_event_quality_projection",
+    "scope": [
+      "organization",
+      "workspace",
+      "source",
+      "destination",
+      "tracking_plan",
+      "violation",
+      "project",
+      "mission",
+      "work_product",
+      "window",
+      "permission_revision",
+      "scope_revision",
+      "source_evidence_digest"
+    ],
+    "proposalOnly": true,
+    "connected": false,
+    "nativeProvider": false,
+    "adoptsWorkProduct": false,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "organizationId",
+      "organizationRevision",
+      "workspaceId",
+      "workspaceRevision",
+      "sourceId",
+      "sourceRevision",
+      "destinationIdOrNone",
+      "destinationRevisionOrNone",
+      "trackingPlanIdOrNone",
+      "trackingPlanRevisionOrNone",
+      "violationAllowlist",
+      "violationRevision",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "window",
+      "permissionRevision",
+      "privacyPolicyDigest"
+    ],
+    "secret": "opaque_api_token_reference_only",
+    "leastPrivilege": true,
+    "revisionFenced": true
+  },
+  "permissions": [
+    "source_metadata.read",
+    "tracking_plan_versions.read",
+    "schema_violations.read",
+    "delivery_health.read",
+    "governance_metrics.read"
+  ],
+  "reads": {
+    "sourceMetadata": {
+      "aggregateOnly": true,
+      "retains": ["sourceId", "sourceType", "state", "boundedCounts", "metadataDigest"]
+    },
+    "trackingPlanVersions": {
+      "aggregateOnly": true,
+      "retains": ["trackingPlanId", "version", "planState", "eventNameDigest", "propertyDigest", "schemaDigest"]
+    },
+    "schemaViolations": {
+      "aggregateOnly": true,
+      "kinds": [
+        "unplanned_event",
+        "missing_required_property",
+        "datatype_mismatch",
+        "additional_property",
+        "unknown"
+      ],
+      "retains": ["violationKind", "eventNameDigest", "propertyNameDigest", "trackingPlanId", "count"]
+    },
+    "deliveryHealth": {
+      "aggregateOnly": true,
+      "retains": ["destinationId", "delivered", "failed", "retried", "dropped"]
+    },
+    "governanceMetrics": {
+      "aggregateOnly": true,
+      "retains": ["eventsValidated", "eventsWithViolations", "eventsDropped", "eventsForwarded", "eventsDelivered", "deliveryFailures", "violationCounts"]
+    }
+  },
+  "bounds": {
+    "maxWindowDays": 31,
+    "maxPageSize": 100,
+    "maxCursorBytes": 256,
+    "maxResponseBytes": 262144,
+    "maxDiagnosticBytes": 512,
+    "maxEventNames": 128,
+    "maxProperties": 256,
+    "maxViolations": 256,
+    "maxRequestsPerMinute": 60,
+    "maxAggregateCount": 1000000000
+  },
+  "receipts": {
+    "cursor": ["cursorDigest", "page", "pageSize", "hasMore", "requestDigest"],
+    "rateLimit": ["limitPerMinute", "remaining", "retryAfterSeconds", "throttled"],
+    "observation": true,
+    "durableNativeReceipt": false,
+    "rawCursor": false,
+    "rawHeaders": false,
+    "rawResponseBody": false
+  },
+  "normalization": {
+    "eventNames": "digest_only",
+    "propertyNames": "digest_only",
+    "schema": "deterministic_digest",
+    "responseOrderIndependent": true,
+    "rawEvents": "dropped",
+    "identities": "dropped",
+    "payloadBodies": "dropped",
+    "states": [
+      "complete",
+      "partial",
+      "empty",
+      "rate_limited",
+      "access_lost",
+      "provider_unknown",
+      "tamper",
+      "stale",
+      "revoked"
+    ],
+    "emptyIsSuccess": false,
+    "rateIsGovernanceEvidenceOnly": true
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "privacyDigestBound": true,
+    "secretReferenceDigestBound": true,
+    "evidenceDigestBound": true,
+    "registrationDigestBound": true,
+    "revisionFenced": true,
+    "reversible": true,
+    "revocable": true,
+    "rotationOnStateChange": true,
+    "failClosedOn": [
+      "version_drift",
+      "contract_drift",
+      "provider_drift",
+      "permission_drift",
+      "scope_drift",
+      "source_revision_drift",
+      "tracking_plan_revision_drift",
+      "violation_scope_drift",
+      "destination_revision_drift",
+      "mission_stale",
+      "work_product_revision_drift",
+      "evidence_tamper",
+      "response_tamper",
+      "stale",
+      "revocation",
+      "replay"
+    ]
+  },
+  "privacyPolicy": {
+    "version": "rudderstack-event-quality-privacy/v1",
+    "requiredRedactions": [
+      "raw_event",
+      "raw_payload",
+      "user_identity",
+      "anonymous_identity",
+      "device_identity",
+      "api_token",
+      "raw_cursor",
+      "raw_response_body",
+      "raw_diagnostic"
+    ],
+    "retained": [
+      "bounded_resource_ids",
+      "event_name_digest",
+      "property_name_digest",
+      "schema_digest",
+      "aggregate_counts",
+      "response_digest",
+      "evidence_digest",
+      "redaction_summary"
+    ],
+    "rawEvents": false,
+    "rawIdentities": false,
+    "rawPayloads": false
+  },
+  "forbidden": [
+    "raw_event_retention",
+    "raw_identity_retention",
+    "raw_payload_retention",
+    "raw_api_token_retention",
+    "event_send",
+    "event_transform",
+    "destination_write",
+    "source_mutation",
+    "tracking_plan_create",
+    "tracking_plan_update",
+    "tracking_plan_delete",
+    "tracking_plan_replay",
+    "destination_configuration_mutation",
+    "kernel_receipt_authority",
+    "verified_work_product_adoption",
+    "truth_authority",
+    "outcome_authority",
+    "consent_authority"
+  ],
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "httpsTransport": false,
+    "durableReceipt": false,
+    "readback": false,
+    "adoptedWorkProduct": false,
+    "adoptedOutcome": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "native_opaque_api_token_resolution",
+    "native_https_read_execution",
+    "durable_provider_receipt",
+    "independent_reread_and_reconciliation",
+    "consented_governance_effects",
+    "verified_work_product_adoption",
+    "kernel_truth_or_outcome_authority"
+  ],
+  "states": [
+    "complete",
+    "partial",
+    "empty",
+    "rate_limited",
+    "access_lost",
+    "provider_unknown",
+    "tamper",
+    "stale",
+    "revoked"
+  ],
+  "documentation": [
+    "https://www.rudderstack.com/docs/",
+    "https://www.rudderstack.com/knowledge-base/get-started-with-tracking-plans/"
+  ]
+}
