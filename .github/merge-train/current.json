@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "779c0f1dfb1b0b695b0deb875f6be586aee5c1c7",
+  "baseCommit": "4e39c3312da2d15af0bc737294ceb2a1fdf73e2e",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-mistral-inference-result-01",
-      "headCommit": "e194144b1246c96c7020d244143ad0ff493ca0ca",
-      "number": 717
+      "headBranch": "codex/ext-brex-01",
+      "headCommit": "2b1169fe4a900cde5c5fcf2ecd74c224f780e940",
+      "number": 727
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-statuspage-incident-result-01",
-      "headCommit": "80f36ef00b7a459f54d045014b455e63f375be3f",
-      "number": 718
+      "headBranch": "codex/issue-713-ext-chargebee-subscription-result-01",
+      "headCommit": "5beaf0337a123fa920bdc670001995a21fc8e4bd",
+      "number": 731
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-lokalise-localization-result-01",
-      "headCommit": "38fd05df1df5360052e2b264c272f6bc6e056235",
-      "number": 719
+      "headBranch": "codex/issue-722-ext-planetscale-branch-result-01",
+      "headCommit": "578fa3d528d3021e30c6adb32446d952907e5170",
+      "number": 732
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-701-bamboohr-directory-result",
-      "headCommit": "d7674882f96a1f42f9324cd3e21d46e8b76320d4",
-      "number": 726
+      "headBranch": "codex/ext-deepgram-transcript-result-01",
+      "headCommit": "43c18159c2a4a23c51d5d1a55b771ae4c4f4dbb4",
+      "number": 735
     }
   ],
-  "createdAt": "2026-08-15T16:17:08Z",
+  "createdAt": "2026-08-15T16:48:58Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-162000"
+  "trainBranch": "merge-train/20260815-164800"
 }
