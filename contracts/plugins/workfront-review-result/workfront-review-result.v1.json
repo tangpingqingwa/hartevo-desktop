@@ -1,0 +1,333 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/workfront-review-result/workfront-review-result.v1.json",
+  "title": "Hartevo Adobe Workfront review-approval result Layer-1 contract",
+  "description": "Bounded project/task/review/approval state evidence below kernel authority.",
+  "schemaVersion": "hartevo.workfront-review-result/v1",
+  "contractVersion": "EXT-WORKFRONT-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "workfront.review.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.workfront-review-result/v1|layer=1|service=workfront.review.result.read|provider=workfront.review.result.recording|consumer=mission.workfront-review-result.consumer|api=workfront-attask-v15-unified-review-approvals-r1",
+  "contractDigest": "3e15b2ecfff2f5fb3b7d5e6c198d1a33ba77d7f43876a18281ec5141f005e95c",
+  "service": {
+    "type": "WorkfrontReviewResultService",
+    "id": "workfront.review.result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "read_project",
+      "read_task",
+      "read_review",
+      "read_approval",
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "WorkfrontProvider",
+    "id": "workfront.review.result.recording",
+    "apiRevision": "workfront-attask-v15-unified-review-approvals-r1",
+    "operations": [
+      "GET project state",
+      "GET task state",
+      "GET review state",
+      "GET approval state"
+    ],
+    "allowlistedTransports": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "oauth2_or_api_reference",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false,
+    "approvalEffects": false
+  },
+  "consumer": {
+    "type": "MissionWorkfrontReviewConsumer",
+    "id": "mission.workfront-review-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "tenant",
+      "workfrontProject",
+      "task",
+      "document",
+      "review",
+      "approval",
+      "assignee",
+      "timeWindow",
+      "missionIdAndRevision",
+      "projectIdAndRevision",
+      "workProductIdAndRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque OAuth/API SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "tenant",
+      "workfrontProject",
+      "task",
+      "document",
+      "review",
+      "approval",
+      "assignee",
+      "timeWindow",
+      "expectedProjectRevision",
+      "expectedTaskRevision",
+      "expectedReviewRevision",
+      "expectedApprovalRevision",
+      "missionIdAndRevision",
+      "projectIdAndRevision",
+      "workProductIdAndRevision",
+      "permissionDigest",
+      "scopeDigest"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "rawDocumentBytes": false,
+    "rawReviewerPii": false,
+    "rawComments": false,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxResponseBytes": 1048576,
+    "maxReviewerRoleDigests": 16
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "bindingDigests": [
+      "versionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "registrationStatus",
+      "registrationDigest"
+    ],
+    "permissions": [
+      "workfront:project:read",
+      "workfront:task:read",
+      "workfront:review:read",
+      "workfront:approval:read",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "workfront:project:write",
+      "workfront:task:write",
+      "workfront:document:download",
+      "workfront:review:decide",
+      "workfront:approval:approve",
+      "workfront:approval:reject",
+      "workfront:approval:recall",
+      "outcome.adopt",
+      "work_product.adopt"
+    ]
+  },
+  "pagination": {
+    "style": "opaque_cursor",
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "tenant",
+      "scopeDigest",
+      "registrationDigest",
+      "operation",
+      "pageSize",
+      "pageNumber"
+    ],
+    "explicitAllowlist": true,
+    "loopRejected": true,
+    "filterDriftRejected": true,
+    "truncationIsNonAdoptable": true
+  },
+  "projection": {
+    "states": [
+      "PENDING",
+      "IN_REVIEW",
+      "APPROVED",
+      "REJECTED",
+      "CHANGES_REQUESTED",
+      "EXPIRED",
+      "PARTIAL",
+      "ACCESS_LOST",
+      "PROVIDER_UNKNOWN",
+      "TAMPERED",
+      "REVOKED"
+    ],
+    "allowlistedFields": [
+      "projectState",
+      "taskState",
+      "reviewState",
+      "approvalState",
+      "revisionDigests",
+      "decisionTimestamps",
+      "reviewerRoleDigests",
+      "assigneeDigest",
+      "paginationComplete",
+      "requestReceiptDigest",
+      "costDigest",
+      "evidenceDigest"
+    ],
+    "rawProjectPayload": false,
+    "rawTaskPayload": false,
+    "rawReviewPayload": false,
+    "rawApprovalPayload": false,
+    "documentBytes": false,
+    "reviewerPii": false,
+    "reviewerComments": false,
+    "approvalEffect": false
+  },
+  "receipts": {
+    "request": {
+      "redacted": true,
+      "retain": [
+        "operation",
+        "requestDigest",
+        "pathDigest",
+        "scopeDigest",
+        "cursorDigest"
+      ],
+      "drop": [
+        "rawPathWithIdentifier",
+        "authorizationHeader",
+        "credentialMaterial"
+      ]
+    },
+    "cost": {
+      "redacted": true,
+      "retain": [
+        "operation",
+        "responseBytes",
+        "boundedRequestUnits",
+        "costDigest"
+      ],
+      "estimateOnly": true,
+      "durableProviderReceipt": false
+    }
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "projectReadDigest",
+      "taskReadDigest",
+      "reviewReadDigest",
+      "approvalReadDigest",
+      "paginationDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "ready",
+      "pending",
+      "in_review",
+      "approved",
+      "rejected",
+      "changes_requested",
+      "expired",
+      "partial",
+      "access_lost",
+      "provider_unknown",
+      "tampered",
+      "registration_revoked"
+    ],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "staleRevisionRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "partialIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "providerReceipt": false,
+    "nativeReadback": false
+  },
+  "authorityBoundary": {
+    "truth": false,
+    "consent": false,
+    "effect": false,
+    "receipt": false,
+    "verification": false,
+    "outcome": false,
+    "workProduct": false,
+    "secondWorkGraph": false
+  },
+  "forbiddenEffects": [
+    "create_project",
+    "update_project",
+    "create_task",
+    "update_task",
+    "download_document",
+    "approve_review",
+    "reject_review",
+    "approve_approval",
+    "reject_approval",
+    "recall_approval",
+    "serialize_reviewer_pii",
+    "serialize_comments",
+    "serialize_document_bytes",
+    "resolve_live_secret",
+    "claim_connected",
+    "claim_native",
+    "claim_first_party",
+    "adopt_outcome",
+    "adopt_work_product"
+  ],
+  "layer2Gaps": [
+    "native_oauth_or_api_reference_resolution",
+    "authenticated_workfront_https",
+    "durable_provider_receipts",
+    "independent_native_readback",
+    "project_task_review_or_approval_mutation",
+    "approval_or_decision_effects",
+    "document_download_or_raw_proof_bytes",
+    "reviewer_pii_or_comment_access",
+    "host_owned_consent_and_effect_authority",
+    "verified_mission_work_product_adoption"
+  ]
+}
