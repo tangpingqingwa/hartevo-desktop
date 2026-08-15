@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/aws-appflow-flow-result/contract.v1.json",
+  "title": "Hartevo AWS AppFlow flow-execution result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-appflow-flow-result/v1",
+  "contractVersion": "EXT-AWS-APPFLOW-01-L1/v1",
+  "pluginId": "aws.appflow.flow-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-appflow-flow-result/v1|layer=1|service=aws.appflow.flow-result.read|provider=aws.appflow.flow-result.recording|consumer=mission.aws-appflow-flow-result.consumer",
+  "contractDigest": "ed9d6f03f4d9b4694e56af960ce13056e4fd6f50b427f1d6aa5c71c9aa7c1e73",
+  "service": {
+    "type": "AwsAppFlowResultService",
+    "id": "aws.appflow.flow-result.read",
+    "version": "1.0.0",
+    "operations": [
+      "ListFlows",
+      "DescribeFlow",
+      "DescribeFlowExecutionRecords",
+      "proposal",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false,
+    "mutations": []
+  },
+  "provider": {
+    "type": "AwsAppFlowProvider",
+    "id": "aws.appflow.flow-result.recording",
+    "apiRevision": "appflow-list-flows-describe-flow-describe-flow-execution-records-1",
+    "operations": [
+      "appflow:ListFlows",
+      "appflow:DescribeFlow",
+      "appflow:DescribeFlowExecutionRecords"
+    ],
+    "acceptedProvenance": ["recording", "fixture", "loopback", "blocked_env"],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "serialized": false,
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAwsAppFlowConsumer",
+    "id": "mission.aws-appflow-flow-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "flowName",
+      "executionId",
+      "sourceConnector",
+      "targetConnector",
+      "triggerType",
+      "projectId",
+      "missionId",
+      "workProductId"
+    ],
+    "digests": [
+      "accountDigest",
+      "regionDigest",
+      "flowDigest",
+      "executionDigest",
+      "sourceDigest",
+      "targetDigest",
+      "triggerDigest",
+      "projectDigest",
+      "missionDigest",
+      "workProductDigest"
+    ],
+    "revisions": [
+      "flowRevision",
+      "executionRevision",
+      "projectRevision",
+      "missionRevision",
+      "workProductRevision"
+    ],
+    "sourceTargetRecords": false,
+    "rawConnectorConfiguration": false
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked"],
+    "restorableStatuses": ["reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "flowRevision",
+      "executionRevision",
+      "registrationRevision"
+    ],
+    "permissions": [
+      "appflow:ListFlows",
+      "appflow:DescribeFlow",
+      "appflow:DescribeFlowExecutionRecords",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "appflow:StartFlow",
+      "appflow:StopFlow",
+      "appflow:DeleteFlow",
+      "appflow:UpdateFlow",
+      "appflow:CreateFlow",
+      "appflow:UpdateConnectorProfile",
+      "appflow:DeleteConnectorProfile",
+      "iam:PassRole",
+      "appflow:ListTagsForResource",
+      "source.record.read",
+      "target.record.read",
+      "outcome.adopt"
+    ],
+    "failClosedOnDrift": true
+  },
+  "pagination": {
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "operation",
+      "scopeDigest",
+      "flowDigest",
+      "executionDigest",
+      "filterDigest",
+      "flowRevision",
+      "executionRevision",
+      "pageNumber"
+    ],
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxResponseBytes": 1048576,
+    "rawTokenRetained": false,
+    "filterDriftRejected": true,
+    "revisionDriftRejected": true,
+    "partialPageIsNonAdoptable": true
+  },
+  "projections": {
+    "executionStates": [
+      "completed",
+      "in_progress",
+      "failed",
+      "partial",
+      "not_found",
+      "access_loss",
+      "throttled",
+      "provider_unknown",
+      "tamper",
+      "replay"
+    ],
+    "timing": ["startedAt", "endedAt", "durationMs"],
+    "counters": [
+      "recordsProcessed",
+      "bytesProcessed",
+      "bytesWritten",
+      "putFailures"
+    ],
+    "countersBounded": true,
+    "sourceTarget": "digest_only",
+    "trigger": "allowlisted_or_digest",
+    "error": "bounded_class_only",
+    "rawErrors": false,
+    "rawSourceRecords": false,
+    "rawTargetRecords": false,
+    "rawFlowConfiguration": false,
+    "providerReceipt": false
+  },
+  "provenance": {
+    "recording": {
+      "connected": false,
+      "native": false,
+      "firstParty": false
+    },
+    "fixture": {
+      "connected": false,
+      "native": false,
+      "firstParty": false
+    },
+    "loopback": {
+      "connected": false,
+      "native": false,
+      "firstParty": false
+    },
+    "blockedEnv": {
+      "connected": false,
+      "native": false,
+      "firstParty": false
+    }
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS AppFlow account/region/flow/execution/source/target/trigger scope",
+      "bounded ListFlows projection",
+      "bounded DescribeFlow projection",
+      "bounded DescribeFlowExecutionRecords projection",
+      "flow and execution revision fences",
+      "version/contract/provider/permission/consent/scope/evidence digests",
+      "reversible registration and revocation",
+      "redacted deterministic proposal/record/verify projections"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live AWS AppFlow HTTPS",
+      "StartFlow, StopFlow, DeleteFlow, UpdateFlow, or CreateFlow effects",
+      "connector credential mutation",
+      "source records or target records",
+      "raw provider errors or flow configuration",
+      "delivery correctness",
+      "independent destination read-back",
+      "verified Work Product adoption"
+    ]
+  },
+  "honesty": {
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "durableProviderReceipt": false,
+    "rawSecretSerialized": false,
+    "rawErrorsRetained": false,
+    "sourceTargetRecordsRetained": false,
+    "kernelAuthority": false,
+    "workProductAdopted": false
+  },
+  "layer2Gaps": [
+    "native_sigv4_credential_resolution",
+    "live_aws_appflow_https",
+    "durable_provider_receipt",
+    "independent_destination_reconciliation",
+    "consented_flow_effects",
+    "source_and_target_record_access",
+    "delivery_correctness_claim",
+    "connected_native_first_party_evidence",
+    "kernel_outcome_or_work_product_adoption"
+  ]
+}
