@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "c26e0aac016b0bb00659e95d8ccc37b3fc9cd809",
+  "baseCommit": "2ff561668af581634860128c457b89d8d1050005",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-510-ext-aws-iam-access-analyzer-01",
-      "headCommit": "a42be9fef69b9dc6ac5a947602f961d219ee8d43",
-      "number": 532
+      "headBranch": "codex/issue-524-ext-gcp-security-center-result-01",
+      "headCommit": "5592f14d30bfbf4a7b23f080f31ef083e042e96a",
+      "number": 547
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-522-ext-gcp-iam-analysis-01",
-      "headCommit": "ebe3ec798e055029403976959de7255d8a6722dc",
-      "number": 539
+      "headBranch": "issue-531-ext-aws-health-event-result-01",
+      "headCommit": "720e9200180540100b2b80f0400cb5f13eacee6c",
+      "number": 556
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-529-ext-gcp-binary-authorization-result-01",
-      "headCommit": "7f820ffd74874bd4447ebed56739a51039298e60",
-      "number": 545
+      "headBranch": "codex/ext-splunk-search-01",
+      "headCommit": "0e87242013bfc9f6b2cac46ec13cc594f9793a62",
+      "number": 849
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-530-gcp-asset-inventory-result-01",
-      "headCommit": "5719aea861483832be398c0402b24deb605da32b",
-      "number": 546
+      "headBranch": "codex/ext-gcp-cloud-logging-01",
+      "headCommit": "5104f519526c3bcc0eefa0f7eb99fa8ef0b15928",
+      "number": 850
     }
   ],
-  "createdAt": "2026-08-15T18:58:38Z",
+  "createdAt": "2026-08-15T19:28:25Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-185900"
+  "trainBranch": "merge-train/20260815-192700"
 }
