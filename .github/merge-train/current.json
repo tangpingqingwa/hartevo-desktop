@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "fa4545177f5e36679e3c54c0ac717b06e95fc875",
+  "baseCommit": "8b87a004182c8035828fc15a4313ffd52b5c30ed",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-589-ext-aws-codeartifact-provenance-result-01",
-      "headCommit": "9ffacadb787449db29b7d08755e9515ae45598bd",
-      "number": 605
+      "headBranch": "codex/issue-600-ext-aws-network-firewall-posture-result-01",
+      "headCommit": "bc5e28a858ea5d5603174d82ca370b9659dffb2e",
+      "number": 617
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/gh582-aws-eventbridge-pipe-result",
-      "headCommit": "a2a9454b7188878473e84b5450d6f02691bdb39f",
-      "number": 606
+      "headBranch": "codex/aws-cloudformation-drift-result-594",
+      "headCommit": "152266c71ba0bcf840013f446559bf00daef776b",
+      "number": 618
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/aws-inspector-vulnerability-result-596",
-      "headCommit": "16736b3c10a009fe9ba2bfc5531f2c367dfa4cca",
-      "number": 607
+      "headBranch": "codex/issue-608-ext-aws-synthetics-canary-result-01",
+      "headCommit": "f17dcf76172628a9ab9de2afcf401e15ecbd721e",
+      "number": 621
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-599-aws-elastic-beanstalk",
-      "headCommit": "7247e3101a35b764437b023d1f56b66f4970ce05",
-      "number": 615
+      "headBranch": "codex/issue-612-github-dependabot-result",
+      "headCommit": "273f7c3e75970bcf89ff30fa3c3a8264cb031993",
+      "number": 622
     }
   ],
-  "createdAt": "2026-08-15T23:23:58Z",
+  "createdAt": "2026-08-15T23:54:15Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-233000"
+  "trainBranch": "merge-train/20260815-235352"
 }
