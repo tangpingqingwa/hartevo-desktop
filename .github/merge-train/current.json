@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "fbe9436684d1e1f161eddc414c94a92839bce7b9",
+  "baseCommit": "7904db4db8a5f5540ac96bf5015b41e5b224498d",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-828-aws-neptune-graph-result",
-      "headCommit": "06f8bad09a2d3cc35cee76f772fd0a2128a3890b",
-      "number": 843
+      "headBranch": "codex/ext-flyio-01-flyio-deployment-result",
+      "headCommit": "eeb6159b5118e940e0b7f51083ffa8d6d44f378d",
+      "number": 851
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-azure-monitor-logs-result",
-      "headCommit": "b9350be072d3702e40af6378a42bccb799dbe251",
-      "number": 844
+      "headBranch": "codex/issue-838-ext-azure-service-bus-01",
+      "headCommit": "a5d042311f225d79efd4f7d6e04604a83be2dae2",
+      "number": 852
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-835-gcp-pubsub-subscription-result",
-      "headCommit": "729c816014ae1375be25e809ec94554a974b9d31",
-      "number": 846
+      "headBranch": "codex/aws-kinesis-stream-result-834",
+      "headCommit": "e7e6cf81b290d2e5829b3b8516494499c88cb680",
+      "number": 857
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-dynatrace-problem-01",
-      "headCommit": "f22d9322ef41aac2cadeb52aea5cab18dbc6d0db",
-      "number": 847
+      "headBranch": "codex/issue-845-ext-nomad-deployment-result-01",
+      "headCommit": "9a667eaa160e1e5128cd9e2f71345c201013a5d5",
+      "number": 865
     }
   ],
-  "createdAt": "2026-08-15T10:26:12Z",
+  "createdAt": "2026-08-15T11:01:00Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-102500"
+  "trainBranch": "merge-train/20260815-110000"
 }
