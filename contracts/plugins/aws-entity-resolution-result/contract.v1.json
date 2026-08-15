@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-entity-resolution-result/contract.v1.json",
+  "title": "Hartevo AWS Entity Resolution match-evidence result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-entity-resolution-result/v1",
+  "contractVersion": "EXT-AWS-ENTITY-RESOLUTION-01-L1/v1",
+  "pluginId": "aws.entity-resolution.result",
+  "objectiveType": "entity_match_evidence",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-entity-resolution-result/v1|layer=1|service=aws.entity-resolution.result.read|provider=aws.entity-resolution.result.recording|consumer=mission.aws-entity-resolution.consumer",
+  "contractDigest": "da7bd0a4191183bf97e2cba6f98ecc19c731d170d42a2f627b3bc741a91dfefd",
+  "service": {
+    "type": "AwsEntityResolutionResultService",
+    "id": "aws.entity-resolution.result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register_scope",
+      "list_id_namespaces",
+      "get_id_namespace_metadata",
+      "get_matching_workflow_metadata",
+      "get_schema_mapping_metadata",
+      "get_match_id_dry_run",
+      "compile_match_evidence_proposal",
+      "verify_match_evidence",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "identityMutation": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "type": "AwsEntityResolutionProvider",
+    "id": "aws.entity-resolution.result.recording",
+    "apiRevision": "list-id-namespaces-get-id-namespace-get-matching-workflow-get-schema-mapping-get-match-id-1",
+    "operations": [
+      "ListIdNamespaces",
+      "GetIdNamespace",
+      "GetMatchingWorkflow",
+      "GetSchemaMapping",
+      "GetMatchId"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "serviceName": "entityresolution",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false,
+      "resolvedByLayer": 2
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAwsEntityResolutionConsumer",
+    "id": "mission.aws-entity-resolution.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "awsAccountId",
+      "awsRegion",
+      "schemaMapping",
+      "idNamespace",
+      "matchingWorkflow",
+      "sourceRecordFingerprint",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "identityAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque non-serializing SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "schemaMapping",
+      "idNamespace",
+      "matchingWorkflow",
+      "sourceRecordFingerprint",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "resourceIdentifiersInEvidence": "digest_only",
+    "sourceRecordBytes": false,
+    "rawNames": false,
+    "rawEmails": false,
+    "rawPhones": false,
+    "rawMatchIds": false,
+    "identityMapBytes": false,
+    "s3Outputs": false,
+    "maxPages": 4,
+    "maxPageSize": 25,
+    "maxResponseBytes": 1048576,
+    "maxRecordFields": 32,
+    "maxFieldBytes": 255
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "evidenceContractDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "status"
+    ],
+    "permissions": [
+      "entityresolution:ListIdNamespaces",
+      "entityresolution:GetIdNamespace",
+      "entityresolution:GetMatchingWorkflow",
+      "entityresolution:GetSchemaMapping",
+      "entityresolution:GetMatchId",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "entityresolution:CreateIdNamespace",
+      "entityresolution:UpdateIdNamespace",
+      "entityresolution:DeleteIdNamespace",
+      "entityresolution:CreateMatchingWorkflow",
+      "entityresolution:UpdateMatchingWorkflow",
+      "entityresolution:DeleteMatchingWorkflow",
+      "entityresolution:StartMatchingJob",
+      "entityresolution:CreateSchemaMapping",
+      "entityresolution:UpdateSchemaMapping",
+      "entityresolution:DeleteSchemaMapping",
+      "s3:GetObject",
+      "kms:Decrypt",
+      "iam:PassRole",
+      "outcome.adopt",
+      "work_product.adopt"
+    ]
+  },
+  "metadata": {
+    "idNamespaces": [
+      "nameDigest",
+      "arnDigest",
+      "type",
+      "descriptionDigest",
+      "idMappingTypeDigests",
+      "createdAt",
+      "updatedAt"
+    ],
+    "matchingWorkflow": [
+      "nameDigest",
+      "arnDigest",
+      "matchingType",
+      "schemaMappingDigest",
+      "idNamespaceDigest",
+      "sourceCount",
+      "normalizationEnabled",
+      "ruleCount",
+      "createdAt",
+      "updatedAt"
+    ],
+    "schemaMapping": [
+      "nameDigest",
+      "arnDigest",
+      "attributeCount",
+      "attributeTypeCounts",
+      "primaryKeyPresent",
+      "normalizationEnabled",
+      "createdAt",
+      "updatedAt"
+    ],
+    "outputLocation": false,
+    "rawProviderDescriptions": false,
+    "rawSchemaFields": false
+  },
+  "matchEvidence": {
+    "operation": "GetMatchId_dry_run",
+    "input": "sourceRecordFingerprintDigestOnly",
+    "redactedFields": [
+      "matchGroupDigest",
+      "matchRuleDigest",
+      "resultDigest"
+    ],
+    "statuses": [
+      "MATCHED",
+      "UNMATCHED",
+      "AMBIGUOUS",
+      "INVALID",
+      "PARTIAL",
+      "ACCESS_LOST",
+      "PROVIDER_UNKNOWN",
+      "TAMPERED",
+      "REVOKED"
+    ],
+    "rawMatchId": false,
+    "rawMatchRule": false,
+    "identityCertainty": false,
+    "causalAttribution": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "namespaceDigest",
+      "workflowDigest",
+      "schemaDigest",
+      "sourceRecordFingerprintDigest",
+      "requestDigest",
+      "matchGroupDigest",
+      "matchRuleDigest",
+      "resultDigest",
+      "evidenceDigest"
+    ],
+    "tamperRejected": true,
+    "registrationDriftRejected": true,
+    "revocationRejected": true,
+    "partialIsNonAdoptable": true,
+    "accessLossIsNonAdoptable": true,
+    "providerUnknownIsNonAdoptable": true,
+    "allResultsReviewOnly": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS account/region/schema-mapping/id-namespace/matching-workflow scope",
+      "bounded ListIdNamespaces and metadata read seams",
+      "dry-run GetMatchId proposal and redacted result evidence",
+      "deterministic source-record normalization and fingerprint fences",
+      "version/contract/provider/permission/scope/evidence digests",
+      "reversible registration",
+      "redacted idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live AWS Entity Resolution HTTPS",
+      "workflow/schema/namespace mutation",
+      "bulk matching jobs",
+      "raw names, emails, phones, or source records",
+      "raw match IDs or identity-map bytes",
+      "S3 outputs",
+      "identity certainty or causal attribution",
+      "verified Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live AWS Entity Resolution HTTPS",
+    "consented matching effects",
+    "workflow/schema/namespace mutation",
+    "bulk matching jobs",
+    "durable provider receipt",
+    "independent native read-back",
+    "identity-map or S3 output access",
+    "Connected/native/first-party evidence",
+    "identity certainty, causal attribution, or Mission adoption"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live metadata/GetMatchId HTTPS, matching effects, durable provider receipts, independent read-back, identity-map/S3 output access, and verified Mission adoption remain Layer-2 work; recording, fixture, loopback and BLOCKED_ENV never claim Connected, native or first-party evidence. A matched result is provider match evidence only, not identity certainty or causal attribution."
+}
