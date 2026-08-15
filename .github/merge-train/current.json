@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "37ccef18574073b51346ff875339dff393870cfa",
+  "baseCommit": "601315d5fbc2a3d8a31d7a9f6e24d7ad0607e800",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-863-gcp-alloydb-cluster-result",
-      "headCommit": "f8750de748244345f423aeec550d30acf95958e5",
-      "number": 872
+      "headBranch": "codex/ext-redis-cloud-01",
+      "headCommit": "5b8f6ff7e286b155a184b7f8c3f9a407e0f81658",
+      "number": 875
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-861-hcp-packer-artifact-result",
-      "headCommit": "e98e70b6547b7a055e87d50853e0485f0a47fafd",
-      "number": 873
+      "headBranch": "codex/issue-859-ext-gcp-bigtable",
+      "headCommit": "6b1879d03410c8bbd6aeae39f39b76f6e2a3dc5c",
+      "number": 876
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-841-azure-cosmosdb-container-result-01",
-      "headCommit": "3b19849bf097d9e83606e44fcc59c5ad12762c2f",
-      "number": 874
+      "headBranch": "codex/gcp-cloud-sql-instance-result-842",
+      "headCommit": "0f16f55cdf19969b32d56a4e74d5ad77057c8e17",
+      "number": 877
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-860-azure-container-apps-revision-result",
-      "headCommit": "5134ecb0af930df8ff7b93ba94dd2fe5d1d16f41",
-      "number": 879
+      "headBranch": "codex/ext-azure-event-hub-posture-result-864",
+      "headCommit": "f57e89808ff272de261816834740cc7b14367175",
+      "number": 878
     }
   ],
-  "createdAt": "2026-08-15T08:54:34Z",
+  "createdAt": "2026-08-15T09:30:34Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-085404"
+  "trainBranch": "merge-train/20260815-093100"
 }
