@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::aggregate::{PendingEvent, append_events};
 use crate::normalized::update_mission_normalized_cas;
+use crate::relationship_projection_store::upsert_inbox_projection_for_conversation;
 use crate::{PersistedMutation, ProjectStore, StorageError};
 
 impl ProjectStore {
@@ -53,6 +54,7 @@ impl ProjectStore {
             expected_conversation_revision,
         )?;
         persist_conversation_messages(&transaction, conversation)?;
+        upsert_inbox_projection_for_conversation(&transaction, conversation)?;
         update_mission_normalized_cas(&transaction, mission, expected_mission_revision)?;
         append_events(
             &transaction,
@@ -100,6 +102,7 @@ impl ProjectStore {
         ensure_conversation_scope(&transaction, conversation)?;
         insert_conversation(&transaction, conversation)?;
         persist_conversation_messages(&transaction, conversation)?;
+        upsert_inbox_projection_for_conversation(&transaction, conversation)?;
         finish(
             transaction,
             &conversation.tenant_id,
@@ -135,6 +138,7 @@ impl ProjectStore {
             expected_revision,
         )?;
         persist_conversation_messages(&transaction, conversation)?;
+        upsert_inbox_projection_for_conversation(&transaction, conversation)?;
         finish(
             transaction,
             &conversation.tenant_id,

@@ -507,6 +507,7 @@ fn fixture_project_projection(
             keyring_revision: 1,
         },
         missions,
+        inbox: None,
     }
 }
 

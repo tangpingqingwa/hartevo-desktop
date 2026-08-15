@@ -17,13 +17,13 @@ use hartevo_application::{
 };
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_domain_kernel::{
-    CadenceTriggerKind, KpiContract, KpiDirection, MissionCheckpointCompletionPolicy,
-    MissionCheckpointExecutor, MissionCheckpointStatus, MissionConversationMessageId,
-    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionScheduleStatus,
-    MissionStage, Money, OperatingMode, OutcomeDecision, OutcomeReviewCaveat,
-    OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus, ProjectEncryptionMode, ProjectId,
-    RuntimeProcessClaimStatus, RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode,
-    WorkProductId, WorkProductStatus,
+    CadenceTriggerKind, ConversationState, KpiContract, KpiDirection,
+    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointStatus,
+    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
+    MissionId, MissionScheduleStatus, MissionStage, Money, OperatingMode, OutcomeDecision,
+    OutcomeReviewCaveat, OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus,
+    ProjectEncryptionMode, ProjectId, RuntimeProcessClaimStatus, RuntimeRecoveryStatus,
+    RuntimeTurnStatus, StorageMode, WorkProductId, WorkProductStatus,
 };
 use rust_decimal::Decimal;
 use zeroize::Zeroizing;
@@ -6627,6 +6627,16 @@ fn RelationshipsSurface(
     let mission_label = mission
         .as_ref()
         .map_or("未选择 Mission", |mission| mission.title.as_str());
+    let inbox = project.inbox.as_ref();
+    let relationship_count = inbox.map_or(0, |projection| projection.relationships.len());
+    let inbox_count = inbox.map_or(0, |projection| projection.items.len());
+    let waiting_human_count = inbox.map_or(0, |projection| {
+        projection
+            .items
+            .iter()
+            .filter(|item| item.state == ConversationState::WaitingHuman)
+            .count()
+    });
     rsx! {
         div { class: "surface-scroll business-surface relationships-surface",
             header { class: "surface-head",
@@ -6635,7 +6645,7 @@ fn RelationshipsSurface(
                     h1 { "关系与 CRM" }
                     p { "联系人、公司、邮件、会话与机会共享同一条关系记录；公开发现不会自动获得触达许可。" }
                 }
-                span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                span { class: "honesty-badge", if inbox.is_some() { "E1 · READ-ONLY" } else { "NOT_IMPLEMENTED" } }
             }
             nav { class: "surface-tabs", aria_label: "关系与 CRM 视图",
                 button { class: if active_tab() == "pipeline" { "active" } else { "" }, onclick: move |_| active_tab.set("pipeline"), "Pipeline" }
@@ -6643,14 +6653,17 @@ fn RelationshipsSurface(
                 button { class: if active_tab() == "sequences" { "active" } else { "" }, onclick: move |_| active_tab.set("sequences"), "邮件序列" }
                 button { class: if active_tab() == "contacts" { "active" } else { "" }, onclick: move |_| active_tab.set("contacts"), "联系人" }
             }
-            section { class: "readiness-strip blocked",
+            section { class: if inbox.is_some() { "readiness-strip" } else { "readiness-strip blocked" },
                 div { class: "readiness-intro",
                     span { class: "readiness-mark", UiIcon { name: if active_tab() == "inbox" { UiIconName::Inbox } else { UiIconName::Contact }, size: 18 } }
-                    span { strong { "CRM / Inbox Projection 尚未接线" } small { "可以查看当前 Mission 边界；不能显示演示联系人、Consent、发送或回复。" } }
+                    span {
+                        strong { if inbox.is_some() { "CRM / Inbox Projection 已持久化" } else { "CRM / Inbox Projection 尚未接线" } }
+                        small { if inbox.is_some() { "当前仅显示真实读路径的内容-free projection；发送、Consent 和 Provider Connected 仍由各自事实边界决定。" } else { "可以查看当前 Mission 边界；不能显示演示联系人、Consent、发送或回复。" } }
+                    }
                 }
-                div { class: "readiness-stat", b { "0" } small { "可验证联系人" } }
-                div { class: "readiness-stat", b { "0" } small { "可合法跟进" } }
-                div { class: "readiness-stat", b { "0" } small { "开放机会" } }
+                div { class: "readiness-stat", b { "{relationship_count}" } small { "已读关系" } }
+                div { class: "readiness-stat", b { "{inbox_count}" } small { "Inbox 会话" } }
+                div { class: "readiness-stat", b { "{waiting_human_count}" } small { "等待人工" } }
             }
             div { class: "relationship-layout",
                 section { class: "surface-section relationship-main",
@@ -6663,14 +6676,79 @@ fn RelationshipsSurface(
                         }
                         p { "{project.name} · {mission_label}" }
                     }
-                    div { class: "state-canvas",
-                        UiIcon {
-                            name: if active_tab() == "pipeline" { UiIconName::Briefcase } else if active_tab() == "inbox" { UiIconName::Message } else if active_tab() == "sequences" { UiIconName::Mail } else { UiIconName::Contact },
-                            size: 22,
+                    if active_tab() == "inbox" {
+                        if let Some(projection) = inbox {
+                            if projection.items.is_empty() {
+                                div { class: "state-canvas",
+                                    UiIcon { name: UiIconName::Message, size: 22 }
+                                    span { class: "honesty-badge", "READ-ONLY" }
+                                    h3 { "暂无持久 Inbox 会话" }
+                                    p { "HubSpot CRM 关系读路径与 Conversation Projection 分开；未读到的会话不会被页面制造出来。" }
+                                }
+                            } else {
+                                div { class: "relationship-record-list",
+                                    for item in projection.items.iter() {
+                                        article { class: "relationship-record",
+                                            div { class: "relationship-record-head",
+                                                strong { "{item.provider} · {item.conversation_id}" }
+                                                span { class: "honesty-badge", "{conversation_state_label(&item.state)}" }
+                                            }
+                                            small { "Person {item.person_id} · Account {item.account_id} · control generation {item.control_generation}" }
+                                            small { "delivery boundary: {message_delivery_label(item.latest_message_delivery.as_ref())}" }
+                                            small { "latest message digest: {item.latest_message_digest.as_deref().unwrap_or(\"none\")}" }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            div { class: "state-canvas",
+                                UiIcon { name: UiIconName::Message, size: 22 }
+                                span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                                h3 { "等待 Application Projection" }
+                                p { "该视图不会从页面维护第二套 CRM，也不会把 Provider 200 OK 冒充 Conversation 或业务完成。" }
+                            }
                         }
-                        span { class: "honesty-badge", "NOT_IMPLEMENTED" }
-                        h3 { "等待 Application Projection" }
-                        p { "该视图不会从页面维护第二套 CRM，也不会把公开邮箱、草稿或 Provider 200 OK 冒充 Consent、Conversation 或业务完成。" }
+                    } else if active_tab() == "contacts" {
+                        if let Some(projection) = inbox {
+                            if projection.relationships.is_empty() {
+                                div { class: "state-canvas",
+                                    UiIcon { name: UiIconName::Contact, size: 22 }
+                                    span { class: "honesty-badge", "READ-ONLY" }
+                                    h3 { "暂无持久关系记录" }
+                                    p { "联系人只有在 credentialed provider read observation 进入当前 Project scope 后才会出现。" }
+                                }
+                            } else {
+                                div { class: "relationship-record-list",
+                                    for record in projection.relationships.iter() {
+                                        article { class: "relationship-record",
+                                            div { class: "relationship-record-head",
+                                                strong { "{record.source.provider} · {record.source.external_id}" }
+                                                span { class: "honesty-badge", "SOURCE REVISION" }
+                                            }
+                                            small { "canonical relationship: {record.canonical_id}" }
+                                            small { "display digest: {record.display_name_digest} · values: {record.value_digests.len()}" }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            div { class: "state-canvas",
+                                UiIcon { name: UiIconName::Contact, size: 22 }
+                                span { class: "honesty-badge", "NOT_IMPLEMENTED" }
+                                h3 { "等待 Application Projection" }
+                                p { "该视图不会从页面维护第二套 CRM。" }
+                            }
+                        }
+                    } else {
+                        div { class: "state-canvas",
+                            UiIcon {
+                                name: if active_tab() == "pipeline" { UiIconName::Briefcase } else { UiIconName::Mail },
+                                size: 22,
+                            }
+                            span { class: "honesty-badge", if inbox.is_some() { "READ-ONLY" } else { "NOT_IMPLEMENTED" } }
+                            h3 { if inbox.is_some() { "等待对应写入/机会事实接线" } else { "等待 Application Projection" } }
+                            p { "该视图不会从页面维护第二套 CRM，也不会把公开邮箱、草稿或 Provider 200 OK 冒充 Consent、Conversation 或业务完成。" }
+                        }
                     }
                 }
                 aside { class: "surface-section relationship-policy",
@@ -6682,6 +6760,37 @@ fn RelationshipsSurface(
                     }
                 }
             }
+        }
+    }
+}
+
+fn conversation_state_label(state: &ConversationState) -> &'static str {
+    match state {
+        ConversationState::Open => "OPEN",
+        ConversationState::WaitingHuman => "HUMAN TAKEOVER",
+        ConversationState::Resolved => "RESOLVED",
+        ConversationState::Closed => "CLOSED",
+        ConversationState::DeadLetter => "DEAD LETTER",
+    }
+}
+
+fn message_delivery_label(
+    delivery: Option<&hartevo_domain_kernel::MessageDelivery>,
+) -> &'static str {
+    match delivery {
+        None => "NO MESSAGE",
+        Some(hartevo_domain_kernel::MessageDelivery::Received) => "RECEIVED",
+        Some(hartevo_domain_kernel::MessageDelivery::Draft) => "DRAFT",
+        Some(hartevo_domain_kernel::MessageDelivery::EffectPrepared { .. }) => "AWAITING APPROVAL",
+        Some(hartevo_domain_kernel::MessageDelivery::Sent { .. }) => "SENT",
+        Some(hartevo_domain_kernel::MessageDelivery::Failed { .. }) => "FAILED",
+        Some(hartevo_domain_kernel::MessageDelivery::Uncertain { .. }) => "UNCERTAIN · RECONCILE",
+        Some(hartevo_domain_kernel::MessageDelivery::ReconciledNotSent { .. }) => "NOT SENT",
+        Some(hartevo_domain_kernel::MessageDelivery::ReconciliationDeadLetter { .. }) => {
+            "DEAD LETTER"
+        }
+        Some(hartevo_domain_kernel::MessageDelivery::CancelledByHandoff { .. }) => {
+            "CANCELLED BY HUMAN"
         }
     }
 }
