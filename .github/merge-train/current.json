@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "6c9d8b266ce95cbc76169181497c6f03b7f4e2c7",
+  "baseCommit": "dca6802ef5b7fdeeeb0162a791dda2848321fad9",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-aws-msk-01",
-      "headCommit": "329073b7ddd688bbbeae23ca6fe4a0aa5f51c6e7",
-      "number": 672
+      "headBranch": "codex/ext-cockroach-01",
+      "headCommit": "d28e8f837c7e86efe68504c46799135f3709fc56",
+      "number": 725
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-721-ext-mailgun-delivery-result-01",
-      "headCommit": "4ac55d5aecac36c10581ed09fb5eeb6fd1b68d7d",
-      "number": 738
+      "headBranch": "codex/issue-729-ext-cohere-inference-result-01",
+      "headCommit": "611e86fd4742cd7303dbf88802a964378abeaa4d",
+      "number": 741
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-723-ext-freshservice-incident-result-01",
-      "headCommit": "b8b1bbe82c4701be338adf0735be3f8e52f08e84",
-      "number": 739
+      "headBranch": "codex/issue-728-ext-openalex-research-result-01",
+      "headCommit": "abb30c6619e5b7eafd8b31ef954ceb31ff6b7185",
+      "number": 742
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-openfga-01",
-      "headCommit": "9bc67c28eaa38ecac10fe5641cfbfbe05e42525c",
-      "number": 740
+      "headBranch": "codex/issue-837-aws-emr-serverless-job-result",
+      "headCommit": "a4e3018646f23848bd4f1fb21eafaea371eb3454",
+      "number": 848
     }
   ],
-  "createdAt": "2026-08-15T17:20:59Z",
+  "createdAt": "2026-08-15T17:52:21Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-172100"
+  "trainBranch": "merge-train/20260815-175200"
 }
