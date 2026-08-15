@@ -1,6 +1,17 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod pending_plugin_approval;
 mod runtime_text_subscription;
+
+pub use pending_plugin_approval::{
+    PENDING_PLUGIN_APPROVAL_DECISION_EVENT, PENDING_PLUGIN_APPROVAL_REQUEST_EVENT,
+    PendingPluginApprovalDecision, PendingPluginApprovalDecisionCommand,
+    PendingPluginApprovalDecisionResult, PendingPluginApprovalError,
+    PendingPluginApprovalLifecycle, PendingPluginApprovalMissionShellConsumer,
+    PendingPluginApprovalProjection, PendingPluginApprovalProvider, PendingPluginApprovalRequest,
+    PendingPluginApprovalRevisions, PendingPluginApprovalScope, PendingPluginApprovalService,
+    PendingPluginApprovalState,
+};
 
 pub use runtime_text_subscription::{
     CatalogMissionExecutionHandle, CatalogMissionExecutionStart,
@@ -20950,6 +20961,8 @@ pub enum ApplicationError {
     RuntimeTurn(#[from] RuntimeTurnError),
     #[error(transparent)]
     RuntimeTextSubscription(#[from] RuntimeTextSubscriptionError),
+    #[error(transparent)]
+    PendingPluginApproval(#[from] PendingPluginApprovalError),
     #[error(transparent)]
     Browser(#[from] BrowserError),
     #[error(
