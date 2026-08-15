@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "7904db4db8a5f5540ac96bf5015b41e5b224498d",
+  "baseCommit": "ffa5c84b95ed4b4603148cfee3f50982a96e291f",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-flyio-01-flyio-deployment-result",
-      "headCommit": "eeb6159b5118e940e0b7f51083ffa8d6d44f378d",
-      "number": 851
+      "headBranch": "codex/issue-636-ext-aws-sqs-01",
+      "headCommit": "672b8fb337ad8b9f511fb43d39b976e514ecd0a4",
+      "number": 658
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-838-ext-azure-service-bus-01",
-      "headCommit": "a5d042311f225d79efd4f7d6e04604a83be2dae2",
-      "number": 852
+      "headBranch": "codex/issue-644-ext-aws-sns-01",
+      "headCommit": "746f77eff6db9171c7345d4893e0e139fa87b77a",
+      "number": 660
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/aws-kinesis-stream-result-834",
-      "headCommit": "e7e6cf81b290d2e5829b3b8516494499c88cb680",
-      "number": 857
+      "headBranch": "codex/issue-645-aws-service-quota-result",
+      "headCommit": "fe4160420e631b92e40219d87ba9d004e725d92b",
+      "number": 661
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-845-ext-nomad-deployment-result-01",
-      "headCommit": "9a667eaa160e1e5128cd9e2f71345c201013a5d5",
-      "number": 865
+      "headBranch": "codex/issue-648-ext-aws-dynamodb-01",
+      "headCommit": "8279e5b4dc55c3172b1d158d0a454773c43d88ab",
+      "number": 662
     }
   ],
-  "createdAt": "2026-08-15T11:01:00Z",
+  "createdAt": "2026-08-15T11:34:16Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-110000"
+  "trainBranch": "merge-train/20260815-113500"
 }
