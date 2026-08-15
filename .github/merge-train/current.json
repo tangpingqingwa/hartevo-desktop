@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "857f0f998e38e7a77f84b117769ee052014a25b6",
+  "baseCommit": "e2c606d438fa9afcf90895fbf3a4522bcc2ee115",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/aws-service-catalog-provisioned-result-679",
-      "headCommit": "6bb4cd831df72156590bab78f21d0bff63c6391c",
-      "number": 695
+      "headBranch": "codex/issue-690-ext-gcp-scheduler-01",
+      "headCommit": "ae1c837bc4a379d6189fb3ea7c9c29a2683efdc6",
+      "number": 703
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-684-gcp-org-policy-result",
-      "headCommit": "6b7e5099e8ae29f963e0cea2e97cab773fe8d0f7",
-      "number": 696
+      "headBranch": "codex/ext-adyen-payment-result-01",
+      "headCommit": "c6468200130b3c1788e3fda340d458ed4acf540f",
+      "number": 704
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-682-ext-aws-control-tower-01",
-      "headCommit": "61bd15bb16fdac7de1ab3e38f3e62c8d636f5a42",
-      "number": 697
+      "headBranch": "codex/issue-691-ext-gcp-monitoring-alert-01",
+      "headCommit": "7b0528f6ac1cd612cc3e16510101c3aa17f719f8",
+      "number": 708
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-693-ext-workos-directory-01",
-      "headCommit": "aa98b07fa46fe1ae82d5039293530a9910d764f7",
-      "number": 702
+      "headBranch": "codex/ext-oci-devops-01",
+      "headCommit": "01854c2d259581ea6e48a92eddca5d8dd2303298",
+      "number": 709
     }
   ],
-  "createdAt": "2026-08-15T15:03:51Z",
+  "createdAt": "2026-08-15T15:33:45Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-150300"
+  "trainBranch": "merge-train/20260815-153300"
 }
