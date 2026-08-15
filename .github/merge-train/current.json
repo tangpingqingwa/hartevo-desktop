@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "fc49ff49be74283905461d686ae72151d03681f2",
+  "baseCommit": "37ccef18574073b51346ff875339dff393870cfa",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-856-ext-dockerhub-image-result-01",
-      "headCommit": "42a26496fc3c7bc9b01ecf5c54fcf08488ca4f66",
-      "number": 867
+      "headBranch": "codex/issue-863-gcp-alloydb-cluster-result",
+      "headCommit": "f8750de748244345f423aeec550d30acf95958e5",
+      "number": 872
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-854-boundary-session-result",
-      "headCommit": "5d74eea9a18dbb40b5f161a6968cddefd86df563",
-      "number": 868
+      "headBranch": "codex/issue-861-hcp-packer-artifact-result",
+      "headCommit": "e98e70b6547b7a055e87d50853e0485f0a47fafd",
+      "number": 873
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-853-ext-gcp-spanner-database-result-01",
-      "headCommit": "728ad01749c56b9430ccc1b2f2e5879b27d8b221",
-      "number": 869
+      "headBranch": "codex/issue-841-azure-cosmosdb-container-result-01",
+      "headCommit": "3b19849bf097d9e83606e44fcc59c5ad12762c2f",
+      "number": 874
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-855-digitalocean-app-deployment-result",
-      "headCommit": "cebfe62d0efd6b86648f2872f4998ff4a09ac386",
-      "number": 871
+      "headBranch": "codex/issue-860-azure-container-apps-revision-result",
+      "headCommit": "5134ecb0af930df8ff7b93ba94dd2fe5d1d16f41",
+      "number": 879
     }
   ],
-  "createdAt": "2026-08-15T07:58:14Z",
+  "createdAt": "2026-08-15T08:54:34Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-080300"
+  "trainBranch": "merge-train/20260815-085404"
 }
