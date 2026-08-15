@@ -2386,6 +2386,57 @@ esac
     }
 
     #[test]
+    fn repeated_timeout_restarts_keep_the_process_boundary_unpoisoned() {
+        let fixture = ScannerFixture::new();
+        let launch_count = fixture.temp.path().join("timeout-launch-count.marker");
+        let body = format!(
+            r#"    launch_count=0
+    if [ -f {count} ]; then
+      IFS= read -r launch_count < {count}
+    fi
+    launch_count=$((launch_count + 1))
+    printf '%s\n' "$launch_count" > {count}
+    if [ "$launch_count" -le 2 ]; then
+      /bin/sleep 30 &
+      wait
+    fi
+    emit_scan clean"#,
+            count = shell_quote(&launch_count),
+        );
+        let limits =
+            ScannerProcessLimits::new(Duration::from_secs(2), 4096, 4096).expect("timeout limits");
+        let (mut scanner, _) = scanner_with_limits(&fixture, &body, limits);
+        let mut broker = fixture.broker();
+
+        for (generation, grant_id) in [
+            (2, "grant-timeout-repeat-first"),
+            (3, "grant-timeout-repeat-second"),
+        ] {
+            let source = fixture.source(&format!("timeout-repeat-{generation}.json"), b"{}");
+            let result = fixture.prepare(&mut broker, &mut scanner, grant_id, &source);
+            assert!(matches!(result, Err(BrowserError::FileScanUnavailable)));
+            assert_eq!(scanner.process_generation, generation);
+            assert!(!scanner.process_boundary_poisoned);
+            assert!(scanner.active_launch_digest.is_none());
+            assert_no_run_directory_residue(&scanner);
+        }
+
+        let source = fixture.source("timeout-repeat-clean.json", b"{}");
+        let result = fixture
+            .prepare(
+                &mut broker,
+                &mut scanner,
+                "grant-timeout-repeat-clean",
+                &source,
+            )
+            .expect("fresh scanner process after repeated timeouts");
+        assert_eq!(result.scan_report.decision, FileScanDecision::Clean);
+        assert_eq!(scanner.process_generation, 4);
+        assert!(!scanner.process_boundary_poisoned);
+        assert_no_run_directory_residue(&scanner);
+    }
+
+    #[test]
     fn every_result_revalidates_scanner_identity_digest_and_version_before_restart() {
         let cases = [
             (
