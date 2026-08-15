@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "dca6802ef5b7fdeeeb0162a791dda2848321fad9",
+  "baseCommit": "e72892acd212d5eeebfc8eb5ff1238d50ae5c4e0",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-cockroach-01",
-      "headCommit": "d28e8f837c7e86efe68504c46799135f3709fc56",
-      "number": 725
+      "headBranch": "codex/issue-819-aws-athena-query-result-01",
+      "headCommit": "089f6783c13042ea6ce3573ccb6dc3f3caada1f1",
+      "number": 826
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-729-ext-cohere-inference-result-01",
-      "headCommit": "611e86fd4742cd7303dbf88802a964378abeaa4d",
-      "number": 741
+      "headBranch": "codex/issue-822-gcp-dataflow-job-result-01",
+      "headCommit": "ae4a2c192c2b6f8f3ca6ffea9285885e5544162d",
+      "number": 827
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-728-ext-openalex-research-result-01",
-      "headCommit": "abb30c6619e5b7eafd8b31ef954ceb31ff6b7185",
-      "number": 742
+      "headBranch": "codex/issue-825-azure-data-factory-pipeline-result-01",
+      "headCommit": "8c08be209c2b1a3ca806e40f750852bfc214bc83",
+      "number": 829
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-837-aws-emr-serverless-job-result",
-      "headCommit": "a4e3018646f23848bd4f1fb21eafaea371eb3454",
-      "number": 848
+      "headBranch": "codex/issue-824-jenkins-build-result",
+      "headCommit": "539b9c37e4b266ad89f82f13e630466513517328",
+      "number": 830
     }
   ],
-  "createdAt": "2026-08-15T17:52:21Z",
+  "createdAt": "2026-08-15T18:25:11Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-175200"
+  "trainBranch": "merge-train/20260815-182300"
 }
