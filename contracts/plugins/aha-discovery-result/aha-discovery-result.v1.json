@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/plugins/aha-discovery-result/v1",
+  "contractId": "aha-discovery-result",
+  "schemaVersion": "hartevo-aha-discovery-result-contract/v1",
+  "contractVersion": "aha-discovery-result-e1/v1",
+  "pluginVersion": "1.0.0",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "aha.discovery.result",
+    "readOnly": true,
+    "liveExecution": false,
+    "mutationAuthority": false,
+    "output": "deterministic-redacted-proposal"
+  },
+  "provider": {
+    "id": "aha.discovery.study-interview-evidence",
+    "revision": 1,
+    "operation": "metadata.read",
+    "native": false,
+    "httpsTransport": false,
+    "readback": false,
+    "firstParty": false,
+    "durableReceipt": false,
+    "transports": [
+      {
+        "kind": "fixture",
+        "connected": false,
+        "native": false,
+        "firstParty": false
+      },
+      {
+        "kind": "recording",
+        "connected": false,
+        "native": false,
+        "firstParty": false
+      },
+      {
+        "kind": "loopback",
+        "connected": false,
+        "native": false,
+        "firstParty": false
+      },
+      {
+        "kind": "BLOCKED_ENV",
+        "connected": false,
+        "native": false,
+        "firstParty": false
+      }
+    ]
+  },
+  "scope": {
+    "required": [
+      "account",
+      "workspace",
+      "project",
+      "mission",
+      "work_product"
+    ],
+    "optionalExactResourceFences": [
+      "study",
+      "interview",
+      "question",
+      "response",
+      "highlight",
+      "linked_record"
+    ],
+    "digestBound": true
+  },
+  "metadata": {
+    "allowlist": [
+      "study_id",
+      "study_redacted_label",
+      "interview_id",
+      "interview_redacted_label",
+      "question_id",
+      "question_ordinal",
+      "question_prompt_digest",
+      "response_id",
+      "response_answer_digest",
+      "highlight_id",
+      "highlight_redacted_label",
+      "highlight_quote_digest",
+      "linked_record_id",
+      "linked_record_kind",
+      "linked_record_digest",
+      "lifecycle_state",
+      "revision",
+      "bounded_counts"
+    ],
+    "rawTranscript": false,
+    "rawMedia": false,
+    "participantPii": false,
+    "credentials": false,
+    "mutationAuthority": false,
+    "redaction": "deterministic"
+  },
+  "fences": {
+    "sourceRevision": "required_non_zero",
+    "transcriptDigest": "required_sha256",
+    "highlightDigest": "required_sha256",
+    "projectionDigest": "required_sha256",
+    "scopeDigest": "required_sha256"
+  },
+  "limits": {
+    "maxPageSize": 50,
+    "maxRedactedTextBytes": 256,
+    "maxOpaqueCursorBytes": 128,
+    "maxBoundedCount": 50,
+    "pagination": "opaque_cursor_only"
+  },
+  "registration": {
+    "digestBound": [
+      "plugin_version",
+      "contract_version",
+      "provider_revision",
+      "provider_digest",
+      "permission_digest",
+      "scope_digest",
+      "evidence_fence",
+      "secret_reference_digest",
+      "registration_revision",
+      "status"
+    ],
+    "revocable": true,
+    "restorable": true,
+    "secretReferenceSerializable": false
+  },
+  "states": [
+    "PRESENT",
+    "PARTIAL",
+    "ARCHIVED",
+    "ACCESS_LOST",
+    "PROVIDER_UNKNOWN",
+    "STALE",
+    "TAMPERED",
+    "REVOKED"
+  ],
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "httpsTransport": false,
+    "firstParty": false,
+    "durableReceipt": false,
+    "independentReadback": false,
+    "adoptedWorkProduct": false,
+    "adoptedOutcome": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "forbidden": [
+    "raw_transcript_retention",
+    "raw_media_retention",
+    "participant_pii_retention",
+    "credential_resolution",
+    "interview_creation",
+    "participant_invitation",
+    "transcript_upload",
+    "response_mutation",
+    "highlight_mutation",
+    "idea_mutation",
+    "webhooks",
+    "kernel_truth_authority",
+    "kernel_consent_authority",
+    "kernel_effect_authority",
+    "kernel_receipt_authority",
+    "verified_work_product_adoption"
+  ],
+  "officialBasis": [
+    "https://support.aha.io/aha-discovery/getting-started/introduction/get-started-with-aha-discovery~7476107730889780746",
+    "https://support.aha.io/aha-discovery/support-articles/interviews/introduction-to-interviews~7478450449910192869",
+    "https://support.aha.io/aha-discovery/support-articles/interviews/responses-overview~7491332098055000389",
+    "https://support.aha.io/aha-discovery/support-articles/interviews/capture-interview-highlights~7568525911237586915"
+  ]
+}
