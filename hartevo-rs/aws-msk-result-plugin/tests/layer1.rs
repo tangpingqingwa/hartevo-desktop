@@ -553,7 +553,7 @@ fn contract_and_digest_fields_are_deterministic() {
             PermissionAction::ListClustersV2,
             PermissionAction::DescribeClusterV2,
             PermissionAction::DescribeConfigurationRevision,
-            PermissionAction::ListClusterOperations,
+            PermissionAction::ListClusterOperationsV2,
         ])
     );
 }

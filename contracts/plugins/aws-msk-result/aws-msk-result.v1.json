@@ -39,7 +39,7 @@
       "ListClustersV2",
       "DescribeClusterV2",
       "DescribeConfigurationRevision",
-      "ListClusterOperations"
+      "ListClusterOperationsV2"
     ],
     "allowlistedMethods": ["GET"],
     "acceptedTransports": ["fixture", "fake", "recording", "loopback", "BLOCKED_ENV"],

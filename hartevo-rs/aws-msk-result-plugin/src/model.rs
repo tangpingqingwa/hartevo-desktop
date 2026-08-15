@@ -452,7 +452,7 @@ pub enum PermissionAction {
     ListClustersV2,
     DescribeClusterV2,
     DescribeConfigurationRevision,
-    ListClusterOperations,
+    ListClusterOperationsV2,
 }
 
 impl PermissionAction {
@@ -461,7 +461,7 @@ impl PermissionAction {
             Self::ListClustersV2 => "ListClustersV2",
             Self::DescribeClusterV2 => "DescribeClusterV2",
             Self::DescribeConfigurationRevision => "DescribeConfigurationRevision",
-            Self::ListClusterOperations => "ListClusterOperations",
+            Self::ListClusterOperationsV2 => "ListClusterOperationsV2",
         }
     }
 }
@@ -483,7 +483,7 @@ impl PermissionFence {
                 PermissionAction::ListClustersV2,
                 PermissionAction::DescribeClusterV2,
                 PermissionAction::DescribeConfigurationRevision,
-                PermissionAction::ListClusterOperations,
+                PermissionAction::ListClusterOperationsV2,
             ]
             .into_iter()
             .collect(),
@@ -914,7 +914,7 @@ pub enum AwsMskReadOperation {
     ListClustersV2,
     DescribeClusterV2,
     DescribeConfigurationRevision,
-    ListClusterOperations,
+    ListClusterOperationsV2,
 }
 
 impl AwsMskReadOperation {
@@ -923,7 +923,7 @@ impl AwsMskReadOperation {
             Self::ListClustersV2 => PermissionAction::ListClustersV2,
             Self::DescribeClusterV2 => PermissionAction::DescribeClusterV2,
             Self::DescribeConfigurationRevision => PermissionAction::DescribeConfigurationRevision,
-            Self::ListClusterOperations => PermissionAction::ListClusterOperations,
+            Self::ListClusterOperationsV2 => PermissionAction::ListClusterOperationsV2,
         }
     }
 
@@ -1042,7 +1042,7 @@ impl AwsMskReadRequest {
         bounds: ReadBounds,
     ) -> Result<Self, ModelError> {
         Self::new(
-            AwsMskReadOperation::ListClusterOperations,
+            AwsMskReadOperation::ListClusterOperationsV2,
             scope,
             None,
             None,
@@ -1194,7 +1194,8 @@ impl AwsMskReadRequest {
                     });
                 }
             }
-            AwsMskReadOperation::DescribeClusterV2 | AwsMskReadOperation::ListClusterOperations => {
+            AwsMskReadOperation::DescribeClusterV2
+            | AwsMskReadOperation::ListClusterOperationsV2 => {
                 if self.cluster_arn.as_ref() != Some(&scope.cluster.arn)
                     || self.cluster_name_filter.is_some()
                     || self.cluster_type_filter.is_some()
@@ -2053,7 +2054,7 @@ impl AwsMskReadPage {
                     && configuration.is_some()
                     && operations.is_empty()
             }
-            AwsMskReadOperation::ListClusterOperations => {
+            AwsMskReadOperation::ListClusterOperationsV2 => {
                 clusters.is_empty() && cluster.is_none() && configuration.is_none()
             }
         };
@@ -2403,8 +2404,8 @@ pub type AwsMskResourceScope = AwsMskScope;
 pub type ListClustersV2Request = AwsMskReadRequest;
 pub type DescribeClusterV2Request = AwsMskReadRequest;
 pub type DescribeConfigurationRevisionRequest = AwsMskReadRequest;
-pub type ListClusterOperationsRequest = AwsMskReadRequest;
+pub type ListClusterOperationsV2Request = AwsMskReadRequest;
 pub type ListClustersV2Page = AwsMskReadPage;
 pub type DescribeClusterV2Page = AwsMskReadPage;
 pub type DescribeConfigurationRevisionPage = AwsMskReadPage;
-pub type ListClusterOperationsPage = AwsMskReadPage;
+pub type ListClusterOperationsV2Page = AwsMskReadPage;

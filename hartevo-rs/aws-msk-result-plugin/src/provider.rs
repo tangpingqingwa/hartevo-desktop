@@ -62,7 +62,7 @@ impl AwsMskProviderIdentity {
                 "ListClustersV2".to_owned(),
                 "DescribeClusterV2".to_owned(),
                 "DescribeConfigurationRevision".to_owned(),
-                "ListClusterOperations".to_owned(),
+                "ListClusterOperationsV2".to_owned(),
                 "GET".to_owned(),
             ],
         );
@@ -301,7 +301,7 @@ where
                 )
                 .map_err(AwsMskProviderError::Model)
             }
-            AwsMskReadOperation::ListClusterOperations => {
+            AwsMskReadOperation::ListClusterOperationsV2 => {
                 let items = array_field(
                     &value,
                     &[

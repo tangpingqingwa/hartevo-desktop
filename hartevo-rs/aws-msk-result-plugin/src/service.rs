@@ -100,7 +100,7 @@ impl AwsMskCapabilities {
                 "ListClustersV2",
                 "DescribeClusterV2",
                 "DescribeConfigurationRevision",
-                "ListClusterOperations",
+                "ListClusterOperationsV2",
             ],
             allowlisted_methods: ["GET"],
             read_only: true,
@@ -553,7 +553,7 @@ where
             PermissionAction::ListClustersV2,
             PermissionAction::DescribeClusterV2,
             PermissionAction::DescribeConfigurationRevision,
-            PermissionAction::ListClusterOperations,
+            PermissionAction::ListClusterOperationsV2,
         ] {
             if !permission.allows(action) {
                 return Err(AwsMskServiceError::ScopeMismatch(format!(
@@ -723,7 +723,7 @@ where
                                 }
                             }
                         }
-                        AwsMskReadOperation::ListClusterOperations => {
+                        AwsMskReadOperation::ListClusterOperationsV2 => {
                             for observed in page.operations {
                                 match self.validate_operation(&observed) {
                                     Ok(()) => {

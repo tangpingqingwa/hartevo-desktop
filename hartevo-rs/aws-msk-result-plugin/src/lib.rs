@@ -179,7 +179,7 @@ impl AwsMskContract {
             serde_json::Value::String("ListClustersV2".to_owned()),
             serde_json::Value::String("DescribeClusterV2".to_owned()),
             serde_json::Value::String("DescribeConfigurationRevision".to_owned()),
-            serde_json::Value::String("ListClusterOperations".to_owned()),
+            serde_json::Value::String("ListClusterOperationsV2".to_owned()),
         ];
         if provider.get("id").and_then(serde_json::Value::as_str) != Some(AWS_MSK_PROVIDER_ID)
             || provider
