@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/intune-device-compliance-result/intune-device-compliance-result.v1.json",
+  "schemaVersion": "hartevo.intune-device-compliance-result-contract/v1",
+  "contractVersion": "intune-device-compliance-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "intune.device.compliance.result",
+    "version": "1.0.0",
+    "operation": "governed_intune_device_compliance_read_proposal",
+    "readOnly": true,
+    "liveExecution": false,
+    "externalWrites": false,
+    "certification": false,
+    "outcomeAuthority": false
+  },
+  "provider": {
+    "id": "microsoft.graph.intune.device-compliance",
+    "version": "1.0.0",
+    "apiVersion": "v1.0",
+    "method": "GET",
+    "operations": [
+      "deviceManagement.deviceCompliancePolicies",
+      "deviceManagement.managedDevices",
+      "deviceManagement.deviceCompliancePolicySettingStateSummaries"
+    ],
+    "selectAllowlist": {
+      "policyMetadata": ["id", "platforms", "createdDateTime", "lastModifiedDateTime"],
+      "managedDeviceCompliance": ["id", "complianceState", "operatingSystem", "lastSyncDateTime"],
+      "policyStateSummary": ["id", "settingName", "compliantDeviceCount", "nonCompliantDeviceCount", "errorDeviceCount", "conflictDeviceCount", "unknownDeviceCount", "retiredDeviceCount"]
+    },
+    "acceptedProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "httpsTransport": false,
+    "readback": false
+  },
+  "consumer": {
+    "id": "mission.intune.device.compliance.result",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "proposalOnly": true,
+    "adoptsOutcome": false,
+    "claimsCertification": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "tenantDigest",
+      "nationalCloud",
+      "policyFingerprints",
+      "deviceSelector",
+      "platform",
+      "complianceWindow",
+      "projectIdAndRevision",
+      "missionIdAndRevision",
+      "workProductIdAndRevision",
+      "permissionDigest"
+    ],
+    "secret": "opaque_non_serializing_entra_secret_reference_only",
+    "rawTenant": false,
+    "rawDeviceId": false,
+    "rawUserId": false,
+    "rawUserPrincipalName": false,
+    "rawSerialNumber": false,
+    "rawImei": false,
+    "location": false
+  },
+  "queryPolicy": {
+    "operation": "bounded_read_only_graph_v1_0",
+    "resources": [
+      "deviceCompliancePolicies",
+      "managedDevices",
+      "deviceCompliancePolicySettingStateSummaries"
+    ],
+    "allowlistedFieldsOnly": true,
+    "rawOData": false,
+    "writes": [],
+    "wipe": false,
+    "retire": false,
+    "policyMutation": false,
+    "notification": false,
+    "revisionFence": true
+  },
+  "bounds": {
+    "maxPages": 8,
+    "maxRecords": 512,
+    "maxRecordsPerPage": 128,
+    "maxResponseBytes": 1048576,
+    "nextLink": "opaque_digest_only",
+    "retries": "bounded"
+  },
+  "retention": {
+    "retained": [
+      "tenantDigest",
+      "policyDigest",
+      "deviceDigest",
+      "platform",
+      "complianceState",
+      "observedAt",
+      "boundedCounts",
+      "responseDigest",
+      "nextLinkDigest"
+    ],
+    "digestOnly": ["tenant", "policyId", "deviceId", "userId", "userPrincipalName", "serialNumber", "imei", "nextLink"],
+    "redacted": ["rawDeviceJson", "rawUserJson", "rawPolicyJson", "location", "deviceName", "errorBody", "secretHandle"]
+  },
+  "registration": {
+    "boundFields": [
+      "providerDigest",
+      "providerApiVersion",
+      "contractDigest",
+      "pluginVersion",
+      "permissionDigest",
+      "scopeDigest",
+      "evidenceDigest"
+    ],
+    "versionBound": true,
+    "providerBound": true,
+    "apiBound": true,
+    "contractDigestBound": true,
+    "permissionBound": true,
+    "scopeBound": true,
+    "evidenceBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "failClosed": [
+    "tenantDrift",
+    "nationalCloudDrift",
+    "policyFingerprintDrift",
+    "deviceSelectorDrift",
+    "platformDrift",
+    "complianceWindowDrift",
+    "projectRevisionDrift",
+    "missionRevisionDrift",
+    "workProductRevisionDrift",
+    "permissionDrift",
+    "nextLinkScopeMismatch",
+    "nextLinkReplay",
+    "partialPage",
+    "revisionMismatch",
+    "400",
+    "401",
+    "403",
+    "404",
+    "409",
+    "429",
+    "5xx",
+    "timeout",
+    "tamper",
+    "revocation"
+  ],
+  "authority": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "httpsTransport": false,
+    "durableReceipt": false,
+    "independentReadback": false,
+    "verification": false,
+    "externalWrites": false,
+    "remediation": false,
+    "certification": false,
+    "outcomeAuthority": false,
+    "workProductAdoption": false,
+    "truthAuthority": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "nativeMicrosoftEntraResolution",
+    "nativeHttpsGraphRead",
+    "durableProviderReceipt",
+    "independentReadback",
+    "consentedDeviceRemediation",
+    "policyMutation",
+    "verifiedWorkProductAdoption",
+    "kernelOutcomeAuthority",
+    "complianceCertification"
+  ],
+  "honestNativeGap": "Fixture, recording, loopback and BLOCKED_ENV evidence are not Connected, native or first-party. Native Microsoft Entra resolution, HTTPS transport, durable provider receipts, independent read-back, device wipe/retire, policy mutation, notifications, remediation, certification, Outcome authority and Work Product adoption remain Layer-2 or host-authority exits."
+}
