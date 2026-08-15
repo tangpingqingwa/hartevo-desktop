@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "ffa5c84b95ed4b4603148cfee3f50982a96e291f",
+  "baseCommit": "af636d27fc9878ce2e16560bf193ed0475c35c43",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-636-ext-aws-sqs-01",
-      "headCommit": "672b8fb337ad8b9f511fb43d39b976e514ecd0a4",
-      "number": 658
+      "headBranch": "codex/issue-634-ext-aws-acm-01",
+      "headCommit": "f6a946f16b6f959f8b536e1442fa43fecbbb5dcc",
+      "number": 650
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-644-ext-aws-sns-01",
-      "headCommit": "746f77eff6db9171c7345d4893e0e139fa87b77a",
-      "number": 660
+      "headBranch": "codex/issue-637-ext-aws-cloudwatch-logs-01",
+      "headCommit": "420111b1c9118e1f447a19265c9ce0fdf8e27136",
+      "number": 651
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-645-aws-service-quota-result",
-      "headCommit": "fe4160420e631b92e40219d87ba9d004e725d92b",
-      "number": 661
+      "headBranch": "codex/issue-628-ext-aws-elb-01",
+      "headCommit": "5a609c1550f47cb6b6e133a45ed8606eeb170aaf",
+      "number": 652
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-648-ext-aws-dynamodb-01",
-      "headCommit": "8279e5b4dc55c3172b1d158d0a454773c43d88ab",
-      "number": 662
+      "headBranch": "codex/issue-638-aws-cost-anomaly-result",
+      "headCommit": "bd8203df4755f095decf271ce87b933617f0622a",
+      "number": 654
     }
   ],
-  "createdAt": "2026-08-15T11:34:16Z",
+  "createdAt": "2026-08-15T12:07:45Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-113500"
+  "trainBranch": "merge-train/20260815-120700"
 }
