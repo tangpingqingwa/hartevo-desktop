@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "cb2bab14609caa7a44e3477256d957cc39ec6059",
+  "baseCommit": "61b192d8259783ad1e059d326322bc03da771cdf",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-vercel-preview-01",
-      "headCommit": "f7a5801003147c24f8e6c43607863156b821db09",
-      "number": 299
+      "headBranch": "codex/paid-social-linkedin-org-read-ps01",
+      "headCommit": "b313a338999f10f77a4872e0c4f336079c433371",
+      "number": 241
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/scheduler-local-host-timer-01",
-      "headCommit": "ba0d17efa10c318ac93bd3d683c9012f616fe4d3",
-      "number": 293
+      "headBranch": "codex/capability-degradation-fallback-01",
+      "headCommit": "5f0e0307e33d2c33dc83eddc1cc549c746ecc02e",
+      "number": 222
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/gm01-observation-evidence-pack-01",
-      "headCommit": "b203b8c9a41eb0c855bc5f959757ccd0e6ef4eec",
-      "number": 292
+      "headBranch": "codex/cj-authenticated-read-plugin-01",
+      "headCommit": "05a4af51d5a062b0d46834ae34b9caa9a31e8d12",
+      "number": 215
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/connectors-channel-youtube-root-01",
-      "headCommit": "695e80dad76c856bae4fb61c21324a51b2fbf3fe",
-      "number": 291
+      "headBranch": "codex/connector-probe-capability-consumer-02",
+      "headCommit": "cae52c06c4d706a79fee6fceacb5deecae25648c",
+      "number": 200
     }
   ],
-  "createdAt": "2026-08-16T02:38:25Z",
+  "createdAt": "2026-08-16T03:15:39Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260816-0237"
+  "trainBranch": "merge-train/20260816-0313"
 }
