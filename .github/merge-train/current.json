@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "50be7b94e6027635b3d82bde184588e0f1a44e11",
+  "baseCommit": "7f340da0275ca15a604b5618baeb3517e0de6f39",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/shopify-durable-cursor-plugin-01",
-      "headCommit": "f4f69006ea8b63863a147c0b46078f88ad6399bc",
-      "number": 193
+      "headBranch": "codex/operations-plugin-log-01",
+      "headCommit": "16726ec5a234942a25d51b7d7e6aed15ebd79a83",
+      "number": 163
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/browser-workspace-handoff-plugin-01",
-      "headCommit": "9aa882a6ae61ef5532bdbfac142d9bcd71fd9a5d",
-      "number": 190
+      "headBranch": "codex/connectors-commerce-sorftime-outcome-02",
+      "headCommit": "40ab0fce8458b26806dd40f704715775ba046be9",
+      "number": 266
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/docs-plugin-truth-check-01",
-      "headCommit": "8458db937cb88fb2580bfcc609ac33abc29ea8c8",
-      "number": 179
+      "headBranch": "codex/dist-sbom-target-01",
+      "headCommit": "7390755095e0d2d8f35f3b81d7e20210b16f6a48",
+      "number": 265
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/plugin-contract-closure-01",
-      "headCommit": "14d5bd39a78c208a6d43aa848c22ea883a642278",
-      "number": 178
+      "headBranch": "codex/browser-mission-batch-plugin-01",
+      "headCommit": "5bc69402f7ea10a513e47a98a6a245927c260b29",
+      "number": 273
     }
   ],
-  "createdAt": "2026-08-16T03:47:11Z",
+  "createdAt": "2026-08-16T04:21:55Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260816-0346"
+  "trainBranch": "merge-train/20260816-0421"
 }
