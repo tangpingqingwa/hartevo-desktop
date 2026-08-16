@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "7f340da0275ca15a604b5618baeb3517e0de6f39",
+  "baseCommit": "75b91d0157935f23a36fd060059dea4cdd3ed53b",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/operations-plugin-log-01",
-      "headCommit": "16726ec5a234942a25d51b7d7e6aed15ebd79a83",
-      "number": 163
+      "headBranch": "codex/platform-distribution-dist01",
+      "headCommit": "597d1c6bf0a9a5e34d94ce6c51dfa9a008b87e49",
+      "number": 100
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/connectors-commerce-sorftime-outcome-02",
-      "headCommit": "40ab0fce8458b26806dd40f704715775ba046be9",
-      "number": 266
+      "headBranch": "codex/platform-creator-work-creator01",
+      "headCommit": "8fe42c836ddce500df2afdfe8ede4a6b9d37a2ad",
+      "number": 107
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/dist-sbom-target-01",
-      "headCommit": "7390755095e0d2d8f35f3b81d7e20210b16f6a48",
-      "number": 265
+      "headBranch": "codex/connectors-commerce-amazon-commerce02",
+      "headCommit": "452040e22346ef17db69ea99c715cd55f7332821",
+      "number": 108
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/browser-mission-batch-plugin-01",
-      "headCommit": "5bc69402f7ea10a513e47a98a6a245927c260b29",
-      "number": 273
+      "headBranch": "codex/platform-attribution-ingestion-attr02",
+      "headCommit": "871d4bc8639b550f9e56825540de72793a6b7bae",
+      "number": 115
     }
   ],
-  "createdAt": "2026-08-16T04:21:55Z",
+  "createdAt": "2026-08-16T04:53:24Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260816-0421"
+  "trainBranch": "merge-train/20260816-0452"
 }
