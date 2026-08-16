@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "6b5954b45106e0abb555fa78d499b5f7f7eabeee",
+  "baseCommit": "cb2bab14609caa7a44e3477256d957cc39ec6059",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-github-app-work-01",
-      "headCommit": "60a327a7b637aeddf13ce7d3362987889047adb7",
-      "number": 303
+      "headBranch": "codex/ext-vercel-preview-01",
+      "headCommit": "f7a5801003147c24f8e6c43607863156b821db09",
+      "number": 299
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-linear-work-01",
-      "headCommit": "c8d12d253972cea5a240c5e758eaf5884ca2ba63",
-      "number": 302
+      "headBranch": "codex/scheduler-local-host-timer-01",
+      "headCommit": "ba0d17efa10c318ac93bd3d683c9012f616fe4d3",
+      "number": 293
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-posthog-outcome-01",
-      "headCommit": "6dc40d93d864154b50fc71f65943470c63ea9f75",
-      "number": 301
+      "headBranch": "codex/gm01-observation-evidence-pack-01",
+      "headCommit": "b203b8c9a41eb0c855bc5f959757ccd0e6ef4eec",
+      "number": 292
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-google-workspace-result-01",
-      "headCommit": "d7d325b990d24889f81fb2c968872130e2f65eca",
-      "number": 300
+      "headBranch": "codex/connectors-channel-youtube-root-01",
+      "headCommit": "695e80dad76c856bae4fb61c21324a51b2fbf3fe",
+      "number": 291
     }
   ],
-  "createdAt": "2026-08-16T02:05:50Z",
+  "createdAt": "2026-08-16T02:38:25Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260816-0201"
+  "trainBranch": "merge-train/20260816-0237"
 }
