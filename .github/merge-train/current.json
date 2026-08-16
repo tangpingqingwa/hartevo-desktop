@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "215f75b81a3d8fdebdad5597b3234f5bb98a1139",
+  "baseCommit": "b84434077974556f31e4f4ffb83eb1dab9e5a2ec",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-sentry-01",
-      "headCommit": "fc8b5d31aeeb226f8c719974e9a9e57879b632e0",
-      "number": 323
+      "headBranch": "codex/ext-twilio-handoff-01",
+      "headCommit": "ada0d19feb0466b1ebedeb5d78ed18d179e03cc7",
+      "number": 319
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-figma-01",
-      "headCommit": "d306cd4c1dcf58226f5448af2ef408e7724eb2d3",
-      "number": 322
+      "headBranch": "codex/ext-notion-result-01",
+      "headCommit": "68593150bee0a7c4c3b29431c4d10ac4b1740642",
+      "number": 312
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-docusign-01",
-      "headCommit": "1a9505be5efbbfcd45e5bf291f08e6df62ac5254",
-      "number": 321
+      "headBranch": "codex/ext-airtable-ops-01",
+      "headCommit": "b148ef0eafdcfdbfe77b0f9e5fdbea4a97cd5f15",
+      "number": 311
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-sfn-01-step-functions-worker",
-      "headCommit": "befef412e69e98abd9c59e222c2c8f7246decb2c",
-      "number": 320
+      "headBranch": "codex/ext-temporal-worker-01",
+      "headCommit": "34b1123c5695774ced5f0cc7eb452e0b3419fe74",
+      "number": 310
     }
   ],
-  "createdAt": "2026-08-16T00:56:19Z",
+  "createdAt": "2026-08-16T01:30:33Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260816-005555"
+  "trainBranch": "merge-train/20260816-012849"
 }
