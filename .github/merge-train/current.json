@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "20b85c39c100dfb36144ef6c9ed4ddd26a6c459b",
+  "baseCommit": "215f75b81a3d8fdebdad5597b3234f5bb98a1139",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-neon-branch-result-01",
-      "headCommit": "1ed3e8e3b4e1445fe5554d66c0a76cde02d4edd8",
-      "number": 331
+      "headBranch": "codex/ext-sentry-01",
+      "headCommit": "fc8b5d31aeeb226f8c719974e9a9e57879b632e0",
+      "number": 323
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-heygen-video-result-315",
-      "headCommit": "738a7c99a5b7f8651a5709c0c453ab04281ee72e",
-      "number": 329
+      "headBranch": "codex/ext-figma-01",
+      "headCommit": "d306cd4c1dcf58226f5448af2ef408e7724eb2d3",
+      "number": 322
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ext-box-artifact-plugin-01",
-      "headCommit": "472380d68432edac21cb77d705853fc692bb660b",
-      "number": 328
+      "headBranch": "codex/ext-docusign-01",
+      "headCommit": "1a9505be5efbbfcd45e5bf291f08e6df62ac5254",
+      "number": 321
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/zotero-evidence-314",
-      "headCommit": "e7c76542599c22aede8c259a1e0fdf8f5294c409",
-      "number": 327
+      "headBranch": "codex/ext-sfn-01-step-functions-worker",
+      "headCommit": "befef412e69e98abd9c59e222c2c8f7246decb2c",
+      "number": 320
     }
   ],
-  "createdAt": "2026-08-16T00:26:14Z",
+  "createdAt": "2026-08-16T00:56:19Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260816-002402"
+  "trainBranch": "merge-train/20260816-005555"
 }
