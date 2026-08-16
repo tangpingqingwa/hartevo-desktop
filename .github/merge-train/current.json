@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "61b192d8259783ad1e059d326322bc03da771cdf",
+  "baseCommit": "50be7b94e6027635b3d82bde184588e0f1a44e11",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/paid-social-linkedin-org-read-ps01",
-      "headCommit": "b313a338999f10f77a4872e0c4f336079c433371",
-      "number": 241
+      "headBranch": "codex/shopify-durable-cursor-plugin-01",
+      "headCommit": "f4f69006ea8b63863a147c0b46078f88ad6399bc",
+      "number": 193
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/capability-degradation-fallback-01",
-      "headCommit": "5f0e0307e33d2c33dc83eddc1cc549c746ecc02e",
-      "number": 222
+      "headBranch": "codex/browser-workspace-handoff-plugin-01",
+      "headCommit": "9aa882a6ae61ef5532bdbfac142d9bcd71fd9a5d",
+      "number": 190
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/cj-authenticated-read-plugin-01",
-      "headCommit": "05a4af51d5a062b0d46834ae34b9caa9a31e8d12",
-      "number": 215
+      "headBranch": "codex/docs-plugin-truth-check-01",
+      "headCommit": "8458db937cb88fb2580bfcc609ac33abc29ea8c8",
+      "number": 179
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/connector-probe-capability-consumer-02",
-      "headCommit": "cae52c06c4d706a79fee6fceacb5deecae25648c",
-      "number": 200
+      "headBranch": "codex/plugin-contract-closure-01",
+      "headCommit": "14d5bd39a78c208a6d43aa848c22ea883a642278",
+      "number": 178
     }
   ],
-  "createdAt": "2026-08-16T03:15:39Z",
+  "createdAt": "2026-08-16T03:47:11Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260816-0313"
+  "trainBranch": "merge-train/20260816-0346"
 }
