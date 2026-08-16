@@ -9,8 +9,11 @@
 
 #![forbid(unsafe_code)]
 
+mod degradation;
 mod invocation;
 mod resolution;
+pub use degradation::CapabilityVersion as DegradationCapabilityVersion;
+pub use degradation::*;
 pub use invocation::{
     CapabilityInvocationCloseReason, CapabilityInvocationContext,
     CapabilityInvocationEffectReceipt, CapabilityInvocationError, CapabilityInvocationEvent,
