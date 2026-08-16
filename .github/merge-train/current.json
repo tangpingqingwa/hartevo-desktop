@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "8b87a004182c8035828fc15a4313ffd52b5c30ed",
+  "baseCommit": "20b85c39c100dfb36144ef6c9ed4ddd26a6c459b",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-600-ext-aws-network-firewall-posture-result-01",
-      "headCommit": "bc5e28a858ea5d5603174d82ca370b9659dffb2e",
-      "number": 617
+      "headBranch": "codex/ext-neon-branch-result-01",
+      "headCommit": "1ed3e8e3b4e1445fe5554d66c0a76cde02d4edd8",
+      "number": 331
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/aws-cloudformation-drift-result-594",
-      "headCommit": "152266c71ba0bcf840013f446559bf00daef776b",
-      "number": 618
+      "headBranch": "codex/ext-heygen-video-result-315",
+      "headCommit": "738a7c99a5b7f8651a5709c0c453ab04281ee72e",
+      "number": 329
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-608-ext-aws-synthetics-canary-result-01",
-      "headCommit": "f17dcf76172628a9ab9de2afcf401e15ecbd721e",
-      "number": 621
+      "headBranch": "codex/ext-box-artifact-plugin-01",
+      "headCommit": "472380d68432edac21cb77d705853fc692bb660b",
+      "number": 328
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/issue-612-github-dependabot-result",
-      "headCommit": "273f7c3e75970bcf89ff30fa3c3a8264cb031993",
-      "number": 622
+      "headBranch": "codex/zotero-evidence-314",
+      "headCommit": "e7c76542599c22aede8c259a1e0fdf8f5294c409",
+      "number": 327
     }
   ],
-  "createdAt": "2026-08-15T23:54:15Z",
+  "createdAt": "2026-08-16T00:26:14Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260815-235352"
+  "trainBranch": "merge-train/20260816-002402"
 }
