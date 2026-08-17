@@ -8,7 +8,8 @@ use hartevo_eval::{
     HarnessEvaluationInput, HarnessLabPlan, HarnessPromotionKey, HarnessSignedPromotionRecord,
     VERTICAL_SLICE_ID, catalog_snapshot, evaluate_harness_lab, export_public_key,
     finalize_evaluation_run, generate_keypair, harness_lab_source_commit, run_vertical_slice,
-    sign_file, validate_evaluation_run, validate_gate, verify_file, wave_zero_release_evidence,
+    sign_file, validate_evaluation_run, validate_gate, validate_progress_trace_example,
+    verify_file, wave_zero_release_evidence,
 };
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,12 @@ fn run_standard_command(arguments: &[String]) -> Result<()> {
                 snapshot.summary.dataset_case_count,
                 snapshot.summary.cross_cutting_case_count
             );
+        }
+        [progress_trace, command]
+            if progress_trace == "progress-trace" && command == "validate-example" =>
+        {
+            let report = validate_progress_trace_example()?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         [catalog, command, output_flag, output]
             if catalog == "catalog" && command == "export" && output_flag == "--output" =>
@@ -272,6 +279,7 @@ fn print_help() {
          hartevo-eval catalog validate\n  \
          hartevo-eval catalog export --output <path>\n  \
          hartevo-eval evidence baseline --commit <sha> --output <path>\n  \
+         hartevo-eval progress-trace validate-example\n  \
          hartevo-eval evaluation-run finalize --run-dir <path>\n  \
          hartevo-eval evaluation-run validate --run-dir <path>\n  \
          hartevo-eval harness-lab validate --plan <plan.json> --results <results.json> [--keys <keys.json>] [--promotion <record.json>]\n  \
