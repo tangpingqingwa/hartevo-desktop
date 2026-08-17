@@ -35,6 +35,7 @@ CHECKED_IN_WORKSPACE_MEMBERS = (
     "hartevo-rs/application",
     "hartevo-rs/browser-adapter",
     "hartevo-rs/capability-gateway",
+    "hartevo-rs/channel-adapters",
     "hartevo-rs/catalog",
     "hartevo-rs/cloud-storage",
     "hartevo-rs/connector-sdk",
@@ -66,6 +67,7 @@ CHECKED_IN_SHARDS = (
     (
         "hartevo-browser-adapter",
         "hartevo-catalog",
+        "hartevo-channel-adapters",
         "hartevo-commerce-connector",
         "hartevo-context-fabric",
         "hartevo-domain-kernel",
@@ -96,8 +98,8 @@ def layout_descriptor(shards: Sequence[Sequence[str]] = CHECKED_IN_SHARDS) -> di
     }
 
 
-CHECKED_IN_LAYOUT_DIGEST = "aa41a33cd0b0b50d9e68e4c5893646cc4497ec5c98bf61d8f0b2a9d5fe6072dd"
-CHECKED_IN_SOURCE_WORKSPACE_MEMBER_DIGEST = "f449e4db87a42c207cb1b5da3478f3494c83c28a3d3f8a4a08e74013fb91b95c"
+CHECKED_IN_LAYOUT_DIGEST = "9dd71583b927d744247e45b64d406ee237d752c31675a276ffe29a5ed938ddda"
+CHECKED_IN_SOURCE_WORKSPACE_MEMBER_DIGEST = "3a766d636b5d92d792f6645f88b0a37ea6ace8a59cf1d9723315b62cbd736d96"
 
 
 def fail(message: str) -> None:
@@ -473,8 +475,10 @@ def self_test() -> None:
         for index in range(SHARD_COUNT)
     ]
     selected = [package for plan in plans for package in plan["packages"]]
-    assert len(selected) == len(set(selected)) == len(CHECKED_IN_WORKSPACE_PACKAGES)
+    assert len(selected) == len(set(selected)) == len(CHECKED_IN_WORKSPACE_PACKAGES) == 17
     assert sorted(selected) == list(CHECKED_IN_WORKSPACE_PACKAGES)
+    assert plans[1]["packages"][-1] == "hartevo-storage"
+    assert "hartevo-channel-adapters" in plans[1]["packages"]
 
     scoped = build_plan(
         workspace,
