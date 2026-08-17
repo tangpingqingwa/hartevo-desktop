@@ -6,10 +6,12 @@
 
 use chrono::{DateTime, Utc};
 use hartevo_domain_kernel::{
-    ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE, ATTRIBUTION_SPINE_EVENT_TYPE,
-    ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE, AttributionError, AttributionLedger,
-    CurrencyCode, OutcomeCandidate, OutcomeCandidateId, OutcomeVerification, ProjectId,
-    SourceObservationBatch, TenantId,
+    ATTRIBUTION_SPINE_EVENT_TYPE, AttributionError, AttributionLedger, CurrencyCode,
+    OutcomeCandidate, OutcomeCandidateId, OutcomeVerification, ProjectId, SourceObservationBatch,
+    TenantId,
+    attribution_spine_contract::{
+        ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE, ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
