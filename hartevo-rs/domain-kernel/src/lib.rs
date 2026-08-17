@@ -40,16 +40,25 @@ pub use attribution_outcome_plugin::{
     OutcomeResultStatus, OutcomeServiceDefinition, OutcomeServiceProvider,
 };
 pub use attribution_spine::{
-    ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE, ATTRIBUTION_SPINE_EVENT_TYPE,
-    ATTRIBUTION_SPINE_SCHEMA_VERSION, ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
-    AttributionAssignment, AttributionError, AttributionLedger, AttributionProjection,
-    AttributionReason, AttributionWindow, BatchIngestResult, ConnectorObservationSource,
-    CorrectionKind, CorrectionLineage, IngestDisposition, ObservationOrigin, ObservationProvenance,
+    ATTRIBUTION_SPINE_EVENT_TYPE, ATTRIBUTION_SPINE_SCHEMA_VERSION, AttributionAssignment,
+    AttributionError, AttributionLedger, AttributionProjection, AttributionReason,
+    AttributionWindow, BatchIngestResult, ConnectorObservationSource, CorrectionKind,
+    CorrectionLineage, IngestDisposition, ObservationOrigin, ObservationProvenance,
     OutcomeCandidate, OutcomeCandidateId, OutcomeKind, OutcomeVerification, ProviderCursor,
     ProviderEntityRef, ProviderEventIdentity, SourceEntityKind, SourceEvent, SourceEventId,
     SourceEventKind, SourceEventLinks, SourceObservationBatch, VerificationMethod, VerifiedOutcome,
     VerifiedOutcomeId,
 };
+
+/// Stable contract constants for storage crates.  The candidate and verified
+/// event names are also owned by the attribution-outcome adoption contract on
+/// newer bootstrap compositions, so they intentionally stay out of the root
+/// re-export above to avoid duplicate public names when that slice is composed.
+pub mod attribution_spine_contract {
+    pub use super::attribution_spine::{
+        ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE, ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
+    };
+}
 pub use context::{
     ContextBranch, ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleStatus,
     ContextDataClass, ContextDataPolicy, ContextError, ContextFactGrant, ContextInputRefs,
