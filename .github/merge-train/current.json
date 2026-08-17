@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "7f340da0275ca15a604b5618baeb3517e0de6f39",
+  "baseCommit": "75b91d0157935f23a36fd060059dea4cdd3ed53b",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/operations-plugin-log-01",
-      "headCommit": "16726ec5a234942a25d51b7d7e6aed15ebd79a83",
-      "number": 163
+      "headBranch": "codex/scan-05-supply-chain-policy-fence",
+      "headCommit": "8edf9be2123a7b052ae27a39f51e04976f6c211f",
+      "number": 25
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/connectors-commerce-sorftime-outcome-02",
-      "headCommit": "40ab0fce8458b26806dd40f704715775ba046be9",
-      "number": 266
+      "headBranch": "codex/bw01-browser-service-lifecycle",
+      "headCommit": "d6aa51e988bd040e8b974a324a659d8b154adb65",
+      "number": 144
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/dist-sbom-target-01",
-      "headCommit": "7390755095e0d2d8f35f3b81d7e20210b16f6a48",
-      "number": 265
+      "headBranch": "codex/plugin-provenance-evidence-01",
+      "headCommit": "7035f2c2a5f79b45b110fc2767a19e25e0a3bd0b",
+      "number": 284
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/browser-mission-batch-plugin-01",
-      "headCommit": "5bc69402f7ea10a513e47a98a6a245927c260b29",
-      "number": 273
+      "headBranch": "codex/platform-cloud-cell-region-transfer-01",
+      "headCommit": "cb8f426d0aee30a7aa87c641c57aab259e8bfc4e",
+      "number": 285
     }
   ],
-  "createdAt": "2026-08-16T04:21:55Z",
+  "createdAt": "2026-08-17T02:08:26Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260816-0421"
+  "trainBranch": "merge-train/20260817-020744"
 }

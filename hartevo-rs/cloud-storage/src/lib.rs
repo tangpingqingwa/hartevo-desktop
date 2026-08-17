@@ -19,9 +19,14 @@ use thiserror::Error;
 use tokio_postgres::{Client, Row, Transaction};
 
 mod effect_ledger;
+mod region_transfer;
 mod scheduler;
 
 pub use effect_ledger::{CloudPermissionFenceMutation, CloudPermissionFenceResult};
+pub use region_transfer::{
+    EncryptedRegionTransferRequest, RegionTransferConsumer, RegionTransferProvider,
+    RegionTransferReceipt, RegionTransferServiceDefinition, RegionTransferStatus,
+};
 pub use scheduler::{
     MAX_SCHEDULER_LEASE_SECONDS, SchedulerAttempt, SchedulerAttemptOutcome,
     SchedulerAttemptSurface, SchedulerBackpressure, SchedulerBackpressureState, SchedulerBudget,
@@ -31,7 +36,7 @@ pub use scheduler::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_CIPHERTEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REMOTE_WORKER_LEASE: Duration = Duration::seconds(15 * 60);
 const CLAIM_OUTBOX_SQL: &str = "WITH candidates AS (
@@ -589,7 +594,7 @@ impl PostgresCellStore {
         let transaction = client.transaction().await?;
         transaction
             .query_one(
-                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v5'))",
+                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v6'))",
                 &[],
             )
             .await?;
@@ -3555,6 +3560,22 @@ pub enum CloudStorageError {
     InvalidRemoteWorkerTask,
     #[error("remote Worker completion or result is invalid")]
     InvalidRemoteWorkerCompletion,
+    #[error("encrypted region transfer service, provider, consumer, or scope is invalid")]
+    InvalidRegionTransfer,
+    #[error("region transfer source mission head is not visible in the exact Project scope")]
+    RegionTransferSourceHeadNotFound,
+    #[error("region transfer receipt is not visible in the exact tenant, Project, and Cell scope")]
+    RegionTransferNotFound,
+    #[error("region transfer receipt or encrypted bundle failed integrity verification")]
+    RegionTransferReceiptTampered,
+    #[error("region transfer was revoked before adoption")]
+    RegionTransferRevoked,
+    #[error("region transfer was aborted after a crash and cannot be replayed")]
+    RegionTransferCrashed,
+    #[error("region transfer target already contains a conflicting Mission head")]
+    RegionTransferTargetConflict,
+    #[error("region transfer is already terminal and cannot change state")]
+    RegionTransferAlreadyTerminal,
     #[error("tenant has not been registered in this Cell")]
     TenantNotRegistered,
     #[error("project already exists and the request is not an idempotent replay")]
@@ -3962,13 +3983,15 @@ mod tests {
 
     #[test]
     fn schema_contract_has_physical_cell_rls_ciphertext_and_append_only_versions() {
-        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(SCHEMA_VERSION, 6);
         assert!(SCHEMA.contains("FORCE ROW LEVEL SECURITY"));
         assert!(SCHEMA.contains("current_setting(''hartevo.tenant_id'', true)"));
         assert!(SCHEMA.contains("current_setting(''hartevo.cell'', true)"));
         assert!(SCHEMA.contains("sync_object_versions"));
         assert!(SCHEMA.contains("payload_ciphertext BYTEA"));
         assert!(SCHEMA.contains("sync_mutations"));
+        assert!(SCHEMA.contains("region_transfer_receipts"));
+        assert!(SCHEMA.contains("region_transfer_events"));
         assert!(SCHEMA.contains("remote_worker_mailbox_messages"));
         assert!(SCHEMA.contains("remote_worker_claims"));
         assert!(SCHEMA.contains("claim_request_digest"));
