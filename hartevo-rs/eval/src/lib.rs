@@ -4,6 +4,8 @@ extern crate self as hartevo_eval;
 
 #[path = "../examples/hartevo-browser-contract/digest.rs"]
 mod digest;
+mod distribution;
+mod evaluation_plugin;
 mod harness_lab;
 #[path = "../examples/hartevo-browser-contract/model.rs"]
 mod model;
@@ -12,6 +14,16 @@ mod run_receipt;
 #[path = "../examples/hartevo-browser-contract/verifier.rs"]
 mod verifier;
 
+pub use distribution::{
+    export_public_key, generate_keypair, sign_file, validate_gate, verify_file,
+};
+pub use evaluation_plugin::{
+    DurableEvaluationResultProvider, DurableEvaluationService, EVALUATION_PLUGIN_AUTHORITY,
+    EVALUATION_PLUGIN_RELEASE_DECISION, EVALUATION_PLUGIN_SCHEMA_VERSION, EvaluationEvaluator,
+    EvaluationEvidence, EvaluationEvidenceProvenance, EvaluationExecutionStatus,
+    EvaluationMissionConsumer, EvaluationMissionView, EvaluationPluginService,
+    EvaluationPluginState, EvaluationResult, EvaluationResultProvider,
+};
 pub use harness_lab::{
     CandidateIdentity as HarnessCandidateIdentity, CaseObservation as HarnessCaseObservation,
     ComparisonRole as HarnessComparisonRole, CrossLaneLeakageFlags as HarnessCrossLaneLeakageFlags,

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/distribution/gate/1.0.0",
+  "title": "Hartevo distribution gate report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "issue", "releaseCommit", "sourceDirty", "ciStatus", "releaseDecision", "releaseReady", "artifactReferences", "checks", "nativeEvidence", "blockedEnv", "failures"],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-distribution-gate/v1"},
+    "issue": {"const": "DIST-01"},
+    "releaseCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sourceDirty": {"type": "boolean"},
+    "ciStatus": {"enum": ["CI_EXECUTED", "CI_NOT_EXECUTED", "LOCAL_SCOPED"]},
+    "releaseDecision": {"const": "NOT_EVALUATED"},
+    "releaseReady": {"const": false},
+    "artifactReferences": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest", "sbom", "updateMetadata", "telemetry", "restoreDrill", "releaseEvidence"],
+      "properties": {
+        "manifest": {"type": "string", "minLength": 1},
+        "sbom": {"type": "string", "minLength": 1},
+        "updateMetadata": {"type": "string", "minLength": 1},
+        "telemetry": {"type": "string", "minLength": 1},
+        "restoreDrill": {"type": "string", "minLength": 1},
+        "releaseEvidence": {"type": "string", "minLength": 1}
+      }
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest", "sbom", "updateMetadata", "telemetry", "restoreDrill", "releaseEvidence"],
+      "properties": {
+        "manifest": {"enum": ["PASS", "FAIL", "BLOCKED_ENV", "CI_NOT_EXECUTED"]},
+        "sbom": {"enum": ["PASS", "FAIL", "BLOCKED_ENV", "CI_NOT_EXECUTED"]},
+        "updateMetadata": {"enum": ["PASS", "FAIL", "BLOCKED_ENV", "CI_NOT_EXECUTED"]},
+        "telemetry": {"enum": ["PASS", "FAIL", "BLOCKED_ENV", "CI_NOT_EXECUTED"]},
+        "restoreDrill": {"enum": ["PASS", "FAIL", "BLOCKED_ENV", "CI_NOT_EXECUTED"]},
+        "releaseEvidence": {"enum": ["PASS", "FAIL", "BLOCKED_ENV", "CI_NOT_EXECUTED"]}
+      }
+    },
+    "nativeEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "requiredForRelease", "productCompletionCounted"],
+      "properties": {
+        "status": {"const": "NOT_PROVEN"},
+        "requiredForRelease": {"const": true},
+        "productCompletionCounted": {"const": false}
+      }
+    },
+    "blockedEnv": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "failures": {"type": "array", "items": {"type": "string", "minLength": 1}}
+  }
+}
