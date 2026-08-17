@@ -10,10 +10,12 @@
 #![forbid(unsafe_code)]
 
 mod degradation;
+mod fallback_invocation;
 mod invocation;
 mod resolution;
 pub use degradation::CapabilityVersion as DegradationCapabilityVersion;
 pub use degradation::*;
+pub use fallback_invocation::*;
 pub use invocation::{
     CapabilityInvocationCloseReason, CapabilityInvocationContext,
     CapabilityInvocationEffectReceipt, CapabilityInvocationError, CapabilityInvocationEvent,
