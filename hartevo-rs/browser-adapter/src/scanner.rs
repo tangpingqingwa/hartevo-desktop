@@ -227,6 +227,8 @@ pub struct ProductionFileScanner {
     process_generation: u64,
     last_launch_digest: String,
     active_launch_digest: Option<String>,
+    acceptance_generation: u64,
+    pending_acceptance_digest: Option<String>,
     process_boundary_poisoned: bool,
 }
 
@@ -288,6 +290,8 @@ impl ProductionFileScanner {
             process_generation: 0,
             last_launch_digest: lifecycle_root_digest,
             active_launch_digest: None,
+            acceptance_generation: 0,
+            pending_acceptance_digest: None,
             process_boundary_poisoned: false,
         };
         let probe = scanner.run_process(ProcessOperation::Version)?;
@@ -525,6 +529,9 @@ impl ProductionFileScanner {
     }
 
     fn poison_process_boundary(&mut self) {
+        if self.pending_acceptance_digest.take().is_some() {
+            self.acceptance_generation = self.acceptance_generation.saturating_add(1);
+        }
         self.process_boundary_poisoned = true;
     }
 }
@@ -552,6 +559,11 @@ impl fmt::Debug for ProductionFileScanner {
                 &self.version_probe_evidence_digest,
             )
             .field("process_generation", &self.process_generation)
+            .field("acceptance_generation", &self.acceptance_generation)
+            .field(
+                "scan_acceptance_pending",
+                &self.pending_acceptance_digest.is_some(),
+            )
             .field("process_boundary_poisoned", &self.process_boundary_poisoned)
             .field(
                 "process_launch_active",
@@ -561,11 +573,15 @@ impl fmt::Debug for ProductionFileScanner {
     }
 }
 
-impl FileSafetyScanner for ProductionFileScanner {
-    fn scan(&mut self, request: &FileScanRequest<'_>) -> Result<FileScanReport, BrowserError> {
+impl ProductionFileScanner {
+    fn prepare_scan_verdict(
+        &mut self,
+        request: &ScannerInputRequest<'_>,
+    ) -> Result<PreparedScanVerdict, BrowserError> {
         if self.process_boundary_poisoned || self.active_launch_digest.is_some() {
             return Err(BrowserError::FileScanUnavailable);
         }
+        self.supersede_pending_acceptance()?;
         self.release_pin.validate()?;
         self.limits.validate()?;
         if !is_sha256(request.content_digest) || request.byte_count == 0 {
@@ -603,7 +619,8 @@ impl FileSafetyScanner for ProductionFileScanner {
             return Err(BrowserError::FileScanUnavailable);
         };
         let decision = result_envelope.decision;
-        let evidence_digest = digest_json(&serde_json::json!({
+        let result_envelope_digest = result_envelope.evidence_digest()?;
+        let verdict_evidence_digest = digest_json(&serde_json::json!({
             "protocol": SCANNER_PROTOCOL,
             "operation": SCAN_OPERATION,
             "releaseDigest": self.release_pin.release_digest,
@@ -622,22 +639,247 @@ impl FileSafetyScanner for ProductionFileScanner {
             "retainedInputFdAfterDigest": input_revalidation.retained_fd_evidence_digest()?,
             "inputPathAfterDigest": input_revalidation.path_evidence_digest()?,
             "decision": decision,
-            "scannerResultEnvelopeDigest": result_envelope.evidence_digest()?,
+            "scannerResultEnvelopeDigest": result_envelope_digest,
         }))?;
-        Ok(FileScanReport {
+        if decision == FileScanDecision::Rejected {
+            return Ok(PreparedScanVerdict::Rejected(self.scan_report(
+                decision,
+                verdict_evidence_digest,
+                request,
+            )));
+        }
+        let acceptance = self.issue_clean_acceptance(
+            request,
+            &input_revalidation,
+            &process,
+            &result_envelope,
+            verdict_evidence_digest,
+        )?;
+        Ok(PreparedScanVerdict::Clean(Box::new(acceptance)))
+    }
+}
+
+impl ProductionFileScanner {
+    fn issue_clean_acceptance(
+        &mut self,
+        request: &ScannerInputRequest<'_>,
+        input_revalidation: &DispatchedInputRevalidation,
+        process: &ProcessObservation,
+        result_envelope: &ScannerResultEnvelope,
+        verdict_evidence_digest: String,
+    ) -> Result<PendingScanAcceptance, BrowserError> {
+        if result_envelope.decision != FileScanDecision::Clean
+            || self.pending_acceptance_digest.is_some()
+            || process.identity.launch.generation != self.process_generation
+        {
+            self.poison_process_boundary();
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        let acceptance_generation = self
+            .acceptance_generation
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        let input_snapshot = input_revalidation.dispatched.clone();
+        let request_digest = scan_request_digest(request, &input_snapshot)?;
+        let mut acceptance = PendingScanAcceptance {
+            state: ScanAcceptanceState::Pending,
+            acceptance_generation,
+            process_generation: process.identity.launch.generation,
+            request_digest,
+            input_snapshot,
+            release_digest: self.release_pin.release_digest.clone(),
+            executable_identity_digest: process.identity.launch.executable_identity_digest.clone(),
+            policy_digest: self.release_pin.policy_digest.clone(),
+            config_sha256: self.release_pin.config_sha256.clone(),
+            invocation_contract_digest: process.identity.launch.invocation_contract_digest.clone(),
+            result_envelope_digest: result_envelope.evidence_digest()?,
+            launch_digest: process.identity.launch.launch_digest.clone(),
+            launch_identity_digest: process.identity.launch.evidence_digest()?,
+            verdict_evidence_digest,
+            acceptance_digest: digest(b"pending-one-shot-scan-acceptance"),
+            report: None,
+        };
+        let acceptance_digest = acceptance.evidence_digest()?;
+        let report_evidence_digest =
+            accepted_scan_report_evidence(&acceptance.verdict_evidence_digest, &acceptance_digest)?;
+        acceptance.acceptance_digest.clone_from(&acceptance_digest);
+        acceptance.report =
+            Some(self.scan_report(FileScanDecision::Clean, report_evidence_digest, request));
+        self.acceptance_generation = acceptance_generation;
+        self.pending_acceptance_digest = Some(acceptance_digest);
+        Ok(acceptance)
+    }
+
+    fn consume_scan_acceptance(
+        &mut self,
+        acceptance: &mut PendingScanAcceptance,
+        request: &ScannerInputRequest<'_>,
+    ) -> Result<FileScanReport, BrowserError> {
+        if self.validate_scan_acceptance(acceptance, request).is_err() {
+            self.reject_scan_acceptance(acceptance)?;
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        let report = acceptance
+            .report
+            .take()
+            .ok_or(BrowserError::FileScanUnavailable)?;
+        acceptance.state = ScanAcceptanceState::Consumed;
+        self.pending_acceptance_digest = None;
+        Ok(report)
+    }
+
+    fn validate_scan_acceptance(
+        &self,
+        acceptance: &PendingScanAcceptance,
+        request: &ScannerInputRequest<'_>,
+    ) -> Result<(), BrowserError> {
+        if acceptance.state != ScanAcceptanceState::Pending
+            || self.process_boundary_poisoned
+            || self.active_launch_digest.is_some()
+            || self.pending_acceptance_digest.as_deref()
+                != Some(acceptance.acceptance_digest.as_str())
+            || self.acceptance_generation != acceptance.acceptance_generation
+            || self.process_generation != acceptance.process_generation
+            || self.last_launch_digest != acceptance.launch_digest
+        {
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        self.release_pin.validate()?;
+        self.limits.validate()?;
+        let executable_identity = self.verify_runtime_boundary()?;
+        let executable_identity_digest = executable_identity.evidence_digest()?;
+        let (_, current_input) = inspect_staged_path(request.staged_path())?;
+        let request_digest = scan_request_digest(request, &current_input)?;
+        let invocation_digest = ScannerInvocationContract::for_scan_request(
+            request,
+            &self.release_pin,
+            &executable_identity_digest,
+            self.limits,
+        )?
+        .evidence_digest()?;
+        if current_input != acceptance.input_snapshot
+            || request_digest != acceptance.request_digest
+            || self.release_pin.release_digest != acceptance.release_digest
+            || executable_identity_digest != acceptance.executable_identity_digest
+            || self.release_pin.policy_digest != acceptance.policy_digest
+            || self.release_pin.config_sha256 != acceptance.config_sha256
+            || invocation_digest != acceptance.invocation_contract_digest
+            || acceptance.evidence_digest()? != acceptance.acceptance_digest
+        {
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        let report = acceptance
+            .report
+            .as_ref()
+            .ok_or(BrowserError::FileScanUnavailable)?;
+        let expected_report_evidence = accepted_scan_report_evidence(
+            &acceptance.verdict_evidence_digest,
+            &acceptance.acceptance_digest,
+        )?;
+        if report.scanner_id != self.release_pin.scanner_id
+            || report.scanner_version != self.release_pin.scanner_version
+            || report.decision != FileScanDecision::Clean
+            || report.evidence_digest != expected_report_evidence
+            || report.scanned_at != request.observed_at
+        {
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        Ok(())
+    }
+
+    fn reject_scan_acceptance(
+        &mut self,
+        acceptance: &mut PendingScanAcceptance,
+    ) -> Result<(), BrowserError> {
+        if acceptance.state == ScanAcceptanceState::Pending {
+            acceptance.state = ScanAcceptanceState::Cancelled;
+            acceptance.report = None;
+        }
+        if self.pending_acceptance_digest.as_deref() == Some(acceptance.acceptance_digest.as_str())
+        {
+            self.pending_acceptance_digest = None;
+            self.bump_acceptance_generation()?;
+        }
+        Ok(())
+    }
+
+    /// Invalidates a pending clean verdict after cancellation or lease loss.
+    pub fn cancel_pending_acceptance(&mut self) -> Result<(), BrowserError> {
+        if self.pending_acceptance_digest.take().is_some() {
+            self.bump_acceptance_generation()?;
+        }
+        Ok(())
+    }
+
+    fn supersede_pending_acceptance(&mut self) -> Result<(), BrowserError> {
+        self.cancel_pending_acceptance()
+    }
+
+    fn bump_acceptance_generation(&mut self) -> Result<(), BrowserError> {
+        self.acceptance_generation = self
+            .acceptance_generation
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        Ok(())
+    }
+
+    fn scan_report(
+        &self,
+        decision: FileScanDecision,
+        evidence_digest: String,
+        request: &ScannerInputRequest<'_>,
+    ) -> FileScanReport {
+        FileScanReport {
             scanner_id: self.release_pin.scanner_id.clone(),
             scanner_version: self.release_pin.scanner_version.clone(),
             decision,
             evidence_digest,
             scanned_at: request.observed_at,
-        })
+        }
+    }
+}
+
+impl FileSafetyScanner for ProductionFileScanner {
+    fn scan(&mut self, request: &FileScanRequest<'_>) -> Result<FileScanReport, BrowserError> {
+        let scanner_request = ScannerInputRequest::from_file_scan_request(request);
+        match self.prepare_scan_verdict(&scanner_request)? {
+            PreparedScanVerdict::Clean(mut acceptance) => {
+                self.consume_scan_acceptance(&mut acceptance, &scanner_request)
+            }
+            PreparedScanVerdict::Rejected(report) => Ok(report),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScannerInputRequest<'input> {
+    staged_path: &'input Path,
+    content_digest: &'input str,
+    byte_count: u64,
+    detected_type: BrowserFileType,
+    observed_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl<'input> ScannerInputRequest<'input> {
+    fn from_file_scan_request(request: &'input FileScanRequest<'_>) -> Self {
+        Self {
+            staged_path: request.staged_path(),
+            content_digest: request.content_digest,
+            byte_count: request.byte_count,
+            detected_type: request.detected_type,
+            observed_at: request.observed_at,
+        }
+    }
+
+    fn staged_path(self) -> &'input Path {
+        self.staged_path
     }
 }
 
 enum ProcessOperation<'request, 'staged> {
     Version,
     Scan {
-        request: &'request FileScanRequest<'staged>,
+        request: &'request ScannerInputRequest<'staged>,
         input: File,
     },
 }
@@ -678,27 +920,57 @@ impl ScannerInvocationContract {
         executable_identity_digest: &str,
         limits: ScannerProcessLimits,
     ) -> Result<Self, BrowserError> {
+        match operation {
+            ProcessOperation::Version => Self::from_input(
+                VERSION_OPERATION,
+                None,
+                release_pin,
+                executable_identity_digest,
+                limits,
+            ),
+            ProcessOperation::Scan { request, .. } => {
+                Self::for_scan_request(request, release_pin, executable_identity_digest, limits)
+            }
+        }
+    }
+
+    fn for_scan_request(
+        request: &ScannerInputRequest<'_>,
+        release_pin: &ScannerReleasePin,
+        executable_identity_digest: &str,
+        limits: ScannerProcessLimits,
+    ) -> Result<Self, BrowserError> {
+        if !is_sha256(request.content_digest) || request.byte_count == 0 {
+            return Err(BrowserError::FileChanged);
+        }
+        Self::from_input(
+            SCAN_OPERATION,
+            Some(ScannerInvocationInput {
+                content_digest: request.content_digest.to_owned(),
+                byte_count: request.byte_count,
+                detected_type: file_type_protocol_name(request.detected_type),
+                observed_at: request.observed_at.to_rfc3339(),
+            }),
+            release_pin,
+            executable_identity_digest,
+            limits,
+        )
+    }
+
+    fn from_input(
+        operation: &'static str,
+        input: Option<ScannerInvocationInput>,
+        release_pin: &ScannerReleasePin,
+        executable_identity_digest: &str,
+        limits: ScannerProcessLimits,
+    ) -> Result<Self, BrowserError> {
         release_pin.validate()?;
         limits.validate()?;
         if !is_sha256(executable_identity_digest) {
             return Err(BrowserError::FileScanUnavailable);
         }
-        let input = match operation {
-            ProcessOperation::Version => None,
-            ProcessOperation::Scan { request, .. } => {
-                if !is_sha256(request.content_digest) || request.byte_count == 0 {
-                    return Err(BrowserError::FileChanged);
-                }
-                Some(ScannerInvocationInput {
-                    content_digest: request.content_digest.to_owned(),
-                    byte_count: request.byte_count,
-                    detected_type: file_type_protocol_name(request.detected_type),
-                    observed_at: request.observed_at.to_rfc3339(),
-                })
-            }
-        };
         Ok(Self {
-            operation: operation.name(),
+            operation,
             release_digest: release_pin.release_digest.clone(),
             policy_digest: release_pin.policy_digest.clone(),
             executable_identity_digest: executable_identity_digest.to_owned(),
@@ -1069,6 +1341,41 @@ impl DispatchedInputRevalidation {
     fn path_evidence_digest(&self) -> Result<String, BrowserError> {
         self.path_after.evidence_digest()
     }
+}
+
+fn scan_request_digest(
+    request: &ScannerInputRequest<'_>,
+    input_snapshot: &DispatchedInputSnapshot,
+) -> Result<String, BrowserError> {
+    if !is_sha256(request.content_digest)
+        || request.byte_count == 0
+        || request.content_digest != input_snapshot.file_identity.content_digest
+        || request.byte_count != input_snapshot.file_identity.byte_count
+    {
+        return Err(BrowserError::FileChanged);
+    }
+    digest_json(&serde_json::json!({
+        "contentDigest": request.content_digest,
+        "byteCount": request.byte_count,
+        "detectedType": request.detected_type,
+        "observedAt": request.observed_at,
+        "inputIdentityDigest": input_snapshot.evidence_digest()?,
+    }))
+}
+
+fn accepted_scan_report_evidence(
+    verdict_evidence_digest: &str,
+    acceptance_digest: &str,
+) -> Result<String, BrowserError> {
+    if !is_sha256(verdict_evidence_digest) || !is_sha256(acceptance_digest) {
+        return Err(BrowserError::FileScanUnavailable);
+    }
+    digest_json(&serde_json::json!({
+        "protocol": SCANNER_PROTOCOL,
+        "report": "consumed-one-shot-clean-verdict",
+        "verdictEvidenceDigest": verdict_evidence_digest,
+        "acceptanceDigest": acceptance_digest,
+    }))
 }
 
 fn valid_release_identifier(value: &str) -> bool {
@@ -1765,6 +2072,91 @@ impl fmt::Debug for ScannerResultEnvelope {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanAcceptanceState {
+    Pending,
+    Consumed,
+    Cancelled,
+}
+
+struct PendingScanAcceptance {
+    state: ScanAcceptanceState,
+    acceptance_generation: u64,
+    process_generation: u64,
+    request_digest: String,
+    input_snapshot: DispatchedInputSnapshot,
+    release_digest: String,
+    executable_identity_digest: String,
+    policy_digest: String,
+    config_sha256: String,
+    invocation_contract_digest: String,
+    result_envelope_digest: String,
+    launch_digest: String,
+    launch_identity_digest: String,
+    verdict_evidence_digest: String,
+    acceptance_digest: String,
+    report: Option<FileScanReport>,
+}
+
+impl PendingScanAcceptance {
+    fn evidence_digest(&self) -> Result<String, BrowserError> {
+        digest_json(&serde_json::json!({
+            "protocol": SCANNER_PROTOCOL,
+            "acceptance": "one-shot-clean-verdict",
+            "acceptanceGeneration": self.acceptance_generation.to_string(),
+            "processGeneration": self.process_generation.to_string(),
+            "requestDigest": self.request_digest,
+            "inputIdentityDigest": self.input_snapshot.evidence_digest()?,
+            "releaseDigest": self.release_digest,
+            "executableIdentityDigest": self.executable_identity_digest,
+            "policyDigest": self.policy_digest,
+            "configSha256": self.config_sha256,
+            "invocationContractDigest": self.invocation_contract_digest,
+            "resultEnvelopeDigest": self.result_envelope_digest,
+            "launchDigest": self.launch_digest,
+            "launchIdentityDigest": self.launch_identity_digest,
+            "verdictEvidenceDigest": self.verdict_evidence_digest,
+        }))
+    }
+}
+
+impl fmt::Debug for PendingScanAcceptance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingScanAcceptance")
+            .field("state", &self.state)
+            .field("acceptance_generation", &self.acceptance_generation)
+            .field("process_generation", &self.process_generation)
+            .field("request_digest", &self.request_digest)
+            .field(
+                "input_identity_digest",
+                &self.input_snapshot.evidence_digest().ok(),
+            )
+            .field("release_digest", &self.release_digest)
+            .field(
+                "executable_identity_digest",
+                &self.executable_identity_digest,
+            )
+            .field("policy_digest", &self.policy_digest)
+            .field("config_sha256", &self.config_sha256)
+            .field(
+                "invocation_contract_digest",
+                &self.invocation_contract_digest,
+            )
+            .field("result_envelope_digest", &self.result_envelope_digest)
+            .field("launch_digest", &self.launch_digest)
+            .field("launch_identity_digest", &self.launch_identity_digest)
+            .field("verdict_evidence_digest", &self.verdict_evidence_digest)
+            .field("acceptance_digest", &self.acceptance_digest)
+            .finish_non_exhaustive()
+    }
+}
+
+enum PreparedScanVerdict {
+    Clean(Box<PendingScanAcceptance>),
+    Rejected(FileScanReport),
+}
+
 enum ProcessStop {
     Exited(ExitStatus),
     Timeout,
@@ -2353,6 +2745,30 @@ esac
             .expect("input revalidation")
     }
 
+    fn read_only_scan_source(
+        fixture: &ScannerFixture,
+        name: &str,
+        content: &[u8],
+    ) -> (PathBuf, String) {
+        let source = fixture.source(name, content);
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o400))
+            .expect("read-only direct scan source");
+        (source, digest(content))
+    }
+
+    fn prepare_clean_acceptance(
+        scanner: &mut ProductionFileScanner,
+        request: &ScannerInputRequest<'_>,
+    ) -> PendingScanAcceptance {
+        match scanner
+            .prepare_scan_verdict(request)
+            .expect("prepared scanner verdict")
+        {
+            PreparedScanVerdict::Clean(acceptance) => *acceptance,
+            PreparedScanVerdict::Rejected(_) => panic!("clean fixture rejected"),
+        }
+    }
+
     #[test]
     fn process_environment_is_an_exact_allowlist_without_path() {
         let fixture = ScannerFixture::new();
@@ -2679,6 +3095,178 @@ esac
                 baseline
             );
         }
+    }
+
+    #[test]
+    fn clean_acceptance_binds_full_verdict_context_and_is_consumed_exactly_once() {
+        let fixture = ScannerFixture::new();
+        let private_content = br#"{"private-one-shot":"customer@example.com"}"#;
+        let (source, content_digest) =
+            read_only_scan_source(&fixture, "private-one-shot.json", private_content);
+        let request = ScannerInputRequest {
+            staged_path: &source,
+            content_digest: &content_digest,
+            byte_count: u64::try_from(private_content.len()).expect("private content length"),
+            detected_type: BrowserFileType::Json,
+            observed_at: now(),
+        };
+        let (mut scanner, _) =
+            scanner_with_limits(&fixture, "    emit_scan clean", default_limits());
+        let mut acceptance = prepare_clean_acceptance(&mut scanner, &request);
+        let baseline = acceptance.evidence_digest().expect("acceptance evidence");
+        assert_eq!(acceptance.acceptance_digest, baseline);
+        assert_eq!(acceptance.state, ScanAcceptanceState::Pending);
+        assert_eq!(acceptance.process_generation, scanner.process_generation);
+        assert_eq!(
+            scanner.pending_acceptance_digest.as_deref(),
+            Some(baseline.as_str())
+        );
+
+        let request_digest = acceptance.request_digest.clone();
+        acceptance.request_digest = sha('0');
+        assert_ne!(
+            acceptance.evidence_digest().expect("request drift"),
+            baseline
+        );
+        acceptance.request_digest = request_digest;
+        let executable_identity_digest = acceptance.executable_identity_digest.clone();
+        acceptance.executable_identity_digest = sha('1');
+        assert_ne!(
+            acceptance.evidence_digest().expect("executable drift"),
+            baseline
+        );
+        acceptance.executable_identity_digest = executable_identity_digest;
+        let policy_digest = acceptance.policy_digest.clone();
+        acceptance.policy_digest = sha('2');
+        assert_ne!(
+            acceptance.evidence_digest().expect("policy drift"),
+            baseline
+        );
+        acceptance.policy_digest = policy_digest;
+        let config_sha256 = acceptance.config_sha256.clone();
+        acceptance.config_sha256 = sha('3');
+        assert_ne!(
+            acceptance.evidence_digest().expect("config drift"),
+            baseline
+        );
+        acceptance.config_sha256 = config_sha256;
+        let invocation_digest = acceptance.invocation_contract_digest.clone();
+        acceptance.invocation_contract_digest = sha('4');
+        assert_ne!(
+            acceptance.evidence_digest().expect("invocation drift"),
+            baseline
+        );
+        acceptance.invocation_contract_digest = invocation_digest;
+        let result_envelope_digest = acceptance.result_envelope_digest.clone();
+        acceptance.result_envelope_digest = sha('5');
+        assert_ne!(
+            acceptance.evidence_digest().expect("result envelope drift"),
+            baseline
+        );
+        acceptance.result_envelope_digest = result_envelope_digest;
+        let process_generation = acceptance.process_generation;
+        acceptance.process_generation = process_generation.checked_add(1).expect("next generation");
+        assert_ne!(
+            acceptance.evidence_digest().expect("lifecycle drift"),
+            baseline
+        );
+        acceptance.process_generation = process_generation;
+        assert_eq!(
+            acceptance.evidence_digest().expect("restored token"),
+            baseline
+        );
+
+        let debug = format!("{scanner:?} {acceptance:?}");
+        assert!(!debug.contains("customer@example.com"));
+        assert!(!debug.contains(source.to_string_lossy().as_ref()));
+        let report = scanner
+            .consume_scan_acceptance(&mut acceptance, &request)
+            .expect("one-shot acceptance consumption");
+        assert_eq!(report.decision, FileScanDecision::Clean);
+        assert_eq!(acceptance.state, ScanAcceptanceState::Consumed);
+        assert!(scanner.pending_acceptance_digest.is_none());
+        assert!(matches!(
+            scanner.consume_scan_acceptance(&mut acceptance, &request),
+            Err(BrowserError::FileScanUnavailable)
+        ));
+        assert_eq!(acceptance.state, ScanAcceptanceState::Consumed);
+        assert!(!format!("{scanner:?} {acceptance:?}").contains("customer@example.com"));
+        assert_no_run_directory_residue(&scanner);
+    }
+
+    #[test]
+    fn cancellation_cross_file_supersession_and_stale_generation_reject_acceptance() {
+        let fixture = ScannerFixture::new();
+        let private_content = br#"{"same-private-content":"lease-bound"}"#;
+        let (first_source, content_digest) =
+            read_only_scan_source(&fixture, "acceptance-first.json", private_content);
+        let (second_source, second_content_digest) =
+            read_only_scan_source(&fixture, "acceptance-second.json", private_content);
+        let byte_count = u64::try_from(private_content.len()).expect("private content length");
+        let first_request = ScannerInputRequest {
+            staged_path: &first_source,
+            content_digest: &content_digest,
+            byte_count,
+            detected_type: BrowserFileType::Json,
+            observed_at: now(),
+        };
+        let second_request = ScannerInputRequest {
+            staged_path: &second_source,
+            content_digest: &second_content_digest,
+            byte_count,
+            detected_type: BrowserFileType::Json,
+            observed_at: now(),
+        };
+        let (mut scanner, _) =
+            scanner_with_limits(&fixture, "    emit_scan clean", default_limits());
+
+        let mut cancelled = prepare_clean_acceptance(&mut scanner, &first_request);
+        scanner
+            .cancel_pending_acceptance()
+            .expect("lease-loss cancellation");
+        assert!(matches!(
+            scanner.consume_scan_acceptance(&mut cancelled, &first_request),
+            Err(BrowserError::FileScanUnavailable)
+        ));
+        assert_eq!(cancelled.state, ScanAcceptanceState::Cancelled);
+
+        let mut cross_file = prepare_clean_acceptance(&mut scanner, &first_request);
+        assert!(matches!(
+            scanner.consume_scan_acceptance(&mut cross_file, &second_request),
+            Err(BrowserError::FileScanUnavailable)
+        ));
+        assert_eq!(cross_file.state, ScanAcceptanceState::Cancelled);
+
+        let mut superseded = prepare_clean_acceptance(&mut scanner, &first_request);
+        let mut replacement = prepare_clean_acceptance(&mut scanner, &second_request);
+        assert!(matches!(
+            scanner.consume_scan_acceptance(&mut superseded, &first_request),
+            Err(BrowserError::FileScanUnavailable)
+        ));
+        assert_eq!(superseded.state, ScanAcceptanceState::Cancelled);
+        assert_eq!(
+            scanner
+                .consume_scan_acceptance(&mut replacement, &second_request)
+                .expect("current superseding acceptance")
+                .decision,
+            FileScanDecision::Clean
+        );
+
+        let mut stale = prepare_clean_acceptance(&mut scanner, &first_request);
+        let version_process = scanner
+            .run_process(ProcessOperation::Version)
+            .expect("new lifecycle generation");
+        assert!(version_process.status.success());
+        assert!(matches!(
+            scanner.consume_scan_acceptance(&mut stale, &first_request),
+            Err(BrowserError::FileScanUnavailable)
+        ));
+        assert_eq!(stale.state, ScanAcceptanceState::Cancelled);
+        let debug = format!("{scanner:?} {cancelled:?} {cross_file:?} {superseded:?} {stale:?}");
+        assert!(!debug.contains("lease-bound"));
+        assert!(!debug.contains(first_source.to_string_lossy().as_ref()));
+        assert!(!debug.contains(second_source.to_string_lossy().as_ref()));
+        assert_no_run_directory_residue(&scanner);
     }
 
     #[test]
