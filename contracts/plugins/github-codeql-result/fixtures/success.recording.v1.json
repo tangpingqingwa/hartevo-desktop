@@ -1,0 +1,34 @@
+{
+  "schemaVersion": "hartevo.github-codeql-result/v1",
+  "contractVersion": "github-codeql-result-01-layer-1/v1",
+  "provenance": "recording",
+  "connected": false,
+  "native": false,
+  "firstParty": false,
+  "repository": {
+    "owner": "acme",
+    "name": "checkout",
+    "ref": "refs/heads/main",
+    "commit": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "analysis": {
+    "id": "analysis-2026-08-15-01",
+    "tool": "CodeQL",
+    "status": "complete"
+  },
+  "alert": {
+    "number": 17,
+    "fingerprint": "fixture-alert-fingerprint-17",
+    "state": "open",
+    "severity": "high",
+    "rule": "js/sql-injection",
+    "locations": [
+      {
+        "pathDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "startLine": 42,
+        "endLine": 42,
+        "regionDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ]
+  }
+}

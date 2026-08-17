@@ -22,6 +22,23 @@ pub struct PersistedMutation {
 }
 
 impl ProjectStore {
+    pub fn creator_tasks_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<CreatorTask>, StorageError> {
+        self.load_project(project_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM creator_tasks
+             WHERE project_id = ?1 ORDER BY created_at, id",
+        )?;
+        let ids = statement
+            .query_map(params![project_id.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| self.load_creator_task(project_id, &CreatorTaskId::from_stable(id)))
+            .collect()
+    }
+
     pub fn create_creator_task(
         &mut self,
         task: &CreatorTask,

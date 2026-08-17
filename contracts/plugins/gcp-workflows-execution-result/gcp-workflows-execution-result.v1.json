@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/gcp-workflows-execution-result/gcp-workflows-execution-result.v1.json",
+  "title": "Hartevo governed Google Cloud Workflows execution-result Layer-1 contract",
+  "schemaVersion": "hartevo.gcp-workflows-execution-result-contract/v1",
+  "contractVersion": "gcp-workflows-execution-result/v1",
+  "pluginVersion": "0.1.0",
+  "layer": 1,
+  "service": {
+    "id": "gcp.workflows.execution-result",
+    "name": "GcpWorkflowsExecutionService",
+    "version": "1.0.0",
+    "operation": "bounded_execution_list_get_result_proposal",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "propose_list_executions",
+      "read_list_executions",
+      "propose_get_execution",
+      "read_get_execution",
+      "record_observation",
+      "verify_proposal",
+      "consume_observation"
+    ],
+    "readOnly": true,
+    "liveExecution": false,
+    "connected": false,
+    "native": false,
+    "createsExecutions": false,
+    "cancelsExecutions": false,
+    "retriesExecutions": false,
+    "resumesExecutions": false
+  },
+  "provider": {
+    "id": "gcp.workflows.executions",
+    "implementation": "GcpWorkflowsProvider",
+    "apiVersion": "v1",
+    "baseUrl": "https://workflowexecutions.googleapis.com",
+    "operations": ["executions.list", "executions.get"],
+    "permissions": [
+      "workflows.executions.list",
+      "workflows.executions.get"
+    ],
+    "acceptedTransports": [
+      "fixture",
+      "recording",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "native": false,
+    "connected": false,
+    "firstParty": false,
+    "liveCredentialResolution": false,
+    "rawArguments": false,
+    "rawResults": false,
+    "rawStackTraces": false
+  },
+  "consumer": {
+    "id": "mission.gcp.workflows.execution-result",
+    "implementation": "MissionGcpWorkflowConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "observesEvidence": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "kernelAuthority": false,
+    "connected": false,
+    "native": false
+  },
+  "scope": {
+    "required": [
+      "gcpProject",
+      "location",
+      "workflow",
+      "workflowRevision",
+      "executionSelector",
+      "projectAndRevision",
+      "missionAndRevision",
+      "workProductAndRevision",
+      "permissionDigest",
+      "consentDigest"
+    ],
+    "secret": "opaque_non_serializing_oauth_or_service_account_reference",
+    "executionIdentity": "retained_typed_id",
+    "cursor": "opaque_digest_only",
+    "rawArgumentRetention": false,
+    "rawResultRetention": false,
+    "rawWorkflowDefinitionRetention": false
+  },
+  "permissions": {
+    "allow": [
+      "workflows.executions.list",
+      "workflows.executions.get"
+    ],
+    "deny": [
+      "workflows.executions.create",
+      "workflows.executions.cancel",
+      "workflows.executions.retry",
+      "workflows.executions.resume",
+      "workflow_definition_read",
+      "callback_invoke",
+      "raw_argument_read",
+      "raw_result_read",
+      "raw_stack_trace_read"
+    ],
+    "leastPrivilege": true,
+    "externalWrites": false
+  },
+  "bounds": {
+    "maxPageSize": 100,
+    "maxPages": 16,
+    "maxExecutions": 500,
+    "maxStepsPerExecution": 256,
+    "maxStepNameBytes": 256,
+    "maxIdentifierBytes": 256,
+    "maxOpaqueCursorBytes": 4096,
+    "maxDigestInputBytes": 32768,
+    "maxRetryCount": 1024
+  },
+  "evidence": {
+    "bounded": true,
+    "executionIdentity": true,
+    "workflowRevision": true,
+    "state": true,
+    "timing": true,
+    "stepStateSummaries": true,
+    "retryAndTerminationMetadata": true,
+    "resultPresence": "digest_only",
+    "errorPresence": "digest_only",
+    "stateError": "digest_only",
+    "rawArguments": false,
+    "rawResults": false,
+    "rawStackTraces": false,
+    "rawStepOutput": false,
+    "workflowDefinition": false,
+    "labels": false,
+    "states": [
+      "complete",
+      "partial",
+      "unknown",
+      "access_lost",
+      "not_found",
+      "conflict",
+      "rate_limited",
+      "timeout",
+      "provider_unknown"
+    ]
+  },
+  "registration": {
+    "boundDigests": [
+      "schemaVersion",
+      "contractVersion",
+      "pluginVersion",
+      "versionDigest",
+      "contractDigest",
+      "providerDigest",
+      "providerRevision",
+      "permissionDigest",
+      "scopeDigest",
+      "executionDigest",
+      "evidenceDigest",
+      "secretReferenceDigest",
+      "credentialRevision"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "rotationOnStateChange": true,
+    "failClosedOnDrift": true
+  },
+  "transport": {
+    "fixture": true,
+    "recording": true,
+    "loopback": true,
+    "blockedEnv": true,
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "safeBackoff": true,
+    "timeoutIsUnknown": true
+  },
+  "authority": {
+    "externalWrites": false,
+    "executionCreation": false,
+    "executionCancellation": false,
+    "executionRetry": false,
+    "executionResume": false,
+    "callbackInvocation": false,
+    "rawArguments": false,
+    "rawResults": false,
+    "rawStackTraces": false,
+    "connected": false,
+    "nativeProvider": false,
+    "credentialResolution": false,
+    "durableNativeReceipt": false,
+    "independentNativeReadback": false,
+    "verificationAuthority": false,
+    "kernelOutcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_google_oauth_https_receipt_and_independent_readback",
+    "failClosedCases": [
+      "missing_google_auth_authority",
+      "revoked_secret_reference",
+      "api_version_drift",
+      "project_location_workflow_execution_scope_drift",
+      "workflow_revision_drift",
+      "permission_drift",
+      "opaque_cursor_or_filter_drift",
+      "partial_or_truncated_response",
+      "raw_argument_or_result_request",
+      "create_cancel_retry_or_resume_request",
+      "provider_timeout",
+      "tampered_record",
+      "registration_revocation"
+    ]
+  },
+  "layer2Gaps": [
+    "native_oauth_or_service_account_resolution",
+    "native_https_transport",
+    "durable_provider_receipt",
+    "independent_terminal_readback",
+    "consented_execution_effects",
+    "kernel_outcome_adoption"
+  ],
+  "honestNativeGap": "Layer 1 only prepares and verifies bounded, typed, redacted execution list/get evidence from fixture, recording, loopback, or BLOCKED_ENV provenance. It never resolves live credentials, calls Google Cloud, reports Connected/native/first-party, retains workflow arguments/results/definitions/raw stack traces/unbounded step output, creates/cancels/retries/resumes executions, invokes callbacks, claims success from missing evidence, or adopts a kernel Outcome."
+}

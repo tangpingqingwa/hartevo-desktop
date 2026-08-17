@@ -28,6 +28,7 @@ use crate::workspace::{digest, digest_json};
 use crate::{
     BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionRisk, BrowserActionSurface,
     BrowserControlHost, BrowserElementRef, BrowserError, BrowserFileGrant, BrowserFileType,
+    BrowserHandoffFrameBinding, BrowserHandoffHost, BrowserHandoffScope, BrowserHandoffSnapshot,
     BrowserLeaseProof, BrowserLocatorResolution, BrowserNavigationPolicy, BrowserNavigationReceipt,
     BrowserNavigationTarget, BrowserProfile, BrowserPromptRisk,
     BrowserRecipeExecutionAuthorization, BrowserRecipePreparedPlan, BrowserRecipeRegistry,
@@ -1367,6 +1368,14 @@ impl ManagedChromiumHost {
         parse_frame_tree_snapshot(&result)
     }
 
+    fn read_frame_tree_snapshot_unchecked(
+        &mut self,
+        session_id: &str,
+    ) -> Result<CdpFrameTreeSnapshot, BrowserError> {
+        let result = self.command(CdpMethod::PageGetFrameTree, json!({}), Some(session_id))?;
+        parse_frame_tree_snapshot(&result)
+    }
+
     fn read_scoped_frame_tree_snapshot(
         &mut self,
         tab_id: &BrowserTabId,
@@ -1446,6 +1455,97 @@ impl ManagedChromiumHost {
             json!({"targetId": target_id}),
             None,
             guard,
+        )?;
+        let target_info = result
+            .get("targetInfo")
+            .and_then(Value::as_object)
+            .ok_or_else(|| self.poison())?;
+        let observed_target_id = target_info
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| self.poison())?;
+        let url = target_info
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 32 * 1_024)
+            .ok_or_else(|| self.poison())?;
+        if observed_target_id != target_id {
+            return Err(self.poison());
+        }
+        Ok(url.to_owned())
+    }
+
+    pub(crate) fn observe_handoff_snapshot(
+        &mut self,
+        profile: &BrowserProfile,
+        workspace: &BrowserWorkspace,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserHandoffSnapshot, BrowserError> {
+        profile.validate()?;
+        workspace.validate()?;
+        if profile.id != self.profile.id
+            || profile.revision != self.profile.revision
+            || profile.identity.identity_digest != self.profile.identity.identity_digest
+            || workspace.id != self.workspace.id
+            || workspace.tenant_id != self.workspace.tenant_id
+            || workspace.project_id != self.workspace.project_id
+            || workspace.mission_id != self.workspace.mission_id
+            || workspace.profile_id != self.workspace.profile_id
+            || workspace.revision != self.workspace.revision
+            || workspace.lease_generation != self.workspace.lease_generation
+            || workspace.control_state != self.workspace.control_state
+        {
+            return Err(BrowserError::ScopeMismatch);
+        }
+        let (target_id, session_id) = {
+            let tab = self
+                .tabs
+                .get(&workspace.active_tab_id)
+                .ok_or(BrowserError::TabNotFound)?;
+            (tab.target_id.clone(), tab.session_id.clone())
+        };
+        let target_url = self.read_target_url_unchecked(&target_id)?;
+        let mut frame_tree = self.read_frame_tree_snapshot_unchecked(&session_id)?;
+        frame_tree.lifecycle_revisions = self
+            .tabs
+            .get(&workspace.active_tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .frame_lifecycle_revisions
+            .clone();
+        let document_generation =
+            self.sync_frame_tree_identity(&workspace.active_tab_id, &frame_tree)?;
+        if target_url != frame_tree.root.url
+            || frame_tree.root.unreachable_url.is_some()
+            || frame_tree.root.frame_id.is_empty()
+            || frame_tree.root.loader_id.is_empty()
+        {
+            return Err(BrowserError::StaleSnapshot);
+        }
+        let scope = BrowserHandoffScope::bind(profile, workspace)?;
+        let frame = BrowserHandoffFrameBinding::from_verified(
+            workspace.active_tab_id.clone(),
+            &frame_tree.root.frame_id,
+            &frame_tree.root.loader_id,
+            &frame_tree.root.url,
+            document_generation,
+        )?;
+        BrowserHandoffSnapshot::from_verified(crate::handoff::BrowserHandoffSnapshotInput {
+            snapshot_id: BrowserSnapshotId::new(),
+            scope,
+            frame,
+            profile_revision: profile.revision,
+            workspace_revision: workspace.revision,
+            lease_generation: workspace.lease_generation,
+            control_state: workspace.control_state,
+            observed_at: now,
+        })
+    }
+
+    fn read_target_url_unchecked(&mut self, target_id: &str) -> Result<String, BrowserError> {
+        let result = self.command(
+            CdpMethod::TargetGetTargetInfo,
+            json!({"targetId": target_id}),
+            None,
         )?;
         let target_info = result
             .get("targetInfo")
@@ -3661,6 +3761,21 @@ impl BrowserControlHost for ManagedChromiumHost {
             tab.latest_execution_context = None;
         }
         Ok(())
+    }
+}
+
+impl BrowserHandoffHost for ManagedChromiumHost {
+    fn observe_handoff_snapshot(
+        &mut self,
+        profile: &BrowserProfile,
+        workspace: &BrowserWorkspace,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserHandoffSnapshot, BrowserError> {
+        ManagedChromiumHost::observe_handoff_snapshot(self, profile, workspace, now)
+    }
+
+    fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
+        <Self as BrowserControlHost>::sync_workspace(self, workspace)
     }
 }
 
