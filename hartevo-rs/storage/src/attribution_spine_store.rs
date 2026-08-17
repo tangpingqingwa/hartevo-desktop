@@ -18,6 +18,31 @@ use serde_json::Value;
 
 use crate::{DomainEventRecord, ProjectStore, StorageError};
 
+/// Compatibility extension for the pre-adoption attribution storage API.
+///
+/// The newer adoption slice owns the same inherent method names on
+/// `ProjectStore`. Keeping these two methods on a trait lets this branch stay
+/// independently usable while allowing a clean synthetic composition with
+/// that newer slice (inherent methods take precedence when both are present).
+pub trait AttributionSpineStoreExt {
+    fn append_attribution_candidate(
+        &mut self,
+        project_id: &ProjectId,
+        candidate: &OutcomeCandidate,
+        reporting_currency: CurrencyCode,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<i64, StorageError>;
+
+    fn append_attribution_verification(
+        &mut self,
+        project_id: &ProjectId,
+        candidate_id: &OutcomeCandidateId,
+        verification: &OutcomeVerification,
+        reporting_currency: CurrencyCode,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<i64, StorageError>;
+}
+
 impl ProjectStore {
     /// Appends one connector observation batch as an immutable domain event.
     /// The batch's provider cursor is the durable replay fence; no connector
@@ -57,120 +82,6 @@ impl ProjectStore {
             &batch.project_id,
             batch.mission_id.as_ref(),
             ATTRIBUTION_SPINE_EVENT_TYPE,
-            &payload,
-            recorded_at,
-        )
-    }
-
-    /// Persists the candidate stage independently from verification. A
-    /// duplicate exact candidate is idempotent; a same-id content swap is
-    /// rejected before another domain event can be appended.
-    pub fn append_attribution_candidate(
-        &mut self,
-        project_id: &ProjectId,
-        candidate: &OutcomeCandidate,
-        reporting_currency: CurrencyCode,
-        recorded_at: DateTime<Utc>,
-    ) -> Result<i64, StorageError> {
-        let mut ledger = self.replay_attribution_spine(project_id, reporting_currency)?;
-        if let Some(existing) = ledger
-            .candidates
-            .iter()
-            .find(|existing| existing.id == candidate.id)
-        {
-            if existing == candidate {
-                return self.find_attribution_record_sequence(
-                    project_id,
-                    ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE,
-                    |payload| {
-                        serde_json::from_value::<OutcomeCandidate>(payload.clone())
-                            .ok()
-                            .is_some_and(|value| value == *candidate)
-                    },
-                );
-            }
-            return Err(StorageError::DomainDecode(
-                "attribution candidate content conflicts with immutable history".into(),
-            ));
-        }
-        ledger
-            .register_candidate(candidate.clone())
-            .map_err(|error| domain_decode(&error))?;
-        let event = ledger
-            .events
-            .iter()
-            .find(|event| event.id == candidate.source_event_id)
-            .ok_or_else(|| StorageError::DomainDecode("candidate source event missing".into()))?;
-        let payload = serde_json::to_value(candidate)?;
-        self.append_event(
-            project_id,
-            event.mission_id.as_ref(),
-            ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE,
-            &payload,
-            recorded_at,
-        )
-    }
-
-    /// Persists an independent verification record without mutating the
-    /// candidate payload. Exact replay is idempotent; a second, different
-    /// verification for one candidate fails closed.
-    pub fn append_attribution_verification(
-        &mut self,
-        project_id: &ProjectId,
-        candidate_id: &OutcomeCandidateId,
-        verification: &OutcomeVerification,
-        reporting_currency: CurrencyCode,
-        recorded_at: DateTime<Utc>,
-    ) -> Result<i64, StorageError> {
-        let mut ledger = self.replay_attribution_spine(project_id, reporting_currency)?;
-        let candidate = ledger
-            .candidates
-            .iter()
-            .find(|candidate| candidate.id == *candidate_id)
-            .cloned()
-            .ok_or_else(|| StorageError::DomainDecode("verification candidate missing".into()))?;
-        if let Some(existing) = ledger
-            .verified_outcomes
-            .iter()
-            .find(|existing| existing.candidate_id == *candidate_id)
-        {
-            if existing.verification == *verification {
-                let record = StoredAttributionVerification {
-                    candidate_id: candidate_id.clone(),
-                    verification: verification.clone(),
-                };
-                return self.find_attribution_record_sequence(
-                    project_id,
-                    ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
-                    |payload| {
-                        serde_json::from_value::<StoredAttributionVerification>(payload.clone())
-                            .ok()
-                            .is_some_and(|value| value == record)
-                    },
-                );
-            }
-            return Err(StorageError::DomainDecode(
-                "verified outcome content conflicts with immutable history".into(),
-            ));
-        }
-        ledger
-            .verify_candidate(candidate_id, verification.clone())
-            .map_err(|error| domain_decode(&error))?;
-        let event = ledger
-            .events
-            .iter()
-            .find(|event| event.id == candidate.source_event_id)
-            .ok_or_else(|| {
-                StorageError::DomainDecode("verification source event missing".into())
-            })?;
-        let payload = serde_json::to_value(StoredAttributionVerification {
-            candidate_id: candidate_id.clone(),
-            verification: verification.clone(),
-        })?;
-        self.append_event(
-            project_id,
-            event.mission_id.as_ref(),
-            ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
             &payload,
             recorded_at,
         )
@@ -310,6 +221,122 @@ impl ProjectStore {
             .ok_or_else(|| {
                 StorageError::DomainDecode("attribution idempotency record missing".into())
             })
+    }
+}
+
+impl AttributionSpineStoreExt for ProjectStore {
+    /// Persists the candidate stage independently from verification. A
+    /// duplicate exact candidate is idempotent; a same-id content swap is
+    /// rejected before another domain event can be appended.
+    fn append_attribution_candidate(
+        &mut self,
+        project_id: &ProjectId,
+        candidate: &OutcomeCandidate,
+        reporting_currency: CurrencyCode,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<i64, StorageError> {
+        let mut ledger = self.replay_attribution_spine(project_id, reporting_currency)?;
+        if let Some(existing) = ledger
+            .candidates
+            .iter()
+            .find(|existing| existing.id == candidate.id)
+        {
+            if existing == candidate {
+                return self.find_attribution_record_sequence(
+                    project_id,
+                    ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE,
+                    |payload| {
+                        serde_json::from_value::<OutcomeCandidate>(payload.clone())
+                            .ok()
+                            .is_some_and(|value| value == *candidate)
+                    },
+                );
+            }
+            return Err(StorageError::DomainDecode(
+                "attribution candidate content conflicts with immutable history".into(),
+            ));
+        }
+        ledger
+            .register_candidate(candidate.clone())
+            .map_err(|error| domain_decode(&error))?;
+        let event = ledger
+            .events
+            .iter()
+            .find(|event| event.id == candidate.source_event_id)
+            .ok_or_else(|| StorageError::DomainDecode("candidate source event missing".into()))?;
+        let payload = serde_json::to_value(candidate)?;
+        self.append_event(
+            project_id,
+            event.mission_id.as_ref(),
+            ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE,
+            &payload,
+            recorded_at,
+        )
+    }
+
+    /// Persists an independent verification record without mutating the
+    /// candidate payload. Exact replay is idempotent; a second, different
+    /// verification for one candidate fails closed.
+    fn append_attribution_verification(
+        &mut self,
+        project_id: &ProjectId,
+        candidate_id: &OutcomeCandidateId,
+        verification: &OutcomeVerification,
+        reporting_currency: CurrencyCode,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<i64, StorageError> {
+        let mut ledger = self.replay_attribution_spine(project_id, reporting_currency)?;
+        let candidate = ledger
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == *candidate_id)
+            .cloned()
+            .ok_or_else(|| StorageError::DomainDecode("verification candidate missing".into()))?;
+        if let Some(existing) = ledger
+            .verified_outcomes
+            .iter()
+            .find(|existing| existing.candidate_id == *candidate_id)
+        {
+            if existing.verification == *verification {
+                let record = StoredAttributionVerification {
+                    candidate_id: candidate_id.clone(),
+                    verification: verification.clone(),
+                };
+                return self.find_attribution_record_sequence(
+                    project_id,
+                    ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
+                    |payload| {
+                        serde_json::from_value::<StoredAttributionVerification>(payload.clone())
+                            .ok()
+                            .is_some_and(|value| value == record)
+                    },
+                );
+            }
+            return Err(StorageError::DomainDecode(
+                "verified outcome content conflicts with immutable history".into(),
+            ));
+        }
+        ledger
+            .verify_candidate(candidate_id, verification.clone())
+            .map_err(|error| domain_decode(&error))?;
+        let event = ledger
+            .events
+            .iter()
+            .find(|event| event.id == candidate.source_event_id)
+            .ok_or_else(|| {
+                StorageError::DomainDecode("verification source event missing".into())
+            })?;
+        let payload = serde_json::to_value(StoredAttributionVerification {
+            candidate_id: candidate_id.clone(),
+            verification: verification.clone(),
+        })?;
+        self.append_event(
+            project_id,
+            event.mission_id.as_ref(),
+            ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
+            &payload,
+            recorded_at,
+        )
     }
 }
 
