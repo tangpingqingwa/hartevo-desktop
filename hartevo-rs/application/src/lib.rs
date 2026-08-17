@@ -1,6 +1,7 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
 mod observation_evidence_pack;
+mod openinterpreter_mission_execution;
 mod runtime_text_subscription;
 
 pub use observation_evidence_pack::{
@@ -9,6 +10,14 @@ pub use observation_evidence_pack::{
     ObservationPlanBinding, ObservationProviderRequest, ObservationSourceBinding,
     ObservationSourceKind, ObservationStopCommand, ObservationStopResult,
     RuntimeObservationProvider, TypedRuntimeObservation,
+};
+pub use openinterpreter_mission_execution::{
+    MissionExecutionError, MissionExecutionObservation, MissionExecutionProvider,
+    MissionExecutionProviderFactory, MissionExecutionState, MissionExecutionWriteReceipt,
+    MissionRuntimeProviderIdentity, MissionRuntimeStreamPacket, OpenInterpreterMissionExecution,
+    OpenInterpreterMissionInvocation, OpenInterpreterMissionProjection,
+    OpenInterpreterMissionRuntimeSelection, OpenInterpreterRuntimeProviderFactory,
+    StartOpenInterpreterMission,
 };
 pub use runtime_text_subscription::{
     CatalogMissionExecutionHandle, CatalogMissionExecutionStart,
@@ -20958,6 +20967,8 @@ pub enum ApplicationError {
     RuntimeTurn(#[from] RuntimeTurnError),
     #[error(transparent)]
     RuntimeTextSubscription(#[from] RuntimeTextSubscriptionError),
+    #[error(transparent)]
+    MissionExecution(#[from] MissionExecutionError),
     #[error(transparent)]
     Browser(#[from] BrowserError),
     #[error(
