@@ -1,16 +1,28 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "d4b6075137322d00fffb5463ee290be90b4b467d",
-  "candidateCount": 1,
+  "baseCommit": "4770376beee4418e176ce1808b65d8f3f29b1da8",
+  "candidateCount": 3,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/gm01-progress-trace-oracle",
-      "headCommit": "4b8569fbc0feb1f71028aa1da6f8ba4352c5bd20",
-      "number": 73
+      "headBranch": "codex/browser-batch-cancel-replay-batch02",
+      "headCommit": "848c1c4c00aae2f8e6ce86cdd8670bb7d2ea014d",
+      "number": 35
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/ctx02-worker-graph",
+      "headCommit": "3d7eccb40e29f440fc686485bc185c10829d5529",
+      "number": 140
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/connection-repair-plugin-01",
+      "headCommit": "4e60559ac66080ff3e606584fa3ee23a99ab3489",
+      "number": 235
     }
   ],
-  "createdAt": "2026-08-17T06:58:54Z",
+  "createdAt": "2026-08-17T09:44:42Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -21,5 +33,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260817-0656"
+  "trainBranch": "merge-train/20260817-094420"
 }
