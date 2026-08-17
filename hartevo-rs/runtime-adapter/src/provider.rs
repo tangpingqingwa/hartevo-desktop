@@ -4,7 +4,7 @@
 //! catalog/configuration, scope, policy, secret resolver, and durable session-log implementation;
 //! this module never becomes the authority for Mission state or external effects.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,9 @@ use super::{
     RuntimePluginMountState, RuntimePluginRegistrationKind, RuntimePluginRegistrationStopper,
     RuntimePluginScope, RuntimePluginTeardownReceipt, RuntimeProtocolWriteReceipt,
     RuntimeRecoveryHint, RuntimeResultPacket, RuntimeServiceCapability, RuntimeServiceDefinition,
-    RuntimeServiceProviderManifest, RuntimeTurnCompletionStatus, RuntimeTurnDispatch,
+    RuntimeServiceProviderManifest, RuntimeSteeringAck, RuntimeSteeringError, RuntimeSteeringEvent,
+    RuntimeSteeringFence, RuntimeSteeringLog, RuntimeSteeringPhase, RuntimeSteeringService,
+    RuntimeSteeringTerminalReason, RuntimeTurnCompletionStatus, RuntimeTurnDispatch,
     SecretResolver, ShutdownReport, StdioRuntime, VerifiedRuntimeArtifact,
 };
 
@@ -261,6 +263,11 @@ where
 /// A typed stream item returned by one mounted provider session.
 #[derive(Clone, PartialEq)]
 pub enum RuntimeProviderStreamEvent {
+    Steering {
+        phase: RuntimeSteeringPhase,
+        event_digest: String,
+        client_steering_id_digest: String,
+    },
     TurnStarted {
         event_digest: String,
     },
@@ -298,6 +305,16 @@ impl fmt::Debug for RuntimeProviderStreamEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = formatter.debug_struct("RuntimeProviderStreamEvent");
         match self {
+            Self::Steering {
+                phase,
+                event_digest,
+                client_steering_id_digest,
+            } => {
+                debug
+                    .field("phase", phase)
+                    .field("event_digest", event_digest)
+                    .field("client_steering_id_digest", client_steering_id_digest);
+            }
             Self::TurnStarted { event_digest }
             | Self::ItemStarted { event_digest }
             | Self::Diagnostic { event_digest }
@@ -370,6 +387,8 @@ pub enum RuntimeProviderError {
     Adapter(#[from] AdapterError),
     #[error(transparent)]
     Plugin(#[from] super::RuntimePluginError),
+    #[error(transparent)]
+    Steering(#[from] RuntimeSteeringError),
     #[error("runtime provider policy is invalid")]
     InvalidPolicy,
     #[error("runtime provider durable event is invalid")]
@@ -391,6 +410,13 @@ pub enum RuntimeProviderError {
     MissingModelVisibleContent,
     #[error("runtime approval event did not contain a request")]
     MissingApprovalRequest,
+    #[error("runtime steering durable log rejected {event_digest}: {reason}")]
+    SteeringDurableLog {
+        event_digest: String,
+        reason: String,
+    },
+    #[error("runtime steering provider state is uncertain; restart and explicitly Continue")]
+    SteeringProviderStateUncertain { error_digest: String },
 }
 
 /// The concrete OpenInterpreter provider. The Mission consumer only sees the generic service
@@ -444,6 +470,69 @@ impl OpenInterpreterRuntimeProvider {
         runtime_generation: u64,
         timeout: Duration,
     ) -> Result<RuntimeProviderSession, RuntimeProviderError> {
+        self.mount_internal(
+            command,
+            workspace_root,
+            scope,
+            catalog,
+            config,
+            policy,
+            resolver,
+            log,
+            None,
+            runtime_generation,
+            timeout,
+        )
+    }
+
+    /// Mount with the typed durable steering boundary supplied by the Mission/session consumer.
+    /// The provider refuses to dispatch steering without this log; the ordinary `mount` API stays
+    /// available for callers that do not opt into mid-turn steering.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mount_with_steering_log(
+        &self,
+        command: RuntimeCommand,
+        workspace_root: &Path,
+        scope: RuntimePluginScope,
+        catalog: RuntimeCatalog,
+        config: RuntimeExecutionConfig,
+        policy: RuntimeProviderPolicy,
+        resolver: &dyn SecretResolver,
+        log: Box<dyn MissionSessionLog>,
+        steering_log: Box<dyn RuntimeSteeringLog>,
+        runtime_generation: u64,
+        timeout: Duration,
+    ) -> Result<RuntimeProviderSession, RuntimeProviderError> {
+        self.mount_internal(
+            command,
+            workspace_root,
+            scope,
+            catalog,
+            config,
+            policy,
+            resolver,
+            log,
+            Some(steering_log),
+            runtime_generation,
+            timeout,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mount_internal(
+        &self,
+        command: RuntimeCommand,
+        workspace_root: &Path,
+        scope: RuntimePluginScope,
+        catalog: RuntimeCatalog,
+        config: RuntimeExecutionConfig,
+        policy: RuntimeProviderPolicy,
+        resolver: &dyn SecretResolver,
+        log: Box<dyn MissionSessionLog>,
+        steering_log: Option<Box<dyn RuntimeSteeringLog>>,
+        runtime_generation: u64,
+        timeout: Duration,
+    ) -> Result<RuntimeProviderSession, RuntimeProviderError> {
         self.manifest.validate()?;
         scope.validate()?;
         policy.validate()?;
@@ -464,6 +553,7 @@ impl OpenInterpreterRuntimeProvider {
         let mut mount = RuntimePluginMount::new(self.manifest.clone(), scope.clone())?;
         let stream_registration_digest =
             mount.register(RuntimePluginRegistrationKind::Stream, &scope.session_id)?;
+        let steering = RuntimeSteeringService::new(scope.clone(), &mapping)?;
         Ok(RuntimeProviderSession {
             manifest: self.manifest.clone(),
             scope,
@@ -478,6 +568,9 @@ impl OpenInterpreterRuntimeProvider {
             mount,
             stream_registration_digest,
             log,
+            steering_log,
+            steering,
+            pending_stream_events: VecDeque::new(),
             next_log_sequence: 1,
             stream_event_count: 0,
             stream_byte_count: 0,
@@ -514,6 +607,38 @@ impl OpenInterpreterRuntimeProvider {
             timeout,
         )
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mount_from_verified_artifact_with_steering_log(
+        &self,
+        artifact: &VerifiedRuntimeArtifact,
+        workspace_root: &Path,
+        runtime_home: &Path,
+        scope: RuntimePluginScope,
+        catalog: RuntimeCatalog,
+        config: RuntimeExecutionConfig,
+        policy: RuntimeProviderPolicy,
+        resolver: &dyn SecretResolver,
+        log: Box<dyn MissionSessionLog>,
+        steering_log: Box<dyn RuntimeSteeringLog>,
+        runtime_generation: u64,
+        timeout: Duration,
+    ) -> Result<RuntimeProviderSession, RuntimeProviderError> {
+        let command = artifact.runtime_command(workspace_root, runtime_home)?;
+        self.mount_with_steering_log(
+            command,
+            workspace_root,
+            scope,
+            catalog,
+            config,
+            policy,
+            resolver,
+            log,
+            steering_log,
+            runtime_generation,
+            timeout,
+        )
+    }
 }
 
 /// A mounted, exact Mission/session provider instance.
@@ -531,6 +656,9 @@ pub struct RuntimeProviderSession {
     mount: RuntimePluginMount,
     stream_registration_digest: String,
     log: Box<dyn MissionSessionLog>,
+    steering_log: Option<Box<dyn RuntimeSteeringLog>>,
+    steering: RuntimeSteeringService,
+    pending_stream_events: VecDeque<RuntimeProviderStreamEvent>,
     next_log_sequence: u64,
     stream_event_count: u32,
     stream_byte_count: u64,
@@ -552,6 +680,11 @@ impl fmt::Debug for RuntimeProviderSession {
             .field(
                 "stream_registration_digest",
                 &self.stream_registration_digest,
+            )
+            .field("steering", &self.steering)
+            .field(
+                "pending_stream_event_count",
+                &self.pending_stream_events.len(),
             )
             .field("next_log_sequence", &self.next_log_sequence)
             .field("stream_event_count", &self.stream_event_count)
@@ -598,6 +731,28 @@ impl RuntimeProviderSession {
         self.mount.state
     }
 
+    pub fn steering_fence(&self) -> Result<RuntimeSteeringFence, RuntimeProviderError> {
+        Ok(self.steering.current_fence()?)
+    }
+
+    /// Obtain the exact fence that an explicit Continue must acknowledge after recovery.  This
+    /// remains available while normal steering is blocked by uncertain provider state.
+    pub fn steering_continuation_fence(
+        &self,
+    ) -> Result<RuntimeSteeringFence, RuntimeProviderError> {
+        Ok(self.steering.continuation_fence()?)
+    }
+
+    /// Clear a steering uncertainty after the caller has explicitly decided to continue.  This
+    /// never replays the uncertain request; the caller must submit a fresh idempotency key/fence.
+    pub fn continue_steering(
+        &mut self,
+        fence: &RuntimeSteeringFence,
+    ) -> Result<RuntimeSteeringFence, RuntimeProviderError> {
+        self.ensure_active()?;
+        Ok(self.steering.explicit_continue(fence)?)
+    }
+
     pub fn start_turn(
         &mut self,
         client_user_message_id: &str,
@@ -638,7 +793,78 @@ impl RuntimeProviderSession {
                 RuntimeProviderError::Adapter(error)
             })?;
         self.mapping = result.mapping.clone();
+        if let Err(error) = self.steering.bind_mapping(&self.mapping) {
+            self.steering.block();
+            self.poisoned = true;
+            return Err(error.into());
+        }
         Ok(result)
+    }
+
+    /// Submit one model-visible correction to the active OpenInterpreter turn.  The queued
+    /// durable event is committed before `turn/steer`; the accepted event is committed before the
+    /// acknowledgement returns.  No new Mission, thread, or turn is created here.
+    pub fn steer(
+        &mut self,
+        fence: &RuntimeSteeringFence,
+        client_steering_id: &str,
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<RuntimeSteeringAck, RuntimeProviderError> {
+        self.ensure_active()?;
+        if self.steering_log.is_none() {
+            return Err(RuntimeSteeringError::DurableLogRequired.into());
+        }
+        let queued = self.steering.queue(fence, client_steering_id, prompt)?;
+        self.append_steering(queued)?;
+
+        let mapping = self.mapping.clone();
+        let receipt = match self.runtime_mut()?.steer_mapped_turn(
+            &mapping,
+            client_steering_id,
+            prompt,
+            timeout,
+        ) {
+            Ok(receipt) => receipt,
+            Err(error @ AdapterError::TurnSteerRejected { .. }) => {
+                let error_digest = super::digest_hex(error.to_string().as_bytes());
+                self.append_steering_terminal(
+                    RuntimeSteeringTerminalReason::ProviderRejected,
+                    Some(error_digest.clone()),
+                )?;
+                return Err(error.into());
+            }
+            Err(error) => {
+                self.fail_steering_closed(&error);
+                return Err(RuntimeProviderError::SteeringProviderStateUncertain {
+                    error_digest: super::digest_hex(error.to_string().as_bytes()),
+                });
+            }
+        };
+        let accepted = match self.steering.accepted(
+            receipt.request_digest.clone(),
+            receipt.response_digest.clone(),
+        ) {
+            Ok(event) => event,
+            Err(error) => {
+                self.fail_steering_closed(&error);
+                return Err(RuntimeProviderError::SteeringProviderStateUncertain {
+                    error_digest: super::digest_hex(error.to_string().as_bytes()),
+                });
+            }
+        };
+        let accepted_digest = accepted.event_digest.clone();
+        if let Err(error) = self.append_steering(accepted) {
+            self.steering.block();
+            self.poisoned = true;
+            return Err(error);
+        }
+        Ok(RuntimeSteeringAck {
+            phase: RuntimeSteeringPhase::Accepted,
+            fence: fence.clone(),
+            client_steering_id_digest: super::digest_hex(client_steering_id.as_bytes()),
+            event_digest: accepted_digest,
+        })
     }
 
     pub fn stream_next(
@@ -646,15 +872,57 @@ impl RuntimeProviderSession {
         timeout: Duration,
     ) -> Result<RuntimeProviderStreamEvent, RuntimeProviderError> {
         self.ensure_active()?;
+        if let Some(event) = self.pending_stream_events.pop_front() {
+            return Ok(event);
+        }
         let mapping = self.mapping.clone();
         let mapped = self
             .runtime_mut()?
             .next_mapped_turn_event(&mapping, timeout)
             .map_err(|error| {
+                self.fail_steering_closed(&error);
                 self.poisoned = true;
                 RuntimeProviderError::Adapter(error)
             })?;
-        self.map_event(mapped)
+        let event_digest = mapped.event_digest.clone();
+        let event_kind = mapped.kind.clone();
+        let mapped_event = match self.map_event(mapped) {
+            Ok(event) => event,
+            Err(error) => {
+                self.fail_steering_closed(&error);
+                return Err(error);
+            }
+        };
+        let steering_event = match self.steering.observe_stream(&event_kind, &event_digest) {
+            Ok(event) => event,
+            Err(error) => {
+                self.fail_steering_closed(&error);
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = self.steering.advance_cursor() {
+            self.fail_steering_closed(&error);
+            return Err(error.into());
+        }
+        if let Some(steering_event) = steering_event {
+            let stream_event = RuntimeProviderStreamEvent::Steering {
+                phase: steering_event.phase,
+                event_digest: steering_event.event_digest.clone(),
+                client_steering_id_digest: steering_event.client_steering_id_digest.clone(),
+            };
+            if let Err(error) = self.append_steering(steering_event) {
+                self.steering.block();
+                self.poisoned = true;
+                return Err(error);
+            }
+            self.pending_stream_events.push_back(stream_event);
+            self.pending_stream_events.push_back(mapped_event);
+            return self
+                .pending_stream_events
+                .pop_front()
+                .ok_or(RuntimeProviderError::SessionClosed);
+        }
+        Ok(mapped_event)
     }
 
     pub fn respond_to_approval(
@@ -678,12 +946,19 @@ impl RuntimeProviderSession {
     ) -> Result<RuntimeProtocolWriteReceipt, RuntimeProviderError> {
         self.ensure_active()?;
         let mapping = self.mapping.clone();
-        self.runtime_mut()?
+        let receipt = self
+            .runtime_mut()?
             .interrupt_mapped_turn(&mapping, timeout)
             .map_err(|error| {
+                self.fail_steering_closed(&error);
                 self.poisoned = true;
                 RuntimeProviderError::Adapter(error)
-            })
+            })?;
+        self.append_steering_terminal(
+            RuntimeSteeringTerminalReason::Interrupted,
+            Some(receipt.response_digest.clone()),
+        )?;
+        Ok(receipt)
     }
 
     /// Restart after a poisoned/crashed process. The old mount is revoked first, no uncertain
@@ -697,6 +972,9 @@ impl RuntimeProviderSession {
         if self.runtime.is_none() {
             return Err(RuntimeProviderError::SessionClosed);
         }
+        let steering_uncertainty = self
+            .record_steering_uncertain("runtime-restart-provider-state")
+            .err();
         let previous_instance_digest = self.mapping.runtime_instance_digest.clone();
         let old_mount_digest = self.mount.mount_digest.clone();
         let mut stopper = SessionRegistrationStopper::default();
@@ -749,9 +1027,14 @@ impl RuntimeProviderSession {
         self.runtime = Some(runtime);
         self.capabilities = capabilities;
         self.mapping = mapping;
+        self.steering.bind_mapping(&self.mapping)?;
         self.mount = mount;
         self.stream_registration_digest = stream_registration_digest;
         self.poisoned = false;
+        if let Some(error) = steering_uncertainty {
+            self.poisoned = true;
+            return Err(error);
+        }
         Ok(ProviderRestartReceipt {
             previous_instance_digest,
             new_instance_digest,
@@ -771,17 +1054,32 @@ impl RuntimeProviderSession {
     }
 
     fn teardown(mut self, revoke: bool) -> Result<RuntimeProviderTeardown, RuntimeProviderError> {
+        let steering_error = self
+            .append_steering_terminal(
+                if revoke {
+                    RuntimeSteeringTerminalReason::Revoked
+                } else {
+                    RuntimeSteeringTerminalReason::Unmounted
+                },
+                None,
+            )
+            .err();
         let mut stopper = SessionRegistrationStopper::default();
-        let plugin = if revoke {
-            self.mount.revoke(&mut stopper)?
+        let plugin_result = if revoke {
+            self.mount.revoke(&mut stopper)
         } else {
-            self.mount.unmount(&mut stopper)?
+            self.mount.unmount(&mut stopper)
         };
-        let runtime = self
+        let shutdown_result = self
             .runtime
             .take()
-            .ok_or(RuntimeProviderError::SessionClosed)?;
-        let shutdown = runtime.shutdown()?;
+            .ok_or(RuntimeProviderError::SessionClosed)
+            .and_then(|runtime| runtime.shutdown().map_err(RuntimeProviderError::from));
+        let plugin = plugin_result?;
+        let shutdown = shutdown_result?;
+        if let Some(error) = steering_error {
+            return Err(error);
+        }
         Ok(RuntimeProviderTeardown { plugin, shutdown })
     }
 
@@ -819,6 +1117,50 @@ impl RuntimeProviderSession {
             .checked_add(1)
             .ok_or(RuntimeProviderError::InvalidDurableEvent)?;
         Ok(())
+    }
+
+    fn append_steering(&mut self, event: RuntimeSteeringEvent) -> Result<(), RuntimeProviderError> {
+        event.validate()?;
+        let event_digest = event.event_digest.clone();
+        let Some(log) = self.steering_log.as_mut() else {
+            self.steering.block();
+            self.poisoned = true;
+            return Err(RuntimeSteeringError::DurableLogRequired.into());
+        };
+        if let Err(reason) = log.append_steering_event(event) {
+            self.steering.block();
+            self.poisoned = true;
+            return Err(RuntimeProviderError::SteeringDurableLog {
+                event_digest,
+                reason,
+            });
+        }
+        Ok(())
+    }
+
+    fn append_steering_terminal(
+        &mut self,
+        reason: RuntimeSteeringTerminalReason,
+        response_digest: Option<String>,
+    ) -> Result<(), RuntimeProviderError> {
+        let Some(event) = self.steering.terminate(reason, response_digest)? else {
+            return Ok(());
+        };
+        self.append_steering(event)
+    }
+
+    fn record_steering_uncertain(&mut self, reason: &str) -> Result<(), RuntimeProviderError> {
+        let error_digest = super::digest_hex(reason.as_bytes());
+        let Some(event) = self.steering.uncertain(error_digest)? else {
+            return Ok(());
+        };
+        self.append_steering(event)
+    }
+
+    fn fail_steering_closed(&mut self, error: &dyn fmt::Display) {
+        let _ = self.record_steering_uncertain(&error.to_string());
+        self.steering.block();
+        self.poisoned = true;
     }
 
     fn append_output(
@@ -935,6 +1277,8 @@ impl RuntimeProviderSession {
 
 impl Drop for RuntimeProviderSession {
     fn drop(&mut self) {
+        let _ = self.record_steering_uncertain("runtime-session-drop-provider-state");
+        self.steering.block();
         let mut stopper = SessionRegistrationStopper::default();
         let _ = self.mount.revoke(&mut stopper);
         let _ = self.runtime.take();
@@ -1137,6 +1481,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingLog {
         events: Arc<Mutex<Vec<DurableModelVisibleEvent>>>,
+        steering_events: Arc<Mutex<Vec<RuntimeSteeringEvent>>>,
     }
 
     impl MissionSessionLog for RecordingLog {
@@ -1148,6 +1493,17 @@ mod tests {
             self.events
                 .lock()
                 .map_err(|_| "recording log lock poisoned".to_owned())?
+                .push(event);
+            Ok(())
+        }
+    }
+
+    impl RuntimeSteeringLog for RecordingLog {
+        fn append_steering_event(&mut self, event: RuntimeSteeringEvent) -> Result<(), String> {
+            event.validate().map_err(|error| error.to_string())?;
+            self.steering_events
+                .lock()
+                .map_err(|_| "recording steering log lock poisoned".to_owned())?
                 .push(event);
             Ok(())
         }
@@ -1392,6 +1748,211 @@ done
         assert_eq!(teardown.plugin.stopped_registration_count, 1);
         assert_eq!(teardown.plugin.residual_registration_count, 0);
         assert_eq!(teardown.plugin.state, RuntimePluginMountState::Unmounted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fake App Server keeps the turn open until the real pinned turn/steer call and proves durable phase ordering"
+    )]
+    fn fake_provider_steering_is_same_turn_durable_and_idempotent() {
+        let workspace = std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("workspace");
+        let workspace_json =
+            serde_json::to_string(&workspace.to_string_lossy()).expect("workspace json");
+        let script = r#"
+while IFS= read -r request; do
+    id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    case "$request" in
+        *'"method":"initialize"'*)
+            if [ "$OPENAI_API_KEY" != "provider-plugin-test-secret" ]; then exit 42; fi
+            printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"serverInfo":{"name":"fake-steering-runtime"}}}'
+            ;;
+        *'"method":"interpreter/provider/list"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"data":[{"id":"openai","wireApi":"responses","envKey":"OPENAI_API_KEY","configured":true}]}}'
+            ;;
+        *'"method":"interpreter/model/list"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"data":[{"model":"gpt-5.6","supportedReasoningEfforts":[{"reasoningEffort":"medium"}],"serviceTiers":[{"id":"default"}]}]}}'
+            ;;
+        *'"method":"interpreter/harness/list"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"data":[{"id":null,"isRecommended":true}]}}'
+            ;;
+        *'"method":"interpreter/provider/set"'*|*'"method":"interpreter/model/set"'*|*'"method":"interpreter/harness/set"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"thread":{"id":"provider-thread-steering"},"cwd":__WORKSPACE__,"model":"gpt-5.6","modelProvider":"openai","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"workspace-write"}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"turn":{"id":"provider-turn-steering","status":"inProgress"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"provider-thread-steering","turn":{"id":"provider-turn-steering","status":"inProgress"}}}'
+            ;;
+        *'"method":"turn/steer"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'$id',"result":{"turnId":"provider-turn-steering"}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"provider-thread-steering","turnId":"provider-turn-steering","itemId":"provider-item-steering","delta":"steered output"}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"provider-thread-steering","turnId":"provider-turn-steering","item":{"id":"provider-item-steering","type":"agentMessage","text":"steered output"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"provider-thread-steering","turnId":"provider-turn-steering","turn":{"id":"provider-turn-steering","status":"completed"}}}'
+            ;;
+    esac
+done
+"#;
+        let script = script.replace("__WORKSPACE__", &workspace_json);
+        let catalog = catalog_fixture();
+        let config = config_fixture(&catalog);
+        let scope = super::super::RuntimePluginScope::new(
+            "project-provider-steering",
+            "mission-provider-steering",
+            "session-provider-steering",
+        )
+        .expect("scope");
+        let log = RecordingLog::default();
+        let model_events = log.events.clone();
+        let steering_events = log.steering_events.clone();
+        let provider = OpenInterpreterRuntimeProvider::new().expect("provider");
+        let mut session = provider
+            .mount_with_steering_log(
+                shell_runtime(&script),
+                &workspace,
+                scope,
+                catalog,
+                config,
+                RuntimeProviderPolicy::new(16, 4_096, 10_000, "USD").expect("policy"),
+                &FakeResolver,
+                Box::new(log.clone()),
+                Box::new(log),
+                1,
+                Duration::from_secs(1),
+            )
+            .expect("mounted session");
+        let start = session
+            .start_turn(
+                "provider-message-steering",
+                "Start the bounded task.",
+                Duration::from_secs(1),
+            )
+            .expect("turn");
+        let initial_mapping = start.mapping.clone();
+        assert!(matches!(
+            session
+                .stream_next(Duration::from_secs(1))
+                .expect("started"),
+            RuntimeProviderStreamEvent::TurnStarted { .. }
+        ));
+        let fence = session.steering_fence().expect("active steering fence");
+        let ack = session
+            .steer(
+                &fence,
+                "provider-steering-1",
+                "Correct direction: keep the answer bounded.",
+                Duration::from_secs(1),
+            )
+            .expect("steer accepted");
+        assert_eq!(ack.phase, RuntimeSteeringPhase::Accepted);
+        assert_eq!(ack.fence, fence);
+        assert_eq!(
+            session.mapping().runtime_thread_id,
+            initial_mapping.runtime_thread_id
+        );
+        assert_eq!(
+            session.mapping().runtime_turn_id,
+            initial_mapping.runtime_turn_id
+        );
+        assert!(matches!(
+            session.steer(
+                &fence,
+                "provider-steering-1",
+                "Correct direction: keep the answer bounded.",
+                Duration::from_secs(1),
+            ),
+            Err(RuntimeProviderError::Steering(
+                RuntimeSteeringError::DuplicateSteering
+            ))
+        ));
+        assert!(matches!(
+            session
+                .stream_next(Duration::from_secs(1))
+                .expect("applied event"),
+            RuntimeProviderStreamEvent::Steering {
+                phase: RuntimeSteeringPhase::Applied,
+                ..
+            }
+        ));
+        assert!(matches!(
+            session.stream_next(Duration::from_secs(1)).expect("delta"),
+            RuntimeProviderStreamEvent::AgentMessageDelta {
+                ref content, ..
+            } if content == "steered output"
+        ));
+        assert!(matches!(
+            session.stream_next(Duration::from_secs(1)).expect("item"),
+            RuntimeProviderStreamEvent::ItemCompleted {
+                result: Some(ref packet),
+                ..
+            } if packet.content == "steered output"
+        ));
+        assert!(matches!(
+            session
+                .stream_next(Duration::from_secs(1))
+                .expect("terminal event"),
+            RuntimeProviderStreamEvent::Steering {
+                phase: RuntimeSteeringPhase::Terminal,
+                ..
+            }
+        ));
+        assert!(matches!(
+            session
+                .stream_next(Duration::from_secs(1))
+                .expect("completed turn"),
+            RuntimeProviderStreamEvent::TurnCompleted {
+                status: RuntimeTurnCompletionStatus::Completed,
+                ..
+            }
+        ));
+
+        let steering_events = steering_events.lock().expect("steering events");
+        assert_eq!(
+            steering_events
+                .iter()
+                .map(|event| event.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                RuntimeSteeringPhase::Queued,
+                RuntimeSteeringPhase::Accepted,
+                RuntimeSteeringPhase::Applied,
+                RuntimeSteeringPhase::Terminal,
+            ]
+        );
+        assert!(steering_events.iter().all(|event| event.fence == fence));
+        assert!(
+            steering_events
+                .iter()
+                .all(|event| event.fence.project_id == "project-provider-steering")
+        );
+        assert_eq!(
+            steering_events[0].prompt,
+            "Correct direction: keep the answer bounded."
+        );
+        drop(steering_events);
+        let model_events = model_events.lock().expect("model events");
+        assert_eq!(
+            model_events
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                DurableModelVisibleEventKind::Input,
+                DurableModelVisibleEventKind::AssistantDelta,
+                DurableModelVisibleEventKind::AssistantResult,
+            ]
+        );
+        assert_eq!(model_events[0].content, "Start the bounded task.");
+        assert_eq!(model_events[1].content, "steered output");
+        assert_eq!(model_events[2].content, "steered output");
+        drop(model_events);
+        session.unmount().expect("unmount");
     }
 
     #[test]

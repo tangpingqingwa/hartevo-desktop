@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
 mod control_plane;
 mod plugin;
 mod provider;
+mod steering;
 
 pub use control_plane::{
     CONTROL_PLANE_CONTRACT_SHA256, ResolvedSecret, RuntimeBudget, RuntimeCapabilities,
@@ -48,6 +49,11 @@ pub use provider::{
     OpenInterpreterRuntimeProvider, ProviderRestartReceipt, RuntimeProviderError,
     RuntimeProviderPolicy, RuntimeProviderSession, RuntimeProviderStreamEvent,
     RuntimeProviderTeardown,
+};
+pub use steering::{
+    RUNTIME_STEERING_EVENT_SCHEMA, RUNTIME_STEERING_SERVICE_SCHEMA, RuntimeSteeringAck,
+    RuntimeSteeringError, RuntimeSteeringEvent, RuntimeSteeringFence, RuntimeSteeringLog,
+    RuntimeSteeringPhase, RuntimeSteeringService, RuntimeSteeringTerminalReason,
 };
 
 pub const OPENINTERPRETER_COMMIT: &str = "52a31019714294add53cafbc5268e1467b471263";

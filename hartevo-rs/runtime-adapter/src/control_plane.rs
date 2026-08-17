@@ -26,7 +26,7 @@ const CONTROL_PLANE_CONTRACT: &str = include_str!(concat!(
 ));
 const CONTROL_PLANE_SCHEMA: &str = "hartevo.openinterpreter-control-plane/v1";
 pub const CONTROL_PLANE_CONTRACT_SHA256: &str =
-    "faab0d703ba676078ef016e10271525c951b52bb9b3813c609f30761edbff09c";
+    "d3fca6f6829cdb4d4dde4aec98b2e62c7839f6e80c47ee375ac2e089a95e1798";
 const SECRET_REFERENCE_SCHEMA_VERSION: u32 = 1;
 const RUNTIME_CONFIG_SCHEMA_VERSION: u32 = 1;
 const RUNTIME_CATALOG_SCHEMA_VERSION: u32 = 1;

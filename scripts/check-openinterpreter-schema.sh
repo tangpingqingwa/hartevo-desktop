@@ -18,6 +18,7 @@ readonly expected_upstream_notice="9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0d
 readonly workspace_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly source_manifest="${workspace_root}/third_party/openinterpreter/SOURCE.toml"
 readonly contract_summary="${HARTEVO_OPENINTERPRETER_CONTRACT_PATH:-${workspace_root}/contracts/openinterpreter/app-server-v2.methods.json}"
+readonly steering_contract="${workspace_root}/contracts/openinterpreter/steering.v1.json"
 readonly adapter_source="${workspace_root}/hartevo-rs/runtime-adapter/src/lib.rs"
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/hartevo-openinterpreter.XXXXXX")"
@@ -174,6 +175,20 @@ require_adapter_string_constant() {
 }
 
 require_contract_shape
+
+if ! jq -e '
+  type == "object"
+  and .schema == "hartevo.runtime-steering-service/v1"
+  and .providerMethod == "turn/steer"
+  and (.phases == ["queued", "accepted", "applied", "terminal", "uncertain"])
+  and (.exactFence == ["projectId", "missionId", "sessionId", "runtimeThreadId", "runtimeTurnId", "runtimeGeneration", "cursor", "revision", "mappingDigest"])
+  and (.durableOrder[0] == "queued")
+  and (.durableOrder[2] == "accepted")
+  and (.uncertainty | contains("fail-closed"))
+' "${steering_contract}" >/dev/null; then
+  echo "OpenInterpreter local steering contract is malformed" >&2
+  exit 1
+fi
 
 write_expected_set "${work_dir}/expected-client-methods" \
   initialize \

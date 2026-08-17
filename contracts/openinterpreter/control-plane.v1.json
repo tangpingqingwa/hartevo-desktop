@@ -43,6 +43,9 @@
       "steer",
       "bounded-stream"
     ],
+    "providerServices": [
+      "durable-steering"
+    ],
     "recovery": "typed-hint-no-automatic-uncertain-replay"
   },
   "businessAuthority": {
