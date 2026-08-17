@@ -18,7 +18,7 @@ use hartevo_effect_broker::{ConnectedAuthority, ConnectedAuthorization};
 pub use hartevo_effect_broker::{
     ProviderAdapterIdentity, ProviderAdapterOperation, ProviderAdapterRegistry,
     ProviderCapabilityKey, ProviderCapabilitySupport, ProviderContractError, ProviderEvidenceClass,
-    ProviderProvenanceClass,
+    ProviderEvidenceSupport, ProviderProvenanceClass,
 };
 pub use linkedin::{
     CurlHttpsTransport, DurableObservationLog, EnvLinkedInCredentialResolver,
@@ -46,6 +46,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub mod authenticated_probe;
+pub mod connection_center;
 
 pub const CONNECTOR_SDK_SCHEMA_VERSION: &str = "hartevo-connector-sdk/v1";
 pub const MAX_CREDENTIAL_LEASE_TTL_SECONDS: i64 = 900;
