@@ -52,11 +52,28 @@ impl ProjectStore {
         batch: &SourceObservationBatch,
         recorded_at: DateTime<Utc>,
     ) -> Result<i64, StorageError> {
-        // Older provider adapters populated a cursor token but left the
-        // content digest as a transport placeholder. Canonicalize that
-        // legacy input before validating and persisting so the stricter
-        // domain replay fence remains compatible with already-typed callers.
         let mut batch = batch.clone();
+        let reporting_currency = batch
+            .events
+            .iter()
+            .find_map(|event| event.amount.as_ref().map(|amount| amount.currency.clone()))
+            .unwrap_or_else(|| CurrencyCode::parse("USD").expect("static currency"));
+        let mut ledger = self.replay_attribution_spine(&batch.project_id, reporting_currency)?;
+        // Older provider adapters populated a cursor token but left the
+        // content digest as a transport placeholder. Rebind only an exact
+        // prior cursor whose non-digest fields match, then derive the new
+        // content digest before strict validation.
+        if let Some(cursor_before) = batch.cursor_before.as_mut()
+            && let Some(expected) = ledger.cursors.iter().find(|expected| {
+                let mut candidate = cursor_before.clone();
+                candidate.batch_digest.clone_from(&expected.batch_digest);
+                candidate == **expected
+            })
+        {
+            cursor_before
+                .batch_digest
+                .clone_from(&expected.batch_digest);
+        }
         batch.cursor_after.batch_digest = batch
             .content_digest()
             .map_err(|error| StorageError::DomainDecode(error.to_string()))?;
@@ -76,12 +93,6 @@ impl ProjectStore {
         {
             return Ok(existing);
         }
-        let reporting_currency = batch
-            .events
-            .iter()
-            .find_map(|event| event.amount.as_ref().map(|amount| amount.currency.clone()))
-            .unwrap_or_else(|| CurrencyCode::parse("USD").expect("static currency"));
-        let mut ledger = self.replay_attribution_spine(&batch.project_id, reporting_currency)?;
         ledger
             .ingest_batch(batch.clone())
             .map_err(|error| domain_decode(&error))?;
