@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/distribution/update-metadata/1.0.0",
+  "title": "Hartevo TUF-like signed update metadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "channel", "architecture", "root", "targets", "snapshot", "timestamp", "rollbackPolicy", "releaseDecision", "signingIdentity"],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-update-metadata/v1"},
+    "channel": {"enum": ["alpha", "beta", "stable"]},
+    "architecture": {"type": "string", "minLength": 1},
+    "root": {"type": "string", "const": "root.json"},
+    "targets": {"type": "string", "const": "targets.json"},
+    "snapshot": {"type": "string", "const": "snapshot.json"},
+    "timestamp": {"type": "string", "const": "timestamp.json"},
+    "rollbackPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "requiresSignedAuthorization", "freezeProtection", "maxClockSkewSeconds"],
+      "properties": {
+        "mode": {"const": "monotonic-unless-authorized"},
+        "requiresSignedAuthorization": {"const": true},
+        "freezeProtection": {"const": true},
+        "maxClockSkewSeconds": {"type": "integer", "minimum": 0, "maximum": 900}
+      }
+    },
+    "releaseDecision": {"const": "NOT_EVALUATED"},
+    "signingIdentity": {"enum": ["TEST_ONLY", "CONFIGURED_RELEASE_KEY"]}
+  }
+}

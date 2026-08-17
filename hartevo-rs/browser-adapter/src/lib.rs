@@ -16,6 +16,7 @@
 mod action;
 #[cfg(unix)]
 mod chromium_host;
+mod consumer;
 mod fake_host;
 mod file_broker;
 mod handoff;
@@ -23,11 +24,13 @@ mod locator;
 mod mission_batch;
 mod navigation;
 mod profile_dir;
+mod provider;
 #[cfg(test)]
 mod real_chromium_signed_recipe_test;
 mod recipe;
 #[cfg(unix)]
 mod scanner;
+mod service;
 mod workspace;
 
 pub use action::{
@@ -42,6 +45,7 @@ pub use chromium_host::{
     ChromiumTextInputDispatchEvidence, ManagedChromiumClickExecutor,
     ManagedChromiumFileUploadExecutor, ManagedChromiumHost, ManagedChromiumTextInputExecutor,
 };
+pub use consumer::{MissionBrowserWorkspaceConsumer, MissionBrowserWorkspaceState};
 pub use fake_host::{
     BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost, FakeBrowserPage,
 };
@@ -69,6 +73,9 @@ pub use mission_batch::{
 };
 pub use navigation::{BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserNavigationTarget};
 pub use profile_dir::{BrowserExecutableIdentity, ManagedProfileDirectory};
+pub use provider::{
+    AuthenticatedChromiumProvider, BrowserProviderLifecycle, DurableBrowserObservation,
+};
 pub use recipe::{
     BrowserRecipeActivation, BrowserRecipeActiveVersion, BrowserRecipeCandidate,
     BrowserRecipeEvaluationEvidence, BrowserRecipeExecutionAuthorization, BrowserRecipeKeyPurpose,
@@ -79,6 +86,10 @@ pub use recipe::{
 };
 #[cfg(unix)]
 pub use scanner::{ProductionFileScanner, ScannerProcessLimits, ScannerReleasePin};
+pub use service::{
+    BrowserWorkspaceCapability, BrowserWorkspaceMountRequest, BrowserWorkspaceScope,
+    BrowserWorkspaceServiceDefinition,
+};
 pub use workspace::{
     BrowserControlState, BrowserControlTransition, BrowserIdentity, BrowserLeaseProof,
     BrowserProfile, BrowserProfileSource, BrowserProfileStatus, BrowserWorkspace,
