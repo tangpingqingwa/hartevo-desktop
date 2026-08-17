@@ -9,8 +9,11 @@
 
 #![forbid(unsafe_code)]
 
+mod degradation;
 mod invocation;
 mod resolution;
+pub use degradation::CapabilityVersion as DegradationCapabilityVersion;
+pub use degradation::*;
 pub use invocation::{
     CapabilityInvocationCloseReason, CapabilityInvocationContext,
     CapabilityInvocationEffectReceipt, CapabilityInvocationError, CapabilityInvocationEvent,
@@ -52,6 +55,7 @@ pub const CAPABILITY_REQUEST_SCHEMA: &str = "hartevo.capability-request/v1";
 pub const CAPABILITY_RESULT_SCHEMA: &str = "hartevo.capability-result/v1";
 pub const CAPABILITY_RECOVERY_SCHEMA: &str = "hartevo.capability-recovery/v1";
 pub const CAPABILITY_EXECUTION_SCHEMA: &str = "hartevo.capability-execution/v1";
+pub const CAPABILITY_AUDIT_SCHEMA: &str = "hartevo.capability-audit/v1";
 pub const ADAPTER_REGISTRY_SCHEMA: &str = "hartevo.capability-adapter-registry/v1";
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_PROVENANCE_LINKS: usize = 8;
@@ -249,6 +253,28 @@ pub enum CapabilityClass {
     Read,
     LocalMutation,
     ExternalEffect,
+}
+
+/// The trusted Hartevo-owned host surface that may invoke a capability.
+/// Runtime, Browser and Connector adapters share one audit contract, but a
+/// request/result provenance source must still identify the concrete surface.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySurface {
+    Runtime,
+    Browser,
+    Connector,
+}
+
+impl CapabilitySurface {
+    fn accepts(self, source: ProvenanceSource) -> bool {
+        matches!(
+            (self, source),
+            (Self::Runtime, ProvenanceSource::Runtime)
+                | (Self::Browser, ProvenanceSource::BrowserAdapter)
+                | (Self::Connector, ProvenanceSource::ConnectorAdapter)
+        )
+    }
 }
 
 /// Data that may be carried in a Runtime result. Secrets are not a data class
@@ -982,11 +1008,12 @@ impl fmt::Debug for RevocationBinding {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceSource {
     Runtime,
     BrowserAdapter,
+    ConnectorAdapter,
     Application,
     EffectBroker,
     Recovery,
@@ -1300,6 +1327,13 @@ impl SignedCapabilityManifest {
 
     pub fn digest(&self) -> Result<Digest, GatewayError> {
         self.manifest.digest()
+    }
+
+    pub fn revision_snapshot(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<SignedCapabilityManifestRevision, GatewayError> {
+        SignedCapabilityManifestRevision::from_signed(self, now)
     }
 }
 
@@ -2348,6 +2382,485 @@ impl RecoveryEnvelope {
     }
 }
 
+/// Content-free authority facts copied into an invocation audit. Secret
+/// references, network origins and effect providers are represented by
+/// digests; the manifest remains the signed source of authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityAuthorityAudit {
+    pub authority_digest: Digest,
+    pub data_maximum_class: DataClass,
+    pub data_resource_set_digest: Digest,
+    pub network_digest: Digest,
+    pub secret_reference_set_digest: Digest,
+    pub budget_digest: Digest,
+    pub effect_digest: Digest,
+}
+
+impl CapabilityAuthorityAudit {
+    fn from_manifest(manifest: &CapabilityManifest) -> Result<Self, GatewayError> {
+        Ok(Self {
+            authority_digest: manifest.authority_digest()?,
+            data_maximum_class: manifest.data.maximum_class,
+            data_resource_set_digest: digest_serialized(&manifest.data.allowed_resource_digests),
+            network_digest: digest_serialized(&manifest.network),
+            secret_reference_set_digest: digest_serialized(&manifest.secrets.references),
+            budget_digest: digest_serialized(&manifest.budget),
+            effect_digest: digest_serialized(&manifest.effect),
+        })
+    }
+
+    fn validate(&self) -> Result<(), GatewayError> {
+        if ![
+            &self.authority_digest,
+            &self.data_resource_set_digest,
+            &self.network_digest,
+            &self.secret_reference_set_digest,
+            &self.budget_digest,
+            &self.effect_digest,
+        ]
+        .into_iter()
+        .all(|digest| is_sha256(digest.as_str()))
+        {
+            return Err(GatewayError::InvalidAuditEnvelope);
+        }
+        Ok(())
+    }
+
+    fn validate_against(&self, manifest: &CapabilityManifest) -> Result<(), GatewayError> {
+        self.validate()?;
+        if self != &Self::from_manifest(manifest)? {
+            return Err(GatewayError::InvalidAuditEnvelope);
+        }
+        Ok(())
+    }
+}
+
+/// The signed manifest/revocation snapshot that an audit entry binds to.
+/// Signature and key identity are retained as digests so audit/debug output
+/// cannot become a credential or raw cryptographic-material channel.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedCapabilityManifestRevision {
+    pub manifest_digest: Digest,
+    pub manifest_version: u32,
+    pub parent_manifest_digest: Option<Digest>,
+    pub generation: u64,
+    pub authority_digest: Digest,
+    pub registry_revision: u64,
+    pub revocation_epoch: u64,
+    pub revocation_status: RevocationStatus,
+    pub revocation_record_digest: Digest,
+    pub signature_key_id_digest: Digest,
+    pub signature_public_key_digest: Digest,
+    pub signature_digest: Digest,
+}
+
+impl SignedCapabilityManifestRevision {
+    fn from_signed(
+        signed_manifest: &SignedCapabilityManifest,
+        now: DateTime<Utc>,
+    ) -> Result<Self, GatewayError> {
+        signed_manifest.verify(now)?;
+        let manifest = &signed_manifest.manifest;
+        Ok(Self {
+            manifest_digest: manifest.digest()?,
+            manifest_version: manifest.manifest_version,
+            parent_manifest_digest: manifest.provenance.parent_manifest_digest.clone(),
+            generation: manifest.mission.generation,
+            authority_digest: manifest.authority_digest()?,
+            registry_revision: manifest.revocation.registry_revision,
+            revocation_epoch: manifest.revocation.revocation_epoch,
+            revocation_status: manifest.revocation.status,
+            revocation_record_digest: manifest.revocation.record_digest.clone(),
+            signature_key_id_digest: Digest::from_text(&signed_manifest.signature.key_id),
+            signature_public_key_digest: Digest::from_bytes(&signed_manifest.signature.public_key),
+            signature_digest: digest_serialized(&signed_manifest.signature),
+        })
+    }
+
+    fn validate(&self) -> Result<(), GatewayError> {
+        if self.manifest_version == 0
+            || self.generation == 0
+            || self.registry_revision == 0
+            || self.revocation_epoch == 0
+            || self.revocation_status == RevocationStatus::Revoked
+            || ![
+                &self.manifest_digest,
+                &self.authority_digest,
+                &self.revocation_record_digest,
+                &self.signature_key_id_digest,
+                &self.signature_public_key_digest,
+                &self.signature_digest,
+            ]
+            .into_iter()
+            .all(|digest| is_sha256(digest.as_str()))
+            || self
+                .parent_manifest_digest
+                .as_ref()
+                .is_some_and(|digest| !is_sha256(digest.as_str()))
+        {
+            return Err(GatewayError::InvalidAuditEnvelope);
+        }
+        Ok(())
+    }
+
+    fn validate_against(
+        &self,
+        signed_manifest: &SignedCapabilityManifest,
+        now: DateTime<Utc>,
+    ) -> Result<(), GatewayError> {
+        self.validate()?;
+        if self != &Self::from_signed(signed_manifest, now)? {
+            return Err(GatewayError::InvalidAuditEnvelope);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum CapabilityInvocationAuditOutcome {
+    Completed { result_digest: Digest },
+    Recovery { disposition: RecoveryDisposition },
+    Rejected { code: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityInvocationAuditEnvelope {
+    pub schema: String,
+    pub audit_digest: Digest,
+    pub sequence: u64,
+    pub previous_audit_digest: Option<Digest>,
+    pub surface: CapabilitySurface,
+    pub request_id: RequestId,
+    pub request_digest: Digest,
+    pub capability_id: CapabilityId,
+    pub class: CapabilityClass,
+    pub project_digest: Digest,
+    pub mission_digest: Digest,
+    pub scope_digest: Digest,
+    pub generation: u64,
+    pub provenance_digest: Digest,
+    pub authority: CapabilityAuthorityAudit,
+    pub manifest_revision: SignedCapabilityManifestRevision,
+    pub budget_use: BudgetUse,
+    pub outcome: CapabilityInvocationAuditOutcome,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CapabilityInvocationAuditBody<'a> {
+    schema: &'a str,
+    sequence: u64,
+    previous_audit_digest: &'a Option<Digest>,
+    surface: CapabilitySurface,
+    request_id: &'a RequestId,
+    request_digest: &'a Digest,
+    capability_id: &'a CapabilityId,
+    class: CapabilityClass,
+    project_digest: &'a Digest,
+    mission_digest: &'a Digest,
+    scope_digest: &'a Digest,
+    generation: u64,
+    provenance_digest: &'a Digest,
+    authority: &'a CapabilityAuthorityAudit,
+    manifest_revision: &'a SignedCapabilityManifestRevision,
+    budget_use: &'a BudgetUse,
+    outcome: &'a CapabilityInvocationAuditOutcome,
+}
+
+impl CapabilityInvocationAuditEnvelope {
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        surface: CapabilitySurface,
+        signed_manifest: &SignedCapabilityManifest,
+        registry: &AdapterRegistry,
+        request: &CapabilityRequest,
+        outcome: CapabilityInvocationAuditOutcome,
+        budget_use: BudgetUse,
+        sequence: u64,
+        previous_audit_digest: Option<Digest>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, GatewayError> {
+        if sequence == 0 {
+            return Err(GatewayError::InvalidAuditEnvelope);
+        }
+        let manifest = &signed_manifest.manifest;
+        let mut envelope = Self {
+            schema: CAPABILITY_AUDIT_SCHEMA.into(),
+            audit_digest: Digest::from_text("unsealed-capability-audit"),
+            sequence,
+            previous_audit_digest,
+            surface,
+            request_id: request.request_id.clone(),
+            request_digest: request.digest(),
+            capability_id: request.capability_id.clone(),
+            class: request.class,
+            project_digest: Digest::from_text(request.scope.project_id.as_str()),
+            mission_digest: Digest::from_text(request.scope.mission_id.as_str()),
+            scope_digest: request.scope.scope_digest.clone(),
+            generation: request.generation,
+            provenance_digest: digest_serialized(&request.provenance),
+            authority: CapabilityAuthorityAudit::from_manifest(manifest)?,
+            manifest_revision: SignedCapabilityManifestRevision::from_signed(signed_manifest, now)?,
+            budget_use,
+            outcome,
+        };
+        envelope.audit_digest = envelope.computed_digest();
+        envelope.validate_against(signed_manifest, registry, request, now)?;
+        Ok(envelope)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn completed(
+        surface: CapabilitySurface,
+        signed_manifest: &SignedCapabilityManifest,
+        registry: &AdapterRegistry,
+        request: &CapabilityRequest,
+        result: &CapabilityResult,
+        sequence: u64,
+        previous_audit_digest: Option<Digest>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, GatewayError> {
+        let envelope = Self::build(
+            surface,
+            signed_manifest,
+            registry,
+            request,
+            CapabilityInvocationAuditOutcome::Completed {
+                result_digest: result.digest(),
+            },
+            result.budget_use.clone(),
+            sequence,
+            previous_audit_digest,
+            now,
+        )?;
+        envelope.validate_completed_against(signed_manifest, registry, request, result, now)?;
+        Ok(envelope)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn recovery(
+        surface: CapabilitySurface,
+        signed_manifest: &SignedCapabilityManifest,
+        registry: &AdapterRegistry,
+        request: &CapabilityRequest,
+        disposition: RecoveryDisposition,
+        sequence: u64,
+        previous_audit_digest: Option<Digest>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, GatewayError> {
+        Self::build(
+            surface,
+            signed_manifest,
+            registry,
+            request,
+            CapabilityInvocationAuditOutcome::Recovery { disposition },
+            request.budget_use.clone(),
+            sequence,
+            previous_audit_digest,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rejected(
+        surface: CapabilitySurface,
+        signed_manifest: &SignedCapabilityManifest,
+        registry: &AdapterRegistry,
+        request: &CapabilityRequest,
+        code: impl Into<String>,
+        sequence: u64,
+        previous_audit_digest: Option<Digest>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, GatewayError> {
+        Self::build(
+            surface,
+            signed_manifest,
+            registry,
+            request,
+            CapabilityInvocationAuditOutcome::Rejected { code: code.into() },
+            request.budget_use.clone(),
+            sequence,
+            previous_audit_digest,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_error(
+        surface: CapabilitySurface,
+        signed_manifest: &SignedCapabilityManifest,
+        registry: &AdapterRegistry,
+        request: &CapabilityRequest,
+        error: &GatewayError,
+        sequence: u64,
+        previous_audit_digest: Option<Digest>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, GatewayError> {
+        match error {
+            GatewayError::Recovery(disposition) => Self::recovery(
+                surface,
+                signed_manifest,
+                registry,
+                request,
+                disposition.clone(),
+                sequence,
+                previous_audit_digest,
+                now,
+            ),
+            _ => Self::rejected(
+                surface,
+                signed_manifest,
+                registry,
+                request,
+                error.code(),
+                sequence,
+                previous_audit_digest,
+                now,
+            ),
+        }
+    }
+
+    pub fn digest(&self) -> Digest {
+        self.computed_digest()
+    }
+
+    fn computed_digest(&self) -> Digest {
+        digest_serialized(&CapabilityInvocationAuditBody {
+            schema: &self.schema,
+            sequence: self.sequence,
+            previous_audit_digest: &self.previous_audit_digest,
+            surface: self.surface,
+            request_id: &self.request_id,
+            request_digest: &self.request_digest,
+            capability_id: &self.capability_id,
+            class: self.class,
+            project_digest: &self.project_digest,
+            mission_digest: &self.mission_digest,
+            scope_digest: &self.scope_digest,
+            generation: self.generation,
+            provenance_digest: &self.provenance_digest,
+            authority: &self.authority,
+            manifest_revision: &self.manifest_revision,
+            budget_use: &self.budget_use,
+            outcome: &self.outcome,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), GatewayError> {
+        if self.schema != CAPABILITY_AUDIT_SCHEMA
+            || self.sequence == 0
+            || (self.sequence == 1 && self.previous_audit_digest.is_some())
+            || (self.sequence > 1 && self.previous_audit_digest.is_none())
+            || ![
+                &self.audit_digest,
+                &self.request_digest,
+                &self.project_digest,
+                &self.mission_digest,
+                &self.scope_digest,
+                &self.provenance_digest,
+            ]
+            .into_iter()
+            .all(|digest| is_sha256(digest.as_str()))
+            || self
+                .previous_audit_digest
+                .as_ref()
+                .is_some_and(|digest| !is_sha256(digest.as_str()))
+        {
+            return Err(GatewayError::InvalidAuditEnvelope);
+        }
+        self.request_id.validate()?;
+        self.capability_id.validate()?;
+        self.authority.validate()?;
+        self.manifest_revision.validate()?;
+        self.budget_use.estimated_cost.validate()?;
+        match &self.outcome {
+            CapabilityInvocationAuditOutcome::Completed { result_digest } => {
+                if !is_sha256(result_digest.as_str()) {
+                    return Err(GatewayError::InvalidAuditEnvelope);
+                }
+            }
+            CapabilityInvocationAuditOutcome::Recovery { .. } => {}
+            CapabilityInvocationAuditOutcome::Rejected { code } => {
+                if !valid_audit_code(code) {
+                    return Err(GatewayError::InvalidAuditEnvelope);
+                }
+            }
+        }
+        if self.audit_digest != self.computed_digest() {
+            return Err(GatewayError::InvalidAuditEnvelope);
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(
+        &self,
+        signed_manifest: &SignedCapabilityManifest,
+        registry: &AdapterRegistry,
+        request: &CapabilityRequest,
+        now: DateTime<Utc>,
+    ) -> Result<(), GatewayError> {
+        self.validate()?;
+        signed_manifest.verify(now)?;
+        let manifest = &signed_manifest.manifest;
+        registry.authorize(
+            &manifest.adapter,
+            &manifest.capability_id,
+            &manifest.revocation,
+        )?;
+        request.validate_against(manifest, now)?;
+        self.manifest_revision
+            .validate_against(signed_manifest, now)?;
+        self.authority.validate_against(manifest)?;
+        if self.request_id != request.request_id
+            || self.request_digest != request.digest()
+            || self.capability_id != request.capability_id
+            || self.class != request.class
+            || self.project_digest != Digest::from_text(request.scope.project_id.as_str())
+            || self.mission_digest != Digest::from_text(request.scope.mission_id.as_str())
+            || self.scope_digest != request.scope.scope_digest
+            || self.generation != request.generation
+            || self.provenance_digest != digest_serialized(&request.provenance)
+            || !self.surface.accepts(request.provenance.source)
+            || self.budget_use.validate_against(&manifest.budget).is_err()
+        {
+            return Err(GatewayError::InvalidAuditEnvelope);
+        }
+        match &self.outcome {
+            CapabilityInvocationAuditOutcome::Recovery { disposition } => {
+                disposition.validate_for(request)?;
+            }
+            CapabilityInvocationAuditOutcome::Completed { .. }
+            | CapabilityInvocationAuditOutcome::Rejected { .. } => {}
+        }
+        Ok(())
+    }
+
+    pub fn validate_completed_against(
+        &self,
+        signed_manifest: &SignedCapabilityManifest,
+        registry: &AdapterRegistry,
+        request: &CapabilityRequest,
+        result: &CapabilityResult,
+        now: DateTime<Utc>,
+    ) -> Result<(), GatewayError> {
+        self.validate_against(signed_manifest, registry, request, now)?;
+        let CapabilityInvocationAuditOutcome::Completed { result_digest } = &self.outcome else {
+            return Err(GatewayError::InvalidAuditEnvelope);
+        };
+        if result_digest != &result.digest()
+            || self.budget_use != result.budget_use
+            || !self.surface.accepts(result.provenance.source)
+        {
+            return Err(GatewayError::InvalidAuditEnvelope);
+        }
+        result.validate_against(request, &signed_manifest.manifest, now)
+    }
+}
+
 pub const MAX_AUTOMATIC_READ_RETRIES: u32 = 8;
 
 /// Bounds the work that this execution may perform after a typed read
@@ -3268,6 +3781,52 @@ impl CapabilityGateway {
         &self.registry
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn audit_completed(
+        &self,
+        surface: CapabilitySurface,
+        signed_manifest: &SignedCapabilityManifest,
+        request: &CapabilityRequest,
+        result: &CapabilityResult,
+        sequence: u64,
+        previous_audit_digest: Option<Digest>,
+        now: DateTime<Utc>,
+    ) -> Result<CapabilityInvocationAuditEnvelope, GatewayError> {
+        CapabilityInvocationAuditEnvelope::completed(
+            surface,
+            signed_manifest,
+            &self.registry,
+            request,
+            result,
+            sequence,
+            previous_audit_digest,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn audit_error(
+        &self,
+        surface: CapabilitySurface,
+        signed_manifest: &SignedCapabilityManifest,
+        request: &CapabilityRequest,
+        error: &GatewayError,
+        sequence: u64,
+        previous_audit_digest: Option<Digest>,
+        now: DateTime<Utc>,
+    ) -> Result<CapabilityInvocationAuditEnvelope, GatewayError> {
+        CapabilityInvocationAuditEnvelope::from_error(
+            surface,
+            signed_manifest,
+            &self.registry,
+            request,
+            error,
+            sequence,
+            previous_audit_digest,
+            now,
+        )
+    }
+
     pub fn authorize(
         &self,
         signed_manifest: &SignedCapabilityManifest,
@@ -3568,6 +4127,8 @@ pub enum GatewayError {
     ResultScopeMismatch,
     #[error("result is invalid")]
     InvalidResult,
+    #[error("capability invocation audit envelope is invalid")]
+    InvalidAuditEnvelope,
     #[error("resource reference is invalid")]
     InvalidResourceReference,
     #[error("adapter rejected a typed request")]
@@ -3664,6 +4225,7 @@ impl GatewayError {
             Self::RecoveryLimitExceeded => "recovery_limit_exceeded",
             Self::ResultScopeMismatch => "result_scope_mismatch",
             Self::InvalidResult => "invalid_result",
+            Self::InvalidAuditEnvelope => "invalid_audit_envelope",
             Self::InvalidResourceReference => "invalid_resource_reference",
             Self::AdapterRejected(_) => "adapter_rejected",
             Self::Recovery(_) => "recovery",
@@ -3680,6 +4242,14 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_audit_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn valid_capability_id(value: &str) -> bool {

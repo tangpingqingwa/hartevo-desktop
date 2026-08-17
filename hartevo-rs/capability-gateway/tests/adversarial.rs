@@ -9,16 +9,17 @@ use std::{
 use chrono::{Duration, Utc};
 use hartevo_capability_gateway::{
     AdapterBinding, AdapterFailure, AdapterId, AdapterRegistry, ApprovalRequirement,
-    BoundedPayload, BudgetAuthority, BudgetUse, CAPABILITY_EXECUTION_SCHEMA,
-    CAPABILITY_MANIFEST_SCHEMA, CAPABILITY_REQUEST_SCHEMA, CAPABILITY_RESULT_SCHEMA,
-    CapabilityAdapter, CapabilityClass, CapabilityGateway, CapabilityId, CapabilityManifest,
-    CapabilityRequest, CapabilityResult, CostLimit, DataAuthority, DataClass, EffectAuthority,
-    EffectId, EffectKind, ExternalEffectRequest, InvocationScope, LocalMutationOperation,
-    LocalMutationRequest, ManifestIssuer, ManifestProvenance, MemoryInvocationLedger, MissionId,
-    MissionScope, NetworkAuthority, ProjectId, ProjectScope, Provenance, ProvenanceSource,
-    ReadCompleteness, ReadOperation, ReadRequest, RecoveryDisposition, RevocationBinding,
-    RevocationStatus, SecretAuthority, SecretReference, SecretReferenceId,
-    SignedCapabilityManifest, TaskId, TenantId, ToolSelfRecoveryPolicy, WorkerId, WorkerLeaseId,
+    BoundedPayload, BudgetAuthority, BudgetUse, CAPABILITY_AUDIT_SCHEMA,
+    CAPABILITY_EXECUTION_SCHEMA, CAPABILITY_MANIFEST_SCHEMA, CAPABILITY_REQUEST_SCHEMA,
+    CAPABILITY_RESULT_SCHEMA, CapabilityAdapter, CapabilityClass, CapabilityGateway, CapabilityId,
+    CapabilityInvocationAuditOutcome, CapabilityManifest, CapabilityRequest, CapabilityResult,
+    CapabilitySurface, CostLimit, DataAuthority, DataClass, EffectAuthority, EffectId, EffectKind,
+    ExternalEffectRequest, InvocationScope, LocalMutationOperation, LocalMutationRequest,
+    ManifestIssuer, ManifestProvenance, MemoryInvocationLedger, MissionId, MissionScope,
+    NetworkAuthority, ProjectId, ProjectScope, Provenance, ProvenanceSource, ReadCompleteness,
+    ReadOperation, ReadRequest, RecoveryDisposition, RevocationBinding, RevocationStatus,
+    SecretAuthority, SecretReference, SecretReferenceId, SignedCapabilityManifest, TaskId,
+    TenantId, ToolSelfRecoveryPolicy, WorkerId, WorkerLeaseId,
 };
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
@@ -322,7 +323,10 @@ fn local_mutation_request(manifest: &CapabilityManifest, request_id: &str) -> Ca
     }
 }
 
-fn read_result(request: &CapabilityRequest) -> CapabilityResult {
+fn read_result_with_source(
+    request: &CapabilityRequest,
+    source: ProvenanceSource,
+) -> CapabilityResult {
     CapabilityResult {
         schema: CAPABILITY_RESULT_SCHEMA.into(),
         request_id: request.request_id.clone(),
@@ -331,7 +335,7 @@ fn read_result(request: &CapabilityRequest) -> CapabilityResult {
         scope: request.scope.clone(),
         generation: request.generation,
         manifest_digest: request.manifest_digest.clone(),
-        provenance: provenance(request, ProvenanceSource::Runtime),
+        provenance: provenance(request, source),
         budget_use: budget_use(0),
         payload: hartevo_capability_gateway::ResultPayload::Read(
             hartevo_capability_gateway::ReadResult {
@@ -341,6 +345,10 @@ fn read_result(request: &CapabilityRequest) -> CapabilityResult {
             },
         ),
     }
+}
+
+fn read_result(request: &CapabilityRequest) -> CapabilityResult {
+    read_result_with_source(request, ProvenanceSource::Runtime)
 }
 
 #[test]
@@ -879,6 +887,7 @@ fn bounded_payload_byte_tamper_and_registry_tamper_fail_closed() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn uncertain_external_effect_is_reconcile_only_and_never_retried() {
     let (manifest, registry) = manifest_parts(
         CapabilityClass::ExternalEffect,
@@ -916,7 +925,7 @@ fn uncertain_external_effect_is_reconcile_only_and_never_retried() {
         idempotency_key: hartevo_capability_gateway::IdempotencyKey::from_stable("send-once"),
         manifest_digest: manifest_digest.clone(),
         provenance: Provenance {
-            source: ProvenanceSource::Runtime,
+            source: ProvenanceSource::ConnectorAdapter,
             manifest_digest,
             authority_digest,
             parent_digest: None,
@@ -950,20 +959,43 @@ fn uncertain_external_effect_is_reconcile_only_and_never_retried() {
             },
         ),
     };
-    let first = gateway.dispatch_with_recovery(
-        &signed_manifest,
-        &request,
-        &adapter,
-        &mut ledger,
-        now(),
-        ToolSelfRecoveryPolicy::default(),
-    );
+    let first = gateway
+        .dispatch_with_recovery(
+            &signed_manifest,
+            &request,
+            &adapter,
+            &mut ledger,
+            now(),
+            ToolSelfRecoveryPolicy::default(),
+        )
+        .expect_err("uncertain external effect");
     assert!(matches!(
-        first,
-        Err(hartevo_capability_gateway::GatewayError::Recovery(
+        &first,
+        hartevo_capability_gateway::GatewayError::Recovery(
             RecoveryDisposition::UncertainExternalEffect { .. }
-        ))
+        )
     ));
+    let audit = gateway
+        .audit_error(
+            CapabilitySurface::Connector,
+            &signed_manifest,
+            &request,
+            &first,
+            1,
+            None,
+            now(),
+        )
+        .expect("uncertain audit envelope");
+    assert!(matches!(
+        &audit.outcome,
+        CapabilityInvocationAuditOutcome::Recovery {
+            disposition: RecoveryDisposition::UncertainExternalEffect { .. }
+        }
+    ));
+    audit
+        .validate_against(&signed_manifest, gateway.registry(), &request, now())
+        .expect("uncertain audit validates");
+    assert!(!format!("{audit:?}").contains("opaque-message-material"));
     let second = gateway.dispatch_with_recovery(
         &signed_manifest,
         &request,
@@ -979,6 +1011,141 @@ fn uncertain_external_effect_is_reconcile_only_and_never_retried() {
         ))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn invocation_audit_binds_surface_scope_authority_and_manifest_revision() {
+    let (manifest, registry) = manifest_parts(
+        CapabilityClass::Read,
+        "project.inventory",
+        NetworkAuthority::None,
+        EffectAuthority::proposal_only(digest("broker-policy")),
+    );
+    let signed_manifest = signed(manifest.clone());
+    let gateway = CapabilityGateway::new(registry.clone()).expect("gateway");
+    let mut request = read_request(&manifest, "request-audit");
+    request.provenance.source = ProvenanceSource::BrowserAdapter;
+    let result = read_result_with_source(&request, ProvenanceSource::BrowserAdapter);
+
+    let audit = gateway
+        .audit_completed(
+            CapabilitySurface::Browser,
+            &signed_manifest,
+            &request,
+            &result,
+            1,
+            None,
+            now(),
+        )
+        .expect("audit envelope");
+    audit
+        .validate_completed_against(
+            &signed_manifest,
+            gateway.registry(),
+            &request,
+            &result,
+            now(),
+        )
+        .expect("audit validates");
+    assert_eq!(audit.schema, CAPABILITY_AUDIT_SCHEMA);
+    assert!(matches!(
+        &audit.outcome,
+        CapabilityInvocationAuditOutcome::Completed { result_digest }
+            if result_digest == &result.digest()
+    ));
+    let encoded = serde_json::to_value(&audit).expect("audit JSON");
+    assert_eq!(encoded["schema"], CAPABILITY_AUDIT_SCHEMA);
+    assert_eq!(encoded["surface"], "browser");
+    assert_eq!(encoded["manifestRevision"]["manifestVersion"], 1);
+    assert_eq!(encoded["manifestRevision"]["registryRevision"], 2);
+    assert_eq!(encoded["manifestRevision"]["revocationEpoch"], 1);
+    assert_eq!(encoded["authority"]["dataMaximumClass"], "restricted");
+    assert!(!encoded.to_string().contains("mail-secret-ref"));
+    assert!(!format!("{audit:?}").contains("mail-secret-ref"));
+
+    let chained = gateway
+        .audit_completed(
+            CapabilitySurface::Browser,
+            &signed_manifest,
+            &request,
+            &result,
+            2,
+            Some(audit.digest()),
+            now(),
+        )
+        .expect("chained audit envelope");
+    chained.validate().expect("chained audit validates");
+
+    let mut tampered_scope = audit.clone();
+    tampered_scope.scope_digest = digest("tampered-scope");
+    assert!(matches!(
+        tampered_scope.validate(),
+        Err(hartevo_capability_gateway::GatewayError::InvalidAuditEnvelope)
+    ));
+
+    let mut tampered_authority = audit.clone();
+    tampered_authority.authority.data_maximum_class = DataClass::Public;
+    assert!(matches!(
+        tampered_authority.validate(),
+        Err(hartevo_capability_gateway::GatewayError::InvalidAuditEnvelope)
+    ));
+
+    let mut tampered_manifest_revision = audit.clone();
+    tampered_manifest_revision
+        .manifest_revision
+        .registry_revision += 1;
+    assert!(matches!(
+        tampered_manifest_revision.validate(),
+        Err(hartevo_capability_gateway::GatewayError::InvalidAuditEnvelope)
+    ));
+
+    let mut tampered_signed_manifest = signed_manifest.clone();
+    tampered_signed_manifest.manifest.expires_at += Duration::seconds(1);
+    assert!(matches!(
+        audit.validate_against(
+            &tampered_signed_manifest,
+            gateway.registry(),
+            &request,
+            now(),
+        ),
+        Err(hartevo_capability_gateway::GatewayError::SignatureVerificationFailed)
+    ));
+
+    let mut tampered_result = result.clone();
+    tampered_result.provenance.source = ProvenanceSource::Runtime;
+    assert!(matches!(
+        audit.validate_completed_against(
+            &signed_manifest,
+            gateway.registry(),
+            &request,
+            &tampered_result,
+            now(),
+        ),
+        Err(hartevo_capability_gateway::GatewayError::InvalidAuditEnvelope)
+    ));
+
+    assert!(matches!(
+        gateway.audit_completed(
+            CapabilitySurface::Runtime,
+            &signed_manifest,
+            &request,
+            &result,
+            1,
+            None,
+            now(),
+        ),
+        Err(hartevo_capability_gateway::GatewayError::InvalidAuditEnvelope)
+    ));
+
+    let mut revoked_registry = registry;
+    revoked_registry
+        .revoke(&manifest.adapter.adapter_id)
+        .expect("revoke adapter");
+    assert!(matches!(
+        audit.validate_against(&signed_manifest, &revoked_registry, &request, now()),
+        Err(hartevo_capability_gateway::GatewayError::AdapterRevoked)
+    ));
 }
 
 #[test]
