@@ -9,16 +9,17 @@ use std::{
 use chrono::{Duration, Utc};
 use hartevo_capability_gateway::{
     AdapterBinding, AdapterFailure, AdapterId, AdapterRegistry, ApprovalRequirement,
-    BoundedPayload, BudgetAuthority, BudgetUse, CAPABILITY_MANIFEST_SCHEMA,
-    CAPABILITY_REQUEST_SCHEMA, CAPABILITY_RESULT_SCHEMA, CapabilityAdapter, CapabilityClass,
-    CapabilityGateway, CapabilityId, CapabilityManifest, CapabilityRequest, CapabilityResult,
-    CostLimit, DataAuthority, DataClass, EffectAuthority, EffectId, EffectKind,
+    BoundedPayload, BudgetAuthority, BudgetUse, CAPABILITY_AUDIT_SCHEMA,
+    CAPABILITY_EXECUTION_SCHEMA, CAPABILITY_MANIFEST_SCHEMA, CAPABILITY_REQUEST_SCHEMA,
+    CAPABILITY_RESULT_SCHEMA, CapabilityAdapter, CapabilityClass, CapabilityGateway, CapabilityId,
+    CapabilityInvocationAuditOutcome, CapabilityManifest, CapabilityRequest, CapabilityResult,
+    CapabilitySurface, CostLimit, DataAuthority, DataClass, EffectAuthority, EffectId, EffectKind,
     ExternalEffectRequest, InvocationScope, LocalMutationOperation, LocalMutationRequest,
     ManifestIssuer, ManifestProvenance, MemoryInvocationLedger, MissionId, MissionScope,
     NetworkAuthority, ProjectId, ProjectScope, Provenance, ProvenanceSource, ReadCompleteness,
     ReadOperation, ReadRequest, RecoveryDisposition, RevocationBinding, RevocationStatus,
     SecretAuthority, SecretReference, SecretReferenceId, SignedCapabilityManifest, TaskId,
-    TenantId, WorkerId, WorkerLeaseId,
+    TenantId, ToolSelfRecoveryPolicy, WorkerId, WorkerLeaseId,
 };
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
@@ -36,6 +37,9 @@ struct MockAdapter {
 enum MockMode {
     Read,
     RetryRead { retried: Arc<AtomicUsize> },
+    RetryReadForever { attempts: Arc<AtomicUsize> },
+    RetryReadExpandsMax { attempts: Arc<AtomicUsize> },
+    RetryLocalMutation,
     UncertainExternal,
 }
 
@@ -63,6 +67,27 @@ impl CapabilityAdapter for MockAdapter {
                     Ok(read_result(request))
                 }
             }
+            MockMode::RetryReadForever { attempts } => {
+                let attempt = u32::try_from(attempts.fetch_add(1, Ordering::SeqCst))
+                    .expect("bounded test attempts");
+                Err(AdapterFailure::recovery(
+                    RecoveryDisposition::retryable_read(request, attempt, 8)
+                        .expect("valid bounded read recovery"),
+                ))
+            }
+            MockMode::RetryReadExpandsMax { attempts } => {
+                let attempt = u32::try_from(attempts.fetch_add(1, Ordering::SeqCst))
+                    .expect("bounded test attempts");
+                let max_attempts = if attempt == 0 { 2 } else { 8 };
+                Err(AdapterFailure::recovery(
+                    RecoveryDisposition::retryable_read(request, attempt, max_attempts)
+                        .expect("valid bounded read recovery"),
+                ))
+            }
+            MockMode::RetryLocalMutation => Err(AdapterFailure::recovery(
+                RecoveryDisposition::stale_locator_or_path(request, 0, 1)
+                    .expect("valid local recovery"),
+            )),
             MockMode::UncertainExternal => Err(AdapterFailure::UncertainExternalEffect {
                 effect_digest: request.digest(),
                 reconciliation_digest: digest("reconcile-external-effect"),
@@ -257,7 +282,51 @@ fn read_request(manifest: &CapabilityManifest, request_id: &str) -> CapabilityRe
     }
 }
 
-fn read_result(request: &CapabilityRequest) -> CapabilityResult {
+fn local_mutation_request(manifest: &CapabilityManifest, request_id: &str) -> CapabilityRequest {
+    let manifest_digest = manifest.digest().expect("manifest digest");
+    let authority_digest = manifest.authority_digest().expect("authority digest");
+    CapabilityRequest {
+        schema: CAPABILITY_REQUEST_SCHEMA.into(),
+        request_id: hartevo_capability_gateway::RequestId::from_stable(request_id),
+        capability_id: manifest.capability_id.clone(),
+        class: CapabilityClass::LocalMutation,
+        scope: InvocationScope::from_manifest(manifest),
+        generation: manifest.mission.generation,
+        idempotency_key: hartevo_capability_gateway::IdempotencyKey::from_stable(
+            "local-mutation-once",
+        ),
+        manifest_digest: manifest_digest.clone(),
+        provenance: Provenance {
+            source: ProvenanceSource::Runtime,
+            manifest_digest,
+            authority_digest,
+            parent_digest: None,
+            input_digest: digest("typed-local-input"),
+            generation: manifest.mission.generation,
+            observed_at: now(),
+            links: Vec::new(),
+        },
+        budget_use: budget_use(0),
+        payload: hartevo_capability_gateway::RequestPayload::LocalMutation(LocalMutationRequest {
+            operation: LocalMutationOperation::WorkspaceWrite {
+                file_grant_digest: digest("file-grant-a"),
+                content: BoundedPayload::try_new(
+                    "hartevo.draft/v1",
+                    DataClass::Business,
+                    b"typed-local-material".to_vec(),
+                    1024,
+                )
+                .expect("local payload"),
+            },
+            secret_references: BTreeSet::new(),
+        }),
+    }
+}
+
+fn read_result_with_source(
+    request: &CapabilityRequest,
+    source: ProvenanceSource,
+) -> CapabilityResult {
     CapabilityResult {
         schema: CAPABILITY_RESULT_SCHEMA.into(),
         request_id: request.request_id.clone(),
@@ -266,7 +335,7 @@ fn read_result(request: &CapabilityRequest) -> CapabilityResult {
         scope: request.scope.clone(),
         generation: request.generation,
         manifest_digest: request.manifest_digest.clone(),
-        provenance: provenance(request, ProvenanceSource::Runtime),
+        provenance: provenance(request, source),
         budget_use: budget_use(0),
         payload: hartevo_capability_gateway::ResultPayload::Read(
             hartevo_capability_gateway::ReadResult {
@@ -276,6 +345,10 @@ fn read_result(request: &CapabilityRequest) -> CapabilityResult {
             },
         ),
     }
+}
+
+fn read_result(request: &CapabilityRequest) -> CapabilityResult {
+    read_result_with_source(request, ProvenanceSource::Runtime)
 }
 
 #[test]
@@ -382,6 +455,306 @@ fn read_recovery_is_typed_explicit_and_idempotent() {
         ))
     ));
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn tool_self_recovery_executes_bounded_read_retry_and_duplicate_without_replay() {
+    let (manifest, registry) = manifest_parts(
+        CapabilityClass::Read,
+        "project.inventory",
+        NetworkAuthority::None,
+        EffectAuthority::proposal_only(digest("broker-policy")),
+    );
+    let signed_manifest = signed(manifest.clone());
+    let gateway = CapabilityGateway::new(registry).expect("gateway");
+    let adapter = MockAdapter {
+        binding: manifest.adapter.clone(),
+        mode: MockMode::RetryRead {
+            retried: Arc::new(AtomicUsize::new(0)),
+        },
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut ledger = MemoryInvocationLedger::default();
+    let request = read_request(&manifest, "request-auto-recovery");
+
+    let execution = gateway
+        .dispatch_with_recovery(
+            &signed_manifest,
+            &request,
+            &adapter,
+            &mut ledger,
+            now(),
+            ToolSelfRecoveryPolicy {
+                max_read_retries: 1,
+            },
+        )
+        .expect("bounded read recovery");
+    assert_eq!(execution.schema, CAPABILITY_EXECUTION_SCHEMA);
+    execution.validate().expect("execution envelope");
+    let encoded = serde_json::to_value(&execution).expect("execution contract envelope");
+    assert_eq!(encoded["schema"], CAPABILITY_EXECUTION_SCHEMA);
+    assert_eq!(encoded["policy"]["maxReadRetries"], 1);
+    assert_eq!(encoded["receipt"]["automaticReadRetries"], 1);
+    assert_eq!(execution.result.class, CapabilityClass::Read);
+    assert_eq!(execution.receipt.adapter_invocations, 2);
+    assert_eq!(execution.receipt.automatic_read_retries, 1);
+    assert_eq!(
+        execution.receipt.cumulative_budget_use.estimated_tokens,
+        128
+    );
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+
+    let resumed_adapter = MockAdapter {
+        binding: manifest.adapter.clone(),
+        mode: MockMode::RetryRead {
+            retried: Arc::new(AtomicUsize::new(0)),
+        },
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let resumed_request = read_request(&manifest, "request-auto-recovery-resume");
+    let mut resumed_ledger = MemoryInvocationLedger::default();
+    assert!(matches!(
+        gateway.dispatch(
+            &signed_manifest,
+            &resumed_request,
+            &resumed_adapter,
+            &mut resumed_ledger,
+            now()
+        ),
+        Err(hartevo_capability_gateway::GatewayError::Recovery(
+            RecoveryDisposition::RetryRead { .. }
+        ))
+    ));
+    let resumed = gateway
+        .dispatch_with_recovery(
+            &signed_manifest,
+            &resumed_request,
+            &resumed_adapter,
+            &mut resumed_ledger,
+            now(),
+            ToolSelfRecoveryPolicy::default(),
+        )
+        .expect("resumed read recovery");
+    assert_eq!(resumed.receipt.adapter_invocations, 2);
+    assert_eq!(resumed.receipt.automatic_read_retries, 1);
+    assert_eq!(resumed_adapter.calls.load(Ordering::SeqCst), 2);
+
+    let duplicate = gateway.dispatch_with_recovery(
+        &signed_manifest,
+        &request,
+        &adapter,
+        &mut ledger,
+        now(),
+        ToolSelfRecoveryPolicy::default(),
+    );
+    assert!(matches!(
+        duplicate,
+        Err(hartevo_capability_gateway::GatewayError::Recovery(
+            RecoveryDisposition::DuplicateRequest { .. }
+        ))
+    ));
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn tool_self_recovery_never_expands_retry_count_or_budget() {
+    let (manifest, registry) = manifest_parts(
+        CapabilityClass::Read,
+        "project.inventory",
+        NetworkAuthority::None,
+        EffectAuthority::proposal_only(digest("broker-policy")),
+    );
+    let signed_manifest = signed(manifest.clone());
+    let gateway = CapabilityGateway::new(registry).expect("gateway");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = MockAdapter {
+        binding: manifest.adapter.clone(),
+        mode: MockMode::RetryReadForever {
+            attempts: Arc::new(AtomicUsize::new(0)),
+        },
+        calls: calls.clone(),
+    };
+    let mut ledger = MemoryInvocationLedger::default();
+    let request = read_request(&manifest, "request-retry-limit");
+    let error = gateway
+        .dispatch_with_recovery(
+            &signed_manifest,
+            &request,
+            &adapter,
+            &mut ledger,
+            now(),
+            ToolSelfRecoveryPolicy {
+                max_read_retries: 1,
+            },
+        )
+        .expect_err("retry count must be bounded");
+    assert!(matches!(
+        error,
+        hartevo_capability_gateway::GatewayError::Recovery(RecoveryDisposition::FailClosed {
+            code: hartevo_capability_gateway::FailClosedCode::RecoveryLimitExceeded
+        })
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let repeated = gateway.dispatch_with_recovery(
+        &signed_manifest,
+        &request,
+        &adapter,
+        &mut ledger,
+        now(),
+        ToolSelfRecoveryPolicy::default(),
+    );
+    assert!(matches!(
+        repeated,
+        Err(hartevo_capability_gateway::GatewayError::Recovery(
+            RecoveryDisposition::FailClosed {
+                code: hartevo_capability_gateway::FailClosedCode::RecoveryLimitExceeded
+            }
+        ))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let resumed_calls = Arc::new(AtomicUsize::new(0));
+    let resumed_adapter = MockAdapter {
+        binding: manifest.adapter.clone(),
+        mode: MockMode::RetryReadForever {
+            attempts: Arc::new(AtomicUsize::new(0)),
+        },
+        calls: resumed_calls.clone(),
+    };
+    let resumed_request = read_request(&manifest, "request-policy-resume-limit");
+    let mut resumed_ledger = MemoryInvocationLedger::default();
+    assert!(matches!(
+        gateway.dispatch(
+            &signed_manifest,
+            &resumed_request,
+            &resumed_adapter,
+            &mut resumed_ledger,
+            now()
+        ),
+        Err(hartevo_capability_gateway::GatewayError::Recovery(
+            RecoveryDisposition::RetryRead { .. }
+        ))
+    ));
+    let resumed_error = gateway
+        .dispatch_with_recovery(
+            &signed_manifest,
+            &resumed_request,
+            &resumed_adapter,
+            &mut resumed_ledger,
+            now(),
+            ToolSelfRecoveryPolicy {
+                max_read_retries: 0,
+            },
+        )
+        .expect_err("a narrower resumed policy must not invoke the adapter");
+    assert!(matches!(
+        resumed_error,
+        hartevo_capability_gateway::GatewayError::Recovery(RecoveryDisposition::FailClosed {
+            code: hartevo_capability_gateway::FailClosedCode::RecoveryLimitExceeded
+        })
+    ));
+    assert_eq!(resumed_calls.load(Ordering::SeqCst), 1);
+
+    let expanding_calls = Arc::new(AtomicUsize::new(0));
+    let expanding_adapter = MockAdapter {
+        binding: manifest.adapter.clone(),
+        mode: MockMode::RetryReadExpandsMax {
+            attempts: Arc::new(AtomicUsize::new(0)),
+        },
+        calls: expanding_calls.clone(),
+    };
+    let expanding_request = read_request(&manifest, "request-adapter-retry-expansion");
+    let mut expanding_ledger = MemoryInvocationLedger::default();
+    let expanding_error = gateway
+        .dispatch_with_recovery(
+            &signed_manifest,
+            &expanding_request,
+            &expanding_adapter,
+            &mut expanding_ledger,
+            now(),
+            ToolSelfRecoveryPolicy {
+                max_read_retries: 3,
+            },
+        )
+        .expect_err("an adapter cannot expand its recovery attempt contract");
+    assert!(matches!(
+        expanding_error,
+        hartevo_capability_gateway::GatewayError::Recovery(RecoveryDisposition::FailClosed {
+            code: hartevo_capability_gateway::FailClosedCode::UntrustedAdapter
+        })
+    ));
+    assert_eq!(expanding_calls.load(Ordering::SeqCst), 2);
+
+    let mut budget_limited_manifest = manifest;
+    budget_limited_manifest.budget.max_tokens = 100;
+    let signed_budget_limited_manifest = signed(budget_limited_manifest.clone());
+    let budget_limited_request = read_request(&budget_limited_manifest, "request-budget-limit");
+    let budget_calls = Arc::new(AtomicUsize::new(0));
+    let budget_adapter = MockAdapter {
+        binding: budget_limited_manifest.adapter.clone(),
+        mode: MockMode::RetryReadForever {
+            attempts: Arc::new(AtomicUsize::new(0)),
+        },
+        calls: budget_calls.clone(),
+    };
+    let mut budget_ledger = MemoryInvocationLedger::default();
+    let error = gateway
+        .dispatch_with_recovery(
+            &signed_budget_limited_manifest,
+            &budget_limited_request,
+            &budget_adapter,
+            &mut budget_ledger,
+            now(),
+            ToolSelfRecoveryPolicy {
+                max_read_retries: 3,
+            },
+        )
+        .expect_err("cumulative budget must be bounded");
+    assert!(matches!(
+        error,
+        hartevo_capability_gateway::GatewayError::Recovery(RecoveryDisposition::FailClosed {
+            code: hartevo_capability_gateway::FailClosedCode::BudgetExceeded
+        })
+    ));
+    assert_eq!(budget_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn tool_self_recovery_keeps_stale_locator_explicit_and_external_write_uncertain() {
+    let (manifest, registry) = manifest_parts(
+        CapabilityClass::LocalMutation,
+        "project.draft",
+        NetworkAuthority::None,
+        EffectAuthority::proposal_only(digest("broker-policy")),
+    );
+    let signed_manifest = signed(manifest.clone());
+    let gateway = CapabilityGateway::new(registry).expect("gateway");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter = MockAdapter {
+        binding: manifest.adapter.clone(),
+        mode: MockMode::RetryLocalMutation,
+        calls: calls.clone(),
+    };
+    let request = local_mutation_request(&manifest, "request-stale-locator");
+    let mut ledger = MemoryInvocationLedger::default();
+    let error = gateway
+        .dispatch_with_recovery(
+            &signed_manifest,
+            &request,
+            &adapter,
+            &mut ledger,
+            now(),
+            ToolSelfRecoveryPolicy::default(),
+        )
+        .expect_err("stale locator must require explicit handling");
+    assert!(matches!(
+        error,
+        hartevo_capability_gateway::GatewayError::Recovery(
+            RecoveryDisposition::RetryLocalMutation { .. }
+        )
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -514,6 +887,7 @@ fn bounded_payload_byte_tamper_and_registry_tamper_fail_closed() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn uncertain_external_effect_is_reconcile_only_and_never_retried() {
     let (manifest, registry) = manifest_parts(
         CapabilityClass::ExternalEffect,
@@ -551,7 +925,7 @@ fn uncertain_external_effect_is_reconcile_only_and_never_retried() {
         idempotency_key: hartevo_capability_gateway::IdempotencyKey::from_stable("send-once"),
         manifest_digest: manifest_digest.clone(),
         provenance: Provenance {
-            source: ProvenanceSource::Runtime,
+            source: ProvenanceSource::ConnectorAdapter,
             manifest_digest,
             authority_digest,
             parent_digest: None,
@@ -585,14 +959,51 @@ fn uncertain_external_effect_is_reconcile_only_and_never_retried() {
             },
         ),
     };
-    let first = gateway.dispatch(&signed_manifest, &request, &adapter, &mut ledger, now());
+    let first = gateway
+        .dispatch_with_recovery(
+            &signed_manifest,
+            &request,
+            &adapter,
+            &mut ledger,
+            now(),
+            ToolSelfRecoveryPolicy::default(),
+        )
+        .expect_err("uncertain external effect");
     assert!(matches!(
-        first,
-        Err(hartevo_capability_gateway::GatewayError::Recovery(
+        &first,
+        hartevo_capability_gateway::GatewayError::Recovery(
             RecoveryDisposition::UncertainExternalEffect { .. }
-        ))
+        )
     ));
-    let second = gateway.dispatch(&signed_manifest, &request, &adapter, &mut ledger, now());
+    let audit = gateway
+        .audit_error(
+            CapabilitySurface::Connector,
+            &signed_manifest,
+            &request,
+            &first,
+            1,
+            None,
+            now(),
+        )
+        .expect("uncertain audit envelope");
+    assert!(matches!(
+        &audit.outcome,
+        CapabilityInvocationAuditOutcome::Recovery {
+            disposition: RecoveryDisposition::UncertainExternalEffect { .. }
+        }
+    ));
+    audit
+        .validate_against(&signed_manifest, gateway.registry(), &request, now())
+        .expect("uncertain audit validates");
+    assert!(!format!("{audit:?}").contains("opaque-message-material"));
+    let second = gateway.dispatch_with_recovery(
+        &signed_manifest,
+        &request,
+        &adapter,
+        &mut ledger,
+        now(),
+        ToolSelfRecoveryPolicy::default(),
+    );
     assert!(matches!(
         second,
         Err(hartevo_capability_gateway::GatewayError::Recovery(
@@ -600,6 +1011,141 @@ fn uncertain_external_effect_is_reconcile_only_and_never_retried() {
         ))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn invocation_audit_binds_surface_scope_authority_and_manifest_revision() {
+    let (manifest, registry) = manifest_parts(
+        CapabilityClass::Read,
+        "project.inventory",
+        NetworkAuthority::None,
+        EffectAuthority::proposal_only(digest("broker-policy")),
+    );
+    let signed_manifest = signed(manifest.clone());
+    let gateway = CapabilityGateway::new(registry.clone()).expect("gateway");
+    let mut request = read_request(&manifest, "request-audit");
+    request.provenance.source = ProvenanceSource::BrowserAdapter;
+    let result = read_result_with_source(&request, ProvenanceSource::BrowserAdapter);
+
+    let audit = gateway
+        .audit_completed(
+            CapabilitySurface::Browser,
+            &signed_manifest,
+            &request,
+            &result,
+            1,
+            None,
+            now(),
+        )
+        .expect("audit envelope");
+    audit
+        .validate_completed_against(
+            &signed_manifest,
+            gateway.registry(),
+            &request,
+            &result,
+            now(),
+        )
+        .expect("audit validates");
+    assert_eq!(audit.schema, CAPABILITY_AUDIT_SCHEMA);
+    assert!(matches!(
+        &audit.outcome,
+        CapabilityInvocationAuditOutcome::Completed { result_digest }
+            if result_digest == &result.digest()
+    ));
+    let encoded = serde_json::to_value(&audit).expect("audit JSON");
+    assert_eq!(encoded["schema"], CAPABILITY_AUDIT_SCHEMA);
+    assert_eq!(encoded["surface"], "browser");
+    assert_eq!(encoded["manifestRevision"]["manifestVersion"], 1);
+    assert_eq!(encoded["manifestRevision"]["registryRevision"], 2);
+    assert_eq!(encoded["manifestRevision"]["revocationEpoch"], 1);
+    assert_eq!(encoded["authority"]["dataMaximumClass"], "restricted");
+    assert!(!encoded.to_string().contains("mail-secret-ref"));
+    assert!(!format!("{audit:?}").contains("mail-secret-ref"));
+
+    let chained = gateway
+        .audit_completed(
+            CapabilitySurface::Browser,
+            &signed_manifest,
+            &request,
+            &result,
+            2,
+            Some(audit.digest()),
+            now(),
+        )
+        .expect("chained audit envelope");
+    chained.validate().expect("chained audit validates");
+
+    let mut tampered_scope = audit.clone();
+    tampered_scope.scope_digest = digest("tampered-scope");
+    assert!(matches!(
+        tampered_scope.validate(),
+        Err(hartevo_capability_gateway::GatewayError::InvalidAuditEnvelope)
+    ));
+
+    let mut tampered_authority = audit.clone();
+    tampered_authority.authority.data_maximum_class = DataClass::Public;
+    assert!(matches!(
+        tampered_authority.validate(),
+        Err(hartevo_capability_gateway::GatewayError::InvalidAuditEnvelope)
+    ));
+
+    let mut tampered_manifest_revision = audit.clone();
+    tampered_manifest_revision
+        .manifest_revision
+        .registry_revision += 1;
+    assert!(matches!(
+        tampered_manifest_revision.validate(),
+        Err(hartevo_capability_gateway::GatewayError::InvalidAuditEnvelope)
+    ));
+
+    let mut tampered_signed_manifest = signed_manifest.clone();
+    tampered_signed_manifest.manifest.expires_at += Duration::seconds(1);
+    assert!(matches!(
+        audit.validate_against(
+            &tampered_signed_manifest,
+            gateway.registry(),
+            &request,
+            now(),
+        ),
+        Err(hartevo_capability_gateway::GatewayError::SignatureVerificationFailed)
+    ));
+
+    let mut tampered_result = result.clone();
+    tampered_result.provenance.source = ProvenanceSource::Runtime;
+    assert!(matches!(
+        audit.validate_completed_against(
+            &signed_manifest,
+            gateway.registry(),
+            &request,
+            &tampered_result,
+            now(),
+        ),
+        Err(hartevo_capability_gateway::GatewayError::InvalidAuditEnvelope)
+    ));
+
+    assert!(matches!(
+        gateway.audit_completed(
+            CapabilitySurface::Runtime,
+            &signed_manifest,
+            &request,
+            &result,
+            1,
+            None,
+            now(),
+        ),
+        Err(hartevo_capability_gateway::GatewayError::InvalidAuditEnvelope)
+    ));
+
+    let mut revoked_registry = registry;
+    revoked_registry
+        .revoke(&manifest.adapter.adapter_id)
+        .expect("revoke adapter");
+    assert!(matches!(
+        audit.validate_against(&signed_manifest, &revoked_registry, &request, now()),
+        Err(hartevo_capability_gateway::GatewayError::AdapterRevoked)
+    ));
 }
 
 #[test]
