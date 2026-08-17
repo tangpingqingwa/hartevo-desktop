@@ -740,6 +740,14 @@ pub struct Effect {
 }
 
 impl Effect {
+    /// Stable immutable scope used by Mission usage reservations. Status,
+    /// Receipt, and Verification are intentionally excluded so the same
+    /// proposed Effect can be reserved before execution and settled only
+    /// against the exact provider scope after execution.
+    pub fn usage_scope_digest(&self) -> String {
+        self.approval_digest()
+    }
+
     pub fn approval_digest(&self) -> String {
         let mut digest = Sha256::new();
         hash_field(&mut digest, self.tenant_id.as_str());
