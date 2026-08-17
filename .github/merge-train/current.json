@@ -1,34 +1,28 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "7f340da0275ca15a604b5618baeb3517e0de6f39",
-  "candidateCount": 4,
+  "baseCommit": "4770376beee4418e176ce1808b65d8f3f29b1da8",
+  "candidateCount": 3,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/operations-plugin-log-01",
-      "headCommit": "16726ec5a234942a25d51b7d7e6aed15ebd79a83",
-      "number": 163
+      "headBranch": "codex/browser-batch-cancel-replay-batch02",
+      "headCommit": "848c1c4c00aae2f8e6ce86cdd8670bb7d2ea014d",
+      "number": 35
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/connectors-commerce-sorftime-outcome-02",
-      "headCommit": "40ab0fce8458b26806dd40f704715775ba046be9",
-      "number": 266
+      "headBranch": "codex/ctx02-worker-graph",
+      "headCommit": "3d7eccb40e29f440fc686485bc185c10829d5529",
+      "number": 140
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/dist-sbom-target-01",
-      "headCommit": "7390755095e0d2d8f35f3b81d7e20210b16f6a48",
-      "number": 265
-    },
-    {
-      "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/browser-mission-batch-plugin-01",
-      "headCommit": "5bc69402f7ea10a513e47a98a6a245927c260b29",
-      "number": 273
+      "headBranch": "codex/connection-repair-plugin-01",
+      "headCommit": "4e60559ac66080ff3e606584fa3ee23a99ab3489",
+      "number": 235
     }
   ],
-  "createdAt": "2026-08-16T04:21:55Z",
+  "createdAt": "2026-08-17T09:44:42Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +33,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260816-0421"
+  "trainBranch": "merge-train/20260817-094420"
 }
