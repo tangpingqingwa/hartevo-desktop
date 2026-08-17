@@ -14,6 +14,7 @@ hartevo-catalog = { path = "../catalog" }
 hartevo-domain-kernel = { path = "../domain-kernel" }
 hartevo-effect-broker = { path = "../effect-broker" }
 hartevo-storage = { path = "../storage" }
+hartevo-runtime-adapter = { path = "../runtime-adapter" }
 hex.workspace = true
 ring.workspace = true
 serde.workspace = true

@@ -2358,6 +2358,7 @@ dependencies = [
  "hartevo-catalog",
  "hartevo-domain-kernel",
  "hartevo-effect-broker",
+ "hartevo-runtime-adapter",
  "hartevo-storage",
  "hex",
  "ring",
