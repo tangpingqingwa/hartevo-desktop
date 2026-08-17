@@ -1,0 +1,302 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/cockroach-cloud-result/cockroach-cloud-result.v1.json",
+  "title": "Hartevo CockroachDB Cloud posture result Layer-1 contract",
+  "description": "A bounded read/proposal/record/verify-only CockroachDB Cloud metadata seam. It is not a database connection, SQL executor, cluster mutator, health certification, or Hartevo authority.",
+  "schemaVersion": "hartevo.cockroach-cloud-result/v1",
+  "contractVersion": "EXT-COCKROACH-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "cockroach.cloud.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_record_verify_only",
+  "service": {
+    "type": "CockroachCloudResultService",
+    "id": "cockroach.cloud.result.read",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "read_cluster_posture",
+      "read_health_posture",
+      "read_settings_metadata",
+      "read_sql_activity_posture",
+      "compile_posture_proposal",
+      "record_redacted_proposal",
+      "verify_posture_proposal"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "sqlExecution": false,
+    "ddl": false,
+    "dml": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "type": "CockroachCloudProvider",
+    "id": "cockroach.cloud.result.recording",
+    "apiRevision": "cockroach-cloud-api-v1-read-r1",
+    "operations": [
+      "GET organizations/{organizationId}",
+      "GET organizations/{organizationId}/projects/{projectId}",
+      "GET clusters/{clusterId}",
+      "GET clusters/{clusterId}/health",
+      "GET clusters/{clusterId}/settings-metadata",
+      "GET clusters/{clusterId}/sql-activity"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "fake",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "cockroach_cloud_api",
+      "secretReference": "opaque_non_serializing_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionCockroachCloudConsumer",
+    "id": "mission.cockroach-cloud.consumer",
+    "authority": "mission_review_projection_below_kernel",
+    "binding": [
+      "organizationId",
+      "organizationRevision",
+      "cloudProjectId",
+      "cloudProjectRevision",
+      "clusterId",
+      "clusterRevision",
+      "regionId",
+      "regionRevision",
+      "databaseId",
+      "databaseRevision",
+      "branchId",
+      "branchRevision",
+      "sqlActivityRevision",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "permissionDigest",
+      "registrationDigest"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "organization",
+      "cloudProject",
+      "cluster",
+      "region",
+      "database",
+      "branch",
+      "sqlActivityWindowAndRevision",
+      "hartevoProject",
+      "mission",
+      "workProduct",
+      "permissionSnapshot",
+      "scopeRevision"
+    ],
+    "exactRevisionFence": true,
+    "scopeDigest": "sha256_of_canonical_typed_scope",
+    "secret": "opaque_reference_digest_only",
+    "rawEndpoints": false,
+    "connectionStrings": false,
+    "passwords": false
+  },
+  "permissions": {
+    "requiredReadOnly": [
+      "organization:read",
+      "project:read",
+      "cluster:read",
+      "cluster_health:read",
+      "cluster_settings:read",
+      "database:read",
+      "branch:read",
+      "sql_activity:read",
+      "mission.scope",
+      "work_product.proposal"
+    ],
+    "forbidden": [
+      "sql:execute",
+      "sql:ddl",
+      "sql:dml",
+      "cluster:create",
+      "cluster:update",
+      "cluster:delete",
+      "branch:create",
+      "branch:update",
+      "branch:delete",
+      "settings:mutate",
+      "outcome.adopt"
+    ],
+    "permissionDigestBound": true
+  },
+  "pagination": {
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "scopeDigest",
+      "revisionFenceDigest",
+      "queryDigest",
+      "page",
+      "expiry"
+    ],
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxCursorBytes": 256,
+    "scopeDriftRejected": true,
+    "revisionDriftRejected": true,
+    "expiredCursorRejected": true,
+    "repeatedCursorRejected": true,
+    "partialPaginationIsNonAdoptable": true
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxSettingsEntries": 64,
+    "maxSqlActivityEntries": 128,
+    "maxIdentifierBytes": 256,
+    "maxActivityWindowSeconds": 86400,
+    "maxRequestAgeSeconds": 900
+  },
+  "evidence": {
+    "states": [
+      "healthy",
+      "degraded",
+      "unavailable",
+      "absent",
+      "denied",
+      "partial",
+      "expired",
+      "access_loss",
+      "rate_limited",
+      "provider_unknown",
+      "stale",
+      "registration_revoked"
+    ],
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "revisionFenceDigest",
+      "queryDigest",
+      "clusterDigest",
+      "healthDigest",
+      "settingsDigest",
+      "sqlActivityDigest",
+      "responseDigest",
+      "evidenceDigest",
+      "proposalDigest",
+      "recordDigest"
+    ],
+    "retained": [
+      "redacted_cluster_projection",
+      "provider_reported_health_posture",
+      "settings_metadata_digest_and_count",
+      "bounded_sql_activity_posture_digest",
+      "page_and_cursor_digests",
+      "typed_state",
+      "revision_fences"
+    ],
+    "notRetained": [
+      "raw_provider_payload",
+      "raw_sql",
+      "raw_query_results",
+      "connection_string",
+      "password",
+      "api_credential",
+      "cluster_endpoint",
+      "unbounded_settings",
+      "unbounded_activity"
+    ]
+  },
+  "redaction": {
+    "receipt": "digest_and_bounded_counts_only",
+    "secretReference": "digest_only",
+    "cursor": "digest_only",
+    "rawPayload": false,
+    "rawSql": false,
+    "rawRows": false,
+    "credentialMaterial": false
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerRevisionBound": true,
+    "providerDigestBound": true,
+    "apiRevisionBound": true,
+    "scopeDigestBound": true,
+    "permissionDigestBound": true,
+    "secretReferenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "stateTransitions": [
+      "active_to_reversed_to_active",
+      "active_to_revoked"
+    ],
+    "failClosedOn": [
+      "scope_drift",
+      "revision_drift",
+      "permission_drift",
+      "contract_drift",
+      "provider_drift",
+      "cursor_drift",
+      "evidence_tamper",
+      "registration_revocation"
+    ]
+  },
+  "authority": {
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "sqlExecution": false,
+    "clusterMutation": false,
+    "branchMutation": false,
+    "settingsMutation": false,
+    "durableProviderReceipt": false,
+    "independentReadBack": false,
+    "healthCertification": false,
+    "securityTruth": false,
+    "kernelOutcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "connected": false,
+    "deferredTo": "Layer-2 host authority",
+    "gaps": [
+      "native_opaque_credential_resolution",
+      "live_cockroach_cloud_api_reads",
+      "live_sql_activity_reads",
+      "durable_provider_receipts",
+      "independent_provider_read_back",
+      "consented_cluster_branch_or_settings_effects",
+      "verified_work_product_adoption",
+      "verified_outcome_adoption"
+    ]
+  },
+  "primaryApiBasis": [
+    "https://www.cockroachlabs.com/docs/cockroachcloud/cloud-api"
+  ]
+}

@@ -1,8 +1,16 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod observation_evidence_pack;
 mod plugin_invocation_timeline;
 mod runtime_text_subscription;
 
+pub use observation_evidence_pack::{
+    ObservationClassification, ObservationEvidencePack, ObservationPackConsumer,
+    ObservationPipelineError, ObservationPipelineRequest, ObservationPipelineResult,
+    ObservationPlanBinding, ObservationProviderRequest, ObservationSourceBinding,
+    ObservationSourceKind, ObservationStopCommand, ObservationStopResult,
+    RuntimeObservationProvider, TypedRuntimeObservation,
+};
 pub use plugin_invocation_timeline::{
     PLUGIN_INVOCATION_TIMELINE_MAX_PAGE_SIZE, PluginInvocationTimeline,
     PluginInvocationTimelineAuditPage, PluginInvocationTimelineCursor,

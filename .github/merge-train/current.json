@@ -1,16 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "330390edff38d0f9559137c2d238f2964f714901",
-  "candidateCount": 1,
+  "baseCommit": "7f340da0275ca15a604b5618baeb3517e0de6f39",
+  "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/connector-authenticated-probe-result-01",
-      "headCommit": "e5397b7b52e27e8644228b194c9accd1e9425ff9",
-      "number": 183
+      "headBranch": "codex/operations-plugin-log-01",
+      "headCommit": "16726ec5a234942a25d51b7d7e6aed15ebd79a83",
+      "number": 163
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/connectors-commerce-sorftime-outcome-02",
+      "headCommit": "40ab0fce8458b26806dd40f704715775ba046be9",
+      "number": 266
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/dist-sbom-target-01",
+      "headCommit": "7390755095e0d2d8f35f3b81d7e20210b16f6a48",
+      "number": 265
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/browser-mission-batch-plugin-01",
+      "headCommit": "5bc69402f7ea10a513e47a98a6a245927c260b29",
+      "number": 273
     }
   ],
-  "createdAt": "2026-08-14T05:26:49Z",
+  "createdAt": "2026-08-16T04:21:55Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -21,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260814-183"
+  "trainBranch": "merge-train/20260816-0421"
 }
