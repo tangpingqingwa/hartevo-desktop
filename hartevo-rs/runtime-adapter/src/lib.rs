@@ -58,6 +58,7 @@ pub const PROTOCOL_VERSION: &str = "hartevo-runtime-protocol/v1";
 pub const RUNTIME_LAUNCH_TOKEN_ENV: &str = "HARTEVO_RUNTIME_LAUNCH_TOKEN";
 
 static RUNTIME_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+static RUNTIME_LAUNCH_STAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const CONTRACT_METHODS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -3259,6 +3260,56 @@ impl Drop for RuntimeLaunchArtifactGuard {
     }
 }
 
+struct RuntimeLaunchStagingGuard {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl RuntimeLaunchStagingGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RuntimeLaunchStagingGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn runtime_launch_staging_path(launch: &RuntimeLaunchSpec) -> Result<PathBuf, AdapterError> {
+    let file_name = launch
+        .executable_path
+        .file_name()
+        .ok_or(AdapterError::RuntimeLaunchArtifactInvalid)?;
+    let counter = RUNTIME_LAUNCH_STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut staging_name = file_name.to_os_string();
+    staging_name.push(format!(".staging-{}-{counter}", std::process::id()));
+    Ok(launch.executable_path.with_file_name(staging_name))
+}
+
+fn finalize_runtime_launch(staging_path: &Path, final_path: &Path) -> Result<(), AdapterError> {
+    match fs::symlink_metadata(final_path) {
+        Ok(_) => return Err(AdapterError::RuntimeLaunchArtifactExists),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // The staging file is in the same private directory as the final path. Once its writer has
+    // been closed and its digest verified, same-filesystem rename makes the immutable executable
+    // visible to the child without exposing a partially written final path.
+    fs::rename(staging_path, final_path)?;
+    Ok(())
+}
+
 fn materialize_runtime_launch(
     validated: &ValidatedRuntimeCommand,
     launch: &RuntimeLaunchSpec,
@@ -3297,17 +3348,27 @@ fn materialize_runtime_launch(
     }
     fs::create_dir(launch_directory)?;
     set_private_runtime_permissions(launch_directory, true)?;
-    let mut source = fs::File::open(&validated.program)?;
-    let mut destination = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&launch.executable_path)?;
-    std::io::copy(&mut source, &mut destination)?;
-    destination.sync_all()?;
-    set_private_runtime_permissions(&launch.executable_path, false)?;
-    if sha256_file(&launch.executable_path)? != validated.program_sha256 {
+    let staging_path = runtime_launch_staging_path(launch)?;
+    let mut staging_guard = RuntimeLaunchStagingGuard::new(staging_path.clone());
+    {
+        let mut source = fs::File::open(&validated.program)?;
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)?;
+        std::io::copy(&mut source, &mut destination)?;
+        destination.sync_all()?;
+        // Do not expose the file to exec until both the source and destination handles are
+        // closed. Linux returns ETXTBSY when an executable is still open for writing.
+        drop(destination);
+        drop(source);
+    }
+    set_private_runtime_permissions(&staging_path, false)?;
+    if sha256_file(&staging_path)? != validated.program_sha256 {
         return Err(AdapterError::RuntimeProgramChangedDuringSpawn);
     }
+    finalize_runtime_launch(&staging_path, &launch.executable_path)?;
+    staging_guard.commit();
     Ok(RuntimeLaunchArtifactGuard {
         path: launch.executable_path.clone(),
         path_digest: launch.executable_path_digest.clone(),
@@ -4934,6 +4995,43 @@ wait"#,
             create_private_runtime_directory(&symlink_path),
             Err(AdapterError::RuntimeLaunchArtifactInvalid)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_launch_artifact_is_closed_before_atomic_finalization() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary launch base");
+        let program = std::env::current_exe().expect("current test executable");
+        let command = RuntimeCommand::new(&program, directory.path());
+        let validated = validate_runtime_command(&command).expect("validated runtime command");
+        let launch = prepare_runtime_launch(&command, &"c".repeat(64)).expect("launch spec");
+        let artifact = materialize_runtime_launch(&validated, &launch).expect("launch artifact");
+
+        let launch_directory = launch.executable_path().parent().expect("launch directory");
+        let entries = fs::read_dir(launch_directory)
+            .expect("finalized launch directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("launch directory entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path(), launch.executable_path());
+        assert_eq!(
+            fs::metadata(launch.executable_path())
+                .expect("final launch artifact")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+        assert_eq!(
+            sha256_file(launch.executable_path()).expect("final launch digest"),
+            validated.program_sha256
+        );
+
+        drop(artifact);
+        assert!(!launch.executable_path().exists());
+        assert!(!launch_directory.exists());
     }
 
     #[cfg(unix)]

@@ -1,8 +1,16 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod observation_evidence_pack;
 mod openinterpreter_mission_execution;
 mod runtime_text_subscription;
 
+pub use observation_evidence_pack::{
+    ObservationClassification, ObservationEvidencePack, ObservationPackConsumer,
+    ObservationPipelineError, ObservationPipelineRequest, ObservationPipelineResult,
+    ObservationPlanBinding, ObservationProviderRequest, ObservationSourceBinding,
+    ObservationSourceKind, ObservationStopCommand, ObservationStopResult,
+    RuntimeObservationProvider, TypedRuntimeObservation,
+};
 pub use openinterpreter_mission_execution::{
     MissionExecutionError, MissionExecutionObservation, MissionExecutionProvider,
     MissionExecutionProviderFactory, MissionExecutionState, MissionExecutionWriteReceipt,

@@ -1,0 +1,300 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/gcp-org-policy-result/gcp-org-policy-result.v1.json",
+  "title": "Hartevo Google Cloud Organization Policy result Layer-1 contract",
+  "schemaVersion": "hartevo.gcp-org-policy-result/v1",
+  "contractVersion": "EXT-GCP-ORG-POLICY-01-L1/v1",
+  "pluginId": "gcp.organization-policy.result",
+  "objectiveType": "organization_policy_evidence",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.gcp-org-policy-result/v1|layer=1|service=gcp.organization-policy.result.read|provider=gcp.organization-policy.recording|consumer=mission.gcp-org-policy.consumer",
+  "contractDigest": "f65cc8a42bffe39c262726e4ce6820c014a62129f0dcb9ed1d5e0badbbcd9525",
+  "service": {
+    "type": "GcpOrgPolicyService",
+    "id": "gcp.organization-policy.result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "list_policies",
+      "get_policy",
+      "get_effective_policy",
+      "list_available_constraints",
+      "propose",
+      "record",
+      "verify",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "type": "GcpOrgPolicyProvider",
+    "id": "gcp.organization-policy.recording",
+    "apiVersion": "v2",
+    "apiRevision": "organization-policy-v2-list-get-effective-policy-constraints-1",
+    "operations": [
+      "ListPolicies",
+      "GetPolicy",
+      "GetEffectivePolicy",
+      "ListAvailableConstraints"
+    ],
+    "allowedTransportProvenance": [
+      "fixture",
+      "recording",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "schemes": ["oauth", "service_account"],
+      "secretReference": "opaque_only",
+      "serialized": false,
+      "debugRedacted": true,
+      "rawMaterialAccepted": false,
+      "nativeResolution": false,
+      "resolvedByLayer": 2
+    },
+    "native": false,
+    "connected": false,
+    "firstParty": false,
+    "readOnly": true,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionGcpOrgPolicyConsumer",
+    "id": "mission.gcp-org-policy.consumer",
+    "authority": "review_only_below_kernel",
+    "scope": [
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "consentDigest"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "effectiveAuthorization": false
+  },
+  "credentials": {
+    "acceptedKinds": ["oauth", "service_account"],
+    "boundary": "opaque SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "nativeResolution": false,
+    "secretScopeBound": true,
+    "revocable": true
+  },
+  "scope": {
+    "required": [
+      "organizationId",
+      "folderId",
+      "gcpProjectId",
+      "resourceName",
+      "constraintId",
+      "policyId",
+      "policyRevision",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "consentDigest",
+      "permissionRevision",
+      "permissionDigest",
+      "scopeDigest"
+    ],
+    "hierarchy": ["organization", "folder", "project", "resource"],
+    "constraintAllowlist": true,
+    "identifiersInEvidence": "typed_identifiers_and_digests",
+    "revisionBound": true,
+    "crossOrganizationRejected": true
+  },
+  "policyProjection": {
+    "retained": [
+      "constraintId",
+      "policyId",
+      "policyRevision",
+      "ruleMode",
+      "source",
+      "state",
+      "etagDigest",
+      "updateTimeDigest",
+      "ruleDigest",
+      "policyDigest"
+    ],
+    "states": ["CURRENT", "INHERITED", "DRY_RUN"],
+    "rawPolicyValues": false,
+    "rawPolicyMembers": false,
+    "rawEtags": false,
+    "rawUpdateTimes": false,
+    "pii": false
+  },
+  "availableConstraints": {
+    "operation": "ListAvailableConstraints",
+    "definitionProjection": "digest_only",
+    "allowlistBound": true,
+    "rawDefinitions": false
+  },
+  "registration": {
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "apiDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "evidenceDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "registrationDigest"
+    ],
+    "permissions": [
+      "orgpolicy.policies.list",
+      "orgpolicy.policies.get",
+      "orgpolicy.policies.getEffectivePolicy",
+      "orgpolicy.constraints.list",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "orgpolicy.policies.create",
+      "orgpolicy.policies.patch",
+      "orgpolicy.policies.delete",
+      "orgpolicy.customConstraints.create",
+      "orgpolicy.customConstraints.patch",
+      "orgpolicy.customConstraints.delete",
+      "outcome.adopt",
+      "work_product.adopt"
+    ]
+  },
+  "pagination": {
+    "maxPages": 32,
+    "maxPageSize": 100,
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "operation",
+      "organizationId",
+      "resourceName",
+      "constraintId",
+      "pageSize",
+      "scopeDigest",
+      "permissionDigest"
+    ],
+    "filterDriftRejected": true,
+    "scopeDriftRejected": true,
+    "permissionDriftRejected": true,
+    "repeatedCursorRejected": true,
+    "incompletePaginationNonAdoptable": true
+  },
+  "errors": {
+    "mapped": [400, 401, 403, 404, 409, 429, "5xx", "timeout"],
+    "failClosed": true,
+    "malformedResponseRejected": true,
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "staleMissionRejected": true,
+    "revocationRejected": true
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "apiDigest",
+      "providerDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "requestDigest",
+      "paginationDigest",
+      "readDigest",
+      "evidenceDigest"
+    ],
+    "redaction": [
+      "rawPolicyValuesRemoved",
+      "rawPolicyMembersRemoved",
+      "rawConstraintDefinitionRemoved",
+      "piiRemoved",
+      "secretMaterialRemoved",
+      "rawPageTokensRemoved"
+    ],
+    "reviewOnly": true,
+    "durableProviderReceipt": false
+  },
+  "provenance": {
+    "fixture": "non_native_non_connected_non_first_party",
+    "recording": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "durableProviderReceipt": false,
+    "effectiveAuthorization": false,
+    "policyTruthAuthority": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "forbiddenEffects": [
+    "CreatePolicy",
+    "PatchPolicy",
+    "DeletePolicy",
+    "CreateCustomConstraint",
+    "PatchCustomConstraint",
+    "DeleteCustomConstraint",
+    "SetIamPolicy",
+    "ResolveCredentialMaterial",
+    "AdoptOutcome",
+    "AdoptWorkProduct"
+  ],
+  "authorityBoundary": {
+    "owns": [
+      "typed organization/folder/project/resource scope",
+      "typed constraint and policy identity/revision",
+      "bounded list/get/effective-policy reads",
+      "bounded available-constraint read",
+      "inherited/current/dry-run projection",
+      "opaque page-token binding",
+      "redacted evidence and digest fences",
+      "reversible registration",
+      "Mission-scoped proposal/record/verify"
+    ],
+    "doesNotOwn": [
+      "live Google OAuth or service-account resolution",
+      "live Google HTTPS",
+      "raw policy values or members",
+      "PII or organization metadata",
+      "policy or constraint mutation",
+      "effective authorization or compliance truth",
+      "Hartevo Truth, Outcome, Receipt or Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native OAuth/service-account resolution",
+    "live Organization Policy HTTPS",
+    "durable provider receipt",
+    "independent reread and tamper-proof verification",
+    "consented policy effects",
+    "Connected/native/first-party evidence",
+    "Hartevo Truth or Work Product adoption"
+  ],
+  "honestNativeGap": "Native OAuth/service-account resolution, live Organization Policy v2 HTTPS, durable provider receipt, independent reread, consented policy effects and verified Mission adoption remain Layer-2 work. Fixture, recording, loopback and BLOCKED_ENV never claim Connected, native or first-party evidence; an effective policy projection is not an effective authorization or compliance claim."
+}
