@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/gcp-asset-inventory-result/gcp-asset-inventory-result.v1.json",
+  "schemaVersion": "hartevo.gcp-asset-inventory-result-contract/v1",
+  "contractVersion": "gcp-asset-inventory-result/v1",
+  "layer": 1,
+  "apiVersion": "v1",
+  "service": {
+    "id": "gcp.asset-inventory",
+    "name": "GcpAssetInventoryService",
+    "version": "1.0.0",
+    "operation": "governed_search_all_resources_result",
+    "readOnly": true,
+    "connected": false,
+    "native": false,
+    "liveExecution": false
+  },
+  "provider": {
+    "id": "gcp.cloud-asset.search-all-resources",
+    "revision": "gcp-cloud-asset-search-all-resources-v1-r1",
+    "operations": ["searchAllResources"],
+    "acceptedProvenance": ["recording", "fake", "loopback", "blocked_env"],
+    "native": false,
+    "liveExecution": false,
+    "writesResources": false,
+    "writesAssets": false,
+    "bigQueryExport": false,
+    "resolvesCredentials": false
+  },
+  "consumer": {
+    "id": "mission.gcp.asset-inventory",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "observesEvidence": true,
+    "claimsSuccessfulEffect": false,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "ownershipAuthority": false,
+    "healthAuthority": false,
+    "deployabilityAuthority": false
+  },
+  "scope": {
+    "required": [
+      "organizationIdOrFolderIdOrProjectId",
+      "assetType",
+      "resourceNameDigest",
+      "ancestry",
+      "readTime",
+      "projectAndRevision",
+      "missionAndRevision",
+      "workProductAndRevision",
+      "permissionDigest"
+    ],
+    "secret": "opaque_non_serializing_oauth_or_service_account_reference",
+    "resourceRetention": "digest_only",
+    "versionMetadata": "digest_only",
+    "enrichmentMetadata": "digest_only"
+  },
+  "searchAllResources": {
+    "allowedOperation": "searchAllResources",
+    "scopeKinds": ["organization", "folder", "project"],
+    "resourceIdentity": "resource_name_digest_and_asset_type",
+    "ancestry": "typed_digest_only",
+    "readTimeRequired": true,
+    "pageToken": "opaque_digest_bound",
+    "maxPages": 4,
+    "maxPageSize": 50,
+    "maxAssets": 200,
+    "query": "allowlisted_scope_and_asset_type_only",
+    "rawResourceRetention": false,
+    "rawResponseBodyRetention": false,
+    "tagRetention": false,
+    "piiRetention": false
+  },
+  "operations": [
+    "describe_capabilities",
+    "register",
+    "revoke_registration",
+    "propose_search_all_resources",
+    "read_search_all_resources",
+    "record_search_all_resources",
+    "verify_search_all_resources",
+    "consume_observation"
+  ],
+  "registration": {
+    "boundFields": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "versionDigest",
+      "scopeDigest",
+      "organizationIdOrFolderIdOrProjectId",
+      "assetType",
+      "resourceNameDigest",
+      "ancestryDigest",
+      "readTime",
+      "project",
+      "mission",
+      "workProduct",
+      "permissionDigest",
+      "queryDigest",
+      "providerDigest",
+      "providerRevision",
+      "secretReferenceDigest",
+      "credentialRevision"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "digests": [
+    "version",
+    "contract",
+    "provider",
+    "permission",
+    "scope",
+    "query",
+    "evidence"
+  ],
+  "redaction": {
+    "retained": [
+      "resourceNameDigest",
+      "assetType",
+      "ancestryResourceType",
+      "ancestryResourceNameDigest",
+      "readTime",
+      "versionDigest",
+      "enrichmentDigest",
+      "assetDigest",
+      "redactedProviderState"
+    ],
+    "forbidden": [
+      "Resource",
+      "resourceData",
+      "rawResource",
+      "rawResponseBody",
+      "tags",
+      "labels",
+      "additionalAttributes",
+      "oauthAccessToken",
+      "serviceAccountPrivateKey",
+      "pageToken",
+      "PII",
+      "ownershipClaim",
+      "healthClaim",
+      "deployabilityClaim",
+      "bigQueryExport"
+    ]
+  },
+  "states": [
+    "complete",
+    "partial",
+    "access_lost",
+    "provider_unknown"
+  ],
+  "authority": {
+    "externalWrites": false,
+    "resourceMutation": false,
+    "assetMutation": false,
+    "bigQueryExport": false,
+    "rawResourcePayload": false,
+    "rawResponseBody": false,
+    "successfulExternalEffect": false,
+    "connected": false,
+    "nativeProvider": false,
+    "credentialResolution": false,
+    "receipt": false,
+    "verificationAuthority": false,
+    "outcome": false,
+    "workProductAdoption": false,
+    "ownership": false,
+    "health": false,
+    "deployability": false
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_google_cloud_asset_inventory_read_and_independent_readback",
+    "failClosedCases": [
+      "missing_google_auth_authority",
+      "revoked_secret_reference",
+      "api_version_drift",
+      "scope_or_revision_drift",
+      "query_or_page_binding_drift",
+      "raw_resource_or_raw_response_request",
+      "bigquery_export_request",
+      "resource_mutation_request",
+      "ownership_health_or_deployability_claim"
+    ]
+  },
+  "honestNativeGap": "Layer 1 is recording/fake/loopback/blocked-environment evidence only. Native OAuth or service-account resolution, live Cloud Asset Inventory searchAllResources execution, Connected status, raw resource payloads, tags, PII, BigQuery export, resource mutation, native receipt, independent readback, verification authority, ownership/health/deployability authority, successful external-effect state, Outcome authority, and Work Product adoption remain deferred."
+}
