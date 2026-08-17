@@ -42,6 +42,15 @@ self_test() {
   grep -F -- '-p hartevo-browser-adapter' "$cargo_log" >/dev/null || fail "self-test lost the second package selector"
   grep -F -- '--all-targets --all-features --locked' "$cargo_log" >/dev/null || fail "self-test lost locked Cargo flags"
 
+  local stale_full_scope='["hartevo-application","hartevo-browser-adapter","hartevo-capability-gateway","hartevo-catalog","hartevo-cloud-storage","hartevo-commerce-connector","hartevo-connector-sdk","hartevo-context-fabric","hartevo-desktop","hartevo-domain-kernel","hartevo-effect-broker","hartevo-eval","hartevo-mission-scheduler","hartevo-plugin-runtime","hartevo-runtime-adapter"]'
+  : > "$cargo_log"
+  run_fake test --full --packages "$stale_full_scope"
+  [[ "$(wc -l < "$cargo_log" | tr -d ' ')" == "1" ]] || fail "self-test expected one full-workspace Cargo invocation"
+  grep -F -- 'test --workspace --all-targets --all-features --locked' "$cargo_log" >/dev/null || fail "self-test lost full-workspace Cargo flags"
+  if grep -F -- ' -p ' "$cargo_log" >/dev/null; then
+    fail "self-test converted stale full-workspace scope into package selectors"
+  fi
+
   local invalid_scope
   for invalid_scope in \
     'not-json' \
@@ -116,12 +125,12 @@ case "$mode" in
   clippy|test)
     if [[ "$full" == true ]]; then
       [[ "$plan" == "" ]] || { usage >&2; exit 2; }
-      if [[ "$packages" != '[]' ]]; then
-        python3 "$planner" verify \
-          --repo "$repo_root" \
-          --packages "$packages" \
-          --full-workspace true >/dev/null || exit $?
-      fi
+      # Full-workspace verification discovers the current workspace.  The
+      # caller's package list can be stale, so it must not define coverage.
+      python3 "$planner" verify \
+        --repo "$repo_root" \
+        --packages '[]' \
+        --full-workspace true >/dev/null || exit $?
       if [[ "$mode" == clippy ]]; then
         cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       else

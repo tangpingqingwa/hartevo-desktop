@@ -285,6 +285,11 @@ def parse_packages(raw: object, *, workspace_packages: Sequence[str], allow_empt
     return sorted(names)
 
 
+def planning_scope(full_workspace: bool, packages: object) -> object:
+    """Return the discovery scope used by the full-workspace plan command."""
+    return [] if full_workspace else packages
+
+
 def build_plan(
     workspace: dict[str, object],
     *,
@@ -458,7 +463,7 @@ def plan_command(args: argparse.Namespace) -> int:
         shard=args.shard,
         shard_count=args.shard_count,
         full_workspace=args.full_workspace,
-        packages=args.packages,
+        packages=planning_scope(args.full_workspace, args.packages),
     )
     write_plan(record, args.output)
     write_github_outputs(record, args.github_output)
@@ -479,6 +484,52 @@ def self_test() -> None:
     assert sorted(selected) == list(CHECKED_IN_WORKSPACE_PACKAGES)
     assert plans[1]["packages"][-1] == "hartevo-storage"
     assert "hartevo-channel-adapters" in plans[1]["packages"]
+
+    stale_full_scope = list(workspace["packages"][:-2])
+    assert len(stale_full_scope) == 15
+    stale_full_scope_json = json.dumps(stale_full_scope)
+    assert planning_scope(True, stale_full_scope_json) == []
+    stale_plans = [
+        build_plan(
+            workspace,
+            shard=index,
+            shard_count=SHARD_COUNT,
+            full_workspace=True,
+            packages=planning_scope(True, stale_full_scope_json),
+        )
+        for index in range(SHARD_COUNT)
+    ]
+    stale_selected = [package for plan in stale_plans for package in plan["packages"]]
+    assert stale_selected == selected
+    assert sorted(stale_selected) == list(CHECKED_IN_WORKSPACE_PACKAGES)
+
+    try:
+        build_plan(
+            workspace,
+            shard=0,
+            shard_count=SHARD_COUNT,
+            full_workspace=True,
+            packages=stale_full_scope_json,
+        )
+    except ShardError as error:
+        assert str(error) == "full-workspace scope must be empty or contain every workspace package exactly once"
+    else:
+        raise AssertionError("self-test accepted an incomplete full-workspace build scope")
+
+    try:
+        verify_command(
+            argparse.Namespace(
+                repo=Path.cwd(),
+                plan=None,
+                packages=stale_full_scope_json,
+                full_workspace=True,
+                emit_packages=False,
+            )
+        )
+    except ShardError as error:
+        assert str(error) == "full-workspace scope must be empty or contain every workspace package exactly once"
+    else:
+        raise AssertionError("self-test accepted an incomplete explicit full-workspace scope")
 
     scoped = build_plan(
         workspace,
