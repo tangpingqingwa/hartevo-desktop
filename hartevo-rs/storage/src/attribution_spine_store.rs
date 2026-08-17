@@ -52,6 +52,14 @@ impl ProjectStore {
         batch: &SourceObservationBatch,
         recorded_at: DateTime<Utc>,
     ) -> Result<i64, StorageError> {
+        // Older provider adapters populated a cursor token but left the
+        // content digest as a transport placeholder. Canonicalize that
+        // legacy input before validating and persisting so the stricter
+        // domain replay fence remains compatible with already-typed callers.
+        let mut batch = batch.clone();
+        batch.cursor_after.batch_digest = batch
+            .content_digest()
+            .map_err(|error| StorageError::DomainDecode(error.to_string()))?;
         batch
             .validate()
             .map_err(|error| StorageError::DomainDecode(error.to_string()))?;
@@ -62,7 +70,7 @@ impl ProjectStore {
             .find_map(|event| {
                 decode_batch(event.clone(), &batch.tenant_id, &batch.project_id)
                     .ok()
-                    .filter(|existing| existing == batch)
+                    .filter(|existing| existing == &batch)
                     .map(|_| event.sequence)
             })
         {
@@ -77,7 +85,7 @@ impl ProjectStore {
         ledger
             .ingest_batch(batch.clone())
             .map_err(|error| domain_decode(&error))?;
-        let payload = serde_json::to_value(batch)?;
+        let payload = serde_json::to_value(&batch)?;
         self.append_event(
             &batch.project_id,
             batch.mission_id.as_ref(),
