@@ -1,22 +1,16 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "9ed2806d2d2ab86e9aab9676e65870c53f3007ad",
-  "candidateCount": 2,
+  "baseCommit": "d4b6075137322d00fffb5463ee290be90b4b467d",
+  "candidateCount": 1,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/recipe-smoke-03-crash-resume",
-      "headCommit": "b6a52ce9cc161881bacf5f857b53917469992773",
-      "number": 29
-    },
-    {
-      "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/openinterpreter-provider-plugin-01",
-      "headCommit": "c31ef5df5714b09b338fcc786ef5c716200db53c",
-      "number": 226
+      "headBranch": "codex/gm01-progress-trace-oracle",
+      "headCommit": "4b8569fbc0feb1f71028aa1da6f8ba4352c5bd20",
+      "number": 73
     }
   ],
-  "createdAt": "2026-08-17T06:11:52Z",
+  "createdAt": "2026-08-17T06:58:54Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -27,5 +21,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260817-0610"
+  "trainBranch": "merge-train/20260817-0656"
 }
