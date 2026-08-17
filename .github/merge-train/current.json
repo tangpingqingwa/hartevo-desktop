@@ -1,22 +1,22 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "391da8885196c5b6bc6fb22b256fe2f9f424d65a",
+  "baseCommit": "9ed2806d2d2ab86e9aab9676e65870c53f3007ad",
   "candidateCount": 2,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ci-01-deterministic-ubuntu-rust-test-sharding",
-      "headCommit": "ae8afe85afd207d07ef92b9626bacfa68cfeff4b",
-      "number": 925
+      "headBranch": "codex/recipe-smoke-03-crash-resume",
+      "headCommit": "b6a52ce9cc161881bacf5f857b53917469992773",
+      "number": 29
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/evaluation-plugin-result-01",
-      "headCommit": "c7c7af9694ccb86bf6fc0a10512e3de8087a65d8",
-      "number": 159
+      "headBranch": "codex/openinterpreter-provider-plugin-01",
+      "headCommit": "c31ef5df5714b09b338fcc786ef5c716200db53c",
+      "number": 226
     }
   ],
-  "createdAt": "2026-08-17T05:00:57Z",
+  "createdAt": "2026-08-17T06:11:52Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -27,5 +27,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260817-0500"
+  "trainBranch": "merge-train/20260817-0610"
 }
