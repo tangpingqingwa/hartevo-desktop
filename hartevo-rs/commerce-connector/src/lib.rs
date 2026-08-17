@@ -10,7 +10,10 @@
 pub mod amazon;
 mod canonical;
 pub mod shopify;
+pub mod shopify_effect;
+pub mod shopify_effect_reconcile;
 pub mod sorftime;
+pub mod sorftime_outcome;
 pub mod sorftime_plugin;
 pub mod world;
 
