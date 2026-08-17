@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use hartevo_domain_kernel::{
@@ -31,6 +32,7 @@ use crate::{ApplicationError, ApplicationService, StartCatalogMission};
 pub const RUNTIME_TEXT_SUBSCRIPTION_MAX_PAGE_SIZE: usize = 64;
 const SHA256_HEX_LENGTH: usize = 64;
 const DIGEST_LABEL_LENGTH: usize = 8;
+static NEXT_OPERATIONS_CONTINUATION_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -899,7 +901,7 @@ impl fmt::Debug for OperationsScope {
     }
 }
 
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum OperationsPluginError {
     #[error("Operations plugin page size must be between 1 and 32")]
     InvalidPageSize,
@@ -925,6 +927,18 @@ pub(crate) enum OperationsPluginError {
     NotMounted,
     #[error("Operations plugin has been revoked")]
     Revoked,
+    #[error("Operations continuation token is stale")]
+    ContinuationStale,
+    #[error("Operations continuation token is not canonical")]
+    ContinuationMismatch,
+    #[error("Operations continuation requires a final caught-up acknowledgement")]
+    FinalAckRequired,
+    #[error("Operations continuation final acknowledgement is not ready")]
+    FinalAckNotReady,
+    #[error("Operations continuation final acknowledgement is not caught up")]
+    FinalAckNotCaughtUp,
+    #[error("Operations continuation epoch cannot advance")]
+    ContinuationEpochOverflow,
     #[error("Operations plugin cannot advance its revision")]
     RevisionOverflow,
 }
@@ -1266,6 +1280,161 @@ impl fmt::Debug for OperationsSelectedDetail {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperationsContinuationMode {
+    Follow,
+    Pause,
+    Unseen,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationsContinuationPhase {
+    Open,
+    AwaitingFinalCaughtUp,
+}
+
+/// A single-use, mount-bound continuation token for an inline Operations
+/// detail stream. It carries only canonical digests and typed boundaries;
+/// durable event payloads never cross this seam.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct OperationsDetailContinuation {
+    plugin_id: String,
+    scope_digest: String,
+    revision: u64,
+    epoch_digest: String,
+    cursor: OperationsCursor,
+    selection: OperationsSelection,
+    mode: OperationsContinuationMode,
+    phase: OperationsContinuationPhase,
+    nonce: u64,
+    continuation_digest: String,
+}
+
+impl OperationsDetailContinuation {
+    fn new(
+        scope: &OperationsScope,
+        revision: u64,
+        epoch_digest: String,
+        cursor: OperationsCursor,
+        selection: OperationsSelection,
+        mode: OperationsContinuationMode,
+        phase: OperationsContinuationPhase,
+    ) -> Result<Self, OperationsPluginError> {
+        let mut continuation = Self {
+            plugin_id: OPERATIONS_PLUGIN_ID.into(),
+            scope_digest: scope.digest()?,
+            revision,
+            epoch_digest,
+            cursor,
+            selection,
+            mode,
+            phase,
+            nonce: next_operations_continuation_nonce()?,
+            continuation_digest: String::new(),
+        };
+        continuation.continuation_digest = continuation.computed_digest()?;
+        Ok(continuation)
+    }
+
+    fn validate_for(
+        &self,
+        scope: &OperationsScope,
+        revision: u64,
+        epoch_digest: &str,
+        active_digest: Option<&str>,
+    ) -> Result<(), OperationsPluginError> {
+        let expected_scope = scope.digest()?;
+        if self.scope_digest != expected_scope {
+            return Err(OperationsPluginError::ScopeMismatch);
+        }
+        if self.revision != revision {
+            return Err(OperationsPluginError::RevisionMismatch);
+        }
+        if self.plugin_id != OPERATIONS_PLUGIN_ID
+            || self.nonce == 0
+            || !is_digest(&self.scope_digest)
+            || !is_digest(&self.epoch_digest)
+            || !is_digest(&self.continuation_digest)
+            || self.computed_digest()? != self.continuation_digest
+        {
+            return Err(OperationsPluginError::ContinuationMismatch);
+        }
+        if self.epoch_digest != epoch_digest
+            || active_digest != Some(self.continuation_digest.as_str())
+        {
+            return Err(OperationsPluginError::ContinuationStale);
+        }
+        self.cursor.validate_for(scope, revision)?;
+        self.selection.validate_for(scope, revision)
+    }
+
+    fn computed_digest(&self) -> Result<String, OperationsPluginError> {
+        digest_json(&OperationsContinuationDigestMaterial {
+            plugin_id: &self.plugin_id,
+            scope_digest: &self.scope_digest,
+            revision: self.revision,
+            epoch_digest: &self.epoch_digest,
+            cursor_digest: &self.cursor.cursor_digest,
+            selection_digest: &self.selection.selection_digest,
+            mode: self.mode,
+            phase: self.phase,
+            nonce: self.nonce,
+        })
+        .map_err(|_| OperationsPluginError::InvalidSource)
+    }
+
+    pub(crate) fn cursor(&self) -> &OperationsCursor {
+        &self.cursor
+    }
+
+    pub(crate) fn selection(&self) -> &OperationsSelection {
+        &self.selection
+    }
+
+    pub(crate) const fn mode(&self) -> OperationsContinuationMode {
+        self.mode
+    }
+
+    pub(crate) fn continuation_digest(&self) -> &str {
+        &self.continuation_digest
+    }
+}
+
+impl fmt::Debug for OperationsDetailContinuation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OperationsDetailContinuation")
+            .field("plugin_id", &self.plugin_id)
+            .field("scope", &ShortDigest(&self.scope_digest))
+            .field("revision", &self.revision)
+            .field("epoch", &ShortDigest(&self.epoch_digest))
+            .field("cursor", &self.cursor)
+            .field("selection", &self.selection)
+            .field("mode", &self.mode)
+            .field("phase", &self.phase)
+            .field("nonce", &self.nonce)
+            .field("continuation", &ShortDigest(&self.continuation_digest))
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationsContinuationDigestMaterial<'a> {
+    plugin_id: &'a str,
+    scope_digest: &'a str,
+    revision: u64,
+    epoch_digest: &'a str,
+    cursor_digest: &'a str,
+    selection_digest: &'a str,
+    mode: OperationsContinuationMode,
+    phase: OperationsContinuationPhase,
+    nonce: u64,
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct OperationsInlineProjection {
@@ -1335,6 +1504,192 @@ impl fmt::Debug for OperationsInlineProjection {
             .field("selected_detail", &self.selected_detail)
             .field("next_cursor", &self.next_cursor)
             .field("has_more", &self.has_more)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperationsContinuationErrorCode {
+    Invalid,
+    Stale,
+    ScopeMismatch,
+    RevisionMismatch,
+    CursorMismatch,
+    CursorAhead,
+    CursorHistoryMissing,
+    SelectionMismatch,
+    NotMounted,
+    Revoked,
+    SourceUnavailable,
+    InvalidSource,
+    FinalAckRequired,
+    FinalAckNotReady,
+    FinalAckNotCaughtUp,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
+#[error("Operations continuation failed: {code:?}")]
+pub(crate) struct OperationsContinuationError {
+    code: OperationsContinuationErrorCode,
+    held_result: Option<Box<OperationsSelectedDetail>>,
+}
+
+impl OperationsContinuationError {
+    fn from_plugin_error(
+        error: OperationsPluginError,
+        held_result: Option<OperationsSelectedDetail>,
+    ) -> Self {
+        let code = match error {
+            OperationsPluginError::InvalidPageSize
+            | OperationsPluginError::InvalidScope
+            | OperationsPluginError::ContinuationMismatch
+            | OperationsPluginError::ContinuationEpochOverflow
+            | OperationsPluginError::RevisionOverflow => OperationsContinuationErrorCode::Invalid,
+            OperationsPluginError::SourceUnavailable => {
+                OperationsContinuationErrorCode::SourceUnavailable
+            }
+            OperationsPluginError::InvalidSource => OperationsContinuationErrorCode::InvalidSource,
+            OperationsPluginError::ScopeMismatch => OperationsContinuationErrorCode::ScopeMismatch,
+            OperationsPluginError::RevisionMismatch => {
+                OperationsContinuationErrorCode::RevisionMismatch
+            }
+            OperationsPluginError::CursorMismatch => {
+                OperationsContinuationErrorCode::CursorMismatch
+            }
+            OperationsPluginError::CursorAhead => OperationsContinuationErrorCode::CursorAhead,
+            OperationsPluginError::CursorHistoryMissing => {
+                OperationsContinuationErrorCode::CursorHistoryMissing
+            }
+            OperationsPluginError::SelectionMismatch => {
+                OperationsContinuationErrorCode::SelectionMismatch
+            }
+            OperationsPluginError::NotMounted => OperationsContinuationErrorCode::NotMounted,
+            OperationsPluginError::Revoked => OperationsContinuationErrorCode::Revoked,
+            OperationsPluginError::ContinuationStale => OperationsContinuationErrorCode::Stale,
+            OperationsPluginError::FinalAckRequired => {
+                OperationsContinuationErrorCode::FinalAckRequired
+            }
+            OperationsPluginError::FinalAckNotReady => {
+                OperationsContinuationErrorCode::FinalAckNotReady
+            }
+            OperationsPluginError::FinalAckNotCaughtUp => {
+                OperationsContinuationErrorCode::FinalAckNotCaughtUp
+            }
+        };
+        Self {
+            code,
+            held_result: held_result.map(Box::new),
+        }
+    }
+
+    pub(crate) const fn code(&self) -> OperationsContinuationErrorCode {
+        self.code
+    }
+
+    pub(crate) fn held_result(&self) -> Option<&OperationsSelectedDetail> {
+        self.held_result.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationsContinuationDelivery {
+    CaughtUp,
+    Unseen { count: usize, has_more: bool },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationsContinuationTerminalState {
+    Active,
+    Pending,
+    Closed,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct OperationsContinuationEnvelope {
+    scope_digest: String,
+    revision: u64,
+    continuation: Option<OperationsDetailContinuation>,
+    mode: OperationsContinuationMode,
+    nodes: Vec<OperationsInlineNode>,
+    selected_detail: Option<OperationsSelectedDetail>,
+    delivery: OperationsContinuationDelivery,
+    terminal_state: OperationsContinuationTerminalState,
+}
+
+impl OperationsContinuationEnvelope {
+    pub(crate) fn continuation(&self) -> Option<&OperationsDetailContinuation> {
+        self.continuation.as_ref()
+    }
+
+    pub(crate) const fn mode(&self) -> OperationsContinuationMode {
+        self.mode
+    }
+
+    pub(crate) fn nodes(&self) -> &[OperationsInlineNode] {
+        &self.nodes
+    }
+
+    pub(crate) fn selected_detail(&self) -> Option<&OperationsSelectedDetail> {
+        self.selected_detail.as_ref()
+    }
+
+    pub(crate) fn unseen(&self) -> bool {
+        matches!(self.delivery, OperationsContinuationDelivery::Unseen { .. })
+    }
+
+    pub(crate) fn unseen_count(&self) -> usize {
+        match self.delivery {
+            OperationsContinuationDelivery::CaughtUp => 0,
+            OperationsContinuationDelivery::Unseen { count, .. } => count,
+        }
+    }
+
+    pub(crate) fn caught_up(&self) -> bool {
+        matches!(self.delivery, OperationsContinuationDelivery::CaughtUp)
+    }
+
+    pub(crate) fn has_more(&self) -> bool {
+        match self.delivery {
+            OperationsContinuationDelivery::CaughtUp => false,
+            OperationsContinuationDelivery::Unseen { has_more, .. } => has_more,
+        }
+    }
+
+    pub(crate) fn terminal(&self) -> bool {
+        !matches!(
+            self.terminal_state,
+            OperationsContinuationTerminalState::Active
+        )
+    }
+
+    pub(crate) fn final_caught_up(&self) -> bool {
+        matches!(
+            self.terminal_state,
+            OperationsContinuationTerminalState::Closed
+        )
+    }
+
+    pub(crate) fn closed(&self) -> bool {
+        self.final_caught_up()
+    }
+}
+
+impl fmt::Debug for OperationsContinuationEnvelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OperationsContinuationEnvelope")
+            .field("scope", &ShortDigest(&self.scope_digest))
+            .field("revision", &self.revision)
+            .field("continuation", &self.continuation)
+            .field("mode", &self.mode)
+            .field("node_count", &self.nodes.len())
+            .field("selected_detail", &self.selected_detail)
+            .field("delivery", &self.delivery)
+            .field("terminal_state", &self.terminal_state)
             .finish()
     }
 }
@@ -1553,6 +1908,8 @@ pub(crate) struct OperationsDetailService<'a> {
     consumer: OperationsConversationConsumer,
     lifecycle: OperationsPluginLifecycle,
     private_projection: Option<OperationsInlineProjection>,
+    continuation_epoch_digest: String,
+    active_continuation_digest: Option<String>,
 }
 
 impl<'a> OperationsDetailService<'a> {
@@ -1565,6 +1922,8 @@ impl<'a> OperationsDetailService<'a> {
             },
             lifecycle: OperationsPluginLifecycle::Mounted,
             private_projection: None,
+            continuation_epoch_digest: new_operations_continuation_epoch_digest()?,
+            active_continuation_digest: None,
         })
     }
 
@@ -1582,6 +1941,10 @@ impl<'a> OperationsDetailService<'a> {
                 }
                 OperationsPluginLifecycle::Revoked => OperationsPluginError::Revoked,
             });
+        }
+        if let Err(error) = self.rotate_continuation_epoch() {
+            self.private_projection = None;
+            return Err(error);
         }
         let result = self
             .provider
@@ -1601,23 +1964,232 @@ impl<'a> OperationsDetailService<'a> {
 
     pub(crate) fn mount_again(&mut self) -> Result<(), OperationsPluginError> {
         self.private_projection = None;
+        self.active_continuation_digest = None;
         if self.lifecycle == OperationsPluginLifecycle::Revoked {
             return Err(OperationsPluginError::Revoked);
         }
         self.lifecycle = OperationsPluginLifecycle::Unmounted;
         self.provider.read_snapshot()?;
+        self.continuation_epoch_digest = new_operations_continuation_epoch_digest()?;
         self.lifecycle = OperationsPluginLifecycle::Mounted;
         Ok(())
     }
 
     pub(crate) fn unmount(&mut self) {
         self.private_projection = None;
+        self.active_continuation_digest = None;
         self.lifecycle = OperationsPluginLifecycle::Unmounted;
     }
 
     pub(crate) fn revoke(&mut self) {
         self.private_projection = None;
+        self.active_continuation_digest = None;
         self.lifecycle = OperationsPluginLifecycle::Revoked;
+    }
+
+    pub(crate) fn start_continuation(
+        &mut self,
+        cursor: &OperationsCursor,
+        selection: &OperationsSelection,
+    ) -> Result<OperationsDetailContinuation, OperationsContinuationError> {
+        let result = self.start_continuation_inner(cursor, selection);
+        result.map_err(|error| self.continuation_error(error))
+    }
+
+    fn start_continuation_inner(
+        &mut self,
+        cursor: &OperationsCursor,
+        selection: &OperationsSelection,
+    ) -> Result<OperationsDetailContinuation, OperationsPluginError> {
+        self.ensure_mounted()?;
+        self.rotate_continuation_epoch()?;
+        let page = self.provider.read_page(Some(cursor), Some(selection), 1)?;
+        let continuation = OperationsDetailContinuation::new(
+            &page.scope,
+            page.revision,
+            self.continuation_epoch_digest.clone(),
+            cursor.clone(),
+            selection.clone(),
+            OperationsContinuationMode::Follow,
+            OperationsContinuationPhase::Open,
+        )?;
+        self.active_continuation_digest = Some(continuation.continuation_digest.clone());
+        Ok(continuation)
+    }
+
+    pub(crate) fn continue_detail(
+        &mut self,
+        continuation: &OperationsDetailContinuation,
+        mode: OperationsContinuationMode,
+        page_size: usize,
+    ) -> Result<OperationsContinuationEnvelope, OperationsContinuationError> {
+        let result = self.continue_detail_inner(continuation, mode, page_size);
+        result.map_err(|error| self.continuation_error(error))
+    }
+
+    fn continue_detail_inner(
+        &mut self,
+        continuation: &OperationsDetailContinuation,
+        mode: OperationsContinuationMode,
+        page_size: usize,
+    ) -> Result<OperationsContinuationEnvelope, OperationsPluginError> {
+        self.ensure_mounted()?;
+        let snapshot = self.provider.read_snapshot()?;
+        continuation.validate_for(
+            &snapshot.scope,
+            snapshot.revision,
+            &self.continuation_epoch_digest,
+            self.active_continuation_digest.as_deref(),
+        )?;
+        if continuation.phase == OperationsContinuationPhase::AwaitingFinalCaughtUp {
+            return Err(OperationsPluginError::FinalAckRequired);
+        }
+        let page = self.provider.read_page(
+            Some(&continuation.cursor),
+            Some(&continuation.selection),
+            page_size,
+        )?;
+        let projection = self
+            .consumer
+            .project(page.clone(), Some(&continuation.selection))?;
+        let terminal = page.business_status.is_terminal();
+        let phase =
+            if terminal && page.caught_up && matches!(mode, OperationsContinuationMode::Follow) {
+                OperationsContinuationPhase::AwaitingFinalCaughtUp
+            } else {
+                OperationsContinuationPhase::Open
+            };
+        let (nodes, next_cursor, unseen, unseen_count, update_projection) = match mode {
+            OperationsContinuationMode::Follow => (
+                projection.nodes.clone(),
+                page.next_cursor.clone(),
+                page.has_more,
+                usize::from(page.has_more),
+                true,
+            ),
+            OperationsContinuationMode::Pause => (
+                Vec::new(),
+                continuation.cursor.clone(),
+                !page.entries.is_empty() || page.has_more,
+                page.entries.len(),
+                false,
+            ),
+            OperationsContinuationMode::Unseen => (
+                projection.nodes.clone(),
+                continuation.cursor.clone(),
+                !page.entries.is_empty() || page.has_more,
+                page.entries.len(),
+                true,
+            ),
+        };
+        let next = OperationsDetailContinuation::new(
+            &page.scope,
+            page.revision,
+            self.continuation_epoch_digest.clone(),
+            next_cursor,
+            continuation.selection.clone(),
+            mode,
+            phase,
+        )?;
+        self.active_continuation_digest = Some(next.continuation_digest.clone());
+        if update_projection {
+            self.private_projection = Some(projection.clone());
+        }
+        Ok(OperationsContinuationEnvelope {
+            scope_digest: page.scope.digest()?,
+            revision: page.revision,
+            continuation: Some(next),
+            mode,
+            nodes,
+            selected_detail: projection.selected_detail.clone(),
+            delivery: if unseen {
+                OperationsContinuationDelivery::Unseen {
+                    count: unseen_count,
+                    has_more: page.has_more,
+                }
+            } else {
+                OperationsContinuationDelivery::CaughtUp
+            },
+            terminal_state: if terminal {
+                OperationsContinuationTerminalState::Pending
+            } else {
+                OperationsContinuationTerminalState::Active
+            },
+        })
+    }
+
+    pub(crate) fn acknowledge_final_caught_up(
+        &mut self,
+        continuation: &OperationsDetailContinuation,
+    ) -> Result<OperationsContinuationEnvelope, OperationsContinuationError> {
+        let result = self.acknowledge_final_caught_up_inner(continuation);
+        result.map_err(|error| self.continuation_error(error))
+    }
+
+    fn acknowledge_final_caught_up_inner(
+        &mut self,
+        continuation: &OperationsDetailContinuation,
+    ) -> Result<OperationsContinuationEnvelope, OperationsPluginError> {
+        self.ensure_mounted()?;
+        let snapshot = self.provider.read_snapshot()?;
+        continuation.validate_for(
+            &snapshot.scope,
+            snapshot.revision,
+            &self.continuation_epoch_digest,
+            self.active_continuation_digest.as_deref(),
+        )?;
+        if continuation.phase != OperationsContinuationPhase::AwaitingFinalCaughtUp {
+            return Err(OperationsPluginError::FinalAckNotReady);
+        }
+        let page = self.provider.read_page(
+            Some(&continuation.cursor),
+            Some(&continuation.selection),
+            1,
+        )?;
+        if !page.business_status.is_terminal() {
+            return Err(OperationsPluginError::FinalAckNotReady);
+        }
+        if !page.caught_up || !page.entries.is_empty() {
+            return Err(OperationsPluginError::FinalAckNotCaughtUp);
+        }
+        let projection = self
+            .consumer
+            .project(page.clone(), Some(&continuation.selection))?;
+        self.private_projection = Some(projection.clone());
+        self.active_continuation_digest = None;
+        Ok(OperationsContinuationEnvelope {
+            scope_digest: page.scope.digest()?,
+            revision: page.revision,
+            continuation: None,
+            mode: continuation.mode,
+            nodes: projection.nodes.clone(),
+            selected_detail: projection.selected_detail,
+            delivery: OperationsContinuationDelivery::CaughtUp,
+            terminal_state: OperationsContinuationTerminalState::Closed,
+        })
+    }
+
+    fn ensure_mounted(&self) -> Result<(), OperationsPluginError> {
+        match self.lifecycle {
+            OperationsPluginLifecycle::Mounted => Ok(()),
+            OperationsPluginLifecycle::Unmounted => Err(OperationsPluginError::NotMounted),
+            OperationsPluginLifecycle::Revoked => Err(OperationsPluginError::Revoked),
+        }
+    }
+
+    fn rotate_continuation_epoch(&mut self) -> Result<(), OperationsPluginError> {
+        self.active_continuation_digest = None;
+        self.continuation_epoch_digest = new_operations_continuation_epoch_digest()?;
+        Ok(())
+    }
+
+    fn continuation_error(&self, error: OperationsPluginError) -> OperationsContinuationError {
+        OperationsContinuationError::from_plugin_error(
+            error,
+            self.private_projection
+                .as_ref()
+                .and_then(|projection| projection.selected_detail.clone()),
+        )
     }
 
     #[cfg(test)]
@@ -1816,6 +2388,30 @@ fn log_prefix_digest(
         })
         .collect::<Vec<_>>();
     digest_json(&material).map_err(|_| OperationsPluginError::InvalidSource)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationsContinuationEpochMaterial {
+    process_id: u32,
+    nonce: u64,
+}
+
+fn next_operations_continuation_nonce() -> Result<u64, OperationsPluginError> {
+    let nonce = NEXT_OPERATIONS_CONTINUATION_NONCE.fetch_add(1, Ordering::Relaxed);
+    if nonce == 0 {
+        return Err(OperationsPluginError::ContinuationEpochOverflow);
+    }
+    Ok(nonce)
+}
+
+fn new_operations_continuation_epoch_digest() -> Result<String, OperationsPluginError> {
+    let nonce = next_operations_continuation_nonce()?;
+    digest_json(&OperationsContinuationEpochMaterial {
+        process_id: std::process::id(),
+        nonce,
+    })
+    .map_err(|_| OperationsPluginError::InvalidSource)
 }
 
 #[cfg(test)]
@@ -2105,6 +2701,12 @@ mod tests {
         selection.selection_digest = selection
             .computed_digest()
             .expect("canonical Operations selection");
+    }
+
+    fn resign_operations_continuation(continuation: &mut OperationsDetailContinuation) {
+        continuation.continuation_digest = continuation
+            .computed_digest()
+            .expect("canonical Operations continuation");
     }
 
     #[test]
@@ -2746,5 +3348,306 @@ mod tests {
             Err(OperationsPluginError::Revoked)
         );
         assert_eq!(service.mount_again(), Err(OperationsPluginError::Revoked));
+    }
+
+    #[test]
+    fn operations_continuation_supports_follow_pause_unseen_and_selected_boundary() {
+        let mut fixture = started_operations_fixture();
+        let (cursor, selection) = {
+            let mut service = operations_service(&fixture);
+            let projection = service
+                .read(None, None, OPERATIONS_MAX_PAGE_SIZE)
+                .expect("initial Operations projection");
+            (
+                projection.next_cursor().clone(),
+                projection.nodes()[0].selection.clone(),
+            )
+        };
+        append_durable_operation_event(
+            &mut fixture,
+            "mission.checkpoint_started",
+            &serde_json::json!({
+                "checkpointId": "continuation-checkpoint",
+                "privateBody": PRIVATE_GOAL,
+            }),
+            5,
+        );
+        let mut service = operations_service(&fixture);
+        let continuation = service
+            .start_continuation(&cursor, &selection)
+            .expect("start exact detail continuation");
+        assert_eq!(continuation.mode(), OperationsContinuationMode::Follow);
+        assert_eq!(continuation.selection(), &selection);
+        assert!(is_digest(continuation.continuation_digest()));
+
+        let paused = service
+            .continue_detail(&continuation, OperationsContinuationMode::Pause, 1)
+            .expect("pause without consuming unseen detail");
+        assert_eq!(paused.mode(), OperationsContinuationMode::Pause);
+        assert!(paused.unseen());
+        assert_eq!(paused.unseen_count(), 1);
+        assert!(!paused.has_more());
+        assert!(paused.nodes().is_empty());
+        assert_eq!(
+            paused
+                .selected_detail()
+                .expect("reselected held detail")
+                .selection,
+            selection
+        );
+
+        let unseen = service
+            .continue_detail(
+                paused.continuation().expect("paused continuation"),
+                OperationsContinuationMode::Unseen,
+                1,
+            )
+            .expect("inspect unseen detail without consuming it");
+        assert_eq!(unseen.mode(), OperationsContinuationMode::Unseen);
+        assert!(unseen.unseen());
+        assert_eq!(unseen.nodes().len(), 1);
+        assert_eq!(
+            unseen.continuation().expect("unseen continuation").cursor(),
+            &cursor
+        );
+        assert_eq!(
+            unseen
+                .selected_detail()
+                .expect("selected result boundary")
+                .selection,
+            selection
+        );
+
+        let followed = service
+            .continue_detail(
+                unseen.continuation().expect("follow continuation"),
+                OperationsContinuationMode::Follow,
+                1,
+            )
+            .expect("follow durable detail");
+        assert_eq!(followed.mode(), OperationsContinuationMode::Follow);
+        assert!(!followed.unseen());
+        assert!(followed.caught_up());
+        assert_eq!(followed.nodes().len(), 1);
+        assert_ne!(
+            followed
+                .continuation()
+                .expect("advanced continuation")
+                .cursor(),
+            &cursor
+        );
+        assert_eq!(
+            followed
+                .selected_detail()
+                .expect("selected result remains exact")
+                .selection,
+            selection
+        );
+    }
+
+    #[test]
+    fn operations_terminal_continuation_requires_final_caught_up_ack() {
+        let mut fixture = started_operations_fixture();
+        let (cursor, selection) = {
+            let mut service = operations_service(&fixture);
+            let projection = service
+                .read(None, None, OPERATIONS_MAX_PAGE_SIZE)
+                .expect("initial Operations projection");
+            (
+                projection.next_cursor().clone(),
+                projection.nodes()[0].selection.clone(),
+            )
+        };
+        append_durable_operation_event(
+            &mut fixture,
+            "mission.completed",
+            &serde_json::json!({"privateBody": PRIVATE_GOAL}),
+            5,
+        );
+        let mut service = operations_service(&fixture);
+        let continuation = service
+            .start_continuation(&cursor, &selection)
+            .expect("start terminal continuation");
+        let pending = service
+            .continue_detail(&continuation, OperationsContinuationMode::Follow, 1)
+            .expect("terminal envelope");
+        assert!(pending.terminal());
+        assert!(pending.caught_up());
+        assert!(!pending.final_caught_up());
+        assert!(!pending.closed());
+
+        let pending_continuation = pending
+            .continuation()
+            .expect("final-ack continuation")
+            .clone();
+        let required = service
+            .continue_detail(&pending_continuation, OperationsContinuationMode::Follow, 1)
+            .expect_err("terminal continuation must require final ack");
+        assert_eq!(
+            required.code(),
+            OperationsContinuationErrorCode::FinalAckRequired
+        );
+        assert!(required.held_result().is_some());
+
+        let closed = service
+            .acknowledge_final_caught_up(&pending_continuation)
+            .expect("final caught-up acknowledgement");
+        assert!(closed.terminal());
+        assert!(closed.caught_up());
+        assert!(closed.final_caught_up());
+        assert!(closed.closed());
+        assert!(closed.continuation().is_none());
+        assert_eq!(
+            closed
+                .selected_detail()
+                .expect("selected terminal result")
+                .selection,
+            selection
+        );
+
+        let stale = service
+            .acknowledge_final_caught_up(&pending_continuation)
+            .expect_err("closed continuation must not replay");
+        assert_eq!(stale.code(), OperationsContinuationErrorCode::Stale);
+    }
+
+    #[test]
+    fn operations_continuation_reselect_cross_scope_and_lifecycle_invalidate_old_token() {
+        let fixture = started_operations_fixture();
+        let mut service = operations_service(&fixture);
+        let projection = service
+            .read(None, None, OPERATIONS_MAX_PAGE_SIZE)
+            .expect("initial Operations projection");
+        let cursor = projection.next_cursor().clone();
+        let first_selection = projection.nodes()[0].selection.clone();
+        let second_selection = projection.nodes()[1].selection.clone();
+        let old = service
+            .start_continuation(&cursor, &first_selection)
+            .expect("first continuation");
+        let reselected = service
+            .read(Some(&cursor), Some(&second_selection), 1)
+            .expect("reselect current inline node");
+        let stale_after_reselect = service
+            .continue_detail(&old, OperationsContinuationMode::Follow, 1)
+            .expect_err("reselect invalidates old continuation");
+        assert_eq!(
+            stale_after_reselect.code(),
+            OperationsContinuationErrorCode::Stale
+        );
+        assert_eq!(
+            stale_after_reselect
+                .held_result()
+                .expect("held selected result after reselect")
+                .selection,
+            second_selection
+        );
+        assert_eq!(
+            reselected
+                .selected_detail()
+                .expect("reselected detail")
+                .selection,
+            second_selection
+        );
+
+        let mut cross_scope = service
+            .start_continuation(&cursor, &second_selection)
+            .expect("second continuation");
+        cross_scope.scope_digest = sha256("foreign-operations-scope");
+        resign_operations_continuation(&mut cross_scope);
+        let scope_error = service
+            .continue_detail(&cross_scope, OperationsContinuationMode::Follow, 1)
+            .expect_err("cross-scope continuation");
+        assert_eq!(
+            scope_error.code(),
+            OperationsContinuationErrorCode::ScopeMismatch
+        );
+
+        let lifecycle_token = service
+            .start_continuation(&cursor, &second_selection)
+            .expect("lifecycle continuation");
+        service.unmount();
+        let unmounted = service
+            .continue_detail(&lifecycle_token, OperationsContinuationMode::Follow, 1)
+            .expect_err("unmounted continuation");
+        assert_eq!(
+            unmounted.code(),
+            OperationsContinuationErrorCode::NotMounted
+        );
+        service.mount_again().expect("remount Operations service");
+        let after_remount = service
+            .continue_detail(&lifecycle_token, OperationsContinuationMode::Follow, 1)
+            .expect_err("old token after remount");
+        assert_eq!(after_remount.code(), OperationsContinuationErrorCode::Stale);
+
+        let revoked_token = service
+            .start_continuation(&cursor, &second_selection)
+            .expect("revocation continuation");
+        service.revoke();
+        let revoked = service
+            .continue_detail(&revoked_token, OperationsContinuationMode::Follow, 1)
+            .expect_err("revoked continuation");
+        assert_eq!(revoked.code(), OperationsContinuationErrorCode::Revoked);
+    }
+
+    #[test]
+    fn operations_continuation_restart_and_error_redaction_preserve_held_result() {
+        let mut fixture = started_operations_fixture();
+        append_durable_operation_event(
+            &mut fixture,
+            "mission.checkpoint_started",
+            &serde_json::json!({
+                "checkpointId": "continuation-private-checkpoint",
+                "privateBody": PRIVATE_GOAL,
+            }),
+            5,
+        );
+        let old_continuation = {
+            let mut service = operations_service(&fixture);
+            let projection = service
+                .read(None, None, OPERATIONS_MAX_PAGE_SIZE)
+                .expect("projection before continuation");
+            let cursor = projection.next_cursor().clone();
+            let selection = projection.nodes()[0].selection.clone();
+            let old_continuation = service
+                .start_continuation(&cursor, &selection)
+                .expect("continuation before reselect");
+            let reselected = projection.nodes()[1].selection.clone();
+            service
+                .read(Some(&cursor), Some(&reselected), 1)
+                .expect("private reselect");
+            let error = service
+                .continue_detail(&old_continuation, OperationsContinuationMode::Follow, 1)
+                .expect_err("stale continuation error");
+            let serialized = serde_json::to_string(&error).expect("serialized continuation error");
+            let debug = format!("{error:?}");
+            for private in [PRIVATE_GOAL, "continuation-private-checkpoint"] {
+                assert!(!serialized.contains(private));
+                assert!(!debug.contains(private));
+            }
+            assert!(error.held_result().is_some());
+            old_continuation
+        };
+        let DurableMissionFixture {
+            _database_directory: database_directory,
+            _workspace: workspace,
+            database_path,
+            database_key,
+            service,
+            project_id,
+            mission_id,
+        } = fixture;
+        drop(service);
+        let restarted = ApplicationService::new(
+            ProjectStore::open(&database_path, &database_key).expect("reopened SQLCipher store"),
+        );
+        let mut replay = restarted
+            .operations_detail_service(&project_id, &mission_id)
+            .expect("restarted Operations service");
+        let crash_error = replay
+            .continue_detail(&old_continuation, OperationsContinuationMode::Follow, 1)
+            .expect_err("pre-crash continuation must fail after restart");
+        assert_eq!(crash_error.code(), OperationsContinuationErrorCode::Stale);
+        assert!(crash_error.held_result().is_none());
+        drop((database_directory, workspace));
     }
 }
