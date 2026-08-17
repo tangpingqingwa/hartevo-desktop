@@ -156,7 +156,7 @@ jobs:
             --packages '${{ inputs.rust_packages }}'
 
   test-ubuntu-shards:
-    name: ${{ inputs.check_prefix }} / test shard ${{ matrix.shard + 1 }} of 2 (ubuntu-24.04)
+    name: ${{ inputs.check_prefix }} / test shard ${{ matrix.shard }} of 2 (ubuntu-24.04)
     strategy:
       fail-fast: false
       max-parallel: 2

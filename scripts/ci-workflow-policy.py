@@ -213,8 +213,8 @@ RUST_REUSABLE_CHECK_SUFFIXES = (
     "fmt",
     "clippy (ubuntu-24.04)",
     "clippy (macos-15)",
+    "test shard 0 of 2 (ubuntu-24.04)",
     "test shard 1 of 2 (ubuntu-24.04)",
-    "test shard 2 of 2 (ubuntu-24.04)",
     "test (ubuntu-24.04)",
     "test (macos-15)",
 )
@@ -242,6 +242,8 @@ def reusable_rust_scope_plan(
 def validate_reusable_scope_contract(path: Path, text: str) -> None:
     if path.name != "rust-reusable.yml":
         return
+    if re.search(r"\$\{\{[^}\n]*\+[^}\n]*\}\}", text):
+        raise PolicyError(f"{path} contains unsupported arithmetic in a GitHub Actions expression")
     required = (
         "run_rust:\n",
         "run_macos:\n",
@@ -250,7 +252,7 @@ def validate_reusable_scope_contract(path: Path, text: str) -> None:
         "name: ${{ inputs.check_prefix }} / clippy (${{ matrix.os }})",
         "os: [ubuntu-24.04, macos-15]",
         "test-ubuntu-shards:",
-        "name: ${{ inputs.check_prefix }} / test shard ${{ matrix.shard + 1 }} of 2 (ubuntu-24.04)",
+        "name: ${{ inputs.check_prefix }} / test shard ${{ matrix.shard }} of 2 (ubuntu-24.04)",
         "shard: [0, 1]",
         "fail-fast: false",
         "max-parallel: 2",
@@ -991,6 +993,14 @@ jobs:
         "a dynamic shard cardinality",
         scope_fixture.replace("shard: [0, 1]", "shard: " + "$" + "{{ fromJSON('[0,1]') }}"),
     )
+    expect_scope_rejection(
+        "arithmetic in a GitHub Actions expression",
+        scope_fixture.replace(
+            "name: ${{ inputs.check_prefix }} / test shard ${{ matrix.shard }} of 2 (ubuntu-24.04)",
+            "name: ${{ inputs.check_prefix }} / test shard ${{ matrix.shard + 1 }} of 2 (ubuntu-24.04)",
+            1,
+        ),
+    )
     expect_scope_rejection("an aggregate without always", scope_fixture.replace("always()", "success()", 1))
     expect_scope_rejection("an aggregate accepting failure", scope_fixture.replace("!= success", "== failure", 1))
 
@@ -999,8 +1009,8 @@ jobs:
         "PR / Fast Rust / fmt",
         "PR / Fast Rust / clippy (ubuntu-24.04)",
         "PR / Fast Rust / clippy (macos-15)",
+        "PR / Fast Rust / test shard 0 of 2 (ubuntu-24.04)",
         "PR / Fast Rust / test shard 1 of 2 (ubuntu-24.04)",
-        "PR / Fast Rust / test shard 2 of 2 (ubuntu-24.04)",
         "PR / Fast Rust / test (ubuntu-24.04)",
         "PR / Fast Rust / test (macos-15)",
     ]
