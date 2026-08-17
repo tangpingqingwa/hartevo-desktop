@@ -1,7 +1,15 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod observation_evidence_pack;
 mod runtime_text_subscription;
 
+pub use observation_evidence_pack::{
+    ObservationClassification, ObservationEvidencePack, ObservationPackConsumer,
+    ObservationPipelineError, ObservationPipelineRequest, ObservationPipelineResult,
+    ObservationPlanBinding, ObservationProviderRequest, ObservationSourceBinding,
+    ObservationSourceKind, ObservationStopCommand, ObservationStopResult,
+    RuntimeObservationProvider, TypedRuntimeObservation,
+};
 pub use runtime_text_subscription::{
     CatalogMissionExecutionHandle, CatalogMissionExecutionStart,
     RUNTIME_TEXT_SUBSCRIPTION_MAX_PAGE_SIZE, RuntimeTextSubscriptionBatch,

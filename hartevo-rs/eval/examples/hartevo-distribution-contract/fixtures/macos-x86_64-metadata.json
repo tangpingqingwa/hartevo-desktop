@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "hartevo-cargo-metadata-receipt/v1",
+  "target": "x86_64-apple-darwin",
+  "sourceCommit": "1111111111111111111111111111111111111111",
+  "cargoMetadata": {
+    "packages": [
+      {
+        "id": "path+fixture://hartevo-desktop#hartevo-desktop@0.1.0",
+        "name": "hartevo-desktop",
+        "version": "0.1.0",
+        "source": null
+      },
+      {
+        "id": "registry+fixture#mac-safe@1.0.0",
+        "name": "mac-safe",
+        "version": "1.0.0",
+        "source": "registry+https://github.com/rust-lang/crates.io-index"
+      }
+    ],
+    "workspace_members": [
+      "path+fixture://hartevo-desktop#hartevo-desktop@0.1.0"
+    ],
+    "resolve": {
+      "root": null,
+      "nodes": [
+        {
+          "id": "path+fixture://hartevo-desktop#hartevo-desktop@0.1.0",
+          "dependencies": [
+            "registry+fixture#mac-safe@1.0.0"
+          ],
+          "deps": [
+            {
+              "pkg": "registry+fixture#mac-safe@1.0.0",
+              "dep_kinds": [
+                {
+                  "kind": null,
+                  "target": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "registry+fixture#mac-safe@1.0.0",
+          "dependencies": [],
+          "deps": []
+        }
+      ]
+    }
+  }
+}
