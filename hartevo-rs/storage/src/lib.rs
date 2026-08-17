@@ -1,6 +1,7 @@
 //! Local-first, project-scoped persistence with encrypted files and atomic outbox writes.
 
 mod aggregate;
+mod attribution_outcome_adoption_store;
 mod attribution_spine_store;
 mod authorization;
 mod browser_file_store;
@@ -37,6 +38,7 @@ mod work_product_store;
 pub use aggregate::{
     ApplicationSourceKind, ApplicationSourceRevisionFence, AtomicMutation, PendingEvent,
 };
+pub use attribution_spine_store::AttributionSpineStoreExt;
 pub use browser_recipe_store::BrowserRecipeRuntimeState;
 pub use context_material_store::{
     ContextMaterialDescriptor, ContextMaterialStoreError, ContextQuerySnapshot,
