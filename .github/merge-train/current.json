@@ -1,34 +1,34 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "75b91d0157935f23a36fd060059dea4cdd3ed53b",
+  "baseCommit": "7de5f85384321fcd0d0dc09d33daeaba122f9b23",
   "candidateCount": 4,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/scan-05-supply-chain-policy-fence",
-      "headCommit": "8edf9be2123a7b052ae27a39f51e04976f6c211f",
-      "number": 25
+      "headBranch": "codex/platform-attribution-ingestion-attr02",
+      "headCommit": "cf83c482114fe37139482a7615b44a8c26cbd411",
+      "number": 115
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/bw01-browser-service-lifecycle",
-      "headCommit": "d6aa51e988bd040e8b974a324a659d8b154adb65",
-      "number": 144
+      "headBranch": "codex/platform-capability-audit-cap03",
+      "headCommit": "e096d33e1651ebe6a328791b4439220de56db100",
+      "number": 133
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/plugin-provenance-evidence-01",
-      "headCommit": "7035f2c2a5f79b45b110fc2767a19e25e0a3bd0b",
-      "number": 284
+      "headBranch": "codex/platform-creator-work-creator01",
+      "headCommit": "8fe42c836ddce500df2afdfe8ede4a6b9d37a2ad",
+      "number": 107
     },
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/platform-cloud-cell-region-transfer-01",
-      "headCommit": "cb8f426d0aee30a7aa87c641c57aab259e8bfc4e",
-      "number": 285
+      "headBranch": "codex/connectors-commerce-amazon-commerce02",
+      "headCommit": "452040e22346ef17db69ea99c715cd55f7332821",
+      "number": 108
     }
   ],
-  "createdAt": "2026-08-17T02:08:26Z",
+  "createdAt": "2026-08-17T02:45:46Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -39,5 +39,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260817-020744"
+  "trainBranch": "merge-train/20260817-0244"
 }
