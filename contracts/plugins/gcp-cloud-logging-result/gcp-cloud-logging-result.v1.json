@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/gcp-cloud-logging-result/gcp-cloud-logging-result.v1.json",
+  "title": "Hartevo governed Google Cloud Logging evidence-result Layer-1 contract",
+  "schemaVersion": "hartevo.gcp-cloud-logging-result.contract/v1",
+  "contractVersion": "gcp-cloud-logging-result-e1/v1",
+  "pluginVersion": "0.1.0",
+  "evidenceLevel": "E1",
+  "layer": "Layer-1",
+  "service": {
+    "id": "gcp.cloud.logging.result",
+    "version": "1.0.0",
+    "operation": "governed_entries_list_result",
+    "readOnly": true,
+    "liveExecution": false
+  },
+  "provider": {
+    "id": "gcp.cloud.logging.entries-list",
+    "apiVersion": "v2",
+    "officialApi": "entries.list",
+    "allowedOperations": ["entries.list"],
+    "acceptedTransports": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "rawPayloadRetained": false,
+    "resourceMutation": false
+  },
+  "consumer": {
+    "id": "mission.gcp.cloud.logging.result",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false
+  },
+  "scope": {
+    "required": [
+      "organization",
+      "folder",
+      "providerProject",
+      "location",
+      "bucket",
+      "view",
+      "allowlistedLogs",
+      "allowlistedResourceTypes",
+      "filterTemplate",
+      "timeWindow",
+      "project",
+      "mission",
+      "workProduct",
+      "permissionDigest"
+    ],
+    "secret": "opaque_non_serializing_secret_reference_only",
+    "pageToken": "opaque_digest_and_scope_binding_only"
+  },
+  "filterPolicy": {
+    "operation": "entries.list",
+    "mandatoryTimeBound": true,
+    "singleResourceType": true,
+    "singleLog": true,
+    "resourceTypeAllowlist": true,
+    "logAllowlist": true,
+    "arbitraryFilterText": false,
+    "crossScopeFanout": false,
+    "unboundedScan": false,
+    "sinks": false,
+    "exports": false,
+    "mutations": false
+  },
+  "evidence": {
+    "projections": [
+      "PRESENT",
+      "EMPTY",
+      "PARTIAL",
+      "TIMEOUT",
+      "ACCESS_LOST",
+      "PROVIDER_UNKNOWN",
+      "TAMPERED",
+      "REVOKED"
+    ],
+    "bounded": {
+      "pages": 16,
+      "pageSize": 1000,
+      "entries": 4096,
+      "metadataSamples": 64
+    },
+    "retained": [
+      "severity",
+      "resourceType",
+      "logId",
+      "timestamp",
+      "sampledMetadataDigest",
+      "queryDigest",
+      "pageDigest",
+      "resultDigest"
+    ],
+    "rawText": false,
+    "rawJson": false,
+    "rawProto": false,
+    "labels": false,
+    "traceIds": false,
+    "spanIds": false,
+    "pii": false
+  },
+  "registration": {
+    "boundDigests": [
+      "pluginVersion",
+      "contract",
+      "provider",
+      "api",
+      "permission",
+      "scope",
+      "evidence",
+      "secretReference"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "transportClaims": {
+    "fixture": {"connected": false, "native": false, "firstParty": false},
+    "recording": {"connected": false, "native": false, "firstParty": false},
+    "loopback": {"connected": false, "native": false, "firstParty": false},
+    "BLOCKED_ENV": {"connected": false, "native": false, "firstParty": false}
+  },
+  "authority": {
+    "truth": false,
+    "consent": false,
+    "effect": false,
+    "receipt": false,
+    "verification": false,
+    "outcome": false,
+    "connected": false,
+    "nativeEvidence": false,
+    "firstParty": false,
+    "externalWrites": false
+  },
+  "layer2Gaps": [
+    "native_oauth_or_service_account_resolution",
+    "native_https_entries_list",
+    "durable_provider_receipt",
+    "independent_repeat_read_reconciliation",
+    "kernel_consent_effect_receipt_verification_authority",
+    "verified_work_product_adoption"
+  ],
+  "honestNativeGap": "Layer 1 only prepares a typed, bounded, redacted entries.list seam and consumes fixture, recording, loopback, or BLOCKED_ENV responses. It never resolves native credentials, calls Google Cloud, retains raw log payloads, mutates sinks/exports/views/buckets, claims Connected/native/first-party evidence, or adopts Truth, Consent, Effect, Receipt, Verification, Outcome, or a Work Product."
+}

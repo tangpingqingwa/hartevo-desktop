@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/bigquery-outcome/bigquery-outcome.v1.json",
+  "schemaVersion": "hartevo-bigquery-outcome-contract/v1",
+  "contractVersion": "bigquery-outcome-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "bigquery.outcome.result",
+    "version": "1.0.0",
+    "operation": "governed_analytical_read_proposal",
+    "readOnly": true,
+    "liveExecution": false
+  },
+  "provider": {
+    "id": "bigquery.jobs.query-results",
+    "version": "1.0.0",
+    "operations": ["jobs.query", "jobs.getQueryResults"],
+    "acceptedProvenance": ["recording", "fake", "loopback", "blocked_env"],
+    "native": false
+  },
+  "consumer": {
+    "id": "mission.bigquery.result.consumer",
+    "missionBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "googleProject",
+      "location",
+      "dataset",
+      "allowlistedTables",
+      "mission",
+      "workProduct",
+      "workProductRevision",
+      "permissionDigest",
+      "consentDigest"
+    ],
+    "secret": "opaque_secret_reference_only"
+  },
+  "queryPolicy": {
+    "allow": ["parameterized_select", "bounded_limit", "dry_run_proposal"],
+    "deny": [
+      "ddl",
+      "dml",
+      "script",
+      "multi_statement",
+      "unbounded_read",
+      "live_query_execution",
+      "unbounded_bytes"
+    ]
+  },
+  "evidence": {
+    "digests": [
+      "query",
+      "configuration",
+      "schema",
+      "row_set",
+      "job",
+      "result"
+    ],
+    "bounded": ["rows", "pages", "bytes"],
+    "pageToken": "opaque_digest_only",
+    "retries": "bounded"
+  },
+  "registration": {
+    "versionBound": true,
+    "digestBound": true,
+    "scopeBound": true,
+    "reversible": true,
+    "revocable": true
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "durableReceipt": false,
+    "adoptedOutcome": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "consented_live_query_execution",
+    "durable_native_job_receipt",
+    "bounded_polling_against_google",
+    "independent_read_back",
+    "verified_work_product_adoption"
+  ]
+}

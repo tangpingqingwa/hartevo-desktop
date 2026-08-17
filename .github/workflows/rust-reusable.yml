@@ -63,13 +63,17 @@ jobs:
         if: inputs.run_rust
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
+          enableCrossOsArchive: false
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             ~/.rustup/toolchains/1.95.0-*
             ~/.rustup/update
-            target/ci-cargo
-          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}
+          key: hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-fmt-deps-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-fmt-deps-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}-
+            hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-fmt-deps-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-
+            hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-fmt-deps-all-targets-all-features-
       - name: Install the locked Rust components
         if: inputs.run_rust
         run: rustup component add clippy rustfmt rust-src --toolchain 1.95.0
@@ -129,13 +133,18 @@ jobs:
         if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
+          enableCrossOsArchive: false
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             ~/.rustup/toolchains/1.95.0-*
             ~/.rustup/update
             target/ci-cargo
-          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}
+          key: hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-clippy-target-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-clippy-target-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}-
+            hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-clippy-target-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-
+            hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-clippy-target-all-targets-all-features-
       - name: Install the locked Rust components
         if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         run: rustup component add clippy rustfmt rust-src --toolchain 1.95.0
@@ -195,13 +204,18 @@ jobs:
         if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
+          enableCrossOsArchive: false
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             ~/.rustup/toolchains/1.95.0-*
             ~/.rustup/update
             target/ci-cargo
-          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}
+          key: hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-test-target-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-test-target-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-${{ inputs.full_workspace }}-
+            hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-test-target-all-targets-all-features-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}-
+            hartevo-rust-cache-v2-${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-test-target-all-targets-all-features-
       - name: Install the locked Rust components
         if: inputs.run_rust && (matrix.os == 'ubuntu-24.04' || inputs.run_macos)
         run: rustup component add clippy rustfmt rust-src --toolchain 1.95.0
