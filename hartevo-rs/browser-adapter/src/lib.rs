@@ -29,25 +29,28 @@ mod provider;
 mod real_chromium_signed_recipe_test;
 mod recipe;
 #[cfg(unix)]
+mod recipe_resume;
+#[cfg(unix)]
 mod scanner;
 mod service;
 mod workspace;
 
 pub use action::{
-    BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionRisk, BrowserActionSurface,
-    BrowserEffectBinding, BrowserElementRef, BrowserPromptRisk, BrowserTextInput, SemanticSnapshot,
+    BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionResult, BrowserActionRisk,
+    BrowserActionSurface, BrowserBatchReceipt, BrowserBatchReceiptState, BrowserEffectBinding,
+    BrowserElementRef, BrowserPromptRisk, BrowserTextInput, SemanticSnapshot,
 };
 #[cfg(unix)]
 pub use chromium_host::{
     ChromiumClickDispatchEvidence, ChromiumCredentialStoreMode, ChromiumFileUploadDispatchEvidence,
     ChromiumHostHealth, ChromiumHostShutdown, ChromiumLaunchConfig,
     ChromiumTextInputDispatchEvidence, ManagedChromiumClickExecutor,
-    ManagedChromiumFileUploadExecutor, ManagedChromiumHost, ManagedChromiumTextInputExecutor,
+    ManagedChromiumFileUploadExecutor, ManagedChromiumHost, ManagedChromiumRecipeClickStepExecutor,
+    ManagedChromiumTextInputExecutor,
 };
 pub use consumer::{MissionBrowserWorkspaceConsumer, MissionBrowserWorkspaceState};
 pub use fake_host::{
-    BrowserActionResult, BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost,
-    FakeBrowserPage,
+    BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost, FakeBrowserPage,
 };
 pub use file_broker::{
     BrowserFileGrant, BrowserFileGrantState, BrowserFileType, FileBroker, FileBrokerReconciliation,
@@ -84,6 +87,8 @@ pub use recipe::{
     BrowserRecipeResolvedAction, BrowserRecipeStep, BrowserRecipeStepBinding,
     BrowserRecipeTrustSnapshot, BrowserRecipeTrustStore, TrustedBrowserRecipeKey,
 };
+#[cfg(unix)]
+pub use recipe_resume::{BrowserRecipeResumeContext, BrowserRecipeResumeCursor};
 #[cfg(unix)]
 pub use scanner::{ProductionFileScanner, ScannerProcessLimits, ScannerReleasePin};
 pub use service::{
@@ -134,7 +139,9 @@ pub enum BrowserError {
     InvalidAction,
     #[error("browser action batch is malformed or expired")]
     InvalidBatch,
-    #[error("browser batch cursor or receipt is malformed, stale, or already terminal")]
+    #[error(
+        "browser batch cursor or receipt is malformed, stale, terminal, or does not acknowledge an exact digest-bound action prefix"
+    )]
     InvalidBatchReceipt,
     #[error("potential browser external write requires the Effect Broker")]
     EffectBrokerRequired,

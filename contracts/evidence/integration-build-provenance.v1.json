@@ -4,11 +4,11 @@
   "authority": "INTEGRATION_BUILD_PROVENANCE_ONLY",
   "currentInstance": {
     "manifestPath": "artifacts/evidence/integration-build/7724c5ca06425262508136ab610e63df534df939/manifest.json",
-    "manifestSha256": "099c12bf4b0221394f8c92d4c9f1d36a26a319ad15478a963b590138bad150a0",
-    "manifestBytes": 3820,
+    "manifestSha256": "cc99aad4523de6de992cae57696005648d27618d49f7b067146e2fe09670b0c1",
+    "manifestBytes": 9739,
     "rawArtifactPath": "artifacts/evidence/integration-build/7724c5ca06425262508136ab610e63df534df939/github-pr-ci-candidate.raw.json",
-    "rawArtifactSha256": "214e8af3c9a21c4be8d2023d775f20da3333771d732229e336a5df694f147ca1",
-    "rawArtifactBytes": 3277
+    "rawArtifactSha256": "9fdb0520035ad9ab8c8991928bdd94bbbe59f8f25790f60637e2442fe301f1e8",
+    "rawArtifactBytes": 9205
   },
   "historicalInstance": {
     "manifestPath": "artifacts/evidence/integration-build/5991c80d2bf7b072f45621b03f55a7cf4b7e555f/manifest.json",
@@ -20,12 +20,12 @@
   },
   "currentBaseline": {
     "ref": "origin/bootstrap/macos-r0",
-    "commit": "114abe2bc04d77d1eca4efea64092b37a0b0fb06",
-    "tree": "6a7914fcd147643b6957b92a3ac552650866e4ef",
+    "commit": "6bee5f69eee691f30f37b443a18b63ec27d38414",
+    "tree": "6c1620b3d9f3ba22928d466a0b6454975912846f",
     "requireExactCheckout": true,
-    "artifactStatus": "CURRENT_CANDIDATE_PENDING_CI",
+    "artifactStatus": "CURRENT_CANDIDATE_DRAFT_CI_GREEN",
     "historicalArtifactHead": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
-    "staleReason": "The tracked 5991c80 manifest remains historical; the current PR #20 candidate has no completed CI conclusion, so no old run, fixture, or BLOCKED_ENV receipt is promoted."
+    "staleReason": "The tracked 5991c80 manifest remains historical. PR #20 head c8731260 has a live completed 8-job success run but remains Draft; Bootstrap run 32023256203 on protected 6bee5f69 completed 14/14 successfully. Neither run proves native visual/accessibility/process-restart or grants Release/E-level authority."
   },
   "candidatePolicy": {
     "pullRequest": {
@@ -34,23 +34,29 @@
       "merged": false,
       "draft": true,
       "baseRef": "bootstrap/macos-r0",
-      "baseCommit": "114abe2bc04d77d1eca4efea64092b37a0b0fb06",
+      "baseCommit": "391da8885196c5b6bc6fb22b256fe2f9f424d65a",
       "headRef": "codex/evidence-integration-receipt-ev04",
-      "headCommit": "7724c5ca06425262508136ab610e63df534df939",
-      "headTree": "758c38b956b59b88fb478df46ae37017dda4bc9d",
+      "headCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
+      "headTree": "3fe9eeb5f98c5008623a7e89dac4d497c9167fc5",
       "mergeCommit": null
     },
     "ci": {
       "provider": "github-actions",
       "workflowId": 333267489,
-      "workflowName": "ci",
+      "workflowName": "PR / Fast CI",
       "workflowPath": ".github/workflows/ci.yml",
       "event": "pull_request",
       "requiredStatus": "completed",
       "requiredConclusion": "success",
       "requiredJobs": [
-        "PostgreSQL 18 Cell contract",
-        "Rust workspace"
+        "PR / Scope plan",
+        "PR / Workflow policy",
+        "PR / Fast Rust matrix / PR / Fast Rust / fmt",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
+        "PR / Result taxonomy"
       ]
     },
     "protectedIntegrationRun": {
@@ -59,25 +65,32 @@
       "workflowName": "Integration / Bootstrap CI",
       "workflowPath": ".github/workflows/integration.yml",
       "event": "push",
-      "runId": 31782232735,
+      "runId": 32023256203,
       "runAttempt": 1,
-      "headCommit": "114abe2bc04d77d1eca4efea64092b37a0b0fb06",
-      "status": "queued",
-      "conclusion": null,
+      "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414",
+      "status": "completed",
+      "conclusion": "success",
       "requiredJobs": [
+        "Integration / Reviewed gate",
+        "Integration / PostgreSQL 18 Cell",
         "Integration / Catalog and evidence",
         "Integration / Dependency and SBOM",
-        "Integration / Dioxus build and receipt",
-        "Integration / Full Rust matrix",
         "Integration / OpenInterpreter contract",
-        "Integration / PostgreSQL 18 Cell",
+        "Integration / Dioxus build and receipt",
+        "Integration / Full Rust matrix / Integration / Full Rust / test shard 1 of 2 (ubuntu-24.04)",
+        "Integration / Full Rust matrix / Integration / Full Rust / clippy (ubuntu-24.04)",
+        "Integration / Full Rust matrix / Integration / Full Rust / clippy (macos-15)",
+        "Integration / Full Rust matrix / Integration / Full Rust / test (macos-15)",
+        "Integration / Full Rust matrix / Integration / Full Rust / fmt",
+        "Integration / Full Rust matrix / Integration / Full Rust / test shard 0 of 2 (ubuntu-24.04)",
+        "Integration / Full Rust matrix / Integration / Full Rust / test (ubuntu-24.04)",
         "Integration / Result taxonomy"
       ]
     }
   },
   "nativeEvidencePolicy": {
     "path": "contracts/evidence/current-evidence-truth.v1.json",
-    "sourceCommit": "7724c5ca06425262508136ab610e63df534df939",
+    "sourceCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414",
     "sha256": "f5a5f6486b865311a79f1a6f162ee8c9fc3a7e95938904d487d3e800536ba30e",
     "bytes": 5596,
     "status": "NOT_PROVEN",
@@ -95,16 +108,16 @@
       "kind": "EVIDENCE_QUERY",
       "path": "hartevo-rs/eval/src/lib.rs",
       "symbol": "catalog_snapshot",
-      "sourceCommit": "7724c5ca06425262508136ab610e63df534df939",
-      "sha256": "ccbe9a6644acd017bf270d289f3d7e10a6a0652a517342958c57d3ebb842377e",
-      "bytes": 48982
+      "sourceCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
+      "sha256": "13333d80733a231df9ea5b1b25500172f8b63c4b9d097a1c2715d28df8fbc8bf",
+      "bytes": 49107
     },
     "provider": {
       "id": "evidence-producer",
       "kind": "EVIDENCE_PRODUCER",
       "path": "hartevo-rs/catalog/src/evidence.rs",
       "symbol": "wave_zero_baseline",
-      "sourceCommit": "7724c5ca06425262508136ab610e63df534df939",
+      "sourceCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
       "sha256": "6c64c2fa18a011c4b6d856f4f40c238b210a46d88c1e585d6a7ae6ffeece4c37",
       "bytes": 102229
     },
@@ -113,7 +126,7 @@
       "kind": "RELEASE_GATE_CONSUMER",
       "path": "hartevo-rs/catalog/src/evidence.rs",
       "symbol": "validate_fail_closed",
-      "sourceCommit": "7724c5ca06425262508136ab610e63df534df939",
+      "sourceCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
       "sha256": "6c64c2fa18a011c4b6d856f4f40c238b210a46d88c1e585d6a7ae6ffeece4c37",
       "bytes": 102229
     }

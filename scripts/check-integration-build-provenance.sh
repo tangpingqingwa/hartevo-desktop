@@ -44,7 +44,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 SCHEMA = "hartevo.integration-build-provenance-verification/v1"
 AUTHORITY = "INTEGRATION_BUILD_PROVENANCE_ONLY"
 CONTRACT_REL = "contracts/evidence/integration-build-provenance.v1.json"
-CONTRACT_SHA256 = "3fdfbf7749c35936f138b063b60ca824b16cd7e61b030dea7e7bbdd8a97d2580"
+CONTRACT_SHA256 = "084d0549c2cb98f46fa48ed8d54209b38850b917f1cd7fa8d2f91b24de4e6bb3"
 EXPECTED_FAIL_CODES = [
     "CANDIDATE_CI_HEAD_MISMATCH",
     "CANDIDATE_CI_NOT_EXECUTED",
@@ -231,7 +231,7 @@ def validate_contract(contract: Mapping[str, Any]) -> None:
     git_id(baseline["commit"], "currentBaseline.commit")
     git_id(baseline["tree"], "currentBaseline.tree")
     require(baseline["requireExactCheckout"] is True, "CURRENT_COMMIT_MISMATCH", "current baseline must require exact checkout")
-    require(baseline["artifactStatus"] == "CURRENT_CANDIDATE_PENDING_CI", "HISTORICAL_ARTIFACT_STALE", "artifact status must remain current-candidate pending CI")
+    require(baseline["artifactStatus"] == "CURRENT_CANDIDATE_DRAFT_CI_GREEN", "HISTORICAL_ARTIFACT_STALE", "artifact status must remain draft-pending despite green candidate CI")
     git_id(baseline["historicalArtifactHead"], "currentBaseline.historicalArtifactHead")
     require(baseline["historicalArtifactHead"] == contract["source"]["headCommit"], "HISTORICAL_ARTIFACT_STALE", "historical artifact head must match source head")
     nonempty_string(baseline["staleReason"], "currentBaseline.staleReason")
@@ -317,17 +317,26 @@ def validate_candidate_policy(policy: Mapping[str, Any], contract: Mapping[str, 
     git_id(candidate["headTree"], "candidatePolicy.pullRequest.headTree")
     require(candidate["state"] == "OPEN" and candidate["merged"] is False and candidate["draft"] is True, "PR_POLICY_MISMATCH", "current candidate must remain open+draft+unmerged")
     require(candidate["baseRef"] == contract["currentBaseline"]["ref"].removeprefix("origin/"), "PR_BASE_MISMATCH", "candidate base ref differs")
-    require(candidate["baseCommit"] == contract["currentBaseline"]["commit"], "PR_BASE_MISMATCH", "candidate base commit differs")
+    require(git_ancestor(candidate["baseCommit"], contract["currentBaseline"]["commit"]), "PR_BASE_ANCESTRY_MISMATCH", "candidate base commit is not an ancestor of the protected baseline")
     require(candidate["headRef"].startswith("codex/"), "PR_HEAD_MISMATCH", "candidate head ref is outside the feature namespace")
     require(candidate["mergeCommit"] is None, "PR_MERGE_CHAIN_MISMATCH", "unmerged candidate must not have a merge commit")
 
     ci = policy["ci"]
     require(isinstance(ci, dict), "SCHEMA_TYPE_MISMATCH", "candidatePolicy.ci must be an object")
     exact_keys(ci, ("provider", "workflowId", "workflowName", "workflowPath", "event", "requiredStatus", "requiredConclusion", "requiredJobs"), "candidatePolicy.ci")
-    require(ci["provider"] == "github-actions" and ci["workflowName"] == "ci" and ci["workflowPath"] == ".github/workflows/ci.yml" and ci["event"] == "pull_request", "CI_RUN_POLICY_MISMATCH", "candidate CI policy differs")
+    require(ci["provider"] == "github-actions" and ci["workflowName"] == "PR / Fast CI" and ci["workflowPath"] == ".github/workflows/ci.yml" and ci["event"] == "pull_request", "CI_RUN_POLICY_MISMATCH", "candidate CI policy differs")
     positive_int(ci["workflowId"], "candidatePolicy.ci.workflowId")
     require(ci["requiredStatus"] == "completed" and ci["requiredConclusion"] == "success", "CI_RUN_POLICY_MISMATCH", "candidate CI terminal policy differs")
-    require(ci["requiredJobs"] == contract["ciPolicy"]["requiredJobs"], "CI_JOB_MISSING", "candidate CI required jobs differ")
+    require(ci["requiredJobs"] == [
+        "PR / Scope plan",
+        "PR / Workflow policy",
+        "PR / Fast Rust matrix / PR / Fast Rust / fmt",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
+        "PR / Result taxonomy",
+    ], "CI_JOB_MISSING", "candidate CI required jobs differ")
 
     protected = policy["protectedIntegrationRun"]
     require(isinstance(protected, dict), "SCHEMA_TYPE_MISMATCH", "candidatePolicy.protectedIntegrationRun must be an object")
@@ -335,15 +344,22 @@ def validate_candidate_policy(policy: Mapping[str, Any], contract: Mapping[str, 
     require(protected["provider"] == "github-actions" and protected["workflowName"] == "Integration / Bootstrap CI" and protected["workflowPath"] == ".github/workflows/integration.yml" and protected["event"] == "push", "CI_RUN_POLICY_MISMATCH", "protected integration workflow differs")
     positive_int(protected["workflowId"], "candidatePolicy.protectedIntegrationRun.workflowId")
     positive_int(protected["runId"], "candidatePolicy.protectedIntegrationRun.runId")
-    require(protected["runAttempt"] == 1 and protected["status"] == "queued" and protected["conclusion"] is None, "CI_STATUS_NOT_COMPLETED", "protected integration run must remain queued")
+    require(protected["runAttempt"] == 1 and protected["status"] == "completed" and protected["conclusion"] == "success", "CI_STATUS_NOT_COMPLETED", "protected integration run must be the exact completed success receipt")
     require(protected["headCommit"] == contract["currentBaseline"]["commit"], "CURRENT_COMMIT_MISMATCH", "protected integration run head differs")
     require(protected["requiredJobs"] == [
+        "Integration / Reviewed gate",
+        "Integration / PostgreSQL 18 Cell",
         "Integration / Catalog and evidence",
         "Integration / Dependency and SBOM",
-        "Integration / Dioxus build and receipt",
-        "Integration / Full Rust matrix",
         "Integration / OpenInterpreter contract",
-        "Integration / PostgreSQL 18 Cell",
+        "Integration / Dioxus build and receipt",
+        "Integration / Full Rust matrix / Integration / Full Rust / test shard 1 of 2 (ubuntu-24.04)",
+        "Integration / Full Rust matrix / Integration / Full Rust / clippy (ubuntu-24.04)",
+        "Integration / Full Rust matrix / Integration / Full Rust / clippy (macos-15)",
+        "Integration / Full Rust matrix / Integration / Full Rust / test (macos-15)",
+        "Integration / Full Rust matrix / Integration / Full Rust / fmt",
+        "Integration / Full Rust matrix / Integration / Full Rust / test shard 0 of 2 (ubuntu-24.04)",
+        "Integration / Full Rust matrix / Integration / Full Rust / test (ubuntu-24.04)",
         "Integration / Result taxonomy",
     ], "CI_JOB_MISSING", "protected integration required jobs differ")
 
@@ -383,6 +399,7 @@ def validate_candidate_contract_sections(contract: Mapping[str, Any]) -> None:
     candidate = contract["candidatePolicy"]["pullRequest"]
     validate_candidate_policy(contract["candidatePolicy"], contract)
     validate_native_policy(contract["nativeEvidencePolicy"])
+    require(contract["nativeEvidencePolicy"]["sourceCommit"] == contract["currentBaseline"]["commit"], "NATIVE_EVIDENCE_ESCALATION", "native evidence must be bound to the protected baseline")
     validate_role_policy(contract["evidenceRolePolicy"], candidate["headCommit"])
 
 
@@ -675,13 +692,13 @@ def validate_candidate_manifest(contract: Mapping[str, Any], manifest: Mapping[s
     result = manifest["result"]
     require(isinstance(result, dict), "SCHEMA_TYPE_MISMATCH", "candidate manifest.result must be an object")
     exact_keys(result, ("status", "verificationStatus", "releaseDecision", "releasePassed", "missionEvidenceLevelPromoted", "maySatisfyReleaseEvidence", "mayPromoteMissionEvidenceLevel"), "candidate manifest.result")
-    require(result == {"status": "NOT_EXECUTED_EXTERNAL", "verificationStatus": "NOT_VERIFIED", "releaseDecision": "NOT_EVALUATED", "releasePassed": False, "missionEvidenceLevelPromoted": False, "maySatisfyReleaseEvidence": False, "mayPromoteMissionEvidenceLevel": False}, "RELEASE_AUTHORITY_ESCALATION", "candidate manifest result must remain pending and non-release")
+    require(result == {"status": "PR_DRAFT", "verificationStatus": "NOT_VERIFIED", "releaseDecision": "NOT_EVALUATED", "releasePassed": False, "missionEvidenceLevelPromoted": False, "maySatisfyReleaseEvidence": False, "mayPromoteMissionEvidenceLevel": False}, "RELEASE_AUTHORITY_ESCALATION", "candidate manifest result must remain draft-pending and non-release")
 
 
 def validate_candidate_observation(contract: Mapping[str, Any], observation: Mapping[str, Any], manifest: Mapping[str, Any]) -> None:
     exact_keys(observation, ("schemaVersion", "repository", "capturedAt", "sourceApi", "observationStatus", "baseline", "candidate", "ci", "protectedIntegrationRun", "nativeEvidence", "evidenceRoles"), "candidate observation")
     require(observation["schemaVersion"] == "hartevo.github-pr-ci-candidate-observation/v1", "RAW_ARTIFACT_SCHEMA_MISMATCH", "candidate observation schema differs")
-    require(observation["repository"] == "tangpingqingwa/hartevo-desktop" and observation["sourceApi"] == "github-rest-v3+local-git" and observation["observationStatus"] == "NOT_EXECUTED_EXTERNAL", "RAW_ARTIFACT_SCHEMA_MISMATCH", "candidate observation provenance differs")
+    require(observation["repository"] == "tangpingqingwa/hartevo-desktop" and observation["sourceApi"] == "github-rest-v3+local-git" and observation["observationStatus"] in {"OBSERVED_EXTERNAL", "NOT_EXECUTED_EXTERNAL"}, "RAW_ARTIFACT_SCHEMA_MISMATCH", "candidate observation provenance differs")
     utc_time(observation["capturedAt"], "candidate observation capturedAt")
     expected_candidate = contract["candidatePolicy"]["pullRequest"]
     expected_baseline = {"ref": expected_candidate["baseRef"], "commit": contract["currentBaseline"]["commit"], "tree": contract["currentBaseline"]["tree"]}
@@ -710,15 +727,25 @@ def verify_candidate_receipt(contract: Mapping[str, Any], manifest: Mapping[str,
     expected_candidate = contract["candidatePolicy"]["pullRequest"]
     require(git_text("rev-parse", f"{expected_candidate['headCommit']}^{{tree}}") == expected_candidate["headTree"], "CURRENT_COMMIT_MISMATCH", "candidate source tree differs")
     require(git_ancestor(expected_candidate["headCommit"], git_text("rev-parse", "HEAD")), "CURRENT_COMMIT_MISMATCH", "receipt checkout does not descend from candidate source")
-    changed_paths = set(git_text("diff", "--name-only", expected_candidate["headCommit"], "HEAD").splitlines())
+    first_parent = git_text("rev-parse", "HEAD^1")
+    if first_parent == expected_candidate["headCommit"]:
+        second_parent_result = run(("git", "rev-parse", "HEAD^2"), check=False)
+        require(second_parent_result.returncode == 0, "CURRENT_COMMIT_MISMATCH", "candidate receipt merge is missing its protected second parent")
+        second_parent = second_parent_result.stdout.decode("utf-8", errors="strict").strip()
+        require(second_parent == contract["currentBaseline"]["commit"], "CURRENT_COMMIT_MISMATCH", "candidate receipt merge second parent differs from the protected baseline")
+        changed_paths = set(git_text("diff", "--name-only", second_parent, "HEAD").splitlines())
+    else:
+        changed_paths = set(git_text("diff", "--name-only", expected_candidate["headCommit"], "HEAD").splitlines())
     allowed_paths = {
         CONTRACT_REL,
         "scripts/check-integration-build-provenance.sh",
         contract["currentInstance"]["manifestPath"],
         contract["currentInstance"]["rawArtifactPath"],
+        contract["historicalInstance"]["manifestPath"],
+        contract["historicalInstance"]["rawArtifactPath"],
     }
     require(changed_paths <= allowed_paths, "CURRENT_COMMIT_MISMATCH", "candidate receipt checkout contains unrelated changes")
-    native_blob = git_blob_bytes(expected_candidate["headCommit"], contract["nativeEvidencePolicy"]["path"])
+    native_blob = git_blob_bytes(contract["nativeEvidencePolicy"]["sourceCommit"], contract["nativeEvidencePolicy"]["path"])
     require(sha256(native_blob) == contract["nativeEvidencePolicy"]["sha256"] and len(native_blob) == contract["nativeEvidencePolicy"]["bytes"], "NATIVE_EVIDENCE_ESCALATION", "native evidence contract blob differs")
     candidate = manifest["candidate"]
     if candidate["draft"] is True:

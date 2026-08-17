@@ -1,13 +1,13 @@
 {
   "schemaVersion": "hartevo.github-pr-ci-candidate-observation/v1",
   "repository": "tangpingqingwa/hartevo-desktop",
-  "capturedAt": "2026-08-14T09:00:36Z",
+  "capturedAt": "2026-08-17T11:34:36Z",
   "sourceApi": "github-rest-v3+local-git",
-  "observationStatus": "NOT_EXECUTED_EXTERNAL",
+  "observationStatus": "OBSERVED_EXTERNAL",
   "baseline": {
     "ref": "bootstrap/macos-r0",
-    "commit": "114abe2bc04d77d1eca4efea64092b37a0b0fb06",
-    "tree": "6a7914fcd147643b6957b92a3ac552650866e4ef"
+    "commit": "6bee5f69eee691f30f37b443a18b63ec27d38414",
+    "tree": "6c1620b3d9f3ba22928d466a0b6454975912846f"
   },
   "candidate": {
     "number": 20,
@@ -15,25 +15,90 @@
     "merged": false,
     "draft": true,
     "baseRef": "bootstrap/macos-r0",
-    "baseCommit": "114abe2bc04d77d1eca4efea64092b37a0b0fb06",
+    "baseCommit": "391da8885196c5b6bc6fb22b256fe2f9f424d65a",
     "headRef": "codex/evidence-integration-receipt-ev04",
-    "headCommit": "7724c5ca06425262508136ab610e63df534df939",
-    "headTree": "758c38b956b59b88fb478df46ae37017dda4bc9d",
+    "headCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
+    "headTree": "3fe9eeb5f98c5008623a7e89dac4d497c9167fc5",
     "mergeCommit": null
   },
   "ci": {
     "provider": "github-actions",
     "workflowId": 333267489,
-    "workflowName": "ci",
+    "workflowName": "PR / Fast CI",
     "workflowPath": ".github/workflows/ci.yml",
     "event": "pull_request",
-    "status": "NOT_EXECUTED_EXTERNAL",
-    "conclusion": "NOT_RUN",
-    "runId": null,
-    "runAttempt": null,
+    "status": "completed",
+    "conclusion": "success",
+    "runId": 31997701523,
+    "runAttempt": 1,
     "headBranch": "codex/evidence-integration-receipt-ev04",
-    "headCommit": "7724c5ca06425262508136ab610e63df534df939",
-    "jobs": []
+    "headCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
+    "jobs": [
+      {
+        "id": 95292240639,
+        "name": "PR / Scope plan",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "c87312600dc7a005347db5d71c4515e6cab04baf"
+      },
+      {
+        "id": 95292240668,
+        "name": "PR / Workflow policy",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "c87312600dc7a005347db5d71c4515e6cab04baf"
+      },
+      {
+        "id": 95292270613,
+        "name": "PR / Fast Rust matrix / PR / Fast Rust / fmt",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "c87312600dc7a005347db5d71c4515e6cab04baf"
+      },
+      {
+        "id": 95292270627,
+        "name": "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "c87312600dc7a005347db5d71c4515e6cab04baf"
+      },
+      {
+        "id": 95292270666,
+        "name": "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "c87312600dc7a005347db5d71c4515e6cab04baf"
+      },
+      {
+        "id": 95292270680,
+        "name": "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "c87312600dc7a005347db5d71c4515e6cab04baf"
+      },
+      {
+        "id": 95292270681,
+        "name": "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "c87312600dc7a005347db5d71c4515e6cab04baf"
+      },
+      {
+        "id": 95296846562,
+        "name": "PR / Result taxonomy",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "c87312600dc7a005347db5d71c4515e6cab04baf"
+      }
+    ]
   },
   "protectedIntegrationRun": {
     "provider": "github-actions",
@@ -41,16 +106,129 @@
     "workflowName": "Integration / Bootstrap CI",
     "workflowPath": ".github/workflows/integration.yml",
     "event": "push",
-    "runId": 31782232735,
+    "runId": 32023256203,
     "runAttempt": 1,
-    "headCommit": "114abe2bc04d77d1eca4efea64092b37a0b0fb06",
-    "status": "queued",
-    "conclusion": null,
-    "jobs": []
+    "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414",
+    "status": "completed",
+    "conclusion": "success",
+    "jobs": [
+      {
+        "id": 95367166535,
+        "name": "Integration / Reviewed gate",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95367190256,
+        "name": "Integration / PostgreSQL 18 Cell",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95367190302,
+        "name": "Integration / Catalog and evidence",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95367190331,
+        "name": "Integration / Dependency and SBOM",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95367190361,
+        "name": "Integration / OpenInterpreter contract",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95367190407,
+        "name": "Integration / Dioxus build and receipt",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95367190892,
+        "name": "Integration / Full Rust matrix / Integration / Full Rust / test shard 1 of 2 (ubuntu-24.04)",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95367190895,
+        "name": "Integration / Full Rust matrix / Integration / Full Rust / clippy (ubuntu-24.04)",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95367190917,
+        "name": "Integration / Full Rust matrix / Integration / Full Rust / clippy (macos-15)",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95367190976,
+        "name": "Integration / Full Rust matrix / Integration / Full Rust / test (macos-15)",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95367190986,
+        "name": "Integration / Full Rust matrix / Integration / Full Rust / fmt",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95367191069,
+        "name": "Integration / Full Rust matrix / Integration / Full Rust / test shard 0 of 2 (ubuntu-24.04)",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95372429360,
+        "name": "Integration / Full Rust matrix / Integration / Full Rust / test (ubuntu-24.04)",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      },
+      {
+        "id": 95372454073,
+        "name": "Integration / Result taxonomy",
+        "status": "completed",
+        "conclusion": "success",
+        "runAttempt": 1,
+        "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414"
+      }
+    ]
   },
   "nativeEvidence": {
     "path": "contracts/evidence/current-evidence-truth.v1.json",
-    "sourceCommit": "7724c5ca06425262508136ab610e63df534df939",
+    "sourceCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414",
     "sha256": "f5a5f6486b865311a79f1a6f162ee8c9fc3a7e95938904d487d3e800536ba30e",
     "bytes": 5596,
     "status": "NOT_PROVEN",
@@ -68,16 +246,16 @@
       "kind": "EVIDENCE_QUERY",
       "path": "hartevo-rs/eval/src/lib.rs",
       "symbol": "catalog_snapshot",
-      "sourceCommit": "7724c5ca06425262508136ab610e63df534df939",
-      "sha256": "ccbe9a6644acd017bf270d289f3d7e10a6a0652a517342958c57d3ebb842377e",
-      "bytes": 48982
+      "sourceCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
+      "sha256": "13333d80733a231df9ea5b1b25500172f8b63c4b9d097a1c2715d28df8fbc8bf",
+      "bytes": 49107
     },
     "provider": {
       "id": "evidence-producer",
       "kind": "EVIDENCE_PRODUCER",
       "path": "hartevo-rs/catalog/src/evidence.rs",
       "symbol": "wave_zero_baseline",
-      "sourceCommit": "7724c5ca06425262508136ab610e63df534df939",
+      "sourceCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
       "sha256": "6c64c2fa18a011c4b6d856f4f40c238b210a46d88c1e585d6a7ae6ffeece4c37",
       "bytes": 102229
     },
@@ -86,7 +264,7 @@
       "kind": "RELEASE_GATE_CONSUMER",
       "path": "hartevo-rs/catalog/src/evidence.rs",
       "symbol": "validate_fail_closed",
-      "sourceCommit": "7724c5ca06425262508136ab610e63df534df939",
+      "sourceCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
       "sha256": "6c64c2fa18a011c4b6d856f4f40c238b210a46d88c1e585d6a7ae6ffeece4c37",
       "bytes": 102229
     }
