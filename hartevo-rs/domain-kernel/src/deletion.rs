@@ -160,6 +160,18 @@ pub enum DeletionPropagationStatus {
     NotApplicable,
     BlockedRetention,
     Failed,
+    DeadLetter,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionRequestStatus {
+    Requested,
+    Propagating,
+    PartiallyApplied,
+    Blocked,
+    DeadLettered,
+    Completed,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -168,6 +180,12 @@ pub struct DeletionSurfaceState {
     pub status: DeletionPropagationStatus,
     pub evidence_digest: Option<String>,
     pub error_code: Option<String>,
+    #[serde(default)]
+    pub matched_items: u64,
+    #[serde(default)]
+    pub deleted_items: u64,
+    #[serde(default)]
+    pub residual_items: Option<u64>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -312,17 +330,50 @@ impl DeletionSurfaceState {
             .is_none_or(|digest| is_sha256(digest));
         let shape_valid = match self.status {
             DeletionPropagationStatus::Pending => {
-                self.evidence_digest.is_none() && self.error_code.is_none()
+                self.evidence_digest.is_none()
+                    && self.error_code.is_none()
+                    && self.matched_items == 0
+                    && self.deleted_items == 0
+                    && self.residual_items.is_none()
             }
-            DeletionPropagationStatus::Applied | DeletionPropagationStatus::NotApplicable => {
-                self.evidence_digest.is_some() && self.error_code.is_none()
+            DeletionPropagationStatus::Applied => {
+                self.evidence_digest.is_some()
+                    && self.error_code.is_none()
+                    && self.deleted_items == self.matched_items
+                    && self.residual_items.is_none_or(|residual| residual == 0)
             }
-            DeletionPropagationStatus::BlockedRetention | DeletionPropagationStatus::Failed => self
-                .error_code
-                .as_ref()
-                .is_some_and(|code| !code.trim().is_empty()),
+            DeletionPropagationStatus::NotApplicable => {
+                self.evidence_digest.is_some()
+                    && self.error_code.is_none()
+                    && self.matched_items == 0
+                    && self.deleted_items == 0
+                    && self.residual_items.is_none_or(|residual| residual == 0)
+            }
+            DeletionPropagationStatus::BlockedRetention
+            | DeletionPropagationStatus::Failed
+            | DeletionPropagationStatus::DeadLetter => {
+                self.error_code
+                    .as_ref()
+                    .is_some_and(|code| !code.trim().is_empty() && code.len() <= 128)
+                    && self.matched_items == 0
+                    && self.deleted_items == 0
+            }
         };
-        if !evidence_valid || !shape_valid {
+        let counts_valid = match self.status {
+            DeletionPropagationStatus::Applied | DeletionPropagationStatus::NotApplicable => {
+                self.deleted_items <= self.matched_items
+                    && self.residual_items.is_none_or(|residual| {
+                        self.deleted_items
+                            .checked_add(residual)
+                            .is_some_and(|total| total == self.matched_items)
+                    })
+            }
+            DeletionPropagationStatus::Pending
+            | DeletionPropagationStatus::BlockedRetention
+            | DeletionPropagationStatus::Failed
+            | DeletionPropagationStatus::DeadLetter => true,
+        };
+        if !evidence_valid || !shape_valid || !counts_valid {
             return Err(DeletionError::InvalidPropagationState);
         }
         Ok(())
@@ -359,6 +410,9 @@ impl DeletionRecord {
                         status: DeletionPropagationStatus::Pending,
                         evidence_digest: None,
                         error_code: None,
+                        matched_items: 0,
+                        deleted_items: 0,
+                        residual_items: None,
                         updated_at: now,
                     },
                 )
@@ -400,6 +454,18 @@ impl DeletionRecord {
         evidence_digest: String,
         now: DateTime<Utc>,
     ) -> Result<Self, DeletionError> {
+        self.mark_surface_applied_with_counts(surface, evidence_digest, 0, 0, 0, now)
+    }
+
+    fn mark_surface_applied_with_counts(
+        &self,
+        surface: DeletionSurface,
+        evidence_digest: String,
+        matched_items: u64,
+        deleted_items: u64,
+        residual_items: u64,
+        now: DateTime<Utc>,
+    ) -> Result<Self, DeletionError> {
         let mut next = self.clone();
         let state = next
             .surfaces
@@ -414,7 +480,15 @@ impl DeletionRecord {
             }
             return Err(DeletionError::InvalidPropagationTransition);
         }
-        set_applied(&mut next.surfaces, surface, evidence_digest, now)?;
+        set_applied_with_counts(
+            &mut next.surfaces,
+            surface,
+            evidence_digest,
+            matched_items,
+            deleted_items,
+            residual_items,
+            now,
+        )?;
         next.revision = next
             .revision
             .checked_add(1)
@@ -432,22 +506,185 @@ impl DeletionRecord {
         self.mark_surface_applied(DeletionSurface::EncryptedCell, evidence_digest, now)
     }
 
+    pub fn mark_surface_failed(
+        &self,
+        surface: DeletionSurface,
+        error_code: impl Into<String>,
+        residual_items: Option<u64>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, DeletionError> {
+        self.mark_surface_failure(
+            surface,
+            DeletionPropagationStatus::Failed,
+            error_code.into(),
+            residual_items,
+            now,
+        )
+    }
+
+    pub fn mark_surface_dead_letter(
+        &self,
+        surface: DeletionSurface,
+        error_code: impl Into<String>,
+        residual_items: Option<u64>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, DeletionError> {
+        self.mark_surface_failure(
+            surface,
+            DeletionPropagationStatus::DeadLetter,
+            error_code.into(),
+            residual_items,
+            now,
+        )
+    }
+
+    pub fn mark_surface_blocked(
+        &self,
+        surface: DeletionSurface,
+        error_code: impl Into<String>,
+        residual_items: Option<u64>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, DeletionError> {
+        self.mark_surface_failure(
+            surface,
+            DeletionPropagationStatus::BlockedRetention,
+            error_code.into(),
+            residual_items,
+            now,
+        )
+    }
+
+    fn mark_surface_failure(
+        &self,
+        surface: DeletionSurface,
+        status: DeletionPropagationStatus,
+        error_code: String,
+        residual_items: Option<u64>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, DeletionError> {
+        let worker_failure = matches!(
+            status,
+            DeletionPropagationStatus::Failed | DeletionPropagationStatus::DeadLetter
+        );
+        let retention_block = status == DeletionPropagationStatus::BlockedRetention;
+        if (!worker_failure && !retention_block)
+            || (worker_failure && !surface.is_worker_managed())
+            || error_code.trim().is_empty()
+            || error_code.len() > 128
+        {
+            return Err(DeletionError::InvalidPropagationState);
+        }
+        let mut next = self.clone();
+        let state = next
+            .surfaces
+            .get(&surface)
+            .ok_or(DeletionError::InvalidPropagationState)?;
+        if matches!(
+            state.status,
+            DeletionPropagationStatus::Applied
+                | DeletionPropagationStatus::NotApplicable
+                | DeletionPropagationStatus::BlockedRetention
+                | DeletionPropagationStatus::DeadLetter
+        ) {
+            if state.status == status
+                && state.error_code.as_deref() == Some(error_code.as_str())
+                && state.residual_items == residual_items
+            {
+                return Ok(next);
+            }
+            return Err(DeletionError::InvalidPropagationTransition);
+        }
+        next.surfaces.insert(
+            surface,
+            DeletionSurfaceState {
+                status,
+                evidence_digest: None,
+                error_code: Some(error_code),
+                matched_items: 0,
+                deleted_items: 0,
+                residual_items,
+                updated_at: now,
+            },
+        );
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or(DeletionError::RevisionOverflow)?;
+        next.updated_at = now;
+        next.validate(now)?;
+        Ok(next)
+    }
+
     pub fn apply_receipt(
         &self,
         receipt: &DeletionPropagationReceipt,
         now: DateTime<Utc>,
     ) -> Result<Self, DeletionError> {
         receipt.validate_for(&self.tombstone, now)?;
-        self.mark_surface_applied(receipt.surface, receipt.receipt_digest.clone(), now)
+        self.mark_surface_applied_with_counts(
+            receipt.surface,
+            receipt.receipt_digest.clone(),
+            receipt.matched_items,
+            receipt.deleted_items,
+            receipt.residual_items,
+            now,
+        )
     }
 
     pub fn is_complete(&self) -> bool {
-        self.surfaces.values().all(|state| {
+        self.status() == DeletionRequestStatus::Completed
+    }
+
+    pub fn status(&self) -> DeletionRequestStatus {
+        if self
+            .surfaces
+            .values()
+            .any(|state| state.status == DeletionPropagationStatus::BlockedRetention)
+        {
+            return DeletionRequestStatus::Blocked;
+        }
+        if self
+            .surfaces
+            .values()
+            .any(|state| state.status == DeletionPropagationStatus::DeadLetter)
+        {
+            return DeletionRequestStatus::DeadLettered;
+        }
+        if self.surfaces.values().all(|state| {
+            matches!(
+                state.status,
+                DeletionPropagationStatus::Applied | DeletionPropagationStatus::NotApplicable
+            ) && state.residual_items == Some(0)
+        }) {
+            return DeletionRequestStatus::Completed;
+        }
+        if self
+            .surfaces
+            .values()
+            .any(|state| state.status == DeletionPropagationStatus::Failed)
+        {
+            return DeletionRequestStatus::PartiallyApplied;
+        }
+        if self.surfaces.values().any(|state| {
             matches!(
                 state.status,
                 DeletionPropagationStatus::Applied | DeletionPropagationStatus::NotApplicable
             )
-        })
+        }) {
+            DeletionRequestStatus::Propagating
+        } else {
+            DeletionRequestStatus::Requested
+        }
+    }
+
+    /// Returns a count only when every surface has supplied an inventory
+    /// result. `None` is intentionally not interpreted as zero.
+    pub fn residual_item_count(&self) -> Option<u64> {
+        self.surfaces
+            .values()
+            .map(|state| state.residual_items)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|counts| counts.into_iter().try_fold(0_u64, u64::checked_add))
     }
 
     pub fn validate(&self, now: DateTime<Utc>) -> Result<(), DeletionError> {
@@ -483,7 +720,26 @@ fn set_applied(
     evidence_digest: String,
     now: DateTime<Utc>,
 ) -> Result<(), DeletionError> {
+    set_applied_with_counts(surfaces, surface, evidence_digest, 0, 0, 0, now)
+}
+
+fn set_applied_with_counts(
+    surfaces: &mut BTreeMap<DeletionSurface, DeletionSurfaceState>,
+    surface: DeletionSurface,
+    evidence_digest: String,
+    matched_items: u64,
+    deleted_items: u64,
+    residual_items: u64,
+    now: DateTime<Utc>,
+) -> Result<(), DeletionError> {
     if !is_sha256(&evidence_digest) {
+        return Err(DeletionError::InvalidPropagationState);
+    }
+    if deleted_items > matched_items
+        || deleted_items
+            .checked_add(residual_items)
+            .is_none_or(|total| total != matched_items)
+    {
         return Err(DeletionError::InvalidPropagationState);
     }
     surfaces.insert(
@@ -492,6 +748,9 @@ fn set_applied(
             status: DeletionPropagationStatus::Applied,
             evidence_digest: Some(evidence_digest),
             error_code: None,
+            matched_items,
+            deleted_items,
+            residual_items: Some(residual_items),
             updated_at: now,
         },
     );
@@ -513,6 +772,9 @@ fn set_not_applicable(
             status: DeletionPropagationStatus::NotApplicable,
             evidence_digest: Some(evidence_digest),
             error_code: None,
+            matched_items: 0,
+            deleted_items: 0,
+            residual_items: Some(0),
             updated_at: now,
         },
     );
@@ -665,5 +927,60 @@ mod tests {
             ),
             Err(DeletionError::InvalidPropagationReceipt)
         );
+    }
+
+    #[test]
+    fn retryable_and_dead_letter_surface_states_remain_incomplete() {
+        let record = DeletionRecord::pending(
+            tombstone(),
+            5,
+            "2".repeat(64),
+            "3".repeat(64),
+            "4".repeat(64),
+            now(),
+        )
+        .expect("record");
+        let failed = record
+            .mark_surface_failed(
+                DeletionSurface::Cache,
+                "CACHE_TEMPORARILY_UNAVAILABLE",
+                Some(2),
+                now() + Duration::minutes(1),
+            )
+            .expect("retryable failure");
+        assert_eq!(failed.status(), DeletionRequestStatus::PartiallyApplied);
+        assert_eq!(
+            failed.surfaces[&DeletionSurface::Cache].residual_items,
+            Some(2)
+        );
+        assert_eq!(failed.surfaces[&DeletionSurface::Cache].matched_items, 0);
+        assert_eq!(failed.surfaces[&DeletionSurface::Cache].deleted_items, 0);
+        assert!(!failed.is_complete());
+
+        let dead_lettered = failed
+            .mark_surface_dead_letter(
+                DeletionSurface::Replay,
+                "REPLAY_STORE_UNAVAILABLE",
+                None,
+                now() + Duration::minutes(2),
+            )
+            .expect("dead letter");
+        assert_eq!(dead_lettered.status(), DeletionRequestStatus::DeadLettered);
+        assert!(!dead_lettered.is_complete());
+
+        let blocked = record
+            .mark_surface_blocked(
+                DeletionSurface::Cache,
+                "LEGAL_HOLD_ACTIVE",
+                Some(1),
+                now() + Duration::minutes(3),
+            )
+            .expect("retention block");
+        assert_eq!(blocked.status(), DeletionRequestStatus::Blocked);
+        assert_eq!(
+            blocked.surfaces[&DeletionSurface::Cache].residual_items,
+            Some(1)
+        );
+        assert!(!blocked.is_complete());
     }
 }

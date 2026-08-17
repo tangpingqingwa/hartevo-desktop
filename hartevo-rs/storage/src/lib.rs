@@ -27,6 +27,7 @@ mod normalized;
 mod outbox;
 mod outcome_review_store;
 mod outcome_store;
+mod privacy_store;
 mod registration_store;
 mod relationship_store;
 mod runtime_process_store;
@@ -83,7 +84,7 @@ use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const STORAGE_SCHEMA_VERSION: i64 = 47;
+pub const STORAGE_SCHEMA_VERSION: i64 = 48;
 
 pub struct DatabaseKey([u8; 32]);
 
@@ -4405,10 +4406,77 @@ impl ProjectStore {
             record_migration(&transaction, 47)?;
             transaction.commit()?;
         }
+        if current_schema_version(&self.connection)? < 48 {
+            let transaction = self.connection.transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS privacy_retention_policies (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   policy_id TEXT NOT NULL CHECK (length(trim(policy_id)) > 0),
+                   version INTEGER NOT NULL CHECK (version > 0),
+                   effective_at TEXT NOT NULL,
+                   policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+                   policy_json TEXT NOT NULL,
+                   PRIMARY KEY (project_id),
+                   UNIQUE (project_id, policy_id, version),
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS privacy_retention_policy_scope_idx
+                   ON privacy_retention_policies(tenant_id, project_id, version);
+                 CREATE TABLE IF NOT EXISTS privacy_data_subject_exports (
+                   tenant_id TEXT NOT NULL,
+                   project_id TEXT NOT NULL,
+                   export_id TEXT NOT NULL,
+                   subject_digest TEXT NOT NULL CHECK (length(subject_digest) = 64),
+                   authorized_by TEXT NOT NULL CHECK (length(trim(authorized_by)) > 0),
+                   authorization_evidence_digest TEXT NOT NULL CHECK (
+                     length(authorization_evidence_digest) = 64
+                   ),
+                   status TEXT NOT NULL CHECK (
+                     status IN ('requested', 'ready', 'blocked')
+                   ),
+                   redaction_profile TEXT NOT NULL CHECK (length(trim(redaction_profile)) > 0),
+                   artifact_json TEXT NOT NULL,
+                   generated_at TEXT NOT NULL,
+                   export_digest TEXT NOT NULL CHECK (length(export_digest) = 64),
+                   revision INTEGER NOT NULL CHECK (revision = 1),
+                   record_json TEXT NOT NULL,
+                   PRIMARY KEY (project_id, export_id),
+                   UNIQUE (project_id, export_digest),
+                   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS privacy_export_scope_idx
+                   ON privacy_data_subject_exports(
+                     tenant_id, project_id, subject_digest, generated_at
+                   );",
+            )?;
+            validate_privacy_schema(&transaction)?;
+            record_migration(&transaction, 48)?;
+            transaction.commit()?;
+        }
         self.backfill_normalized_state()?;
         self.backfill_mission_conversations()?;
         Ok(())
     }
+}
+
+fn validate_privacy_schema(transaction: &Transaction<'_>) -> Result<(), StorageError> {
+    {
+        let _ = transaction.prepare(
+            "SELECT tenant_id, project_id, policy_id, version, effective_at,
+                    policy_digest, policy_json
+             FROM privacy_retention_policies WHERE 1 = 0",
+        )?;
+    }
+    {
+        let _ = transaction.prepare(
+            "SELECT tenant_id, project_id, export_id, subject_digest, authorized_by,
+                    authorization_evidence_digest, status, redaction_profile, artifact_json,
+                    generated_at, export_digest, revision, record_json
+             FROM privacy_data_subject_exports WHERE 1 = 0",
+        )?;
+    }
+    Ok(())
 }
 
 fn validated_database_path(path: &Path) -> Result<PathBuf, StorageError> {
@@ -4631,6 +4699,8 @@ pub enum StorageError {
     KeyManagement(#[from] hartevo_domain_kernel::KeyManagementError),
     #[error(transparent)]
     Deletion(#[from] hartevo_domain_kernel::DeletionError),
+    #[error(transparent)]
+    Privacy(#[from] hartevo_domain_kernel::PrivacyError),
     #[error("immutable {kind} record {id} does not match its persisted value")]
     ImmutableRecordMismatch { kind: &'static str, id: String },
     #[error("outbox lease {sequence} is no longer owned by {owner} generation {generation}")]
@@ -5334,8 +5404,11 @@ mod tests {
         }
 
         let mut migrated =
-            ProjectStore::open(&database, &database_key()).expect("migrate v46 to v47");
-        assert_eq!(migrated.schema_version().expect("v47 schema"), 47);
+            ProjectStore::open(&database, &database_key()).expect("migrate v46 to current");
+        assert_eq!(
+            migrated.schema_version().expect("current schema"),
+            STORAGE_SCHEMA_VERSION
+        );
         assert!(checkpoint_policy_table_sql(&migrated.connection).contains("effect_readback_v2"));
         assert_eq!(
             migrated
@@ -5446,7 +5519,10 @@ mod tests {
             .execute_batch("DROP TABLE mission_checkpoints_v47;")
             .expect("remove injected collision");
         store.migrate().expect("retry v47 migration");
-        assert_eq!(store.schema_version().expect("retried schema"), 47);
+        assert_eq!(
+            store.schema_version().expect("retried schema"),
+            STORAGE_SCHEMA_VERSION
+        );
         assert_eq!(
             store
                 .load_mission(&project.id, &legacy.id)
@@ -5454,6 +5530,71 @@ mod tests {
             legacy
         );
         assert!(checkpoint_policy_table_sql(&store.connection).contains("effect_readback_v2"));
+    }
+
+    #[test]
+    fn migration_v48_collision_rolls_back_privacy_tables_and_ledger() {
+        let mut store = ProjectStore::in_memory().expect("privacy migration store");
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX privacy_export_scope_idx;
+                 DROP INDEX privacy_retention_policy_scope_idx;
+                 DROP TABLE privacy_data_subject_exports;
+                 DROP TABLE privacy_retention_policies;
+                 DELETE FROM schema_migrations WHERE version = 48;
+                 CREATE TABLE privacy_retention_policies (sentinel INTEGER NOT NULL);",
+            )
+            .expect("inject privacy table collision");
+        assert_eq!(store.schema_version().expect("schema v47"), 47);
+
+        assert!(matches!(store.migrate(), Err(StorageError::Sql(_))));
+        assert_eq!(store.schema_version().expect("rolled back schema"), 47);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 48",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("failed privacy migration ledger"),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'privacy_retention_policies'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("sentinel after rollback"),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'privacy_data_subject_exports'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("export table after rollback"),
+            0
+        );
+
+        store
+            .connection
+            .execute_batch("DROP TABLE privacy_retention_policies;")
+            .expect("remove privacy sentinel");
+        store.migrate().expect("retry privacy migration");
+        assert_eq!(
+            store.schema_version().expect("retried current schema"),
+            STORAGE_SCHEMA_VERSION
+        );
     }
 
     fn persist_catalog_mission_at_next_checkpoint_ready(

@@ -62,10 +62,11 @@ use hartevo_domain_kernel::{
     CreatorDeliverableInput, CreatorEligibility, CreatorExternalProof, CreatorHiring,
     CreatorHiringError, CreatorHiringId, CreatorHiringSpec, CreatorId, CreatorIdentitySnapshot,
     CreatorMilestoneId, CreatorPayoutConfirmation, CreatorTask, CreatorTaskId, CreatorTaskSpec,
-    CreatorWorkError, CurrencyCode, DeletionError, DeletionId, DeletionReason, DeletionTombstone,
-    DeliverableId, DeliverableReviewInput, DeviceAttachment, DeviceAttachmentId,
-    DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim, DeviceHandoffContext,
-    DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
+    CreatorWorkError, CurrencyCode, DataSubjectExport, DataSubjectExportId, DeletionError,
+    DeletionId, DeletionPropagationStatus, DeletionReason, DeletionRecord, DeletionRequestStatus,
+    DeletionSurface, DeletionTombstone, DeliverableId, DeliverableReviewInput, DeviceAttachment,
+    DeviceAttachmentId, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim,
+    DeviceHandoffContext, DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
     DevicePublicKeyRegistration, Effect, EffectClass, EffectId, EffectRisk, EffectSpec,
     EffectStatus, Evidence, EvidenceId, EvidenceStatus, FactId, FundingReservation, IdentityError,
     IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject, InboundIngest,
@@ -84,9 +85,9 @@ use hartevo_domain_kernel::{
     OutcomeReviewCausalStatus, OutcomeReviewCaveat, OutcomeReviewDecision, OutcomeReviewLoopPolicy,
     OutcomeReviewNextContractIntent, OutcomeReviewNextContractResolution, OutcomeReviewProjection,
     OutcomeReviewRoiStatus, OutcomeSettlementProjection, Partner, PartnerId, PayoutAuthorization,
-    PayoutId, Person, PersonId, PreparedAutomaticReply, Project, ProjectDataCell,
+    PayoutId, Person, PersonId, PreparedAutomaticReply, PrivacyError, Project, ProjectDataCell,
     ProjectEncryptionMode, ProjectError, ProjectId, ProjectKeyring, ProjectKeyringBootstrap,
-    ReceiptId, RelationshipError, ReviewDecision, ReviewId, RuntimeProcessClaim,
+    ReceiptId, RelationshipError, RetentionPolicy, ReviewDecision, ReviewId, RuntimeProcessClaim,
     RuntimeProcessClaimStatus, RuntimeProcessCleanupDisposition, RuntimeProcessIdentity,
     RuntimeRecoveryAttempt, RuntimeRecoveryAttemptId, RuntimeRecoveryFailureClass,
     RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttempt, RuntimeTurnAttemptId,
@@ -115,15 +116,15 @@ use hartevo_runtime_adapter::{
 use hartevo_storage::{
     ApplicationSourceKind, ApplicationSourceRevisionFence, BrowserRecipeRuntimeState,
     ContentCrypto, ContentEncryptionContext, ContextMaterialDescriptor, ContextMaterialStoreError,
-    ContextQuerySnapshot, DeviceKeyAgreementCrypto, DomainEventRecord, EncryptedContent,
-    EnvelopeContext, EnvelopeCrypto, KeyBootstrapCell, KeyBootstrapOperationKind,
-    KeyBootstrapOperationStatus, KeyMaterial, LocalEncryptedContextMaterialStore,
-    LocalInboundSyncEnvelope, LocalInboundSyncObject, LocalInboundSyncStageDisposition,
-    LocalInboundSyncStageOutcome, LocalKeyBootstrapOperation, LocalProjectCloudRegistration,
-    LocalProjectCloudRegistrationPrepareOutcome, LocalSyncOperation, LocalSyncPrepareOutcome,
-    LocalSyncStatus, PendingEvent, ProjectCloudRegistrationStatus, ProjectKeySecretReference,
-    ProjectStore, RuntimeTurnStartupReconciliation, SecretBytes, SecretReference, SecretStore,
-    SecretStoreError, StorageError,
+    ContextQuerySnapshot, DeletionPropagationJobStatus, DeviceKeyAgreementCrypto,
+    DomainEventRecord, EncryptedContent, EnvelopeContext, EnvelopeCrypto, KeyBootstrapCell,
+    KeyBootstrapOperationKind, KeyBootstrapOperationStatus, KeyMaterial,
+    LocalEncryptedContextMaterialStore, LocalInboundSyncEnvelope, LocalInboundSyncObject,
+    LocalInboundSyncStageDisposition, LocalInboundSyncStageOutcome, LocalKeyBootstrapOperation,
+    LocalProjectCloudRegistration, LocalProjectCloudRegistrationPrepareOutcome, LocalSyncOperation,
+    LocalSyncPrepareOutcome, LocalSyncStatus, PendingEvent, ProjectCloudRegistrationStatus,
+    ProjectKeySecretReference, ProjectStore, RuntimeTurnStartupReconciliation, SecretBytes,
+    SecretReference, SecretStore, SecretStoreError, StorageError,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -1491,6 +1492,23 @@ pub struct PrepareContextCapsuleDeletion {
     pub expected_revision: u64,
     pub authorizing_key: RecipientKeyReference,
     pub reason: DeletionReason,
+    pub authorized_by: ActorId,
+    pub authorization_evidence_digest: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SaveLocalRetentionPolicy {
+    pub project_id: ProjectId,
+    pub policy: RetentionPolicy,
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestDataSubjectExport {
+    pub project_id: ProjectId,
+    /// The caller supplies a digest so the raw subject reference never enters
+    /// the Application or SQLCipher persistence boundary.
+    pub subject_digest: String,
     pub authorized_by: ActorId,
     pub authorization_evidence_digest: String,
     pub idempotency_key: String,
@@ -4438,6 +4456,45 @@ pub struct DesktopInventoryProjection {
     pub projects: Vec<DesktopProjectProjection>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionSurfaceProjection {
+    pub surface: DeletionSurface,
+    pub status: DeletionPropagationStatus,
+    pub matched_items: u64,
+    pub deleted_items: u64,
+    pub residual_items: Option<u64>,
+    pub error_code: Option<String>,
+    pub attempts: u32,
+    pub lease_generation: u64,
+    pub job_status: Option<DeletionPropagationJobStatus>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionRequestProjection {
+    pub deletion_id: DeletionId,
+    pub object_id: String,
+    pub object_kind: String,
+    pub deletion_generation: u64,
+    pub tombstone_digest: String,
+    pub status: DeletionRequestStatus,
+    pub residual_items: Option<u64>,
+    pub requested_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub surfaces: Vec<DeletionSurfaceProjection>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivacyCenterProjection {
+    pub project_id: ProjectId,
+    pub retention_policy: RetentionPolicy,
+    pub deletion_requests: Vec<DeletionRequestProjection>,
+    pub exports: Vec<DataSubjectExport>,
+}
+
 /// Content-free Runtime evidence for one Mission. Private Runtime thread/turn
 /// identifiers and prompt/output bodies never cross this projection boundary.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4482,6 +4539,87 @@ impl ApplicationService {
             runtime_process_startup_reconciled: false,
             runtime_turn_startup_reconciled: false,
         }
+    }
+
+    pub fn save_local_retention_policy(
+        &mut self,
+        command: SaveLocalRetentionPolicy,
+        now: DateTime<Utc>,
+    ) -> Result<RetentionPolicy, ApplicationError> {
+        let SaveLocalRetentionPolicy { project_id, policy } = command;
+        Ok(self
+            .store
+            .save_retention_policy(&project_id, &policy, now)?)
+    }
+
+    pub fn request_data_subject_export(
+        &mut self,
+        command: RequestDataSubjectExport,
+        now: DateTime<Utc>,
+    ) -> Result<DataSubjectExport, ApplicationError> {
+        let RequestDataSubjectExport {
+            project_id,
+            subject_digest,
+            authorized_by,
+            authorization_evidence_digest,
+            idempotency_key,
+        } = command;
+        if idempotency_key.trim().is_empty()
+            || !is_sha256_text(&subject_digest)
+            || authorized_by.as_str().trim().is_empty()
+            || !is_sha256_text(&authorization_evidence_digest)
+        {
+            return Err(ApplicationError::InvalidPrivacyCommand);
+        }
+        let idempotency_digest = canonical_sha256(&serde_json::json!({
+            "projectId": &project_id,
+            "idempotencyKey": idempotency_key.trim(),
+        }))?;
+        let export_id =
+            DataSubjectExportId::from_stable(format!("data-subject-export:{idempotency_digest}"));
+        match self.store.load_data_subject_export(&project_id, &export_id) {
+            Ok(existing) => {
+                if existing.subject_digest != subject_digest
+                    || existing.authorized_by != authorized_by.as_str()
+                    || existing.authorization_evidence_digest != authorization_evidence_digest
+                {
+                    return Err(ApplicationError::PrivacyExportIdempotencyConflict);
+                }
+                Ok(existing)
+            }
+            Err(StorageError::ScopedRecordNotFound {
+                kind: "data-subject export",
+                ..
+            }) => Ok(self.store.build_redacted_data_subject_export(
+                export_id,
+                &project_id,
+                &subject_digest,
+                authorized_by.as_str(),
+                &authorization_evidence_digest,
+                now,
+            )?),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn privacy_center(
+        &mut self,
+        project_id: &ProjectId,
+        now: DateTime<Utc>,
+    ) -> Result<PrivacyCenterProjection, ApplicationError> {
+        let retention_policy = self.store.ensure_local_retention_policy(project_id, now)?;
+        let deletion_requests = self
+            .store
+            .list_deletion_records(project_id)?
+            .into_iter()
+            .map(|record| deletion_request_projection(&self.store, record))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(PrivacyCenterProjection {
+            project_id: project_id.clone(),
+            retention_policy,
+            deletion_requests,
+            exports: self.store.list_data_subject_exports(project_id)?,
+        })
     }
 
     #[allow(
@@ -17532,6 +17670,56 @@ impl ApplicationService {
 
 #[allow(
     clippy::too_many_lines,
+    reason = "the projection keeps each deletion surface's residual, retry, lease, and error fields together"
+)]
+fn deletion_request_projection(
+    store: &ProjectStore,
+    record: DeletionRecord,
+) -> Result<DeletionRequestProjection, ApplicationError> {
+    let status = record.status();
+    let residual_items = record.residual_item_count();
+    let mut surfaces = Vec::with_capacity(record.surfaces.len());
+    for (surface, state) in &record.surfaces {
+        let job = if surface.is_worker_managed()
+            && state.status != DeletionPropagationStatus::NotApplicable
+        {
+            Some(store.load_deletion_propagation_job(
+                &record.tombstone.project_id,
+                &record.tombstone.id,
+                *surface,
+            )?)
+        } else {
+            None
+        };
+        surfaces.push(DeletionSurfaceProjection {
+            surface: *surface,
+            status: state.status,
+            matched_items: state.matched_items,
+            deleted_items: state.deleted_items,
+            residual_items: state.residual_items,
+            error_code: state.error_code.clone(),
+            attempts: job.as_ref().map_or(0, |job| job.attempts),
+            lease_generation: job.as_ref().map_or(0, |job| job.lease_generation),
+            job_status: job.map(|job| job.status),
+            updated_at: state.updated_at,
+        });
+    }
+    Ok(DeletionRequestProjection {
+        deletion_id: record.tombstone.id,
+        object_id: record.tombstone.object_id,
+        object_kind: record.tombstone.object_kind,
+        deletion_generation: record.tombstone.deletion_generation,
+        tombstone_digest: record.tombstone.tombstone_digest,
+        status,
+        residual_items,
+        requested_at: record.tombstone.requested_at,
+        updated_at: record.updated_at,
+        surfaces,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
     reason = "the projection exhaustively validates and redacts all Mission, Conversation, checkpoint, Work Product, Effect, and Outcome fields"
 )]
 fn mission_projection(
@@ -20945,6 +21133,8 @@ pub enum ApplicationError {
     #[error(transparent)]
     Deletion(#[from] DeletionError),
     #[error(transparent)]
+    Privacy(#[from] PrivacyError),
+    #[error(transparent)]
     KeyManagement(#[from] KeyManagementError),
     #[error(transparent)]
     SecretStore(#[from] SecretStoreError),
@@ -21228,6 +21418,10 @@ pub enum ApplicationError {
         "synchronized deletion scope, authorization, generation, or causal revision is invalid"
     )]
     InvalidSyncDeletion,
+    #[error("privacy command requires digested subject, authorization, and idempotency inputs")]
+    InvalidPrivacyCommand,
+    #[error("data-subject export idempotency was reused for a different request")]
+    PrivacyExportIdempotencyConflict,
     #[error(
         "project cloud registration requires a scoped Cell, key, authorization, and idempotency key"
     )]
@@ -21284,12 +21478,12 @@ mod tests {
         Approval, ApprovalDecision, ApprovalId, AttributionId, AttributionModel,
         AttributionTrafficClass, CommissionStatus, ContactPermission, ContextCapsuleStatus,
         ContextDataClass, ConversationContentRisk, CreatorHiringAward, CreatorId,
-        CreatorMilestoneSpec, CurrencyCode, DeletionPropagationStatus, DeletionSurface,
-        DeliverableAssessment, DeviceId, ExternalIdentity, KpiDirection, LegalBasis, MemberId,
-        MessagingGateway, OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification,
-        OutcomeVerificationMethod, PartnerSupplyClass, ProbeOutcome, Receipt, ReceiptId, RefundId,
-        RightsAttestation, Touchpoint, TruthSource, TruthStatus, TruthValue, UsageRights,
-        Verification, VerificationId,
+        CreatorMilestoneSpec, CurrencyCode, DeletionPropagationStatus, DeletionRequestStatus,
+        DeletionSurface, DeliverableAssessment, DeviceId, ExternalIdentity, KpiDirection,
+        LegalBasis, MemberId, MessagingGateway, OutcomeEventId, OutcomeEventKind,
+        OutcomeSourceVerification, OutcomeVerificationMethod, PartnerSupplyClass, ProbeOutcome,
+        Receipt, ReceiptId, RefundId, RightsAttestation, Touchpoint, TruthSource, TruthStatus,
+        TruthValue, UsageRights, Verification, VerificationId,
     };
     use hartevo_domain_kernel::{
         MarketCounterevidence, MarketDecisionRecommendation, MarketEvidenceClaim,
@@ -21299,7 +21493,9 @@ mod tests {
         EffectPolicy, EffectRateLimit, PermissionFailure, ProviderFailure,
         ReconciliationObservation, ReconciliationPolicy,
     };
-    use hartevo_storage::{DatabaseKey, LocalInboundSyncStatus, MemorySecretStore};
+    use hartevo_storage::{
+        DatabaseKey, DeletionPropagationJobStatus, LocalInboundSyncStatus, MemorySecretStore,
+    };
 
     use super::*;
 
@@ -36295,6 +36491,37 @@ sleep 30"#
             !deletion_record.is_complete(),
             "cache and replay propagation remain explicit pending work"
         );
+        let privacy = service
+            .privacy_center(&project, now() + Duration::minutes(8))
+            .expect("privacy center deletion projection");
+        let deletion_projection = privacy
+            .deletion_requests
+            .iter()
+            .find(|request| request.deletion_id == deletion_record.tombstone.id)
+            .expect("deletion request projection");
+        assert_eq!(
+            deletion_projection.status,
+            DeletionRequestStatus::Propagating
+        );
+        assert_eq!(deletion_projection.residual_items, None);
+        assert_eq!(
+            deletion_projection
+                .surfaces
+                .iter()
+                .find(|surface| surface.surface == DeletionSurface::Cache)
+                .expect("cache surface projection")
+                .job_status,
+            Some(DeletionPropagationJobStatus::Pending)
+        );
+        assert_eq!(
+            deletion_projection
+                .surfaces
+                .iter()
+                .find(|surface| surface.surface == DeletionSurface::ObjectStorage)
+                .expect("object-storage surface projection")
+                .job_status,
+            None
+        );
 
         let ingested_tombstone = service
             .ingest_encrypted_sync_object(
@@ -39214,5 +39441,77 @@ sleep 30"#
             hartevo_browser_adapter::BrowserControlState::AgentControlled
         );
         assert_eq!(durable.lease_generation, 3);
+    }
+
+    #[test]
+    fn privacy_center_exposes_typed_policy_and_idempotent_redacted_export() {
+        let mut store = ProjectStore::in_memory().expect("store");
+        let project = Project::create_local(
+            TenantId::from("tenant-privacy-application"),
+            ProjectId::from("project-privacy-application"),
+            "private application project",
+            "private application description",
+            PathBuf::from("/tmp/hartevo-privacy-application"),
+            StorageMode::LocalExisting,
+        )
+        .expect("project");
+        store
+            .create_project_atomic(
+                &project,
+                &[PendingEvent::new(
+                    "project.created",
+                    serde_json::json!({}),
+                    now(),
+                )],
+            )
+            .expect("persist project");
+        let mut service = ApplicationService::new(store);
+        let command = RequestDataSubjectExport {
+            project_id: project.id.clone(),
+            subject_digest: "1".repeat(64),
+            authorized_by: ActorId::from("privacy-owner"),
+            authorization_evidence_digest: "2".repeat(64),
+            idempotency_key: "privacy-export-1".into(),
+        };
+        let export = service
+            .request_data_subject_export(command.clone(), now() + Duration::minutes(1))
+            .expect("export");
+        let encoded = serde_json::to_string(&export).expect("export json");
+        assert!(!encoded.contains("private application project"));
+        assert!(!encoded.contains("private application description"));
+        assert!(export.artifacts.iter().any(|artifact| {
+            artifact.redaction == hartevo_domain_kernel::DataSubjectExportRedaction::SecretWithheld
+        }));
+        assert_eq!(
+            service
+                .request_data_subject_export(command.clone(), now() + Duration::minutes(2))
+                .expect("exact export replay"),
+            export
+        );
+        let mut conflicting_command = command.clone();
+        conflicting_command.subject_digest = "9".repeat(64);
+        assert!(matches!(
+            service.request_data_subject_export(conflicting_command, now() + Duration::minutes(3),),
+            Err(ApplicationError::PrivacyExportIdempotencyConflict)
+        ));
+        let privacy = service
+            .privacy_center(&project.id, now() + Duration::minutes(4))
+            .expect("privacy center");
+        assert_eq!(privacy.retention_policy.id, "local-default");
+        assert_eq!(privacy.exports, vec![export]);
+        assert!(privacy.deletion_requests.is_empty());
+        assert!(matches!(
+            service.request_data_subject_export(
+                RequestDataSubjectExport {
+                    project_id: project.id,
+                    subject_digest: "raw-subject-reference".into(),
+                    authorized_by: ActorId::from("privacy-owner"),
+                    authorization_evidence_digest: "2".repeat(64),
+                    idempotency_key: "privacy-export-raw".into(),
+                },
+                now() + Duration::minutes(5),
+            ),
+            Err(ApplicationError::InvalidPrivacyCommand)
+        ));
     }
 }

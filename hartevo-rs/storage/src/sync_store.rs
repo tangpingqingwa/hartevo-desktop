@@ -3974,23 +3974,24 @@ mod tests {
         CreatorApplicationId, CreatorApplicationInput, CreatorApplicationOrigin,
         CreatorContactEffectGuard, CreatorExternalProof, CreatorHiringId, CreatorHiringSpec,
         CreatorId, CreatorMilestoneId, CreatorMilestoneSpec, CreatorTaskSpec, CurrencyCode,
-        DeletionId, DeletionPropagationReceipt, DeletionReason, DeletionReceiptId, DeletionSurface,
-        DeletionTombstone, EffectClass, EffectId, EffectRisk, EffectSpec, Evidence, EvidenceId,
-        EvidenceStatus, ExternalIdentity, FactId, FundingReservation, IdentityLink,
-        IdentitySubject, InboundMessageInput, LegalBasis, MessageId, MessagingGateway, Mission,
-        MissionContract, MissionId, Money, OrderId, OutcomeEvent, OutcomeEventId, OutcomeEventKind,
-        OutcomeLedger, OutcomeSourceVerification, OutcomeVerificationMethod, Partner, PartnerId,
-        PartnerSupplyClass, ProbeOutcome, Project, Receipt, ReceiptId, StorageMode, Task, TaskId,
-        TaskStatus, TruthSource, TruthStatus, TruthValue, UsageRights, Verification,
-        VerificationId, VerificationStatus, WebhookAttestation, WorkProductDependencies,
-        WorkProductId, WorkProductPreview, WorkerId, WorkerLease, WorkerLeaseId,
+        DeletionId, DeletionPropagationReceipt, DeletionReason, DeletionReceiptId, DeletionRecord,
+        DeletionSurface, DeletionTombstone, EffectClass, EffectId, EffectRisk, EffectSpec,
+        Evidence, EvidenceId, EvidenceStatus, ExternalIdentity, FactId, FundingReservation,
+        IdentityLink, IdentitySubject, InboundMessageInput, LegalBasis, MessageId,
+        MessagingGateway, Mission, MissionContract, MissionId, Money, OrderId, OutcomeEvent,
+        OutcomeEventId, OutcomeEventKind, OutcomeLedger, OutcomeSourceVerification,
+        OutcomeVerificationMethod, Partner, PartnerId, PartnerSupplyClass, ProbeOutcome, Project,
+        Receipt, ReceiptId, StorageMode, Task, TaskId, TaskStatus, TruthSource, TruthStatus,
+        TruthValue, UsageRights, Verification, VerificationId, VerificationStatus,
+        WebhookAttestation, WorkProductDependencies, WorkProductId, WorkProductPreview, WorkerId,
+        WorkerLease, WorkerLeaseId,
     };
     use proptest::prelude::*;
     use rust_decimal::Decimal;
 
     use super::*;
     use crate::{
-        DeletionPropagationJobStatus, LocalProjectCloudRegistration, PendingEvent,
+        DatabaseKey, DeletionPropagationJobStatus, LocalProjectCloudRegistration, PendingEvent,
         ProjectCloudRegistrationStatus,
     };
 
@@ -7492,6 +7493,18 @@ mod tests {
                 false,
             )
             .expect("release with durable retry backoff");
+        let retrying = store
+            .load_deletion_record(&project_id, "context_capsule", cancelled.id.as_str())
+            .expect("retrying deletion record");
+        assert_eq!(
+            retrying.surfaces[&DeletionSurface::Replay].status,
+            hartevo_domain_kernel::DeletionPropagationStatus::Failed
+        );
+        assert_eq!(
+            retrying.status(),
+            hartevo_domain_kernel::DeletionRequestStatus::PartiallyApplied
+        );
+        assert!(!retrying.is_complete());
         assert!(
             store
                 .claim_deletion_propagation_jobs(
@@ -7550,6 +7563,150 @@ mod tests {
                 )
                 .expect("immutable receipt count"),
             2
+        );
+    }
+
+    #[test]
+    fn propagation_dead_letter_updates_typed_surface_state_without_claiming_completion() {
+        let (mut store, project_id) = setup();
+        let tombstone = DeletionTombstone::create(
+            DeletionId::from("deletion-dead-letter-1"),
+            TenantId::from("tenant-sync-local"),
+            project_id.clone(),
+            "capsule-dead-letter-1",
+            "context_capsule",
+            1,
+            1,
+            DeletionReason::UserRequest,
+            ActorId::from("owner-dead-letter"),
+            "1".repeat(64),
+            now(),
+        )
+        .expect("tombstone");
+        let record = DeletionRecord::pending(
+            tombstone.clone(),
+            2,
+            "2".repeat(64),
+            "3".repeat(64),
+            "4".repeat(64),
+            now(),
+        )
+        .expect("record");
+        let transaction = store.connection.transaction().expect("transaction");
+        crate::deletion_store::insert_deletion_record(&transaction, &record)
+            .expect("persist record");
+        transaction.commit().expect("commit record");
+
+        let lease = store
+            .claim_deletion_propagation_jobs(
+                DeletionSurface::Cache,
+                "cache-dead-letter-worker",
+                now() + Duration::minutes(1),
+                Duration::minutes(1),
+                1,
+            )
+            .expect("claim cache job")
+            .into_iter()
+            .next()
+            .expect("cache job");
+        let job = store
+            .release_deletion_propagation_job_with_residual(
+                &project_id,
+                &tombstone.id,
+                DeletionSurface::Cache,
+                "cache-dead-letter-worker",
+                lease.lease_generation,
+                "CACHE_PURGE_PERMANENTLY_UNAVAILABLE",
+                now() + Duration::minutes(2),
+                now() + Duration::minutes(1),
+                true,
+                Some(3),
+            )
+            .expect("dead letter cache job");
+        assert_eq!(job.status, DeletionPropagationJobStatus::DeadLetter);
+        let record = store
+            .load_deletion_record(&project_id, "context_capsule", "capsule-dead-letter-1")
+            .expect("typed status record");
+        assert_eq!(
+            record.surfaces[&DeletionSurface::Cache].status,
+            hartevo_domain_kernel::DeletionPropagationStatus::DeadLetter
+        );
+        assert_eq!(
+            record.surfaces[&DeletionSurface::Cache].residual_items,
+            Some(3)
+        );
+        assert_eq!(
+            record.status(),
+            hartevo_domain_kernel::DeletionRequestStatus::DeadLettered
+        );
+        assert!(!record.is_complete());
+    }
+
+    #[test]
+    fn deletion_tombstone_blocks_resurrection_after_database_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("privacy-reopen.sqlite3");
+        let key = DatabaseKey::new([8; 32]).expect("database key");
+        let project = Project::create_local(
+            TenantId::from("tenant-reopen"),
+            ProjectId::from("project-reopen"),
+            "reopen proof",
+            "",
+            PathBuf::from("/tmp/hartevo-reopen"),
+            StorageMode::LocalEncryptedSync,
+        )
+        .expect("project");
+        let tombstone = DeletionTombstone::create(
+            DeletionId::from("deletion-reopen-1"),
+            project.tenant_id.clone(),
+            project.id.clone(),
+            "capsule-reopen-1",
+            "context_capsule",
+            4,
+            1,
+            DeletionReason::UserRequest,
+            ActorId::from("reopen-owner"),
+            "1".repeat(64),
+            now(),
+        )
+        .expect("tombstone");
+        {
+            let mut store = ProjectStore::open(&database, &key).expect("open store");
+            store
+                .create_project_atomic(
+                    &project,
+                    &[PendingEvent::new("project.created", json!({}), now())],
+                )
+                .expect("project");
+            let record = DeletionRecord::pending(
+                tombstone.clone(),
+                5,
+                "2".repeat(64),
+                "3".repeat(64),
+                "4".repeat(64),
+                now(),
+            )
+            .expect("record");
+            let transaction = store.connection.transaction().expect("transaction");
+            crate::deletion_store::insert_deletion_record(&transaction, &record)
+                .expect("persist tombstone");
+            transaction.commit().expect("commit tombstone");
+        }
+        let reopened = ProjectStore::open(&database, &key).expect("reopen store");
+        assert!(matches!(
+            reopened.ensure_sync_object_not_deleted(
+                &project.id,
+                "context_capsule",
+                "capsule-reopen-1",
+            ),
+            Err(StorageError::SyncObjectDeleted { .. })
+        ));
+        assert_eq!(
+            reopened
+                .load_deletion_record(&project.id, "context_capsule", "capsule-reopen-1")
+                .expect("reopened tombstone")
+                .tombstone,
+            tombstone
         );
     }
 
