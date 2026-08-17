@@ -1121,6 +1121,11 @@ impl AttributionLedger {
             .iter()
             .find(|candidate| candidate.id == *candidate_id)
             .ok_or(AttributionError::VerificationCandidateMismatch)?;
+        let source = self
+            .events
+            .iter()
+            .find(|event| event.id == candidate.source_event_id)
+            .ok_or(AttributionError::VerificationCandidateMismatch)?;
         if verification.verifier.trim().is_empty()
             || !verification.independent
             || !matches!(
@@ -1129,6 +1134,7 @@ impl AttributionLedger {
             )
             || !is_sha256(&verification.evidence_digest)
             || verification.verified_at < candidate.observed_at
+            || source.provenance.origin == ObservationOrigin::Estimate
         {
             return Err(AttributionError::InvalidOutcomeVerification);
         }
