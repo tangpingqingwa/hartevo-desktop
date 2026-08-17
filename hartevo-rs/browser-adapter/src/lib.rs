@@ -16,16 +16,21 @@
 mod action;
 #[cfg(unix)]
 mod chromium_host;
+mod consumer;
 mod fake_host;
 mod file_broker;
+mod handoff;
 mod locator;
+mod mission_batch;
 mod navigation;
 mod profile_dir;
+mod provider;
 #[cfg(test)]
 mod real_chromium_signed_recipe_test;
 mod recipe;
 #[cfg(unix)]
 mod scanner;
+mod service;
 mod workspace;
 
 pub use action::{
@@ -39,6 +44,7 @@ pub use chromium_host::{
     ChromiumTextInputDispatchEvidence, ManagedChromiumClickExecutor,
     ManagedChromiumFileUploadExecutor, ManagedChromiumHost, ManagedChromiumTextInputExecutor,
 };
+pub use consumer::{MissionBrowserWorkspaceConsumer, MissionBrowserWorkspaceState};
 pub use fake_host::{
     BrowserActionResult, BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost,
     FakeBrowserPage,
@@ -48,9 +54,28 @@ pub use file_broker::{
     FileClaimPlan, FileSafetyScanner, FileScanDecision, FileScanReport, FileScanRequest,
     FileTerminalPlan, FileUploadHandle,
 };
+pub use handoff::{
+    BrowserHandoffCapability, BrowserHandoffConsumerState, BrowserHandoffEvent,
+    BrowserHandoffFrameBinding, BrowserHandoffHost, BrowserHandoffLog, BrowserHandoffProviderState,
+    BrowserHandoffScope, BrowserHandoffServiceDefinition, BrowserHandoffSnapshot,
+    BrowserResumeReceipt, BrowserTakeoverOffer, BrowserTakeoverReceipt,
+    BrowserWorkspaceHandoffProvider, MissionBrowserHandoffConsumer,
+};
 pub use locator::{BrowserLocatorResolution, BrowserStableLocator};
+#[cfg(unix)]
+pub use mission_batch::ManagedChromiumBatchProvider;
+pub use mission_batch::{
+    MissionBrowserBatchClaimSet, MissionBrowserBatchConsumer, MissionBrowserBatchPlan,
+    MissionBrowserBatchProvider, MissionBrowserBatchProviderFailure,
+    MissionBrowserBatchProviderResult, MissionBrowserBatchReceipt, MissionBrowserBatchScope,
+    MissionBrowserBatchService, MissionBrowserBatchState, MissionBrowserBatchStepOutcome,
+    MissionBrowserBatchStepResult, MissionBrowserBatchTerminalReason, MissionBrowserFrameScope,
+};
 pub use navigation::{BrowserNavigationPolicy, BrowserNavigationReceipt, BrowserNavigationTarget};
 pub use profile_dir::{BrowserExecutableIdentity, ManagedProfileDirectory};
+pub use provider::{
+    AuthenticatedChromiumProvider, BrowserProviderLifecycle, DurableBrowserObservation,
+};
 pub use recipe::{
     BrowserRecipeActivation, BrowserRecipeActiveVersion, BrowserRecipeCandidate,
     BrowserRecipeEvaluationEvidence, BrowserRecipeExecutionAuthorization, BrowserRecipeKeyPurpose,
@@ -61,6 +86,10 @@ pub use recipe::{
 };
 #[cfg(unix)]
 pub use scanner::{ProductionFileScanner, ScannerProcessLimits, ScannerReleasePin};
+pub use service::{
+    BrowserWorkspaceCapability, BrowserWorkspaceMountRequest, BrowserWorkspaceScope,
+    BrowserWorkspaceServiceDefinition,
+};
 pub use workspace::{
     BrowserControlState, BrowserControlTransition, BrowserIdentity, BrowserLeaseProof,
     BrowserProfile, BrowserProfileSource, BrowserProfileStatus, BrowserWorkspace,
@@ -95,10 +124,18 @@ pub enum BrowserError {
     ControlLeaseLost,
     #[error("browser semantic snapshot is malformed")]
     InvalidSnapshot,
+    #[error("browser human-takeover offer is malformed or outside the exact workspace scope")]
+    InvalidHandoffOffer,
+    #[error("browser human-takeover receipt is malformed, stale, or not explicit")]
+    InvalidHandoffReceipt,
+    #[error("browser human-takeover host is detached, crashed, or unavailable")]
+    HandoffHostUnavailable,
     #[error("browser action is malformed")]
     InvalidAction,
     #[error("browser action batch is malformed or expired")]
     InvalidBatch,
+    #[error("browser batch cursor or receipt is malformed, stale, or already terminal")]
+    InvalidBatchReceipt,
     #[error("potential browser external write requires the Effect Broker")]
     EffectBrokerRequired,
     #[error("browser action batch does not match the exact approved Effect")]
@@ -239,8 +276,12 @@ impl BrowserError {
             Self::InvalidTabTransition => "BROWSER_INVALID_TAB_TRANSITION",
             Self::ControlLeaseLost => "BROWSER_CONTROL_LEASE_LOST",
             Self::InvalidSnapshot => "BROWSER_INVALID_SNAPSHOT",
+            Self::InvalidHandoffOffer => "BROWSER_INVALID_HANDOFF_OFFER",
+            Self::InvalidHandoffReceipt => "BROWSER_INVALID_HANDOFF_RECEIPT",
+            Self::HandoffHostUnavailable => "BROWSER_HANDOFF_HOST_UNAVAILABLE",
             Self::InvalidAction => "BROWSER_INVALID_ACTION",
             Self::InvalidBatch => "BROWSER_INVALID_BATCH",
+            Self::InvalidBatchReceipt => "BROWSER_INVALID_BATCH_RECEIPT",
             Self::EffectBrokerRequired => "BROWSER_EFFECT_BROKER_REQUIRED",
             Self::EffectScopeMismatch => "BROWSER_EFFECT_SCOPE_MISMATCH",
             Self::WorkspaceNotRegistered => "BROWSER_WORKSPACE_NOT_REGISTERED",
