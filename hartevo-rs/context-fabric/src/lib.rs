@@ -6,6 +6,7 @@
 //! envelope. Only the content-free manifest is suitable for persistence.
 
 mod model_tokenizer;
+pub mod worker_graph;
 
 pub use model_tokenizer::{
     ConservativeByteBudgetTokenizer, PinnedModelTokenizer, PinnedTokenizerSpec,

@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.bigcommerce-order-result/v1",
+  "schemaVersion": "hartevo.bigcommerce-order-result/v1",
+  "contractVersion": "EXT-BIGCOMMERCE-ORDER-01-L1/v1",
+  "pluginVersion": "0.1.0",
+  "pluginId": "bigcommerce.order.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "officialApiBasis": [
+    "https://docs.bigcommerce.com/developer/docs/admin/checkout-and-cart/orders/overview",
+    "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/get-orders",
+    "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/get-order"
+  ],
+  "digestInput": "hartevo.bigcommerce-order-result/v1|layer=1|service=bigcommerce.order.result.read|provider=bigcommerce.order.result.recording|consumer=mission.bigcommerce-order-result.consumer|api=bigcommerce-v2-orders-list-get-r1",
+  "contractDigest": "6744cb0aced7fee61bcbafd1807641c6d6453e1c5e326f05d243685d0d8b0be7",
+  "service": {
+    "id": "bigcommerce.order.result.read",
+    "implementation": "BigCommerceOrderResultService",
+    "readOnly": true,
+    "bounded": true,
+    "externalWrites": false,
+    "operations": [
+      "GET /stores/{store_hash}/v2/orders",
+      "GET /stores/{store_hash}/v2/orders/{order_id}"
+    ]
+  },
+  "provider": {
+    "id": "bigcommerce.order.result.recording",
+    "implementation": "BigCommerceProvider",
+    "apiRevision": "bigcommerce-v2-orders-list-get-r1",
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "acceptedProvenance": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "mutatingOperations": [],
+    "fixtureEvidence": false,
+    "recordingEvidence": false,
+    "loopbackEvidence": false,
+    "blockedEnvEvidence": false
+  },
+  "consumer": {
+    "id": "mission.bigcommerce-order-result.consumer",
+    "implementation": "MissionBigCommerceOrderConsumer",
+    "missionScoped": true,
+    "projectScoped": true,
+    "workProductScoped": true,
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "readBack": true
+  },
+  "credentials": {
+    "secretReference": "opaque",
+    "supportedAuthKinds": ["api_token", "oauth"],
+    "rawCredentialMaterial": false,
+    "storeBound": true,
+    "reversible": true
+  },
+  "scope": {
+    "required": [
+      "store",
+      "order",
+      "customer_fingerprint",
+      "status",
+      "transaction",
+      "fulfillment",
+      "mission",
+      "project",
+      "work_product"
+    ],
+    "customerData": "fingerprint_digest_only",
+    "paymentData": "amount_digest_and_currency_only",
+    "lineItemCount": "bounded_integer",
+    "shipmentStatus": "redacted_enum",
+    "paymentState": "redacted_enum",
+    "rawAddresses": false,
+    "rawPaymentInstruments": false,
+    "rawCustomerPii": false
+  },
+  "registration": {
+    "digestBound": true,
+    "scopeBound": true,
+    "reversible": true,
+    "states": ["active", "revoked", "reversed"]
+  },
+  "pagination": {
+    "listPageSizeCeiling": 50,
+    "pageCeiling": 4,
+    "orderCeiling": 200,
+    "responseBytesCeiling": 1048576,
+    "opaqueCursor": true
+  },
+  "projection": {
+    "orderRevision": "sha256_digest",
+    "amount": "sha256_digest",
+    "customerFingerprint": "sha256_digest",
+    "transaction": "redacted_metadata",
+    "fulfillment": "redacted_metadata",
+    "statuses": [
+      "complete",
+      "partial",
+      "access_lost",
+      "not_found",
+      "conflict",
+      "rate_limited",
+      "provider_unknown"
+    ]
+  },
+  "receipts": {
+    "proposal": true,
+    "record": true,
+    "readBack": true,
+    "providerReceipt": false,
+    "durableKernelReceipt": false
+  },
+  "provenance": {
+    "fixture": "non_connected_non_native",
+    "recording": "non_connected_non_native",
+    "loopback": "non_connected_non_native",
+    "blockedEnv": "non_connected_non_native"
+  },
+  "authorityBoundary": {
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "outcomeAuthority": false,
+    "workProductAuthority": false,
+    "financialAdvice": false
+  },
+  "forbiddenEffects": [
+    "POST /stores/{store_hash}/v2/orders",
+    "PUT /stores/{store_hash}/v2/orders/{order_id}",
+    "DELETE /stores/{store_hash}/v2/orders/{order_id}",
+    "ship_order",
+    "refund_order",
+    "capture_payment",
+    "raw_address_export",
+    "raw_payment_instrument_export",
+    "raw_customer_pii_export",
+    "financial_advice"
+  ],
+  "layer2Gaps": [
+    "native BigCommerce transport is intentionally not supplied",
+    "credential resolution remains host-owned",
+    "Mission records remain review-only and are not Outcomes or Work Products"
+  ]
+}
