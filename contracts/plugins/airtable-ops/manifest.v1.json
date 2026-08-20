@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/plugins/airtable-ops/manifest/v1",
+  "title": "Hartevo Airtable Operations Plugin Layer 1",
+  "description": "A base/table scoped schema, read, recording, structured proposal, and read-back receipt contract. It has no live Airtable write or webhook truth authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "layer",
+    "pluginId",
+    "provider",
+    "service",
+    "missionConsumer",
+    "authority",
+    "constraints",
+    "environmentStates"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-airtable-ops-plugin-contract/v1"},
+    "contractVersion": {"const": "EXT-AIRTABLE-01-L1/v1"},
+    "layer": {"const": 1},
+    "pluginId": {"const": "airtable-ops.structured-record"},
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "manifestDigestAlgorithm",
+        "apiBaseUrl",
+        "authentication",
+        "scope",
+        "schema",
+        "pagination",
+        "batching",
+        "rateLimits",
+        "webhooks",
+        "provenance"
+      ],
+      "properties": {
+        "id": {"const": "airtable.web-api.ops"},
+        "version": {"const": 1},
+        "manifestDigestAlgorithm": {"const": "sha256"},
+        "apiBaseUrl": {"const": "https://api.airtable.com/v0"},
+        "authentication": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scheme", "secretReference", "rawSecretInReceipt"],
+          "properties": {
+            "scheme": {"const": "bearer"},
+            "secretReference": {"const": "pat_or_bearer_reference"},
+            "rawSecretInReceipt": {"const": false}
+          }
+        },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["baseId", "tableId", "viewIdOptional", "namesAreNotAuthority"],
+          "properties": {
+            "baseId": {"const": true},
+            "tableId": {"const": true},
+            "viewIdOptional": {"const": true},
+            "namesAreNotAuthority": {"const": true}
+          }
+        },
+        "schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["readEndpoint", "fieldIdsRequired", "fingerprintRequired", "driftFailsClosed"],
+          "properties": {
+            "readEndpoint": {"const": "/meta/bases/{baseId}/tables"},
+            "fieldIdsRequired": {"const": true},
+            "fingerprintRequired": {"const": true},
+            "driftFailsClosed": {"const": true}
+          }
+        },
+        "pagination": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["style", "maxPageSize", "offsetRequiredForContinuation"],
+          "properties": {
+            "style": {"const": "opaque_offset"},
+            "maxPageSize": {"const": 100},
+            "offsetRequiredForContinuation": {"const": true}
+          }
+        },
+        "batching": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["maxRecordsPerRequest", "writesEnabled"],
+          "properties": {
+            "maxRecordsPerRequest": {"const": 10},
+            "writesEnabled": {"const": false}
+          }
+        },
+        "rateLimits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["perBaseRequestsPerSecond", "patRequestsPerSecond", "rateLimitedStatus", "retryAfterSeconds"],
+          "properties": {
+            "perBaseRequestsPerSecond": {"const": 5},
+            "patRequestsPerSecond": {"const": 50},
+            "rateLimitedStatus": {"const": 429},
+            "retryAfterSeconds": {"const": 30}
+          }
+        },
+        "webhooks": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availableInLayer", "role", "truthRequiresReadback"],
+          "properties": {
+            "availableInLayer": {"const": false},
+            "role": {"const": "change_signal_only"},
+            "truthRequiresReadback": {"const": true}
+          }
+        },
+        "provenance": {
+          "type": "array",
+          "const": ["recording", "fixture", "blocked_env"]
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "operations", "authority", "sourceOfTruth"],
+      "properties": {
+        "id": {"const": "external.record.operations"},
+        "version": {"const": 1},
+        "operations": {
+          "type": "array",
+          "const": ["describe_schema", "compile_record_proposal", "read_records", "verify_record_readback"]
+        },
+        "authority": {"const": "schema_read_recording_and_proposal_only"},
+        "sourceOfTruth": {"const": "mission_and_verified_readback"}
+      }
+    },
+    "missionConsumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "acceptedOutputs", "fieldAllowlistRequired", "idempotencyRequired", "adoptableResult"],
+      "properties": {
+        "id": {"const": "mission.external.record.airtable"},
+        "acceptedOutputs": {"const": ["work_product", "outcome_candidate"]},
+        "fieldAllowlistRequired": {"const": true},
+        "idempotencyRequired": {"const": true},
+        "adoptableResult": {"const": true}
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["externalWrite", "webhookTruth", "store", "keyring", "browserProfile", "effectBroker"],
+      "properties": {
+        "externalWrite": {"const": false},
+        "webhookTruth": {"const": false},
+        "store": {"const": false},
+        "keyring": {"const": false},
+        "browserProfile": {"const": false},
+        "effectBroker": {"const": false}
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recordIdReceipt", "fieldFingerprintReceipt", "readBackContentDigest", "rawSecretForbidden", "tableNameNotCapability"],
+      "properties": {
+        "recordIdReceipt": {"const": true},
+        "fieldFingerprintReceipt": {"const": true},
+        "readBackContentDigest": {"const": true},
+        "rawSecretForbidden": {"const": true},
+        "tableNameNotCapability": {"const": true}
+      }
+    },
+    "environmentStates": {
+      "type": "array",
+      "const": ["BLOCKED_ENV", "RECORDING", "FIXTURE_NOT_CONNECTED"]
+    }
+  }
+}
