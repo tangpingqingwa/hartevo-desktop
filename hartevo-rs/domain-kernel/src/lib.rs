@@ -3,6 +3,7 @@
 //! Runtime threads, model output, and provider responses are projections into this
 //! kernel. They are never accepted as business truth without a domain command.
 
+mod attribution_outcome_adoption;
 mod attribution_spine;
 mod connection;
 mod context;
@@ -28,6 +29,17 @@ mod runtime_turn;
 mod truth;
 mod work_product;
 
+pub use attribution_outcome_adoption::{
+    ATTRIBUTION_ADOPTION_CANDIDATE_EVENT_TYPE, ATTRIBUTION_ADOPTION_CONSUMER_MOUNT_EVENT_TYPE,
+    ATTRIBUTION_ADOPTION_CONSUMER_REVOKE_EVENT_TYPE,
+    ATTRIBUTION_ADOPTION_CONSUMER_UNMOUNT_EVENT_TYPE, ATTRIBUTION_ADOPTION_RECEIPT_EVENT_TYPE,
+    ATTRIBUTION_OUTCOME_ADOPTION_CONTRACT_VERSION, ATTRIBUTION_OUTCOME_ADOPTION_SCHEMA_VERSION,
+    ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE, ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
+    AttributionAdoptionConsumer, AttributionAdoptionConsumerRecord,
+    AttributionAdoptionConsumerState, AttributionAdoptionDecision, AttributionAdoptionError,
+    AttributionAdoptionReceipt, AttributionAdoptionScope, AttributionAdoptionSnapshot,
+    AttributionModelVersion, AttributionOutcomeCandidate, AttributionVerificationRecord,
+};
 pub use attribution_spine::{
     ATTRIBUTION_SPINE_EVENT_TYPE, ATTRIBUTION_SPINE_SCHEMA_VERSION, AttributionAssignment,
     AttributionError, AttributionLedger, AttributionProjection, AttributionReason,
@@ -38,6 +50,16 @@ pub use attribution_spine::{
     SourceEventKind, SourceEventLinks, SourceObservationBatch, VerificationMethod, VerifiedOutcome,
     VerifiedOutcomeId,
 };
+
+/// Stable contract constants for storage crates.  The candidate and verified
+/// event names are also owned by the attribution-outcome adoption contract on
+/// newer bootstrap compositions, so they intentionally stay out of the root
+/// re-export above to avoid duplicate public names when that slice is composed.
+pub mod attribution_spine_contract {
+    pub use super::attribution_spine::{
+        ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE, ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
+    };
+}
 pub use context::{
     ContextBranch, ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleStatus,
     ContextDataClass, ContextDataPolicy, ContextError, ContextFactGrant, ContextInputRefs,
