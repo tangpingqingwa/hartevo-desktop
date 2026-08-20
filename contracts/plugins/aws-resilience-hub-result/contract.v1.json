@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-resilience-hub-result/contract.v1.json",
+  "title": "Hartevo AWS Resilience Hub application assessment result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-resilience-hub-result/v1",
+  "contractVersion": "EXT-AWS-RESILIENCE-HUB-01-L1/v1",
+  "pluginId": "aws.resilience-hub.result",
+  "objectiveType": "application_resiliency_assessment_posture",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-resilience-hub-result/v1|layer=1|service=aws.resilience-hub.result.read|provider=aws.resilience-hub.result.recording|consumer=mission.aws-resilience-hub.consumer",
+  "contractDigest": "2154d52687ffb5a10e33f08c506749f7c1c5829b8d2735b5b1abeb5daf8cb9d9",
+  "service": {
+    "type": "AwsResilienceHubService",
+    "id": "aws.resilience-hub.result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register_scope",
+      "ListApps",
+      "DescribeApp",
+      "ListAppAssessments",
+      "DescribeAppAssessment",
+      "compile_resilience_assessment_proposal",
+      "read_resilience_assessment",
+      "verify_resilience_assessment",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsResilienceHubProvider",
+    "id": "aws.resilience-hub.result.recording",
+    "apiRevision": "resilience-hub-list-apps-describe-app-list-app-assessments-describe-app-assessment-1",
+    "operations": [
+      "ListApps",
+      "DescribeApp",
+      "ListAppAssessments",
+      "DescribeAppAssessment"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "fake",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "service": "resiliencehub",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAwsResilienceHubConsumer",
+    "id": "mission.aws-resilience-hub.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false
+  },
+  "credentials": {
+    "boundary": "opaque SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "application",
+      "applicationVersion",
+      "assessment",
+      "resiliencyPolicy",
+      "applicationAllowlist",
+      "assessmentAllowlist",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "rawResourceArns": false,
+    "rawRecommendationText": false,
+    "rawMessages": false,
+    "rawTags": false,
+    "accountPii": false,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerApiRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "consentDigest",
+      "scopeDigest",
+      "applicationAllowlistDigest",
+      "assessmentAllowlistDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "evidenceDigest"
+    ],
+    "permissions": [
+      "resiliencehub:ListApps",
+      "resiliencehub:DescribeApp",
+      "resiliencehub:ListAppAssessments",
+      "resiliencehub:DescribeAppAssessment",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "resiliencehub:StartAppAssessment",
+      "resiliencehub:ImportResourcesToApp",
+      "resiliencehub:AcceptRecommendation",
+      "resiliencehub:CreateResiliencyPolicy",
+      "resiliencehub:UpdateResiliencyPolicy",
+      "resiliencehub:DeleteApp",
+      "resiliencehub:DeleteAppAssessment",
+      "resiliencehub:ListRecommendationTemplates",
+      "iam:PassRole",
+      "outcome.adopt",
+      "effect.execute"
+    ]
+  },
+  "pagination": {
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "account",
+      "region",
+      "applicationAllowlistDigest",
+      "assessmentAllowlistDigest",
+      "operation",
+      "pageNumber",
+      "queryDigest"
+    ],
+    "filterDriftRejected": true,
+    "applicationDriftRejected": true,
+    "applicationVersionDriftRejected": true,
+    "assessmentDriftRejected": true,
+    "policyDriftRejected": true,
+    "paginationLoopRejected": true,
+    "partialPageIsNonAdoptable": true
+  },
+  "assessmentProjection": {
+    "status": ["pending", "succeeded", "compliant", "non_compliant", "in_progress", "failed", "expired", "drifted", "partial", "unknown", "access_loss", "throttled", "not_found", "registration_revoked"],
+    "complianceStatus": ["compliant", "non_compliant", "unknown"],
+    "resiliencyScore": "bounded_percent_0_to_100",
+    "rpoRtoPosture": ["met", "at_risk", "not_met", "unknown"],
+    "drift": ["not_detected", "detected", "unknown"],
+    "riskCategories": "bounded_enum_and_count",
+    "timestamps": ["observedAt", "assessedAt", "expiresAt", "riskObservedAt"],
+    "maxAssessmentAgeSeconds": 86400,
+    "redactedDigestOnly": true,
+    "resourceArns": false,
+    "recommendationText": false,
+    "rawMessages": false,
+    "tags": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "applicationAllowlistDigest",
+      "assessmentAllowlistDigest",
+      "listAppsDigest",
+      "describeAppDigest",
+      "listAppAssessmentsDigest",
+      "describeAppAssessmentDigest",
+      "paginationDigest",
+      "evidenceDigest"
+    ],
+    "tamperRejected": true,
+    "replayConflictsRejected": true,
+    "revocationRejected": true,
+    "staleOrExpiredRejected": true,
+    "driftRejected": true,
+    "partialIsNonAdoptable": true,
+    "unknownIsNonAdoptable": true,
+    "accessLossIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS Resilience Hub account/region/application/application-version/assessment/policy scope",
+      "explicit application and assessment allowlists",
+      "bounded ListApps, DescribeApp, ListAppAssessments and DescribeAppAssessment seams",
+      "assessment status/compliance/score/RPO/RTO/drift/risk/timestamp projection",
+      "pagination and digest fences",
+      "version/contract/provider/API/permission/consent/scope/evidence digests",
+      "reversible registration",
+      "redacted idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live AWS Resilience Hub HTTPS",
+      "StartAppAssessment",
+      "resource import",
+      "recommendation acceptance",
+      "resiliency-policy mutation",
+      "failover or recovery execution",
+      "raw resource inventory, messages or tags",
+      "durable native receipt",
+      "independent native reread",
+      "verified Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live AWS Resilience Hub HTTPS",
+    "durable provider receipt",
+    "independent native reread",
+    "Connected/native/first-party evidence",
+    "Hartevo Outcome or Work Product adoption"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live ListApps/DescribeApp/ListAppAssessments/DescribeAppAssessment HTTPS, durable provider receipt, independent native reread and verified Mission adoption remain Layer-2 work; recording, fixture, fake, loopback and BLOCKED_ENV never claim Connected, native or first-party evidence. Application assessment posture is provider-state evidence, not a failover or recovery guarantee."
+}
