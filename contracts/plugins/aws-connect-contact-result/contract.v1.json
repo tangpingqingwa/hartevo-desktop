@@ -1,0 +1,307 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-connect-contact-result/contract.v1.json",
+  "title": "Hartevo Amazon Connect contact-result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-connect-contact-result/v1",
+  "contractVersion": "EXT-AWSCONNECTCONTACT-01-L1/v1",
+  "pluginId": "aws.connect.contact-result",
+  "objectiveType": "contact_result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-connect-contact-result/v1|layer=1|service=aws.connect.contact-result.read|provider=aws.connect.contact-result.recording|consumer=mission.aws-connect-contact-result.consumer",
+  "contractDigest": "18b801ab3402be0f076f5c0f91777e942afdc3f7bcea1a923fb0e151e771f653",
+  "service": {
+    "type": "AwsConnectContactResultService",
+    "id": "aws.connect.contact-result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register_scope",
+      "search_contacts",
+      "describe_contact",
+      "get_contact_attributes_allowlisted_digest_only",
+      "compile_contact_evidence_proposal",
+      "verify_contact_evidence",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "type": "AwsConnectProvider",
+    "id": "aws.connect.contact-result.recording",
+    "apiRevision": "connect-search-contacts-describe-contact-get-contact-attributes-1",
+    "operations": [
+      "SearchContacts",
+      "DescribeContact",
+      "GetContactAttributes"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "serialized": false,
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false,
+    "liveHttps": false
+  },
+  "consumer": {
+    "type": "MissionAwsConnectContactConsumer",
+    "id": "mission.aws-connect-contact-result.consumer",
+    "authority": "proposal_and_redacted_receipt_candidate_below_kernel",
+    "scope": [
+      "awsAccountId",
+      "awsRegion",
+      "connectInstanceId",
+      "contactId",
+      "queueId",
+      "agentId",
+      "channel",
+      "timeWindowUtc",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false
+  },
+  "credentials": {
+    "boundary": "opaque non-serializing SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "connectInstanceId",
+      "contactId",
+      "queueId",
+      "agentId",
+      "channel",
+      "timeWindowUtc",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "timeWindowRequired": true,
+    "timeWindowTimezone": "UTC",
+    "maxWindowDays": 31,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxResponseBytes": 1048576,
+    "rawPhone": false,
+    "rawEmail": false,
+    "rawTranscript": false,
+    "rawRecording": false,
+    "rawArbitraryAttributes": false
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "apiRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "evidenceBindingDigest",
+      "evidenceLevel",
+      "registrationRevision",
+      "registrationStatus"
+    ],
+    "permissions": [
+      "connect:SearchContacts",
+      "connect:DescribeContact",
+      "connect:GetContactAttributes",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "connect:StartOutboundVoiceContact",
+      "connect:TransferContact",
+      "connect:StopContact",
+      "connect:UpdateContactAttributes",
+      "connect:UpdateContactRecordingBehavior",
+      "connect:CreateContact",
+      "contact.send",
+      "contact.schedule",
+      "contact.record",
+      "contact.evaluate",
+      "receipt.durable",
+      "work_product.adopt",
+      "outcome.adopt"
+    ]
+  },
+  "searchContacts": {
+    "requiredUtcTimeWindow": true,
+    "allowlistedFilterFields": [
+      "ContactId",
+      "InstanceId",
+      "QueueId",
+      "AgentId",
+      "Channel",
+      "State",
+      "InitiationMethod"
+    ],
+    "allowlistedSortFields": [
+      "InitiationTimestamp",
+      "LastUpdateTimestamp",
+      "DisconnectTimestamp"
+    ],
+    "maxContactsPerPage": 100,
+    "maxPages": 4,
+    "nextToken": "opaque_digest_bound",
+    "cursorLoopRejected": true,
+    "cursorTamperRejected": true,
+    "filterDriftRejected": true,
+    "scopeDriftRejected": true
+  },
+  "describeContact": {
+    "lifecycleProjection": [
+      "initiationTimestamp",
+      "connectedTimestamp",
+      "lastUpdateTimestamp",
+      "disconnectTimestamp",
+      "state",
+      "initiationMethod",
+      "disconnectReasonClass"
+    ],
+    "assignmentProjection": ["queueIdDigest", "agentIdDigest", "channel"],
+    "rawProviderMessage": false
+  },
+  "getContactAttributes": {
+    "strictAllowlist": [
+      "customer_reference",
+      "case_reference",
+      "language",
+      "intent",
+      "outcome_code",
+      "campaign_reference"
+    ],
+    "valueProjection": "sha256_digest_only",
+    "rawValues": false,
+    "arbitraryKeys": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "evidenceBindingDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "filterDigest",
+      "sortDigest",
+      "cursorDigest",
+      "searchDigest",
+      "describeDigest",
+      "attributesDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "completed",
+      "partial",
+      "retention_expired",
+      "access_loss",
+      "provider_unknown",
+      "not_found",
+      "throttled",
+      "registration_revoked"
+    ],
+    "tamperRejected": true,
+    "replayRejected": true,
+    "staleMissionRejected": true,
+    "revocationRejected": true,
+    "partialIsNonAdoptable": true,
+    "retentionLossIsNonAdoptable": true,
+    "accessLossIsNonAdoptable": true,
+    "providerUnknownIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false,
+    "durableReceipt": false,
+    "independentReadback": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed Amazon Connect account/region/instance/contact/queue/agent/channel/time-window scope",
+      "bounded SearchContacts, DescribeContact, and allowlisted GetContactAttributes seams",
+      "lifecycle/assignment/channel/disconnect-class projection",
+      "attribute key/value digest evidence",
+      "pagination/filter/cursor/revision fences",
+      "version/contract/provider/API/permission/consent/scope/evidence digests",
+      "reversible registration",
+      "redacted idempotent proposal and receipt candidate"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Work Product adoption",
+      "Hartevo Outcome adoption",
+      "live SigV4 credential resolution",
+      "live AWS Connect HTTPS",
+      "contact send/transfer/disconnect/schedule/record/evaluate/mutation",
+      "raw phone/email/transcript/recording",
+      "raw arbitrary contact attributes",
+      "independent provider read-back"
+    ]
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live Amazon Connect HTTPS",
+    "durable provider receipt",
+    "independent read-back",
+    "consented contact effects",
+    "Connected/native/first-party evidence",
+    "verified Work Product adoption",
+    "Hartevo Outcome adoption"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live SearchContacts/DescribeContact/GetContactAttributes HTTPS, durable provider receipt, independent read-back, contact effects, and verified Work Product/Outcome adoption remain Layer-2 work; recording, fixture, loopback, and BLOCKED_ENV never claim Connected or native evidence."
+}
