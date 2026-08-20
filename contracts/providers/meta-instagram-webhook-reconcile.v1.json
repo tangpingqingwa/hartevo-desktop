@@ -1,0 +1,99 @@
+{
+  "schemaVersion": "hartevo-meta-instagram-webhook-reconcile-contract/v1",
+  "contractVersion": "meta-instagram-webhook-reconcile-e1/v1",
+  "adapterId": "meta.graph.instagram-insight-read",
+  "adapterVersion": 1,
+  "service": "MetaWebhookReconcileService",
+  "consumer": "MetaMissionInsightConsumer",
+  "provider": "Meta Webhooks + Meta Graph API / Instagram Graph API",
+  "evidenceLevel": "E1",
+  "firstParty": true,
+  "readOnly": true,
+  "registrations": [],
+  "claimAuthority": {
+    "connected": false,
+    "providerExecution": false,
+    "providerReceipt": false,
+    "businessVerification": false,
+    "e4": false
+  },
+  "authentication": {
+    "accessToken": "opaque_secret_reference_and_credential_lease",
+    "appSecret": "opaque_secret_reference_only",
+    "authenticatedGraphReadRequired": true,
+    "subscriptionIdentityRequired": true,
+    "missingNativeConfiguration": "BLOCKED_ENV"
+  },
+  "scope": {
+    "exactBindings": [
+      "tenant",
+      "project",
+      "business_id",
+      "ad_account_id",
+      "page_id",
+      "instagram_account_id"
+    ],
+    "subscriptionBinds": [
+      "connector_scope_digest",
+      "meta_scope_digest",
+      "api_digest",
+      "object",
+      "revision"
+    ],
+    "deliveryBinds": [
+      "subscription_id",
+      "delivery_id",
+      "event_id",
+      "payload_digest",
+      "reconcile_request_digest",
+      "reconcile_cursor_token_digest",
+      "credential_binding_digest"
+    ]
+  },
+  "webhook": {
+    "signatureHeader": "X-Hub-Signature-256",
+    "signatureAlgorithm": "HMAC-SHA256",
+    "exactEntryScopeRequired": true,
+    "rawPayloadDurablyPersisted": false,
+    "durableReceiptBeforeGraphRead": true,
+    "duplicateDelivery": "same_verified_identity_returns_same_result",
+    "deliveryIdentityDrift": "fail_closed"
+  },
+  "reconcile": {
+    "method": "GET",
+    "boundedAuthenticatedGraphReads": 1,
+    "readService": "PaidSocialInsightReadService",
+    "cursor": "existing_exact_provider_after_cursor",
+    "checkpoint": "webhook_pending_and_read_cursor_restore_together",
+    "providerVersionAndDigestBound": true,
+    "quotaFreshnessCostAndRateReceiptRequired": true
+  },
+  "receipts": {
+    "source": "verified_meta_webhook_and_provider_native_https",
+    "deliveryTime": "required",
+    "requestDigest": "required",
+    "responseDigest": "required",
+    "payloadDigest": "required",
+    "signatureDigest": "required",
+    "classification": "required",
+    "causalAttribution": "not_claimed",
+    "missionResultDurableLogged": true,
+    "missionResultAdoptable": true
+  },
+  "lifecycle": {
+    "revoke": "clear_mount_pending_delivery_completed_delivery_and_cursor",
+    "unmount": "clear_mount_pending_delivery_completed_delivery_and_cursor",
+    "crashRecovery": "restore_pending_delivery_and_exact_read_checkpoint",
+    "refreshDrift": "fail_closed",
+    "registrations": "empty_until_real_attach"
+  },
+  "writes": {
+    "providerMutation": false,
+    "effectAuthority": false,
+    "registrationAuthority": false
+  },
+  "backlog": [
+    "generic multi-provider resource abstraction",
+    "campaign/adset/ad/creative/media resource reads beyond this bounded insight slice"
+  ]
+}
