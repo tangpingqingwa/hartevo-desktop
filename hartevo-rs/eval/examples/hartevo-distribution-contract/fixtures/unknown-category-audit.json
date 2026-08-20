@@ -1,0 +1,24 @@
+{
+  "vulnerabilities": {
+    "found": false,
+    "count": 0,
+    "list": []
+  },
+  "warnings": {
+    "future-category": [
+      {
+        "kind": "future-category",
+        "package": {
+          "name": "glib",
+          "version": "0.18.5",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        "advisory": {
+          "id": "RUSTSEC-TEST-UNKNOWN",
+          "package": "glib",
+          "informational": "future-category"
+        }
+      }
+    ]
+  }
+}
