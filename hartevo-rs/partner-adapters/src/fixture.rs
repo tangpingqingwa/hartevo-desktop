@@ -159,6 +159,7 @@ impl PartnerFixtureWorld {
         serde_json::to_vec(&json!({
             "eventId": event_id,
             "eventType": event_type,
+            "accountId": self.account_id.as_str(),
             "programId": self.program_id.as_str(),
             "conversionId": conversion_id,
             "orderId": order_id,

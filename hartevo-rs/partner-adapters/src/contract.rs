@@ -3,7 +3,7 @@ use std::fmt;
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_domain_kernel::{CurrencyCode, Money};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -14,6 +14,23 @@ use crate::ids::{
 
 pub const PARTNER_NETWORK_CONTRACT_SCHEMA_VERSION: &str = "hartevo-partner-network-contract/v1";
 pub const PARTNER_NETWORK_CONTRACT_VERSION: &str = "partner-network-e1/v1";
+/// A compact machine-readable contract marker.  The full typed contract is
+/// enforced by the strict serde representations below; this marker is kept in
+/// the adapter boundary so a catalog or Mission consumer can bind the exact
+/// schema revision without inventing a second registry.
+pub const PARTNER_NETWORK_CONTRACT_SCHEMA: &str = r#"{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"hartevo-partner-network-contract/v1",
+  "type":"object",
+  "additionalProperties":false,
+  "required":["provider","scope","sourceDigest","observedAt","evidenceDigest"]
+}"#;
+
+pub fn deserialize_partner_contract<T: DeserializeOwned>(
+    json: &str,
+) -> Result<T, PartnerNetworkError> {
+    serde_json::from_str(json).map_err(|_| PartnerNetworkError::MalformedCallback)
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,13 +81,39 @@ pub enum NetworkCapability {
     OutcomeIngest,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetworkScope {
     pub tenant_id: String,
     pub project_id: String,
     pub account_id: NetworkAccountId,
     pub program_id: Option<ProgramId>,
+}
+
+impl<'de> Deserialize<'de> for NetworkScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        #[allow(clippy::struct_field_names)]
+        struct Wire {
+            tenant_id: String,
+            project_id: String,
+            account_id: NetworkAccountId,
+            program_id: Option<ProgramId>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.tenant_id,
+            wire.project_id,
+            wire.account_id,
+            wire.program_id,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl NetworkScope {
@@ -142,8 +185,8 @@ impl NetworkScope {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpaqueSecretReference {
     reference_id: String,
     revision: u64,
@@ -181,6 +224,33 @@ impl OpaqueSecretReference {
     pub const fn revision(&self) -> u64 {
         self.revision
     }
+
+    pub(crate) fn validate(&self) -> Result<(), PartnerNetworkError> {
+        if self.reference_id.trim().is_empty()
+            || self.reference_id.chars().any(char::is_control)
+            || self.revision == 0
+        {
+            return Err(PartnerNetworkError::InvalidAuthorizationReference);
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for OpaqueSecretReference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            reference_id: String,
+            revision: u64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.reference_id, wire.revision).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -193,7 +263,7 @@ pub enum AuthorizationState {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthorizationGrant {
     pub scope: NetworkScope,
     pub secret_reference: OpaqueSecretReference,
@@ -226,6 +296,7 @@ impl AuthorizationGrant {
         observed_at: DateTime<Utc>,
     ) -> Result<(), PartnerNetworkError> {
         self.scope.validate()?;
+        self.secret_reference.validate()?;
         if self.capabilities.is_empty() || self.expires_at <= observed_at {
             return Err(PartnerNetworkError::InvalidAuthorizationGrant);
         }
@@ -234,7 +305,7 @@ impl AuthorizationGrant {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthorizationObservation {
     pub provider: NetworkProvider,
     pub scope: NetworkScope,
@@ -245,12 +316,31 @@ pub struct AuthorizationObservation {
     pub evidence_digest: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProgramExpectation {
     pub program_id: ProgramId,
     pub revision: u64,
     pub terms_digest: String,
+}
+
+impl<'de> Deserialize<'de> for ProgramExpectation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            program_id: ProgramId,
+            revision: u64,
+            terms_digest: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.program_id, wire.revision, wire.terms_digest)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl ProgramExpectation {
@@ -277,7 +367,7 @@ impl ProgramExpectation {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetworkProbeRequest {
     pub scope: NetworkScope,
     pub expected_program: Option<ProgramExpectation>,
@@ -331,7 +421,7 @@ pub enum NetworkProbeStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetworkProbeObservation {
     pub provider: NetworkProvider,
     pub scope: NetworkScope,
@@ -345,13 +435,20 @@ pub struct NetworkProbeObservation {
     pub program_digest: Option<String>,
     pub observed_at: DateTime<Utc>,
     pub evidence_digest: String,
+    /// Only an independently recorded native credential/permission/probe/
+    /// readback canary may populate this field.  Provider payloads cannot.
+    pub native_canary_digest: Option<String>,
+    #[serde(skip)]
+    pub(crate) native_canary_attested: bool,
 }
 
 impl NetworkProbeObservation {
     pub fn can_claim_connected(&self) -> bool {
         self.status == NetworkProbeStatus::Reachable
             && self.provenance == NetworkProvenance::ProductionProvider
-            && self.claim_authority == "connection_state_only"
+            && self.claim_authority == "native_canary_readback"
+            && self.native_canary_digest.as_deref().is_some_and(is_sha256)
+            && self.native_canary_attested
     }
 }
 
@@ -372,31 +469,116 @@ pub enum NetworkResource {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct ReadCursor(String);
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReadCursor {
+    token_digest: String,
+    binding_digest: Option<String>,
+    sequence: u64,
+}
 
 impl ReadCursor {
     pub fn new(value: impl Into<String>) -> Result<Self, PartnerNetworkError> {
         let value = value.into();
-        let cursor = Self(value);
+        let cursor = Self {
+            token_digest: value,
+            binding_digest: None,
+            sequence: 0,
+        };
+        cursor.validate()?;
+        Ok(cursor)
+    }
+
+    pub fn bound(
+        scope: &NetworkScope,
+        resource: NetworkResource,
+        expected_program: Option<&ProgramExpectation>,
+        window: Option<&SettlementPeriod>,
+        authorization_generation: &str,
+        sequence: u64,
+        token: impl Into<String>,
+    ) -> Result<Self, PartnerNetworkError> {
+        if authorization_generation.trim().is_empty() || sequence == 0 {
+            return Err(PartnerNetworkError::InvalidReadCursor);
+        }
+        let token = token.into();
+        let token_digest = if is_sha256(&token) {
+            token
+        } else {
+            digest_bytes(token.as_bytes())
+        };
+        let binding_digest = cursor_binding_digest(
+            scope,
+            resource,
+            expected_program,
+            window,
+            authorization_generation,
+            sequence,
+        )?;
+        let cursor = Self {
+            token_digest,
+            binding_digest: Some(binding_digest),
+            sequence,
+        };
         cursor.validate()?;
         Ok(cursor)
     }
 
     pub fn validate(&self) -> Result<(), PartnerNetworkError> {
-        if self.0.trim().is_empty() || self.0.chars().any(char::is_control) {
+        if self.token_digest.trim().is_empty()
+            || self.token_digest.chars().any(char::is_control)
+            || (self
+                .binding_digest
+                .as_deref()
+                .is_some_and(|digest| !is_sha256(digest)))
+            || (self.binding_digest.is_some() && !is_sha256(&self.token_digest))
+        {
             return Err(PartnerNetworkError::InvalidReadCursor);
         }
         Ok(())
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.token_digest
+    }
+
+    pub fn binding_digest(&self) -> Option<&str> {
+        self.binding_digest.as_deref()
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.binding_digest.is_some() && self.sequence > 0
+    }
+
+    pub(crate) fn validate_for(
+        &self,
+        scope: &NetworkScope,
+        resource: NetworkResource,
+        expected_program: Option<&ProgramExpectation>,
+        window: Option<&SettlementPeriod>,
+        authorization_generation: &str,
+    ) -> Result<(), PartnerNetworkError> {
+        self.validate()?;
+        let expected = cursor_binding_digest(
+            scope,
+            resource,
+            expected_program,
+            window,
+            authorization_generation,
+            self.sequence,
+        )?;
+        if self.binding_digest.as_deref() != Some(expected.as_str()) {
+            return Err(PartnerNetworkError::CursorBindingMismatch);
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReadPage {
     pub cursor: Option<ReadCursor>,
     pub next_cursor: Option<ReadCursor>,
@@ -405,12 +587,14 @@ pub struct ReadPage {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetworkReadRequest {
     pub scope: NetworkScope,
     pub resource: NetworkResource,
     pub expected_program: Option<ProgramExpectation>,
     pub cursor: Option<ReadCursor>,
+    pub window: Option<SettlementPeriod>,
+    pub authorization_generation: Option<String>,
     pub limit: u16,
     pub observed_at: DateTime<Utc>,
 }
@@ -422,6 +606,8 @@ impl NetworkReadRequest {
             resource,
             expected_program: None,
             cursor: None,
+            window: None,
+            authorization_generation: None,
             limit: 100,
             observed_at,
         }
@@ -438,6 +624,8 @@ impl NetworkReadRequest {
             resource,
             expected_program: Some(expected_program),
             cursor: None,
+            window: None,
+            authorization_generation: None,
             limit: 100,
             observed_at,
         }
@@ -450,11 +638,63 @@ impl NetworkReadRequest {
         }
         if let Some(cursor) = &self.cursor {
             cursor.validate()?;
+            let authorization_generation = self
+                .authorization_generation
+                .as_deref()
+                .ok_or(PartnerNetworkError::CursorBindingMismatch)?;
+            cursor.validate_for(
+                &self.scope,
+                self.resource,
+                self.expected_program.as_ref(),
+                self.window.as_ref(),
+                authorization_generation,
+            )?;
+        }
+        if let Some(window) = &self.window {
+            SettlementPeriod::new(window.started_at, window.ended_at)?;
+        }
+        if self
+            .authorization_generation
+            .as_deref()
+            .is_some_and(|generation| generation.trim().is_empty())
+        {
+            return Err(PartnerNetworkError::InvalidAuthorizationGrant);
         }
         if self.limit == 0 || self.limit > 500 {
             return Err(PartnerNetworkError::InvalidReadLimit);
         }
         Ok(())
+    }
+
+    pub fn with_window(mut self, window: SettlementPeriod) -> Result<Self, PartnerNetworkError> {
+        window.validate()?;
+        self.window = Some(window);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_authorization_generation(mut self, generation: impl Into<String>) -> Self {
+        self.authorization_generation = Some(generation.into());
+        self
+    }
+
+    pub(crate) fn cursor_digest(&self) -> String {
+        self.cursor.as_ref().map_or_else(
+            || {
+                cursor_binding_digest(
+                    &self.scope,
+                    self.resource,
+                    self.expected_program.as_ref(),
+                    self.window.as_ref(),
+                    self.authorization_generation
+                        .as_deref()
+                        .unwrap_or("unbound"),
+                    0,
+                )
+                .unwrap_or_else(|_| digest_bytes(b"invalid-initial-cursor"))
+            },
+            |cursor| cursor.as_str().to_owned(),
+        )
     }
 }
 
@@ -545,7 +785,7 @@ pub enum ReportSettlementState {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SettlementPeriod {
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
@@ -564,12 +804,19 @@ impl SettlementPeriod {
             ended_at,
         })
     }
+
+    pub fn validate(&self) -> Result<(), PartnerNetworkError> {
+        if self.started_at >= self.ended_at {
+            return Err(PartnerNetworkError::InvalidSettlementPeriod);
+        }
+        Ok(())
+    }
 }
 
 macro_rules! source_record {
     ($name:ident { $($field:ident : $type:ty),* $(,)? }) => {
         #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-        #[serde(rename_all = "camelCase")]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
         pub struct $name {
             $(pub $field: $type,)*
             pub observed_at: DateTime<Utc>,
@@ -689,7 +936,7 @@ source_record!(PayoutRecord {
 });
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReportRow {
     pub action_id: Option<ActionId>,
     pub conversion_id: Option<ConversionId>,
@@ -702,7 +949,7 @@ pub struct ReportRow {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReportRecord {
     pub account_id: NetworkAccountId,
     pub program_id: ProgramId,
@@ -718,7 +965,7 @@ pub struct ReportRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", tag = "resource")]
+#[serde(rename_all = "camelCase", tag = "resource", deny_unknown_fields)]
 pub enum NetworkReadData {
     Programs { records: Vec<ProgramRecord> },
     Partners { records: Vec<PartnerRecord> },
@@ -956,30 +1203,283 @@ impl NetworkReadData {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetworkReadBudgetReceipt {
+    pub quota_limit: u16,
+    pub quota_remaining: u16,
+    pub rate_limit_remaining: u16,
+    pub rate_limit_reset_at: DateTime<Utc>,
+    pub cost_units: u32,
+    pub freshness_expires_at: DateTime<Utc>,
+    pub source: String,
+    pub evidence_digest: String,
+}
+
+impl NetworkReadBudgetReceipt {
+    pub(crate) fn local(observed_at: DateTime<Utc>, limit: u16) -> Self {
+        let rate_limit_reset_at = observed_at + Duration::minutes(1);
+        let freshness_expires_at = observed_at + Duration::seconds(30);
+        let value = (
+            limit,
+            limit.saturating_sub(1),
+            0_u16,
+            rate_limit_reset_at,
+            1_u32,
+            freshness_expires_at,
+            "adapter-bounded-local",
+        );
+        let evidence_digest = canonical_digest(&value).expect("local read receipt is serializable");
+        Self {
+            quota_limit: limit,
+            quota_remaining: limit.saturating_sub(1),
+            rate_limit_remaining: 0,
+            rate_limit_reset_at,
+            cost_units: 1,
+            freshness_expires_at,
+            source: "adapter-bounded-local".into(),
+            evidence_digest,
+        }
+    }
+
+    pub fn validate_at(&self, observed_at: DateTime<Utc>) -> Result<(), PartnerNetworkError> {
+        if self.quota_remaining > self.quota_limit
+            || self.cost_units == 0
+            || self.rate_limit_reset_at < observed_at
+            || self.freshness_expires_at <= observed_at
+            || self.source.trim().is_empty()
+        {
+            return Err(PartnerNetworkError::InvalidReadReceipt);
+        }
+        let value = (
+            self.quota_limit,
+            self.quota_remaining,
+            self.rate_limit_remaining,
+            self.rate_limit_reset_at,
+            self.cost_units,
+            self.freshness_expires_at,
+            self.source.as_str(),
+        );
+        if self.evidence_digest != canonical_digest(&value)? {
+            return Err(PartnerNetworkError::ReadScopeOrEvidenceMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetworkReadObservation {
     pub provider: NetworkProvider,
     pub scope: NetworkScope,
     pub request: NetworkResource,
     pub data: NetworkReadData,
     pub page: ReadPage,
+    pub expected_program: Option<ProgramExpectation>,
+    pub window: Option<SettlementPeriod>,
+    pub observed_program_id: Option<ProgramId>,
+    pub program_revision: Option<u64>,
+    pub program_terms_digest: Option<String>,
+    pub authorization_revision: u64,
+    pub authorization_generation: String,
+    pub cursor_digest: String,
     pub provenance: NetworkProvenance,
     pub evidence_level: EvidenceLevel,
     pub observed_at: DateTime<Utc>,
     pub source_digest: String,
+    pub budget: NetworkReadBudgetReceipt,
+    pub native_canary_digest: Option<String>,
+    #[serde(skip)]
+    pub(crate) native_canary_attested: bool,
+    pub evidence_digest: String,
 }
 
 impl NetworkReadObservation {
     pub fn validate(&self) -> Result<(), PartnerNetworkError> {
         self.scope.validate()?;
         let expected_source_digest = canonical_digest(&self.data)?;
+        if let Some(expected_program) = &self.expected_program {
+            expected_program.validate()?;
+        }
+        if let Some(window) = &self.window {
+            window.validate()?;
+        }
+        if self.authorization_revision == 0
+            || self.authorization_generation.trim().is_empty()
+            || !is_sha256(&self.cursor_digest)
+            || self
+                .native_canary_digest
+                .as_deref()
+                .is_some_and(|digest| !is_sha256(digest))
+            || (self.native_canary_digest.is_some() && !self.native_canary_attested)
+        {
+            return Err(PartnerNetworkError::ReadScopeOrEvidenceMismatch);
+        }
         if self.request != self.data.resource()
             || self.page.item_count as usize != self.data.item_count()
             || self.source_digest != expected_source_digest
         {
             return Err(PartnerNetworkError::ReadScopeOrEvidenceMismatch);
         }
-        self.data.validate_for(&self.scope)
+        self.data.validate_for(&self.scope)?;
+        verify_program_expectation(
+            &self.scope,
+            self.expected_program.as_ref(),
+            self.observed_program_id.as_ref(),
+            self.program_revision,
+            self.program_terms_digest.as_deref(),
+        )?;
+        for cursor in [self.page.cursor.as_ref(), self.page.next_cursor.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            cursor.validate_for(
+                &self.scope,
+                self.request,
+                self.expected_program.as_ref(),
+                self.window.as_ref(),
+                &self.authorization_generation,
+            )?;
+        }
+        self.budget.validate_at(self.observed_at)?;
+        let evidence = read_observation_evidence_digest(self)?;
+        if self.evidence_digest != evidence {
+            return Err(PartnerNetworkError::ReadScopeOrEvidenceMismatch);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn read_observation_evidence_digest(
+    observation: &NetworkReadObservation,
+) -> Result<String, PartnerNetworkError> {
+    canonical_digest(&(
+        (
+            &observation.provider,
+            &observation.scope,
+            &observation.request,
+            &observation.source_digest,
+            &observation.expected_program,
+            &observation.window,
+            &observation.observed_program_id,
+            &observation.program_revision,
+            &observation.program_terms_digest,
+        ),
+        (
+            &observation.authorization_revision,
+            &observation.authorization_generation,
+            &observation.cursor_digest,
+            &observation.page,
+            &observation.provenance,
+            &observation.evidence_level,
+            &observation.observed_at,
+            &observation.budget,
+            &observation.native_canary_digest,
+        ),
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionOutcomeClassification {
+    FixtureEvidence,
+    ControlledEvidence,
+    NativeCanaryEvidence,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MissionOutcomeReceipt {
+    pub provider: NetworkProvider,
+    pub scope: NetworkScope,
+    pub expected_program: ProgramExpectation,
+    pub window: SettlementPeriod,
+    pub cursor_digest: String,
+    pub source_digest: String,
+    pub observed_at: DateTime<Utc>,
+    pub classification: MissionOutcomeClassification,
+    pub claim_connected: bool,
+    pub evidence_digest: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PartnerMissionConsumer {
+    provider: NetworkProvider,
+    scope: NetworkScope,
+    expected_program: ProgramExpectation,
+    window: SettlementPeriod,
+}
+
+impl PartnerMissionConsumer {
+    pub fn new(
+        provider: NetworkProvider,
+        scope: NetworkScope,
+        expected_program: ProgramExpectation,
+        window: SettlementPeriod,
+    ) -> Result<Self, PartnerNetworkError> {
+        scope.validate()?;
+        expected_program.validate()?;
+        window.validate()?;
+        if scope.program_id.as_ref() != Some(&expected_program.program_id) {
+            return Err(PartnerNetworkError::ProgramDrift);
+        }
+        Ok(Self {
+            provider,
+            scope,
+            expected_program,
+            window,
+        })
+    }
+
+    pub fn consume(
+        &self,
+        observation: &NetworkReadObservation,
+    ) -> Result<MissionOutcomeReceipt, PartnerNetworkError> {
+        observation.validate()?;
+        if observation.provider != self.provider
+            || observation.scope != self.scope
+            || observation.expected_program.as_ref() != Some(&self.expected_program)
+            || observation.window.as_ref() != Some(&self.window)
+        {
+            return Err(PartnerNetworkError::MissionBindingMismatch);
+        }
+        let classification = match observation.provenance {
+            NetworkProvenance::Fixture => MissionOutcomeClassification::FixtureEvidence,
+            NetworkProvenance::ControlledProvider => {
+                MissionOutcomeClassification::ControlledEvidence
+            }
+            NetworkProvenance::ProductionProvider => {
+                if observation.native_canary_digest.is_none() || !observation.native_canary_attested
+                {
+                    return Err(PartnerNetworkError::NativeCanaryRequired);
+                }
+                MissionOutcomeClassification::NativeCanaryEvidence
+            }
+        };
+        let claim_connected = classification == MissionOutcomeClassification::NativeCanaryEvidence;
+        let evidence_digest = canonical_digest(&(
+            &observation.provider,
+            &observation.scope,
+            &self.expected_program,
+            &self.window,
+            &observation.cursor_digest,
+            &observation.source_digest,
+            &observation.observed_at,
+            &classification,
+            &claim_connected,
+            &observation.evidence_digest,
+        ))?;
+        Ok(MissionOutcomeReceipt {
+            provider: observation.provider,
+            scope: observation.scope.clone(),
+            expected_program: self.expected_program.clone(),
+            window: self.window.clone(),
+            cursor_digest: observation.cursor_digest.clone(),
+            source_digest: observation.source_digest.clone(),
+            observed_at: observation.observed_at,
+            classification,
+            claim_connected,
+            evidence_digest,
+        })
     }
 }
 
@@ -1056,6 +1556,18 @@ pub enum PartnerNetworkError {
     InvalidSettlementPeriod,
     #[error("partner network callback signature scheme is unsupported")]
     UnsupportedCallbackSignature,
+    #[error("partner network provider provenance is not independently attested")]
+    UntrustedProvenance,
+    #[error("partner network native credential/probe/readback canary is required")]
+    NativeCanaryRequired,
+    #[error("partner network durable state or receipt store is unavailable")]
+    DurabilityUnavailable,
+    #[error("partner network read cursor binding does not match the request generation")]
+    CursorBindingMismatch,
+    #[error("partner network read budget receipt is invalid")]
+    InvalidReadReceipt,
+    #[error("partner network Mission outcome binding does not match the exact tuple")]
+    MissionBindingMismatch,
 }
 
 /// Provider-native typed operations consumed by the SDK bridge. This is not
@@ -1098,6 +1610,24 @@ pub trait TypedPartnerNetworkAdapter {
 pub(crate) fn canonical_digest<T: Serialize>(value: &T) -> Result<String, PartnerNetworkError> {
     let bytes = serde_json::to_vec(value).map_err(|_| PartnerNetworkError::MalformedCallback)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn cursor_binding_digest(
+    scope: &NetworkScope,
+    resource: NetworkResource,
+    expected_program: Option<&ProgramExpectation>,
+    window: Option<&SettlementPeriod>,
+    authorization_generation: &str,
+    sequence: u64,
+) -> Result<String, PartnerNetworkError> {
+    canonical_digest(&(
+        scope,
+        &resource,
+        expected_program,
+        window,
+        authorization_generation,
+        sequence,
+    ))
 }
 
 pub(crate) fn digest_bytes(bytes: &[u8]) -> String {

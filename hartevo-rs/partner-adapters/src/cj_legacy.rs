@@ -283,6 +283,27 @@ impl<C: CjApi> CjAdapter<C> {
             inner: ProviderAdapter::new(NetworkProvider::Cj, CjTransport(client)),
         }
     }
+
+    pub fn with_state_file(
+        client: C,
+        path: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, PartnerNetworkError> {
+        Ok(Self {
+            inner: ProviderAdapter::with_state_file(
+                NetworkProvider::Cj,
+                CjTransport(client),
+                path,
+            )?,
+        })
+    }
+
+    pub fn unmount(&mut self) -> Result<(), PartnerNetworkError> {
+        self.inner.unmount()
+    }
+
+    pub fn durable_receipts(&self) -> Vec<crate::DurableReceipt> {
+        self.inner.durable_receipts()
+    }
 }
 
 impl CjAdapter<UnavailableCjApi> {

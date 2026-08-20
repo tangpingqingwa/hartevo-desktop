@@ -1,11 +1,13 @@
 use chrono::{DateTime, Utc};
+use std::path::PathBuf;
 
 use crate::callback::{CallbackObservation, CallbackRequest, CallbackSignatureScheme};
 use crate::contract::{
     AuthorizationGrant, AuthorizationObservation, BlockedEnvironmentReason, EvidenceLevel,
     NetworkCapability, NetworkProbeObservation, NetworkProbeRequest, NetworkProbeStatus,
-    NetworkProvenance, NetworkProvider, NetworkReadData, NetworkReadObservation,
-    NetworkReadRequest, NetworkScope, PartnerNetworkError, ReadPage, validate_scope_record_ids,
+    NetworkProvenance, NetworkProvider, NetworkReadBudgetReceipt, NetworkReadData,
+    NetworkReadObservation, NetworkReadRequest, NetworkScope, PartnerNetworkError, ReadCursor,
+    ReadPage, is_sha256, read_observation_evidence_digest, validate_scope_record_ids,
     verify_program_expectation,
 };
 use crate::state::AdapterState;
@@ -69,6 +71,18 @@ impl<C: ProviderTransport> ProviderAdapter<C> {
             client,
             state: AdapterState::new(provider),
         }
+    }
+
+    pub(crate) fn with_state_file(
+        provider: NetworkProvider,
+        client: C,
+        path: impl Into<PathBuf>,
+    ) -> Result<Self, PartnerNetworkError> {
+        Ok(Self {
+            provider,
+            client,
+            state: AdapterState::with_state_file(provider, path)?,
+        })
     }
 
     pub(crate) fn authorize(
@@ -150,6 +164,14 @@ impl<C: ProviderTransport> ProviderAdapter<C> {
         } else {
             NetworkProbeStatus::Reachable
         };
+        let provenance = seal_provenance(self.provider, response.provenance)?;
+        if response
+            .program_digest
+            .as_deref()
+            .is_some_and(|digest| !is_sha256(digest))
+        {
+            return Err(PartnerNetworkError::ReadScopeOrEvidenceMismatch);
+        }
         let evidence_digest = crate::contract::canonical_digest(&(
             &request,
             &response.account_id,
@@ -157,33 +179,53 @@ impl<C: ProviderTransport> ProviderAdapter<C> {
             &response.program_revision,
             &response.program_terms_digest,
             &status,
+            &provenance,
         ))?;
         Ok(NetworkProbeObservation {
             provider: self.provider,
             scope: request.scope,
             status,
-            provenance: response.provenance,
+            provenance,
             evidence_level: EvidenceLevel::E1,
-            claim_authority: "connection_state_only",
+            claim_authority: "unattested_provider_evidence",
             observed_account_id: response.account_id,
             observed_program_id: response.program_id,
             program_revision: response.program_revision,
             program_digest: response.program_digest,
             observed_at: response.observed_at,
             evidence_digest,
+            native_canary_digest: None,
+            native_canary_attested: false,
         })
     }
 
     pub(crate) fn read(
         &self,
-        request: NetworkReadRequest,
+        mut request: NetworkReadRequest,
     ) -> Result<NetworkReadObservation, PartnerNetworkError> {
-        request.validate()?;
         let authorization = self.state.grant_for(
             &request.scope,
             NetworkCapability::PartnerRead,
             request.observed_at,
         )?;
+        let expected_generation = format!(
+            "grant:{}:{}",
+            authorization.secret_reference.reference_id(),
+            authorization.secret_reference.revision()
+        );
+        if request
+            .authorization_generation
+            .as_deref()
+            .is_some_and(|generation| {
+                generation.starts_with("grant:") && generation != expected_generation
+            })
+        {
+            return Err(PartnerNetworkError::CursorBindingMismatch);
+        }
+        if request.authorization_generation.is_none() {
+            request.authorization_generation = Some(expected_generation);
+        }
+        request.validate()?;
         let response = self
             .client
             .read(&authorization.secret_reference, &request)
@@ -200,18 +242,49 @@ impl<C: ProviderTransport> ProviderAdapter<C> {
         }
         response.data.validate_for(&request.scope)?;
         validate_scope_record_ids(&response.data)?;
-        let observation = NetworkReadObservation {
+        let provenance = seal_provenance(self.provider, response.provenance)?;
+        if !is_sha256(&response.source_digest) {
+            return Err(PartnerNetworkError::ReadScopeOrEvidenceMismatch);
+        }
+        let page = bind_page(response.page, &request)?;
+        let generation = request
+            .authorization_generation
+            .clone()
+            .ok_or(PartnerNetworkError::InvalidAuthorizationGrant)?;
+        let cursor_digest = request.cursor_digest();
+        let budget = NetworkReadBudgetReceipt::local(request.observed_at, request.limit);
+        let mut observation = NetworkReadObservation {
             provider: self.provider,
             scope: request.scope,
             request: request.resource,
             data: response.data,
-            page: response.page,
-            provenance: response.provenance,
+            page,
+            expected_program: request.expected_program,
+            window: request.window,
+            observed_program_id: response.program_id,
+            program_revision: response.program_revision,
+            program_terms_digest: response.program_terms_digest,
+            authorization_revision: authorization.secret_reference.revision(),
+            authorization_generation: generation,
+            cursor_digest,
+            provenance,
             evidence_level: EvidenceLevel::E1,
             observed_at: response.observed_at,
             source_digest: response.source_digest,
+            budget,
+            native_canary_digest: None,
+            native_canary_attested: false,
+            evidence_digest: String::new(),
         };
+        observation.evidence_digest = read_observation_evidence_digest(&observation)?;
         observation.validate()?;
+        self.state.record_read_receipt(
+            &observation.scope,
+            observation.authorization_revision,
+            observation.budget.evidence_digest.clone(),
+            observation.observed_at,
+            observation.evidence_digest.clone(),
+        )?;
         Ok(observation)
     }
 
@@ -236,6 +309,14 @@ impl<C: ProviderTransport> ProviderAdapter<C> {
 
     pub(crate) fn accepted_callbacks(&self) -> Vec<crate::CallbackEvent> {
         self.state.accepted_callbacks()
+    }
+
+    pub(crate) fn durable_receipts(&self) -> Vec<crate::state::DurableReceipt> {
+        self.state.durable_receipts()
+    }
+
+    pub(crate) fn unmount(&mut self) -> Result<(), PartnerNetworkError> {
+        self.state.unmount()
     }
 }
 
@@ -270,12 +351,62 @@ fn denied_probe(
         status,
         provenance: NetworkProvenance::Fixture,
         evidence_level: EvidenceLevel::E1,
-        claim_authority: "connection_state_only",
+        claim_authority: "unattested_provider_evidence",
         observed_account_id: request.scope.account_id,
         observed_program_id: request.scope.program_id,
         program_revision: None,
         program_digest: None,
         observed_at: request.observed_at,
         evidence_digest,
+        native_canary_digest: None,
+        native_canary_attested: false,
     }
+}
+
+fn seal_provenance(
+    provider: NetworkProvider,
+    provenance: NetworkProvenance,
+) -> Result<NetworkProvenance, PartnerNetworkError> {
+    if provenance == NetworkProvenance::ProductionProvider {
+        return Err(PartnerNetworkError::BlockedEnv {
+            provider,
+            reason: BlockedEnvironmentReason::OfficialApiCapabilityNotEnabled,
+        });
+    }
+    Ok(provenance)
+}
+
+fn bind_page(
+    page: ReadPage,
+    request: &NetworkReadRequest,
+) -> Result<ReadPage, PartnerNetworkError> {
+    let generation = request
+        .authorization_generation
+        .as_deref()
+        .ok_or(PartnerNetworkError::InvalidAuthorizationGrant)?;
+    let current_sequence = request
+        .cursor
+        .as_ref()
+        .map_or(1, |cursor| cursor.sequence().saturating_add(1));
+    let bind = |cursor: Option<ReadCursor>, sequence: u64| {
+        cursor
+            .map(|cursor| {
+                ReadCursor::bound(
+                    &request.scope,
+                    request.resource,
+                    request.expected_program.as_ref(),
+                    request.window.as_ref(),
+                    generation,
+                    sequence,
+                    cursor.as_str(),
+                )
+            })
+            .transpose()
+    };
+    Ok(ReadPage {
+        cursor: bind(page.cursor, current_sequence)?,
+        next_cursor: bind(page.next_cursor, current_sequence.saturating_add(1))?,
+        has_more: page.has_more,
+        item_count: page.item_count,
+    })
 }

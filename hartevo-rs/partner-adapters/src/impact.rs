@@ -289,6 +289,27 @@ impl<C: ImpactApi> ImpactAdapter<C> {
     pub fn callback_body_digest(body: &[u8]) -> String {
         crate::contract::digest_bytes(body)
     }
+
+    pub fn with_state_file(
+        client: C,
+        path: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, PartnerNetworkError> {
+        Ok(Self {
+            inner: ProviderAdapter::with_state_file(
+                NetworkProvider::Impact,
+                ImpactTransport(client),
+                path,
+            )?,
+        })
+    }
+
+    pub fn unmount(&mut self) -> Result<(), PartnerNetworkError> {
+        self.inner.unmount()
+    }
+
+    pub fn durable_receipts(&self) -> Vec<crate::DurableReceipt> {
+        self.inner.durable_receipts()
+    }
 }
 
 impl ImpactAdapter<UnavailableImpactApi> {

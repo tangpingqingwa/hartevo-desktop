@@ -8,19 +8,32 @@ use hartevo_connector_sdk::{
 use crate::awin::{AwinAdapter, AwinFixtureWorld};
 use crate::cj_legacy::{CjAdapter, CjFixtureWorld};
 use crate::contract::TypedPartnerNetworkAdapter;
-use crate::impact::{ImpactAdapter, ImpactFixtureWorld};
+use crate::impact::{
+    ImpactAdapter, ImpactApi, ImpactApiError, ImpactFixtureWorld, ImpactProbeResponse,
+    ImpactReadResponse,
+};
 use crate::{
-    ActionState, AuthorizationState, CallbackChannel, CallbackDisposition, CallbackRequest,
-    CallbackSignatureScheme, CommissionState, ConnectorAdapterBridge, ConversionState,
-    FixtureScenario, NetworkAccountId, NetworkProbeRequest, NetworkProbeStatus, NetworkReadData,
-    NetworkReadRequest, NetworkResource, NetworkScope, PartnerNetworkError, ProgramId,
-    ReportSettlementState, ReversalState,
+    ActionState, AuthorizationState, CallbackChannel, CallbackDisposition, CallbackKeyLease,
+    CallbackRequest, CallbackSignatureScheme, CommissionState, ConnectorAdapterBridge,
+    ConversionState, FixtureScenario, NetworkAccountId, NetworkProbeRequest, NetworkProbeStatus,
+    NetworkReadData, NetworkReadRequest, NetworkResource, NetworkScope, OpaqueSecretReference,
+    PartnerMissionConsumer, PartnerNetworkError, ProgramId, ReadCursor, ReportSettlementState,
+    ReversalState, SettlementPeriod,
 };
 
 fn observed_at() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 13, 8, 0, 0)
         .single()
         .expect("valid fixture timestamp")
+}
+
+fn fixture_callback_key(at: DateTime<Utc>) -> CallbackKeyLease {
+    CallbackKeyLease::new(
+        OpaqueSecretReference::fixture(),
+        ImpactFixtureWorld::callback_key(),
+        at + Duration::hours(1),
+    )
+    .expect("fixture callback key lease")
 }
 
 fn all_resources() -> [NetworkResource; 11] {
@@ -195,6 +208,12 @@ fn merged_connector_sdk_bridge_keeps_fixture_probe_out_of_connected_authority()
         ProviderAdapterOperation::Read,
         ProviderProvenanceClass::Fixture,
     ));
+    let outcome_key = ProviderCapabilityKey::new("impact", "outcome.ingest")?;
+    assert!(worker.descriptor().supports(
+        &outcome_key,
+        hartevo_connector_sdk::ProviderAdapterOperation::HandleWebhook,
+        ProviderProvenanceClass::Fixture,
+    ));
     Ok(())
 }
 
@@ -259,6 +278,7 @@ fn impact_signed_callbacks_dedupe_conversions_and_preserve_out_of_order_events()
     adapter
         .authorize(world.authorization(), at)
         .expect("fixture grant is valid");
+    let key_lease = fixture_callback_key(at);
 
     let first_body = world.callback_body(
         "impact-event-1",
@@ -280,7 +300,7 @@ fn impact_signed_callbacks_dedupe_conversions_and_preserve_out_of_order_events()
             channel: CallbackChannel::Webhook,
             body: &first_body,
             signature: &first_signature,
-            signature_key: ImpactFixtureWorld::callback_key(),
+            signature_key: &key_lease,
             scheme: CallbackSignatureScheme::ImpactHookHmacSha1,
             received_at: at,
         })
@@ -308,7 +328,7 @@ fn impact_signed_callbacks_dedupe_conversions_and_preserve_out_of_order_events()
             channel: CallbackChannel::Postback,
             body: &duplicate_body,
             signature: &duplicate_signature,
-            signature_key: ImpactFixtureWorld::callback_key(),
+            signature_key: &key_lease,
             scheme: CallbackSignatureScheme::FixtureHmacSha256,
             received_at: at,
         })
@@ -338,7 +358,7 @@ fn impact_signed_callbacks_dedupe_conversions_and_preserve_out_of_order_events()
             channel: CallbackChannel::Webhook,
             body: &out_of_order_body,
             signature: &out_of_order_signature,
-            signature_key: ImpactFixtureWorld::callback_key(),
+            signature_key: &key_lease,
             scheme: CallbackSignatureScheme::FixtureHmacSha256,
             received_at: at,
         })
@@ -355,6 +375,7 @@ fn impact_production_detached_jws_requires_an_injected_verifier() {
     adapter
         .authorize(world.authorization(), at)
         .expect("fixture grant is valid");
+    let key_lease = fixture_callback_key(at);
     let body = world.callback_body(
         "impact-jws-event-1",
         "conversion.recorded",
@@ -372,7 +393,7 @@ fn impact_production_detached_jws_requires_an_injected_verifier() {
         channel: CallbackChannel::Webhook,
         body: &body,
         signature: "detached-jws-header..signature",
-        signature_key: b"jwks-key-reference",
+        signature_key: &key_lease,
         scheme: CallbackSignatureScheme::ImpactHookJwsDetached,
         received_at: at,
     });
@@ -620,4 +641,222 @@ fn program_scoped_authorization_does_not_cover_the_account() {
         )),
         Err(PartnerNetworkError::AuthorizationRequired { .. })
     ));
+}
+
+#[derive(Clone, Debug)]
+struct ProductionClaimingImpactApi {
+    world: ImpactFixtureWorld,
+}
+
+impl ImpactApi for ProductionClaimingImpactApi {
+    fn probe(
+        &self,
+        authorization: &OpaqueSecretReference,
+        request: &NetworkProbeRequest,
+    ) -> Result<ImpactProbeResponse, ImpactApiError> {
+        let mut response = ImpactApi::probe(&self.world, authorization, request)?;
+        response.provenance = crate::NetworkProvenance::ProductionProvider;
+        Ok(response)
+    }
+
+    fn read(
+        &self,
+        authorization: &OpaqueSecretReference,
+        request: &NetworkReadRequest,
+    ) -> Result<ImpactReadResponse, ImpactApiError> {
+        let mut response = ImpactApi::read(&self.world, authorization, request)?;
+        response.provenance = crate::NetworkProvenance::ProductionProvider;
+        Ok(response)
+    }
+}
+
+#[test]
+fn provider_returned_production_provenance_is_sealed_without_native_canary() {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let mut adapter = ImpactAdapter::new(ProductionClaimingImpactApi {
+        world: world.clone(),
+    });
+    adapter
+        .authorize(world.authorization(), at)
+        .expect("fixture authorization is valid");
+    let result = adapter.probe(NetworkProbeRequest::for_program(
+        world.scope(),
+        world.current_program_expectation(),
+        at,
+    ));
+    assert!(matches!(
+        result,
+        Err(PartnerNetworkError::BlockedEnv {
+            provider: crate::NetworkProvider::Impact,
+            reason: crate::BlockedEnvironmentReason::OfficialApiCapabilityNotEnabled,
+        })
+    ));
+}
+
+#[test]
+fn mission_consumer_requires_program_window_and_preserves_fixture_honesty() {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let mut adapter = ImpactAdapter::new(world.clone());
+    adapter
+        .authorize(world.authorization(), at)
+        .expect("fixture authorization is valid");
+    let window = SettlementPeriod::new(at - Duration::days(30), at).expect("window");
+    let request = NetworkReadRequest::for_program(
+        world.scope(),
+        NetworkResource::Reports,
+        world.current_program_expectation(),
+        at,
+    )
+    .with_window(window.clone())
+    .expect("valid window");
+    let observation = adapter.read(request).expect("fixture report read");
+    let consumer = PartnerMissionConsumer::new(
+        crate::NetworkProvider::Impact,
+        world.scope(),
+        world.current_program_expectation(),
+        window,
+    )
+    .expect("exact Mission binding");
+    let receipt = consumer.consume(&observation).expect("Mission evidence");
+    assert_eq!(
+        receipt.classification,
+        crate::MissionOutcomeClassification::FixtureEvidence
+    );
+    assert!(!receipt.claim_connected);
+    assert_eq!(receipt.source_digest, observation.source_digest);
+    assert!(!receipt.evidence_digest.is_empty());
+}
+
+#[test]
+fn strict_contract_deserialization_rejects_unknown_fields_and_invalid_ids() {
+    let extra_reference = r#"{"referenceId":"opaque","revision":1,"extra":true}"#;
+    assert!(crate::deserialize_partner_contract::<OpaqueSecretReference>(extra_reference).is_err());
+    let invalid_id = r"";
+    assert!(crate::deserialize_partner_contract::<crate::ProgramId>(invalid_id).is_err());
+    assert!(crate::PARTNER_NETWORK_CONTRACT_SCHEMA.contains("additionalProperties"));
+}
+
+#[test]
+fn durable_state_reopens_replay_and_rotation_fences_old_cursor() {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let state_path = std::env::temp_dir().join(format!(
+        "hartevo-partner-state-{}-{}.json",
+        std::process::id(),
+        "impact-repair"
+    ));
+    let _ = std::fs::remove_file(&state_path);
+    let mut adapter = ImpactAdapter::with_state_file(world.clone(), state_path.clone())
+        .expect("durable adapter state opens");
+    adapter
+        .authorize(world.authorization(), at)
+        .expect("fixture authorization is valid");
+    let body = world.callback_body(
+        "impact-durable-event-1",
+        "conversion.recorded",
+        at - Duration::minutes(1),
+        Some("impact-durable-conversion"),
+        Some("impact-durable-order"),
+        Some("impact-durable-action"),
+        Some("impact-durable-commission"),
+        None,
+        None,
+        Some(10_000),
+    );
+    let signature = world.sign_callback(CallbackSignatureScheme::FixtureHmacSha256, &body);
+    let key_lease = fixture_callback_key(at);
+    let first = adapter
+        .handle_callback(CallbackRequest {
+            scope: world.scope(),
+            channel: CallbackChannel::Postback,
+            body: &body,
+            signature: &signature,
+            signature_key: &key_lease,
+            scheme: CallbackSignatureScheme::FixtureHmacSha256,
+            received_at: at,
+        })
+        .expect("callback is durable");
+    assert_eq!(first.disposition, CallbackDisposition::Accepted);
+    assert!(adapter.durable_receipts().len() >= 2);
+    drop(adapter);
+
+    let mut reopened = ImpactAdapter::with_state_file(world.clone(), state_path.clone())
+        .expect("durable state reopens");
+    let reopened_key_lease = fixture_callback_key(at);
+    let duplicate = reopened
+        .handle_callback(CallbackRequest {
+            scope: world.scope(),
+            channel: CallbackChannel::Postback,
+            body: &body,
+            signature: &signature,
+            signature_key: &reopened_key_lease,
+            scheme: CallbackSignatureScheme::FixtureHmacSha256,
+            received_at: at + Duration::minutes(1),
+        })
+        .expect("replayed callback is classified");
+    assert_eq!(duplicate.disposition, CallbackDisposition::Duplicate);
+    assert_eq!(reopened.accepted_callbacks().len(), 1);
+
+    let generation = "grant:fixture:opaque-secret-reference:1";
+    let cursor = ReadCursor::bound(
+        &world.scope(),
+        NetworkResource::Reports,
+        Some(&world.current_program_expectation()),
+        None,
+        generation,
+        1,
+        "provider-page-token",
+    )
+    .expect("bound cursor");
+    let mut cursor_request = NetworkReadRequest::for_program(
+        world.scope(),
+        NetworkResource::Reports,
+        world.current_program_expectation(),
+        at,
+    )
+    .with_authorization_generation(generation);
+    cursor_request.cursor = Some(cursor);
+    reopened
+        .read(cursor_request.clone())
+        .expect("current credential accepts its cursor");
+    assert!(
+        reopened
+            .durable_receipts()
+            .iter()
+            .any(|receipt| receipt.kind == "read.budget")
+    );
+
+    let mut rotated = world.authorization();
+    rotated.secret_reference =
+        OpaqueSecretReference::new("rotated-reference", 2).expect("rotated opaque reference");
+    reopened
+        .authorize(rotated, at + Duration::minutes(2))
+        .expect("credential rotation is recorded");
+    assert!(matches!(
+        reopened.read(cursor_request),
+        Err(PartnerNetworkError::CursorBindingMismatch)
+    ));
+    reopened.unmount().expect("unmount removes durable state");
+    assert!(!state_path.exists());
+}
+
+#[test]
+fn callback_debug_never_exposes_borrowed_key_material() {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let key_lease = fixture_callback_key(at);
+    let request = CallbackRequest {
+        scope: world.scope(),
+        channel: CallbackChannel::Webhook,
+        body: b"payload",
+        signature: "signature",
+        signature_key: &key_lease,
+        scheme: CallbackSignatureScheme::FixtureHmacSha256,
+        received_at: at,
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("super-secret-callback-key"));
+    assert!(debug.contains("signature_key_present"));
 }

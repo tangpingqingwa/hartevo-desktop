@@ -29,27 +29,30 @@ pub use hartevo_connector_sdk::{
 pub use sdk::ConnectorAdapterBridge;
 
 pub use callback::{
-    CallbackChannel, CallbackDisposition, CallbackEvent, CallbackEventKind, CallbackObservation,
-    CallbackRequest, CallbackSignatureScheme,
+    CallbackChannel, CallbackDisposition, CallbackEvent, CallbackEventKind, CallbackKeyLease,
+    CallbackObservation, CallbackRequest, CallbackSignatureScheme,
 };
 pub use contract::{
     ActionRecord, ActionState, AuthorizationGrant, AuthorizationObservation, AuthorizationState,
     BlockedEnvironmentReason, ClickRecord, CommissionRecord, CommissionState, ContractRecord,
     ContractState, ConversionRecord, ConversionState, EvidenceLevel, FixtureScenario,
-    NetworkCapability, NetworkProbeObservation, NetworkProbeRequest, NetworkProbeStatus,
-    NetworkProvenance, NetworkProvider, NetworkReadData, NetworkReadObservation,
+    MissionOutcomeClassification, MissionOutcomeReceipt, NetworkCapability,
+    NetworkProbeObservation, NetworkProbeRequest, NetworkProbeStatus, NetworkProvenance,
+    NetworkProvider, NetworkReadBudgetReceipt, NetworkReadData, NetworkReadObservation,
     NetworkReadRequest, NetworkResource, NetworkScope, OpaqueSecretReference,
-    PARTNER_NETWORK_CONTRACT_SCHEMA_VERSION, PARTNER_NETWORK_CONTRACT_VERSION, PartnerNetworkError,
-    PartnerRecord, PartnerRelationshipState, PayoutRecord, PayoutState, ProgramExpectation,
-    ProgramRecord, ProgramState, ReadCursor, ReadPage, ReportRecord, ReportRow,
-    ReportSettlementState, ReversalRecord, ReversalState, SettlementPeriod, TrackingLinkRecord,
-    TypedPartnerNetworkAdapter,
+    PARTNER_NETWORK_CONTRACT_SCHEMA, PARTNER_NETWORK_CONTRACT_SCHEMA_VERSION,
+    PARTNER_NETWORK_CONTRACT_VERSION, PartnerMissionConsumer, PartnerNetworkError, PartnerRecord,
+    PartnerRelationshipState, PayoutRecord, PayoutState, ProgramExpectation, ProgramRecord,
+    ProgramState, ReadCursor, ReadPage, ReportRecord, ReportRow, ReportSettlementState,
+    ReversalRecord, ReversalState, SettlementPeriod, TrackingLinkRecord,
+    TypedPartnerNetworkAdapter, deserialize_partner_contract,
 };
 pub use ids::{
     ActionId, CallbackEventId, ClickId, CommissionId, ContractId, ConversionId, LinkId,
     NetworkAccountId, NetworkIdentityError, NetworkOrderId, PartnerId, PayoutId, ProgramId,
     ReportId, ReversalId,
 };
+pub use state::{DurableReceipt, DurableStateStore};
 
 #[cfg(test)]
 mod tests;

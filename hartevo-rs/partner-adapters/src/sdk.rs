@@ -24,6 +24,7 @@ use crate::contract::{
     OpaqueSecretReference, PartnerNetworkError, ProgramExpectation, ReadCursor,
     TypedPartnerNetworkAdapter,
 };
+use crate::{CallbackObservation, CallbackRequest};
 
 /// The only generic connector lifecycle implementation exposed by this crate.
 /// `A` still owns provider-native typed records and transport behavior; all
@@ -147,20 +148,36 @@ impl<A: TypedPartnerNetworkAdapter + Send> ConnectorAdapter for ConnectorAdapter
     fn read(&mut self, request: ReadRequest) -> Result<ReadObservation, ConnectorError> {
         let scope = network_scope(&request.scope, self.inner.provider())?;
         let resource = resource_for_capability(&request.capability)?;
+        let authorization_generation = request.live_probe.evidence_digest().to_owned();
         let mut network_request = match &self.expected_program {
-            Some(expectation) => {
-                NetworkReadRequest::for_program(scope, resource, expectation.clone(), request.at)
-            }
-            None => NetworkReadRequest::new(scope, resource, request.at),
+            Some(expectation) => NetworkReadRequest::for_program(
+                scope.clone(),
+                resource,
+                expectation.clone(),
+                request.at,
+            ),
+            None => NetworkReadRequest::new(scope.clone(), resource, request.at),
         };
         network_request.limit =
             u16::try_from(request.page_size).map_err(|_| ConnectorError::InvalidPageSize)?;
+        network_request =
+            network_request.with_authorization_generation(authorization_generation.clone());
         network_request.cursor = request
             .cursor
             .as_ref()
-            .map(|cursor| ReadCursor::new(cursor.token_digest()))
+            .map(|cursor| {
+                ReadCursor::bound(
+                    &scope,
+                    resource,
+                    self.expected_program.as_ref(),
+                    None,
+                    &authorization_generation,
+                    cursor.sequence(),
+                    cursor.token_digest(),
+                )
+            })
             .transpose()
-            .map_err(|error| map_network_error(&error))?;
+            .map_err(|error: PartnerNetworkError| map_network_error(&error))?;
         let observation = self
             .inner
             .read(network_request)
@@ -234,10 +251,12 @@ impl<A: TypedPartnerNetworkAdapter + Send> ConnectorAdapter for ConnectorAdapter
         &mut self,
         request: WebhookRequest,
     ) -> Result<WebhookObservation, ConnectorError> {
-        // ConnectorWorker has already verified the SDK envelope signature and
-        // replay sequence. Provider-specific raw callback verification remains
-        // available through TypedPartnerNetworkAdapter::handle_callback.
-        WebhookObservation::from_envelope(&request.envelope, request.scope, request.at)
+        // The merged SDK envelope intentionally carries only a payload digest;
+        // it does not carry the provider body, callback signature scheme, or
+        // opaque key revision.  Accepting it here would bypass the provider
+        // verifier.  Callers must use the explicit typed callback seam below.
+        let _ = request;
+        Err(ConnectorError::ProviderRejected)
     }
 
     fn revoke(&mut self, request: RevokeRequest) -> Result<(), ConnectorError> {
@@ -246,6 +265,15 @@ impl<A: TypedPartnerNetworkAdapter + Send> ConnectorAdapter for ConnectorAdapter
             .revoke(&scope, request.at)
             .map(|_| ())
             .map_err(|error| map_network_error(&error))
+    }
+}
+
+impl<A: TypedPartnerNetworkAdapter + Send> ConnectorAdapterBridge<A> {
+    pub fn handle_provider_callback(
+        &mut self,
+        request: CallbackRequest<'_>,
+    ) -> Result<CallbackObservation, PartnerNetworkError> {
+        self.inner.handle_callback(request)
     }
 }
 
@@ -291,7 +319,7 @@ fn descriptor_for(provider: NetworkProvider) -> Result<ConnectorDescriptor, Conn
     registrations.push(registration(
         &identity,
         provider,
-        "partner.outcome-ingest",
+        "outcome.ingest",
         ProviderAdapterOperation::HandleWebhook,
         ProviderEvidenceClass::WebhookObservation,
     )?);
@@ -306,10 +334,13 @@ fn registration(
     evidence_class: ProviderEvidenceClass,
 ) -> Result<ProviderCapabilitySupport, ConnectorError> {
     let key = ProviderCapabilityKey::new(provider.as_str(), capability)?;
+    // No native credential/permission/probe/readback canary is available in
+    // this crate today.  Register only evidence classes that can be honestly
+    // produced; a future native adapter must add an explicit canary-gated
+    // descriptor path before ProductionProvider can be registered.
     let evidence_support = [
         ProviderProvenanceClass::Fixture,
         ProviderProvenanceClass::ControlledProvider,
-        ProviderProvenanceClass::ProductionProvider,
     ]
     .into_iter()
     .map(|provenance| ProviderEvidenceSupport::new(operation, evidence_class, provenance))
@@ -407,6 +438,9 @@ fn map_network_error(error: &PartnerNetworkError) -> ConnectorError {
         | PartnerNetworkError::InvalidReadLimit
         | PartnerNetworkError::InvalidProgramExpectation
         | PartnerNetworkError::InvalidSettlementPeriod
+        | PartnerNetworkError::InvalidReadReceipt
+        | PartnerNetworkError::MissionBindingMismatch
+        | PartnerNetworkError::CursorBindingMismatch
         | PartnerNetworkError::MalformedCallback => ConnectorError::InvalidRequest,
         PartnerNetworkError::ScopeMismatch | PartnerNetworkError::CallbackScopeMismatch => {
             ConnectorError::ScopeMismatch
@@ -423,6 +457,9 @@ fn map_network_error(error: &PartnerNetworkError) -> ConnectorError {
         | PartnerNetworkError::ProgramDrift
         | PartnerNetworkError::AuthorizationExpired
         | PartnerNetworkError::ProviderUnavailable
-        | PartnerNetworkError::UnsupportedCallbackSignature => ConnectorError::ProviderRejected,
+        | PartnerNetworkError::UnsupportedCallbackSignature
+        | PartnerNetworkError::UntrustedProvenance
+        | PartnerNetworkError::NativeCanaryRequired
+        | PartnerNetworkError::DurabilityUnavailable => ConnectorError::ProviderRejected,
     }
 }

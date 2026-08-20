@@ -284,6 +284,27 @@ impl<C: AwinApi> AwinAdapter<C> {
             inner: ProviderAdapter::new(NetworkProvider::Awin, AwinTransport(client)),
         }
     }
+
+    pub fn with_state_file(
+        client: C,
+        path: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, PartnerNetworkError> {
+        Ok(Self {
+            inner: ProviderAdapter::with_state_file(
+                NetworkProvider::Awin,
+                AwinTransport(client),
+                path,
+            )?,
+        })
+    }
+
+    pub fn unmount(&mut self) -> Result<(), PartnerNetworkError> {
+        self.inner.unmount()
+    }
+
+    pub fn durable_receipts(&self) -> Vec<crate::DurableReceipt> {
+        self.inner.durable_receipts()
+    }
 }
 
 impl AwinAdapter<UnavailableAwinApi> {

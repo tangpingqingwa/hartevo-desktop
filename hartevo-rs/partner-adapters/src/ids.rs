@@ -1,6 +1,6 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -11,9 +11,19 @@ pub enum NetworkIdentityError {
 
 macro_rules! network_identity {
     ($name:ident, $kind:literal) => {
-        #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::parse(value).map_err(serde::de::Error::custom)
+            }
+        }
 
         impl $name {
             pub fn parse(value: impl Into<String>) -> Result<Self, NetworkIdentityError> {

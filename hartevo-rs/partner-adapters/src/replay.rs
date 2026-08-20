@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::callback::{CallbackDisposition, CallbackEvent};
 use crate::contract::{NetworkScope, PartnerNetworkError};
@@ -8,7 +9,8 @@ use crate::ids::{CallbackEventId, ConversionId};
 
 const REPLAY_WINDOW: Duration = Duration::hours(48);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ReplayGuard {
     event_ids: BTreeSet<CallbackEventId>,
     conversion_ids: BTreeSet<ConversionId>,
@@ -60,5 +62,12 @@ impl ReplayGuard {
 
     pub(crate) fn accepted(&self) -> Vec<CallbackEvent> {
         self.accepted.clone()
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.event_ids.clear();
+        self.conversion_ids.clear();
+        self.latest_by_scope.clear();
+        self.accepted.clear();
     }
 }
