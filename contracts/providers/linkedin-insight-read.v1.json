@@ -1,0 +1,167 @@
+{
+  "schemaVersion": "hartevo-linkedin-insight-read-contract/v1",
+  "contractVersion": "linkedin-insight-read-e1/v1",
+  "evidenceLevel": "E1",
+  "providerId": "linkedin",
+  "adapterId": "linkedin.marketing.organization-insights",
+  "adapterVersion": 1,
+  "service": "PaidSocialInsightReadService",
+  "consumer": "MissionPaidSocialInsightConsumer",
+  "centralCatalogRegistration": "deferred_until_mission_reverse_mapping",
+  "registrations": [],
+  "connectionAuthority": "authenticated_probe_only",
+  "connectionStates": [
+    "unmounted",
+    "mounted",
+    "stale",
+    "revoked"
+  ],
+  "connectedClaim": false,
+  "claimAuthority": {
+    "connected": false,
+    "providerExecution": false,
+    "providerReceipt": false,
+    "businessVerification": false,
+    "e4": false,
+    "effect": false
+  },
+  "scope": {
+    "connector": [
+      "tenant",
+      "project",
+      "provider=linkedin",
+      "account=authenticated_member"
+    ],
+    "provider": [
+      "member",
+      "organization",
+      "organization_page",
+      "ad_account"
+    ],
+    "binding": "member_identity_and_each_requested_provider_id_must_match_authenticated_probe"
+  },
+  "authentication": {
+    "flow": "member_authorization_3_legged_oauth",
+    "secretMaterial": "opaque_reference_only",
+    "memberProbe": "GET /v2/userinfo",
+    "organizationProbe": "GET /rest/organizations/{organizationId}",
+    "pageProbe": "GET /rest/organizations/{pageId}",
+    "adAccountProbe": "GET /rest/adAccounts/{adAccountId}",
+    "requiredScopes": {
+      "member": [
+        "openid",
+        "profile"
+      ],
+      "organizationPageRead": [
+        "rw_organization_admin",
+        "r_organization_social"
+      ],
+      "adAccountRead": [
+        "r_ads",
+        "r_ads_reporting"
+      ]
+    },
+    "providerWritePermissionNote": "LinkedIn documents rw_organization_admin for organizationalEntityShareStatistics reporting; this adapter exposes no write operation, no Effect authority, and no write registration."
+  },
+  "readSurfaces": {
+    "organizationPagePerformance": {
+      "method": "GET",
+      "path": "/rest/organizationalEntityShareStatistics",
+      "model": "linkedin_organization_share_statistics",
+      "activity": "organic_only",
+      "scopeParameter": "organizationalEntity=urn:li:organization:{pageId}"
+    },
+    "organizationPostPerformance": {
+      "method": "GET",
+      "path": "/rest/organizationalEntityShareStatistics",
+      "model": "linkedin_organization_share_statistics",
+      "activity": "organic_only",
+      "scopeParameter": "organizationalEntity=urn:li:organization:{pageId}",
+      "postFilter": "shares=List(urn:li:share:{postId})",
+      "timeWindow": "provider_lifetime_only; time-bound statistics are not supported for specific shares"
+    },
+    "adAccountPerformance": {
+      "method": "GET",
+      "path": "/rest/adAnalytics",
+      "model": "linkedin_ad_analytics",
+      "activity": "sponsored_reporting",
+      "scopeParameter": "accounts=List(urn:li:sponsoredAccount:{adAccountId})",
+      "pivot": "ACCOUNT",
+      "timeGranularity": "DAILY"
+    }
+  },
+  "requestHeaders": {
+    "Linkedin-Version": "configurable YYYYMM marketing version",
+    "X-Restli-Protocol-Version": "2.0.0",
+    "Content-Type": "application/json"
+  },
+  "pagination": {
+    "providerBehavior": "organizationalEntityShareStatistics_and_adAnalytics_do_not_support_pagination",
+    "connectorCursor": "scope_and_request_bound_durable_complete_cursor",
+    "providerNextPage": "typed_fail_closed",
+    "pageSize": "bounded_request_contract_only; not sent to_non_paginated_provider_endpoints"
+  },
+  "rateLimitAndBudget": {
+    "providerEvidenceHeaders": [
+      "x-ratelimit-limit",
+      "x-ratelimit-remaining",
+      "x-ratelimit-reset",
+      "retry-after"
+    ],
+    "status429": "typed_rate_limit_with_bounded_retry_after",
+    "localBudget": "DispatchBudget_receipt_with_quota_and_cost_minor"
+  },
+  "freshness": {
+    "probeMaxTtlSeconds": 120,
+    "observationPolicyMaxTtlSeconds": 900,
+    "boundedTimeRangeMaxDays": 31,
+    "staleProbe": "fail_closed"
+  },
+  "observation": {
+    "schema": "hartevo-linkedin-insight-read/v1",
+    "durableLog": true,
+    "requiredReceipts": [
+      "source_method_path_query_digest_status_response_digest",
+      "requested_and_observed_time",
+      "freshness",
+      "quota",
+      "cost",
+      "durable_cursor",
+      "classification",
+      "attribution_model",
+      "causal_status_not_claimed"
+    ],
+    "unknownProviderFields": "digest_only",
+    "secretAndPayloadLogging": "forbidden"
+  },
+  "attribution": {
+    "organicModel": "linkedin_organization_share_statistics",
+    "sponsoredModel": "linkedin_ad_analytics",
+    "causalClaim": false,
+    "reviewState": [
+      "required",
+      "unknown"
+    ]
+  },
+  "revocationAndDrift": {
+    "secretReference": "typed_fail_closed",
+    "credentialLease": "typed_fail_closed",
+    "providerUnauthorized": "typed_fail_closed",
+    "unmount": "clears_mount_and_cursor",
+    "refreshScopeOrRevisionDrift": "typed_fail_closed",
+    "writeAuthority": "never_granted"
+  },
+  "credentialedProbe": {
+    "liveHttpsPath": true,
+    "transport": "HTTPS_only_curl_config_stdin_with_authorization_redacted_from_argv",
+    "environmentGate": "HARTEVO_RUN_LINKEDIN_CREDENTIAL_PROBE=1 plus HARTEVO_LINKEDIN_ACCESS_TOKEN",
+    "missingCredentials": "BLOCKED_ENV",
+    "fixtures": "contract_tests_only; not_native_completion"
+  },
+  "writePolicy": {
+    "enabled": false,
+    "prepareEffect": "writes_disabled",
+    "execute": "not_implemented",
+    "approvalReceiptReadback": "required_before_any_future_write_slice"
+  }
+}

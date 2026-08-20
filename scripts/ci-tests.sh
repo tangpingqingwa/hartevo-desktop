@@ -2,6 +2,7 @@
 set -euo pipefail
 
 python3 scripts/ci-scope.py --self-test
+python3 scripts/ci-rust-test-shards.py self-test
 bash scripts/ci-workflow-syntax.sh self-test
 python3 scripts/ci-workflow-policy.py self-test
 python3 scripts/ci-branch-policy.py self-test
@@ -10,6 +11,7 @@ python3 scripts/ci-result.py self-test
 python3 scripts/ci-dependency-audit.py self-test
 python3 scripts/ci-promotion.py self-test
 bash scripts/check-dioxus-toolchain.sh self-test
+bash scripts/ci-rust-gate.sh self-test
 
 fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/hartevo-ci-script-tests.XXXXXX")"
 trap 'rm -rf -- "$fixture_dir"' EXIT
