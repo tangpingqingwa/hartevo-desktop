@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.product-observability/v1",
+  "title": "Hartevo PostHog product-outcome evidence plugin contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "layer",
+    "authority",
+    "service",
+    "provider",
+    "consumer",
+    "templates",
+    "bounds",
+    "transport",
+    "honesty"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "hartevo.product-observability/v1" },
+    "layer": { "const": "posthog_layer_1" },
+    "authority": { "const": "read_only_observational_evidence" },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "access", "contractDigest"],
+      "properties": {
+        "id": { "const": "product.outcome-evidence.read" },
+        "version": { "const": "1.0.0" },
+        "access": { "const": "read_only" },
+        "contractDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "serviceId", "version", "implementation", "scope"],
+      "properties": {
+        "id": { "const": "product.observability.posthog" },
+        "serviceId": { "const": "product.outcome-evidence.read" },
+        "version": { "const": "1.0.0" },
+        "implementation": { "const": "PostHogOutcomeProvider" },
+        "scope": { "enum": ["project", "mission", "provider_project"] }
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "serviceId", "version", "kind", "binding"],
+      "properties": {
+        "id": { "const": "mission.outcome-evidence.consumer" },
+        "serviceId": { "const": "product.outcome-evidence.read" },
+        "version": { "const": "1.0.0" },
+        "kind": { "const": "mission_outcome" },
+        "binding": {
+          "const": [
+            "mission_id",
+            "mission_revision",
+            "result_id",
+            "result_revision",
+            "deployment_id",
+            "deployment_revision",
+            "release_id",
+            "release_revision"
+          ]
+        }
+      }
+    },
+    "templates": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "parameterized", "allowlisted", "keyset"],
+        "properties": {
+          "id": {
+            "enum": ["outcome_by_result", "reliability_by_release"]
+          },
+          "parameterized": { "const": true },
+          "allowlisted": { "const": true },
+          "keyset": { "const": true }
+        }
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxWindowSeconds",
+        "maxPageSize",
+        "maxPages",
+        "maxRows",
+        "maxBytes",
+        "maxCostUnits",
+        "maxPolls"
+      ],
+      "properties": {
+        "maxWindowSeconds": { "const": 86400 },
+        "maxPageSize": { "const": 500 },
+        "maxPages": { "const": 100 },
+        "maxRows": { "const": 100000 },
+        "maxBytes": { "const": 16777216 },
+        "maxCostUnits": { "const": 10000 },
+        "maxPolls": { "const": 20 }
+      }
+    },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["queryApi", "async", "cancel", "probe", "credentials"],
+      "properties": {
+        "queryApi": { "const": "official_project_query_api" },
+        "async": { "const": true },
+        "cancel": { "const": true },
+        "probe": { "const": true },
+        "credentials": { "const": "opaque_or_env_gated_only" }
+      }
+    },
+    "honesty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "readOnly",
+        "noArbitraryHogQL",
+        "fixtureNative",
+        "loopbackNative",
+        "blockedEnvNative",
+        "causalClaim"
+      ],
+      "properties": {
+        "readOnly": { "const": true },
+        "noArbitraryHogQL": { "const": true },
+        "fixtureNative": { "const": false },
+        "loopbackNative": { "const": false },
+        "blockedEnvNative": { "const": false },
+        "causalClaim": { "const": false }
+      }
+    }
+  }
+}

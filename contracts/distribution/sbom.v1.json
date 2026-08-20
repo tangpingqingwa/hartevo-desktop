@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/distribution/sbom/1.0.0",
+  "title": "Hartevo dependency SBOM",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "bomFormat", "specVersion", "serialNumber", "version", "metadata", "components", "dependencies", "licenseAudit", "vulnerabilityAudit", "provenance"],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-sbom/v1"},
+    "bomFormat": {"const": "CycloneDX"},
+    "specVersion": {"const": "1.5"},
+    "serialNumber": {"type": "string", "pattern": "^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "version": {"const": 1},
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timestamp", "tools", "component"],
+      "properties": {
+        "timestamp": {"type": "string", "format": "date-time"},
+        "tools": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "component": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "bom-ref", "name", "version"],
+          "properties": {
+            "type": {"const": "application"},
+            "bom-ref": {"const": "hartevo-desktop"},
+            "name": {"const": "hartevo-desktop"},
+            "version": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "components": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "bom-ref", "name", "version", "scope", "licenses", "properties"],
+        "properties": {
+          "type": {"const": "library"},
+          "bom-ref": {"type": "string", "minLength": 1},
+          "group": {"type": "string"},
+          "name": {"type": "string", "minLength": 1},
+          "version": {"type": "string", "minLength": 1},
+          "scope": {"enum": ["required", "optional", "excluded"]},
+          "purl": {"type": "string", "minLength": 1},
+          "licenses": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+          "properties": {"type": "array", "items": {"type": "object", "required": ["name", "value"], "properties": {"name": {"type": "string"}, "value": {"type": "string"}}, "additionalProperties": false}}
+        }
+      }
+    },
+    "dependencies": {"type": "array", "items": {"type": "object", "required": ["ref", "dependsOn"], "properties": {"ref": {"type": "string"}, "dependsOn": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": false}},
+    "licenseAudit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "policy", "missing", "denied"],
+      "properties": {
+        "status": {"enum": ["PASS", "FAIL", "BLOCKED_ENV", "CI_NOT_EXECUTED"]},
+        "policy": {"type": "string", "minLength": 1},
+        "missing": {"type": "array", "items": {"type": "string"}},
+        "denied": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "vulnerabilityAudit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "tool", "findings"],
+      "properties": {
+        "status": {"enum": ["PASS", "FAIL", "BLOCKED_ENV", "CI_NOT_EXECUTED"]},
+        "tool": {"type": "string", "minLength": 1},
+        "findings": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "cargoLockSha256", "catalogDigest"],
+      "properties": {
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "cargoLockSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "catalogDigest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

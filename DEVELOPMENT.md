@@ -201,6 +201,9 @@ cargo run -p hartevo-eval --locked -- catalog validate
 cargo run -p hartevo-eval --locked -- catalog export --output target/eval/catalog-v1.json
 cargo run -p hartevo-eval --locked -- evidence baseline --commit "$(git rev-parse HEAD)" --output target/eval/release-baseline.json
 cargo run -p hartevo-eval --locked -- run --mission VS-01 --output target/eval/vs-01.json
+bash scripts/check-distribution.sh self-test
+bash scripts/check-distribution.sh gate --output target/distribution --ci-status LOCAL_SCOPED
+cargo run -p hartevo-eval --locked -- distribution validate --gate target/distribution/gate.json --commit "$(git rev-parse HEAD)"
 dx doctor
 bash scripts/check-dioxus-toolchain.sh self-test
 mkdir -p target/evidence
@@ -210,6 +213,8 @@ dx serve --package hartevo-desktop
 ```
 
 Dioxus bundle gate 以 [`contracts/toolchain/dioxus-cli-build.json`](./contracts/toolchain/dioxus-cli-build.json) 固定 CLI `0.7.10`、Desktop package、命令、feature 与 `.app` 目录结构；每次 build 对 bundle 内全部常规文件的相对路径、内容 SHA-256 和字节数生成确定性 tree digest，并输出本次 provenance receipt。`self-test` 只使用临时 fixture/fake CLI，不执行真实构建；正式 `build` 或 `verify-receipt` 遇到 CLI 缺失、版本错误、命令失败、产物漂移或 digest 回读不一致均以非零退出，`BLOCKED_ENV` receipt 也不能作为通过证据。
+
+DIST-01 distribution gate 只生成当前 `HEAD` 绑定的 manifest、CycloneDX SBOM、TUF-like signed update metadata、rollback authorization check、默认关闭的 content-free telemetry 和 restore-drill report；它会保留 `releaseDecision: NOT_EVALUATED`、`releaseReady: false` 与 `nativeEvidence: NOT_PROVEN`。没有 GitHub Actions 执行权时用 `--ci-status CI_NOT_EXECUTED`，不得把账单/权限失败伪装成通过；`LOCAL_SCOPED` 只表示本机等价检查。测试签名密钥、SQLite/SQLCipher simulator 和 `BLOCKED_ENV` 结果都不会计入产品完成或 release evidence。
 
 OpenInterpreter 边界的当前验证命令为：
 
