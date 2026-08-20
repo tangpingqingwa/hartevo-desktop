@@ -16,8 +16,8 @@
 mod action;
 #[cfg(unix)]
 mod chromium_host;
-mod control;
 mod consumer;
+mod control;
 mod fake_host;
 mod file_broker;
 mod handoff;
@@ -49,10 +49,10 @@ pub use chromium_host::{
     ManagedChromiumFileUploadExecutor, ManagedChromiumHost, ManagedChromiumRecipeClickStepExecutor,
     ManagedChromiumTextInputExecutor,
 };
+pub use consumer::{MissionBrowserWorkspaceConsumer, MissionBrowserWorkspaceState};
 pub use control::{
     BrowserControlHandoff, BrowserQueuedBatch, BrowserQueuedBatchState, BrowserWorkspaceControl,
 };
-pub use consumer::{MissionBrowserWorkspaceConsumer, MissionBrowserWorkspaceState};
 pub use fake_host::{
     BrowserBatchCursor, FakeBrowserEffectExecutor, FakeBrowserHost, FakeBrowserPage,
 };
