@@ -2,6 +2,7 @@
 
 mod aggregate;
 mod attribution_evidence_query_store;
+mod attribution_outcome_adoption_store;
 mod attribution_spine_store;
 mod authorization;
 mod browser_file_store;
@@ -12,6 +13,7 @@ mod context_collaboration_store;
 mod context_foundation_store;
 mod context_material_store;
 mod context_store;
+mod context_worker_graph_store;
 mod creator;
 mod creator_hiring_store;
 mod deletion_propagation;
@@ -38,10 +40,14 @@ mod work_product_store;
 pub use aggregate::{
     ApplicationSourceKind, ApplicationSourceRevisionFence, AtomicMutation, PendingEvent,
 };
+pub use attribution_spine_store::AttributionSpineStoreExt;
 pub use browser_recipe_store::BrowserRecipeRuntimeState;
 pub use context_material_store::{
     ContextMaterialDescriptor, ContextMaterialStoreError, ContextQuerySnapshot,
     LocalEncryptedContextMaterialStore,
+};
+pub use context_worker_graph_store::{
+    ContextWorkerGraphError, ContextWorkerGraphSnapshot, WorkerGraphStoreDisposition,
 };
 pub use creator::PersistedMutation;
 pub use deletion_propagation::{DeletionPropagationJob, DeletionPropagationJobStatus};

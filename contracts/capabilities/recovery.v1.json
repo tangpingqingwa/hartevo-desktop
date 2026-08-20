@@ -55,7 +55,7 @@
       "properties": {
         "schema": {"const": "hartevo.capability-recovery/v1"},
         "type": {"const": "fail_closed"},
-        "code": {"enum": ["scope_drift", "authority_drift", "adapter_revoked", "payload_tampered", "budget_exceeded", "generation_stale", "untrusted_adapter"]}
+        "code": {"enum": ["scope_drift", "authority_drift", "adapter_revoked", "payload_tampered", "budget_exceeded", "recovery_limit_exceeded", "generation_stale", "untrusted_adapter"]}
       }
     }
   ],

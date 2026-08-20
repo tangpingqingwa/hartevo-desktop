@@ -1,0 +1,102 @@
+{
+  "schemaVersion": "hartevo-meta-instagram-insight-read-contract/v1",
+  "contractVersion": "meta-instagram-insight-read-e1/v1",
+  "adapterId": "meta.graph.instagram-insight-read",
+  "adapterVersion": 1,
+  "service": "PaidSocialInsightReadService",
+  "provider": "Meta Graph API / Instagram Graph API",
+  "evidenceLevel": "E1",
+  "firstParty": true,
+  "readOnly": true,
+  "registrations": [],
+  "claimAuthority": {
+    "connected": false,
+    "providerExecution": false,
+    "providerReceipt": false,
+    "businessVerification": false,
+    "e4": false
+  },
+  "authentication": {
+    "mode": "oauth2_bearer",
+    "secretMaterial": "opaque_reference_only",
+    "probe": "authenticated_provider_request_required",
+    "missingCredential": "BLOCKED_ENV"
+  },
+  "permissionProfiles": {
+    "facebookLogin": [
+      "business_management",
+      "ads_read",
+      "ads_management (when Page-linked via Business Manager)",
+      "pages_read_engagement",
+      "instagram_basic",
+      "instagram_manage_insights"
+    ],
+    "instagramLogin": [
+      "instagram_business_basic",
+      "instagram_business_manage_insights"
+    ],
+    "scopeDrift": "missing-or-downgraded-permission-fails-closed"
+  },
+  "scope": {
+    "exactBindings": [
+      "tenant",
+      "project",
+      "business_id",
+      "ad_account_id",
+      "page_id",
+      "instagram_account_id"
+    ],
+    "adAccountFormat": "act_<numeric_id>",
+    "targetRequiresExactScope": true,
+    "scopeDigestRequired": true
+  },
+  "api": {
+    "versionBound": true,
+    "hosts": [
+      "https://graph.facebook.com",
+      "https://graph.instagram.com"
+    ],
+    "readEndpoints": [
+      "GET /{version}/me",
+      "GET /{version}/{business_id}",
+      "GET /{version}/act_{ad_account_id}",
+      "GET /{version}/{page_id}",
+      "GET /{version}/{instagram_account_id}",
+      "GET /{version}/act_{ad_account_id}/insights",
+      "GET /{version}/{page_id}/insights",
+      "GET /{version}/{instagram_account_id}/insights",
+      "GET /{version}/{instagram_media_id}/insights"
+    ],
+    "writes": "disabled"
+  },
+  "receipts": {
+    "source": "provider_native_https",
+    "requestId": "preserved_when_provider_returns_one",
+    "requestDigest": "required",
+    "responseDigest": "required",
+    "contentDigest": "required",
+    "classification": "required",
+    "freshness": "required",
+    "quota": "required",
+    "cost": "required",
+    "causalAttribution": "not_claimed"
+  },
+  "pagination": {
+    "cursor": "opaque_provider_after_token",
+    "durable": true,
+    "scopeAndQueryBound": true,
+    "duplicatePages": "fail_closed",
+    "cursorRollback": "fail_closed"
+  },
+  "lifecycle": {
+    "revoke": "clear_mount_and_cursor",
+    "unmount": "clear_mount_and_cursor",
+    "crashRecovery": "resume_from_exact_durable_cursor",
+    "refreshDrift": "fail_closed"
+  },
+  "backlogFromSuperseded154": [
+    "generic multi-provider resource abstraction",
+    "webhook ingestion and replay handling",
+    "campaign/adset/ad/creative/media resource reads beyond this insight slice"
+  ]
+}
