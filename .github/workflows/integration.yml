@@ -105,6 +105,10 @@ jobs:
             tests::postgres_l2_contract_reports_blocked_or_executes_full_replay \
             -- --nocapture --exact
           cargo test -p hartevo-cloud-storage --locked \
+            --test cell_integration \
+            postgres_typed_device_sync_attach_head_rotation_and_revoke_is_fail_closed \
+            -- --nocapture --exact
+          cargo test -p hartevo-cloud-storage --locked \
             effect_ledger::tests::postgres_effect_claim_contract_reports_blocked_or_executes_full_recovery \
             -- --nocapture --exact
           cargo test -p hartevo-cloud-storage --locked \

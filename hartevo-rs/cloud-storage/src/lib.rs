@@ -18,12 +18,21 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_postgres::{Client, Row, Transaction};
 
+mod device_sync;
 mod effect_ledger;
 mod region_transfer;
 mod remote_worker_execution;
 mod remote_worker_plugin;
 mod scheduler;
 
+pub use device_sync::{
+    CloudDeviceSyncAttach, CloudDeviceSyncAttachResult, CloudDeviceSyncConsumer,
+    CloudDeviceSyncDocumentHead, CloudDeviceSyncDocumentMutation, CloudDeviceSyncDocumentResult,
+    CloudDeviceSyncKeyFence, CloudDeviceSyncProvider, CloudDeviceSyncRegistrationState,
+    CloudDeviceSyncRelease, CloudDeviceSyncReleaseKind, CloudDeviceSyncReleaseResult,
+    CloudDeviceSyncServiceDefinition, CloudDeviceSyncSession, DEVICE_SYNC_SCHEMA,
+    DEVICE_SYNC_SERVICE_ID, DEVICE_SYNC_SERVICE_VERSION,
+};
 pub use effect_ledger::{CloudPermissionFenceMutation, CloudPermissionFenceResult};
 pub use region_transfer::{
     EncryptedRegionTransferRequest, RegionTransferConsumer, RegionTransferProvider,
@@ -57,7 +66,7 @@ pub use scheduler::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const MAX_CIPHERTEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REMOTE_WORKER_LEASE: Duration = Duration::seconds(15 * 60);
 const CLAIM_OUTBOX_SQL: &str = "WITH candidates AS (
@@ -625,7 +634,7 @@ impl PostgresCellStore {
         let transaction = client.transaction().await?;
         transaction
             .query_one(
-                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v7'))",
+                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v8'))",
                 &[],
             )
             .await?;
@@ -3685,6 +3694,8 @@ pub enum CloudStorageError {
     InvalidProjectRegistration,
     #[error("encrypted sync mutation or precondition is invalid")]
     InvalidSyncMutation,
+    #[error("typed encrypted device-sync registration, session, or document request is invalid")]
+    InvalidDeviceSyncRequest,
     #[error("remote Worker task or bounded lease request is invalid")]
     InvalidRemoteWorkerTask,
     #[error("Mission-scoped remote Worker work request, lease, or fence is invalid")]
@@ -3747,6 +3758,24 @@ pub enum CloudStorageError {
     RemoteWorkerDispatchNotRegistered,
     #[error("device public key is not visible in the exact tenant/project/device scope")]
     DevicePublicKeyNotFound,
+    #[error("typed device-sync registration is not visible in the exact scope")]
+    DeviceSyncRegistrationNotFound,
+    #[error("typed device-sync registration is no longer active")]
+    DeviceSyncRegistrationNotActive,
+    #[error("typed device-sync registration is already active for this device")]
+    DeviceSyncRegistrationAlreadyActive,
+    #[error("typed device-sync registration uses a stale project key generation")]
+    DeviceSyncKeyGenerationStale,
+    #[error("typed device-sync registration uses a revoked or rotated device public key")]
+    DeviceSyncDeviceKeyRevoked,
+    #[error("typed device-sync provider or consumer identity does not match the registration")]
+    DeviceSyncProviderMismatch,
+    #[error("typed encrypted SyncDocument head is not visible in the exact scope")]
+    DeviceSyncDocumentNotFound,
+    #[error("typed encrypted SyncDocument head or registration fence is stale")]
+    DeviceSyncDocumentFenceLost,
+    #[error("typed device-sync registration lifecycle transition is already terminal")]
+    DeviceSyncLifecycleAlreadyApplied,
     #[error("device public-key revision is not the exact next transition")]
     InvalidDevicePublicKeyTransition,
     #[error("project keyring bootstrap is not visible in the exact tenant/project scope")]
@@ -4141,7 +4170,7 @@ mod tests {
 
     #[test]
     fn schema_contract_has_physical_cell_rls_ciphertext_and_append_only_versions() {
-        assert_eq!(SCHEMA_VERSION, 7);
+        assert_eq!(SCHEMA_VERSION, 8);
         assert!(SCHEMA.contains("FORCE ROW LEVEL SECURITY"));
         assert!(SCHEMA.contains("current_setting(''hartevo.tenant_id'', true)"));
         assert!(SCHEMA.contains("current_setting(''hartevo.cell'', true)"));
@@ -4155,6 +4184,10 @@ mod tests {
         assert!(SCHEMA.contains("remote_worker_work_requests"));
         assert!(SCHEMA.contains("remote_worker_result_receipts"));
         assert!(SCHEMA.contains("remote_worker_work_log"));
+        assert!(SCHEMA.contains("device_sync_registrations"));
+        assert!(SCHEMA.contains("device_sync_document_versions"));
+        assert!(SCHEMA.contains("device_sync_document_heads"));
+        assert!(SCHEMA.contains("device_sync_event_log"));
         assert!(SCHEMA.contains("remote_worker_transport_registrations"));
         assert!(SCHEMA.contains("remote_worker_dispatch_registrations"));
         assert!(SCHEMA.contains("state IN ('mounted', 'unmounted', 'revoked')"));
