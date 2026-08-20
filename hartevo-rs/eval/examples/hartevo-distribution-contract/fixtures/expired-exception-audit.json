@@ -1,0 +1,24 @@
+{
+  "vulnerabilities": {
+    "found": false,
+    "count": 0,
+    "list": []
+  },
+  "warnings": {
+    "unsound": [
+      {
+        "kind": "unsound",
+        "package": {
+          "name": "mac-safe",
+          "version": "1.0.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        "advisory": {
+          "id": "RUSTSEC-TEST-0001",
+          "package": "mac-safe",
+          "informational": "unsound"
+        }
+      }
+    ]
+  }
+}

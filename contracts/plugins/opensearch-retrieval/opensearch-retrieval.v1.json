@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.opensearch-retrieval/v1",
+  "title": "Hartevo Layer 1 governed OpenSearch retrieval-evidence contract",
+  "schemaVersion": "hartevo.opensearch-retrieval/v1",
+  "contractVersion": "EXT-OPENSEARCH-01-L1/v1",
+  "layer": 1,
+  "contractDigestInput": "hartevo.opensearch-retrieval/v1|layer=1|service=search.opensearch.retrieval|provider=opensearch.search.recording|consumer=mission.retrieval-evidence.opensearch",
+  "contractDigest": "33c99028e167ef343c837504312dc28d7fcccc97bb621de0fb7f95771944cc79",
+  "plugin": {
+    "id": "opensearch.retrieval",
+    "version": "1.0.0",
+    "registration": {
+      "versioned": true,
+      "contractDigestBound": true,
+      "scopeBound": true,
+      "reversible": true,
+      "revocable": true,
+      "revocation": "registration_digest_rotation"
+    }
+  },
+  "service": {
+    "type": "OpenSearchRetrievalService",
+    "id": "search.opensearch.retrieval",
+    "operations": [
+      "describe_capabilities",
+      "compile_bounded_query_proposal",
+      "create_point_in_time_proposal",
+      "search_with_pit_and_search_after",
+      "paginate_bounded_evidence",
+      "create_receipt_candidate",
+      "verify_read_projection",
+      "propose_retrieval_evidence"
+    ],
+    "effectAuthority": "bounded_read_and_proposal_only",
+    "liveExternalIo": false,
+    "kernelAuthority": false
+  },
+  "provider": {
+    "type": "OpenSearchProvider",
+    "id": "opensearch.search.recording",
+    "operations": [
+      "describe_capabilities",
+      "create_point_in_time",
+      "search",
+      "revoke"
+    ],
+    "transportSeam": [
+      "https_secret_reference",
+      "https_sigv4_secret_reference",
+      "recording",
+      "fake",
+      "loopback",
+      "blocked_env"
+    ],
+    "nativeStatus": "BLOCKED_ENV",
+    "connected": false,
+    "native": false,
+    "rawResponseBodies": false,
+    "rawSecrets": false,
+    "writes": false,
+    "deletes": false,
+    "scroll": false
+  },
+  "authentication": {
+    "boundary": "opaque SecretReference",
+    "supportedSchemes": [
+      "https",
+      "https_sigv4",
+      "bearer_via_secret_reference",
+      "basic_via_secret_reference",
+      "client_certificate_via_secret_reference",
+      "sigv4_via_secret_reference"
+    ],
+    "serialized": false,
+    "debugged": false,
+    "resolvedByLayer": 2,
+    "rawBearerBasicCredentials": false,
+    "rawPrivateKeys": false
+  },
+  "scope": {
+    "exactFields": [
+      "domain",
+      "cluster",
+      "index",
+      "alias",
+      "mappingDigest",
+      "mappingRevision",
+      "projectId",
+      "missionId"
+    ],
+    "scopeBound": true,
+    "crossCluster": false,
+    "wildcardIndex": false,
+    "unboundedAlias": false
+  },
+  "mapping": {
+    "digestBound": true,
+    "revisionBound": true,
+    "driftIsFailClosed": true,
+    "queryAndSortFieldsMustBeAllowlisted": true,
+    "sourceFieldsMustBeAllowlisted": true
+  },
+  "queryPolicy": {
+    "representation": "typed_bounded_allowlist_ast",
+    "allowedClauses": ["match", "term", "prefix", "range", "bool"],
+    "allowedBoolDepth": 4,
+    "allowedClauseCount": 32,
+    "maxPageSize": 100,
+    "maxPages": 32,
+    "maxHits": 1000,
+    "maxSourceFieldBytes": 4096,
+    "scroll": "forbidden",
+    "rawDsl": "forbidden",
+    "stableSort": "required_with_unique_id_tiebreaker"
+  },
+  "pagination": {
+    "pointInTime": "required",
+    "searchAfter": "required_for_next_page",
+    "cursorLoop": "fail_closed",
+    "pitExpiry": "typed_failure",
+    "deepFromSize": "forbidden",
+    "unboundedScroll": "forbidden"
+  },
+  "evidence": {
+    "hitFields": [
+      "id",
+      "sortValues",
+      "allowlistedSourceFields",
+      "sourceDigest",
+      "hitDigest"
+    ],
+    "resultDigests": [
+      "queryDigest",
+      "mappingDigest",
+      "pitDigest",
+      "resultDigest",
+      "pageDigest",
+      "registrationDigest"
+    ],
+    "statuses": [
+      "present",
+      "empty",
+      "partial",
+      "timeout",
+      "shard_failure",
+      "deleted",
+      "access_loss",
+      "provider_unknown"
+    ],
+    "rawProviderBodies": false,
+    "formattedOrUnboundedSource": false,
+    "adopted": false,
+    "kernelVerified": false
+  },
+  "receiptAndVerification": {
+    "proposal": true,
+    "receiptCandidate": true,
+    "durableNativeReceipt": false,
+    "readVerification": true,
+    "independentReadBack": false,
+    "durableAdoption": false,
+    "layer2Gaps": [
+      "native_https_transport",
+      "sigv4_or_secret_resolution",
+      "durable_native_receipt",
+      "independent_read_back",
+      "durable_work_product_adoption"
+    ]
+  },
+  "testSeams": {
+    "fixture": "BLOCKED_ENV",
+    "recording": "BLOCKED_ENV",
+    "fake": "BLOCKED_ENV",
+    "loopback": "BLOCKED_ENV",
+    "connected": false,
+    "native": false,
+    "adversarial": [
+      "pit_expiry",
+      "cursor_loop",
+      "mapping_drift",
+      "sort_instability",
+      "tamper",
+      "pagination",
+      "rate_limit",
+      "revocation",
+      "partial_shards",
+      "access_loss",
+      "deleted_index",
+      "provider_unknown"
+    ]
+  },
+  "authority": {
+    "externalWrite": false,
+    "indexing": false,
+    "documentDelete": false,
+    "scroll": false,
+    "durableReceipt": false,
+    "durableMemory": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAuthority": false,
+    "connected": false,
+    "native": false
+  },
+  "native": {
+    "status": "BLOCKED_ENV",
+    "httpsTransport": "BLOCKED_ENV",
+    "sigv4Resolution": "BLOCKED_ENV",
+    "secretResolution": "BLOCKED_ENV",
+    "durableReceipt": "BLOCKED_ENV",
+    "readBack": "BLOCKED_ENV",
+    "adoption": "BLOCKED_ENV"
+  },
+  "layer2": {
+    "externalRead": "typed_seam_only",
+    "sigv4OrSecretResolution": "typed_seam_only",
+    "durableNativeReceipt": "not_implemented",
+    "independentReadBack": "not_implemented",
+    "workProductAdoption": "not_implemented"
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "$id",
+    "schemaVersion",
+    "contractVersion",
+    "layer",
+    "contractDigestInput",
+    "contractDigest",
+    "plugin",
+    "service",
+    "provider",
+    "authentication",
+    "scope",
+    "mapping",
+    "queryPolicy",
+    "pagination",
+    "evidence",
+    "receiptAndVerification",
+    "testSeams",
+    "authority",
+    "native",
+    "layer2"
+  ]
+}

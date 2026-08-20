@@ -1,16 +1,16 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "edbf24666c8eed40bffc7e3736dad36342643643",
+  "baseCommit": "7bb44d98cebd1d7ded417b48746456474f79d244",
   "candidateCount": 1,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ci-runtime-adapter-etxtbsy-fix",
-      "headCommit": "feb9c5c2d9ef02a24ea32eb8631bca5b9d4b3a0f",
-      "number": 394
+      "headBranch": "codex/plugin-invocation-timeline-01",
+      "headCommit": "36f0251b712e43cfaad88253a2b9ca5cddaf56b6",
+      "number": 185
     }
   ],
-  "createdAt": "2026-08-14T13:51:55Z",
+  "createdAt": "2026-08-17T10:44:48Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -21,5 +21,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260814-1351"
+  "trainBranch": "merge-train/20260817-104437"
 }
