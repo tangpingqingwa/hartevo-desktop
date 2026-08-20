@@ -1,0 +1,97 @@
+{
+  "schemaVersion": "hartevo.statuspage-incident-result/v1",
+  "contractVersion": "statuspage-incident-result-e1/v1",
+  "layer": 1,
+  "name": "governed Statuspage incident result",
+  "service": {
+    "id": "statuspage.incident-result",
+    "type": "StatuspageIncidentResultService",
+    "readOnly": true,
+    "liveExecution": false,
+    "emitsOutcome": false
+  },
+  "provider": {
+    "id": "statuspage.incident",
+    "type": "StatuspageProvider",
+    "version": "1.0.0",
+    "apiRevision": "statuspage-api-v1",
+    "baseUrl": "https://api.statuspage.io/v1",
+    "requiredPermissions": [
+      "read_page",
+      "read_components",
+      "read_component_groups",
+      "read_incidents",
+      "read_updates",
+      "read_maintenance"
+    ],
+    "maxRequestsPerMinute": 60,
+    "maxResponseBytes": 1048576,
+    "maxItemsPerCollection": 100,
+    "native": false,
+    "connected": false,
+    "firstParty": false
+  },
+  "consumer": {
+    "id": "mission.statuspage.incident",
+    "type": "MissionStatuspageIncidentConsumer",
+    "proposalOnly": true,
+    "adoptsOutcome": false
+  },
+  "models": [
+    "Organization",
+    "Page",
+    "Component",
+    "ComponentGroup",
+    "Incident",
+    "Maintenance",
+    "Update",
+    "TimeWindow",
+    "Project",
+    "Mission",
+    "WorkProduct",
+    "ConsentScope",
+    "SecretReference"
+  ],
+  "allowlist": {
+    "methods": ["GET"],
+    "reads": [
+      "/v1/pages/{page_id}",
+      "/v1/pages/{page_id}/components",
+      "/v1/pages/{page_id}/component-groups",
+      "/v1/pages/{page_id}/incidents",
+      "/v1/pages/{page_id}/incidents/scheduled"
+    ],
+    "writes": []
+  },
+  "redactions": [
+    "secret_reference",
+    "raw_response",
+    "update_body",
+    "postmortem_body",
+    "internal_notes",
+    "subscriber_contact",
+    "custom_tweet",
+    "automation_email",
+    "provider_metadata"
+  ],
+  "transports": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+  "authority": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "durableReceipt": false,
+    "kernelTruth": false,
+    "kernelConsent": false,
+    "kernelEffect": false,
+    "kernelReceipt": false,
+    "kernelVerification": false,
+    "outcomeAuthority": false,
+    "externalWrites": false
+  },
+  "honestyBoundary": [
+    "published status observations are not customer-wide uptime truth",
+    "incident status does not establish causality or remediation",
+    "maintenance is retained as an explicit observation",
+    "partial, access-lost, rate-limited, and provider-unknown states remain typed"
+  ]
+}

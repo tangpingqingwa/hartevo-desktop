@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.confluence-result/v1",
+  "title": "Hartevo Layer 1 Confluence Cloud knowledge-result contract",
+  "schemaVersion": "hartevo.confluence-result/v1",
+  "contractVersion": "EXT-CONFLUENCE-01-L1/v1",
+  "layer": 1,
+  "plugin": {
+    "id": "confluence-result.knowledge-result",
+    "version": "1.0.0",
+    "digestBound": true,
+    "scopeBound": true,
+    "revocable": true
+  },
+  "service": {
+    "id": "ConfluenceKnowledgeResultService",
+    "providerId": "ConfluenceCloudProvider",
+    "consumerId": "MissionConfluenceKnowledgeConsumer",
+    "operations": [
+      "describe_content_scope",
+      "read_page_evidence",
+      "search_knowledge",
+      "compile_knowledge_proposal",
+      "record_knowledge_receipt",
+      "verify_knowledge_result"
+    ],
+    "effectAuthority": "proposal_and_recording_only"
+  },
+  "api": {
+    "basePath": "/wiki/rest/api",
+    "content": "/content/{id}",
+    "contentBody": "/content/{id}?expand=body.{representation}",
+    "search": "/content/search",
+    "cloudIdBound": true,
+    "httpsSiteBound": true,
+    "officialReferences": [
+      "https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-content/",
+      "https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-search/",
+      "https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-content-body/"
+    ]
+  },
+  "scope": {
+    "exactFields": [
+      "site",
+      "cloud_id",
+      "account_id",
+      "space_id",
+      "page_id",
+      "content_id",
+      "page_version",
+      "body_representation",
+      "body_field_allowlist",
+      "cql_template",
+      "project_id",
+      "mission_id",
+      "work_product_id",
+      "work_product_revision",
+      "consent_id",
+      "policy_revision",
+      "permission_digest"
+    ],
+    "pageVersionFenced": true,
+    "permissionFenced": true,
+    "cursorFenced": true
+  },
+  "readBoundaries": {
+    "pageMetadata": true,
+    "ancestors": true,
+    "children": true,
+    "selectedBodyRepresentation": true,
+    "labels": true,
+    "versionAndLastModified": true,
+    "boundedCqlSearch": true,
+    "allowlistedCqlTemplates": ["space_text_v1"],
+    "opaqueCursor": true,
+    "maxBodyBytes": 65536,
+    "maxPageSize": 50,
+    "maxPages": 16
+  },
+  "redaction": {
+    "rawBodyInEvidence": false,
+    "rawBodyInReceipt": false,
+    "rawMetadataInReceipt": false,
+    "rawSearchQueryInReceipt": false,
+    "rawComments": false,
+    "attachments": false,
+    "pii": false,
+    "digests": ["body", "metadata", "search", "result", "permission", "registration"]
+  },
+  "authority": {
+    "externalWrite": false,
+    "pageCreate": false,
+    "pageUpdate": false,
+    "pageArchive": false,
+    "permissionChange": false,
+    "durableNativeReceipt": false,
+    "independentReadback": false,
+    "kernelOutcome": false,
+    "store": false,
+    "keyring": false,
+    "browserProfile": false,
+    "effect": false
+  },
+  "native": {
+    "credentials": "BLOCKED_ENV",
+    "httpsReads": "BLOCKED_ENV",
+    "externalWrite": "BLOCKED_ENV",
+    "fixtureConnected": false,
+    "recordingConnected": false,
+    "loopbackConnected": false,
+    "blockedEnvConnected": false,
+    "fixtureNative": false,
+    "recordingNative": false,
+    "loopbackNative": false,
+    "blockedEnvNative": false
+  },
+  "typedHttpStatuses": [401, 403, 404, 409, 429, 500, 502, 503, 504],
+  "secretBoundary": {
+    "opaqueSecretReferenceOnly": true,
+    "rawOAuthTokenInScope": false,
+    "rawApiTokenInScope": false,
+    "rawAuthorizationInDebug": false,
+    "rawAuthorizationInReceipt": false
+  },
+  "layer2Gaps": [
+    "native Atlassian OAuth/API-token resolution",
+    "bounded native HTTPS reads",
+    "durable native provider receipt",
+    "independent content read-back and reconciliation",
+    "verified Work Product adoption",
+    "page create/update/archive",
+    "permission mutation",
+    "attachment/comment transfer"
+  ]
+}

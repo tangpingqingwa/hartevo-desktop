@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/aws-verified-permissions-result/aws-verified-permissions-result.v1.json",
+  "schemaVersion": "hartevo-aws-verified-permissions-result-contract/v1",
+  "contractVersion": "aws-verified-permissions-result-l1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "aws.verified-permissions.result",
+    "version": "1.0.0",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "is_authorized_read",
+      "propose_authorization",
+      "record_authorization",
+      "verify_authorization",
+      "consume_observation"
+    ],
+    "readOnly": true,
+    "liveExecution": false,
+    "policyMutation": false,
+    "externalActionExecution": false
+  },
+  "provider": {
+    "id": "aws.verified-permissions",
+    "version": "1.0.0",
+    "operation": "IsAuthorized",
+    "acceptedProvenance": ["fixture", "recording", "fake", "loopback", "blocked_env"],
+    "native": false,
+    "liveCredentialResolution": false,
+    "rawCedar": false,
+    "rawPolicy": false,
+    "rawContext": false,
+    "secret": "opaque_non_serializing_sigv4_reference"
+  },
+  "consumer": {
+    "id": "mission.aws.verified-permissions.result",
+    "projectBound": true,
+    "missionBound": true,
+    "workProductBound": true,
+    "kernelConsentReference": "digest_only",
+    "kernelEffectBoundary": "required_and_never_bypassed",
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "account",
+      "region",
+      "policyStore",
+      "principalDigest",
+      "actionDigest",
+      "resourceDigest",
+      "contextDigest",
+      "project",
+      "mission",
+      "workProduct",
+      "workProductRevision",
+      "consentDigest",
+      "permissionDigest",
+      "policyDigest"
+    ],
+    "rawPrincipal": false,
+    "rawAction": false,
+    "rawResource": false,
+    "rawCedar": false,
+    "rawPolicy": false,
+    "rawContext": false,
+    "pii": false
+  },
+  "digests": [
+    "version",
+    "contract",
+    "provider",
+    "permission",
+    "scope",
+    "policy",
+    "context",
+    "evidence",
+    "registration",
+    "proposal",
+    "record",
+    "verification"
+  ],
+  "decisionStates": ["allow", "deny", "indeterminate"],
+  "evidenceStates": [
+    "complete",
+    "partial",
+    "access_lost",
+    "context_mismatch",
+    "tampered",
+    "replay_rejected"
+  ],
+  "seams": {
+    "isAuthorizedRead": {
+      "requestMetadata": "typed_identifiers_and_digests_only",
+      "responseMetadata": "determining_policy_principal_resource_context_digests_only",
+      "decision": "allow_deny_indeterminate"
+    },
+    "proposal": {
+      "readOnly": true,
+      "createsEffect": false,
+      "createsReceipt": false,
+      "executionEligible": false
+    },
+    "record": {
+      "requiresKernelConsentFence": true,
+      "requiresKernelEffectFence": true,
+      "replayRejected": true,
+      "tamperChecked": true
+    },
+    "verify": {
+      "scopeChecked": true,
+      "contextChecked": true,
+      "registrationChecked": true,
+      "effectNeverExecuted": true
+    }
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "policyDigestBound": true,
+    "contextDigestBound": true,
+    "reversible": true,
+    "revocable": true
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "liveCredentialResolution": false,
+    "policyMutation": false,
+    "externalActionExecution": false,
+    "durableReceipt": false,
+    "adoptedOutcome": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "kernel_owned_consent_and_effect_authority",
+    "live_sigv4_credential_resolution",
+    "live_is_authorized_call",
+    "durable_native_receipt",
+    "independent_effect_verification",
+    "verified_work_product_adoption"
+  ]
+}

@@ -1,0 +1,208 @@
+{
+  "schemaVersion": "hartevo-aws-detective-result-contract/v1",
+  "contractVersion": "EXT-AWS-DETECTIVE-01-L1/v1",
+  "pluginId": "aws.detective.result",
+  "pluginVersion": "1.0.0",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "layer": 1,
+  "service": {
+    "id": "aws.detective.result",
+    "implementation": "AwsDetectiveService",
+    "readOnly": true,
+    "proposalOnly": true,
+    "liveExecution": false,
+    "operations": [
+      "ListInvestigations",
+      "GetInvestigation",
+      "ListIndicators",
+      "ListMembers",
+      "Register",
+      "RevokeRegistration",
+      "Read",
+      "Propose",
+      "Record",
+      "Verify"
+    ]
+  },
+  "provider": {
+    "id": "aws.detective.read",
+    "implementation": "AwsDetectiveProvider",
+    "apiVersion": "2018-10-26",
+    "providerVersion": "aws-detective-provider/v1",
+    "native": false,
+    "firstParty": false,
+    "connected": false,
+    "readOnly": true,
+    "externalWrites": false,
+    "allowlistedOperations": [
+      "ListInvestigations",
+      "GetInvestigation",
+      "ListIndicators",
+      "ListMembers"
+    ],
+    "permissionActions": [
+      "detective:ListInvestigations",
+      "detective:GetInvestigation",
+      "detective:ListIndicators",
+      "detective:ListMembers"
+    ],
+    "maxResults": 100,
+    "maxPages": 4,
+    "paginationTokenTtlHours": 24,
+    "opaquePagination": true,
+    "responseBoundBytes": 1048576
+  },
+  "consumer": {
+    "id": "mission.aws-detective.consumer",
+    "implementation": "MissionAwsDetectiveConsumer",
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "effectiveAuthorization": false
+  },
+  "scope": {
+    "account": "accountId",
+    "region": "awsRegion",
+    "behaviorGraph": ["graphId", "graphRevision"],
+    "investigation": ["investigationId", "investigationRevision", "timeWindow"],
+    "indicator": ["indicatorId", "indicatorRevision"],
+    "member": ["memberId", "memberRevision", "accountDigest"],
+    "mission": ["missionId", "missionRevision"],
+    "project": ["projectId", "projectRevision"],
+    "workProduct": ["workProductId", "workProductRevision"],
+    "permission": ["permissionDigest", "allowlistedReadActions"],
+    "registration": ["registrationDigest", "reversible", "revocable"]
+  },
+  "digests": [
+    "versionDigest",
+    "contractDigest",
+    "providerDigest",
+    "apiDigest",
+    "permissionDigest",
+    "scopeDigest",
+    "graphDigest",
+    "investigationScopeDigest",
+    "indicatorScopeDigest",
+    "memberScopeDigest",
+    "evidenceDigest",
+    "registrationDigest"
+  ],
+  "reads": {
+    "ListInvestigations": {
+      "filter": "scopedTimeWindow",
+      "items": "severityStatusEntityTypeDigestProjection"
+    },
+    "GetInvestigation": {
+      "item": "severityStatusTacticTechniqueDigestProjection"
+    },
+    "ListIndicators": {
+      "items": "indicatorTypeSeverityStatusTacticTechniqueDigestProjection"
+    },
+    "ListMembers": {
+      "items": "memberStatusAccountDigestProjection"
+    },
+    "bounded": {
+      "maxPageSize": 100,
+      "maxPages": 4,
+      "maxResponseBytes": 1048576,
+      "paginationTokenTtlHours": 24,
+      "investigationWindowMaxHours": 24
+    },
+    "record": "normalizedRedactedProjectionsOnly",
+    "verify": [
+      "requestDigest",
+      "opaqueCursorDigest",
+      "cursorExpiry",
+      "cursorBinding",
+      "permissionDigest",
+      "scopeDigest",
+      "providerDigest",
+      "evidenceDigest",
+      "registrationDigest"
+    ]
+  },
+  "redaction": {
+    "retain": [
+      "behaviorGraphId",
+      "investigationId",
+      "indicatorId",
+      "memberId",
+      "accountDigest",
+      "entityDigest",
+      "entityType",
+      "severityDigest",
+      "statusDigest",
+      "tacticDigest",
+      "techniqueDigest",
+      "paginationTokenDigest",
+      "timeWindow",
+      "revisionDigest"
+    ],
+    "drop": [
+      "entityArn",
+      "entityEmail",
+      "accountEmail",
+      "memberEmail",
+      "rawGraphSearch",
+      "rawGraphEdges",
+      "indicatorText",
+      "indicatorDetails",
+      "cloudTrailPayload",
+      "vpcFlowPayload",
+      "datasourcePayload",
+      "rawNextToken",
+      "secretMaterial"
+    ]
+  },
+  "authority": {
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "externalWrites": false,
+    "graphSearch": false,
+    "graphMutation": false,
+    "memberMutation": false,
+    "datasourceMutation": false,
+    "investigationStart": false,
+    "investigationStateMutation": false,
+    "kernelAuthority": false,
+    "durableReceipt": false
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "durableReceipt": false,
+    "effectiveAuthorization": false,
+    "truthAuthority": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "forbidden": [
+    "StartInvestigation",
+    "UpdateInvestigationState",
+    "SearchGraph",
+    "CreateGraph",
+    "DeleteGraph",
+    "CreateMembers",
+    "DeleteMembers",
+    "StartMonitoringMember",
+    "UpdateDatasourcePackages",
+    "TagResource",
+    "UntagResource",
+    "retain_entity_arn",
+    "retain_entity_email",
+    "retain_raw_graph_edges",
+    "adopt_kernel_authority",
+    "claim_connected",
+    "claim_native",
+    "claim_first_party"
+  ],
+  "layer2Exits": [
+    "nativeSigV4",
+    "hostOwnedConsent",
+    "effectAuthority",
+    "durableNativeReceipt",
+    "independentNativeReread",
+    "verifiedWorkProductAdoption"
+  ]
+}
