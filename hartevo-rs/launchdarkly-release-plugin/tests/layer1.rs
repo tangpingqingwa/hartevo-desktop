@@ -1,15 +1,15 @@
 use hartevo_launchdarkly_release_plugin::*;
-use serde_json::to_string;
+use serde_json::{json, to_string, to_value};
 
 fn digest(label: &str) -> Digest {
     Digest::from_text(label)
 }
 
-fn scope() -> FeatureReleaseScope {
+fn scope_for(account_id: &str, base_url: &str) -> FeatureReleaseScope {
     let policy = ApprovalPolicySnapshot::required("release-policy", 7).expect("policy");
     FeatureReleaseScope::new(
-        "account-fixture",
-        "https://app.launchdarkly.com",
+        account_id,
+        base_url,
         "project-fixture",
         "production",
         "checkout-banner",
@@ -24,6 +24,10 @@ fn scope() -> FeatureReleaseScope {
         7,
     )
     .expect("scope")
+}
+
+fn scope() -> FeatureReleaseScope {
+    scope_for("account-fixture", "https://app.launchdarkly.com")
 }
 
 fn flag(scope: &FeatureReleaseScope, version: u64, suffix: &str) -> FlagSnapshot {
@@ -92,6 +96,7 @@ fn secret(scope: &FeatureReleaseScope) -> SecretReference {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn typed_service_compiles_records_and_verifies_exact_readback_without_native_claims() {
     let scope = scope();
     let before = flag(&scope, 42, "before");
@@ -119,9 +124,16 @@ fn typed_service_compiles_records_and_verifies_exact_readback_without_native_cla
     assert!(proposal.recordable);
     assert!(!proposal.dry_run);
     assert_eq!(proposal.claims, EvidenceClaims::layer_one());
-    let mission_proposal = MissionFeatureReleaseConsumer::for_scope(&scope)
-        .consume(&proposal)
-        .expect("mission proposal");
+    let mission_proposal = MissionFeatureReleaseConsumer::for_scope(
+        &scope,
+        service
+            .provider()
+            .registration_receipt()
+            .registration_digest
+            .clone(),
+    )
+    .consume(&proposal)
+    .expect("mission proposal");
     assert_eq!(mission_proposal.status, ReleaseStatus::Approved);
     assert!(mission_proposal.adoptable);
     assert_eq!(
@@ -130,13 +142,26 @@ fn typed_service_compiles_records_and_verifies_exact_readback_without_native_cla
     );
 
     let after = flag(&scope, 43, "after");
-    let applied_audit = audit(
+    let applied_audit = AuditEvidence::for_scope_with_bindings(
         &scope,
         "audit-01",
-        43,
         AuditEventKind::ChangeApplied,
+        43,
+        b"actor@example.invalid",
+        b"raw targeting context user=customer@example.invalid",
         Some("approval-01".into()),
-    );
+        Some(
+            proposal
+                .approval
+                .as_ref()
+                .expect("approval evidence")
+                .evidence_digest
+                .clone(),
+        ),
+        Some(proposal.proposal_digest.clone()),
+        2_000,
+    )
+    .expect("audit");
     let readback = ReleaseReadBack::new(
         &scope,
         service
@@ -167,6 +192,18 @@ fn typed_service_compiles_records_and_verifies_exact_readback_without_native_cla
     assert!(!encoded.contains("customer@example.invalid"));
     assert!(!encoded.contains("targeting context"));
     assert!(!encoded.contains("token-value"));
+    let payload = FeatureReleaseContractPayload::from_evidence(
+        &scope,
+        service.provider().registration_receipt(),
+        &evidence,
+    )
+    .expect("contract payload");
+    let mut tampered_payload = to_value(&payload).expect("payload json");
+    tampered_payload["evidence"]["flag"]["unexpected"] = json!(true);
+    assert_eq!(
+        validate_contract_json(&tampered_payload),
+        Err(FeatureReleaseError::SchemaValidation)
+    );
 }
 
 #[test]
@@ -202,7 +239,7 @@ fn dry_run_is_validation_only_and_redacted_types_have_no_secret_or_context_field
             &scope,
             "audit-01",
             43,
-            AuditEventKind::ChangeApplied,
+            AuditEventKind::ChangeScheduled,
             None,
         )],
         TransportProvenance::Loopback,
@@ -305,6 +342,169 @@ fn adversarial_digest_version_conflict_and_redaction_fences_fail_closed() {
 }
 
 #[test]
+fn exact_provider_mission_and_audit_fences_reject_replay() {
+    let scope = scope();
+    let other_scope = scope_for("other-account", "https://other.launchdarkly.com");
+    let before = flag(&scope, 42, "before");
+    let patch = patch(&scope, &before);
+    let dry_run = DryRunEvidence::local_valid(&scope, &before, &patch).expect("dry run");
+    let request = FeatureReleaseProposalRequest::for_scope(&scope, patch, false).expect("request");
+    let provider = LaunchDarklyReleaseProvider::with_defaults(
+        RecordingTransport::new(
+            before,
+            vec![approved(&scope, "approval-01", ApprovalStatus::Approved)],
+            Vec::new(),
+        ),
+        scope.clone(),
+        secret(&scope),
+    )
+    .expect("provider");
+    let mut service = FeatureReleaseService::new(provider);
+    let evidence = service.read_flag_evidence().expect("evidence");
+    let proposal = service
+        .compile_release_proposal(&request, &evidence, &dry_run)
+        .expect("proposal");
+    let registration_digest = service
+        .provider()
+        .registration_receipt()
+        .registration_digest
+        .clone();
+
+    let wrong_registration =
+        MissionFeatureReleaseConsumer::for_scope(&scope, digest("different-registration"));
+    assert_eq!(
+        wrong_registration.consume(&proposal),
+        Err(FeatureReleaseError::ScopeMismatch)
+    );
+    let wrong_account = MissionFeatureReleaseConsumer::for_scope(&other_scope, registration_digest);
+    assert_eq!(
+        wrong_account.consume(&proposal),
+        Err(FeatureReleaseError::ScopeMismatch)
+    );
+
+    let cross_scope_audit = audit(
+        &other_scope,
+        "audit-cross-account",
+        43,
+        AuditEventKind::ChangeScheduled,
+        None,
+    );
+    assert_eq!(
+        cross_scope_audit.validate_for_scope(&scope),
+        Err(FeatureReleaseError::ScopeMismatch)
+    );
+    assert!(matches!(
+        AuditEvidence::for_scope_with_bindings(
+            &scope,
+            "audit-missing-bindings",
+            AuditEventKind::ChangeApplied,
+            43,
+            b"actor",
+            b"description",
+            Some("approval-01".into()),
+            None,
+            Some(proposal.proposal_digest.clone()),
+            2_000,
+        ),
+        Err(FeatureReleaseError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn secret_tamper_revoke_and_retry_bounds_fail_closed() {
+    let scope = scope();
+    let before = flag(&scope, 42, "before");
+    let mut tampered_secret = to_value(secret(&scope)).expect("secret json");
+    tampered_secret["metadataDigest"] = json!(digest("tampered").to_string());
+    let tampered_secret: SecretReference =
+        serde_json::from_value(tampered_secret).expect("secret reference json");
+    assert_eq!(
+        tampered_secret.validate(),
+        Err(FeatureReleaseError::SecretReferenceTampered)
+    );
+
+    let mut provider = LaunchDarklyReleaseProvider::with_defaults(
+        RecordingTransport::new(before, Vec::new(), Vec::new()),
+        scope.clone(),
+        secret(&scope),
+    )
+    .expect("provider");
+    provider.revoke_secret_reference().expect("secret revoke");
+    assert!(provider.secret_reference().is_revoked());
+    assert_eq!(
+        provider.read_flag_evidence(),
+        Err(FeatureReleaseError::SecretReferenceRevoked)
+    );
+    provider.revoke_registration().expect("registration revoke");
+    assert_eq!(
+        provider.reregister(),
+        Err(FeatureReleaseError::SecretReferenceRevoked)
+    );
+
+    let unbounded: RetryPolicy = serde_json::from_value(json!({
+        "maxAttempts": 255,
+        "maxBackoffSeconds": 60
+    }))
+    .expect("retry policy json");
+    assert!(matches!(
+        unbounded.validate(),
+        Err(FeatureReleaseError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        LaunchDarklyReleaseProvider::new(
+            RecordingTransport::new(flag(&scope, 42, "retry"), Vec::new(), Vec::new()),
+            scope.clone(),
+            secret(&scope),
+            PluginVersion::new(1, 0, 0),
+            DEFAULT_ADAPTER_REVISION,
+            DEFAULT_API_REVISION,
+            unbounded,
+        ),
+        Err(FeatureReleaseError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn blocked_env_is_not_contract_or_mission_evidence() {
+    let scope = scope();
+    let provider = LaunchDarklyReleaseProvider::with_defaults(
+        BlockedEnvTransport::new("missing-launchdarkly-token"),
+        scope.clone(),
+        secret(&scope),
+    )
+    .expect("provider");
+    let service = FeatureReleaseService::new(provider);
+    let registration = service.provider().registration_receipt().clone();
+    let before = flag(&scope, 42, "before");
+    let patch = patch(&scope, &before);
+    let request =
+        FeatureReleaseProposalRequest::for_scope(&scope, patch.clone(), false).expect("request");
+    let blocked = ReleaseReadEvidence::blocked_env_for_registration(
+        &scope,
+        registration.registration_digest.clone(),
+        b"environment blocked",
+    );
+    assert_eq!(
+        FeatureReleaseContractPayload::from_evidence(&scope, &registration, &blocked),
+        Err(FeatureReleaseError::RegistrationFenceMismatch)
+    );
+    let proposal = service
+        .compile_release_proposal(
+            &request,
+            &blocked,
+            &DryRunEvidence::rejected(&scope, &patch, b"blocked"),
+        )
+        .expect("blocked proposal");
+    assert_eq!(proposal.status, ReleaseStatus::BlockedEnv);
+    assert!(!proposal.recordable);
+    assert_eq!(
+        MissionFeatureReleaseConsumer::for_scope(&scope, registration.registration_digest.clone(),)
+            .consume(&proposal),
+        Err(FeatureReleaseError::RegistrationFenceMismatch)
+    );
+}
+
+#[test]
 fn bounded_429_retries_and_405_400_401_403_404_409_statuses_are_transparent() {
     let scope = scope();
     let before = flag(&scope, 42, "before");
@@ -315,7 +515,7 @@ fn bounded_429_retries_and_405_400_401_403_404_409_statuses_are_transparent() {
         ],
         vec![Ok(vec![])],
         vec![Ok(vec![])],
-        TransportProvenance::Fixture,
+        TransportProvenance::Recording,
     );
     let provider = LaunchDarklyReleaseProvider::with_defaults(
         retried_transport,
@@ -326,8 +526,20 @@ fn bounded_429_retries_and_405_400_401_403_404_409_statuses_are_transparent() {
     let mut service = FeatureReleaseService::new(provider);
     let evidence = service.read_flag_evidence().expect("bounded retry");
     assert_eq!(evidence.retry_summary.flag_attempts, 2);
-    assert_eq!(evidence.provenance, TransportProvenance::Fixture);
+    assert_eq!(evidence.provenance, TransportProvenance::Recording);
     assert!(!EvidenceClaims::layer_one().connected);
+
+    let fixture_provider = LaunchDarklyReleaseProvider::with_defaults(
+        FixtureTransport::new(before.clone(), Vec::new(), Vec::new()),
+        scope.clone(),
+        secret(&scope),
+    )
+    .expect("fixture provider");
+    let mut fixture_service = FeatureReleaseService::new(fixture_provider);
+    assert_eq!(
+        fixture_service.read_flag_evidence(),
+        Err(FeatureReleaseError::ProvenanceForbidden)
+    );
 
     for status in [400, 401, 403, 404, 409] {
         let transport = RecordingTransport::from_results(

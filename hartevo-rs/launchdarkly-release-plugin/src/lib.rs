@@ -11,6 +11,7 @@ use std::{
     fmt,
 };
 
+use jsonschema::Validator;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
 use thiserror::Error;
@@ -158,6 +159,8 @@ pub enum FeatureReleaseError {
     SecretReferenceRevoked,
     #[error("secret reference is bound to a different scope")]
     SecretReferenceScopeMismatch,
+    #[error("secret reference metadata or lifecycle was tampered")]
+    SecretReferenceTampered,
     #[error("least-privilege permission snapshot is invalid or drifted")]
     PermissionDrift,
     #[error("feature-release registration is revoked")]
@@ -208,6 +211,10 @@ pub enum FeatureReleaseError {
     ProviderUnknown,
     #[error("provider evidence is BLOCKED_ENV")]
     BlockedEnv,
+    #[error("synthetic fixture or BLOCKED_ENV provenance cannot be accepted")]
+    ProvenanceForbidden,
+    #[error("feature-release payload does not satisfy its JSON Schema contract")]
+    SchemaValidation,
     #[error("transport error: {0}")]
     Transport(TransportError),
 }
@@ -235,6 +242,13 @@ fn valid_identifier(value: &str) -> bool {
 
 fn valid_revision(value: u64) -> bool {
     value > 0
+}
+
+fn valid_bounded_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_IDENTIFIER_BYTES
+        && !value.contains('\n')
+        && !value.contains('\r')
 }
 
 fn valid_digest(digest: &Digest) -> bool {
@@ -334,6 +348,7 @@ pub struct FeatureReleaseScope {
     pub work_product_id: String,
     pub consent_revision: u64,
     pub policy_revision: u64,
+    pub scope_digest: Digest,
 }
 
 impl FeatureReleaseScope {
@@ -360,7 +375,7 @@ impl FeatureReleaseScope {
         T: IntoIterator,
         T::Item: Into<String>,
     {
-        let scope = Self {
+        let mut scope = Self {
             account_id: account_id.into(),
             base_url: base_url.into(),
             project_key: project_key.into(),
@@ -382,7 +397,11 @@ impl FeatureReleaseScope {
             work_product_id: work_product_id.into(),
             consent_revision,
             policy_revision,
+            scope_digest: Digest::from_text("pending"),
         };
+        scope.validate_components()?;
+        let scope_digest = Digest::from_serialized(&scope_without_digest(&scope));
+        scope.scope_digest = scope_digest;
         scope.validate()?;
         Ok(scope)
     }
@@ -396,11 +415,13 @@ impl FeatureReleaseScope {
             return Err(FeatureReleaseError::InvalidScope);
         }
         self.environment_id = Some(environment_id);
+        let scope_digest = Digest::from_serialized(&scope_without_digest(&self));
+        self.scope_digest = scope_digest;
         self.validate()?;
         Ok(self)
     }
 
-    pub fn validate(&self) -> Result<(), FeatureReleaseError> {
+    fn validate_components(&self) -> Result<(), FeatureReleaseError> {
         if !valid_identifier(&self.account_id)
             || !valid_base_url(&self.base_url)
             || !valid_identifier(&self.project_key)
@@ -437,9 +458,39 @@ impl FeatureReleaseScope {
         Ok(())
     }
 
-    pub fn scope_digest(&self) -> Digest {
-        Digest::from_serialized(self)
+    pub fn validate(&self) -> Result<(), FeatureReleaseError> {
+        self.validate_components()?;
+        if !valid_digest(&self.scope_digest)
+            || self.scope_digest != Digest::from_serialized(&scope_without_digest(self))
+        {
+            return Err(FeatureReleaseError::InvalidDigest);
+        }
+        Ok(())
     }
+
+    pub fn scope_digest(&self) -> Digest {
+        self.scope_digest.clone()
+    }
+}
+
+fn scope_without_digest(scope: &FeatureReleaseScope) -> impl Serialize + '_ {
+    (
+        &scope.account_id,
+        &scope.base_url,
+        &scope.project_key,
+        &scope.environment_key,
+        &scope.environment_id,
+        &scope.flag_key,
+        &scope.flag_version,
+        &scope.allowed_variation_paths,
+        &scope.allowed_targeting_paths,
+        &scope.approval_policy,
+        &scope.mission_id,
+        &scope.project_id,
+        &scope.work_product_id,
+        &scope.consent_revision,
+        &scope.policy_revision,
+    )
 }
 
 /// A registration-only permission vocabulary. There are no write permissions
@@ -506,11 +557,12 @@ impl PermissionSnapshot {
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SecretReference {
-    pub reference_id: String,
-    pub scope_digest: Digest,
-    pub credential_revision: u64,
-    pub permission_class: String,
-    pub revoked: bool,
+    reference_id: String,
+    scope_digest: Digest,
+    credential_revision: u64,
+    permission_class: String,
+    revoked: bool,
+    metadata_digest: Digest,
 }
 
 impl SecretReference {
@@ -519,13 +571,15 @@ impl SecretReference {
         scope_digest: Digest,
         credential_revision: u64,
     ) -> Result<Self, FeatureReleaseError> {
-        let reference = Self {
+        let mut reference = Self {
             reference_id: reference_id.into(),
             scope_digest,
             credential_revision,
             permission_class: "least_privilege_read_only_service_token".into(),
             revoked: false,
+            metadata_digest: Digest::from_text("pending"),
         };
+        reference.metadata_digest = reference.calculate_metadata_digest();
         reference.validate()?;
         Ok(reference)
     }
@@ -543,12 +597,49 @@ impl SecretReference {
             || !valid_digest(&self.scope_digest)
             || self.credential_revision == 0
             || self.permission_class != "least_privilege_read_only_service_token"
+            || !valid_digest(&self.metadata_digest)
+            || self.metadata_digest != self.calculate_metadata_digest()
         {
-            return Err(FeatureReleaseError::InvalidInput(
-                "invalid secret reference metadata".into(),
-            ));
+            return Err(FeatureReleaseError::SecretReferenceTampered);
         }
         Ok(())
+    }
+
+    fn calculate_metadata_digest(&self) -> Digest {
+        Digest::from_serialized(&(
+            &self.reference_id,
+            &self.scope_digest,
+            &self.credential_revision,
+            &self.permission_class,
+        ))
+    }
+
+    pub fn reference_id(&self) -> &str {
+        &self.reference_id
+    }
+
+    pub fn scope_digest(&self) -> &Digest {
+        &self.scope_digest
+    }
+
+    pub fn credential_revision(&self) -> u64 {
+        self.credential_revision
+    }
+
+    pub fn permission_class(&self) -> &str {
+        &self.permission_class
+    }
+
+    pub fn is_revoked(&self) -> bool {
+        self.revoked
+    }
+
+    pub fn metadata_digest(&self) -> &Digest {
+        &self.metadata_digest
+    }
+
+    pub fn reference_digest(&self) -> Digest {
+        Digest::from_serialized(self)
     }
 
     pub fn revoke(&mut self) {
@@ -565,6 +656,7 @@ impl fmt::Debug for SecretReference {
             .field("credential_revision", &self.credential_revision)
             .field("permission_class", &self.permission_class)
             .field("revoked", &self.revoked)
+            .field("metadata_digest", &self.metadata_digest)
             .finish()
     }
 }
@@ -638,6 +730,15 @@ impl RetryPolicy {
             max_attempts,
             max_backoff_seconds,
         })
+    }
+
+    pub fn validate(&self) -> Result<(), FeatureReleaseError> {
+        if !(1..=4).contains(&self.max_attempts) || self.max_backoff_seconds > 60 {
+            return Err(FeatureReleaseError::InvalidInput(
+                "retry budget is not bounded".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -763,6 +864,95 @@ impl FlagSnapshot {
 
     pub fn fingerprint(&self) -> Digest {
         Digest::from_serialized(self)
+    }
+}
+
+/// Exact provider/account/base/project/environment/flag/version registration
+/// identity carried through proposal, read-back, receipt, and Mission seams.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FeatureReleaseProviderFence {
+    pub provider_id: String,
+    pub account_id: String,
+    pub base_url: String,
+    pub project_key: String,
+    pub environment_key: String,
+    pub environment_id: Option<String>,
+    pub flag_key: String,
+    pub flag_version: u64,
+    pub scope_digest: Digest,
+    pub registration_digest: Digest,
+}
+
+impl FeatureReleaseProviderFence {
+    fn from_flag(flag: &FlagSnapshot, scope_digest: Digest, registration_digest: Digest) -> Self {
+        Self {
+            provider_id: PROVIDER_ID.into(),
+            account_id: flag.account_id.clone(),
+            base_url: flag.base_url.clone(),
+            project_key: flag.project_key.clone(),
+            environment_key: flag.environment_key.clone(),
+            environment_id: flag.environment_id.clone(),
+            flag_key: flag.flag_key.clone(),
+            flag_version: flag.flag_version,
+            scope_digest,
+            registration_digest,
+        }
+    }
+
+    fn for_scope(scope: &FeatureReleaseScope, registration_digest: Digest) -> Self {
+        Self {
+            provider_id: PROVIDER_ID.into(),
+            account_id: scope.account_id.clone(),
+            base_url: scope.base_url.clone(),
+            project_key: scope.project_key.clone(),
+            environment_key: scope.environment_key.clone(),
+            environment_id: scope.environment_id.clone(),
+            flag_key: scope.flag_key.clone(),
+            flag_version: scope.flag_version,
+            scope_digest: scope.scope_digest(),
+            registration_digest,
+        }
+    }
+
+    fn validate_for_scope(
+        &self,
+        scope: &FeatureReleaseScope,
+        registration_digest: &Digest,
+        expected_flag_version: Option<u64>,
+    ) -> Result<(), FeatureReleaseError> {
+        if self.provider_id != PROVIDER_ID
+            || self.account_id != scope.account_id
+            || self.base_url != scope.base_url
+            || self.project_key != scope.project_key
+            || self.environment_key != scope.environment_key
+            || self.environment_id != scope.environment_id
+            || self.flag_key != scope.flag_key
+            || self.scope_digest != scope.scope_digest()
+            || self.registration_digest != *registration_digest
+            || expected_flag_version.is_some_and(|version| self.flag_version != version)
+        {
+            return Err(FeatureReleaseError::ScopeMismatch);
+        }
+        if self.flag_version == 0
+            || !valid_digest(&self.scope_digest)
+            || !valid_digest(&self.registration_digest)
+        {
+            return Err(FeatureReleaseError::InvalidDigest);
+        }
+        Ok(())
+    }
+
+    fn same_target(&self, other: &Self) -> bool {
+        self.provider_id == other.provider_id
+            && self.account_id == other.account_id
+            && self.base_url == other.base_url
+            && self.project_key == other.project_key
+            && self.environment_key == other.environment_key
+            && self.environment_id == other.environment_id
+            && self.flag_key == other.flag_key
+            && self.scope_digest == other.scope_digest
+            && self.registration_digest == other.registration_digest
     }
 }
 
@@ -903,6 +1093,9 @@ pub enum AuditEventKind {
 pub struct AuditEvidence {
     pub entry_id: String,
     pub event_kind: AuditEventKind,
+    pub provider_id: String,
+    pub account_id: String,
+    pub base_url: String,
     pub project_key: String,
     pub environment_key: String,
     pub environment_id: Option<String>,
@@ -911,7 +1104,9 @@ pub struct AuditEvidence {
     pub actor_digest: Digest,
     pub description_digest: Digest,
     pub related_approval_id: Option<String>,
+    pub related_approval_digest: Option<Digest>,
     pub related_proposal_digest: Option<Digest>,
+    pub scope_digest: Digest,
     pub observed_at: u64,
     pub bounded: bool,
     pub evidence_digest: Digest,
@@ -930,12 +1125,42 @@ impl AuditEvidence {
         related_proposal_digest: Option<Digest>,
         observed_at: u64,
     ) -> Result<Self, FeatureReleaseError> {
+        Self::for_scope_with_bindings(
+            scope,
+            entry_id,
+            event_kind,
+            flag_version,
+            actor_material,
+            description,
+            related_approval_id,
+            None,
+            related_proposal_digest,
+            observed_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_scope_with_bindings(
+        scope: &FeatureReleaseScope,
+        entry_id: impl Into<String>,
+        event_kind: AuditEventKind,
+        flag_version: u64,
+        actor_material: impl AsRef<[u8]>,
+        description: impl AsRef<[u8]>,
+        related_approval_id: Option<String>,
+        related_approval_digest: Option<Digest>,
+        related_proposal_digest: Option<Digest>,
+        observed_at: u64,
+    ) -> Result<Self, FeatureReleaseError> {
         if description.as_ref().len() > MAX_AUDIT_DESCRIPTION_BYTES {
             return Err(FeatureReleaseError::AuditUnbounded);
         }
         let evidence = Self {
             entry_id: entry_id.into(),
             event_kind,
+            provider_id: PROVIDER_ID.into(),
+            account_id: scope.account_id.clone(),
+            base_url: scope.base_url.clone(),
             project_key: scope.project_key.clone(),
             environment_key: scope.environment_key.clone(),
             environment_id: scope.environment_id.clone(),
@@ -944,7 +1169,9 @@ impl AuditEvidence {
             actor_digest: Digest::from_bytes(actor_material.as_ref()),
             description_digest: Digest::from_bytes(description.as_ref()),
             related_approval_id,
+            related_approval_digest,
             related_proposal_digest,
+            scope_digest: scope.scope_digest(),
             observed_at,
             bounded: true,
             evidence_digest: Digest::from_text("pending"),
@@ -960,6 +1187,9 @@ impl AuditEvidence {
 
     pub fn validate(&self) -> Result<(), FeatureReleaseError> {
         if !valid_identifier(&self.entry_id)
+            || self.provider_id != PROVIDER_ID
+            || !valid_identifier(&self.account_id)
+            || !valid_base_url(&self.base_url)
             || !valid_identifier(&self.project_key)
             || !valid_identifier(&self.environment_key)
             || self
@@ -970,6 +1200,7 @@ impl AuditEvidence {
             || self.flag_version == 0
             || !valid_digest(&self.actor_digest)
             || !valid_digest(&self.description_digest)
+            || !valid_digest(&self.scope_digest)
             || !valid_digest(&self.evidence_digest)
             || self.evidence_digest != Digest::from_serialized(&audit_without_digest(self))
             || !self.bounded
@@ -978,9 +1209,17 @@ impl AuditEvidence {
                 .as_deref()
                 .is_some_and(|value| !valid_identifier(value))
             || self
+                .related_approval_digest
+                .as_ref()
+                .is_some_and(|value| !valid_digest(value))
+            || self
                 .related_proposal_digest
                 .as_ref()
                 .is_some_and(|value| !valid_digest(value))
+            || (self.event_kind == AuditEventKind::ChangeApplied
+                && (self.related_approval_id.is_none()
+                    || self.related_approval_digest.is_none()
+                    || self.related_proposal_digest.is_none()))
         {
             return Err(FeatureReleaseError::InvalidInput(
                 "invalid audit evidence".into(),
@@ -994,10 +1233,14 @@ impl AuditEvidence {
         scope: &FeatureReleaseScope,
     ) -> Result<(), FeatureReleaseError> {
         self.validate()?;
-        if self.project_key != scope.project_key
+        if self.provider_id != PROVIDER_ID
+            || self.account_id != scope.account_id
+            || self.base_url != scope.base_url
+            || self.project_key != scope.project_key
             || self.environment_key != scope.environment_key
             || self.environment_id != scope.environment_id
             || self.flag_key != scope.flag_key
+            || self.scope_digest != scope.scope_digest()
         {
             return Err(FeatureReleaseError::ScopeMismatch);
         }
@@ -1013,6 +1256,9 @@ fn audit_without_digest(evidence: &AuditEvidence) -> serde_json::Value {
     serde_json::json!({
         "entryId": &evidence.entry_id,
         "eventKind": &evidence.event_kind,
+        "providerId": &evidence.provider_id,
+        "accountId": &evidence.account_id,
+        "baseUrl": &evidence.base_url,
         "projectKey": &evidence.project_key,
         "environmentKey": &evidence.environment_key,
         "environmentId": &evidence.environment_id,
@@ -1021,7 +1267,9 @@ fn audit_without_digest(evidence: &AuditEvidence) -> serde_json::Value {
         "actorDigest": &evidence.actor_digest,
         "descriptionDigest": &evidence.description_digest,
         "relatedApprovalId": &evidence.related_approval_id,
+        "relatedApprovalDigest": &evidence.related_approval_digest,
         "relatedProposalDigest": &evidence.related_proposal_digest,
+        "scopeDigest": &evidence.scope_digest,
         "observedAt": &evidence.observed_at,
         "bounded": &evidence.bounded
     })
@@ -1325,6 +1573,7 @@ impl ReleaseReadEvidence {
         provenance: TransportProvenance,
         retry_summary: RetrySummary,
     ) -> Result<Self, FeatureReleaseError> {
+        ensure_complete_provenance(provenance)?;
         if approvals.len() > usize::from(MAX_APPROVAL_ENTRIES)
             || audit_entries.len() > usize::from(MAX_AUDIT_ENTRIES)
         {
@@ -1448,6 +1697,7 @@ impl ReleaseReadEvidence {
         }
         match self.availability {
             EvidenceAvailability::Complete => {
+                ensure_complete_provenance(self.provenance)?;
                 let flag = self
                     .flag
                     .as_ref()
@@ -1471,6 +1721,15 @@ impl ReleaseReadEvidence {
             }
             EvidenceAvailability::ProviderUnknown => Err(FeatureReleaseError::ProviderUnknown),
             EvidenceAvailability::BlockedEnv => Err(FeatureReleaseError::BlockedEnv),
+        }
+    }
+}
+
+fn ensure_complete_provenance(provenance: TransportProvenance) -> Result<(), FeatureReleaseError> {
+    match provenance {
+        TransportProvenance::Recording | TransportProvenance::Loopback => Ok(()),
+        TransportProvenance::Fixture | TransportProvenance::BlockedEnv => {
+            Err(FeatureReleaseError::ProvenanceForbidden)
         }
     }
 }
@@ -1642,6 +1901,7 @@ pub struct FeatureReleaseResultProposal {
     pub request_digest: Digest,
     pub scope_digest: Digest,
     pub registration_digest: Digest,
+    pub provider_fence: Option<FeatureReleaseProviderFence>,
     pub mission_id: String,
     pub project_id: String,
     pub work_product_id: String,
@@ -1676,11 +1936,17 @@ impl FeatureReleaseResultProposal {
         blocked_reason: Option<ProposalBlockedReason>,
         provenance: TransportProvenance,
     ) -> Self {
+        let provider_fence = FeatureReleaseProviderFence::from_flag(
+            &flag,
+            request.scope_digest.clone(),
+            registration_digest.clone(),
+        );
         let proposal = Self {
             proposal_digest: Digest::from_text("pending"),
             request_digest: request.request_digest.clone(),
             scope_digest: request.scope_digest.clone(),
             registration_digest: registration_digest.clone(),
+            provider_fence: Some(provider_fence),
             mission_id: request.mission_id.clone(),
             project_id: request.project_id.clone(),
             work_product_id: request.work_product_id.clone(),
@@ -1696,7 +1962,12 @@ impl FeatureReleaseResultProposal {
             audit_fence,
             status,
             blocked_reason,
-            recordable: !request.dry_run && matches!(status, ReleaseStatus::Approved),
+            recordable: !request.dry_run
+                && matches!(status, ReleaseStatus::Approved)
+                && matches!(
+                    provenance,
+                    TransportProvenance::Recording | TransportProvenance::Loopback
+                ),
             provenance,
             claims: EvidenceClaims::layer_one(),
         };
@@ -1734,6 +2005,7 @@ impl FeatureReleaseResultProposal {
             request_digest: request.request_digest.clone(),
             scope_digest: request.scope_digest.clone(),
             registration_digest: registration_digest.clone(),
+            provider_fence: None,
             mission_id: request.mission_id.clone(),
             project_id: request.project_id.clone(),
             work_product_id: request.work_product_id.clone(),
@@ -1768,6 +2040,30 @@ impl FeatureReleaseResultProposal {
     fn validate_digest(&self) -> Result<(), FeatureReleaseError> {
         self.claims.validate()?;
         self.patch.validate_digest()?;
+        if let Some(fence) = &self.provider_fence
+            && (fence.provider_id != PROVIDER_ID
+                || fence.flag_version == 0
+                || !valid_digest(&fence.scope_digest)
+                || !valid_digest(&fence.registration_digest))
+        {
+            return Err(FeatureReleaseError::RegistrationFenceMismatch);
+        }
+        if matches!(
+            self.provenance,
+            TransportProvenance::Fixture | TransportProvenance::BlockedEnv
+        ) && (self.recordable || self.status == ReleaseStatus::Approved)
+        {
+            return Err(FeatureReleaseError::ProvenanceForbidden);
+        }
+        let expected_recordable = !self.dry_run
+            && self.status == ReleaseStatus::Approved
+            && matches!(
+                self.provenance,
+                TransportProvenance::Recording | TransportProvenance::Loopback
+            );
+        if self.recordable != expected_recordable {
+            return Err(FeatureReleaseError::ProvenanceForbidden);
+        }
         if let Some(approval) = &self.approval {
             approval.validate()?;
         }
@@ -1785,6 +2081,7 @@ fn proposal_without_digest(proposal: &FeatureReleaseResultProposal) -> serde_jso
         "requestDigest": &proposal.request_digest,
         "scopeDigest": &proposal.scope_digest,
         "registrationDigest": &proposal.registration_digest,
+        "providerFence": &proposal.provider_fence,
         "missionId": &proposal.mission_id,
         "projectId": &proposal.project_id,
         "workProductId": &proposal.work_product_id,
@@ -1813,6 +2110,7 @@ fn proposal_without_digest(proposal: &FeatureReleaseResultProposal) -> serde_jso
 pub struct ReleaseReadBack {
     pub scope_digest: Digest,
     pub registration_digest: Digest,
+    pub provider_fence: FeatureReleaseProviderFence,
     pub flag: FlagSnapshot,
     pub audit_entries: Vec<AuditEvidence>,
     pub provenance: TransportProvenance,
@@ -1828,6 +2126,12 @@ impl ReleaseReadBack {
         audit_entries: Vec<AuditEvidence>,
         provenance: TransportProvenance,
     ) -> Result<Self, FeatureReleaseError> {
+        if matches!(
+            provenance,
+            TransportProvenance::Fixture | TransportProvenance::BlockedEnv
+        ) {
+            return Err(FeatureReleaseError::ProvenanceForbidden);
+        }
         flag.validate_for_scope(scope)?;
         if audit_entries.is_empty() || audit_entries.len() > usize::from(MAX_AUDIT_ENTRIES) {
             return Err(FeatureReleaseError::AuditMissing);
@@ -1836,9 +2140,15 @@ impl ReleaseReadBack {
             audit.validate_for_scope(scope)?;
         }
         ensure_unique_audits(&audit_entries)?;
+        let provider_fence = FeatureReleaseProviderFence::from_flag(
+            &flag,
+            scope.scope_digest(),
+            registration_digest.clone(),
+        );
         let mut readback = Self {
             scope_digest: scope.scope_digest(),
             registration_digest,
+            provider_fence,
             flag,
             audit_entries,
             provenance,
@@ -1861,10 +2171,21 @@ impl ReleaseReadBack {
         {
             return Err(FeatureReleaseError::RegistrationFenceMismatch);
         }
+        if matches!(
+            self.provenance,
+            TransportProvenance::Fixture | TransportProvenance::BlockedEnv
+        ) {
+            return Err(FeatureReleaseError::ProvenanceForbidden);
+        }
         if self.readback_digest != Digest::from_serialized(&readback_without_digest(self)) {
             return Err(FeatureReleaseError::InvalidDigest);
         }
         self.flag.validate_for_scope(scope)?;
+        self.provider_fence.validate_for_scope(
+            scope,
+            registration_digest,
+            Some(self.flag.flag_version),
+        )?;
         for audit in &self.audit_entries {
             audit.validate_for_scope(scope)?;
         }
@@ -1876,6 +2197,7 @@ fn readback_without_digest(readback: &ReleaseReadBack) -> impl Serialize + '_ {
     (
         &readback.scope_digest,
         &readback.registration_digest,
+        &readback.provider_fence,
         &readback.flag,
         &readback.audit_entries,
         &readback.provenance,
@@ -1891,8 +2213,10 @@ fn readback_without_digest(readback: &ReleaseReadBack) -> impl Serialize + '_ {
 pub struct ReleaseReceipt {
     pub receipt_digest: Digest,
     pub proposal_digest: Digest,
+    pub approval_digest: Digest,
     pub scope_digest: Digest,
     pub registration_digest: Digest,
+    pub provider_fence: FeatureReleaseProviderFence,
     pub before_flag_version: u64,
     pub after_flag_version: u64,
     pub after_flag_digest: Digest,
@@ -1910,12 +2234,19 @@ impl ReleaseReceipt {
         proposal: &FeatureReleaseResultProposal,
         readback: &ReleaseReadBack,
         audit: &AuditEvidence,
-    ) -> Self {
+    ) -> Result<Self, FeatureReleaseError> {
+        let approval_digest = proposal
+            .approval
+            .as_ref()
+            .map(|approval| approval.evidence_digest.clone())
+            .ok_or(FeatureReleaseError::ApprovalNotApproved)?;
         let receipt = Self {
             receipt_digest: Digest::from_text("pending"),
             proposal_digest: proposal.proposal_digest.clone(),
+            approval_digest,
             scope_digest: proposal.scope_digest.clone(),
             registration_digest: proposal.registration_digest.clone(),
+            provider_fence: readback.provider_fence.clone(),
             before_flag_version: proposal.base_flag_version,
             after_flag_version: readback.flag.flag_version,
             after_flag_digest: readback.flag.fingerprint(),
@@ -1928,10 +2259,10 @@ impl ReleaseReceipt {
             claims: EvidenceClaims::layer_one(),
         };
         let receipt_digest = Digest::from_serialized(&release_receipt_without_digest(&receipt));
-        Self {
+        Ok(Self {
             receipt_digest,
             ..receipt
-        }
+        })
     }
 
     fn validate(&self) -> Result<(), FeatureReleaseError> {
@@ -1940,6 +2271,22 @@ impl ReleaseReceipt {
             || self.write_effect
             || self.before_flag_version >= self.after_flag_version
         {
+            return Err(FeatureReleaseError::ReceiptTampered);
+        }
+        if matches!(
+            self.provenance,
+            TransportProvenance::Fixture | TransportProvenance::BlockedEnv
+        ) {
+            return Err(FeatureReleaseError::ProvenanceForbidden);
+        }
+        if self.provider_fence.provider_id != PROVIDER_ID
+            || self.provider_fence.flag_version != self.after_flag_version
+            || self.provider_fence.registration_digest != self.registration_digest
+            || self.provider_fence.scope_digest != self.scope_digest
+        {
+            return Err(FeatureReleaseError::ReceiptTampered);
+        }
+        if !valid_digest(&self.approval_digest) {
             return Err(FeatureReleaseError::ReceiptTampered);
         }
         if !valid_digest(&self.receipt_digest)
@@ -1954,8 +2301,10 @@ impl ReleaseReceipt {
 fn release_receipt_without_digest(receipt: &ReleaseReceipt) -> impl Serialize + '_ {
     (
         &receipt.proposal_digest,
+        &receipt.approval_digest,
         &receipt.scope_digest,
         &receipt.registration_digest,
+        &receipt.provider_fence,
         &receipt.before_flag_version,
         &receipt.after_flag_version,
         &receipt.after_flag_digest,
@@ -2051,6 +2400,161 @@ impl FeatureReleaseServiceDefinition {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContractCapabilityPayload {
+    service_id: String,
+    provider_id: String,
+    consumer_id: String,
+    operations: Vec<CapabilityOperation>,
+    mode: ServiceMode,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContractEvidencePayload {
+    flag: FlagSnapshot,
+    approval: Vec<ApprovalEvidence>,
+    audit: Vec<AuditEvidence>,
+    claims: EvidenceClaims,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContractBoundariesPayload {
+    forbidden_operations: Vec<String>,
+    forbidden_authorities: Vec<String>,
+    blocked_environment_status: String,
+    audit_description: String,
+    targeting: String,
+    secret_material: String,
+}
+
+/// Canonical payload validated against the versioned JSON Schema. This is the
+/// executable schema/serde seam; a typed Rust value is not accepted merely
+/// because its individual fields happen to deserialize.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FeatureReleaseContractPayload {
+    schema_version: String,
+    capability: ContractCapabilityPayload,
+    scope: FeatureReleaseScope,
+    registration: RegistrationReceipt,
+    evidence: ContractEvidencePayload,
+    boundaries: ContractBoundariesPayload,
+}
+
+impl FeatureReleaseContractPayload {
+    pub fn from_evidence(
+        scope: &FeatureReleaseScope,
+        registration: &RegistrationReceipt,
+        evidence: &ReleaseReadEvidence,
+    ) -> Result<Self, FeatureReleaseError> {
+        registration.validate_digest()?;
+        if registration.contract_digest != contract_digest()
+            || registration.scope_digest != scope.scope_digest()
+            || registration.lifecycle != RegistrationLifecycle::Active
+        {
+            return Err(FeatureReleaseError::RegistrationFenceMismatch);
+        }
+        evidence.claims.validate()?;
+        if evidence.availability != EvidenceAvailability::Complete
+            || evidence.scope_digest != scope.scope_digest()
+            || evidence.registration_digest != registration.registration_digest
+            || evidence.evidence_digest
+                != Digest::from_serialized(&evidence_without_digest(evidence))
+        {
+            return Err(FeatureReleaseError::RegistrationFenceMismatch);
+        }
+        ensure_complete_provenance(evidence.provenance)?;
+        let flag = evidence
+            .flag
+            .clone()
+            .ok_or(FeatureReleaseError::ProviderUnknown)?;
+        flag.validate_for_scope(scope)?;
+        for approval in &evidence.approvals {
+            approval.validate_for_scope(scope)?;
+        }
+        for audit in &evidence.audit_entries {
+            audit.validate_for_scope(scope)?;
+        }
+        ensure_unique_approvals(&evidence.approvals)?;
+        ensure_unique_audits(&evidence.audit_entries)?;
+        let payload = Self {
+            schema_version: CONTRACT_SCHEMA_VERSION.into(),
+            capability: ContractCapabilityPayload {
+                service_id: SERVICE_ID.into(),
+                provider_id: PROVIDER_ID.into(),
+                consumer_id: CONSUMER_ID.into(),
+                operations: vec![
+                    CapabilityOperation::DescribeRelease,
+                    CapabilityOperation::ReadFlagEvidence,
+                    CapabilityOperation::CompileReleaseProposal,
+                    CapabilityOperation::RecordReleaseReceipt,
+                    CapabilityOperation::VerifyReleaseResult,
+                ],
+                mode: ServiceMode::ReadProposalRecord,
+            },
+            scope: scope.clone(),
+            registration: registration.clone(),
+            evidence: ContractEvidencePayload {
+                flag,
+                approval: evidence.approvals.clone(),
+                audit: evidence.audit_entries.clone(),
+                claims: evidence.claims,
+            },
+            boundaries: ContractBoundariesPayload {
+                forbidden_operations: vec![
+                    "patch_flag".into(),
+                    "toggle_flag".into(),
+                    "create_flag".into(),
+                    "delete_flag".into(),
+                    "create_approval".into(),
+                    "review_approval".into(),
+                    "apply_approval".into(),
+                    "schedule_change".into(),
+                    "evaluate_context".into(),
+                    "ingest_event".into(),
+                ],
+                forbidden_authorities: [
+                    "Truth",
+                    "Consent",
+                    "Effect",
+                    "Receipt",
+                    "Verification",
+                    "Outcome",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+                blocked_environment_status: "BLOCKED_ENV".into(),
+                audit_description: "digest_only_bounded".into(),
+                targeting: "digest_only_no_context_attributes".into(),
+                secret_material: "never_serialized".into(),
+            },
+        };
+        payload.validate_schema()?;
+        Ok(payload)
+    }
+
+    pub fn validate_schema(&self) -> Result<(), FeatureReleaseError> {
+        let instance =
+            serde_json::to_value(self).map_err(|_| FeatureReleaseError::SchemaValidation)?;
+        validate_contract_json(&instance)
+    }
+}
+
+pub fn validate_contract_json(instance: &serde_json::Value) -> Result<(), FeatureReleaseError> {
+    let schema = serde_json::from_str::<serde_json::Value>(CONTRACT_SCHEMA)
+        .map_err(|_| FeatureReleaseError::SchemaValidation)?;
+    let validator: Validator =
+        jsonschema::validator_for(&schema).map_err(|_| FeatureReleaseError::SchemaValidation)?;
+    if validator.validate(instance).is_err() {
+        return Err(FeatureReleaseError::SchemaValidation);
+    }
+    Ok(())
+}
+
 pub fn contract_digest() -> Digest {
     Digest::from_bytes(CONTRACT_SCHEMA.as_bytes())
 }
@@ -2073,11 +2577,35 @@ pub struct RegistrationReceipt {
     pub api_revision: String,
     pub service_definition_digest: Digest,
     pub permission_snapshot_digest: Digest,
+    pub secret_reference_digest: Digest,
     pub approval_policy_revision: u64,
     pub scope_digest: Digest,
     pub registration_revision: u64,
     pub lifecycle: RegistrationLifecycle,
     pub registration_digest: Digest,
+}
+
+impl RegistrationReceipt {
+    fn validate_digest(&self) -> Result<(), FeatureReleaseError> {
+        if self.plugin_id != PLUGIN_ID
+            || self.plugin_version != PluginVersion::new(1, 0, 0)
+            || !valid_digest(&self.contract_digest)
+            || !valid_bounded_text(&self.adapter_revision)
+            || !valid_bounded_text(&self.api_revision)
+            || !valid_digest(&self.service_definition_digest)
+            || !valid_digest(&self.permission_snapshot_digest)
+            || !valid_digest(&self.secret_reference_digest)
+            || !valid_revision(self.approval_policy_revision)
+            || !valid_digest(&self.scope_digest)
+            || !valid_revision(self.registration_revision)
+            || !valid_digest(&self.registration_digest)
+            || self.registration_digest
+                != Digest::from_serialized(&registration_receipt_without_digest(self))
+        {
+            return Err(FeatureReleaseError::RegistrationFenceMismatch);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2089,6 +2617,7 @@ pub struct FeatureReleaseRegistration {
     api_revision: String,
     service_definition_digest: Digest,
     permission_snapshot: PermissionSnapshot,
+    secret_reference_digest: Digest,
     registration_revision: u64,
     lifecycle: RegistrationLifecycle,
     receipt: RegistrationReceipt,
@@ -2105,13 +2634,20 @@ impl FeatureReleaseRegistration {
     ) -> Result<Self, FeatureReleaseError> {
         scope.validate()?;
         secret_reference.validate()?;
-        if secret_reference.revoked {
+        if secret_reference.is_revoked() {
             return Err(FeatureReleaseError::SecretReferenceRevoked);
         }
-        if secret_reference.scope_digest != scope.scope_digest() {
+        if secret_reference.scope_digest() != &scope.scope_digest() {
             return Err(FeatureReleaseError::SecretReferenceScopeMismatch);
         }
         permission_snapshot.validate_for_scope(scope)?;
+        let adapter_revision = adapter_revision.into();
+        let api_revision = api_revision.into();
+        if !valid_bounded_text(&adapter_revision) || !valid_bounded_text(&api_revision) {
+            return Err(FeatureReleaseError::InvalidInput(
+                "adapter and API revisions must be bounded single-line text".into(),
+            ));
+        }
         let definition = FeatureReleaseServiceDefinition::layer_one();
         if plugin_version != definition.plugin_version {
             return Err(FeatureReleaseError::InvalidInput(
@@ -2122,10 +2658,11 @@ impl FeatureReleaseRegistration {
             scope_digest: scope.scope_digest(),
             plugin_version,
             contract_digest: definition.contract_digest.clone(),
-            adapter_revision: bounded_code(adapter_revision.into()),
-            api_revision: bounded_code(api_revision.into()),
+            adapter_revision,
+            api_revision,
             service_definition_digest: definition.digest(),
             permission_snapshot,
+            secret_reference_digest: secret_reference.reference_digest(),
             registration_revision: 1,
             lifecycle: RegistrationLifecycle::Active,
             receipt: RegistrationReceipt {
@@ -2136,6 +2673,7 @@ impl FeatureReleaseRegistration {
                 api_revision: String::new(),
                 service_definition_digest: Digest::from_text("pending"),
                 permission_snapshot_digest: Digest::from_text("pending"),
+                secret_reference_digest: Digest::from_text("pending"),
                 approval_policy_revision: scope.policy_revision,
                 scope_digest: scope.scope_digest(),
                 registration_revision: 1,
@@ -2160,6 +2698,7 @@ impl FeatureReleaseRegistration {
             api_revision: self.api_revision.clone(),
             service_definition_digest: self.service_definition_digest.clone(),
             permission_snapshot_digest: self.permission_snapshot.digest(),
+            secret_reference_digest: self.secret_reference_digest.clone(),
             approval_policy_revision: self.permission_snapshot.approval_policy_revision,
             scope_digest: self.scope_digest.clone(),
             registration_revision: self.registration_revision,
@@ -2189,6 +2728,8 @@ impl FeatureReleaseRegistration {
         scope: &FeatureReleaseScope,
         secret_reference: &SecretReference,
     ) -> Result<(), FeatureReleaseError> {
+        secret_reference.validate()?;
+        self.receipt.validate_digest()?;
         match self.lifecycle {
             RegistrationLifecycle::Active => {}
             RegistrationLifecycle::Revoked => return Err(FeatureReleaseError::RegistrationRevoked),
@@ -2197,13 +2738,15 @@ impl FeatureReleaseRegistration {
             }
         }
         if self.scope_digest != scope.scope_digest()
-            || secret_reference.scope_digest != scope.scope_digest()
-            || secret_reference.revoked
+            || secret_reference.scope_digest() != &scope.scope_digest()
+            || secret_reference.is_revoked()
+            || secret_reference.reference_digest() != self.secret_reference_digest
             || self.receipt.lifecycle != RegistrationLifecycle::Active
+            || self.receipt.secret_reference_digest != self.secret_reference_digest
             || self.receipt.registration_digest
                 != Digest::from_serialized(&registration_receipt_without_digest(&self.receipt))
         {
-            return if secret_reference.revoked {
+            return if secret_reference.is_revoked() {
                 Err(FeatureReleaseError::SecretReferenceRevoked)
             } else {
                 Err(FeatureReleaseError::RegistrationFenceMismatch)
@@ -2235,14 +2778,16 @@ impl FeatureReleaseRegistration {
         scope: &FeatureReleaseScope,
         secret_reference: &SecretReference,
     ) -> Result<RegistrationReceipt, FeatureReleaseError> {
+        secret_reference.validate()?;
         if self.lifecycle == RegistrationLifecycle::Active {
             return Ok(self.receipt.clone());
         }
-        if secret_reference.revoked {
+        if secret_reference.is_revoked() {
             return Err(FeatureReleaseError::SecretReferenceRevoked);
         }
         if self.scope_digest != scope.scope_digest()
-            || secret_reference.scope_digest != self.scope_digest
+            || secret_reference.scope_digest() != &self.scope_digest
+            || secret_reference.reference_digest() != self.secret_reference_digest
         {
             return Err(FeatureReleaseError::SecretReferenceScopeMismatch);
         }
@@ -2268,6 +2813,7 @@ fn registration_receipt_without_digest(receipt: &RegistrationReceipt) -> impl Se
         &receipt.api_revision,
         &receipt.service_definition_digest,
         &receipt.permission_snapshot_digest,
+        &receipt.secret_reference_digest,
         &receipt.approval_policy_revision,
         &receipt.scope_digest,
         &receipt.registration_revision,
@@ -2555,6 +3101,7 @@ impl<T: LaunchDarklyReleaseTransport> LaunchDarklyReleaseProvider<T> {
         api_revision: impl Into<String>,
         retry_policy: RetryPolicy,
     ) -> Result<Self, FeatureReleaseError> {
+        retry_policy.validate()?;
         let permission_snapshot = PermissionSnapshot::read_only(&scope);
         let registration = FeatureReleaseRegistration::new(
             &scope,
@@ -2601,8 +3148,9 @@ impl<T: LaunchDarklyReleaseTransport> LaunchDarklyReleaseProvider<T> {
         &self.secret_reference
     }
 
-    pub fn secret_reference_mut(&mut self) -> &mut SecretReference {
-        &mut self.secret_reference
+    pub fn revoke_secret_reference(&mut self) -> Result<(), FeatureReleaseError> {
+        self.secret_reference.revoke();
+        Ok(())
     }
 
     pub fn registration(&self) -> &FeatureReleaseRegistration {
@@ -2649,6 +3197,7 @@ impl<T: LaunchDarklyReleaseTransport> LaunchDarklyReleaseProvider<T> {
     where
         F: FnMut(&mut T, &FeatureReleaseScope, &SecretReference) -> Result<R, TransportError>,
     {
+        self.retry_policy.validate()?;
         let mut attempts = 0;
         loop {
             attempts += 1;
@@ -2677,7 +3226,7 @@ impl<T: LaunchDarklyReleaseTransport> LaunchDarklyReleaseProvider<T> {
         if audits.len() > usize::from(MAX_AUDIT_ENTRIES) {
             return Err(FeatureReleaseError::AuditUnbounded);
         }
-        ReleaseReadEvidence::complete(
+        let evidence = ReleaseReadEvidence::complete(
             &self.scope,
             self.registration.receipt().registration_digest.clone(),
             flag,
@@ -2690,7 +3239,13 @@ impl<T: LaunchDarklyReleaseTransport> LaunchDarklyReleaseProvider<T> {
                 approval_attempts,
                 audit_attempts,
             ),
-        )
+        )?;
+        FeatureReleaseContractPayload::from_evidence(
+            &self.scope,
+            self.registration.receipt(),
+            &evidence,
+        )?;
+        Ok(evidence)
     }
 
     /// Compile a local semantic-patch proposal against a read fence and local
@@ -2726,6 +3281,16 @@ impl<T: LaunchDarklyReleaseTransport> LaunchDarklyReleaseProvider<T> {
             .clone()
             .ok_or(FeatureReleaseError::ProviderUnknown)?;
         flag.validate_for_scope(&self.scope)?;
+        let provider_fence = FeatureReleaseProviderFence::from_flag(
+            &flag,
+            self.scope.scope_digest(),
+            self.registration.receipt().registration_digest.clone(),
+        );
+        provider_fence.validate_for_scope(
+            &self.scope,
+            &self.registration.receipt().registration_digest,
+            Some(self.scope.flag_version),
+        )?;
         request.patch.validate_against(&self.scope, &flag)?;
         dry_run_evidence.validate_for(&self.scope, &flag, &request.patch)?;
         let (approval_status, approval) = select_approval(&self.scope, &evidence.approvals);
@@ -2799,11 +3364,18 @@ impl<T: LaunchDarklyReleaseTransport> LaunchDarklyReleaseProvider<T> {
             &self.scope,
             &self.registration.receipt().registration_digest,
         )?;
+        let proposal_fence = proposal
+            .provider_fence
+            .as_ref()
+            .ok_or(FeatureReleaseError::RegistrationFenceMismatch)?;
+        if !proposal_fence.same_target(&readback.provider_fence) {
+            return Err(FeatureReleaseError::ScopeMismatch);
+        }
         if readback.flag.flag_version <= proposal.base_flag_version {
             return Err(FeatureReleaseError::ReadBackVersionNotNewer);
         }
         let audit = matching_applied_audit(proposal, readback)?;
-        Ok(ReleaseReceipt::new(proposal, readback, audit))
+        ReleaseReceipt::new(proposal, readback, audit)
     }
 
     /// Verify an existing recording-only receipt against a new exact read-back.
@@ -2823,6 +3395,9 @@ impl<T: LaunchDarklyReleaseTransport> LaunchDarklyReleaseProvider<T> {
             &self.scope,
             &self.registration.receipt().registration_digest,
         )?;
+        if !receipt.provider_fence.same_target(&readback.provider_fence) {
+            return Err(FeatureReleaseError::ReadBackFlagMismatch);
+        }
         if readback.flag.flag_version != receipt.after_flag_version {
             return Err(FeatureReleaseError::VersionDrift {
                 expected: receipt.after_flag_version,
@@ -2840,7 +3415,11 @@ impl<T: LaunchDarklyReleaseTransport> LaunchDarklyReleaseProvider<T> {
         if matches.is_empty() {
             return Err(FeatureReleaseError::AuditMissing);
         }
-        if matches.len() != 1 || matches[0].fingerprint() != receipt.audit_entry_digest {
+        if matches.len() != 1
+            || matches[0].fingerprint() != receipt.audit_entry_digest
+            || matches[0].related_proposal_digest.as_ref() != Some(&receipt.proposal_digest)
+            || matches[0].related_approval_digest.as_ref() != Some(&receipt.approval_digest)
+        {
             return Err(FeatureReleaseError::AuditMismatch);
         }
         if matches[0].event_kind != AuditEventKind::ChangeApplied
@@ -2867,6 +3446,15 @@ impl<T: LaunchDarklyReleaseTransport> LaunchDarklyReleaseProvider<T> {
         {
             return Err(FeatureReleaseError::RegistrationFenceMismatch);
         }
+        proposal
+            .provider_fence
+            .as_ref()
+            .ok_or(FeatureReleaseError::RegistrationFenceMismatch)?
+            .validate_for_scope(
+                &self.scope,
+                &self.registration.receipt().registration_digest,
+                Some(proposal.base_flag_version),
+            )?;
         Ok(())
     }
 
@@ -2945,16 +3533,11 @@ fn matching_applied_audit<'a>(
                 && audit
                     .related_proposal_digest
                     .as_ref()
-                    .is_none_or(|digest| digest == &proposal.proposal_digest)
-                && audit
-                    .related_approval_id
-                    .as_ref()
-                    .is_none_or(|approval_id| {
-                        proposal
-                            .approval
-                            .as_ref()
-                            .is_some_and(|approval| approval.request_id == *approval_id)
-                    })
+                    .is_some_and(|digest| digest == &proposal.proposal_digest)
+                && proposal.approval.as_ref().is_some_and(|approval| {
+                    audit.related_approval_id.as_deref() == Some(approval.request_id.as_str())
+                        && audit.related_approval_digest.as_ref() == Some(&approval.evidence_digest)
+                })
         })
         .collect::<Vec<_>>();
     match matches.as_slice() {
@@ -3042,21 +3625,15 @@ impl<T: LaunchDarklyReleaseTransport> FeatureReleaseService<T> {
 /// Outcome or invoking kernel authority.
 #[derive(Clone, Debug)]
 pub struct MissionFeatureReleaseConsumer {
-    mission_id: String,
-    project_id: String,
-    work_product_id: String,
-    consent_revision: u64,
-    policy_revision: u64,
+    scope: FeatureReleaseScope,
+    provider_fence: FeatureReleaseProviderFence,
 }
 
 impl MissionFeatureReleaseConsumer {
-    pub fn for_scope(scope: &FeatureReleaseScope) -> Self {
+    pub fn for_scope(scope: &FeatureReleaseScope, registration_digest: Digest) -> Self {
         Self {
-            mission_id: scope.mission_id.clone(),
-            project_id: scope.project_id.clone(),
-            work_product_id: scope.work_product_id.clone(),
-            consent_revision: scope.consent_revision,
-            policy_revision: scope.policy_revision,
+            scope: scope.clone(),
+            provider_fence: FeatureReleaseProviderFence::for_scope(scope, registration_digest),
         }
     }
 
@@ -3066,27 +3643,42 @@ impl MissionFeatureReleaseConsumer {
     ) -> Result<MissionFeatureReleaseProposal, FeatureReleaseError> {
         proposal.validate_digest()?;
         proposal.claims.validate()?;
-        if proposal.mission_id != self.mission_id
-            || proposal.project_id != self.project_id
-            || proposal.work_product_id != self.work_product_id
-            || proposal.consent_revision != self.consent_revision
-            || proposal.policy_revision != self.policy_revision
+        if proposal.mission_id != self.scope.mission_id
+            || proposal.project_id != self.scope.project_id
+            || proposal.work_product_id != self.scope.work_product_id
+            || proposal.consent_revision != self.scope.consent_revision
+            || proposal.policy_revision != self.scope.policy_revision
         {
             return Err(FeatureReleaseError::ScopeMismatch);
+        }
+        let Some(provider_fence) = &proposal.provider_fence else {
+            return Err(FeatureReleaseError::RegistrationFenceMismatch);
+        };
+        if provider_fence != &self.provider_fence {
+            return Err(FeatureReleaseError::ScopeMismatch);
+        }
+        provider_fence.validate_for_scope(
+            &self.scope,
+            &self.provider_fence.registration_digest,
+            Some(self.scope.flag_version),
+        )?;
+        if matches!(
+            proposal.provenance,
+            TransportProvenance::Fixture | TransportProvenance::BlockedEnv
+        ) {
+            return Err(FeatureReleaseError::ProvenanceForbidden);
         }
         let mission = MissionFeatureReleaseProposal {
             consumer_id: CONSUMER_ID.into(),
             proposal_digest: proposal.proposal_digest.clone(),
-            mission_id: self.mission_id.clone(),
-            project_id: self.project_id.clone(),
-            work_product_id: self.work_product_id.clone(),
-            consent_revision: self.consent_revision,
-            policy_revision: self.policy_revision,
+            provider_fence: provider_fence.clone(),
+            mission_id: self.scope.mission_id.clone(),
+            project_id: self.scope.project_id.clone(),
+            work_product_id: self.scope.work_product_id.clone(),
+            consent_revision: self.scope.consent_revision,
+            policy_revision: self.scope.policy_revision,
             status: proposal.status,
-            adoptable: !matches!(
-                proposal.status,
-                ReleaseStatus::BlockedEnv | ReleaseStatus::ProviderUnknown
-            ),
+            adoptable: proposal.recordable && proposal.status == ReleaseStatus::Approved,
             authority_boundary: AuthorityBoundary::layer_one(),
             claims: EvidenceClaims::layer_one(),
         };
@@ -3124,6 +3716,7 @@ impl AuthorityBoundary {
 pub struct MissionFeatureReleaseProposal {
     pub consumer_id: String,
     pub proposal_digest: Digest,
+    pub provider_fence: FeatureReleaseProviderFence,
     pub mission_id: String,
     pub project_id: String,
     pub work_product_id: String,
