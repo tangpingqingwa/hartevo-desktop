@@ -1,0 +1,22 @@
+[package]
+name = "hartevo-commerce-connector"
+description = "Provider-specific read-only commerce connector vertical slice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+hartevo-connector-sdk = { path = "../connector-sdk" }
+hartevo-domain-kernel = { path = "../domain-kernel" }
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

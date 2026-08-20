@@ -1,0 +1,25 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "7bb44d98cebd1d7ded417b48746456474f79d244",
+  "candidateCount": 1,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "headBranch": "codex/plugin-invocation-timeline-01",
+      "headCommit": "36f0251b712e43cfaad88253a2b9ca5cddaf56b6",
+      "number": 185
+    }
+  ],
+  "createdAt": "2026-08-17T10:44:48Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260817-104437"
+}

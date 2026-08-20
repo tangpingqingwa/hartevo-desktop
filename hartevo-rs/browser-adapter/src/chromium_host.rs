@@ -32,11 +32,12 @@ use crate::workspace::{digest, digest_json};
 use crate::{
     BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionRisk, BrowserActionSurface,
     BrowserControlHost, BrowserElementRef, BrowserError, BrowserFileGrant, BrowserFileType,
+    BrowserHandoffFrameBinding, BrowserHandoffHost, BrowserHandoffScope, BrowserHandoffSnapshot,
     BrowserLeaseProof, BrowserLocatorResolution, BrowserNavigationPolicy, BrowserNavigationReceipt,
     BrowserNavigationTarget, BrowserProfile, BrowserPromptRisk,
     BrowserRecipeExecutionAuthorization, BrowserRecipePreparedPlan, BrowserRecipeRegistry,
-    BrowserRecipeTrustStore, BrowserStableLocator, BrowserTextInput, BrowserWorkspace,
-    FileUploadHandle, SemanticSnapshot,
+    BrowserRecipeResumeContext, BrowserRecipeResumeCursor, BrowserRecipeTrustStore,
+    BrowserStableLocator, BrowserTextInput, BrowserWorkspace, FileUploadHandle, SemanticSnapshot,
 };
 
 const DEFAULT_MAX_FRAME_BYTES: usize = 8 * 1_024 * 1_024;
@@ -215,8 +216,8 @@ pub struct ChromiumHostShutdown {
 /// Digest-only evidence that Chromium accepted the two low-level input
 /// dispatches for one exact Effect-bound semantic click. This is a Provider
 /// receipt, not proof that the intended business operation happened.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChromiumClickDispatchEvidence {
     pub schema_version: u32,
     pub batch_id: BrowserActionBatchId,
@@ -1060,6 +1061,8 @@ impl ManagedChromiumHost {
             return Err(error);
         }
         self.workspace.validate_agent_lease(proof, now)?;
+        let runtime_session_id = session_id.clone();
+        let target_id_for_cleanup = target_id.clone();
         self.tabs.insert(
             tab_id.clone(),
             CdpTabSession {
@@ -1088,6 +1091,21 @@ impl ManagedChromiumHost {
                 blocked_request_count: 0,
             },
         );
+        if let Err(error) = self.command(
+            CdpMethod::RuntimeEnable,
+            json!({}),
+            Some(&runtime_session_id),
+        ) {
+            self.tabs.remove(tab_id);
+            let _ = self.command(
+                CdpMethod::TargetCloseTarget,
+                json!({"targetId": target_id_for_cleanup}),
+                None,
+            );
+            return Err(error);
+        }
+        let tab = self.tabs.get_mut(tab_id).ok_or(BrowserError::TabNotFound)?;
+        tab.runtime_events = CdpRuntimeEvents::Enabled;
         Ok(())
     }
 
@@ -1544,6 +1562,14 @@ impl ManagedChromiumHost {
         parse_frame_tree_snapshot(&result)
     }
 
+    fn read_frame_tree_snapshot_unchecked(
+        &mut self,
+        session_id: &str,
+    ) -> Result<CdpFrameTreeSnapshot, BrowserError> {
+        let result = self.command(CdpMethod::PageGetFrameTree, json!({}), Some(session_id))?;
+        parse_frame_tree_snapshot(&result)
+    }
+
     fn read_scoped_frame_tree_snapshot(
         &mut self,
         tab_id: &BrowserTabId,
@@ -1623,6 +1649,97 @@ impl ManagedChromiumHost {
             json!({"targetId": target_id}),
             None,
             guard,
+        )?;
+        let target_info = result
+            .get("targetInfo")
+            .and_then(Value::as_object)
+            .ok_or_else(|| self.poison())?;
+        let observed_target_id = target_info
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| self.poison())?;
+        let url = target_info
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 32 * 1_024)
+            .ok_or_else(|| self.poison())?;
+        if observed_target_id != target_id {
+            return Err(self.poison());
+        }
+        Ok(url.to_owned())
+    }
+
+    pub(crate) fn observe_handoff_snapshot(
+        &mut self,
+        profile: &BrowserProfile,
+        workspace: &BrowserWorkspace,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserHandoffSnapshot, BrowserError> {
+        profile.validate()?;
+        workspace.validate()?;
+        if profile.id != self.profile.id
+            || profile.revision != self.profile.revision
+            || profile.identity.identity_digest != self.profile.identity.identity_digest
+            || workspace.id != self.workspace.id
+            || workspace.tenant_id != self.workspace.tenant_id
+            || workspace.project_id != self.workspace.project_id
+            || workspace.mission_id != self.workspace.mission_id
+            || workspace.profile_id != self.workspace.profile_id
+            || workspace.revision != self.workspace.revision
+            || workspace.lease_generation != self.workspace.lease_generation
+            || workspace.control_state != self.workspace.control_state
+        {
+            return Err(BrowserError::ScopeMismatch);
+        }
+        let (target_id, session_id) = {
+            let tab = self
+                .tabs
+                .get(&workspace.active_tab_id)
+                .ok_or(BrowserError::TabNotFound)?;
+            (tab.target_id.clone(), tab.session_id.clone())
+        };
+        let target_url = self.read_target_url_unchecked(&target_id)?;
+        let mut frame_tree = self.read_frame_tree_snapshot_unchecked(&session_id)?;
+        frame_tree.lifecycle_revisions = self
+            .tabs
+            .get(&workspace.active_tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .frame_lifecycle_revisions
+            .clone();
+        let document_generation =
+            self.sync_frame_tree_identity(&workspace.active_tab_id, &frame_tree)?;
+        if target_url != frame_tree.root.url
+            || frame_tree.root.unreachable_url.is_some()
+            || frame_tree.root.frame_id.is_empty()
+            || frame_tree.root.loader_id.is_empty()
+        {
+            return Err(BrowserError::StaleSnapshot);
+        }
+        let scope = BrowserHandoffScope::bind(profile, workspace)?;
+        let frame = BrowserHandoffFrameBinding::from_verified(
+            workspace.active_tab_id.clone(),
+            &frame_tree.root.frame_id,
+            &frame_tree.root.loader_id,
+            &frame_tree.root.url,
+            document_generation,
+        )?;
+        BrowserHandoffSnapshot::from_verified(crate::handoff::BrowserHandoffSnapshotInput {
+            snapshot_id: BrowserSnapshotId::new(),
+            scope,
+            frame,
+            profile_revision: profile.revision,
+            workspace_revision: workspace.revision,
+            lease_generation: workspace.lease_generation,
+            control_state: workspace.control_state,
+            observed_at: now,
+        })
+    }
+
+    fn read_target_url_unchecked(&mut self, target_id: &str) -> Result<String, BrowserError> {
+        let result = self.command(
+            CdpMethod::TargetGetTargetInfo,
+            json!({"targetId": target_id}),
+            None,
         )?;
         let target_info = result
             .get("targetInfo")
@@ -1903,6 +2020,48 @@ impl ManagedChromiumHost {
         let [action] = batch.actions.as_slice() else {
             return Err(BrowserError::RealActionRejected);
         };
+        Self::validate_semantic_write_action_binding(
+            batch,
+            resolution,
+            action,
+            expected_kind,
+            expected_surface,
+            expected_payload_digest,
+        )
+    }
+
+    fn validate_recipe_click_binding(
+        &self,
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        action_index: usize,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserAction, BrowserError> {
+        batch.validate_for(&self.profile, &self.workspace, now)?;
+        resolution.validate()?;
+        let action = batch
+            .actions
+            .get(action_index)
+            .ok_or(BrowserError::RealActionRejected)?;
+        let resolution_digest = resolution.evidence_digest()?;
+        Self::validate_semantic_write_action_binding(
+            batch,
+            resolution,
+            action,
+            BrowserActionKind::Click,
+            BrowserActionSurface::Semantic,
+            &resolution_digest,
+        )
+    }
+
+    fn validate_semantic_write_action_binding(
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        action: &BrowserAction,
+        expected_kind: BrowserActionKind,
+        expected_surface: BrowserActionSurface,
+        expected_payload_digest: &str,
+    ) -> Result<BrowserAction, BrowserError> {
         if batch.effect_binding.is_none()
             || action.kind != expected_kind
             || action.surface != expected_surface
@@ -1933,6 +2092,31 @@ impl ManagedChromiumHost {
         guard: &OperationLeaseGuard<'_>,
     ) -> Result<ChromiumClickPreflight, BrowserError> {
         let action = self.validate_click_binding(batch, resolution, guard.logical_started_at)?;
+        let context = self.load_semantic_target_context(action, batch, resolution, guard)?;
+        let binding = context.input_binding();
+        self.resolve_click_geometry(resolution, &binding, guard)?;
+        self.workspace
+            .validate_agent_lease(&batch.lease, guard.observed_at()?)?;
+        Ok(ChromiumClickPreflight {
+            binding,
+            action_digest: digest_json(&context.action)?,
+            locator_resolution_digest: resolution.evidence_digest()?,
+        })
+    }
+
+    fn preflight_recipe_semantic_click(
+        &mut self,
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        action_index: usize,
+        guard: &OperationLeaseGuard<'_>,
+    ) -> Result<ChromiumClickPreflight, BrowserError> {
+        let action = self.validate_recipe_click_binding(
+            batch,
+            resolution,
+            action_index,
+            guard.logical_started_at,
+        )?;
         let context = self.load_semantic_target_context(action, batch, resolution, guard)?;
         let binding = context.input_binding();
         self.resolve_click_geometry(resolution, &binding, guard)?;
@@ -2325,13 +2509,37 @@ impl ManagedChromiumHost {
         effect: &Effect,
         now: DateTime<Utc>,
     ) -> Result<(Receipt, ChromiumClickDispatchEvidence), ChromiumActionFailure> {
+        self.execute_effect_bound_click_at(batch, resolution, effect, None, now)
+    }
+
+    fn execute_effect_bound_recipe_click_step(
+        &mut self,
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        effect: &Effect,
+        action_index: usize,
+        now: DateTime<Utc>,
+    ) -> Result<(Receipt, ChromiumClickDispatchEvidence), ChromiumActionFailure> {
+        self.execute_effect_bound_click_at(batch, resolution, effect, Some(action_index), now)
+    }
+
+    fn execute_effect_bound_click_at(
+        &mut self,
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        effect: &Effect,
+        action_index: Option<usize>,
+        now: DateTime<Utc>,
+    ) -> Result<(Receipt, ChromiumClickDispatchEvidence), ChromiumActionFailure> {
         batch
             .validate_effect(effect, now)
             .map_err(ChromiumActionFailure::rejected)?;
         let guard = OperationLeaseGuard::new(&batch.lease, now);
-        let preflight = self
-            .preflight_semantic_click(batch, resolution, &guard)
-            .map_err(ChromiumActionFailure::rejected)?;
+        let preflight = match action_index {
+            Some(index) => self.preflight_recipe_semantic_click(batch, resolution, index, &guard),
+            None => self.preflight_semantic_click(batch, resolution, &guard),
+        }
+        .map_err(ChromiumActionFailure::rejected)?;
         let observed_at = guard
             .observed_at()
             .map_err(ChromiumActionFailure::rejected)?;
@@ -2403,10 +2611,13 @@ impl ManagedChromiumHost {
         let response_digest = evidence
             .evidence_digest()
             .map_err(ChromiumActionFailure::uncertain)?;
+        let step_suffix = action_index
+            .and_then(|index| batch.actions.get(index))
+            .map_or_else(String::new, |action| format!("-step-{}", action.sequence));
         let receipt = Receipt {
-            id: ReceiptId::from_stable(format!("chromium-click-receipt-{}", batch.id)),
+            id: ReceiptId::from_stable(format!("chromium-click-receipt-{}{step_suffix}", batch.id)),
             provider: effect.provider.clone(),
-            external_id: format!("chromium-click-batch-{}", batch.id),
+            external_id: format!("chromium-click-batch-{}{step_suffix}", batch.id),
             accepted_at: dispatched_at,
             request_digest: batch.plan_digest.clone(),
             response_digest,
@@ -3592,6 +3803,119 @@ impl EffectExecutor for ManagedChromiumClickExecutor<'_> {
     }
 }
 
+/// Single-use bridge for exactly the next unacknowledged click in a durable
+/// signed-Recipe cursor. Cursor, Recipe authority, full batch, selected action,
+/// and locator resolution are revalidated before Chromium receives input.
+pub struct ManagedChromiumRecipeClickStepExecutor<'a> {
+    host: &'a mut ManagedChromiumHost,
+    context: BrowserRecipeResumeContext<'a>,
+    cursor: &'a BrowserRecipeResumeCursor,
+    batch: BrowserActionBatch,
+    resolution: BrowserLocatorResolution,
+    recipe_authorization: BrowserRecipeExecutionAuthorization<'a>,
+    action_index: usize,
+    now: DateTime<Utc>,
+    consumed: bool,
+    last_evidence: Option<ChromiumClickDispatchEvidence>,
+}
+
+impl<'a> ManagedChromiumRecipeClickStepExecutor<'a> {
+    pub fn new(
+        host: &'a mut ManagedChromiumHost,
+        context: BrowserRecipeResumeContext<'a>,
+        cursor: &'a BrowserRecipeResumeCursor,
+        resolution: BrowserLocatorResolution,
+        now: DateTime<Utc>,
+    ) -> Result<Self, BrowserError> {
+        cursor.validate_for(context, now)?;
+        let action_index = cursor.next_action_index();
+        let action = context
+            .batch
+            .actions
+            .get(action_index)
+            .ok_or(BrowserError::RecipeScopeMismatch)?;
+        let recipe_authorization = BrowserRecipeExecutionAuthorization::new(
+            context.prepared_plan.clone(),
+            context.registry,
+            context.trust,
+            context.batch,
+            now,
+        )?;
+        let selected =
+            host.validate_recipe_click_binding(context.batch, &resolution, action_index, now)?;
+        if &selected != action {
+            return Err(BrowserError::RecipeScopeMismatch);
+        }
+        recipe_authorization.validate_resolution(action, &resolution)?;
+        Ok(Self {
+            host,
+            context,
+            cursor,
+            batch: context.batch.clone(),
+            resolution,
+            recipe_authorization,
+            action_index,
+            now,
+            consumed: false,
+            last_evidence: None,
+        })
+    }
+
+    pub fn last_evidence(&self) -> Option<&ChromiumClickDispatchEvidence> {
+        self.last_evidence.as_ref()
+    }
+}
+
+impl fmt::Debug for ManagedChromiumRecipeClickStepExecutor<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedChromiumRecipeClickStepExecutor")
+            .field("batch_id", &self.batch.id)
+            .field("workspace_id", &self.batch.workspace_id)
+            .field("action_index", &self.action_index)
+            .field("cursor_revision", &self.cursor.revision())
+            .field("consumed", &self.consumed)
+            .field("has_evidence", &self.last_evidence.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl EffectExecutor for ManagedChromiumRecipeClickStepExecutor<'_> {
+    fn execute(&mut self, effect: &Effect) -> Result<Receipt, ProviderFailure> {
+        if self.consumed {
+            return Err(ProviderFailure::Uncertain(
+                BrowserError::RealActionRejected.code().into(),
+            ));
+        }
+        self.consumed = true;
+        if let Err(error) = self.cursor.validate_for(self.context, self.now) {
+            return Err(ProviderFailure::Rejected(error.code().into()));
+        }
+        if let Err(error) = self
+            .recipe_authorization
+            .validate_effect(&self.batch, effect, self.now)
+        {
+            return Err(ProviderFailure::Rejected(error.code().into()));
+        }
+        match self.host.execute_effect_bound_recipe_click_step(
+            &self.batch,
+            &self.resolution,
+            effect,
+            self.action_index,
+            self.now,
+        ) {
+            Ok((receipt, evidence)) => {
+                self.last_evidence = Some(evidence);
+                Ok(receipt)
+            }
+            Err(failure) if failure.external_write_may_have_occurred => {
+                Err(ProviderFailure::Uncertain(failure.error.code().into()))
+            }
+            Err(failure) => Err(ProviderFailure::Rejected(failure.error.code().into())),
+        }
+    }
+}
+
 /// Single-use bridge from an exact approved Effect to one managed Chromium
 /// text insertion. The payload is zeroized when the executor is dropped, and
 /// any failure once `Input.insertText` starts is conservatively uncertain.
@@ -3865,6 +4189,21 @@ impl BrowserControlHost for ManagedChromiumHost {
             tab.latest_execution_context = None;
         }
         Ok(())
+    }
+}
+
+impl BrowserHandoffHost for ManagedChromiumHost {
+    fn observe_handoff_snapshot(
+        &mut self,
+        profile: &BrowserProfile,
+        workspace: &BrowserWorkspace,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserHandoffSnapshot, BrowserError> {
+        ManagedChromiumHost::observe_handoff_snapshot(self, profile, workspace, now)
+    }
+
+    fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
+        <Self as BrowserControlHost>::sync_workspace(self, workspace)
     }
 }
 
@@ -5699,15 +6038,24 @@ fn permits_read_observation_request(
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
-    use std::io::{BufRead as _, BufReader, Cursor, Write as _};
+    use std::io::Cursor;
+    #[cfg(target_os = "macos")]
+    use std::io::{BufRead as _, BufReader, Write as _};
+    #[cfg(target_os = "macos")]
     use std::net::{SocketAddr, TcpListener};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "macos")]
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(target_os = "macos")]
     use std::sync::{Arc, Mutex};
+    #[cfg(target_os = "macos")]
     use std::thread;
 
-    use chrono::{Duration as ChronoDuration, TimeZone};
+    #[cfg(target_os = "macos")]
+    use chrono::Duration as ChronoDuration;
+    use chrono::TimeZone;
+    #[cfg(target_os = "macos")]
     use hartevo_domain_kernel::{
         AccountId, ActorId, Approval, ApprovalDecision, ApprovalId, BrowserActionBatchId,
         BrowserControlLeaseId, BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId,
@@ -5718,6 +6066,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    #[cfg(target_os = "macos")]
     use crate::{
         BrowserFileGrantState, BrowserIdentity, FileBroker, FileSafetyScanner, FileScanDecision,
         FileScanReport, FileScanRequest,
@@ -5925,6 +6274,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     struct TestHttpServer {
         address: SocketAddr,
         request_count: Arc<AtomicUsize>,
@@ -5933,8 +6283,10 @@ mod tests {
         thread: Option<JoinHandle<()>>,
     }
 
+    #[cfg(target_os = "macos")]
     struct TestCleanScanner;
 
+    #[cfg(target_os = "macos")]
     impl FileSafetyScanner for TestCleanScanner {
         fn scan(&mut self, request: &FileScanRequest<'_>) -> Result<FileScanReport, BrowserError> {
             Ok(FileScanReport {
@@ -5952,6 +6304,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl TestHttpServer {
         fn start(
             handler: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static,
@@ -6038,6 +6391,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl Drop for TestHttpServer {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
@@ -6047,6 +6401,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn http_response(status: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
         let mut response = format!(
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
