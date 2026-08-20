@@ -19,12 +19,16 @@ use thiserror::Error;
 use tokio_postgres::{Client, Row, Transaction};
 
 mod effect_ledger;
+mod region_transfer;
 mod remote_worker_execution;
 mod remote_worker_plugin;
-mod region_transfer;
 mod scheduler;
 
 pub use effect_ledger::{CloudPermissionFenceMutation, CloudPermissionFenceResult};
+pub use region_transfer::{
+    EncryptedRegionTransferRequest, RegionTransferConsumer, RegionTransferProvider,
+    RegionTransferReceipt, RegionTransferServiceDefinition, RegionTransferStatus,
+};
 pub use remote_worker_execution::{
     CloudRemoteWorkerDispatchAvailability, CloudRemoteWorkerDispatchDecision,
     CloudRemoteWorkerMissionFence, CloudRemoteWorkerWorkCancel, CloudRemoteWorkerWorkCancelResult,
@@ -43,10 +47,6 @@ pub use remote_worker_plugin::{
     CloudRemoteWorkerTransportRegistration, CloudRemoteWorkerTransportRegistrationState,
     REMOTE_WORKER_TRANSPORT_SCHEMA, REMOTE_WORKER_TRANSPORT_SERVICE_ID,
     REMOTE_WORKER_TRANSPORT_SERVICE_VERSION,
-};
-pub use region_transfer::{
-    EncryptedRegionTransferRequest, RegionTransferConsumer, RegionTransferProvider,
-    RegionTransferReceipt, RegionTransferServiceDefinition, RegionTransferStatus,
 };
 pub use scheduler::{
     MAX_SCHEDULER_LEASE_SECONDS, SchedulerAttempt, SchedulerAttemptOutcome,
