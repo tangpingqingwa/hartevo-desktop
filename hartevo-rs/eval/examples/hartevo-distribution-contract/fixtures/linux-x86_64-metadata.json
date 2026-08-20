@@ -1,0 +1,118 @@
+{
+  "schemaVersion": "hartevo-cargo-metadata-receipt/v1",
+  "target": "x86_64-unknown-linux-gnu",
+  "sourceCommit": "1111111111111111111111111111111111111111",
+  "cargoMetadata": {
+    "packages": [
+      {
+        "id": "path+fixture://hartevo-desktop#hartevo-desktop@0.1.0",
+        "name": "hartevo-desktop",
+        "version": "0.1.0",
+        "source": null
+      },
+      {
+        "id": "registry+fixture#dioxus@0.7.10",
+        "name": "dioxus",
+        "version": "0.7.10",
+        "source": "registry+https://github.com/rust-lang/crates.io-index"
+      },
+      {
+        "id": "registry+fixture#gtk@0.18.2",
+        "name": "gtk",
+        "version": "0.18.2",
+        "source": "registry+https://github.com/rust-lang/crates.io-index"
+      },
+      {
+        "id": "registry+fixture#glib@0.18.5",
+        "name": "glib",
+        "version": "0.18.5",
+        "source": "registry+https://github.com/rust-lang/crates.io-index"
+      },
+      {
+        "id": "registry+fixture#rand@0.7.3",
+        "name": "rand",
+        "version": "0.7.3",
+        "source": "registry+https://github.com/rust-lang/crates.io-index"
+      }
+    ],
+    "workspace_members": [
+      "path+fixture://hartevo-desktop#hartevo-desktop@0.1.0"
+    ],
+    "resolve": {
+      "root": null,
+      "nodes": [
+        {
+          "id": "path+fixture://hartevo-desktop#hartevo-desktop@0.1.0",
+          "dependencies": [
+            "registry+fixture#dioxus@0.7.10"
+          ],
+          "deps": [
+            {
+              "pkg": "registry+fixture#dioxus@0.7.10",
+              "dep_kinds": [
+                {
+                  "kind": null,
+                  "target": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "registry+fixture#dioxus@0.7.10",
+          "dependencies": [
+            "registry+fixture#gtk@0.18.2",
+            "registry+fixture#rand@0.7.3"
+          ],
+          "deps": [
+            {
+              "pkg": "registry+fixture#gtk@0.18.2",
+              "dep_kinds": [
+                {
+                  "kind": null,
+                  "target": null
+                }
+              ]
+            },
+            {
+              "pkg": "registry+fixture#rand@0.7.3",
+              "dep_kinds": [
+                {
+                  "kind": null,
+                  "target": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "registry+fixture#gtk@0.18.2",
+          "dependencies": [
+            "registry+fixture#glib@0.18.5"
+          ],
+          "deps": [
+            {
+              "pkg": "registry+fixture#glib@0.18.5",
+              "dep_kinds": [
+                {
+                  "kind": null,
+                  "target": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "registry+fixture#glib@0.18.5",
+          "dependencies": [],
+          "deps": []
+        },
+        {
+          "id": "registry+fixture#rand@0.7.3",
+          "dependencies": [],
+          "deps": []
+        }
+      ]
+    }
+  }
+}
