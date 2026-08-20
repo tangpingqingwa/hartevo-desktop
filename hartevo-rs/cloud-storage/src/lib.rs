@@ -625,11 +625,7 @@ impl PostgresCellStore {
         let transaction = client.transaction().await?;
         transaction
             .query_one(
-<<<<<<< HEAD
                 "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v7'))",
-=======
-                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v6'))",
->>>>>>> 6bee5f69eee691f30f37b443a18b63ec27d38414
                 &[],
             )
             .await?;
