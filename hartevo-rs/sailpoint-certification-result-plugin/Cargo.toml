@@ -1,0 +1,40 @@
+[package]
+name = "hartevo-sailpoint-certification-result-plugin"
+description = "Standalone Layer-1 bounded SailPoint certification result plugin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Proprietary"
+authors = ["Hartevo"]
+repository = "https://github.com/tangpingqingwa/hartevo-desktop"
+
+# This nested workspace is intentionally standalone. Host wiring, native
+# credentials, and kernel authority belong to the Integration Manager.
+[workspace]
+resolver = "3"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+hartevo-plugin-runtime = { path = "../plugin-runtime" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+
+[dev-dependencies]
+proptest = "1.11"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+struct_excessive_bools = "allow"
+too_many_arguments = "allow"

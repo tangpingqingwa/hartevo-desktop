@@ -1,0 +1,330 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-dynamodb-table-result/contract.v1.json",
+  "title": "Hartevo AWS DynamoDB table-posture result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-dynamodb-table-result/v1",
+  "contractVersion": "EXT-AWS-DYNAMODB-01-L1/v1",
+  "pluginId": "aws.dynamodb.table-result",
+  "pluginVersion": "1.0.0",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-dynamodb-table-result/v1|layer=1|service=aws.dynamodb.table.read|provider=aws.dynamodb.table.recording|consumer=mission.aws-dynamodb-table.consumer",
+  "contractDigest": "a86242dbbca033232efbcb4c68547873f1ae9f386aa338a4695e66bc8927a83c",
+  "service": {
+    "type": "AwsDynamoDbTableService",
+    "id": "aws.dynamodb.table.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register",
+      "read",
+      "propose",
+      "record",
+      "verify",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "liveExecution": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsDynamoDbProvider",
+    "id": "aws.dynamodb.table.recording",
+    "apiRevision": "dynamodb-list-tables-describe-table-describe-continuous-backups-describe-time-to-live-list-tags-of-resource-1",
+    "operations": [
+      "ListTables",
+      "DescribeTable",
+      "DescribeContinuousBackups",
+      "DescribeTimeToLive",
+      "ListTagsOfResource"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "serialized": false,
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAwsDynamoDbConsumer",
+    "id": "mission.aws-dynamodb-table.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "connected": false,
+    "native": false
+  },
+  "credentials": {
+    "boundary": "opaque SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "tableArn",
+      "tableNameAllowlist",
+      "tableRevision",
+      "schemaDigest",
+      "indexDigest",
+      "replicaDigest",
+      "backupDigest",
+      "ttlDigest",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "items": false,
+    "keyValues": false,
+    "rawTags": false,
+    "rawPolicies": false,
+    "streams": false,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "tableDigest",
+      "permissionSnapshotDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "evidenceFenceDigest",
+      "registrationRevision",
+      "status"
+    ],
+    "permissions": [
+      "dynamodb:ListTables",
+      "dynamodb:DescribeTable",
+      "dynamodb:DescribeContinuousBackups",
+      "dynamodb:DescribeTimeToLive",
+      "dynamodb:ListTagsOfResource",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "dynamodb:GetItem",
+      "dynamodb:Query",
+      "dynamodb:Scan",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:DeleteItem",
+      "dynamodb:CreateTable",
+      "dynamodb:DeleteTable",
+      "dynamodb:RestoreTableFromBackup",
+      "dynamodb:RestoreTableToPointInTime",
+      "dynamodb:ExportTableToPointInTime",
+      "dynamodb:ImportTable",
+      "iam:PassRole",
+      "kms:Decrypt",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "account",
+      "region",
+      "tableAllowlistDigest",
+      "pageNumber",
+      "pageSize"
+    ],
+    "filterDriftRejected": true,
+    "tableReplacementRejected": true,
+    "schemaDriftRejected": true,
+    "indexDriftRejected": true,
+    "eventualConsistencyFence": true,
+    "paginationLoopRejected": true,
+    "partialPageIsNonAdoptable": true
+  },
+  "projection": {
+    "table": [
+      "status",
+      "tableIdDigest",
+      "schemaDigest",
+      "keyComponentDigests",
+      "indexDigests",
+      "replicaDigests",
+      "encryptionPosture",
+      "revision",
+      "observedAt"
+    ],
+    "backup": [
+      "pointInTimeRecoveryStatus",
+      "recoveryWindowDigest",
+      "latestRestorableTimeDigest",
+      "revision",
+      "observedAt"
+    ],
+    "ttl": [
+      "status",
+      "attributeNameDigest",
+      "revision",
+      "observedAt"
+    ],
+    "tags": [
+      "boundedTagKeyDigests",
+      "observedAt"
+    ],
+    "retained": "digests_and_bounded_posture_only",
+    "rawItemData": false,
+    "rawKeyValues": false,
+    "rawTagValues": false,
+    "accountPii": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "tableDigest",
+      "allowlistDigest",
+      "cursorDigest",
+      "listDigest",
+      "describeTableDigest",
+      "backupDigest",
+      "ttlDigest",
+      "tagsDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "completed",
+      "partial",
+      "not_found",
+      "access_loss",
+      "throttled",
+      "provider_unknown",
+      "table_replaced",
+      "schema_drift",
+      "index_drift",
+      "stale_metadata",
+      "registration_revoked"
+    ],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "partialIsNonAdoptable": true,
+    "staleMetadataIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed account/region/table scope",
+      "explicit table allowlist",
+      "bounded ListTables and table posture metadata seams",
+      "schema/index/replica/encryption posture projection",
+      "PITR/recovery-window and TTL posture projection",
+      "bounded tag-key digests and timestamps",
+      "pagination and eventual-consistency fences",
+      "version/contract/provider/table/scope/permission/evidence digests",
+      "reversible registration",
+      "redacted idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live DynamoDB HTTPS",
+      "item reads, Query, or Scan",
+      "table or item mutation",
+      "restore or export",
+      "raw key/value data",
+      "raw tag values",
+      "raw policies or account PII",
+      "recoverability guarantee",
+      "verified Work Product adoption"
+    ]
+  },
+  "forbiddenOperations": [
+    "GetItem",
+    "Query",
+    "Scan",
+    "PutItem",
+    "UpdateItem",
+    "DeleteItem",
+    "CreateTable",
+    "DeleteTable",
+    "RestoreTableFromBackup",
+    "RestoreTableToPointInTime",
+    "ExportTableToPointInTime",
+    "ImportTable",
+    "resolve_native_credentials",
+    "claim_connected",
+    "adopt_kernel_outcome"
+  ],
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live ListTables/DescribeTable/DescribeContinuousBackups/DescribeTimeToLive/ListTagsOfResource HTTPS",
+    "durable provider receipt",
+    "independent metadata and data reconciliation",
+    "consented table effects",
+    "Connected/native/first-party evidence",
+    "recoverability guarantee",
+    "Hartevo Outcome or Work Product adoption"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live DynamoDB HTTPS, durable provider receipt, independent readback, consented table effects and verified Mission adoption remain Layer-2 work. Recording, fixture, loopback and BLOCKED_ENV never claim Connected, native or first-party evidence. Table posture is bounded provider metadata and is not proof that application data is readable or recoverable."
+}
