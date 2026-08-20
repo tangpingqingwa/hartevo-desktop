@@ -394,10 +394,12 @@ impl<T: YouTubePublishTransport> YouTubeDataApiProvider<T> {
         if !matches!(response.status(), 200 | 201) {
             return Err(YouTubeError::InvalidResponse("YouTube upload completion"));
         }
+        let provider_request_digest = provider_request.digest();
         Ok(YouTubeUploadProgress::Completed(parse_provider_receipt(
             request,
             session,
             &response,
+            &provider_request_digest,
             self.provenance,
         )?))
     }
@@ -410,6 +412,7 @@ impl<T: YouTubePublishTransport> YouTubeDataApiProvider<T> {
         valid_for: Duration,
     ) -> Result<YouTubeReadbackReceipt, YouTubeError> {
         let provider_request = readback_request(credential, request, provider_receipt.video_id())?;
+        let provider_request_digest = provider_request.digest();
         let response = self.send(&provider_request)?;
         ensure_success(
             &response,
@@ -421,6 +424,7 @@ impl<T: YouTubePublishTransport> YouTubeDataApiProvider<T> {
             request,
             provider_receipt,
             &response,
+            &provider_request_digest,
             valid_for,
             self.provenance,
         )
@@ -709,6 +713,7 @@ fn parse_provider_receipt(
     request: &DraftVideoPublishRequest,
     session: &YouTubeUploadSessionReference,
     response: &YouTubeProviderResponse,
+    provider_request_digest: &str,
     provenance: YouTubeEvidenceProvenance,
 ) -> Result<YouTubeProviderReceipt, YouTubeError> {
     let body = response.json()?;
@@ -721,6 +726,7 @@ fn parse_provider_receipt(
         provider: YouTubeProviderId::YouTube,
         binding: request.binding().clone(),
         request_digest: request.request_digest(),
+        provider_request_digest: provider_request_digest.to_owned(),
         idempotency_key: request.idempotency_key().clone(),
         video_id,
         session: session.clone(),
@@ -734,6 +740,7 @@ fn parse_readback_response(
     request: &DraftVideoPublishRequest,
     provider_receipt: &YouTubeProviderReceipt,
     response: &YouTubeProviderResponse,
+    provider_request_digest: &str,
     valid_for: Duration,
     provenance: YouTubeEvidenceProvenance,
 ) -> Result<YouTubeReadbackReceipt, YouTubeError> {
@@ -804,6 +811,7 @@ fn parse_readback_response(
         provider: YouTubeProviderId::YouTube,
         binding: request.binding().clone(),
         request_digest: request.request_digest(),
+        provider_request_digest: provider_request_digest.to_owned(),
         video_id,
         channel_id,
         title,

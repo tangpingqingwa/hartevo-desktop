@@ -30,3 +30,23 @@ can exercise deterministic worlds but can never become first-party evidence.
 The real entrypoint requires `HARTEVO_YOUTUBE_REAL_PUBLISH=1` and an opaque
 `HARTEVO_YOUTUBE_SECRET_REFERENCE`. Without both, it returns
 `BlockedEnvironment`; no local fake provider is presented as YouTube.
+
+## Second-layer receipt/readback verification
+
+The `YouTubeAuthorizedPublishEffect` boundary records an already-authorized
+publish decision without granting authority or holding a secret. The
+`YouTubePublishVerificationService` consumes that typed Effect and the exact
+provider receipt, then issues only a `videos.list` readback. Receipt,
+verification, and outcome evidence preserve the Effect/plugin revisions,
+tenant/business/account/channel/provider-generation binding, request and
+idempotency digests, provider request/response digests, and exact video state.
+
+The verification checkpoint is durable and deterministic. A 429 persists the
+provider reset receipt; reopen/retry repeats only readback, while processing
+returns `Pending`. It becomes `Completed` only after a fresh, exact video and
+channel readback confirms title, visibility, schedule, and ready status.
+Effect expiry, plugin/effect/scope or credential drift, revoke/unmount,
+private/public or channel mismatch, and readback mismatch invalidate or reject
+the checkpoint without publishing again. Fixture and controlled evidence remain
+non-production, and the real verification gate stays `BlockedEnvironment`
+until an explicitly enabled production transport and secret reference exist.

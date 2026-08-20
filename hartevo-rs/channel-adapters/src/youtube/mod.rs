@@ -19,8 +19,10 @@ use thiserror::Error;
 use crate::transport::YouTubeSecretReference;
 
 mod consumer;
+mod effect;
 mod provider;
 mod service;
+mod verification;
 
 #[path = "../youtube.rs"]
 mod read;
@@ -28,6 +30,10 @@ mod read;
 pub mod testkit;
 
 pub use consumer::{MissionYouTubePublishConsumer, YouTubeMissionAcceptedPublish};
+pub use effect::{
+    YOUTUBE_PUBLISH_PLUGIN_ID, YOUTUBE_PUBLISH_PLUGIN_REVISION, YouTubeAuthorizedPublishEffect,
+    YouTubeEffectId, YouTubePluginIdentity,
+};
 pub use provider::{
     YouTubeDataApiProvider, YouTubeHttpMethod, YouTubeProductionTransport, YouTubeProviderRequest,
     YouTubeProviderResponse, YouTubePublishTransport,
@@ -43,6 +49,13 @@ pub use read::{
     parse_read_response,
 };
 pub use service::{YouTubePublishService, YouTubeRealPublishGate, execute_real_publish_gate};
+pub use verification::{
+    YouTubeEvidenceId, YouTubePublishOutcomeEvidence, YouTubePublishReceiptEvidence,
+    YouTubePublishVerificationCheckpoint, YouTubePublishVerificationDispatchResult,
+    YouTubePublishVerificationEvidence, YouTubePublishVerificationPhase,
+    YouTubePublishVerificationService, YouTubeVerificationInvalidationReason,
+    YouTubeVerificationStatus, execute_real_publish_verification_gate,
+};
 
 pub const YOUTUBE_API_BASE_URL: &str = "https://www.googleapis.com/youtube/v3";
 pub const YOUTUBE_UPLOAD_BASE_URL: &str = "https://www.googleapis.com/upload/youtube/v3";
@@ -592,6 +605,16 @@ impl YouTubeCredential {
         &self.granted_scopes
     }
 
+    pub fn scope_digest(&self) -> String {
+        sha256_json(&serde_json::json!({
+            "scopes": self
+                .granted_scopes
+                .iter()
+                .map(|scope| scope.as_str())
+                .collect::<Vec<_>>(),
+        }))
+    }
+
     pub const fn generation(&self) -> u64 {
         self.generation
     }
@@ -787,6 +810,7 @@ pub struct YouTubeProviderReceipt {
     provider: YouTubeProviderId,
     binding: YouTubePublishBinding,
     request_digest: String,
+    provider_request_digest: String,
     idempotency_key: YouTubeIdempotencyKey,
     video_id: YouTubeVideoId,
     session: YouTubeUploadSessionReference,
@@ -806,6 +830,10 @@ impl YouTubeProviderReceipt {
 
     pub fn request_digest(&self) -> &str {
         &self.request_digest
+    }
+
+    pub fn provider_request_digest(&self) -> &str {
+        &self.provider_request_digest
     }
 
     pub const fn idempotency_key(&self) -> &YouTubeIdempotencyKey {
@@ -848,6 +876,7 @@ pub struct YouTubeReadbackReceipt {
     provider: YouTubeProviderId,
     binding: YouTubePublishBinding,
     request_digest: String,
+    provider_request_digest: String,
     video_id: YouTubeVideoId,
     channel_id: YouTubeChannelId,
     title: String,
@@ -872,6 +901,10 @@ impl YouTubeReadbackReceipt {
 
     pub fn request_digest(&self) -> &str {
         &self.request_digest
+    }
+
+    pub fn provider_request_digest(&self) -> &str {
+        &self.provider_request_digest
     }
 
     pub const fn video_id(&self) -> &YouTubeVideoId {
@@ -930,9 +963,13 @@ impl YouTubeReadbackReceipt {
             || self.request_digest != provider_receipt.request_digest()
             || self.video_id != *provider_receipt.video_id()
             || self.channel_id != *request.binding().channel_id()
+            || self.provenance != provider_receipt.provenance()
             || self.title != request.title()
             || self.visibility != *request.visibility()
             || self.schedule != request.schedule()
+            || !is_sha256(&self.provider_request_digest)
+            || !is_sha256(provider_receipt.provider_request_digest())
+            || !is_sha256(provider_receipt.response_digest())
             || !is_sha256(&self.response_digest)
             || self.valid_until <= self.observed_at
         {
@@ -1410,6 +1447,13 @@ impl YouTubePublishCheckpoint {
         {
             return Err(YouTubeError::InvalidCheckpoint);
         }
+        if self.provider_receipt.as_ref().is_some_and(|receipt| {
+            !is_sha256(receipt.provider_request_digest()) || !is_sha256(receipt.response_digest())
+        }) || self.readback.as_ref().is_some_and(|readback| {
+            !is_sha256(readback.provider_request_digest()) || !is_sha256(readback.response_digest())
+        }) {
+            return Err(YouTubeError::InvalidCheckpoint);
+        }
         if let (Some(provider_receipt), Some(readback)) =
             (self.provider_receipt.as_ref(), self.readback.as_ref())
         {
@@ -1534,6 +1578,20 @@ pub enum YouTubeError {
     ReconciliationRequired,
     #[error("YouTube production publish is blocked by environment: {requirement}")]
     BlockedEnvironment { requirement: &'static str },
+    #[error("YouTube authorized publish effect boundary does not match")]
+    EffectBoundaryMismatch,
+    #[error("YouTube authorized publish effect has expired")]
+    EffectExpired,
+    #[error("YouTube publish plugin identity or revision does not match")]
+    PluginRevisionMismatch,
+    #[error("YouTube publish effect revision does not match")]
+    EffectRevisionMismatch,
+    #[error("YouTube publish effect scope digest does not match the live credential")]
+    ScopeDigestMismatch,
+    #[error("YouTube verification checkpoint was invalidated")]
+    VerificationCheckpointInvalidated,
+    #[error("YouTube publish readback verification was rejected")]
+    VerificationRejected,
 }
 
 impl YouTubeError {
