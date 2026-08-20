@@ -1,0 +1,120 @@
+{
+  "schemaVersion": "hartevo-temporal-worker-plugin-contract/v1",
+  "contractVersion": "temporal-worker-layer1/v1",
+  "layer": 1,
+  "authority": "proposal_recording_and_recovery_verification_only",
+  "secretMaterial": "opaque_reference_only",
+  "plugin": {
+    "id": "hartevo.temporal-worker",
+    "version": "temporal-worker/v1",
+    "registration": {
+      "versionBound": true,
+      "manifestDigestBound": true,
+      "namespaceBound": true,
+      "taskQueueBound": true,
+      "workflowIdBound": true,
+      "missionRevisionBound": true,
+      "effectFenceBound": true,
+      "reversible": true
+    }
+  },
+  "service": {
+    "id": "DurableWorkerService",
+    "provider": "TemporalProvider",
+    "consumer": "MissionWorkerConsumer",
+    "operations": [
+      "compile_workflow_proposal",
+      "describe_capabilities",
+      "record_signal",
+      "verify_recovery",
+      "record_start",
+      "record_query",
+      "record_timer",
+      "record_activity_attempt",
+      "record_heartbeat",
+      "record_continue_as_new",
+      "record_cancel",
+      "record_outcome"
+    ]
+  },
+  "provider": {
+    "id": "temporal",
+    "version": "temporal-provider/v1",
+    "apiVersion": "temporal-workflow-api/v1",
+    "manifestDigest": "sha256",
+    "capabilities": [
+      "workflow",
+      "activity",
+      "signal",
+      "query",
+      "timer",
+      "retry_policy",
+      "heartbeat",
+      "continue_as_new",
+      "cancellation",
+      "recovery_verification"
+    ],
+    "authentication": "secret_reference_boundary_only",
+    "realGrpc": false,
+    "temporalCloud": false,
+    "nativeWorker": false,
+    "driftPolicy": "fail_closed"
+  },
+  "workflowScope": ["namespace", "taskQueue", "workflowId"],
+  "missionBinding": [
+    "projectId",
+    "missionId",
+    "workerId",
+    "revision",
+    "effectFence",
+    "planDigest"
+  ],
+  "workflowPlan": {
+    "commands": [
+      "start_workflow",
+      "schedule_activity",
+      "register_signal",
+      "register_query",
+      "start_timer"
+    ],
+    "activityBoundaries": [
+      "deterministic_attempt_fence",
+      "retry_index",
+      "idempotency_key",
+      "heartbeat_digest"
+    ],
+    "historyBoundary": "event_history_is_replay_input_not_hartevo_outcome_authority"
+  },
+  "recording": {
+    "transport": "deterministic_in_memory_fake",
+    "operations": [
+      "start",
+      "signal",
+      "query",
+      "timer",
+      "activity_retry",
+      "heartbeat",
+      "continue_as_new",
+      "cancel",
+      "recovery",
+      "terminal_outcome"
+    ],
+    "duplicateCommand": "same_digest_replayed",
+    "conflictingCommand": "fail_closed",
+    "uncertainReplay": "forbidden"
+  },
+  "receipts": [
+    "record_receipt",
+    "activity_attempt",
+    "signal_envelope",
+    "recovery_receipt",
+    "outcome_receipt"
+  ],
+  "nativeBoundary": {
+    "provenance": ["recording", "fixture", "controlled_provider", "blocked_env"],
+    "connected": false,
+    "native": false,
+    "externalWorkerStarted": false,
+    "blockedGap": "BLOCKED_ENV: real Temporal gRPC, Temporal Cloud, and native worker journey are deferred"
+  }
+}

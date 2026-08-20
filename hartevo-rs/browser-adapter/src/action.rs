@@ -17,6 +17,7 @@ use crate::{
 use crate::{BrowserFileGrant, BrowserFileGrantState, BrowserLocatorResolution};
 
 const ACTION_SCHEMA_VERSION: u32 = 1;
+const BATCH_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const MAX_BATCH_ACTIONS: usize = 64;
 const MAX_BATCH_LIFETIME: Duration = Duration::minutes(15);
 const MAX_ELEMENT_REFS: usize = 4_096;
@@ -506,6 +507,353 @@ pub struct BrowserEffectBinding {
     pub plan_digest: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserActionResult {
+    pub batch_id: BrowserActionBatchId,
+    pub action_sequence: u32,
+    pub action_digest: String,
+    pub host_receipt_digest: String,
+    pub external_write_may_have_occurred: bool,
+    pub business_verified: bool,
+}
+
+impl BrowserActionResult {
+    pub fn digest(&self) -> Result<String, BrowserError> {
+        if !is_bounded_identifier(self.batch_id.as_str())
+            || self.action_sequence == 0
+            || !is_sha256(&self.action_digest)
+            || !is_sha256(&self.host_receipt_digest)
+            || self.business_verified
+        {
+            return Err(BrowserError::InvalidBatchReceipt);
+        }
+        digest_json(self)
+    }
+
+    fn validate_for(
+        &self,
+        batch: &BrowserActionBatch,
+        action: &BrowserAction,
+        external_write_may_have_occurred: bool,
+    ) -> Result<(), BrowserError> {
+        if self.batch_id != batch.id
+            || self.action_sequence != action.sequence
+            || self.action_digest != digest_json(action)?
+            || self.external_write_may_have_occurred != external_write_may_have_occurred
+        {
+            return Err(BrowserError::InvalidBatchReceipt);
+        }
+        self.digest().map(|_| ())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserBatchReceiptState {
+    Active,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl BrowserBatchReceiptState {
+    pub fn is_terminal(self) -> bool {
+        self != Self::Active
+    }
+}
+
+/// Content-free durable acknowledgement of the exact successful prefix of one
+/// typed browser batch. It never proves Provider or business completion.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserBatchReceipt {
+    pub schema_version: u32,
+    pub batch_id: BrowserActionBatchId,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub workspace_id: BrowserWorkspaceId,
+    pub batch_digest: String,
+    pub plan_digest: String,
+    pub completed_action_count: u32,
+    pub acknowledged_results: Vec<BrowserActionResult>,
+    pub result_digest: String,
+    pub last_observation_digest: Option<String>,
+    pub external_write_may_have_occurred: bool,
+    pub state: BrowserBatchReceiptState,
+    pub terminal_reason_digest: Option<String>,
+    pub cursor_digest: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserBatchCursorDigestMaterial<'a> {
+    batch_id: &'a str,
+    workspace_id: &'a str,
+    batch_digest: &'a str,
+    plan_digest: &'a str,
+    completed_action_count: u32,
+    result_digest: &'a str,
+    last_observation_digest: Option<&'a str>,
+    external_write_may_have_occurred: bool,
+    state: BrowserBatchReceiptState,
+    terminal_reason_digest: Option<&'a str>,
+}
+
+impl BrowserBatchReceipt {
+    pub(crate) fn new(
+        batch: &BrowserActionBatch,
+        acknowledged_results: Vec<BrowserActionResult>,
+        last_observation_digest: Option<String>,
+        external_write_may_have_occurred: bool,
+        state: BrowserBatchReceiptState,
+        terminal_reason_digest: Option<String>,
+    ) -> Result<Self, BrowserError> {
+        let completed_action_count =
+            u32::try_from(acknowledged_results.len()).map_err(|_| BrowserError::CounterOverflow)?;
+        let batch_digest = batch.digest()?;
+        let result_digest = digest_json(&acknowledged_results)?;
+        let cursor_digest = Self::cursor_digest_for_scope(BrowserBatchCursorDigestMaterial {
+            batch_id: batch.id.as_str(),
+            workspace_id: batch.workspace_id.as_str(),
+            batch_digest: &batch_digest,
+            plan_digest: &batch.plan_digest,
+            completed_action_count,
+            result_digest: &result_digest,
+            last_observation_digest: last_observation_digest.as_deref(),
+            external_write_may_have_occurred,
+            state,
+            terminal_reason_digest: terminal_reason_digest.as_deref(),
+        })?;
+        let receipt = Self {
+            schema_version: BATCH_RECEIPT_SCHEMA_VERSION,
+            batch_id: batch.id.clone(),
+            tenant_id: batch.tenant_id.clone(),
+            project_id: batch.project_id.clone(),
+            mission_id: batch.mission_id.clone(),
+            workspace_id: batch.workspace_id.clone(),
+            batch_digest,
+            plan_digest: batch.plan_digest.clone(),
+            completed_action_count,
+            acknowledged_results,
+            result_digest,
+            last_observation_digest,
+            external_write_may_have_occurred,
+            state,
+            terminal_reason_digest,
+            cursor_digest,
+        };
+        receipt.validate_for(batch)?;
+        Ok(receipt)
+    }
+
+    pub fn validate_for(&self, batch: &BrowserActionBatch) -> Result<(), BrowserError> {
+        batch.validate_structure()?;
+        self.validate_scope()?;
+        if self.batch_id != batch.id
+            || self.tenant_id != batch.tenant_id
+            || self.project_id != batch.project_id
+            || self.mission_id != batch.mission_id
+            || self.workspace_id != batch.workspace_id
+            || self.batch_digest != batch.digest()?
+            || self.plan_digest != batch.plan_digest
+            || usize::try_from(self.completed_action_count).ok()
+                != Some(self.acknowledged_results.len())
+            || self.acknowledged_results.len() > batch.actions.len()
+            || self.result_digest != digest_json(&self.acknowledged_results)?
+        {
+            return Err(BrowserError::InvalidBatchReceipt);
+        }
+
+        let mut external_write_may_have_occurred = false;
+        for (index, result) in self.acknowledged_results.iter().enumerate() {
+            let action = batch
+                .actions
+                .get(index)
+                .ok_or(BrowserError::InvalidBatchReceipt)?;
+            external_write_may_have_occurred |= action.dispatches_external_input();
+            result.validate_for(batch, action, external_write_may_have_occurred)?;
+        }
+        let permits_unacknowledged_external_input = self.state == BrowserBatchReceiptState::Failed;
+        if (!permits_unacknowledged_external_input
+            && self.external_write_may_have_occurred != external_write_may_have_occurred)
+            || (permits_unacknowledged_external_input
+                && external_write_may_have_occurred
+                && !self.external_write_may_have_occurred)
+        {
+            return Err(BrowserError::InvalidBatchReceipt);
+        }
+
+        let cursor_digest = Self::cursor_digest_for_scope(BrowserBatchCursorDigestMaterial {
+            batch_id: batch.id.as_str(),
+            workspace_id: batch.workspace_id.as_str(),
+            batch_digest: &self.batch_digest,
+            plan_digest: &batch.plan_digest,
+            completed_action_count: self.completed_action_count,
+            result_digest: &self.result_digest,
+            last_observation_digest: self.last_observation_digest.as_deref(),
+            external_write_may_have_occurred: self.external_write_may_have_occurred,
+            state: self.state,
+            terminal_reason_digest: self.terminal_reason_digest.as_deref(),
+        })?;
+        if self.cursor_digest != cursor_digest
+            || matches!(
+                self.state,
+                BrowserBatchReceiptState::Active | BrowserBatchReceiptState::Completed
+            ) != self.terminal_reason_digest.is_none()
+            || self.state == BrowserBatchReceiptState::Completed
+                && self.acknowledged_results.len() != batch.actions.len()
+            || !self.acknowledged_results.is_empty() && self.last_observation_digest.is_none()
+        {
+            return Err(BrowserError::InvalidBatchReceipt);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_scope(&self) -> Result<(), BrowserError> {
+        if self.schema_version != BATCH_RECEIPT_SCHEMA_VERSION
+            || !is_bounded_identifier(self.batch_id.as_str())
+            || !is_bounded_identifier(self.tenant_id.as_str())
+            || !is_bounded_identifier(self.project_id.as_str())
+            || !is_bounded_identifier(self.mission_id.as_str())
+            || !is_bounded_identifier(self.workspace_id.as_str())
+            || !is_sha256(&self.batch_digest)
+            || !is_sha256(&self.plan_digest)
+            || self.acknowledged_results.len() > MAX_BATCH_ACTIONS
+            || usize::try_from(self.completed_action_count).ok()
+                != Some(self.acknowledged_results.len())
+            || self
+                .last_observation_digest
+                .as_deref()
+                .is_some_and(|value| !is_sha256(value))
+            || self
+                .terminal_reason_digest
+                .as_deref()
+                .is_some_and(|value| !is_sha256(value))
+            || !is_sha256(&self.result_digest)
+            || !is_sha256(&self.cursor_digest)
+        {
+            return Err(BrowserError::InvalidBatchReceipt);
+        }
+        for (index, result) in self.acknowledged_results.iter().enumerate() {
+            let expected_sequence = u32::try_from(index)
+                .map_err(|_| BrowserError::CounterOverflow)?
+                .checked_add(1)
+                .ok_or(BrowserError::CounterOverflow)?;
+            if result.batch_id != self.batch_id || result.action_sequence != expected_sequence {
+                return Err(BrowserError::InvalidBatchReceipt);
+            }
+            result.digest()?;
+        }
+        let expected_result_digest = digest_json(&self.acknowledged_results)?;
+        let expected_cursor_digest =
+            Self::cursor_digest_for_scope(BrowserBatchCursorDigestMaterial {
+                batch_id: self.batch_id.as_str(),
+                workspace_id: self.workspace_id.as_str(),
+                batch_digest: &self.batch_digest,
+                plan_digest: &self.plan_digest,
+                completed_action_count: self.completed_action_count,
+                result_digest: &expected_result_digest,
+                last_observation_digest: self.last_observation_digest.as_deref(),
+                external_write_may_have_occurred: self.external_write_may_have_occurred,
+                state: self.state,
+                terminal_reason_digest: self.terminal_reason_digest.as_deref(),
+            })?;
+        if self.result_digest != expected_result_digest
+            || self.cursor_digest != expected_cursor_digest
+            || matches!(
+                self.state,
+                BrowserBatchReceiptState::Active | BrowserBatchReceiptState::Completed
+            ) != self.terminal_reason_digest.is_none()
+        {
+            return Err(BrowserError::InvalidBatchReceipt);
+        }
+        Ok(())
+    }
+
+    pub fn is_resumable(&self) -> bool {
+        self.state == BrowserBatchReceiptState::Active
+    }
+
+    pub fn is_valid_successor_of(
+        &self,
+        previous: &Self,
+        batch: &BrowserActionBatch,
+    ) -> Result<bool, BrowserError> {
+        self.validate_for(batch)?;
+        previous.validate_for(batch)?;
+        self.follows_acknowledgement(previous)
+    }
+
+    pub(crate) fn follows_acknowledgement(&self, previous: &Self) -> Result<bool, BrowserError> {
+        self.validate_scope()?;
+        previous.validate_scope()?;
+        if previous.state.is_terminal()
+            || self.batch_id != previous.batch_id
+            || self.tenant_id != previous.tenant_id
+            || self.project_id != previous.project_id
+            || self.mission_id != previous.mission_id
+            || self.workspace_id != previous.workspace_id
+            || self.batch_digest != previous.batch_digest
+            || self.plan_digest != previous.plan_digest
+            || !self
+                .acknowledged_results
+                .starts_with(&previous.acknowledged_results)
+        {
+            return Ok(false);
+        }
+        let advanced = self.completed_action_count > previous.completed_action_count;
+        let terminalized_same_prefix = self.state.is_terminal()
+            && self.completed_action_count == previous.completed_action_count;
+        Ok(advanced || terminalized_same_prefix)
+    }
+
+    pub fn digest(&self) -> Result<String, BrowserError> {
+        self.validate_scope()?;
+        digest_json(self)
+    }
+
+    fn cursor_digest_for_scope(
+        material: BrowserBatchCursorDigestMaterial<'_>,
+    ) -> Result<String, BrowserError> {
+        digest_json(&(
+            BATCH_RECEIPT_SCHEMA_VERSION,
+            "hartevo-browser-batch-cursor/v1",
+            material,
+        ))
+    }
+}
+
+impl fmt::Debug for BrowserBatchReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrowserBatchReceipt")
+            .field("schema_version", &self.schema_version)
+            .field("batch_id", &self.batch_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("batch_digest", &self.batch_digest)
+            .field("plan_digest", &self.plan_digest)
+            .field("completed_action_count", &self.completed_action_count)
+            .field("result_digest", &self.result_digest)
+            .field(
+                "has_last_observation",
+                &self.last_observation_digest.is_some(),
+            )
+            .field(
+                "external_write_may_have_occurred",
+                &self.external_write_may_have_occurred,
+            )
+            .field("state", &self.state)
+            .field(
+                "has_terminal_reason",
+                &self.terminal_reason_digest.is_some(),
+            )
+            .field("cursor_digest", &self.cursor_digest)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserActionBatch {
@@ -701,8 +1049,32 @@ impl BrowserActionBatch {
         workspace: &BrowserWorkspace,
         now: DateTime<Utc>,
     ) -> Result<(), BrowserError> {
+        self.validate_structure()?;
         profile.validate()?;
         workspace.validate_agent_lease(&self.lease, now)?;
+        if self.tenant_id != profile.tenant_id
+            || self.tenant_id != workspace.tenant_id
+            || self.project_id != profile.project_id
+            || self.project_id != workspace.project_id
+            || self.mission_id != workspace.mission_id
+            || self.workspace_id != workspace.id
+            || workspace.profile_id != profile.id
+            || profile.status != crate::BrowserProfileStatus::Active
+            || self.expected_identity_digest != profile.identity.identity_digest
+            || self.expected_identity_digest != workspace.expected_identity_digest
+            || self.created_at > now
+            || self.expires_at <= now
+            || self
+                .actions
+                .iter()
+                .any(|action| !workspace.tabs.contains(&action.tab_id))
+        {
+            return Err(BrowserError::InvalidBatch);
+        }
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> Result<(), BrowserError> {
         let plan_digest = match self.recipe_binding_digest.as_deref() {
             Some(recipe_digest) => Self::recipe_plan_digest(&self.actions, recipe_digest)?,
             None => Self::plan_digest(&self.actions)?,
@@ -723,25 +1095,18 @@ impl BrowserActionBatch {
         };
         if self.schema_version != ACTION_SCHEMA_VERSION
             || !is_bounded_identifier(self.id.as_str())
-            || self.tenant_id != profile.tenant_id
-            || self.tenant_id != workspace.tenant_id
-            || self.project_id != profile.project_id
-            || self.project_id != workspace.project_id
-            || self.mission_id != workspace.mission_id
-            || self.workspace_id != workspace.id
-            || workspace.profile_id != profile.id
-            || profile.status != crate::BrowserProfileStatus::Active
-            || self.expected_identity_digest != profile.identity.identity_digest
-            || self.expected_identity_digest != workspace.expected_identity_digest
+            || !is_bounded_identifier(self.tenant_id.as_str())
+            || !is_bounded_identifier(self.project_id.as_str())
+            || !is_bounded_identifier(self.mission_id.as_str())
+            || !is_bounded_identifier(self.workspace_id.as_str())
+            || self.lease.workspace_id != self.workspace_id
+            || !is_bounded_identifier(self.lease.lease_id.as_str())
+            || self.lease.generation == 0
+            || !is_sha256(&self.expected_identity_digest)
             || !is_sha256(&self.policy_digest)
             || self.plan_digest != plan_digest
-            || self.created_at > now
-            || self.expires_at <= now
+            || self.expires_at <= self.created_at
             || self.expires_at - self.created_at > MAX_BATCH_LIFETIME
-            || self
-                .actions
-                .iter()
-                .any(|action| !workspace.tabs.contains(&action.tab_id))
             || !effect_shape
         {
             return Err(BrowserError::InvalidBatch);
@@ -768,9 +1133,7 @@ impl BrowserActionBatch {
     }
 
     pub fn digest(&self) -> Result<String, BrowserError> {
-        if self.schema_version != ACTION_SCHEMA_VERSION {
-            return Err(BrowserError::InvalidBatch);
-        }
+        self.validate_structure()?;
         digest_json(self)
     }
 

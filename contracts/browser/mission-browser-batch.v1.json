@@ -1,0 +1,69 @@
+{
+  "schemaVersion": "hartevo-browser-mission-batch/v1",
+  "contractVersion": "mission-browser-batch-d01/v1",
+  "serviceId": "hartevo.browser-workspace.mission-batch",
+  "provider": "managed_chromium_adapter_lease",
+  "consumer": "mission_execution_result",
+  "maxActions": 64,
+  "maxSessionBatchClaims": 1024,
+  "claimPolicy": {
+    "claimAfterCompleteValidation": true,
+    "duplicateBatchId": "reject_without_plan_disclosure",
+    "capacity": "fail_closed",
+    "eviction": "forbidden"
+  },
+  "scope": [
+    "tenant_id",
+    "project_id",
+    "mission_id",
+    "profile_id",
+    "workspace_id",
+    "lease_id",
+    "lease_generation",
+    "expected_identity_digest",
+    "policy_digest",
+    "tab_id",
+    "frame_id_digest",
+    "loader_id_digest",
+    "url_digest",
+    "origin_digest",
+    "document_generation",
+    "profile_revision",
+    "workspace_revision"
+  ],
+  "cursor": {
+    "receipt": "content_free_serializable_prefix",
+    "requiresPlanDigest": true,
+    "requiresScopeDigest": true,
+    "requiresResultPrefixDigest": true,
+    "perStepObservationAndHostReceiptDigests": true,
+    "lastAcknowledgedInputIsNotReplayed": true,
+    "uncertainActionIsNotCompleted": true,
+    "uncertainActionDigestIsReconciliationOnly": true
+  },
+  "resume": {
+    "crashOrRestart": "explicit_resume_only",
+    "takeoverRequiresSamePlanCursorAndResultDigests": true,
+    "newLeaseMayResumeOnlyAfterTakeover": true,
+    "uncertainExternalInteraction": "requires_reconciliation_and_replay_forbidden",
+    "automaticReplay": false,
+    "crossProcessDurableReplayAuthority": "not_claimed"
+  },
+  "terminalStates": [
+    "completed",
+    "cancelled",
+    "takeover",
+    "revoked",
+    "timed_out",
+    "failed",
+    "uncertain",
+    "unmounted"
+  ],
+  "effectBoundary": {
+    "readOnlyObservation": "managed_host_only",
+    "externalInteraction": "typed_action_must_be_effect_bound",
+    "businessCompletion": "not_claimed",
+    "realChromiumEvidence": "separate_runtime_gate",
+    "fakeHostEvidence": "contract_only"
+  }
+}

@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/mux-media-result/mux-media-result.v1.json",
+  "title": "Hartevo Mux media-delivery result Layer-1 contract",
+  "description": "A bounded, read-only Mux Video metadata seam for governed media-delivery result proposals. It is not a native connector, media downloader, playback authority, viewer analytics source, publication authority, or kernel Outcome authority.",
+  "schemaVersion": "hartevo.mux-media-result.contract/v1",
+  "contractVersion": "mux-media-result/v1",
+  "pluginVersion": "0.1.0",
+  "layer": "Layer-1",
+  "serviceId": "mux.media.result",
+  "providerId": "mux.video.metadata",
+  "consumerId": "mission.mux-media.result",
+  "providerRevision": "mux-video-api-v1-read-r1",
+  "operations": [
+    "describe_capabilities",
+    "register",
+    "revoke_registration",
+    "compile_media_result_proposal",
+    "read_asset_metadata",
+    "read_playback_association",
+    "project_track_metadata",
+    "project_delivery_readiness",
+    "record_redacted_receipt",
+    "consume_media_result"
+  ],
+  "scope": [
+    "mux_environment_and_revision",
+    "mux_api_host",
+    "opaque_secret_reference_and_revision",
+    "asset_id_and_revision",
+    "playback_id_and_revision",
+    "playback_policy_and_revision",
+    "track_id_and_revision",
+    "static_rendition_scope_and_revision",
+    "encoding_scope_and_revision",
+    "project_id_and_revision",
+    "mission_id_and_revision",
+    "work_product_id_and_revision",
+    "consent_id_and_revision"
+  ],
+  "digests": [
+    "plugin_version_digest",
+    "contract_digest",
+    "provider_digest",
+    "scope_digest",
+    "registration_digest",
+    "asset_digest",
+    "playback_digest",
+    "track_digest",
+    "encoding_digest",
+    "proposal_digest",
+    "request_digest",
+    "response_digest",
+    "receipt_digest",
+    "evidence_digest",
+    "observation_digest"
+  ],
+  "allowlistedGetSeams": [
+    {
+      "name": "asset_list_metadata",
+      "method": "GET",
+      "path": "/video/v1/assets",
+      "projection": "bounded_page_cursor_exact_asset_match_only"
+    },
+    {
+      "name": "asset_metadata",
+      "method": "GET",
+      "path": "/video/v1/assets/{ASSET_ID}",
+      "projection": "bounded_asset_status_tracks_playback_policies_encoding_dimensions_duration_timestamp"
+    },
+    {
+      "name": "playback_association",
+      "method": "GET",
+      "path": "/video/v1/playback-ids/{PLAYBACK_ID}",
+      "projection": "bounded_playback_policy_and_asset_association"
+    },
+    {
+      "name": "track_metadata_projection",
+      "method": "GET",
+      "path": "/video/v1/assets/{ASSET_ID}",
+      "projection": "asset_track_metadata_only_no_track_bytes_or_caption_bytes"
+    },
+    {
+      "name": "delivery_readiness_projection",
+      "method": "GET",
+      "path": "/video/v1/assets/{ASSET_ID}",
+      "projection": "metadata_readiness_only_never_playback_success"
+    }
+  ],
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxTracks": 64,
+    "maxPlaybackIds": 32,
+    "maxPages": 4,
+    "maxCursorBytes": 256,
+    "maxRetryAttempts": 3,
+    "maxBackoffSeconds": 30
+  },
+  "redaction": {
+    "requestReceipts": "method_seam_path_digest_scope_digest_only",
+    "resultReceipts": "status_size_response_digest_provider_revision_only",
+    "removed": [
+      "mux_token_id",
+      "mux_token_secret",
+      "signing_key",
+      "signed_url",
+      "playback_token",
+      "source_url",
+      "media_bytes",
+      "thumbnail_bytes",
+      "manifest_bytes",
+      "caption_bytes",
+      "viewer_identifier",
+      "raw_provider_payload"
+    ]
+  },
+  "registration": {
+    "boundFields": [
+      "pluginVersion",
+      "pluginVersionDigest",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "scopeDigest",
+      "environmentDigest",
+      "assetDigest",
+      "playbackDigest",
+      "trackDigest",
+      "encodingDigest",
+      "projectDigest",
+      "missionDigest",
+      "workProductDigest",
+      "consentDigest",
+      "secretReferenceDigest"
+    ],
+    "versionAndScopeBound": true,
+    "contractBound": true,
+    "providerBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "version_drift",
+      "contract_drift",
+      "provider_drift",
+      "environment_drift",
+      "asset_revision_drift",
+      "playback_revision_drift",
+      "track_revision_drift",
+      "encoding_revision_drift",
+      "project_mission_work_product_consent_drift",
+      "registration_tamper",
+      "registration_revocation",
+      "duplicate_evidence",
+      "scope_drift"
+    ]
+  },
+  "authority": {
+    "connected": false,
+    "native": false,
+    "externalWrites": false,
+    "assetMutation": false,
+    "playbackMutation": false,
+    "staticRenditionGeneration": false,
+    "signedTokenGeneration": false,
+    "mediaDownload": false,
+    "webhooks": false,
+    "viewerAnalytics": false,
+    "durableNativeReceipt": false,
+    "independentReadBack": false,
+    "kernelOutcomeAdoption": false,
+    "publicationAuthority": false
+  },
+  "evidenceModes": [
+    "recording",
+    "fixture",
+    "loopback",
+    "BLOCKED_ENV"
+  ],
+  "forbidden": [
+    "asset_create",
+    "asset_upload",
+    "asset_update",
+    "asset_delete",
+    "playback_id_create",
+    "playback_id_update",
+    "playback_id_delete",
+    "playback_policy_mutation",
+    "static_rendition_generation",
+    "signed_url_generation",
+    "jwt_generation",
+    "hls_manifest_read",
+    "media_or_rendition_download",
+    "caption_or_transcript_download",
+    "webhook_registration",
+    "viewer_analytics",
+    "raw_media_or_thumbnail_retention",
+    "viewer_pii_retention",
+    "native_connected_claim",
+    "kernel_receipt_authority",
+    "outcome_authority",
+    "work_product_adoption"
+  ],
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "connected": false,
+    "deferredTo": "layer_2_native_mux_credentials_https_readback_and_adoption",
+    "failClosedCases": [
+      "missing_host_native_secret_resolution",
+      "missing_native_https_transport",
+      "missing_independent_byte_or_playback_readback",
+      "missing_durable_provider_receipt",
+      "asset_or_playback_mutation_request",
+      "signed_token_or_url_request",
+      "media_manifest_or_bytes_request",
+      "viewer_analytics_request",
+      "scope_or_revision_drift"
+    ]
+  },
+  "honestNativeGap": "Layer 1 records, replays, and projects bounded metadata only. Native Mux credentials, live HTTPS execution, provider receipt durability, independent byte/readback verification, and verified Work Product or kernel Outcome adoption remain explicit Layer-2 gaps; BLOCKED_ENV is never Connected.",
+  "primaryApiBasis": [
+    "https://www.mux.com/docs/api-reference/video/assets/get-asset",
+    "https://www.mux.com/docs/api-reference/video/assets/list-assets",
+    "https://www.mux.com/docs/api-reference/video/playback-id/get-asset-or-livestream-id",
+    "https://www.mux.com/docs/guides/secure-video-playback"
+  ]
+}
