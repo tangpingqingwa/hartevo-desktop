@@ -7,8 +7,9 @@
 //! authority.
 
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
+    sync::{Mutex, OnceLock},
 };
 
 use jsonschema::Validator;
@@ -163,6 +164,8 @@ pub enum FeatureReleaseError {
     SecretReferenceTampered,
     #[error("secret reference revocation tombstone was rolled back or raced")]
     SecretReferenceRevocationRollback,
+    #[error("secret reference revocation ledger is unavailable")]
+    SecretReferenceRevocationLedgerUnavailable,
     #[error("least-privilege permission snapshot is invalid or drifted")]
     PermissionDrift,
     #[error("feature-release registration is revoked")]
@@ -276,7 +279,7 @@ fn valid_base_url(value: &str) -> bool {
 
 /// Semantic version of the plugin contribution.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginVersion {
     pub major: u16,
     pub minor: u16,
@@ -570,6 +573,62 @@ pub struct SecretReference {
     metadata_digest: Digest,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SecretRevocationKey {
+    scope_digest: Digest,
+    reference_id: String,
+    credential_revision: u64,
+}
+
+static SECRET_REVOCATION_LEDGER: OnceLock<Mutex<BTreeMap<SecretRevocationKey, u64>>> =
+    OnceLock::new();
+
+fn secret_revocation_ledger() -> &'static Mutex<BTreeMap<SecretRevocationKey, u64>> {
+    SECRET_REVOCATION_LEDGER.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn secret_revocation_key(reference: &SecretReference) -> SecretRevocationKey {
+    SecretRevocationKey {
+        scope_digest: reference.scope_digest.clone(),
+        reference_id: reference.reference_id.clone(),
+        credential_revision: reference.credential_revision,
+    }
+}
+
+fn shared_secret_revocation(
+    reference: &SecretReference,
+) -> Result<Option<u64>, FeatureReleaseError> {
+    secret_revocation_ledger()
+        .lock()
+        .map_err(|_| FeatureReleaseError::SecretReferenceRevocationLedgerUnavailable)
+        .map(|ledger| ledger.get(&secret_revocation_key(reference)).copied())
+}
+
+fn record_shared_secret_revocation(reference: &SecretReference) -> Result<(), FeatureReleaseError> {
+    let revision = reference.revocation_revision;
+    let mut ledger = secret_revocation_ledger()
+        .lock()
+        .map_err(|_| FeatureReleaseError::SecretReferenceRevocationLedgerUnavailable)?;
+    let key = secret_revocation_key(reference);
+    match ledger.get_mut(&key) {
+        None => {
+            ledger.insert(key, revision);
+            Ok(())
+        }
+        Some(current) if revision == *current => Ok(()),
+        Some(current) => {
+            let expected = current
+                .checked_add(1)
+                .ok_or(FeatureReleaseError::SecretReferenceRevocationRollback)?;
+            if revision != expected {
+                return Err(FeatureReleaseError::SecretReferenceRevocationRollback);
+            }
+            *current = revision;
+            Ok(())
+        }
+    }
+}
+
 impl SecretReference {
     pub fn new(
         reference_id: impl Into<String>,
@@ -657,15 +716,23 @@ impl SecretReference {
 
     pub fn revoke(&mut self) -> Result<(), FeatureReleaseError> {
         if self.revoked {
+            record_shared_secret_revocation(self)?;
             return Ok(());
         }
-        self.revocation_revision = self
+        if shared_secret_revocation(self)?.is_some() {
+            return Err(FeatureReleaseError::SecretReferenceRevoked);
+        }
+        let mut revoked = self.clone();
+        revoked.revocation_revision = revoked
             .revocation_revision
             .checked_add(1)
             .ok_or(FeatureReleaseError::SecretReferenceRevocationRollback)?;
-        self.revoked = true;
-        self.metadata_digest = self.calculate_metadata_digest();
-        self.validate()
+        revoked.revoked = true;
+        revoked.metadata_digest = revoked.calculate_metadata_digest();
+        revoked.validate()?;
+        record_shared_secret_revocation(&revoked)?;
+        *self = revoked;
+        Ok(())
     }
 }
 
@@ -1103,6 +1170,12 @@ impl ApprovalEvidence {
         {
             return Err(FeatureReleaseError::ScopeMismatch);
         }
+        if self.flag_version != scope.flag_version {
+            return Err(FeatureReleaseError::VersionDrift {
+                expected: scope.flag_version,
+                actual: self.flag_version,
+            });
+        }
         Ok(())
     }
 }
@@ -1281,6 +1354,20 @@ impl AuditEvidence {
         scope: &FeatureReleaseScope,
     ) -> Result<(), FeatureReleaseError> {
         self.validate()?;
+        self.validate_identity_for_scope(scope)?;
+        if self.flag_version != scope.flag_version {
+            return Err(FeatureReleaseError::VersionDrift {
+                expected: scope.flag_version,
+                actual: self.flag_version,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_identity_for_scope(
+        &self,
+        scope: &FeatureReleaseScope,
+    ) -> Result<(), FeatureReleaseError> {
         if self.provider_id != PROVIDER_ID
             || self.account_id != scope.account_id
             || self.base_url != scope.base_url
@@ -1291,6 +1378,18 @@ impl AuditEvidence {
             || self.scope_digest != scope.scope_digest()
         {
             return Err(FeatureReleaseError::ScopeMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_readback_for_scope(
+        &self,
+        scope: &FeatureReleaseScope,
+    ) -> Result<(), FeatureReleaseError> {
+        self.validate()?;
+        self.validate_identity_for_scope(scope)?;
+        if self.flag_version <= scope.flag_version {
+            return Err(FeatureReleaseError::ReadBackVersionNotNewer);
         }
         Ok(())
     }
@@ -1982,6 +2081,7 @@ pub struct FeatureReleaseResultProposal {
     pub request_digest: Digest,
     pub scope_digest: Digest,
     pub registration_digest: Digest,
+    pub read_evidence_digest: Digest,
     pub provider_fence: Option<FeatureReleaseProviderFence>,
     pub mission_id: String,
     pub project_id: String,
@@ -2008,6 +2108,7 @@ impl FeatureReleaseResultProposal {
     fn new(
         request: &FeatureReleaseProposalRequest,
         registration_digest: &Digest,
+        read_evidence_digest: Digest,
         flag: FlagSnapshot,
         dry_run_evidence: DryRunEvidence,
         approval_status: Option<ApprovalStatus>,
@@ -2028,6 +2129,7 @@ impl FeatureReleaseResultProposal {
             request_digest: request.request_digest.clone(),
             scope_digest: request.scope_digest.clone(),
             registration_digest: registration_digest.clone(),
+            read_evidence_digest,
             provider_fence: Some(provider_fence),
             mission_id: request.mission_id.clone(),
             project_id: request.project_id.clone(),
@@ -2094,6 +2196,7 @@ impl FeatureReleaseResultProposal {
             request_digest: request.request_digest.clone(),
             scope_digest: request.scope_digest.clone(),
             registration_digest: registration_digest.clone(),
+            read_evidence_digest: Digest::from_text("unavailable"),
             provider_fence: None,
             mission_id: request.mission_id.clone(),
             project_id: request.project_id.clone(),
@@ -2136,6 +2239,9 @@ impl FeatureReleaseResultProposal {
     fn validate_digest(&self) -> Result<(), FeatureReleaseError> {
         self.claims.validate()?;
         self.patch.validate_digest()?;
+        if !valid_digest(&self.read_evidence_digest) {
+            return Err(FeatureReleaseError::InvalidDigest);
+        }
         if let Some(fence) = &self.provider_fence
             && (fence.provider_id != PROVIDER_ID
                 || fence.flag_version == 0
@@ -2183,6 +2289,9 @@ impl FeatureReleaseResultProposal {
         self.validate_digest()?;
         if self.registration_digest != *registration_digest {
             return Err(FeatureReleaseError::RegistrationFenceMismatch);
+        }
+        if !valid_digest(&self.read_evidence_digest) {
+            return Err(FeatureReleaseError::InvalidDigest);
         }
         let request = FeatureReleaseProposalRequest {
             scope_digest: self.scope_digest.clone(),
@@ -2254,7 +2363,12 @@ impl FeatureReleaseResultProposal {
             return Err(FeatureReleaseError::ApprovalNotApproved);
         }
         let expected_audit_status = audit_status_from_kinds(&self.audit_fence.entry_kinds);
-        if expected_audit_status.is_some_and(|status| status != self.status) {
+        if expected_audit_status.is_some_and(|status| status != self.status)
+            || (matches!(
+                self.status,
+                ReleaseStatus::Applied | ReleaseStatus::Failed | ReleaseStatus::Scheduled
+            ) && expected_audit_status != Some(self.status))
+        {
             return Err(FeatureReleaseError::ProposalSemanticMismatch);
         }
         if self.status == ReleaseStatus::Approved
@@ -2278,6 +2392,7 @@ fn proposal_semantic_without_digest(proposal: &FeatureReleaseResultProposal) -> 
         "requestDigest": &proposal.request_digest,
         "scopeDigest": &proposal.scope_digest,
         "registrationDigest": &proposal.registration_digest,
+        "readEvidenceDigest": &proposal.read_evidence_digest,
         "providerFence": &proposal.provider_fence,
         "missionId": &proposal.mission_id,
         "projectId": &proposal.project_id,
@@ -2318,6 +2433,7 @@ fn proposal_without_digest(proposal: &FeatureReleaseResultProposal) -> serde_jso
         "requestDigest": &proposal.request_digest,
         "scopeDigest": &proposal.scope_digest,
         "registrationDigest": &proposal.registration_digest,
+        "readEvidenceDigest": &proposal.read_evidence_digest,
         "providerFence": &proposal.provider_fence,
         "missionId": &proposal.mission_id,
         "projectId": &proposal.project_id,
@@ -2374,7 +2490,7 @@ impl ReleaseReadBack {
             return Err(FeatureReleaseError::AuditMissing);
         }
         for audit in &audit_entries {
-            audit.validate_for_scope(scope)?;
+            audit.validate_readback_for_scope(scope)?;
         }
         ensure_unique_audits(&audit_entries)?;
         let provider_fence = FeatureReleaseProviderFence::from_flag(
@@ -2424,7 +2540,7 @@ impl ReleaseReadBack {
             Some(self.flag.flag_version),
         )?;
         for audit in &self.audit_entries {
-            audit.validate_for_scope(scope)?;
+            audit.validate_readback_for_scope(scope)?;
         }
         ensure_unique_audits(&self.audit_entries)
     }
@@ -2710,6 +2826,7 @@ impl FeatureReleaseContractPayload {
             return Err(FeatureReleaseError::RegistrationFenceMismatch);
         }
         ensure_complete_provenance(evidence.provenance)?;
+        evidence.validate_fence(scope, &registration.registration_digest)?;
         let flag = evidence
             .flag
             .clone()
@@ -2882,7 +2999,7 @@ impl FeatureReleaseRegistration {
     ) -> Result<Self, FeatureReleaseError> {
         scope.validate()?;
         secret_reference.validate()?;
-        if secret_reference.is_revoked() {
+        if secret_reference.is_revoked() || shared_secret_revocation(secret_reference)?.is_some() {
             return Err(FeatureReleaseError::SecretReferenceRevoked);
         }
         if secret_reference.scope_digest() != &scope.scope_digest() {
@@ -2982,7 +3099,10 @@ impl FeatureReleaseRegistration {
         secret_reference: &SecretReference,
     ) -> Result<(), FeatureReleaseError> {
         secret_reference.validate()?;
-        if self.secret_revocation_revision > 0 || secret_reference.is_revoked() {
+        if self.secret_revocation_revision > 0
+            || secret_reference.is_revoked()
+            || shared_secret_revocation(secret_reference)?.is_some()
+        {
             return Err(FeatureReleaseError::SecretReferenceRevoked);
         }
         self.receipt.validate_digest()?;
@@ -3038,6 +3158,7 @@ impl FeatureReleaseRegistration {
         if secret_reference.revocation_revision() != next_revision {
             return Err(FeatureReleaseError::SecretReferenceRevocationRollback);
         }
+        record_shared_secret_revocation(secret_reference)?;
         self.secret_revocation_revision = secret_reference.revocation_revision();
         self.secret_reference_digest = secret_reference.reference_digest();
         self.registration_revision =
@@ -3081,6 +3202,7 @@ impl FeatureReleaseRegistration {
         if self.secret_revocation_revision > 0
             || secret_reference.is_revoked()
             || secret_reference.revocation_revision() > 0
+            || shared_secret_revocation(secret_reference)?.is_some()
         {
             return Err(FeatureReleaseError::SecretReferenceRevoked);
         }
@@ -3639,6 +3761,7 @@ impl<T: LaunchDarklyReleaseTransport> LaunchDarklyReleaseProvider<T> {
         let proposal = FeatureReleaseResultProposal::new(
             request,
             &self.registration.receipt().registration_digest,
+            evidence.evidence_digest.clone(),
             flag,
             dry_run_evidence.clone(),
             approval_status,
@@ -3945,6 +4068,8 @@ pub struct MissionFeatureReleaseConsumer {
     scope: FeatureReleaseScope,
     provider_fence: FeatureReleaseProviderFence,
     expected_request: Option<FeatureReleaseProposalRequest>,
+    expected_read_evidence_digest: Option<Digest>,
+    expected_audit_fence: Option<AuditFence>,
 }
 
 impl MissionFeatureReleaseConsumer {
@@ -3953,6 +4078,8 @@ impl MissionFeatureReleaseConsumer {
             scope: scope.clone(),
             provider_fence: FeatureReleaseProviderFence::for_scope(scope, registration_digest),
             expected_request: None,
+            expected_read_evidence_digest: None,
+            expected_audit_fence: None,
         }
     }
 
@@ -3966,6 +4093,25 @@ impl MissionFeatureReleaseConsumer {
             scope: scope.clone(),
             provider_fence: FeatureReleaseProviderFence::for_scope(scope, registration_digest),
             expected_request: Some(request),
+            expected_read_evidence_digest: None,
+            expected_audit_fence: None,
+        })
+    }
+
+    pub fn for_request_with_evidence(
+        scope: &FeatureReleaseScope,
+        registration_digest: Digest,
+        request: FeatureReleaseProposalRequest,
+        evidence: &ReleaseReadEvidence,
+    ) -> Result<Self, FeatureReleaseError> {
+        request.validate(scope)?;
+        evidence.validate_fence(scope, &registration_digest)?;
+        Ok(Self {
+            scope: scope.clone(),
+            provider_fence: FeatureReleaseProviderFence::for_scope(scope, registration_digest),
+            expected_request: Some(request),
+            expected_read_evidence_digest: Some(evidence.evidence_digest.clone()),
+            expected_audit_fence: Some(AuditFence::from_entries(&evidence.audit_entries)?),
         })
     }
 
@@ -3980,6 +4126,23 @@ impl MissionFeatureReleaseConsumer {
             self.expected_request.as_ref(),
             &self.provider_fence.registration_digest,
         )?;
+        if let (Some(expected_digest), Some(expected_audit_fence)) = (
+            &self.expected_read_evidence_digest,
+            &self.expected_audit_fence,
+        ) {
+            if proposal.read_evidence_digest != *expected_digest
+                || proposal.audit_fence != *expected_audit_fence
+            {
+                return Err(FeatureReleaseError::ProposalSemanticMismatch);
+            }
+        } else if proposal.audit_fence.entry_count != 0
+            || matches!(
+                proposal.status,
+                ReleaseStatus::Applied | ReleaseStatus::Failed | ReleaseStatus::Scheduled
+            )
+        {
+            return Err(FeatureReleaseError::ProposalSemanticMismatch);
+        }
         if proposal.mission_id != self.scope.mission_id
             || proposal.project_id != self.scope.project_id
             || proposal.work_product_id != self.scope.work_product_id
@@ -4014,6 +4177,7 @@ impl MissionFeatureReleaseConsumer {
             proposal_digest: proposal.proposal_digest.clone(),
             semantic_fence_digest: proposal.semantic_fence_digest.clone(),
             request_digest: proposal.request_digest.clone(),
+            read_evidence_digest: proposal.read_evidence_digest.clone(),
             provider_fence: provider_fence.clone(),
             mission_id: self.scope.mission_id.clone(),
             project_id: self.scope.project_id.clone(),
@@ -4061,6 +4225,7 @@ pub struct MissionFeatureReleaseProposal {
     pub proposal_digest: Digest,
     pub semantic_fence_digest: Digest,
     pub request_digest: Digest,
+    pub read_evidence_digest: Digest,
     pub provider_fence: FeatureReleaseProviderFence,
     pub mission_id: String,
     pub project_id: String,

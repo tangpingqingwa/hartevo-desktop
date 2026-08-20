@@ -92,7 +92,11 @@ fn patch(scope: &FeatureReleaseScope, base: &FlagSnapshot) -> SemanticPatch {
 }
 
 fn secret(scope: &FeatureReleaseScope) -> SecretReference {
-    SecretReference::for_scope("secret-ref-launchdarkly-read", scope, 1).expect("secret reference")
+    secret_with_id(scope, "secret-ref-launchdarkly-read")
+}
+
+fn secret_with_id(scope: &FeatureReleaseScope, reference_id: &str) -> SecretReference {
+    SecretReference::for_scope(reference_id, scope, 1).expect("secret reference")
 }
 
 fn reseal_proposal(proposal: &mut FeatureReleaseResultProposal) {
@@ -107,6 +111,39 @@ fn reseal_proposal(proposal: &mut FeatureReleaseResultProposal) {
         .expect("proposal object")
         .remove("proposalDigest");
     proposal.proposal_digest = Digest::from_serialized(&full);
+}
+
+fn reseal_read_evidence(evidence: &mut ReleaseReadEvidence) {
+    for approval in &mut evidence.approvals {
+        let mut value = to_value(&*approval).expect("approval json");
+        value
+            .as_object_mut()
+            .expect("approval object")
+            .remove("evidenceDigest");
+        approval.evidence_digest = Digest::from_serialized(&value);
+    }
+    for audit in &mut evidence.audit_entries {
+        let mut value = to_value(&*audit).expect("audit json");
+        value
+            .as_object_mut()
+            .expect("audit object")
+            .remove("evidenceDigest");
+        audit.evidence_digest = Digest::from_serialized(&value);
+    }
+    let without_digest = (
+        &evidence.availability,
+        &evidence.scope_digest,
+        &evidence.registration_digest,
+        &evidence.flag,
+        &evidence.approvals,
+        &evidence.audit_entries,
+        &evidence.audit_limit,
+        &evidence.provider_code_digest,
+        &evidence.provenance,
+        &evidence.retry_summary,
+        &evidence.claims,
+    );
+    evidence.evidence_digest = Digest::from_serialized(&without_digest);
 }
 
 #[test]
@@ -455,6 +492,189 @@ fn exact_provider_mission_and_audit_fences_reject_replay() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn approval_and_audit_versions_bind_complete_contract_and_mission() {
+    let scope = scope();
+    let before = flag(&scope, 42, "version-fence");
+    let wrong_approval = ApprovalEvidence::for_scope(
+        &scope,
+        "approval-wrong-version",
+        ApprovalStatus::Approved,
+        41,
+        scope.policy_revision,
+        b"decision",
+        1_100,
+    )
+    .expect("wrong-version approval remains structurally valid");
+    assert!(matches!(
+        wrong_approval.validate_for_scope(&scope),
+        Err(FeatureReleaseError::VersionDrift { .. })
+    ));
+    let wrong_audit = AuditEvidence::for_scope(
+        &scope,
+        "audit-wrong-version",
+        AuditEventKind::ChangeScheduled,
+        41,
+        b"actor",
+        b"description",
+        None,
+        None,
+        2_000,
+    )
+    .expect("wrong-version audit remains structurally valid");
+    assert!(matches!(
+        wrong_audit.validate_for_scope(&scope),
+        Err(FeatureReleaseError::VersionDrift { .. })
+    ));
+
+    let approval_provider = LaunchDarklyReleaseProvider::with_defaults(
+        RecordingTransport::new(before.clone(), vec![wrong_approval.clone()], Vec::new()),
+        scope.clone(),
+        secret_with_id(&scope, "secret-ref-approval-version-complete"),
+    )
+    .expect("approval-version provider");
+    let mut approval_service = FeatureReleaseService::new(approval_provider);
+    assert!(matches!(
+        approval_service.read_flag_evidence(),
+        Err(FeatureReleaseError::VersionDrift { .. })
+    ));
+
+    let audit_provider = LaunchDarklyReleaseProvider::with_defaults(
+        RecordingTransport::new(
+            before.clone(),
+            vec![approved(
+                &scope,
+                "approval-audit-version",
+                ApprovalStatus::Approved,
+            )],
+            vec![wrong_audit.clone()],
+        ),
+        scope.clone(),
+        secret_with_id(&scope, "secret-ref-audit-version-complete"),
+    )
+    .expect("audit-version provider");
+    let mut audit_service = FeatureReleaseService::new(audit_provider);
+    assert!(matches!(
+        audit_service.read_flag_evidence(),
+        Err(FeatureReleaseError::VersionDrift { .. })
+    ));
+
+    let exact_audit = audit(
+        &scope,
+        "audit-version-binding",
+        42,
+        AuditEventKind::ChangeScheduled,
+        None,
+    );
+    let provider = LaunchDarklyReleaseProvider::with_defaults(
+        RecordingTransport::new(
+            before.clone(),
+            vec![approved(
+                &scope,
+                "approval-version-binding",
+                ApprovalStatus::Approved,
+            )],
+            vec![exact_audit],
+        ),
+        scope.clone(),
+        secret_with_id(&scope, "secret-ref-version-contract"),
+    )
+    .expect("contract provider");
+    let mut service = FeatureReleaseService::new(provider);
+    let evidence = service.read_flag_evidence().expect("exact evidence");
+    let registration = service.provider().registration_receipt().clone();
+
+    let mut wrong_approval_evidence = evidence.clone();
+    wrong_approval_evidence.approvals[0].flag_version = 41;
+    reseal_read_evidence(&mut wrong_approval_evidence);
+    assert!(matches!(
+        FeatureReleaseContractPayload::from_evidence(
+            &scope,
+            &registration,
+            &wrong_approval_evidence,
+        ),
+        Err(FeatureReleaseError::VersionDrift { .. })
+    ));
+
+    let mut wrong_audit_evidence = evidence.clone();
+    wrong_audit_evidence.audit_entries[0].flag_version = 41;
+    reseal_read_evidence(&mut wrong_audit_evidence);
+    assert!(matches!(
+        FeatureReleaseContractPayload::from_evidence(&scope, &registration, &wrong_audit_evidence,),
+        Err(FeatureReleaseError::VersionDrift { .. })
+    ));
+
+    let patch = patch(&scope, &before);
+    let request = FeatureReleaseProposalRequest::for_scope(&scope, patch, false).expect("request");
+    let dry_run = DryRunEvidence::local_valid(&scope, &before, &request.patch).expect("dry run");
+    let proposal = service
+        .compile_release_proposal(&request, &evidence, &dry_run)
+        .expect("scheduled proposal");
+    let consumer = MissionFeatureReleaseConsumer::for_request_with_evidence(
+        &scope,
+        registration.registration_digest.clone(),
+        request.clone(),
+        &evidence,
+    )
+    .expect("evidence-bound mission consumer");
+    consumer.consume(&proposal).expect("trusted proposal");
+
+    let mut fabricated = proposal.clone();
+    fabricated.audit_fence.entry_kinds[0] = AuditEventKind::ChangeApplied;
+    fabricated.audit_fence.entry_digests[0] = digest("fabricated-audit");
+    fabricated.status = ReleaseStatus::Applied;
+    reseal_proposal(&mut fabricated);
+    assert_eq!(
+        consumer.consume(&fabricated),
+        Err(FeatureReleaseError::ProposalSemanticMismatch)
+    );
+    let unbound_consumer = MissionFeatureReleaseConsumer::for_request(
+        &scope,
+        registration.registration_digest,
+        request,
+    )
+    .expect("unbound consumer");
+    assert_eq!(
+        unbound_consumer.consume(&proposal),
+        Err(FeatureReleaseError::ProposalSemanticMismatch)
+    );
+}
+
+#[test]
+fn plugin_version_unknown_fields_fail_schema_and_serde() {
+    let scope = scope();
+    let provider = LaunchDarklyReleaseProvider::with_defaults(
+        RecordingTransport::new(
+            flag(&scope, 42, "plugin-version"),
+            vec![approved(
+                &scope,
+                "approval-plugin-version",
+                ApprovalStatus::Approved,
+            )],
+            Vec::new(),
+        ),
+        scope.clone(),
+        secret_with_id(&scope, "secret-ref-plugin-version"),
+    )
+    .expect("provider");
+    let mut service = FeatureReleaseService::new(provider);
+    let evidence = service.read_flag_evidence().expect("evidence");
+    let payload = FeatureReleaseContractPayload::from_evidence(
+        &scope,
+        service.provider().registration_receipt(),
+        &evidence,
+    )
+    .expect("payload");
+    let mut encoded = to_value(&payload).expect("payload json");
+    encoded["registration"]["pluginVersion"]["extra"] = json!(true);
+    assert_eq!(
+        validate_contract_json(&encoded),
+        Err(FeatureReleaseError::SchemaValidation)
+    );
+    assert!(serde_json::from_value::<FeatureReleaseContractPayload>(encoded).is_err());
+}
+
+#[test]
 fn mission_denies_recomputed_cross_semantic_proposal() {
     let scope = scope();
     let before = flag(&scope, 42, "before");
@@ -515,7 +735,7 @@ fn mission_denies_recomputed_cross_semantic_proposal() {
 fn secret_tamper_revoke_and_retry_bounds_fail_closed() {
     let scope = scope();
     let before = flag(&scope, 42, "before");
-    let original_secret = secret(&scope);
+    let original_secret = secret_with_id(&scope, "secret-ref-revocation-regression");
     let original_secret_json = to_value(&original_secret).expect("secret json");
     let mut tampered_secret = original_secret_json.clone();
     tampered_secret["metadataDigest"] = json!(digest("tampered").to_string());
@@ -549,6 +769,17 @@ fn secret_tamper_revoke_and_retry_bounds_fail_closed() {
     rolled_back
         .validate()
         .expect("old snapshot remains well formed");
+    assert!(matches!(
+        FeatureReleaseRegistration::new(
+            &scope,
+            &rolled_back,
+            PluginVersion::new(1, 0, 0),
+            DEFAULT_ADAPTER_REVISION,
+            DEFAULT_API_REVISION,
+            PermissionSnapshot::read_only(&scope),
+        ),
+        Err(FeatureReleaseError::SecretReferenceRevoked)
+    ));
     assert_eq!(
         registration.reregister(&scope, &rolled_back),
         Err(FeatureReleaseError::SecretReferenceRevoked)
@@ -557,7 +788,7 @@ fn secret_tamper_revoke_and_retry_bounds_fail_closed() {
     let mut provider = LaunchDarklyReleaseProvider::with_defaults(
         RecordingTransport::new(before, Vec::new(), Vec::new()),
         scope.clone(),
-        secret(&scope),
+        secret_with_id(&scope, "secret-ref-revocation-provider"),
     )
     .expect("provider");
     provider.revoke_secret_reference().expect("secret revoke");

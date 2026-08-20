@@ -8,6 +8,10 @@ plugin. It is deliberately limited to read, proposal, and recording seams:
 - redacted flag, approval, and bounded audit evidence;
 - canonical semantic-patch and dry-run validation digests;
 - approval, version, audit, registration, revocation, and `BLOCKED_ENV` fences;
+- Mission proposals bind the exact read-evidence digest and audit entry
+  IDs/digests/kinds; current approval and audit evidence must match the
+  registered flag version, while post-change read-back uses a separate newer
+  version fence;
 - a Mission-consumable release-result proposal with no Effect, Receipt,
   Verification, Truth, Consent, or Outcome authority.
 
@@ -18,8 +22,10 @@ never assert Connected, native, or first-party status.
 Recording and loopback evidence may be inspected or used to compile a
 non-adoptable proposal, but it cannot become `recordable` or Mission
 `adoptable` without an independently attested native canary. Secret revocation
-is persisted as a monotonic registration tombstone; an older deserialized
-`revoked=false` snapshot cannot re-register that identity.
+is persisted as a monotonic registration tombstone and process-shared
+revocation ledger keyed by exact scope, reference, and credential revision; an
+older deserialized `revoked=false` snapshot cannot create a fresh registration
+for that identity.
 
 ## Layer 2 native exit plan (not executed)
 
