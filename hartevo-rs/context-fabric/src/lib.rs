@@ -7,6 +7,7 @@
 
 mod mission_memory;
 mod model_tokenizer;
+pub mod worker_graph;
 
 pub use mission_memory::{
     DeterministicMissionMemoryProvider, MISSION_MEMORY_SCHEMA_VERSION,
