@@ -1,9 +1,11 @@
 //! First-party web publication provider seams.
 //!
-//! This crate owns the GitHub Pages read/proposal vertical slice.  It uses the
-//! existing Connector SDK for authentication, probe, read, scope, freshness,
-//! and prepare-only Effect fences.  It deliberately does not execute an
-//! external write, create a receipt, or claim independent verification.
+//! This crate owns the GitHub Pages read/proposal and approval-bound publication
+//! vertical slices. It uses the existing Connector SDK for authentication,
+//! probe, read, scope, freshness, Effect execution context, reconciliation,
+//! and verification. External writes require a Broker-created execution
+//! capsule and an exact Mission approval binding; a provider receipt is never
+//! treated as independent verification without a fresh public readback.
 
 #![deny(unsafe_code)]
 
@@ -28,17 +30,23 @@ pub use audit::{
 };
 pub use github_pages::{
     BlockedEnvCredentialResolver, EnvironmentGithubCredentialResolver, GithubCredentialResolver,
-    GithubPagesAdapter, GithubPagesApiBlob, GithubPagesApiCommit, GithubPagesApiObject,
-    GithubPagesApiPages, GithubPagesApiSource, GithubPagesApiTree, GithubPagesApiTreeEntry,
-    GithubPagesConnection, GithubPagesConnectionState, GithubPagesHttpTransport,
-    GithubPagesProvider, GithubPagesProviderError, GithubPagesProviderRead,
-    GithubPagesRepositorySnapshot, GithubPagesTransportError, UreqGithubPagesTransport,
+    GithubPagesAdapter, GithubPagesApiBlob, GithubPagesApiBlobWrite, GithubPagesApiCommit,
+    GithubPagesApiCommitWrite, GithubPagesApiObject, GithubPagesApiPages, GithubPagesApiRefUpdate,
+    GithubPagesApiSource, GithubPagesApiTree, GithubPagesApiTreeEntry, GithubPagesApiTreeWrite,
+    GithubPagesApiTreeWriteEntry, GithubPagesConnection, GithubPagesConnectionState,
+    GithubPagesHttpTransport, GithubPagesIndependentReadback, GithubPagesProvider,
+    GithubPagesProviderError, GithubPagesProviderExecution, GithubPagesProviderRead,
+    GithubPagesProviderReceipt, GithubPagesProviderReconciliation, GithubPagesPublicReadback,
+    GithubPagesPublicationAction, GithubPagesPublishPayload, GithubPagesRepositorySnapshot,
+    GithubPagesTransportError, GithubPagesVerification, UreqGithubPagesTransport,
 };
 pub use publication::{
-    CanonicalDiffEntry, CanonicalDiffKind, CanonicalTreeDiff, MissionPublicationConsumer,
-    MissionPublicationProposalResult, MissionPublicationReadResult, PreparedPublicationEffect,
-    PublicationProposalInput, PublicationReadResult, PublicationResultConsumer,
-    SitePublicationService,
+    CanonicalDiffEntry, CanonicalDiffKind, CanonicalTreeDiff, MissionPublicationAdoptableResult,
+    MissionPublicationConsumer, MissionPublicationProposalResult, MissionPublicationReadResult,
+    PreparedPublicationEffect, PublicationAction, PublicationApprovalBinding,
+    PublicationExecutionAuthorization, PublicationOutcome, PublicationProposalInput,
+    PublicationReadResult, PublicationReconcileResult, PublicationResultConsumer,
+    PublicationRollbackInput, SitePublicationService,
 };
 
 pub const WEB_PUBLICATION_SCHEMA_VERSION: &str = "hartevo-web-adapters/github-pages/v1";

@@ -2,17 +2,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use hartevo_connector_sdk::{PreparedEffect, ReadObservation};
+use hartevo_connector_sdk::{
+    EffectExecutionContext, PreparedEffect, ReadObservation, ReceiptCandidate,
+    ReconciliationObservation, ReconciliationStatus, VerificationStatus,
+};
 use hartevo_domain_kernel::{
-    ActorId, ConsentState, CurrencyCode, EffectClass, EffectId, EffectRisk, EffectSpec, Mission,
-    Money, WorkProductStatus,
+    ActorId, ApprovalDecision, ConsentState, CurrencyCode, Effect, EffectClass, EffectId,
+    EffectRisk, EffectSpec, EffectStatus, Mission, Money, WorkProductStatus,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::audit::{PublicationAuditEntry, PublicationDurableLog, PublicationOperation};
 use crate::{
-    Domain, GITHUB_PAGES_REQUIRED_SCOPES, GITHUB_PROVIDER_ID, GithubPagesProvider,
-    GithubPagesProviderRead, GithubPagesRepositorySnapshot, Publication, PublicationId, Site,
+    Domain, GITHUB_PAGES_REQUIRED_SCOPES, GITHUB_PROVIDER_ID, GithubPagesIndependentReadback,
+    GithubPagesProvider, GithubPagesProviderExecution, GithubPagesProviderRead,
+    GithubPagesProviderReceipt, GithubPagesPublicationAction, GithubPagesPublishPayload,
+    GithubPagesRepositorySnapshot, GithubPagesVerification, Publication, PublicationId, Site,
     WebPublicationError, digest_json,
 };
 
@@ -196,6 +201,152 @@ impl PublicationProposalInput {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationAction {
+    Publish,
+    Rollback,
+}
+
+impl PublicationAction {
+    const fn provider_action(self) -> GithubPagesPublicationAction {
+        match self {
+            Self::Publish => GithubPagesPublicationAction::Publish,
+            Self::Rollback => GithubPagesPublicationAction::Rollback,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicationRollbackInput {
+    pub proposal: PublicationProposalInput,
+    pub rollback_site: Site,
+    pub expected_current_head_sha: String,
+    pub expected_current_content_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicationApprovalBinding {
+    pub action: PublicationAction,
+    pub proposal_digest: String,
+    pub source_work_product_id: hartevo_domain_kernel::WorkProductId,
+    pub source_work_product_revision: u64,
+    pub source_work_product_digest: String,
+    pub connection_id: String,
+    pub account_id: String,
+    pub domain_id: crate::DomainId,
+    pub environment: crate::GithubPagesEnvironment,
+    pub target_revision: u64,
+    pub base_head_sha: String,
+    pub base_tree_sha: String,
+    pub target_tree_digest: String,
+    pub diff_digest: String,
+    pub registration_digest: String,
+    pub payload_digest: String,
+    pub effect_digest: String,
+    pub effect_approval_digest: String,
+    pub authority_digest: String,
+}
+
+impl PublicationApprovalBinding {
+    pub fn digest(&self) -> Result<String, WebPublicationError> {
+        digest_json(self)
+    }
+
+    fn from_proposal(
+        proposal: &MissionPublicationProposalResult,
+        domain: &Domain,
+        effect: &Effect,
+        execution_context: &EffectExecutionContext,
+    ) -> Self {
+        Self::from_proposal_with_authority(
+            proposal,
+            domain,
+            effect,
+            execution_context.authorization_digest().to_owned(),
+        )
+    }
+
+    fn from_proposal_with_authority(
+        proposal: &MissionPublicationProposalResult,
+        domain: &Domain,
+        effect: &Effect,
+        authority_digest: String,
+    ) -> Self {
+        let target = &proposal.publication_read.publication.target;
+        Self {
+            action: proposal.action,
+            proposal_digest: proposal.proposal_digest.clone(),
+            source_work_product_id: proposal
+                .publication_read
+                .publication
+                .source_work_product_id
+                .clone(),
+            source_work_product_revision: proposal
+                .publication_read
+                .publication
+                .source_work_product_revision,
+            source_work_product_digest: proposal
+                .publication_read
+                .publication
+                .source_work_product_digest
+                .clone(),
+            connection_id: proposal.publication_read.publication.connection_id.clone(),
+            account_id: target.account_id.clone(),
+            domain_id: domain.id.clone(),
+            environment: target.environment,
+            target_revision: proposal.target_revision,
+            base_head_sha: proposal.canonical_diff.base_head_sha.clone(),
+            base_tree_sha: proposal.canonical_diff.base_tree_sha.clone(),
+            target_tree_digest: proposal.canonical_diff.target_tree_digest.clone(),
+            diff_digest: proposal.canonical_diff.diff_digest.clone(),
+            registration_digest: proposal.publication_read.registration_digest.clone(),
+            payload_digest: proposal.prepared_effect.effect_spec.payload_digest.clone(),
+            effect_digest: proposal
+                .prepared_effect
+                .connector_effect
+                .effect_digest()
+                .to_owned(),
+            effect_approval_digest: effect.approval_digest(),
+            authority_digest,
+        }
+    }
+}
+
+/// The Application/Effect Broker supplies this value only after its normal
+/// approval, permission, idempotency, rate-limit and execution-claim checks.
+/// The web adapter treats it as an opaque authority capsule and re-validates
+/// every binding; it cannot mint one from a proposal on its own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicationExecutionAuthorization {
+    pub binding: PublicationApprovalBinding,
+    pub approved_effect: Effect,
+    pub execution_context: EffectExecutionContext,
+}
+
+impl PublicationExecutionAuthorization {
+    pub fn from_approved_effect(
+        proposal: &MissionPublicationProposalResult,
+        domain: &Domain,
+        approved_effect: Effect,
+        execution_context: EffectExecutionContext,
+    ) -> Self {
+        let binding = PublicationApprovalBinding::from_proposal(
+            proposal,
+            domain,
+            &approved_effect,
+            &execution_context,
+        );
+        Self {
+            binding,
+            approved_effect,
+            execution_context,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreparedPublicationEffect {
@@ -211,6 +362,7 @@ pub struct MissionPublicationProposalResult {
     pub tenant_id: hartevo_domain_kernel::TenantId,
     pub project_id: hartevo_domain_kernel::ProjectId,
     pub mission_id: hartevo_domain_kernel::MissionId,
+    pub action: PublicationAction,
     pub publication_read: PublicationReadResult,
     pub canonical_diff: CanonicalTreeDiff,
     pub target_revision: u64,
@@ -219,6 +371,47 @@ pub struct MissionPublicationProposalResult {
     pub preview_only: bool,
     pub external_effect_created: bool,
     pub publish_authority: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationOutcome {
+    Adoptable,
+    NotExecuted,
+    StillUncertain,
+    ProviderRejected,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MissionPublicationAdoptableResult {
+    pub tenant_id: hartevo_domain_kernel::TenantId,
+    pub project_id: hartevo_domain_kernel::ProjectId,
+    pub mission_id: hartevo_domain_kernel::MissionId,
+    pub action: PublicationAction,
+    pub proposal_digest: String,
+    pub approval_binding_digest: String,
+    pub receipt: GithubPagesProviderReceipt,
+    pub receipt_candidate: ReceiptCandidate,
+    pub verification: GithubPagesVerification,
+    pub outcome: PublicationOutcome,
+    pub adoptable: bool,
+    pub result_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicationReconcileResult {
+    pub tenant_id: hartevo_domain_kernel::TenantId,
+    pub project_id: hartevo_domain_kernel::ProjectId,
+    pub mission_id: hartevo_domain_kernel::MissionId,
+    pub action: PublicationAction,
+    pub proposal_digest: String,
+    pub disposition: PublicationOutcome,
+    pub observation: ReconciliationObservation,
+    pub snapshot: GithubPagesRepositorySnapshot,
+    pub adoptable_result: Option<MissionPublicationAdoptableResult>,
+    pub result_digest: String,
 }
 
 pub trait PublicationResultConsumer {
@@ -233,6 +426,12 @@ pub trait PublicationResultConsumer {
         mission: &Mission,
         result: MissionPublicationProposalResult,
     ) -> Result<MissionPublicationProposalResult, WebPublicationError>;
+
+    fn consume_adoptable(
+        &self,
+        mission: &Mission,
+        result: MissionPublicationAdoptableResult,
+    ) -> Result<MissionPublicationAdoptableResult, WebPublicationError>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -298,6 +497,32 @@ impl PublicationResultConsumer for MissionPublicationConsumer {
             return Err(WebPublicationError::ScopeMismatch {
                 detail: "Mission consumer rejected a non-preview or out-of-scope proposal"
                     .to_owned(),
+            });
+        }
+        Ok(result)
+    }
+
+    fn consume_adoptable(
+        &self,
+        mission: &Mission,
+        result: MissionPublicationAdoptableResult,
+    ) -> Result<MissionPublicationAdoptableResult, WebPublicationError> {
+        if result.tenant_id != mission.tenant_id
+            || result.project_id != mission.project_id
+            || result.mission_id != mission.id
+            || result.outcome != PublicationOutcome::Adoptable
+            || !result.adoptable
+            || !result.verification.observation.independent()
+            || result.verification.observation.status() != VerificationStatus::Confirmed
+            || !result.verification.readback.authenticated_content_matches
+            || !result.verification.readback.public_content_matches
+            || result.receipt.effect_digest != result.receipt_candidate.effect_digest()
+            || result.receipt.payload_digest.trim().is_empty()
+        {
+            return Err(WebPublicationError::ScopeMismatch {
+                detail:
+                    "Mission consumer rejected an unverified or out-of-scope publication result"
+                        .to_owned(),
             });
         }
         Ok(result)
@@ -385,26 +610,228 @@ where
         domain: &Domain,
         input: PublicationProposalInput,
     ) -> Result<MissionPublicationProposalResult, WebPublicationError> {
-        Self::validate_proposal_input(mission, &input)?;
+        let result = self.prepare_change(
+            mission,
+            site,
+            domain,
+            &input,
+            PublicationAction::Publish,
+            None,
+        )?;
+        self.append_proposal_audit(&result)?;
+        self.consumer.consume_proposal(mission, result)
+    }
+
+    pub fn propose_rollback(
+        &mut self,
+        mission: &Mission,
+        domain: &Domain,
+        input: &PublicationRollbackInput,
+    ) -> Result<MissionPublicationProposalResult, WebPublicationError> {
+        let result = self.prepare_change(
+            mission,
+            &input.rollback_site,
+            domain,
+            &input.proposal,
+            PublicationAction::Rollback,
+            Some((
+                input.expected_current_head_sha.as_str(),
+                input.expected_current_content_digest.as_str(),
+            )),
+        )?;
+        self.append_proposal_audit(&result)?;
+        self.consumer.consume_proposal(mission, result)
+    }
+
+    pub fn publish(
+        &mut self,
+        mission: &Mission,
+        site: &Site,
+        domain: &Domain,
+        proposal: &MissionPublicationProposalResult,
+        authorization: &PublicationExecutionAuthorization,
+        now: DateTime<Utc>,
+    ) -> Result<MissionPublicationAdoptableResult, WebPublicationError> {
+        if proposal.action != PublicationAction::Publish {
+            return Err(WebPublicationError::Contract {
+                detail: "publish accepts only a publish proposal; rollback requires a new Effect"
+                    .to_owned(),
+            });
+        }
+        self.execute_change(mission, site, domain, proposal, authorization, now)
+    }
+
+    pub fn rollback(
+        &mut self,
+        mission: &Mission,
+        rollback_site: &Site,
+        domain: &Domain,
+        proposal: &MissionPublicationProposalResult,
+        authorization: &PublicationExecutionAuthorization,
+        now: DateTime<Utc>,
+    ) -> Result<MissionPublicationAdoptableResult, WebPublicationError> {
+        if proposal.action != PublicationAction::Rollback {
+            return Err(WebPublicationError::Contract {
+                detail: "rollback accepts only a rollback proposal with a new Effect".to_owned(),
+            });
+        }
+        self.execute_change(mission, rollback_site, domain, proposal, authorization, now)
+    }
+
+    pub fn reconcile(
+        &mut self,
+        mission: &Mission,
+        site: &Site,
+        domain: &Domain,
+        proposal: &MissionPublicationProposalResult,
+        now: DateTime<Utc>,
+    ) -> Result<PublicationReconcileResult, WebPublicationError> {
+        self.validate_proposal_for_execution(mission, site, domain, proposal)?;
+        validate_reconcile_effect(mission, proposal)?;
+        let payload = payload_from_proposal(proposal, site)?;
+        let effect_digest = proposal.prepared_effect.connector_effect.effect_digest();
+        self.provider
+            .register_publish_payload(effect_digest, payload.clone())?;
+        let reconciliation =
+            self.provider
+                .reconcile_publish(payload.clone(), effect_digest, now)?;
+        let mut adoptable_result = None;
+        if reconciliation.observation.status() == ReconciliationStatus::ReceiptFound {
+            let receipt =
+                reconciliation
+                    .receipt
+                    .clone()
+                    .ok_or_else(|| WebPublicationError::Provider {
+                        detail: "ReceiptFound reconciliation did not return a provider receipt"
+                            .to_owned(),
+                    })?;
+            let verification = self.provider.verify_publish(payload, effect_digest, now)?;
+            if verification.observation.status() == VerificationStatus::Confirmed
+                && verification.observation.independent()
+            {
+                let receipt_candidate = ReceiptCandidate::new(
+                    &proposal.prepared_effect.connector_effect,
+                    receipt.provider_request_id_digest.clone(),
+                    hartevo_connector_sdk::ReceiptCandidateStatus::Accepted,
+                    receipt.response_digest.clone(),
+                    receipt.accepted_at,
+                )?;
+                let effect = mission
+                    .effect(&proposal.prepared_effect.effect_spec.id)
+                    .map_err(|error| WebPublicationError::ScopeMismatch {
+                        detail: error.to_string(),
+                    })?;
+                let authority_digest = effect
+                    .approval
+                    .as_ref()
+                    .map(|approval| approval.permission_digest.clone())
+                    .ok_or_else(|| WebPublicationError::Contract {
+                        detail: "reconciled publication Effect has no approval evidence".to_owned(),
+                    })?;
+                let binding = PublicationApprovalBinding::from_proposal_with_authority(
+                    proposal,
+                    domain,
+                    effect,
+                    authority_digest,
+                );
+                adoptable_result = Some(build_adoptable_result(
+                    mission,
+                    proposal,
+                    &binding,
+                    receipt,
+                    receipt_candidate,
+                    verification,
+                )?);
+            }
+        }
+        let disposition = adoptable_result.as_ref().map_or(
+            match reconciliation.observation.status() {
+                ReconciliationStatus::ReceiptFound | ReconciliationStatus::StillUncertain => {
+                    PublicationOutcome::StillUncertain
+                }
+                ReconciliationStatus::NotExecuted => PublicationOutcome::NotExecuted,
+                ReconciliationStatus::ProviderRejected => PublicationOutcome::ProviderRejected,
+            },
+            |_| PublicationOutcome::Adoptable,
+        );
+        let result_digest = digest_json(&(
+            &proposal.proposal_digest,
+            &reconciliation.observation,
+            &reconciliation.snapshot.response_digest,
+            &disposition,
+            &adoptable_result,
+        ))?;
+        self.append_reconcile_audit(proposal, &reconciliation.snapshot, now)?;
+        Ok(PublicationReconcileResult {
+            tenant_id: mission.tenant_id.clone(),
+            project_id: mission.project_id.clone(),
+            mission_id: mission.id.clone(),
+            action: proposal.action,
+            proposal_digest: proposal.proposal_digest.clone(),
+            disposition,
+            observation: reconciliation.observation,
+            snapshot: reconciliation.snapshot,
+            adoptable_result,
+            result_digest,
+        })
+    }
+
+    fn prepare_change(
+        &mut self,
+        mission: &Mission,
+        site: &Site,
+        domain: &Domain,
+        input: &PublicationProposalInput,
+        action: PublicationAction,
+        expected_current: Option<(&str, &str)>,
+    ) -> Result<MissionPublicationProposalResult, WebPublicationError> {
+        Self::validate_proposal_input(mission, input)?;
         let publication =
             self.validate_context(mission, site, domain, input.publication_id.clone())?;
         let read_result = self.read_publication(mission, site, publication, input.now)?;
         self.append_read_audit(&read_result)?;
+        if let Some((expected_head, expected_content)) = expected_current
+            && (read_result.snapshot.head_sha != expected_head
+                || read_result.snapshot.content_digest != expected_content)
+        {
+            return Err(WebPublicationError::ScopeMismatch {
+                detail: "rollback source is stale relative to the current published revision"
+                    .to_owned(),
+            });
+        }
         let canonical_diff = CanonicalTreeDiff::between(site, &read_result.snapshot)?;
-        let payload_digest = proposal_payload_digest(&read_result, &canonical_diff, site)?;
-        let connector_effect = self.provider.prepare_publish(
-            &payload_digest,
-            &format!("effect-idem-{payload_digest}"),
-            input.now,
-            input.expires_at,
-        )?;
+        let payload_digest = proposal_payload_digest(&read_result, &canonical_diff, site, action)?;
+        let idempotency_key = format!("effect-idem-{payload_digest}");
         let effect_spec = effect_spec(
             mission,
             site,
             &read_result.publication,
             &canonical_diff,
-            &input,
+            input,
             &payload_digest,
+            action,
+        )?;
+        let payload = GithubPagesPublishPayload {
+            action: action.provider_action(),
+            target: read_result.publication.target.clone(),
+            base_head_sha: canonical_diff.base_head_sha.clone(),
+            base_tree_sha: canonical_diff.base_tree_sha.clone(),
+            target_tree_digest: canonical_diff.target_tree_digest.clone(),
+            diff_digest: canonical_diff.diff_digest.clone(),
+            site_id: site.id.clone(),
+            site_revision: site.revision,
+            source_work_product_id: site.source_work_product_id.clone(),
+            source_work_product_revision: site.source_work_product_revision,
+            source_work_product_digest: site.source_work_product_digest.clone(),
+            payload_digest: payload_digest.clone(),
+            idempotency_key: idempotency_key.clone(),
+            files: site.files.clone(),
+        };
+        let connector_effect = self.provider.prepare_publish_payload(
+            payload,
+            &idempotency_key,
+            input.now,
+            input.expires_at,
         )?;
         if connector_effect.payload_digest() != effect_spec.payload_digest
             || connector_effect.idempotency_key() != effect_spec.idempotency_key
@@ -421,6 +848,7 @@ where
             external_effect_created: false,
         };
         let proposal_digest = digest_json(&(
+            &action,
             &read_result.result_digest,
             &canonical_diff,
             &prepared_effect.effect_spec,
@@ -428,10 +856,11 @@ where
             input.now,
             input.expires_at,
         ))?;
-        let result = MissionPublicationProposalResult {
+        Ok(MissionPublicationProposalResult {
             tenant_id: mission.tenant_id.clone(),
             project_id: mission.project_id.clone(),
             mission_id: mission.id.clone(),
+            action,
             publication_read: read_result,
             target_revision: site.revision,
             canonical_diff,
@@ -440,9 +869,127 @@ where
             preview_only: true,
             external_effect_created: false,
             publish_authority: "deferred_until_approval_and_execute".to_owned(),
+        })
+    }
+
+    fn execute_change(
+        &mut self,
+        mission: &Mission,
+        site: &Site,
+        domain: &Domain,
+        proposal: &MissionPublicationProposalResult,
+        authorization: &PublicationExecutionAuthorization,
+        now: DateTime<Utc>,
+    ) -> Result<MissionPublicationAdoptableResult, WebPublicationError> {
+        self.validate_proposal_for_execution(mission, site, domain, proposal)?;
+        validate_execution_authorization(
+            mission,
+            site,
+            domain,
+            proposal,
+            authorization,
+            &self.provider.connection().scope()?,
+            now,
+        )?;
+        let payload = payload_from_proposal(proposal, site)?;
+        let effect_digest = proposal.prepared_effect.connector_effect.effect_digest();
+        let execution: GithubPagesProviderExecution = self.provider.execute_publish(
+            payload.clone(),
+            &proposal.prepared_effect.connector_effect,
+            authorization.execution_context.clone(),
+            now,
+        )?;
+        let verification = self.provider.verify_publish(payload, effect_digest, now)?;
+        if execution.receipt.action != proposal.action.provider_action()
+            || execution.receipt.payload_digest
+                != proposal.prepared_effect.effect_spec.payload_digest
+            || execution.receipt.effect_digest != effect_digest
+            || verification.observation.status() != VerificationStatus::Confirmed
+            || !verification.observation.independent()
+            || !verification.readback.authenticated_content_matches
+            || !verification.readback.public_content_matches
+            || verification.readback.authenticated_snapshot.head_sha != execution.receipt.commit_sha
+        {
+            return Err(WebPublicationError::Provider {
+                detail: "GitHub publication receipt or independent readback failed closed"
+                    .to_owned(),
+            });
+        }
+        let approval_binding_digest = authorization.binding.digest()?;
+        let result_digest = digest_json(&(
+            mission.tenant_id.as_str(),
+            mission.project_id.as_str(),
+            mission.id.as_str(),
+            &proposal.action,
+            &proposal.proposal_digest,
+            &approval_binding_digest,
+            &execution.receipt,
+            &execution.receipt_candidate,
+            &verification,
+        ))?;
+        let result = MissionPublicationAdoptableResult {
+            tenant_id: mission.tenant_id.clone(),
+            project_id: mission.project_id.clone(),
+            mission_id: mission.id.clone(),
+            action: proposal.action,
+            proposal_digest: proposal.proposal_digest.clone(),
+            approval_binding_digest,
+            receipt: execution.receipt,
+            receipt_candidate: execution.receipt_candidate,
+            verification,
+            outcome: PublicationOutcome::Adoptable,
+            adoptable: true,
+            result_digest,
         };
-        self.append_proposal_audit(&result)?;
-        self.consumer.consume_proposal(mission, result)
+        self.append_change_audit(proposal, &result.verification.readback, effect_digest)?;
+        self.consumer.consume_adoptable(mission, result)
+    }
+
+    fn validate_proposal_for_execution(
+        &self,
+        mission: &Mission,
+        site: &Site,
+        domain: &Domain,
+        proposal: &MissionPublicationProposalResult,
+    ) -> Result<(), WebPublicationError> {
+        if !proposal.preview_only
+            || proposal.external_effect_created
+            || !proposal.prepared_effect.prepared_only
+            || proposal.tenant_id != mission.tenant_id
+            || proposal.project_id != mission.project_id
+            || proposal.mission_id != mission.id
+            || proposal.publication_read.publication.site_id != site.id
+            || proposal.publication_read.publication.site_revision != site.revision
+            || proposal
+                .publication_read
+                .publication
+                .source_work_product_digest
+                != site.source_work_product_digest
+        {
+            return Err(WebPublicationError::ScopeMismatch {
+                detail: "publish request is not bound to the exact canonical proposal".to_owned(),
+            });
+        }
+        let publication = self.validate_context(
+            mission,
+            site,
+            domain,
+            proposal.publication_read.publication.id.clone(),
+        )?;
+        if publication != proposal.publication_read.publication {
+            return Err(WebPublicationError::ScopeMismatch {
+                detail: "publication target or registration drifted after proposal".to_owned(),
+            });
+        }
+        if proposal.canonical_diff.base_head_sha != proposal.publication_read.snapshot.head_sha
+            || proposal.canonical_diff.base_tree_sha != proposal.publication_read.snapshot.tree_sha
+            || proposal.canonical_diff.diff_digest.is_empty()
+        {
+            return Err(WebPublicationError::ScopeMismatch {
+                detail: "canonical proposal diff changed after approval".to_owned(),
+            });
+        }
+        validate_source_work_product(mission, site)
     }
 
     fn validate_context(
@@ -545,6 +1092,41 @@ where
         )?;
         self.durable_log.append(entry)
     }
+
+    fn append_change_audit(
+        &mut self,
+        proposal: &MissionPublicationProposalResult,
+        readback: &GithubPagesIndependentReadback,
+        effect_digest: &str,
+    ) -> Result<(), WebPublicationError> {
+        let entry = audit_entry_from_proposal(
+            match proposal.action {
+                PublicationAction::Publish => PublicationOperation::Publish,
+                PublicationAction::Rollback => PublicationOperation::Rollback,
+            },
+            proposal,
+            Some(&readback.evidence_digest),
+            Some(effect_digest),
+            readback.observed_at,
+        )?;
+        self.durable_log.append(entry)
+    }
+
+    fn append_reconcile_audit(
+        &mut self,
+        proposal: &MissionPublicationProposalResult,
+        snapshot: &GithubPagesRepositorySnapshot,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), WebPublicationError> {
+        let entry = audit_entry_from_proposal(
+            PublicationOperation::Reconcile,
+            proposal,
+            Some(&snapshot.response_digest),
+            Some(proposal.prepared_effect.connector_effect.effect_digest()),
+            observed_at,
+        )?;
+        self.durable_log.append(entry)
+    }
 }
 
 fn validate_source_work_product(mission: &Mission, site: &Site) -> Result<(), WebPublicationError> {
@@ -577,6 +1159,7 @@ fn proposal_payload_digest(
     read_result: &PublicationReadResult,
     canonical_diff: &CanonicalTreeDiff,
     site: &Site,
+    action: PublicationAction,
 ) -> Result<String, WebPublicationError> {
     let publication_digest = read_result.publication.digest();
     digest_json(&(
@@ -593,6 +1176,7 @@ fn proposal_payload_digest(
         &site.source_work_product_id,
         &site.source_work_product_revision,
         &site.source_work_product_digest,
+        &action,
     ))
 }
 
@@ -603,6 +1187,7 @@ fn effect_spec(
     canonical_diff: &CanonicalTreeDiff,
     input: &PublicationProposalInput,
     payload_digest: &str,
+    action: PublicationAction,
 ) -> Result<EffectSpec, WebPublicationError> {
     let currency =
         CurrencyCode::parse("USD").map_err(|error| WebPublicationError::InvalidInput {
@@ -630,8 +1215,13 @@ fn effect_spec(
             .collect(),
         effect_class: EffectClass::ExternalWrite,
         description: format!(
-            "Publish Site revision {} to GitHub Pages {}",
-            site.revision, publication.target.pages_url
+            "{} Site revision {} to GitHub Pages {}",
+            match action {
+                PublicationAction::Publish => "Publish",
+                PublicationAction::Rollback => "Rollback",
+            },
+            site.revision,
+            publication.target.pages_url
         ),
         target_resource: format!(
             "github-pages/{}/{}/{}/{}",
@@ -659,6 +1249,280 @@ fn effect_spec(
         amount: Money::zero(currency),
         expires_at: input.expires_at,
     })
+}
+
+fn payload_from_proposal(
+    proposal: &MissionPublicationProposalResult,
+    site: &Site,
+) -> Result<GithubPagesPublishPayload, WebPublicationError> {
+    if proposal.canonical_diff.target_tree_digest != site.content_digest
+        || proposal.publication_read.publication.site_id != site.id
+        || proposal.target_revision != site.revision
+    {
+        return Err(WebPublicationError::ScopeMismatch {
+            detail: "publication payload is not the exact selected Site revision".to_owned(),
+        });
+    }
+    Ok(GithubPagesPublishPayload {
+        action: proposal.action.provider_action(),
+        target: proposal.publication_read.publication.target.clone(),
+        base_head_sha: proposal.canonical_diff.base_head_sha.clone(),
+        base_tree_sha: proposal.canonical_diff.base_tree_sha.clone(),
+        target_tree_digest: proposal.canonical_diff.target_tree_digest.clone(),
+        diff_digest: proposal.canonical_diff.diff_digest.clone(),
+        site_id: site.id.clone(),
+        site_revision: site.revision,
+        source_work_product_id: site.source_work_product_id.clone(),
+        source_work_product_revision: site.source_work_product_revision,
+        source_work_product_digest: site.source_work_product_digest.clone(),
+        payload_digest: proposal.prepared_effect.effect_spec.payload_digest.clone(),
+        idempotency_key: proposal.prepared_effect.effect_spec.idempotency_key.clone(),
+        files: site.files.clone(),
+    })
+}
+
+fn validate_reconcile_effect(
+    mission: &Mission,
+    proposal: &MissionPublicationProposalResult,
+) -> Result<(), WebPublicationError> {
+    let effect = mission
+        .effect(&proposal.prepared_effect.effect_spec.id)
+        .map_err(|error| WebPublicationError::ScopeMismatch {
+            detail: format!("reconcile requires the durable Mission Effect: {error}"),
+        })?;
+    if !matches!(
+        effect.status,
+        EffectStatus::Approved
+            | EffectStatus::Executing
+            | EffectStatus::VerificationRequired
+            | EffectStatus::ReceiptRecorded
+    ) || effect.approval.is_none()
+    {
+        return Err(WebPublicationError::Contract {
+            detail: "reconcile requires an approved or verification-required Effect".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_execution_authorization(
+    mission: &Mission,
+    site: &Site,
+    domain: &Domain,
+    proposal: &MissionPublicationProposalResult,
+    authorization: &PublicationExecutionAuthorization,
+    expected_scope: &hartevo_connector_sdk::ConnectorScope,
+    now: DateTime<Utc>,
+) -> Result<(), WebPublicationError> {
+    if authorization.approved_effect
+        != *mission
+            .effect(&proposal.prepared_effect.effect_spec.id)
+            .map_err(|error| WebPublicationError::ScopeMismatch {
+                detail: error.to_string(),
+            })?
+    {
+        return Err(WebPublicationError::ScopeMismatch {
+            detail: "approval Effect is not the durable Mission Effect".to_owned(),
+        });
+    }
+    let effect = &authorization.approved_effect;
+    if !matches!(
+        effect.status,
+        EffectStatus::Approved | EffectStatus::Executing
+    ) {
+        return Err(WebPublicationError::Contract {
+            detail: "publication execution requires an approved Effect claim".to_owned(),
+        });
+    }
+    let approval = effect
+        .approval
+        .as_ref()
+        .ok_or_else(|| WebPublicationError::Contract {
+            detail: "publication execution requires durable approval evidence".to_owned(),
+        })?;
+    if approval.decision != ApprovalDecision::Approved
+        || approval.scope_digest != effect.approval_digest()
+        || approval.valid_until <= now
+        || effect.expires_at <= now
+        || authorization.execution_context.expires_at() <= now
+        || authorization.execution_context.scope() != expected_scope
+        || authorization.execution_context.effect_digest()
+            != proposal.prepared_effect.connector_effect.effect_digest()
+        || authorization.execution_context.authorization_digest() != approval.permission_digest
+        || authorization.binding.authority_digest != approval.permission_digest
+    {
+        return Err(WebPublicationError::ScopeMismatch {
+            detail: "approval, Effect execution context, and connection scope are not exact"
+                .to_owned(),
+        });
+    }
+    let expected_binding = PublicationApprovalBinding::from_proposal(
+        proposal,
+        domain,
+        effect,
+        &authorization.execution_context,
+    );
+    if authorization.binding != expected_binding {
+        return Err(WebPublicationError::ScopeMismatch {
+            detail: "approval binding does not cover the exact proposal/source/target digest"
+                .to_owned(),
+        });
+    }
+    if authorization.binding.action != proposal.action
+        || authorization.binding.effect_approval_digest != effect.approval_digest()
+        || authorization.binding.connection_id
+            != proposal.publication_read.publication.connection_id
+        || authorization.binding.account_id
+            != proposal.publication_read.publication.target.account_id
+        || authorization.binding.domain_id != domain.id
+        || authorization.binding.environment
+            != proposal.publication_read.publication.target.environment
+        || authorization.binding.target_revision != site.revision
+    {
+        return Err(WebPublicationError::ScopeMismatch {
+            detail: "approval target fence differs from the selected Site/Domain".to_owned(),
+        });
+    }
+    if !effect_matches_spec(effect, &proposal.prepared_effect.effect_spec) {
+        return Err(WebPublicationError::ScopeMismatch {
+            detail: "approved Effect fields differ from the canonical proposal EffectSpec"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn effect_matches_spec(effect: &Effect, spec: &EffectSpec) -> bool {
+    effect.id == spec.id
+        && effect.actor_id == spec.actor_id
+        && effect.capability == spec.capability
+        && effect.provider == spec.provider
+        && effect.connection_id == spec.connection_id
+        && effect.account_id == spec.account_id
+        && effect.required_scopes == spec.required_scopes
+        && effect.effect_class == spec.effect_class
+        && effect.description == spec.description
+        && effect.target_resource == spec.target_resource
+        && effect.audience_digest == spec.audience_digest
+        && effect.payload_digest == spec.payload_digest
+        && effect.asset_digests == spec.asset_digests
+        && effect.scheduled_for == spec.scheduled_for
+        && effect.timezone == spec.timezone
+        && effect.consent == spec.consent
+        && effect.consent_record_id == spec.consent_record_id
+        && effect.consent_requirement == spec.consent_requirement
+        && effect.conversation_guard == spec.conversation_guard
+        && effect.creator_contact_guard == spec.creator_contact_guard
+        && effect.policy_version == spec.policy_version
+        && effect.risk == spec.risk
+        && effect.idempotency_key == spec.idempotency_key
+        && effect.amount == spec.amount
+        && effect.expires_at == spec.expires_at
+}
+
+fn build_adoptable_result(
+    mission: &Mission,
+    proposal: &MissionPublicationProposalResult,
+    binding: &PublicationApprovalBinding,
+    receipt: GithubPagesProviderReceipt,
+    receipt_candidate: ReceiptCandidate,
+    verification: GithubPagesVerification,
+) -> Result<MissionPublicationAdoptableResult, WebPublicationError> {
+    if verification.observation.status() != VerificationStatus::Confirmed
+        || !verification.observation.independent()
+        || !verification.readback.authenticated_content_matches
+        || !verification.readback.public_content_matches
+    {
+        return Err(WebPublicationError::Provider {
+            detail: "provider receipt is not independently read back".to_owned(),
+        });
+    }
+    let approval_binding_digest = binding.digest()?;
+    let result_digest = digest_json(&(
+        mission.tenant_id.as_str(),
+        mission.project_id.as_str(),
+        mission.id.as_str(),
+        &proposal.action,
+        &proposal.proposal_digest,
+        &approval_binding_digest,
+        &receipt,
+        &receipt_candidate,
+        &verification,
+    ))?;
+    Ok(MissionPublicationAdoptableResult {
+        tenant_id: mission.tenant_id.clone(),
+        project_id: mission.project_id.clone(),
+        mission_id: mission.id.clone(),
+        action: proposal.action,
+        proposal_digest: proposal.proposal_digest.clone(),
+        approval_binding_digest,
+        receipt,
+        receipt_candidate,
+        verification,
+        outcome: PublicationOutcome::Adoptable,
+        adoptable: true,
+        result_digest,
+    })
+}
+
+fn audit_entry_from_proposal(
+    operation: PublicationOperation,
+    proposal: &MissionPublicationProposalResult,
+    result_digest: Option<&str>,
+    effect_digest: Option<&str>,
+    observed_at: DateTime<Utc>,
+) -> Result<PublicationAuditEntry, WebPublicationError> {
+    let result = &proposal.publication_read;
+    let target = &result.publication.target;
+    let file_count = u32::try_from(result.snapshot.files.len()).map_err(|_| {
+        WebPublicationError::InvalidInput {
+            detail: "repository file count exceeds audit bounds".to_owned(),
+        }
+    })?;
+    PublicationAuditEntry {
+        schema_version: crate::WEB_PUBLICATION_SCHEMA_VERSION.to_owned(),
+        event_id: format!(
+            "publication-{}-{:?}-{}",
+            result.publication.id,
+            operation,
+            observed_at.timestamp()
+        ),
+        event_digest: String::new(),
+        operation,
+        model_visible: true,
+        tenant_id: result.publication.tenant_id.clone(),
+        project_id: result.publication.project_id.clone(),
+        mission_id: result.publication.mission_id.clone(),
+        connection_id: result.publication.connection_id.clone(),
+        account_id: target.account_id.clone(),
+        registration_digest: result.registration_digest.clone(),
+        registry_version: result.registry_version.clone(),
+        scope_digest: result.observation.scope().digest(),
+        plugin_version: crate::GITHUB_PAGES_PLUGIN_VERSION.to_owned(),
+        adapter_id: result.observation.adapter().adapter_id().to_owned(),
+        adapter_version: result.observation.adapter().adapter_version(),
+        environment: target.environment,
+        owner: target.owner.clone(),
+        repository: target.repository.clone(),
+        git_ref: target.git_ref.clone(),
+        pages_url: target.pages_url.clone(),
+        source_work_product_id: result.publication.source_work_product_id.clone(),
+        source_work_product_revision: result.publication.source_work_product_revision,
+        source_work_product_digest: result.publication.source_work_product_digest.clone(),
+        site_revision: result.publication.site_revision,
+        base_head_sha: result.snapshot.head_sha.clone(),
+        base_tree_sha: result.snapshot.tree_sha.clone(),
+        observed_content_digest: result.snapshot.content_digest.clone(),
+        observed_tree_digest: result.snapshot.tree_digest.clone(),
+        observed_file_count: file_count,
+        result_digest: result_digest
+            .unwrap_or(&proposal.proposal_digest)
+            .to_owned(),
+        diff_digest: Some(proposal.canonical_diff.diff_digest.clone()),
+        effect_digest: effect_digest.map(str::to_owned),
+        observed_at,
+    }
+    .finalize()
 }
 
 fn audit_entry(

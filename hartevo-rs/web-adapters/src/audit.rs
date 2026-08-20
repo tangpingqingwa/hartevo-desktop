@@ -13,11 +13,14 @@ use crate::{GithubPagesEnvironment, WebPublicationError, digest_bytes};
 pub enum PublicationOperation {
     Read,
     Proposal,
+    Publish,
+    Rollback,
+    Reconcile,
 }
 
-/// Content-free durable evidence for every model-visible publication read or
-/// proposal. The event contains references and digests, never site bytes or a
-/// resolved credential.
+/// Content-free durable evidence for every model-visible publication read,
+/// proposal, mutation, or reconciliation. The event contains references and
+/// digests, never site bytes or a resolved credential.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicationAuditEntry {
