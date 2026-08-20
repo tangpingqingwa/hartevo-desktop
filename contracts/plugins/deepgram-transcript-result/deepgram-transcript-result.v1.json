@@ -1,0 +1,301 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.deepgram-transcript-result/v1",
+  "title": "Hartevo Layer-1 Deepgram transcript-result contract",
+  "description": "A bounded, digest-only Deepgram transcript result seam. It is read/proposal/recording evidence below kernel authority, not a live transcriber, media store, raw transcript authority, or Work Product/Outcome adopter.",
+  "schemaVersion": "hartevo.deepgram-transcript-result/v1",
+  "contractVersion": "EXT-DEEPGRAM-01-L1/v1",
+  "contractDigestInput": "hartevo.deepgram-transcript-result/v1|layer=1|service=DeepgramTranscriptResultService|provider=DeepgramProvider|consumer=MissionDeepgramTranscriptConsumer",
+  "contractDigest": "9c8819bdd54f0933d81f7769e7d39a6ed1dcfe5f6ba1f8c08caba056b09e14cf",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "plugin": {
+    "id": "deepgram.transcript-result",
+    "version": "1.0.0",
+    "reversible": true,
+    "scopeBound": true,
+    "digestBound": true
+  },
+  "typedSurface": {
+    "service": "DeepgramTranscriptResultService",
+    "provider": "DeepgramProvider",
+    "consumer": "MissionDeepgramTranscriptConsumer"
+  },
+  "service": {
+    "id": "deepgram.transcript-result.read",
+    "access": "bounded_read_proposal_recording_only",
+    "operations": [
+      "describe_capabilities",
+      "register_scope",
+      "read_transcript_result",
+      "compile_redacted_work_product_proposal",
+      "record_redacted_proposal",
+      "verify_transcript_result",
+      "revoke_registration"
+    ],
+    "forbiddenOperations": [
+      "submit_audio",
+      "upload_audio",
+      "fetch_audio",
+      "retain_audio",
+      "export_raw_transcript",
+      "retain_raw_transcript",
+      "speaker_identity_mutation",
+      "external_write",
+      "adopt_work_product",
+      "adopt_outcome",
+      "kernel_authority"
+    ]
+  },
+  "provider": {
+    "id": "deepgram.transcript-result.listen",
+    "apiRevision": "deepgram-listen-pre-recorded-read-1",
+    "allowlistedReadSeams": [
+      {
+        "method": "POST",
+        "path": "/v1/listen",
+        "layer1Behavior": "fixture_recording_loopback_only",
+        "projection": "bounded_metadata_language_quality_digest_only_segments"
+      }
+    ],
+    "transportProvenance": [
+      "fixture",
+      "recording",
+      "fake",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "httpClassification": {
+      "denied": [401, 403],
+      "notFound": 404,
+      "conflict": 409,
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true,
+      "partialResponse": true,
+      "malformedResponse": true
+    },
+    "mutations": {
+      "audioUpload": false,
+      "audioDownload": false,
+      "transcriptSubmission": false,
+      "providerWrite": false,
+      "speakerIdentity": false,
+      "mediaWrite": false
+    }
+  },
+  "credentials": {
+    "boundary": "opaque non-serializing SecretReference",
+    "kind": "api_key",
+    "rawMaterialAcceptedByLayer1": false,
+    "rawMaterialSerialized": false,
+    "rawMaterialDebugged": false,
+    "resolvedBy": "layer_2_host_secret_boundary"
+  },
+  "scope": {
+    "exactFields": [
+      "deepgramHost",
+      "deepgramProjectIdAndRevision",
+      "requestIdAndRevision",
+      "requestParametersDigest",
+      "modelIdVersionAndRevision",
+      "audioFingerprintDigestAndRevision",
+      "utteranceWindowIdRevisionBounds",
+      "projectIdAndRevision",
+      "missionIdAndRevision",
+      "workProductIdAndRevision",
+      "consentIdAndRevision"
+    ],
+    "fences": [
+      "host",
+      "project",
+      "request",
+      "model",
+      "audio_fingerprint",
+      "utterance_window",
+      "Project",
+      "Mission",
+      "Work Product",
+      "consent",
+      "revision",
+      "scope_digest",
+      "registration_digest"
+    ]
+  },
+  "bounds": {
+    "maxIdentifierBytes": 128,
+    "maxRequestBytes": 4096,
+    "maxResponseBytes": 1048576,
+    "maxPageSize": 100,
+    "maxPages": 16,
+    "maxSegments": 512,
+    "maxBackoffSeconds": 30,
+    "maxRetryAttempts": 3,
+    "maxDiagnosticBytes": 256,
+    "repeatedPageToken": "fail_closed",
+    "truncatedProjection": "partial_review_only"
+  },
+  "statusProjection": [
+    "queued",
+    "processing",
+    "completed",
+    "denied",
+    "partial",
+    "expired",
+    "rate_limited",
+    "provider_unknown"
+  ],
+  "evidence": {
+    "transcriptMetadata": true,
+    "languageIndicator": true,
+    "qualityIndicators": true,
+    "modelDigest": true,
+    "requestDigest": true,
+    "audioFingerprintDigest": true,
+    "utteranceWindowDigest": true,
+    "digestOnlySegmentEvidence": true,
+    "boundedContentDigest": true,
+    "rawAudio": false,
+    "rawTranscriptBody": false,
+    "rawWords": false,
+    "unredactedText": false,
+    "mediaBytes": false
+  },
+  "redaction": {
+    "rawApiKey": false,
+    "rawSecretReference": false,
+    "rawAudio": false,
+    "rawTranscript": false,
+    "rawWords": false,
+    "providerErrorText": false,
+    "speakerIdentity": false,
+    "opaquePageToken": false,
+    "mediaWrite": false
+  },
+  "digests": [
+    "request_digest",
+    "model_digest",
+    "scope_digest",
+    "consent_digest",
+    "registration_digest",
+    "status_digest",
+    "segment_digest",
+    "content_digest",
+    "evidence_digest",
+    "proposal_digest",
+    "idempotency_digest",
+    "receipt_digest"
+  ],
+  "registration": {
+    "reversible": true,
+    "revocable": true,
+    "versionFenced": true,
+    "contractFenced": true,
+    "providerFenced": true,
+    "scopeFenced": true,
+    "consentFenced": true,
+    "secretReferenceDigestFenced": true,
+    "idempotencyFenced": true,
+    "requiredReadPermissions": [
+      "project.read",
+      "transcription.result.read",
+      "transcription.metadata.read",
+      "transcription.utterance_digest.read"
+    ],
+    "forbiddenPermissions": [
+      "audio.upload",
+      "audio.fetch",
+      "transcription.submit",
+      "transcription.write",
+      "media.write",
+      "speaker.identity.write",
+      "external.write"
+    ],
+    "failClosedOn": [
+      "scope_drift",
+      "consent_drift",
+      "revision_drift",
+      "registration_tamper",
+      "registration_revocation",
+      "duplicate_proposal",
+      "idempotency_conflict",
+      "replay"
+    ]
+  },
+  "consumer": {
+    "id": "mission.deepgram-transcript-result.consumer",
+    "authority": "redacted_review_proposal_and_recording_below_kernel",
+    "scope": [
+      "Project",
+      "Mission",
+      "Work Product",
+      "consent",
+      "mission_revision",
+      "work_product_revision"
+    ],
+    "proposalRequiresNextMissionDecision": true,
+    "outcomeAdoption": false,
+    "verifiedWorkProductAdoption": false,
+    "kernelAuthority": false
+  },
+  "authority": {
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "externalWrites": false,
+    "audioUpload": false,
+    "audioDownload": false,
+    "rawAudioRetention": false,
+    "rawTranscriptRetention": false,
+    "mediaWrites": false,
+    "speakerIdentityMutation": false,
+    "durableProviderReceipt": false,
+    "independentReadback": false,
+    "workProductAdoption": false,
+    "outcomeAdoption": false,
+    "kernelAuthority": false
+  },
+  "provenance": {
+    "fixture": "non_native_non_connected_non_first_party",
+    "recording": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "BLOCKED_ENV": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "recordingIsDurableProviderReceipt": false
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredToLayer2": [
+      "native_secret_resolution",
+      "live_https_submission_or_read",
+      "consented_audio_effects",
+      "durable_provider_receipt",
+      "independent_transcript_readback",
+      "verified_work_product_adoption"
+    ],
+    "blockedEnvironmentNeverClaimsConnectedOrNative": true
+  },
+  "forbidden": [
+    "raw_audio",
+    "audio_download",
+    "raw_transcript",
+    "raw_words",
+    "raw_provider_error_text",
+    "media_write",
+    "speaker_identity_write",
+    "live_https_authority",
+    "native_connected_claim",
+    "kernel_receipt_authority",
+    "work_product_adoption",
+    "outcome_authority"
+  ],
+  "officialReferences": [
+    "https://developers.deepgram.com/reference/speech-to-text/listen-pre-recorded",
+    "https://developers.deepgram.com/docs/utterances",
+    "https://developers.deepgram.com/docs/language-detection",
+    "https://developers.deepgram.com/docs/summarization"
+  ]
+}

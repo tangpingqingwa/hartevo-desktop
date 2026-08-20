@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/plugins/linear-work/manifest/v1",
+  "title": "Hartevo Linear OAuth Work Graph Plugin Layer 1",
+  "description": "Stable GraphQL reads, signed webhook observation and a canonical non-mutating Mission work proposal.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "service",
+    "provider",
+    "missionConsumer",
+    "forbiddenAuthorities",
+    "honestyBoundary"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-linear-work-plugin-contract/v1"},
+    "contractVersion": {"const": "linear-work-e1/v1"},
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "operations", "authority", "sourceOfTruth"],
+      "properties": {
+        "id": {"const": "external.work.graph"},
+        "version": {"const": 1},
+        "operations": {
+          "type": "array",
+          "const": [
+            "oauth_probe",
+            "read_issues",
+            "read_projects",
+            "read_cycles",
+            "verify_webhook",
+            "propose"
+          ]
+        },
+        "authority": {"const": "read_and_propose_only"},
+        "sourceOfTruth": {"const": "mission"}
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "api",
+        "graphqlEndpoint",
+        "agentSessionDeveloperPreview",
+        "scopeBindings",
+        "provenanceClasses",
+        "pagination",
+        "webhook",
+        "reversible"
+      ],
+      "properties": {
+        "id": {"const": "linear.oauth.work"},
+        "version": {"const": 1},
+        "api": {"const": "stable_graphql"},
+        "graphqlEndpoint": {"const": "https://api.linear.app/graphql"},
+        "agentSessionDeveloperPreview": {"const": false},
+        "scopeBindings": {
+          "type": "array",
+          "const": [
+            "organization",
+            "team_set",
+            "actor",
+            "app_identity",
+            "oauth_scope",
+            "token_expiry"
+          ]
+        },
+        "provenanceClasses": {
+          "type": "array",
+          "const": ["native_https", "fixture", "loopback", "blocked_env"]
+        },
+        "pagination": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["style", "maxPageSize", "rateLimitReceipts"],
+          "properties": {
+            "style": {"const": "relay_cursor"},
+            "maxPageSize": {"const": 100},
+            "rateLimitReceipts": {"const": true}
+          }
+        },
+        "webhook": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["signature", "rawBodyRequired", "replayFence", "revocationEvents"],
+          "properties": {
+            "signature": {"const": "hmac_sha256_hex"},
+            "rawBodyRequired": {"const": true},
+            "replayFence": {"const": "delivery_id_and_timestamp"},
+            "revocationEvents": {
+              "type": "array",
+              "const": ["oauth_revoked", "permission_change"]
+            }
+          }
+        },
+        "reversible": {"const": true}
+      }
+    },
+    "missionConsumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "proposalKinds", "mutatingGraphqlOperations", "adoptableResult"],
+      "properties": {
+        "id": {"const": "mission.external.work.linear"},
+        "proposalKinds": {"const": ["issue", "comment", "status"]},
+        "mutatingGraphqlOperations": {"const": false},
+        "adoptableResult": {"const": true}
+      }
+    },
+    "forbiddenAuthorities": {
+      "type": "array",
+      "const": ["store", "keyring", "browser_profile", "effect_broker"]
+    },
+    "honestyBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixturesAreConnected", "loopbackIsNative", "blockedEnvIsConnected", "linearIsMissionTruth"],
+      "properties": {
+        "fixturesAreConnected": {"const": false},
+        "loopbackIsNative": {"const": false},
+        "blockedEnvIsConnected": {"const": false},
+        "linearIsMissionTruth": {"const": false}
+      }
+    }
+  }
+}
