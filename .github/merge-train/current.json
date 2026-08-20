@@ -1,16 +1,16 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "edbf24666c8eed40bffc7e3736dad36342643643",
+  "baseCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414",
   "candidateCount": 1,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/ci-runtime-adapter-etxtbsy-fix",
-      "headCommit": "feb9c5c2d9ef02a24ea32eb8631bca5b9d4b3a0f",
-      "number": 394
+      "headBranch": "codex/issue-335-launchdarkly-release-layer1",
+      "headCommit": "20c8dbb756259a49dd83d7b3dd91b5b1c4d1e9d2",
+      "number": 362
     }
   ],
-  "createdAt": "2026-08-14T13:51:55Z",
+  "createdAt": "2026-08-20T11:45:02Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -21,5 +21,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260814-1351"
+  "trainBranch": "merge-train/20260820-1141-pr362"
 }
