@@ -3,6 +3,7 @@ members = [
   "hartevo-rs/application",
   "hartevo-rs/browser-adapter",
   "hartevo-rs/capability-gateway",
+  "hartevo-rs/channel-adapters",
   "hartevo-rs/catalog",
   "hartevo-rs/cloud-storage",
   "hartevo-rs/connector-sdk",
@@ -14,6 +15,7 @@ members = [
   "hartevo-rs/eval",
   "hartevo-rs/runtime-adapter",
   "hartevo-rs/mission-scheduler",
+  "hartevo-rs/plugin-runtime",
   "hartevo-rs/storage",
 ]
 resolver = "3"
@@ -42,7 +44,7 @@ os_pipe = "1.2.3"
 proptest = "1.11.0"
 ring = "0.17.14"
 rusqlite = { version = "0.38", features = ["backup", "bundled-sqlcipher-vendored-openssl"] }
-rust_decimal = { version = "1.39", features = ["serde"] }
+rust_decimal = { version = "1.39", default-features = false, features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

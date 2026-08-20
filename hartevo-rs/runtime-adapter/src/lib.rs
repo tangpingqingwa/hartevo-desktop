@@ -24,6 +24,32 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, U
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+mod control_plane;
+mod plugin;
+mod provider;
+
+pub use control_plane::{
+    CONTROL_PLANE_CONTRACT_SHA256, ResolvedSecret, RuntimeBudget, RuntimeCapabilities,
+    RuntimeCatalog, RuntimeDataBoundary, RuntimeEndpointClass, RuntimeExecutionConfig,
+    RuntimeHarnessDescriptor, RuntimeHarnessDiscovery, RuntimeModelDescriptor,
+    RuntimeModelDiscovery, RuntimeProviderDescriptor, RuntimeRecoveryAction, RuntimeRecoveryHint,
+    RuntimeServiceTier, RuntimeWireApi, SecretBinding, SecretReference, SecretResolver,
+    control_plane_contract_digest,
+};
+pub use plugin::{
+    RUNTIME_PLUGIN_MOUNT_SCHEMA, RUNTIME_PLUGIN_SCOPE_SCHEMA, RUNTIME_SERVICE_DEFINITION_SCHEMA,
+    RUNTIME_SERVICE_PROVIDER_MANIFEST_SCHEMA, RuntimePluginError, RuntimePluginMount,
+    RuntimePluginMountState, RuntimePluginRegistration, RuntimePluginRegistrationKind,
+    RuntimePluginRegistrationStopper, RuntimePluginScope, RuntimePluginTeardownReceipt,
+    RuntimeServiceCapability, RuntimeServiceDefinition, RuntimeServiceProviderManifest,
+};
+pub use provider::{
+    DurableModelVisibleEvent, DurableModelVisibleEventKind, MissionSessionLog, NativeProbeStatus,
+    OpenInterpreterRuntimeProvider, ProviderRestartReceipt, RuntimeProviderError,
+    RuntimeProviderPolicy, RuntimeProviderSession, RuntimeProviderStreamEvent,
+    RuntimeProviderTeardown,
+};
+
 pub const OPENINTERPRETER_COMMIT: &str = "52a31019714294add53cafbc5268e1467b471263";
 pub const OPENINTERPRETER_RELEASE: &str = "rust-v0.0.34";
 pub const APP_SERVER_SCHEMA_SHA256: &str =
@@ -32,6 +58,7 @@ pub const PROTOCOL_VERSION: &str = "hartevo-runtime-protocol/v1";
 pub const RUNTIME_LAUNCH_TOKEN_ENV: &str = "HARTEVO_RUNTIME_LAUNCH_TOKEN";
 
 static RUNTIME_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+static RUNTIME_LAUNCH_STAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const CONTRACT_METHODS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -404,6 +431,8 @@ pub struct RuntimeMapping {
     pub runtime_instance_digest: String,
     pub runtime_model: String,
     pub runtime_model_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_config: Option<RuntimeExecutionConfig>,
     pub runtime_thread_id: String,
     pub runtime_turn_id: Option<String>,
     pub schema_digest: String,
@@ -426,6 +455,31 @@ impl RuntimeMapping {
             runtime_instance_digest: runtime_instance_digest.into(),
             runtime_model: runtime_model.into(),
             runtime_model_provider: runtime_model_provider.into(),
+            runtime_config: None,
+            runtime_thread_id: runtime_thread_id.into(),
+            runtime_turn_id: None,
+            schema_digest: format!("sha256:{APP_SERVER_SCHEMA_SHA256}"),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn new_with_config(
+        project_id: impl Into<String>,
+        mission_id: impl Into<String>,
+        runtime_generation: u64,
+        runtime_instance_digest: impl Into<String>,
+        runtime_config: RuntimeExecutionConfig,
+        runtime_thread_id: impl Into<String>,
+    ) -> Result<Self, AdapterError> {
+        let value = Self {
+            project_id: project_id.into(),
+            mission_id: mission_id.into(),
+            runtime_generation,
+            runtime_instance_digest: runtime_instance_digest.into(),
+            runtime_model: runtime_config.model_id.clone(),
+            runtime_model_provider: runtime_config.provider_id.clone(),
+            runtime_config: Some(runtime_config),
             runtime_thread_id: runtime_thread_id.into(),
             runtime_turn_id: None,
             schema_digest: format!("sha256:{APP_SERVER_SCHEMA_SHA256}"),
@@ -441,6 +495,11 @@ impl RuntimeMapping {
             || !is_sha256(&self.runtime_instance_digest)
             || !is_bounded_identifier(&self.runtime_model)
             || !is_bounded_identifier(&self.runtime_model_provider)
+            || self.runtime_config.as_ref().is_some_and(|config| {
+                config.validate().is_err()
+                    || config.model_id != self.runtime_model
+                    || config.provider_id != self.runtime_model_provider
+            })
             || !is_bounded_identifier(&self.runtime_thread_id)
             || self
                 .runtime_turn_id
@@ -474,6 +533,13 @@ impl fmt::Debug for RuntimeMapping {
             .field(
                 "runtime_model_provider_digest",
                 &digest_bytes(self.runtime_model_provider.as_bytes()),
+            )
+            .field(
+                "runtime_config_digest",
+                &self
+                    .runtime_config
+                    .as_ref()
+                    .and_then(|config| config.digest().ok()),
             )
             .field(
                 "runtime_thread_digest",
@@ -681,6 +747,7 @@ pub struct MappedTurnEvent {
     pub kind: MappedTurnEventKind,
     pub event_digest: String,
     pub approval_request: Option<RuntimeLocalApprovalRequest>,
+    pub recovery_hint: Option<RuntimeRecoveryHint>,
     /// Incremental user-facing assistant text. It is transient, zeroized on
     /// drop, and omitted from content-free evidence.
     pub agent_message_delta: Option<RuntimeAgentMessageDelta>,
@@ -696,6 +763,7 @@ impl fmt::Debug for MappedTurnEvent {
             .field("kind", &self.kind)
             .field("event_digest", &self.event_digest)
             .field("approval_request", &self.approval_request)
+            .field("recovery_hint", &self.recovery_hint)
             .field("agent_message_delta", &self.agent_message_delta)
             .field("agent_message", &self.agent_message)
             .finish()
@@ -719,6 +787,161 @@ impl fmt::Debug for RuntimeTurnDispatch {
             .field("response_digest", &self.response_digest)
             .field("elapsed", &self.elapsed)
             .finish()
+    }
+}
+
+pub const RUNTIME_RESULT_PACKET_SCHEMA: &str = "hartevo.runtime-result-packet/v1";
+
+/// The only authority a completed runtime item can carry across the adapter boundary.
+///
+/// This is local execution evidence. It is deliberately not a provider receipt, an external
+/// effect receipt, a business Outcome, or Release evidence. The packet is separate from
+/// `RuntimeMapping`, so business content is never inserted into Runtime identity or process
+/// state merely because it is eligible for adoption.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeResultAuthority {
+    LocalExecutionEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeResultKind {
+    AgentMessage,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeResultPacket {
+    pub schema: String,
+    pub authority: RuntimeResultAuthority,
+    pub result_kind: RuntimeResultKind,
+    pub project_id: String,
+    pub mission_id: String,
+    pub runtime_generation: u64,
+    pub runtime_instance_digest: String,
+    pub runtime_commit: String,
+    pub runtime_release: String,
+    pub mapping_digest: String,
+    pub runtime_thread_id_digest: String,
+    pub runtime_turn_id_digest: String,
+    pub app_server_schema_digest: String,
+    pub runtime_config_digest: String,
+    pub catalog_digest: String,
+    pub source_item_id_digest: String,
+    pub source_event_digest: String,
+    pub content_digest: String,
+    pub content_byte_count: u64,
+    pub content: String,
+}
+
+impl RuntimeResultPacket {
+    /// Convert exactly one bounded completed agent item into an adoptable packet.
+    ///
+    /// Non-content events and completed items without a supported agent message are not
+    /// errors; they simply are not result packets.
+    pub fn from_mapped_event(
+        mapping: &RuntimeMapping,
+        event: &MappedTurnEvent,
+    ) -> Result<Option<Self>, AdapterError> {
+        if !matches!(&event.kind, MappedTurnEventKind::ItemCompleted) {
+            return Ok(None);
+        }
+        let Some(message) = event.agent_message.as_ref() else {
+            return Ok(None);
+        };
+        mapping.validate()?;
+        let config = mapping
+            .runtime_config
+            .as_ref()
+            .ok_or(AdapterError::InvalidRuntimeResultPacket)?;
+        config.validate()?;
+        let turn_id = mapping
+            .runtime_turn_id
+            .as_deref()
+            .ok_or(AdapterError::InvalidRuntimeResultPacket)?;
+        let packet = Self {
+            schema: RUNTIME_RESULT_PACKET_SCHEMA.to_owned(),
+            authority: RuntimeResultAuthority::LocalExecutionEvidence,
+            result_kind: RuntimeResultKind::AgentMessage,
+            project_id: mapping.project_id.clone(),
+            mission_id: mapping.mission_id.clone(),
+            runtime_generation: mapping.runtime_generation,
+            runtime_instance_digest: mapping.runtime_instance_digest.clone(),
+            runtime_commit: OPENINTERPRETER_COMMIT.to_owned(),
+            runtime_release: OPENINTERPRETER_RELEASE.to_owned(),
+            mapping_digest: mapping.digest()?,
+            runtime_thread_id_digest: digest_hex(mapping.runtime_thread_id.as_bytes()),
+            runtime_turn_id_digest: digest_hex(turn_id.as_bytes()),
+            app_server_schema_digest: mapping.schema_digest.clone(),
+            runtime_config_digest: config.digest()?,
+            catalog_digest: config.catalog_digest.clone(),
+            source_item_id_digest: message.item_id_digest.clone(),
+            source_event_digest: event.event_digest.clone(),
+            content_digest: message.content_digest.clone(),
+            content_byte_count: message.byte_count,
+            content: message.as_str().to_owned(),
+        };
+        packet.validate()?;
+        Ok(Some(packet))
+    }
+
+    pub fn validate(&self) -> Result<(), AdapterError> {
+        let content_byte_count = u64::try_from(self.content.len())
+            .map_err(|_| AdapterError::InvalidRuntimeResultPacket)?;
+        if self.schema != RUNTIME_RESULT_PACKET_SCHEMA
+            || self.authority != RuntimeResultAuthority::LocalExecutionEvidence
+            || self.result_kind != RuntimeResultKind::AgentMessage
+            || !is_bounded_identifier(&self.project_id)
+            || !is_bounded_identifier(&self.mission_id)
+            || self.runtime_generation == 0
+            || !is_sha256(&self.runtime_instance_digest)
+            || self.runtime_commit != OPENINTERPRETER_COMMIT
+            || self.runtime_release != OPENINTERPRETER_RELEASE
+            || !is_sha256(&self.mapping_digest)
+            || !is_sha256(&self.runtime_thread_id_digest)
+            || !is_sha256(&self.runtime_turn_id_digest)
+            || self.app_server_schema_digest != format!("sha256:{APP_SERVER_SCHEMA_SHA256}")
+            || !is_sha256(&self.runtime_config_digest)
+            || !is_sha256(&self.catalog_digest)
+            || !is_sha256(&self.source_item_id_digest)
+            || !is_sha256(&self.source_event_digest)
+            || !is_sha256(&self.content_digest)
+            || self.content.is_empty()
+            || self.content.len() > MAX_AGENT_MESSAGE_BYTES
+            || self.content_byte_count != content_byte_count
+            || self.content_digest != digest_hex(self.content.as_bytes())
+        {
+            return Err(AdapterError::InvalidRuntimeResultPacket);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for RuntimeResultPacket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeResultPacket")
+            .field("schema", &self.schema)
+            .field("authority", &self.authority)
+            .field("result_kind", &self.result_kind)
+            .field("project_digest", &digest_hex(self.project_id.as_bytes()))
+            .field("mission_digest", &digest_hex(self.mission_id.as_bytes()))
+            .field("runtime_generation", &self.runtime_generation)
+            .field("runtime_instance_digest", &self.runtime_instance_digest)
+            .field("runtime_commit", &self.runtime_commit)
+            .field("runtime_release", &self.runtime_release)
+            .field("mapping_digest", &self.mapping_digest)
+            .field("runtime_thread_id_digest", &self.runtime_thread_id_digest)
+            .field("runtime_turn_id_digest", &self.runtime_turn_id_digest)
+            .field("app_server_schema_digest", &self.app_server_schema_digest)
+            .field("runtime_config_digest", &self.runtime_config_digest)
+            .field("catalog_digest", &self.catalog_digest)
+            .field("source_item_id_digest", &self.source_item_id_digest)
+            .field("source_event_digest", &self.source_event_digest)
+            .field("content_digest", &self.content_digest)
+            .field("content_byte_count", &self.content_byte_count)
+            .finish_non_exhaustive()
     }
 }
 
@@ -803,6 +1026,28 @@ impl AppServerContract {
         )
     }
 
+    pub fn turn_steer(
+        id: RequestId,
+        thread_id: &str,
+        expected_turn_id: &str,
+        client_user_message_id: &str,
+        prompt: &str,
+    ) -> JsonRpcRequest {
+        request(
+            id,
+            "turn/steer",
+            json!({
+                "threadId": thread_id,
+                "expectedTurnId": expected_turn_id,
+                "clientUserMessageId": client_user_message_id,
+                "input": [{
+                    "type": "text",
+                    "text": prompt
+                }]
+            }),
+        )
+    }
+
     pub fn turn_interrupt(id: RequestId, thread_id: &str, turn_id: &str) -> JsonRpcRequest {
         request(
             id,
@@ -810,6 +1055,76 @@ impl AppServerContract {
             json!({
                 "threadId": thread_id,
                 "turnId": turn_id
+            }),
+        )
+    }
+
+    pub fn provider_list(id: RequestId, include_unconfigured: bool) -> JsonRpcRequest {
+        request(
+            id,
+            "interpreter/provider/list",
+            json!({
+                "includeUnconfigured": include_unconfigured
+            }),
+        )
+    }
+
+    pub fn provider_set(id: RequestId, provider_id: &str) -> JsonRpcRequest {
+        request(
+            id,
+            "interpreter/provider/set",
+            json!({
+                "providerId": provider_id,
+                "profile": null
+            }),
+        )
+    }
+
+    pub fn model_list(
+        id: RequestId,
+        model_provider: Option<&str>,
+        include_hidden: bool,
+    ) -> JsonRpcRequest {
+        request(
+            id,
+            "interpreter/model/list",
+            json!({
+                "modelProvider": model_provider,
+                "includeHidden": include_hidden
+            }),
+        )
+    }
+
+    pub fn model_set(id: RequestId, model: &str, reasoning_effort: Option<&str>) -> JsonRpcRequest {
+        request(
+            id,
+            "interpreter/model/set",
+            json!({
+                "model": model,
+                "reasoningEffort": reasoning_effort,
+                "profile": null
+            }),
+        )
+    }
+
+    pub fn harness_list(id: RequestId, provider_id: &str, model: Option<&str>) -> JsonRpcRequest {
+        request(
+            id,
+            "interpreter/harness/list",
+            json!({
+                "providerId": provider_id,
+                "model": model
+            }),
+        )
+    }
+
+    pub fn harness_set(id: RequestId, harness: Option<&str>) -> JsonRpcRequest {
+        request(
+            id,
+            "interpreter/harness/set",
+            json!({
+                "harness": harness,
+                "profile": null
             }),
         )
     }
@@ -831,6 +1146,21 @@ impl AppServerContract {
     pub fn stable_methods() -> Result<Vec<String>, AdapterError> {
         let document: Value = serde_json::from_str(CONTRACT_METHODS)?;
         document["stableMethods"]
+            .as_array()
+            .ok_or(AdapterError::InvalidContract)?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or(AdapterError::InvalidContract)
+            })
+            .collect()
+    }
+
+    pub fn stable_server_requests() -> Result<Vec<String>, AdapterError> {
+        let document: Value = serde_json::from_str(CONTRACT_METHODS)?;
+        document["stableServerRequests"]
             .as_array()
             .ok_or(AdapterError::InvalidContract)?
             .iter()
@@ -874,6 +1204,9 @@ pub struct RuntimeCommand {
     pub args: Vec<String>,
     pub current_dir: PathBuf,
     pub environment: BTreeMap<String, String>,
+    /// Opaque credential bindings resolved only for a child-process spawn.  The secret material
+    /// itself is never part of this command or its digest.
+    pub secret_bindings: Vec<SecretBinding>,
     /// Exact isolated state root expected back from OpenInterpreter `initialize`.
     ///
     /// When set, `INTERPRETER_HOME` must resolve to this already-created directory and the
@@ -895,6 +1228,7 @@ impl RuntimeCommand {
             args: Vec::new(),
             current_dir: current_dir.into(),
             environment: BTreeMap::new(),
+            secret_bindings: Vec::new(),
             openinterpreter_home: None,
             stdout_capacity: DEFAULT_STDOUT_CAPACITY,
             stderr_capacity: DEFAULT_STDERR_CAPACITY,
@@ -907,6 +1241,19 @@ impl RuntimeCommand {
     pub fn intent_digest(&self) -> Result<String, AdapterError> {
         let validated = validate_runtime_command(self)?;
         Ok(self.intent_digest_with(&validated))
+    }
+
+    pub fn add_secret_binding(
+        &mut self,
+        environment_key: impl Into<String>,
+        reference: SecretReference,
+    ) -> Result<(), AdapterError> {
+        let binding = SecretBinding::new(environment_key, reference)?;
+        let mut candidate = self.secret_bindings.clone();
+        candidate.push(binding);
+        control_plane::validate_secret_bindings(&candidate)?;
+        self.secret_bindings = candidate;
+        Ok(())
     }
 
     pub fn program_sha256(&self) -> Result<String, AdapterError> {
@@ -935,6 +1282,17 @@ impl RuntimeCommand {
         for (key, value) in &self.environment {
             hash_length_prefixed(&mut hasher, key.as_bytes());
             hash_length_prefixed(&mut hasher, value.as_bytes());
+        }
+        for binding in &self.secret_bindings {
+            hash_length_prefixed(&mut hasher, binding.environment_key.as_bytes());
+            hash_length_prefixed(
+                &mut hasher,
+                binding
+                    .reference
+                    .digest()
+                    .unwrap_or_else(|_| "invalid".to_owned())
+                    .as_bytes(),
+            );
         }
         match &validated.openinterpreter_home {
             Some(home) => {
@@ -966,6 +1324,15 @@ impl fmt::Debug for RuntimeCommand {
             .field(
                 "environment_keys",
                 &self.environment.keys().collect::<Vec<_>>(),
+            )
+            .field("secret_binding_count", &self.secret_bindings.len())
+            .field(
+                "secret_binding_keys",
+                &self
+                    .secret_bindings
+                    .iter()
+                    .map(|binding| binding.environment_key.as_str())
+                    .collect::<Vec<_>>(),
             )
             .field(
                 "openinterpreter_home_digest",
@@ -1278,6 +1645,7 @@ pub struct StdioRuntime {
     expected_runtime_home: Option<PathBuf>,
     program_sha256: String,
     program_integrity_pinned: bool,
+    last_control_plane_provider_id: Option<String>,
     poisoned: bool,
 }
 
@@ -1303,12 +1671,32 @@ impl StdioRuntime {
         Self::spawn_prepared(config, &launch)
     }
 
+    /// Resolve opaque credentials at the last possible boundary and inject them only into the
+    /// isolated child environment. The resolver and material are not retained by the runtime.
+    pub fn spawn_with_secret_resolver(
+        config: &RuntimeCommand,
+        resolver: &dyn SecretResolver,
+    ) -> Result<Self, AdapterError> {
+        let launch_token = generate_runtime_launch_token(config)?;
+        let launch = prepare_runtime_launch(config, &launch_token)?;
+        Self::spawn_prepared_with_secret_resolver(config, &launch, resolver)
+    }
+
     pub fn spawn_with_launch_token(
         config: &RuntimeCommand,
         launch_token: &str,
     ) -> Result<Self, AdapterError> {
         let launch = prepare_runtime_launch(config, launch_token)?;
         Self::spawn_prepared(config, &launch)
+    }
+
+    pub fn spawn_with_launch_token_and_secret_resolver(
+        config: &RuntimeCommand,
+        launch_token: &str,
+        resolver: &dyn SecretResolver,
+    ) -> Result<Self, AdapterError> {
+        let launch = prepare_runtime_launch(config, launch_token)?;
+        Self::spawn_prepared_with_secret_resolver(config, &launch, resolver)
     }
 
     #[allow(
@@ -1318,6 +1706,31 @@ impl StdioRuntime {
     pub fn spawn_prepared(
         config: &RuntimeCommand,
         launch: &RuntimeLaunchSpec,
+    ) -> Result<Self, AdapterError> {
+        if !config.secret_bindings.is_empty() {
+            return Err(AdapterError::SecretResolverRequired);
+        }
+        Self::spawn_prepared_with_resolved_secrets(config, launch, &[])
+    }
+
+    pub fn spawn_prepared_with_secret_resolver(
+        config: &RuntimeCommand,
+        launch: &RuntimeLaunchSpec,
+        resolver: &dyn SecretResolver,
+    ) -> Result<Self, AdapterError> {
+        let resolved_bindings =
+            control_plane::resolve_secret_bindings(&config.secret_bindings, resolver)?;
+        Self::spawn_prepared_with_resolved_secrets(config, launch, &resolved_bindings)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the spawn boundary keeps executable identity, environment, pipe readers, process-group ownership, and cleanup rollback in one auditable sequence"
+    )]
+    fn spawn_prepared_with_resolved_secrets(
+        config: &RuntimeCommand,
+        launch: &RuntimeLaunchSpec,
+        resolved_secrets: &[control_plane::ResolvedSecretBinding],
     ) -> Result<Self, AdapterError> {
         if &prepare_runtime_launch(config, launch.launch_token())? != launch {
             return Err(AdapterError::RuntimeProcessIdentityInvalid);
@@ -1342,6 +1755,9 @@ impl StdioRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         apply_minimal_environment(&mut command, &config.environment);
+        for binding in resolved_secrets {
+            command.env(&binding.environment_key, binding.secret.as_str());
+        }
         command.env(RUNTIME_LAUNCH_TOKEN_ENV, launch.launch_token());
 
         let mut child = spawn_process_group(&mut command)?;
@@ -1442,6 +1858,7 @@ impl StdioRuntime {
             expected_runtime_home: validated.openinterpreter_home,
             program_sha256: validated.program_sha256,
             program_integrity_pinned: config.expected_program_sha256.is_some(),
+            last_control_plane_provider_id: None,
             poisoned: false,
         })
     }
@@ -1555,10 +1972,14 @@ impl StdioRuntime {
         let Some((stream, message)) = selected else {
             return Err(AdapterError::NextEventTimedOut);
         };
-        Ok(match message {
+        let event = match message {
             Ok(message) => self.handle_reader_message(stream, message),
             Err(_) => self.handle_reader_disconnect(stream),
-        })
+        };
+        if matches!(&event, RuntimeEvent::StderrClosed) {
+            return self.prioritize_stdout_before_stderr_closed(deadline, event);
+        }
+        Ok(event)
     }
 
     pub fn health_check(&mut self, timeout: Duration) -> Result<RuntimeHealth, AdapterError> {
@@ -1755,6 +2176,7 @@ impl StdioRuntime {
                         kind: approval_kind,
                         request_digest,
                     }),
+                    recovery_hint: None,
                     agent_message_delta: None,
                     agent_message: None,
                 })
@@ -1763,6 +2185,7 @@ impl StdioRuntime {
                 let event_digest = digest_hex(&serde_json::to_vec(&notification)?);
                 let mut agent_message = None;
                 let mut agent_message_delta = None;
+                let mut recovery_hint = None;
                 let mapped_kind = match kind {
                     RuntimeEventKind::TurnStarted => {
                         self.validate_turn_scope_fields(mapping, &notification.params, true)?;
@@ -1787,6 +2210,10 @@ impl StdioRuntime {
                     }
                     RuntimeEventKind::ItemCompleted => {
                         self.validate_turn_scope_fields(mapping, &notification.params, false)?;
+                        recovery_hint = notification
+                            .params
+                            .get("item")
+                            .and_then(control_plane::recovery_hint_for_item);
                         agent_message = match completed_agent_message(&notification.params) {
                             Ok(message) => message,
                             Err(_) => {
@@ -1812,6 +2239,7 @@ impl StdioRuntime {
                     kind: mapped_kind,
                     event_digest,
                     approval_request: None,
+                    recovery_hint,
                     agent_message_delta,
                     agent_message,
                 })
@@ -1820,6 +2248,7 @@ impl StdioRuntime {
                 kind: MappedTurnEventKind::Diagnostic,
                 event_digest: digest_hex(format!("{diagnostic:?}").as_bytes()),
                 approval_request: None,
+                recovery_hint: None,
                 agent_message_delta: None,
                 agent_message: None,
             }),
@@ -1827,6 +2256,7 @@ impl StdioRuntime {
                 kind: MappedTurnEventKind::Diagnostic,
                 event_digest: digest_hex(b"runtime-stderr-closed"),
                 approval_request: None,
+                recovery_hint: None,
                 agent_message_delta: None,
                 agent_message: None,
             }),
@@ -2121,6 +2551,42 @@ impl StdioRuntime {
             model,
             model_provider,
         })
+    }
+
+    fn prioritize_stdout_before_stderr_closed(
+        &mut self,
+        deadline: Instant,
+        stderr_closed: RuntimeEvent,
+    ) -> Result<RuntimeEvent, AdapterError> {
+        if let Some(event) = self.try_ready_event() {
+            self.defer_event(stderr_closed)?;
+            return Ok(event);
+        }
+        let Some(stdout_rx) = self.stdout_rx.clone() else {
+            return Ok(stderr_closed);
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(stderr_closed);
+        }
+        let event = match stdout_rx.recv_timeout(remaining) {
+            Ok(message) => self.handle_reader_message(RuntimeStream::Stdout, message),
+            Err(RecvTimeoutError::Disconnected) => {
+                self.handle_reader_disconnect(RuntimeStream::Stdout)
+            }
+            Err(RecvTimeoutError::Timeout) => return Ok(stderr_closed),
+        };
+        self.defer_event(stderr_closed)?;
+        Ok(event)
+    }
+
+    fn defer_event(&mut self, event: RuntimeEvent) -> Result<(), AdapterError> {
+        if self.deferred.len() >= self.deferred_capacity {
+            self.poisoned = true;
+            return Err(AdapterError::DeferredEventOverflow);
+        }
+        self.deferred.push_back(event);
+        Ok(())
     }
 
     fn try_ready_event(&mut self) -> Option<RuntimeEvent> {
@@ -2422,6 +2888,10 @@ struct ValidatedRuntimeCommand {
     openinterpreter_home: Option<PathBuf>,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "command validation keeps path, environment, credential, and release-pin checks at one process boundary"
+)]
 fn validate_runtime_command(
     config: &RuntimeCommand,
 ) -> Result<ValidatedRuntimeCommand, AdapterError> {
@@ -2464,8 +2934,16 @@ fn validate_runtime_command(
     if config.environment.len() > MAX_ENVIRONMENT_VARIABLES {
         return Err(AdapterError::ConfigurationOutOfRange("environment"));
     }
+    control_plane::validate_secret_bindings(&config.secret_bindings)?;
     for (key, value) in &config.environment {
         validate_environment_pair(key, value)?;
+    }
+    if config
+        .secret_bindings
+        .iter()
+        .any(|binding| config.environment.contains_key(&binding.environment_key))
+    {
+        return Err(AdapterError::SecretEnvironmentCollision);
     }
 
     let program = config.program.canonicalize().map_err(AdapterError::Io)?;
@@ -2782,6 +3260,56 @@ impl Drop for RuntimeLaunchArtifactGuard {
     }
 }
 
+struct RuntimeLaunchStagingGuard {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl RuntimeLaunchStagingGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RuntimeLaunchStagingGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn runtime_launch_staging_path(launch: &RuntimeLaunchSpec) -> Result<PathBuf, AdapterError> {
+    let file_name = launch
+        .executable_path
+        .file_name()
+        .ok_or(AdapterError::RuntimeLaunchArtifactInvalid)?;
+    let counter = RUNTIME_LAUNCH_STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut staging_name = file_name.to_os_string();
+    staging_name.push(format!(".staging-{}-{counter}", std::process::id()));
+    Ok(launch.executable_path.with_file_name(staging_name))
+}
+
+fn finalize_runtime_launch(staging_path: &Path, final_path: &Path) -> Result<(), AdapterError> {
+    match fs::symlink_metadata(final_path) {
+        Ok(_) => return Err(AdapterError::RuntimeLaunchArtifactExists),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // The staging file is in the same private directory as the final path. Once its writer has
+    // been closed and its digest verified, same-filesystem rename makes the immutable executable
+    // visible to the child without exposing a partially written final path.
+    fs::rename(staging_path, final_path)?;
+    Ok(())
+}
+
 fn materialize_runtime_launch(
     validated: &ValidatedRuntimeCommand,
     launch: &RuntimeLaunchSpec,
@@ -2820,17 +3348,27 @@ fn materialize_runtime_launch(
     }
     fs::create_dir(launch_directory)?;
     set_private_runtime_permissions(launch_directory, true)?;
-    let mut source = fs::File::open(&validated.program)?;
-    let mut destination = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&launch.executable_path)?;
-    std::io::copy(&mut source, &mut destination)?;
-    destination.sync_all()?;
-    set_private_runtime_permissions(&launch.executable_path, false)?;
-    if sha256_file(&launch.executable_path)? != validated.program_sha256 {
+    let staging_path = runtime_launch_staging_path(launch)?;
+    let mut staging_guard = RuntimeLaunchStagingGuard::new(staging_path.clone());
+    {
+        let mut source = fs::File::open(&validated.program)?;
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)?;
+        std::io::copy(&mut source, &mut destination)?;
+        destination.sync_all()?;
+        // Do not expose the file to exec until both the source and destination handles are
+        // closed. Linux returns ETXTBSY when an executable is still open for writing.
+        drop(destination);
+        drop(source);
+    }
+    set_private_runtime_permissions(&staging_path, false)?;
+    if sha256_file(&staging_path)? != validated.program_sha256 {
         return Err(AdapterError::RuntimeProgramChangedDuringSpawn);
     }
+    finalize_runtime_launch(&staging_path, &launch.executable_path)?;
+    staging_guard.commit();
     Ok(RuntimeLaunchArtifactGuard {
         path: launch.executable_path.clone(),
         path_digest: launch.executable_path_digest.clone(),
@@ -2991,7 +3529,8 @@ pub fn cleanup_runtime_process(
     if let Some(expected) = &target.identity {
         let root = system.process(Pid::from_u32(expected.process_id));
         let root_matches_identity = root.is_some_and(|process| {
-            process.start_time() == expected.started_at_epoch_seconds
+            !process_is_zombie(process)
+                && process.start_time() == expected.started_at_epoch_seconds
                 && process.exe().is_some_and(|path| {
                     digest_hex(path.to_string_lossy().as_bytes()) == expected.executable_path_digest
                 })
@@ -3097,6 +3636,10 @@ fn process_has_launch_token(process: &sysinfo::Process, launch_token: &str) -> b
     })
 }
 
+fn process_is_zombie(process: &sysinfo::Process) -> bool {
+    matches!(process.status(), sysinfo::ProcessStatus::Zombie)
+}
+
 fn processes_for_runtime_claim(system: &System, target: &RuntimeProcessCleanupTarget) -> Vec<Pid> {
     let marker_processes = system
         .processes()
@@ -3106,8 +3649,9 @@ fn processes_for_runtime_claim(system: &System, target: &RuntimeProcessCleanupTa
                 digest_hex(path.to_string_lossy().as_bytes())
                     == target.launch_executable_path_digest
             });
-            (executable_matches || process_has_launch_token(process, &target.launch_token))
-                .then_some(*pid)
+            (!process_is_zombie(process)
+                && (executable_matches || process_has_launch_token(process, &target.launch_token)))
+            .then_some(*pid)
         })
         .collect::<HashSet<_>>();
     let mut selected = marker_processes.clone();
@@ -3198,7 +3742,18 @@ fn runtime_process_cleanup_report(
 fn is_stable_client_method(method: &str) -> bool {
     matches!(
         method,
-        "initialize" | "thread/start" | "thread/resume" | "turn/start" | "turn/interrupt"
+        "initialize"
+            | "thread/start"
+            | "thread/resume"
+            | "turn/start"
+            | "turn/steer"
+            | "turn/interrupt"
+            | "interpreter/provider/list"
+            | "interpreter/provider/set"
+            | "interpreter/model/list"
+            | "interpreter/model/set"
+            | "interpreter/harness/list"
+            | "interpreter/harness/set"
     )
 }
 
@@ -3394,6 +3949,8 @@ pub enum AdapterError {
     },
     #[error("runtime configuration field is outside its allowed range: {0}")]
     ConfigurationOutOfRange(&'static str),
+    #[error("runtime budget is invalid")]
+    InvalidRuntimeBudget,
     #[error("runtime argument {index} is invalid")]
     InvalidArgument { index: usize },
     #[error("runtime environment key is invalid ({key_digest})")]
@@ -3478,8 +4035,12 @@ pub enum AdapterError {
     InvalidTurnResponse { response_digest: String },
     #[error("runtime turn notification is invalid ({notification_digest})")]
     InvalidTurnNotification { notification_digest: String },
+    #[error("runtime turn steer was rejected ({error_digest})")]
+    TurnSteerRejected { error_digest: String },
     #[error("runtime agent message has {byte_count} bytes; maximum is {maximum}")]
     AgentMessageTooLarge { byte_count: usize, maximum: usize },
+    #[error("runtime result packet is invalid")]
+    InvalidRuntimeResultPacket,
     #[error("runtime resumed a different thread ({expected_digest} != {actual_digest})")]
     ThreadIdentityMismatch {
         expected_digest: String,
@@ -3489,6 +4050,59 @@ pub enum AdapterError {
     InvalidRuntimeMapping,
     #[error("runtime model identifier is invalid")]
     InvalidRuntimeModel,
+    #[error("runtime secret reference is invalid")]
+    InvalidSecretReference,
+    #[error("resolved runtime secret material is invalid")]
+    InvalidSecretMaterial,
+    #[error("runtime secret binding is invalid")]
+    InvalidSecretBinding,
+    #[error("runtime secret resolution failed for {reference_digest}")]
+    SecretResolutionFailed { reference_digest: String },
+    #[error("runtime has too many secret bindings")]
+    TooManySecretBindings,
+    #[error("runtime secret environment keys must be unique")]
+    DuplicateSecretEnvironmentKey,
+    #[error("runtime secret binding collides with an explicit environment key")]
+    SecretEnvironmentCollision,
+    #[error("runtime secret bindings require an explicit secret resolver")]
+    SecretResolverRequired,
+    #[error("runtime catalog is invalid")]
+    InvalidRuntimeCatalog,
+    #[error("runtime catalog contains a duplicate provider, model, or harness")]
+    DuplicateRuntimeCatalogEntry,
+    #[error("runtime catalog response is malformed")]
+    InvalidRuntimeCatalogResponse,
+    #[error("runtime control-plane contract is invalid")]
+    InvalidControlPlaneContract,
+    #[error("runtime provider is not present in the pinned catalog")]
+    RuntimeProviderUnavailable,
+    #[error("runtime model is not present in the pinned catalog")]
+    RuntimeModelUnavailable,
+    #[error("runtime harness is not present in the pinned catalog")]
+    RuntimeHarnessUnavailable,
+    #[error("runtime catalog drift detected ({expected_digest} != {actual_digest})")]
+    RuntimeCatalogDrift {
+        expected_digest: String,
+        actual_digest: String,
+    },
+    #[error("runtime configuration drift detected for {field}")]
+    RuntimeConfigDrift { field: &'static str },
+    #[error("runtime App Server schema drift detected ({expected_digest} != {actual_digest})")]
+    RuntimeSchemaDrift {
+        expected_digest: String,
+        actual_digest: String,
+    },
+    #[error("runtime capability was not negotiated: {capability}")]
+    CapabilityNotNegotiated { capability: &'static str },
+    #[error("runtime execution configuration is invalid")]
+    InvalidRuntimeExecutionConfig,
+    #[error("runtime configuration request {method} was rejected ({error_digest})")]
+    RuntimeConfigRequestRejected {
+        method: String,
+        error_digest: String,
+    },
+    #[error("runtime configuration response for {method} is invalid")]
+    InvalidRuntimeConfigResponse { method: String },
     #[error("system clock is before the Unix epoch")]
     SystemClockBeforeUnixEpoch,
     #[error("runtime exited before completing the protocol operation: {exit_code:?}")]
@@ -3589,11 +4203,57 @@ mod tests {
                 "thread/start",
                 "thread/resume",
                 "turn/start",
-                "turn/interrupt"
+                "turn/steer",
+                "turn/interrupt",
+                "interpreter/provider/list",
+                "interpreter/provider/set",
+                "interpreter/model/list",
+                "interpreter/model/set",
+                "interpreter/harness/list",
+                "interpreter/harness/set",
             ]
         );
         assert_eq!(APP_SERVER_SCHEMA_SHA256.len(), 64);
         assert_eq!(AppServerContract::contract_subset_digest().len(), 64);
+    }
+
+    #[test]
+    fn result_packet_is_schema_bound_and_debug_redacts_content() {
+        let content = "private adopted result";
+        let mut packet = RuntimeResultPacket {
+            schema: RUNTIME_RESULT_PACKET_SCHEMA.to_owned(),
+            authority: RuntimeResultAuthority::LocalExecutionEvidence,
+            result_kind: RuntimeResultKind::AgentMessage,
+            project_id: "project-result-packet".to_owned(),
+            mission_id: "mission-result-packet".to_owned(),
+            runtime_generation: 1,
+            runtime_instance_digest: "a".repeat(64),
+            runtime_commit: OPENINTERPRETER_COMMIT.to_owned(),
+            runtime_release: OPENINTERPRETER_RELEASE.to_owned(),
+            mapping_digest: digest_hex(b"mapping"),
+            runtime_thread_id_digest: digest_hex(b"thread"),
+            runtime_turn_id_digest: digest_hex(b"turn"),
+            app_server_schema_digest: format!("sha256:{APP_SERVER_SCHEMA_SHA256}"),
+            runtime_config_digest: digest_hex(b"config"),
+            catalog_digest: digest_hex(b"catalog"),
+            source_item_id_digest: digest_hex(b"item"),
+            source_event_digest: digest_hex(b"event"),
+            content_digest: digest_hex(content.as_bytes()),
+            content_byte_count: content.len() as u64,
+            content: content.to_owned(),
+        };
+        packet.validate().expect("valid result packet");
+        let rendered = format!("{packet:?}");
+        assert!(!rendered.contains(content));
+        let wire = serde_json::to_value(&packet).expect("packet wire value");
+        assert_eq!(wire["authority"], "local_execution_evidence");
+        assert_eq!(wire["content"], content);
+
+        packet.content_digest = digest_hex(b"drifted-content");
+        assert!(matches!(
+            packet.validate(),
+            Err(AdapterError::InvalidRuntimeResultPacket)
+        ));
     }
 
     #[test]
@@ -3629,6 +4289,36 @@ mod tests {
         assert_eq!(request.method, "turn/start");
         assert_eq!(request.params["threadId"], "runtime-thread-1");
         assert_eq!(request.params["input"][0]["type"], "text");
+    }
+
+    #[test]
+    fn control_plane_contract_uses_exact_pinned_wire_keys() {
+        let steer = AppServerContract::turn_steer(
+            RequestId::Number(1),
+            "thread-1",
+            "turn-1",
+            "message-1",
+            "Continue with the bounded task.",
+        );
+        assert_eq!(steer.method, "turn/steer");
+        assert_eq!(steer.params["expectedTurnId"], "turn-1");
+        assert_eq!(steer.params["input"][0]["type"], "text");
+
+        let provider = AppServerContract::provider_list(RequestId::Number(2), true);
+        assert_eq!(provider.params["includeUnconfigured"], true);
+        let model = AppServerContract::model_list(RequestId::Number(3), Some("openai"), false);
+        assert_eq!(model.params["modelProvider"], "openai");
+        let harness =
+            AppServerContract::harness_list(RequestId::Number(4), "openai", Some("gpt-5.6"));
+        assert_eq!(harness.params["providerId"], "openai");
+        assert_eq!(harness.params["model"], "gpt-5.6");
+        assert_eq!(
+            AppServerContract::stable_server_requests().expect("server contract"),
+            vec![
+                "item/commandExecution/requestApproval",
+                "item/fileChange/requestApproval"
+            ]
+        );
     }
 
     #[test]
@@ -3714,6 +4404,191 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"fake-runt
         let report = runtime.shutdown().expect("shutdown");
         assert!(!report.forced);
         assert!(report.success);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fake contract test intentionally exercises the complete credentialed lifecycle in one deterministic script"
+    )]
+    fn fake_credentialed_control_plane_lifecycle_is_exact_and_streamed() {
+        struct FakeResolver;
+
+        impl SecretResolver for FakeResolver {
+            fn resolve(
+                &self,
+                _reference: &SecretReference,
+            ) -> Result<ResolvedSecret, AdapterError> {
+                ResolvedSecret::new("fake-secret")
+            }
+        }
+
+        let workspace = std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical workspace");
+        let workspace_json =
+            serde_json::to_string(&workspace.to_string_lossy()).expect("workspace json");
+        let script = r#"
+while IFS= read -r request; do
+    case "$request" in
+        *'"method":"initialize"'*)
+            if [ "$OPENAI_API_KEY" != "fake-secret" ]; then exit 42; fi
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"',"result":{"serverInfo":{"name":"fake-runtime"}}}'
+            ;;
+        *'"method":"interpreter/provider/list"'*)
+            case "$request" in
+                *'"id":2,'*|*'"id":6,'*|*'"id":9,'*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":'"$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"',"result":{"data":[{"id":"openai","wireApi":"responses","envKey":"OPENAI_API_KEY","configured":true}]}}'
+                    ;;
+            esac
+            ;;
+        *'"method":"interpreter/model/list"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"',"result":{"data":[{"model":"gpt-5.6","supportedReasoningEfforts":[{"reasoningEffort":"medium"}],"serviceTiers":[{"id":"default"}]}]}}'
+            ;;
+        *'"method":"interpreter/harness/list"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"',"result":{"data":[{"id":null,"label":"Native","description":"","isRecommended":true}]}}'
+            ;;
+        *'"method":"interpreter/provider/set"'*|*'"method":"interpreter/model/set"'*|*'"method":"interpreter/harness/set"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"',"result":{}}'
+            ;;
+        *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"',"result":{"thread":{"id":"thread-1"},"cwd":__WORKSPACE_JSON__,"model":"gpt-5.6","modelProvider":"openai","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"workspace-write"}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"',"result":{"turn":{"id":"turn-1","status":"inProgress"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"item-1","type":"error","error":{"code":"rate_limit","message":"private runtime detail"}}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turnId":"turn-1","turn":{"id":"turn-1","status":"failed"}}}'
+            ;;
+        *'"method":"turn/steer"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":'"$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"',"result":{"turnId":"turn-1"}}'
+            ;;
+    esac
+done
+"#.replace("__WORKSPACE_JSON__", &workspace_json);
+        let reference = SecretReference::new(
+            "openai",
+            "fake-account",
+            "keyring/openai/fake",
+            "f".repeat(64),
+            1,
+        )
+        .expect("secret reference");
+        let mut command = shell_runtime(&script);
+        command
+            .add_secret_binding("OPENAI_API_KEY", reference.clone())
+            .expect("secret binding");
+        let mut runtime =
+            StdioRuntime::spawn_with_secret_resolver(&command, &FakeResolver).expect("runtime");
+
+        let capabilities = runtime
+            .negotiate_capabilities(Duration::from_secs(1))
+            .expect("capability negotiation");
+        assert!(capabilities.provider_catalog);
+        assert!(capabilities.model_catalog);
+        assert!(capabilities.harness_catalog);
+        assert!(capabilities.steer);
+
+        let catalog = runtime
+            .discover_runtime_catalog("fake-runtime-catalog-v1", Duration::from_secs(1))
+            .expect("runtime catalog");
+        let provider = catalog.provider("openai").expect("provider");
+        let model = catalog.model("openai", "gpt-5.6").expect("model");
+        let harness = catalog
+            .harness("openai", "gpt-5.6", "native")
+            .expect("harness");
+        let config = RuntimeExecutionConfig::new(
+            provider.id.clone(),
+            provider.revision.clone(),
+            model.id.clone(),
+            model.revision.clone(),
+            "native",
+            harness.revision.clone(),
+            Some("medium".to_owned()),
+            Some("default".to_owned()),
+            RuntimeEndpointClass::Responses,
+            RuntimeBudget::new(8_192, 4_096, 8, 60_000).expect("budget"),
+            RuntimeDataBoundary::ProviderDeclared,
+            reference,
+            catalog.digest().expect("catalog digest"),
+        )
+        .expect("execution config");
+        assert!(
+            catalog
+                .secret_binding(&config)
+                .expect("secret binding")
+                .is_some()
+        );
+
+        let mapping = runtime
+            .start_mapped_thread_with_config(
+                "project-fake-control-plane",
+                "mission-fake-control-plane",
+                1,
+                &workspace,
+                &capabilities,
+                &catalog,
+                &config,
+                Duration::from_secs(1),
+            )
+            .expect("configured thread");
+        let mapping = runtime
+            .resume_mapped_thread_with_config(
+                "project-fake-control-plane",
+                "mission-fake-control-plane",
+                1,
+                &mapping.runtime_thread_id,
+                &workspace,
+                &capabilities,
+                &catalog,
+                &config,
+                Duration::from_secs(1),
+            )
+            .expect("configured resume");
+        let dispatch = runtime
+            .start_mapped_turn_with_config(
+                &mapping,
+                &config,
+                "message-fake-control-plane",
+                "Return a short readiness response.",
+                Duration::from_secs(1),
+            )
+            .expect("configured turn");
+        runtime
+            .steer_mapped_turn(
+                &dispatch.mapping,
+                "steer-fake-control-plane",
+                "Stop and report the current state.",
+                Duration::from_secs(1),
+            )
+            .expect("typed steer");
+
+        assert!(matches!(
+            runtime
+                .next_mapped_turn_event(&dispatch.mapping, Duration::from_secs(1))
+                .expect("turn started"),
+            MappedTurnEvent {
+                kind: MappedTurnEventKind::TurnStarted,
+                ..
+            }
+        ));
+        let item = runtime
+            .next_mapped_turn_event(&dispatch.mapping, Duration::from_secs(1))
+            .expect("item completed");
+        assert_eq!(
+            item.recovery_hint.expect("recovery hint").action,
+            RuntimeRecoveryAction::ReconcileBeforeRetry
+        );
+        assert!(matches!(
+            runtime
+                .next_mapped_turn_event(&dispatch.mapping, Duration::from_secs(1))
+                .expect("turn completed")
+                .kind,
+            MappedTurnEventKind::TurnCompleted(RuntimeTurnCompletionStatus::Failed)
+        ));
+        runtime.shutdown().expect("shutdown");
     }
 
     #[cfg(unix)]
@@ -4003,13 +4878,16 @@ printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"approved":%s}}\n' 
         let event = runtime
             .next_event(Duration::from_secs(1))
             .expect("completion notification");
-        assert!(matches!(
-            event,
-            RuntimeEvent::Notification {
-                kind: RuntimeEventKind::TurnCompleted,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                event,
+                RuntimeEvent::Notification {
+                    kind: RuntimeEventKind::TurnCompleted,
+                    ..
+                }
+            ),
+            "unexpected event after approval response: {event:?}"
+        );
         runtime.shutdown().expect("shutdown");
     }
 
@@ -4117,6 +4995,43 @@ wait"#,
             create_private_runtime_directory(&symlink_path),
             Err(AdapterError::RuntimeLaunchArtifactInvalid)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_launch_artifact_is_closed_before_atomic_finalization() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary launch base");
+        let program = std::env::current_exe().expect("current test executable");
+        let command = RuntimeCommand::new(&program, directory.path());
+        let validated = validate_runtime_command(&command).expect("validated runtime command");
+        let launch = prepare_runtime_launch(&command, &"c".repeat(64)).expect("launch spec");
+        let artifact = materialize_runtime_launch(&validated, &launch).expect("launch artifact");
+
+        let launch_directory = launch.executable_path().parent().expect("launch directory");
+        let entries = fs::read_dir(launch_directory)
+            .expect("finalized launch directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("launch directory entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path(), launch.executable_path());
+        assert_eq!(
+            fs::metadata(launch.executable_path())
+                .expect("final launch artifact")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+        assert_eq!(
+            sha256_file(launch.executable_path()).expect("final launch digest"),
+            validated.program_sha256
+        );
+
+        drop(artifact);
+        assert!(!launch.executable_path().exists());
+        assert!(!launch_directory.exists());
     }
 
     #[cfg(unix)]

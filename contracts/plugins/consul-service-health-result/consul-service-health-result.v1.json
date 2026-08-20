@@ -1,0 +1,110 @@
+{
+  "schemaVersion": "hartevo-consul-service-health-result-contract/v1",
+  "contractVersion": "consul-service-health-result-l1/v1",
+  "layer": 1,
+  "service": {
+    "id": "consul.service-health.result",
+    "name": "ConsulServiceHealthResultService",
+    "version": "0.1.0",
+    "readOnly": true,
+    "liveExecution": false,
+    "nativeClaims": false,
+    "capabilities": [
+      "bounded-redacted-read",
+      "deterministic-proposal",
+      "digest-only-local-record",
+      "replay-and-tamper-verification"
+    ],
+    "scope": [
+      "Project",
+      "Mission",
+      "Work Product",
+      "HTTPS endpoint",
+      "datacenter",
+      "admin partition",
+      "namespace",
+      "service",
+      "tag",
+      "node",
+      "service instance",
+      "check"
+    ]
+  },
+  "provider": {
+    "id": "consul.health.read",
+    "name": "ConsulHealthProvider",
+    "version": "consul-health-provider/v1",
+    "api": {
+      "version": "v1",
+      "revision": "health-service-catalog-service-v1",
+      "endpoints": [
+        "GET /v1/health/service/:service",
+        "GET /v1/catalog/service/:service"
+      ]
+    },
+    "permissions": ["node:read", "service:read"],
+    "readOnly": true,
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "nativeCredentialResolution": false,
+    "provenances": ["fixture", "recording", "fake", "loopback", "BLOCKED_ENV"]
+  },
+  "consumer": {
+    "id": "mission.consul.service-health",
+    "name": "MissionConsulServiceHealthConsumer",
+    "adoptsWorkProduct": false,
+    "kernelAuthority": false
+  },
+  "registration": {
+    "versionBound": true,
+    "contractBound": true,
+    "providerBound": true,
+    "apiBound": true,
+    "permissionBound": true,
+    "scopeBound": true,
+    "evidenceDigestBound": true,
+    "reversible": true,
+    "revocable": true
+  },
+  "redaction": {
+    "addressesAndPorts": true,
+    "notesAndOutput": true,
+    "metadataValues": true,
+    "aclToken": true,
+    "boundedTags": true,
+    "boundedInstances": true
+  },
+  "states": [
+    "PASSING",
+    "WARNING",
+    "CRITICAL",
+    "MAINTENANCE",
+    "EMPTY",
+    "ACL_FILTERED",
+    "PARTIAL",
+    "ACCESS_LOST",
+    "PROVIDER_UNKNOWN",
+    "TAMPERED",
+    "REPLAY",
+    "REVOKED"
+  ],
+  "authority": {
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "truth": false,
+    "consent": false,
+    "effect": false,
+    "receipt": false,
+    "verification": false,
+    "outcome": false
+  },
+  "layer2Gaps": [
+    "native ACL-token resolution and TLS/HTTPS transport",
+    "durable kernel Receipt and independent repeat-read reconciliation",
+    "Work Product adoption and Truth/Consent/Effect/Outcome authority",
+    "external writes or service mutations"
+  ],
+  "blockedEnvironment": "BLOCKED_ENV"
+}
