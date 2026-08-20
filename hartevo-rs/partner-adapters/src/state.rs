@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::callback::{
@@ -10,13 +10,14 @@ use crate::callback::{
 };
 use crate::contract::{
     AuthorizationGrant, AuthorizationObservation, AuthorizationState, NetworkCapability,
-    NetworkProvider, NetworkScope, PartnerNetworkError, authorization_observation,
+    NetworkProvider, NetworkScope, PartnerNetworkError, authorization_observation, is_sha256,
     scope_authorized,
 };
 use crate::replay::ReplayGuard;
 
 const DURABLE_STATE_SCHEMA: &str = "hartevo-partner-adapter-state/v1";
 const MAX_DURABLE_RECEIPTS: usize = 1_024;
+const DURABLE_RECEIPT_WINDOW: Duration = Duration::days(7);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -67,6 +68,16 @@ impl DurableStateStore {
         let state = serde_json::from_slice::<PersistedAdapterState>(&bytes)
             .map_err(|_| PartnerNetworkError::DurabilityUnavailable)?;
         if state.schema_version != DURABLE_STATE_SCHEMA || state.provider != provider {
+            return Err(PartnerNetworkError::DurabilityUnavailable);
+        }
+        state.replay.validate()?;
+        if state.receipts.len() > MAX_DURABLE_RECEIPTS
+            || state.receipts.iter().any(|receipt| {
+                !is_sha256(&receipt.scope_digest)
+                    || !is_sha256(&receipt.event_digest)
+                    || !is_sha256(&receipt.evidence_digest)
+            })
+        {
             return Err(PartnerNetworkError::DurabilityUnavailable);
         }
         Ok(Some(state))
@@ -175,6 +186,8 @@ impl AdapterState {
             .receipts
             .lock()
             .map_err(|_| PartnerNetworkError::DurabilityUnavailable)?;
+        let cutoff = observed_at - DURABLE_RECEIPT_WINDOW;
+        receipts.retain(|receipt| receipt.observed_at >= cutoff);
         receipts.push(DurableReceipt {
             kind: kind.into(),
             scope_digest: scope.digest(),
@@ -220,6 +233,16 @@ impl AdapterState {
         grant: AuthorizationGrant,
         observed_at: DateTime<Utc>,
     ) -> Result<AuthorizationObservation, PartnerNetworkError> {
+        if grant.provenance() == crate::NetworkProvenance::ProductionProvider
+            && grant
+                .native_canary()
+                .is_none_or(|receipt| !receipt.is_attested())
+        {
+            return Err(PartnerNetworkError::BlockedEnv {
+                provider: self.provider,
+                reason: crate::BlockedEnvironmentReason::OfficialApiCapabilityNotEnabled,
+            });
+        }
         grant.validate_at(observed_at)?;
         let rotated = self.grant.as_ref().is_some_and(|previous| {
             previous.secret_reference.reference_id() != grant.secret_reference.reference_id()
@@ -340,12 +363,15 @@ impl AdapterState {
         )?;
         let secret_reference_revision = grant.secret_reference.revision();
         let grant_expires_at = grant.expires_at;
-        let provenance = grant.provenance;
-        if request.signature_key.secret_reference() != &grant.secret_reference
-            || request.signature_key.expires_at() <= request.received_at
-        {
-            return Err(PartnerNetworkError::InvalidAuthorizationGrant);
-        }
+        let provenance = grant.provenance();
+        let lease_digest = request.signature_key.validate_for(
+            self.provider,
+            &request.scope,
+            provenance,
+            request.scheme,
+            &grant.secret_reference,
+            request.received_at,
+        )?;
         verify_signature(
             request.scheme,
             request.signature_key.key(),
@@ -374,6 +400,7 @@ impl AdapterState {
             disposition,
             secret_reference_revision,
             grant_expires_at,
+            lease_digest,
             provenance,
         )?;
         let observation = CallbackObservation {
@@ -385,6 +412,7 @@ impl AdapterState {
             signature_scheme: request.scheme,
             secret_reference_revision,
             grant_expires_at,
+            lease_digest: lease_digest.to_owned(),
             provenance,
             signature_verified: true,
             observed_at: request.received_at,

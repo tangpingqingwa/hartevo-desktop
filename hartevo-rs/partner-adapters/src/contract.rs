@@ -4,6 +4,7 @@ use std::fmt;
 use chrono::{DateTime, Duration, Utc};
 use hartevo_domain_kernel::{CurrencyCode, Money};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -14,22 +15,100 @@ use crate::ids::{
 
 pub const PARTNER_NETWORK_CONTRACT_SCHEMA_VERSION: &str = "hartevo-partner-network-contract/v1";
 pub const PARTNER_NETWORK_CONTRACT_VERSION: &str = "partner-network-e1/v1";
-/// A compact machine-readable contract marker.  The full typed contract is
-/// enforced by the strict serde representations below; this marker is kept in
-/// the adapter boundary so a catalog or Mission consumer can bind the exact
-/// schema revision without inventing a second registry.
-pub const PARTNER_NETWORK_CONTRACT_SCHEMA: &str = r#"{
+/// The published JSON Schema for the typed read observation envelope.
+///
+/// The schema is intentionally kept beside the owned serde contract because
+/// this crate is the only owner of the provider-specific envelope.  The
+/// executable validator below checks this document before serde decoding;
+/// serde then remains the second, typed validation boundary.  Provider record
+/// fields are validated by their deny-unknown-fields serde types after the
+/// envelope schema has accepted the resource/records shape.
+pub const PARTNER_NETWORK_CONTRACT_SCHEMA: &str = r##"{
   "$schema":"https://json-schema.org/draft/2020-12/schema",
-  "$id":"hartevo-partner-network-contract/v1",
+  "$id":"hartevo-partner-network-contract/v1/read-observation",
+  "title":"Hartevo Partner Network Read Observation",
   "type":"object",
   "additionalProperties":false,
-  "required":["provider","scope","sourceDigest","observedAt","evidenceDigest"]
-}"#;
+  "required":["provider","scope","request","data","page","expectedProgram","window","observedProgramId","programRevision","programTermsDigest","authorizationRevision","authorizationGeneration","cursorDigest","provenance","evidenceLevel","observedAt","sourceDigest","budget","nativeCanaryDigest","adapterVersion","registrationIdentity","registrationDigest","evidenceDigest"],
+  "properties":{
+    "provider":{"enum":["impact","awin","cj"]},
+    "scope":{"$ref":"#/$defs/scope"},
+    "request":{"enum":["programs","partners","contracts","links","clicks","conversions","actions","commissions","reversals","payouts","reports"]},
+    "data":{"$ref":"#/$defs/data"},
+    "page":{"$ref":"#/$defs/page"},
+    "expectedProgram":{"anyOf":[{"$ref":"#/$defs/programExpectation"},{"type":"null"}]},
+    "window":{"anyOf":[{"$ref":"#/$defs/window"},{"type":"null"}]},
+    "observedProgramId":{"anyOf":[{"type":"string","minLength":1},{"type":"null"}]},
+    "programRevision":{"anyOf":[{"type":"integer","minimum":1},{"type":"null"}]},
+    "programTermsDigest":{"anyOf":[{"$ref":"#/$defs/digest"},{"type":"null"}]},
+    "authorizationRevision":{"type":"integer","minimum":1},
+    "authorizationGeneration":{"type":"string","minLength":1},
+    "cursorDigest":{"$ref":"#/$defs/digest"},
+    "provenance":{"enum":["fixture","controlled_provider","production_provider"]},
+    "evidenceLevel":{"const":"e1"},
+    "observedAt":{"type":"string","format":"date-time"},
+    "sourceDigest":{"$ref":"#/$defs/digest"},
+    "budget":{"$ref":"#/$defs/budget"},
+    "nativeCanaryDigest":{"anyOf":[{"$ref":"#/$defs/digest"},{"type":"null"}]},
+    "adapterVersion":{"type":"integer","minimum":1},
+    "registrationIdentity":{"type":"string","minLength":1},
+    "registrationDigest":{"$ref":"#/$defs/digest"},
+    "evidenceDigest":{"$ref":"#/$defs/digest"}
+  },
+  "$defs":{
+    "digest":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+    "identifier":{"type":"string","minLength":1},
+    "scope":{"type":"object","additionalProperties":false,"required":["tenantId","projectId","accountId","programId"],"properties":{"tenantId":{"$ref":"#/$defs/identifier"},"projectId":{"$ref":"#/$defs/identifier"},"accountId":{"$ref":"#/$defs/identifier"},"programId":{"anyOf":[{"$ref":"#/$defs/identifier"},{"type":"null"}]}}},
+    "programExpectation":{"type":"object","additionalProperties":false,"required":["programId","revision","termsDigest"],"properties":{"programId":{"$ref":"#/$defs/identifier"},"revision":{"type":"integer","minimum":1},"termsDigest":{"$ref":"#/$defs/digest"}}},
+    "window":{"type":"object","additionalProperties":false,"required":["startedAt","endedAt"],"properties":{"startedAt":{"type":"string","format":"date-time"},"endedAt":{"type":"string","format":"date-time"}}},
+    "cursor":{"type":"object","additionalProperties":false,"required":["tokenDigest","bindingDigest","sequence"],"properties":{"tokenDigest":{"$ref":"#/$defs/digest"},"bindingDigest":{"anyOf":[{"$ref":"#/$defs/digest"},{"type":"null"}]},"sequence":{"type":"integer","minimum":0}}},
+    "page":{"type":"object","additionalProperties":false,"required":["cursor","nextCursor","hasMore","itemCount"],"properties":{"cursor":{"anyOf":[{"$ref":"#/$defs/cursor"},{"type":"null"}]},"nextCursor":{"anyOf":[{"$ref":"#/$defs/cursor"},{"type":"null"}]},"hasMore":{"type":"boolean"},"itemCount":{"type":"integer","minimum":0}}},
+    "data":{"type":"object","additionalProperties":false,"required":["resource","records"],"properties":{"resource":{"enum":["programs","partners","contracts","links","clicks","conversions","actions","commissions","reversals","payouts","reports"]},"records":{"type":"array","items":{"type":"object"}}}},
+    "budget":{"type":"object","additionalProperties":false,"required":["quotaLimit","quotaRemaining","rateLimitRemaining","rateLimitResetAt","costUnits","freshnessExpiresAt","source","evidenceDigest"],"properties":{"quotaLimit":{"type":"integer","minimum":1},"quotaRemaining":{"type":"integer","minimum":0},"rateLimitRemaining":{"type":"integer","minimum":0},"rateLimitResetAt":{"type":"string","format":"date-time"},"costUnits":{"type":"integer","minimum":1},"freshnessExpiresAt":{"type":"string","format":"date-time"},"source":{"type":"string","minLength":1},"evidenceDigest":{"$ref":"#/$defs/digest"}}}
+  }
+}"##;
 
 pub fn deserialize_partner_contract<T: DeserializeOwned>(
     json: &str,
 ) -> Result<T, PartnerNetworkError> {
-    serde_json::from_str(json).map_err(|_| PartnerNetworkError::MalformedCallback)
+    let value =
+        serde_json::from_str::<Value>(json).map_err(|_| PartnerNetworkError::MalformedCallback)?;
+    if value.get("request").is_some() && value.get("data").is_some() {
+        let serialized = serde_json::to_string(&value)
+            .map_err(|_| PartnerNetworkError::SchemaValidationFailed)?;
+        validate_published_partner_schema(&serialized)?;
+    }
+    serde_json::from_value(value).map_err(|_| PartnerNetworkError::MalformedCallback)
+}
+
+/// Validate a serialized read observation against the published JSON Schema.
+/// This is deliberately separate from `serde_json::from_str`: schema drift is
+/// rejected before the typed representation is allowed to deserialize.
+pub fn validate_published_partner_schema(json: &str) -> Result<(), PartnerNetworkError> {
+    let schema = serde_json::from_str::<Value>(PARTNER_NETWORK_CONTRACT_SCHEMA)
+        .map_err(|_| PartnerNetworkError::SchemaValidationFailed)?;
+    let instance = serde_json::from_str::<Value>(json)
+        .map_err(|_| PartnerNetworkError::SchemaValidationFailed)?;
+    validate_json_schema(&schema, &instance, &schema)
+}
+
+pub fn validate_partner_read_observation(
+    observation: &NetworkReadObservation,
+) -> Result<(), PartnerNetworkError> {
+    let json = serde_json::to_string(observation)
+        .map_err(|_| PartnerNetworkError::SchemaValidationFailed)?;
+    validate_published_partner_schema(&json)?;
+    observation.validate()
+}
+
+pub fn deserialize_partner_read_observation(
+    json: &str,
+) -> Result<NetworkReadObservation, PartnerNetworkError> {
+    validate_published_partner_schema(json)?;
+    let observation = serde_json::from_str::<NetworkReadObservation>(json)
+        .map_err(|_| PartnerNetworkError::MalformedCallback)?;
+    observation.validate()?;
+    Ok(observation)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -56,6 +135,40 @@ impl fmt::Display for NetworkProvider {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.as_str().fmt(formatter)
     }
+}
+
+pub const PARTNER_ADAPTER_VERSION: u32 = 1;
+
+const PARTNER_REGISTRATION_BINDINGS: &[&str] = &[
+    "connection.probe:probe:probe_observation:fixture:controlled_provider",
+    "partner.read:read:read_observation:fixture:controlled_provider",
+    "partner.program.read:read:read_observation:fixture:controlled_provider",
+    "partner.partner.read:read:read_observation:fixture:controlled_provider",
+    "partner.contract.read:read:read_observation:fixture:controlled_provider",
+    "partner.link.read:read:read_observation:fixture:controlled_provider",
+    "partner.click.read:read:read_observation:fixture:controlled_provider",
+    "partner.conversion.read:read:read_observation:fixture:controlled_provider",
+    "partner.action.read:read:read_observation:fixture:controlled_provider",
+    "partner.commission.read:read:read_observation:fixture:controlled_provider",
+    "partner.reversal.read:read:read_observation:fixture:controlled_provider",
+    "partner.payout.read:read:read_observation:fixture:controlled_provider",
+    "partner.report.read:read:read_observation:fixture:controlled_provider",
+    "outcome.ingest:handle_webhook:webhook_observation:fixture:controlled_provider",
+];
+
+pub fn partner_registration_identity(provider: NetworkProvider) -> String {
+    format!("partner.{}.network", provider.as_str())
+}
+
+pub(crate) fn partner_registration_digest(
+    provider: NetworkProvider,
+) -> Result<String, PartnerNetworkError> {
+    canonical_digest(&(
+        PARTNER_NETWORK_CONTRACT_VERSION,
+        partner_registration_identity(provider),
+        PARTNER_ADAPTER_VERSION,
+        PARTNER_REGISTRATION_BINDINGS,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -269,7 +382,9 @@ pub struct AuthorizationGrant {
     pub secret_reference: OpaqueSecretReference,
     pub capabilities: BTreeSet<NetworkCapability>,
     pub expires_at: DateTime<Utc>,
-    pub provenance: NetworkProvenance,
+    provenance: NetworkProvenance,
+    #[serde(skip)]
+    native_canary: Option<NativeCanaryReceipt>,
 }
 
 impl AuthorizationGrant {
@@ -284,7 +399,32 @@ impl AuthorizationGrant {
             ]),
             expires_at,
             provenance: NetworkProvenance::Fixture,
+            native_canary: None,
         }
+    }
+
+    pub(crate) fn controlled(
+        scope: NetworkScope,
+        secret_reference: OpaqueSecretReference,
+        capabilities: BTreeSet<NetworkCapability>,
+        expires_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            scope,
+            secret_reference,
+            capabilities,
+            expires_at,
+            provenance: NetworkProvenance::ControlledProvider,
+            native_canary: None,
+        }
+    }
+
+    pub fn provenance(&self) -> NetworkProvenance {
+        self.provenance
+    }
+
+    pub(crate) fn native_canary(&self) -> Option<&NativeCanaryReceipt> {
+        self.native_canary.as_ref()
     }
 
     pub fn validate(&self) -> Result<(), PartnerNetworkError> {
@@ -300,7 +440,108 @@ impl AuthorizationGrant {
         if self.capabilities.is_empty() || self.expires_at <= observed_at {
             return Err(PartnerNetworkError::InvalidAuthorizationGrant);
         }
+        if self.provenance == NetworkProvenance::ProductionProvider
+            && self
+                .native_canary
+                .as_ref()
+                .is_none_or(|receipt| !receipt.is_attested())
+        {
+            return Err(PartnerNetworkError::NativeCanaryRequired);
+        }
         Ok(())
+    }
+}
+
+/// A native Layer-2 canary receipt is intentionally not constructible from a
+/// provider payload.  Only a future in-crate native transport implementation
+/// can create the attested form after credential resolution, permission
+/// verification, probe, independent readback, and cleanup have all completed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeCanaryReceipt {
+    pub status: NativeCanaryStatus,
+    pub secret_reference_revision: u64,
+    pub permission_digest: Option<String>,
+    pub probe_digest: Option<String>,
+    pub readback_digest: Option<String>,
+    pub cleanup_digest: Option<String>,
+    pub observed_at: DateTime<Utc>,
+    pub evidence_digest: String,
+    #[serde(skip)]
+    attested: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCanaryStatus {
+    NotProven,
+    Attested,
+}
+
+impl NativeCanaryReceipt {
+    pub fn blocked(
+        secret_reference_revision: u64,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Self, PartnerNetworkError> {
+        if secret_reference_revision == 0 {
+            return Err(PartnerNetworkError::InvalidAuthorizationReference);
+        }
+        let value = (
+            NativeCanaryStatus::NotProven,
+            secret_reference_revision,
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            observed_at,
+        );
+        Ok(Self {
+            status: NativeCanaryStatus::NotProven,
+            secret_reference_revision,
+            permission_digest: None,
+            probe_digest: None,
+            readback_digest: None,
+            cleanup_digest: None,
+            observed_at,
+            evidence_digest: canonical_digest(&value)?,
+            attested: false,
+        })
+    }
+
+    pub fn is_attested(&self) -> bool {
+        self.attested && self.status == NativeCanaryStatus::Attested
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeCanaryPlan {
+    pub schema_version: &'static str,
+    pub required_steps: [&'static str; 5],
+    pub acceptance: [&'static str; 5],
+    pub blocked_transition: &'static str,
+    pub cleanup: &'static str,
+}
+
+pub const fn native_canary_plan() -> NativeCanaryPlan {
+    NativeCanaryPlan {
+        schema_version: "hartevo-partner-native-canary/v1",
+        required_steps: [
+            "resolve_opaque_credential",
+            "verify_provider_permission",
+            "probe_exact_scope",
+            "independent_readback_digest",
+            "revoke_and_unmount_cleanup",
+        ],
+        acceptance: [
+            "credential_reference_and_revision_match",
+            "permission_receipt_is_independent",
+            "probe_is_reachable_for_exact_account_program",
+            "readback_source_and_content_digests_match",
+            "cleanup_receipt_closes_generation_and_secret_lease",
+        ],
+        blocked_transition: "NOT_PROVEN/BLOCKED_ENV",
+        cleanup: "discard_native_lease_and_clear_durable_receipts_on_failure",
     }
 }
 
@@ -1288,6 +1529,9 @@ pub struct NetworkReadObservation {
     pub source_digest: String,
     pub budget: NetworkReadBudgetReceipt,
     pub native_canary_digest: Option<String>,
+    pub adapter_version: u32,
+    pub registration_identity: String,
+    pub registration_digest: String,
     #[serde(skip)]
     pub(crate) native_canary_attested: bool,
     pub evidence_digest: String,
@@ -1306,6 +1550,9 @@ impl NetworkReadObservation {
         if self.authorization_revision == 0
             || self.authorization_generation.trim().is_empty()
             || !is_sha256(&self.cursor_digest)
+            || self.adapter_version == 0
+            || self.registration_identity != partner_registration_identity(self.provider)
+            || !is_sha256(&self.registration_digest)
             || self
                 .native_canary_digest
                 .as_deref()
@@ -1313,6 +1560,14 @@ impl NetworkReadObservation {
             || (self.native_canary_digest.is_some() && !self.native_canary_attested)
         {
             return Err(PartnerNetworkError::ReadScopeOrEvidenceMismatch);
+        }
+        if self.registration_digest != partner_registration_digest(self.provider)? {
+            return Err(PartnerNetworkError::MissionBindingMismatch);
+        }
+        if self.provenance == NetworkProvenance::ProductionProvider
+            && (!self.native_canary_attested || self.native_canary_digest.is_none())
+        {
+            return Err(PartnerNetworkError::NativeCanaryRequired);
         }
         if self.request != self.data.resource()
             || self.page.item_count as usize != self.data.item_count()
@@ -1374,6 +1629,9 @@ pub(crate) fn read_observation_evidence_digest(
             &observation.observed_at,
             &observation.budget,
             &observation.native_canary_digest,
+            &observation.adapter_version,
+            &observation.registration_identity,
+            &observation.registration_digest,
         ),
     ))
 }
@@ -1395,10 +1653,51 @@ pub struct MissionOutcomeReceipt {
     pub window: SettlementPeriod,
     pub cursor_digest: String,
     pub source_digest: String,
+    pub authorization_revision: u64,
+    pub authorization_generation: String,
+    pub adapter_version: u32,
+    pub registration_identity: String,
+    pub registration_digest: String,
     pub observed_at: DateTime<Utc>,
     pub classification: MissionOutcomeClassification,
     pub claim_connected: bool,
     pub evidence_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionOutcomeBinding {
+    pub authorization_revision: u64,
+    pub authorization_generation: String,
+    pub adapter_version: u32,
+    pub registration_identity: String,
+    pub registration_digest: String,
+}
+
+impl MissionOutcomeBinding {
+    pub fn new(
+        authorization_revision: u64,
+        authorization_generation: impl Into<String>,
+        adapter_version: u32,
+        registration_identity: impl Into<String>,
+        registration_digest: impl Into<String>,
+    ) -> Result<Self, PartnerNetworkError> {
+        let binding = Self {
+            authorization_revision,
+            authorization_generation: authorization_generation.into(),
+            adapter_version,
+            registration_identity: registration_identity.into(),
+            registration_digest: registration_digest.into(),
+        };
+        if binding.authorization_revision == 0
+            || binding.authorization_generation.trim().is_empty()
+            || binding.adapter_version == 0
+            || binding.registration_identity.trim().is_empty()
+            || !is_sha256(&binding.registration_digest)
+        {
+            return Err(PartnerNetworkError::MissionBindingMismatch);
+        }
+        Ok(binding)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1407,6 +1706,7 @@ pub struct PartnerMissionConsumer {
     scope: NetworkScope,
     expected_program: ProgramExpectation,
     window: SettlementPeriod,
+    binding: MissionOutcomeBinding,
 }
 
 impl PartnerMissionConsumer {
@@ -1415,6 +1715,7 @@ impl PartnerMissionConsumer {
         scope: NetworkScope,
         expected_program: ProgramExpectation,
         window: SettlementPeriod,
+        binding: MissionOutcomeBinding,
     ) -> Result<Self, PartnerNetworkError> {
         scope.validate()?;
         expected_program.validate()?;
@@ -1422,11 +1723,17 @@ impl PartnerMissionConsumer {
         if scope.program_id.as_ref() != Some(&expected_program.program_id) {
             return Err(PartnerNetworkError::ProgramDrift);
         }
+        if binding.registration_identity != partner_registration_identity(provider)
+            || binding.registration_digest != partner_registration_digest(provider)?
+        {
+            return Err(PartnerNetworkError::MissionBindingMismatch);
+        }
         Ok(Self {
             provider,
             scope,
             expected_program,
             window,
+            binding,
         })
     }
 
@@ -1439,6 +1746,11 @@ impl PartnerMissionConsumer {
             || observation.scope != self.scope
             || observation.expected_program.as_ref() != Some(&self.expected_program)
             || observation.window.as_ref() != Some(&self.window)
+            || observation.authorization_revision != self.binding.authorization_revision
+            || observation.authorization_generation != self.binding.authorization_generation
+            || observation.adapter_version != self.binding.adapter_version
+            || observation.registration_identity != self.binding.registration_identity
+            || observation.registration_digest != self.binding.registration_digest
         {
             return Err(PartnerNetworkError::MissionBindingMismatch);
         }
@@ -1463,6 +1775,11 @@ impl PartnerMissionConsumer {
             &self.window,
             &observation.cursor_digest,
             &observation.source_digest,
+            &observation.authorization_revision,
+            &observation.authorization_generation,
+            &observation.adapter_version,
+            &observation.registration_identity,
+            &observation.registration_digest,
             &observation.observed_at,
             &classification,
             &claim_connected,
@@ -1475,6 +1792,11 @@ impl PartnerMissionConsumer {
             window: self.window.clone(),
             cursor_digest: observation.cursor_digest.clone(),
             source_digest: observation.source_digest.clone(),
+            authorization_revision: observation.authorization_revision,
+            authorization_generation: observation.authorization_generation.clone(),
+            adapter_version: observation.adapter_version,
+            registration_identity: observation.registration_identity.clone(),
+            registration_digest: observation.registration_digest.clone(),
             observed_at: observation.observed_at,
             classification,
             claim_connected,
@@ -1568,6 +1890,14 @@ pub enum PartnerNetworkError {
     InvalidReadReceipt,
     #[error("partner network Mission outcome binding does not match the exact tuple")]
     MissionBindingMismatch,
+    #[error("partner network published JSON Schema validation failed")]
+    SchemaValidationFailed,
+    #[error("partner network callback replay quota is exhausted")]
+    ReplayQuotaExceeded,
+    #[error("partner network callback replay rate is limited")]
+    ReplayRateLimited,
+    #[error("partner network callback key lease is not bound to the request tuple")]
+    InvalidCallbackLease,
 }
 
 /// Provider-native typed operations consumed by the SDK bridge. This is not
@@ -1605,6 +1935,138 @@ pub trait TypedPartnerNetworkAdapter {
     ) -> Result<AuthorizationObservation, PartnerNetworkError>;
 
     fn accepted_callbacks(&self) -> Vec<crate::callback::CallbackEvent>;
+}
+
+fn validate_json_schema(
+    schema: &Value,
+    instance: &Value,
+    root: &Value,
+) -> Result<(), PartnerNetworkError> {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let pointer = reference
+            .strip_prefix('#')
+            .ok_or(PartnerNetworkError::SchemaValidationFailed)?;
+        let resolved = root
+            .pointer(pointer)
+            .ok_or(PartnerNetworkError::SchemaValidationFailed)?;
+        return validate_json_schema(resolved, instance, root);
+    }
+    if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
+        if any_of
+            .iter()
+            .any(|candidate| validate_json_schema(candidate, instance, root).is_ok())
+        {
+            return Ok(());
+        }
+        return Err(PartnerNetworkError::SchemaValidationFailed);
+    }
+    if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
+        for candidate in all_of {
+            validate_json_schema(candidate, instance, root)?;
+        }
+    }
+    if let Some(expected) = schema.get("const")
+        && expected != instance
+    {
+        return Err(PartnerNetworkError::SchemaValidationFailed);
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array)
+        && !values.iter().any(|value| value == instance)
+    {
+        return Err(PartnerNetworkError::SchemaValidationFailed);
+    }
+    if let Some(expected_type) = schema.get("type")
+        && !json_type_matches(expected_type, instance)
+    {
+        return Err(PartnerNetworkError::SchemaValidationFailed);
+    }
+    if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64)
+        && instance.as_f64().is_none_or(|value| value < minimum)
+    {
+        return Err(PartnerNetworkError::SchemaValidationFailed);
+    }
+    if let Some(min_length) = schema.get("minLength").and_then(Value::as_u64)
+        && instance.as_str().is_none_or(|value| {
+            usize::try_from(min_length).map_or(true, |minimum| value.chars().count() < minimum)
+        })
+    {
+        return Err(PartnerNetworkError::SchemaValidationFailed);
+    }
+    if let Some(pattern) = schema.get("pattern").and_then(Value::as_str)
+        && !schema_pattern_matches(pattern, instance.as_str().unwrap_or_default())
+    {
+        return Err(PartnerNetworkError::SchemaValidationFailed);
+    }
+    if schema.get("format").and_then(Value::as_str) == Some("date-time")
+        && instance
+            .as_str()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .is_none()
+    {
+        return Err(PartnerNetworkError::SchemaValidationFailed);
+    }
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        let object = instance
+            .as_object()
+            .ok_or(PartnerNetworkError::SchemaValidationFailed)?;
+        for name in required.iter().filter_map(Value::as_str) {
+            if !object.contains_key(name) {
+                return Err(PartnerNetworkError::SchemaValidationFailed);
+            }
+        }
+    }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        let object = instance
+            .as_object()
+            .ok_or(PartnerNetworkError::SchemaValidationFailed)?;
+        for (name, property_schema) in properties {
+            if let Some(value) = object.get(name) {
+                validate_json_schema(property_schema, value, root)?;
+            }
+        }
+        if schema.get("additionalProperties") == Some(&Value::Bool(false))
+            && object.keys().any(|name| !properties.contains_key(name))
+        {
+            return Err(PartnerNetworkError::SchemaValidationFailed);
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        for value in instance
+            .as_array()
+            .ok_or(PartnerNetworkError::SchemaValidationFailed)?
+        {
+            validate_json_schema(items, value, root)?;
+        }
+    }
+    Ok(())
+}
+
+fn json_type_matches(expected: &Value, instance: &Value) -> bool {
+    let matches = |kind: &str| match kind {
+        "object" => instance.is_object(),
+        "array" => instance.is_array(),
+        "string" => instance.is_string(),
+        "integer" => instance.as_i64().is_some() || instance.as_u64().is_some(),
+        "number" => instance.is_number(),
+        "boolean" => instance.is_boolean(),
+        "null" => instance.is_null(),
+        _ => false,
+    };
+    expected.as_str().map_or_else(
+        || {
+            expected
+                .as_array()
+                .is_some_and(|types| types.iter().filter_map(Value::as_str).any(matches))
+        },
+        matches,
+    )
+}
+
+fn schema_pattern_matches(pattern: &str, value: &str) -> bool {
+    if pattern == "^[0-9a-f]{64}$" {
+        return is_sha256(value);
+    }
+    false
 }
 
 pub(crate) fn canonical_digest<T: Serialize>(value: &T) -> Result<String, PartnerNetworkError> {
@@ -1663,7 +2125,7 @@ pub(crate) fn authorization_observation(
         provider,
         scope: grant.scope.clone(),
         state,
-        provenance: Some(grant.provenance),
+        provenance: Some(grant.provenance()),
         reference_revision: Some(grant.secret_reference.revision()),
         observed_at,
         evidence_digest: digest_bytes(binding.as_bytes()),

@@ -88,6 +88,18 @@ pub struct CallbackKeyLease {
     secret_reference: OpaqueSecretReference,
     key: Zeroizing<Vec<u8>>,
     expires_at: DateTime<Utc>,
+    binding: Option<CallbackAuthorityBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CallbackAuthorityBinding {
+    provider: NetworkProvider,
+    scope: NetworkScope,
+    account_id: crate::NetworkAccountId,
+    provenance: NetworkProvenance,
+    scheme: CallbackSignatureScheme,
+    expires_at: DateTime<Utc>,
+    lease_digest: String,
 }
 
 impl fmt::Debug for CallbackKeyLease {
@@ -100,6 +112,7 @@ impl fmt::Debug for CallbackKeyLease {
             )
             .field("expires_at", &self.expires_at)
             .field("key_present", &!self.key.is_empty())
+            .field("tuple_bound", &self.binding.is_some())
             .finish()
     }
 }
@@ -118,19 +131,80 @@ impl CallbackKeyLease {
             secret_reference,
             key: Zeroizing::new(key.as_ref().to_vec()),
             expires_at,
+            binding: None,
         })
     }
 
-    pub(crate) fn secret_reference(&self) -> &OpaqueSecretReference {
-        &self.secret_reference
+    #[allow(clippy::too_many_arguments)]
+    pub fn bound(
+        secret_reference: OpaqueSecretReference,
+        key: impl AsRef<[u8]>,
+        expires_at: DateTime<Utc>,
+        provider: NetworkProvider,
+        scope: NetworkScope,
+        provenance: NetworkProvenance,
+        scheme: CallbackSignatureScheme,
+    ) -> Result<Self, PartnerNetworkError> {
+        secret_reference.validate()?;
+        scope.validate()?;
+        if key.as_ref().is_empty() {
+            return Err(PartnerNetworkError::InvalidAuthorizationGrant);
+        }
+        let account_id = scope.account_id.clone();
+        let lease_digest = canonical_digest(&(
+            &secret_reference,
+            &provider,
+            &scope,
+            &account_id,
+            &provenance,
+            &scheme,
+            expires_at,
+        ))?;
+        Ok(Self {
+            secret_reference,
+            key: Zeroizing::new(key.as_ref().to_vec()),
+            expires_at,
+            binding: Some(CallbackAuthorityBinding {
+                provider,
+                scope,
+                account_id,
+                provenance,
+                scheme,
+                expires_at,
+                lease_digest,
+            }),
+        })
     }
 
     pub(crate) fn key(&self) -> &[u8] {
         self.key.as_slice()
     }
 
-    pub(crate) const fn expires_at(&self) -> DateTime<Utc> {
-        self.expires_at
+    pub(crate) fn validate_for(
+        &self,
+        provider: NetworkProvider,
+        scope: &NetworkScope,
+        provenance: NetworkProvenance,
+        scheme: CallbackSignatureScheme,
+        reference: &OpaqueSecretReference,
+        received_at: DateTime<Utc>,
+    ) -> Result<&str, PartnerNetworkError> {
+        let Some(binding) = &self.binding else {
+            return Err(PartnerNetworkError::InvalidCallbackLease);
+        };
+        if self.expires_at <= received_at
+            || binding.expires_at <= received_at
+            || self.expires_at != binding.expires_at
+            || binding.provider != provider
+            || binding.scope != *scope
+            || binding.account_id != scope.account_id
+            || binding.provenance != provenance
+            || binding.scheme != scheme
+            || self.secret_reference != *reference
+        {
+            return Err(PartnerNetworkError::InvalidCallbackLease);
+        }
+        Ok(&binding.lease_digest)
     }
 }
 
@@ -172,6 +246,7 @@ pub struct CallbackObservation {
     pub signature_scheme: CallbackSignatureScheme,
     pub secret_reference_revision: u64,
     pub grant_expires_at: DateTime<Utc>,
+    pub lease_digest: String,
     pub provenance: NetworkProvenance,
     pub signature_verified: bool,
     pub observed_at: DateTime<Utc>,
@@ -302,6 +377,7 @@ pub(crate) fn callback_evidence_digest_with_authority(
     disposition: CallbackDisposition,
     secret_reference_revision: u64,
     grant_expires_at: DateTime<Utc>,
+    lease_digest: &str,
     provenance: NetworkProvenance,
 ) -> Result<String, PartnerNetworkError> {
     if secret_reference_revision == 0 {
@@ -316,6 +392,7 @@ pub(crate) fn callback_evidence_digest_with_authority(
         &disposition,
         secret_reference_revision,
         grant_expires_at,
+        lease_digest,
         &provenance,
     );
     let digest = canonical_digest(&value)?;

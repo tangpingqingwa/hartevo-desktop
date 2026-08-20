@@ -2,8 +2,9 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use hartevo_connector_sdk::{
     BeginAuthRequest, ConnectorAdapter, ConnectorAuth, ConnectorScope, ConnectorWorker,
     ProbeRequest, ProviderAdapterOperation, ProviderAdapterRegistry, ProviderCapabilityKey,
-    ProviderProvenanceClass, SecretReference,
+    ProviderProvenanceClass, SecretReference, WebhookEnvelope, WebhookRequest, WebhookSigningKey,
 };
+use serde_json::Value;
 
 use crate::awin::{AwinAdapter, AwinFixtureWorld};
 use crate::cj_legacy::{CjAdapter, CjFixtureWorld};
@@ -15,10 +16,11 @@ use crate::impact::{
 use crate::{
     ActionState, AuthorizationState, CallbackChannel, CallbackDisposition, CallbackKeyLease,
     CallbackRequest, CallbackSignatureScheme, CommissionState, ConnectorAdapterBridge,
-    ConversionState, FixtureScenario, NetworkAccountId, NetworkProbeRequest, NetworkProbeStatus,
-    NetworkReadData, NetworkReadRequest, NetworkResource, NetworkScope, OpaqueSecretReference,
-    PartnerMissionConsumer, PartnerNetworkError, ProgramId, ReadCursor, ReportSettlementState,
-    ReversalState, SettlementPeriod,
+    ConversionState, FixtureScenario, MissionOutcomeBinding, NetworkAccountId, NetworkProbeRequest,
+    NetworkProbeStatus, NetworkReadData, NetworkReadRequest, NetworkResource, NetworkScope,
+    OpaqueSecretReference, PartnerMissionConsumer, PartnerNetworkError, ProgramId, ReadCursor,
+    ReportSettlementState, ReversalState, SettlementPeriod, deserialize_partner_read_observation,
+    native_canary_plan, validate_published_partner_schema,
 };
 
 fn observed_at() -> DateTime<Utc> {
@@ -27,11 +29,19 @@ fn observed_at() -> DateTime<Utc> {
         .expect("valid fixture timestamp")
 }
 
-fn fixture_callback_key(at: DateTime<Utc>) -> CallbackKeyLease {
-    CallbackKeyLease::new(
+fn fixture_callback_key(
+    at: DateTime<Utc>,
+    scope: &NetworkScope,
+    scheme: CallbackSignatureScheme,
+) -> CallbackKeyLease {
+    CallbackKeyLease::bound(
         OpaqueSecretReference::fixture(),
         ImpactFixtureWorld::callback_key(),
         at + Duration::hours(1),
+        crate::NetworkProvider::Impact,
+        scope.clone(),
+        crate::NetworkProvenance::Fixture,
+        scheme,
     )
     .expect("fixture callback key lease")
 }
@@ -131,6 +141,7 @@ fn impact_awin_and_cj_share_the_typed_network_contract() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn merged_connector_sdk_bridge_keeps_fixture_probe_out_of_connected_authority()
 -> Result<(), hartevo_connector_sdk::ConnectorError> {
     let at = observed_at();
@@ -185,7 +196,7 @@ fn merged_connector_sdk_bridge_keeps_fixture_probe_out_of_connected_authority()
     })?;
     let probe = worker.probe(ProbeRequest {
         dispatch,
-        scope: sdk_scope,
+        scope: sdk_scope.clone(),
         secret_reference: secret,
         credential_lease: lease,
         session,
@@ -214,6 +225,27 @@ fn merged_connector_sdk_bridge_keeps_fixture_probe_out_of_connected_authority()
         hartevo_connector_sdk::ProviderAdapterOperation::HandleWebhook,
         ProviderProvenanceClass::Fixture,
     ));
+    let webhook_key = WebhookSigningKey::new(b"partner-generic-webhook-key")?;
+    let envelope = WebhookEnvelope::sign(
+        &sdk_scope,
+        descriptor.identity().clone(),
+        "webhook-event-impact-1",
+        1,
+        at + Duration::seconds(2),
+        at + Duration::seconds(2),
+        crate::contract::digest_bytes(b"generic-webhook-payload"),
+        &webhook_key,
+    )?;
+    let webhook = worker.handle_webhook(
+        WebhookRequest {
+            dispatch: worker.dispatch_fence(),
+            scope: sdk_scope.clone(),
+            envelope,
+            at: at + Duration::seconds(2),
+        },
+        &webhook_key,
+    )?;
+    assert_eq!(webhook.event_id(), "webhook-event-impact-1");
     Ok(())
 }
 
@@ -278,7 +310,7 @@ fn impact_signed_callbacks_dedupe_conversions_and_preserve_out_of_order_events()
     adapter
         .authorize(world.authorization(), at)
         .expect("fixture grant is valid");
-    let key_lease = fixture_callback_key(at);
+    let key_lease = fixture_callback_key(at, &scope, CallbackSignatureScheme::ImpactHookHmacSha1);
 
     let first_body = world.callback_body(
         "impact-event-1",
@@ -322,13 +354,15 @@ fn impact_signed_callbacks_dedupe_conversions_and_preserve_out_of_order_events()
     );
     let duplicate_signature =
         world.sign_callback(CallbackSignatureScheme::FixtureHmacSha256, &duplicate_body);
+    let duplicate_key_lease =
+        fixture_callback_key(at, &scope, CallbackSignatureScheme::FixtureHmacSha256);
     let duplicate = adapter
         .handle_callback(CallbackRequest {
             scope: scope.clone(),
             channel: CallbackChannel::Postback,
             body: &duplicate_body,
             signature: &duplicate_signature,
-            signature_key: &key_lease,
+            signature_key: &duplicate_key_lease,
             scheme: CallbackSignatureScheme::FixtureHmacSha256,
             received_at: at,
         })
@@ -352,13 +386,15 @@ fn impact_signed_callbacks_dedupe_conversions_and_preserve_out_of_order_events()
         CallbackSignatureScheme::FixtureHmacSha256,
         &out_of_order_body,
     );
+    let out_of_order_key_lease =
+        fixture_callback_key(at, &scope, CallbackSignatureScheme::FixtureHmacSha256);
     let out_of_order = adapter
         .handle_callback(CallbackRequest {
             scope,
             channel: CallbackChannel::Webhook,
             body: &out_of_order_body,
             signature: &out_of_order_signature,
-            signature_key: &key_lease,
+            signature_key: &out_of_order_key_lease,
             scheme: CallbackSignatureScheme::FixtureHmacSha256,
             received_at: at,
         })
@@ -375,7 +411,11 @@ fn impact_production_detached_jws_requires_an_injected_verifier() {
     adapter
         .authorize(world.authorization(), at)
         .expect("fixture grant is valid");
-    let key_lease = fixture_callback_key(at);
+    let key_lease = fixture_callback_key(
+        at,
+        &world.scope(),
+        CallbackSignatureScheme::ImpactHookJwsDetached,
+    );
     let body = world.callback_body(
         "impact-jws-event-1",
         "conversion.recorded",
@@ -695,6 +735,61 @@ fn provider_returned_production_provenance_is_sealed_without_native_canary() {
 }
 
 #[test]
+fn caller_supplied_production_grant_is_sealed_at_authorize() {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let mut grant = serde_json::to_value(world.authorization()).expect("grant JSON");
+    grant["provenance"] = Value::String("production_provider".into());
+    let production: crate::AuthorizationGrant = serde_json::from_value(grant)
+        .expect("typed production input is parseable but not authorized");
+    let mut adapter = ImpactAdapter::without_authorization();
+    assert!(matches!(
+        adapter.authorize(production, at),
+        Err(PartnerNetworkError::BlockedEnv {
+            provider: crate::NetworkProvider::Impact,
+            reason: crate::BlockedEnvironmentReason::OfficialApiCapabilityNotEnabled,
+        })
+    ));
+}
+
+#[test]
+fn raw_unattested_production_read_observation_is_rejected() {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let mut adapter = ImpactAdapter::new(world.clone());
+    adapter
+        .authorize(world.authorization(), at)
+        .expect("fixture authorization is valid");
+    let mut observation = adapter
+        .read(NetworkReadRequest::for_program(
+            world.scope(),
+            NetworkResource::Reports,
+            world.current_program_expectation(),
+            at,
+        ))
+        .expect("fixture read");
+    observation.provenance = crate::NetworkProvenance::ProductionProvider;
+    observation.evidence_digest = crate::contract::read_observation_evidence_digest(&observation)
+        .expect("rebound raw evidence");
+    assert!(matches!(
+        observation.validate(),
+        Err(PartnerNetworkError::NativeCanaryRequired)
+    ));
+}
+
+#[test]
+fn layer_two_canary_plan_has_executable_blocked_transition() {
+    let plan = native_canary_plan();
+    assert_eq!(plan.required_steps.len(), 5);
+    assert_eq!(plan.acceptance.len(), 5);
+    assert_eq!(plan.blocked_transition, "NOT_PROVEN/BLOCKED_ENV");
+    let receipt = crate::NativeCanaryReceipt::blocked(1, observed_at())
+        .expect("blocked canary receipt is typed");
+    assert_eq!(receipt.status, crate::NativeCanaryStatus::NotProven);
+    assert!(!receipt.is_attested());
+}
+
+#[test]
 fn mission_consumer_requires_program_window_and_preserves_fixture_honesty() {
     let at = observed_at();
     let world = ImpactFixtureWorld::default_fixture(at);
@@ -712,11 +807,20 @@ fn mission_consumer_requires_program_window_and_preserves_fixture_honesty() {
     .with_window(window.clone())
     .expect("valid window");
     let observation = adapter.read(request).expect("fixture report read");
+    let binding = MissionOutcomeBinding::new(
+        observation.authorization_revision,
+        observation.authorization_generation.clone(),
+        observation.adapter_version,
+        observation.registration_identity.clone(),
+        observation.registration_digest.clone(),
+    )
+    .expect("exact Mission authority binding");
     let consumer = PartnerMissionConsumer::new(
         crate::NetworkProvider::Impact,
         world.scope(),
         world.current_program_expectation(),
         window,
+        binding,
     )
     .expect("exact Mission binding");
     let receipt = consumer.consume(&observation).expect("Mission evidence");
@@ -739,6 +843,47 @@ fn strict_contract_deserialization_rejects_unknown_fields_and_invalid_ids() {
 }
 
 #[test]
+fn published_schema_round_trip_and_adversarial_drift_fail_closed() {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let mut adapter = ImpactAdapter::new(world.clone());
+    adapter
+        .authorize(world.authorization(), at)
+        .expect("fixture authorization is valid");
+    let observation = adapter
+        .read(NetworkReadRequest::for_program(
+            world.scope(),
+            NetworkResource::Reports,
+            world.current_program_expectation(),
+            at,
+        ))
+        .expect("fixture read");
+    let json = serde_json::to_string(&observation).expect("observation JSON");
+    validate_published_partner_schema(&json).expect("published schema accepts typed envelope");
+    assert_eq!(
+        deserialize_partner_read_observation(&json).expect("schema-to-serde round trip"),
+        observation
+    );
+
+    let mut unknown: Value = serde_json::from_str(&json).expect("observation value");
+    unknown
+        .as_object_mut()
+        .expect("observation object")
+        .insert("futureField".into(), Value::Bool(true));
+    let unknown_json = serde_json::to_string(&unknown).expect("unknown field JSON");
+    assert!(validate_published_partner_schema(&unknown_json).is_err());
+
+    let mut missing: Value = serde_json::from_str(&json).expect("observation value");
+    missing
+        .as_object_mut()
+        .expect("observation object")
+        .remove("evidenceDigest");
+    let missing_json = serde_json::to_string(&missing).expect("missing field JSON");
+    assert!(validate_published_partner_schema(&missing_json).is_err());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn durable_state_reopens_replay_and_rotation_fences_old_cursor() {
     let at = observed_at();
     let world = ImpactFixtureWorld::default_fixture(at);
@@ -766,7 +911,11 @@ fn durable_state_reopens_replay_and_rotation_fences_old_cursor() {
         Some(10_000),
     );
     let signature = world.sign_callback(CallbackSignatureScheme::FixtureHmacSha256, &body);
-    let key_lease = fixture_callback_key(at);
+    let key_lease = fixture_callback_key(
+        at,
+        &world.scope(),
+        CallbackSignatureScheme::FixtureHmacSha256,
+    );
     let first = adapter
         .handle_callback(CallbackRequest {
             scope: world.scope(),
@@ -784,7 +933,11 @@ fn durable_state_reopens_replay_and_rotation_fences_old_cursor() {
 
     let mut reopened = ImpactAdapter::with_state_file(world.clone(), state_path.clone())
         .expect("durable state reopens");
-    let reopened_key_lease = fixture_callback_key(at);
+    let reopened_key_lease = fixture_callback_key(
+        at,
+        &world.scope(),
+        CallbackSignatureScheme::FixtureHmacSha256,
+    );
     let duplicate = reopened
         .handle_callback(CallbackRequest {
             scope: world.scope(),
@@ -843,10 +996,67 @@ fn durable_state_reopens_replay_and_rotation_fences_old_cursor() {
 }
 
 #[test]
+fn replay_and_durable_receipts_enforce_explicit_bounds() {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let mut replay = crate::replay::ReplayGuard::default();
+    let mut rate_limited = false;
+    let max_events = u32::try_from(crate::replay::MAX_REPLAY_EVENTS_PER_SCOPE)
+        .expect("replay bound fits fixture index");
+    for index in 0..=max_events {
+        let body = world.callback_body(
+            &format!("impact-rate-{index}"),
+            "conversion.recorded",
+            at - Duration::minutes(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let event = crate::callback::parse_callback(crate::NetworkProvider::Impact, &body)
+            .expect("bounded replay event");
+        if matches!(
+            replay.ingest(&world.scope(), event, at),
+            Err(PartnerNetworkError::ReplayRateLimited)
+        ) {
+            rate_limited = true;
+            break;
+        }
+    }
+    assert!(rate_limited, "replay rate policy must be executable");
+    replay
+        .validate()
+        .expect("rate-limited replay remains bounded");
+
+    let state = crate::state::AdapterState::new(crate::NetworkProvider::Impact);
+    let event_digest = crate::contract::digest_bytes(b"bounded-event");
+    let evidence_digest = crate::contract::digest_bytes(b"bounded-evidence");
+    for _ in 0..2_000 {
+        state
+            .record_read_receipt(
+                &world.scope(),
+                1,
+                event_digest.clone(),
+                at,
+                evidence_digest.clone(),
+            )
+            .expect("bounded durable receipt");
+    }
+    assert_eq!(state.durable_receipts().len(), 1_024);
+}
+
+#[test]
 fn callback_debug_never_exposes_borrowed_key_material() {
     let at = observed_at();
     let world = ImpactFixtureWorld::default_fixture(at);
-    let key_lease = fixture_callback_key(at);
+    let key_lease = fixture_callback_key(
+        at,
+        &world.scope(),
+        CallbackSignatureScheme::FixtureHmacSha256,
+    );
     let request = CallbackRequest {
         scope: world.scope(),
         channel: CallbackChannel::Webhook,
@@ -859,4 +1069,63 @@ fn callback_debug_never_exposes_borrowed_key_material() {
     let debug = format!("{request:?}");
     assert!(!debug.contains("super-secret-callback-key"));
     assert!(debug.contains("signature_key_present"));
+}
+
+#[test]
+fn callback_lease_tuple_mismatch_and_unbound_keys_fail_closed() {
+    let at = observed_at();
+    let world = ImpactFixtureWorld::default_fixture(at);
+    let mut adapter = ImpactAdapter::new(world.clone());
+    adapter
+        .authorize(world.authorization(), at)
+        .expect("fixture authorization is valid");
+    let body = world.callback_body(
+        "impact-lease-fence",
+        "conversion.recorded",
+        at - Duration::minutes(1),
+        Some("impact-lease-conversion"),
+        Some("impact-lease-order"),
+        Some("impact-lease-action"),
+        Some("impact-lease-commission"),
+        None,
+        None,
+        Some(100),
+    );
+    let signature = world.sign_callback(CallbackSignatureScheme::FixtureHmacSha256, &body);
+    let unbound = CallbackKeyLease::new(
+        OpaqueSecretReference::fixture(),
+        ImpactFixtureWorld::callback_key(),
+        at + Duration::hours(1),
+    )
+    .expect("unbound key material");
+    assert!(matches!(
+        adapter.handle_callback(CallbackRequest {
+            scope: world.scope(),
+            channel: CallbackChannel::Webhook,
+            body: &body,
+            signature: &signature,
+            signature_key: &unbound,
+            scheme: CallbackSignatureScheme::FixtureHmacSha256,
+            received_at: at,
+        }),
+        Err(PartnerNetworkError::InvalidCallbackLease)
+    ));
+
+    let mismatched_scheme = fixture_callback_key(
+        at,
+        &world.scope(),
+        CallbackSignatureScheme::ImpactHookHmacSha1,
+    );
+    assert!(matches!(
+        adapter.handle_callback(CallbackRequest {
+            scope: world.scope(),
+            channel: CallbackChannel::Webhook,
+            body: &body,
+            signature: &signature,
+            signature_key: &mismatched_scheme,
+            scheme: CallbackSignatureScheme::FixtureHmacSha256,
+            received_at: at,
+        }),
+        Err(PartnerNetworkError::InvalidCallbackLease)
+    ));
 }

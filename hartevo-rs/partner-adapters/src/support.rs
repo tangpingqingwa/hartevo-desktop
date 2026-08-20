@@ -7,8 +7,8 @@ use crate::contract::{
     NetworkCapability, NetworkProbeObservation, NetworkProbeRequest, NetworkProbeStatus,
     NetworkProvenance, NetworkProvider, NetworkReadBudgetReceipt, NetworkReadData,
     NetworkReadObservation, NetworkReadRequest, NetworkScope, PartnerNetworkError, ReadCursor,
-    ReadPage, is_sha256, read_observation_evidence_digest, validate_scope_record_ids,
-    verify_program_expectation,
+    ReadPage, is_sha256, partner_registration_digest, partner_registration_identity,
+    read_observation_evidence_digest, validate_scope_record_ids, verify_program_expectation,
 };
 use crate::state::AdapterState;
 
@@ -273,11 +273,14 @@ impl<C: ProviderTransport> ProviderAdapter<C> {
             source_digest: response.source_digest,
             budget,
             native_canary_digest: None,
+            adapter_version: crate::contract::PARTNER_ADAPTER_VERSION,
+            registration_identity: partner_registration_identity(self.provider),
+            registration_digest: partner_registration_digest(self.provider)?,
             native_canary_attested: false,
             evidence_digest: String::new(),
         };
         observation.evidence_digest = read_observation_evidence_digest(&observation)?;
-        observation.validate()?;
+        crate::contract::validate_partner_read_observation(&observation)?;
         self.state.record_read_receipt(
             &observation.scope,
             observation.authorization_revision,
