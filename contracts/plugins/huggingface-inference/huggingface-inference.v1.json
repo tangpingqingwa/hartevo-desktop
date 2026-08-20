@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/huggingface-inference/huggingface-inference.v1.json",
+  "title": "Hartevo Hugging Face Inference Providers Layer-1 result contract",
+  "description": "A scoped, read/proposal/recording-only Hugging Face Inference Providers seam. It is not a model catalog, native connector, kernel receipt, or adoption authority.",
+  "schemaVersion": "hartevo.huggingface-inference.contract/v1",
+  "contractVersion": "hf-inference-result/v1",
+  "pluginVersion": "0.1.0",
+  "layer": "Layer-1",
+  "serviceId": "hartevo.huggingface.inference.result",
+  "providerId": "huggingface.inference-providers",
+  "consumerId": "mission.huggingface.inference.result",
+  "tasks": [
+    "chat_completion",
+    "text_generation"
+  ],
+  "scope": [
+    "api_host",
+    "account_or_organization",
+    "opaque_secret_reference",
+    "permission",
+    "model_id",
+    "immutable_model_revision",
+    "task",
+    "selected_provider_route",
+    "project_id_and_revision",
+    "mission_id_and_revision",
+    "work_product_id_and_revision",
+    "policy_revision",
+    "input_bounds",
+    "output_redaction_policy"
+  ],
+  "digests": [
+    "plugin_version_digest",
+    "contract_digest",
+    "provider_digest",
+    "model_digest",
+    "task_digest",
+    "scope_digest",
+    "permission_digest",
+    "registration_digest",
+    "request_fingerprint",
+    "result_fingerprint",
+    "content_digest"
+  ],
+  "registration": {
+    "versionAndScopeBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "model_revision_drift",
+      "provider_route_drift",
+      "permission_drift",
+      "policy_drift",
+      "registration_tamper",
+      "registration_revocation"
+    ]
+  },
+  "allowlist": {
+    "chatCompletion": {
+      "messageRoles": [
+        "system",
+        "user",
+        "assistant"
+      ],
+      "content": "text_only",
+      "tools": false,
+      "streaming": false
+    },
+    "textGeneration": {
+      "input": "single_text",
+      "tools": false,
+      "streaming": false
+    },
+    "providerSelection": "one_explicit_route_no_silent_failover"
+  },
+  "authority": {
+    "connected": false,
+    "native": false,
+    "externalWrites": false,
+    "durableNativeReceipt": false,
+    "independentReadBack": false,
+    "kernelOutcomeAdoption": false
+  },
+  "evidenceModes": [
+    "fixture",
+    "fake",
+    "recording",
+    "loopback",
+    "BLOCKED_ENV"
+  ],
+  "forbidden": [
+    "raw_token_serialization",
+    "hidden_reasoning_retention",
+    "raw_sensitive_content_retention_by_default",
+    "tool_call_execution",
+    "hub_model_or_endpoint_creation",
+    "external_write",
+    "silent_provider_failover",
+    "native_connected_claim"
+  ],
+  "layer2Gaps": [
+    "native_secret_resolution",
+    "bounded_https_inference",
+    "durable_provider_receipt",
+    "independent_result_read_back",
+    "verified_work_product_adoption"
+  ]
+}

@@ -1,0 +1,134 @@
+{
+  "schemaVersion": "hartevo-aws-organizations-governance-result-contract/v1",
+  "contractVersion": "aws-organizations-governance-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "aws.organizations.governance.result",
+    "readOnly": true,
+    "liveExecution": false,
+    "operations": [
+      "ListPolicies",
+      "ListTargetsForPolicy",
+      "ListPoliciesForTarget",
+      "Register",
+      "RevokeRegistration"
+    ]
+  },
+  "provider": {
+    "id": "aws.organizations.read",
+    "apiVersion": "2016-11-28",
+    "providerVersion": "aws-organizations-provider/v1",
+    "native": false,
+    "firstParty": false,
+    "connected": false,
+    "readOnly": true,
+    "allowedOperations": [
+      "ListPolicies",
+      "ListTargetsForPolicy",
+      "ListPoliciesForTarget"
+    ],
+    "managementOrDelegatedAdministratorRequired": true,
+    "maxResults": 20,
+    "opaquePagination": true
+  },
+  "consumer": {
+    "id": "mission.aws.organizations.governance",
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "effectiveAuthorization": false
+  },
+  "scope": {
+    "organization": "organizationId",
+    "targets": ["ROOT", "ORGANIZATIONAL_UNIT", "ACCOUNT"],
+    "policyIdentity": ["policyType", "policyId", "policyArn"],
+    "missionBinding": ["missionId", "projectId", "workProductId", "missionRevision", "consentDigest"],
+    "permissionBinding": ["authority", "callerAccountId", "permissionRevision", "permissionDigest"],
+    "hierarchyBinding": ["parentTarget", "hierarchyDigest"],
+    "registrationBinding": ["registrationDigest", "reversible", "revocable"]
+  },
+  "digests": [
+    "versionDigest",
+    "providerDigest",
+    "contractDigest",
+    "permissionDigest",
+    "scopeDigest",
+    "hierarchyDigest",
+    "evidenceDigest"
+  ],
+  "reads": {
+    "ListPolicies": {
+      "direction": "none",
+      "filter": "policyType",
+      "items": "policySummaryOnly"
+    },
+    "ListTargetsForPolicy": {
+      "direction": "policyToTarget",
+      "items": "rootOuAccountTargetSummary"
+    },
+    "ListPoliciesForTarget": {
+      "direction": "targetToPolicy",
+      "filter": "policyType",
+      "items": "policySummaryOnly"
+    },
+    "record": "normalizedPagesOnly",
+    "verify": [
+      "requestDigest",
+      "opaqueCursorDigest",
+      "permissionDigest",
+      "hierarchyDigest",
+      "scopeDigest",
+      "providerDigest",
+      "completePagination"
+    ]
+  },
+  "redaction": {
+    "retain": [
+      "organizationId",
+      "accountId",
+      "organizationalUnitId",
+      "rootId",
+      "parentTargetId",
+      "policyType",
+      "policyId",
+      "policyArn",
+      "policyRevisionDigest",
+      "attachmentState",
+      "attachmentDirection",
+      "paginationTokenDigest"
+    ],
+    "drop": [
+      "policyDocument",
+      "policyJson",
+      "accountEmail",
+      "accountName",
+      "billingContact",
+      "organizationMetadata",
+      "secretMaterial",
+      "rawNextToken"
+    ]
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "durableReceipt": false,
+    "effectiveAuthorization": false,
+    "policyTruthAuthority": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "forbiddenEffects": [
+    "CreateAccount",
+    "CreateOrganizationalUnit",
+    "AttachPolicy",
+    "DetachPolicy",
+    "UpdatePolicy",
+    "CloseOrganization"
+  ],
+  "layer2Exits": [
+    "nativeSigV4",
+    "durableProviderReceipt",
+    "independentPolicyReadback",
+    "consentedGovernanceEffect"
+  ]
+}
