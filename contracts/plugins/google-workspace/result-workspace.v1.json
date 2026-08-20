@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schemaVersion": "hartevo-google-workspace-result/v1",
+  "contractVersion": "EXT-GWS-01-L1/v1",
+  "layer": 1,
+  "pluginId": "google-workspace.result-workspace",
+  "providerId": "google-drive-docs",
+  "serviceId": "result-workspace",
+  "missionConsumerId": "mission.result-workspace.adoption",
+  "adapterId": "google-workspace.result-workspace.read",
+  "evidenceLevel": "E1",
+  "transport": {
+    "production": "https",
+    "loopback": "test_only",
+    "fixture": "test_only"
+  },
+  "oauth": {
+    "probeEndpoint": "https://oauth2.googleapis.com/tokeninfo",
+    "requiredScopes": [
+      "https://www.googleapis.com/auth/drive.metadata.readonly",
+      "https://www.googleapis.com/auth/documents.readonly"
+    ],
+    "accessTokenEnvironmentVariable": "HARTEVO_GOOGLE_WORKSPACE_ACCESS_TOKEN",
+    "refreshTokenAuthority": false
+  },
+  "readCapabilities": [
+    "oauth_probe",
+    "user_probe",
+    "shared_drive_probe",
+    "folder_probe",
+    "document_metadata_read",
+    "document_content_read",
+    "document_revision_read",
+    "user_change_cursor",
+    "shared_drive_change_cursor",
+    "change_classification",
+    "document_adoption_proposal"
+  ],
+  "changeClassification": [
+    "current",
+    "deletion",
+    "access_loss",
+    "corpus_move",
+    "ambiguous_removal"
+  ],
+  "authority": {
+    "connectedFromLoopback": false,
+    "connectedFromFixture": false,
+    "externalWrite": false,
+    "effectAuthority": false,
+    "storeAuthority": false,
+    "keyringAuthority": false,
+    "browserProfileAuthority": false
+  },
+  "adoptionProposal": {
+    "mutating": false,
+    "bindsWorkProductRevisionAndDigest": true,
+    "bindsRequiredProviderRevision": true,
+    "layer2RequiredForWrite": true,
+    "layer2RequiredForReadback": true
+  },
+  "environmentStates": [
+    "BLOCKED_ENV",
+    "AUTHENTICATION_REJECTED",
+    "CONNECTED_NATIVE_HTTPS",
+    "VERIFIED_LOOPBACK_NOT_CONNECTED"
+  ]
+}
