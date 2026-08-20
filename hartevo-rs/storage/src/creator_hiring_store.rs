@@ -15,6 +15,23 @@ use crate::normalized::update_mission_normalized_cas;
 use crate::{PersistedMutation, ProjectStore, StorageError};
 
 impl ProjectStore {
+    pub fn creator_hirings_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<CreatorHiring>, StorageError> {
+        self.load_project(project_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM creator_hirings
+             WHERE project_id = ?1 ORDER BY created_at, id",
+        )?;
+        let ids = statement
+            .query_map(params![project_id.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| self.load_creator_hiring(project_id, &CreatorHiringId::from_stable(id)))
+            .collect()
+    }
+
     pub fn update_creator_hiring_and_mission_atomic(
         &mut self,
         hiring: &CreatorHiring,
