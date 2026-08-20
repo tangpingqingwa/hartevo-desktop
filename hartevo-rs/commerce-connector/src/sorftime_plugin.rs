@@ -304,6 +304,19 @@ impl SorftimeEstimateResult {
             && self.evidence_level == SORFTIME_ESTIMATE_EVIDENCE_LEVEL
     }
 
+    /// Verifies the provider receipt's canonical digest before another layer
+    /// is allowed to persist or adopt it.  The digest deliberately excludes
+    /// the replay marker, so a replayed view cannot change the evidence
+    /// identity while the durable committed receipt remains immutable.
+    pub fn validate_integrity(&self) -> Result<(), SorftimePluginError> {
+        if self.result_digest.is_empty() || self.digest()? != self.result_digest {
+            return Err(SorftimePluginError::InvalidEvidence(
+                "result digest mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn digest(&self) -> Result<String, SorftimePluginError> {
         let mut unsigned = self.clone();
         unsigned.result_digest.clear();
@@ -316,6 +329,11 @@ impl SorftimeEstimateResult {
         self
     }
 }
+
+/// The committed provider result is the receipt consumed by the Mission
+/// adoption layer.  This alias keeps the provider and adoption layers on one
+/// typed receipt rather than introducing a second provider-result registry.
+pub type SorftimeEstimateReceipt = SorftimeEstimateResult;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -373,6 +391,43 @@ impl SorftimeDurableCheckpoint {
 
     pub fn is_empty(&self) -> bool {
         self.state == SorftimeCheckpointState::Empty
+    }
+
+    /// Returns only a digest-verified committed receipt.  In-flight,
+    /// failed-closed, empty, and malformed checkpoints cannot cross the
+    /// provider-to-Mission boundary.
+    pub fn committed_receipt(&self) -> Result<&SorftimeEstimateResult, SorftimePluginError> {
+        if self.state != SorftimeCheckpointState::Committed {
+            return Err(SorftimePluginError::InvalidEvidence(
+                "checkpoint is not committed".into(),
+            ));
+        }
+        let result = self
+            .result
+            .as_ref()
+            .ok_or_else(|| SorftimePluginError::InvalidEvidence("missing result".into()))?;
+        if self.result_digest.as_deref() != Some(result.result_digest.as_str()) {
+            return Err(SorftimePluginError::InvalidEvidence(
+                "checkpoint result digest mismatch".into(),
+            ));
+        }
+        if self.scope_digest.as_deref() != Some(result.scope_digest.as_str())
+            || self.account.as_ref() != Some(&result.account)
+            || self.market.as_ref() != Some(&result.market)
+            || self.dataset != Some(result.dataset)
+            || self.request_id.as_deref() != Some(result.request_id.as_str())
+            || self.request_digest.as_deref() != Some(result.request_digest.as_str())
+            || self.secret_reference_id.as_deref() != Some(result.secret_reference_id.as_str())
+            || self.credential_revision != Some(result.credential_revision)
+            || self.lease_id.as_deref() != Some(result.lease_id.as_str())
+            || self.lease_revision != Some(result.lease_revision)
+        {
+            return Err(SorftimePluginError::InvalidEvidence(
+                "checkpoint binding does not match committed result".into(),
+            ));
+        }
+        result.validate_integrity()?;
+        Ok(result)
     }
 
     fn bind(

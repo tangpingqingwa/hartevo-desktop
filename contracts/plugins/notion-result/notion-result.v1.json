@@ -1,0 +1,301 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.notion-result/v1",
+  "title": "Hartevo Layer 1 Notion knowledge-result proposal contract",
+  "schemaVersion": "hartevo.notion-result/v1",
+  "contractVersion": "EXT-NOTION-01-L1/v1",
+  "layer": 1,
+  "api": {
+    "version": "2026-03-11",
+    "databaseAndDataSourceDistinct": true
+  },
+  "errors": {
+    "typedHttpStatuses": [403, 404, 409, 429]
+  },
+  "pagination": {
+    "maxPageSize": 100,
+    "maxPages": 100,
+    "cursorField": "next_cursor",
+    "hasMoreField": "has_more"
+  },
+  "async": {
+    "maxPolls": 20,
+    "mode": "task_polling_template",
+    "nativeStatus": "BLOCKED_ENV"
+  },
+  "authority": {
+    "externalWrite": false,
+    "storeAuthority": false,
+    "keyringAuthority": false,
+    "browserProfileAuthority": false,
+    "effectAuthority": false
+  },
+  "native": {
+    "write": "BLOCKED_ENV",
+    "credentials": "BLOCKED_ENV",
+    "webhook": "BLOCKED_ENV"
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "layer",
+    "plugin",
+    "service",
+    "provider",
+    "consumer",
+    "api",
+    "scope",
+    "proposal",
+    "readback",
+    "pagination",
+    "async",
+    "errors",
+    "authority",
+    "native",
+    "secrets"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "hartevo.notion-result/v1" },
+    "contractVersion": { "const": "EXT-NOTION-01-L1/v1" },
+    "layer": { "const": 1 },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "digestBound"],
+      "properties": {
+        "id": { "const": "notion-result.knowledge-result" },
+        "version": { "const": "1.0.0" },
+        "digestBound": { "const": true }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "operations", "effectAuthority"],
+      "properties": {
+        "id": { "const": "notion-result.publish-proposal" },
+        "operations": {
+          "const": [
+            "read",
+            "describe",
+            "compile_publish_proposal",
+            "verify_readback",
+            "record_proposal"
+          ]
+        },
+        "effectAuthority": { "const": "proposal_and_recording_only" }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "apiVersion", "parentKinds", "capabilities", "manifestDigest"],
+      "properties": {
+        "id": { "const": "notion.knowledge-result" },
+        "apiVersion": { "const": "2026-03-11" },
+        "parentKinds": { "const": ["page_id", "data_source_id"] },
+        "capabilities": {
+          "const": ["read_content", "insert_content", "update_content"]
+        },
+        "manifestDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "binding"],
+      "properties": {
+        "id": { "const": "mission.notion-result.consumer" },
+        "binding": {
+          "const": [
+            "tenant_id",
+            "project_id",
+            "mission_id",
+            "work_product_id",
+            "work_product_revision",
+            "content_digest",
+            "manifest_digest",
+            "scope_digest",
+            "consent_id",
+            "provider_manifest_digest"
+          ]
+        }
+      }
+    },
+    "api": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseUrl", "version", "databaseAndDataSourceDistinct", "endpoints"],
+      "properties": {
+        "baseUrl": { "const": "https://api.notion.com/v1" },
+        "version": { "const": "2026-03-11" },
+        "databaseAndDataSourceDistinct": { "const": true },
+        "endpoints": {
+          "type": "array",
+          "minItems": 5,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["operation", "method", "path", "effect"],
+            "properties": {
+              "operation": {
+                "enum": [
+                  "create_page",
+                  "update_page",
+                  "append_block_children",
+                  "retrieve_page",
+                  "retrieve_block_children"
+                ]
+              },
+              "method": { "enum": ["GET", "POST", "PATCH"] },
+              "path": { "type": "string" },
+              "effect": { "enum": ["read_only", "proposal_only", "template_only"] }
+            }
+          }
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["parents", "consentBound", "capabilities"],
+      "properties": {
+        "parents": { "const": ["page_id", "data_source_id"] },
+        "consentBound": { "const": true },
+        "capabilities": {
+          "const": ["read_content", "insert_content", "update_content"]
+        }
+      }
+    },
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operations",
+        "mutating",
+        "effect",
+        "idempotency",
+        "workProductBinding",
+        "contentBlocks"
+      ],
+      "properties": {
+        "operations": {
+          "const": ["create_page", "update_page", "append_content"]
+        },
+        "mutating": { "const": false },
+        "effect": { "const": "proposal_only" },
+        "idempotency": { "const": "sha256_scope_work_product_revision_content" },
+        "workProductBinding": {
+          "const": [
+            "mission_id",
+            "project_id",
+            "work_product_id",
+            "work_product_revision",
+            "content_digest",
+            "manifest_digest"
+          ]
+        },
+        "contentBlocks": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["paragraphRichTextOnly", "rawJsonNotAccepted"],
+          "properties": {
+            "paragraphRichTextOnly": { "const": true },
+            "rawJsonNotAccepted": { "const": true }
+          }
+        }
+      }
+    },
+    "readback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requiredFields", "mismatchIsTypedFailure", "rawPageBodyInReceipt"],
+      "properties": {
+        "requiredFields": {
+          "const": [
+            "page_id",
+            "page_url",
+            "parent",
+            "revision",
+            "content_fingerprint",
+            "provider_manifest_digest"
+          ]
+        },
+        "mismatchIsTypedFailure": { "const": true },
+        "rawPageBodyInReceipt": { "const": false }
+      }
+    },
+    "pagination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cursorField", "hasMoreField", "maxPageSize", "maxPages"],
+      "properties": {
+        "cursorField": { "const": "next_cursor" },
+        "hasMoreField": { "const": "has_more" },
+        "maxPageSize": { "const": 100 },
+        "maxPages": { "const": 100 }
+      }
+    },
+    "async": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "taskEndpoint", "maxPolls", "nativeStatus"],
+      "properties": {
+        "mode": { "const": "task_polling_template" },
+        "taskEndpoint": { "const": "/tasks/{task_id}" },
+        "maxPolls": { "const": 20 },
+        "nativeStatus": { "const": "BLOCKED_ENV" }
+      }
+    },
+    "errors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["typedHttpStatuses"],
+      "properties": {
+        "typedHttpStatuses": { "const": [403, 404, 409, 429] }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "externalWrite",
+        "storeAuthority",
+        "keyringAuthority",
+        "browserProfileAuthority",
+        "effectAuthority"
+      ],
+      "properties": {
+        "externalWrite": { "const": false },
+        "storeAuthority": { "const": false },
+        "keyringAuthority": { "const": false },
+        "browserProfileAuthority": { "const": false },
+        "effectAuthority": { "const": false }
+      }
+    },
+    "native": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["write", "credentials", "webhook", "recordingEvidence"],
+      "properties": {
+        "write": { "const": "BLOCKED_ENV" },
+        "credentials": { "const": "BLOCKED_ENV" },
+        "webhook": { "const": "BLOCKED_ENV" },
+        "recordingEvidence": { "const": "not_connected" }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["secretReferenceBoundaryOnly", "rawTokenInProposal", "rawTokenInReceipt"],
+      "properties": {
+        "secretReferenceBoundaryOnly": { "const": true },
+        "rawTokenInProposal": { "const": false },
+        "rawTokenInReceipt": { "const": false }
+      }
+    }
+  }
+}
