@@ -1,0 +1,331 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/dockerhub-image-result/dockerhub-image-result.v1.json",
+  "title": "Hartevo Docker Hub image result Layer-1 contract",
+  "schemaVersion": "hartevo.dockerhub-image-result/v1",
+  "contractVersion": "EXT-DOCKERHUB-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "dockerhub.image.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.dockerhub-image-result/v1|layer=1|service=dockerhub.image.result.read|provider=dockerhub.image.result.recording|consumer=mission.dockerhub-image.consumer|api=dockerhub-hub-v2-read-repository-tag-r1",
+  "contractDigest": "5737a484d4b360966c042366ba3a529436b93a4bb2fbd8b499120e0965d5c532",
+  "service": {
+    "type": "DockerHubImageResultService",
+    "id": "dockerhub.image.result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "ReadRepositoryTag",
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "propose",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "DockerHubProvider",
+    "id": "dockerhub.image.result.recording",
+    "apiRevision": "dockerhub-hub-v2-read-repository-tag-r1",
+    "operations": [
+      "ReadRepositoryTag"
+    ],
+    "allowlistPaths": [
+      "GET /v2/namespaces/{namespace}/repositories/{repository}/tags/{tag}"
+    ],
+    "allowedTransports": [
+      "recording",
+      "fixture",
+      "fake",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "docker_hub_bearer",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "type": "MissionDockerHubImageConsumer",
+    "id": "mission.dockerhub-image.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque DockerHub SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "namespace",
+      "repository",
+      "tag",
+      "manifestDigestScope",
+      "platformScope",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "maxPlatformTuples": 32,
+    "maxResponseBytes": 1048576,
+    "exactTagOnly": true,
+    "rawNamespaceRepositoryTagInEvidence": false
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": [
+      "active"
+    ],
+    "terminalStatuses": [
+      "reversed"
+    ],
+    "bindingDigests": [
+      "versionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "registrationDigest"
+    ],
+    "permissions": [
+      "dockerhub:ReadRepositoryTag",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "dockerhub:Login",
+      "dockerhub:Pull",
+      "dockerhub:Push",
+      "dockerhub:Delete",
+      "dockerhub:Tag",
+      "dockerhub:Build",
+      "dockerhub:Scan",
+      "dockerhub:WebhookMutation",
+      "dockerhub:DownloadLayer",
+      "dockerhub:ExecuteImage",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "style": "none_exact_tag",
+    "cursorAccepted": false,
+    "listTags": false,
+    "truncationIsNonAdoptable": true
+  },
+  "projection": {
+    "tagStatus": true,
+    "lastUpdatedTimestamp": true,
+    "immutableDigestIdentities": true,
+    "platformTuples": [
+      "os",
+      "architecture",
+      "variant"
+    ],
+    "sizeMetadata": [
+      "fullSizeBytes",
+      "imageSizeBytes",
+      "layerCount"
+    ],
+    "countMetadata": [
+      "imageCount",
+      "platformCount",
+      "totalLayerCount"
+    ],
+    "deterministicDigests": [
+      "tagDigest",
+      "manifestDigest",
+      "platformDigest",
+      "projectionDigest",
+      "evidenceDigest"
+    ],
+    "rawDescription": false,
+    "collaborators": false,
+    "usernames": false,
+    "layerUrls": false,
+    "layerDigests": false,
+    "dockerfileHistory": false,
+    "dockerfileInstructions": false,
+    "scanDetails": false,
+    "rawResponseBody": false
+  },
+  "receipts": {
+    "request": {
+      "redacted": true,
+      "retain": [
+        "operation",
+        "requestDigest",
+        "pathDigest",
+        "scopeDigest"
+      ],
+      "drop": [
+        "rawPath",
+        "namespace",
+        "repository",
+        "tag",
+        "authorizationHeader",
+        "credentialMaterial"
+      ]
+    },
+    "cost": {
+      "redacted": true,
+      "retain": [
+        "operation",
+        "responseBytes",
+        "boundedRequestUnits",
+        "costDigest"
+      ],
+      "estimateOnly": true,
+      "durableProviderReceipt": false
+    }
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "tagDigest",
+      "manifestDigest",
+      "platformDigest",
+      "projectionDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "ready",
+      "partial",
+      "access_loss",
+      "unauthorized",
+      "forbidden",
+      "not_found",
+      "throttled",
+      "timed_out",
+      "config_drift",
+      "tampered",
+      "provider_unknown",
+      "registration_revoked"
+    ],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "partialIsNonAdoptable": true,
+    "driftIsNonAdoptable": true,
+    "tagMetadataIsNotContentIntegrity": true,
+    "tagMetadataIsNotSignatureAttestation": true,
+    "tagMetadataIsNotSbomVulnerability": true,
+    "tagMetadataIsNotRuntimeTruth": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "bounded exact Docker Hub repository/tag metadata read seam",
+      "namespace/repository/tag/manifest/image/platform scope fence",
+      "tag status and last-updated projection",
+      "immutable digest identities and bounded platform tuples",
+      "size/count metadata and deterministic digests",
+      "version/contract/provider/API/permission/scope/evidence digests",
+      "reversible and revocable registration",
+      "redacted request and cost receipts",
+      "Mission-scoped review-only proposal and replay fence"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "native Docker Hub credential resolution",
+      "live Docker Hub HTTPS",
+      "durable provider receipt",
+      "content integrity",
+      "signature or attestation verification",
+      "SBOM or vulnerability scanning",
+      "layer download",
+      "image execution",
+      "login or repository mutation",
+      "webhook mutation",
+      "verified Work Product adoption"
+    ]
+  },
+  "forbiddenEffects": [
+    "Login",
+    "Pull",
+    "Push",
+    "Delete",
+    "Tag",
+    "Build",
+    "Scan",
+    "WebhookMutation",
+    "DownloadLayer",
+    "ExecuteImage",
+    "VerifyContentIntegrity",
+    "VerifySignature",
+    "VerifyAttestation",
+    "ProduceSbom",
+    "ProduceVulnerabilityResult",
+    "adopt_verified_work_product"
+  ],
+  "layer2Gaps": [
+    "native Docker Hub authentication and live HTTPS",
+    "durable provider receipt",
+    "registry manifest and layer reads",
+    "content-integrity, signature, and attestation verification",
+    "SBOM and vulnerability scanning",
+    "image download or execution",
+    "login, pull, push, delete, tag, build, scan, and webhook mutation",
+    "production availability or integrity certification",
+    "verified Mission Work Product adoption"
+  ],
+  "honestNativeGap": "Layer-1 uses only recording, fixture, fake, loopback, and BLOCKED_ENV transports. None claims Connected, native, first-party, durable provider receipt, content integrity, signature/attestation, SBOM/vulnerability, runtime execution, or verified adoption. Native Docker Hub/registry transport and all mutation or verification exits remain Layer-2 work."
+}
