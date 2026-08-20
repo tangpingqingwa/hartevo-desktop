@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schemaVersion": "hartevo.aws-codepipeline-release-result.contract/v1",
+  "contractVersion": "EXT-AWS-CODEPIPELINE-01-L1/v1",
+  "pluginId": "aws.codepipeline.release-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.aws-codepipeline-release-result.contract/v1|layer=1|service=aws.codepipeline.release-result.read|provider=aws.codepipeline.release-result.recording|consumer=mission.aws-codepipeline-release-result.consumer",
+  "contractDigest": "a03812002cd3f80f47091831a408058502fae215dd429ad1f53ffc00e0024555",
+  "service": {
+    "type": "AwsCodePipelineReleaseService",
+    "id": "aws.codepipeline.release-result.read",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "register_scope",
+      "revoke_registration",
+      "reverse_registration",
+      "read_bounded",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "providerOperations": [
+      "GetPipelineState",
+      "GetPipelineExecution",
+      "ListPipelineExecutions",
+      "ListActionExecutions"
+    ]
+  },
+  "provider": {
+    "type": "AwsCodePipelineProvider",
+    "id": "aws.codepipeline.release-result.recording",
+    "apiRevision": "aws-codepipeline-release-read-r1",
+    "operations": [
+      "GetPipelineState",
+      "GetPipelineExecution",
+      "ListPipelineExecutions",
+      "ListActionExecutions"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "mutations": {
+      "StartPipelineExecution": false,
+      "StopPipelineExecution": false,
+      "UpdatePipeline": false,
+      "artifactDownload": false,
+      "rawLogs": false,
+      "resolveCredential": false
+    },
+    "httpClassification": {
+      "clientError": "400-499",
+      "rateLimited": 429,
+      "serverError": "500-599",
+      "timeout": true
+    }
+  },
+  "consumer": {
+    "type": "MissionAwsCodePipelineConsumer",
+    "id": "mission.aws-codepipeline-release-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false
+  },
+  "credentials": {
+    "boundary": "opaque non-serializing SigV4 SecretReference",
+    "kind": "sigv4",
+    "serialized": false,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "accountId",
+      "accountRevision",
+      "region",
+      "regionRevision",
+      "pipelineName",
+      "pipelineRevision",
+      "executionId",
+      "executionRevision",
+      "stageName",
+      "stageRevision",
+      "actionName",
+      "actionRevision",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "permissions": [
+      "codepipeline:GetPipelineState",
+      "codepipeline:GetPipelineExecution",
+      "codepipeline:ListPipelineExecutions",
+      "codepipeline:ListActionExecutions",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "codepipeline:StartPipelineExecution",
+      "codepipeline:StopPipelineExecution",
+      "codepipeline:UpdatePipeline",
+      "codepipeline:artifactDownload",
+      "codepipeline:rawLogs",
+      "credential.resolve",
+      "kernel.outcome.adopt"
+    ]
+  },
+  "bounds": {
+    "maxPageSize": 50,
+    "maxPages": 4,
+    "maxPipelineExecutions": 128,
+    "maxActionExecutions": 256,
+    "maxCursorBytes": 512,
+    "maxResponseBytes": 1048576,
+    "repeatedCursor": "fail_closed",
+    "filterCursorMismatch": "fail_closed",
+    "outOfScopeEntry": "fail_closed"
+  },
+  "evidence": {
+    "executionReplacement": true,
+    "stageActionTransitions": true,
+    "retryIdentity": true,
+    "retryState": true,
+    "tamperDigest": true,
+    "redactionEvidence": true,
+    "revocationEvidence": true,
+    "artifactContent": false,
+    "errorMessage": false,
+    "rawLogs": false,
+    "truncationIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected",
+    "fixture": "non_native_non_connected",
+    "loopback": "non_native_non_connected",
+    "blocked_env": "non_native_non_connected",
+    "nativeConnectedClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed CodePipeline service/provider/consumer",
+      "exact account/region/pipeline/execution/stage/action/revision/Mission/Project/Work Product scope",
+      "bounded pipeline state, execution, and action metadata projections",
+      "redacted artifact and error metadata",
+      "pagination/filter binding and retry identity/state evidence",
+      "execution replacement and stage/action transition evidence",
+      "proposal digest and recording idempotency seam",
+      "reversible registration, permission, revision, and revocation evidence"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "native SigV4 resolution or signing",
+      "external CodePipeline writes",
+      "artifact download",
+      "raw logs or secrets",
+      "kernel authority",
+      "generic provider registry"
+    ]
+  },
+  "forbidden": [
+    "StartPipelineExecution",
+    "StopPipelineExecution",
+    "UpdatePipeline",
+    "download_artifact",
+    "read_raw_logs",
+    "serialize_secret_material",
+    "adopt_kernel_outcome"
+  ],
+  "honestNativeGap": "Native SigV4 resolution/signing, HTTPS readback, Connected status, provider receipts, independent verification, terminal reconciliation, artifact download, raw logs, raw secrets, Mission adoption, and Outcome authority remain Layer-2 work; recording, fixture, loopback, and BLOCKED_ENV never claim Connected or native."
+}
