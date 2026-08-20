@@ -34,5 +34,3 @@ must_use_candidate = "allow"
 doc_markdown = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
-
-[workspace]
