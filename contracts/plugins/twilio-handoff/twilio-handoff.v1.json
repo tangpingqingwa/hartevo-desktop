@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schemaVersion": "hartevo.twilio-handoff-plugin/v1",
+  "contractVersion": "ext-twilio-01-l1/v1",
+  "layer": 1,
+  "pluginId": "twilio-handoff",
+  "provider": "TwilioHandoffProvider",
+  "providerVersion": 1,
+  "service": "TwilioHandoffService",
+  "consumer": "MissionHandoffResultConsumer",
+  "authority": "proposal_and_receipt_projection_only",
+  "sourceOfTruth": "mission",
+  "transport": "twilio_message_resource_over_https",
+  "authentication": "SecretReference",
+  "channels": ["sms", "whatsapp"],
+  "scopeBindings": [
+    "account",
+    "sender_or_messaging_service",
+    "channel",
+    "e164_recipient",
+    "project",
+    "mission"
+  ],
+  "operations": [
+    "propose",
+    "read_receipt",
+    "project_delivery_status",
+    "verify_inbound_signal"
+  ],
+  "messageStatuses": [
+    "accepted",
+    "scheduled",
+    "queued",
+    "sending",
+    "sent",
+    "delivered",
+    "partially_delivered",
+    "undelivered",
+    "failed",
+    "read",
+    "canceled"
+  ],
+  "idempotency": {
+    "providerMessageSid": true,
+    "missionResultFingerprint": true,
+    "duplicateResolution": "same_binding_returns_existing_receipt"
+  },
+  "retry": {
+    "maxAttempts": 3,
+    "backoff": "bounded_exponential_without_sleep_in_layer_1",
+    "retryable": ["429", "timeout"],
+    "ambiguousResponse": "non_connected_and_not_adopted"
+  },
+  "callback": {
+    "signature": "x_twilio_signature_hmac_sha1_base64",
+    "canonicalization": "exact_https_url_plus_sorted_form_parameters",
+    "replayWindowMs": 300000,
+    "unverifiedInput": "rejected_without_projection",
+    "liveWebhookAcceptance": false
+  },
+  "missionConsumer": {
+    "operation": "canonical_non_mutating_handoff_proposal",
+    "mutating": false,
+    "bindings": [
+      "mission_identity",
+      "source_result_digest",
+      "recipient_channel_scope",
+      "provider_version",
+      "registration_digest"
+    ],
+    "adoptableResult": true
+  },
+  "statusProjection": {
+    "monotonic": true,
+    "truthful": [
+      "queued",
+      "sending",
+      "sent",
+      "delivered",
+      "read",
+      "undelivered",
+      "failed"
+    ],
+    "connectedClaim": false
+  },
+  "forbiddenAuthorities": [
+    "store",
+    "keyring",
+    "browser_profile",
+    "effect_execution",
+    "live_webhook_listener"
+  ],
+  "honestyBoundary": {
+    "fixturesAreConnected": false,
+    "loopbackIsNative": false,
+    "blockedEnvIsConnected": false,
+    "nativeConnectedEvidence": false,
+    "liveMessageSend": false,
+    "liveWebhookAcceptance": false,
+    "receiptRedaction": [
+      "phone_numbers",
+      "message_bodies",
+      "auth_material",
+      "callback_payloads",
+      "provider_tokens"
+    ]
+  },
+  "nativeGap": [
+    "No live Twilio create-message request is sent in Layer 1.",
+    "No live Twilio webhook listener or unverified callback adoption is accepted in Layer 1.",
+    "Native Connected evidence requires a later Layer-2 environment-gated transport and readback acceptance.",
+    "429, timeout, scope mismatch, unsupported channel, missing credentials, and ambiguous responses remain non-Connected outcomes."
+  ]
+}
