@@ -1,0 +1,357 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/gcp-spanner-database-result/gcp-spanner-database-result.v1.json",
+  "title": "Hartevo Google Cloud Spanner database posture result Layer-1 contract",
+  "schemaVersion": "hartevo.gcp-spanner-database-result/v1",
+  "contractVersion": "EXT-GCP-SPANNER-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "gcp.spanner.database.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.gcp-spanner-database-result/v1|layer=1|service=gcp.spanner.database.result.read|provider=gcp.spanner.admin|consumer=mission.gcp-spanner-database.consumer|api=spanner-instances-get-databases-get-operations-get-r1",
+  "contractDigest": "91ec46160031edcafbc6e8dae33d2f0dfebd92a43aab15d631a31f8def8d70ee",
+  "service": {
+    "type": "GcpSpannerDatabaseResultService",
+    "id": "gcp.spanner.database.result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "GetInstance",
+      "GetDatabase",
+      "GetOperation",
+      "ListInstances",
+      "ListDatabases",
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "read",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "GcpSpannerAdminProvider",
+    "id": "gcp.spanner.admin",
+    "apiRevision": "spanner-instances-get-databases-get-operations-get-r1",
+    "operations": [
+      "GetInstance",
+      "GetDatabase",
+      "GetOperation",
+      "ListInstances",
+      "ListDatabases"
+    ],
+    "allowedTransports": [
+      "recording",
+      "fixture",
+      "fake",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "schemes": ["oauth2", "service_account"],
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "type": "MissionGcpSpannerDatabaseConsumer",
+    "id": "mission.gcp-spanner-database.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "organizationId",
+      "folderId",
+      "gcpProjectId",
+      "instanceId",
+      "databaseId",
+      "databaseDialect",
+      "instanceConfigId",
+      "operationId",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque OAuth or service-account SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "organizationId",
+      "folderId",
+      "gcpProjectId",
+      "instanceId",
+      "databaseId",
+      "databaseDialect",
+      "instanceConfigId",
+      "operationId",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "ddl": false,
+    "schemas": false,
+    "rows": false,
+    "iamPolicies": false,
+    "labels": false,
+    "endpoints": false,
+    "keyNames": false,
+    "descriptions": false,
+    "maxPages": 4,
+    "maxPageSize": 32,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "bindingDigests": [
+      "pluginVersionDigest",
+      "contractVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "registrationDigest"
+    ],
+    "permissions": [
+      "spanner.instances.get",
+      "spanner.databases.get",
+      "spanner.operations.get",
+      "spanner.instances.list",
+      "spanner.databases.list",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "spanner.databases.create",
+      "spanner.databases.updateDdl",
+      "spanner.databases.drop",
+      "spanner.databases.restore",
+      "spanner.backup.create",
+      "spanner.backup.restore",
+      "spanner.instances.update",
+      "spanner.instances.delete",
+      "spanner.sessions.create",
+      "spanner.databaseRoles.list",
+      "iam.serviceAccounts.getAccessToken",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "style": "pageToken_pageSize",
+    "pageTokenOpaque": true,
+    "pageTokenDigestOnly": true,
+    "cursorBoundTo": [
+      "organization",
+      "folder",
+      "project",
+      "instance",
+      "database",
+      "pageSize",
+      "pageNumber",
+      "scopeDigest"
+    ],
+    "exactObjectResolutionOnly": true,
+    "loopRejected": true,
+    "filterDriftRejected": true,
+    "truncationIsNonAdoptable": true
+  },
+  "projection": {
+    "instance": [
+      "instanceIdentityDigest",
+      "state",
+      "createdAt",
+      "updatedAt",
+      "configurationDigest",
+      "encryptionPostureDigest"
+    ],
+    "database": [
+      "databaseIdentityDigest",
+      "instanceIdentityDigest",
+      "state",
+      "dialect",
+      "createdAt",
+      "updatedAt",
+      "configurationDigest",
+      "encryptionPostureDigest"
+    ],
+    "operation": [
+      "operationIdentityDigest",
+      "state",
+      "startedAt",
+      "completedAt",
+      "errorDigest"
+    ],
+    "rawDdl": false,
+    "rawSchemas": false,
+    "rawRows": false,
+    "rawIamPolicies": false,
+    "rawLabels": false,
+    "rawEndpoints": false,
+    "rawKeyNames": false,
+    "rawDescriptions": false
+  },
+  "receipts": {
+    "request": {
+      "redacted": true,
+      "retain": [
+        "operation",
+        "requestDigest",
+        "pathDigest",
+        "scopeDigest",
+        "pageTokenDigest"
+      ],
+      "drop": ["rawPageToken", "rawResourcePath", "authorizationHeader", "credentialMaterial"]
+    },
+    "cost": {
+      "redacted": true,
+      "retain": ["operation", "responseBytes", "boundedRequestUnits", "costDigest"],
+      "estimateOnly": true,
+      "durableProviderReceipt": false
+    }
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "registrationDigest",
+      "instanceDigest",
+      "databaseDigest",
+      "operationDigest",
+      "requestDigest",
+      "responseDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "CREATING",
+      "READY",
+      "UPDATING",
+      "RESTORING",
+      "BACKING_UP",
+      "FAILED",
+      "PARTIAL",
+      "ACCESS_LOST",
+      "PROVIDER_UNKNOWN",
+      "TAMPERED",
+      "REVOKED"
+    ],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "staleMissionRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "partialIsNonAdoptable": true,
+    "driftIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "bounded Spanner instance/database/operation management read seams",
+      "exact organization/folder/project/instance/database/dialect/instance-config/operation scope",
+      "bounded opaque page-token binding and pagination fences",
+      "state/timestamp/configuration posture projections",
+      "version/contract/provider/API/permission/scope/evidence digests",
+      "reversible and revocable registration",
+      "redacted request/cost receipts",
+      "Mission-scoped review-only proposal and in-memory idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live OAuth or service-account resolution",
+      "live Spanner HTTPS",
+      "durable provider receipt",
+      "SQL sessions or queries",
+      "DDL or DML",
+      "schema, row, IAM, label, endpoint, key-name, or description reads",
+      "backup or restore",
+      "instance scaling",
+      "database create or drop",
+      "verified Work Product adoption",
+      "availability, authorization, data correctness, or Outcome claims"
+    ]
+  },
+  "forbiddenEffects": [
+    "create_database",
+    "drop_database",
+    "update_ddl",
+    "execute_sql",
+    "create_session",
+    "read_rows",
+    "read_schema",
+    "read_iam",
+    "read_labels",
+    "read_endpoints",
+    "read_key_names",
+    "read_descriptions",
+    "create_backup",
+    "restore_backup",
+    "scale_instance",
+    "resolve_live_credentials",
+    "adopt_kernel_outcome",
+    "claim_provider_receipt",
+    "adopt_verified_work_product"
+  ],
+  "layer2Gaps": [
+    "native OAuth or service-account resolution",
+    "live Spanner HTTPS",
+    "durable provider receipt",
+    "independent repeat-read reconciliation",
+    "production provider verification",
+    "Connected/native/first-party evidence",
+    "Hartevo Truth, Consent, Effect, Receipt, Verification, Outcome or Work Product adoption"
+  ],
+  "honestNativeGap": "Native OAuth or service-account resolution, live GetInstance/GetDatabase/GetOperation HTTPS, durable provider receipt, independent repeat-read reconciliation, and verified Mission or Work Product adoption remain Layer-2 work. Recording, fixture, fake, loopback and BLOCKED_ENV never claim Connected, native or first-party evidence; provider database state is evidence of provider posture only, not correctness, availability, authorization, Truth or Outcome authority."
+}

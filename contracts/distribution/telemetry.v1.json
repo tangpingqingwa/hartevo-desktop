@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/distribution/telemetry/1.0.0",
+  "title": "Hartevo content-free operational telemetry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "policy", "event"],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-operational-telemetry/v1"},
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["defaultEnabled", "optInRequired", "contentAllowed", "secretAllowed", "piiAllowed", "retentionDays"],
+      "properties": {
+        "defaultEnabled": {"const": false},
+        "optInRequired": {"const": true},
+        "contentAllowed": {"const": false},
+        "secretAllowed": {"const": false},
+        "piiAllowed": {"const": false},
+        "retentionDays": {"const": 7}
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "eventName", "eventId", "occurredAt", "buildCommit", "buildManifestSha256", "tenantPseudonym", "projectPseudonym", "missionPseudonym", "runPseudonym", "checkpointPseudonym", "effectPseudonym", "providerId", "sequence", "status", "durationMs", "attributes"],
+      "properties": {
+        "schemaVersion": {"const": "hartevo-operational-telemetry/v1"},
+        "eventName": {"enum": ["app.start", "app.update_check", "app.update_apply", "app.rollback", "run.started", "run.terminal", "run.failure", "restore.drill", "crash.redacted"]},
+        "eventId": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "occurredAt": {"type": "string", "format": "date-time"},
+        "buildCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "buildManifestSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "tenantPseudonym": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "projectPseudonym": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "missionPseudonym": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "runPseudonym": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "checkpointPseudonym": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "effectPseudonym": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "providerId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+        "sequence": {"type": "integer", "minimum": 0},
+        "status": {"enum": ["started", "in_progress", "succeeded", "failed", "uncertain", "blocked", "disabled"]},
+        "durationMs": {"type": "integer", "minimum": 0},
+        "attributes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "failureClass": {"type": "string", "pattern": "^[A-Z0-9_]{1,64}$"},
+            "items": {"type": "integer", "minimum": 0},
+            "bytes": {"type": "integer", "minimum": 0},
+            "retryCount": {"type": "integer", "minimum": 0},
+            "costMinor": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    }
+  }
+}

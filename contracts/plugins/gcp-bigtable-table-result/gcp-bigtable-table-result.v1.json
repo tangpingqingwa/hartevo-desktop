@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/gcp-bigtable-table-result/gcp-bigtable-table-result.v1.json",
+  "title": "Hartevo Google Cloud Bigtable table posture Layer-1 contract",
+  "schemaVersion": "hartevo-gcp-bigtable-table-result-contract/v1",
+  "contractVersion": "gcp-bigtable-table-result-e1/v1",
+  "pluginId": "gcp-bigtable-table-result",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "gcp.bigtable.table.result",
+    "version": "1.0.0",
+    "operation": "governed_table_posture_read",
+    "readOnly": true,
+    "liveExecution": false,
+    "typed": "GcpBigtableTableResultService",
+    "proposalOnly": true
+  },
+  "provider": {
+    "id": "gcp.bigtable.admin",
+    "version": "1.0.0",
+    "operations": [
+      "GET /v2/projects/{project}/instances/{instance}/tables/{table}?view=SCHEMA_VIEW",
+      "GET /v2/projects/{project}/instances/{instance}/clusters/{cluster}"
+    ],
+    "apiRevision": "bigtable-admin-rest-v2-tables-get-clusters-get-r1",
+    "permissions": ["bigtable.tables.get", "bigtable.clusters.get"],
+    "acceptedProvenance": ["fixture", "recording", "fake", "loopback", "blocked_env"],
+    "typed": "GcpBigtableAdminProvider",
+    "native": false,
+    "firstParty": false,
+    "connected": false,
+    "rowReads": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "id": "mission.gcp.bigtable.table.result.consumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "typed": "MissionGcpBigtableTableConsumer",
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAuthority": false
+  },
+  "scope": {
+    "exact": ["project", "instance", "table"],
+    "required": ["project", "instance", "table", "mission", "workProduct", "workProductRevision", "permissionDigest", "consentDigest"],
+    "identifiersInResult": "digest_only",
+    "secret": "opaque_non_serializing_secret_reference"
+  },
+  "readPolicy": {
+    "allow": ["get_table_schema", "get_cluster_posture"],
+    "deny": [
+      "read_rows", "read_cells", "read_values", "mutate_schema", "modify_column_families",
+      "create_table", "drop_row_range", "delete_table", "backup", "restore", "set_iam_policy",
+      "get_iam_policy", "test_iam_permissions", "credential_material", "raw_provider_payload", "pii"
+    ]
+  },
+  "projection": {
+    "database": ["projectDigest", "instanceDigest"],
+    "table": ["tableDigest", "schemaDigest", "familyCount", "familyDigest", "granularity"],
+    "families": "family_names_digest_only",
+    "clusters": ["clusterDigest", "state", "locationDigest", "serveNodes", "storageType", "encryptionDigest"],
+    "rawValues": false,
+    "rows": false,
+    "credentials": false,
+    "pii": false
+  },
+  "pagination": {
+    "getMethodsAreUnpaged": true,
+    "unexpectedPaginationRejected": true,
+    "truncationRejected": true,
+    "replayOrDuplicateClusterRejected": true
+  },
+  "registration": {
+    "versionBound": true,
+    "contractBound": true,
+    "providerBound": true,
+    "apiBound": true,
+    "permissionBound": true,
+    "scopeBound": true,
+    "evidenceBound": true,
+    "secretReferenceBound": true,
+    "reversible": true,
+    "revocable": true,
+    "driftRejected": true,
+    "staleRejected": true,
+    "tamperRejected": true,
+    "replayRejected": true,
+    "revocationRejected": true
+  },
+  "postureStates": ["READY", "CREATING", "DEGRADED", "PARTIAL", "ACCESS_LOST", "PROVIDER_UNKNOWN", "STALE", "TAMPERED", "PAGINATION", "TRUNCATED", "MISCONFIGURED", "REVOKED"],
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "durableReceipt": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAuthority": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "native_oauth_or_service_account_https", "durable_provider_receipt", "independent_configuration_readback",
+    "verified_permission_and_consent_adoption", "kernel_truth_consent_effect_receipt_verification_outcome_authority",
+    "row_or_cell_evidence", "schema_mutation_and_backup_restore_effects"
+  ],
+  "officialApiBasis": [
+    "https://docs.cloud.google.com/bigtable/docs/reference/admin/rest/v2/projects.instances.tables/get",
+    "https://docs.cloud.google.com/bigtable/docs/reference/admin/rest/v2/projects.instances.clusters/get"
+  ]
+}
