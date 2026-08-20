@@ -2177,6 +2177,7 @@ impl ScopeRegistry {
     }
 }
 
+pub mod provenance;
 pub mod sample;
 pub mod skill;
 

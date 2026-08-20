@@ -3,6 +3,7 @@ members = [
   "hartevo-rs/application",
   "hartevo-rs/browser-adapter",
   "hartevo-rs/capability-gateway",
+  "hartevo-rs/channel-adapters",
   "hartevo-rs/catalog",
   "hartevo-rs/cloud-storage",
   "hartevo-rs/connector-sdk",

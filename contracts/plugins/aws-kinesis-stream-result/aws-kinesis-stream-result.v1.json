@@ -1,0 +1,321 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-kinesis-stream-result/aws-kinesis-stream-result.v1.json",
+  "title": "Hartevo AWS Kinesis Data Streams posture result Layer-1 contract",
+  "description": "A bounded, read-only Kinesis Data Streams stream/shard/encryption posture seam for one explicitly scoped stream. It never reads records, writes data, changes capacity, or claims kernel authority.",
+  "schemaVersion": "hartevo.aws-kinesis-stream-result/v1",
+  "contractVersion": "EXT-AWS-KINESIS-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "aws.kinesis.stream.result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-kinesis-stream-result/v1|layer=1|service=aws.kinesis.stream.result.read|provider=aws.kinesis.stream.result.recording|consumer=mission.aws-kinesis-stream-result.consumer|api=kinesis-describe-stream-summary-list-shards-describe-stream-consumer-2013-12-02-r1",
+  "contractDigest": "687a07177a9af75fe4ed7d4b33c62ddf71671de686023b241392487f74d59148",
+  "officialReferences": [
+    "https://docs.aws.amazon.com/kinesis/latest/APIReference/API_DescribeStreamSummary.html",
+    "https://docs.aws.amazon.com/kinesis/latest/APIReference/API_ListShards.html",
+    "https://docs.aws.amazon.com/kinesis/latest/APIReference/API_DescribeStreamConsumer.html"
+  ],
+  "service": {
+    "type": "AwsKinesisStreamResultService",
+    "id": "aws.kinesis.stream.result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "register_scope",
+      "DescribeStreamSummary",
+      "ListShards",
+      "DescribeStreamConsumer",
+      "compile_result_proposal",
+      "verify_result",
+      "record_result",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "type": "AwsKinesisProvider",
+    "id": "aws.kinesis.stream.result.recording",
+    "apiVersion": "2013-12-02",
+    "apiRevision": "kinesis-describe-stream-summary-list-shards-describe-stream-consumer-2013-12-02-r1",
+    "operations": [
+      "DescribeStreamSummary",
+      "ListShards",
+      "DescribeStreamConsumer"
+    ],
+    "allowedTransportProvenance": [
+      "fixture",
+      "recording",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_non_serializing_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "type": "MissionAwsKinesisConsumer",
+    "id": "mission.aws-kinesis-stream-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "staleMissionRevision": "fail_closed",
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque non-serializing SigV4 SecretReference",
+    "serialized": false,
+    "rawCredentialMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "streamArn",
+      "streamName",
+      "streamCreationTimestampVersion",
+      "exactShardFilter",
+      "optionalExactConsumerArnAndName",
+      "projectIdAndRevision",
+      "missionIdAndRevision",
+      "workProductIdAndRevision"
+    ],
+    "providerResource": "exactly_one_kinesis_data_stream",
+    "identifiersInEvidence": "digest_only",
+    "rawRecords": false,
+    "rawPartitionKeys": false,
+    "rawSequenceNumbers": false,
+    "rawHashKeyRanges": false,
+    "rawConsumerData": false,
+    "rawKeyMaterial": false,
+    "maxPages": 8,
+    "maxPageSize": 100,
+    "maxShards": 512,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "apiDigestBound": true,
+    "permissionDigestBound": true,
+    "consentDigestBound": true,
+    "scopeDigestBound": true,
+    "secretReferenceDigestBound": true,
+    "registrationRevisionBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "registration_tamper",
+      "registration_revocation",
+      "registration_reversal",
+      "secret_revocation",
+      "provider_or_api_drift",
+      "permission_or_consent_drift",
+      "scope_or_stream_version_drift",
+      "shard_filter_drift",
+      "stale_mission_revision"
+    ],
+    "permissions": [
+      "kinesis:DescribeStreamSummary",
+      "kinesis:ListShards",
+      "kinesis:DescribeStreamConsumer",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "kinesis:GetRecords",
+      "kinesis:GetShardIterator",
+      "kinesis:SubscribeToShard",
+      "kinesis:PutRecord",
+      "kinesis:PutRecords",
+      "kinesis:MergeShards",
+      "kinesis:SplitShard",
+      "kinesis:UpdateShardCount",
+      "kinesis:IncreaseStreamRetentionPeriod",
+      "kinesis:DecreaseStreamRetentionPeriod",
+      "kinesis:StartStreamEncryption",
+      "kinesis:StopStreamEncryption",
+      "kinesis:RegisterStreamConsumer",
+      "kinesis:DeregisterStreamConsumer",
+      "kinesis:DescribeStream",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "style": "ListShards_NextToken",
+    "tokenOpaque": true,
+    "tokenDigestOnly": true,
+    "tokenTtlSeconds": 300,
+    "cursorBoundTo": [
+      "account",
+      "region",
+      "streamArn",
+      "streamCreationTimestampVersion",
+      "exactShardFilter",
+      "pageSize",
+      "pageNumber",
+      "scopeDigest"
+    ],
+    "tokenExpiryIsExplicit": true,
+    "repeatedTokenFailsClosed": true,
+    "filterDriftFailsClosed": true,
+    "truncationIsNonAdoptable": true
+  },
+  "projection": {
+    "stream": [
+      "streamDigest",
+      "streamVersionDigest",
+      "status",
+      "mode",
+      "retentionPeriodHours",
+      "openShardCount",
+      "monitoringStateAndDigest",
+      "encryptionStateAndKeyReferenceDigest"
+    ],
+    "shards": [
+      "boundedShardCount",
+      "digestOnlyShardId",
+      "digestOnlyParentShardId",
+      "digestOnlyAdjacentParentShardId",
+      "topologyDigest"
+    ],
+    "consumer": [
+      "exactConsumerDigest",
+      "consumerNameDigest",
+      "consumerStatus",
+      "consumerCreationTimestamp"
+    ],
+    "rawShardIds": false,
+    "rawPartitionKeys": false,
+    "rawSequenceNumbers": false,
+    "rawHashKeyRanges": false,
+    "rawConsumerPayload": false,
+    "rawKmsKeyMaterial": false
+  },
+  "evidence": {
+    "states": [
+      "CREATING",
+      "ACTIVE",
+      "UPDATING",
+      "DELETING",
+      "PARTIAL",
+      "TOKEN_EXPIRED",
+      "ACCESS_LOST",
+      "PROVIDER_UNKNOWN",
+      "TAMPERED",
+      "REVOKED"
+    ],
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "filterDigest",
+      "summaryDigest",
+      "shardsDigest",
+      "topologyDigest",
+      "encryptionDigest",
+      "evidenceDigest",
+      "proposalDigest"
+    ],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "partialIsNonAdoptable": true,
+    "tokenExpiredIsNonAdoptable": true,
+    "providerUnknownIsNonAdoptable": true
+  },
+  "provenance": {
+    "fixture": "non_native_non_connected_non_first_party",
+    "recording": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AwsKinesisStreamResultService, AwsKinesisProvider, and MissionAwsKinesisConsumer",
+      "exact account/region/stream/version/shard-filter/consumer/Project/Mission/Work Product scope",
+      "bounded DescribeStreamSummary, ListShards, and optional exact DescribeStreamConsumer seams",
+      "digest-only shard lineage and bounded stream/encryption/monitoring posture projection",
+      "deterministic version/provider/API/permission/consent/scope/evidence/result digests",
+      "reversible and revocable registration",
+      "idempotent recording below kernel authority"
+    ],
+    "doesNotOwn": [
+      "Kinesis records",
+      "partition keys",
+      "sequence numbers",
+      "hash-key ranges",
+      "GetRecords",
+      "GetShardIterator",
+      "SubscribeToShard",
+      "PutRecord or PutRecords",
+      "resharding",
+      "retention mutation",
+      "encryption mutation",
+      "consumer registration or deregistration",
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "Work Product adoption",
+      "native SigV4 credential resolution",
+      "durable provider receipt",
+      "independent reread or verified adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution and HTTPS transport",
+    "durable provider request and cost receipts",
+    "independent stream/shard/consumer reread",
+    "consented stream effects and capacity changes",
+    "verified Mission Work Product adoption",
+    "Hartevo Truth, Consent, Effect, Receipt, Verification, and Outcome authority"
+  ],
+  "honestNativeGap": "Layer 1 uses only fixture, recording, loopback, and BLOCKED_ENV transports. All remain connected=false, native=false, and first_party=false. Native SigV4/HTTPS, durable receipt, independent reread, consented effects, and verified adoption remain Layer 2; no record or stream-effect authority is present."
+}
