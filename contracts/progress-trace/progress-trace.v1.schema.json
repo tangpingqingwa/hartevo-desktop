@@ -1,0 +1,429 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/progress-trace/progress-trace.v1.schema.json",
+  "title": "Hartevo durable progress trace contract and Eval example",
+  "description": "Producer-neutral, non-native progress sequencing contract. A checked-in document is fixture evidence only.",
+  "schemaVersion": "hartevo-progress-trace/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "contract", "trace"],
+  "properties": {
+    "schemaVersion": { "const": "hartevo-progress-trace/v1" },
+    "contract": { "$ref": "#/$defs/contract" },
+    "trace": { "$ref": "#/$defs/trace" }
+  },
+  "$defs": {
+    "provenanceKind": {
+      "type": "string",
+      "enum": ["fixture", "simulator", "native"]
+    },
+    "restartPosition": {
+      "type": "string",
+      "enum": ["before_resume", "after_first_useful_progress", "before_terminal"]
+    },
+    "terminalOperation": {
+      "type": "string",
+      "enum": ["append", "reset"]
+    },
+    "progressClass": {
+      "type": "string",
+      "enum": ["useful", "generic_loading", "heartbeat"]
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenantId", "projectId", "missionId", "conversationId", "runId"],
+      "properties": {
+        "tenantId": { "type": "string", "minLength": 1 },
+        "projectId": { "type": "string", "minLength": 1 },
+        "missionId": { "type": "string", "minLength": 1 },
+        "conversationId": { "type": "string", "minLength": 1 },
+        "runId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "epoch", "cursor"],
+      "properties": {
+        "scope": { "$ref": "#/$defs/scope" },
+        "epoch": { "type": "integer", "minimum": 1 },
+        "cursor": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "clock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority", "tickMs"],
+      "properties": {
+        "authority": { "const": "virtual_monotonic/v1" },
+        "tickMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "fixtureProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "fixtureId", "checkedIn", "nativeReceiptId"],
+      "properties": {
+        "kind": { "const": "fixture" },
+        "fixtureId": { "type": "string", "minLength": 1 },
+        "checkedIn": { "const": true },
+        "nativeReceiptId": { "type": ["string", "null"] }
+      }
+    },
+    "simulatorProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "simulatorId", "deterministicSeed", "nativeReceiptId"],
+      "properties": {
+        "kind": { "const": "simulator" },
+        "simulatorId": { "type": "string", "minLength": 1 },
+        "deterministicSeed": { "type": "string", "minLength": 1 },
+        "nativeReceiptId": { "type": ["string", "null"] }
+      }
+    },
+    "nativeProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "nativeReceiptId", "nativeExecutionDigest", "checkedIn"],
+      "properties": {
+        "kind": { "const": "native" },
+        "nativeReceiptId": { "type": "string", "minLength": 1 },
+        "nativeExecutionDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "checkedIn": { "const": false }
+      }
+    },
+    "provenance": {
+      "oneOf": [
+        { "$ref": "#/$defs/fixtureProvenance" },
+        { "$ref": "#/$defs/simulatorProvenance" },
+        { "$ref": "#/$defs/nativeProvenance" }
+      ]
+    },
+    "awaitingDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["persistence", "presentation", "checkpointId"],
+      "properties": {
+        "persistence": { "const": "durable" },
+        "presentation": { "const": "painted" },
+        "checkpointId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "resumeDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": { "mode": { "const": "runtime" } }
+    },
+    "firstUsefulProgressDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["progressClass", "generic", "businessStepId", "label", "detailDigest"],
+      "properties": {
+        "progressClass": { "const": "useful" },
+        "generic": { "const": false },
+        "businessStepId": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "detailDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "runningDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase"],
+      "properties": { "phase": { "const": "running" } }
+    },
+    "deltaDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "deltaId", "payloadDigest", "late"],
+      "properties": {
+        "operation": { "const": "append" },
+        "deltaId": { "type": "string", "minLength": 1 },
+        "payloadDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "late": { "type": "boolean" }
+      }
+    },
+    "caughtUpDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["finalCaughtUp"],
+      "properties": { "finalCaughtUp": { "type": "boolean" } }
+    },
+    "terminalEnvelopeDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "envelopeDigest"],
+      "properties": {
+        "operation": { "$ref": "#/$defs/terminalOperation" },
+        "envelopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "restartMarkerDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position", "contractPositionOnly", "processKillObserved"],
+      "properties": {
+        "position": { "$ref": "#/$defs/restartPosition" },
+        "contractPositionOnly": { "const": true },
+        "processKillObserved": { "const": false }
+      }
+    },
+    "eventBody": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "awaiting" },
+            "data": { "$ref": "#/$defs/awaitingDetails" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "resume" },
+            "data": { "$ref": "#/$defs/resumeDetails" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "first_useful_progress" },
+            "data": { "$ref": "#/$defs/firstUsefulProgressDetails" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "running" },
+            "data": { "$ref": "#/$defs/runningDetails" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "delta" },
+            "data": { "$ref": "#/$defs/deltaDetails" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "caught_up" },
+            "data": { "$ref": "#/$defs/caughtUpDetails" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "terminal_envelope" },
+            "data": { "$ref": "#/$defs/terminalEnvelopeDetails" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "data"],
+          "properties": {
+            "type": { "const": "restart_marker" },
+            "data": { "$ref": "#/$defs/restartMarkerDetails" }
+          }
+        }
+      ]
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["eventId", "ordinal", "identity", "clock", "event"],
+      "properties": {
+        "eventId": { "type": "string", "minLength": 1 },
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "identity": { "$ref": "#/$defs/identity" },
+        "clock": { "$ref": "#/$defs/clock" },
+        "event": { "$ref": "#/$defs/eventBody" }
+      }
+    },
+    "trace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["traceId", "scope", "epoch", "initialCursor", "provenance", "events"],
+      "properties": {
+        "traceId": { "type": "string", "minLength": 1 },
+        "scope": { "$ref": "#/$defs/scope" },
+        "epoch": { "type": "integer", "minimum": 1 },
+        "initialCursor": { "type": "integer", "minimum": 0 },
+        "provenance": { "$ref": "#/$defs/provenance" },
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/event" }
+        }
+      }
+    },
+    "requiredIdentityRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "epoch", "cursor", "everyEvent"],
+      "properties": {
+        "scope": { "const": true },
+        "epoch": { "const": true },
+        "cursor": { "const": true },
+        "everyEvent": { "const": true }
+      }
+    },
+    "awaitingRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["persistence", "presentation", "beforeResume"],
+      "properties": {
+        "persistence": { "const": "durable" },
+        "presentation": { "const": "painted" },
+        "beforeResume": { "const": true }
+      }
+    },
+    "firstUsefulProgressRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["progressClass", "distinctFromGeneric", "requiresBusinessStep"],
+      "properties": {
+        "progressClass": { "const": "useful" },
+        "distinctFromGeneric": { "const": true },
+        "requiresBusinessStep": { "const": true }
+      }
+    },
+    "runningCaughtUpRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["caughtUpIsNonTerminal", "lateDeltaLegal"],
+      "properties": {
+        "caughtUpIsNonTerminal": { "const": true },
+        "lateDeltaLegal": { "const": true }
+      }
+    },
+    "terminalRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operations", "finalCaughtUpRequired", "finalCaughtUpSameCursor"],
+      "properties": {
+        "operations": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/terminalOperation" }
+        },
+        "finalCaughtUpRequired": { "const": true },
+        "finalCaughtUpSameCursor": { "const": true }
+      }
+    },
+    "rejectionRules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "duplicateEventId",
+        "duplicateCursor",
+        "skippedCursor",
+        "crossScope",
+        "cursorRegression",
+        "postTerminal",
+        "rawClockDeterminism"
+      ],
+      "properties": {
+        "duplicateEventId": { "const": true },
+        "duplicateCursor": { "const": true },
+        "skippedCursor": { "const": true },
+        "crossScope": { "const": true },
+        "cursorRegression": { "const": true },
+        "postTerminal": { "const": true },
+        "rawClockDeterminism": { "const": true }
+      }
+    },
+    "clockRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority", "wallClockOrderingAllowed"],
+      "properties": {
+        "authority": { "const": "virtual_monotonic/v1" },
+        "wallClockOrderingAllowed": { "const": false }
+      }
+    },
+    "provenanceRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowedKinds",
+        "mixedSourcesAllowed",
+        "nativeReceiptRequired",
+        "checkedInSampleSatisfiesNative"
+      ],
+      "properties": {
+        "allowedKinds": {
+          "type": "array",
+          "minItems": 3,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/provenanceKind" }
+        },
+        "mixedSourcesAllowed": { "const": false },
+        "nativeReceiptRequired": { "const": true },
+        "checkedInSampleSatisfiesNative": { "const": false }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "contractId",
+        "authority",
+        "releaseEligible",
+        "requiredIdentity",
+        "awaiting",
+        "firstUsefulProgress",
+        "runningCaughtUp",
+        "terminal",
+        "rejectionRules",
+        "requiredRestartMarkers",
+        "clock",
+        "provenance"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "hartevo-progress-trace/v1" },
+        "contractId": { "const": "durable-progress-trace" },
+        "authority": { "const": "eval_only_no_production_authority" },
+        "releaseEligible": { "const": false },
+        "requiredIdentity": { "$ref": "#/$defs/requiredIdentityRule" },
+        "awaiting": { "$ref": "#/$defs/awaitingRule" },
+        "firstUsefulProgress": { "$ref": "#/$defs/firstUsefulProgressRule" },
+        "runningCaughtUp": { "$ref": "#/$defs/runningCaughtUpRule" },
+        "terminal": { "$ref": "#/$defs/terminalRule" },
+        "rejectionRules": { "$ref": "#/$defs/rejectionRules" },
+        "requiredRestartMarkers": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/restartPosition" }
+        },
+        "clock": { "$ref": "#/$defs/clockRule" },
+        "provenance": { "$ref": "#/$defs/provenanceRule" }
+      }
+    }
+  }
+}

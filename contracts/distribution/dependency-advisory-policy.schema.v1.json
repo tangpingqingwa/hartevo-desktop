@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.dev/contracts/distribution/dependency-advisory-policy.schema.v1.json",
+  "title": "Hartevo target-aware dependency advisory policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "policyId",
+    "authority",
+    "releaseDecision",
+    "release",
+    "releaseTargets",
+    "targetGraphs",
+    "allowedCategories",
+    "failureCategories",
+    "unreachableDisposition",
+    "releaseFailureDisposition",
+    "reviewedExceptions",
+    "inputContract",
+    "findingRecordFields",
+    "noBlanketIgnore"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "hartevo-distribution-dependency-advisory-policy/v1"
+    },
+    "policyId": {
+      "const": "DIST-SBOM-TARGET-01"
+    },
+    "authority": {
+      "const": "hartevo-distribution-contract"
+    },
+    "releaseDecision": {
+      "const": "NOT_EVALUATED"
+    },
+    "release": {
+      "$ref": "#/$defs/release"
+    },
+    "releaseTargets": {
+      "type": "array",
+      "const": [
+        "macos-aarch64",
+        "macos-x86_64"
+      ]
+    },
+    "targetGraphs": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "$ref": "#/$defs/targetGraph"
+      }
+    },
+    "allowedCategories": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "notice",
+          "unmaintained",
+          "unsound",
+          "vulnerability"
+        ]
+      }
+    },
+    "failureCategories": {
+      "const": [
+        "unsound",
+        "vulnerability"
+      ]
+    },
+    "unreachableDisposition": {
+      "const": "INFORMATIONAL_WARNING"
+    },
+    "releaseFailureDisposition": {
+      "const": "CODE_FAILURE"
+    },
+    "reviewedExceptions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/reviewedException"
+      }
+    },
+    "inputContract": {
+      "$ref": "#/$defs/inputContract"
+    },
+    "findingRecordFields": {
+      "type": "array",
+      "const": [
+        "advisoryId",
+        "category",
+        "package",
+        "dependencyPath",
+        "target",
+        "targetReachability",
+        "releaseImpact",
+        "sourceCommit",
+        "lockfileSha256",
+        "auditReceiptSha256"
+      ]
+    },
+    "noBlanketIgnore": {
+      "const": true
+    }
+  },
+  "$defs": {
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "passed",
+        "deployment"
+      ],
+      "properties": {
+        "passed": {
+          "const": false
+        },
+        "deployment": {
+          "const": false
+        }
+      }
+    },
+    "targetGraph": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "target",
+        "role",
+        "release",
+        "releaseRoots"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "enum": [
+            "release",
+            "ci"
+          ]
+        },
+        "release": {
+          "type": "boolean"
+        },
+        "releaseRoots": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "reviewedException": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "advisoryId",
+        "category",
+        "packageName",
+        "packageVersion",
+        "target",
+        "owner",
+        "reason",
+        "expiresAt"
+      ],
+      "properties": {
+        "advisoryId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "enum": [
+            "unsound",
+            "vulnerability"
+          ]
+        },
+        "packageName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "packageVersion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "inputContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requiredBindings",
+        "cargoMetadataCommand",
+        "cargoAuditTool",
+        "lockDigestAlgorithm",
+        "metadataDigestAlgorithm",
+        "auditReceiptDigestAlgorithm"
+      ],
+      "properties": {
+        "requiredBindings": {
+          "type": "array",
+          "const": [
+            "sourceCommit",
+            "lockfileSha256",
+            "metadataPerTarget",
+            "cargoAuditReceipt"
+          ]
+        },
+        "cargoMetadataCommand": {
+          "type": "string"
+        },
+        "cargoAuditTool": {
+          "const": "cargo-audit 0.22.2"
+        },
+        "lockDigestAlgorithm": {
+          "const": "sha256"
+        },
+        "metadataDigestAlgorithm": {
+          "const": "sha256"
+        },
+        "auditReceiptDigestAlgorithm": {
+          "const": "sha256"
+        }
+      }
+    }
+  }
+}

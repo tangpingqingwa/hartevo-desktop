@@ -1,0 +1,264 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.neon-branch-result/v1",
+  "title": "Hartevo Layer 1 Neon branch and verified-query result contract",
+  "schemaVersion": "hartevo.neon-branch-result/v1",
+  "contractVersion": "EXT-NEON-01-L1/v1",
+  "layer": 1,
+  "status": "proposal_and_recording_only",
+  "plugin": {
+    "id": "hartevo.neon-branch-result",
+    "version": "1.0.0",
+    "digestBound": true,
+    "registration": "version_manifest_digest_scope_digest_and_opaque_secret_reference",
+    "reversibleRegistration": true
+  },
+  "service": {
+    "id": "neon-branch-result.service",
+    "operations": [
+      "capability_probe",
+      "branch_proposal",
+      "query_proposal",
+      "query_receipt",
+      "result_adoption_proposal",
+      "registration",
+      "revocation"
+    ],
+    "effectAuthority": "proposal_and_recording_only",
+    "liveBranchCreate": false,
+    "liveBranchDelete": false,
+    "endpointMutation": false,
+    "ddl": false,
+    "dml": false,
+    "connectionString": false,
+    "durableAdoption": false
+  },
+  "provider": {
+    "id": "neon.branch-result",
+    "version": "1.0.0",
+    "separateTransportSeams": [
+      "neon_control_plane",
+      "postgres_query"
+    ],
+    "queryProtocols": [
+      "postgres",
+      "http"
+    ],
+    "capabilities": [
+      "capability_probe",
+      "branch_proposal",
+      "parameterized_select",
+      "parameterized_explain",
+      "query_receipt",
+      "result_adoption_proposal",
+      "digest_fencing",
+      "reversible_registration"
+    ],
+    "nativeStatus": "BLOCKED_ENV",
+    "connectedEvidence": false,
+    "fixtureEvidence": "recording_only",
+    "loopbackEvidence": "recording_only"
+  },
+  "consumer": {
+    "id": "mission.database-result.consumer",
+    "binding": [
+      "organization_id",
+      "project_id",
+      "mission_id",
+      "parent_branch_id",
+      "branch_id",
+      "endpoint_id",
+      "database",
+      "role",
+      "branch_digest",
+      "point_in_time_digest",
+      "source_result_id",
+      "source_revision",
+      "query_digest",
+      "parameter_digest",
+      "schema_digest",
+      "row_set_digest",
+      "provider_version",
+      "provider_manifest_digest",
+      "registration_digest"
+    ],
+    "requiresIndependentQueryReceipt": true,
+    "rawRowsInProposalOrReceipt": false
+  },
+  "scope": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "organizationId",
+      "projectId",
+      "missionId",
+      "parentBranchId",
+      "branchId",
+      "endpointId",
+      "database",
+      "role"
+    ],
+    "properties": {
+      "organizationId": { "type": "string" },
+      "projectId": { "type": "string" },
+      "missionId": { "type": "string" },
+      "parentBranchId": { "type": "string" },
+      "branchId": { "type": "string" },
+      "endpointId": { "type": "string" },
+      "database": { "type": "string" },
+      "role": { "type": "string" }
+    },
+    "humanBranchNameIsIdentity": false,
+    "scopeDigest": "sha256_of_exact_typed_scope"
+  },
+  "branch": {
+    "identity": [
+      "organization_id",
+      "project_id",
+      "parent_branch_id",
+      "branch_id",
+      "endpoint_id"
+    ],
+    "pointInTime": [
+      "head",
+      "timestamp",
+      "lsn"
+    ],
+    "fences": [
+      "branch_digest",
+      "point_in_time_digest"
+    ],
+    "statesFailClosed": [
+      "archived",
+      "suspended",
+      "activating",
+      "missing",
+      "permission_lost",
+      "throttled",
+      "timed_out",
+      "unknown"
+    ],
+    "liveLifecycle": "BLOCKED_ENV"
+  },
+  "capabilityProbe": {
+    "controlPlaneOnly": true,
+    "proposalCapableRequires": [
+      "ready_branch",
+      "ready_or_scale_to_zero_endpoint",
+      "stable_eventual_consistency"
+    ],
+    "unstableStateIsVerifiedEvidence": false,
+    "scaleToZeroActivation": "recorded_fixture_observation_only"
+  },
+  "query": {
+    "allowlist": [
+      "SELECT",
+      "EXPLAIN SELECT"
+    ],
+    "parameterStyle": "postgres_positional_dollar_parameters",
+    "requiresAtLeastOneParameter": true,
+    "requiresExplicitLimit": true,
+    "maxQueryBytes": 8192,
+    "maxParameters": 32,
+    "maxRows": 10000,
+    "maxBytes": 4194304,
+    "maxTimeoutMs": 30000,
+    "reject": [
+      "multi_statement_sql",
+      "comments_that_hide_statements",
+      "unsafe_interpolation",
+      "ddl",
+      "dml",
+      "transaction_control",
+      "unbounded_results",
+      "EXPLAIN_ANALYZE"
+    ],
+    "canonicalization": [
+      "ordered",
+      "unordered"
+    ],
+    "queryDigest": "sha256_of_query_shape",
+    "parameterDigest": "sha256_of_typed_parameters"
+  },
+  "receipts": {
+    "queryReceiptKind": "independent_query_receipt",
+    "requiredFences": [
+      "scope_digest",
+      "branch_digest",
+      "point_in_time_digest",
+      "query_digest",
+      "parameter_digest",
+      "schema_digest",
+      "row_set_digest",
+      "provider_version",
+      "provider_manifest_digest"
+    ],
+    "requiredLimits": [
+      "timeout_ms",
+      "max_rows",
+      "max_bytes",
+      "elapsed_ms",
+      "row_count",
+      "result_bytes"
+    ],
+    "rawSql": false,
+    "rawParameters": false,
+    "rawRows": false,
+    "rawDatabaseErrors": false,
+    "truncatedResultIsVerified": false,
+    "reorderedRowsRequireCanonicalization": true,
+    "successfulTransportWithoutIndependentReceipt": "not_verified"
+  },
+  "adoption": {
+    "operation": "proposal_only",
+    "requiredBinding": [
+      "mission_id",
+      "project_id",
+      "source_result_id",
+      "source_revision",
+      "exact_branch_fence",
+      "query_digest",
+      "parameter_digest",
+      "schema_digest",
+      "row_set_digest",
+      "provider_version",
+      "registration_digest"
+    ],
+    "durableWorkProductAdoption": "BLOCKED_ENV",
+    "verifiedRequiresExactIndependentReceipt": true
+  },
+  "registration": {
+    "versionBound": true,
+    "manifestDigestBound": true,
+    "scopeDigestBound": true,
+    "secretReferenceDigestBound": true,
+    "rawSecretMaterial": false,
+    "revocation": "monotonic_and_reversible_registry_removal",
+    "nativeStatus": "BLOCKED_ENV"
+  },
+  "secrets": {
+    "type": "opaque_secret_reference",
+    "rawApiKey": false,
+    "rawDatabaseCredential": false,
+    "connectionString": false,
+    "receiptMaterial": "reference_digest_only"
+  },
+  "nativeGaps": [
+    "live_branch_create_delete",
+    "durable_operation_receipt",
+    "bounded_activation_polling",
+    "live_query",
+    "independent_repeatable_read_digest_verification",
+    "ambiguous_create_recovery",
+    "durable_work_product_adoption"
+  ],
+  "authority": {
+    "organizationAuthority": false,
+    "projectAuthority": false,
+    "branchLifecycleAuthority": false,
+    "endpointMutationAuthority": false,
+    "databaseCredentialAuthority": false,
+    "effectAuthority": false,
+    "storageAuthority": false
+  }
+}

@@ -1,0 +1,294 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-ebs-volume-result/contract.v1.json",
+  "title": "Hartevo AWS EBS volume and snapshot posture result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-ebs-volume-result/v1",
+  "contractVersion": "EXT-AWSEBS-01-L1/v1",
+  "pluginId": "aws.ec2.ebs-volume-result",
+  "objectiveType": "ebs_posture",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-ebs-volume-result/v1|layer=1|service=aws.ec2.ebs-volume-result.read|provider=aws.ec2.ebs-volume-result.recording|consumer=mission.aws-ebs-volume.consumer",
+  "contractDigest": "19a15e4743282ac95c46bdd716e0d773245a04d5021ad48563ed344967cfd880",
+  "service": {
+    "type": "AwsEbsVolumeService",
+    "id": "aws.ec2.ebs-volume-result.read",
+    "access": "read_proposal_record_verify",
+    "operations": [
+      "describe_volumes",
+      "describe_volume_status",
+      "describe_snapshots",
+      "describe_fast_snapshot_restores"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsEbsProvider",
+    "id": "aws.ec2.ebs-volume-result.recording",
+    "apiRevision": "ec2-describe-volumes-status-snapshots-fsr-2016-11-15-v1",
+    "operations": [
+      "DescribeVolumes",
+      "DescribeVolumeStatus",
+      "DescribeSnapshots",
+      "DescribeFastSnapshotRestores"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAwsEbsConsumer",
+    "id": "mission.aws-ebs-volume.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "awsAccountId",
+      "awsRegion",
+      "volumeAllowlist",
+      "snapshotAllowlist",
+      "attachmentAllowlist",
+      "workloadRevision",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false
+  },
+  "credentials": {
+    "boundary": "opaque non-serializing SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "volumeAllowlist",
+      "snapshotAllowlist",
+      "attachmentAllowlist",
+      "workloadRevision",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "volumeAllowlistRequired": true,
+    "snapshotAllowlistBound": true,
+    "attachmentIdentifiersDigestOnly": true,
+    "blockBytes": false,
+    "mountPaths": false,
+    "tagValues": false,
+    "kmsMaterial": false,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxResponseBytes": 1048576,
+    "maxStatusAgeSeconds": 300
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerApiRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "consentDigest",
+      "volumeAllowlistDigest",
+      "snapshotAllowlistDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "evidenceDigest",
+      "evidenceSchemaDigest",
+      "registrationRevision",
+      "status"
+    ],
+    "permissions": [
+      "ec2:DescribeVolumes",
+      "ec2:DescribeVolumeStatus",
+      "ec2:DescribeSnapshots",
+      "ec2:DescribeFastSnapshotRestores",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "ec2:CreateVolume",
+      "ec2:ModifyVolume",
+      "ec2:DeleteVolume",
+      "ec2:AttachVolume",
+      "ec2:DetachVolume",
+      "ec2:CreateSnapshot",
+      "ec2:DeleteSnapshot",
+      "ec2:EnableFastSnapshotRestores",
+      "ec2:DisableFastSnapshotRestores",
+      "ec2:ExportSnapshot",
+      "kms:Decrypt",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "operation",
+      "account",
+      "region",
+      "volumeAllowlistDigest",
+      "snapshotAllowlistDigest",
+      "scopeDigest",
+      "filterDigest",
+      "pageNumber"
+    ],
+    "filterDriftRejected": true,
+    "allowlistDriftRejected": true,
+    "resourceReplacementRejected": true,
+    "paginationLoopRejected": true,
+    "partialPageIsNonAdoptable": true
+  },
+  "metadata": {
+    "bounded": true,
+    "volume": [
+      "state",
+      "volumeType",
+      "sizeGiB",
+      "encrypted",
+      "multiAttachEnabled",
+      "createTime",
+      "attachmentState"
+    ],
+    "status": ["overallStatus", "detailStatus", "eventDigest", "actionDigest"],
+    "snapshot": [
+      "state",
+      "encrypted",
+      "ageSeconds",
+      "storageTier",
+      "completionTime"
+    ],
+    "fastSnapshotRestore": ["availabilityZoneDigest", "state"],
+    "rawIdentifiers": false,
+    "rawTags": false,
+    "rawMountPaths": false,
+    "rawKmsMaterial": false,
+    "blockBytes": false,
+    "accountPii": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "consentDigest",
+      "volumeAllowlistDigest",
+      "snapshotAllowlistDigest",
+      "scopeDigest",
+      "requestDigest",
+      "volumeReadDigest",
+      "statusReadDigest",
+      "snapshotReadDigest",
+      "fastSnapshotRestoreReadDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "completed",
+      "partial",
+      "stale_status",
+      "resource_replaced",
+      "not_found",
+      "access_loss",
+      "throttled",
+      "provider_unknown",
+      "registration_revoked"
+    ],
+    "tamperRejected": true,
+    "replayRejected": true,
+    "revocationRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "staleStatusIsNonAdoptable": true,
+    "truncationIsNonAdoptable": true,
+    "malformedIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS account/region/volume/snapshot/attachment/workload scope",
+      "bounded DescribeVolumes and DescribeVolumeStatus seams",
+      "bounded DescribeSnapshots and DescribeFastSnapshotRestores seams",
+      "digest-only volume/status/snapshot posture projection",
+      "pagination, eventual-consistency and resource-replacement fences",
+      "version/contract/provider/API/permission/volume/snapshot/scope/evidence digests",
+      "reversible registration",
+      "redacted idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live EC2 HTTPS",
+      "Create/Modify/DeleteVolume",
+      "Attach/DetachVolume",
+      "Create/DeleteSnapshot",
+      "Restore or Export",
+      "block bytes",
+      "mount paths",
+      "tag values",
+      "KMS material",
+      "production recoverability guarantee",
+      "verified Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live EC2 HTTPS",
+    "durable provider receipt",
+    "independent metadata and block-data reconciliation",
+    "consented storage effects",
+    "Connected/native/first-party evidence",
+    "verified Mission or Work Product adoption"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live DescribeVolumes/DescribeVolumeStatus/DescribeSnapshots/DescribeFastSnapshotRestores HTTPS, durable provider receipt, independent metadata/data reconciliation, consented storage effects and verified Mission adoption remain Layer-2 work; recording, fixture, loopback and BLOCKED_ENV never claim Connected, native or first-party evidence. A completed metadata read is not a production recoverability guarantee."
+}
