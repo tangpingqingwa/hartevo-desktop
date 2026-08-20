@@ -234,8 +234,22 @@ impl Connection {
         &self.account_id
     }
 
+    pub fn required_scopes(&self) -> &BTreeSet<String> {
+        &self.required_scopes
+    }
+
+    pub fn granted_scopes(&self) -> &BTreeSet<String> {
+        &self.granted_scopes
+    }
+
     pub fn last_probe(&self) -> Option<&ConnectionProbe> {
         self.last_probe.as_ref()
+    }
+
+    pub fn live_probe(&self, now: DateTime<Utc>) -> Option<&ConnectionProbe> {
+        self.is_connected(now)
+            .then_some(self.last_probe.as_ref())
+            .flatten()
     }
 
     pub fn revision(&self) -> u64 {
