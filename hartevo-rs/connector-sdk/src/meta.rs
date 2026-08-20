@@ -7,6 +7,7 @@
 //! Connected or grants Effect authority.
 
 use chrono::{DateTime, Duration, Utc};
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -29,16 +30,22 @@ pub const META_INSIGHT_READ_SCHEMA: &str = "hartevo-meta-instagram-insight-read/
 pub const META_SERVICE_ID: &str = "PaidSocialInsightReadService";
 pub const META_PROVIDER_ID: &str = "meta";
 pub const META_ACCESS_TOKEN_ENV: &str = "HARTEVO_META_ACCESS_TOKEN";
+pub const META_APP_SECRET_ENV: &str = "HARTEVO_META_APP_SECRET";
 pub const META_RUN_PROBE_ENV: &str = "HARTEVO_RUN_META_CREDENTIAL_PROBE";
+pub const META_RUN_WEBHOOK_RECONCILE_ENV: &str = "HARTEVO_RUN_META_WEBHOOK_RECONCILE";
+pub const META_WEBHOOK_SUBSCRIPTION_ENV: &str = "HARTEVO_META_WEBHOOK_SUBSCRIPTION_ID";
 pub const META_API_VERSION_ENV: &str = "HARTEVO_META_API_VERSION";
 pub const META_DEFAULT_API_VERSION: &str = "v25.0";
 pub const META_FACEBOOK_GRAPH_HOST: &str = "https://graph.facebook.com";
 pub const META_INSTAGRAM_GRAPH_HOST: &str = "https://graph.instagram.com";
 pub const META_REGISTRATIONS: &[()] = &[];
+pub const META_WEBHOOK_REGISTRATIONS: &[()] = &[];
 
 const MAX_CURSOR_BYTES: usize = 4096;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_WEBHOOK_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_FRESHNESS_SECONDS: i64 = 900;
+const META_WEBHOOK_SCHEMA: &str = "hartevo-meta-instagram-webhook-reconcile/v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -536,8 +543,48 @@ impl Drop for MetaAccessToken {
     }
 }
 
+/// An app secret is resolved only inside the signature verifier.  It is never
+/// serialized, debug-printed, or included in a webhook receipt.
+pub struct MetaAppSecret(Zeroizing<String>);
+
+impl Clone for MetaAppSecret {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl MetaAppSecret {
+    pub fn new(value: impl Into<String>) -> Result<Self, MetaConnectorError> {
+        let value = value.into();
+        if value.trim().is_empty() || value.len() > 16_384 {
+            return Err(MetaConnectorError::MissingCredential);
+        }
+        Ok(Self(Zeroizing::new(value)))
+    }
+
+    fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for MetaAppSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MetaAppSecret(REDACTED)")
+    }
+}
+
+impl Drop for MetaAppSecret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 pub trait MetaCredentialResolver: fmt::Debug + Send + Sync {
     fn resolve(&self, reference: &SecretReference) -> Result<MetaAccessToken, MetaConnectorError>;
+}
+
+pub trait MetaWebhookSecretResolver: fmt::Debug + Send + Sync {
+    fn resolve(&self, reference: &SecretReference) -> Result<MetaAppSecret, MetaConnectorError>;
 }
 
 #[derive(Clone, Default)]
@@ -585,6 +632,54 @@ impl MetaCredentialResolver for EnvironmentMetaCredentialResolver {
         let token =
             std::env::var(META_ACCESS_TOKEN_ENV).map_err(|_| MetaConnectorError::BlockedEnv)?;
         MetaAccessToken::new(token)
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct InMemoryMetaWebhookSecretResolver {
+    values: BTreeMap<String, MetaAppSecret>,
+}
+
+impl fmt::Debug for InMemoryMetaWebhookSecretResolver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InMemoryMetaWebhookSecretResolver")
+            .field("references", &self.values.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl InMemoryMetaWebhookSecretResolver {
+    pub fn insert(
+        &mut self,
+        reference: &SecretReference,
+        app_secret: impl Into<String>,
+    ) -> Result<(), MetaConnectorError> {
+        self.values.insert(
+            reference.reference_id().to_owned(),
+            MetaAppSecret::new(app_secret)?,
+        );
+        Ok(())
+    }
+}
+
+impl MetaWebhookSecretResolver for InMemoryMetaWebhookSecretResolver {
+    fn resolve(&self, reference: &SecretReference) -> Result<MetaAppSecret, MetaConnectorError> {
+        self.values
+            .get(reference.reference_id())
+            .cloned()
+            .ok_or(MetaConnectorError::MissingCredential)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EnvironmentMetaWebhookSecretResolver;
+
+impl MetaWebhookSecretResolver for EnvironmentMetaWebhookSecretResolver {
+    fn resolve(&self, _reference: &SecretReference) -> Result<MetaAppSecret, MetaConnectorError> {
+        let app_secret =
+            std::env::var(META_APP_SECRET_ENV).map_err(|_| MetaConnectorError::BlockedEnv)?;
+        MetaAppSecret::new(app_secret)
     }
 }
 
@@ -817,6 +912,16 @@ pub enum MetaConnectorError {
     InvalidObservation,
     #[error("Meta durable checkpoint is invalid")]
     InvalidCheckpoint,
+    #[error("Meta webhook signature is invalid")]
+    InvalidWebhookSignature,
+    #[error("Meta webhook delivery is invalid")]
+    InvalidWebhookDelivery,
+    #[error("Meta webhook delivery is already pending")]
+    DuplicateWebhookDelivery,
+    #[error("Meta webhook delivery is not pending")]
+    WebhookDeliveryNotPending,
+    #[error("Meta webhook durable state is invalid")]
+    InvalidWebhookState,
 }
 
 impl From<ConnectorError> for MetaConnectorError {
@@ -849,6 +954,153 @@ fn normalize_ad_account(value: &str) -> Result<String, MetaConnectorError> {
         return Err(MetaConnectorError::InvalidScope);
     }
     Ok(format!("act_{numeric}"))
+}
+
+fn valid_webhook_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+        })
+}
+
+fn webhook_object_matches_scope(object: &str, scope: &MetaScope) -> bool {
+    match object {
+        "business" => numeric_id(scope.business_id()),
+        "ad_account" => scope.ad_account_id().is_some(),
+        "page" => scope.page_id().is_some(),
+        "instagram" => scope.instagram_account_id().is_some(),
+        _ => false,
+    }
+}
+
+fn webhook_scope_entry_matches(object: &str, entry_id: &str, scope: &MetaScope) -> bool {
+    match object {
+        "business" => entry_id == scope.business_id(),
+        "ad_account" => scope
+            .ad_account_id()
+            .and_then(|id| normalize_ad_account(id).ok())
+            .is_some_and(|id| {
+                normalize_ad_account(entry_id)
+                    .ok()
+                    .is_some_and(|entry| id == entry)
+            }),
+        "page" => scope.page_id() == Some(entry_id),
+        "instagram" => scope.instagram_account_id() == Some(entry_id),
+        _ => false,
+    }
+}
+
+fn webhook_surface(object: &str) -> Result<MetaSurface, MetaConnectorError> {
+    match object {
+        "business" => Ok(MetaSurface::Business),
+        "ad_account" => Ok(MetaSurface::Marketing),
+        "page" => Ok(MetaSurface::Page),
+        "instagram" => Ok(MetaSurface::InstagramAccount),
+        _ => Err(MetaConnectorError::InvalidWebhookDelivery),
+    }
+}
+
+fn parse_webhook_signature(signature: &str) -> Result<Vec<u8>, MetaConnectorError> {
+    let encoded = signature
+        .strip_prefix("sha256=")
+        .ok_or(MetaConnectorError::InvalidWebhookSignature)?;
+    if encoded.len() != 64 {
+        return Err(MetaConnectorError::InvalidWebhookSignature);
+    }
+    let mut bytes = Vec::with_capacity(32);
+    let mut chars = encoded.chars();
+    while let (Some(high), Some(low)) = (chars.next(), chars.next()) {
+        let high = high
+            .to_digit(16)
+            .ok_or(MetaConnectorError::InvalidWebhookSignature)?;
+        let low = low
+            .to_digit(16)
+            .ok_or(MetaConnectorError::InvalidWebhookSignature)?;
+        bytes.push(
+            u8::try_from((high << 4) | low)
+                .map_err(|_| MetaConnectorError::InvalidWebhookSignature)?,
+        );
+    }
+    if bytes.len() == 32 {
+        Ok(bytes)
+    } else {
+        Err(MetaConnectorError::InvalidWebhookSignature)
+    }
+}
+
+fn parse_webhook_payload(
+    request: &MetaWebhookDeliveryRequest,
+) -> Result<MetaWebhookVerifiedDelivery, MetaConnectorError> {
+    let body: Value = serde_json::from_str(request.body())
+        .map_err(|_| MetaConnectorError::InvalidProviderResponse)?;
+    let object = body
+        .get("object")
+        .and_then(Value::as_str)
+        .ok_or(MetaConnectorError::InvalidWebhookDelivery)?
+        .to_owned();
+    if object != request.subscription.object()
+        || !webhook_object_matches_scope(&object, &request.reconcile_request.meta_scope)
+    {
+        return Err(MetaConnectorError::RefreshDrift);
+    }
+    let entries = body
+        .get("entry")
+        .and_then(Value::as_array)
+        .filter(|entries| !entries.is_empty())
+        .ok_or(MetaConnectorError::InvalidWebhookDelivery)?;
+    let mut entry_ids = BTreeSet::new();
+    let mut change_fields = BTreeSet::new();
+    let mut timestamps = Vec::new();
+    for entry in entries {
+        let entry_id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or(MetaConnectorError::InvalidWebhookDelivery)?;
+        if !webhook_scope_entry_matches(&object, entry_id, &request.reconcile_request.meta_scope) {
+            return Err(MetaConnectorError::ScopeNotAccessible);
+        }
+        entry_ids.insert(entry_id.to_owned());
+        let timestamp = entry
+            .get("time")
+            .and_then(Value::as_i64)
+            .filter(|time| *time > 0)
+            .ok_or(MetaConnectorError::InvalidWebhookDelivery)?;
+        timestamps.push(timestamp);
+        let changes = entry
+            .get("changes")
+            .and_then(Value::as_array)
+            .filter(|changes| !changes.is_empty())
+            .ok_or(MetaConnectorError::InvalidWebhookDelivery)?;
+        for change in changes {
+            let field = change
+                .get("field")
+                .and_then(Value::as_str)
+                .filter(|field| valid_metric(field))
+                .ok_or(MetaConnectorError::InvalidWebhookDelivery)?;
+            change_fields.insert(field.to_owned());
+        }
+    }
+    if entry_ids.is_empty() || change_fields.is_empty() {
+        return Err(MetaConnectorError::InvalidWebhookDelivery);
+    }
+    let payload_digest = request.payload_digest();
+    let event_digest = digest_json(&(
+        &object,
+        &entry_ids,
+        &change_fields,
+        &timestamps,
+        &payload_digest,
+    ));
+    Ok(MetaWebhookVerifiedDelivery {
+        object,
+        entry_ids,
+        change_fields,
+        event_timestamp: timestamps.into_iter().max().unwrap_or_default(),
+        payload_digest,
+        event_digest,
+        signature_digest: request.signature_digest(),
+    })
 }
 
 fn valid_metric(value: &str) -> bool {
@@ -1109,6 +1361,250 @@ fn provider_query_digest(request: &MetaInsightReadRequest) -> String {
     ))
 }
 
+fn webhook_cursor_token_digest(request: &MetaInsightReadRequest) -> Option<String> {
+    request
+        .cursor
+        .as_ref()
+        .map(|cursor| cursor.token_digest().to_owned())
+}
+
+fn webhook_credential_binding_digest(request: &MetaInsightReadRequest) -> String {
+    digest_json(&(
+        request.secret_reference.reference_id(),
+        request.secret_reference.scope().digest(),
+        request.secret_reference.credential_revision(),
+        request.lease.lease_id(),
+        request.lease.scope().digest(),
+        request.lease.adapter().adapter_id(),
+        request.lease.adapter().adapter_version(),
+        request.lease.credential_revision(),
+        request.lease.lease_revision(),
+        request.lease.issued_at(),
+        request.lease.expires_at(),
+    ))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetaWebhookSubscription {
+    subscription_id: String,
+    connector_scope_digest: String,
+    meta_scope_digest: String,
+    api_digest: String,
+    object: String,
+    revision: u64,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+impl MetaWebhookSubscription {
+    pub fn new(
+        subscription_id: impl Into<String>,
+        connector_scope: &ConnectorScope,
+        meta_scope: &MetaScope,
+        api: &MetaApiBinding,
+        object: impl Into<String>,
+        revision: u64,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<Self, MetaConnectorError> {
+        let subscription = Self {
+            subscription_id: subscription_id.into(),
+            connector_scope_digest: connector_scope.digest(),
+            meta_scope_digest: meta_scope.digest(),
+            api_digest: api.digest(),
+            object: object.into(),
+            revision,
+            expires_at,
+        };
+        subscription.validate()?;
+        Ok(subscription)
+    }
+
+    pub fn subscription_id(&self) -> &str {
+        &self.subscription_id
+    }
+
+    pub fn object(&self) -> &str {
+        &self.object
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn expires_at(&self) -> Option<DateTime<Utc>> {
+        self.expires_at
+    }
+
+    pub fn digest(&self) -> String {
+        digest_json(self)
+    }
+
+    fn validate(&self) -> Result<(), MetaConnectorError> {
+        if !valid_webhook_identity(&self.subscription_id)
+            || !is_sha256(&self.connector_scope_digest)
+            || !is_sha256(&self.meta_scope_digest)
+            || !is_sha256(&self.api_digest)
+            || !matches!(
+                self.object.as_str(),
+                "business" | "ad_account" | "page" | "instagram"
+            )
+            || self.revision == 0
+            || self
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= Utc::now())
+        {
+            return Err(MetaConnectorError::InvalidWebhookDelivery);
+        }
+        Ok(())
+    }
+
+    fn validate_for(&self, request: &MetaInsightReadRequest) -> Result<(), MetaConnectorError> {
+        self.validate()?;
+        if self.connector_scope_digest != request.connector_scope.digest()
+            || self.meta_scope_digest != request.meta_scope.digest()
+            || self.api_digest != request.api.digest()
+            || self
+                .expires_at
+                .is_some_and(|expires_at| request.at >= expires_at)
+            || !webhook_object_matches_scope(self.object.as_str(), &request.meta_scope)
+        {
+            return Err(MetaConnectorError::RefreshDrift);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct MetaWebhookDeliveryRequest {
+    pub subscription: MetaWebhookSubscription,
+    pub delivery_id: String,
+    pub event_id: String,
+    signature: String,
+    body: String,
+    pub reconcile_request: MetaInsightReadRequest,
+    pub at: DateTime<Utc>,
+}
+
+impl fmt::Debug for MetaWebhookDeliveryRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetaWebhookDeliveryRequest")
+            .field("subscription", &self.subscription)
+            .field("delivery_id", &self.delivery_id)
+            .field("event_id", &self.event_id)
+            .field("signature_digest", &sha256(&self.signature))
+            .field("payload_digest", &sha256(&self.body))
+            .field("body_bytes", &self.body.len())
+            .field("reconcile_request", &self.reconcile_request)
+            .field("at", &self.at)
+            .finish()
+    }
+}
+
+impl MetaWebhookDeliveryRequest {
+    pub fn new(
+        subscription: MetaWebhookSubscription,
+        delivery_id: impl Into<String>,
+        event_id: impl Into<String>,
+        signature: impl Into<String>,
+        body: impl Into<String>,
+        reconcile_request: MetaInsightReadRequest,
+        at: DateTime<Utc>,
+    ) -> Result<Self, MetaConnectorError> {
+        let request = Self {
+            subscription,
+            delivery_id: delivery_id.into(),
+            event_id: event_id.into(),
+            signature: signature.into(),
+            body: body.into(),
+            reconcile_request,
+            at,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn signature(&self) -> &str {
+        &self.signature
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    pub fn payload_digest(&self) -> String {
+        sha256(&self.body)
+    }
+
+    pub fn signature_digest(&self) -> String {
+        sha256(&self.signature)
+    }
+
+    pub fn request_digest(&self) -> String {
+        digest_json(&(
+            self.subscription.digest(),
+            &self.delivery_id,
+            &self.event_id,
+            self.payload_digest(),
+            self.reconcile_request.request_digest(),
+            webhook_cursor_token_digest(&self.reconcile_request),
+            webhook_credential_binding_digest(&self.reconcile_request),
+        ))
+    }
+
+    fn validate(&self) -> Result<(), MetaConnectorError> {
+        self.reconcile_request.validate()?;
+        if self.at != self.reconcile_request.at
+            || !valid_webhook_identity(&self.delivery_id)
+            || !valid_webhook_identity(&self.event_id)
+            || self.body.is_empty()
+            || self.body.len() > MAX_WEBHOOK_BODY_BYTES
+        {
+            return Err(MetaConnectorError::InvalidWebhookDelivery);
+        }
+        self.subscription.validate_for(&self.reconcile_request)?;
+        parse_webhook_signature(&self.signature)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetaWebhookVerifiedDelivery {
+    pub object: String,
+    pub entry_ids: BTreeSet<String>,
+    pub change_fields: BTreeSet<String>,
+    pub event_timestamp: i64,
+    pub payload_digest: String,
+    pub event_digest: String,
+    pub signature_digest: String,
+}
+
+pub trait MetaWebhookProvider: fmt::Debug + Send + Sync {
+    fn verify(
+        &self,
+        request: &MetaWebhookDeliveryRequest,
+        app_secret: &MetaAppSecret,
+    ) -> Result<MetaWebhookVerifiedDelivery, MetaConnectorError>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetaGraphWebhookAdapter;
+
+impl MetaWebhookProvider for MetaGraphWebhookAdapter {
+    fn verify(
+        &self,
+        request: &MetaWebhookDeliveryRequest,
+        app_secret: &MetaAppSecret,
+    ) -> Result<MetaWebhookVerifiedDelivery, MetaConnectorError> {
+        request.validate()?;
+        let signature = parse_webhook_signature(request.signature())?;
+        let key = hmac::Key::new(hmac::HMAC_SHA256, app_secret.expose().as_bytes());
+        hmac::verify(&key, request.body().as_bytes(), &signature)
+            .map_err(|_| MetaConnectorError::InvalidWebhookSignature)?;
+        parse_webhook_payload(request)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetaCausalStatus {
@@ -1212,6 +1708,103 @@ pub struct MetaClassificationReceipt {
     pub causal_status: MetaCausalStatus,
     pub first_party: bool,
     pub review_state: MetaReviewState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetaWebhookSourceReceipt {
+    pub source: String,
+    pub provider: String,
+    pub host: String,
+    pub api_version: String,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub delivery_id: String,
+    pub request_digest: String,
+    pub response_digest: String,
+    pub payload_digest: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+impl MetaWebhookSourceReceipt {
+    fn validate(&self) -> Result<(), MetaConnectorError> {
+        if self.source != "meta_webhook"
+            || self.provider != META_PROVIDER_ID
+            || self.method != "POST"
+            || self.path != "/meta/webhook"
+            || self.status != 202
+            || !valid_webhook_identity(&self.delivery_id)
+            || !is_sha256(&self.request_digest)
+            || !is_sha256(&self.response_digest)
+            || !is_sha256(&self.payload_digest)
+        {
+            return Err(MetaConnectorError::InvalidWebhookDelivery);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetaWebhookDeliveryReceipt {
+    pub schema: String,
+    pub provider: String,
+    pub subscription_id: String,
+    pub subscription_digest: String,
+    pub scope_digest: String,
+    pub meta_scope_digest: String,
+    pub api_digest: String,
+    pub delivery_id: String,
+    pub event_id: String,
+    pub event_digest: String,
+    pub payload_digest: String,
+    pub signature_digest: String,
+    pub request_digest: String,
+    pub reconcile_request_digest: String,
+    pub reconcile_cursor_token_digest: Option<String>,
+    pub credential_binding_digest: String,
+    pub response_digest: String,
+    pub source: MetaWebhookSourceReceipt,
+    pub classification: MetaClassificationReceipt,
+    pub causal_status: MetaCausalStatus,
+    pub durable_logged: bool,
+}
+
+impl MetaWebhookDeliveryReceipt {
+    fn validate(&self) -> Result<(), MetaConnectorError> {
+        self.source.validate()?;
+        if self.schema != META_WEBHOOK_SCHEMA
+            || self.provider != META_PROVIDER_ID
+            || !valid_webhook_identity(&self.subscription_id)
+            || !valid_webhook_identity(&self.delivery_id)
+            || !valid_webhook_identity(&self.event_id)
+            || !is_sha256(&self.subscription_digest)
+            || !is_sha256(&self.scope_digest)
+            || !is_sha256(&self.meta_scope_digest)
+            || !is_sha256(&self.api_digest)
+            || !is_sha256(&self.event_digest)
+            || !is_sha256(&self.payload_digest)
+            || !is_sha256(&self.signature_digest)
+            || !is_sha256(&self.request_digest)
+            || !is_sha256(&self.reconcile_request_digest)
+            || self
+                .reconcile_cursor_token_digest
+                .as_deref()
+                .is_some_and(|digest| !is_sha256(digest))
+            || !is_sha256(&self.credential_binding_digest)
+            || !is_sha256(&self.response_digest)
+            || self.source.delivery_id != self.delivery_id
+            || self.source.request_digest != self.request_digest
+            || self.source.payload_digest != self.payload_digest
+            || self.classification.causal_status != MetaCausalStatus::NotClaimed
+            || self.causal_status != MetaCausalStatus::NotClaimed
+            || !self.durable_logged
+        {
+            return Err(MetaConnectorError::InvalidWebhookDelivery);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2329,6 +2922,421 @@ impl MetaReadBudget {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetaWebhookPendingDelivery {
+    pub delivery: MetaWebhookDeliveryReceipt,
+}
+
+impl MetaWebhookPendingDelivery {
+    fn validate(&self) -> Result<(), MetaConnectorError> {
+        self.delivery.validate()?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetaWebhookMissionResult {
+    pub result_id: String,
+    pub delivery: MetaWebhookDeliveryReceipt,
+    pub observation: MetaInsightObservation,
+    pub durable_logged: bool,
+    pub connected_claim: bool,
+    pub write_authority: bool,
+}
+
+impl MetaWebhookMissionResult {
+    fn validate(&self) -> Result<(), MetaConnectorError> {
+        self.delivery.validate()?;
+        self.observation.validate()?;
+        if !valid_webhook_identity(&self.result_id)
+            || self.delivery.scope_digest != self.observation.connector_scope.digest()
+            || self.delivery.meta_scope_digest != self.observation.meta_scope.digest()
+            || self.delivery.api_digest != self.observation.api.digest()
+            || self.delivery.reconcile_request_digest != self.observation.request_digest
+            || !self.durable_logged
+            || !self.observation.durable_logged
+            || self.connected_claim
+            || self.write_authority
+        {
+            return Err(MetaConnectorError::InvalidWebhookState);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetaWebhookDurableState {
+    pub schema: String,
+    pub pending: BTreeMap<String, MetaWebhookPendingDelivery>,
+    pub completed: BTreeMap<String, MetaWebhookMissionResult>,
+    pub next_result: u64,
+}
+
+impl Default for MetaWebhookDurableState {
+    fn default() -> Self {
+        Self {
+            schema: META_WEBHOOK_SCHEMA.to_owned(),
+            pending: BTreeMap::new(),
+            completed: BTreeMap::new(),
+            next_result: 1,
+        }
+    }
+}
+
+impl MetaWebhookDurableState {
+    fn validate(&self) -> Result<(), MetaConnectorError> {
+        if self.schema != META_WEBHOOK_SCHEMA || self.next_result == 0 {
+            return Err(MetaConnectorError::InvalidWebhookState);
+        }
+        if self
+            .pending
+            .keys()
+            .chain(self.completed.keys())
+            .any(|delivery_id| !valid_webhook_identity(delivery_id))
+        {
+            return Err(MetaConnectorError::InvalidWebhookState);
+        }
+        if self
+            .pending
+            .keys()
+            .any(|delivery_id| self.completed.contains_key(delivery_id))
+        {
+            return Err(MetaConnectorError::InvalidWebhookState);
+        }
+        for (delivery_id, pending) in &self.pending {
+            pending.validate()?;
+            if pending.delivery.delivery_id != *delivery_id {
+                return Err(MetaConnectorError::InvalidWebhookState);
+            }
+        }
+        for (delivery_id, result) in &self.completed {
+            result.validate()?;
+            if result.delivery.delivery_id != *delivery_id {
+                return Err(MetaConnectorError::InvalidWebhookState);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetaWebhookReconcileCheckpoint {
+    pub schema: String,
+    pub insight: MetaDurableState,
+    pub webhooks: MetaWebhookDurableState,
+}
+
+#[derive(Clone)]
+pub struct MetaWebhookReconcileService {
+    insight: PaidSocialInsightReadService,
+    webhook_provider: Arc<dyn MetaWebhookProvider>,
+    webhooks: MetaWebhookDurableState,
+}
+
+impl fmt::Debug for MetaWebhookReconcileService {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetaWebhookReconcileService")
+            .field("connection_state", &self.insight.connection_state())
+            .field("pending_deliveries", &self.webhooks.pending.len())
+            .field("completed_deliveries", &self.webhooks.completed.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl MetaWebhookReconcileService {
+    pub fn new(insight: PaidSocialInsightReadService) -> Self {
+        Self::with_webhook_provider(insight, Arc::new(MetaGraphWebhookAdapter))
+    }
+
+    pub fn with_webhook_provider(
+        insight: PaidSocialInsightReadService,
+        webhook_provider: Arc<dyn MetaWebhookProvider>,
+    ) -> Self {
+        Self {
+            insight,
+            webhook_provider,
+            webhooks: MetaWebhookDurableState::default(),
+        }
+    }
+
+    pub fn service(&self) -> &PaidSocialInsightReadService {
+        &self.insight
+    }
+
+    pub fn service_mut(&mut self) -> &mut PaidSocialInsightReadService {
+        &mut self.insight
+    }
+
+    pub fn webhook_state(&self) -> &MetaWebhookDurableState {
+        &self.webhooks
+    }
+
+    pub fn pending_delivery_ids(&self) -> Vec<String> {
+        self.webhooks.pending.keys().cloned().collect()
+    }
+
+    pub fn read<R: MetaCredentialResolver>(
+        &mut self,
+        request: &MetaInsightReadRequest,
+        resolver: &R,
+        budget: &mut MetaReadBudget,
+    ) -> Result<MetaMissionInsightResult, MetaConnectorError> {
+        self.insight.read(request, resolver, budget)
+    }
+
+    pub fn accept_webhook<S: MetaWebhookSecretResolver>(
+        &mut self,
+        request: &MetaWebhookDeliveryRequest,
+        resolver: &S,
+    ) -> Result<MetaWebhookDeliveryReceipt, MetaConnectorError> {
+        request.validate()?;
+        let mount = self
+            .insight
+            .mount
+            .as_ref()
+            .ok_or(MetaConnectorError::NotMounted)?;
+        mount.validate_request(&request.reconcile_request)?;
+        let app_secret = resolver.resolve(&request.reconcile_request.secret_reference)?;
+        let verified = self.webhook_provider.verify(request, &app_secret)?;
+        let subscription_digest = request.subscription.digest();
+        if verified.payload_digest != request.payload_digest()
+            || verified.signature_digest != request.signature_digest()
+            || verified.object != request.subscription.object()
+        {
+            return Err(MetaConnectorError::InvalidWebhookDelivery);
+        }
+
+        if let Some(result) = self.webhooks.completed.get(&request.delivery_id) {
+            if !same_webhook_identity(&result.delivery, request, &verified, &subscription_digest) {
+                return Err(MetaConnectorError::InvalidWebhookDelivery);
+            }
+            return Ok(result.delivery.clone());
+        }
+        if let Some(pending) = self.webhooks.pending.get(&request.delivery_id) {
+            if !same_webhook_identity(&pending.delivery, request, &verified, &subscription_digest) {
+                return Err(MetaConnectorError::InvalidWebhookDelivery);
+            }
+            return Ok(pending.delivery.clone());
+        }
+
+        let response_digest = sha256(&format!(
+            "accepted:{}:{}",
+            request.delivery_id, verified.event_digest
+        ));
+        let request_digest = request.request_digest();
+        let source = MetaWebhookSourceReceipt {
+            source: "meta_webhook".to_owned(),
+            provider: META_PROVIDER_ID.to_owned(),
+            host: request.reconcile_request.api.host.base_url().to_owned(),
+            api_version: request.reconcile_request.api.api_version.clone(),
+            method: "POST".to_owned(),
+            path: "/meta/webhook".to_owned(),
+            status: 202,
+            delivery_id: request.delivery_id.clone(),
+            request_digest: request_digest.clone(),
+            response_digest: response_digest.clone(),
+            payload_digest: verified.payload_digest.clone(),
+            observed_at: request.at,
+        };
+        let provenance_class = mount.probe.classification.provenance_class;
+        let receipt = MetaWebhookDeliveryReceipt {
+            schema: META_WEBHOOK_SCHEMA.to_owned(),
+            provider: META_PROVIDER_ID.to_owned(),
+            subscription_id: request.subscription.subscription_id.clone(),
+            subscription_digest,
+            scope_digest: request.reconcile_request.connector_scope.digest(),
+            meta_scope_digest: request.reconcile_request.meta_scope.digest(),
+            api_digest: request.reconcile_request.api.digest(),
+            delivery_id: request.delivery_id.clone(),
+            event_id: request.event_id.clone(),
+            event_digest: verified.event_digest,
+            payload_digest: verified.payload_digest,
+            signature_digest: verified.signature_digest,
+            request_digest,
+            reconcile_request_digest: request.reconcile_request.request_digest(),
+            reconcile_cursor_token_digest: webhook_cursor_token_digest(&request.reconcile_request),
+            credential_binding_digest: webhook_credential_binding_digest(
+                &request.reconcile_request,
+            ),
+            response_digest,
+            source,
+            classification: MetaClassificationReceipt {
+                provenance_class,
+                surface: webhook_surface(&verified.object)?,
+                attribution: MetaAttributionModel::NotApplicable,
+                causal_status: MetaCausalStatus::NotClaimed,
+                first_party: provenance_class == ProviderProvenanceClass::ProductionProvider,
+                review_state: MetaReviewState::Required,
+            },
+            causal_status: MetaCausalStatus::NotClaimed,
+            durable_logged: true,
+        };
+        receipt.validate()?;
+        self.webhooks.pending.insert(
+            request.delivery_id.clone(),
+            MetaWebhookPendingDelivery {
+                delivery: receipt.clone(),
+            },
+        );
+        Ok(receipt)
+    }
+
+    pub fn reconcile_webhook<R: MetaCredentialResolver>(
+        &mut self,
+        delivery_id: &str,
+        request: &MetaInsightReadRequest,
+        resolver: &R,
+        budget: &mut MetaReadBudget,
+    ) -> Result<MetaWebhookMissionResult, MetaConnectorError> {
+        self.validate_reconcile_request(delivery_id, request)?;
+        if let Some(result) = self.webhooks.completed.get(delivery_id) {
+            return Ok(result.clone());
+        }
+        let pending = self
+            .webhooks
+            .pending
+            .get(delivery_id)
+            .cloned()
+            .ok_or(MetaConnectorError::WebhookDeliveryNotPending)?;
+        let next_result = self
+            .webhooks
+            .next_result
+            .checked_add(1)
+            .ok_or(MetaConnectorError::InvalidWebhookState)?;
+        let insight = self.insight.read(request, resolver, budget)?;
+        if pending.delivery.classification.provenance_class
+            != insight.observation.classification.provenance_class
+        {
+            return Err(MetaConnectorError::InvalidWebhookState);
+        }
+        let result = MetaWebhookMissionResult {
+            result_id: format!("meta-webhook-result-{}", self.webhooks.next_result),
+            delivery: pending.delivery,
+            observation: insight.observation,
+            durable_logged: true,
+            connected_claim: false,
+            write_authority: false,
+        };
+        result.validate()?;
+        self.webhooks.pending.remove(delivery_id);
+        self.webhooks
+            .completed
+            .insert(delivery_id.to_owned(), result.clone());
+        self.webhooks.next_result = next_result;
+        Ok(result)
+    }
+
+    pub fn deliver_and_reconcile<S: MetaWebhookSecretResolver, R: MetaCredentialResolver>(
+        &mut self,
+        request: &MetaWebhookDeliveryRequest,
+        secret_resolver: &S,
+        credential_resolver: &R,
+        budget: &mut MetaReadBudget,
+    ) -> Result<MetaWebhookMissionResult, MetaConnectorError> {
+        self.accept_webhook(request, secret_resolver)?;
+        self.reconcile_webhook(
+            &request.delivery_id,
+            &request.reconcile_request,
+            credential_resolver,
+            budget,
+        )
+    }
+
+    pub fn checkpoint(&self) -> MetaWebhookReconcileCheckpoint {
+        MetaWebhookReconcileCheckpoint {
+            schema: META_WEBHOOK_SCHEMA.to_owned(),
+            insight: self.insight.checkpoint(),
+            webhooks: self.webhooks.clone(),
+        }
+    }
+
+    pub fn restore_checkpoint(
+        &mut self,
+        checkpoint: MetaWebhookReconcileCheckpoint,
+    ) -> Result<(), MetaConnectorError> {
+        if checkpoint.schema != META_WEBHOOK_SCHEMA {
+            return Err(MetaConnectorError::InvalidWebhookState);
+        }
+        checkpoint.webhooks.validate()?;
+        self.insight.restore_checkpoint(checkpoint.insight)?;
+        self.webhooks = checkpoint.webhooks;
+        Ok(())
+    }
+
+    pub fn unmount(&mut self) {
+        self.insight.unmount();
+        self.webhooks.pending.clear();
+        self.webhooks.completed.clear();
+    }
+
+    pub fn revoke(&mut self) {
+        self.insight.revoke();
+        self.webhooks.pending.clear();
+        self.webhooks.completed.clear();
+    }
+
+    fn validate_reconcile_request(
+        &self,
+        delivery_id: &str,
+        request: &MetaInsightReadRequest,
+    ) -> Result<(), MetaConnectorError> {
+        request.validate()?;
+        let mount = self
+            .insight
+            .mount
+            .as_ref()
+            .ok_or(MetaConnectorError::NotMounted)?;
+        mount.validate_request(request)?;
+        let receipt = self
+            .webhooks
+            .completed
+            .get(delivery_id)
+            .map(|result| &result.delivery)
+            .or_else(|| {
+                self.webhooks
+                    .pending
+                    .get(delivery_id)
+                    .map(|pending| &pending.delivery)
+            })
+            .ok_or(MetaConnectorError::WebhookDeliveryNotPending)?;
+        if receipt.scope_digest != request.connector_scope.digest()
+            || receipt.meta_scope_digest != request.meta_scope.digest()
+            || receipt.api_digest != request.api.digest()
+            || receipt.reconcile_request_digest != request.request_digest()
+            || receipt.reconcile_cursor_token_digest != webhook_cursor_token_digest(request)
+            || receipt.credential_binding_digest != webhook_credential_binding_digest(request)
+        {
+            return Err(MetaConnectorError::RefreshDrift);
+        }
+        Ok(())
+    }
+}
+
+fn same_webhook_identity(
+    receipt: &MetaWebhookDeliveryReceipt,
+    request: &MetaWebhookDeliveryRequest,
+    verified: &MetaWebhookVerifiedDelivery,
+    subscription_digest: &str,
+) -> bool {
+    receipt.delivery_id == request.delivery_id
+        && receipt.event_id == request.event_id
+        && receipt.subscription_digest == subscription_digest
+        && receipt.payload_digest == verified.payload_digest
+        && receipt.event_digest == verified.event_digest
+        && receipt.signature_digest == verified.signature_digest
+        && receipt.request_digest == request.request_digest()
+        && receipt.reconcile_request_digest == request.reconcile_request.request_digest()
+        && receipt.reconcile_cursor_token_digest
+            == webhook_cursor_token_digest(&request.reconcile_request)
+        && receipt.credential_binding_digest
+            == webhook_credential_binding_digest(&request.reconcile_request)
+}
+
 #[derive(Clone)]
 pub struct PaidSocialInsightReadService {
     provider: Arc<dyn MetaInsightProvider>,
@@ -2644,19 +3652,38 @@ pub type MetaInsightReadService = PaidSocialInsightReadService;
 
 #[derive(Clone, Debug)]
 pub struct MetaMissionInsightConsumer {
-    service: PaidSocialInsightReadService,
+    service: MetaWebhookReconcileService,
 }
 
 impl MetaMissionInsightConsumer {
     pub fn new(service: PaidSocialInsightReadService) -> Self {
-        Self { service }
+        Self {
+            service: MetaWebhookReconcileService::new(service),
+        }
+    }
+
+    pub fn with_webhook_provider(
+        service: PaidSocialInsightReadService,
+        webhook_provider: Arc<dyn MetaWebhookProvider>,
+    ) -> Self {
+        Self {
+            service: MetaWebhookReconcileService::with_webhook_provider(service, webhook_provider),
+        }
     }
 
     pub fn service(&self) -> &PaidSocialInsightReadService {
-        &self.service
+        self.service.service()
     }
 
     pub fn service_mut(&mut self) -> &mut PaidSocialInsightReadService {
+        self.service.service_mut()
+    }
+
+    pub fn webhook_service(&self) -> &MetaWebhookReconcileService {
+        &self.service
+    }
+
+    pub fn webhook_service_mut(&mut self) -> &mut MetaWebhookReconcileService {
         &mut self.service
     }
 
@@ -2667,6 +3694,36 @@ impl MetaMissionInsightConsumer {
         budget: &mut MetaReadBudget,
     ) -> Result<MetaMissionInsightResult, MetaConnectorError> {
         self.service.read(request, resolver, budget)
+    }
+
+    pub fn handle_webhook<S: MetaWebhookSecretResolver, R: MetaCredentialResolver>(
+        &mut self,
+        request: &MetaWebhookDeliveryRequest,
+        secret_resolver: &S,
+        credential_resolver: &R,
+        budget: &mut MetaReadBudget,
+    ) -> Result<MetaWebhookMissionResult, MetaConnectorError> {
+        self.service
+            .deliver_and_reconcile(request, secret_resolver, credential_resolver, budget)
+    }
+
+    pub fn checkpoint(&self) -> MetaWebhookReconcileCheckpoint {
+        self.service.checkpoint()
+    }
+
+    pub fn restore_checkpoint(
+        &mut self,
+        checkpoint: MetaWebhookReconcileCheckpoint,
+    ) -> Result<(), MetaConnectorError> {
+        self.service.restore_checkpoint(checkpoint)
+    }
+
+    pub fn unmount(&mut self) {
+        self.service.unmount();
+    }
+
+    pub fn revoke(&mut self) {
+        self.service.revoke();
     }
 }
 
@@ -2682,11 +3739,34 @@ pub fn run_env_gated_probe(
     adapter.probe(request, &token)
 }
 
+pub fn run_env_gated_webhook_reconcile(
+    service: &mut MetaWebhookReconcileService,
+    request: &MetaWebhookDeliveryRequest,
+    budget: &mut MetaReadBudget,
+) -> Result<MetaWebhookMissionResult, MetaConnectorError> {
+    if std::env::var(META_RUN_WEBHOOK_RECONCILE_ENV)
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return Err(MetaConnectorError::BlockedEnv);
+    }
+    let subscription_id =
+        std::env::var(META_WEBHOOK_SUBSCRIPTION_ENV).map_err(|_| MetaConnectorError::BlockedEnv)?;
+    if subscription_id != request.subscription.subscription_id {
+        return Err(MetaConnectorError::BlockedEnv);
+    }
+    let secret_resolver = EnvironmentMetaWebhookSecretResolver;
+    let credential_resolver = EnvironmentMetaCredentialResolver;
+    service.deliver_and_reconcile(request, &secret_resolver, &credential_resolver, budget)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ConnectorAuth, ProviderAdapterIdentity};
     use std::collections::VecDeque;
+    use std::fmt::Write as _;
     use std::sync::Mutex;
 
     #[derive(Debug, Default)]
@@ -2864,6 +3944,56 @@ mod tests {
             attribution,
         )
         .expect("insight query")
+    }
+
+    fn webhook_signature(app_secret: &str, body: &str) -> String {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, app_secret.as_bytes());
+        let tag = hmac::sign(&key, body.as_bytes());
+        let mut encoded = String::with_capacity(64);
+        for byte in tag.as_ref() {
+            write!(&mut encoded, "{byte:02x}").expect("hex buffer write");
+        }
+        format!("sha256={encoded}")
+    }
+
+    fn webhook_request(
+        connector: &ConnectorScope,
+        scope: &MetaScope,
+        api: &MetaApiBinding,
+        secret: SecretReference,
+        lease: CredentialLease,
+        at: DateTime<Utc>,
+    ) -> MetaWebhookDeliveryRequest {
+        let read = read_request(
+            connector.clone(),
+            scope.clone(),
+            api.clone(),
+            secret,
+            lease,
+            MetaReadTarget::PageInsights,
+            query(
+                at,
+                MetaAttributionModel::PagePeriod {
+                    period: "day".to_owned(),
+                },
+            ),
+            None,
+            at,
+        );
+        let subscription =
+            MetaWebhookSubscription::new("meta-sub-page-1", connector, scope, api, "page", 1, None)
+                .expect("webhook subscription");
+        let body = r#"{"object":"page","entry":[{"id":"456","time":1723593600,"changes":[{"field":"feed","value":{"id":"post-1"}}]}]}"#;
+        MetaWebhookDeliveryRequest::new(
+            subscription,
+            "meta-delivery-1",
+            "meta-event-1",
+            webhook_signature("meta-app-secret", body),
+            body,
+            read,
+            at,
+        )
+        .expect("webhook request")
     }
 
     #[test]
@@ -3279,5 +4409,223 @@ mod tests {
                 Err(MetaConnectorError::BlockedEnv)
             ));
         }
+    }
+
+    #[test]
+    fn webhook_signature_is_verified_and_reconciles_one_adoptable_result() {
+        let (connector, scope, api, secret, lease, resolver, at) = fixture();
+        let mut responses = probe_responses();
+        responses.push(MetaHttpResponse::json(
+            200,
+            r#"{"__request_id":"webhook-read-1","data":[{"name":"page_impressions","period":"day","values":[{"value":7,"end_time":"2026-08-14T00:00:00+0000"}]}]}"#,
+        ));
+        let transport = Arc::new(ScriptedMetaTransport::new(responses));
+        let adapter = Arc::new(MetaGraphApiAdapter::new(transport, api.clone()));
+        let mut insight = PaidSocialInsightReadService::new(adapter);
+        let probe = probe_request(
+            connector.clone(),
+            scope.clone(),
+            api.clone(),
+            secret.clone(),
+            lease.clone(),
+            at,
+        );
+        insight.probe_and_mount(&probe, &resolver).expect("mount");
+        let mut service = MetaWebhookReconcileService::new(insight);
+        let request = webhook_request(&connector, &scope, &api, secret.clone(), lease, at);
+        let mut app_secrets = InMemoryMetaWebhookSecretResolver::default();
+        app_secrets
+            .insert(&secret, "meta-app-secret")
+            .expect("app secret");
+        let mut budget = MetaReadBudget::new(3, at + Duration::seconds(60), 3, 20).expect("budget");
+        let result = service
+            .deliver_and_reconcile(&request, &app_secrets, &resolver, &mut budget)
+            .expect("webhook reconciliation");
+        assert_eq!(result.delivery.source.method, "POST");
+        assert_eq!(result.observation.records.len(), 1);
+        assert_eq!(budget.quota_used(), 1);
+        assert_eq!(budget.cost_used_minor(), 1);
+        assert!(is_sha256(&result.delivery.request_digest));
+        assert!(is_sha256(&result.delivery.response_digest));
+        assert_eq!(
+            result.observation.causal_status,
+            MetaCausalStatus::NotClaimed
+        );
+        assert!(!result.connected_claim);
+        assert!(!result.write_authority);
+        assert_eq!(service.webhook_state().pending.len(), 0);
+        assert_eq!(service.webhook_state().completed.len(), 1);
+        assert_eq!(service.service().durable_log().entries().len(), 1);
+        let result_json = serde_json::to_string(&result).expect("result JSON");
+        assert!(!result_json.contains("meta-app-secret"));
+        assert!(!result_json.contains("feed"));
+
+        let replay = service
+            .deliver_and_reconcile(&request, &app_secrets, &resolver, &mut budget)
+            .expect("idempotent webhook replay");
+        assert_eq!(replay.result_id, result.result_id);
+        assert_eq!(service.webhook_state().completed.len(), 1);
+        assert_eq!(service.service().durable_log().entries().len(), 1);
+    }
+
+    #[test]
+    fn webhook_checkpoint_resumes_pending_delivery_after_restart() {
+        let (connector, scope, api, secret, lease, resolver, at) = fixture();
+        let transport = Arc::new(ScriptedMetaTransport::new(probe_responses()));
+        let adapter = Arc::new(MetaGraphApiAdapter::new(transport, api.clone()));
+        let mut insight = PaidSocialInsightReadService::new(adapter);
+        let probe_request = probe_request(
+            connector.clone(),
+            scope.clone(),
+            api.clone(),
+            secret.clone(),
+            lease.clone(),
+            at,
+        );
+        let probe = {
+            let token = resolver.resolve(&secret).expect("token");
+            insight
+                .provider
+                .probe(&probe_request, &token)
+                .expect("probe")
+        };
+        insight
+            .mount(MetaMount::new(&probe_request, probe.clone()).expect("mount"))
+            .expect("mount service");
+        let mut service = MetaWebhookReconcileService::new(insight);
+        let request = webhook_request(&connector, &scope, &api, secret.clone(), lease.clone(), at);
+        let mut app_secrets = InMemoryMetaWebhookSecretResolver::default();
+        app_secrets
+            .insert(&secret, "meta-app-secret")
+            .expect("app secret");
+        service
+            .accept_webhook(&request, &app_secrets)
+            .expect("durable pending delivery");
+        let checkpoint = service.checkpoint();
+        let checkpoint_json = serde_json::to_string(&checkpoint).expect("checkpoint JSON");
+        assert!(!checkpoint_json.contains("meta-app-secret"));
+        assert!(!checkpoint_json.contains("feed"));
+
+        let read_response = MetaHttpResponse::json(
+            200,
+            r#"{"__request_id":"webhook-read-restart","data":[{"name":"page_impressions","period":"day","values":[{"value":8,"end_time":"2026-08-14T00:00:00+0000"}]}]}"#,
+        );
+        let restarted_adapter = Arc::new(MetaGraphApiAdapter::new(
+            Arc::new(ScriptedMetaTransport::new([read_response])),
+            api.clone(),
+        ));
+        let mut restarted =
+            MetaWebhookReconcileService::new(PaidSocialInsightReadService::new(restarted_adapter));
+        restarted
+            .restore_checkpoint(checkpoint)
+            .expect("restore webhook checkpoint");
+        restarted
+            .service_mut()
+            .mount(MetaMount::new(&probe_request, probe).expect("restart mount"))
+            .expect("mount after restart");
+        let mut budget = MetaReadBudget::new(2, at + Duration::seconds(60), 2, 20).expect("budget");
+        let result = restarted
+            .reconcile_webhook(
+                &request.delivery_id,
+                &request.reconcile_request,
+                &resolver,
+                &mut budget,
+            )
+            .expect("reconcile pending delivery");
+        assert_eq!(result.delivery.delivery_id, "meta-delivery-1");
+        assert_eq!(restarted.pending_delivery_ids(), Vec::<String>::new());
+        assert_eq!(restarted.webhook_state().completed.len(), 1);
+        assert_eq!(restarted.service().durable_log().entries().len(), 1);
+    }
+
+    #[test]
+    fn webhook_invalid_signature_drift_and_cleanup_fail_closed() {
+        let (connector, scope, api, secret, lease, resolver, at) = fixture();
+        let transport = Arc::new(ScriptedMetaTransport::new(probe_responses()));
+        let adapter = Arc::new(MetaGraphApiAdapter::new(transport, api.clone()));
+        let mut insight = PaidSocialInsightReadService::new(adapter);
+        let probe = probe_request(
+            connector.clone(),
+            scope.clone(),
+            api.clone(),
+            secret.clone(),
+            lease.clone(),
+            at,
+        );
+        insight.probe_and_mount(&probe, &resolver).expect("mount");
+        let mut service = MetaWebhookReconcileService::new(insight);
+        let request = webhook_request(&connector, &scope, &api, secret.clone(), lease, at);
+        let mut app_secrets = InMemoryMetaWebhookSecretResolver::default();
+        app_secrets
+            .insert(&secret, "wrong-secret")
+            .expect("wrong app secret");
+        assert_eq!(
+            service.accept_webhook(&request, &app_secrets),
+            Err(MetaConnectorError::InvalidWebhookSignature)
+        );
+        assert!(service.pending_delivery_ids().is_empty());
+
+        let mut correct_secrets = InMemoryMetaWebhookSecretResolver::default();
+        correct_secrets
+            .insert(&secret, "meta-app-secret")
+            .expect("app secret");
+        service
+            .accept_webhook(&request, &correct_secrets)
+            .expect("pending delivery");
+        let mut pending = request.clone();
+        pending.reconcile_request = MetaInsightReadRequest::new(
+            pending.reconcile_request.connector_scope.clone(),
+            pending.reconcile_request.meta_scope.clone(),
+            pending.reconcile_request.api.clone(),
+            MetaReadTarget::PageInsights,
+            query(
+                at,
+                MetaAttributionModel::PagePeriod {
+                    period: "week".to_owned(),
+                },
+            ),
+            pending.reconcile_request.secret_reference.clone(),
+            pending.reconcile_request.lease.clone(),
+            None,
+            at,
+        )
+        .expect("drifted read request");
+        assert_eq!(
+            service.accept_webhook(&pending, &correct_secrets),
+            Err(MetaConnectorError::InvalidWebhookDelivery)
+        );
+
+        service.unmount();
+        assert!(service.pending_delivery_ids().is_empty());
+        assert_eq!(
+            service.service().connection_state(),
+            MetaConnectionState::Disconnected
+        );
+        service.revoke();
+        assert!(service.pending_delivery_ids().is_empty());
+        assert!(!service.service().grant().connected_claim);
+    }
+
+    #[test]
+    fn env_gated_webhook_reconcile_requires_native_configuration() {
+        let (connector, scope, api, secret, lease, _resolver, at) = fixture();
+        let service = PaidSocialInsightReadService::new(Arc::new(MetaGraphApiAdapter::new(
+            Arc::new(ScriptedMetaTransport::default()),
+            api.clone(),
+        )));
+        let mut service = MetaWebhookReconcileService::new(service);
+        let request = webhook_request(&connector, &scope, &api, secret, lease, at);
+        let mut budget = MetaReadBudget::new(1, at + Duration::seconds(60), 1, 1).expect("budget");
+        if std::env::var(META_RUN_WEBHOOK_RECONCILE_ENV)
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            assert_eq!(
+                run_env_gated_webhook_reconcile(&mut service, &request, &mut budget),
+                Err(MetaConnectorError::BlockedEnv)
+            );
+        }
+        assert!(META_WEBHOOK_REGISTRATIONS.is_empty());
     }
 }

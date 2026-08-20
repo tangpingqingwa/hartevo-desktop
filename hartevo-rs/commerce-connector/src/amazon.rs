@@ -24,6 +24,8 @@ pub const NOTIFICATIONS_API_VERSION: &str = "v1";
 pub const RATE_LIMIT_HEADER: &str = "x-amzn-RateLimit-Limit";
 pub const REQUEST_ID_HEADER: &str = "x-amzn-RequestId";
 pub const ERROR_TYPE_HEADER: &str = "x-amzn-ErrorType";
+pub const AMAZON_READ_EVIDENCE_LEVEL: &str = "E1";
+pub const AMAZON_LIVE_VALIDATION_STATUS: &str = "BLOCKED_ENV";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,6 +287,101 @@ impl LwaAccessTokenObservation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AmazonLwaAuthStatus {
+    Disconnected,
+    BlockedEnv,
+    TokenObserved,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AmazonBlockedEnvReason {
+    CredentialsUnavailable,
+    NetworkUnavailable,
+    ProviderUnavailable,
+}
+
+/// LWA state is an observation, not a Connected or Effect authority.
+/// `TokenObserved` intentionally does not claim that an account is connected;
+/// it only permits a read request while the opaque token observation is live.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum AmazonLwaAuthState {
+    Disconnected {
+        observed_at: CanonicalTime,
+    },
+    BlockedEnv {
+        observed_at: CanonicalTime,
+        reason: AmazonBlockedEnvReason,
+    },
+    TokenObserved {
+        observed_at: CanonicalTime,
+        token: LwaAccessTokenObservation,
+    },
+}
+
+impl AmazonLwaAuthState {
+    pub fn disconnected(observed_at: DateTime<Utc>) -> Self {
+        Self::Disconnected {
+            observed_at: CanonicalTime::from_datetime(observed_at),
+        }
+    }
+
+    pub fn no_credentials(observed_at: DateTime<Utc>) -> Self {
+        Self::BlockedEnv {
+            observed_at: CanonicalTime::from_datetime(observed_at),
+            reason: AmazonBlockedEnvReason::CredentialsUnavailable,
+        }
+    }
+
+    pub fn blocked_env(observed_at: DateTime<Utc>, reason: AmazonBlockedEnvReason) -> Self {
+        Self::BlockedEnv {
+            observed_at: CanonicalTime::from_datetime(observed_at),
+            reason,
+        }
+    }
+
+    pub fn token_observed(token: LwaAccessTokenObservation) -> Self {
+        Self::TokenObserved {
+            observed_at: token.issued_at.clone(),
+            token,
+        }
+    }
+
+    pub const fn status(&self) -> AmazonLwaAuthStatus {
+        match self {
+            Self::Disconnected { .. } => AmazonLwaAuthStatus::Disconnected,
+            Self::BlockedEnv { .. } => AmazonLwaAuthStatus::BlockedEnv,
+            Self::TokenObserved { .. } => AmazonLwaAuthStatus::TokenObserved,
+        }
+    }
+
+    pub fn observed_at(&self) -> &CanonicalTime {
+        match self {
+            Self::Disconnected { observed_at }
+            | Self::BlockedEnv { observed_at, .. }
+            | Self::TokenObserved { observed_at, .. } => observed_at,
+        }
+    }
+
+    pub fn token(&self) -> Option<&LwaAccessTokenObservation> {
+        match self {
+            Self::TokenObserved { token, .. } => Some(token),
+            Self::Disconnected { .. } | Self::BlockedEnv { .. } => None,
+        }
+    }
+
+    pub fn can_issue_read_at(&self, now: DateTime<Utc>) -> bool {
+        self.token().is_some_and(|token| token.is_valid_at(now))
+    }
+
+    pub const fn grants_connected_authority(&self) -> bool {
+        false
+    }
+}
+
 pub trait AmazonLwaTransport {
     fn refresh(
         &mut self,
@@ -319,7 +416,20 @@ pub enum AmazonOperation {
     ReportsGet,
     ReportsDocument,
     NotificationsDestinations,
+    NotificationsSubscriptionsList,
     NotificationsSubscriptions,
+}
+
+impl AmazonOperation {
+    pub const fn required_role(self) -> Option<&'static str> {
+        match self {
+            Self::ReportsList | Self::ReportsGet | Self::ReportsDocument => Some("Reports"),
+            Self::NotificationsDestinations
+            | Self::NotificationsSubscriptionsList
+            | Self::NotificationsSubscriptions => Some("Notifications"),
+            Self::MarketplaceParticipations => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -334,7 +444,31 @@ pub struct AmazonSpApiRequest {
 }
 
 impl AmazonSpApiRequest {
+    pub fn validate_read_at(&self, now: DateTime<Utc>) -> Result<(), AmazonError> {
+        self.validate_read_shape()?;
+        if !self.access_token.is_valid_at(now) {
+            return Err(AmazonError::ExpiredAccessToken);
+        }
+        Ok(())
+    }
+
+    fn validate_read_shape(&self) -> Result<(), AmazonError> {
+        if self.method != "GET" {
+            return Err(AmazonError::ReadOnlyMethod(self.method.clone()));
+        }
+        if let Some(role) = self.operation.required_role()
+            && !self.scope.has_role(role)
+        {
+            return Err(AmazonError::MissingOperationRole {
+                operation: self.operation,
+                role: role.into(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn endpoint(&self) -> Result<Url, AmazonError> {
+        self.validate_read_shape()?;
         if !self.path.starts_with('/') || self.path.contains("//") || self.path.contains("..") {
             return Err(AmazonError::InvalidPath(self.path.clone()));
         }
@@ -369,6 +503,19 @@ impl AmazonSpApiResponse {
             return Err(AmazonError::HttpStatus(self.status));
         }
         serde_json::from_value(self.body.clone())
+            .map_err(|error| AmazonError::MalformedResponse(error.to_string()))
+    }
+
+    pub fn payload<T: DeserializeOwned>(&self) -> Result<T, AmazonError> {
+        if !(200..300).contains(&self.status) {
+            return Err(AmazonError::HttpStatus(self.status));
+        }
+        let payload = self
+            .body
+            .get("payload")
+            .cloned()
+            .unwrap_or_else(|| self.body.clone());
+        serde_json::from_value(payload)
             .map_err(|error| AmazonError::MalformedResponse(error.to_string()))
     }
 
@@ -411,6 +558,171 @@ impl AmazonRateLimit {
             requests_per_second,
         })
     }
+
+    fn request_interval(&self) -> Result<Duration, AmazonThrottleError> {
+        let seconds = 1.0 / self.requests_per_second;
+        if !seconds.is_finite() || seconds <= 0.0 {
+            return Err(AmazonThrottleError::InvalidInterval {
+                rate: self.raw.clone(),
+            });
+        }
+        let interval = std::time::Duration::try_from_secs_f64(seconds).map_err(|_| {
+            AmazonThrottleError::InvalidInterval {
+                rate: self.raw.clone(),
+            }
+        })?;
+        if interval.is_zero() {
+            return Err(AmazonThrottleError::InvalidInterval {
+                rate: self.raw.clone(),
+            });
+        }
+        Duration::from_std(interval).map_err(|_| AmazonThrottleError::InvalidInterval {
+            rate: self.raw.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AmazonOperationThrottle {
+    pub operation: AmazonOperation,
+    pub rate_limit: Option<AmazonRateLimit>,
+    pub last_observed_at: Option<CanonicalTime>,
+    pub next_available_at: Option<CanonicalTime>,
+}
+
+impl AmazonOperationThrottle {
+    pub fn new(operation: AmazonOperation) -> Self {
+        Self {
+            operation,
+            rate_limit: None,
+            last_observed_at: None,
+            next_available_at: None,
+        }
+    }
+
+    pub fn from_response(
+        operation: AmazonOperation,
+        response: &AmazonSpApiResponse,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Self, AmazonError> {
+        let mut throttle = Self::new(operation);
+        throttle.observe_response(response, observed_at)?;
+        Ok(throttle)
+    }
+
+    pub fn observe_response(
+        &mut self,
+        response: &AmazonSpApiResponse,
+        observed_at: DateTime<Utc>,
+    ) -> Result<AmazonResponseMetadata, AmazonError> {
+        let metadata = response.metadata()?;
+        if metadata.rate_limit.is_some() {
+            self.rate_limit.clone_from(&metadata.rate_limit);
+        }
+        self.last_observed_at = Some(CanonicalTime::from_datetime(observed_at));
+        Ok(metadata)
+    }
+
+    pub fn admit(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Result<AmazonThrottlePermit, AmazonThrottleError> {
+        if let Some(next_available_at) = self.next_available_at.as_ref()
+            && now < next_available_at.as_datetime()
+        {
+            return Err(AmazonThrottleError::ThrottledUntil {
+                operation: self.operation,
+                until: next_available_at.clone(),
+            });
+        }
+        let next_available_at = self
+            .rate_limit
+            .as_ref()
+            .map(|rate| {
+                now.checked_add_signed(rate.request_interval()?)
+                    .ok_or(AmazonThrottleError::ClockOverflow)
+            })
+            .transpose()?;
+        self.next_available_at = next_available_at.map(CanonicalTime::from_datetime);
+        Ok(AmazonThrottlePermit {
+            operation: self.operation,
+            admitted_at: CanonicalTime::from_datetime(now),
+            rate_limit: self.rate_limit.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AmazonThrottlePermit {
+    pub operation: AmazonOperation,
+    pub admitted_at: CanonicalTime,
+    pub rate_limit: Option<AmazonRateLimit>,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum AmazonThrottleError {
+    #[error("Amazon operation {operation:?} is throttled until {until:?}")]
+    ThrottledUntil {
+        operation: AmazonOperation,
+        until: CanonicalTime,
+    },
+    #[error("Amazon rate limit {rate} cannot be converted to a safe interval")]
+    InvalidInterval { rate: String },
+    #[error("Amazon throttle clock overflowed")]
+    ClockOverflow,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AmazonFirstPartySource {
+    SellingPartnerApi,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AmazonFirstPartyProvenance {
+    pub provider_id: String,
+    pub source: AmazonFirstPartySource,
+    pub evidence_level: String,
+    pub scope: AmazonAccountScope,
+    pub operation: AmazonOperation,
+    pub observed_at: CanonicalTime,
+    pub request_id: Option<String>,
+    pub rate_limit: Option<AmazonRateLimit>,
+}
+
+impl AmazonFirstPartyProvenance {
+    pub fn from_response(
+        request: &AmazonSpApiRequest,
+        response: &AmazonSpApiResponse,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Self, AmazonError> {
+        request.validate_read_at(observed_at)?;
+        let metadata = response.metadata()?;
+        Ok(Self {
+            provider_id: AMAZON_PROVIDER_ID.into(),
+            source: AmazonFirstPartySource::SellingPartnerApi,
+            evidence_level: AMAZON_READ_EVIDENCE_LEVEL.into(),
+            scope: request.scope.clone(),
+            operation: request.operation,
+            observed_at: CanonicalTime::from_datetime(observed_at),
+            request_id: metadata.request_id,
+            rate_limit: metadata.rate_limit,
+        })
+    }
+
+    pub const fn is_first_party(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AmazonFirstPartyRead<T> {
+    pub value: T,
+    pub provenance: AmazonFirstPartyProvenance,
 }
 
 pub fn marketplace_participations_request(
@@ -493,6 +805,56 @@ pub fn notification_destinations_request(
         query: BTreeMap::new(),
         access_token,
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct AmazonNotificationCursor(String);
+
+impl AmazonNotificationCursor {
+    pub fn parse(value: impl Into<String>) -> Result<Self, AmazonError> {
+        let value = value.into();
+        validate_token(&value, "notification next token")?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+pub fn list_notification_subscriptions_request(
+    scope: AmazonAccountScope,
+    access_token: LwaAccessTokenObservation,
+    notification_type: impl Into<String>,
+    payload_version: Option<String>,
+    page_size: u32,
+    next_cursor: Option<AmazonNotificationCursor>,
+) -> Result<AmazonSpApiRequest, AmazonError> {
+    if !(30..=100).contains(&page_size) {
+        return Err(AmazonError::InvalidNotificationPageSize(page_size));
+    }
+    let notification_type = notification_type.into();
+    validate_path_segment(&notification_type, "notification type")?;
+    let mut query = BTreeMap::from([
+        ("notificationTypes".into(), notification_type),
+        ("pageSize".into(), page_size.to_string()),
+    ]);
+    if let Some(payload_version) = payload_version {
+        validate_token(&payload_version, "notification payload version")?;
+        query.insert("payloadVersion".into(), payload_version);
+    }
+    if let Some(next_cursor) = next_cursor {
+        query.insert("nextToken".into(), next_cursor.0);
+    }
+    Ok(AmazonSpApiRequest {
+        scope,
+        operation: AmazonOperation::NotificationsSubscriptionsList,
+        method: "GET".into(),
+        path: format!("/notifications/{NOTIFICATIONS_API_VERSION}/subscriptions"),
+        query,
+        access_token,
+    })
 }
 
 pub fn notification_subscriptions_request(
@@ -596,6 +958,36 @@ pub fn parse_reports_page(
     })
 }
 
+pub fn parse_report_response(response: &AmazonSpApiResponse) -> Result<AmazonReport, AmazonError> {
+    response.payload::<AmazonReportPayload>()?.into_report()
+}
+
+pub fn parse_reports_page_read(
+    request: &AmazonSpApiRequest,
+    response: &AmazonSpApiResponse,
+    observed_at: DateTime<Utc>,
+) -> Result<AmazonFirstPartyRead<AmazonReportsPage>, AmazonError> {
+    ensure_operation(request, AmazonOperation::ReportsList)?;
+    let provenance = AmazonFirstPartyProvenance::from_response(request, response, observed_at)?;
+    Ok(AmazonFirstPartyRead {
+        value: parse_reports_page(response)?,
+        provenance,
+    })
+}
+
+pub fn parse_report_read(
+    request: &AmazonSpApiRequest,
+    response: &AmazonSpApiResponse,
+    observed_at: DateTime<Utc>,
+) -> Result<AmazonFirstPartyRead<AmazonReport>, AmazonError> {
+    ensure_operation(request, AmazonOperation::ReportsGet)?;
+    let provenance = AmazonFirstPartyProvenance::from_response(request, response, observed_at)?;
+    Ok(AmazonFirstPartyRead {
+        value: parse_report_response(response)?,
+        provenance,
+    })
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AmazonReportsPagePayload {
@@ -645,6 +1037,107 @@ fn parse_amazon_timestamp(value: &str) -> Result<DateTime<Utc>, AmazonError> {
     DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.with_timezone(&Utc))
         .map_err(|_| AmazonError::InvalidTimestamp(value.into()))
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AmazonNotificationSubscription {
+    pub subscription_id: String,
+    pub payload_version: String,
+    pub destination_id: String,
+}
+
+impl AmazonNotificationSubscription {
+    pub fn new(
+        subscription_id: impl Into<String>,
+        payload_version: impl Into<String>,
+        destination_id: impl Into<String>,
+    ) -> Result<Self, AmazonError> {
+        let subscription_id = subscription_id.into();
+        let payload_version = payload_version.into();
+        let destination_id = destination_id.into();
+        validate_path_segment(&subscription_id, "subscription id")?;
+        validate_token(&payload_version, "notification payload version")?;
+        validate_path_segment(&destination_id, "destination id")?;
+        Ok(Self {
+            subscription_id,
+            payload_version,
+            destination_id,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AmazonNotificationSubscriptionsPage {
+    pub subscriptions: Vec<AmazonNotificationSubscription>,
+    pub next_cursor: Option<AmazonNotificationCursor>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AmazonNotificationSubscriptionsPayload {
+    subscriptions: Vec<AmazonNotificationSubscriptionPayload>,
+    next_token: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AmazonNotificationSubscriptionPayload {
+    subscription_id: String,
+    payload_version: String,
+    destination_id: String,
+}
+
+pub fn parse_notification_subscriptions_page(
+    response: &AmazonSpApiResponse,
+) -> Result<AmazonNotificationSubscriptionsPage, AmazonError> {
+    let payload = response.payload::<AmazonNotificationSubscriptionsPayload>()?;
+    let subscriptions = payload
+        .subscriptions
+        .into_iter()
+        .map(|subscription| {
+            AmazonNotificationSubscription::new(
+                subscription.subscription_id,
+                subscription.payload_version,
+                subscription.destination_id,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let next_cursor = payload
+        .next_token
+        .map(AmazonNotificationCursor::parse)
+        .transpose()?;
+    Ok(AmazonNotificationSubscriptionsPage {
+        subscriptions,
+        next_cursor,
+    })
+}
+
+pub fn parse_notification_subscriptions_page_read(
+    request: &AmazonSpApiRequest,
+    response: &AmazonSpApiResponse,
+    observed_at: DateTime<Utc>,
+) -> Result<AmazonFirstPartyRead<AmazonNotificationSubscriptionsPage>, AmazonError> {
+    ensure_operation(request, AmazonOperation::NotificationsSubscriptionsList)?;
+    let provenance = AmazonFirstPartyProvenance::from_response(request, response, observed_at)?;
+    Ok(AmazonFirstPartyRead {
+        value: parse_notification_subscriptions_page(response)?,
+        provenance,
+    })
+}
+
+fn ensure_operation(
+    request: &AmazonSpApiRequest,
+    expected: AmazonOperation,
+) -> Result<(), AmazonError> {
+    if request.operation != expected {
+        return Err(AmazonError::UnexpectedOperation {
+            expected,
+            observed: request.operation,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -819,8 +1312,17 @@ pub enum AmazonError {
     InvalidLwaTokenLifetime,
     #[error("invalid LWA token observation")]
     InvalidLwaObservation,
+    #[error("Amazon access token is expired or not valid at the read time")]
+    ExpiredAccessToken,
     #[error("Amazon transport failed: {0}")]
     Transport(String),
+    #[error("Amazon read slice rejected non-GET method {0}")]
+    ReadOnlyMethod(String),
+    #[error("Amazon operation {operation:?} requires role {role}")]
+    MissingOperationRole {
+        operation: AmazonOperation,
+        role: String,
+    },
     #[error("invalid Amazon request path {0}")]
     InvalidPath(String),
     #[error("invalid Amazon endpoint")]
@@ -837,6 +1339,13 @@ pub enum AmazonError {
     InvalidReportStatus(String),
     #[error("invalid Amazon timestamp {0}")]
     InvalidTimestamp(String),
+    #[error("invalid Amazon notification page size {0}; expected 30..=100")]
+    InvalidNotificationPageSize(u32),
+    #[error("Amazon parser expected operation {expected:?}, observed {observed:?}")]
+    UnexpectedOperation {
+        expected: AmazonOperation,
+        observed: AmazonOperation,
+    },
     #[error("invalid Amazon path segment {kind}: {value}")]
     InvalidPathSegment { kind: &'static str, value: String },
     #[error("canonical identity error: {0}")]

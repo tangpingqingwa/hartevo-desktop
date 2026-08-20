@@ -361,6 +361,13 @@ impl DraftFulfillmentRequest {
         &self.request_digest
     }
 
+    /// Revalidates a draft recovered from Mission or a durable checkpoint.
+    /// This checks the canonical field digest and the provider-specific shape;
+    /// it does not confer approval or Effect authority.
+    pub fn validate(&self) -> Result<(), ShopifyFulfillmentEffectError> {
+        self.validate_digest()
+    }
+
     fn validate_digest(&self) -> Result<(), ShopifyFulfillmentEffectError> {
         validate_request_id(&self.request_id)?;
         validate_mission_id(&self.mission_id)?;

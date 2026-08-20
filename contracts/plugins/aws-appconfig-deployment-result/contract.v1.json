@@ -1,0 +1,258 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-appconfig-deployment-result/contract.v1.json",
+  "title": "Hartevo AWS AppConfig deployment result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-appconfig-deployment-result/v1",
+  "contractVersion": "EXT-AWS-APPCONFIG-01-L1/v1",
+  "pluginId": "aws.appconfig.deployment-result",
+  "objectiveType": "configuration_rollout_readiness",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-appconfig-deployment-result/v1|layer=1|service=aws.appconfig.deployment-result.read|provider=aws.appconfig.deployment-result.recording|consumer=mission.aws-appconfig-deployment.consumer",
+  "contractDigest": "4b33234da092646e2b5b2e88af95a92905bd1549ba9402bb6ce4acafb6eb263c",
+  "service": {
+    "type": "AwsAppConfigDeploymentService",
+    "id": "aws.appconfig.deployment-result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register_scope",
+      "list_deployments",
+      "get_deployment",
+      "compile_deployment_evidence_proposal",
+      "verify_deployment_evidence",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsAppConfigProvider",
+    "id": "aws.appconfig.deployment-result.recording",
+    "apiRevision": "appconfig-list-deployments-get-deployment-1",
+    "operations": ["ListDeployments", "GetDeployment"],
+    "allowedTransportProvenance": ["recording", "fixture", "loopback", "blocked_env"],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAwsAppConfigConsumer",
+    "id": "mission.aws-appconfig-deployment.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false
+  },
+  "credentials": {
+    "boundary": "opaque SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "applicationId",
+      "environmentId",
+      "deploymentId",
+      "configurationProfileId",
+      "configurationVersion",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "typed_and_digest_bound",
+    "configurationValues": false,
+    "rawEventBodies": false,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxEvents": 32,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ],
+    "permissions": [
+      "appconfig:ListDeployments",
+      "appconfig:GetDeployment",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "appconfig:StartDeployment",
+      "appconfig:StopDeployment",
+      "appconfig:ValidateConfiguration",
+      "appconfig:CreateDeploymentStrategy",
+      "appconfig:DeleteDeploymentStrategy",
+      "appconfig:CreateHostedConfigurationVersion",
+      "appconfig:DeleteHostedConfigurationVersion",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "account",
+      "region",
+      "application",
+      "environment",
+      "deploymentFilter",
+      "pageNumber"
+    ],
+    "filterDriftRejected": true,
+    "applicationDriftRejected": true,
+    "environmentDriftRejected": true,
+    "deploymentReplacementRejected": true,
+    "partialPageIsNonAdoptable": true
+  },
+  "metadata": {
+    "bounded": true,
+    "deploymentIdentity": [
+      "applicationId",
+      "environmentId",
+      "deploymentId",
+      "configurationProfileId",
+      "configurationVersion"
+    ],
+    "lifecycle": [
+      "deploymentStrategyId",
+      "state",
+      "percentageComplete",
+      "startedAt",
+      "lastUpdatedAt",
+      "completedAt"
+    ],
+    "eventEvidence": ["eventSequence", "eventClassification", "eventDigest"],
+    "configurationValues": false,
+    "rawEventBodies": false,
+    "rawProviderMessages": false,
+    "eventTruncationIsExplicit": true
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "filterDigest",
+      "cursorDigest",
+      "listDigest",
+      "getDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "completed",
+      "in_progress",
+      "rolling_back",
+      "rolled_back",
+      "failed",
+      "stopped",
+      "partial",
+      "not_found",
+      "access_loss",
+      "throttled",
+      "provider_unknown",
+      "registration_revoked"
+    ],
+    "tamperRejected": true,
+    "replayBound": true,
+    "revocationRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "truncationIsNonAdoptable": true,
+    "stateProgressDriftRejected": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS AppConfig application/environment/deployment/profile/version scope",
+      "bounded ListDeployments and GetDeployment seams",
+      "deployment strategy/progress/state/timestamp projection",
+      "redacted event classification and digest projection",
+      "pagination/filter/cursor fences",
+      "version/contract/provider/permission/consent/scope/evidence digests",
+      "reversible registration",
+      "redacted idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live AWS AppConfig HTTPS",
+      "StartDeployment",
+      "StopDeployment",
+      "ValidateConfiguration",
+      "deployment or configuration mutation",
+      "configuration values",
+      "raw event bodies",
+      "verified Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live AWS AppConfig HTTPS",
+    "durable provider receipt",
+    "independent deployment read-back",
+    "consented StartDeployment/StopDeployment/ValidateConfiguration effects",
+    "Connected/native/first-party evidence",
+    "Hartevo Outcome or Work Product adoption"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live ListDeployments/GetDeployment HTTPS, durable provider receipt, independent deployment read-back, consented deployment effects, and verified Mission adoption remain Layer-2 work; recording, fixture, loopback and BLOCKED_ENV never claim Connected, native or first-party evidence. A completed deployment is provider-state metadata, not proof that configuration values are valid or that a Work Product is adopted."
+}
