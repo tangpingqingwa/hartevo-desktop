@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/azure-container-apps-revision-result/azure-container-apps-revision-result.v1.json",
+  "title": "Hartevo Azure Container Apps governed revision result Layer-1 contract",
+  "schemaVersion": "hartevo.azure-container-apps-revision-result/v1",
+  "contractVersion": "EXT-AZURE-CONTAINER-APPS-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "azure.container-apps.revision.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.azure-container-apps-revision-result/v1|layer=1|service=azure.container-apps.revision.result.read|provider=azure.container-apps.revision.result.recording|consumer=mission.azure-container-apps-revision.consumer|api=azure-container-apps-get-get-revision-list-revisions-2026-01-01-r1",
+  "contractDigest": "19259fdc1520e1afe2eadb68895c4b63ef5d9891cd48632c03e8e4399fc992f1",
+  "service": {
+    "type": "AzureContainerAppsRevisionResultService",
+    "id": "azure.container-apps.revision.result.read",
+    "operations": ["GetContainerApp", "GetRevision", "ListRevisions", "describe_capabilities", "register", "revoke_registration", "reverse_registration", "restore_registration", "propose", "record"],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AzureContainerAppsProvider",
+    "id": "azure.container-apps.revision.result.recording",
+    "apiRevision": "azure-container-apps-get-get-revision-list-revisions-2026-01-01-r1",
+    "operations": ["GetContainerApp", "GetRevision", "ListRevisions"],
+    "allowedTransports": ["fixture", "recording", "fake", "loopback", "blocked_env"],
+    "authentication": {"scheme": "entra_bearer", "secretReference": "opaque_only", "nativeResolution": false, "rawCredentialMaterial": false},
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "type": "MissionAzureContainerAppsRevisionConsumer",
+    "id": "mission.azure-container-apps-revision.consumer",
+    "scope": ["tenantId", "subscriptionId", "resourceGroup", "environmentId", "containerApp", "revision", "imageDigest", "componentId", "projectId", "projectRevision", "missionId", "missionRevision", "workProductId", "workProductRevision"],
+    "authority": "proposal_and_recording_below_kernel",
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false
+  },
+  "credentials": {"boundary": "opaque Entra SecretReference", "serialized": false, "debugRedacted": true, "rawMaterialAccepted": false, "resolvedByLayer": 2},
+  "scope": {
+    "required": ["tenantId", "subscriptionId", "resourceGroup", "environmentId", "containerApp", "revision", "imageDigest", "componentId", "projectId", "projectRevision", "missionId", "missionRevision", "workProductId", "workProductRevision"],
+    "identifiersInEvidence": "digest_only",
+    "rawResourceIds": false,
+    "rawImageReferences": false,
+    "rawConfigurationBytes": false,
+    "maxPages": 8,
+    "maxPageSize": 50,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "bindingDigests": ["pluginVersionDigest", "contractVersionDigest", "contractDigest", "providerIdDigest", "providerDigest", "apiDigest", "permissionDigest", "scopeDigest", "secretReferenceDigest", "evidenceSchemaDigest", "registrationRevision", "registrationDigest"],
+    "failClosedOn": ["version_drift", "contract_drift", "provider_drift", "api_drift", "permission_drift", "scope_drift", "evidence_drift", "stale_state", "tamper", "replay_conflict", "pagination_loop", "truncation", "access_loss", "provider_unknown", "revocation"],
+    "permissions": ["Microsoft.App/containerApps/read", "Microsoft.App/containerApps/revisions/read", "mission.scope"],
+    "forbiddenPermissions": ["Microsoft.App/containerApps/write", "Microsoft.App/containerApps/delete", "Microsoft.App/containerApps/start/action", "Microsoft.App/containerApps/stop/action", "Microsoft.App/containerApps/revisions/activate/action", "Microsoft.App/containerApps/revisions/deactivate/action", "Microsoft.App/containerApps/revisions/restart/action", "Microsoft.App/containerApps/revisions/exec/action", "Microsoft.App/containerApps/logs/read", "Microsoft.Authorization/roleAssignments/write", "outcome.adopt"]
+  },
+  "pagination": {"style": "opaque_nextLink", "cursorOpaque": true, "cursorDigestOnly": true, "rawNextLinkRetained": false, "loopRejected": true, "filterDriftRejected": true, "truncationIsNonAdoptable": true, "maxPages": 8},
+  "projection": {
+    "app": ["appDigest", "provisioningState", "latestRevisionDigest"],
+    "revision": ["revisionDigest", "active", "healthState", "provisioningState", "runningState", "createdTime", "lastActiveTime", "replicas", "trafficWeight", "redactedImageDigest"],
+    "readiness": ["appProvisioningState", "revisionProvisioningState", "healthState", "runningState", "active", "replicas", "trafficWeight"],
+    "redacted": ["fqdn", "template", "commands", "args", "environmentVariableNames", "environmentVariableValues", "secretReferences", "scaleRules", "identities", "registries", "volumes", "probes", "systemDataIdentities", "logs", "rawProviderErrors"]
+  },
+  "receipts": {
+    "request": {"redacted": true, "retain": ["operation", "requestDigest", "pathDigest", "scopeDigest", "pageDigest", "responseBytes", "responseDigest"], "drop": ["rawResourcePath", "rawNextLink", "authorizationHeader", "credentialMaterial", "rawProviderError"]},
+    "provider": {"durableProviderReceipt": false, "localRecording": true}
+  },
+  "evidence": {
+    "requiredDigests": ["pluginVersionDigest", "contractVersionDigest", "contractDigest", "providerDigest", "apiDigest", "permissionDigest", "scopeDigest", "evidenceSchemaDigest", "evidenceDigest"],
+    "states": ["provisioning", "running", "healthy", "unhealthy", "inactive", "failed", "deprovisioned", "partial", "access_lost", "provider_unknown", "tampered", "revoked", "not_found", "timed_out", "throttled", "pagination_loop", "truncated", "conflict"],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "partialIsNonAdoptable": true,
+    "truncationIsNonAdoptable": true,
+    "driftIsNonAdoptable": true
+  },
+  "provenance": {"fixture": "non_native_non_connected_non_first_party", "recording": "non_native_non_connected_non_first_party", "fake": "non_native_non_connected_non_first_party", "loopback": "non_native_non_connected_non_first_party", "blockedEnv": "non_native_non_connected_non_first_party", "connectedClaim": false, "nativeClaim": false, "firstPartyClaim": false, "providerReceipt": false},
+  "authorityBoundary": {
+    "owns": ["typed tenant/subscription/resource-group/environment/container-app/revision/component/Project/Mission/Work Product scope", "bounded Container Apps Get, Get Revision, and List Revisions read seams", "app/revision readiness, health, provisioning, running, replica, traffic, timestamp, and redacted image metadata", "opaque nextLink pagination and page/response bounds", "version/contract/provider/api/permission/scope/evidence digests", "reversible and revocable registration", "redacted idempotent local recording"],
+    "doesNotOwn": ["Hartevo Truth", "Hartevo Consent", "Hartevo Effect", "Hartevo Receipt", "Hartevo Verification authority", "Hartevo Outcome", "durable provider receipt", "native Entra resolution", "live Azure Resource Manager HTTPS", "Container App deploy or update", "revision activation, deactivation, restart, or exec", "traffic or scale mutation", "IAM, identity, secret, domain, or endpoint mutation", "logs, templates, environment variables, or raw provider errors", "endpoint reachability", "workload correctness", "successful release", "verified Work Product adoption"]
+  },
+  "forbiddenEffects": ["create_or_update_container_app", "delete_container_app", "activate_revision", "deactivate_revision", "restart_revision", "traffic_mutation", "scale_mutation", "exec", "log_download", "secret_read", "identity_mutation", "iam_mutation", "adopt_outcome", "adopt_work_product"],
+  "layer2Gaps": ["native Entra credential resolution", "live ARM HTTPS transport", "durable Azure provider receipt", "independent repeat-read reconciliation", "verified Work Product adoption"]
+}

@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/gcp-pubsub-subscription-result/gcp-pubsub-subscription-result.v1.json",
+  "schemaVersion": "hartevo-gcp-pubsub-subscription-result-contract/v1",
+  "contractVersion": "gcp-pubsub-subscription-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "gcp.pubsub.subscription.result",
+    "version": "1.0.0",
+    "operation": "governed_subscription_posture_read",
+    "readOnly": true,
+    "liveExecution": false,
+    "typed": "GcpPubsubSubscriptionResultService"
+  },
+  "provider": {
+    "id": "gcp.pubsub.subscription",
+    "version": "1.0.0",
+    "operations": [
+      "GET /v1/{topic}",
+      "GET /v1/{subscription}",
+      "GET /v1/{project}/subscriptions"
+    ],
+    "acceptedProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "typed": "GcpPubsubProvider",
+    "native": false,
+    "firstParty": false,
+    "messageEffects": false
+  },
+  "consumer": {
+    "id": "mission.gcp.pubsub.subscription.result.consumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "typed": "MissionGcpPubsubConsumer",
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false
+  },
+  "scope": {
+    "required": [
+      "project",
+      "topic",
+      "subscription",
+      "schema",
+      "deadLetterTopic",
+      "retryPolicy",
+      "retentionPolicy",
+      "expirationPolicy",
+      "filter",
+      "pushEndpointDomain",
+      "mission",
+      "workProduct",
+      "workProductRevision",
+      "permissionDigest",
+      "consentDigest"
+    ],
+    "secret": "opaque_secret_reference_only",
+    "resourceNames": "scope_bound_digest_only_in_result"
+  },
+  "readPolicy": {
+    "allow": ["get_topic_configuration", "get_subscription_configuration", "list_subscriptions"],
+    "deny": [
+      "publish",
+      "pull",
+      "acknowledge",
+      "seek",
+      "detach",
+      "modify_ack_deadline",
+      "modify_push_config",
+      "create",
+      "patch",
+      "delete",
+      "set_iam_policy",
+      "message_body",
+      "message_attributes",
+      "ordering_keys",
+      "ack_ids",
+      "subscriber_pii"
+    ]
+  },
+  "evidence": {
+    "digests": [
+      "topic",
+      "subscription",
+      "configuration",
+      "permission",
+      "result"
+    ],
+    "boundedProjections": [
+      "resource_digest",
+      "schema_digest",
+      "dead_letter_topic_digest",
+      "filter_digest_and_length",
+      "push_endpoint_domain",
+      "push_endpoint_digest",
+      "oidc_identity_digest",
+      "retention_seconds",
+      "retry_seconds",
+      "expiration_seconds"
+    ],
+    "pageToken": "opaque_digest_bound_to_scope_and_list_request",
+    "messageData": "never_retained"
+  },
+  "postureStates": [
+    "ACTIVE",
+    "DETACHED",
+    "EXPIRED",
+    "MISCONFIGURED",
+    "PARTIAL",
+    "ACCESS_LOST",
+    "PROVIDER_UNKNOWN",
+    "TAMPERED",
+    "REVOKED"
+  ],
+  "registration": {
+    "versionBound": true,
+    "digestBound": true,
+    "scopeBound": true,
+    "reversible": true,
+    "revocable": true
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "durableReceipt": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAuthority": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "native_oauth_or_service_account_https",
+    "durable_provider_receipt",
+    "independent_configuration_readback",
+    "verified_permission_and_consent_adoption",
+    "kernel_truth_consent_effect_receipt_verification_outcome_authority",
+    "delivery_completion_or_message_evidence"
+  ],
+  "officialApiBasis": [
+    "https://docs.cloud.google.com/pubsub/docs/reference/rest/v1/projects.subscriptions/get",
+    "https://docs.cloud.google.com/pubsub/docs/reference/rest"
+  ]
+}
