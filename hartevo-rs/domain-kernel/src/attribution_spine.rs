@@ -20,6 +20,9 @@ use crate::{CurrencyCode, FxQuote, MissionId, Money, ProjectId, TenantId};
 
 pub const ATTRIBUTION_SPINE_SCHEMA_VERSION: &str = "hartevo-attribution-spine/v1";
 pub const ATTRIBUTION_SPINE_EVENT_TYPE: &str = "attribution-spine.observation-batch/v1";
+pub const ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE: &str = "attribution-spine.outcome-candidate/v1";
+pub const ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE: &str =
+    "attribution-spine.verified-outcome/v1";
 
 macro_rules! spine_id {
     ($name:ident) => {
@@ -572,6 +575,7 @@ impl OutcomeCandidate {
                     .outcome_kind()
                     .ok_or(AttributionError::NotAnOutcomeEvent)?
             || self.source_event_digest != event.canonical_digest()?
+            || self.provenance != event.provenance
         {
             return Err(AttributionError::CandidateSourceMismatch);
         }
@@ -688,6 +692,9 @@ impl SourceObservationBatch {
         {
             return Err(AttributionError::CursorScopeMismatch);
         }
+        if self.cursor_after.batch_digest != self.content_digest()? {
+            return Err(AttributionError::CursorBatchDigestMismatch);
+        }
         if let Some(cursor) = &self.cursor_before {
             cursor.validate()?;
             if cursor.provider != self.provider || cursor.account_id != self.account_id {
@@ -715,6 +722,23 @@ impl SourceObservationBatch {
 
     pub fn canonical_digest(&self) -> Result<String, AttributionError> {
         canonical_digest(self)
+    }
+
+    /// Digest of the exact provider payload covered by `cursor_after`.
+    /// `cursor_after.batch_digest` is intentionally excluded to avoid a
+    /// self-referential digest and to make cursor fences independently
+    /// verifiable after a restart.
+    pub fn content_digest(&self) -> Result<String, AttributionError> {
+        canonical_digest(&(
+            ATTRIBUTION_SPINE_SCHEMA_VERSION,
+            &self.tenant_id,
+            &self.project_id,
+            &self.mission_id,
+            &self.provider,
+            &self.account_id,
+            &self.cursor_before,
+            &self.events,
+        ))
     }
 }
 
@@ -990,6 +1014,20 @@ impl AttributionLedger {
     }
 
     pub fn ingest_batch(
+        &mut self,
+        batch: SourceObservationBatch,
+    ) -> Result<BatchIngestResult, AttributionError> {
+        let before = self.clone();
+        match self.ingest_batch_inner(batch) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                *self = before;
+                Err(error)
+            }
+        }
+    }
+
+    fn ingest_batch_inner(
         &mut self,
         batch: SourceObservationBatch,
     ) -> Result<BatchIngestResult, AttributionError> {
@@ -1409,6 +1447,8 @@ pub enum AttributionError {
     InvalidObservationBatch,
     #[error("observation batch cursor is outside its provider/account scope")]
     CursorScopeMismatch,
+    #[error("observation batch cursor is not bound to the exact batch content")]
+    CursorBatchDigestMismatch,
     #[error("observation batch cursor regressed")]
     CursorRegression,
     #[error("observation batch cursor fence does not match durable state")]
@@ -1628,7 +1668,7 @@ mod tests {
         // valid batch remain replayable by provider time, while correction
         // chains still require their parent.
         let mut replay = ledger();
-        let batch = SourceObservationBatch {
+        let mut batch = SourceObservationBatch {
             tenant_id: TenantId::from("tenant-1"),
             project_id: ProjectId::from("project-1"),
             mission_id: Some(MissionId::from("mission-11")),
@@ -1646,6 +1686,7 @@ mod tests {
             },
             events: vec![order, click],
         };
+        batch.cursor_after.batch_digest = batch.content_digest().expect("batch digest");
         // Batch transport may contain out-of-order events, but a correction
         // parent is still a hard invariant. Here both are originals.
         replay.ingest_batch(batch).expect("batch");
@@ -1675,6 +1716,76 @@ mod tests {
             .expect("batch replay");
         assert_eq!(expected.assignments.len(), replayed.assignments.len());
         assert_eq!(expected.event_order_digest, replayed.event_order_digest);
+    }
+
+    #[test]
+    fn batch_ingestion_is_atomic_and_cursor_binds_exact_content() {
+        let mut ledger = ledger();
+        let click = event("meta", "atomic-click", SourceEventKind::Click, 1, |links| {
+            links.click = Some(link(SourceEntityKind::Click, "meta", "atomic-click"));
+        });
+        let mut invalid_order = event("meta", "atomic-order", SourceEventKind::Order, 2, |links| {
+            links.order = Some(link(SourceEntityKind::Order, "meta", "atomic-order"));
+        });
+        invalid_order.links.order = None;
+        let mut invalid_batch = SourceObservationBatch {
+            tenant_id: TenantId::from("tenant-1"),
+            project_id: ProjectId::from("project-1"),
+            mission_id: Some(MissionId::from("mission-11")),
+            provider: "meta".into(),
+            account_id: "acct-1".into(),
+            cursor_before: None,
+            cursor_after: ProviderCursor {
+                provider: "meta".into(),
+                account_id: "acct-1".into(),
+                sequence: 1,
+                token: "atomic-cursor".into(),
+                observed_through: at(4),
+                ingested_at: at(5),
+                batch_digest: "0".repeat(64),
+            },
+            events: vec![click.clone(), invalid_order],
+        };
+        invalid_batch.cursor_after.batch_digest = invalid_batch.content_digest().expect("digest");
+        let before = ledger.clone();
+        assert!(matches!(
+            ledger.ingest_batch(invalid_batch),
+            Err(AttributionError::InvalidEntityLink)
+        ));
+        assert_eq!(
+            ledger, before,
+            "a failed batch must not partially advance the ledger"
+        );
+
+        let mut valid_batch = SourceObservationBatch {
+            tenant_id: TenantId::from("tenant-1"),
+            project_id: ProjectId::from("project-1"),
+            mission_id: Some(MissionId::from("mission-11")),
+            provider: "meta".into(),
+            account_id: "acct-1".into(),
+            cursor_before: None,
+            cursor_after: ProviderCursor {
+                provider: "meta".into(),
+                account_id: "acct-1".into(),
+                sequence: 1,
+                token: "atomic-cursor".into(),
+                observed_through: at(4),
+                ingested_at: at(5),
+                batch_digest: "0".repeat(64),
+            },
+            events: vec![click],
+        };
+        valid_batch.cursor_after.batch_digest = valid_batch.content_digest().expect("digest");
+        valid_batch.events[0].payload_digest = "1".repeat(64);
+        let before = ledger.clone();
+        assert!(matches!(
+            ledger.ingest_batch(valid_batch),
+            Err(AttributionError::CursorBatchDigestMismatch)
+        ));
+        assert_eq!(
+            ledger, before,
+            "a cursor digest mismatch must not ingest anything"
+        );
     }
 
     #[test]
@@ -1834,6 +1945,12 @@ mod tests {
         let candidate = order.outcome_candidate().expect("candidate");
         let candidate_id = candidate.id.clone();
         ledger.ingest_event(order).expect("event");
+        let mut tampered_candidate = candidate.clone();
+        tampered_candidate.provenance.request_digest = "3".repeat(64);
+        assert!(matches!(
+            ledger.register_candidate(tampered_candidate),
+            Err(AttributionError::CandidateSourceMismatch)
+        ));
         ledger.register_candidate(candidate).expect("candidate");
         assert!(matches!(
             ledger.verify_candidate(

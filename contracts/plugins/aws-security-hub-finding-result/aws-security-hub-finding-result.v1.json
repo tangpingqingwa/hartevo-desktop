@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/aws-security-hub-finding-result/aws-security-hub-finding-result.v1.json",
+  "schemaVersion": "hartevo.aws-security-hub-finding-result-contract/v1",
+  "contractVersion": "aws-security-hub-finding-result/v1",
+  "layer": 1,
+  "service": {
+    "id": "aws-security-hub.finding-result",
+    "implementation": "AwsSecurityHubFindingService",
+    "version": "1.0.0",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "read_get_findings",
+      "read_get_findings_v2",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "arbitraryQuery": false,
+    "rawFindingJson": false,
+    "native": false
+  },
+  "provider": {
+    "id": "aws-security-hub.findings",
+    "implementation": "AwsSecurityHubProvider",
+    "version": "1.0.0",
+    "apiVersion": "2018-10-26",
+    "apiOperations": ["GetFindings", "GetFindingsV2"],
+    "iamPermissions": ["securityhub:GetFindings"],
+    "getFindingsV2PermissionNote": "AWS documents GetFindingsV2 as using the securityhub:GetFindings permission.",
+    "acceptedProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "native": false,
+    "liveCredentialResolution": false,
+    "externalWrites": false,
+    "mutationOperations": []
+  },
+  "consumer": {
+    "id": "mission.aws-security-hub-finding-result",
+    "implementation": "MissionAwsSecurityHubConsumer",
+    "version": "1.0.0",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "durableReceiptAuthority": false
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "productArn",
+      "sourceId",
+      "findingId",
+      "resourceId",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "permissionDigest"
+    ],
+    "filterBinding": ["severity", "status", "resourceType", "resourceId", "sourceId"],
+    "pageBinding": ["apiOperation", "scopeDigest", "filterDigest", "pageNumber", "pageSize", "pageTokenDigest"],
+    "secret": "opaque_non_serializing_sigv4_secret_reference_only"
+  },
+  "digests": {
+    "required": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "evidenceDigest",
+      "registrationDigest"
+    ],
+    "secretMaterialExcluded": true
+  },
+  "findingProjection": {
+    "fields": ["findingId", "productArn", "sourceId", "severity", "status", "resourceMetadata"],
+    "severity": ["informational", "low", "medium", "high", "critical", "unknown"],
+    "status": ["new", "in_progress", "resolved", "suppressed", "unknown"],
+    "resourceMetadata": ["resourceId", "resourceType", "awsAccountId", "awsRegion", "tagsDigest"],
+    "redactedFields": [
+      "description",
+      "remediation",
+      "productFields",
+      "userDefinedFields",
+      "rawProviderPayload",
+      "providerAccessToken"
+    ],
+    "rawFindingJsonRetained": false
+  },
+  "evidence": {
+    "statuses": ["complete", "partial", "access_lost"],
+    "adversarialCases": ["tampered", "revoked", "partial", "access_loss"],
+    "bounded": {
+      "maxPages": 4,
+      "maxPageSize": 100,
+      "maxFindings": 400,
+      "maxIdentifierBytes": 256
+    },
+    "readProposalRecordVerify": true,
+    "independentNativeReadback": false
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "evidenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "authority": {
+    "readOnly": true,
+    "externalWrites": false,
+    "connected": false,
+    "nativeProvider": false,
+    "liveCredentialResolution": false,
+    "rawFindingJson": false,
+    "durableReceipt": false,
+    "verificationAuthority": false,
+    "outcomeAuthority": false,
+    "workProductAdoption": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "transport": {
+    "fixture": true,
+    "recording": true,
+    "loopback": true,
+    "blockedEnv": true,
+    "productionRead": false,
+    "rawRequestsRetained": false,
+    "rawResponsesRetained": false,
+    "rawSecretsRetained": false
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_sigv4_and_connected_authority",
+    "failClosedCases": [
+      "missing_native_sigv4_authority",
+      "missing_live_credential_resolver",
+      "contract_or_provider_drift",
+      "permission_or_scope_drift",
+      "filter_or_page_binding_drift",
+      "tampered_evidence",
+      "revoked_registration",
+      "raw_finding_json_request",
+      "finding_update_or_mute_request",
+      "remediation_or_external_write_request"
+    ]
+  },
+  "honestNativeGap": "Layer 1 supplies bounded normalized finding evidence and read/proposal/record/verify seams through fixture, recording, loopback, or BLOCKED_ENV transports. It does not resolve SigV4 credentials, claim Connected/native status, retain raw finding JSON, mutate findings, create durable receipts, verify through an independent live readback, or adopt a Work Product outcome."
+}
