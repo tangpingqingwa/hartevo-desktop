@@ -1,7 +1,25 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod observation_evidence_pack;
+mod plugin_invocation_timeline;
 mod runtime_text_subscription;
 
+pub use observation_evidence_pack::{
+    ObservationClassification, ObservationEvidencePack, ObservationPackConsumer,
+    ObservationPipelineError, ObservationPipelineRequest, ObservationPipelineResult,
+    ObservationPlanBinding, ObservationProviderRequest, ObservationSourceBinding,
+    ObservationSourceKind, ObservationStopCommand, ObservationStopResult,
+    RuntimeObservationProvider, TypedRuntimeObservation,
+};
+pub use plugin_invocation_timeline::{
+    PLUGIN_INVOCATION_TIMELINE_MAX_PAGE_SIZE, PluginInvocationTimeline,
+    PluginInvocationTimelineAuditPage, PluginInvocationTimelineCursor,
+    PluginInvocationTimelineEntry, PluginInvocationTimelineError,
+    PluginInvocationTimelineInlineNode, PluginInvocationTimelineInlinePage,
+    PluginInvocationTimelineLifecycle, PluginInvocationTimelineMissionShellConsumer,
+    PluginInvocationTimelineNodeStatus, PluginInvocationTimelineProvider,
+    PluginInvocationTimelineScope, PluginInvocationTimelineStage,
+};
 pub use runtime_text_subscription::{
     CatalogMissionExecutionHandle, CatalogMissionExecutionStart,
     RUNTIME_TEXT_SUBSCRIPTION_MAX_PAGE_SIZE, RuntimeTextSubscriptionBatch,
@@ -16,11 +34,12 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_browser_adapter::{
-    BrowserAction, BrowserControlHost, BrowserError, BrowserFileGrant, BrowserFileType,
-    BrowserIdentity, BrowserLeaseProof, BrowserLocatorResolution, BrowserProfile,
-    BrowserRecipeActivation, BrowserRecipeCandidate, BrowserRecipePreparedPlan,
-    BrowserRecipeRelease, BrowserRecipeResolvedAction, BrowserWorkspace, FileBroker,
-    FileBrokerReconciliation, FileSafetyScanner, FileUploadHandle, TrustedBrowserRecipeKey,
+    BrowserAction, BrowserActionBatch, BrowserBatchReceipt, BrowserControlHost, BrowserError,
+    BrowserFileGrant, BrowserFileType, BrowserIdentity, BrowserLeaseProof,
+    BrowserLocatorResolution, BrowserProfile, BrowserRecipeActivation, BrowserRecipeCandidate,
+    BrowserRecipePreparedPlan, BrowserRecipeRelease, BrowserRecipeResolvedAction, BrowserWorkspace,
+    FileBroker, FileBrokerReconciliation, FileSafetyScanner, FileUploadHandle,
+    TrustedBrowserRecipeKey,
 };
 use hartevo_catalog::{CapabilityManifest, Catalog, CatalogError, MissionManifest};
 use hartevo_cloud_storage::{
@@ -35,29 +54,29 @@ use hartevo_context_fabric::{
 };
 use hartevo_domain_kernel::{
     AcceptanceCheck, AccountId, ActorId, ApprovalPolicy, AttributionRecord,
-    AutomatedReplyAuthorization, AutonomyLevel, BrowserControlLeaseId, BrowserFileClaimId,
-    BrowserFileGrantId, BrowserProfileId, BrowserRecipeId, BrowserTabId, BrowserWorkspaceId,
-    Cadence, CadenceTriggerKind, Campaign, CampaignId, CampaignSendAuthorization, CommissionId,
-    CommissionRecord, Company, CompanyId, Connection, ConnectionError, ConnectionId,
-    ConnectionProbe, ConnectionSnapshot, ConsentPurpose, ConsentRecord, ConsentRecordId,
-    ConsentRequirement, ConsentState, Constraint, ContextAssemblyId, ContextBranch,
-    ContextBranchId, ContextBranchMerge, ContextBranchMergeId, ContextBranchStatus, ContextBudget,
-    ContextCapsule, ContextCapsuleId, ContextCapsuleStatus, ContextCheckpoint, ContextCheckpointId,
-    ContextCompactionRecord, ContextCompactionRecordId, ContextContinuationLedgerId,
-    ContextDataPolicy, ContextError, ContextFactGrant, ContextFoundationSnapshot, ContextInputRefs,
-    ContextMergePolicy, ContextReturnContract, ContextReturnReceipt, ContextWorkerMailboxId,
-    ContextWorkerMessage, ContextWorkerMessageId, ContextWorkerMessageKind, ContextWorkingItem,
-    ContextWorkingSet, ContextWorkingSetId, ContextWorkspace, ContextWorkspaceId,
-    ContinuationEntry, ContinuationEntryInput, ContinuationEntryKind, ContinuationLedger,
-    Conversation, ConversationEffectGuard, ConversationId, ConversationIdentitySnapshot,
-    CreatorApplicationId, CreatorApplicationInput, CreatorCandidate, CreatorContactEffectGuard,
-    CreatorDeliverableInput, CreatorEligibility, CreatorExternalProof, CreatorHiring,
-    CreatorHiringError, CreatorHiringId, CreatorHiringSpec, CreatorId, CreatorIdentitySnapshot,
-    CreatorMilestoneId, CreatorPayoutConfirmation, CreatorTask, CreatorTaskId, CreatorTaskSpec,
-    CreatorWorkError, CurrencyCode, DeletionError, DeletionId, DeletionReason, DeletionTombstone,
-    DeliverableId, DeliverableReviewInput, DeviceAttachment, DeviceAttachmentId,
-    DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim, DeviceHandoffContext,
-    DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
+    AutomatedReplyAuthorization, AutonomyLevel, BrowserActionBatchId, BrowserControlLeaseId,
+    BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId, BrowserRecipeId, BrowserTabId,
+    BrowserWorkspaceId, Cadence, CadenceTriggerKind, Campaign, CampaignId,
+    CampaignSendAuthorization, CommissionId, CommissionRecord, Company, CompanyId, Connection,
+    ConnectionError, ConnectionId, ConnectionProbe, ConnectionSnapshot, ConsentPurpose,
+    ConsentRecord, ConsentRecordId, ConsentRequirement, ConsentState, Constraint,
+    ContextAssemblyId, ContextBranch, ContextBranchId, ContextBranchMerge, ContextBranchMergeId,
+    ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleId, ContextCapsuleStatus,
+    ContextCheckpoint, ContextCheckpointId, ContextCompactionRecord, ContextCompactionRecordId,
+    ContextContinuationLedgerId, ContextDataPolicy, ContextError, ContextFactGrant,
+    ContextFoundationSnapshot, ContextInputRefs, ContextMergePolicy, ContextReturnContract,
+    ContextReturnReceipt, ContextWorkerMailboxId, ContextWorkerMessage, ContextWorkerMessageId,
+    ContextWorkerMessageKind, ContextWorkingItem, ContextWorkingSet, ContextWorkingSetId,
+    ContextWorkspace, ContextWorkspaceId, ContinuationEntry, ContinuationEntryInput,
+    ContinuationEntryKind, ContinuationLedger, Conversation, ConversationEffectGuard,
+    ConversationId, ConversationIdentitySnapshot, CreatorApplicationId, CreatorApplicationInput,
+    CreatorCandidate, CreatorContactEffectGuard, CreatorDeliverableInput, CreatorEligibility,
+    CreatorExternalProof, CreatorHiring, CreatorHiringError, CreatorHiringId, CreatorHiringSpec,
+    CreatorId, CreatorIdentitySnapshot, CreatorMilestoneId, CreatorPayoutConfirmation, CreatorTask,
+    CreatorTaskId, CreatorTaskSpec, CreatorWorkError, CurrencyCode, DeletionError, DeletionId,
+    DeletionReason, DeletionTombstone, DeliverableId, DeliverableReviewInput, DeviceAttachment,
+    DeviceAttachmentId, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim,
+    DeviceHandoffContext, DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
     DevicePublicKeyRegistration, Effect, EffectClass, EffectId, EffectRisk, EffectSpec,
     EffectStatus, Evidence, EvidenceId, EvidenceStatus, FactId, FundingReservation, IdentityError,
     IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject, InboundIngest,
@@ -2181,6 +2200,15 @@ pub struct ContinueBrowserWorkspace {
     pub new_lease_id: BrowserControlLeaseId,
     pub lease_expires_at: DateTime<Utc>,
     pub evidence_digest: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AcknowledgeBrowserBatchReceipt {
+    pub project_id: ProjectId,
+    pub workspace_id: BrowserWorkspaceId,
+    pub expected_revision: u64,
+    pub batch: BrowserActionBatch,
+    pub receipt: BrowserBatchReceipt,
 }
 
 #[derive(Clone)]
@@ -4790,6 +4818,50 @@ impl ApplicationService {
         Ok(self
             .store
             .load_browser_workspace(project_id, workspace_id)?)
+    }
+
+    pub fn acknowledge_browser_batch_receipt(
+        &mut self,
+        command: AcknowledgeBrowserBatchReceipt,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserWorkspace, ApplicationError> {
+        let mut workspace = self
+            .store
+            .load_browser_workspace(&command.project_id, &command.workspace_id)?;
+        command.receipt.validate_for(&command.batch)?;
+        if command.batch.workspace_id != command.workspace_id
+            || command.batch.project_id != command.project_id
+        {
+            return Err(BrowserError::InvalidBatchReceipt.into());
+        }
+        if workspace.batch_receipt(&command.batch.id) == Some(&command.receipt)
+            && (workspace.revision == command.expected_revision
+                || workspace.revision == command.expected_revision.saturating_add(1))
+        {
+            return Ok(workspace);
+        }
+        workspace.acknowledge_batch_receipt(
+            command.expected_revision,
+            &command.batch,
+            command.receipt,
+            now,
+        )?;
+        self.store
+            .update_browser_workspace_atomic(&workspace, command.expected_revision)?;
+        Ok(workspace)
+    }
+
+    pub fn load_browser_batch_receipt(
+        &self,
+        project_id: &ProjectId,
+        workspace_id: &BrowserWorkspaceId,
+        batch_id: &BrowserActionBatchId,
+    ) -> Result<Option<BrowserBatchReceipt>, ApplicationError> {
+        Ok(self
+            .store
+            .load_browser_workspace(project_id, workspace_id)?
+            .batch_receipt(batch_id)
+            .cloned())
     }
 
     pub fn install_browser_recipe_trust_key(
@@ -27234,22 +27306,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn runtime_process_orphan_fixture() {
-        if std::env::var("HARTEVO_RUNTIME_PROCESS_ORPHAN_FIXTURE").as_deref() != Ok("run") {
-            return;
-        }
-        loop {
-            std::thread::sleep(StdDuration::from_mins(1));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the crash-recovery test proves real process reaping, privacy projection, attempt fencing, a second commit-gap crash, and idempotent replay end to end"
+        reason = "the crash-recovery test proves exact exited-claim cleanup, privacy projection, attempt fencing, a second commit-gap crash, and idempotent replay end to end"
     )]
-    fn startup_reconciliation_reaps_exact_forgotten_runtime_process_claim() {
+    fn startup_reconciliation_reconciles_exact_exited_runtime_process_claim() {
         let mut fixture = runtime_recovery_fixture();
         let attached = fixture
             .service
@@ -27307,16 +27368,6 @@ mod tests {
         command.expected_program_sha256 = Some(sha256(
             &std::fs::read(&program).expect("read test executable"),
         ));
-        command.args = vec![
-            "--exact".into(),
-            "tests::runtime_process_orphan_fixture".into(),
-            "--nocapture".into(),
-        ];
-        command.environment.insert(
-            "HARTEVO_RUNTIME_PROCESS_ORPHAN_FIXTURE".into(),
-            "run".into(),
-        );
-        command.shutdown_grace = StdDuration::from_millis(25);
         let launch_token = generate_runtime_launch_token(&command).expect("launch token");
         let launch = prepare_runtime_launch(&command, &launch_token).expect("launch spec");
         let mut claim = RuntimeProcessClaim::prepare(
@@ -27345,25 +27396,18 @@ mod tests {
                 now() + Duration::seconds(7),
             )
             .expect("persist process claim");
-        let runtime = StdioRuntime::spawn_prepared(&command, &launch).expect("spawn fixture");
         let expected_recovery_revision = recovery.revision;
         let expected_claim_revision = claim.revision;
         recovery
-            .mark_spawned(
-                runtime.instance_digest().to_owned(),
-                now() + Duration::seconds(8),
-            )
+            .mark_spawned("2".repeat(64), now() + Duration::seconds(8))
             .expect("mark recovery spawned");
         claim
             .mark_spawned(
                 RuntimeProcessIdentity {
-                    process_id: runtime.process_identity().process_id,
-                    started_at_epoch_seconds: runtime.process_identity().started_at_epoch_seconds,
-                    executable_path_digest: runtime
-                        .process_identity()
-                        .executable_path_digest
-                        .clone(),
-                    runtime_instance_digest: runtime.instance_digest().to_owned(),
+                    process_id: u32::MAX,
+                    started_at_epoch_seconds: 1,
+                    executable_path_digest: launch.executable_path_digest().to_owned(),
+                    runtime_instance_digest: "2".repeat(64),
                 },
                 now() + Duration::seconds(8),
             )
@@ -27403,7 +27447,6 @@ mod tests {
         let projection_json = serde_json::to_string(&active_projection).expect("projection JSON");
         assert!(!projection_json.contains(&launch_token));
         assert!(!projection_json.contains(launch.executable_path().to_string_lossy().as_ref()));
-        std::mem::forget(runtime);
 
         let RuntimeRecoveryFixture {
             service,
@@ -27415,17 +27458,17 @@ mod tests {
         let mut restarted = ApplicationService::new(service.store);
         let report = restarted
             .reconcile_runtime_processes_on_startup(now() + Duration::seconds(9))
-            .expect("reap exact orphan");
+            .expect("reconcile exact exited claim");
         assert_eq!(report.scanned_claims, 1);
-        assert_eq!(report.terminated, 1);
-        assert_eq!(report.already_exited, 0);
+        assert_eq!(report.terminated, 0);
+        assert_eq!(report.already_exited, 1);
         assert_eq!(report.blocked, 0);
         assert_eq!(report.recovery_attempts_fenced, 1);
         let cleaned = restarted
             .store
             .load_runtime_process_claim(&project_id, &recovery.id, recovery.process_attempt)
             .expect("cleaned claim");
-        assert_eq!(cleaned.status, RuntimeProcessClaimStatus::Terminated);
+        assert_eq!(cleaned.status, RuntimeProcessClaimStatus::Exited);
         assert!(!launch.executable_path().exists());
         let cleaned_projection = restarted
             .desktop_runtime_activity()
@@ -27435,7 +27478,7 @@ mod tests {
             .expect("cleaned Mission projection");
         assert_eq!(
             cleaned_projection.process_claim_status,
-            Some(RuntimeProcessClaimStatus::Terminated)
+            Some(RuntimeProcessClaimStatus::Exited)
         );
         assert_eq!(cleaned_projection.process_cleanup_attempt_count, 1);
         assert!(!cleaned_projection.requires_reconciliation);
@@ -27917,6 +27960,58 @@ mod tests {
             initialize_response,
             thread_response,
         ];
+        command.shutdown_grace = StdDuration::from_millis(50);
+        command
+    }
+
+    #[cfg(unix)]
+    fn checkpoint_bound_health_timeout_runtime_command(
+        workspace: &Path,
+        thread_id: &str,
+    ) -> RuntimeCommand {
+        let canonical_workspace = workspace.canonicalize().expect("canonical workspace");
+        let first_process_marker = workspace.join(".hartevo-first-health-timeout");
+        let initialize_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {}
+        })
+        .to_string();
+        let thread_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "thread": {"id": thread_id},
+                "cwd": canonical_workspace,
+                "model": "fixture-model",
+                "modelProvider": "fixture-provider",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandbox": "workspace-write"
+            }
+        })
+        .to_string();
+        let mut command = RuntimeCommand::new(PathBuf::from("/bin/sh"), canonical_workspace);
+        command.args = vec![
+            "-c".into(),
+            "IFS= read -r _
+if (set -C; : > \"$1\") 2>/dev/null; then
+  IFS= read -r _
+else
+  printf '%s\\n' \"$2\"
+  IFS= read -r _
+  printf '%s\\n' \"$3\"
+  sleep 30
+fi"
+            .into(),
+            "hartevo-checkpoint-bound-runtime".into(),
+            first_process_marker.to_string_lossy().into_owned(),
+            initialize_response,
+            thread_response,
+        ];
+        command
+            .environment
+            .insert("PATH".into(), "/usr/bin:/bin".into());
         command.shutdown_grace = StdDuration::from_millis(50);
         command
     }
@@ -29163,8 +29258,10 @@ sleep 30"#
     fn runtime_recovery_is_checkpoint_bound_retryable_and_thread_redacted() {
         let mut fixture = runtime_recovery_fixture();
         let runtime_thread_id = "private-runtime-thread-recovery";
-        let runtime_command =
-            delayed_fake_runtime_command(fixture.workspace.path(), runtime_thread_id, "0.20");
+        let runtime_command = checkpoint_bound_health_timeout_runtime_command(
+            fixture.workspace.path(),
+            runtime_thread_id,
+        );
         let recovery_id = RuntimeRecoveryAttemptId::from("recovery-runtime-health-timeout");
         let first_result = fixture.service.recover_context_worker_runtime(
             RecoverContextWorkerRuntime {
@@ -38662,6 +38759,184 @@ sleep 30"#
         assert_eq!(
             restored_workspace.control_state,
             hartevo_browser_adapter::BrowserControlState::AgentControlled
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one journey proves exact browser prefix persistence, restart, tamper rejection, idempotent acknowledgement, and suffix-only recovery"
+    )]
+    fn browser_batch_receipt_survives_restart_and_resumes_only_exact_suffix() {
+        use hartevo_browser_adapter::{
+            BrowserActionKind, BrowserActionRisk, BrowserActionSurface, BrowserBatchReceiptState,
+        };
+        use hartevo_domain_kernel::BrowserSnapshotId;
+        use hartevo_storage::DatabaseKey;
+
+        let directory = tempfile::tempdir().expect("batch receipt directory");
+        let database_path = directory.path().join("browser-batch-receipt.sqlite3");
+        let key = DatabaseKey::new([83; 32]).expect("database key");
+        let store = ProjectStore::open(&database_path, &key).expect("encrypted store");
+        let mut fixture = browser_application_fixture(store, directory.path().to_path_buf());
+        let mut host = registered_browser_host(&fixture.profile, &fixture.workspace);
+        let proof = fixture
+            .workspace
+            .agent_lease_proof(now())
+            .expect("lease proof");
+        let snapshot = host
+            .observe(
+                &fixture.workspace.id,
+                &proof,
+                BrowserSnapshotId::from("snapshot-browser-batch-receipt"),
+                &fixture.workspace.active_tab_id,
+                now(),
+            )
+            .expect("initial snapshot");
+        let actions = [1, 2]
+            .into_iter()
+            .map(|sequence| BrowserAction {
+                sequence,
+                kind: BrowserActionKind::Verify,
+                surface: BrowserActionSurface::Semantic,
+                risk: BrowserActionRisk::ReadOnly,
+                tab_id: fixture.workspace.active_tab_id.clone(),
+                snapshot_id: Some(snapshot.id.clone()),
+                element_ref: None,
+                target_origin_digest: sha256(b"https://example.com"),
+                payload_digest: "9".repeat(64),
+            })
+            .collect::<Vec<_>>();
+        let batch = BrowserActionBatch::read_only(
+            BrowserActionBatchId::from("batch-browser-durable-prefix"),
+            &fixture.profile,
+            &fixture.workspace,
+            proof,
+            "a".repeat(64),
+            actions,
+            now(),
+            now() + Duration::minutes(5),
+        )
+        .expect("read-only batch");
+        let mut cursor = host
+            .begin_read_only_batch(&batch, now())
+            .expect("begin batch");
+        let first = host
+            .execute_next(&mut cursor, now())
+            .expect("first action")
+            .expect("first result");
+        assert_eq!(first.action_sequence, 1);
+        let receipt = cursor.receipt().expect("first prefix receipt");
+        assert_eq!(receipt.state, BrowserBatchReceiptState::Active);
+
+        let mut tampered = receipt.clone();
+        tampered.result_digest = "f".repeat(64);
+        assert!(matches!(
+            fixture.service.acknowledge_browser_batch_receipt(
+                AcknowledgeBrowserBatchReceipt {
+                    project_id: fixture.project_id.clone(),
+                    workspace_id: fixture.workspace.id.clone(),
+                    expected_revision: 1,
+                    batch: batch.clone(),
+                    receipt: tampered,
+                },
+                now() + Duration::seconds(1),
+            ),
+            Err(ApplicationError::Browser(BrowserError::InvalidBatchReceipt))
+        ));
+
+        let acknowledge = AcknowledgeBrowserBatchReceipt {
+            project_id: fixture.project_id.clone(),
+            workspace_id: fixture.workspace.id.clone(),
+            expected_revision: 1,
+            batch: batch.clone(),
+            receipt: receipt.clone(),
+        };
+        let acknowledged = fixture
+            .service
+            .acknowledge_browser_batch_receipt(acknowledge.clone(), now() + Duration::seconds(1))
+            .expect("persist exact prefix");
+        assert_eq!(acknowledged.revision, 2);
+        assert_eq!(
+            fixture
+                .service
+                .acknowledge_browser_batch_receipt(acknowledge, now() + Duration::seconds(1),)
+                .expect("exact acknowledgement replay")
+                .revision,
+            2
+        );
+
+        let project_id = fixture.project_id.clone();
+        let profile_id = fixture.profile.id.clone();
+        let workspace_id = fixture.workspace.id.clone();
+        drop(host);
+        drop(fixture);
+        let mut restarted = ApplicationService::new(
+            ProjectStore::open(&database_path, &key).expect("application restart"),
+        );
+        let restored_profile = restarted
+            .load_browser_profile(&project_id, &profile_id)
+            .expect("restored profile");
+        let restored_workspace = restarted
+            .load_browser_workspace(&project_id, &workspace_id)
+            .expect("restored workspace");
+        let restored_receipt = restarted
+            .load_browser_batch_receipt(&project_id, &workspace_id, &batch.id)
+            .expect("load receipt")
+            .expect("durable receipt");
+        assert_eq!(restored_receipt, receipt);
+
+        let mut restarted_host = registered_browser_host(&restored_profile, &restored_workspace);
+        restarted_host
+            .observe(
+                &workspace_id,
+                &restored_workspace
+                    .agent_lease_proof(now() + Duration::seconds(2))
+                    .expect("restored lease"),
+                snapshot.id,
+                &restored_workspace.active_tab_id,
+                now() + Duration::seconds(2),
+            )
+            .expect("restored live snapshot");
+        let mut resumed = restarted_host
+            .resume_read_only_batch(&batch, &restored_receipt, now() + Duration::seconds(2))
+            .expect("resume exact prefix");
+        let second = restarted_host
+            .execute_next(&mut resumed, now() + Duration::seconds(2))
+            .expect("execute suffix")
+            .expect("second result");
+        assert_eq!(second.action_sequence, 2);
+        assert!(
+            restarted_host
+                .execute_next(&mut resumed, now() + Duration::seconds(2))
+                .expect("complete suffix")
+                .is_none()
+        );
+        let completed = resumed.receipt().expect("completed receipt");
+        assert_eq!(completed.completed_action_count, 2);
+        assert_eq!(completed.state, BrowserBatchReceiptState::Completed);
+        let completed_workspace = restarted
+            .acknowledge_browser_batch_receipt(
+                AcknowledgeBrowserBatchReceipt {
+                    project_id: project_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    expected_revision: 2,
+                    batch,
+                    receipt: completed.clone(),
+                },
+                now() + Duration::seconds(3),
+            )
+            .expect("persist completed prefix");
+        assert_eq!(completed_workspace.revision, 3);
+        assert_eq!(
+            restarted
+                .load_browser_batch_receipt(
+                    &project_id,
+                    &workspace_id,
+                    &BrowserActionBatchId::from("batch-browser-durable-prefix"),
+                )
+                .expect("reload completed receipt"),
+            Some(completed)
         );
     }
 

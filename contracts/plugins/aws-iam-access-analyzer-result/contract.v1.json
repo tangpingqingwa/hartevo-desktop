@@ -1,0 +1,272 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-iam-access-analyzer-result/contract.v1.json",
+  "title": "Hartevo AWS IAM Access Analyzer governed result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-iam-access-analyzer-result/v1",
+  "contractVersion": "EXT-AWS-IAM-ACCESS-ANALYZER-01-L1/v1",
+  "pluginId": "aws.iam.access-analyzer.result",
+  "objectiveType": "permission_analysis",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_record_verify_only",
+  "digestInput": "hartevo.aws-iam-access-analyzer-result/v1|layer=1|service=aws.iam.access-analyzer.result.read|provider=aws.iam.access-analyzer.result.recording|consumer=mission.aws-iam-access-analyzer.consumer",
+  "contractDigest": "0a243b54edac711c289fb02fc530b83d1720f6fd98d51b48ec6db739d4fa4021",
+  "service": {
+    "type": "AwsIamAccessAnalyzerService",
+    "id": "aws.iam.access-analyzer.result.read",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register_scope",
+      "list_findings_v2_read",
+      "list_findings_v2_proposal",
+      "list_findings_v2_record",
+      "list_findings_v2_verify",
+      "validate_policy_read",
+      "validate_policy_proposal",
+      "validate_policy_record",
+      "validate_policy_verify",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsIamAccessAnalyzerProvider",
+    "id": "aws.iam.access-analyzer.result.recording",
+    "apiRevision": "access-analyzer-list-findings-v2-validate-policy-read-1",
+    "operations": ["ListFindingsV2", "ValidatePolicy"],
+    "allowedTransportProvenance": ["recording", "fake", "loopback", "blocked_env"],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "service": "access-analyzer",
+      "secretReference": "opaque_only",
+      "serialized": false,
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "mutations": {
+      "createAnalyzer": false,
+      "updateAnalyzer": false,
+      "deleteAnalyzer": false,
+      "archiveFinding": false,
+      "updateFinding": false,
+      "iamPolicyWrite": false,
+      "attachDetachPolicy": false,
+      "paidCheck": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionIamAccessAnalyzerConsumer",
+    "id": "mission.aws-iam-access-analyzer.consumer",
+    "authority": "bounded_review_candidate_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "consentId",
+      "consentRevision",
+      "consentDigest"
+    ],
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "leastPrivilegeCertification": false
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "analyzerArn",
+      "analyzerType",
+      "policyType",
+      "policyResourceType",
+      "policyRevision",
+      "resourceArn",
+      "resourceType",
+      "resourceOwnerAccount",
+      "resourceRevision",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "consentId",
+      "consentRevision",
+      "consentDigest"
+    ],
+    "registrationBinding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "evidenceDigest",
+      "registrationRevision"
+    ]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "statuses": ["active", "revoked", "reversed"],
+    "permissions": [
+      "access-analyzer:ListFindings",
+      "access-analyzer:ValidatePolicy",
+      "mission.scope",
+      "consent.scope"
+    ],
+    "forbiddenPermissions": [
+      "access-analyzer:CreateAnalyzer",
+      "access-analyzer:UpdateFindings",
+      "access-analyzer:DeleteAnalyzer",
+      "iam:Put*",
+      "iam:Attach*",
+      "iam:Detach*",
+      "outcome.adopt",
+      "least-privilege.certify"
+    ],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "evidenceDigest",
+      "registrationRevision"
+    ]
+  },
+  "listFindingsV2": {
+    "access": "read_only",
+    "findingTypes": [
+      "ExternalAccess",
+      "InternalAccess",
+      "UnusedIAMRole",
+      "UnusedIAMUserAccessKey",
+      "UnusedIAMUserPassword",
+      "UnusedPermission"
+    ],
+    "statuses": ["ACTIVE", "ARCHIVED", "RESOLVED"],
+    "filters": [
+      "findingType",
+      "status",
+      "resourceType",
+      "resource",
+      "resourceOwnerAccount",
+      "isPublic"
+    ],
+    "maxPages": 32,
+    "maxFindings": 512,
+    "maxPageSize": 100,
+    "cursor": "opaque_digest_bound_to_scope_filter_sort"
+  },
+  "validatePolicy": {
+    "access": "read_only_policy_validation",
+    "policyTypes": [
+      "IDENTITY_POLICY",
+      "RESOURCE_POLICY",
+      "SERVICE_CONTROL_POLICY",
+      "RESOURCE_CONTROL_POLICY"
+    ],
+    "resourceTypes": [
+      "AWS::S3::Bucket",
+      "AWS::S3::AccessPoint",
+      "AWS::S3::MultiRegionAccessPoint",
+      "AWS::S3ObjectLambda::AccessPoint",
+      "AWS::IAM::AssumeRolePolicyDocument",
+      "AWS::DynamoDB::Table"
+    ],
+    "findingTypes": ["ERROR", "SECURITY_WARNING", "WARNING", "SUGGESTION"],
+    "maxPolicyBytes": 262144,
+    "maxPages": 32,
+    "maxFindings": 512,
+    "maxPageSize": 100,
+    "rawPolicyRetention": false,
+    "cursor": "opaque_digest_bound_to_policy_scope"
+  },
+  "evidence": {
+    "requiredDigests": [
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "requestDigest",
+      "policyDigest",
+      "findingDigest",
+      "evidenceDigest",
+      "registrationDigest"
+    ],
+    "bounded": true,
+    "emptyFindingsAreNotProof": true,
+    "rawPolicyRetention": false,
+    "rawPrincipalRetention": false,
+    "rawFindingBodyRetention": false,
+    "maxAttempts": 8,
+    "partialIsNonCertifying": true,
+    "providerUnknownIsNonCertifying": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS IAM Access Analyzer scope and registration",
+      "bounded ListFindingsV2 findings metadata",
+      "bounded ValidatePolicy issue and location metadata",
+      "public/cross-account/internal/unused exposure labels",
+      "error/security-warning/warning/suggestion labels",
+      "redacted digest evidence",
+      "reversible registration and Mission review candidate"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "live SigV4 resolution",
+      "live AWS HTTPS",
+      "analyzer creation or mutation",
+      "finding archive/update",
+      "IAM policy writes",
+      "raw policy text",
+      "raw principals",
+      "raw finding bodies",
+      "least-privilege certification",
+      "safe-access proof from empty findings",
+      "second worker kernel"
+    ]
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live ListFindingsV2 and ValidatePolicy HTTPS",
+    "durable provider receipt",
+    "independent read-back reconciliation",
+    "consented IAM policy effects",
+    "kernel Verification and Outcome adoption",
+    "Connected/native/first-party evidence"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live Access Analyzer HTTPS, durable receipt, independent read-back and consented policy effects remain Layer-2 work; all Layer-1 fixture evidence is non-connected, non-native and non-first-party."
+}

@@ -1,0 +1,7 @@
+# Governance and release surfaces require explicit product-owner review.
+/.github/ @tangpingqingwa
+/scripts/ci-* @tangpingqingwa
+/contracts/release-evidence/ @tangpingqingwa
+/contracts/security/ @tangpingqingwa
+/docs/security/ @tangpingqingwa
+/hartevo-rs/ @tangpingqingwa
