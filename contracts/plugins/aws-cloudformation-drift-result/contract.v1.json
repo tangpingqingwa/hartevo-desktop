@@ -1,0 +1,266 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-cloudformation-drift-result/contract.v1.json",
+  "title": "Hartevo AWS CloudFormation drift result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-cloudformation-drift-result/v1",
+  "contractVersion": "EXT-AWS-CLOUDFORMATION-DRIFT-01-L1/v1",
+  "pluginId": "aws.cloudformation.drift-result",
+  "objectiveType": "cloudformation_drift_evidence",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-cloudformation-drift-result/v1|layer=1|service=aws.cloudformation.drift-result.read|provider=aws.cloudformation.drift-result.recording|consumer=mission.aws-cloudformation-drift.consumer",
+  "contractDigest": "40b171d684c1a1ece03529d55b32df946e5ac52d216427e863e8318ad12cce06",
+  "service": {
+    "type": "AwsCloudFormationDriftService",
+    "id": "aws.cloudformation.drift-result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "describe_stacks",
+      "describe_stack_events",
+      "detect_stack_drift",
+      "describe_stack_drift_detection_status",
+      "describe_stack_resource_drifts",
+      "read",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsCloudFormationProvider",
+    "id": "aws.cloudformation.drift-result.recording",
+    "apiRevision": "cloudformation-describe-stacks-describe-stack-events-detect-stack-drift-describe-stack-drift-detection-status-describe-stack-resource-drifts-1",
+    "operations": [
+      "DescribeStacks",
+      "DescribeStackEvents",
+      "DetectStackDrift",
+      "DescribeStackDriftDetectionStatus",
+      "DescribeStackResourceDrifts"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAwsCloudFormationDriftConsumer",
+    "id": "mission.aws-cloudformation-drift.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "awsAccountId",
+      "awsRegion",
+      "stackNameOrId",
+      "stackRevision",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "stackNameOrId",
+      "stackRevision",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "stackTemplateBytes": false,
+    "stackParameters": false,
+    "stackOutputs": false,
+    "rawResourceProperties": false,
+    "rawEventReasons": false,
+    "rawPhysicalResourceIds": false,
+    "maxLogicalResourceIds": 200,
+    "maxPages": 4,
+    "maxPolls": 4,
+    "maxPageSize": 100,
+    "maxEvents": 256,
+    "maxResources": 512,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ],
+    "permissions": [
+      "cloudformation:DescribeStacks",
+      "cloudformation:DescribeStackEvents",
+      "cloudformation:DetectStackDrift",
+      "cloudformation:DescribeStackDriftDetectionStatus",
+      "cloudformation:DescribeStackResourceDrifts",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "cloudformation:CreateStack",
+      "cloudformation:UpdateStack",
+      "cloudformation:DeleteStack",
+      "cloudformation:CancelUpdateStack",
+      "cloudformation:ContinueUpdateRollback",
+      "cloudformation:RollbackStack",
+      "cloudformation:CreateChangeSet",
+      "cloudformation:ExecuteChangeSet",
+      "cloudformation:SetStackPolicy",
+      "cloudformation:UpdateTerminationProtection",
+      "iam:PassRole",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "account",
+      "region",
+      "stack",
+      "stackRevision",
+      "logicalResourceIds",
+      "resourceDriftStatusFilters",
+      "operation",
+      "pageNumber"
+    ],
+    "filterDriftRejected": true,
+    "stackRevisionDriftRejected": true,
+    "cursorReplayRejected": true,
+    "partialPageIsNonAdoptable": true
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "requestDigest",
+      "cursorDigest",
+      "stackDigest",
+      "eventDigest",
+      "detectionDigest",
+      "resourceDriftDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "completed",
+      "in_progress",
+      "partial",
+      "access_loss",
+      "throttled",
+      "provider_unknown",
+      "not_found",
+      "registration_revoked"
+    ],
+    "stackDriftStatuses": ["DRIFTED", "IN_SYNC", "UNKNOWN", "NOT_CHECKED"],
+    "detectionStatuses": ["DETECTION_IN_PROGRESS", "DETECTION_FAILED", "DETECTION_COMPLETE"],
+    "resourceDriftStatuses": ["IN_SYNC", "MODIFIED", "DELETED", "UNKNOWN", "UNSUPPORTED"],
+    "tamperRejected": true,
+    "revocationRejected": true,
+    "stackRevisionMismatchIsNonAdoptable": true,
+    "asyncInProgressIsNonAdoptable": true,
+    "accessLossIsNonAdoptable": true,
+    "truncationIsNonAdoptable": true,
+    "rawPropertiesAreNeverRetained": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS account/region/stack and explicit stack revision scope",
+      "bounded DescribeStacks and DescribeStackEvents metadata reads",
+      "bounded DetectStackDrift and async DescribeStackDriftDetectionStatus progress",
+      "bounded DescribeStackResourceDrifts resource-drift status and redacted digests",
+      "version/contract/provider/api/permission/consent/scope/evidence digests",
+      "opaque cursor and stack-revision fences",
+      "reversible registration",
+      "redacted idempotent recording",
+      "Mission-scoped review proposal"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live AWS CloudFormation HTTPS",
+      "stack creation, update, deletion, rollback, or remediation",
+      "stack templates, parameters, outputs, raw properties, or raw event reasons",
+      "resource mutation or drift remediation",
+      "connected or native evidence",
+      "Layer-2 credential/native provider implementation"
+    ]
+  },
+  "layer2Gaps": [
+    "credential resolution",
+    "native SigV4 transport",
+    "AWS account authorization",
+    "live CloudFormation response receipt",
+    "independent verification and adoption"
+  ]
+}

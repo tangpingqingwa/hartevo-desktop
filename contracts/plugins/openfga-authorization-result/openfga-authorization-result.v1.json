@@ -1,0 +1,327 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/openfga-authorization-result/openfga-authorization-result.v1.json",
+  "title": "Hartevo OpenFGA authorization decision result Layer-1 contract",
+  "schemaVersion": "hartevo.openfga-authorization-result/v1",
+  "contractVersion": "EXT-OPENFGA-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "openfga.authorization.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.openfga-authorization-result/v1|layer=1|service=openfga.authorization.result.read|provider=openfga.authorization.result.recording|consumer=mission.openfga-authorization.consumer|api=openfga-read-authorization-model-check-tuples-r1",
+  "contractDigest": "dadcf5a4a4e010fba0b87623070fbe8613ddfa4041c237bab2b931f0f1be461b",
+  "service": {
+    "type": "OpenFgaAuthorizationResultService",
+    "id": "openfga.authorization.result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "ReadAuthorizationModel",
+      "Check",
+      "ReadTuples",
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "propose",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "tupleWrites": false,
+    "authorizationAuthority": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "type": "OpenFgaProvider",
+    "id": "openfga.authorization.result.recording",
+    "apiRevision": "openfga-read-authorization-model-check-tuples-r1",
+    "operations": ["ReadAuthorizationModel", "Check", "ReadTuples"],
+    "allowedTransports": ["recording", "fixture", "fake", "loopback", "blocked_env"],
+    "authentication": {
+      "scheme": "opaque_reference",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false,
+    "tupleWrites": false,
+    "authorizationAuthority": false
+  },
+  "consumer": {
+    "type": "MissionOpenFgaAuthorizationConsumer",
+    "id": "mission.openfga-authorization.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "storeId",
+      "storeRevision",
+      "authorizationModelId",
+      "authorizationModelRevision",
+      "authorizationCheckRevision",
+      "tupleRevision",
+      "user",
+      "object",
+      "relation",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "authorizationAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque OpenFGA SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "storeId",
+      "storeRevision",
+      "authorizationModelId",
+      "authorizationModelRevision",
+      "authorizationCheckRevision",
+      "tupleRevision",
+      "user",
+      "object",
+      "relation",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "rawIdentifiers": false,
+    "rawModelJson": false,
+    "rawTupleKeys": false,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxModelTypes": 128,
+    "maxModelRelations": 512,
+    "maxTuples": 100,
+    "maxResponseBytes": 1048576
+  },
+  "consent": {
+    "required": true,
+    "revisionBound": true,
+    "scopeBound": true,
+    "expiryBound": true,
+    "effectAuthority": false
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["reversed"],
+    "bindingDigests": [
+      "versionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "consentDigest",
+      "secretReferenceDigest",
+      "revisionDigest",
+      "registrationRevision",
+      "registrationDigest"
+    ],
+    "permissions": [
+      "openfga:ReadAuthorizationModel",
+      "openfga:Check",
+      "openfga:Read",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "openfga:Write",
+      "openfga:WriteAuthorizationModel",
+      "openfga:WriteTuple",
+      "authorization.grant",
+      "outcome.adopt",
+      "work_product.adopt"
+    ]
+  },
+  "pagination": {
+    "style": "opaque_cursor",
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "scopeDigest",
+      "tupleQueryDigest",
+      "pageSize",
+      "pageNumber"
+    ],
+    "maxPages": 4,
+    "maxTuples": 100,
+    "loopRejected": true,
+    "filterDriftRejected": true,
+    "truncationIsNonAdoptable": true
+  },
+  "projection": {
+    "model": [
+      "modelDigest",
+      "modelRevisionDigest",
+      "typeCount",
+      "relationCount",
+      "rulesDigest"
+    ],
+    "authorizationCheck": [
+      "decision",
+      "userDigest",
+      "objectDigest",
+      "relationDigest",
+      "modelDigest",
+      "checkRevisionDigest",
+      "checkDigest"
+    ],
+    "tuples": [
+      "tupleDigest",
+      "userDigest",
+      "objectDigest",
+      "relationDigest",
+      "tupleRevisionDigest"
+    ],
+    "rawModelJson": false,
+    "rawTupleKeys": false,
+    "rawIdentifiers": false
+  },
+  "receipts": {
+    "request": {
+      "redacted": true,
+      "retain": [
+        "operation",
+        "requestDigest",
+        "pathDigest",
+        "scopeDigest",
+        "modelDigest",
+        "checkDigest",
+        "tupleQueryDigest",
+        "cursorDigest"
+      ],
+      "drop": ["rawPathWithIdentifier", "authorizationHeader", "credentialMaterial", "rawCursor"]
+    },
+    "cost": {
+      "redacted": true,
+      "retain": ["operation", "responseBytes", "boundedRequestUnits", "costDigest"],
+      "estimateOnly": true,
+      "durableProviderReceipt": false
+    }
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "consentDigest",
+      "registrationDigest",
+      "modelDigest",
+      "checkDigest",
+      "tupleDigest",
+      "revisionDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "ready",
+      "denied",
+      "partial",
+      "stale",
+      "tampered",
+      "provider_unknown",
+      "rate_limited",
+      "unauthorized",
+      "forbidden",
+      "not_found",
+      "conflict",
+      "timed_out",
+      "consent_expired",
+      "registration_revoked"
+    ],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "deniedIsNonAdoptable": true,
+    "partialIsNonAdoptable": true,
+    "staleIsNonAdoptable": true,
+    "providerUnknownIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "bounded OpenFGA authorization-model read, check, and tuple-read seams",
+      "exact Store/Model/check/tuple/user/object/relation/Project/Mission/Work Product scope",
+      "model/check/tuple digest-only projections",
+      "version/contract/provider/API/permission/consent/revision/scope/evidence digests",
+      "opaque secret-reference binding",
+      "reversible and revocable registration",
+      "redacted request and cost receipts",
+      "Mission-scoped review-only proposal and idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "Hartevo Work Product adoption",
+      "native credential resolution",
+      "live OpenFGA HTTPS",
+      "durable provider receipt",
+      "tuple or authorization-model mutation",
+      "authorization grant authority",
+      "raw model or tuple export",
+      "production policy truth"
+    ]
+  },
+  "forbiddenEffects": [
+    "WriteTuple",
+    "WriteAuthorizationModel",
+    "WriteStore",
+    "authorization.grant",
+    "authorization.revoke",
+    "adopt_verified_work_product",
+    "adopt_outcome",
+    "export_raw_model",
+    "export_raw_tuple"
+  ],
+  "layer2Gaps": [
+    "native OpenFGA credential resolution and live HTTPS",
+    "durable provider receipt",
+    "independent model/check/tuple readback and consistency verification",
+    "consented tuple or authorization-model mutation",
+    "authorization grant/revoke authority",
+    "production policy truth",
+    "verified Mission Work Product or Outcome adoption"
+  ],
+  "honestNativeGap": "Layer-1 uses only recording, fixture, fake, loopback, and BLOCKED_ENV transports. None claims Connected, native, first-party, durable provider receipt, authorization authority, or verified adoption. Native OpenFGA resolution/HTTPS, mutation, independent readback, and adopted effects remain Layer-2 work."
+}
