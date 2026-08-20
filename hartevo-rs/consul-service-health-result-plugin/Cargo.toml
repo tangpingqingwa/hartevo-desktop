@@ -1,0 +1,48 @@
+[package]
+name = "hartevo-consul-service-health-result-plugin"
+description = "Standalone Layer-1 governed Consul service-health result plugin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Proprietary"
+authors = ["Hartevo"]
+repository = "https://github.com/tangpingqingwa/hartevo-desktop"
+publish = false
+
+# This is intentionally a standalone Layer-1 root.  Host/kernel wiring,
+# native credential resolution, and Work Product adoption belong to Layer 2.
+[workspace]
+resolver = "3"
+
+[dependencies]
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1.11"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+struct_excessive_bools = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+return_self_not_must_use = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+match_same_arms = "allow"
+unnecessary_wraps = "allow"

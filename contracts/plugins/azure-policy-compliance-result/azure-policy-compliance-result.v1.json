@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/azure-policy-compliance-result/azure-policy-compliance-result.v1.json",
+  "schemaVersion": "hartevo.azure-policy-compliance-result-contract/v1",
+  "contractVersion": "azure-policy-compliance-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "azure.policy.compliance.result",
+    "version": "1.0.0",
+    "operation": "governed_policy_insights_read_proposal",
+    "readOnly": true,
+    "liveExecution": false,
+    "externalWrites": false,
+    "certification": false,
+    "outcomeAuthority": false
+  },
+  "provider": {
+    "id": "azure.policy-insights.query-results",
+    "version": "1.0.0",
+    "apiVersion": "2024-10-01",
+    "method": "POST",
+    "operations": [
+      "queryResults.resource",
+      "queryResults.resourceGroup",
+      "queryResults.subscription"
+    ],
+    "acceptedProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "native": false,
+    "httpsTransport": false,
+    "readback": false
+  },
+  "consumer": {
+    "id": "mission.azure.policy.compliance.result",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "proposalOnly": true,
+    "adoptsOutcome": false,
+    "claimsCertification": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "allowedKinds": ["resource", "resource_group", "subscription"],
+    "required": [
+      "tenantDigest",
+      "subscriptionId",
+      "resourceGroupNameWhenScoped",
+      "resourceIdWhenResourceScoped",
+      "policyDefinitionFingerprints",
+      "policyAssignmentFingerprints",
+      "policySetDefinitionFingerprints",
+      "queryWindow",
+      "policyStateView",
+      "projectIdAndRevision",
+      "missionIdAndRevision",
+      "workProductIdAndRevision",
+      "permissionDigest"
+    ],
+    "secret": "opaque_non_serializing_entra_secret_reference_only"
+  },
+  "queryPolicy": {
+    "operation": "bounded_read_only_queryResults",
+    "filterAst": [
+      "complianceState",
+      "policyDefinitionId",
+      "policyAssignmentId",
+      "policySetDefinitionId",
+      "timestampAfter",
+      "timestampBefore",
+      "and"
+    ],
+    "allowlistedFieldsOnly": true,
+    "rawOData": false,
+    "writes": [],
+    "remediation": false,
+    "assignmentMutation": false,
+    "exemptionMutation": false,
+    "stateViews": ["latest", "default"]
+  },
+  "bounds": {
+    "maxPages": 8,
+    "maxRecords": 512,
+    "maxRecordsPerPage": 128,
+    "maxResponseBytes": 1048576,
+    "maxFilterNodes": 8,
+    "nextLink": "opaque_digest_only",
+    "retries": "bounded"
+  },
+  "retention": {
+    "retained": [
+      "policyDefinitionId",
+      "policyAssignmentId",
+      "policySetDefinitionId",
+      "resourceId",
+      "complianceState",
+      "timestamp",
+      "resourceLocation",
+      "resourceType",
+      "policyMetadataDigest",
+      "responseDigest"
+    ],
+    "digestOnly": ["policyMetadata", "nextLink", "query", "tenant"],
+    "redacted": ["rawPolicyJson", "resourceTags", "tenantPii", "remediationPayload"]
+  },
+  "registration": {
+    "boundFields": [
+      "providerDigest",
+      "providerApiVersion",
+      "contractDigest",
+      "pluginVersion",
+      "permissionDigest",
+      "queryDigest",
+      "scopeDigest",
+      "evidenceDigest"
+    ],
+    "versionBound": true,
+    "providerBound": true,
+    "apiBound": true,
+    "contractDigestBound": true,
+    "permissionBound": true,
+    "queryBound": true,
+    "scopeBound": true,
+    "evidenceBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "failClosed": [
+    "tenantOrSubscriptionDrift",
+    "resourceGroupOrResourceDrift",
+    "policyFingerprintDrift",
+    "queryWindowDrift",
+    "policyStateViewDrift",
+    "nextLinkScopeMismatch",
+    "nextLinkReplay",
+    "partialPage",
+    "400",
+    "401",
+    "403",
+    "404",
+    "409",
+    "429",
+    "5xx",
+    "timeout",
+    "tamper",
+    "revocation"
+  ],
+  "authority": {
+    "connected": false,
+    "nativeProvider": false,
+    "httpsTransport": false,
+    "durableReceipt": false,
+    "independentReadback": false,
+    "verification": false,
+    "externalWrites": false,
+    "remediation": false,
+    "certification": false,
+    "outcomeAuthority": false,
+    "workProductAdoption": false,
+    "truthAuthority": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "nativeMicrosoftEntraResolution",
+    "nativeHttpsPolicyInsightsRead",
+    "durableProviderReceipt",
+    "independentReadback",
+    "consentedAssignmentOrRemediation",
+    "verifiedWorkProductAdoption",
+    "kernelOutcomeAuthority",
+    "complianceCertification"
+  ],
+  "honestNativeGap": "Fixture, recording, loopback and BLOCKED_ENV evidence are not Connected, native or first-party. Native Microsoft Entra resolution, HTTPS transport, durable provider receipts, independent readback, consented remediation, assignment/exemption mutation, certification, Outcome authority and Work Product adoption remain Layer-2 or host-authority exits."
+}
