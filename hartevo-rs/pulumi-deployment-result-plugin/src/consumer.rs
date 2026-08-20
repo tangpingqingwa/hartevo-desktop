@@ -22,9 +22,13 @@ impl MissionPulumiDeploymentConsumer {
         registration: &PulumiDeploymentResultRegistration,
     ) -> Result<Self, PulumiDeploymentResultError> {
         scope.validate()?;
+        registration
+            .validate_integrity()
+            .map_err(|_| PulumiDeploymentResultError::MissionScopeMismatch)?;
         if !registration.is_active()
             || registration.scope != scope
             || registration.scope_digest != scope.digest()
+            || registration.permission_snapshot_digest != *scope.permissions.digest()
             || registration.provider_version != crate::PROVIDER_VERSION
             || registration.registration_digest.validate().is_err()
         {

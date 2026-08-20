@@ -68,7 +68,7 @@ impl fmt::Display for Digest {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginVersion {
     major: u16,
     minor: u16,
@@ -668,6 +668,7 @@ impl PulumiDeploymentResultRegistration {
         if self.state == RegistrationState::Active {
             secret_reference.validate_for_scope(&scope.digest())?;
         }
+        self.validate_integrity()?;
         self.validate_without_digest()?;
         if self.scope_digest != scope.digest()
             || self.scope != *scope
@@ -675,6 +676,21 @@ impl PulumiDeploymentResultRegistration {
             || self.secret_reference_digest != *secret_reference.reference_digest()
             || self.credential_revision != secret_reference.credential_revision()
             || self.auth_kind != secret_reference.kind()
+            || self.contract_digest.as_str() != crate::contract_digest()
+            || self.registration_digest != self.compute_digest()
+        {
+            return Err(PulumiDeploymentResultError::RegistrationDrift);
+        }
+        Ok(())
+    }
+
+    /// Validate the registration without requiring access to credential
+    /// material. Mission-facing boundaries use this canonical self-integrity
+    /// fence before admitting a registration or proposal.
+    pub fn validate_integrity(&self) -> Result<(), PulumiDeploymentResultError> {
+        self.validate_without_digest()?;
+        if self.scope_digest != self.scope.digest()
+            || self.permission_snapshot_digest != *self.scope.permissions.digest()
             || self.contract_digest.as_str() != crate::contract_digest()
             || self.registration_digest != self.compute_digest()
         {

@@ -291,6 +291,96 @@ fn credential_revision_is_bound_to_secret_registration_and_fences() {
 }
 
 #[test]
+fn mission_consumer_recomputes_registration_and_rejects_public_field_tamper() {
+    let scope = scope();
+    let secret = secret(&scope);
+    let registration = PulumiDeploymentResultRegistration::new(&scope, &secret, "adapter-r1", 1)
+        .expect("registration");
+    registration
+        .validate_integrity()
+        .expect("canonical registration integrity");
+    MissionPulumiDeploymentConsumer::from_registration(&registration)
+        .expect("valid Mission consumer");
+
+    let assert_rejected = |tampered: PulumiDeploymentResultRegistration| {
+        assert!(matches!(
+            MissionPulumiDeploymentConsumer::from_registration(&tampered),
+            Err(PulumiDeploymentResultError::MissionScopeMismatch)
+        ));
+    };
+
+    let mut tampered = registration.clone();
+    tampered.plugin_id = "tampered.plugin".into();
+    assert_rejected(tampered);
+
+    let mut tampered = registration.clone();
+    tampered.plugin_version = PluginVersion::new(9, 0, 0);
+    assert_rejected(tampered);
+
+    let mut tampered = registration.clone();
+    tampered.contract_version = "tampered-contract".into();
+    assert_rejected(tampered);
+
+    let mut tampered = registration.clone();
+    tampered.contract_digest = Digest::from_text("tampered-contract-digest");
+    assert_rejected(tampered);
+
+    let mut tampered = registration.clone();
+    tampered.provider_id = "tampered.provider".into();
+    assert_rejected(tampered);
+
+    let mut tampered = registration.clone();
+    tampered.provider_version = PluginVersion::new(9, 0, 0);
+    assert_rejected(tampered);
+
+    let mut tampered = registration.clone();
+    tampered.permission_snapshot_digest = Digest::from_text("tampered-permissions");
+    assert_rejected(tampered);
+
+    let mut tampered = registration.clone();
+    tampered.auth_kind = AuthKind::Oidc;
+    assert_rejected(tampered);
+
+    let mut tampered = registration.clone();
+    tampered.credential_revision = 99;
+    assert_rejected(tampered);
+
+    let mut tampered = registration.clone();
+    tampered.scope_digest = Digest::from_text("tampered-scope");
+    assert_rejected(tampered);
+
+    let mut tampered = registration.clone();
+    tampered.registration_digest = Digest::from_text("stale-registration");
+    assert_rejected(tampered);
+
+    let mut altered_scope = scope.clone();
+    altered_scope.mission_revision += 1;
+    let mut tampered = registration.clone();
+    tampered.scope = altered_scope;
+    assert_rejected(tampered);
+}
+
+#[test]
+fn nested_plugin_versions_reject_unknown_published_schema_fields() {
+    let scope = scope();
+    let secret = secret(&scope);
+    let registration = PulumiDeploymentResultRegistration::new(&scope, &secret, "adapter-r1", 1)
+        .expect("registration");
+    let mut registration_json = serde_json::to_value(&registration).expect("registration JSON");
+    registration_json["pluginVersion"]["futureField"] = serde_json::json!(true);
+    assert!(
+        serde_json::from_value::<PulumiDeploymentResultRegistration>(registration_json).is_err()
+    );
+
+    let mut service_json = serde_json::to_value(PulumiDeploymentResultServiceDefinition::layer1())
+        .expect("service JSON");
+    service_json["pluginVersion"]["futureField"] = serde_json::json!(true);
+    assert!(
+        serde_json::from_value::<PulumiDeploymentResultServiceDefinition>(service_json).is_err()
+    );
+}
+
+#[test]
 fn recording_path_reads_exact_evidence_and_consumes_a_non_outcome_proposal() {
     let mut service = service_with_status(PulumiDeploymentStatus::Succeeded);
     let description = service.describe_stack().expect("stack description");
