@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "hartevo.github-work-plugin/v1",
+  "contractVersion": "github-work-e1/v1",
+  "service": "DevWorkService",
+  "provider": "GitHubAppWorkProvider",
+  "consumer": "MissionGithubWorkConsumer",
+  "authority": "repository_scoped_read_and_proposal",
+  "transport": "github_app_installation_access_token_over_https",
+  "apiVersion": "2022-11-28",
+  "operations": [
+    "probe_installation",
+    "probe_repository",
+    "read_issue",
+    "read_pull_request",
+    "read_check_runs",
+    "propose_issue_comment",
+    "propose_pull_request_comment",
+    "propose_pull_request_update"
+  ],
+  "requiredPermissions": {
+    "metadata": "read",
+    "issues": "read",
+    "pull_requests": "read",
+    "checks": "read"
+  },
+  "readOnly": true,
+  "externalMutation": false,
+  "proposalOnly": true,
+  "pagination": {
+    "maxPageSize": 100,
+    "maxPages": 100
+  },
+  "forbiddenAuthorities": [
+    "store",
+    "keyring",
+    "browser_profile",
+    "effect_execution"
+  ],
+  "nativeProbe": {
+    "envGate": "HARTEVO_GITHUB_APP_NATIVE_PROBE=1",
+    "credentialEnv": "HARTEVO_GITHUB_APP_INSTALLATION_TOKEN",
+    "statusWithoutGate": "BLOCKED_ENV"
+  }
+}
