@@ -52,6 +52,7 @@ impl TiktokRealReadGate {
     }
 }
 
+#[derive(Debug)]
 pub struct TiktokAuthenticatedReadService<T> {
     provider: TiktokDisplayApiProvider<T>,
     quota: TiktokQuotaLedger,
@@ -246,15 +247,14 @@ fn video_page_envelope(
     cursor_generation: u64,
     provenance: EvidenceProvenance,
 ) -> TiktokVideoPageEnvelope {
-    let account = page
-        .observations
-        .first()
-        .map(|observation| observation.account().clone())
-        .unwrap_or_else(|| super::TiktokAccountIdentity {
+    let account = page.observations.first().map_or_else(
+        || super::TiktokAccountIdentity {
             open_id: page.scope.account().clone(),
             display_name: None,
             username: None,
-        });
+        },
+        |observation| observation.account().clone(),
+    );
     TiktokVideoPageEnvelope {
         provider: super::ProviderId::Tiktok,
         scope: page.scope.clone(),
@@ -333,8 +333,11 @@ mod tests {
             Some("keychain://tiktok/open01"),
         )
         .unwrap();
-        let mut service =
-            TiktokAuthenticatedReadService::production(NoopTransport, gate, Default::default());
+        let mut service = TiktokAuthenticatedReadService::production(
+            NoopTransport,
+            gate,
+            TiktokFreshnessPolicy::default(),
+        );
         let credential = OAuthCredential::new(
             SecretReference::new("keychain://tiktok/other").unwrap(),
             scope(),

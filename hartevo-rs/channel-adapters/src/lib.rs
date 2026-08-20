@@ -1,19 +1,26 @@
-//! TikTok authenticated read plugin.
+//! Provider-specific read-only channel adapter contracts.
 //!
-//! This package is intentionally self-contained on the bootstrap branch. It
-//! exposes an official TikTok Display API provider boundary, an authenticated
-//! read service, and a fail-closed Mission consumer. OAuth tokens never enter
-//! this package: callers pass an opaque [`SecretReference`] that an external
-//! credential service resolves at dispatch time.
+//! The TikTok plugin keeps its independent authenticated-read service,
+//! provider, and Mission consumer boundary while sharing the bootstrap
+//! crate's YouTube read-only root. No module here owns credentials,
+//! persistence, Effect authority, or a central connector registry.
 
 #![forbid(unsafe_code)]
 
+pub mod identity;
+pub mod testkit;
 pub mod tiktok;
 pub mod transport;
+pub mod youtube;
+pub mod youtube_read;
+
+pub use identity::{
+    AccountIdentity, ChannelIdentity, ContentIdentity, ProviderId, RevisionIdentity,
+};
 
 pub use tiktok::{
     BusinessId, DEFAULT_VIDEO_PAGE_SIZE, EvidenceProvenance, MissionTiktokReadConsumer,
-    OAuthCredential, ProviderId, SecretReference, TenantId, TiktokAccountId, TiktokAccountIdentity,
+    OAuthCredential, SecretReference, TenantId, TiktokAccountId, TiktokAccountIdentity,
     TiktokApiOperation, TiktokAuthenticatedReadService, TiktokConnectionState, TiktokCursor,
     TiktokCursorDisposition, TiktokDisplayApiProvider, TiktokError, TiktokFreshness,
     TiktokFreshnessPolicy, TiktokMissionAcceptedRead, TiktokOAuthScope, TiktokObservationEnvelope,
@@ -22,5 +29,7 @@ pub use tiktok::{
     TiktokVideoPageEnvelope,
 };
 pub use transport::{
-    HttpMethod, ProviderReadRequest, ProviderResponse, ReadOnlyTransport, ScopeName, TransportError,
+    AuthorizationReason, ChannelAdapterError, CredentialReference, HttpMethod, ProviderKind,
+    ProviderReadRequest, ProviderResponse, ReadOnlyTransport, ReadOperation, ScopeName,
+    TransportError,
 };

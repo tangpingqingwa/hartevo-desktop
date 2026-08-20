@@ -86,7 +86,7 @@ fn authenticated_probe_uses_official_display_api_and_fixture_is_not_first_party(
     assert_eq!(service.provenance(), EvidenceProvenance::Fixture);
     assert_eq!(
         envelope.provider(),
-        hartevo_channel_adapters::ProviderId::Tiktok
+        hartevo_channel_adapters::tiktok::ProviderId::Tiktok
     );
     assert_eq!(envelope.scope(), &read_scope);
     assert_eq!(envelope.account().open_id(), read_scope.account());
@@ -256,6 +256,7 @@ fn query_returns_video_performance_and_exact_revision_envelope() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn authenticated_read_fails_closed_for_expiry_revocation_rate_limit_and_disconnect() {
     let now = fixed_now();
     let read_scope = scope();
@@ -271,7 +272,7 @@ fn authenticated_read_fails_closed_for_expiry_revocation_rate_limit_and_disconne
     .unwrap();
     let mut expired_service = TiktokAuthenticatedReadService::fixture(
         FixtureTransport::responses([]),
-        Default::default(),
+        TiktokFreshnessPolicy::default(),
     );
     let expired_error = expired_service.probe(&expired, now).unwrap_err();
     assert_eq!(expired_error, TiktokError::CredentialExpired);
@@ -284,7 +285,7 @@ fn authenticated_read_fails_closed_for_expiry_revocation_rate_limit_and_disconne
     revoked.revoke(now);
     let mut revoked_service = TiktokAuthenticatedReadService::fixture(
         FixtureTransport::responses([]),
-        Default::default(),
+        TiktokFreshnessPolicy::default(),
     );
     let revoked_error = revoked_service.probe(&revoked, now).unwrap_err();
     assert_eq!(revoked_error, TiktokError::CredentialRevoked);
@@ -295,7 +296,7 @@ fn authenticated_read_fails_closed_for_expiry_revocation_rate_limit_and_disconne
 
     let mut provider_revoked = TiktokAuthenticatedReadService::fixture(
         FixtureTransport::responses([revoked_response()]),
-        Default::default(),
+        TiktokFreshnessPolicy::default(),
     );
     let provider_revoked_error = provider_revoked
         .probe(&credential(&read_scope, now), now)
@@ -304,7 +305,7 @@ fn authenticated_read_fails_closed_for_expiry_revocation_rate_limit_and_disconne
 
     let mut rate_limited = TiktokAuthenticatedReadService::fixture(
         FixtureTransport::responses([rate_limited_response()]),
-        Default::default(),
+        TiktokFreshnessPolicy::default(),
     );
     let rate_error = rate_limited
         .probe(&credential(&read_scope, now), now)
@@ -323,7 +324,7 @@ fn authenticated_read_fails_closed_for_expiry_revocation_rate_limit_and_disconne
 
     let mut disconnected = TiktokAuthenticatedReadService::fixture(
         FixtureTransport::from_results([Err(TransportError::Unavailable)]),
-        Default::default(),
+        TiktokFreshnessPolicy::default(),
     );
     let disconnected_error = disconnected
         .probe(&credential(&read_scope, now), now)
@@ -345,7 +346,7 @@ fn authenticated_read_fails_closed_for_expiry_revocation_rate_limit_and_disconne
     .unwrap();
     let mut missing_scope = TiktokAuthenticatedReadService::fixture(
         FixtureTransport::responses([]),
-        Default::default(),
+        TiktokFreshnessPolicy::default(),
     );
     let mut cursor = TiktokVideoListCursor::new(read_scope.clone()).unwrap();
     assert_eq!(
@@ -375,7 +376,7 @@ fn authenticated_read_fails_closed_for_expiry_revocation_rate_limit_and_disconne
     );
     let mut drifted = TiktokAuthenticatedReadService::fixture(
         FixtureTransport::responses([first_video_page_response(), drifted_page]),
-        Default::default(),
+        TiktokFreshnessPolicy::default(),
     );
     let read_credential = credential(&read_scope, now);
     let mut drift_cursor = TiktokVideoListCursor::new(read_scope).unwrap();
@@ -399,7 +400,7 @@ fn quota_scope_and_real_read_gate_are_explicit() {
     let quota = hartevo_channel_adapters::TiktokQuotaLedger::new(1).unwrap();
     let mut service = TiktokAuthenticatedReadService::fixture_with_quota(
         FixtureTransport::responses([profile_response(), profile_response()]),
-        Default::default(),
+        TiktokFreshnessPolicy::default(),
         quota,
     );
     service.probe(&read_credential, now).unwrap();
@@ -418,7 +419,7 @@ fn quota_scope_and_real_read_gate_are_explicit() {
 
     let mut missing_scope_service = TiktokAuthenticatedReadService::fixture(
         FixtureTransport::responses([missing_scope_response()]),
-        Default::default(),
+        TiktokFreshnessPolicy::default(),
     );
     let user_only = OAuthCredential::new(
         SecretReference::new("keychain://tiktok/open01").unwrap(),

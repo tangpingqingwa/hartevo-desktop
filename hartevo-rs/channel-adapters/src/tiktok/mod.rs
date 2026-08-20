@@ -51,6 +51,7 @@ impl TiktokOAuthScope {
 
     pub fn name(self) -> Result<ScopeName, TiktokError> {
         ScopeName::new(self.as_str())
+            .map_err(|_| TiktokError::InvalidRequest("invalid TikTok scope"))
     }
 }
 
@@ -610,16 +611,15 @@ impl TiktokQuotaLedger {
     }
 
     pub fn remaining(&self, operation: TiktokApiOperation, now: DateTime<Utc>) -> u32 {
-        let count = self
-            .calls
-            .get(&operation)
-            .map(|calls| {
+        let count = self.calls.get(&operation).map_or(0, |calls| {
+            u32::try_from(
                 calls
                     .iter()
                     .filter(|observed_at| **observed_at > now - Duration::minutes(1))
-                    .count() as u32
-            })
-            .unwrap_or(0);
+                    .count(),
+            )
+            .unwrap_or(u32::MAX)
+        });
         self.per_minute_limit.saturating_sub(count)
     }
 
@@ -743,9 +743,7 @@ impl TiktokVideoListCursor {
     }
 
     pub fn durable_digest(&self) -> String {
-        serde_json::to_value(self)
-            .map(|value| sha256_json(&value))
-            .unwrap_or_else(|_| "0".repeat(64))
+        serde_json::to_value(self).map_or_else(|_| "0".repeat(64), |value| sha256_json(&value))
     }
 
     pub fn apply_page(
@@ -828,6 +826,7 @@ pub enum TiktokCursorDisposition {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(clippy::struct_field_names)]
 #[serde(rename_all = "snake_case")]
 pub struct TiktokPerformanceObservation {
     like_count: Option<u64>,
@@ -1144,6 +1143,20 @@ pub enum TiktokError {
     MissionRevisionMismatch,
     #[error("TikTok observation revision was already admitted")]
     DuplicateRevision,
+}
+
+impl From<crate::transport::ChannelAdapterError> for TiktokError {
+    fn from(error: crate::transport::ChannelAdapterError) -> Self {
+        match error {
+            crate::transport::ChannelAdapterError::InvalidRequest(message) => {
+                Self::InvalidRequest(message)
+            }
+            crate::transport::ChannelAdapterError::InvalidResponse { field, .. } => {
+                Self::InvalidResponse { field }
+            }
+            _ => Self::InvalidRequest("invalid TikTok provider request"),
+        }
+    }
 }
 
 impl TiktokError {

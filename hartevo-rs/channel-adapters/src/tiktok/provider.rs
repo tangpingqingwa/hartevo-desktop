@@ -18,6 +18,7 @@ use super::{
     video_list_request_fingerprint,
 };
 
+#[derive(Debug)]
 pub struct TiktokDisplayApiProvider<T> {
     transport: T,
     provenance: EvidenceProvenance,
@@ -83,7 +84,7 @@ impl<T: ReadOnlyTransport> TiktokDisplayApiProvider<T> {
 pub fn probe_request(credential: SecretReference) -> Result<ProviderReadRequest, TiktokError> {
     let url = endpoint(USER_INFO_PATH)?;
     let url = with_fields(url, &["open_id", "display_name"]);
-    ProviderReadRequest::new(
+    Ok(ProviderReadRequest::new(
         ProviderId::Tiktok,
         TiktokApiOperation::UserInfo,
         HttpMethod::Get,
@@ -91,7 +92,7 @@ pub fn probe_request(credential: SecretReference) -> Result<ProviderReadRequest,
         [TiktokOAuthScope::UserInfoBasic.name()?],
         credential,
         None,
-    )
+    )?)
 }
 
 pub fn video_list_request(
@@ -110,7 +111,7 @@ pub fn video_list_request(
     if let Some(cursor) = cursor {
         body.insert("cursor".to_owned(), Value::from(cursor.value()));
     }
-    ProviderReadRequest::new(
+    Ok(ProviderReadRequest::new(
         ProviderId::Tiktok,
         TiktokApiOperation::VideoList,
         HttpMethod::Post,
@@ -118,7 +119,7 @@ pub fn video_list_request(
         [TiktokOAuthScope::VideoList.name()?],
         credential,
         Some(Value::Object(body)),
-    )
+    )?)
 }
 
 pub fn video_query_request(
@@ -136,7 +137,7 @@ pub fn video_query_request(
             "video_ids": video_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
         }
     });
-    ProviderReadRequest::new(
+    Ok(ProviderReadRequest::new(
         ProviderId::Tiktok,
         TiktokApiOperation::VideoQuery,
         HttpMethod::Post,
@@ -144,7 +145,7 @@ pub fn video_query_request(
         [TiktokOAuthScope::VideoList.name()?],
         credential,
         Some(body),
-    )
+    )?)
 }
 
 pub fn parse_probe_response(
@@ -295,7 +296,11 @@ fn successful_json(
     response: &ProviderResponse,
     operation: TiktokApiOperation,
 ) -> Result<Value, TiktokError> {
-    let body = response.json()?;
+    let body = response
+        .json_value()
+        .map_err(|_| TiktokError::InvalidResponse {
+            field: "json".to_owned(),
+        })?;
     let code = body
         .pointer("/error/code")
         .and_then(Value::as_str)
