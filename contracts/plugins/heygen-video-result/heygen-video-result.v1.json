@@ -1,0 +1,98 @@
+{
+  "schemaVersion": "hartevo-heygen-video-result-contract/v1",
+  "contractVersion": "heygen-video-result-layer1/v1",
+  "pluginId": "heygen.video.result",
+  "serviceId": "video.result.heygen",
+  "providerId": "provider.heygen.video-result",
+  "consumerId": "mission.video-result.heygen",
+  "evidenceLevel": "L1",
+  "authority": "proposal_read_recording_only",
+  "scopeBindings": [
+    "workspace",
+    "project",
+    "mission",
+    "template",
+    "avatar",
+    "voice",
+    "locale",
+    "mission_revision",
+    "source_revision"
+  ],
+  "identityConsent": {
+    "customAvatar": "required_consent_reference",
+    "customVoice": "required_consent_reference",
+    "secretMaterial": "opaque_secret_reference_only"
+  },
+  "digestBindings": [
+    "script_digest",
+    "ordered_scene_digest",
+    "ordered_variable_digest",
+    "ordered_input_asset_digest",
+    "source_revision_digest",
+    "template_id",
+    "avatar_id",
+    "voice_id",
+    "locale",
+    "provider_version",
+    "registration_digest",
+    "idempotency_fingerprint"
+  ],
+  "statusProjection": [
+    "pending",
+    "waiting",
+    "processing",
+    "completed",
+    "failed",
+    "cancelled",
+    "provider_unknown"
+  ],
+  "receipts": [
+    "registration",
+    "revocation",
+    "capability_probe",
+    "template_probe",
+    "avatar_probe",
+    "voice_probe",
+    "operation",
+    "status",
+    "artifact",
+    "url_expiry",
+    "adoption_proposal"
+  ],
+  "adoptionFences": [
+    "exact_scope",
+    "exact_mission_revision",
+    "exact_source_revision",
+    "exact_operation_id",
+    "exact_video_id",
+    "completed_terminal_status",
+    "artifact_metadata_digest",
+    "independent_byte_digest_required"
+  ],
+  "fixtureProvenance": [
+    "fixture",
+    "recording",
+    "loopback",
+    "BLOCKED_ENV"
+  ],
+  "nativeConnectedClaim": false,
+  "liveGeneration": false,
+  "liveUpload": false,
+  "liveClone": false,
+  "livePoll": false,
+  "webhookAcceptance": false,
+  "mediaDownload": false,
+  "mediaStore": false,
+  "durableWorkProductAdoption": false,
+  "futureLayer2Gaps": [
+    "live_generation",
+    "durable_video_id_receipt",
+    "bounded_status_reconciliation",
+    "signed_webhook_verification",
+    "independent_artifact_download_and_digest",
+    "expired_url_refresh",
+    "ambiguous_create_recovery",
+    "durable_work_product_adoption",
+    "native_connected_evidence"
+  ]
+}
