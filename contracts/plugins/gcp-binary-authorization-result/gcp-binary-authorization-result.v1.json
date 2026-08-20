@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/gcp-binary-authorization-result/gcp-binary-authorization-result.v1.json",
+  "schemaVersion": "hartevo.gcp-binary-authorization-result-contract/v1",
+  "contractVersion": "gcp-binary-authorization-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "gcp.binary-authorization.result",
+    "name": "GcpBinaryAuthorizationService",
+    "version": "1.0.0",
+    "readOnly": true,
+    "native": false,
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "get_policy",
+      "get_attestor",
+      "propose_validate_attestation_occurrence",
+      "record_validate_attestation_occurrence",
+      "verify_validate_attestation_occurrence",
+      "consume_observation"
+    ]
+  },
+  "provider": {
+    "id": "gcp.binary-authorization",
+    "name": "GcpBinaryAuthorizationProvider",
+    "version": "1.0.0",
+    "providerRevision": "gcp-binary-authorization-rest-r1",
+    "operations": [
+      "get_policy",
+      "get_attestor",
+      "validateAttestationOccurrence"
+    ],
+    "acceptedProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "native": false,
+    "liveExecution": false,
+    "credentialResolution": false,
+    "oauthSecretReference": true,
+    "serviceAccountSecretReference": true,
+    "rawKeys": false,
+    "rawAttestationPayload": false,
+    "containerBytes": false,
+    "policyMutation": false,
+    "attestorMutation": false,
+    "signing": false,
+    "deployment": false,
+    "consentEffectBypass": false
+  },
+  "consumer": {
+    "id": "mission.gcp-binary-authorization.result",
+    "name": "MissionGcpBinaryAuthorizationConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "nativeConnected": false,
+    "durableAdoption": false
+  },
+  "scope": {
+    "required": [
+      "projectId",
+      "policyId",
+      "attestorIds",
+      "imageDigest",
+      "platform",
+      "projectIdAndRevision",
+      "missionIdAndRevision",
+      "workProductIdAndRevision",
+      "permissionDigest",
+      "consentDigest",
+      "secretReferenceDigest",
+      "credentialRevision"
+    ],
+    "secret": "opaque_secret_reference_only",
+    "imageDigestFormat": "sha256:<64 lowercase hex>",
+    "rootProject": false,
+    "unboundedAttestorSet": false,
+    "pathTraversal": false
+  },
+  "policy": {
+    "getOnly": true,
+    "digestBound": true,
+    "mutation": false,
+    "rawProviderPayload": false
+  },
+  "attestor": {
+    "getOnly": true,
+    "digestBound": true,
+    "mutation": false,
+    "signing": false,
+    "rawPublicKey": false
+  },
+  "validation": {
+    "operation": "validateAttestationOccurrence",
+    "proposalRecordVerify": true,
+    "decisions": ["allow", "deny", "error", "unknown"],
+    "imageDigestBound": true,
+    "occurrencePayload": "digest_only",
+    "replayDetection": true,
+    "tamperDetection": true,
+    "revocationEvidence": true,
+    "partialEvidence": true,
+    "accessLossEvidence": true,
+    "requiresConsentEffectFence": true,
+    "bypassesKernelConsentEffect": false
+  },
+  "evidence": {
+    "digests": [
+      "version",
+      "contract",
+      "provider",
+      "permission",
+      "scope",
+      "policy",
+      "attestor",
+      "image",
+      "occurrence",
+      "request",
+      "response",
+      "evidence"
+    ],
+    "adversarialFindings": ["replay", "tamper", "revocation", "partial", "access_loss"],
+    "rawProviderPayload": false,
+    "rawAttestationPayload": false,
+    "rawKeys": false,
+    "containerBytes": false,
+    "bounded": {
+      "maxAttestors": 32,
+      "maxDiagnosticBytes": 256,
+      "maxEvidenceRecords": 64
+    }
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "policyDigestBound": true,
+    "attestorDigestBound": true,
+    "imageDigestBound": true,
+    "evidenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "authority": {
+    "connected": false,
+    "nativeProvider": false,
+    "consent": false,
+    "effect": false,
+    "receipt": false,
+    "verification": false,
+    "outcome": false,
+    "workProductAdoption": false,
+    "durableAdoption": false
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_gcp_auth_https_receipt_and_readback",
+    "failClosedCases": [
+      "missing_native_gcp_authority",
+      "live_credential_resolution",
+      "policy_or_attestor_mutation_request",
+      "signing_request",
+      "deployment_request",
+      "raw_key_or_attestation_payload_request",
+      "scope_or_revision_drift",
+      "permission_or_consent_drift",
+      "image_digest_drift",
+      "replayed_or_tampered_record",
+      "revoked_attestor",
+      "partial_or_access_lost_evidence"
+    ]
+  },
+  "layer2Gaps": [
+    "consented_native_gcp_https_transport",
+    "native_oauth_or_service_account_resolution",
+    "durable_provider_receipt",
+    "independent_policy_and_attestor_readback",
+    "verified_mission_or_work_product_adoption"
+  ],
+  "honestNativeGap": "Layer 1 is fixture, recording, loopback, or BLOCKED_ENV evidence only. It never claims Connected/native authority, never resolves live credentials, never mutates policy or attestors, never signs or deploys, never retains raw keys, attestation payloads, or container bytes, and never bypasses kernel Consent/Effect. Native GCP transport, durable receipts, independent readback, and adoption remain Layer-2 exits."
+}

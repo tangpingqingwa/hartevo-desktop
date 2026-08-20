@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.aws-marketplace-entitlement-result/v1",
+  "schemaVersion": "hartevo.aws-marketplace-entitlement-result/v1",
+  "contractVersion": "EXT-AWS-MARKETPLACE-ENTITLEMENT-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "aws.marketplace.entitlement-result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.aws-marketplace-entitlement-result/v1|layer=1|service=aws.marketplace.entitlement.result.read|provider=aws.marketplace.entitlement.result.recording|consumer=mission.aws-marketplace-entitlement.consumer|api=get-entitlements-2017-01-11-r1",
+  "contractDigest": "2af3c083272af4e0281c29173c47502846c54bf98d720d00aa403f75bf7e2718",
+  "service": {
+    "id": "aws.marketplace.entitlement.result.read",
+    "readOnly": true,
+    "proposalOnly": true,
+    "externalWrites": false,
+    "operations": [
+      "GetEntitlements",
+      "Register",
+      "RevokeRegistration",
+      "ReverseRegistration",
+      "RestoreRegistration"
+    ]
+  },
+  "provider": {
+    "id": "aws.marketplace.entitlement.result.recording",
+    "apiRevision": "get-entitlements-2017-01-11-r1",
+    "providerVersion": "aws-marketplace-entitlement-provider/v1",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "readOnly": true,
+    "allowedOperations": [
+      "GetEntitlements"
+    ],
+    "maxPageSize": 25,
+    "maxPages": 25,
+    "opaquePagination": true
+  },
+  "consumer": {
+    "id": "mission.aws-marketplace-entitlement.consumer",
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "effectiveAuthorization": false
+  },
+  "credentials": {
+    "kind": "sigv4",
+    "opaqueReference": true,
+    "serializable": false,
+    "rawMaterialRetained": false,
+    "nativeTransport": false
+  },
+  "scope": {
+    "product": "productCode",
+    "customer": [
+      "customerAwsAccountIdDigest",
+      "customerIdentifierDigest"
+    ],
+    "dimension": "dimensionDigest",
+    "license": "licenseArnDigest",
+    "expiry": [
+      "observedAt",
+      "requiredUntil",
+      "expirationProjection"
+    ],
+    "missionBinding": [
+      "missionId",
+      "projectId",
+      "workProductId",
+      "missionRevision",
+      "projectRevision",
+      "workProductRevision"
+    ],
+    "filterBinding": [
+      "exactlyOneCustomerFilter",
+      "productCode",
+      "dimensionDigest",
+      "licenseArnDigest"
+    ]
+  },
+  "registration": {
+    "binding": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "status"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "tamperFenced": true
+  },
+  "pagination": {
+    "operation": "GetEntitlements",
+    "maxResults": 25,
+    "maxPages": 25,
+    "nextTokenDigestOnly": true,
+    "loopFence": true,
+    "emptyPageFence": true
+  },
+  "projection": {
+    "retain": [
+      "productCode",
+      "customerReferenceDigest",
+      "dimensionDigest",
+      "licenseArnDigest",
+      "expirationDate",
+      "entitlementValueDigest",
+      "expiryProjection",
+      "pageDigest",
+      "evidenceDigest"
+    ],
+    "drop": [
+      "customerAwsAccountId",
+      "customerIdentifier",
+      "licenseArn",
+      "rawEntitlementValue",
+      "rawNextToken",
+      "credentials",
+      "purchaseState",
+      "agreementState"
+    ]
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "filterDigest",
+      "requestDigest",
+      "pagesDigest",
+      "expiryDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "complete",
+      "empty",
+      "empty_page",
+      "expired",
+      "filter_mismatch",
+      "pagination_loop",
+      "page_limit_exceeded",
+      "access_loss",
+      "throttled",
+      "not_found",
+      "partial",
+      "tampered",
+      "provider_unknown",
+      "registration_revoked",
+      "registration_reversed",
+      "consent_expired",
+      "consent_revoked"
+    ],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "expiredIsNonAdoptable": true,
+    "emptyPageIsNonAdoptable": true,
+    "paginationLoopIsNonAdoptable": true
+  },
+  "provenance": {
+    "fixture": {
+      "connected": false,
+      "native": false,
+      "firstParty": false
+    },
+    "recording": {
+      "connected": false,
+      "native": false,
+      "firstParty": false
+    },
+    "loopback": {
+      "connected": false,
+      "native": false,
+      "firstParty": false
+    },
+    "BLOCKED_ENV": {
+      "connected": false,
+      "native": false,
+      "firstParty": false
+    }
+  },
+  "authorityBoundary": {
+    "readOnly": true,
+    "truthAuthority": false,
+    "effectiveAuthorization": false,
+    "durableProviderReceipt": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "forbiddenEffects": [
+    "ResolveCustomer",
+    "MeterUsage",
+    "purchase",
+    "agreement",
+    "deployment",
+    "mutate_entitlement",
+    "issue_license",
+    "persist_raw_customer_identifier",
+    "persist_raw_license_arn"
+  ],
+  "layer2Gaps": [
+    "nativeSigV4Https",
+    "hostConsent",
+    "hostEffect",
+    "durableProviderReceipt",
+    "independentNativeReread",
+    "verificationAuthority",
+    "verifiedWorkProductAdoption"
+  ]
+}
