@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/plugins/figma-design/v1",
+  "title": "Hartevo Figma design-result Layer 1 contract",
+  "description": "Typed, read-only, recording-only Figma design-result boundary. It cannot claim native Connected evidence or perform external writes.",
+  "schemaVersion": "hartevo.figma-design-plugin-contract/v1",
+  "contractVersion": "figma-design-layer1/v1",
+  "evidenceLevel": "E1",
+  "readOnly": true,
+  "connected": false,
+  "native": false,
+  "secretMaterial": "opaque_reference_only",
+  "operations": [
+    "file_metadata",
+    "version_history",
+    "node_metadata",
+    "bounded_export_metadata",
+    "design_result_record",
+    "adoption_proposal"
+  ],
+  "scopeBindings": [
+    "tenant",
+    "hartevo_project",
+    "mission",
+    "team",
+    "figma_project",
+    "file",
+    "node",
+    "version"
+  ],
+  "providerModes": [
+    "fixture",
+    "loopback",
+    "BLOCKED_ENV"
+  ],
+  "limits": {
+    "maxNodeIds": 64,
+    "maxVersionPages": 8,
+    "maxVersionPageSize": 100,
+    "maxExportBytes": 4194304,
+    "maxRetryAttempts": 3
+  },
+  "layer2Gaps": [
+    "file_comment_branch_variable_permission_writes",
+    "webhook_registration_and_reconciliation",
+    "durable_external_export_receipt",
+    "independent_provider_readback",
+    "verified_work_product_adoption",
+    "native_connected_evidence"
+  ]
+}

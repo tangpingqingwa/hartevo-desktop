@@ -1,0 +1,134 @@
+{
+  "schemaVersion": "hartevo-plugin-manifest/v1",
+  "contractVersion": "plugin-contract-closure-01/v1",
+  "catalogVersion": "desktop-2026-08-14-plugin-catalog/v1",
+  "authority": "contract_validation_only",
+  "releaseDecision": "NOT_EVALUATED",
+  "plugin": {
+    "pluginId": "hartevo.readonly.market-evidence",
+    "version": "1.0.0",
+    "manifestRevision": 1,
+    "sourceDigest": "43316dbd02ac3beaa0e0aefd0784a2fe49bf20a9907e609cdfb08f216414b84c",
+    "definitionDigest": "efb8f0fe578f8436bc01546790c32d75253b69674ca53b9d11b836bb50be6cf9",
+    "provenance": "synthetic_contract_fixture",
+    "lifecycle": {
+      "initialState": "defined",
+      "states": ["defined", "mounted", "stopping", "stopped", "revoked", "failed"],
+      "terminalStates": ["stopped", "revoked", "failed"],
+      "reversibleMount": true,
+      "atomicMountReceipt": true,
+      "reverseOrderUnmount": true,
+      "crashPolicy": "revoke_and_unmount"
+    },
+    "scopeKinds": ["host", "project_mission"]
+  },
+  "serviceDefinitions": [
+    {
+      "serviceId": "market.evidence.read",
+      "version": 1,
+      "inputSchemaDigest": "fb19409cf285ef41c8bf59e2516719f57007632dcf779b9eb679f5f8815df835",
+      "outputSchemaDigest": "25b4c904a719960d4c5e0258eb2811db768ab654dc410648c1d84fa7e7130e18",
+      "definitionDigest": "abac1eddcfc82d68d51ea7f99881c4bd837111c274c8f439c7a57a46d5a4f409",
+      "mode": "read_only",
+      "scopeKind": "project_mission",
+      "providerCardinality": "exactly_one",
+      "reversible": true
+    }
+  ],
+  "providers": [
+    {
+      "providerId": "market.evidence.real-provider",
+      "serviceId": "market.evidence.read",
+      "version": 1,
+      "implementationDigest": "0af6c4e296b3451fa7c46e5d838d52cbc6e7e9134a0b41e3e907990a3a2b6d9c",
+      "definitionDigest": "55fe9774d10c7dd97c7dc836e4bfc19ba56409423f73f28420fb1fa3c4d7b81a",
+      "providerKind": "real_provider_adapter",
+      "availability": "NOT_EVALUATED",
+      "registrationState": "catalog_only",
+      "readOnly": true,
+      "realProviderRequired": true,
+      "authority": "provider_adapter_only",
+      "directAuthorities": {
+        "store": false,
+        "keyring": false,
+        "browserProfile": false,
+        "effect": false
+      }
+    }
+  ],
+  "consumers": [
+    {
+      "consumerId": "market.evidence.inspect",
+      "serviceId": "market.evidence.read",
+      "version": 1,
+      "definitionDigest": "f15c61b8333ebbd7e1df035c2020cd74fb64b1ed46dbc9f176cc200f0399b261",
+      "kind": "tool",
+      "modelVisible": true,
+      "readOnly": true,
+      "scopeKind": "project_mission",
+      "commandDigest": "8089142117873797b1f39eda1b7d58b3dc17ccc63becdd98ff8727c2cce8290e"
+    }
+  ],
+  "surfaces": [
+    {
+      "surfaceId": "market.evidence.conversation",
+      "surfaceKind": "conversation_node",
+      "consumerId": "market.evidence.inspect",
+      "version": 1,
+      "definitionDigest": "e939e3cdaeed2ea39fb787a1b5eb991d6fe0b7bd33e063d469b8df4de6efd1ee",
+      "modelVisible": true,
+      "scopeKind": "project_mission"
+    },
+    {
+      "surfaceId": "market.evidence.result",
+      "surfaceKind": "result_view",
+      "consumerId": "market.evidence.inspect",
+      "version": 1,
+      "definitionDigest": "22b3ebea0e9f38d65dfbadbafa65dba234b0cc15bb726f87358664c74cbc87be",
+      "modelVisible": true,
+      "scopeKind": "project_mission"
+    }
+  ],
+  "compositionRules": {
+    "hostScopeKind": "host",
+    "projectMissionScopeKind": "project_mission",
+    "hostContributionKinds": ["service_definition", "provider"],
+    "projectMissionContributionKinds": ["consumer", "surface", "provider"],
+    "crossScopeMountForbidden": true,
+    "providerSelectionPerProjectMission": true,
+    "duplicateProviderPolicy": "deny",
+    "staleGenerationPolicy": "deny",
+    "scopeDriftPolicy": "deny"
+  },
+  "durableLogFence": {
+    "schemaVersion": "hartevo-plugin-durable-log/v1",
+    "eventKinds": ["input", "output", "lifecycle"],
+    "modelVisibleInputRequired": true,
+    "modelVisibleOutputRequired": true,
+    "sequenceMonotonic": true,
+    "scopeDigestRequired": true,
+    "definitionDigestRequired": true,
+    "replayDeterministic": true,
+    "debugContentFree": true,
+    "rawSecretOrPrivateContentAllowed": false
+  },
+  "authorityBoundary": {
+    "directStoreAccess": "forbidden",
+    "directKeyringAccess": "forbidden",
+    "directBrowserProfileAccess": "forbidden",
+    "directEffectAuthority": "forbidden",
+    "effectBrokerOnly": true,
+    "secretMaterial": "reference_only",
+    "modelVisibleRawSecrets": "forbidden",
+    "manifestPrivateContent": "forbidden"
+  },
+  "readinessPolicy": {
+    "registrationMode": "empty_by_default",
+    "realProviderRequired": true,
+    "catalogDoesNotCount": true,
+    "fixtureDoesNotCount": true,
+    "emptyRegistryStatus": "NOT_EVALUATED",
+    "statusOnMissingRealProvider": "NOT_EVALUATED",
+    "releaseDecision": "NOT_EVALUATED"
+  }
+}
