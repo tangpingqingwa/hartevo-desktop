@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/mistral-inference-result/mistral-inference-result.v1.json",
+  "schemaVersion": "hartevo.mistral-inference-result.contract/v1",
+  "contractVersion": "mistral-inference-result/v1",
+  "pluginVersion": "0.1.0",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "hartevo.mistral.inference.result",
+    "version": "0.1.0",
+    "operation": "governed_inference_result_proposal",
+    "readOnly": true,
+    "liveExecution": false,
+    "emitsKernelReceipt": false,
+    "adoptsOutcome": false
+  },
+  "provider": {
+    "id": "mistral",
+    "version": "0.1.0",
+    "operations": [
+      "GET /v1/models",
+      "POST /v1/chat/completions",
+      "POST /v1/embeddings",
+      "POST /v1/moderations",
+      "POST /v1/chat/moderations"
+    ],
+    "acceptedTransports": ["recording", "fixture", "loopback", "BLOCKED_ENV"],
+    "native": false,
+    "connected": false,
+    "firstParty": false,
+    "secret": "opaque_non_serializing_secret_reference_only"
+  },
+  "consumer": {
+    "id": "mission.mistral.inference.result",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "consentBound": true,
+    "proposalOnly": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "organization",
+      "model",
+      "immutableModelRevision",
+      "task",
+      "providerRoute",
+      "requestRevision",
+      "project",
+      "mission",
+      "workProduct",
+      "consent",
+      "permission",
+      "policyRevision"
+    ],
+    "secret": "opaque_non_serializing_secret_reference_only",
+    "digestFences": [
+      "version",
+      "contract",
+      "provider",
+      "model",
+      "task",
+      "route",
+      "scope",
+      "permission",
+      "consent",
+      "policy",
+      "request",
+      "result"
+    ]
+  },
+  "allowlist": {
+    "modelList": "bounded_explicit_recording_only",
+    "tasks": ["chat_completion", "embedding", "classification"],
+    "chat": {
+      "messages": ["system", "user", "assistant"],
+      "tools": false,
+      "streaming": false
+    },
+    "embeddings": {
+      "input": "bounded_text_batch",
+      "vectors": "digest_and_dimension_only"
+    },
+    "classification": {
+      "input": "bounded_text_batch",
+      "metadata": "bounded_digest_and_flag_count_only"
+    },
+    "files": {
+      "upload": false,
+      "download": false,
+      "contentRetention": false
+    }
+  },
+  "redaction": {
+    "prompts": "digest_and_shape_only",
+    "completions": "digest_and_byte_length_only",
+    "embeddings": "digest_and_dimension_only",
+    "classificationInput": "digest_and_shape_only",
+    "fileContent": "never_retained",
+    "toolArguments": "never_retained",
+    "rawResponseBody": "never_retained",
+    "providerErrors": "class_status_retryable_digest_only"
+  },
+  "lifecycle": {
+    "states": [
+      "submitted",
+      "queued",
+      "running",
+      "completed",
+      "failed",
+      "partial",
+      "timeout",
+      "expired",
+      "provider_unknown"
+    ],
+    "completionDoesNotProve": ["factualCorrectness", "taskSuccess", "outcomeAdoption"]
+  },
+  "evidence": {
+    "bounded": [
+      "model",
+      "task",
+      "requestRevision",
+      "resultRevision",
+      "finishReason",
+      "usage",
+      "latency",
+      "contentDigest",
+      "embeddingDigest",
+      "classificationDigest",
+      "errorDigest"
+    ],
+    "rawPrompt": false,
+    "rawCompletion": false,
+    "rawEmbedding": false,
+    "rawResponse": false,
+    "durableNativeReceipt": false,
+    "independentReadBack": false
+  },
+  "registration": {
+    "versionBound": true,
+    "contractBound": true,
+    "providerBound": true,
+    "modelBound": true,
+    "taskBound": true,
+    "routeBound": true,
+    "scopeBound": true,
+    "permissionBound": true,
+    "consentBound": true,
+    "policyBound": true,
+    "digestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "singleUseRecordings": true
+  },
+  "authority": {
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "externalWrites": false,
+    "toolExecution": false,
+    "fileAuthority": false,
+    "modelMutation": false,
+    "durableNativeReceipt": false,
+    "independentReadBack": false,
+    "kernelTruth": false,
+    "kernelConsent": false,
+    "kernelEffect": false,
+    "kernelReceipt": false,
+    "kernelVerification": false,
+    "kernelOutcomeAdoption": false
+  },
+  "layer2Gaps": [
+    "host_owned_credential_resolution",
+    "consented_live_inference_effect",
+    "durable_provider_receipt",
+    "independent_native_read_back",
+    "verified_work_product_adoption",
+    "file_upload_download",
+    "tool_execution",
+    "fine_tuned_model_mutation"
+  ],
+  "officialApiBasis": [
+    "https://docs.mistral.ai/developers",
+    "https://docs.mistral.ai/api",
+    "https://docs.mistral.ai/api/endpoint/models"
+  ]
+}

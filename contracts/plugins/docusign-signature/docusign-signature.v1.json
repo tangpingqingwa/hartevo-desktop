@@ -1,0 +1,95 @@
+{
+  "schemaVersion": "hartevo-docusign-signature-contract/v1",
+  "contractVersion": "docusign-signature-layer1/v1",
+  "evidenceLevel": "E1",
+  "authority": {
+    "envelopeProposal": true,
+    "receiptProjection": true,
+    "recipientStatusProjection": true,
+    "signedResultAdoptionProposal": true,
+    "connected": false,
+    "native": false,
+    "externalWrites": false,
+    "businessVerification": false
+  },
+  "scopeBindings": [
+    "tenant",
+    "project",
+    "mission",
+    "account",
+    "baseUri",
+    "providerVersion",
+    "registrationDigest",
+    "projectRevision",
+    "missionRevision",
+    "sourceRevision"
+  ],
+  "operations": [
+    "envelopeProposal",
+    "receiptProjection",
+    "recipientStatusProjection",
+    "signedResultAdoptionProposal",
+    "registration",
+    "unregistration",
+    "revocation"
+  ],
+  "envelopeStates": [
+    "created",
+    "sent",
+    "delivered",
+    "completed",
+    "declined",
+    "voided",
+    "providerUnknown"
+  ],
+  "recipientStates": [
+    "created",
+    "sent",
+    "delivered",
+    "completed",
+    "declined",
+    "voided",
+    "providerUnknown"
+  ],
+  "transport": {
+    "protocol": "https",
+    "authentication": "oauth2-secret-reference-only",
+    "nativeOptInEnvironment": "HARTEVO_DOCUSIGN_NATIVE_LAYER2",
+    "liveCallsPermitted": false,
+    "layer2Gaps": [
+      "envelopeCreate",
+      "envelopeSend",
+      "signingCeremony",
+      "envelopeIdAndUrlReceipt",
+      "boundedStatusReconciliation",
+      "independentDocumentReadback",
+      "connectVerification",
+      "ambiguousCreateRecovery"
+    ]
+  },
+  "redaction": {
+    "oauthAccessAndRefreshMaterial": "omitted",
+    "signerPii": "digestOnly",
+    "documentBytes": "omitted",
+    "rawConnectPayload": "omitted",
+    "rawProviderResponse": "digestOnly"
+  },
+  "registration": {
+    "versionBound": true,
+    "digestBound": true,
+    "scopeBound": true,
+    "reversible": true
+  },
+  "nonConnectedEvidence": [
+    "fixture",
+    "loopback",
+    "blockedEnv",
+    "missingCredentials",
+    "accountMismatch",
+    "unsupportedStatus",
+    "rateLimited",
+    "timeout",
+    "eventualConsistency",
+    "nativeLayer2Gap"
+  ]
+}
