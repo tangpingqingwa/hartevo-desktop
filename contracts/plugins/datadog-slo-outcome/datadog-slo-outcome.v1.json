@@ -1,0 +1,302 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.datadog-slo-outcome/v1",
+  "title": "Hartevo Datadog SLO outcome-evidence plugin contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "layer",
+    "authority",
+    "service",
+    "provider",
+    "consumer",
+    "sloForms",
+    "reads",
+    "bounds",
+    "registration",
+    "projections",
+    "transport",
+    "honesty",
+    "layer2Gaps"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "hartevo.datadog-slo-outcome/v1" },
+    "layer": { "const": "datadog_slo_layer_1" },
+    "authority": { "const": "read_only_observational_evidence" },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "access", "contractDigest"],
+      "properties": {
+        "id": { "const": "datadog.slo-outcome-evidence.read" },
+        "version": { "const": "1.0.0" },
+        "access": { "const": "read_only" },
+        "contractDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "serviceId",
+        "version",
+        "implementation",
+        "scope",
+        "authentication",
+        "permissions",
+        "transport",
+        "reversible",
+        "revocable"
+      ],
+      "properties": {
+        "id": { "const": "datadog.slo.outcome" },
+        "serviceId": { "const": "datadog.slo-outcome-evidence.read" },
+        "version": { "const": "1.0.0" },
+        "implementation": { "const": "DatadogSloProvider" },
+        "scope": {
+          "const": [
+            "site",
+            "api_host",
+            "organization_id",
+            "slo_id",
+            "slo_type",
+            "definition_digest",
+            "query_digest",
+            "monitor_ids",
+            "group_ids",
+            "correction_policy",
+            "downtime_policy",
+            "project_id",
+            "deployment_id",
+            "deployment_revision",
+            "release_id",
+            "release_revision",
+            "mission_id",
+            "mission_revision",
+            "observation_window",
+            "policy_revision",
+            "permission_snapshot",
+            "registration_digest"
+          ]
+        },
+        "authentication": {
+          "const": ["oauth_secret_reference", "application_key_secret_reference"]
+        },
+        "permissions": { "const": ["slos_read", "monitors_read"] },
+        "transport": { "const": ["recording", "fake", "fixture", "loopback", "blocked_env"] },
+        "reversible": { "const": true },
+        "revocable": { "const": true }
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "serviceId", "version", "kind", "binding"],
+      "properties": {
+        "id": { "const": "mission.slo-outcome-evidence.consumer" },
+        "serviceId": { "const": "datadog.slo-outcome-evidence.read" },
+        "version": { "const": "1.0.0" },
+        "kind": { "const": "mission_outcome_evidence_proposal" },
+        "binding": {
+          "const": [
+            "site",
+            "api_host",
+            "organization_id",
+            "slo_id",
+            "slo_type",
+            "definition_digest",
+            "query_digest",
+            "observation_window",
+            "project_id",
+            "deployment_id",
+            "deployment_revision",
+            "release_id",
+            "release_revision",
+            "mission_id",
+            "mission_revision",
+            "registration_digest",
+            "source_result_digest",
+            "policy_revision"
+          ]
+        }
+      }
+    },
+    "sloForms": {
+      "type": "array",
+      "const": ["metric", "monitor", "time_slice"]
+    },
+    "reads": {
+      "type": "array",
+      "minItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "readOnly", "bounded", "arbitraryQuery", "writes"],
+        "properties": {
+          "id": {
+            "enum": [
+              "describe_slo",
+              "read_slo_history",
+              "read_slo_status",
+              "read_monitor_details",
+              "read_corrections",
+              "read_downtime",
+              "compile_observation_proposal",
+              "record_observation_receipt",
+              "verify_outcome_evidence"
+            ]
+          },
+          "readOnly": { "const": true },
+          "bounded": { "const": true },
+          "arbitraryQuery": { "const": false },
+          "writes": { "const": false }
+        }
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxObservationWindowSeconds",
+        "maxHistoryPoints",
+        "maxMonitors",
+        "maxGroups",
+        "maxTransitions",
+        "maxCorrections",
+        "maxDowntimes",
+        "maxErrors",
+        "maxAllowlistedTags",
+        "maxIdentifierBytes"
+      ],
+      "properties": {
+        "maxObservationWindowSeconds": { "const": 7776000 },
+        "maxHistoryPoints": { "const": 10000 },
+        "maxMonitors": { "const": 100 },
+        "maxGroups": { "const": 100 },
+        "maxTransitions": { "const": 10000 },
+        "maxCorrections": { "const": 100 },
+        "maxDowntimes": { "const": 100 },
+        "maxErrors": { "const": 100 },
+        "maxAllowlistedTags": { "const": 32 },
+        "maxIdentifierBytes": { "const": 256 }
+      }
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "versionBound",
+        "contractDigestBound",
+        "scopeDigestBound",
+        "permissionSnapshotBound",
+        "registrationDigest",
+        "reversible",
+        "revocable",
+        "failClosedOnDrift"
+      ],
+      "properties": {
+        "versionBound": { "const": true },
+        "contractDigestBound": { "const": true },
+        "scopeDigestBound": { "const": true },
+        "permissionSnapshotBound": { "const": true },
+        "registrationDigest": { "const": true },
+        "reversible": { "const": true },
+        "revocable": { "const": true },
+        "failClosedOnDrift": { "const": ["site", "organization", "slo", "definition", "query", "monitor", "window", "permission", "public_beta_status"] }
+      }
+    },
+    "projections": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["states", "noDataIsHealthy", "noAlertIsSuccess", "downtimeExplicit", "correctionExplicit"],
+      "properties": {
+        "states": {
+          "const": ["healthy", "breached", "warning", "no_data", "partial", "corrected", "downtime", "provider_unknown"]
+        },
+        "noDataIsHealthy": { "const": false },
+        "noAlertIsSuccess": { "const": false },
+        "downtimeExplicit": { "const": true },
+        "correctionExplicit": { "const": true }
+      }
+    },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "siteBound",
+        "organizationBound",
+        "secretReference",
+        "rawSecretSerialized",
+        "rawMetricSerialized",
+        "rawLogSerialized",
+        "rawTraceSerialized",
+        "writes",
+        "submitTelemetry",
+        "arbitraryQuery",
+        "pageResponders"
+      ],
+      "properties": {
+        "siteBound": { "const": true },
+        "organizationBound": { "const": true },
+        "secretReference": { "const": true },
+        "rawSecretSerialized": { "const": false },
+        "rawMetricSerialized": { "const": false },
+        "rawLogSerialized": { "const": false },
+        "rawTraceSerialized": { "const": false },
+        "writes": { "const": false },
+        "submitTelemetry": { "const": false },
+        "arbitraryQuery": { "const": false },
+        "pageResponders": { "const": false }
+      }
+    },
+    "honesty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "readOnly",
+        "proposalOnly",
+        "fixtureNative",
+        "recordingNative",
+        "fakeNative",
+        "loopbackNative",
+        "blockedEnvNative",
+        "fixtureConnected",
+        "recordingConnected",
+        "fakeConnected",
+        "loopbackConnected",
+        "blockedEnvConnected",
+        "absenceIsSuccess",
+        "nativeHttpsLayer"
+      ],
+      "properties": {
+        "readOnly": { "const": true },
+        "proposalOnly": { "const": true },
+        "fixtureNative": { "const": false },
+        "recordingNative": { "const": false },
+        "fakeNative": { "const": false },
+        "loopbackNative": { "const": false },
+        "blockedEnvNative": { "const": false },
+        "fixtureConnected": { "const": false },
+        "recordingConnected": { "const": false },
+        "fakeConnected": { "const": false },
+        "loopbackConnected": { "const": false },
+        "blockedEnvConnected": { "const": false },
+        "absenceIsSuccess": { "const": false },
+        "nativeHttpsLayer": { "const": "layer_2_gap" }
+      }
+    },
+    "layer2Gaps": {
+      "type": "array",
+      "const": [
+        "native_oauth_or_scoped_application_key_resolution",
+        "native_site_organization_probe",
+        "bounded_https_slo_history_status_monitor_correction_downtime_reads",
+        "durable_native_request_and_cost_receipts",
+        "closed_window_reconciliation",
+        "verified_outcome_evidence_adoption"
+      ]
+    }
+  }
+}
