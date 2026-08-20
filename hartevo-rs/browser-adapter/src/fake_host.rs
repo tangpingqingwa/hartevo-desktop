@@ -12,11 +12,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::workspace::{digest, digest_json, is_sha256};
 use crate::{
-    BrowserAction, BrowserActionBatch, BrowserActionRisk, BrowserControlHost, BrowserElementRef,
-    BrowserError, BrowserLeaseProof, BrowserLocatorResolution, BrowserNavigationPolicy,
-    BrowserProfile, BrowserPromptRisk, BrowserRecipeExecutionAuthorization,
-    BrowserRecipePreparedPlan, BrowserRecipeRegistry, BrowserRecipeTrustStore,
-    BrowserStableLocator, BrowserWorkspace, SemanticSnapshot,
+    BrowserAction, BrowserActionBatch, BrowserActionResult, BrowserActionRisk, BrowserBatchReceipt,
+    BrowserBatchReceiptState, BrowserControlHost, BrowserElementRef, BrowserError,
+    BrowserLeaseProof, BrowserLocatorResolution, BrowserNavigationPolicy, BrowserProfile,
+    BrowserPromptRisk, BrowserRecipeExecutionAuthorization, BrowserRecipePreparedPlan,
+    BrowserRecipeRegistry, BrowserRecipeTrustStore, BrowserStableLocator, BrowserWorkspace,
+    SemanticSnapshot,
 };
 
 static HOST_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -287,7 +288,96 @@ impl FakeBrowserHost {
         self.begin_batch(batch, now)
     }
 
+    pub fn resume_read_only_batch(
+        &mut self,
+        batch: &BrowserActionBatch,
+        receipt: &BrowserBatchReceipt,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserBatchCursor, BrowserError> {
+        self.ensure_batch_id_available(&batch.id)?;
+        if batch.effect_binding.is_some()
+            || batch
+                .actions
+                .iter()
+                .any(|action| action.risk == BrowserActionRisk::PotentialExternalWrite)
+        {
+            return Err(BrowserError::EffectBrokerRequired);
+        }
+        self.resume_batch(batch, receipt, now)
+    }
+
     pub fn execute_next(
+        &mut self,
+        cursor: &mut BrowserBatchCursor,
+        now: DateTime<Utc>,
+    ) -> Result<Option<BrowserActionResult>, BrowserError> {
+        if cursor.batch.effect_binding.is_some() {
+            return Self::reject_active_cursor(cursor, BrowserError::EffectBrokerRequired);
+        }
+        self.execute_next_authorized(cursor, now)
+    }
+
+    pub fn begin_effect_batch(
+        &mut self,
+        batch: &BrowserActionBatch,
+        effect: &Effect,
+        recipe_authorization: Option<&BrowserRecipeExecutionAuthorization<'_>>,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserBatchCursor, BrowserError> {
+        self.ensure_batch_id_available(&batch.id)?;
+        Self::validate_effect_dispatch(batch, effect, recipe_authorization, now)?;
+        if batch.effect_binding.is_none()
+            || !batch
+                .actions
+                .iter()
+                .any(|action| action.risk == BrowserActionRisk::PotentialExternalWrite)
+        {
+            return Err(BrowserError::EffectBrokerRequired);
+        }
+        self.begin_batch(batch, now)
+    }
+
+    pub fn resume_effect_batch(
+        &mut self,
+        batch: &BrowserActionBatch,
+        receipt: &BrowserBatchReceipt,
+        effect: &Effect,
+        recipe_authorization: Option<&BrowserRecipeExecutionAuthorization<'_>>,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserBatchCursor, BrowserError> {
+        self.ensure_batch_id_available(&batch.id)?;
+        Self::validate_effect_dispatch(batch, effect, recipe_authorization, now)?;
+        if batch.effect_binding.is_none()
+            || !batch
+                .actions
+                .iter()
+                .any(|action| action.risk == BrowserActionRisk::PotentialExternalWrite)
+        {
+            return Err(BrowserError::EffectBrokerRequired);
+        }
+        self.resume_batch(batch, receipt, now)
+    }
+
+    pub fn execute_next_effect(
+        &mut self,
+        cursor: &mut BrowserBatchCursor,
+        effect: &Effect,
+        recipe_authorization: Option<&BrowserRecipeExecutionAuthorization<'_>>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<BrowserActionResult>, BrowserError> {
+        if cursor.is_terminal() {
+            return Err(BrowserError::RealActionRejected);
+        }
+        if let Err(error) =
+            Self::validate_effect_dispatch(&cursor.batch, effect, recipe_authorization, now)
+        {
+            cursor.mark_failed(&error);
+            return Err(error);
+        }
+        self.execute_next_authorized(cursor, now)
+    }
+
+    fn execute_next_authorized(
         &mut self,
         cursor: &mut BrowserBatchCursor,
         now: DateTime<Utc>,
@@ -302,10 +392,21 @@ impl FakeBrowserHost {
                 Ok(None)
             }
             Err(error) => {
-                cursor.mark_failed();
+                cursor.mark_failed(&error);
                 Err(error)
             }
         }
+    }
+
+    fn reject_active_cursor<T>(
+        cursor: &mut BrowserBatchCursor,
+        error: BrowserError,
+    ) -> Result<T, BrowserError> {
+        if cursor.is_terminal() {
+            return Err(BrowserError::RealActionRejected);
+        }
+        cursor.mark_failed(&error);
+        Err(error)
     }
 
     fn execute_next_active(
@@ -337,18 +438,16 @@ impl FakeBrowserHost {
             &action_digest,
             &observation_digest,
         ))?;
-        cursor.next_action = cursor
-            .next_action
-            .checked_add(1)
-            .ok_or(BrowserError::CounterOverflow)?;
-        Ok(Some(BrowserActionResult {
+        let result = BrowserActionResult {
             batch_id: cursor.batch.id.clone(),
             action_sequence,
             action_digest,
             host_receipt_digest,
             external_write_may_have_occurred: cursor.external_write_may_have_occurred,
             business_verified: false,
-        }))
+        };
+        cursor.acknowledge_result(result.clone())?;
+        Ok(Some(result))
     }
 
     fn observe_next_action(
@@ -380,23 +479,6 @@ impl FakeBrowserHost {
         )))
     }
 
-    fn begin_effect_batch(
-        &mut self,
-        batch: &BrowserActionBatch,
-        now: DateTime<Utc>,
-    ) -> Result<BrowserBatchCursor, BrowserError> {
-        self.ensure_batch_id_available(&batch.id)?;
-        if batch.effect_binding.is_none()
-            || !batch
-                .actions
-                .iter()
-                .any(|action| action.risk == BrowserActionRisk::PotentialExternalWrite)
-        {
-            return Err(BrowserError::EffectBrokerRequired);
-        }
-        self.begin_batch(batch, now)
-    }
-
     fn begin_batch(
         &mut self,
         batch: &BrowserActionBatch,
@@ -417,6 +499,47 @@ impl FakeBrowserHost {
         let cursor = BrowserBatchCursor::new(batch.clone(), self.session_id);
         self.claim_validated_batch_id(&batch.id)?;
         Ok(cursor)
+    }
+
+    fn resume_batch(
+        &mut self,
+        batch: &BrowserActionBatch,
+        receipt: &BrowserBatchReceipt,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserBatchCursor, BrowserError> {
+        let state = self
+            .workspaces
+            .get(&batch.workspace_id)
+            .ok_or(BrowserError::WorkspaceNotRegistered)?;
+        batch.validate_for(&state.profile, &state.workspace, now)?;
+        receipt.validate_for(batch)?;
+        if !receipt.is_resumable() {
+            return Err(BrowserError::InvalidBatchReceipt);
+        }
+        if state
+            .pages
+            .values()
+            .any(|page| page.identity_digest != state.workspace.expected_identity_digest)
+        {
+            return Err(BrowserError::AccountIdentityMismatch);
+        }
+        let cursor = BrowserBatchCursor::resume(batch.clone(), receipt, self.session_id)?;
+        self.claim_validated_batch_id(&batch.id)?;
+        Ok(cursor)
+    }
+
+    fn validate_effect_dispatch(
+        batch: &BrowserActionBatch,
+        effect: &Effect,
+        recipe_authorization: Option<&BrowserRecipeExecutionAuthorization<'_>>,
+        now: DateTime<Utc>,
+    ) -> Result<(), BrowserError> {
+        match (batch.recipe_binding_digest.as_ref(), recipe_authorization) {
+            (Some(_), Some(authorization)) => authorization.validate_effect(batch, effect, now),
+            (Some(_), None) => Err(BrowserError::RecipeRuntimeAuthorizationRequired),
+            (None, None) => batch.validate_effect(effect, now),
+            (None, Some(_)) => Err(BrowserError::RecipeScopeMismatch),
+        }
     }
 
     fn ensure_batch_id_available(
@@ -461,8 +584,10 @@ pub struct BrowserBatchCursor {
     next_action: usize,
     observation_count: usize,
     last_observation_digest: Option<String>,
+    acknowledged_results: Vec<BrowserActionResult>,
     external_write_may_have_occurred: bool,
     state: BrowserBatchCursorState,
+    terminal_reason_digest: Option<String>,
 }
 
 impl BrowserBatchCursor {
@@ -473,9 +598,35 @@ impl BrowserBatchCursor {
             next_action: 0,
             observation_count: 0,
             last_observation_digest: None,
+            acknowledged_results: Vec::new(),
             external_write_may_have_occurred: false,
             state: BrowserBatchCursorState::Active,
+            terminal_reason_digest: None,
         }
+    }
+
+    fn resume(
+        batch: BrowserActionBatch,
+        receipt: &BrowserBatchReceipt,
+        host_session_id: u64,
+    ) -> Result<Self, BrowserError> {
+        receipt.validate_for(&batch)?;
+        if !receipt.is_resumable() {
+            return Err(BrowserError::InvalidBatchReceipt);
+        }
+        let next_action = usize::try_from(receipt.completed_action_count)
+            .map_err(|_| BrowserError::CounterOverflow)?;
+        Ok(Self {
+            batch,
+            host_session_id,
+            next_action,
+            observation_count: next_action,
+            last_observation_digest: receipt.last_observation_digest.clone(),
+            acknowledged_results: receipt.acknowledged_results.clone(),
+            external_write_may_have_occurred: receipt.external_write_may_have_occurred,
+            state: BrowserBatchCursorState::Active,
+            terminal_reason_digest: None,
+        })
     }
 
     pub fn completed_action_count(&self) -> usize {
@@ -498,6 +649,26 @@ impl BrowserBatchCursor {
         self.state != BrowserBatchCursorState::Active
     }
 
+    pub fn receipt(&self) -> Result<BrowserBatchReceipt, BrowserError> {
+        BrowserBatchReceipt::new(
+            &self.batch,
+            self.acknowledged_results.clone(),
+            self.last_observation_digest.clone(),
+            self.external_write_may_have_occurred,
+            self.state.into(),
+            self.terminal_reason_digest.clone(),
+        )
+    }
+
+    pub fn cancel(&mut self, cancellation_evidence_digest: String) -> Result<(), BrowserError> {
+        if self.is_terminal() || !is_sha256(&cancellation_evidence_digest) {
+            return Err(BrowserError::RealActionRejected);
+        }
+        self.state = BrowserBatchCursorState::Cancelled;
+        self.terminal_reason_digest = Some(cancellation_evidence_digest);
+        Ok(())
+    }
+
     pub fn requires_reconciliation(&self, error: &BrowserError) -> bool {
         matches!(error, BrowserError::HostRestarted) || self.external_write_may_have_occurred
     }
@@ -518,12 +689,31 @@ impl BrowserBatchCursor {
         self.external_write_may_have_occurred = true;
     }
 
-    fn mark_completed(&mut self) {
-        self.state = BrowserBatchCursorState::Completed;
+    fn acknowledge_result(&mut self, result: BrowserActionResult) -> Result<(), BrowserError> {
+        let expected_sequence = u32::try_from(self.next_action)
+            .map_err(|_| BrowserError::CounterOverflow)?
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        if result.batch_id != self.batch.id || result.action_sequence != expected_sequence {
+            return Err(BrowserError::InvalidBatchReceipt);
+        }
+        result.digest()?;
+        self.acknowledged_results.push(result);
+        self.next_action = self
+            .next_action
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        Ok(())
     }
 
-    fn mark_failed(&mut self) {
+    fn mark_completed(&mut self) {
+        self.state = BrowserBatchCursorState::Completed;
+        self.terminal_reason_digest = None;
+    }
+
+    fn mark_failed(&mut self, error: &BrowserError) {
         self.state = BrowserBatchCursorState::Failed;
+        self.terminal_reason_digest = Some(digest(error.code().as_bytes()));
     }
 }
 
@@ -531,7 +721,19 @@ impl BrowserBatchCursor {
 enum BrowserBatchCursorState {
     Active,
     Completed,
+    Cancelled,
     Failed,
+}
+
+impl From<BrowserBatchCursorState> for BrowserBatchReceiptState {
+    fn from(value: BrowserBatchCursorState) -> Self {
+        match value {
+            BrowserBatchCursorState::Active => Self::Active,
+            BrowserBatchCursorState::Completed => Self::Completed,
+            BrowserBatchCursorState::Cancelled => Self::Cancelled,
+            BrowserBatchCursorState::Failed => Self::Failed,
+        }
+    }
 }
 
 impl fmt::Debug for BrowserBatchCursor {
@@ -546,6 +748,10 @@ impl fmt::Debug for BrowserBatchCursor {
             .field("next_action", &self.next_action)
             .field("observation_count", &self.observation_count)
             .field(
+                "acknowledged_result_count",
+                &self.acknowledged_results.len(),
+            )
+            .field(
                 "has_last_observation",
                 &self.last_observation_digest.is_some(),
             )
@@ -554,19 +760,12 @@ impl fmt::Debug for BrowserBatchCursor {
                 &self.external_write_may_have_occurred,
             )
             .field("state", &self.state)
+            .field(
+                "has_terminal_reason",
+                &self.terminal_reason_digest.is_some(),
+            )
             .finish()
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BrowserActionResult {
-    pub batch_id: BrowserActionBatchId,
-    pub action_sequence: u32,
-    pub action_digest: String,
-    pub host_receipt_digest: String,
-    pub external_write_may_have_occurred: bool,
-    pub business_verified: bool,
 }
 
 pub struct FakeBrowserEffectExecutor<'a> {
@@ -635,29 +834,23 @@ impl EffectExecutor for FakeBrowserEffectExecutor<'_> {
             ));
         }
         self.consumed = true;
-        match self.recipe_authorization.as_ref() {
-            Some(authorization) => authorization
-                .validate_effect(&self.batch, effect, self.now)
-                .map_err(|error| ProviderFailure::Rejected(error.code().into()))?,
-            None if self.batch.recipe_binding_digest.is_some() => {
-                return Err(ProviderFailure::Rejected(
-                    BrowserError::RecipeRuntimeAuthorizationRequired
-                        .code()
-                        .into(),
-                ));
-            }
-            None => self
-                .batch
-                .validate_effect(effect, self.now)
-                .map_err(|error| ProviderFailure::Rejected(error.code().into()))?,
-        }
         let mut cursor = self
             .host
-            .begin_effect_batch(&self.batch, self.now)
+            .begin_effect_batch(
+                &self.batch,
+                effect,
+                self.recipe_authorization.as_ref(),
+                self.now,
+            )
             .map_err(|error| ProviderFailure::Rejected(error.code().into()))?;
         let mut results = Vec::new();
         loop {
-            match self.host.execute_next(&mut cursor, self.now) {
+            match self.host.execute_next_effect(
+                &mut cursor,
+                effect,
+                self.recipe_authorization.as_ref(),
+                self.now,
+            ) {
                 Ok(Some(result)) => results.push(result),
                 Ok(None) => break,
                 Err(error) if cursor.requires_reconciliation(&error) => {
@@ -1310,15 +1503,17 @@ mod tests {
             let batch = effect_batch(&fixture, actions, &effect);
             let mut cursor = fixture
                 .host
-                .begin_effect_batch(&batch, fixture.now)
+                .begin_effect_batch(&batch, &effect, None, fixture.now)
                 .expect("begin batch");
             assert!(
                 fixture
                     .host
-                    .execute_next(&mut cursor, fixture.now)
+                    .execute_next_effect(&mut cursor, &effect, None, fixture.now)
                     .expect("first action")
                     .is_some()
             );
+            let acknowledged = cursor.receipt().expect("first prefix receipt");
+            assert_eq!(acknowledged.completed_action_count, 1);
 
             fixture
                 .workspace
@@ -1337,7 +1532,12 @@ mod tests {
 
             let failure = fixture
                 .host
-                .execute_next(&mut cursor, fixture.now + Duration::seconds(1))
+                .execute_next_effect(
+                    &mut cursor,
+                    &effect,
+                    None,
+                    fixture.now + Duration::seconds(1),
+                )
                 .expect_err("old batch must be stopped before queued write");
             assert_eq!(failure.code(), "BROWSER_CONTROL_LEASE_LOST");
             assert_eq!(cursor.completed_action_count(), 1);
@@ -1345,10 +1545,19 @@ mod tests {
             assert!(!cursor.external_write_may_have_occurred());
             assert!(!cursor.requires_reconciliation(&failure));
             assert!(cursor.is_terminal());
+            let stopped = cursor.receipt().expect("lease-loss receipt");
+            assert_eq!(stopped.completed_action_count, 1);
+            assert_eq!(stopped.result_digest, acknowledged.result_digest);
+            assert_eq!(stopped.state, BrowserBatchReceiptState::Failed);
             assert_eq!(
                 fixture
                     .host
-                    .execute_next(&mut cursor, fixture.now + Duration::seconds(1))
+                    .execute_next_effect(
+                        &mut cursor,
+                        &effect,
+                        None,
+                        fixture.now + Duration::seconds(1),
+                    )
                     .expect_err("failed cursor cannot retry queued write")
                     .code(),
                 "BROWSER_REAL_ACTION_REJECTED"
@@ -1913,11 +2122,11 @@ mod tests {
             .fail_after_next_external_input_for_test();
         let mut cursor = cursor_fixture
             .host
-            .begin_effect_batch(&batch, cursor_fixture.now)
+            .begin_effect_batch(&batch, &effect, None, cursor_fixture.now)
             .expect("begin input cursor");
         let failure = cursor_fixture
             .host
-            .execute_next(&mut cursor, cursor_fixture.now)
+            .execute_next_effect(&mut cursor, &effect, None, cursor_fixture.now)
             .expect_err("injected post-input host failure");
         assert_eq!(failure.code(), "BROWSER_HOST_EXITED");
         assert_eq!(cursor.completed_action_count(), 0);
@@ -1928,7 +2137,7 @@ mod tests {
         assert_eq!(
             cursor_fixture
                 .host
-                .execute_next(&mut cursor, cursor_fixture.now)
+                .execute_next_effect(&mut cursor, &effect, None, cursor_fixture.now)
                 .expect_err("failed input cursor cannot retry")
                 .code(),
             "BROWSER_REAL_ACTION_REJECTED"
@@ -2017,6 +2226,191 @@ mod tests {
         assert!(fresh_cursor.is_terminal());
         assert!(!fresh_cursor.requires_reconciliation(&stale_failure));
         assert!(!fresh_cursor.external_write_may_have_occurred());
+    }
+
+    #[test]
+    fn cancellation_and_authority_revocation_stop_before_the_next_host_action() {
+        for revoke_approval in [false, true] {
+            let mut fixture = fixture(BrowserPromptRisk::None);
+            let snapshot = observe(&mut fixture);
+            let actions = vec![
+                action(
+                    1,
+                    BrowserActionKind::Click,
+                    BrowserActionRisk::PotentialExternalWrite,
+                    &fixture.tab_id,
+                    Some(snapshot.id.clone()),
+                    Some("element-1"),
+                ),
+                action(
+                    2,
+                    BrowserActionKind::Click,
+                    BrowserActionRisk::PotentialExternalWrite,
+                    &fixture.tab_id,
+                    Some(snapshot.id.clone()),
+                    Some("element-1"),
+                ),
+            ];
+            let mut effect = approved_effect(&fixture, &actions);
+            let batch = effect_batch(&fixture, actions, &effect);
+            let mut cursor = fixture
+                .host
+                .begin_effect_batch(&batch, &effect, None, fixture.now)
+                .expect("begin authorized batch");
+            let first = fixture
+                .host
+                .execute_next_effect(&mut cursor, &effect, None, fixture.now)
+                .expect("first authorized action")
+                .expect("first result");
+            assert_eq!(first.action_sequence, 1);
+            let acknowledged = cursor.receipt().expect("acknowledged first prefix");
+            assert_eq!(acknowledged.completed_action_count, 1);
+            assert_eq!(acknowledged.state, BrowserBatchReceiptState::Active);
+
+            if revoke_approval {
+                effect.approval.as_mut().expect("approval").decision = ApprovalDecision::Rejected;
+            } else {
+                effect.status = EffectStatus::Cancelled;
+            }
+            let failure = fixture
+                .host
+                .execute_next_effect(
+                    &mut cursor,
+                    &effect,
+                    None,
+                    fixture.now + Duration::seconds(1),
+                )
+                .expect_err("changed authority must stop before action two");
+            assert_eq!(failure.code(), "BROWSER_EFFECT_BROKER_REQUIRED");
+            assert_eq!(cursor.completed_action_count(), 1);
+            assert_eq!(cursor.observed_action_count(), 1);
+            assert!(cursor.is_terminal());
+            let failed = cursor.receipt().expect("terminal exact prefix");
+            assert_eq!(failed.completed_action_count, 1);
+            assert_eq!(failed.acknowledged_results, vec![first]);
+            assert_eq!(failed.state, BrowserBatchReceiptState::Failed);
+            assert_eq!(failed.result_digest, acknowledged.result_digest);
+            assert_eq!(
+                fixture
+                    .host
+                    .execute_next_effect(
+                        &mut cursor,
+                        &effect,
+                        None,
+                        fixture.now + Duration::seconds(1),
+                    )
+                    .expect_err("terminal cursor cannot dispatch action two")
+                    .code(),
+                "BROWSER_REAL_ACTION_REJECTED"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_prefix_replay_requires_exact_digests_and_skips_acknowledged_input() {
+        let mut initial = fixture(BrowserPromptRisk::None);
+        let snapshot = observe(&mut initial);
+        let actions = vec![
+            action(
+                1,
+                BrowserActionKind::Click,
+                BrowserActionRisk::PotentialExternalWrite,
+                &initial.tab_id,
+                Some(snapshot.id.clone()),
+                Some("element-1"),
+            ),
+            action(
+                2,
+                BrowserActionKind::Click,
+                BrowserActionRisk::PotentialExternalWrite,
+                &initial.tab_id,
+                Some(snapshot.id),
+                Some("element-1"),
+            ),
+        ];
+        let effect = approved_effect(&initial, &actions);
+        let batch = effect_batch(&initial, actions, &effect);
+        let mut cursor = initial
+            .host
+            .begin_effect_batch(&batch, &effect, None, initial.now)
+            .expect("begin effect batch");
+        let first = initial
+            .host
+            .execute_next_effect(&mut cursor, &effect, None, initial.now)
+            .expect("first action")
+            .expect("first result");
+        assert_eq!(first.action_sequence, 1);
+        let receipt = cursor.receipt().expect("durable prefix receipt");
+        assert_eq!(receipt.completed_action_count, 1);
+
+        cursor
+            .cancel(sha('d'))
+            .expect("explicit cursor cancellation");
+        assert_eq!(
+            initial
+                .host
+                .execute_next_effect(&mut cursor, &effect, None, initial.now)
+                .expect_err("cancelled cursor cannot dispatch action two")
+                .code(),
+            "BROWSER_REAL_ACTION_REJECTED"
+        );
+        let cancelled = cursor.receipt().expect("cancelled receipt");
+        assert_eq!(cancelled.completed_action_count, 1);
+        assert_eq!(cancelled.acknowledged_results, vec![first]);
+        assert_eq!(cancelled.state, BrowserBatchReceiptState::Cancelled);
+
+        let mut replay = fixture(BrowserPromptRisk::None);
+        observe(&mut replay);
+        for tampered in [
+            {
+                let mut value = receipt.clone();
+                value.plan_digest = sha('e');
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value.cursor_digest = sha('e');
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value.result_digest = sha('e');
+                value
+            },
+        ] {
+            assert_eq!(
+                replay
+                    .host
+                    .resume_effect_batch(&batch, &tampered, &effect, None, replay.now)
+                    .expect_err("tampered durable prefix must fail closed")
+                    .code(),
+                "BROWSER_INVALID_BATCH_RECEIPT"
+            );
+        }
+
+        let mut resumed = replay
+            .host
+            .resume_effect_batch(&batch, &receipt, &effect, None, replay.now)
+            .expect("resume exact acknowledged prefix");
+        assert_eq!(resumed.completed_action_count(), 1);
+        let second = replay
+            .host
+            .execute_next_effect(&mut resumed, &effect, None, replay.now)
+            .expect("execute only unacknowledged suffix")
+            .expect("second result");
+        assert_eq!(second.action_sequence, 2);
+        assert_eq!(resumed.completed_action_count(), 2);
+        assert!(
+            replay
+                .host
+                .execute_next_effect(&mut resumed, &effect, None, replay.now)
+                .expect("complete resumed batch")
+                .is_none()
+        );
+        assert_eq!(
+            resumed.receipt().expect("completed receipt").state,
+            BrowserBatchReceiptState::Completed
+        );
     }
 
     #[test]

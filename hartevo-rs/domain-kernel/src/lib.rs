@@ -50,6 +50,16 @@ pub use attribution_spine::{
     SourceEventKind, SourceEventLinks, SourceObservationBatch, VerificationMethod, VerifiedOutcome,
     VerifiedOutcomeId,
 };
+
+/// Stable contract constants for storage crates.  The candidate and verified
+/// event names are also owned by the attribution-outcome adoption contract on
+/// newer bootstrap compositions, so they intentionally stay out of the root
+/// re-export above to avoid duplicate public names when that slice is composed.
+pub mod attribution_spine_contract {
+    pub use super::attribution_spine::{
+        ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE, ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
+    };
+}
 pub use context::{
     ContextBranch, ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleStatus,
     ContextDataClass, ContextDataPolicy, ContextError, ContextFactGrant, ContextInputRefs,
