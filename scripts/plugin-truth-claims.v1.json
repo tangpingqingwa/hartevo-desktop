@@ -1,0 +1,855 @@
+{
+  "schema": "hartevo.doc-plugin-truth-claims/v1",
+  "checker": "DOC-PLUGIN-TRUTH-01",
+  "documentRoots": [
+    "docs/architecture",
+    "docs/product",
+    "docs/quality",
+    "docs/research"
+  ],
+  "facts": [
+    {
+      "id": "adapter_registry_schema",
+      "kind": "json_pointer",
+      "file": "contracts/capabilities/adapter.v1.json",
+      "pointer": "/properties/schema/const"
+    },
+    {
+      "id": "capability_adapter_symbol",
+      "kind": "symbol_present",
+      "file": "hartevo-rs/capability-gateway/src/lib.rs",
+      "symbol": "pub trait CapabilityAdapter"
+    },
+    {
+      "id": "capability_catalog_entries",
+      "kind": "json_array_length",
+      "file": "contracts/capabilities/catalog.v1.json",
+      "pointer": "/capabilities"
+    },
+    {
+      "id": "capability_consumer_symbol",
+      "kind": "symbol_present",
+      "file": "hartevo-rs/capability-gateway/src/lib.rs",
+      "symbol": "pub struct CapabilityGateway"
+    },
+    {
+      "id": "capability_manifest_schema",
+      "kind": "json_pointer",
+      "file": "contracts/capabilities/manifest.v1.json",
+      "pointer": "/properties/schema/const"
+    },
+    {
+      "id": "connector_adapter_symbol",
+      "kind": "symbol_present",
+      "file": "hartevo-rs/connector-sdk/src/lib.rs",
+      "symbol": "pub trait ConnectorAdapter"
+    },
+    {
+      "id": "current_evidence_mission_evidence_level_promoted",
+      "kind": "json_pointer",
+      "file": "contracts/evidence/current-evidence-truth.v1.json",
+      "pointer": "/unprovenEvidence/missionEvidenceLevelPromoted"
+    },
+    {
+      "id": "current_evidence_release_decision",
+      "kind": "json_pointer",
+      "file": "contracts/evidence/current-evidence-truth.v1.json",
+      "pointer": "/unprovenEvidence/releaseDecision"
+    },
+    {
+      "id": "current_evidence_release_passed",
+      "kind": "json_pointer",
+      "file": "contracts/evidence/current-evidence-truth.v1.json",
+      "pointer": "/unprovenEvidence/releasePassed"
+    },
+    {
+      "id": "desktop_plugin_runtime_wiring_count",
+      "kind": "repo_symbol_count",
+      "roots": [
+        "hartevo-rs/desktop"
+      ],
+      "symbol": "PluginRuntime|SkillPackProvider|SkillPackAuditLog"
+    },
+    {
+      "id": "plugin_composition_kernel",
+      "kind": "repo_symbols_all_present",
+      "roots": [
+        "hartevo-rs"
+      ],
+      "symbols": [
+        "ConsumerDefinition",
+        "PluginDefinition",
+        "PluginRuntime",
+        "ProviderDefinition",
+        "RegistrationReceipt",
+        "ServiceDefinition",
+        "UiSurfaceContribution"
+      ]
+    },
+    {
+      "id": "plugin_dashboard_cockpit_symbols",
+      "kind": "repo_symbol_count",
+      "roots": [
+        "hartevo-rs"
+      ],
+      "symbol": "Dashboard|Cockpit"
+    },
+    {
+      "id": "plugin_definition_schema_literal",
+      "kind": "repo_literal_count",
+      "roots": [
+        "contracts",
+        "hartevo-rs"
+      ],
+      "literal": "hartevo.plugin-definition/v1"
+    },
+    {
+      "id": "plugin_durable_audit_log",
+      "kind": "repo_symbols_all_present",
+      "roots": [
+        "hartevo-rs/plugin-runtime/src"
+      ],
+      "symbols": [
+        "DurableSkillPackAuditLog"
+      ]
+    },
+    {
+      "id": "plugin_reversible_lifecycle",
+      "kind": "repo_symbols_all_present",
+      "roots": [
+        "hartevo-rs"
+      ],
+      "symbols": [
+        "PluginLifecycle",
+        "PluginRuntime",
+        "RegistrationReceipt",
+        "UnmountReceipt"
+      ]
+    },
+    {
+      "id": "provider_adapter_registration_count",
+      "kind": "json_array_length",
+      "file": "contracts/providers/adapter-contract.v1.json",
+      "pointer": "/registrations"
+    },
+    {
+      "id": "provider_adapter_registry_symbol",
+      "kind": "symbol_present",
+      "file": "hartevo-rs/effect-broker/src/provider_contract.rs",
+      "symbol": "pub struct ProviderAdapterRegistry"
+    },
+    {
+      "id": "provider_catalog_connected_count",
+      "kind": "json_count_where",
+      "file": "contracts/providers/catalog.v1.json",
+      "pointer": "/providers",
+      "field": "status",
+      "equals": "connected"
+    },
+    {
+      "id": "provider_connected_provenance",
+      "kind": "json_pointer",
+      "file": "contracts/providers/auth-probe.v1.json",
+      "pointer": "/connectedProvenanceClasses"
+    },
+    {
+      "id": "provider_empty_registry_behavior",
+      "kind": "json_pointer",
+      "file": "contracts/providers/auth-probe.v1.json",
+      "pointer": "/registryPolicy/emptyRegistryBehavior"
+    }
+  ],
+  "claims": [
+    {
+      "claimId": "DOC-CATALOG-AS-CAPABILITY-01",
+      "kind": "document",
+      "detector": "catalog_as_capability",
+      "authority": [
+        "capability_catalog_entries",
+        "capability_manifest_schema"
+      ],
+      "matchAll": [
+        "catalog",
+        "capability"
+      ],
+      "maxDistance": 24,
+      "assertionAny": [
+        "available",
+        "connected",
+        "executable",
+        "native",
+        "production",
+        "registered",
+        "可执行",
+        "已注册",
+        "可用",
+        "生产能力"
+      ],
+      "allowAny": [
+        "candidate",
+        "contract",
+        "fixture",
+        "not implemented",
+        "target",
+        "wrap",
+        "不是",
+        "仅",
+        "未",
+        "目标",
+        "规划"
+      ],
+      "code": "CATALOG_AS_CAPABILITY"
+    },
+    {
+      "claimId": "DOC-CONNECTED-EMPTY-REGISTRY-01",
+      "kind": "document",
+      "detector": "connected_status",
+      "authority": [
+        "provider_adapter_registration_count",
+        "provider_catalog_connected_count",
+        "provider_connected_provenance",
+        "provider_empty_registry_behavior"
+      ],
+      "matchAny": [
+        "Connected",
+        "connected:",
+        ": connected",
+        "connected=true"
+      ],
+      "negativeAny": [
+        "cannot",
+        "no real probe",
+        "not connected",
+        "only",
+        "only after",
+        "不显示",
+        "禁止",
+        "假 connected",
+        "没有真实 probe",
+        "未连接",
+        "未经",
+        "不得",
+        "只有",
+        "才是",
+        "只能",
+        "认证 probe 成功"
+      ],
+      "fixtureScopeAll": [
+        "fixture:",
+        "entrystate:"
+      ],
+      "code": "CONNECTED_WITH_EMPTY_REGISTRY"
+    },
+    {
+      "claimId": "DOC-CONTRADICTORY-CONNECTED-01",
+      "kind": "document",
+      "detector": "contradictory_connected",
+      "authority": [
+        "provider_adapter_registration_count",
+        "provider_catalog_connected_count",
+        "provider_empty_registry_behavior"
+      ],
+      "matchAny": [
+        "Connected",
+        "connected:",
+        ": connected",
+        "connected=true"
+      ],
+      "contradictionAny": [
+        "0 registrations",
+        "registrations: 0",
+        "empty registry",
+        "registration is empty",
+        "registrations: []",
+        "注册为空",
+        "没有注册"
+      ],
+      "negativeAny": [
+        "cannot",
+        "deny_connected",
+        "no real probe",
+        "不显示",
+        "禁止",
+        "没有真实 probe"
+      ],
+      "code": "CONTRADICTORY_CLAIM"
+    },
+    {
+      "claimId": "DOC-FIXED-DASHBOARD-COCKPIT-01",
+      "kind": "document",
+      "detector": "fixed_surface",
+      "authority": [
+        "plugin_composition_kernel",
+        "plugin_dashboard_cockpit_symbols"
+      ],
+      "surfaceAny": [
+        "dashboard",
+        "cockpit",
+        "控制台",
+        "仪表盘"
+      ],
+      "assertionAny": [
+        "always",
+        "central",
+        "fixed",
+        "mandatory",
+        "single",
+        "唯一",
+        "中央",
+        "固定",
+        "必须"
+      ],
+      "negativeAny": [
+        "not a",
+        "not the",
+        "不作为",
+        "不是",
+        "不采用",
+        "不进入",
+        "非固定"
+      ],
+      "code": "FIXED_DASHBOARD_OR_COCKPIT"
+    },
+    {
+      "claimId": "DOC-MODEL-VISIBLE-NON-DURABLE-01",
+      "kind": "document",
+      "detector": "model_visible_durable",
+      "authority": [
+        "plugin_durable_audit_log"
+      ],
+      "matchAny": [
+        "model-visible",
+        "model_visible",
+        "model visible",
+        "模型可见",
+        "模型可见项"
+      ],
+      "assertionAny": [
+        "available",
+        "audit log",
+        "audit trail",
+        "auditable",
+        "durable",
+        "exposed",
+        "implemented",
+        "logged",
+        "production",
+        "provided",
+        "shown",
+        "visible",
+        "可审计",
+        "日志",
+        "可用",
+        "已实现",
+        "持久化",
+        "生产",
+        "提供",
+        "展示"
+      ],
+      "negativeAny": [
+        "candidate",
+        "fixture",
+        "historical",
+        "in memory",
+        "not durable",
+        "not logged",
+        "not proven",
+        "only memory",
+        "without durable",
+        "without logging",
+        "simulator",
+        "BLOCKED_ENV",
+        "仅内存",
+        "未持久化",
+        "未证明",
+        "不代表"
+      ],
+      "conditions": [
+        {
+          "fact": "plugin_durable_audit_log",
+          "equals": false
+        }
+      ],
+      "code": "MODEL_VISIBLE_WITHOUT_DURABLE_LOG"
+    },
+    {
+      "claimId": "DOC-NON-NATIVE-EVIDENCE-01",
+      "kind": "document",
+      "detector": "non_native_evidence",
+      "authority": [
+        "capability_manifest_schema",
+        "provider_adapter_registration_count",
+        "provider_connected_provenance"
+      ],
+      "qualifierAny": [
+        "BLOCKED_ENV",
+        "Fake Host",
+        "fixture",
+        "ignored",
+        "simulator"
+      ],
+      "assertionAny": [
+        "native",
+        "production evidence",
+        "production proof",
+        "production-ready",
+        "production success",
+        "release",
+        "release evidence",
+        "release-ready",
+        "E3",
+        "E4",
+        "E5",
+        "原生",
+        "原生证据",
+        "生产证据",
+        "生产可用",
+        "通过原生",
+        "发布"
+      ],
+      "allowAny": [
+        "cannot",
+        "component e2",
+        "default ignored",
+        "do not",
+        "failure",
+        "failed",
+        "historical",
+        "candidate",
+        "migration",
+        "not proven",
+        "not a native",
+        "not production",
+        "no production",
+        "no release",
+        "not release",
+        "not release evidence",
+        "not release-ready",
+        "cannot release",
+        "not an E3",
+        "not an E4",
+        "not an E5",
+        "保持",
+        "失败时",
+        "不代表",
+        "不依赖",
+        "不等于",
+        "不能",
+        "不能替代",
+        "仅",
+        "recipe",
+        "release candidate",
+        "permanent fixture",
+        "仍未",
+        "未证明",
+        "未完成",
+        "不能运行",
+        "不合格",
+        "不模拟",
+        "不强造",
+        "回到本地",
+        "不发布",
+        "不得发布",
+        "不是 Release",
+        "不等于 E3",
+        "不等于 E4",
+        "不等于 E5"
+      ],
+      "code": "NON_NATIVE_EVIDENCE_ESCALATED"
+    },
+    {
+      "claimId": "DOC-PARALLEL-TOOL-REGISTRY-01",
+      "kind": "document",
+      "detector": "parallel_registry",
+      "authority": [
+        "capability_manifest_schema",
+        "plugin_definition_schema_literal"
+      ],
+      "matchAny": [
+        "another tool registry",
+        "duplicate tool registry",
+        "multiple tool registries",
+        "parallel registry",
+        "parallel tool registry",
+        "second tool registry",
+        "two tool registries",
+        "另一个 Tool Registry",
+        "两个 Tool Registry",
+        "平行 Tool Registry"
+      ],
+      "assertionAny": [
+        "adopt",
+        "available",
+        "enabled",
+        "exists",
+        "implemented",
+        "production",
+        "use",
+        "采用",
+        "存在",
+        "启用",
+        "生产",
+        "已实现"
+      ],
+      "negativeAny": [
+        "cannot",
+        "no ",
+        "not ",
+        "only one",
+        "prohibited",
+        "single",
+        "不出现",
+        "不会",
+        "不引入",
+        "不采用",
+        "不维护",
+        "禁止",
+        "唯一",
+        "单一",
+        "不得"
+      ],
+      "code": "PARALLEL_TOOL_REGISTRY"
+    },
+    {
+      "claimId": "DOC-PLUGIN-COMPOSITION-01",
+      "kind": "document",
+      "detector": "plugin_components",
+      "authority": [
+        "desktop_plugin_runtime_wiring_count",
+        "plugin_composition_kernel"
+      ],
+      "matchAny": [
+        "plugin",
+        "plugins",
+        "skill pack",
+        "skill-pack"
+      ],
+      "assertionAny": [
+        "available",
+        "completed",
+        "implemented",
+        "native",
+        "production",
+        "已实现",
+        "可用",
+        "生产",
+        "完成"
+      ],
+      "requiredGroups": [
+        [
+          "service",
+          "服务"
+        ],
+        [
+          "provider",
+          "提供者"
+        ],
+        [
+          "consumer",
+          "消费者"
+        ]
+      ],
+      "allowAny": [
+        "candidate",
+        "design",
+        "not implemented",
+        "not production",
+        "target",
+        "尚无",
+        "未实现",
+        "目标",
+        "规划",
+        "仍未",
+        "不是已实现",
+        "不是已实现声明",
+        "当前均不是",
+        "不作为",
+        "不是",
+        "不代表",
+        "不等于"
+      ],
+      "conditions": [
+        {
+          "fact": "desktop_plugin_runtime_wiring_count",
+          "equals": 0
+        }
+      ],
+      "code": "PLUGIN_COMPOSITION_INCOMPLETE"
+    },
+    {
+      "claimId": "DOC-PLUGIN-CURRENT-COMPLETION-01",
+      "kind": "document",
+      "detector": "plugin_completion",
+      "authority": [
+        "capability_manifest_schema",
+        "plugin_composition_kernel",
+        "plugin_definition_schema_literal"
+      ],
+      "matchAny": [
+        "plugin",
+        "plugins"
+      ],
+      "assertionAny": [
+        "available",
+        "current",
+        "completed",
+        "implemented",
+        "native",
+        "production",
+        "已实现",
+        "当前可用",
+        "生产",
+        "完成"
+      ],
+      "negativeAny": [
+        "not adopted",
+        "not implemented",
+        "not production",
+        "candidate",
+        "design",
+        "target",
+        "尚无",
+        "不是已实现",
+        "未在固定",
+        "未实现",
+        "目标",
+        "规划",
+        "仍未",
+        "缺失",
+        "不运行",
+        "不采用",
+        "不进入",
+        "不能替代"
+      ],
+      "conditions": [
+        {
+          "fact": "desktop_plugin_runtime_wiring_count",
+          "equals": 0
+        }
+      ],
+      "code": "PLUGIN_KERNEL_COMPLETION_UNPROVEN"
+    },
+    {
+      "claimId": "DOC-PLUGIN-IRREVERSIBLE-MOUNT-01",
+      "kind": "document",
+      "detector": "irreversible_lifecycle",
+      "authority": [
+        "plugin_reversible_lifecycle"
+      ],
+      "matchAny": [
+        "mount",
+        "plugin",
+        "plugins",
+        "skill pack",
+        "skill-pack",
+        "挂载"
+      ],
+      "irreversibleAny": [
+        "cannot unmount",
+        "can't unmount",
+        "irreversible",
+        "no unmount",
+        "one-way",
+        "unmount unavailable",
+        "without unmount",
+        "不可逆",
+        "不支持卸载",
+        "不能卸载",
+        "只能挂载",
+        "无法卸载"
+      ],
+      "assertionAny": [
+        "available",
+        "completed",
+        "enabled",
+        "implemented",
+        "native",
+        "production",
+        "supports",
+        "已实现",
+        "可用",
+        "生产",
+        "完成",
+        "支持"
+      ],
+      "negativeAny": [
+        "candidate",
+        "design",
+        "failure",
+        "not implemented",
+        "not supported",
+        "target",
+        "失败",
+        "尚无",
+        "未实现",
+        "目标",
+        "规划",
+        "不支持"
+      ],
+      "code": "IRREVERSIBLE_PLUGIN_MOUNT"
+    },
+    {
+      "claimId": "DOC-PLUGIN-LIFECYCLE-01",
+      "kind": "document",
+      "detector": "plugin_lifecycle",
+      "authority": [
+        "plugin_composition_kernel",
+        "plugin_reversible_lifecycle"
+      ],
+      "matchAny": [
+        "plugin",
+        "plugins"
+      ],
+      "lifecycleAny": [
+        "lifecycle",
+        "mount",
+        "reversible",
+        "unmount",
+        "挂载",
+        "可逆",
+        "生命周期",
+        "卸载"
+      ],
+      "assertionAny": [
+        "available",
+        "completed",
+        "implemented",
+        "native",
+        "production",
+        "已实现",
+        "完成",
+        "支持"
+      ],
+      "negativeAny": [
+        "not implemented",
+        "candidate",
+        "design",
+        "target",
+        "尚无",
+        "未实现",
+        "目标",
+        "规划",
+        "仍未",
+        "缺失",
+        "不运行",
+        "不采用"
+      ],
+      "conditions": [
+        {
+          "fact": "plugin_reversible_lifecycle",
+          "equals": false
+        }
+      ],
+      "code": "PLUGIN_LIFECYCLE_UNPROVEN"
+    },
+    {
+      "claimId": "DOC-PROVIDER-ONLY-AS-CAPABILITY-01",
+      "kind": "document",
+      "detector": "provider_only",
+      "authority": [
+        "capability_manifest_schema",
+        "provider_adapter_registration_count",
+        "provider_catalog_connected_count"
+      ],
+      "matchAny": [
+        "provider capability",
+        "provider-only capability",
+        "provider only capability",
+        "provider card capability"
+      ],
+      "assertionAny": [
+        "available",
+        "connected",
+        "executable",
+        "native",
+        "production",
+        "registered",
+        "可执行",
+        "已注册",
+        "可用",
+        "生产"
+      ],
+      "negativeAny": [
+        "candidate",
+        "contract-only",
+        "not a capability",
+        "not available",
+        "not executable",
+        "not implemented",
+        "target",
+        "不是能力",
+        "仅合同",
+        "未实现",
+        "目标",
+        "规划",
+        "不代表",
+        "不等于"
+      ],
+      "code": "PROVIDER_ONLY_AS_CAPABILITY"
+    },
+    {
+      "claimId": "DOC-UI-CARD-AS-CAPABILITY-01",
+      "kind": "document",
+      "detector": "ui_card_as_capability",
+      "authority": [
+        "capability_catalog_entries",
+        "capability_manifest_schema"
+      ],
+      "matchAll": [
+        "card",
+        "capability"
+      ],
+      "maxDistance": 30,
+      "assertionAny": [
+        "advertises",
+        "available",
+        "connected",
+        "executable",
+        "native",
+        "production",
+        "registered",
+        "提供",
+        "可执行",
+        "已注册",
+        "可用",
+        "生产"
+      ],
+      "allowAny": [
+        "candidate",
+        "not a capability",
+        "not implemented",
+        "target",
+        "不是能力",
+        "仅",
+        "未实现",
+        "目标",
+        "规划",
+        "不代表",
+        "不等于"
+      ],
+      "code": "UI_CARD_AS_CAPABILITY"
+    }
+  ],
+  "requiredClaimIds": [
+    "DOC-CATALOG-AS-CAPABILITY-01",
+    "DOC-CONNECTED-EMPTY-REGISTRY-01",
+    "DOC-CONTRADICTORY-CONNECTED-01",
+    "DOC-FIXED-DASHBOARD-COCKPIT-01",
+    "DOC-MODEL-VISIBLE-NON-DURABLE-01",
+    "DOC-NON-NATIVE-EVIDENCE-01",
+    "DOC-PARALLEL-TOOL-REGISTRY-01",
+    "DOC-PLUGIN-COMPOSITION-01",
+    "DOC-PLUGIN-CURRENT-COMPLETION-01",
+    "DOC-PLUGIN-IRREVERSIBLE-MOUNT-01",
+    "DOC-PLUGIN-LIFECYCLE-01",
+    "DOC-PROVIDER-ONLY-AS-CAPABILITY-01",
+    "DOC-UI-CARD-AS-CAPABILITY-01"
+  ],
+  "exitCodes": {
+    "verified": 0,
+    "drift": 10,
+    "invalidInput": 20,
+    "checkerError": 30,
+    "usage": 64
+  }
+}
