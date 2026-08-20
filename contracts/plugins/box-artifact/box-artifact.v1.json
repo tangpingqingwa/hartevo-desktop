@@ -1,0 +1,131 @@
+{
+  "schemaVersion": "hartevo-box-artifact-plugin-contract/v1",
+  "contractVersion": "EXT-BOX-01-L1/v1",
+  "layer": 1,
+  "evidenceLevel": "E1",
+  "plugin": {
+    "id": "hartevo.box-artifact",
+    "version": 1,
+    "registration": {
+      "versionBound": true,
+      "digestBound": true,
+      "scopeBound": true,
+      "reversible": true
+    }
+  },
+  "service": {
+    "id": "BoxArtifactService",
+    "provider": "BoxArtifactProvider",
+    "consumer": "MissionArtifactResultConsumer",
+    "operations": [
+      "probe_user",
+      "read_user_metadata",
+      "read_folder_metadata",
+      "list_folder_items",
+      "read_file_metadata",
+      "list_file_versions",
+      "read_bounded_content",
+      "propose_artifact_result"
+    ],
+    "readOnly": true,
+    "externalWrites": false
+  },
+  "provider": {
+    "id": "box-artifact",
+    "adapterVersion": 1,
+    "officialApiBaseUrl": "https://api.box.com/2.0",
+    "authentication": {
+      "secretReferenceOnly": true,
+      "methods": ["oauth2_bearer", "jwt_bearer"]
+    },
+    "transport": "https_get_only",
+    "readOnly": true,
+    "externalWrites": false,
+    "boundedContentBytes": 4194304,
+    "boundedResponseBytes": 8388608,
+    "forbiddenAuthorities": [
+      "store",
+      "keyring",
+      "browser_profile",
+      "effect",
+      "upload",
+      "overwrite",
+      "move",
+      "delete",
+      "share",
+      "collaboration_mutation",
+      "durable_readback"
+    ]
+  },
+  "scope": {
+    "required": ["enterprise", "user", "folder_or_file", "project", "mission"],
+    "identityFields": ["file_id", "version_id"],
+    "pathIsNeverIdentity": true
+  },
+  "revisionFence": {
+    "fields": ["file_id", "version_id", "sha1", "size", "media_type", "content_digest"],
+    "changedSha1IsNewRevision": true,
+    "changedSizeIsNewRevision": true,
+    "changedVersionIsNewRevision": true,
+    "partialContentAdoptable": false
+  },
+  "consumer": {
+    "id": "MissionArtifactResultConsumer",
+    "binds": [
+      "file_id",
+      "version_id",
+      "sha1",
+      "content_digest",
+      "size",
+      "media_type",
+      "source_mission_revision",
+      "source_result_revision",
+      "provider_version",
+      "registration_digest"
+    ],
+    "proposalOnly": true,
+    "externalWrites": false,
+    "durableReadback": false,
+    "rejects": [
+      "stale_revision",
+      "cross_enterprise",
+      "scope_mismatch",
+      "tampered_content",
+      "partial_content",
+      "ambiguous_receipt",
+      "deleted",
+      "access_lost",
+      "trashed"
+    ]
+  },
+  "projection": {
+    "availabilityStates": [
+      "present",
+      "deleted",
+      "trashed",
+      "access_lost",
+      "not_found",
+      "provider_unknown"
+    ],
+    "redacts": ["content_bytes", "tokens", "display_name", "email_address", "raw_error_body"]
+  },
+  "nativeBoundary": {
+    "nativeHttpsIsTransportSeam": true,
+    "nativeConnectedClaim": false,
+    "loopbackIsNative": false,
+    "fixtureIsNative": false,
+    "blockedEnvIsConnected": false
+  },
+  "layer2Gaps": [
+    "upload",
+    "overwrite",
+    "move",
+    "delete",
+    "share",
+    "permission_mutation",
+    "durable_content_receipt",
+    "independent_readback",
+    "verified_work_product_adoption",
+    "native_connected_evidence"
+  ]
+}
