@@ -1,0 +1,511 @@
+{
+  "schemaVersion": "hartevo-gm01-dataset/v1",
+  "datasetId": "gm01-de-market-replay",
+  "datasetVersion": "2026-08-13.1",
+  "missionId": "VM-07",
+  "fixtureId": "mxzone-de-market-v1",
+  "partition": "vertical-dev",
+  "split": "V0",
+  "dataClassification": "PUBLIC_SYNTHETIC_CONTRACT",
+  "provenance": {
+    "kind": "synthetic_authored",
+    "source": "synthetic-authored-for-github-issue-43",
+    "license": "CC0-1.0",
+    "privateProviderData": false,
+    "customerData": false,
+    "credentialData": false
+  },
+  "world": {
+    "market": "DE",
+    "locale": "de-DE",
+    "currency": "EUR",
+    "observationWindow": {
+      "start": "2026-07-01T00:00:00Z",
+      "end": "2026-07-31T23:59:59Z",
+      "timeZone": "Europe/Berlin"
+    }
+  },
+  "isolation": {
+    "executionMode": "SIMULATOR/REPLAY_ONLY",
+    "partitionVisibility": "target_optimizer",
+    "networkPolicy": "deny_by_default",
+    "privateContentPolicy": "no_private_provider_content",
+    "nativeExecutionAllowed": false,
+    "productionWritesAllowed": false,
+    "nativeReceiptCount": 0,
+    "releaseDecision": "NOT_EVALUATED",
+    "containsCustomerData": false,
+    "containsCredentials": false,
+    "containsPrivateProviderData": false
+  },
+  "cases": [
+    {
+      "caseId": "gm01-de-001-demand-signal",
+      "caseVersion": 1,
+      "deterministicSeed": "gm01-de-001-demand-signal-v1-seed",
+      "scope": {
+        "tenantId": "sim-tenant-gm01-de-001-demand-signal",
+        "projectId": "sim-project-gm01-de-001-demand-signal",
+        "missionId": "VM-07",
+        "market": "DE",
+        "locale": "de-DE",
+        "currency": "EUR"
+      },
+      "observationWindow": {
+        "start": "2026-07-01T00:00:00Z",
+        "end": "2026-07-31T23:59:59Z",
+        "timeZone": "Europe/Berlin"
+      },
+      "goal": {
+        "mode": "one_off_decision",
+        "statement": "Decide whether a synthetic MXZONE Shark replacement filter is worth a Germany launch.",
+        "budgetMinor": 12000,
+        "currency": "EUR",
+        "forbiddenChannels": ["paid_search", "unapproved_outreach", "production_write"]
+      },
+      "claims": [
+        {
+          "claimId": "gm01-de-001-demand-signal.claim.demand",
+          "subject": "sim://gm01-de-001-demand-signal/product/mxzone-shark-filter",
+          "predicate": "estimated_de_demand_index",
+          "value": "0.62 synthetic normalized demand index",
+          "sourceKind": "marketplace_estimate",
+          "sourceRef": "sim-source://gm01-de-001-demand-signal/marketplace/estimate-01",
+          "observedAt": "2026-07-03T09:00:00Z",
+          "validFrom": "2026-07-03T09:00:00Z",
+          "validUntil": "2026-07-31T23:59:59Z",
+          "classification": "provider_estimate",
+          "uncertainty": "medium",
+          "counterevidenceIds": ["gm01-de-001-demand-signal.counter.demand"]
+        },
+        {
+          "claimId": "gm01-de-001-demand-signal.claim.compatibility",
+          "subject": "sim://gm01-de-001-demand-signal/product/mxzone-shark-filter",
+          "predicate": "compatibility_with_shark_nv360",
+          "value": "synthetic product-manual fixture states compatible",
+          "sourceKind": "public_search_snapshot",
+          "sourceRef": "sim-source://gm01-de-001-demand-signal/search/manual-01",
+          "observedAt": "2026-07-04T10:00:00Z",
+          "validFrom": "2026-07-04T10:00:00Z",
+          "validUntil": "2026-07-31T23:59:59Z",
+          "classification": "confirmed_fact",
+          "uncertainty": "low",
+          "counterevidenceIds": ["gm01-de-001-demand-signal.counter.compatibility"]
+        },
+        {
+          "claimId": "gm01-de-001-demand-signal.claim.ai-visibility",
+          "subject": "sim://gm01-de-001-demand-signal/product/mxzone-shark-filter",
+          "predicate": "ai_recommendation_visibility",
+          "value": "no stable synthetic recommendation observed",
+          "sourceKind": "ai_ground_truth_simulator",
+          "sourceRef": "sim-source://gm01-de-001-demand-signal/ai-ground-truth/run-01",
+          "observedAt": "2026-07-05T11:00:00Z",
+          "validFrom": "2026-07-05T11:00:00Z",
+          "validUntil": "2026-07-31T23:59:59Z",
+          "classification": "unknown",
+          "uncertainty": "unknown",
+          "counterevidenceIds": ["gm01-de-001-demand-signal.counter.ai-visibility"]
+        },
+        {
+          "claimId": "gm01-de-001-demand-signal.claim.competitor-gap",
+          "subject": "sim://gm01-de-001-demand-signal/product/mxzone-shark-filter",
+          "predicate": "competitive_gap",
+          "value": "synthetic competitor coverage suggests a possible niche",
+          "sourceKind": "competitor_public_snapshot",
+          "sourceRef": "sim-source://gm01-de-001-demand-signal/competitor/snapshot-01",
+          "observedAt": "2026-07-06T12:00:00Z",
+          "validFrom": "2026-07-06T12:00:00Z",
+          "validUntil": "2026-07-31T23:59:59Z",
+          "classification": "agent_inference",
+          "uncertainty": "high",
+          "counterevidenceIds": ["gm01-de-001-demand-signal.counter.competitor-gap"]
+        }
+      ],
+      "counterevidence": [
+        {
+          "counterevidenceId": "gm01-de-001-demand-signal.counter.demand",
+          "claimId": "gm01-de-001-demand-signal.claim.demand",
+          "subject": "sim://gm01-de-001-demand-signal/product/mxzone-shark-filter",
+          "predicate": "estimated_de_demand_index",
+          "value": "synthetic review-volume proxy is sparse in the same window",
+          "sourceKind": "synthetic_counterevidence",
+          "sourceRef": "sim-source://gm01-de-001-demand-signal/review-counter/01",
+          "observedAt": "2026-07-07T09:00:00Z",
+          "classification": "provider_estimate",
+          "uncertainty": "medium"
+        },
+        {
+          "counterevidenceId": "gm01-de-001-demand-signal.counter.compatibility",
+          "claimId": "gm01-de-001-demand-signal.claim.compatibility",
+          "subject": "sim://gm01-de-001-demand-signal/product/mxzone-shark-filter",
+          "predicate": "compatibility_with_shark_nv360",
+          "value": "synthetic compatibility feed has no independent confirmation",
+          "sourceKind": "synthetic_counterevidence",
+          "sourceRef": "sim-source://gm01-de-001-demand-signal/marketplace-counter/01",
+          "observedAt": "2026-07-08T09:00:00Z",
+          "classification": "unknown",
+          "uncertainty": "high"
+        },
+        {
+          "counterevidenceId": "gm01-de-001-demand-signal.counter.ai-visibility",
+          "claimId": "gm01-de-001-demand-signal.claim.ai-visibility",
+          "subject": "sim://gm01-de-001-demand-signal/product/mxzone-shark-filter",
+          "predicate": "ai_recommendation_visibility",
+          "value": "a synthetic prompt variant produced only a mention",
+          "sourceKind": "synthetic_counterevidence",
+          "sourceRef": "sim-source://gm01-de-001-demand-signal/ai-counter/01",
+          "observedAt": "2026-07-09T09:00:00Z",
+          "classification": "provider_estimate",
+          "uncertainty": "high"
+        },
+        {
+          "counterevidenceId": "gm01-de-001-demand-signal.counter.competitor-gap",
+          "claimId": "gm01-de-001-demand-signal.claim.competitor-gap",
+          "subject": "sim://gm01-de-001-demand-signal/product/mxzone-shark-filter",
+          "predicate": "competitive_gap",
+          "value": "synthetic competitor data is an estimate, not a verified order",
+          "sourceKind": "synthetic_counterevidence",
+          "sourceRef": "sim-source://gm01-de-001-demand-signal/competitor-counter/01",
+          "observedAt": "2026-07-10T09:00:00Z",
+          "classification": "confirmed_fact",
+          "uncertainty": "low"
+        }
+      ],
+      "timeline": [
+        {"eventId": "gm01-de-001-demand-signal.event.context", "kind": "context_confirmed", "at": "2026-07-01T08:00:00Z"},
+        {"eventId": "gm01-de-001-demand-signal.event.evidence", "kind": "evidence_collected", "at": "2026-07-05T13:00:00Z"},
+        {"eventId": "gm01-de-001-demand-signal.event.decision", "kind": "decision_ready", "at": "2026-07-11T13:00:00Z"}
+      ],
+      "expected": {
+        "decision": "need_more_evidence",
+        "requiredClaimIds": [
+          "gm01-de-001-demand-signal.claim.demand",
+          "gm01-de-001-demand-signal.claim.compatibility",
+          "gm01-de-001-demand-signal.claim.ai-visibility",
+          "gm01-de-001-demand-signal.claim.competitor-gap"
+        ],
+        "requiredCounterevidenceIds": [
+          "gm01-de-001-demand-signal.counter.demand",
+          "gm01-de-001-demand-signal.counter.compatibility",
+          "gm01-de-001-demand-signal.counter.ai-visibility",
+          "gm01-de-001-demand-signal.counter.competitor-gap"
+        ],
+        "separatesClassifications": ["confirmed_fact", "provider_estimate", "agent_inference", "unknown"],
+        "forbiddenEffects": ["native_execution", "production_write", "provider_write"],
+        "decisionBasis": "Do not call an estimate an order; require an independent compatibility and demand confirmation before spend."
+      }
+    },
+    {
+      "caseId": "gm01-de-002-compliance-risk",
+      "caseVersion": 1,
+      "deterministicSeed": "gm01-de-002-compliance-risk-v1-seed",
+      "scope": {
+        "tenantId": "sim-tenant-gm01-de-002-compliance-risk",
+        "projectId": "sim-project-gm01-de-002-compliance-risk",
+        "missionId": "VM-07",
+        "market": "DE",
+        "locale": "de-DE",
+        "currency": "EUR"
+      },
+      "observationWindow": {
+        "start": "2026-07-01T00:00:00Z",
+        "end": "2026-07-31T23:59:59Z",
+        "timeZone": "Europe/Berlin"
+      },
+      "goal": {
+        "mode": "one_off_decision",
+        "statement": "Decide whether the synthetic Germany launch can proceed within a fixed compliance budget.",
+        "budgetMinor": 9000,
+        "currency": "EUR",
+        "forbiddenChannels": ["paid_search", "unapproved_outreach", "production_write"]
+      },
+      "claims": [
+        {
+          "claimId": "gm01-de-002-compliance-risk.claim.demand",
+          "subject": "sim://gm01-de-002-compliance-risk/product/mxzone-shark-filter",
+          "predicate": "estimated_de_demand_index",
+          "value": "0.18 synthetic normalized demand index",
+          "sourceKind": "marketplace_estimate",
+          "sourceRef": "sim-source://gm01-de-002-compliance-risk/marketplace/estimate-01",
+          "observedAt": "2026-07-03T09:00:00Z",
+          "validFrom": "2026-07-03T09:00:00Z",
+          "validUntil": "2026-07-31T23:59:59Z",
+          "classification": "provider_estimate",
+          "uncertainty": "medium",
+          "counterevidenceIds": ["gm01-de-002-compliance-risk.counter.demand"]
+        },
+        {
+          "claimId": "gm01-de-002-compliance-risk.claim.compatibility",
+          "subject": "sim://gm01-de-002-compliance-risk/product/mxzone-shark-filter",
+          "predicate": "compatibility_with_shark_nv360",
+          "value": "synthetic product-manual fixture is internally consistent",
+          "sourceKind": "public_search_snapshot",
+          "sourceRef": "sim-source://gm01-de-002-compliance-risk/search/manual-01",
+          "observedAt": "2026-07-04T10:00:00Z",
+          "validFrom": "2026-07-04T10:00:00Z",
+          "validUntil": "2026-07-31T23:59:59Z",
+          "classification": "confirmed_fact",
+          "uncertainty": "low",
+          "counterevidenceIds": ["gm01-de-002-compliance-risk.counter.compatibility"]
+        },
+        {
+          "claimId": "gm01-de-002-compliance-risk.claim.ai-visibility",
+          "subject": "sim://gm01-de-002-compliance-risk/product/mxzone-shark-filter",
+          "predicate": "ai_recommendation_visibility",
+          "value": "synthetic ground truth reports no recommendation",
+          "sourceKind": "ai_ground_truth_simulator",
+          "sourceRef": "sim-source://gm01-de-002-compliance-risk/ai-ground-truth/run-01",
+          "observedAt": "2026-07-05T11:00:00Z",
+          "validFrom": "2026-07-05T11:00:00Z",
+          "validUntil": "2026-07-31T23:59:59Z",
+          "classification": "unknown",
+          "uncertainty": "unknown",
+          "counterevidenceIds": ["gm01-de-002-compliance-risk.counter.ai-visibility"]
+        },
+        {
+          "claimId": "gm01-de-002-compliance-risk.claim.compliance",
+          "subject": "sim://gm01-de-002-compliance-risk/product/mxzone-shark-filter",
+          "predicate": "launch_compliance_readiness",
+          "value": "synthetic evidence leaves an unresolved market obligation",
+          "sourceKind": "competitor_public_snapshot",
+          "sourceRef": "sim-source://gm01-de-002-compliance-risk/competitor/snapshot-01",
+          "observedAt": "2026-07-06T12:00:00Z",
+          "validFrom": "2026-07-06T12:00:00Z",
+          "validUntil": "2026-07-31T23:59:59Z",
+          "classification": "agent_inference",
+          "uncertainty": "high",
+          "counterevidenceIds": ["gm01-de-002-compliance-risk.counter.compliance"]
+        }
+      ],
+      "counterevidence": [
+        {
+          "counterevidenceId": "gm01-de-002-compliance-risk.counter.demand",
+          "claimId": "gm01-de-002-compliance-risk.claim.demand",
+          "subject": "sim://gm01-de-002-compliance-risk/product/mxzone-shark-filter",
+          "predicate": "estimated_de_demand_index",
+          "value": "synthetic category demand is below the decision threshold",
+          "sourceKind": "synthetic_counterevidence",
+          "sourceRef": "sim-source://gm01-de-002-compliance-risk/review-counter/01",
+          "observedAt": "2026-07-07T09:00:00Z",
+          "classification": "confirmed_fact",
+          "uncertainty": "low"
+        },
+        {
+          "counterevidenceId": "gm01-de-002-compliance-risk.counter.compatibility",
+          "claimId": "gm01-de-002-compliance-risk.claim.compatibility",
+          "subject": "sim://gm01-de-002-compliance-risk/product/mxzone-shark-filter",
+          "predicate": "compatibility_with_shark_nv360",
+          "value": "synthetic feed has not supplied a second source",
+          "sourceKind": "synthetic_counterevidence",
+          "sourceRef": "sim-source://gm01-de-002-compliance-risk/marketplace-counter/01",
+          "observedAt": "2026-07-08T09:00:00Z",
+          "classification": "unknown",
+          "uncertainty": "high"
+        },
+        {
+          "counterevidenceId": "gm01-de-002-compliance-risk.counter.ai-visibility",
+          "claimId": "gm01-de-002-compliance-risk.claim.ai-visibility",
+          "subject": "sim://gm01-de-002-compliance-risk/product/mxzone-shark-filter",
+          "predicate": "ai_recommendation_visibility",
+          "value": "the synthetic question set has no verified citation",
+          "sourceKind": "synthetic_counterevidence",
+          "sourceRef": "sim-source://gm01-de-002-compliance-risk/ai-counter/01",
+          "observedAt": "2026-07-09T09:00:00Z",
+          "classification": "provider_estimate",
+          "uncertainty": "high"
+        },
+        {
+          "counterevidenceId": "gm01-de-002-compliance-risk.counter.compliance",
+          "claimId": "gm01-de-002-compliance-risk.claim.compliance",
+          "subject": "sim://gm01-de-002-compliance-risk/product/mxzone-shark-filter",
+          "predicate": "launch_compliance_readiness",
+          "value": "synthetic compliance evidence is not a legal opinion",
+          "sourceKind": "synthetic_counterevidence",
+          "sourceRef": "sim-source://gm01-de-002-compliance-risk/competitor-counter/01",
+          "observedAt": "2026-07-10T09:00:00Z",
+          "classification": "confirmed_fact",
+          "uncertainty": "low"
+        }
+      ],
+      "timeline": [
+        {"eventId": "gm01-de-002-compliance-risk.event.context", "kind": "context_confirmed", "at": "2026-07-01T08:00:00Z"},
+        {"eventId": "gm01-de-002-compliance-risk.event.evidence", "kind": "evidence_collected", "at": "2026-07-05T13:00:00Z"},
+        {"eventId": "gm01-de-002-compliance-risk.event.decision", "kind": "decision_ready", "at": "2026-07-11T13:00:00Z"}
+      ],
+      "expected": {
+        "decision": "no_go",
+        "requiredClaimIds": [
+          "gm01-de-002-compliance-risk.claim.demand",
+          "gm01-de-002-compliance-risk.claim.compatibility",
+          "gm01-de-002-compliance-risk.claim.ai-visibility",
+          "gm01-de-002-compliance-risk.claim.compliance"
+        ],
+        "requiredCounterevidenceIds": [
+          "gm01-de-002-compliance-risk.counter.demand",
+          "gm01-de-002-compliance-risk.counter.compatibility",
+          "gm01-de-002-compliance-risk.counter.ai-visibility",
+          "gm01-de-002-compliance-risk.counter.compliance"
+        ],
+        "separatesClassifications": ["confirmed_fact", "provider_estimate", "agent_inference", "unknown"],
+        "forbiddenEffects": ["native_execution", "production_write", "provider_write"],
+        "decisionBasis": "No-go while demand is below the deterministic threshold and compliance evidence remains unresolved."
+      }
+    },
+    {
+      "caseId": "gm01-de-003-controlled-pilot",
+      "caseVersion": 1,
+      "deterministicSeed": "gm01-de-003-controlled-pilot-v1-seed",
+      "scope": {
+        "tenantId": "sim-tenant-gm01-de-003-controlled-pilot",
+        "projectId": "sim-project-gm01-de-003-controlled-pilot",
+        "missionId": "VM-07",
+        "market": "DE",
+        "locale": "de-DE",
+        "currency": "EUR"
+      },
+      "observationWindow": {
+        "start": "2026-07-01T00:00:00Z",
+        "end": "2026-07-31T23:59:59Z",
+        "timeZone": "Europe/Berlin"
+      },
+      "goal": {
+        "mode": "one_off_decision",
+        "statement": "Decide whether a small synthetic Germany pilot is justified without opening a production channel.",
+        "budgetMinor": 15000,
+        "currency": "EUR",
+        "forbiddenChannels": ["paid_search", "unapproved_outreach", "production_write"]
+      },
+      "claims": [
+        {
+          "claimId": "gm01-de-003-controlled-pilot.claim.demand",
+          "subject": "sim://gm01-de-003-controlled-pilot/product/mxzone-shark-filter",
+          "predicate": "estimated_de_demand_index",
+          "value": "0.82 synthetic normalized demand index",
+          "sourceKind": "marketplace_estimate",
+          "sourceRef": "sim-source://gm01-de-003-controlled-pilot/marketplace/estimate-01",
+          "observedAt": "2026-07-03T09:00:00Z",
+          "validFrom": "2026-07-03T09:00:00Z",
+          "validUntil": "2026-07-31T23:59:59Z",
+          "classification": "provider_estimate",
+          "uncertainty": "low",
+          "counterevidenceIds": ["gm01-de-003-controlled-pilot.counter.demand"]
+        },
+        {
+          "claimId": "gm01-de-003-controlled-pilot.claim.compatibility",
+          "subject": "sim://gm01-de-003-controlled-pilot/product/mxzone-shark-filter",
+          "predicate": "compatibility_with_shark_nv360",
+          "value": "two synthetic product references agree on compatibility",
+          "sourceKind": "public_search_snapshot",
+          "sourceRef": "sim-source://gm01-de-003-controlled-pilot/search/manual-01",
+          "observedAt": "2026-07-04T10:00:00Z",
+          "validFrom": "2026-07-04T10:00:00Z",
+          "validUntil": "2026-07-31T23:59:59Z",
+          "classification": "confirmed_fact",
+          "uncertainty": "low",
+          "counterevidenceIds": ["gm01-de-003-controlled-pilot.counter.compatibility"]
+        },
+        {
+          "claimId": "gm01-de-003-controlled-pilot.claim.ai-visibility",
+          "subject": "sim://gm01-de-003-controlled-pilot/product/mxzone-shark-filter",
+          "predicate": "ai_recommendation_visibility",
+          "value": "synthetic ground truth shows a candidate recommendation, not an order",
+          "sourceKind": "ai_ground_truth_simulator",
+          "sourceRef": "sim-source://gm01-de-003-controlled-pilot/ai-ground-truth/run-01",
+          "observedAt": "2026-07-05T11:00:00Z",
+          "validFrom": "2026-07-05T11:00:00Z",
+          "validUntil": "2026-07-31T23:59:59Z",
+          "classification": "unknown",
+          "uncertainty": "medium",
+          "counterevidenceIds": ["gm01-de-003-controlled-pilot.counter.ai-visibility"]
+        },
+        {
+          "claimId": "gm01-de-003-controlled-pilot.claim.pilot",
+          "subject": "sim://gm01-de-003-controlled-pilot/product/mxzone-shark-filter",
+          "predicate": "controlled_pilot_feasibility",
+          "value": "synthetic evidence supports a bounded measurement pilot",
+          "sourceKind": "competitor_public_snapshot",
+          "sourceRef": "sim-source://gm01-de-003-controlled-pilot/competitor/snapshot-01",
+          "observedAt": "2026-07-06T12:00:00Z",
+          "validFrom": "2026-07-06T12:00:00Z",
+          "validUntil": "2026-07-31T23:59:59Z",
+          "classification": "agent_inference",
+          "uncertainty": "medium",
+          "counterevidenceIds": ["gm01-de-003-controlled-pilot.counter.pilot"]
+        }
+      ],
+      "counterevidence": [
+        {
+          "counterevidenceId": "gm01-de-003-controlled-pilot.counter.demand",
+          "claimId": "gm01-de-003-controlled-pilot.claim.demand",
+          "subject": "sim://gm01-de-003-controlled-pilot/product/mxzone-shark-filter",
+          "predicate": "estimated_de_demand_index",
+          "value": "synthetic estimate is not a first-party sales result",
+          "sourceKind": "synthetic_counterevidence",
+          "sourceRef": "sim-source://gm01-de-003-controlled-pilot/review-counter/01",
+          "observedAt": "2026-07-07T09:00:00Z",
+          "classification": "confirmed_fact",
+          "uncertainty": "low"
+        },
+        {
+          "counterevidenceId": "gm01-de-003-controlled-pilot.counter.compatibility",
+          "claimId": "gm01-de-003-controlled-pilot.claim.compatibility",
+          "subject": "sim://gm01-de-003-controlled-pilot/product/mxzone-shark-filter",
+          "predicate": "compatibility_with_shark_nv360",
+          "value": "synthetic source window contains no order payload",
+          "sourceKind": "synthetic_counterevidence",
+          "sourceRef": "sim-source://gm01-de-003-controlled-pilot/marketplace-counter/01",
+          "observedAt": "2026-07-08T09:00:00Z",
+          "classification": "confirmed_fact",
+          "uncertainty": "low"
+        },
+        {
+          "counterevidenceId": "gm01-de-003-controlled-pilot.counter.ai-visibility",
+          "claimId": "gm01-de-003-controlled-pilot.claim.ai-visibility",
+          "subject": "sim://gm01-de-003-controlled-pilot/product/mxzone-shark-filter",
+          "predicate": "ai_recommendation_visibility",
+          "value": "candidate recommendation must not be described as a confirmed recommendation",
+          "sourceKind": "synthetic_counterevidence",
+          "sourceRef": "sim-source://gm01-de-003-controlled-pilot/ai-counter/01",
+          "observedAt": "2026-07-09T09:00:00Z",
+          "classification": "provider_estimate",
+          "uncertainty": "medium"
+        },
+        {
+          "counterevidenceId": "gm01-de-003-controlled-pilot.counter.pilot",
+          "claimId": "gm01-de-003-controlled-pilot.claim.pilot",
+          "subject": "sim://gm01-de-003-controlled-pilot/product/mxzone-shark-filter",
+          "predicate": "controlled_pilot_feasibility",
+          "value": "pilot recommendation is an inference and needs a user-approved scope",
+          "sourceKind": "synthetic_counterevidence",
+          "sourceRef": "sim-source://gm01-de-003-controlled-pilot/competitor-counter/01",
+          "observedAt": "2026-07-10T09:00:00Z",
+          "classification": "agent_inference",
+          "uncertainty": "medium"
+        }
+      ],
+      "timeline": [
+        {"eventId": "gm01-de-003-controlled-pilot.event.context", "kind": "context_confirmed", "at": "2026-07-01T08:00:00Z"},
+        {"eventId": "gm01-de-003-controlled-pilot.event.evidence", "kind": "evidence_collected", "at": "2026-07-05T13:00:00Z"},
+        {"eventId": "gm01-de-003-controlled-pilot.event.decision", "kind": "decision_ready", "at": "2026-07-11T13:00:00Z"}
+      ],
+      "expected": {
+        "decision": "go",
+        "requiredClaimIds": [
+          "gm01-de-003-controlled-pilot.claim.demand",
+          "gm01-de-003-controlled-pilot.claim.compatibility",
+          "gm01-de-003-controlled-pilot.claim.ai-visibility",
+          "gm01-de-003-controlled-pilot.claim.pilot"
+        ],
+        "requiredCounterevidenceIds": [
+          "gm01-de-003-controlled-pilot.counter.demand",
+          "gm01-de-003-controlled-pilot.counter.compatibility",
+          "gm01-de-003-controlled-pilot.counter.ai-visibility",
+          "gm01-de-003-controlled-pilot.counter.pilot"
+        ],
+        "separatesClassifications": ["confirmed_fact", "provider_estimate", "agent_inference", "unknown"],
+        "forbiddenEffects": ["native_execution", "production_write", "provider_write"],
+        "decisionBasis": "A bounded pilot is allowed only as a user-approved experiment; estimates and candidate recommendations remain labeled."
+      }
+    }
+  ]
+}

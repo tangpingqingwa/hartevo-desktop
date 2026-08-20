@@ -1,0 +1,48 @@
+{
+  "schemaVersion": "hartevo-connector-authenticated-probe/v1",
+  "contractVersion": "connector-authenticated-probe-e1/v1",
+  "authority": "authenticated_probe_evidence_only",
+  "secretMaterial": "opaque_reference_only",
+  "operations": [
+    "mount",
+    "probe",
+    "unmount",
+    "revoke"
+  ],
+  "statuses": [
+    "reachable",
+    "unreachable",
+    "rejected"
+  ],
+  "provenanceClasses": [
+    "fixture",
+    "component_harness",
+    "controlled_provider",
+    "production_provider"
+  ],
+  "scopeBindings": [
+    "tenant",
+    "project",
+    "provider",
+    "account",
+    "mission"
+  ],
+  "evidenceFields": [
+    "quota",
+    "freshness",
+    "cost",
+    "provider_digest",
+    "evidence_digest",
+    "observed_at",
+    "mount_digest",
+    "registry_digest",
+    "contract_digest"
+  ],
+  "lifecycleRecovery": [
+    "probe_mount",
+    "mission_availability",
+    "provider_state",
+    "secret_resolution"
+  ],
+  "registrations": []
+}

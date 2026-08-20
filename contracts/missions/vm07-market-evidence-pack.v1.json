@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "contractVersion": "vm07-market-evidence-pack/v1",
+  "missionId": "VM-07",
+  "missionVersion": 3,
+  "workProductType": "market_evidence_pack",
+  "scope": {
+    "requiredIdentity": ["tenantId", "projectId", "missionId", "contractDigest"],
+    "requiredRevisionFence": ["missionRevision", "packRevision"],
+    "requiredClaimFields": [
+      "sourceId",
+      "sourceUri",
+      "observedAt",
+      "contentDigest",
+      "classification",
+      "uncertaintyId"
+    ]
+  },
+  "classifications": [
+    "confirmed_fact",
+    "provider_estimate",
+    "inference",
+    "unknown",
+    "conflict"
+  ],
+  "requiredSections": [
+    "claims",
+    "truthUncertaintyMap",
+    "counterevidence",
+    "recommendation",
+    "experimentPlan"
+  ],
+  "decision": {
+    "checkpointId": "go_no_go_need_more_evidence",
+    "actions": ["continue", "stop", "test"],
+    "bindingFields": [
+      "tenantId",
+      "projectId",
+      "missionId",
+      "checkpointId",
+      "action",
+      "contractDigest",
+      "packContentDigest",
+      "packRevision",
+      "missionRevision",
+      "checkpointRevision",
+      "conversationRevision",
+      "idempotencyKeyDigest",
+      "decisionDigest"
+    ],
+    "testRequires": "experimentPlan",
+    "externalWrites": false
+  },
+  "runtimeAuthority": false,
+  "releaseAuthority": false,
+  "migration": "none"
+}

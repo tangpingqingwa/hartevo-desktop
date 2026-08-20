@@ -1,0 +1,312 @@
+{
+  "schemaVersion": "hartevo-docs-machine-truth/v1",
+  "manifestId": "DOCS-MACHINE-TRUTH-45",
+  "authority": {
+    "currentDocument": "docs/SOURCE-OF-TRUTH.md",
+    "beginMarker": "<!-- docs-machine-truth:begin -->",
+    "endMarker": "<!-- docs-machine-truth:end -->"
+  },
+  "facts": [
+    {
+      "id": "release_schema_contract",
+      "source": {
+        "kind": "json_pointer",
+        "file": "contracts/release-evidence/schema.v2.3.json",
+        "pointer": "/properties/schemaVersion/const"
+      }
+    },
+    {
+      "id": "release_schema_stage",
+      "source": {
+        "kind": "json_pointer",
+        "file": "contracts/missions/stage-application-route-scope.v1.json",
+        "pointer": "/releaseEvidenceSchemaVersion"
+      }
+    },
+    {
+      "id": "handler_registry_version",
+      "source": {
+        "kind": "json_pointer",
+        "file": "contracts/application-handlers/catalog.v1.json",
+        "pointer": "/registryVersion"
+      }
+    },
+    {
+      "id": "handler_count",
+      "source": {
+        "kind": "json_array_length",
+        "file": "contracts/application-handlers/catalog.v1.json",
+        "pointer": "/handlers"
+      }
+    },
+    {
+      "id": "application_route_count",
+      "source": {
+        "kind": "json_pointer",
+        "file": "contracts/release-evidence/schema.v2.3.json",
+        "pointer": "/properties/applicationRouteCount/const"
+      }
+    },
+    {
+      "id": "not_implemented_route_count",
+      "source": {
+        "kind": "derived_subtract",
+        "left": "application_route_count",
+        "right": "handler_count"
+      }
+    },
+    {
+      "id": "release_passed",
+      "source": {
+        "kind": "symbol_literal",
+        "file": "hartevo-rs/catalog/src/evidence.rs",
+        "symbol": "pub fn wave_zero_baseline(",
+        "literal": "passed: false,",
+        "literalValue": false
+      }
+    },
+    {
+      "id": "gm01_issue_urls",
+      "source": {
+        "kind": "manifest_issue_urls",
+        "pointer": "/gm01Issues"
+      }
+    },
+    {
+      "id": "desktop_execution_handle",
+      "source": {
+        "kind": "symbol_present",
+        "file": "hartevo-rs/application/src/runtime_text_subscription.rs",
+        "symbol": "pub struct CatalogMissionExecutionHandle",
+        "minimumOccurrences": 1
+      }
+    },
+    {
+      "id": "desktop_subscription_scope",
+      "source": {
+        "kind": "symbol_present",
+        "file": "hartevo-rs/desktop/src/runtime_subscription.rs",
+        "symbol": "pub(crate) struct DesktopRuntimeSubscriptionScope",
+        "minimumOccurrences": 1
+      }
+    },
+    {
+      "id": "desktop_execution_paint_state",
+      "source": {
+        "kind": "symbol_present",
+        "file": "hartevo-rs/desktop/src/runtime_subscription.rs",
+        "symbol": "pub(crate) struct DesktopRuntimeExecutionPaintState",
+        "minimumOccurrences": 1
+      }
+    },
+    {
+      "id": "desktop_subscription_api",
+      "source": {
+        "kind": "symbol_present",
+        "file": "hartevo-rs/desktop/src/data_plane.rs",
+        "symbol": "pub fn runtime_text_subscription_os(",
+        "minimumOccurrences": 1
+      }
+    },
+    {
+      "id": "desktop_subscription_caller",
+      "source": {
+        "kind": "symbol_present",
+        "file": "hartevo-rs/desktop/src/lib.rs",
+        "symbol": "plane.runtime_text_subscription_os(",
+        "minimumOccurrences": 1
+      }
+    },
+    {
+      "id": "desktop_vm11_eighth_caller",
+      "source": {
+        "kind": "directory_literal_absent",
+        "directory": "hartevo-rs/desktop/src",
+        "extensions": [
+          ".rs"
+        ],
+        "needle": "resolve_vm11_next_contract_or_valid_terminal("
+      }
+    }
+  ],
+  "claims": [
+    {
+      "claimId": "DMT-REL-SCHEMA-01",
+      "factId": "release_schema_contract",
+      "status": "current",
+      "expectedValue": "2.3.0"
+    },
+    {
+      "claimId": "DMT-REL-SCHEMA-STAGE-01",
+      "factId": "release_schema_stage",
+      "status": "current",
+      "expectedValue": "2.3.0"
+    },
+    {
+      "claimId": "DMT-APP-REGISTRY-VERSION-01",
+      "factId": "handler_registry_version",
+      "status": "current",
+      "expectedValue": "desktop-2026-08-12-v8"
+    },
+    {
+      "claimId": "DMT-APP-REGISTRY-COUNT-01",
+      "factId": "handler_count",
+      "status": "current",
+      "expectedValue": 8
+    },
+    {
+      "claimId": "DMT-APP-ROUTE-COUNT-01",
+      "factId": "application_route_count",
+      "status": "current",
+      "expectedValue": 52
+    },
+    {
+      "claimId": "DMT-APP-NOT-IMPLEMENTED-COUNT-01",
+      "factId": "not_implemented_route_count",
+      "status": "current",
+      "expectedValue": 44
+    },
+    {
+      "claimId": "DMT-REL-PASSED-01",
+      "factId": "release_passed",
+      "status": "current",
+      "expectedValue": false
+    },
+    {
+      "claimId": "DMT-GM01-ISSUES-01",
+      "factId": "gm01_issue_urls",
+      "status": "current",
+      "expectedValue": [
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/30",
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/36",
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/37",
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/38",
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/39",
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/40",
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/41",
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/42",
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/43",
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/44",
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/47",
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/48",
+        "https://github.com/tangpingqingwa/hartevo-desktop/issues/49"
+      ]
+    },
+    {
+      "claimId": "DMT-DESKTOP-EXECUTION-HANDLE-01",
+      "factId": "desktop_execution_handle",
+      "status": "current",
+      "expectedValue": true
+    },
+    {
+      "claimId": "DMT-DESKTOP-SUBSCRIPTION-SCOPE-01",
+      "factId": "desktop_subscription_scope",
+      "status": "current",
+      "expectedValue": true
+    },
+    {
+      "claimId": "DMT-DESKTOP-EXECUTION-PAINT-01",
+      "factId": "desktop_execution_paint_state",
+      "status": "current",
+      "expectedValue": true
+    },
+    {
+      "claimId": "DMT-DESKTOP-SUBSCRIPTION-API-01",
+      "factId": "desktop_subscription_api",
+      "status": "current",
+      "expectedValue": true
+    },
+    {
+      "claimId": "DMT-DESKTOP-SUBSCRIPTION-CALLER-01",
+      "factId": "desktop_subscription_caller",
+      "status": "current",
+      "expectedValue": true
+    },
+    {
+      "claimId": "DMT-DESKTOP-VM11-EIGHTH-CALLER-01",
+      "factId": "desktop_vm11_eighth_caller",
+      "status": "current",
+      "expectedValue": false
+    }
+  ],
+  "requiredClaimIds": [
+    "DMT-REL-SCHEMA-01",
+    "DMT-REL-SCHEMA-STAGE-01",
+    "DMT-APP-REGISTRY-VERSION-01",
+    "DMT-APP-REGISTRY-COUNT-01",
+    "DMT-APP-ROUTE-COUNT-01",
+    "DMT-APP-NOT-IMPLEMENTED-COUNT-01",
+    "DMT-REL-PASSED-01",
+    "DMT-GM01-ISSUES-01",
+    "DMT-DESKTOP-EXECUTION-HANDLE-01",
+    "DMT-DESKTOP-SUBSCRIPTION-SCOPE-01",
+    "DMT-DESKTOP-EXECUTION-PAINT-01",
+    "DMT-DESKTOP-SUBSCRIPTION-API-01",
+    "DMT-DESKTOP-SUBSCRIPTION-CALLER-01",
+    "DMT-DESKTOP-VM11-EIGHTH-CALLER-01"
+  ],
+  "equalFactGroups": [
+    [
+      "release_schema_contract",
+      "release_schema_stage"
+    ]
+  ],
+  "gm01Issues": [
+    {
+      "number": 30,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/30"
+    },
+    {
+      "number": 36,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/36"
+    },
+    {
+      "number": 37,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/37"
+    },
+    {
+      "number": 38,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/38"
+    },
+    {
+      "number": 39,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/39"
+    },
+    {
+      "number": 40,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/40"
+    },
+    {
+      "number": 41,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/41"
+    },
+    {
+      "number": 42,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/42"
+    },
+    {
+      "number": 43,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/43"
+    },
+    {
+      "number": 44,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/44"
+    },
+    {
+      "number": 47,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/47"
+    },
+    {
+      "number": 48,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/48"
+    },
+    {
+      "number": 49,
+      "url": "https://github.com/tangpingqingwa/hartevo-desktop/issues/49"
+    }
+  ],
+  "nonAuthorities": [
+    "testCount",
+    "eLevel"
+  ]
+}

@@ -3,6 +3,8 @@
 //! Runtime threads, model output, and provider responses are projections into this
 //! kernel. They are never accepted as business truth without a domain command.
 
+mod attribution_outcome_adoption;
+mod attribution_spine;
 mod connection;
 mod context;
 mod context_collaboration;
@@ -13,6 +15,7 @@ mod deletion;
 mod identity;
 mod ids;
 mod key_management;
+mod market_evidence;
 mod mission;
 mod mission_conversation;
 mod mission_schedule;
@@ -26,6 +29,37 @@ mod runtime_turn;
 mod truth;
 mod work_product;
 
+pub use attribution_outcome_adoption::{
+    ATTRIBUTION_ADOPTION_CANDIDATE_EVENT_TYPE, ATTRIBUTION_ADOPTION_CONSUMER_MOUNT_EVENT_TYPE,
+    ATTRIBUTION_ADOPTION_CONSUMER_REVOKE_EVENT_TYPE,
+    ATTRIBUTION_ADOPTION_CONSUMER_UNMOUNT_EVENT_TYPE, ATTRIBUTION_ADOPTION_RECEIPT_EVENT_TYPE,
+    ATTRIBUTION_OUTCOME_ADOPTION_CONTRACT_VERSION, ATTRIBUTION_OUTCOME_ADOPTION_SCHEMA_VERSION,
+    ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE, ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
+    AttributionAdoptionConsumer, AttributionAdoptionConsumerRecord,
+    AttributionAdoptionConsumerState, AttributionAdoptionDecision, AttributionAdoptionError,
+    AttributionAdoptionReceipt, AttributionAdoptionScope, AttributionAdoptionSnapshot,
+    AttributionModelVersion, AttributionOutcomeCandidate, AttributionVerificationRecord,
+};
+pub use attribution_spine::{
+    ATTRIBUTION_SPINE_EVENT_TYPE, ATTRIBUTION_SPINE_SCHEMA_VERSION, AttributionAssignment,
+    AttributionError, AttributionLedger, AttributionProjection, AttributionReason,
+    AttributionWindow, BatchIngestResult, ConnectorObservationSource, CorrectionKind,
+    CorrectionLineage, IngestDisposition, ObservationOrigin, ObservationProvenance,
+    OutcomeCandidate, OutcomeCandidateId, OutcomeKind, OutcomeVerification, ProviderCursor,
+    ProviderEntityRef, ProviderEventIdentity, SourceEntityKind, SourceEvent, SourceEventId,
+    SourceEventKind, SourceEventLinks, SourceObservationBatch, VerificationMethod, VerifiedOutcome,
+    VerifiedOutcomeId,
+};
+
+/// Stable contract constants for storage crates.  The candidate and verified
+/// event names are also owned by the attribution-outcome adoption contract on
+/// newer bootstrap compositions, so they intentionally stay out of the root
+/// re-export above to avoid duplicate public names when that slice is composed.
+pub mod attribution_spine_contract {
+    pub use super::attribution_spine::{
+        ATTRIBUTION_SPINE_CANDIDATE_EVENT_TYPE, ATTRIBUTION_SPINE_VERIFIED_OUTCOME_EVENT_TYPE,
+    };
+}
 pub use context::{
     ContextBranch, ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleStatus,
     ContextDataClass, ContextDataPolicy, ContextError, ContextFactGrant, ContextInputRefs,
@@ -76,6 +110,12 @@ pub use key_management::{
     DeviceHandoffRevocation, DeviceKeyAgreementAlgorithm, DevicePublicKeyRegistration, KeyEnvelope,
     KeyManagementError, KeyRecipient, KeyWrapAlgorithm, ProjectEncryptionMode, ProjectKeyring,
     ProjectKeyringBootstrap, WrappedKeyCiphertext,
+};
+pub use market_evidence::{
+    MarketCounterevidence, MarketDecisionRecommendation, MarketEvidenceClaim,
+    MarketEvidenceClassification, MarketEvidenceError, MarketEvidencePack,
+    MarketExperimentPlanItem, MarketUncertainty, MarketUncertaintyMateriality, Vm07DecisionAction,
+    Vm07DecisionBinding,
 };
 pub use mission::{
     Approval, ApprovalDecision, ApprovalPolicy, AutonomyLevel, Cadence, CadenceTriggerKind,
