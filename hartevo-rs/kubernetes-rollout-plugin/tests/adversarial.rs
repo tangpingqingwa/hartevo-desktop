@@ -168,6 +168,90 @@ fn contract_and_public_definitions_are_read_only_and_version_bound() {
 }
 
 #[test]
+fn schema_constants_and_serde_definitions_round_trip_without_drift() {
+    let contract: Value = serde_json::from_str(include_str!(
+        "../../../contracts/plugins/kubernetes-rollout/kubernetes-rollout.v1.schema.json"
+    ))
+    .expect("contract must be valid JSON");
+
+    let service = KubernetesRolloutService::<KubernetesApiRolloutProvider>::definition();
+    let service_json = serde_json::to_value(&service).expect("service must serialize");
+    assert_eq!(
+        serde_json::from_value::<KubernetesRolloutServiceDefinition>(service_json.clone())
+            .expect("service must deserialize"),
+        service
+    );
+    assert_eq!(
+        service_json["contractVersion"],
+        contract["properties"]["contractVersion"]["const"]
+    );
+    assert_eq!(
+        service_json["serviceId"],
+        contract["properties"]["service"]["properties"]["id"]["const"]
+    );
+    assert_eq!(
+        service_json["access"],
+        contract["properties"]["service"]["properties"]["access"]["const"]
+    );
+    assert_eq!(
+        service_json["operations"],
+        contract["properties"]["service"]["properties"]["operations"]["items"]["enum"]
+    );
+    assert_eq!(
+        service_json["writesAllowed"],
+        contract["properties"]["service"]["properties"]["writesAllowed"]["const"]
+    );
+    assert_eq!(
+        service_json["layer"],
+        contract["properties"]["layer"]["const"]
+    );
+
+    let provider = KubernetesApiRolloutProvider::<BlockedEnvTransport>::definition();
+    let provider_json = serde_json::to_value(&provider).expect("provider must serialize");
+    assert_eq!(
+        serde_json::from_value::<KubernetesRolloutProviderDefinition>(provider_json.clone())
+            .expect("provider must deserialize"),
+        provider
+    );
+    assert_eq!(
+        provider_json["providerId"],
+        contract["properties"]["provider"]["properties"]["id"]["const"]
+    );
+    assert_eq!(
+        provider_json["kubernetesApiRevision"],
+        contract["properties"]["provider"]["properties"]["apiRevision"]["const"]
+    );
+    assert_eq!(
+        provider_json["transport"],
+        contract["properties"]["provider"]["properties"]["transport"]["const"]
+    );
+    assert_eq!(
+        provider_json["nativeConnectedClaim"],
+        contract["properties"]["provider"]["properties"]["nativeConnectedClaim"]["const"]
+    );
+
+    let consumer = MissionKubernetesRolloutConsumer::definition();
+    let consumer_json = serde_json::to_value(&consumer).expect("consumer must serialize");
+    assert_eq!(
+        serde_json::from_value::<MissionKubernetesRolloutConsumerDefinition>(consumer_json.clone())
+            .expect("consumer must deserialize"),
+        consumer
+    );
+    assert_eq!(
+        consumer_json["consumerId"],
+        contract["properties"]["missionConsumer"]["properties"]["id"]["const"]
+    );
+    assert_eq!(
+        consumer_json["authority"],
+        contract["properties"]["missionConsumer"]["properties"]["authority"]["const"]
+    );
+    assert_eq!(
+        consumer_json["outcomeAdoption"],
+        contract["properties"]["missionConsumer"]["properties"]["outcomeAdoption"]["const"]
+    );
+}
+
+#[test]
 fn complete_read_to_mission_result_preserves_all_identity_fences() {
     let scope = scope();
     let images = expected_images(&scope);
