@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-emr-serverless-job-result/contract.v1.json",
+  "schemaVersion": "hartevo.aws-emr-serverless-job-result/v1",
+  "contractVersion": "EXT-AWS-EMR-SERVERLESS-01-L1/v1",
+  "pluginId": "aws.emr-serverless.job-result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.aws-emr-serverless-job-result/v1|layer=1|service=aws.emr-serverless.job-result.read|provider=aws.emr-serverless.job-result.offline|consumer=mission.aws-emr-serverless-job-result.consumer",
+  "contractDigest": "84d5ee6fa45017835fcee9867431adcbe0a213f13a37b20187c7d1530f185982",
+  "service": {
+    "id": "aws.emr-serverless.job-result.read",
+    "typedName": "AwsEmrServerlessJobResultService",
+    "readOnly": true,
+    "externalWrites": false,
+    "operations": ["GetApplication", "GetJobRun", "ListJobRuns"],
+    "forbiddenOperations": ["StartJobRun", "CancelJobRun", "UpdateApplication", "DeleteApplication", "GetDashboardForJobRun", "log-read", "artifact-read", "data-read"]
+  },
+  "provider": {
+    "id": "aws.emr-serverless.job-result.offline",
+    "typedName": "AwsEmrServerlessProvider",
+    "apiRevision": "emr-serverless-get-application-get-job-run-list-job-runs-1",
+    "transportModes": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "secretReference": "opaque-non-serializing-SigV4-reference",
+    "boundedPagination": {"maxPageSize": 50, "maxPages": 4, "maxResponseBytes": 1048576},
+    "officialApiBasis": [
+      "https://docs.aws.amazon.com/emr-serverless/latest/APIReference/API_ListJobRuns.html",
+      "https://docs.aws.amazon.com/emr-serverless/latest/APIReference/API_GetJobRun.html"
+    ]
+  },
+  "consumer": {
+    "id": "mission.aws-emr-serverless-job-result.consumer",
+    "typedName": "MissionAwsEmrServerlessConsumer",
+    "scope": ["Project", "Mission", "Work Product", "account", "region", "application", "jobRun", "attempt", "executionRoleDigest", "releaseLabel", "jobDriverDigest"],
+    "reversibleRegistration": true,
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false
+  },
+  "projection": {
+    "retained": ["status", "attempt", "timestamps", "mode", "aggregateWorkerMetadata", "aggregateResourceMetadata", "aggregateCostMetadata", "redactedStateDetailsDigest", "applicationDigest", "jobRunDigest", "attemptDigest", "stateDigest", "resourceDigest", "resultDigest"],
+    "excluded": ["entryPointArguments", "configurationOverrides", "iamRoleArn", "logs", "s3Uris", "environment", "source", "rows", "outputBytes", "rawDriverConfiguration"],
+    "bounded": true,
+    "deterministicDigests": true
+  },
+  "lifecycleStates": ["SUBMITTED", "PENDING", "SCHEDULED", "QUEUED", "RUNNING", "SUCCESS", "FAILED", "CANCELLING", "CANCELLED", "PARTIAL", "EXPIRED", "ACCESS_LOST", "PROVIDER_UNKNOWN", "TAMPERED", "REVOKED"],
+  "authorityBoundary": {
+    "truth": false,
+    "consent": false,
+    "effect": false,
+    "receipt": false,
+    "verification": false,
+    "outcome": false,
+    "nativeSigV4Https": "layer-2",
+    "durableReceipt": "layer-2",
+    "independentTerminalReadback": "layer-2",
+    "verifiedAdoption": "layer-2"
+  }
+}

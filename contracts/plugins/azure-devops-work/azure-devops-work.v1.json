@@ -1,0 +1,103 @@
+{
+  "schemaVersion": "hartevo.azure-devops-work-contract/v1",
+  "contractVersion": "azure-devops-work/v1",
+  "layer": 1,
+  "serviceId": "azure-devops.work",
+  "providerId": "azure-devops.services",
+  "consumerId": "mission.azure-devops-work",
+  "apiVersion": "7.1",
+  "apiAreas": {
+    "workItems": "wit",
+    "repos": "git",
+    "build": "build"
+  },
+  "transportProvenance": ["fixture", "recording", "blocked_env", "production_read"],
+  "operations": [
+    "describe_capabilities",
+    "register",
+    "revoke_registration",
+    "read_work_item_graph",
+    "read_pull_request",
+    "read_build_timeline_artifacts",
+    "consume_observation"
+  ],
+  "readOnly": true,
+  "mutatingProviderOperations": [],
+  "authority": {
+    "externalWrites": false,
+    "rawLogs": false,
+    "rawArtifacts": false,
+    "connected": false,
+    "effect": false,
+    "receipt": false,
+    "verification": false,
+    "outcome": false,
+    "workProductAdoption": false
+  },
+  "registration": {
+    "boundFields": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "azureDevOpsOrganization",
+      "azureDevOpsProject",
+      "repositoryId",
+      "workItemId",
+      "missionProjectWorkProductScope",
+      "entraSecretReference",
+      "credentialRevision"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "scopeFence": [
+    "organization",
+    "project",
+    "repositoryId",
+    "workItemId",
+    "workItemRev",
+    "pullRequestId",
+    "pullRequestSourceCommit",
+    "pullRequestTargetCommit",
+    "buildSourceVersion",
+    "buildSourceBranch",
+    "missionIdAndRevision",
+    "projectIdAndRevision",
+    "workProductIdAndRevision"
+  ],
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxWorkItemRelations": 128,
+    "maxBuilds": 8,
+    "maxTimelineRecords": 512,
+    "maxArtifacts": 128,
+    "maxPages": 4,
+    "pageSize": 50
+  },
+  "receipts": {
+    "requestPathAndQuery": true,
+    "apiVersion": true,
+    "responseStatus": true,
+    "responseSize": true,
+    "responseDigest": true,
+    "providerRevision": true,
+    "rawProviderPayload": false,
+    "rawLogs": false,
+    "rawArtifacts": false,
+    "credentialMaterial": false
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_entra_and_connected",
+    "failClosedCases": [
+      "missing_native_entra_authority",
+      "missing_native_access_token",
+      "api_version_drift",
+      "scope_or_revision_drift",
+      "raw_log_or_artifact_request",
+      "external_write_request"
+    ]
+  },
+  "honestNativeGap": "Native Microsoft Entra resolution, native Connected status, external writes, raw logs/artifact downloads, provider receipts, exact readback, verification, Outcome authority, and Work Product adoption remain deferred to a later layer; this root is recording/fake/blocked-environment read evidence only."
+}
