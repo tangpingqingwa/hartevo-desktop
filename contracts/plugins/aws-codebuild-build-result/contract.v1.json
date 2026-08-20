@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/aws-codebuild-build-result/aws-codebuild-build-result.v1.json",
+  "schemaVersion": "hartevo.aws-codebuild-build-result-contract/v1",
+  "contractVersion": "aws-codebuild-build-result/v1",
+  "pluginVersion": "1.0.0",
+  "layer": 1,
+  "service": {
+    "id": "aws.codebuild.build-result",
+    "implementation": "AwsCodeBuildResultService",
+    "version": "1.0.0",
+    "access": "read_only",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "read_list_builds_for_project",
+      "read_batch_get_builds",
+      "read_batch_get_projects",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "arbitraryQuery": false,
+    "liveExecution": false,
+    "outcomeAuthority": false
+  },
+  "provider": {
+    "id": "aws.codebuild.builds",
+    "implementation": "AwsCodeBuildProvider",
+    "version": "1.0.0",
+    "apiVersion": "2016-10-06",
+    "apiOperations": [
+      "ListBuildsForProject",
+      "BatchGetBuilds",
+      "BatchGetProjects"
+    ],
+    "iamPermissions": [
+      "codebuild:ListBuildsForProject",
+      "codebuild:BatchGetBuilds",
+      "codebuild:BatchGetProjects"
+    ],
+    "acceptedProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "native": false,
+    "connected": false,
+    "liveCredentialResolution": false,
+    "externalWrites": false,
+    "mutationOperations": [
+      "StartBuild",
+      "StopBuild",
+      "RetryBuild",
+      "StartBuildBatch",
+      "StopBuildBatch",
+      "RetryBuildBatch",
+      "CreateProject",
+      "UpdateProject",
+      "DeleteProject"
+    ]
+  },
+  "consumer": {
+    "id": "mission.aws-codebuild-build-result",
+    "implementation": "MissionAwsCodeBuildConsumer",
+    "version": "1.0.0",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "durableReceiptAuthority": false
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "codeBuildProjectName",
+      "buildId",
+      "sourceRepository",
+      "sourceCommit",
+      "artifactId",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision",
+      "permissionDigest"
+    ],
+    "fences": [
+      "account",
+      "region",
+      "codebuild_project",
+      "build",
+      "source",
+      "commit",
+      "artifact",
+      "mission",
+      "project",
+      "work_product"
+    ],
+    "secret": "opaque_non_serializing_sigv4_secret_reference_only"
+  },
+  "digests": {
+    "required": [
+      "versionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "projectDigest",
+      "buildDigest",
+      "sourceDigest",
+      "artifactDigest",
+      "evidenceDigest",
+      "registrationDigest"
+    ],
+    "secretMaterialExcluded": true,
+    "pageTokensOpaque": true,
+    "rawProviderPayloadExcluded": true
+  },
+  "bounds": {
+    "listBuildsForProjectMaxPages": 4,
+    "listBuildsForProjectMaxPageSize": 100,
+    "batchGetBuildsMaxIds": 100,
+    "batchGetProjectsMaxNames": 100,
+    "maxBuilds": 400,
+    "maxProjects": 100,
+    "maxArtifactsPerBuild": 16,
+    "optionalBatchMetadata": true
+  },
+  "evidence": {
+    "operations": ["ListBuildsForProject", "BatchGetBuilds", "BatchGetProjects"],
+    "retained": [
+      "boundedBuildIdentity",
+      "boundedProjectIdentity",
+      "boundedSourceAndCommitIdentity",
+      "boundedStatus",
+      "boundedTimestamps",
+      "artifactMetadataDigests",
+      "optionalBatchMetadataDigest",
+      "requestAndResponseDigests",
+      "opaquePageTokenDigests"
+    ],
+    "redacted": [
+      "commandArguments",
+      "environment",
+      "secrets",
+      "logs",
+      "sourceBytes",
+      "artifactBytes",
+      "rawProviderPayload",
+      "rawRequests",
+      "rawResponses"
+    ],
+    "statuses": ["complete", "partial", "access_lost"],
+    "partialReasons": [
+      "page_limit_reached",
+      "build_limit_reached",
+      "unknown_status",
+      "missing_target_build",
+      "missing_project",
+      "provider_marked_partial",
+      "optional_batch_metadata_truncated"
+    ],
+    "readProposalRecordVerify": true,
+    "redactedReceipts": true,
+    "independentArtifactReadback": false
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "apiDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "evidenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "authority": {
+    "readOnly": true,
+    "externalWrites": false,
+    "connected": false,
+    "nativeProvider": false,
+    "liveCredentialResolution": false,
+    "nativeSigV4": false,
+    "rawCommandArguments": false,
+    "rawEnvironment": false,
+    "rawSecrets": false,
+    "rawLogs": false,
+    "rawSourceBytes": false,
+    "rawArtifactBytes": false,
+    "durableNativeReceipt": false,
+    "independentArtifactReadback": false,
+    "verificationAuthority": false,
+    "workloadCorrectnessAuthority": false,
+    "outcomeAuthority": false,
+    "workProductAdoption": false,
+    "blockedEnvironmentIsNative": false,
+    "fixtureIsNative": false,
+    "recordingIsNative": false,
+    "loopbackIsNative": false
+  },
+  "transport": {
+    "fixture": true,
+    "recording": true,
+    "loopback": true,
+    "blockedEnv": true,
+    "productionRead": false,
+    "nativeHttps": false,
+    "nativeSigV4": false,
+    "rawRequestsRetained": false,
+    "rawResponsesRetained": false,
+    "rawSecretsRetained": false
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_sigv4_https_transport_and_independent_artifact_readback",
+    "failClosedCases": [
+      "missing_native_sigv4_authority",
+      "missing_live_credential_resolver",
+      "contract_provider_api_version_drift",
+      "permission_scope_account_region_project_build_source_commit_or_artifact_drift",
+      "opaque_pagination_binding_drift",
+      "unknown_or_malformed_status",
+      "partial_or_access_lost_evidence",
+      "tampered_evidence",
+      "replayed_evidence_or_page_token",
+      "revoked_registration",
+      "start_stop_retry_or_mutate_build_request",
+      "project_mutation_request",
+      "raw_command_environment_log_secret_source_or_artifact_bytes_request",
+      "independent_artifact_readback_request"
+    ]
+  },
+  "honestNativeGap": "Layer 1 supplies bounded normalized AWS CodeBuild build evidence and read/proposal/record/verify seams through fixture, recording, loopback, or BLOCKED_ENV transports. It does not mutate builds or projects, resolve SigV4 credentials, sign native HTTPS, claim Connected/native status, retain commands, environments, secrets, logs, source bytes, artifact bytes, raw provider payloads, durable native receipts, independently read artifacts, assert workload correctness, or adopt a Work Product outcome."
+}
