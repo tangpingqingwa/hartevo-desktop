@@ -1,0 +1,1351 @@
+{
+  "schemaVersion": "hartevo-platform-matrix/v2",
+  "matrixVersion": "i-01c-authenticated-receipt-signature/2026-08-13-v2",
+  "repositoryId": "tangpingqingwa/hartevo-desktop",
+  "sourceCommit": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
+  "receiptSchemaUri": "https://hartevo.local/contracts/platform/receipt.schema.v2.json",
+  "receiptSchemaSha256": "f1142ff4ca9b0a6723ac285e9f0b197dc3e02914161998a7518aa861f2a8c1b8",
+  "evidenceMode": "source_audit_baseline",
+  "releaseEligible": false,
+  "nativeReceiptCount": 0,
+  "nativeProducerPolicy": {
+    "mode": "contract_only_fail_closed",
+    "nativeReceiptEmissionAllowed": false,
+    "registryEmptyPolicy": "deny_all",
+    "trustedRegistryRequired": true,
+    "runnerSignatureRequired": true,
+    "signatureAlgorithm": "ed25519",
+    "signatureVerifierAvailable": true,
+    "hostAttestationVerifierAvailable": false,
+    "realHostRequired": true,
+    "contentFree": true,
+    "canonicalPayloadEncoding": "hartevo_sorted_json/v1",
+    "signaturePayloadProjection": "receipt_without_signature_and_runner_signature_evidence/v1",
+    "challengeNonceDigestRequired": true,
+    "persistentNonceReplayGuardAvailable": false,
+    "maxChallengeAgeSeconds": 300,
+    "maxReceiptAgeSeconds": 600,
+    "maxRunDurationSeconds": 3600,
+    "signaturePayloadDomain": "hartevo-platform-native-receipt-signature/v2",
+    "preflightEvidenceKinds": [
+      "host_attestation_digest",
+      "native_preflight_digest",
+      "producer_binary_digest",
+      "production_binary_digest",
+      "runner_signature_digest"
+    ],
+    "executionEvidenceKinds": [
+      "cleanup_digest",
+      "host_attestation_digest",
+      "native_execution_digest",
+      "producer_binary_digest",
+      "production_binary_digest",
+      "runner_signature_digest"
+    ]
+  },
+  "readinessBlockers": [
+    {
+      "code": "NATIVE_HOST_ATTESTATION_UNAVAILABLE",
+      "classification": "BLOCKED_ENV",
+      "observationSource": "native_producer_preflight:host_attestation_registry",
+      "exitCondition": "A privacy-safe actual-host attestation verifier is configured for the exact target OS and architecture."
+    },
+    {
+      "code": "NONCE_REPLAY_GUARD_NOT_IMPLEMENTED",
+      "classification": "NOT_IMPLEMENTED",
+      "observationSource": "native_producer_preflight:persistent_nonce_replay_guard",
+      "exitCondition": "A durable atomic nonce-consumption ledger is wired to native receipt admission and proves cross-invocation replay rejection."
+    },
+    {
+      "code": "RUNNER_REGISTRY_EMPTY",
+      "classification": "BLOCKED_ENV",
+      "observationSource": "matrix.allowedRunners",
+      "exitCondition": "A reviewed, time-bounded Ed25519 runner registration with challenge issuer, target, and host allowlists is committed in a separately approved contract update."
+    }
+  ],
+  "sourceAuditDispositionCounts": {
+    "pass": 0,
+    "fail": 0,
+    "blockedEnv": 16,
+    "notImplemented": 25
+  },
+  "receiptPolicy": {
+    "passReceiptKind": "native_execution",
+    "failReceiptKind": "native_execution",
+    "blockedEnvReceiptKind": "native_preflight",
+    "notImplementedReceiptKind": "source_audit",
+    "nativeTargetMustMatch": true,
+    "cleanupRequiredForNativeExecution": true,
+    "missingReceiptDisposition": "aggregate_failure"
+  },
+  "runnerRegistryEpoch": 0,
+  "runnerRegistryDigest": "67875a5baea0ba0b126c86a2ea88d589249fb2ff5ca8084525d80ed3d47da658",
+  "allowedRunners": [],
+  "prohibitedUpgradeEvidence": [
+    "compile_only",
+    "cross_compile",
+    "fake_host",
+    "ignored_test",
+    "mock_credential_store",
+    "source_audit"
+  ],
+  "allowedBlockerCodes": [
+    "AUTHORIZED_PROVISIONING_PROFILE_UNAVAILABLE",
+    "CODESIGNING_IDENTITY_UNAVAILABLE",
+    "DATA_PROTECTION_KEYCHAIN_UNAVAILABLE",
+    "DEDICATED_PROFILE_ROOT_UNAVAILABLE",
+    "DEDICATED_UNLOCKED_USER_UNAVAILABLE",
+    "LINUX_KEYUTILS_SESSION_UNAVAILABLE",
+    "LINUX_USER_SESSION_UNAVAILABLE",
+    "LINUX_X86_64_NATIVE_HOST_UNAVAILABLE",
+    "MACOS_AARCH64_NATIVE_HOST_UNAVAILABLE",
+    "MACOS_X86_64_NATIVE_HOST_UNAVAILABLE",
+    "REVIEWED_CHROME_BINARY_UNAVAILABLE",
+    "WINDOWS_AARCH64_NATIVE_HOST_UNAVAILABLE",
+    "WINDOWS_TEST_SESSION_UNAVAILABLE",
+    "WINDOWS_X86_64_NATIVE_HOST_UNAVAILABLE"
+  ],
+  "targets": [
+    {
+      "id": "macos-aarch64",
+      "os": "macos",
+      "arch": "aarch64",
+      "supportClass": "release"
+    },
+    {
+      "id": "macos-x86_64",
+      "os": "macos",
+      "arch": "x86_64",
+      "supportClass": "release"
+    },
+    {
+      "id": "windows-aarch64",
+      "os": "windows",
+      "arch": "aarch64",
+      "supportClass": "release"
+    },
+    {
+      "id": "windows-x86_64",
+      "os": "windows",
+      "arch": "x86_64",
+      "supportClass": "release"
+    },
+    {
+      "id": "linux-x86_64",
+      "os": "linux",
+      "arch": "x86_64",
+      "supportClass": "compatibility"
+    }
+  ],
+  "cases": [
+    {
+      "caseId": "I-01.macos-aarch64.secret.macos_data_protection_signed",
+      "targetId": "macos-aarch64",
+      "capabilityId": "secret.macos_data_protection_signed",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-storage::OsSecretStore",
+      "requiredAssertions": [
+        "actual_architecture",
+        "authorized_entitlements",
+        "delete_confirmed",
+        "device_only_round_trip",
+        "no_legacy_fallback",
+        "protected_backend",
+        "signed_bundle"
+      ],
+      "allowedBlockerCodes": [
+        "CODESIGNING_IDENTITY_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "CODESIGNING_IDENTITY_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A signed app-like bundle and matching provisioning profile authorize the Data Protection Keychain access group on macOS ARM64."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/storage/src/secure_store.rs",
+          "locator": "OsSecretStore::entry[target_os=macos]",
+          "fact": "Protected Data Protection Keychain entry uses WhenUnlockedThisDeviceOnly with synchronization disabled; strict native evidence remains absent.",
+          "mode": "100644",
+          "blobSha256": "e01f7f42ed7325bad0664f4a82106eb69836fbc31ac4a174b724a7bc557ce17e",
+          "byteCount": 37396
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-aarch64.browser.pipe_platform_default",
+      "targetId": "macos-aarch64",
+      "capabilityId": "browser.pipe_platform_default",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-browser-adapter::ManagedChromiumHost",
+      "requiredAssertions": [
+        "actual_architecture",
+        "graceful_restart",
+        "isolated_managed_profile",
+        "no_mock_keychain_switch",
+        "pipe_health",
+        "platform_default_mode",
+        "reviewed_chrome_binary"
+      ],
+      "allowedBlockerCodes": [
+        "DEDICATED_UNLOCKED_USER_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "DEDICATED_UNLOCKED_USER_UNAVAILABLE",
+        "observationSource": "source_audit:platform_environment_inventory",
+        "exitCondition": "An unlocked dedicated macOS ARM64 test user with an isolated login Keychain and disposable managed Chrome profile is provisioned."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/chromium_host.rs",
+          "locator": "ChromiumLaunchConfig::default/ManagedChromiumHost::spawn",
+          "fact": "Production configuration defaults to PlatformDefault and launches a Unix remote-debugging pipe; existing real smoke is ignored and explicitly mock-keychain.",
+          "mode": "100644",
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-aarch64.browser.profile_exclusive_lock",
+      "targetId": "macos-aarch64",
+      "capabilityId": "browser.profile_exclusive_lock",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-browser-adapter::ManagedProfileDirectory",
+      "requiredAssertions": [
+        "actual_architecture",
+        "exclusive_lock",
+        "isolated_profile_root",
+        "private_permissions",
+        "reopened_binding"
+      ],
+      "allowedBlockerCodes": [
+        "DEDICATED_UNLOCKED_USER_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "DEDICATED_UNLOCKED_USER_UNAVAILABLE",
+        "observationSource": "source_audit:platform_environment_inventory",
+        "exitCondition": "An unlocked dedicated macOS ARM64 test user and empty disposable profile root are provisioned for native lock validation."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/profile_dir.rs",
+          "locator": "ManagedProfileDirectory::prepare",
+          "fact": "Managed profile preparation has an OS file lock and Unix private-mode and file-identity checks; no qualifying native receipt exists.",
+          "mode": "100644",
+          "blobSha256": "f1eff359cbe40bb0d50ae63898719d55e5fdec3df2a3a45282a10eb84164399b",
+          "byteCount": 35461
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-aarch64.browser.posix_process_group",
+      "targetId": "macos-aarch64",
+      "capabilityId": "browser.posix_process_group",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-browser-adapter::ManagedChromiumHost",
+      "requiredAssertions": [
+        "actual_architecture",
+        "descendant_termination",
+        "no_process_residue",
+        "process_group_created"
+      ],
+      "allowedBlockerCodes": [
+        "DEDICATED_UNLOCKED_USER_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "DEDICATED_UNLOCKED_USER_UNAVAILABLE",
+        "observationSource": "source_audit:platform_environment_inventory",
+        "exitCondition": "An unlocked dedicated macOS ARM64 test user permits reviewed Chrome descendant containment and residue checks."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/chromium_host.rs",
+          "locator": "spawn_chromium_process",
+          "fact": "Unix Chromium launch uses a grouped child process and bounded shutdown; architecture-specific native cleanup evidence is absent.",
+          "mode": "100644",
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-aarch64.auth.account_identity",
+      "targetId": "macos-aarch64",
+      "capabilityId": "auth.account_identity",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "browser_identity_observation_binding",
+        "provider_account_identity_readback"
+      ],
+      "sourceBindings": [
+        {
+          "path": "contracts/providers/auth-probe.v1.json",
+          "locator": "/connectedAuthority",
+          "fact": "The provider auth probe grants connection_state_only authority, not browser account identity authority.",
+          "mode": "100644",
+          "blobSha256": "6523f5658553d88dfd2ed246de7487a5407c646b8fd99e9db0e286854d277c18",
+          "byteCount": 958
+        },
+        {
+          "path": "hartevo-rs/browser-adapter/src/chromium_host.rs",
+          "locator": "ManagedChromiumHost::observe_ax",
+          "fact": "Semantic snapshots copy the workspace expected identity digest rather than reading the authenticated provider account.",
+          "mode": "100644",
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-aarch64.auth.cookie_restart",
+      "targetId": "macos-aarch64",
+      "capabilityId": "auth.cookie_restart",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "cross_profile_cookie_isolation_probe",
+        "managed_profile_cookie_restart_probe"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/profile_dir.rs",
+          "locator": "ManagedProfileDirectory",
+          "fact": "Managed profile persistence exists, but no authenticated cookie restart or cross-profile isolation observation is implemented.",
+          "mode": "100644",
+          "blobSha256": "f1eff359cbe40bb0d50ae63898719d55e5fdec3df2a3a45282a10eb84164399b",
+          "byteCount": 35461
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-aarch64.auth.reauth_refusal",
+      "targetId": "macos-aarch64",
+      "capabilityId": "auth.reauth_refusal",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "expired_or_revoked_browser_session_probe",
+        "reauth_required_human_handoff",
+        "zero_effect_negative_assertion"
+      ],
+      "sourceBindings": [
+        {
+          "path": "contracts/providers/auth-probe.v1.json",
+          "locator": "/freshness",
+          "fact": "Provider lease freshness is modeled, but an expired browser session to ReauthRequired/HumanHandoff zero-effect path is not implemented.",
+          "mode": "100644",
+          "blobSha256": "6523f5658553d88dfd2ed246de7487a5407c646b8fd99e9db0e286854d277c18",
+          "byteCount": 958
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-x86_64.secret.macos_data_protection_signed",
+      "targetId": "macos-x86_64",
+      "capabilityId": "secret.macos_data_protection_signed",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-storage::OsSecretStore",
+      "requiredAssertions": [
+        "actual_architecture",
+        "authorized_entitlements",
+        "delete_confirmed",
+        "device_only_round_trip",
+        "no_legacy_fallback",
+        "protected_backend",
+        "signed_bundle"
+      ],
+      "allowedBlockerCodes": [
+        "MACOS_X86_64_NATIVE_HOST_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "MACOS_X86_64_NATIVE_HOST_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A macOS x86_64 native host provides an authorized signed bundle and dedicated unlocked test Keychain session."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/storage/src/secure_store.rs",
+          "locator": "OsSecretStore::entry[target_os=macos]",
+          "fact": "Protected Data Protection Keychain code is shared across macOS architectures; no x86_64 signed native receipt exists.",
+          "mode": "100644",
+          "blobSha256": "e01f7f42ed7325bad0664f4a82106eb69836fbc31ac4a174b724a7bc557ce17e",
+          "byteCount": 37396
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-x86_64.browser.pipe_platform_default",
+      "targetId": "macos-x86_64",
+      "capabilityId": "browser.pipe_platform_default",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-browser-adapter::ManagedChromiumHost",
+      "requiredAssertions": [
+        "actual_architecture",
+        "graceful_restart",
+        "isolated_managed_profile",
+        "no_mock_keychain_switch",
+        "pipe_health",
+        "platform_default_mode",
+        "reviewed_chrome_binary"
+      ],
+      "allowedBlockerCodes": [
+        "MACOS_X86_64_NATIVE_HOST_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "MACOS_X86_64_NATIVE_HOST_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A macOS x86_64 native host provides reviewed Chrome and a dedicated disposable PlatformDefault profile session."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/chromium_host.rs",
+          "locator": "ChromiumLaunchConfig::default/ManagedChromiumHost::spawn",
+          "fact": "Unix PlatformDefault pipe code is present, while macOS x86_64 has no qualifying native execution.",
+          "mode": "100644",
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-x86_64.browser.profile_exclusive_lock",
+      "targetId": "macos-x86_64",
+      "capabilityId": "browser.profile_exclusive_lock",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-browser-adapter::ManagedProfileDirectory",
+      "requiredAssertions": [
+        "actual_architecture",
+        "exclusive_lock",
+        "isolated_profile_root",
+        "private_permissions",
+        "reopened_binding"
+      ],
+      "allowedBlockerCodes": [
+        "MACOS_X86_64_NATIVE_HOST_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "MACOS_X86_64_NATIVE_HOST_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A macOS x86_64 native host provides an empty private profile root for exclusive-lock and reopen checks."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/profile_dir.rs",
+          "locator": "ManagedProfileDirectory::prepare",
+          "fact": "The shared Unix profile locking path exists, but macOS x86_64 evidence must remain separate.",
+          "mode": "100644",
+          "blobSha256": "f1eff359cbe40bb0d50ae63898719d55e5fdec3df2a3a45282a10eb84164399b",
+          "byteCount": 35461
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-x86_64.browser.posix_process_group",
+      "targetId": "macos-x86_64",
+      "capabilityId": "browser.posix_process_group",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-browser-adapter::ManagedChromiumHost",
+      "requiredAssertions": [
+        "actual_architecture",
+        "descendant_termination",
+        "no_process_residue",
+        "process_group_created"
+      ],
+      "allowedBlockerCodes": [
+        "MACOS_X86_64_NATIVE_HOST_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "MACOS_X86_64_NATIVE_HOST_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A macOS x86_64 native host can execute reviewed Chrome process-group containment and residue checks."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/chromium_host.rs",
+          "locator": "spawn_chromium_process",
+          "fact": "Unix grouped-child lifecycle code exists; no macOS x86_64 descendant cleanup receipt exists.",
+          "mode": "100644",
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-x86_64.auth.account_identity",
+      "targetId": "macos-x86_64",
+      "capabilityId": "auth.account_identity",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "browser_identity_observation_binding",
+        "provider_account_identity_readback"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/chromium_host.rs",
+          "locator": "ManagedChromiumHost::observe_ax",
+          "fact": "No architecture-independent provider account readback exists; snapshots use the expected identity digest.",
+          "mode": "100644",
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-x86_64.auth.cookie_restart",
+      "targetId": "macos-x86_64",
+      "capabilityId": "auth.cookie_restart",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "cross_profile_cookie_isolation_probe",
+        "managed_profile_cookie_restart_probe"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/profile_dir.rs",
+          "locator": "ManagedProfileDirectory",
+          "fact": "No authenticated cookie persistence or isolation observation exists for macOS x86_64.",
+          "mode": "100644",
+          "blobSha256": "f1eff359cbe40bb0d50ae63898719d55e5fdec3df2a3a45282a10eb84164399b",
+          "byteCount": 35461
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.macos-x86_64.auth.reauth_refusal",
+      "targetId": "macos-x86_64",
+      "capabilityId": "auth.reauth_refusal",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "expired_or_revoked_browser_session_probe",
+        "reauth_required_human_handoff",
+        "zero_effect_negative_assertion"
+      ],
+      "sourceBindings": [
+        {
+          "path": "contracts/providers/auth-probe.v1.json",
+          "locator": "/freshness",
+          "fact": "Connection lease expiry does not implement browser reauthentication refusal or human handoff.",
+          "mode": "100644",
+          "blobSha256": "6523f5658553d88dfd2ed246de7487a5407c646b8fd99e9db0e286854d277c18",
+          "byteCount": 958
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-aarch64.browser.pipe",
+      "targetId": "windows-aarch64",
+      "capabilityId": "browser.pipe",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "windows_chromium_pipe_transport"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/lib.rs",
+          "locator": "cfg(unix) chromium_host",
+          "fact": "The Windows ARM64 target cannot compile a managed Chromium pipe host because the module is Unix-only.",
+          "mode": "100644",
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-aarch64.browser.job_object",
+      "targetId": "windows-aarch64",
+      "capabilityId": "browser.job_object",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "windows_browser_job_object_lifecycle"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/lib.rs",
+          "locator": "cfg(unix) chromium_host",
+          "fact": "No Windows ARM64 browser host exists to establish a Job Object lifecycle.",
+          "mode": "100644",
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-aarch64.runtime.job_object",
+      "targetId": "windows-aarch64",
+      "capabilityId": "runtime.job_object",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-runtime-adapter::spawn_grouped",
+      "requiredAssertions": [
+        "actual_architecture",
+        "descendant_containment",
+        "job_assignment",
+        "no_process_residue",
+        "terminate_job"
+      ],
+      "allowedBlockerCodes": [
+        "WINDOWS_AARCH64_NATIVE_HOST_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "WINDOWS_AARCH64_NATIVE_HOST_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A Windows ARM64 native host executes Job Object assignment, descendant termination, and residue validation."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/runtime-adapter/src/lib.rs",
+          "locator": "spawn_grouped[target_os=windows]",
+          "fact": "The shared Windows Job Object branch compiles for ARM64, but has no ARM64 native lifecycle receipt.",
+          "mode": "100644",
+          "blobSha256": "6d4e8ef2c481bad04b92cf3ccde0d5603f490a9b11e3f6c25d0a67907d04e0b6",
+          "byteCount": 166931
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-aarch64.browser.profile_exclusive_lock",
+      "targetId": "windows-aarch64",
+      "capabilityId": "browser.profile_exclusive_lock",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-browser-adapter::ManagedProfileDirectory",
+      "requiredAssertions": [
+        "actual_architecture",
+        "exclusive_lock",
+        "reopened_exclusive_lock"
+      ],
+      "allowedBlockerCodes": [
+        "WINDOWS_AARCH64_NATIVE_HOST_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "WINDOWS_AARCH64_NATIVE_HOST_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A Windows ARM64 native host provides an empty disposable profile root for exclusive-lock validation."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/profile_dir.rs",
+          "locator": "ManagedProfileDirectory::prepare",
+          "fact": "Cross-platform file locking exists, but Windows ARM64 has no native exclusive-lock receipt.",
+          "mode": "100644",
+          "blobSha256": "f1eff359cbe40bb0d50ae63898719d55e5fdec3df2a3a45282a10eb84164399b",
+          "byteCount": 35461
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-aarch64.path.reparse_defense",
+      "targetId": "windows-aarch64",
+      "capabilityId": "path.reparse_defense",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "windows_handle_identity_validation",
+        "windows_reparse_point_safe_open"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/file_broker.rs",
+          "locator": "open_source_no_follow[cfg(not(unix))]",
+          "fact": "The plain non-Unix open has no Windows ARM64 reparse-point defense.",
+          "mode": "100644",
+          "blobSha256": "7229997561c0de27cb3c4332607471ab790a85bfca91b8f97111d0cae8afaf5e",
+          "byteCount": 88826
+        },
+        {
+          "path": "hartevo-rs/browser-adapter/src/profile_dir.rs",
+          "locator": "validate_same_file_identity[cfg(not(unix))]",
+          "fact": "The missing Windows file-identity implementation applies independently to ARM64.",
+          "mode": "100644",
+          "blobSha256": "f1eff359cbe40bb0d50ae63898719d55e5fdec3df2a3a45282a10eb84164399b",
+          "byteCount": 35461
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-aarch64.path.private_acl",
+      "targetId": "windows-aarch64",
+      "capabilityId": "path.private_acl",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "windows_private_directory_acl",
+        "windows_private_file_acl"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/file_broker.rs",
+          "locator": "set_private_directory[cfg(not(unix))]",
+          "fact": "The staged path does not install a private ACL on Windows ARM64.",
+          "mode": "100644",
+          "blobSha256": "7229997561c0de27cb3c4332607471ab790a85bfca91b8f97111d0cae8afaf5e",
+          "byteCount": 88826
+        },
+        {
+          "path": "hartevo-rs/browser-adapter/src/profile_dir.rs",
+          "locator": "validate_private_directory_permissions[cfg(not(unix))]",
+          "fact": "The non-Unix permission no-op leaves Windows ARM64 ACL semantics unimplemented.",
+          "mode": "100644",
+          "blobSha256": "f1eff359cbe40bb0d50ae63898719d55e5fdec3df2a3a45282a10eb84164399b",
+          "byteCount": 35461
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-aarch64.secret.credential_manager_local",
+      "targetId": "windows-aarch64",
+      "capabilityId": "secret.credential_manager_local",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "credential_manager_local_persistence_native_probe",
+        "credential_manager_local_persistence_selection"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/storage/src/secure_store.rs",
+          "locator": "OsSecretStore::entry[target_os=windows]",
+          "fact": "Generic Windows Entry construction does not explicitly select local persistence for ARM64.",
+          "mode": "100644",
+          "blobSha256": "e01f7f42ed7325bad0664f4a82106eb69836fbc31ac4a174b724a7bc557ce17e",
+          "byteCount": 37396
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-aarch64.auth.account_identity",
+      "targetId": "windows-aarch64",
+      "capabilityId": "auth.account_identity",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "browser_identity_observation_binding",
+        "provider_account_identity_readback"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/lib.rs",
+          "locator": "cfg(unix) chromium_host",
+          "fact": "Windows ARM64 has neither a browser host nor provider account identity readback.",
+          "mode": "100644",
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-aarch64.auth.cookie_restart",
+      "targetId": "windows-aarch64",
+      "capabilityId": "auth.cookie_restart",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "cross_profile_cookie_isolation_probe",
+        "managed_profile_cookie_restart_probe"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/lib.rs",
+          "locator": "cfg(unix) chromium_host",
+          "fact": "Windows ARM64 has no authenticated cookie restart or isolation path.",
+          "mode": "100644",
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-aarch64.auth.reauth_refusal",
+      "targetId": "windows-aarch64",
+      "capabilityId": "auth.reauth_refusal",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "expired_or_revoked_browser_session_probe",
+        "reauth_required_human_handoff",
+        "zero_effect_negative_assertion"
+      ],
+      "sourceBindings": [
+        {
+          "path": "contracts/providers/auth-probe.v1.json",
+          "locator": "/connectedAuthority",
+          "fact": "Connection-state authority does not implement a Windows ARM64 browser reauthentication refusal path.",
+          "mode": "100644",
+          "blobSha256": "6523f5658553d88dfd2ed246de7487a5407c646b8fd99e9db0e286854d277c18",
+          "byteCount": 958
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-x86_64.browser.pipe",
+      "targetId": "windows-x86_64",
+      "capabilityId": "browser.pipe",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "windows_chromium_pipe_transport"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/lib.rs",
+          "locator": "cfg(unix) chromium_host",
+          "fact": "The managed Chromium host and pipe exports are compiled only on Unix.",
+          "mode": "100644",
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-x86_64.browser.job_object",
+      "targetId": "windows-x86_64",
+      "capabilityId": "browser.job_object",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "windows_browser_job_object_lifecycle"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/lib.rs",
+          "locator": "cfg(unix) chromium_host",
+          "fact": "No Windows browser host exists to assign Chrome descendants to a Job Object.",
+          "mode": "100644",
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-x86_64.runtime.job_object",
+      "targetId": "windows-x86_64",
+      "capabilityId": "runtime.job_object",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-runtime-adapter::spawn_grouped",
+      "requiredAssertions": [
+        "actual_architecture",
+        "descendant_containment",
+        "job_assignment",
+        "no_process_residue",
+        "terminate_job"
+      ],
+      "allowedBlockerCodes": [
+        "WINDOWS_X86_64_NATIVE_HOST_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "WINDOWS_X86_64_NATIVE_HOST_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A Windows x86_64 native host executes Job Object assignment, descendant termination, and residue validation."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/runtime-adapter/src/lib.rs",
+          "locator": "spawn_grouped[target_os=windows]",
+          "fact": "The command-group Windows branch requests kill_on_drop, but only cross-compile evidence exists.",
+          "mode": "100644",
+          "blobSha256": "6d4e8ef2c481bad04b92cf3ccde0d5603f490a9b11e3f6c25d0a67907d04e0b6",
+          "byteCount": 166931
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-x86_64.browser.profile_exclusive_lock",
+      "targetId": "windows-x86_64",
+      "capabilityId": "browser.profile_exclusive_lock",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-browser-adapter::ManagedProfileDirectory",
+      "requiredAssertions": [
+        "actual_architecture",
+        "exclusive_lock",
+        "reopened_exclusive_lock"
+      ],
+      "allowedBlockerCodes": [
+        "WINDOWS_X86_64_NATIVE_HOST_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "WINDOWS_X86_64_NATIVE_HOST_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A Windows x86_64 native host provides an empty disposable profile root for exclusive-lock validation."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/profile_dir.rs",
+          "locator": "ManagedProfileDirectory::prepare",
+          "fact": "Cross-platform file locking exists; Windows ACL and reparse defenses are tracked as separate NOT_IMPLEMENTED cases.",
+          "mode": "100644",
+          "blobSha256": "f1eff359cbe40bb0d50ae63898719d55e5fdec3df2a3a45282a10eb84164399b",
+          "byteCount": 35461
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-x86_64.path.reparse_defense",
+      "targetId": "windows-x86_64",
+      "capabilityId": "path.reparse_defense",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "windows_handle_identity_validation",
+        "windows_reparse_point_safe_open"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/file_broker.rs",
+          "locator": "open_source_no_follow[cfg(not(unix))]",
+          "fact": "The non-Unix source open is a plain File::open and does not reject reparse points.",
+          "mode": "100644",
+          "blobSha256": "7229997561c0de27cb3c4332607471ab790a85bfca91b8f97111d0cae8afaf5e",
+          "byteCount": 88826
+        },
+        {
+          "path": "hartevo-rs/browser-adapter/src/profile_dir.rs",
+          "locator": "validate_same_file_identity[cfg(not(unix))]",
+          "fact": "The non-Unix same-file identity check is a no-op.",
+          "mode": "100644",
+          "blobSha256": "f1eff359cbe40bb0d50ae63898719d55e5fdec3df2a3a45282a10eb84164399b",
+          "byteCount": 35461
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-x86_64.path.private_acl",
+      "targetId": "windows-x86_64",
+      "capabilityId": "path.private_acl",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "windows_private_directory_acl",
+        "windows_private_file_acl"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/file_broker.rs",
+          "locator": "set_private_directory[cfg(not(unix))]",
+          "fact": "The non-Unix staged-directory and file privacy setters do not install a Windows ACL.",
+          "mode": "100644",
+          "blobSha256": "7229997561c0de27cb3c4332607471ab790a85bfca91b8f97111d0cae8afaf5e",
+          "byteCount": 88826
+        },
+        {
+          "path": "hartevo-rs/browser-adapter/src/profile_dir.rs",
+          "locator": "validate_private_directory_permissions[cfg(not(unix))]",
+          "fact": "The non-Unix private directory and file permission functions are no-ops.",
+          "mode": "100644",
+          "blobSha256": "f1eff359cbe40bb0d50ae63898719d55e5fdec3df2a3a45282a10eb84164399b",
+          "byteCount": 35461
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-x86_64.secret.credential_manager_local",
+      "targetId": "windows-x86_64",
+      "capabilityId": "secret.credential_manager_local",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "credential_manager_local_persistence_native_probe",
+        "credential_manager_local_persistence_selection"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/storage/Cargo.toml",
+          "locator": "target.'cfg(target_os = windows)'.dependencies",
+          "fact": "A Windows keyring adapter dependency exists, which is not sufficient to prove local persistence semantics.",
+          "mode": "100644",
+          "blobSha256": "b854b378a0ea592dc4c1a3b76599ef5c110a78831c43a8d464af994c5d1a2818",
+          "byteCount": 1210
+        },
+        {
+          "path": "hartevo-rs/storage/src/secure_store.rs",
+          "locator": "OsSecretStore::entry[target_os=windows]",
+          "fact": "Generic Entry construction does not explicitly select the required local Credential Manager persistence.",
+          "mode": "100644",
+          "blobSha256": "e01f7f42ed7325bad0664f4a82106eb69836fbc31ac4a174b724a7bc557ce17e",
+          "byteCount": 37396
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-x86_64.auth.account_identity",
+      "targetId": "windows-x86_64",
+      "capabilityId": "auth.account_identity",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "browser_identity_observation_binding",
+        "provider_account_identity_readback"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/lib.rs",
+          "locator": "cfg(unix) chromium_host",
+          "fact": "Windows has neither a managed Chromium host nor provider account identity readback.",
+          "mode": "100644",
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-x86_64.auth.cookie_restart",
+      "targetId": "windows-x86_64",
+      "capabilityId": "auth.cookie_restart",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "cross_profile_cookie_isolation_probe",
+        "managed_profile_cookie_restart_probe"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/lib.rs",
+          "locator": "cfg(unix) chromium_host",
+          "fact": "Windows has no managed Chromium runtime or authenticated cookie restart probe.",
+          "mode": "100644",
+          "blobSha256": "18bd1b32434a1e64953f9440696eb55ccbcac16bb6196fa7e5a91d76c6d5c5a1",
+          "byteCount": 16662
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.windows-x86_64.auth.reauth_refusal",
+      "targetId": "windows-x86_64",
+      "capabilityId": "auth.reauth_refusal",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "expired_or_revoked_browser_session_probe",
+        "reauth_required_human_handoff",
+        "zero_effect_negative_assertion"
+      ],
+      "sourceBindings": [
+        {
+          "path": "contracts/providers/auth-probe.v1.json",
+          "locator": "/connectedAuthority",
+          "fact": "Connection-state authority does not implement a Windows browser reauthentication refusal path.",
+          "mode": "100644",
+          "blobSha256": "6523f5658553d88dfd2ed246de7487a5407c646b8fd99e9db0e286854d277c18",
+          "byteCount": 958
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.linux-x86_64.browser.pipe",
+      "targetId": "linux-x86_64",
+      "capabilityId": "browser.pipe",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-browser-adapter::ManagedChromiumHost",
+      "requiredAssertions": [
+        "actual_architecture",
+        "graceful_restart",
+        "isolated_managed_profile",
+        "pipe_health",
+        "reviewed_chrome_binary"
+      ],
+      "allowedBlockerCodes": [
+        "LINUX_X86_64_NATIVE_HOST_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "LINUX_X86_64_NATIVE_HOST_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A Linux x86_64 native host provides reviewed Chrome and an isolated disposable managed profile."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/chromium_host.rs",
+          "locator": "ManagedChromiumHost::spawn",
+          "fact": "The Unix pipe host is available to Linux builds, but no Linux x86_64 native receipt exists.",
+          "mode": "100644",
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.linux-x86_64.browser.posix_process_group",
+      "targetId": "linux-x86_64",
+      "capabilityId": "browser.posix_process_group",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-browser-adapter::ManagedChromiumHost",
+      "requiredAssertions": [
+        "actual_architecture",
+        "descendant_termination",
+        "no_process_residue",
+        "process_group_created"
+      ],
+      "allowedBlockerCodes": [
+        "LINUX_X86_64_NATIVE_HOST_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "LINUX_X86_64_NATIVE_HOST_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A Linux x86_64 native host executes reviewed Chrome process-group containment and residue checks."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/chromium_host.rs",
+          "locator": "spawn_chromium_process",
+          "fact": "The Unix grouped-child implementation exists, but Linux descendant cleanup has not run natively.",
+          "mode": "100644",
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.linux-x86_64.browser.profile_lock_and_mode",
+      "targetId": "linux-x86_64",
+      "capabilityId": "browser.profile_lock_and_mode",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-browser-adapter::ManagedProfileDirectory",
+      "requiredAssertions": [
+        "actual_architecture",
+        "exclusive_lock",
+        "isolated_profile_root",
+        "private_permissions",
+        "same_file_identity"
+      ],
+      "allowedBlockerCodes": [
+        "LINUX_X86_64_NATIVE_HOST_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "LINUX_X86_64_NATIVE_HOST_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A Linux x86_64 native host provides an empty private profile root for mode, inode, lock, and reopen checks."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/profile_dir.rs",
+          "locator": "ManagedProfileDirectory::prepare",
+          "fact": "Unix mode, lock, and inode checks exist, but Linux x86_64 native evidence is absent.",
+          "mode": "100644",
+          "blobSha256": "f1eff359cbe40bb0d50ae63898719d55e5fdec3df2a3a45282a10eb84164399b",
+          "byteCount": 35461
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.linux-x86_64.secret.linux_keyutils",
+      "targetId": "linux-x86_64",
+      "capabilityId": "secret.linux_keyutils",
+      "sourceAuditDisposition": "BLOCKED_ENV",
+      "implementationState": "IMPLEMENTED",
+      "evidenceRequirement": "native_execution",
+      "productionComponent": "hartevo-storage::OsSecretStore",
+      "requiredAssertions": [
+        "actual_architecture",
+        "delete_confirmed",
+        "keyutils_backend",
+        "round_trip"
+      ],
+      "allowedBlockerCodes": [
+        "LINUX_X86_64_NATIVE_HOST_UNAVAILABLE"
+      ],
+      "currentBlocker": {
+        "code": "LINUX_X86_64_NATIVE_HOST_UNAVAILABLE",
+        "observationSource": "docs/quality/CURRENT-WORKTREE-EVIDENCE.md#environment-blockers",
+        "exitCondition": "A Linux x86_64 native host exposes an isolated keyutils session for round-trip and delete-confirmation checks."
+      },
+      "missingGates": [],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/storage/src/secure_store.rs",
+          "locator": "initialize_native_store[target_os=linux]",
+          "fact": "The Linux keyutils store is installed as the native backend, with no Linux x86_64 round-trip receipt.",
+          "mode": "100644",
+          "blobSha256": "e01f7f42ed7325bad0664f4a82106eb69836fbc31ac4a174b724a7bc557ce17e",
+          "byteCount": 37396
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.linux-x86_64.auth.account_identity",
+      "targetId": "linux-x86_64",
+      "capabilityId": "auth.account_identity",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "browser_identity_observation_binding",
+        "provider_account_identity_readback"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/chromium_host.rs",
+          "locator": "ManagedChromiumHost::observe_ax",
+          "fact": "Linux snapshots use the workspace expected identity digest and do not read the provider account.",
+          "mode": "100644",
+          "blobSha256": "398802efb5e78ee5c5acb483d39087003eef8689bd7349d732d04a6872040fbd",
+          "byteCount": 254014
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.linux-x86_64.auth.cookie_restart",
+      "targetId": "linux-x86_64",
+      "capabilityId": "auth.cookie_restart",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "cross_profile_cookie_isolation_probe",
+        "managed_profile_cookie_restart_probe"
+      ],
+      "sourceBindings": [
+        {
+          "path": "hartevo-rs/browser-adapter/src/profile_dir.rs",
+          "locator": "ManagedProfileDirectory",
+          "fact": "Linux managed profile persistence has no authenticated cookie restart or isolation probe.",
+          "mode": "100644",
+          "blobSha256": "f1eff359cbe40bb0d50ae63898719d55e5fdec3df2a3a45282a10eb84164399b",
+          "byteCount": 35461
+        }
+      ]
+    },
+    {
+      "caseId": "I-01.linux-x86_64.auth.reauth_refusal",
+      "targetId": "linux-x86_64",
+      "capabilityId": "auth.reauth_refusal",
+      "sourceAuditDisposition": "NOT_IMPLEMENTED",
+      "implementationState": "NOT_IMPLEMENTED",
+      "evidenceRequirement": "source_audit",
+      "requiredAssertions": [],
+      "allowedBlockerCodes": [],
+      "missingGates": [
+        "expired_or_revoked_browser_session_probe",
+        "reauth_required_human_handoff",
+        "zero_effect_negative_assertion"
+      ],
+      "sourceBindings": [
+        {
+          "path": "contracts/providers/auth-probe.v1.json",
+          "locator": "/connectedAuthority",
+          "fact": "Connection-state authority does not implement a Linux browser reauthentication refusal path.",
+          "mode": "100644",
+          "blobSha256": "6523f5658553d88dfd2ed246de7487a5407c646b8fd99e9db0e286854d277c18",
+          "byteCount": 958
+        }
+      ]
+    }
+  ]
+}

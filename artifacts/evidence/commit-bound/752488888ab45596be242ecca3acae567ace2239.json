@@ -1,0 +1,116 @@
+{
+  "schemaVersion": "hartevo.commit-bound-evidence-manifest/v1",
+  "manifestId": "commit-bound-752488888ab45596be242ecca3acae567ace2239",
+  "verificationStatus": "VERIFIED",
+  "releaseDecision": "NOT_EVALUATED",
+  "source": {
+    "repositoryUri": "git+repo://752488888ab45596be242ecca3acae567ace2239/",
+    "objectFormat": "sha1",
+    "commit": "752488888ab45596be242ecca3acae567ace2239",
+    "tree": "2b923c4b5f2d2d6409dc2bea46404ef1250eaaa2",
+    "dirty": false
+  },
+  "publication": {
+    "mode": "tracked-child-commit",
+    "path": "artifacts/evidence/commit-bound/752488888ab45596be242ecca3acae567ace2239.json",
+    "sourceRelation": "single-direct-parent"
+  },
+  "build": {
+    "commands": [
+      {
+        "id": "ev02-self-test",
+        "argv": [
+          "scripts/check-evidence-manifest.sh",
+          "self-test"
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "id": "bash",
+        "version": "GNU bash, version 3.2.57(1)-release (arm64-apple-darwin25)",
+        "sha256": "fde343ee184953c1fa1185abddeaa8be61c6acbebae4eb54db5d6b55b09a5755"
+      },
+      {
+        "id": "evidence-gate",
+        "version": "ev-02/v1",
+        "sha256": "4b15612b78f61d4f39bafa9c176376170c2c276c74aee832e9e452de8c5af784"
+      },
+      {
+        "id": "git",
+        "version": "git version 2.50.1 (Apple Git-155)",
+        "sha256": "179301dcb41ea78accc3fa0048a7e6f6710d891945a751a34addd622020c1818"
+      },
+      {
+        "id": "mktemp",
+        "version": "shell_cmds-329",
+        "sha256": "7bb3299fdb41f16ea5d9f7748cb5cb654b93208e0a1d1d78360145dcbbfb21fe"
+      },
+      {
+        "id": "python3",
+        "version": "Python 3.9.6",
+        "sha256": "179301dcb41ea78accc3fa0048a7e6f6710d891945a751a34addd622020c1818"
+      },
+      {
+        "id": "shasum",
+        "version": "6.02",
+        "sha256": "0812595f981a26f813d98dc380af14d4af427626c9339eda29eb849ae13de1e3"
+      }
+    ],
+    "receiptArtifactIds": [
+      "artifact-ev02-self-test-receipt"
+    ]
+  },
+  "environment": {
+    "os": "Darwin",
+    "architecture": "arm64",
+    "isolation": "local",
+    "redaction": "STRICT"
+  },
+  "claims": [
+    {
+      "id": "claim-ev02-contract-gate",
+      "required": true,
+      "artifactIds": [
+        "artifact-ev02-contract",
+        "artifact-ev02-gate"
+      ]
+    },
+    {
+      "id": "claim-ev02-self-test-receipt",
+      "required": false,
+      "artifactIds": [
+        "artifact-ev02-self-test-receipt"
+      ]
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "artifact-ev02-contract",
+      "kind": "CONTRACT",
+      "uri": "git+repo://752488888ab45596be242ecca3acae567ace2239/contracts/evidence/commit-bound-manifest.v1.json",
+      "sha256": "e7639e21b0c993d7c526b6fc01b6b801386ea88eb4fa092315298195791890be",
+      "byteCount": 4362,
+      "mediaType": "application/json",
+      "verificationClass": "SOURCE_COMMIT_BLOB"
+    },
+    {
+      "id": "artifact-ev02-gate",
+      "kind": "GATE_SOURCE",
+      "uri": "git+repo://752488888ab45596be242ecca3acae567ace2239/scripts/check-evidence-manifest.sh",
+      "sha256": "4b15612b78f61d4f39bafa9c176376170c2c276c74aee832e9e452de8c5af784",
+      "byteCount": 66442,
+      "mediaType": "text/x-shellscript",
+      "verificationClass": "SOURCE_COMMIT_BLOB"
+    },
+    {
+      "id": "artifact-ev02-self-test-receipt",
+      "kind": "MACHINE_REPORT",
+      "uri": "urn:sha256:e19a0ca3ae025400a8eda754f2d8f6780a6d637958ebd3cf846e064fecc8c71a",
+      "sha256": "e19a0ca3ae025400a8eda754f2d8f6780a6d637958ebd3cf846e064fecc8c71a",
+      "byteCount": 1567,
+      "mediaType": "application/json",
+      "verificationClass": "DIGEST_ONLY"
+    }
+  ]
+}

@@ -1,0 +1,939 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/platform/receipt.schema.v2.json",
+  "title": "Hartevo I-01B native platform receipt envelope",
+  "description": "A content-free, signed, commit/matrix/case/runner/host-bound native receipt envelope. Contract validation never grants native capability PASS or a release decision.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "matrixVersion",
+    "sourceCommit",
+    "matrixDigest",
+    "caseDefinitionDigest",
+    "receiptId",
+    "runId",
+    "attemptOrdinal",
+    "caseId",
+    "targetId",
+    "target",
+    "actualHost",
+    "status",
+    "receiptKind",
+    "implementationState",
+    "authority",
+    "nativeCalls",
+    "releaseDecision",
+    "testMode",
+    "mock",
+    "startedAt",
+    "completedAt",
+    "executionStarted",
+    "platformTouched",
+    "runnerBinding",
+    "challengeBinding",
+    "productionBinding",
+    "evidenceQualifiers",
+    "artifacts",
+    "evidenceReferences",
+    "assertions",
+    "signature"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "hartevo-platform-native-receipt/v2"
+    },
+    "matrixVersion": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "sourceCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "matrixDigest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "caseDefinitionDigest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "receiptId": {
+      "$ref": "#/$defs/token"
+    },
+    "runId": {
+      "$ref": "#/$defs/token"
+    },
+    "attemptOrdinal": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "caseId": {
+      "$ref": "#/$defs/caseId"
+    },
+    "targetId": {
+      "$ref": "#/$defs/targetId"
+    },
+    "target": {
+      "$ref": "#/$defs/targetTuple"
+    },
+    "actualHost": {
+      "$ref": "#/$defs/actualHost"
+    },
+    "status": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "BLOCKED_ENV"
+      ]
+    },
+    "receiptKind": {
+      "enum": [
+        "native_preflight",
+        "native_execution"
+      ]
+    },
+    "implementationState": {
+      "enum": [
+        "IMPLEMENTED",
+        "NOT_IMPLEMENTED"
+      ]
+    },
+    "authority": {
+      "const": "platform_inventory_only"
+    },
+    "nativeCalls": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "releaseDecision": {
+      "const": "NOT_EVALUATED"
+    },
+    "testMode": {
+      "const": false
+    },
+    "mock": {
+      "const": false
+    },
+    "startedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "completedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "executionStarted": {
+      "type": "boolean"
+    },
+    "platformTouched": {
+      "type": "boolean"
+    },
+    "runnerBinding": {
+      "$ref": "#/$defs/runnerBinding"
+    },
+    "challengeBinding": {
+      "$ref": "#/$defs/challengeBinding"
+    },
+    "productionBinding": {
+      "$ref": "#/$defs/productionBinding"
+    },
+    "evidenceQualifiers": {
+      "$ref": "#/$defs/evidenceQualifiers"
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/evidenceArtifact"
+      }
+    },
+    "evidenceReferences": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/evidenceReference"
+      }
+    },
+    "assertions": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/assertion"
+      }
+    },
+    "cleanup": {
+      "$ref": "#/$defs/cleanup"
+    },
+    "blocker": {
+      "$ref": "#/$defs/blocker"
+    },
+    "signature": {
+      "$ref": "#/$defs/receiptSignature"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ed25519Signature": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    },
+    "token": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]{0,127}$"
+    },
+    "caseId": {
+      "type": "string",
+      "pattern": "^I-01\\.[a-z0-9_-]+\\.[a-z][a-z0-9_.-]+$",
+      "maxLength": 192
+    },
+    "targetId": {
+      "enum": [
+        "macos-aarch64",
+        "macos-x86_64",
+        "windows-aarch64",
+        "windows-x86_64",
+        "linux-x86_64"
+      ]
+    },
+    "targetTuple": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "arch"
+      ],
+      "properties": {
+        "os": {
+          "enum": [
+            "macos",
+            "windows",
+            "linux"
+          ]
+        },
+        "arch": {
+          "enum": [
+            "aarch64",
+            "x86_64"
+          ]
+        }
+      }
+    },
+    "actualHost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "arch",
+        "osBuildDigest",
+        "hostIdentityDigest",
+        "virtualization",
+        "observedAt",
+        "attestationReferenceId",
+        "attestationDigest"
+      ],
+      "properties": {
+        "os": {
+          "enum": [
+            "macos",
+            "windows",
+            "linux"
+          ]
+        },
+        "arch": {
+          "enum": [
+            "aarch64",
+            "x86_64"
+          ]
+        },
+        "osBuildDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "hostIdentityDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "virtualization": {
+          "enum": [
+            "physical",
+            "virtual_machine"
+          ]
+        },
+        "observedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "attestationReferenceId": {
+          "$ref": "#/$defs/token"
+        },
+        "attestationDigest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "runnerBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runnerId",
+        "runnerIdentityDigest",
+        "registryDigest",
+        "registryEpoch",
+        "signingKeyDigest",
+        "signatureAlgorithm",
+        "producerBinaryDigest"
+      ],
+      "properties": {
+        "runnerId": {
+          "$ref": "#/$defs/token"
+        },
+        "runnerIdentityDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "registryDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "registryEpoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "signingKeyDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signatureAlgorithm": {
+          "const": "ed25519"
+        },
+        "producerBinaryDigest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "challengeBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "challengeId",
+        "nonceHex",
+        "nonceDigest",
+        "issuerDigest",
+        "issuedAt",
+        "expiresAt"
+      ],
+      "properties": {
+        "challengeId": {
+          "$ref": "#/$defs/token"
+        },
+        "nonceHex": {
+          "$ref": "#/$defs/sha256"
+        },
+        "nonceDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "issuerDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "issuedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "productionBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "implementationDigest",
+        "executableDigest",
+        "buildManifestDigest",
+        "binaryAttestationReferenceId",
+        "binaryAttestationDigest"
+      ],
+      "properties": {
+        "component": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,160}$"
+        },
+        "implementationDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "executableDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "buildManifestDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "binaryAttestationReferenceId": {
+          "$ref": "#/$defs/token"
+        },
+        "binaryAttestationDigest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "evidenceQualifiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "compileOnly",
+        "crossCompiled",
+        "fakeHost",
+        "ignoredTest",
+        "mockCredentialStore",
+        "sourceAuditOnly"
+      ],
+      "properties": {
+        "compileOnly": {
+          "type": "boolean"
+        },
+        "crossCompiled": {
+          "type": "boolean"
+        },
+        "fakeHost": {
+          "type": "boolean"
+        },
+        "ignoredTest": {
+          "type": "boolean"
+        },
+        "mockCredentialStore": {
+          "type": "boolean"
+        },
+        "sourceAuditOnly": {
+          "type": "boolean"
+        }
+      }
+    },
+    "nativeEvidenceQualifiers": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/evidenceQualifiers"
+        },
+        {
+          "properties": {
+            "compileOnly": {
+              "const": false
+            },
+            "crossCompiled": {
+              "const": false
+            },
+            "fakeHost": {
+              "const": false
+            },
+            "ignoredTest": {
+              "const": false
+            },
+            "mockCredentialStore": {
+              "const": false
+            },
+            "sourceAuditOnly": {
+              "const": false
+            }
+          }
+        }
+      ]
+    },
+    "evidenceArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifactId",
+        "kind",
+        "mediaType",
+        "digest",
+        "byteCount",
+        "producedAt"
+      ],
+      "properties": {
+        "artifactId": {
+          "$ref": "#/$defs/token"
+        },
+        "kind": {
+          "enum": [
+            "native_preflight_digest",
+            "native_execution_digest",
+            "host_attestation_digest",
+            "cleanup_digest",
+            "producer_binary_digest",
+            "production_binary_digest",
+            "runner_signature_digest"
+          ]
+        },
+        "mediaType": {
+          "enum": [
+            "application/hartevo-attestation+json",
+            "application/hartevo-evidence+json",
+            "application/hartevo-signature"
+          ]
+        },
+        "digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "byteCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777216
+        },
+        "producedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "evidenceReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "referenceId",
+        "kind",
+        "artifactId",
+        "digest"
+      ],
+      "properties": {
+        "referenceId": {
+          "$ref": "#/$defs/token"
+        },
+        "kind": {
+          "enum": [
+            "native_preflight_digest",
+            "native_execution_digest",
+            "host_attestation_digest",
+            "cleanup_digest",
+            "producer_binary_digest",
+            "production_binary_digest",
+            "runner_signature_digest"
+          ]
+        },
+        "artifactId": {
+          "$ref": "#/$defs/token"
+        },
+        "digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "assertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "outcome",
+        "evidenceReferenceId",
+        "evidenceDigest"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/token"
+        },
+        "outcome": {
+          "enum": [
+            "PASS",
+            "FAIL",
+            "TIMEOUT"
+          ]
+        },
+        "evidenceReferenceId": {
+          "$ref": "#/$defs/token"
+        },
+        "evidenceDigest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "attempted",
+        "succeeded",
+        "residueCount",
+        "deadlineExceeded",
+        "resourceKind",
+        "beforeStateDigest",
+        "afterStateDigest",
+        "evidenceReferenceId",
+        "evidenceDigest"
+      ],
+      "properties": {
+        "required": {
+          "const": true
+        },
+        "attempted": {
+          "const": true
+        },
+        "succeeded": {
+          "type": "boolean"
+        },
+        "residueCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deadlineExceeded": {
+          "type": "boolean"
+        },
+        "resourceKind": {
+          "$ref": "#/$defs/token"
+        },
+        "beforeStateDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "afterStateDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "evidenceReferenceId": {
+          "$ref": "#/$defs/token"
+        },
+        "evidenceDigest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "observationDigest",
+        "evidenceReferenceId",
+        "exitConditionDigest",
+        "evidenceDigest"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{2,127}$"
+        },
+        "observationDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "evidenceReferenceId": {
+          "$ref": "#/$defs/token"
+        },
+        "exitConditionDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "evidenceDigest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "receiptSignature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "keyDigest",
+        "signedPayloadDigest",
+        "signatureReferenceId",
+        "signatureDigest",
+        "signatureHex"
+      ],
+      "properties": {
+        "algorithm": {
+          "const": "ed25519"
+        },
+        "keyDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signedPayloadDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signatureReferenceId": {
+          "$ref": "#/$defs/token"
+        },
+        "signatureDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signatureHex": {
+          "$ref": "#/$defs/ed25519Signature"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "PASS"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "cleanup"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "blocker"
+              ]
+            }
+          ]
+        },
+        "properties": {
+          "receiptKind": {
+            "const": "native_execution"
+          },
+          "implementationState": {
+            "const": "IMPLEMENTED"
+          },
+          "nativeCalls": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "platformTouched": {
+            "const": true
+          },
+          "executionStarted": {
+            "const": true
+          },
+          "evidenceQualifiers": {
+            "$ref": "#/$defs/nativeEvidenceQualifiers"
+          },
+          "assertions": {
+            "minItems": 1,
+            "items": {
+              "properties": {
+                "outcome": {
+                  "const": "PASS"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            }
+          },
+          "cleanup": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/cleanup"
+              },
+              {
+                "properties": {
+                  "succeeded": {
+                    "const": true
+                  },
+                  "residueCount": {
+                    "const": 0
+                  },
+                  "deadlineExceeded": {
+                    "const": false
+                  }
+                },
+                "required": [
+                  "succeeded",
+                  "residueCount",
+                  "deadlineExceeded"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "FAIL"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "cleanup"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "blocker"
+              ]
+            }
+          ]
+        },
+        "anyOf": [
+          {
+            "properties": {
+              "assertions": {
+                "contains": {
+                  "properties": {
+                    "outcome": {
+                      "enum": [
+                        "FAIL",
+                        "TIMEOUT"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "outcome"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "assertions"
+            ]
+          },
+          {
+            "properties": {
+              "cleanup": {
+                "properties": {
+                  "succeeded": {
+                    "const": false
+                  }
+                },
+                "required": [
+                  "succeeded"
+                ]
+              }
+            },
+            "required": [
+              "cleanup"
+            ]
+          },
+          {
+            "properties": {
+              "cleanup": {
+                "properties": {
+                  "residueCount": {
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "residueCount"
+                ]
+              }
+            },
+            "required": [
+              "cleanup"
+            ]
+          },
+          {
+            "properties": {
+              "cleanup": {
+                "properties": {
+                  "deadlineExceeded": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "deadlineExceeded"
+                ]
+              }
+            },
+            "required": [
+              "cleanup"
+            ]
+          }
+        ],
+        "properties": {
+          "receiptKind": {
+            "const": "native_execution"
+          },
+          "implementationState": {
+            "const": "IMPLEMENTED"
+          },
+          "nativeCalls": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "platformTouched": {
+            "const": true
+          },
+          "executionStarted": {
+            "const": true
+          },
+          "evidenceQualifiers": {
+            "$ref": "#/$defs/nativeEvidenceQualifiers"
+          },
+          "assertions": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "BLOCKED_ENV"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "blocker"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "cleanup"
+              ]
+            }
+          ]
+        },
+        "properties": {
+          "receiptKind": {
+            "const": "native_preflight"
+          },
+          "implementationState": {
+            "const": "IMPLEMENTED"
+          },
+          "nativeCalls": {
+            "const": 0
+          },
+          "platformTouched": {
+            "const": false
+          },
+          "executionStarted": {
+            "const": false
+          },
+          "evidenceQualifiers": {
+            "$ref": "#/$defs/nativeEvidenceQualifiers"
+          },
+          "assertions": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ],
+  "x-hartevo-policy": {
+    "authority": "platform_inventory_only",
+    "nativeReceiptWriter": false,
+    "callerAggregatesAccepted": false,
+    "releaseDecision": "NOT_EVALUATED",
+    "sensitiveMaterialAllowed": false,
+    "sourceAuditReceiptAllowed": false,
+    "trustedRunnerRegistryRequired": true,
+    "runnerSignatureRequired": true,
+    "actualHostAttestationRequired": true,
+    "signatureVerifierAvailable": true,
+    "hostAttestationVerifierAvailable": false,
+    "canonicalPayloadEncoding": "hartevo_sorted_json/v1",
+    "signaturePayloadProjection": "receipt_without_signature_and_runner_signature_evidence/v1",
+    "admissionTimeSource": "validator_clock_utc",
+    "persistentNonceReplayGuardAvailable": false
+  }
+}

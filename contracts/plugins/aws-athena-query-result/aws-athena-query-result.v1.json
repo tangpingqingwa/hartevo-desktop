@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-athena-query-result/aws-athena-query-result.v1.json",
+  "schemaVersion": "hartevo.aws-athena-query-result/v1",
+  "contractVersion": "EXT-AWS-ATHENA-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "aws.athena.query-result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "digestInput": "hartevo.aws-athena-query-result/v1|layer=1|service=aws.athena.query-result.read|provider=aws.athena.query-result.recording|consumer=mission.aws-athena-query-result.consumer|api=athena-get-query-execution-get-query-results-2017-05-18-r1",
+  "contractDigest": "4e260db03b3ed2fd45f2f4f1536584b85922f414c78f7bbf0133d3e4a3e530bf",
+  "service": {
+    "id": "aws.athena.query-result.read",
+    "operation": "bounded_parameterized_select_explain_proposal",
+    "readOnly": true,
+    "proposalOnly": true,
+    "externalWrites": false,
+    "startsQueries": false,
+    "cancelsQueries": false
+  },
+  "provider": {
+    "id": "aws.athena.query-result.recording",
+    "apiRevision": "athena-get-query-execution-get-query-results-2017-05-18-r1",
+    "operations": ["GetQueryExecution", "GetQueryResults"],
+    "acceptedProvenance": ["recording", "fixture", "loopback", "blocked_env"],
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "durableProviderReceipt": false
+  },
+  "consumer": {
+    "id": "mission.aws-athena-query-result.consumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "credentials": {
+    "type": "SigV4SecretReference",
+    "opaque": true,
+    "serializable": false,
+    "rawCredentialsRetained": false,
+    "signedHeadersRetained": false
+  },
+  "scope": {
+    "required": [
+      "awsAccount",
+      "awsRegion",
+      "workgroup",
+      "catalog",
+      "database",
+      "allowlistedTables",
+      "parameterizedQueryDigest",
+      "queryExecutionIdentity",
+      "mission",
+      "project",
+      "workProduct",
+      "missionRevision",
+      "projectRevision",
+      "workProductRevision",
+      "permissionDigest"
+    ],
+    "tableEnumeration": false,
+    "queryExecutionIdentity": "digest_only",
+    "outputLocation": "digest_only"
+  },
+  "queryPolicy": {
+    "allow": ["parameterized_select", "parameterized_explain_select", "numeric_limit", "explicit_table_allowlist"],
+    "deny": [
+      "arbitrary_sql",
+      "ddl",
+      "dml",
+      "ctas",
+      "unload",
+      "multi_statement",
+      "comments",
+      "positional_parameters",
+      "unbounded_rows",
+      "s3_output_reads",
+      "StartQueryExecution",
+      "StopQueryExecution"
+    ],
+    "rawQueryRetained": false,
+    "parameterValuesRetained": false
+  },
+  "registration": {
+    "versionDigestBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "apiRevisionDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "evidenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "parallelRegistry": false
+  },
+  "pagination": {
+    "operations": ["GetQueryResults"],
+    "pageToken": "opaque_digest_and_request_bound",
+    "maxPages": 8,
+    "maxRows": 1000,
+    "maxBytes": 4194304,
+    "rawTokenRetained": false,
+    "loopRejected": true
+  },
+  "projection": {
+    "execution": ["status", "bytesScanned", "executionTimeMillis", "outputLocationDigest", "errorDigest"],
+    "results": ["columnShape", "rowShapeDigest", "boundedRowCount", "pageDigest"],
+    "rawSql": false,
+    "rawRows": false,
+    "rawCells": false,
+    "rawS3Output": false,
+    "rawQueryExecutionId": false
+  },
+  "receipts": {
+    "request": {
+      "redacted": true,
+      "retain": ["operation", "requestDigest", "scopeDigest", "queryDigest", "executionIdDigest", "pageTokenDigest"],
+      "drop": ["queryText", "parameterValues", "authorizationHeader", "credentialMaterial", "rawPageToken"]
+    },
+    "cost": {
+      "redacted": true,
+      "estimateOnly": true,
+      "durableProviderReceipt": false
+    }
+  },
+  "evidence": {
+    "digestContract": "hartevo.aws-athena-query-result/evidence/v1",
+    "states": ["QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED", "PARTIAL", "EXPIRED", "ACCESS_LOST", "PROVIDER_UNKNOWN", "TAMPERED", "REVOKED", "STALE"],
+    "requiredDigests": ["pluginVersionDigest", "contractDigest", "evidenceContractDigest", "providerDigest", "apiRevisionDigest", "permissionDigest", "scopeDigest", "queryDigest", "executionDigest", "resultsDigest", "evidenceDigest"],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "partialIsNonAdoptable": true,
+    "accessLossIsNonAdoptable": true,
+    "staleMissionIsNonAdoptable": true,
+    "revocationRejected": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "bounded GetQueryExecution evidence",
+      "optional capped GetQueryResults metadata and shape",
+      "allowlisted parameterized SELECT/EXPLAIN compilation",
+      "opaque page-token binding",
+      "deterministic digests and redacted projections",
+      "reversible version/contract/provider/permission/scope/evidence registration",
+      "Mission-scoped review-only proposal and idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt authority",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 resolution",
+      "live AWS HTTPS",
+      "StartQueryExecution",
+      "StopQueryExecution",
+      "DDL/DML/CTAS/UNLOAD",
+      "S3 output object reads",
+      "raw SQL or result retention",
+      "verified Work Product adoption"
+    ]
+  },
+  "forbiddenEffects": [
+    "athena:StartQueryExecution",
+    "athena:StopQueryExecution",
+    "s3:GetObject",
+    "arbitrary_sql",
+    "ddl",
+    "dml",
+    "ctas",
+    "unload",
+    "multi_statement",
+    "unbounded_rows",
+    "raw_result_values",
+    "work_product_adoption"
+  ],
+  "layer2Gaps": [
+    "native SigV4 credential resolution and live HTTPS",
+    "live query submission and cancellation with kernel Consent/Effect/Receipt/Verification",
+    "durable provider receipt",
+    "independent result read-back and reconciliation",
+    "S3 output access under separate capability",
+    "verified Mission Work Product adoption"
+  ],
+  "honestNativeGap": "Layer-1 uses only recording, fixture, loopback, and BLOCKED_ENV transports. All four remain connected=false, native=false, and first_party=false. Native AWS access and execution effects remain Layer-2 work."
+}

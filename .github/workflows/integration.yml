@@ -1,0 +1,362 @@
+name: Integration / Bootstrap CI
+
+on:
+  push:
+    branches: [bootstrap/macos-r0]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hartevo-integration-bootstrap
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_TARGET_DIR: target/ci-cargo
+
+jobs:
+  review-gate:
+    name: Integration / Reviewed gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.ready.outputs.ready }}
+    steps:
+      - id: ready
+        name: Mark reviewed integration run ready
+        run: echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+  rust:
+    name: Integration / Full Rust matrix
+    needs: review-gate
+    if: needs.review-gate.outputs.ready == 'true'
+    uses: ./.github/workflows/rust-reusable.yml
+    with:
+      check_prefix: Integration / Full Rust
+      run_rust: true
+      run_macos: true
+      full_workspace: true
+      rust_packages: '["hartevo-application","hartevo-browser-adapter","hartevo-capability-gateway","hartevo-catalog","hartevo-cloud-storage","hartevo-commerce-connector","hartevo-connector-sdk","hartevo-context-fabric","hartevo-desktop","hartevo-domain-kernel","hartevo-effect-broker","hartevo-eval","hartevo-mission-scheduler","hartevo-runtime-adapter","hartevo-storage"]'
+    permissions:
+      contents: read
+
+  postgres:
+    name: Integration / PostgreSQL 18 Cell
+    needs: review-gate
+    if: needs.review-gate.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:18.4
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Cache Cargo and Rust toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains/1.95.0-*
+            ~/.rustup/update
+            target/ci-cargo
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-cell-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}
+      - name: Install PostgreSQL client and locked Rust components
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client
+          rustup component add clippy rustfmt rust-src --toolchain 1.95.0
+      - name: Create non-bypass Cell role and disposable database
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql --host=127.0.0.1 --username=postgres --dbname=postgres --set=ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE hartevo_l2 LOGIN PASSWORD 'hartevo_l2'
+            NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+          CREATE DATABASE hartevo_l2 OWNER hartevo_l2;
+          SQL
+      - name: Run Cell migration, RLS, encrypted sync, CAS, Effect and recovery contracts
+        env:
+          HARTEVO_TEST_POSTGRES_URL: host=127.0.0.1 port=5432 user=hartevo_l2 password=hartevo_l2 dbname=hartevo_l2 sslmode=disable
+        run: |
+          cargo test -p hartevo-cloud-storage --locked \
+            tests::postgres_l2_contract_reports_blocked_or_executes_full_replay \
+            -- --nocapture --exact
+          cargo test -p hartevo-cloud-storage --locked \
+            effect_ledger::tests::postgres_effect_claim_contract_reports_blocked_or_executes_full_recovery \
+            -- --nocapture --exact
+          cargo test -p hartevo-cloud-storage --locked \
+            effect_ledger::tests::postgres_effect_concurrency_and_terminal_recovery_reports_blocked_or_executes \
+            -- --nocapture --exact
+          cargo test -p hartevo-cloud-storage --locked \
+            effect_ledger::tests::postgres_effect_reconciliation_reports_blocked_or_executes_bounded_recovery \
+            -- --nocapture --exact
+
+  contracts:
+    name: Integration / Catalog and evidence
+    needs: review-gate
+    if: needs.review-gate.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Cache Cargo and Rust toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains/1.95.0-*
+            ~/.rustup/update
+            target/ci-cargo
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-contracts-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}
+      - name: Install locked Rust components
+        run: rustup component add clippy rustfmt rust-src --toolchain 1.95.0
+      - name: Validate Catalog and bootstrap assets
+        run: |
+          cargo run -p hartevo-eval --locked -- validate-assets
+          cargo run -p hartevo-eval --locked -- catalog validate
+          mkdir -p target/ci/evidence
+          cargo run -p hartevo-eval --locked -- catalog export --output target/ci/evidence/catalog-v1.json
+      - name: Generate current-commit honest release baseline
+        run: |
+          cargo run -p hartevo-eval --locked -- evidence baseline \
+            --commit "$GITHUB_SHA" \
+            --output target/ci/evidence/release-baseline.json
+          jq -e --arg commit "$GITHUB_SHA" '.passed == false and .releaseCommit == $commit' \
+            target/ci/evidence/release-baseline.json
+      - name: Run docs and evidence truth gates
+        run: |
+          bash scripts/check-docs-machine-truth.sh verify
+          bash scripts/check-evidence-doc-truth.sh verify
+          bash scripts/check-evidence-doc-truth.sh self-test
+          bash scripts/check-evidence-manifest.sh self-test
+      - name: Replay the controlled bootstrap Mission
+        run: cargo run -p hartevo-eval --locked -- run --mission VS-01 --output target/ci/evidence/vs-01.json
+      - name: Upload redacted Catalog and evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: integration-contract-evidence-${{ github.run_id }}
+          path: target/ci/evidence
+          if-no-files-found: warn
+          retention-days: 30
+
+  openinterpreter:
+    name: Integration / OpenInterpreter contract
+    needs: review-gate
+    if: needs.review-gate.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify pinned upstream source, schema, licenses and checksums
+        run: bash scripts/check-openinterpreter-schema.sh
+
+  dioxus:
+    name: Integration / Dioxus build and receipt
+    needs: review-gate
+    if: needs.review-gate.outputs.ready == 'true'
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Cache Cargo and Rust toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains/1.95.0-*
+            ~/.rustup/update
+            target/ci-cargo
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-dioxus-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}
+      - name: Install the pinned Dioxus toolchain surface
+        run: |
+          rustup component add clippy rustfmt rust-src --toolchain 1.95.0
+          rustup toolchain install nightly --profile minimal
+          if ! command -v dx >/dev/null 2>&1; then
+            cargo install dioxus-cli --version 0.7.10 --locked
+          fi
+      - name: Run Dioxus self-test and build receipt
+        run: |
+          mkdir -p target/evidence
+          bash scripts/check-dioxus-toolchain.sh self-test
+          bash scripts/check-dioxus-toolchain.sh build > target/evidence/dioxus-build-provenance.json
+          bash scripts/check-dioxus-toolchain.sh verify-receipt target/evidence/dioxus-build-provenance.json
+      - name: Upload redacted Dioxus evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: integration-dioxus-evidence-${{ github.run_id }}
+          path: target/evidence/dioxus-build-provenance.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  dependencies:
+    name: Integration / Dependency and SBOM
+    needs: review-gate
+    if: needs.review-gate.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Cache Cargo registry for advisory tooling
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains/1.95.0-*
+            ~/.rustup/update
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-audit-0.22.2-${{ hashFiles('Cargo.lock') }}
+      - name: Install pinned advisory tool
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Verify the checked-in locked dependency graph
+        run: |
+          mkdir -p target/ci/dependencies
+          test -s Cargo.lock
+          cargo metadata --format-version 1 --locked > target/ci/dependencies/metadata.json
+          cargo tree --workspace --locked --edges normal > target/ci/dependencies/tree.txt
+      - name: Generate license and vulnerability evidence
+        run: |
+          cargo audit --json > target/ci/dependencies/cargo-audit.json
+          python3 scripts/ci-dependency-audit.py audit \
+            --metadata target/ci/dependencies/metadata.json \
+            --tree target/ci/dependencies/tree.txt \
+            --lock Cargo.lock \
+            --cargo-audit-json target/ci/dependencies/cargo-audit.json \
+            --output target/ci/dependencies/sbom.json
+      - name: Upload dependency evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: integration-dependency-evidence-${{ github.run_id }}
+          path: |
+            target/ci/dependencies/cargo-audit.json
+            target/ci/dependencies/sbom.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  result:
+    name: Integration / Result taxonomy
+    if: always()
+    needs: [review-gate, rust, postgres, contracts, openinterpreter, dioxus, dependencies]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout result verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Capture hosted job execution evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p target/ci
+          curl --fail --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+            > target/ci/github-jobs.json
+      - name: Classify every integration job outcome
+        env:
+          READY: ${{ needs.review-gate.outputs.ready }}
+        run: |
+          mkdir -p target/ci
+          allow=()
+          if [[ "$READY" != true ]]; then
+            allow+=(--allow-skipped review-gate --allow-skipped rust --allow-skipped postgres --allow-skipped contracts --allow-skipped openinterpreter --allow-skipped dioxus --allow-skipped dependencies)
+          fi
+          python3 scripts/ci-result.py aggregate \
+            --workflow "$GITHUB_WORKFLOW" \
+            --run-id "$GITHUB_RUN_ID" \
+            --commit "$GITHUB_SHA" \
+            --event "$GITHUB_EVENT_NAME" \
+            --output target/ci/result.json \
+            --junit target/ci/result.xml \
+            --github-jobs-json target/ci/github-jobs.json \
+            --job "review-gate=${{ needs.review-gate.result }}" \
+            --job "rust=${{ needs.rust.result }}" \
+            --job "postgres=${{ needs.postgres.result }}" \
+            --job "contracts=${{ needs.contracts.result }}" \
+            --job "openinterpreter=${{ needs.openinterpreter.result }}" \
+            --job "dioxus=${{ needs.dioxus.result }}" \
+            --job "dependencies=${{ needs.dependencies.result }}" \
+            --job-name "review-gate=Integration / Reviewed gate" \
+            --job-name "rust=Integration / Full Rust matrix" \
+            --job-name "postgres=Integration / PostgreSQL 18 Cell" \
+            --job-name "contracts=Integration / Catalog and evidence" \
+            --job-name "openinterpreter=Integration / OpenInterpreter contract" \
+            --job-name "dioxus=Integration / Dioxus build and receipt" \
+            --job-name "dependencies=Integration / Dependency and SBOM" \
+            --kind review-gate=infra \
+            --kind rust=code \
+            --kind postgres=infra \
+            --kind contracts=code \
+            --kind openinterpreter=infra \
+            --kind dioxus=infra \
+            --kind dependencies=infra \
+            "${allow[@]}"
+      - name: Upload redacted integration result and JUnit envelope
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: integration-ci-result-${{ github.run_id }}
+          path: |
+            target/ci/result.json
+            target/ci/result.xml
+            target/ci/github-jobs.json
+          if-no-files-found: warn
+          retention-days: 30

@@ -28,11 +28,12 @@ use crate::workspace::{digest, digest_json};
 use crate::{
     BrowserAction, BrowserActionBatch, BrowserActionKind, BrowserActionRisk, BrowserActionSurface,
     BrowserControlHost, BrowserElementRef, BrowserError, BrowserFileGrant, BrowserFileType,
+    BrowserHandoffFrameBinding, BrowserHandoffHost, BrowserHandoffScope, BrowserHandoffSnapshot,
     BrowserLeaseProof, BrowserLocatorResolution, BrowserNavigationPolicy, BrowserNavigationReceipt,
     BrowserNavigationTarget, BrowserProfile, BrowserPromptRisk,
     BrowserRecipeExecutionAuthorization, BrowserRecipePreparedPlan, BrowserRecipeRegistry,
-    BrowserRecipeTrustStore, BrowserStableLocator, BrowserTextInput, BrowserWorkspace,
-    FileUploadHandle, SemanticSnapshot,
+    BrowserRecipeResumeContext, BrowserRecipeResumeCursor, BrowserRecipeTrustStore,
+    BrowserStableLocator, BrowserTextInput, BrowserWorkspace, FileUploadHandle, SemanticSnapshot,
 };
 
 const DEFAULT_MAX_FRAME_BYTES: usize = 8 * 1_024 * 1_024;
@@ -46,6 +47,7 @@ const MAX_AX_NODES: usize = 20_000;
 const MAX_AX_TEXT_BYTES: usize = 2 * 1_024 * 1_024;
 const MAX_AX_ELEMENT_REFS: usize = 4_096;
 const MAX_FRAME_TREE_NODES: usize = 4_096;
+const MAX_EXECUTION_CONTEXTS: usize = 8_192;
 const MAX_LIFECYCLE_EVENTS: usize = 256;
 const MAX_DOM_SUBTREE_NODES: usize = 4_096;
 const MAX_CONTENT_QUADS: usize = 128;
@@ -210,8 +212,8 @@ pub struct ChromiumHostShutdown {
 /// Digest-only evidence that Chromium accepted the two low-level input
 /// dispatches for one exact Effect-bound semantic click. This is a Provider
 /// receipt, not proof that the intended business operation happened.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChromiumClickDispatchEvidence {
     pub schema_version: u32,
     pub batch_id: BrowserActionBatchId,
@@ -437,6 +439,8 @@ struct ChromiumSemanticTargetContext {
     candidate: AxLocatorCandidate,
     target_url: String,
     frame: CdpFrameIdentity,
+    frame_tree: CdpFrameTreeSnapshot,
+    execution_context: CdpExecutionContextBinding,
 }
 
 #[derive(Clone)]
@@ -447,6 +451,8 @@ struct ChromiumInputTargetBinding {
     candidate: AxLocatorCandidate,
     target_url: String,
     frame: CdpFrameIdentity,
+    frame_tree: CdpFrameTreeSnapshot,
+    execution_context: CdpExecutionContextBinding,
 }
 
 impl ChromiumSemanticTargetContext {
@@ -458,6 +464,8 @@ impl ChromiumSemanticTargetContext {
             candidate: self.candidate.clone(),
             target_url: self.target_url.clone(),
             frame: self.frame.clone(),
+            frame_tree: self.frame_tree.clone(),
+            execution_context: self.execution_context.clone(),
         }
     }
 }
@@ -481,14 +489,226 @@ struct AxLocatorCandidate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CdpFrameIdentity {
     frame_id: String,
+    parent_frame_id: Option<String>,
     loader_id: String,
     url: String,
+    security_origin: String,
+    unreachable_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CdpFrameTreeSnapshot {
     root: CdpFrameIdentity,
     frames: BTreeMap<String, CdpFrameIdentity>,
+    lifecycle_revisions: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CdpExecutionWorld {
+    Main,
+    Isolated(String),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CdpExecutionWorldKey {
+    frame_id: String,
+    world: CdpExecutionWorld,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CdpExecutionContextIdentity {
+    execution_context_id: u64,
+    unique_id: String,
+    origin: String,
+    world_key: Option<CdpExecutionWorldKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CdpExecutionContextBinding {
+    identity: CdpExecutionContextIdentity,
+    world_key: CdpExecutionWorldKey,
+    context_revision: u64,
+    document_generation: u64,
+    root_loader_id: String,
+    root_lifecycle_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CdpExecutionContextRegistry {
+    contexts_by_unique_id: BTreeMap<String, CdpExecutionContextIdentity>,
+    unique_id_by_context_id: BTreeMap<u64, String>,
+    revisions: BTreeMap<CdpExecutionWorldKey, u64>,
+}
+
+impl CdpExecutionContextRegistry {
+    fn bump_revision(&mut self, key: &CdpExecutionWorldKey) -> Result<u64, BrowserError> {
+        if !self.revisions.contains_key(key) && self.revisions.len() >= MAX_EXECUTION_CONTEXTS {
+            return Err(BrowserError::ProtocolPoisoned);
+        }
+        let revision = self.revisions.entry(key.clone()).or_default();
+        *revision = revision
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        Ok(*revision)
+    }
+
+    fn context_created(
+        &mut self,
+        identity: CdpExecutionContextIdentity,
+    ) -> Result<(), BrowserError> {
+        if self.contexts_by_unique_id.len() >= MAX_EXECUTION_CONTEXTS
+            || self.contexts_by_unique_id.contains_key(&identity.unique_id)
+            || self
+                .unique_id_by_context_id
+                .contains_key(&identity.execution_context_id)
+        {
+            return Err(BrowserError::ProtocolPoisoned);
+        }
+        if let Some(key) = identity.world_key.as_ref() {
+            self.bump_revision(key)?;
+        }
+        self.unique_id_by_context_id
+            .insert(identity.execution_context_id, identity.unique_id.clone());
+        self.contexts_by_unique_id
+            .insert(identity.unique_id.clone(), identity);
+        Ok(())
+    }
+
+    fn context_destroyed(
+        &mut self,
+        execution_context_id: u64,
+        reported_unique_id: Option<&str>,
+    ) -> Result<(), BrowserError> {
+        let unique_id = self
+            .unique_id_by_context_id
+            .get(&execution_context_id)
+            .cloned()
+            .ok_or(BrowserError::ProtocolPoisoned)?;
+        if reported_unique_id.is_some_and(|reported| reported != unique_id) {
+            return Err(BrowserError::ProtocolPoisoned);
+        }
+        let identity = self
+            .contexts_by_unique_id
+            .remove(&unique_id)
+            .ok_or(BrowserError::ProtocolPoisoned)?;
+        if identity.execution_context_id != execution_context_id
+            || self
+                .unique_id_by_context_id
+                .remove(&execution_context_id)
+                .as_deref()
+                != Some(unique_id.as_str())
+        {
+            return Err(BrowserError::ProtocolPoisoned);
+        }
+        if let Some(key) = identity.world_key.as_ref() {
+            self.bump_revision(key)?;
+        }
+        Ok(())
+    }
+
+    fn contexts_cleared(&mut self) -> Result<(), BrowserError> {
+        let keys = self
+            .contexts_by_unique_id
+            .values()
+            .filter_map(|identity| identity.world_key.clone())
+            .collect::<BTreeSet<_>>();
+        for key in keys {
+            self.bump_revision(&key)?;
+        }
+        self.contexts_by_unique_id.clear();
+        self.unique_id_by_context_id.clear();
+        Ok(())
+    }
+
+    fn bind(
+        &self,
+        frame_tree: &CdpFrameTreeSnapshot,
+        intended_world: CdpExecutionWorld,
+        document_generation: u64,
+    ) -> Result<CdpExecutionContextBinding, BrowserError> {
+        if frame_tree.frames.get(&frame_tree.root.frame_id) != Some(&frame_tree.root) {
+            return Err(BrowserError::ProtocolPoisoned);
+        }
+        let world_key = CdpExecutionWorldKey {
+            frame_id: frame_tree.root.frame_id.clone(),
+            world: intended_world,
+        };
+        let matches = self
+            .contexts_by_unique_id
+            .values()
+            .filter(|identity| identity.world_key.as_ref() == Some(&world_key))
+            .collect::<Vec<_>>();
+        let [identity] = matches.as_slice() else {
+            return Err(BrowserError::StaleSnapshot);
+        };
+        let context_revision = self
+            .revisions
+            .get(&world_key)
+            .copied()
+            .ok_or(BrowserError::StaleSnapshot)?;
+        if identity.origin != frame_tree.root.security_origin
+            || self
+                .unique_id_by_context_id
+                .get(&identity.execution_context_id)
+                != Some(&identity.unique_id)
+        {
+            return Err(BrowserError::StaleSnapshot);
+        }
+        Ok(CdpExecutionContextBinding {
+            identity: (**identity).clone(),
+            world_key,
+            context_revision,
+            document_generation,
+            root_loader_id: frame_tree.root.loader_id.clone(),
+            root_lifecycle_revision: frame_tree
+                .lifecycle_revisions
+                .get(&frame_tree.root.frame_id)
+                .copied(),
+        })
+    }
+
+    fn validate_binding(
+        &self,
+        binding: &CdpExecutionContextBinding,
+        frame_tree: &CdpFrameTreeSnapshot,
+        intended_world: &CdpExecutionWorld,
+        document_generation: u64,
+    ) -> Result<(), BrowserError> {
+        let expected_key = CdpExecutionWorldKey {
+            frame_id: frame_tree.root.frame_id.clone(),
+            world: intended_world.clone(),
+        };
+        let matching_context_count = self
+            .contexts_by_unique_id
+            .values()
+            .filter(|identity| identity.world_key.as_ref() == Some(&expected_key))
+            .count();
+        if frame_tree.frames.get(&frame_tree.root.frame_id) != Some(&frame_tree.root) {
+            return Err(BrowserError::ProtocolPoisoned);
+        }
+        if binding.world_key != expected_key
+            || binding.identity.world_key.as_ref() != Some(&expected_key)
+            || binding.document_generation != document_generation
+            || binding.root_loader_id != frame_tree.root.loader_id
+            || binding.root_lifecycle_revision
+                != frame_tree
+                    .lifecycle_revisions
+                    .get(&frame_tree.root.frame_id)
+                    .copied()
+            || self.revisions.get(&expected_key).copied() != Some(binding.context_revision)
+            || self.contexts_by_unique_id.get(&binding.identity.unique_id)
+                != Some(&binding.identity)
+            || self
+                .unique_id_by_context_id
+                .get(&binding.identity.execution_context_id)
+                != Some(&binding.identity.unique_id)
+            || binding.identity.origin != frame_tree.root.security_origin
+            || matching_context_count != 1
+        {
+            return Err(BrowserError::StaleSnapshot);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -522,16 +742,34 @@ struct CdpTabSession {
     document_generation: u64,
     latest_snapshot: Option<SemanticSnapshot>,
     locator_map: BTreeMap<String, AxLocatorCandidate>,
+    latest_frame_tree: Option<CdpFrameTreeSnapshot>,
+    latest_execution_context: Option<CdpExecutionContextBinding>,
+    execution_context_registry: CdpExecutionContextRegistry,
+    generation_frame_tree: Option<CdpFrameTreeSnapshot>,
+    frame_lifecycle_revisions: BTreeMap<String, u64>,
     current_frame_id: Option<String>,
     current_loader_id: Option<String>,
     current_url_digest: Option<String>,
     navigation_policy: Option<BrowserNavigationPolicy>,
     script_execution_disabled: bool,
+    runtime_events: CdpRuntimeEvents,
     page_events_enabled: bool,
     fetch_enabled: bool,
     lifecycle_events: BTreeSet<(String, String, String)>,
     allowed_request_count: u32,
     blocked_request_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CdpRuntimeEvents {
+    Disabled,
+    Enabled,
+}
+
+impl CdpRuntimeEvents {
+    fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
 }
 
 impl fmt::Debug for CdpTabSession {
@@ -546,6 +784,35 @@ impl fmt::Debug for CdpTabSession {
                 &self.latest_snapshot.as_ref().map(|snapshot| &snapshot.id),
             )
             .field("locator_count", &self.locator_map.len())
+            .field(
+                "latest_frame_count",
+                &self
+                    .latest_frame_tree
+                    .as_ref()
+                    .map(|snapshot| snapshot.frames.len()),
+            )
+            .field(
+                "latest_execution_context_digest",
+                &self
+                    .latest_execution_context
+                    .as_ref()
+                    .map(|binding| digest(binding.identity.unique_id.as_bytes())),
+            )
+            .field(
+                "execution_context_count",
+                &self.execution_context_registry.contexts_by_unique_id.len(),
+            )
+            .field(
+                "generation_frame_count",
+                &self
+                    .generation_frame_tree
+                    .as_ref()
+                    .map(|snapshot| snapshot.frames.len()),
+            )
+            .field(
+                "frame_lifecycle_revision_count",
+                &self.frame_lifecycle_revisions.len(),
+            )
             .field(
                 "current_frame_id_digest",
                 &self
@@ -569,6 +836,7 @@ impl fmt::Debug for CdpTabSession {
                     .map(BrowserNavigationPolicy::evidence_digest),
             )
             .field("script_execution_disabled", &self.script_execution_disabled)
+            .field("runtime_events", &self.runtime_events)
             .field("page_events_enabled", &self.page_events_enabled)
             .field("fetch_enabled", &self.fetch_enabled)
             .field("lifecycle_event_count", &self.lifecycle_events.len())
@@ -779,6 +1047,8 @@ impl ManagedChromiumHost {
             return Err(error);
         }
         self.workspace.validate_agent_lease(proof, now)?;
+        let runtime_session_id = session_id.clone();
+        let target_id_for_cleanup = target_id.clone();
         self.tabs.insert(
             tab_id.clone(),
             CdpTabSession {
@@ -787,11 +1057,17 @@ impl ManagedChromiumHost {
                 document_generation: 1,
                 latest_snapshot: None,
                 locator_map: BTreeMap::new(),
+                latest_frame_tree: None,
+                latest_execution_context: None,
+                execution_context_registry: CdpExecutionContextRegistry::default(),
+                generation_frame_tree: None,
+                frame_lifecycle_revisions: BTreeMap::new(),
                 current_frame_id: None,
                 current_loader_id: None,
                 current_url_digest: None,
                 navigation_policy: None,
                 script_execution_disabled: false,
+                runtime_events: CdpRuntimeEvents::Disabled,
                 page_events_enabled: false,
                 fetch_enabled: false,
                 lifecycle_events: BTreeSet::new(),
@@ -799,6 +1075,21 @@ impl ManagedChromiumHost {
                 blocked_request_count: 0,
             },
         );
+        if let Err(error) = self.command(
+            CdpMethod::RuntimeEnable,
+            json!({}),
+            Some(&runtime_session_id),
+        ) {
+            self.tabs.remove(tab_id);
+            let _ = self.command(
+                CdpMethod::TargetCloseTarget,
+                json!({"targetId": target_id_for_cleanup}),
+                None,
+            );
+            return Err(error);
+        }
+        let tab = self.tabs.get_mut(tab_id).ok_or(BrowserError::TabNotFound)?;
+        tab.runtime_events = CdpRuntimeEvents::Enabled;
         Ok(())
     }
 
@@ -850,6 +1141,7 @@ impl ManagedChromiumHost {
         let (
             session_id,
             script_execution_disabled,
+            runtime_events,
             page_events_enabled,
             fetch_enabled,
             existing_policy,
@@ -858,6 +1150,7 @@ impl ManagedChromiumHost {
             (
                 tab.session_id.clone(),
                 tab.script_execution_disabled,
+                tab.runtime_events,
                 tab.page_events_enabled,
                 tab.fetch_enabled,
                 tab.navigation_policy.clone(),
@@ -886,6 +1179,18 @@ impl ManagedChromiumHost {
                 .get_mut(tab_id)
                 .ok_or(BrowserError::TabNotFound)?
                 .script_execution_disabled = true;
+        }
+        if !runtime_events.is_enabled() {
+            self.command_guarded(
+                CdpMethod::RuntimeEnable,
+                json!({}),
+                Some(&session_id),
+                guard,
+            )?;
+            self.tabs
+                .get_mut(tab_id)
+                .ok_or(BrowserError::TabNotFound)?
+                .runtime_events = CdpRuntimeEvents::Enabled;
         }
         if !page_events_enabled {
             self.command_guarded(CdpMethod::PageEnable, json!({}), Some(&session_id), guard)?;
@@ -930,6 +1235,10 @@ impl ManagedChromiumHost {
                 .ok_or(BrowserError::CounterOverflow)?;
             tab.latest_snapshot = None;
             tab.locator_map.clear();
+            tab.latest_frame_tree = None;
+            tab.latest_execution_context = None;
+            tab.generation_frame_tree = None;
+            tab.frame_lifecycle_revisions.clear();
             tab.lifecycle_events.clear();
             tab.current_frame_id = None;
             tab.current_loader_id = None;
@@ -983,8 +1292,16 @@ impl ManagedChromiumHost {
             Some(&session_id),
             guard,
         )?;
-        let frame_identity =
-            parse_root_frame_identity(&frame_tree).map_err(|_| BrowserError::NavigationFailed)?;
+        let mut frame_tree =
+            parse_frame_tree_snapshot(&frame_tree).map_err(|_| BrowserError::NavigationFailed)?;
+        frame_tree.lifecycle_revisions = self
+            .tabs
+            .get(tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .frame_lifecycle_revisions
+            .clone();
+        validate_frame_tree_navigation_scope(&frame_tree, policy)?;
+        let frame_identity = frame_tree.root.clone();
         if frame_identity.frame_id != frame_id || frame_identity.loader_id != loader_id {
             return Err(BrowserError::NavigationFailed);
         }
@@ -1018,6 +1335,7 @@ impl ManagedChromiumHost {
         let final_origin_digest = policy
             .permitted_origin_digest(final_url)
             .ok_or(BrowserError::NavigationRequestBlocked)?;
+        validate_exact_navigation_target_origin(target, &final_origin_digest)?;
         let (allowed_after, blocked_after) = {
             let tab = self.tabs.get(tab_id).ok_or(BrowserError::TabNotFound)?;
             (tab.allowed_request_count, tab.blocked_request_count)
@@ -1031,6 +1349,7 @@ impl ManagedChromiumHost {
         self.workspace
             .validate_agent_lease(guard.proof, guard.observed_at()?)?;
         let tab = self.tabs.get_mut(tab_id).ok_or(BrowserError::TabNotFound)?;
+        tab.generation_frame_tree = Some(frame_tree);
         tab.current_frame_id = Some(frame_identity.frame_id);
         tab.current_loader_id = Some(frame_identity.loader_id);
         tab.current_url_digest = Some(digest(final_url.as_bytes()));
@@ -1052,18 +1371,81 @@ impl ManagedChromiumHost {
         )
     }
 
-    fn read_root_frame_identity(
+    fn read_frame_tree_snapshot(
         &mut self,
         session_id: &str,
         guard: &OperationLeaseGuard<'_>,
-    ) -> Result<CdpFrameIdentity, BrowserError> {
+    ) -> Result<CdpFrameTreeSnapshot, BrowserError> {
         let result = self.command_guarded(
             CdpMethod::PageGetFrameTree,
             json!({}),
             Some(session_id),
             guard,
         )?;
-        parse_root_frame_identity(&result)
+        parse_frame_tree_snapshot(&result)
+    }
+
+    fn read_frame_tree_snapshot_unchecked(
+        &mut self,
+        session_id: &str,
+    ) -> Result<CdpFrameTreeSnapshot, BrowserError> {
+        let result = self.command(CdpMethod::PageGetFrameTree, json!({}), Some(session_id))?;
+        parse_frame_tree_snapshot(&result)
+    }
+
+    fn read_scoped_frame_tree_snapshot(
+        &mut self,
+        tab_id: &BrowserTabId,
+        session_id: &str,
+        guard: &OperationLeaseGuard<'_>,
+    ) -> Result<(CdpFrameTreeSnapshot, u64), BrowserError> {
+        let policy = self
+            .tabs
+            .get(tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .navigation_policy
+            .clone();
+        let mut snapshot = self.read_frame_tree_snapshot(session_id, guard)?;
+        snapshot.lifecycle_revisions = self
+            .tabs
+            .get(tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .frame_lifecycle_revisions
+            .clone();
+        let document_generation = self.sync_frame_tree_identity(tab_id, &snapshot)?;
+        if let Some(policy) = policy.as_ref() {
+            validate_frame_tree_navigation_scope(&snapshot, policy)?;
+        }
+        Ok((snapshot, document_generation))
+    }
+
+    fn revalidate_input_target_binding(
+        &mut self,
+        tab_id: &BrowserTabId,
+        binding: &ChromiumInputTargetBinding,
+        guard: &OperationLeaseGuard<'_>,
+    ) -> Result<(), BrowserError> {
+        let target_url = self.read_target_url(&binding.target_id, guard)?;
+        let (current, document_generation) =
+            self.read_scoped_frame_tree_snapshot(tab_id, &binding.session_id, guard)?;
+        if validate_bound_frame_tree(&binding.frame_tree, &current).is_err()
+            || current.root != binding.frame
+            || target_url != binding.target_url
+            || target_url != current.root.url
+        {
+            return Err(BrowserError::StaleSnapshot);
+        }
+        let tab = self.tabs.get(tab_id).ok_or(BrowserError::TabNotFound)?;
+        if !tab.runtime_events.is_enabled() {
+            return Err(BrowserError::StaleSnapshot);
+        }
+        tab.execution_context_registry.validate_binding(
+            &binding.execution_context,
+            &current,
+            &CdpExecutionWorld::Main,
+            document_generation,
+        )?;
+        Ok(())
     }
 
     fn read_root_ax_tree(
@@ -1110,38 +1492,121 @@ impl ManagedChromiumHost {
         Ok(url.to_owned())
     }
 
-    fn sync_frame_identity(
+    pub(crate) fn observe_handoff_snapshot(
+        &mut self,
+        profile: &BrowserProfile,
+        workspace: &BrowserWorkspace,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserHandoffSnapshot, BrowserError> {
+        profile.validate()?;
+        workspace.validate()?;
+        if profile.id != self.profile.id
+            || profile.revision != self.profile.revision
+            || profile.identity.identity_digest != self.profile.identity.identity_digest
+            || workspace.id != self.workspace.id
+            || workspace.tenant_id != self.workspace.tenant_id
+            || workspace.project_id != self.workspace.project_id
+            || workspace.mission_id != self.workspace.mission_id
+            || workspace.profile_id != self.workspace.profile_id
+            || workspace.revision != self.workspace.revision
+            || workspace.lease_generation != self.workspace.lease_generation
+            || workspace.control_state != self.workspace.control_state
+        {
+            return Err(BrowserError::ScopeMismatch);
+        }
+        let (target_id, session_id) = {
+            let tab = self
+                .tabs
+                .get(&workspace.active_tab_id)
+                .ok_or(BrowserError::TabNotFound)?;
+            (tab.target_id.clone(), tab.session_id.clone())
+        };
+        let target_url = self.read_target_url_unchecked(&target_id)?;
+        let mut frame_tree = self.read_frame_tree_snapshot_unchecked(&session_id)?;
+        frame_tree.lifecycle_revisions = self
+            .tabs
+            .get(&workspace.active_tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .frame_lifecycle_revisions
+            .clone();
+        let document_generation =
+            self.sync_frame_tree_identity(&workspace.active_tab_id, &frame_tree)?;
+        if target_url != frame_tree.root.url
+            || frame_tree.root.unreachable_url.is_some()
+            || frame_tree.root.frame_id.is_empty()
+            || frame_tree.root.loader_id.is_empty()
+        {
+            return Err(BrowserError::StaleSnapshot);
+        }
+        let scope = BrowserHandoffScope::bind(profile, workspace)?;
+        let frame = BrowserHandoffFrameBinding::from_verified(
+            workspace.active_tab_id.clone(),
+            &frame_tree.root.frame_id,
+            &frame_tree.root.loader_id,
+            &frame_tree.root.url,
+            document_generation,
+        )?;
+        BrowserHandoffSnapshot::from_verified(crate::handoff::BrowserHandoffSnapshotInput {
+            snapshot_id: BrowserSnapshotId::new(),
+            scope,
+            frame,
+            profile_revision: profile.revision,
+            workspace_revision: workspace.revision,
+            lease_generation: workspace.lease_generation,
+            control_state: workspace.control_state,
+            observed_at: now,
+        })
+    }
+
+    fn read_target_url_unchecked(&mut self, target_id: &str) -> Result<String, BrowserError> {
+        let result = self.command(
+            CdpMethod::TargetGetTargetInfo,
+            json!({"targetId": target_id}),
+            None,
+        )?;
+        let target_info = result
+            .get("targetInfo")
+            .and_then(Value::as_object)
+            .ok_or_else(|| self.poison())?;
+        let observed_target_id = target_info
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| self.poison())?;
+        let url = target_info
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 32 * 1_024)
+            .ok_or_else(|| self.poison())?;
+        if observed_target_id != target_id {
+            return Err(self.poison());
+        }
+        Ok(url.to_owned())
+    }
+
+    fn sync_frame_tree_identity(
         &mut self,
         tab_id: &BrowserTabId,
-        identity: &CdpFrameIdentity,
+        snapshot: &CdpFrameTreeSnapshot,
     ) -> Result<u64, BrowserError> {
         let tab = self.tabs.get_mut(tab_id).ok_or(BrowserError::TabNotFound)?;
-        let prior_shape = (
-            tab.current_frame_id.as_ref(),
-            tab.current_loader_id.as_ref(),
-            tab.current_url_digest.as_ref(),
-        );
-        let changed = match prior_shape {
-            (None, None, None) => false,
-            (Some(frame_id), Some(loader_id), Some(url_digest)) => {
-                frame_id != &identity.frame_id
-                    || loader_id != &identity.loader_id
-                    || url_digest != &digest(identity.url.as_bytes())
-            }
-            _ => return Err(self.poison()),
-        };
+        let next_generation = next_frame_document_generation(
+            tab.document_generation,
+            tab.generation_frame_tree.as_ref(),
+            snapshot,
+        )?;
+        let changed = next_generation != tab.document_generation;
         if changed {
-            tab.document_generation = tab
-                .document_generation
-                .checked_add(1)
-                .ok_or(BrowserError::CounterOverflow)?;
+            tab.document_generation = next_generation;
             tab.latest_snapshot = None;
             tab.locator_map.clear();
+            tab.latest_frame_tree = None;
+            tab.latest_execution_context = None;
             tab.lifecycle_events.clear();
         }
-        tab.current_frame_id = Some(identity.frame_id.clone());
-        tab.current_loader_id = Some(identity.loader_id.clone());
-        tab.current_url_digest = Some(digest(identity.url.as_bytes()));
+        tab.generation_frame_tree = Some(snapshot.clone());
+        tab.current_frame_id = Some(snapshot.root.frame_id.clone());
+        tab.current_loader_id = Some(snapshot.root.loader_id.clone());
+        tab.current_url_digest = Some(digest(snapshot.root.url.as_bytes()));
         Ok(tab.document_generation)
     }
 
@@ -1159,22 +1624,29 @@ impl ManagedChromiumHost {
             (tab.target_id.clone(), tab.session_id.clone())
         };
         let target_url_before = self.read_target_url(&target_id, &guard)?;
-        let frame_before = self.read_root_frame_identity(&session_id, &guard)?;
-        let document_generation = self.sync_frame_identity(tab_id, &frame_before)?;
+        let (frame_tree_before, document_generation) =
+            self.read_scoped_frame_tree_snapshot(tab_id, &session_id, &guard)?;
+        let frame_before = frame_tree_before.root.clone();
         if target_url_before != frame_before.url {
             return Err(BrowserError::StaleSnapshot);
         }
         let tree = self.read_root_ax_tree(&session_id, &frame_before, &guard)?;
-        let frame_after = self.read_root_frame_identity(&session_id, &guard)?;
         let target_url_after = self.read_target_url(&target_id, &guard)?;
-        if frame_after != frame_before || target_url_after != frame_after.url {
-            self.sync_frame_identity(tab_id, &frame_after)?;
+        let (frame_tree_after, generation_after) =
+            self.read_scoped_frame_tree_snapshot(tab_id, &session_id, &guard)?;
+        let frame_after = frame_tree_after.root.clone();
+        if generation_after != document_generation
+            || validate_bound_frame_tree(&frame_tree_before, &frame_tree_after).is_err()
+            || frame_after != frame_before
+            || target_url_after != frame_after.url
+        {
             return Err(BrowserError::StaleSnapshot);
         }
         self.workspace
             .validate_agent_lease(proof, guard.observed_at()?)?;
-        let normalized = normalize_ax_tree(&tree, &snapshot_id, document_generation, &frame_before)
-            .map_err(|_| self.poison())?;
+        let normalized =
+            normalize_ax_tree(&tree, &snapshot_id, document_generation, &frame_tree_before)
+                .map_err(|_| self.poison())?;
         let snapshot = SemanticSnapshot::new(
             snapshot_id,
             &self.workspace,
@@ -1188,9 +1660,22 @@ impl ManagedChromiumHost {
             normalized.element_refs,
             now,
         )?;
+        let execution_context = {
+            let tab = self.tabs.get(tab_id).ok_or(BrowserError::TabNotFound)?;
+            if !tab.runtime_events.is_enabled() {
+                return Err(BrowserError::StaleSnapshot);
+            }
+            tab.execution_context_registry.bind(
+                &frame_tree_after,
+                CdpExecutionWorld::Main,
+                document_generation,
+            )?
+        };
         let tab = self.tabs.get_mut(tab_id).ok_or(BrowserError::TabNotFound)?;
         tab.latest_snapshot = Some(snapshot.clone());
         tab.locator_map = normalized.locator_map;
+        tab.latest_frame_tree = Some(frame_tree_after);
+        tab.latest_execution_context = Some(execution_context);
         Ok(snapshot)
     }
 
@@ -1358,6 +1843,48 @@ impl ManagedChromiumHost {
         let [action] = batch.actions.as_slice() else {
             return Err(BrowserError::RealActionRejected);
         };
+        Self::validate_semantic_write_action_binding(
+            batch,
+            resolution,
+            action,
+            expected_kind,
+            expected_surface,
+            expected_payload_digest,
+        )
+    }
+
+    fn validate_recipe_click_binding(
+        &self,
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        action_index: usize,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserAction, BrowserError> {
+        batch.validate_for(&self.profile, &self.workspace, now)?;
+        resolution.validate()?;
+        let action = batch
+            .actions
+            .get(action_index)
+            .ok_or(BrowserError::RealActionRejected)?;
+        let resolution_digest = resolution.evidence_digest()?;
+        Self::validate_semantic_write_action_binding(
+            batch,
+            resolution,
+            action,
+            BrowserActionKind::Click,
+            BrowserActionSurface::Semantic,
+            &resolution_digest,
+        )
+    }
+
+    fn validate_semantic_write_action_binding(
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        action: &BrowserAction,
+        expected_kind: BrowserActionKind,
+        expected_surface: BrowserActionSurface,
+        expected_payload_digest: &str,
+    ) -> Result<BrowserAction, BrowserError> {
         if batch.effect_binding.is_none()
             || action.kind != expected_kind
             || action.surface != expected_surface
@@ -1388,6 +1915,31 @@ impl ManagedChromiumHost {
         guard: &OperationLeaseGuard<'_>,
     ) -> Result<ChromiumClickPreflight, BrowserError> {
         let action = self.validate_click_binding(batch, resolution, guard.logical_started_at)?;
+        let context = self.load_semantic_target_context(action, batch, resolution, guard)?;
+        let binding = context.input_binding();
+        self.resolve_click_geometry(resolution, &binding, guard)?;
+        self.workspace
+            .validate_agent_lease(&batch.lease, guard.observed_at()?)?;
+        Ok(ChromiumClickPreflight {
+            binding,
+            action_digest: digest_json(&context.action)?,
+            locator_resolution_digest: resolution.evidence_digest()?,
+        })
+    }
+
+    fn preflight_recipe_semantic_click(
+        &mut self,
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        action_index: usize,
+        guard: &OperationLeaseGuard<'_>,
+    ) -> Result<ChromiumClickPreflight, BrowserError> {
+        let action = self.validate_recipe_click_binding(
+            batch,
+            resolution,
+            action_index,
+            guard.logical_started_at,
+        )?;
         let context = self.load_semantic_target_context(action, batch, resolution, guard)?;
         let binding = context.input_binding();
         self.resolve_click_geometry(resolution, &binding, guard)?;
@@ -1439,12 +1991,13 @@ impl ManagedChromiumHost {
             &mut initial_tree,
             &binding.snapshot,
             &binding.candidate,
-            &binding.frame,
+            &binding.frame_tree,
         )?;
         if initial_state.byte_len != 0 {
             return Err(BrowserError::TextTargetNotEmpty);
         }
 
+        self.revalidate_input_target_binding(&resolution.tab_id, &binding, guard)?;
         self.command_guarded(
             CdpMethod::DomFocus,
             json!({"backendNodeId": binding.candidate.backend_node_id}),
@@ -1457,18 +2010,13 @@ impl ManagedChromiumHost {
             &mut focused_tree,
             &binding.snapshot,
             &binding.candidate,
-            &binding.frame,
+            &binding.frame_tree,
         )?;
         if focused_state.byte_len != 0 || !focused_state.focused {
             return Err(BrowserError::TextTargetNotEditable);
         }
 
-        let final_frame = self.read_root_frame_identity(&binding.session_id, guard)?;
-        let final_url = self.read_target_url(&binding.target_id, guard)?;
-        if final_frame != binding.frame || final_url != binding.target_url {
-            self.sync_frame_identity(&resolution.tab_id, &final_frame)?;
-            return Err(BrowserError::StaleSnapshot);
-        }
+        self.revalidate_input_target_binding(&resolution.tab_id, &binding, guard)?;
         self.workspace
             .validate_agent_lease(&batch.lease, guard.observed_at()?)?;
         let focus_evidence_digest = digest_json(&json!({
@@ -1531,7 +2079,7 @@ impl ManagedChromiumHost {
             &mut initial_tree,
             &binding.snapshot,
             &binding.candidate,
-            &binding.frame,
+            &binding.frame_tree,
         )?;
         handle.validate_for(grant, &self.workspace)?;
         self.workspace
@@ -1566,7 +2114,7 @@ impl ManagedChromiumHost {
         resolution: &BrowserLocatorResolution,
         guard: &OperationLeaseGuard<'_>,
     ) -> Result<ChromiumSemanticTargetContext, BrowserError> {
-        let (target_id, session_id, policy, snapshot, candidate) = {
+        let (target_id, session_id, policy, snapshot, candidate, frame_tree, execution_context) = {
             let tab = self
                 .tabs
                 .get(&resolution.tab_id)
@@ -1587,12 +2135,22 @@ impl ManagedChromiumHost {
                 .get(&resolution.element_ref.reference)
                 .cloned()
                 .ok_or(BrowserError::StaleElementRef)?;
+            let frame_tree = tab
+                .latest_frame_tree
+                .clone()
+                .ok_or(BrowserError::StaleSnapshot)?;
+            let execution_context = tab
+                .latest_execution_context
+                .clone()
+                .ok_or(BrowserError::StaleSnapshot)?;
             (
                 tab.target_id.clone(),
                 tab.session_id.clone(),
                 policy,
                 snapshot,
                 candidate,
+                frame_tree,
+                execution_context,
             )
         };
         if policy.evidence_digest() != batch.policy_digest
@@ -1611,12 +2169,14 @@ impl ManagedChromiumHost {
         }
 
         let target_url = self.read_target_url(&target_id, guard)?;
-        let frame = self.read_root_frame_identity(&session_id, guard)?;
-        let document_generation = self.sync_frame_identity(&resolution.tab_id, &frame)?;
+        let (current_frame_tree, document_generation) =
+            self.read_scoped_frame_tree_snapshot(&resolution.tab_id, &session_id, guard)?;
+        let frame = current_frame_tree.root.clone();
         let current_origin_digest = policy
             .permitted_origin_digest(&target_url)
             .ok_or(BrowserError::NavigationRequestBlocked)?;
-        if target_url != frame.url
+        if validate_bound_frame_tree(&frame_tree, &current_frame_tree).is_err()
+            || target_url != frame.url
             || document_generation != resolution.document_generation
             || digest(target_url.as_bytes()) != resolution.url_digest
             || current_origin_digest != resolution.origin_digest
@@ -1626,7 +2186,17 @@ impl ManagedChromiumHost {
             return Err(BrowserError::StaleSnapshot);
         }
 
-        self.validate_fresh_ax_candidate(&session_id, &snapshot, &candidate, &frame, guard)?;
+        self.validate_fresh_ax_candidate(&session_id, &snapshot, &candidate, &frame_tree, guard)?;
+        self.tabs
+            .get(&resolution.tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .execution_context_registry
+            .validate_binding(
+                &execution_context,
+                &current_frame_tree,
+                &CdpExecutionWorld::Main,
+                document_generation,
+            )?;
         Ok(ChromiumSemanticTargetContext {
             action,
             target_id,
@@ -1635,6 +2205,8 @@ impl ManagedChromiumHost {
             candidate,
             target_url,
             frame,
+            frame_tree,
+            execution_context,
         })
     }
 
@@ -1651,12 +2223,7 @@ impl ManagedChromiumHost {
             Some(&context.session_id),
             guard,
         )?;
-        let frame_after_scroll = self.read_root_frame_identity(&context.session_id, guard)?;
-        let target_url_after_scroll = self.read_target_url(&context.target_id, guard)?;
-        if frame_after_scroll != context.frame || target_url_after_scroll != context.target_url {
-            self.sync_frame_identity(&resolution.tab_id, &frame_after_scroll)?;
-            return Err(BrowserError::StaleSnapshot);
-        }
+        self.revalidate_input_target_binding(&resolution.tab_id, context, guard)?;
 
         let described = self.command_guarded(
             CdpMethod::DomDescribeNode,
@@ -1708,15 +2275,10 @@ impl ManagedChromiumHost {
             &context.session_id,
             &context.snapshot,
             &context.candidate,
-            &context.frame,
+            &context.frame_tree,
             guard,
         )?;
-        let final_frame = self.read_root_frame_identity(&context.session_id, guard)?;
-        let final_url = self.read_target_url(&context.target_id, guard)?;
-        if final_frame != context.frame || final_url != context.target_url {
-            self.sync_frame_identity(&resolution.tab_id, &final_frame)?;
-            return Err(BrowserError::StaleSnapshot);
-        }
+        self.revalidate_input_target_binding(&resolution.tab_id, context, guard)?;
         Ok((x, y, geometry_digest, hit_test_digest))
     }
 
@@ -1725,16 +2287,16 @@ impl ManagedChromiumHost {
         session_id: &str,
         snapshot: &SemanticSnapshot,
         candidate: &AxLocatorCandidate,
-        root_frame: &CdpFrameIdentity,
+        frame_tree: &CdpFrameTreeSnapshot,
         guard: &OperationLeaseGuard<'_>,
     ) -> Result<(), BrowserError> {
-        validate_candidate_root_binding(candidate, root_frame)?;
-        let tree = self.read_root_ax_tree(session_id, root_frame, guard)?;
+        validate_candidate_root_binding(candidate, &frame_tree.root)?;
+        let tree = self.read_root_ax_tree(session_id, &frame_tree.root, guard)?;
         let normalized = normalize_ax_tree(
             &tree,
             &snapshot.id,
             snapshot.document_generation,
-            root_frame,
+            frame_tree,
         )
         .map_err(|_| self.poison())?;
         if normalized.prompt_risk != BrowserPromptRisk::None {
@@ -1770,13 +2332,37 @@ impl ManagedChromiumHost {
         effect: &Effect,
         now: DateTime<Utc>,
     ) -> Result<(Receipt, ChromiumClickDispatchEvidence), ChromiumActionFailure> {
+        self.execute_effect_bound_click_at(batch, resolution, effect, None, now)
+    }
+
+    fn execute_effect_bound_recipe_click_step(
+        &mut self,
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        effect: &Effect,
+        action_index: usize,
+        now: DateTime<Utc>,
+    ) -> Result<(Receipt, ChromiumClickDispatchEvidence), ChromiumActionFailure> {
+        self.execute_effect_bound_click_at(batch, resolution, effect, Some(action_index), now)
+    }
+
+    fn execute_effect_bound_click_at(
+        &mut self,
+        batch: &BrowserActionBatch,
+        resolution: &BrowserLocatorResolution,
+        effect: &Effect,
+        action_index: Option<usize>,
+        now: DateTime<Utc>,
+    ) -> Result<(Receipt, ChromiumClickDispatchEvidence), ChromiumActionFailure> {
         batch
             .validate_effect(effect, now)
             .map_err(ChromiumActionFailure::rejected)?;
         let guard = OperationLeaseGuard::new(&batch.lease, now);
-        let preflight = self
-            .preflight_semantic_click(batch, resolution, &guard)
-            .map_err(ChromiumActionFailure::rejected)?;
+        let preflight = match action_index {
+            Some(index) => self.preflight_recipe_semantic_click(batch, resolution, index, &guard),
+            None => self.preflight_semantic_click(batch, resolution, &guard),
+        }
+        .map_err(ChromiumActionFailure::rejected)?;
         let observed_at = guard
             .observed_at()
             .map_err(ChromiumActionFailure::rejected)?;
@@ -1790,6 +2376,8 @@ impl ManagedChromiumHost {
             .resolve_click_geometry(resolution, &preflight.binding, &guard)
             .map_err(ChromiumActionFailure::rejected)?;
 
+        self.revalidate_input_target_binding(&resolution.tab_id, &preflight.binding, &guard)
+            .map_err(ChromiumActionFailure::rejected)?;
         self.command_guarded(
             CdpMethod::InputDispatchMouseEvent,
             json!({
@@ -1804,6 +2392,8 @@ impl ManagedChromiumHost {
             &guard,
         )
         .map_err(ChromiumActionFailure::uncertain)?;
+        self.revalidate_input_target_binding(&resolution.tab_id, &preflight.binding, &guard)
+            .map_err(ChromiumActionFailure::uncertain)?;
         self.command_guarded(
             CdpMethod::InputDispatchMouseEvent,
             json!({
@@ -1844,10 +2434,13 @@ impl ManagedChromiumHost {
         let response_digest = evidence
             .evidence_digest()
             .map_err(ChromiumActionFailure::uncertain)?;
+        let step_suffix = action_index
+            .and_then(|index| batch.actions.get(index))
+            .map_or_else(String::new, |action| format!("-step-{}", action.sequence));
         let receipt = Receipt {
-            id: ReceiptId::from_stable(format!("chromium-click-receipt-{}", batch.id)),
+            id: ReceiptId::from_stable(format!("chromium-click-receipt-{}{step_suffix}", batch.id)),
             provider: effect.provider.clone(),
-            external_id: format!("chromium-click-batch-{}", batch.id),
+            external_id: format!("chromium-click-batch-{}{step_suffix}", batch.id),
             accepted_at: dispatched_at,
             request_digest: batch.plan_digest.clone(),
             response_digest,
@@ -1883,6 +2476,8 @@ impl ManagedChromiumHost {
             .resolve_click_geometry(resolution, &preflight.binding, &guard)
             .map_err(ChromiumActionFailure::rejected)?;
 
+        self.revalidate_input_target_binding(&resolution.tab_id, &preflight.binding, &guard)
+            .map_err(ChromiumActionFailure::rejected)?;
         self.command_sensitive_text_guarded(input.expose(), &preflight.binding.session_id, &guard)
             .map_err(ChromiumActionFailure::uncertain)?;
         let (value_readback_evidence_digest, dispatched_at) = self
@@ -1944,7 +2539,7 @@ impl ManagedChromiumHost {
             &mut readback_tree,
             &preflight.binding.snapshot,
             &preflight.binding.candidate,
-            &preflight.binding.frame,
+            &preflight.binding.frame_tree,
         )?;
         if !readback.focused
             || readback.byte_len != input.byte_len()
@@ -1952,13 +2547,8 @@ impl ManagedChromiumHost {
         {
             return Err(BrowserError::TextReadbackMismatch);
         }
-        let final_frame = self.read_root_frame_identity(&preflight.binding.session_id, guard)?;
-        let final_url = self.read_target_url(&preflight.binding.target_id, guard)?;
-        if final_frame != preflight.binding.frame
-            || digest(final_url.as_bytes()) != resolution.url_digest
-            || final_url != preflight.binding.frame.url
-        {
-            self.sync_frame_identity(&resolution.tab_id, &final_frame)?;
+        self.revalidate_input_target_binding(&resolution.tab_id, &preflight.binding, guard)?;
+        if digest(preflight.binding.target_url.as_bytes()) != resolution.url_digest {
             return Err(BrowserError::StaleSnapshot);
         }
         self.workspace
@@ -2006,6 +2596,8 @@ impl ManagedChromiumHost {
             .resolve_click_geometry(resolution, &preflight.binding, &guard)
             .map_err(ChromiumActionFailure::rejected)?;
 
+        self.revalidate_input_target_binding(&resolution.tab_id, &preflight.binding, &guard)
+            .map_err(ChromiumActionFailure::rejected)?;
         self.command_sensitive_file_guarded(
             handle.staged_path(),
             preflight.binding.candidate.backend_node_id,
@@ -2075,18 +2667,13 @@ impl ManagedChromiumHost {
             &mut readback_tree,
             &preflight.binding.snapshot,
             &preflight.binding.candidate,
-            &preflight.binding.frame,
+            &preflight.binding.frame_tree,
         )?;
         if readback.byte_len == 0 || readback.value_digest == preflight.initial_value_digest {
             return Err(BrowserError::FileSelectionReadbackMismatch);
         }
-        let final_frame = self.read_root_frame_identity(&preflight.binding.session_id, guard)?;
-        let final_url = self.read_target_url(&preflight.binding.target_id, guard)?;
-        if final_frame != preflight.binding.frame
-            || digest(final_url.as_bytes()) != resolution.url_digest
-            || final_url != preflight.binding.frame.url
-        {
-            self.sync_frame_identity(&resolution.tab_id, &final_frame)?;
+        self.revalidate_input_target_binding(&resolution.tab_id, &preflight.binding, guard)?;
+        if digest(preflight.binding.target_url.as_bytes()) != resolution.url_digest {
             return Err(BrowserError::StaleSnapshot);
         }
         handle.validate_for(grant, &self.workspace)?;
@@ -2535,6 +3122,31 @@ impl ManagedChromiumHost {
                     envelope.params.as_ref(),
                 )?;
             }
+            "Page.frameAttached" | "Page.frameDetached" | "Page.frameNavigated" => {
+                self.record_frame_lifecycle_revision(
+                    envelope.session_id.as_deref(),
+                    &method,
+                    envelope.params.as_ref(),
+                )?;
+            }
+            "Runtime.executionContextCreated" => {
+                self.record_execution_context_created(
+                    envelope.session_id.as_deref(),
+                    envelope.params.as_ref(),
+                )?;
+            }
+            "Runtime.executionContextDestroyed" => {
+                self.record_execution_context_destroyed(
+                    envelope.session_id.as_deref(),
+                    envelope.params.as_ref(),
+                )?;
+            }
+            "Runtime.executionContextsCleared" => {
+                self.record_execution_contexts_cleared(
+                    envelope.session_id.as_deref(),
+                    envelope.params.as_ref(),
+                )?;
+            }
             "Page.javascriptDialogOpening" | "Page.fileChooserOpened" => {
                 if let Some(tab_id) = self.tab_for_session(envelope.session_id.as_deref()) {
                     let tab = self
@@ -2678,6 +3290,94 @@ impl ManagedChromiumHost {
         tab.lifecycle_events
             .insert((name.to_owned(), frame_id.to_owned(), loader_id.to_owned()));
         Ok(())
+    }
+
+    fn record_frame_lifecycle_revision(
+        &mut self,
+        session_id: Option<&str>,
+        method: &str,
+        params: Option<&Value>,
+    ) -> Result<(), BrowserError> {
+        let tab_id = self
+            .tab_for_session(session_id)
+            .ok_or_else(|| self.poison())?;
+        let frame_id =
+            parse_frame_lifecycle_event_frame_id(method, params).map_err(|_| self.poison())?;
+        let at_capacity = {
+            let revisions = &self
+                .tabs
+                .get(&tab_id)
+                .ok_or(BrowserError::TabNotFound)?
+                .frame_lifecycle_revisions;
+            !revisions.contains_key(&frame_id) && revisions.len() >= MAX_FRAME_TREE_NODES
+        };
+        if at_capacity {
+            return Err(self.poison());
+        }
+        let tab = self
+            .tabs
+            .get_mut(&tab_id)
+            .ok_or(BrowserError::TabNotFound)?;
+        let revision = tab.frame_lifecycle_revisions.entry(frame_id).or_default();
+        *revision = revision
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        Ok(())
+    }
+
+    fn record_execution_context_created(
+        &mut self,
+        session_id: Option<&str>,
+        params: Option<&Value>,
+    ) -> Result<(), BrowserError> {
+        let tab_id = self
+            .tab_for_session(session_id)
+            .ok_or_else(|| self.poison())?;
+        let identity = parse_execution_context_created(params).map_err(|_| self.poison())?;
+        let result = self
+            .tabs
+            .get_mut(&tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .execution_context_registry
+            .context_created(identity);
+        result.map_err(|_| self.poison())
+    }
+
+    fn record_execution_context_destroyed(
+        &mut self,
+        session_id: Option<&str>,
+        params: Option<&Value>,
+    ) -> Result<(), BrowserError> {
+        let tab_id = self
+            .tab_for_session(session_id)
+            .ok_or_else(|| self.poison())?;
+        let (execution_context_id, unique_id) =
+            parse_execution_context_destroyed(params).map_err(|_| self.poison())?;
+        let result = self
+            .tabs
+            .get_mut(&tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .execution_context_registry
+            .context_destroyed(execution_context_id, unique_id.as_deref());
+        result.map_err(|_| self.poison())
+    }
+
+    fn record_execution_contexts_cleared(
+        &mut self,
+        session_id: Option<&str>,
+        params: Option<&Value>,
+    ) -> Result<(), BrowserError> {
+        let tab_id = self
+            .tab_for_session(session_id)
+            .ok_or_else(|| self.poison())?;
+        validate_execution_contexts_cleared_params(params).map_err(|_| self.poison())?;
+        let result = self
+            .tabs
+            .get_mut(&tab_id)
+            .ok_or(BrowserError::TabNotFound)?
+            .execution_context_registry
+            .contexts_cleared();
+        result.map_err(|_| self.poison())
     }
 
     fn tab_for_session(&self, session_id: Option<&str>) -> Option<BrowserTabId> {
@@ -2887,6 +3587,119 @@ impl EffectExecutor for ManagedChromiumClickExecutor<'_> {
             .host
             .execute_effect_bound_click(&self.batch, &self.resolution, effect, self.now)
         {
+            Ok((receipt, evidence)) => {
+                self.last_evidence = Some(evidence);
+                Ok(receipt)
+            }
+            Err(failure) if failure.external_write_may_have_occurred => {
+                Err(ProviderFailure::Uncertain(failure.error.code().into()))
+            }
+            Err(failure) => Err(ProviderFailure::Rejected(failure.error.code().into())),
+        }
+    }
+}
+
+/// Single-use bridge for exactly the next unacknowledged click in a durable
+/// signed-Recipe cursor. Cursor, Recipe authority, full batch, selected action,
+/// and locator resolution are revalidated before Chromium receives input.
+pub struct ManagedChromiumRecipeClickStepExecutor<'a> {
+    host: &'a mut ManagedChromiumHost,
+    context: BrowserRecipeResumeContext<'a>,
+    cursor: &'a BrowserRecipeResumeCursor,
+    batch: BrowserActionBatch,
+    resolution: BrowserLocatorResolution,
+    recipe_authorization: BrowserRecipeExecutionAuthorization<'a>,
+    action_index: usize,
+    now: DateTime<Utc>,
+    consumed: bool,
+    last_evidence: Option<ChromiumClickDispatchEvidence>,
+}
+
+impl<'a> ManagedChromiumRecipeClickStepExecutor<'a> {
+    pub fn new(
+        host: &'a mut ManagedChromiumHost,
+        context: BrowserRecipeResumeContext<'a>,
+        cursor: &'a BrowserRecipeResumeCursor,
+        resolution: BrowserLocatorResolution,
+        now: DateTime<Utc>,
+    ) -> Result<Self, BrowserError> {
+        cursor.validate_for(context, now)?;
+        let action_index = cursor.next_action_index();
+        let action = context
+            .batch
+            .actions
+            .get(action_index)
+            .ok_or(BrowserError::RecipeScopeMismatch)?;
+        let recipe_authorization = BrowserRecipeExecutionAuthorization::new(
+            context.prepared_plan.clone(),
+            context.registry,
+            context.trust,
+            context.batch,
+            now,
+        )?;
+        let selected =
+            host.validate_recipe_click_binding(context.batch, &resolution, action_index, now)?;
+        if &selected != action {
+            return Err(BrowserError::RecipeScopeMismatch);
+        }
+        recipe_authorization.validate_resolution(action, &resolution)?;
+        Ok(Self {
+            host,
+            context,
+            cursor,
+            batch: context.batch.clone(),
+            resolution,
+            recipe_authorization,
+            action_index,
+            now,
+            consumed: false,
+            last_evidence: None,
+        })
+    }
+
+    pub fn last_evidence(&self) -> Option<&ChromiumClickDispatchEvidence> {
+        self.last_evidence.as_ref()
+    }
+}
+
+impl fmt::Debug for ManagedChromiumRecipeClickStepExecutor<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedChromiumRecipeClickStepExecutor")
+            .field("batch_id", &self.batch.id)
+            .field("workspace_id", &self.batch.workspace_id)
+            .field("action_index", &self.action_index)
+            .field("cursor_revision", &self.cursor.revision())
+            .field("consumed", &self.consumed)
+            .field("has_evidence", &self.last_evidence.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl EffectExecutor for ManagedChromiumRecipeClickStepExecutor<'_> {
+    fn execute(&mut self, effect: &Effect) -> Result<Receipt, ProviderFailure> {
+        if self.consumed {
+            return Err(ProviderFailure::Uncertain(
+                BrowserError::RealActionRejected.code().into(),
+            ));
+        }
+        self.consumed = true;
+        if let Err(error) = self.cursor.validate_for(self.context, self.now) {
+            return Err(ProviderFailure::Rejected(error.code().into()));
+        }
+        if let Err(error) = self
+            .recipe_authorization
+            .validate_effect(&self.batch, effect, self.now)
+        {
+            return Err(ProviderFailure::Rejected(error.code().into()));
+        }
+        match self.host.execute_effect_bound_recipe_click_step(
+            &self.batch,
+            &self.resolution,
+            effect,
+            self.action_index,
+            self.now,
+        ) {
             Ok((receipt, evidence)) => {
                 self.last_evidence = Some(evidence);
                 Ok(receipt)
@@ -3168,8 +3981,25 @@ impl BrowserControlHost for ManagedChromiumHost {
         for tab in self.tabs.values_mut() {
             tab.latest_snapshot = None;
             tab.locator_map.clear();
+            tab.latest_frame_tree = None;
+            tab.latest_execution_context = None;
         }
         Ok(())
+    }
+}
+
+impl BrowserHandoffHost for ManagedChromiumHost {
+    fn observe_handoff_snapshot(
+        &mut self,
+        profile: &BrowserProfile,
+        workspace: &BrowserWorkspace,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserHandoffSnapshot, BrowserError> {
+        ManagedChromiumHost::observe_handoff_snapshot(self, profile, workspace, now)
+    }
+
+    fn sync_workspace(&mut self, workspace: &BrowserWorkspace) -> Result<(), BrowserError> {
+        <Self as BrowserControlHost>::sync_workspace(self, workspace)
     }
 }
 
@@ -3231,6 +4061,7 @@ enum CdpMethod {
     PageGetLayoutMetrics,
     PageSetLifecycleEventsEnabled,
     PageNavigate,
+    RuntimeEnable,
     FetchEnable,
     FetchContinueRequest,
     FetchFailRequest,
@@ -3260,6 +4091,7 @@ impl CdpMethod {
             Self::PageGetLayoutMetrics => "Page.getLayoutMetrics",
             Self::PageSetLifecycleEventsEnabled => "Page.setLifecycleEventsEnabled",
             Self::PageNavigate => "Page.navigate",
+            Self::RuntimeEnable => "Runtime.enable",
             Self::FetchEnable => "Fetch.enable",
             Self::FetchContinueRequest => "Fetch.continueRequest",
             Self::FetchFailRequest => "Fetch.failRequest",
@@ -3396,6 +4228,135 @@ impl AxLocatorAccumulator {
     }
 }
 
+fn bounded_optional_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    maximum: usize,
+) -> Result<Option<String>, BrowserError> {
+    match object.get(field) {
+        None => Ok(None),
+        Some(Value::String(value)) if value.len() <= maximum => Ok(Some(value.clone())),
+        _ => Err(BrowserError::ProtocolPoisoned),
+    }
+}
+
+fn parse_execution_context_created(
+    params: Option<&Value>,
+) -> Result<CdpExecutionContextIdentity, BrowserError> {
+    let context = params
+        .and_then(Value::as_object)
+        .and_then(|params| params.get("context"))
+        .and_then(Value::as_object)
+        .ok_or(BrowserError::ProtocolPoisoned)?;
+    let execution_context_id = context
+        .get("id")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0 && i64::try_from(*value).is_ok())
+        .ok_or(BrowserError::ProtocolPoisoned)?;
+    let unique_id = context
+        .get("uniqueId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 4_096)
+        .map(str::to_owned)
+        .ok_or(BrowserError::ProtocolPoisoned)?;
+    let origin = context
+        .get("origin")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() <= 32 * 1_024)
+        .map(str::to_owned)
+        .ok_or(BrowserError::ProtocolPoisoned)?;
+    let name = context
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() <= 4_096)
+        .ok_or(BrowserError::ProtocolPoisoned)?;
+    let world_key = match context.get("auxData") {
+        None => None,
+        Some(Value::Object(aux_data)) => {
+            let frame_id = bounded_optional_string(aux_data, "frameId", 4_096)?;
+            let context_type = bounded_optional_string(aux_data, "type", 128)?;
+            let is_default = match aux_data.get("isDefault") {
+                None => None,
+                Some(Value::Bool(value)) => Some(*value),
+                _ => return Err(BrowserError::ProtocolPoisoned),
+            };
+            match (frame_id, context_type.as_deref(), is_default, name) {
+                (Some(frame_id), Some("default"), Some(true), "") => Some(CdpExecutionWorldKey {
+                    frame_id,
+                    world: CdpExecutionWorld::Main,
+                }),
+                (Some(frame_id), Some("isolated"), Some(false), world_name)
+                    if !world_name.is_empty() =>
+                {
+                    Some(CdpExecutionWorldKey {
+                        frame_id,
+                        world: CdpExecutionWorld::Isolated(world_name.to_owned()),
+                    })
+                }
+                _ => None,
+            }
+        }
+        Some(_) => return Err(BrowserError::ProtocolPoisoned),
+    };
+    Ok(CdpExecutionContextIdentity {
+        execution_context_id,
+        unique_id,
+        origin,
+        world_key,
+    })
+}
+
+fn parse_execution_context_destroyed(
+    params: Option<&Value>,
+) -> Result<(u64, Option<String>), BrowserError> {
+    let params = params
+        .and_then(Value::as_object)
+        .ok_or(BrowserError::ProtocolPoisoned)?;
+    let execution_context_id = params
+        .get("executionContextId")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0 && i64::try_from(*value).is_ok())
+        .ok_or(BrowserError::ProtocolPoisoned)?;
+    let unique_id = match params.get("executionContextUniqueId") {
+        None => None,
+        Some(Value::String(value)) if !value.is_empty() && value.len() <= 4_096 => {
+            Some(value.clone())
+        }
+        _ => return Err(BrowserError::ProtocolPoisoned),
+    };
+    Ok((execution_context_id, unique_id))
+}
+
+fn validate_execution_contexts_cleared_params(params: Option<&Value>) -> Result<(), BrowserError> {
+    match params {
+        None => Ok(()),
+        Some(Value::Object(params)) if params.is_empty() => Ok(()),
+        _ => Err(BrowserError::ProtocolPoisoned),
+    }
+}
+
+fn parse_frame_lifecycle_event_frame_id(
+    method: &str,
+    params: Option<&Value>,
+) -> Result<String, BrowserError> {
+    let params = params
+        .and_then(Value::as_object)
+        .ok_or(BrowserError::ProtocolPoisoned)?;
+    let frame_id = match method {
+        "Page.frameAttached" | "Page.frameDetached" => params.get("frameId"),
+        "Page.frameNavigated" => params
+            .get("frame")
+            .and_then(Value::as_object)
+            .and_then(|frame| frame.get("id")),
+        _ => return Err(BrowserError::ProtocolPoisoned),
+    };
+    frame_id
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 4_096)
+        .map(str::to_owned)
+        .ok_or(BrowserError::ProtocolPoisoned)
+}
+
 fn parse_frame_identity(
     frame: &serde_json::Map<String, Value>,
 ) -> Result<CdpFrameIdentity, BrowserError> {
@@ -3405,6 +4366,13 @@ fn parse_frame_identity(
         .filter(|value| !value.is_empty() && value.len() <= 4_096)
         .map(str::to_owned)
         .ok_or(BrowserError::ProtocolPoisoned)?;
+    let parent_frame_id = match frame.get("parentId") {
+        Some(Value::String(value)) if !value.is_empty() && value.len() <= 4_096 => {
+            Some(value.clone())
+        }
+        None => None,
+        _ => return Err(BrowserError::ProtocolPoisoned),
+    };
     let loader_id = frame
         .get("loaderId")
         .and_then(Value::as_str)
@@ -3417,10 +4385,25 @@ fn parse_frame_identity(
         .filter(|value| !value.is_empty() && value.len() <= 32 * 1_024)
         .map(str::to_owned)
         .ok_or(BrowserError::ProtocolPoisoned)?;
+    let security_origin = frame
+        .get("securityOrigin")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 32 * 1_024)
+        .map(str::to_owned)
+        .ok_or(BrowserError::ProtocolPoisoned)?;
+    let unreachable_url = match frame.get("unreachableUrl") {
+        None => None,
+        Some(Value::String(value)) if value.is_empty() => None,
+        Some(Value::String(value)) if value.len() <= 32 * 1_024 => Some(value.clone()),
+        _ => return Err(BrowserError::ProtocolPoisoned),
+    };
     Ok(CdpFrameIdentity {
         frame_id,
+        parent_frame_id,
         loader_id,
         url,
+        security_origin,
+        unreachable_url,
     })
 }
 
@@ -3442,14 +4425,7 @@ fn parse_frame_tree_snapshot(result: &Value) -> Result<CdpFrameTreeSnapshot, Bro
             .and_then(Value::as_object)
             .ok_or(BrowserError::ProtocolPoisoned)?;
         let identity = parse_frame_identity(frame)?;
-        let observed_parent_id = match frame.get("parentId") {
-            Some(Value::String(value)) if !value.is_empty() && value.len() <= 4_096 => {
-                Some(value.as_str())
-            }
-            None => None,
-            _ => return Err(BrowserError::ProtocolPoisoned),
-        };
-        if observed_parent_id != expected_parent_id.as_deref() {
+        if identity.parent_frame_id.as_deref() != expected_parent_id.as_deref() {
             return Err(BrowserError::ProtocolPoisoned);
         }
         if expected_parent_id.is_none() && root.replace(identity.clone()).is_some() {
@@ -3482,20 +4458,128 @@ fn parse_frame_tree_snapshot(result: &Value) -> Result<CdpFrameTreeSnapshot, Bro
     }
 
     let root = root.ok_or(BrowserError::ProtocolPoisoned)?;
-    Ok(CdpFrameTreeSnapshot { root, frames })
+    Ok(CdpFrameTreeSnapshot {
+        root,
+        frames,
+        lifecycle_revisions: BTreeMap::new(),
+    })
 }
 
-fn parse_root_frame_identity(result: &Value) -> Result<CdpFrameIdentity, BrowserError> {
-    let snapshot = parse_frame_tree_snapshot(result)?;
+fn is_inherited_blank_frame_url(url: &str) -> bool {
+    matches!(url, "about:blank" | "about:srcdoc")
+}
+
+fn is_opaque_security_origin(origin: &str) -> bool {
+    matches!(origin, "://" | "null")
+}
+
+fn permitted_ancestor_origin_digest(
+    snapshot: &CdpFrameTreeSnapshot,
+    frame: &CdpFrameIdentity,
+    policy: &BrowserNavigationPolicy,
+) -> Option<String> {
+    let mut parent_id = frame.parent_frame_id.as_deref()?;
+    for _ in 0..snapshot.frames.len() {
+        let parent = snapshot.frames.get(parent_id)?;
+        if let Some(origin_digest) = policy.permitted_origin_digest(&parent.url) {
+            return Some(origin_digest);
+        }
+        if !is_inherited_blank_frame_url(&parent.url) {
+            return None;
+        }
+        parent_id = parent.parent_frame_id.as_deref()?;
+    }
+    None
+}
+
+fn validate_frame_tree_navigation_scope(
+    snapshot: &CdpFrameTreeSnapshot,
+    policy: &BrowserNavigationPolicy,
+) -> Result<(), BrowserError> {
     if snapshot.frames.get(&snapshot.root.frame_id) != Some(&snapshot.root) {
         return Err(BrowserError::ProtocolPoisoned);
     }
-    Ok(snapshot.root)
+    for frame in snapshot.frames.values() {
+        if frame.unreachable_url.is_some() {
+            return Err(BrowserError::NavigationFailed);
+        }
+        let url_origin_digest = match policy.permitted_origin_digest(&frame.url) {
+            Some(origin_digest) => origin_digest,
+            None if frame.parent_frame_id.is_some() && is_inherited_blank_frame_url(&frame.url) => {
+                permitted_ancestor_origin_digest(snapshot, frame, policy)
+                    .ok_or(BrowserError::NavigationRequestBlocked)?
+            }
+            None => return Err(BrowserError::NavigationRequestBlocked),
+        };
+        match policy.permitted_origin_digest(&frame.security_origin) {
+            Some(security_origin_digest) if security_origin_digest == url_origin_digest => {}
+            None if frame.parent_frame_id.is_some()
+                && is_opaque_security_origin(&frame.security_origin) => {}
+            _ => return Err(BrowserError::NavigationRequestBlocked),
+        }
+    }
+    Ok(())
+}
+
+fn validate_bound_frame_tree(
+    bound: &CdpFrameTreeSnapshot,
+    current: &CdpFrameTreeSnapshot,
+) -> Result<(), BrowserError> {
+    if bound.frames.get(&bound.root.frame_id) != Some(&bound.root)
+        || current.frames.get(&current.root.frame_id) != Some(&current.root)
+    {
+        return Err(BrowserError::ProtocolPoisoned);
+    }
+    if bound.frames.iter().any(|(frame_id, identity)| {
+        current.frames.get(frame_id) != Some(identity)
+            || bound.lifecycle_revisions.get(frame_id) != current.lifecycle_revisions.get(frame_id)
+    }) {
+        return Err(BrowserError::StaleSnapshot);
+    }
+    Ok(())
+}
+
+fn frame_tree_generation_changed(
+    prior: &CdpFrameTreeSnapshot,
+    current: &CdpFrameTreeSnapshot,
+) -> Result<bool, BrowserError> {
+    match validate_bound_frame_tree(prior, current) {
+        Ok(()) => {}
+        Err(BrowserError::StaleSnapshot) => return Ok(true),
+        Err(error) => return Err(error),
+    }
+    Ok(prior
+        .lifecycle_revisions
+        .iter()
+        .any(|(frame_id, revision)| current.lifecycle_revisions.get(frame_id) != Some(revision)))
+}
+
+fn next_frame_document_generation(
+    document_generation: u64,
+    prior: Option<&CdpFrameTreeSnapshot>,
+    current: &CdpFrameTreeSnapshot,
+) -> Result<u64, BrowserError> {
+    match prior {
+        Some(prior) if frame_tree_generation_changed(prior, current)? => document_generation
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow),
+        _ => Ok(document_generation),
+    }
+}
+
+fn validate_exact_navigation_target_origin(
+    target: &BrowserNavigationTarget,
+    final_origin_digest: &str,
+) -> Result<(), BrowserError> {
+    if target.origin_digest() != final_origin_digest {
+        return Err(BrowserError::NavigationRequestBlocked);
+    }
+    Ok(())
 }
 
 fn partition_ax_nodes(
     nodes: &[AxNodeRecord],
-    expected_root_frame_id: &str,
+    frame_tree: &CdpFrameTreeSnapshot,
 ) -> Result<Vec<AxFramePartition>, BrowserError> {
     let mut nodes_by_id = BTreeMap::new();
     let mut frame_anchors = BTreeMap::new();
@@ -3515,7 +4599,7 @@ fn partition_ax_nodes(
     }
 
     let root_index = frame_anchors
-        .get(expected_root_frame_id)
+        .get(&frame_tree.root.frame_id)
         .copied()
         .ok_or(BrowserError::StaleSnapshot)?;
     let mut claimed_parents = BTreeMap::<String, Vec<usize>>::new();
@@ -3555,10 +4639,12 @@ fn partition_ax_nodes(
                 break AxFramePartition::Unproven;
             };
             if let Some(frame_id) = &node.frame.frame_id {
-                break if frame_id == expected_root_frame_id {
+                break if frame_id == &frame_tree.root.frame_id {
                     AxFramePartition::Root
-                } else {
+                } else if frame_tree.frames.contains_key(frame_id) {
                     AxFramePartition::Other
+                } else {
+                    AxFramePartition::Unproven
                 };
             }
             let Some(parent_id) = &node.frame.parent_id else {
@@ -3716,7 +4802,7 @@ fn normalize_ax_tree(
     tree: &Value,
     snapshot_id: &BrowserSnapshotId,
     document_generation: u64,
-    root_frame: &CdpFrameIdentity,
+    frame_tree: &CdpFrameTreeSnapshot,
 ) -> Result<NormalizedAxTree, BrowserError> {
     let nodes = tree
         .get("nodes")
@@ -3726,7 +4812,7 @@ fn normalize_ax_tree(
         return Err(BrowserError::ProtocolPoisoned);
     }
     let records = parse_ax_node_records(nodes)?;
-    let partitions = partition_ax_nodes(&records, &root_frame.frame_id)?;
+    let partitions = partition_ax_nodes(&records, frame_tree)?;
     let mut canonical_nodes = Vec::with_capacity(nodes.len());
     let mut locator_accumulator = AxLocatorAccumulator::default();
     let mut prompt_signals = 0_u32;
@@ -3763,7 +4849,7 @@ fn normalize_ax_tree(
             &name,
             backend_node_id,
             partition,
-            root_frame,
+            &frame_tree.root,
         )?;
     }
     let AxLocatorAccumulator {
@@ -4116,9 +5202,9 @@ fn inspect_semantic_target_ax_value(
     tree: &mut Value,
     snapshot: &SemanticSnapshot,
     candidate: &AxLocatorCandidate,
-    root_frame: &CdpFrameIdentity,
+    frame_tree: &CdpFrameTreeSnapshot,
 ) -> Result<AxTargetValueState, BrowserError> {
-    validate_candidate_root_binding(candidate, root_frame)?;
+    validate_candidate_root_binding(candidate, &frame_tree.root)?;
     let nodes = tree
         .get_mut("nodes")
         .and_then(Value::as_array_mut)
@@ -4127,7 +5213,7 @@ fn inspect_semantic_target_ax_value(
         return Err(BrowserError::ProtocolPoisoned);
     }
     let records = parse_ax_node_records(nodes)?;
-    let partitions = partition_ax_nodes(&records, &root_frame.frame_id)?;
+    let partitions = partition_ax_nodes(&records, frame_tree)?;
     let matching_indices = records
         .iter()
         .enumerate()
@@ -4162,7 +5248,7 @@ fn inspect_semantic_target_ax_value(
     };
 
     let normalized =
-        normalize_ax_tree(tree, &snapshot.id, snapshot.document_generation, root_frame)?;
+        normalize_ax_tree(tree, &snapshot.id, snapshot.document_generation, frame_tree)?;
     if normalized.prompt_risk != BrowserPromptRisk::None {
         return Err(BrowserError::PromptInjectionDetected);
     }
@@ -4705,15 +5791,24 @@ fn terminate_group_best_effort(child: &mut GroupChild) {
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
-    use std::io::{BufRead as _, BufReader, Cursor, Write as _};
+    use std::io::Cursor;
+    #[cfg(target_os = "macos")]
+    use std::io::{BufRead as _, BufReader, Write as _};
+    #[cfg(target_os = "macos")]
     use std::net::{SocketAddr, TcpListener};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "macos")]
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(target_os = "macos")]
     use std::sync::{Arc, Mutex};
+    #[cfg(target_os = "macos")]
     use std::thread;
 
-    use chrono::{Duration as ChronoDuration, TimeZone};
+    #[cfg(target_os = "macos")]
+    use chrono::Duration as ChronoDuration;
+    use chrono::TimeZone;
+    #[cfg(target_os = "macos")]
     use hartevo_domain_kernel::{
         AccountId, ActorId, Approval, ApprovalDecision, ApprovalId, BrowserActionBatchId,
         BrowserControlLeaseId, BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId,
@@ -4724,6 +5819,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    #[cfg(target_os = "macos")]
     use crate::{
         BrowserFileGrantState, BrowserIdentity, FileBroker, FileSafetyScanner, FileScanDecision,
         FileScanReport, FileScanRequest,
@@ -4736,8 +5832,20 @@ mod tests {
     fn root_frame_identity() -> CdpFrameIdentity {
         CdpFrameIdentity {
             frame_id: "frame-root".into(),
+            parent_frame_id: None,
             loader_id: "loader-root".into(),
             url: "https://example.test/root".into(),
+            security_origin: "https://example.test".into(),
+            unreachable_url: None,
+        }
+    }
+
+    fn root_frame_tree_snapshot() -> CdpFrameTreeSnapshot {
+        let root = root_frame_identity();
+        CdpFrameTreeSnapshot {
+            frames: BTreeMap::from([(root.frame_id.clone(), root.clone())]),
+            root,
+            lifecycle_revisions: BTreeMap::new(),
         }
     }
 
@@ -4745,28 +5853,32 @@ mod tests {
         root_frame_id: &'a str,
         root_loader_id: &'a str,
         root_url: &'a str,
+        root_security_origin: &'a str,
         child_frame_id: &'a str,
         child_loader_id: &'a str,
         child_url: &'a str,
+        child_security_origin: &'a str,
         child_parent_frame_id: &'a str,
         expected_partitions: [AxFramePartition; 4],
     }
 
     fn ax_readback_tree_with_duplicate_child_backend(
         contract: &AxFrameFixtureContract<'_>,
-    ) -> Value {
+    ) -> (Value, CdpFrameTreeSnapshot) {
         let frame_tree = json!({
             "frameTree": {
                 "frame": {
                     "id": contract.root_frame_id,
                     "loaderId": contract.root_loader_id,
-                    "url": contract.root_url
+                    "url": contract.root_url,
+                    "securityOrigin": contract.root_security_origin
                 },
                 "childFrames": [{
                     "frame": {
                         "id": contract.child_frame_id,
                         "loaderId": contract.child_loader_id,
                         "url": contract.child_url,
+                        "securityOrigin": contract.child_security_origin,
                         "parentId": contract.child_parent_frame_id
                     }
                 }]
@@ -4825,12 +5937,97 @@ mod tests {
         let records = parse_ax_node_records(tree["nodes"].as_array().expect("AX fixture nodes"))
             .expect("parse AX frame fixture");
         assert_eq!(
-            partition_ax_nodes(&records, contract.root_frame_id).expect("partition AX fixture"),
+            partition_ax_nodes(&records, &parsed).expect("partition AX fixture"),
             contract.expected_partitions
         );
-        tree
+        (tree, parsed)
     }
 
+    fn lifecycle_frame_tree_snapshot() -> CdpFrameTreeSnapshot {
+        let (_, mut frame_tree) =
+            ax_readback_tree_with_duplicate_child_backend(&AxFrameFixtureContract {
+                root_frame_id: "frame-root",
+                root_loader_id: "loader-root",
+                root_url: "https://example.test/root",
+                root_security_origin: "https://example.test",
+                child_frame_id: "frame-oopif",
+                child_loader_id: "loader-oopif",
+                child_url: "https://other.test/child",
+                child_security_origin: "https://other.test",
+                child_parent_frame_id: "frame-root",
+                expected_partitions: [
+                    AxFramePartition::Root,
+                    AxFramePartition::Root,
+                    AxFramePartition::Other,
+                    AxFramePartition::Other,
+                ],
+            });
+        frame_tree.lifecycle_revisions =
+            BTreeMap::from([("frame-root".into(), 1), ("frame-oopif".into(), 1)]);
+        frame_tree
+    }
+
+    fn execution_context_created_event(
+        execution_context_id: u64,
+        unique_id: &str,
+        origin: &str,
+        name: &str,
+        frame_id: &str,
+        context_type: &str,
+        is_default: bool,
+    ) -> Value {
+        json!({
+            "context": {
+                "id": execution_context_id,
+                "origin": origin,
+                "name": name,
+                "uniqueId": unique_id,
+                "auxData": {
+                    "frameId": frame_id,
+                    "type": context_type,
+                    "isDefault": is_default
+                }
+            }
+        })
+    }
+
+    fn root_main_execution_context() -> CdpExecutionContextIdentity {
+        parse_execution_context_created(Some(&execution_context_created_event(
+            41,
+            "context-root-main-v1",
+            "https://example.test",
+            "",
+            "frame-root",
+            "default",
+            true,
+        )))
+        .expect("exact root main execution context")
+    }
+
+    fn root_runtime_registry() -> CdpExecutionContextRegistry {
+        let mut registry = CdpExecutionContextRegistry::default();
+        registry
+            .context_created(root_main_execution_context())
+            .expect("register root main execution context");
+        registry
+    }
+
+    fn contract_dispatch_after_runtime_fence(
+        registry: &CdpExecutionContextRegistry,
+        binding: &CdpExecutionContextBinding,
+        frame_tree: &CdpFrameTreeSnapshot,
+        intended_world: &CdpExecutionWorld,
+        document_generation: u64,
+        dispatch_count: &mut u32,
+    ) -> Result<(), BrowserError> {
+        registry.validate_binding(binding, frame_tree, intended_world, document_generation)?;
+        *dispatch_count = dispatch_count
+            .checked_add(1)
+            .ok_or(BrowserError::CounterOverflow)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
     struct TestHttpServer {
         address: SocketAddr,
         request_count: Arc<AtomicUsize>,
@@ -4839,8 +6036,10 @@ mod tests {
         thread: Option<JoinHandle<()>>,
     }
 
+    #[cfg(target_os = "macos")]
     struct TestCleanScanner;
 
+    #[cfg(target_os = "macos")]
     impl FileSafetyScanner for TestCleanScanner {
         fn scan(&mut self, request: &FileScanRequest<'_>) -> Result<FileScanReport, BrowserError> {
             Ok(FileScanReport {
@@ -4858,6 +6057,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl TestHttpServer {
         fn start(
             handler: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static,
@@ -4944,6 +6144,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl Drop for TestHttpServer {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
@@ -4953,6 +6154,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn http_response(status: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
         let mut response = format!(
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -5025,7 +6227,7 @@ mod tests {
             &tree,
             &BrowserSnapshotId::from("snapshot-ax-normalized"),
             1,
-            &root_frame_identity(),
+            &root_frame_tree_snapshot(),
         )
         .expect("normalize AX tree");
         assert_eq!(
@@ -5078,7 +6280,7 @@ mod tests {
             &tree,
             &BrowserSnapshotId::from("snapshot-duplicate-ax"),
             1,
-            &root_frame_identity(),
+            &root_frame_tree_snapshot(),
         )
         .expect("normalize duplicate AX tree");
 
@@ -5098,7 +6300,8 @@ mod tests {
                 "frame": {
                     "id": "frame-root",
                     "loaderId": "loader-root",
-                    "url": "https://example.test/root"
+                    "url": "https://example.test/root",
+                    "securityOrigin": "https://example.test"
                 },
                 "childFrames": [
                     {
@@ -5106,7 +6309,8 @@ mod tests {
                             "id": "frame-same-origin",
                             "parentId": "frame-root",
                             "loaderId": "loader-same-origin",
-                            "url": "https://example.test/child"
+                            "url": "https://example.test/child",
+                            "securityOrigin": "https://example.test"
                         }
                     },
                     {
@@ -5114,7 +6318,8 @@ mod tests {
                             "id": "frame-oopif",
                             "parentId": "frame-root",
                             "loaderId": "loader-oopif",
-                            "url": "https://other.test/child"
+                            "url": "https://other.test/child",
+                            "securityOrigin": "https://other.test"
                         }
                     }
                 ]
@@ -5130,19 +6335,28 @@ mod tests {
                 "frame": {
                     "id": "frame-root",
                     "loaderId": "loader-root",
-                    "url": "https://example.test/root"
+                    "url": "https://example.test/root",
+                    "securityOrigin": "https://example.test"
                 }
             }
         });
         assert_eq!(
-            parse_root_frame_identity(&tree).expect("root with dynamic children"),
-            parse_root_frame_identity(&root_only).expect("root without children")
+            parse_frame_tree_snapshot(&tree)
+                .expect("root with dynamic children")
+                .root,
+            parse_frame_tree_snapshot(&root_only)
+                .expect("root without children")
+                .root
         );
         let mut loader_drift = root_only;
         loader_drift["frameTree"]["frame"]["loaderId"] = json!("loader-drifted");
         assert_ne!(
-            parse_root_frame_identity(&tree).expect("root before loader drift"),
-            parse_root_frame_identity(&loader_drift).expect("root after loader drift")
+            parse_frame_tree_snapshot(&tree)
+                .expect("root before loader drift")
+                .root,
+            parse_frame_tree_snapshot(&loader_drift)
+                .expect("root after loader drift")
+                .root
         );
 
         let mut wrong_parent = tree.clone();
@@ -5161,6 +6375,574 @@ mod tests {
                 .expect_err("duplicate frame id")
                 .code(),
             "BROWSER_PROTOCOL_POISONED"
+        );
+    }
+
+    #[test]
+    fn frame_tree_scope_rejects_cross_origin_target_drift_and_failed_frames() {
+        let (_, frame_tree) =
+            ax_readback_tree_with_duplicate_child_backend(&AxFrameFixtureContract {
+                root_frame_id: "frame-root",
+                root_loader_id: "loader-root",
+                root_url: "https://example.test/root",
+                root_security_origin: "https://example.test",
+                child_frame_id: "frame-cross-origin",
+                child_loader_id: "loader-cross-origin",
+                child_url: "https://other.test/child",
+                child_security_origin: "https://other.test",
+                child_parent_frame_id: "frame-root",
+                expected_partitions: [
+                    AxFramePartition::Root,
+                    AxFramePartition::Root,
+                    AxFramePartition::Other,
+                    AxFramePartition::Other,
+                ],
+            });
+        let policy =
+            BrowserNavigationPolicy::https_only(["https://example.test", "https://other.test"])
+                .expect("two exact origins");
+        validate_frame_tree_navigation_scope(&frame_tree, &policy)
+            .expect("allowlisted cross-origin child");
+
+        let target = policy
+            .authorize("https://example.test/root")
+            .expect("root target");
+        validate_exact_navigation_target_origin(&target, target.origin_digest())
+            .expect("exact target origin");
+        let other_origin = policy
+            .permitted_origin_digest("https://other.test/child")
+            .expect("allowlisted child origin");
+        assert_eq!(
+            validate_exact_navigation_target_origin(&target, &other_origin)
+                .expect_err("allowlisted cross-origin redirect is still target drift")
+                .code(),
+            "BROWSER_NAVIGATION_REQUEST_BLOCKED"
+        );
+
+        let root_only_policy =
+            BrowserNavigationPolicy::https_only(["https://example.test"]).expect("root origin");
+        assert_eq!(
+            validate_frame_tree_navigation_scope(&frame_tree, &root_only_policy)
+                .expect_err("unlisted child origin")
+                .code(),
+            "BROWSER_NAVIGATION_REQUEST_BLOCKED"
+        );
+        let mut mismatched_root_origin = frame_tree.clone();
+        mismatched_root_origin.root.security_origin = "https://other.test".into();
+        mismatched_root_origin.frames.insert(
+            mismatched_root_origin.root.frame_id.clone(),
+            mismatched_root_origin.root.clone(),
+        );
+        assert_eq!(
+            validate_frame_tree_navigation_scope(&mismatched_root_origin, &policy)
+                .expect_err("root URL and security origin mismatch")
+                .code(),
+            "BROWSER_NAVIGATION_REQUEST_BLOCKED"
+        );
+        let mut failed_frame_tree = frame_tree;
+        failed_frame_tree
+            .frames
+            .get_mut("frame-cross-origin")
+            .expect("child frame")
+            .unreachable_url = Some("https://other.test/failed".into());
+        assert_eq!(
+            validate_frame_tree_navigation_scope(&failed_frame_tree, &policy)
+                .expect_err("unreachable child navigation")
+                .code(),
+            "BROWSER_NAVIGATION_FAILED"
+        );
+    }
+
+    #[test]
+    fn bound_iframe_identity_rejects_drift_but_allows_new_child() {
+        let (_, bound) = ax_readback_tree_with_duplicate_child_backend(&AxFrameFixtureContract {
+            root_frame_id: "frame-root",
+            root_loader_id: "loader-root",
+            root_url: "https://example.test/root",
+            root_security_origin: "https://example.test",
+            child_frame_id: "frame-child",
+            child_loader_id: "loader-child",
+            child_url: "https://example.test/child",
+            child_security_origin: "https://example.test",
+            child_parent_frame_id: "frame-root",
+            expected_partitions: [
+                AxFramePartition::Root,
+                AxFramePartition::Root,
+                AxFramePartition::Other,
+                AxFramePartition::Other,
+            ],
+        });
+        let mut loader_drift = bound.clone();
+        loader_drift
+            .frames
+            .get_mut("frame-child")
+            .expect("child frame")
+            .loader_id = "loader-child-next".into();
+        assert!(matches!(
+            validate_bound_frame_tree(&bound, &loader_drift),
+            Err(BrowserError::StaleSnapshot)
+        ));
+
+        let mut detached = bound.clone();
+        detached.frames.remove("frame-child");
+        assert!(matches!(
+            validate_bound_frame_tree(&bound, &detached),
+            Err(BrowserError::StaleSnapshot)
+        ));
+
+        let mut inserted = bound.clone();
+        inserted.frames.insert(
+            "frame-new".into(),
+            CdpFrameIdentity {
+                frame_id: "frame-new".into(),
+                parent_frame_id: Some("frame-root".into()),
+                loader_id: "loader-new".into(),
+                url: "https://example.test/new".into(),
+                security_origin: "https://example.test".into(),
+                unreachable_url: None,
+            },
+        );
+        validate_bound_frame_tree(&bound, &inserted)
+            .expect("new child alone does not stale an unrelated root target");
+    }
+
+    #[test]
+    fn runtime_context_parser_proves_exact_main_and_named_isolated_worlds() {
+        let main = root_main_execution_context();
+        assert_eq!(main.execution_context_id, 41);
+        assert_eq!(main.unique_id, "context-root-main-v1");
+        assert_eq!(
+            main.world_key,
+            Some(CdpExecutionWorldKey {
+                frame_id: "frame-root".into(),
+                world: CdpExecutionWorld::Main,
+            })
+        );
+
+        let isolated = parse_execution_context_created(Some(&execution_context_created_event(
+            42,
+            "context-root-isolated-v1",
+            "https://example.test",
+            "hartevo-agent",
+            "frame-root",
+            "isolated",
+            false,
+        )))
+        .expect("exact named isolated execution context");
+        assert_eq!(
+            isolated.world_key,
+            Some(CdpExecutionWorldKey {
+                frame_id: "frame-root".into(),
+                world: CdpExecutionWorld::Isolated("hartevo-agent".into()),
+            })
+        );
+
+        let unsupported = parse_execution_context_created(Some(&execution_context_created_event(
+            43,
+            "context-worker-v1",
+            "https://example.test",
+            "worker",
+            "frame-root",
+            "worker",
+            false,
+        )))
+        .expect("well-formed unsupported context remains unbindable");
+        assert_eq!(unsupported.world_key, None);
+
+        let mut missing_unique_id = execution_context_created_event(
+            44,
+            "context-missing",
+            "https://example.test",
+            "",
+            "frame-root",
+            "default",
+            true,
+        );
+        missing_unique_id["context"]
+            .as_object_mut()
+            .expect("context object")
+            .remove("uniqueId");
+        assert!(matches!(
+            parse_execution_context_created(Some(&missing_unique_id)),
+            Err(BrowserError::ProtocolPoisoned)
+        ));
+        assert_eq!(
+            parse_execution_context_destroyed(Some(&json!({
+                "executionContextId": 41,
+                "executionContextUniqueId": "context-root-main-v1"
+            })))
+            .expect("exact destroyed context identity"),
+            (41, Some("context-root-main-v1".into()))
+        );
+        assert_eq!(
+            parse_execution_context_destroyed(Some(&json!({"executionContextId": 41})))
+                .expect("legacy destroy resolves through the registry"),
+            (41, None)
+        );
+        validate_execution_contexts_cleared_params(Some(&json!({})))
+            .expect("empty cleared event parameters");
+        assert!(matches!(
+            validate_execution_contexts_cleared_params(Some(&json!({"unknown": true}))),
+            Err(BrowserError::ProtocolPoisoned)
+        ));
+    }
+
+    #[test]
+    fn runtime_binding_is_exact_for_frame_world_loader_and_generation() {
+        let mut frame_tree = root_frame_tree_snapshot();
+        frame_tree
+            .lifecycle_revisions
+            .insert("frame-root".into(), 7);
+        let mut registry = root_runtime_registry();
+        let main = registry
+            .bind(&frame_tree, CdpExecutionWorld::Main, 11)
+            .expect("bind root main context");
+        registry
+            .validate_binding(&main, &frame_tree, &CdpExecutionWorld::Main, 11)
+            .expect("exact root main binding");
+        let mut dispatch_count = 0;
+        contract_dispatch_after_runtime_fence(
+            &registry,
+            &main,
+            &frame_tree,
+            &CdpExecutionWorld::Main,
+            11,
+            &mut dispatch_count,
+        )
+        .expect("exact binding reaches dispatch boundary");
+        assert_eq!(dispatch_count, 1);
+
+        let isolated_identity =
+            parse_execution_context_created(Some(&execution_context_created_event(
+                42,
+                "context-root-isolated-v1",
+                "https://example.test",
+                "hartevo-agent",
+                "frame-root",
+                "isolated",
+                false,
+            )))
+            .expect("isolated context event");
+        registry
+            .context_created(isolated_identity)
+            .expect("register isolated context");
+        let intended_isolated = CdpExecutionWorld::Isolated("hartevo-agent".into());
+        let isolated = registry
+            .bind(&frame_tree, intended_isolated.clone(), 11)
+            .expect("bind intended isolated world");
+        registry
+            .validate_binding(&isolated, &frame_tree, &intended_isolated, 11)
+            .expect("exact isolated binding");
+
+        assert!(matches!(
+            registry.validate_binding(&main, &frame_tree, &intended_isolated, 11),
+            Err(BrowserError::StaleSnapshot)
+        ));
+        assert!(matches!(
+            registry.validate_binding(&main, &frame_tree, &CdpExecutionWorld::Main, 12),
+            Err(BrowserError::StaleSnapshot)
+        ));
+
+        let mut loader_drift = frame_tree.clone();
+        loader_drift.root.loader_id = "loader-root-next".into();
+        loader_drift.frames.insert(
+            loader_drift.root.frame_id.clone(),
+            loader_drift.root.clone(),
+        );
+        assert!(matches!(
+            registry.validate_binding(&main, &loader_drift, &CdpExecutionWorld::Main, 11),
+            Err(BrowserError::StaleSnapshot)
+        ));
+
+        let mut origin_drift = frame_tree.clone();
+        origin_drift.root.security_origin = "https://other.test".into();
+        origin_drift.frames.insert(
+            origin_drift.root.frame_id.clone(),
+            origin_drift.root.clone(),
+        );
+        assert!(matches!(
+            registry.validate_binding(&main, &origin_drift, &CdpExecutionWorld::Main, 11),
+            Err(BrowserError::StaleSnapshot)
+        ));
+
+        let mut frame_mismatch = frame_tree.clone();
+        frame_mismatch.frames.clear();
+        frame_mismatch.root.frame_id = "frame-other".into();
+        frame_mismatch.frames.insert(
+            frame_mismatch.root.frame_id.clone(),
+            frame_mismatch.root.clone(),
+        );
+        assert!(matches!(
+            registry.validate_binding(&main, &frame_mismatch, &CdpExecutionWorld::Main, 11),
+            Err(BrowserError::StaleSnapshot)
+        ));
+    }
+
+    #[test]
+    fn destroyed_recreated_cleared_or_unknown_runtime_context_never_dispatches() {
+        let mut frame_tree = root_frame_tree_snapshot();
+        frame_tree
+            .lifecycle_revisions
+            .insert("frame-root".into(), 3);
+        let mut registry = root_runtime_registry();
+        let binding = registry
+            .bind(&frame_tree, CdpExecutionWorld::Main, 17)
+            .expect("bind first root main context");
+        registry
+            .context_destroyed(41, Some("context-root-main-v1"))
+            .expect("destroy exact first context");
+        let mut dispatch_count = 0;
+        assert!(matches!(
+            contract_dispatch_after_runtime_fence(
+                &registry,
+                &binding,
+                &frame_tree,
+                &CdpExecutionWorld::Main,
+                17,
+                &mut dispatch_count,
+            ),
+            Err(BrowserError::StaleSnapshot)
+        ));
+        assert_eq!(dispatch_count, 0);
+
+        let recreated = parse_execution_context_created(Some(&execution_context_created_event(
+            41,
+            "context-root-main-v2",
+            "https://example.test",
+            "",
+            "frame-root",
+            "default",
+            true,
+        )))
+        .expect("recreated root main context");
+        registry
+            .context_created(recreated)
+            .expect("register recreated context");
+        assert!(matches!(
+            contract_dispatch_after_runtime_fence(
+                &registry,
+                &binding,
+                &frame_tree,
+                &CdpExecutionWorld::Main,
+                17,
+                &mut dispatch_count,
+            ),
+            Err(BrowserError::StaleSnapshot)
+        ));
+        assert_eq!(dispatch_count, 0);
+
+        let rebound = registry
+            .bind(&frame_tree, CdpExecutionWorld::Main, 17)
+            .expect("explicit re-observation binds recreated context");
+        registry
+            .contexts_cleared()
+            .expect("clear exact runtime registry");
+        assert!(matches!(
+            contract_dispatch_after_runtime_fence(
+                &registry,
+                &rebound,
+                &frame_tree,
+                &CdpExecutionWorld::Main,
+                17,
+                &mut dispatch_count,
+            ),
+            Err(BrowserError::StaleSnapshot)
+        ));
+        assert_eq!(dispatch_count, 0);
+
+        let mut unknown = root_runtime_registry();
+        assert!(matches!(
+            unknown.context_destroyed(99, Some("context-unknown")),
+            Err(BrowserError::ProtocolPoisoned)
+        ));
+    }
+
+    #[test]
+    fn runtime_binding_fences_frame_lifecycle_revision_and_unknown_identity() {
+        let mut frame_tree = root_frame_tree_snapshot();
+        frame_tree
+            .lifecycle_revisions
+            .insert("frame-root".into(), 5);
+        let registry = root_runtime_registry();
+        let binding = registry
+            .bind(&frame_tree, CdpExecutionWorld::Main, 23)
+            .expect("bind exact runtime context");
+        let mut lifecycle_drift = frame_tree.clone();
+        lifecycle_drift
+            .lifecycle_revisions
+            .insert("frame-root".into(), 6);
+        let mut dispatch_count = 0;
+        assert!(matches!(
+            contract_dispatch_after_runtime_fence(
+                &registry,
+                &binding,
+                &lifecycle_drift,
+                &CdpExecutionWorld::Main,
+                23,
+                &mut dispatch_count,
+            ),
+            Err(BrowserError::StaleSnapshot)
+        ));
+
+        let mut unknown_binding = binding;
+        unknown_binding.identity.unique_id = "context-unknown".into();
+        assert!(matches!(
+            contract_dispatch_after_runtime_fence(
+                &registry,
+                &unknown_binding,
+                &frame_tree,
+                &CdpExecutionWorld::Main,
+                23,
+                &mut dispatch_count,
+            ),
+            Err(BrowserError::StaleSnapshot)
+        ));
+        assert_eq!(dispatch_count, 0);
+    }
+
+    #[test]
+    fn frame_lifecycle_event_contract_extracts_exact_frame_identity() {
+        assert_eq!(
+            parse_frame_lifecycle_event_frame_id(
+                "Page.frameAttached",
+                Some(&json!({"frameId": "frame-oopif", "parentFrameId": "frame-root"})),
+            )
+            .expect("attached frame id"),
+            "frame-oopif"
+        );
+        assert_eq!(
+            parse_frame_lifecycle_event_frame_id(
+                "Page.frameDetached",
+                Some(&json!({"frameId": "frame-oopif", "reason": "swap"})),
+            )
+            .expect("detached frame id"),
+            "frame-oopif"
+        );
+        assert_eq!(
+            parse_frame_lifecycle_event_frame_id(
+                "Page.frameNavigated",
+                Some(&json!({"frame": {"id": "frame-root", "loaderId": "loader-next"}})),
+            )
+            .expect("navigated frame id"),
+            "frame-root"
+        );
+        assert!(matches!(
+            parse_frame_lifecycle_event_frame_id(
+                "Page.frameNavigated",
+                Some(&json!({"frame": {"loaderId": "loader-next"}})),
+            ),
+            Err(BrowserError::ProtocolPoisoned)
+        ));
+    }
+
+    #[test]
+    fn oopif_detach_reattach_advances_generation_without_rejecting_new_child() {
+        let bound = lifecycle_frame_tree_snapshot();
+        let mut detached = bound.clone();
+        detached.frames.remove("frame-oopif");
+        detached.lifecycle_revisions.insert("frame-oopif".into(), 2);
+        assert_eq!(
+            next_frame_document_generation(7, Some(&bound), &detached).expect("detach generation"),
+            8
+        );
+
+        let mut reattached = bound.clone();
+        reattached
+            .lifecycle_revisions
+            .insert("frame-oopif".into(), 3);
+        assert_eq!(
+            next_frame_document_generation(8, Some(&detached), &reattached)
+                .expect("reattach generation"),
+            9
+        );
+
+        let mut inserted = bound.clone();
+        inserted.frames.insert(
+            "frame-new".into(),
+            CdpFrameIdentity {
+                frame_id: "frame-new".into(),
+                parent_frame_id: Some("frame-root".into()),
+                loader_id: "loader-new".into(),
+                url: "https://example.test/new".into(),
+                security_origin: "https://example.test".into(),
+                unreachable_url: None,
+            },
+        );
+        inserted.lifecycle_revisions.insert("frame-new".into(), 1);
+        assert_eq!(
+            next_frame_document_generation(9, Some(&bound), &inserted)
+                .expect("unrelated insertion"),
+            9
+        );
+    }
+
+    #[test]
+    fn same_frame_new_loader_and_unreachable_recovery_advance_generation() {
+        let before = lifecycle_frame_tree_snapshot();
+        let mut new_loader = before.clone();
+        new_loader.root.loader_id = "loader-root-next".into();
+        new_loader
+            .frames
+            .insert(new_loader.root.frame_id.clone(), new_loader.root.clone());
+        new_loader
+            .lifecycle_revisions
+            .insert("frame-root".into(), 2);
+        assert_eq!(
+            next_frame_document_generation(11, Some(&before), &new_loader)
+                .expect("same frame, new loader"),
+            12
+        );
+
+        let mut unreachable = new_loader.clone();
+        unreachable
+            .frames
+            .get_mut("frame-oopif")
+            .expect("bound oopif")
+            .unreachable_url = Some("https://other.test/unreachable".into());
+        unreachable
+            .lifecycle_revisions
+            .insert("frame-oopif".into(), 2);
+        assert_eq!(
+            next_frame_document_generation(12, Some(&new_loader), &unreachable)
+                .expect("unreachable transition"),
+            13
+        );
+        let policy =
+            BrowserNavigationPolicy::https_only(["https://example.test", "https://other.test"])
+                .expect("two exact origins");
+        assert!(matches!(
+            validate_frame_tree_navigation_scope(&unreachable, &policy),
+            Err(BrowserError::NavigationFailed)
+        ));
+
+        let mut recovered = new_loader;
+        recovered
+            .lifecycle_revisions
+            .insert("frame-oopif".into(), 3);
+        assert_eq!(
+            next_frame_document_generation(13, Some(&unreachable), &recovered)
+                .expect("recovery transition"),
+            14
+        );
+        validate_frame_tree_navigation_scope(&recovered, &policy)
+            .expect("reachable recovery is scoped");
+    }
+
+    #[test]
+    fn frame_tree_ax_cross_read_aba_is_stale_even_when_identity_matches() {
+        let before = lifecycle_frame_tree_snapshot();
+        let mut after = before.clone();
+        after.lifecycle_revisions.insert("frame-oopif".into(), 3);
+        assert_eq!(before.root, after.root);
+        assert_eq!(before.frames, after.frames);
+        assert!(matches!(
+            validate_bound_frame_tree(&before, &after),
+            Err(BrowserError::StaleSnapshot)
+        ));
+        assert_eq!(
+            next_frame_document_generation(21, Some(&before), &after)
+                .expect("detach and exact reattach across AX read"),
+            22
         );
     }
 
@@ -5190,7 +6972,7 @@ mod tests {
                     "ignored": false,
                     "role": {"type": "role", "value": "RootWebArea"},
                     "name": {"type": "computedString", "value": "Same origin child"},
-                    "childIds": ["same-origin-review", "same-origin-only"],
+                    "childIds": ["same-origin-review"],
                     "frameId": "frame-same-origin"
                 },
                 {
@@ -5201,40 +6983,34 @@ mod tests {
                     "backendDOMNodeId": 51,
                     "parentId": "same-origin-root",
                     "childIds": []
-                },
-                {
-                    "nodeId": "same-origin-only",
-                    "ignored": false,
-                    "role": {"type": "role", "value": "button"},
-                    "name": {"type": "computedString", "value": "Iframe only"},
-                    "backendDOMNodeId": 52,
-                    "parentId": "same-origin-root",
-                    "childIds": []
-                },
-                {
-                    "nodeId": "oopif-root",
-                    "ignored": false,
-                    "role": {"type": "role", "value": "RootWebArea"},
-                    "name": {"type": "computedString", "value": "OOPIF child"},
-                    "childIds": ["oopif-only"],
-                    "frameId": "frame-oopif"
-                },
-                {
-                    "nodeId": "oopif-only",
-                    "ignored": false,
-                    "role": {"type": "role", "value": "button"},
-                    "name": {"type": "computedString", "value": "OOPIF only"},
-                    "backendDOMNodeId": 61,
-                    "parentId": "oopif-root",
-                    "childIds": []
                 }
             ]
         });
+        let frame_tree = parse_frame_tree_snapshot(&json!({
+            "frameTree": {
+                "frame": {
+                    "id": "frame-root",
+                    "loaderId": "loader-root",
+                    "url": "https://example.test/root",
+                    "securityOrigin": "https://example.test"
+                },
+                "childFrames": [{
+                    "frame": {
+                        "id": "frame-same-origin",
+                        "parentId": "frame-root",
+                        "loaderId": "loader-same-origin",
+                        "url": "https://example.test/child",
+                        "securityOrigin": "https://example.test"
+                    }
+                }]
+            }
+        }))
+        .expect("exact root and child frame identities");
         let normalized = normalize_ax_tree(
             &tree,
             &BrowserSnapshotId::from("snapshot-frame-partition"),
             1,
-            &root_frame_identity(),
+            &frame_tree,
         )
         .expect("partitioned AX tree");
         let candidates = normalized.locator_map.values().collect::<Vec<_>>();
@@ -5274,6 +7050,7 @@ mod tests {
                     "role": {"type": "role", "value": "button"},
                     "name": {"type": "computedString", "value": "Review"},
                     "backendDOMNodeId": 71,
+                    "frameId": "frame-not-in-page-tree",
                     "parentId": "missing-parent",
                     "childIds": []
                 }
@@ -5283,7 +7060,7 @@ mod tests {
             &tree,
             &BrowserSnapshotId::from("snapshot-unproven-frame"),
             1,
-            &root_frame_identity(),
+            &root_frame_tree_snapshot(),
         )
         .expect("unproven nodes are excluded, not guessed");
         assert_eq!(normalized.element_refs.len(), 1);
@@ -5297,7 +7074,7 @@ mod tests {
             &tree,
             &BrowserSnapshotId::from("snapshot-missing-root-anchor"),
             1,
-            &root_frame_identity(),
+            &root_frame_tree_snapshot(),
         );
         assert!(matches!(missing_anchor, Err(BrowserError::StaleSnapshot)));
     }
@@ -5584,8 +7361,8 @@ mod tests {
                 }
             ]
         });
-        let frame = root_frame_identity();
-        let state = inspect_semantic_target_ax_value(&mut tree, &snapshot, &candidate, &frame)
+        let frame_tree = root_frame_tree_snapshot();
+        let state = inspect_semantic_target_ax_value(&mut tree, &snapshot, &candidate, &frame_tree)
             .expect("exact readback");
         assert_eq!(state.value_digest, digest(secret.as_bytes()));
         assert_eq!(
@@ -5604,7 +7381,7 @@ mod tests {
         }));
         tree["nodes"][0]["value"] = json!({"type": "string", "value": secret});
         assert_eq!(
-            inspect_semantic_target_ax_value(&mut tree, &snapshot, &candidate, &frame)
+            inspect_semantic_target_ax_value(&mut tree, &snapshot, &candidate, &frame_tree)
                 .expect_err("non-target injection")
                 .code(),
             "BROWSER_PROMPT_INJECTION_DETECTED"
@@ -5612,7 +7389,7 @@ mod tests {
     }
 
     #[test]
-    fn child_frame_duplicate_backend_cannot_confuse_root_readback() {
+    fn cross_origin_child_duplicate_backend_cannot_confuse_root_readback() {
         let created_at = Utc
             .with_ymd_and_hms(2026, 8, 11, 8, 0, 0)
             .single()
@@ -5640,22 +7417,25 @@ mod tests {
             source_frame_id: frame.frame_id.clone(),
             root_loader_id: frame.loader_id.clone(),
         };
-        let mut tree = ax_readback_tree_with_duplicate_child_backend(&AxFrameFixtureContract {
-            root_frame_id: &frame.frame_id,
-            root_loader_id: &frame.loader_id,
-            root_url: &frame.url,
-            child_frame_id: "frame-child",
-            child_loader_id: "loader-child",
-            child_url: "https://example.test/child",
-            child_parent_frame_id: &frame.frame_id,
-            expected_partitions: [
-                AxFramePartition::Root,
-                AxFramePartition::Root,
-                AxFramePartition::Other,
-                AxFramePartition::Other,
-            ],
-        });
-        inspect_semantic_target_ax_value(&mut tree, &snapshot, &candidate, &frame)
+        let (mut tree, frame_tree) =
+            ax_readback_tree_with_duplicate_child_backend(&AxFrameFixtureContract {
+                root_frame_id: &frame.frame_id,
+                root_loader_id: &frame.loader_id,
+                root_url: &frame.url,
+                root_security_origin: &frame.security_origin,
+                child_frame_id: "frame-child",
+                child_loader_id: "loader-child",
+                child_url: "https://other.test/child",
+                child_security_origin: "https://other.test",
+                child_parent_frame_id: &frame.frame_id,
+                expected_partitions: [
+                    AxFramePartition::Root,
+                    AxFramePartition::Root,
+                    AxFramePartition::Other,
+                    AxFramePartition::Other,
+                ],
+            });
+        inspect_semantic_target_ax_value(&mut tree, &snapshot, &candidate, &frame_tree)
             .expect("same backend id outside root partition cannot confuse readback");
     }
 

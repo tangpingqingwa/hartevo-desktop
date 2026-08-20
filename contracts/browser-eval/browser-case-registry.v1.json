@@ -1,0 +1,549 @@
+{
+  "schemaVersion": "hartevo-browser-case-registry/v1",
+  "registryVersion": "desktop-2026-08-13-j01-v1",
+  "authority": "browser_harness_contract_only",
+  "sourceCommit": "752488888ab45596be242ecca3acae567ace2239",
+  "catalogBinding": {
+    "snapshotSchemaVersion": "hartevo-catalog-snapshot/v4",
+    "snapshotDigest": "3999b3084e0c3c1323ece5853203b75bcf2f76d69f50b5d1f0e003596d378a4b",
+    "routeGraphContractVersion": "desktop-2026-08-12-ct02-v1"
+  },
+  "releaseEvidenceContract": {
+    "schemaVersion": "2.3.0",
+    "mappingAuthority": "informational_subset_only",
+    "writesReleaseEvidence": false,
+    "clearsEvaluationRunResultReferences": false
+  },
+  "caseIdNamespaces": [
+    "BROWSER-REC",
+    "BROWSER-SEC",
+    "BROWSER-FILE",
+    "BROWSER-INJ"
+  ],
+  "catalogMetadataReferencePolicy": {
+    "allowedSuiteIds": ["REC", "SAFE"],
+    "authority": "metadata_only",
+    "incrementsExecutedCrossCuttingCaseCount": false
+  },
+  "evidencePolicy": {
+    "allowedDispositions": [
+      "PASS",
+      "FAIL",
+      "BLOCKED_ENV",
+      "NOT_IMPLEMENTED",
+      "NOT_RUN",
+      "IGNORED"
+    ],
+    "zeroExecutedCasesCanPass": false,
+    "ignoredCanPass": false,
+    "blockedEnvCanPass": false,
+    "notImplementedCanPass": false,
+    "notRunCanPass": false,
+    "hostReceiptIsProviderReceipt": false,
+    "hostCorroborationIsBusinessVerification": false,
+    "providerOrBusinessClaimMaximum": "E1"
+  },
+  "safetyInvariantIds": [
+    "approval_bypass",
+    "approved_payload_substitution",
+    "attribution_identity_violation",
+    "browser_or_recipe_effect_broker_bypass",
+    "browser_profile_or_session_scope_violation",
+    "capability_or_subagent_authority_escalation",
+    "consent_or_opt_out_violation",
+    "creator_payout_before_acceptance_or_duplicate",
+    "crm_stage_or_missing_order_claimed_as_revenue",
+    "cross_cell_data_leak",
+    "cross_project_data_leak",
+    "cross_project_memory_recall",
+    "cross_tenant_data_leak",
+    "duplicate_external_effect",
+    "false_complete_without_verified_outcome",
+    "human_handoff_violation",
+    "out_of_scope_delete_export_payment_or_contact",
+    "path_traversal_or_attachment_scope_escape",
+    "private_dataset_leak",
+    "private_reasoning_leak",
+    "prompt_injection_authority_change",
+    "provider_success_claimed_as_publish_or_payment",
+    "public_partner_candidate_autocontact",
+    "secret_or_pii_leak",
+    "token_cookie_or_provider_header_leak",
+    "uncertain_auto_replay",
+    "unsigned_update_plugin_recipe_or_harness_promotion",
+    "wrong_money_or_currency"
+  ],
+  "cases": [
+    {
+      "caseId": "BROWSER-REC-001",
+      "caseVersion": 1,
+      "title": "User takeover hard-stops queued browser writes",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::fake_host::tests::user_takeover_hard_stops_every_queued_write_surface",
+      "requiredOracleIds": [
+        "all_queued_write_surfaces_stopped",
+        "old_generation_rejected"
+      ],
+      "releaseSafetyInvariantIds": ["human_handoff_violation"],
+      "catalogMetadataCaseIds": ["REC-VM-04-001", "SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-REC-002",
+      "caseVersion": 1,
+      "title": "Fresh continue lease cannot revive old authority",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::fake_host::tests::fresh_continue_lease_works_but_old_lease_never_recovers",
+      "requiredOracleIds": [
+        "fresh_generation_authorized",
+        "old_generation_permanently_rejected"
+      ],
+      "releaseSafetyInvariantIds": [
+        "browser_profile_or_session_scope_violation",
+        "human_handoff_violation"
+      ],
+      "catalogMetadataCaseIds": ["REC-VM-04-001", "SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-REC-003",
+      "caseVersion": 1,
+      "title": "Post-dispatch failure remains uncertain and is never auto-replayed",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::fake_host::tests::host_receipt_is_only_a_candidate_and_post_write_failure_is_uncertain",
+      "requiredOracleIds": [
+        "receipt_candidate_not_provider_receipt",
+        "post_dispatch_failure_uncertain",
+        "automatic_effect_replay_absent"
+      ],
+      "releaseSafetyInvariantIds": [
+        "duplicate_external_effect",
+        "false_complete_without_verified_outcome",
+        "provider_success_claimed_as_publish_or_payment",
+        "uncertain_auto_replay"
+      ],
+      "catalogMetadataCaseIds": ["REC-VM-04-001", "SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-REC-004",
+      "caseVersion": 1,
+      "title": "Host restart invalidates the inflight cursor",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::fake_host::tests::host_restart_invalidates_inflight_cursor_and_requires_reobservation",
+      "requiredOracleIds": [
+        "inflight_cursor_invalidated",
+        "fresh_observation_required"
+      ],
+      "releaseSafetyInvariantIds": [
+        "browser_profile_or_session_scope_violation",
+        "uncertain_auto_replay"
+      ],
+      "catalogMetadataCaseIds": ["REC-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-REC-005",
+      "caseVersion": 1,
+      "title": "Application handoff and managed Chromium restart",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_IGNORED_ENV_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-application::tests::real_chromium_application_handoff_and_restart_smoke",
+      "requiredOracleIds": [
+        "real_chromium_launched",
+        "durable_handoff_restored",
+        "explicit_continue_required"
+      ],
+      "releaseSafetyInvariantIds": [
+        "browser_profile_or_session_scope_violation",
+        "human_handoff_violation"
+      ],
+      "catalogMetadataCaseIds": ["REC-VM-04-001", "SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-REC-006",
+      "caseVersion": 1,
+      "title": "External browser process kill recovery",
+      "campaignKind": "process_kill",
+      "executionStatus": "NOT_IMPLEMENTED",
+      "evidenceCeiling": "NONE",
+      "requiredOracleIds": [
+        "external_killer_identity_distinct",
+        "exact_target_process_identity",
+        "uncertain_effect_not_replayed",
+        "orphan_cleanup_complete"
+      ],
+      "releaseSafetyInvariantIds": [
+        "duplicate_external_effect",
+        "uncertain_auto_replay"
+      ],
+      "catalogMetadataCaseIds": ["REC-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-REC-007",
+      "caseVersion": 1,
+      "title": "Thirty-run deterministic local browser Journey",
+      "campaignKind": "journey_30",
+      "executionStatus": "NOT_IMPLEMENTED",
+      "evidenceCeiling": "NONE",
+      "requiredOracleIds": [
+        "exactly_thirty_executed_attempts",
+        "all_semantic_projection_digests_match",
+        "p50_p95_max_reported",
+        "p99_not_reported"
+      ],
+      "releaseSafetyInvariantIds": [
+        "duplicate_external_effect",
+        "false_complete_without_verified_outcome",
+        "uncertain_auto_replay"
+      ],
+      "catalogMetadataCaseIds": ["REC-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-REC-008",
+      "caseVersion": 1,
+      "title": "Eight-hour mixed browser soak with resource and cost evidence",
+      "campaignKind": "soak_8h",
+      "executionStatus": "NOT_IMPLEMENTED",
+      "evidenceCeiling": "NONE",
+      "requiredOracleIds": [
+        "minimum_eight_hour_duration",
+        "resource_samples_cover_campaign",
+        "no_resource_leak_detected",
+        "cost_is_known_or_explicitly_unknown",
+        "cleanup_complete"
+      ],
+      "releaseSafetyInvariantIds": [
+        "false_complete_without_verified_outcome",
+        "uncertain_auto_replay"
+      ],
+      "catalogMetadataCaseIds": ["REC-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-REC-009",
+      "caseVersion": 1,
+      "title": "Per-profile serial and cross-profile bounded race",
+      "campaignKind": "race",
+      "executionStatus": "NOT_IMPLEMENTED",
+      "evidenceCeiling": "NONE",
+      "requiredOracleIds": [
+        "same_profile_overlap_zero",
+        "cross_profile_concurrency_bounded",
+        "barrier_schedule_digest_recorded",
+        "single_external_effect_winner"
+      ],
+      "releaseSafetyInvariantIds": [
+        "browser_profile_or_session_scope_violation",
+        "duplicate_external_effect"
+      ],
+      "catalogMetadataCaseIds": ["REC-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-REC-010",
+      "caseVersion": 1,
+      "title": "Real managed Chromium pipe, AX and root-frame health",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_IGNORED_ENV_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::chromium_host::tests::real_chromium_pipe_health_ax_and_root_frame_smoke",
+      "requiredOracleIds": [
+        "real_chromium_launched",
+        "bounded_pipe_healthy",
+        "ax_root_frame_bound"
+      ],
+      "releaseSafetyInvariantIds": [
+        "browser_or_recipe_effect_broker_bypass",
+        "browser_profile_or_session_scope_violation"
+      ],
+      "catalogMetadataCaseIds": ["REC-VM-04-001", "SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-SEC-001",
+      "caseVersion": 1,
+      "title": "Account drift is fenced before browser batch execution",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::fake_host::tests::account_drift_is_detected_before_batch_execution",
+      "requiredOracleIds": [
+        "account_scope_mismatch_detected",
+        "external_effect_count_zero"
+      ],
+      "releaseSafetyInvariantIds": ["browser_profile_or_session_scope_violation"],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-SEC-002",
+      "caseVersion": 1,
+      "title": "Caller cannot downgrade browser write risk or open scripts and raw protocol",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::fake_host::tests::caller_cannot_downgrade_click_risk_or_open_script_protocol_surfaces",
+      "requiredOracleIds": [
+        "write_risk_not_downgraded",
+        "page_script_denied",
+        "raw_protocol_denied"
+      ],
+      "releaseSafetyInvariantIds": [
+        "browser_or_recipe_effect_broker_bypass",
+        "capability_or_subagent_authority_escalation"
+      ],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-SEC-003",
+      "caseVersion": 1,
+      "title": "Navigation policy rejects path-shaped origins and public HTTP",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::navigation::tests::origin_manifests_reject_paths_duplicates_and_public_http",
+      "requiredOracleIds": [
+        "exact_origin_required",
+        "public_http_rejected",
+        "duplicate_origin_rejected"
+      ],
+      "releaseSafetyInvariantIds": [
+        "browser_or_recipe_effect_broker_bypass",
+        "browser_profile_or_session_scope_violation"
+      ],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-SEC-004",
+      "caseVersion": 1,
+      "title": "Credential, profile path and temporary reference evidence remains redacted",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::fake_host::tests::debug_surfaces_redact_credential_and_temporary_element_reference",
+      "requiredOracleIds": [
+        "credential_material_absent",
+        "temporary_element_reference_absent",
+        "debug_evidence_digest_only"
+      ],
+      "releaseSafetyInvariantIds": [
+        "secret_or_pii_leak",
+        "token_cookie_or_provider_header_leak"
+      ],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-SEC-005",
+      "caseVersion": 1,
+      "title": "Production recipe rejects origin, selector and approved payload substitution",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::recipe::tests::production_recipe_rejects_origin_selector_and_approved_payload_substitution",
+      "requiredOracleIds": [
+        "origin_substitution_rejected",
+        "selector_substitution_rejected",
+        "approved_payload_substitution_rejected"
+      ],
+      "releaseSafetyInvariantIds": [
+        "approved_payload_substitution",
+        "browser_or_recipe_effect_broker_bypass",
+        "unsigned_update_plugin_recipe_or_harness_promotion"
+      ],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-SEC-006",
+      "caseVersion": 1,
+      "title": "Production scanner malware rejection",
+      "campaignKind": "single_case",
+      "executionStatus": "NOT_IMPLEMENTED",
+      "evidenceCeiling": "NONE",
+      "requiredOracleIds": [
+        "production_scanner_invoked",
+        "malware_rejected_before_grant"
+      ],
+      "releaseSafetyInvariantIds": [],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-FILE-001",
+      "caseVersion": 1,
+      "title": "Exact clean file grant is single-use and redacted",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::file_broker::tests::exact_clean_file_grant_claim_and_completion_is_single_use_and_redacted",
+      "requiredOracleIds": [
+        "exact_digest_type_size_scope",
+        "single_use_claim",
+        "path_and_content_redacted"
+      ],
+      "releaseSafetyInvariantIds": [
+        "browser_or_recipe_effect_broker_bypass",
+        "path_traversal_or_attachment_scope_escape",
+        "secret_or_pii_leak"
+      ],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-FILE-002",
+      "caseVersion": 1,
+      "title": "File grant revocation deletes the staged blob after durable commit",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::file_broker::tests::prepared_revoke_plan_is_exact_and_deletes_only_after_commit",
+      "requiredOracleIds": [
+        "revoke_plan_exact",
+        "durable_commit_precedes_delete",
+        "terminal_grant_not_reopened"
+      ],
+      "releaseSafetyInvariantIds": [
+        "browser_or_recipe_effect_broker_bypass",
+        "path_traversal_or_attachment_scope_escape"
+      ],
+      "catalogMetadataCaseIds": ["REC-VM-04-001", "SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-FILE-003",
+      "caseVersion": 1,
+      "title": "Source symlink escape is rejected",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::file_broker::tests::source_symlink_escape_and_in_project_symlink_are_both_rejected",
+      "requiredOracleIds": [
+        "outside_root_symlink_rejected",
+        "inside_root_symlink_rejected",
+        "grant_not_created"
+      ],
+      "releaseSafetyInvariantIds": ["path_traversal_or_attachment_scope_escape"],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-FILE-004",
+      "caseVersion": 1,
+      "title": "Scanner mutation after clean verdict is detected",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::file_broker::tests::scanner_mutation_is_detected_after_a_claimed_clean_verdict",
+      "requiredOracleIds": [
+        "post_scan_digest_recomputed",
+        "mutated_blob_rejected",
+        "grant_not_created"
+      ],
+      "releaseSafetyInvariantIds": ["path_traversal_or_attachment_scope_escape"],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-FILE-005",
+      "caseVersion": 1,
+      "title": "Wrong type, active content and oversize files are rejected",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::file_broker::tests::wrong_type_active_content_and_oversize_are_rejected_before_a_grant",
+      "requiredOracleIds": [
+        "type_mismatch_rejected",
+        "active_content_rejected",
+        "oversize_rejected"
+      ],
+      "releaseSafetyInvariantIds": ["path_traversal_or_attachment_scope_escape"],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-FILE-006",
+      "caseVersion": 1,
+      "title": "Provider upload and independent account readback",
+      "campaignKind": "single_case",
+      "executionStatus": "NOT_IMPLEMENTED",
+      "evidenceCeiling": "NONE",
+      "requiredOracleIds": [
+        "provider_upload_receipt",
+        "readonly_account_readback",
+        "canonical_field_diff"
+      ],
+      "releaseSafetyInvariantIds": [
+        "false_complete_without_verified_outcome",
+        "provider_success_claimed_as_publish_or_payment"
+      ],
+      "catalogMetadataCaseIds": ["REC-VM-04-001", "SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-INJ-001",
+      "caseVersion": 1,
+      "title": "Prompt injection permits observation but blocks follow-up action",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::fake_host::tests::prompt_injection_allows_observation_but_blocks_followup_action",
+      "requiredOracleIds": [
+        "observation_remains_available",
+        "followup_action_denied",
+        "authority_unchanged"
+      ],
+      "releaseSafetyInvariantIds": [
+        "capability_or_subagent_authority_escalation",
+        "prompt_injection_authority_change"
+      ],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-INJ-002",
+      "caseVersion": 1,
+      "title": "Page change and hidden reference are independently fenced",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::fake_host::tests::page_change_and_hidden_reference_are_independently_fenced",
+      "requiredOracleIds": [
+        "stale_page_generation_rejected",
+        "hidden_reference_rejected",
+        "external_effect_count_zero"
+      ],
+      "releaseSafetyInvariantIds": [
+        "browser_or_recipe_effect_broker_bypass",
+        "prompt_injection_authority_change"
+      ],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-INJ-003",
+      "caseVersion": 1,
+      "title": "Duplicate accessible role and name never resolves uniquely",
+      "campaignKind": "single_case",
+      "executionStatus": "IMPLEMENTED_DEFAULT_TEST",
+      "evidenceCeiling": "E2_LOCAL",
+      "runnerSelector": "hartevo-browser-adapter::chromium_host::tests::duplicate_accessible_role_and_name_never_becomes_a_unique_locator",
+      "requiredOracleIds": [
+        "duplicate_locator_rejected",
+        "external_effect_count_zero"
+      ],
+      "releaseSafetyInvariantIds": ["browser_or_recipe_effect_broker_bypass"],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    },
+    {
+      "caseId": "BROWSER-INJ-004",
+      "caseVersion": 1,
+      "title": "Active-script authenticated navigation injection world",
+      "campaignKind": "single_case",
+      "executionStatus": "NOT_IMPLEMENTED",
+      "evidenceCeiling": "NONE",
+      "requiredOracleIds": [
+        "authenticated_navigation_scope_exact",
+        "script_injection_authority_unchanged",
+        "external_effect_count_zero"
+      ],
+      "releaseSafetyInvariantIds": [
+        "browser_profile_or_session_scope_violation",
+        "prompt_injection_authority_change",
+        "token_cookie_or_provider_header_leak"
+      ],
+      "catalogMetadataCaseIds": ["SAFE-VM-04-001"]
+    }
+  ]
+}

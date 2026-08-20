@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/aws-health-event-result/aws-health-event-result.v1.json",
+  "title": "Hartevo governed AWS Health event result Layer-1 contract",
+  "description": "Bounded AWS Health provider evidence for a Mission decision; not outage causality, incident command, operational Truth, or an AWS control-plane authority.",
+  "schemaVersion": "hartevo.aws-health-event-result/v1",
+  "contractVersion": "aws-health-event-result-e1/v1",
+  "pluginVersion": "0.1.0",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "authority": {
+    "readOnly": true,
+    "proposalOnly": true,
+    "connected": false,
+    "nativeProvider": false,
+    "durableReceipt": false,
+    "kernelAuthority": false,
+    "outcomeAuthority": false,
+    "operationalTruth": false,
+    "outageCausality": false,
+    "externalWrites": false
+  },
+  "typedSurface": {
+    "service": "AwsHealthEventService",
+    "provider": "AwsHealthProvider",
+    "consumer": "MissionAwsHealthConsumer",
+    "models": [
+      "AwsHealthEventScope",
+      "AwsHealthPermissionFence",
+      "AwsHealthTimeWindow",
+      "SecretReference",
+      "AwsHealthRegistration",
+      "DescribeEventsRequest",
+      "DescribeEventDetailsRequest",
+      "DescribeAffectedEntitiesRequest",
+      "AwsHealthEventRecord",
+      "AwsHealthEventDetail",
+      "AffectedEntityReference",
+      "AwsHealthEventEvidence",
+      "AwsHealthEventProposal"
+    ]
+  },
+  "service": {
+    "id": "aws.health.event.result",
+    "name": "AwsHealthEventService",
+    "version": "1.0.0",
+    "access": "read_only",
+    "operations": [
+      "describe_events",
+      "describe_event_details",
+      "describe_affected_entities",
+      "compile_proposal",
+      "record_observation",
+      "verify_proposal",
+      "revoke_registration",
+      "restore_registration"
+    ],
+    "externalWrites": false,
+    "liveExternalIo": false,
+    "outageCausality": false,
+    "operationalTruth": false
+  },
+  "provider": {
+    "id": "aws.health.events",
+    "name": "AwsHealthProvider",
+    "version": "1.0.0",
+    "apiRevision": "aws-health-api-2016-08-04",
+    "operations": [
+      "DescribeEvents",
+      "DescribeEventDetails",
+      "DescribeAffectedEntities"
+    ],
+    "requiredPermissions": [
+      "health:DescribeEvents",
+      "health:DescribeEventDetails"
+    ],
+    "optionalPermissions": ["health:DescribeAffectedEntities"],
+    "transportProvenance": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "native": false,
+    "connected": false,
+    "sigV4": "opaque SecretReference only",
+    "rawCredentials": false,
+    "rawDescriptions": false,
+    "rawMetadataMaps": false,
+    "rawEntityIdentifiers": false
+  },
+  "scope": {
+    "required": [
+      "account",
+      "region",
+      "service",
+      "eventArn",
+      "eventTypeCode",
+      "eventStatus",
+      "timeWindow",
+      "project",
+      "mission",
+      "workProduct",
+      "permissionFence",
+      "consent"
+    ],
+    "filterWindowBinding": "account-region-service-identical",
+    "secret": "opaque_non_serializing_sigv4_reference"
+  },
+  "bounds": {
+    "maxTimeWindowSeconds": 2592000,
+    "maxEvents": 100,
+    "maxEventTypeCodes": 8,
+    "maxStatuses": 4,
+    "maxFailedSet": 100,
+    "maxAffectedEntities": 256,
+    "maxDiagnosticBytes": 512,
+    "entityRetention": "digest_only"
+  },
+  "evidence": {
+    "digests": [
+      "contract",
+      "plugin_version",
+      "provider",
+      "registration",
+      "scope",
+      "event_filter",
+      "evidence_policy",
+      "permission",
+      "consent",
+      "request",
+      "response",
+      "events",
+      "details",
+      "affected_entities",
+      "failed_set"
+    ],
+    "retained": [
+      "immutable_event_identifier",
+      "event_type_code",
+      "service",
+      "region",
+      "status",
+      "provider_reported_actionability",
+      "start_end_last_updated_time_metadata",
+      "bounded_affected_entity_digests"
+    ],
+    "redacted": [
+      "raw_event_description",
+      "account_pii",
+      "event_metadata_maps",
+      "raw_affected_entity_identifiers",
+      "unbounded_entity_lists"
+    ],
+    "partialFailure": "fail_closed",
+    "revisionDrift": "fail_closed",
+    "statusTransitions": "provider_reported_only",
+    "outageCausality": false,
+    "operationalTruth": false
+  },
+  "registration": {
+    "pluginVersionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "scopeDigestBound": true,
+    "eventFilterDigestBound": true,
+    "evidencePolicyDigestBound": true,
+    "permissionDigestBound": true,
+    "consentDigestBound": true,
+    "versionBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "provenance": {
+    "fixture": {"connected": false, "native": false},
+    "recording": {"connected": false, "native": false},
+    "loopback": {"connected": false, "native": false},
+    "BLOCKED_ENV": {"connected": false, "native": false, "meaning": "native environment unavailable"}
+  },
+  "forbidden": [
+    "support_case_mutation",
+    "health_event_subscription",
+    "health_event_mutation",
+    "resource_restart",
+    "credential_resolution",
+    "raw_event_description_export",
+    "raw_account_pii_export",
+    "raw_event_metadata_export",
+    "raw_affected_entity_export",
+    "outage_causality_claim",
+    "operational_truth_claim",
+    "kernel_outcome_adoption",
+    "verified_work_product_adoption"
+  ],
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "sigV4Resolution": false,
+    "durableProviderReceipt": false,
+    "independentReadback": false,
+    "adoptedOutcome": false,
+    "operationalTruth": false,
+    "outageCausality": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "native_sigv4_secret_resolution",
+    "native_describe_events_transport",
+    "native_describe_event_details_transport",
+    "native_describe_affected_entities_transport",
+    "durable_provider_receipt",
+    "independent_event_readback",
+    "consented_operational_effects",
+    "verified_work_product_adoption"
+  ],
+  "honestyBoundary": "Provider-reported actionability is bounded evidence for a Mission decision. It is never proof of outage causality, effect success, incident ownership, or Hartevo operational Truth."
+}

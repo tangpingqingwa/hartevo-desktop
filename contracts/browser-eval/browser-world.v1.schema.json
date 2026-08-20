@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/browser-eval/browser-world/1.0.0",
+  "title": "Hartevo Deterministic Browser World",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "worldId",
+    "worldVersion",
+    "deterministicSeed",
+    "initialStateDigest",
+    "fixtureSetDigest",
+    "virtualClock",
+    "profiles",
+    "provider",
+    "networkPolicy",
+    "effectPolicy",
+    "faults",
+    "oracleIds",
+    "cleanupPolicy"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-browser-world/v1"},
+    "worldId": {"$ref": "#/$defs/worldId"},
+    "worldVersion": {"type": "integer", "minimum": 1},
+    "deterministicSeed": {"$ref": "#/$defs/sha256"},
+    "initialStateDigest": {"$ref": "#/$defs/sha256"},
+    "fixtureSetDigest": {"$ref": "#/$defs/sha256"},
+    "virtualClock": {"$ref": "#/$defs/virtualClock"},
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {"$ref": "#/$defs/profile"}
+    },
+    "provider": {"$ref": "#/$defs/provider"},
+    "networkPolicy": {"$ref": "#/$defs/networkPolicy"},
+    "effectPolicy": {"$ref": "#/$defs/effectPolicy"},
+    "faults": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {"$ref": "#/$defs/fault"}
+    },
+    "oracleIds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/token"}
+    },
+    "cleanupPolicy": {"$ref": "#/$defs/cleanupPolicy"}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "worldId": {
+      "type": "string",
+      "pattern": "^BROWSER-WORLD-[A-Z0-9][A-Z0-9-]{0,63}$"
+    },
+    "virtualClock": {
+      "type": "object",
+      "required": [
+        "epochMs",
+        "tickDurationMs",
+        "timezone",
+        "wallClockReadsAllowed"
+      ],
+      "properties": {
+        "epochMs": {"type": "integer", "minimum": 0},
+        "tickDurationMs": {"type": "integer", "minimum": 1, "maximum": 60000},
+        "timezone": {"const": "UTC"},
+        "wallClockReadsAllowed": {"const": false}
+      },
+      "additionalProperties": false
+    },
+    "profile": {
+      "type": "object",
+      "required": [
+        "profileId",
+        "profileDigest",
+        "tenantScopeDigest",
+        "projectScopeDigest",
+        "accountScopeDigest",
+        "storageTemplateDigest"
+      ],
+      "properties": {
+        "profileId": {"$ref": "#/$defs/token"},
+        "profileDigest": {"$ref": "#/$defs/sha256"},
+        "tenantScopeDigest": {"$ref": "#/$defs/sha256"},
+        "projectScopeDigest": {"$ref": "#/$defs/sha256"},
+        "accountScopeDigest": {"$ref": "#/$defs/sha256"},
+        "storageTemplateDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "provider": {
+      "type": "object",
+      "required": [
+        "providerId",
+        "mode",
+        "providerDigest",
+        "accountScopeDigest",
+        "credentialReferenceDigest",
+        "credentialMaterialEmbedded"
+      ],
+      "properties": {
+        "providerId": {"$ref": "#/$defs/token"},
+        "mode": {
+          "enum": ["controlled_simulator", "native_browser_account"]
+        },
+        "providerDigest": {"$ref": "#/$defs/sha256"},
+        "accountScopeDigest": {"$ref": "#/$defs/sha256"},
+        "credentialReferenceDigest": {"$ref": "#/$defs/sha256"},
+        "credentialMaterialEmbedded": {"const": false}
+      },
+      "additionalProperties": false
+    },
+    "networkPolicy": {
+      "type": "object",
+      "required": [
+        "denyByDefault",
+        "externalNetworkAllowed",
+        "allowedOriginDigests",
+        "fixtureResponseSetDigest"
+      ],
+      "properties": {
+        "denyByDefault": {"const": true},
+        "externalNetworkAllowed": {"type": "boolean"},
+        "allowedOriginDigests": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/sha256"}
+        },
+        "fixtureResponseSetDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "effectPolicy": {
+      "type": "object",
+      "required": [
+        "effectBrokerRequired",
+        "approvalRequired",
+        "allowedEffectClassIds",
+        "deniedSurfaceIds"
+      ],
+      "properties": {
+        "effectBrokerRequired": {"const": true},
+        "approvalRequired": {"const": true},
+        "allowedEffectClassIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/token"}
+        },
+        "deniedSurfaceIds": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "contains": {"const": "page_script"},
+          "items": {"$ref": "#/$defs/token"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "fault": {
+      "type": "object",
+      "required": [
+        "ordinal",
+        "atEventOrdinal",
+        "kind",
+        "effectBoundary",
+        "faultDigest",
+        "externalProcessAction",
+        "automaticReplayAllowedAtFault"
+      ],
+      "properties": {
+        "ordinal": {"type": "integer", "minimum": 0},
+        "atEventOrdinal": {"type": "integer", "minimum": 0},
+        "kind": {
+          "enum": [
+            "browser_process_kill",
+            "renderer_process_kill",
+            "harness_process_kill",
+            "transport_disconnect",
+            "provider_timeout",
+            "host_restart",
+            "storage_commit_failure"
+          ]
+        },
+        "effectBoundary": {"$ref": "#/$defs/effectBoundary"},
+        "faultDigest": {"$ref": "#/$defs/sha256"},
+        "externalProcessAction": {"type": "boolean"},
+        "automaticReplayAllowedAtFault": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "effectBoundary": {
+      "enum": [
+        "no_effect",
+        "before_dispatch",
+        "dispatch_started",
+        "receipt_candidate_observed",
+        "host_corroborated",
+        "independent_account_readback"
+      ]
+    },
+    "cleanupPolicy": {
+      "type": "object",
+      "required": [
+        "required",
+        "profileResetRequired",
+        "maximumOrphanProcessCount",
+        "maximumRetainedProfileArtifactCount",
+        "retentionMode"
+      ],
+      "properties": {
+        "required": {"const": true},
+        "profileResetRequired": {"const": true},
+        "maximumOrphanProcessCount": {"const": 0},
+        "maximumRetainedProfileArtifactCount": {"const": 0},
+        "retentionMode": {"const": "digest_only"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

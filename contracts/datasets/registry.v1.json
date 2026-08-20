@@ -73,5 +73,24 @@
     "spearmanMinimum": 0.8,
     "maeMaximum": 0.5,
     "kappaMinimum": 0.8
-  }
+  },
+  "datasetBindings": [
+    {
+      "bindingId": "gm01-de-market-replay-v1",
+      "bindingVersion": "desktop-2026-08-13-gm01-v1",
+      "datasetPath": "contracts/datasets/gm01-de-market-replay-v1.json",
+      "datasetId": "gm01-de-market-replay",
+      "datasetVersion": "2026-08-13.1",
+      "missionId": "VM-07",
+      "fixtureId": "mxzone-de-market-v1",
+      "partition": "vertical-dev",
+      "split": "V0",
+      "caseCount": 3,
+      "rawDigest": "975e1a882b437049d695e2622bebe20a42bd476c68fd3618ca9681f1b7967825",
+      "isolationPolicy": "SIMULATOR/REPLAY_ONLY",
+      "nativeReceiptCount": 0,
+      "releaseDecision": "NOT_EVALUATED",
+      "privateContent": false
+    }
+  ]
 }

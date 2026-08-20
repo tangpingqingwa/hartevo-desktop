@@ -1,6 +1,8 @@
 //! Local-first, project-scoped persistence with encrypted files and atomic outbox writes.
 
 mod aggregate;
+mod attribution_outcome_adoption_store;
+mod attribution_spine_store;
 mod authorization;
 mod browser_file_store;
 mod browser_recipe_store;
@@ -10,6 +12,7 @@ mod context_collaboration_store;
 mod context_foundation_store;
 mod context_material_store;
 mod context_store;
+mod context_worker_graph_store;
 mod creator;
 mod creator_hiring_store;
 mod deletion_propagation;
@@ -19,6 +22,7 @@ mod identity_store;
 mod key_bootstrap_store;
 mod keyring_store;
 mod mission_conversation_store;
+mod mission_recovery_store;
 mod mission_schedule_store;
 mod normalized;
 mod outbox;
@@ -35,10 +39,14 @@ mod work_product_store;
 pub use aggregate::{
     ApplicationSourceKind, ApplicationSourceRevisionFence, AtomicMutation, PendingEvent,
 };
+pub use attribution_spine_store::AttributionSpineStoreExt;
 pub use browser_recipe_store::BrowserRecipeRuntimeState;
 pub use context_material_store::{
     ContextMaterialDescriptor, ContextMaterialStoreError, ContextQuerySnapshot,
     LocalEncryptedContextMaterialStore,
+};
+pub use context_worker_graph_store::{
+    ContextWorkerGraphError, ContextWorkerGraphSnapshot, WorkerGraphStoreDisposition,
 };
 pub use creator::PersistedMutation;
 pub use deletion_propagation::{DeletionPropagationJob, DeletionPropagationJobStatus};
@@ -4606,6 +4614,10 @@ pub enum StorageError {
     WorkProductManifest(#[from] hartevo_domain_kernel::WorkProductManifestError),
     #[error(transparent)]
     ContextAssembly(#[from] hartevo_context_fabric::ContextAssemblyError),
+    #[error(transparent)]
+    MissionRestart(#[from] hartevo_context_fabric::MissionRestartError),
+    #[error(transparent)]
+    MissionControl(#[from] hartevo_context_fabric::MissionControlError),
     #[error(transparent)]
     Browser(#[from] hartevo_browser_adapter::BrowserError),
     #[error(transparent)]

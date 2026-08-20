@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/browser-eval/browser-replay/1.0.0",
+  "title": "Hartevo Browser Semantic Replay",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "replayId",
+    "caseId",
+    "caseVersion",
+    "worldId",
+    "worldVersion",
+    "worldDigest",
+    "deterministicSeed",
+    "recordedInputDigest",
+    "policy",
+    "events",
+    "finalStateDigest",
+    "semanticProjectionDigest"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "hartevo-browser-replay/v1"},
+    "replayId": {"$ref": "#/$defs/replayId"},
+    "caseId": {"$ref": "#/$defs/caseId"},
+    "caseVersion": {"type": "integer", "minimum": 1},
+    "worldId": {"$ref": "#/$defs/worldId"},
+    "worldVersion": {"type": "integer", "minimum": 1},
+    "worldDigest": {"$ref": "#/$defs/sha256"},
+    "deterministicSeed": {"$ref": "#/$defs/sha256"},
+    "recordedInputDigest": {"$ref": "#/$defs/sha256"},
+    "policy": {"$ref": "#/$defs/replayPolicy"},
+    "events": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 4096,
+      "items": {"$ref": "#/$defs/replayEvent"}
+    },
+    "finalStateDigest": {"$ref": "#/$defs/sha256"},
+    "semanticProjectionDigest": {"$ref": "#/$defs/sha256"}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "caseId": {
+      "type": "string",
+      "pattern": "^BROWSER-(REC|SEC|FILE|INJ)-[0-9]{3}$"
+    },
+    "worldId": {
+      "type": "string",
+      "pattern": "^BROWSER-WORLD-[A-Z0-9][A-Z0-9-]{0,63}$"
+    },
+    "replayId": {
+      "type": "string",
+      "pattern": "^BROWSER-REPLAY-[A-Z0-9][A-Z0-9-]{0,63}$"
+    },
+    "replayPolicy": {
+      "type": "object",
+      "required": [
+        "semanticOnly",
+        "rawWallTimeEqualityClaimed",
+        "automaticEffectReplayAllowed",
+        "uncertainEffectObserved"
+      ],
+      "properties": {
+        "semanticOnly": {"const": true},
+        "rawWallTimeEqualityClaimed": {"const": false},
+        "automaticEffectReplayAllowed": {"type": "boolean"},
+        "uncertainEffectObserved": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "replayEvent": {
+      "type": "object",
+      "required": [
+        "ordinal",
+        "virtualTimeMs",
+        "kind",
+        "effectBoundary",
+        "inputDigest",
+        "outputDigest"
+      ],
+      "properties": {
+        "ordinal": {"type": "integer", "minimum": 0},
+        "virtualTimeMs": {"type": "integer", "minimum": 0},
+        "kind": {
+          "enum": [
+            "world_reset",
+            "observe",
+            "resolve",
+            "approval",
+            "dispatch",
+            "receipt_candidate",
+            "host_corroboration",
+            "independent_account_readback",
+            "fault",
+            "restart",
+            "cleanup",
+            "terminal"
+          ]
+        },
+        "effectBoundary": {"$ref": "#/$defs/effectBoundary"},
+        "inputDigest": {"$ref": "#/$defs/sha256"},
+        "outputDigest": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "effectBoundary": {
+      "enum": [
+        "no_effect",
+        "before_dispatch",
+        "dispatch_started",
+        "receipt_candidate_observed",
+        "host_corroborated",
+        "independent_account_readback"
+      ]
+    }
+  }
+}

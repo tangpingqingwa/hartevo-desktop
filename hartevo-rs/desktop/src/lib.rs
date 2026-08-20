@@ -28,21 +28,30 @@ use hartevo_domain_kernel::{
 use rust_decimal::Decimal;
 use zeroize::Zeroizing;
 
+mod agent_operations;
 pub mod data_plane;
 mod runtime_plane;
 mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
 mod visual_fixture;
 
+use agent_operations::{AgentOperationsWorkbenchProjection, OperationsStatus};
 use data_plane::{
     DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane,
     DesktopHumanCheckpointConfirmationRequest, DesktopLoadState, DesktopMissionContinuationRequest,
-    DesktopRuntimeCancellation, DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase,
-    DesktopRuntimeTextStreamProjection, DesktopSnapshot, DesktopVm11OutcomeDecisionRequest,
-    ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
-    RecoveryKitDraft,
+    DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopRuntimeCancellation,
+    DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
+    DesktopSnapshot, DesktopVm11OutcomeDecisionRequest, ProductEvidenceProjection,
+    ProjectContextAccessProjection, ProjectContextAccessStatus, RecoveryKitDraft,
 };
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
+use runtime_subscription::{
+    DESKTOP_RUNTIME_SUBSCRIPTION_PAGE_SIZE, DesktopRuntimeCommandIdentity,
+    DesktopRuntimeCompletionDisposition, DesktopRuntimeExecutionLaunch,
+    DesktopRuntimeExecutionPaintState, DesktopRuntimeExecutionPaintView, DesktopRuntimePaintCommit,
+    DesktopRuntimePollDisposition, DesktopRuntimeReducerEffect, DesktopRuntimeSelection,
+    DesktopRuntimeSelectionChange, DesktopRuntimeStopDisposition, RuntimeSubscriptionError,
+};
 
 static MAIN_CSS: Asset = asset!("/assets/main.css");
 static PROTOTYPE_CSS: Asset = asset!("/assets/prototype.css");
@@ -326,6 +335,13 @@ impl std::fmt::Debug for SensitiveRecoveryInput {
 }
 
 impl UiFailure {
+    fn from_runtime_subscription_error(_error: RuntimeSubscriptionError) -> Self {
+        Self {
+            code: "RUNTIME_SUBSCRIPTION_REJECTED".into(),
+            message: "Runtime 增量与当前 Mission 句柄、游标或选择 epoch 不一致；已拒绝本次绘制，未改变持久 Mission、Runtime 或 Effect 状态。".into(),
+        }
+    }
+
     fn from_error(error: &DesktopDataError) -> Self {
         match error {
             DesktopDataError::MissingDatabaseKey => Self {
@@ -619,18 +635,255 @@ impl DesktopUiModel {
     }
 }
 
+struct ScopedRuntimeRenderProjection<'a> {
+    stream: Option<&'a DesktopRuntimeTextStreamProjection>,
+    error: Option<&'a UiFailure>,
+    fallback_scope_matches: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisualRuntimeFixtureState {
+    Awaiting,
+    FirstAppend,
+    RunningCaughtUp,
+    TerminalBeforeAck,
+    FinalCaughtUp,
+    ErrorRetained,
+    OffscreenReselect,
+}
+
+impl VisualRuntimeFixtureState {
+    const ALL: [Self; 7] = [
+        Self::Awaiting,
+        Self::FirstAppend,
+        Self::RunningCaughtUp,
+        Self::TerminalBeforeAck,
+        Self::FinalCaughtUp,
+        Self::ErrorRetained,
+        Self::OffscreenReselect,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Awaiting => "AWAITING",
+            Self::FirstAppend => "FIRST_APPEND",
+            Self::RunningCaughtUp => "RUNNING_CAUGHT_UP",
+            Self::TerminalBeforeAck => "TERMINAL_BEFORE_ACK",
+            Self::FinalCaughtUp => "FINAL_CAUGHT_UP",
+            Self::ErrorRetained => "ERROR_RETAINED",
+            Self::OffscreenReselect => "OFFSCREEN_RESELECT",
+        }
+    }
+
+    const fn waiting_for_turn(self) -> bool {
+        matches!(self, Self::Awaiting)
+    }
+
+    const fn runtime_busy(self) -> bool {
+        matches!(
+            self,
+            Self::Awaiting
+                | Self::FirstAppend
+                | Self::RunningCaughtUp
+                | Self::TerminalBeforeAck
+                | Self::OffscreenReselect
+        )
+    }
+
+    const fn stop_available(self) -> bool {
+        matches!(
+            self,
+            Self::Awaiting | Self::FirstAppend | Self::RunningCaughtUp
+        )
+    }
+
+    const fn transport_caught_up(self) -> bool {
+        matches!(
+            self,
+            Self::RunningCaughtUp | Self::FinalCaughtUp | Self::OffscreenReselect
+        )
+    }
+
+    const fn follow_latest(self) -> bool {
+        !matches!(self, Self::OffscreenReselect)
+    }
+
+    const fn has_unseen(self) -> bool {
+        matches!(self, Self::OffscreenReselect)
+    }
+}
+
+#[derive(Default)]
+struct InitialVisualRuntimeState {
+    state: Option<VisualRuntimeFixtureState>,
+    scope: Option<(ProjectId, MissionId)>,
+    stream: Option<DesktopRuntimeTextStreamProjection>,
+    error: Option<UiFailure>,
+}
+
+#[derive(Clone, Copy)]
+struct VisualRuntimeStateCopy {
+    title: &'static str,
+    detail: &'static str,
+}
+
+const fn visual_runtime_state_copy(state: VisualRuntimeFixtureState) -> VisualRuntimeStateCopy {
+    match state {
+        VisualRuntimeFixtureState::Awaiting => VisualRuntimeStateCopy {
+            title: "首个 Runtime turn 尚未到达",
+            detail: "Mission snapshot 与 content-free handle 已进入绘制；这不是原生 paint→ack→resume 实机证据。",
+        },
+        VisualRuntimeFixtureState::FirstAppend => VisualRuntimeStateCopy {
+            title: "首段持久正文已进入同一会话",
+            detail: "正文来自确定性视觉夹具；没有 Provider、Receipt、Verification 或业务完成声明。",
+        },
+        VisualRuntimeFixtureState::RunningCaughtUp => VisualRuntimeStateCopy {
+            title: "当前游标已追平，Runtime 仍在运行",
+            detail: "CAUGHT_UP 只表示此刻没有新 delta；轮询与取消边界继续保留。",
+        },
+        VisualRuntimeFixtureState::TerminalBeforeAck => VisualRuntimeStateCopy {
+            title: "已看到 Runtime 终态，等待最终传输确认",
+            detail: "终态正文不会直接清除命令；最终同游标 CaughtUp 前仍不结束传输生命周期。",
+        },
+        VisualRuntimeFixtureState::FinalCaughtUp => VisualRuntimeStateCopy {
+            title: "Runtime 终态正文已完成最终传输确认",
+            detail: "这只结束本次正文传输；不授予 Mission、Provider 或业务结果完成权限。",
+        },
+        VisualRuntimeFixtureState::ErrorRetained => VisualRuntimeStateCopy {
+            title: "Runtime 失败后保留已持久正文",
+            detail: "失败反馈不覆盖已接收文本，也不会把失败美化为 Partial、Outcome 或可自动重试结果。",
+        },
+        VisualRuntimeFixtureState::OffscreenReselect => VisualRuntimeStateCopy {
+            title: "旧 Mission 的 transport 在后台，正文已从当前选择隔离",
+            detail: "当前页面不会绘制旧 scope 的正文、错误或未读提示；fixture 不冒充进程重开证据。",
+        },
+    }
+}
+
+fn initial_visual_runtime_progress(
+    state: Option<VisualRuntimeFixtureState>,
+    legacy_streaming_fixture: bool,
+) -> Vec<DesktopRuntimeProgressEvent> {
+    debug_assert_eq!(VisualRuntimeFixtureState::ALL.len(), 7);
+    let state = state
+        .or_else(|| legacy_streaming_fixture.then_some(VisualRuntimeFixtureState::FirstAppend));
+    let phases: &[DesktopRuntimeProgressPhase] = match state {
+        Some(VisualRuntimeFixtureState::Awaiting) => &[DesktopRuntimeProgressPhase::Preparing],
+        Some(
+            VisualRuntimeFixtureState::FirstAppend
+            | VisualRuntimeFixtureState::RunningCaughtUp
+            | VisualRuntimeFixtureState::OffscreenReselect,
+        ) => &[
+            DesktopRuntimeProgressPhase::Preparing,
+            DesktopRuntimeProgressPhase::Dispatched,
+            DesktopRuntimeProgressPhase::TurnStarted,
+            DesktopRuntimeProgressPhase::ItemStarted,
+        ],
+        Some(
+            VisualRuntimeFixtureState::TerminalBeforeAck | VisualRuntimeFixtureState::FinalCaughtUp,
+        ) => &[
+            DesktopRuntimeProgressPhase::Preparing,
+            DesktopRuntimeProgressPhase::Dispatched,
+            DesktopRuntimeProgressPhase::TurnStarted,
+            DesktopRuntimeProgressPhase::ItemStarted,
+            DesktopRuntimeProgressPhase::ItemCompleted,
+            DesktopRuntimeProgressPhase::Completed,
+        ],
+        Some(VisualRuntimeFixtureState::ErrorRetained) => &[
+            DesktopRuntimeProgressPhase::Preparing,
+            DesktopRuntimeProgressPhase::Dispatched,
+            DesktopRuntimeProgressPhase::TurnStarted,
+            DesktopRuntimeProgressPhase::ItemStarted,
+            DesktopRuntimeProgressPhase::Failed,
+        ],
+        None => &[],
+    };
+    phases
+        .iter()
+        .enumerate()
+        .map(|(index, phase)| DesktopRuntimeProgressEvent {
+            sequence: u64::try_from(index + 1).expect("fixture progress sequence fits u64"),
+            phase: *phase,
+        })
+        .collect()
+}
+
+fn runtime_text_scope_from_projection(
+    projection: Option<&DesktopRuntimeTextStreamProjection>,
+) -> Option<(ProjectId, MissionId)> {
+    projection.map(|stream| (stream.project_id.clone(), stream.mission_id.clone()))
+}
+
+fn scoped_runtime_render_projection<'a>(
+    selected_scope: Option<(&ProjectId, &MissionId)>,
+    runtime_text_scope: Option<(&ProjectId, &MissionId)>,
+    selected_paint_stream: Option<&'a DesktopRuntimeTextStreamProjection>,
+    fallback_stream: Option<&'a DesktopRuntimeTextStreamProjection>,
+    runtime_text_error: Option<&'a UiFailure>,
+) -> ScopedRuntimeRenderProjection<'a> {
+    let Some((selected_project_id, selected_mission_id)) = selected_scope else {
+        return ScopedRuntimeRenderProjection {
+            stream: None,
+            error: None,
+            fallback_scope_matches: false,
+        };
+    };
+    let scope_matches = runtime_text_scope.is_some_and(|(project_id, mission_id)| {
+        project_id == selected_project_id && mission_id == selected_mission_id
+    });
+    let scoped_fallback = if scope_matches {
+        fallback_stream.filter(|stream| {
+            stream.project_id == *selected_project_id && stream.mission_id == *selected_mission_id
+        })
+    } else {
+        None
+    };
+    ScopedRuntimeRenderProjection {
+        stream: selected_paint_stream.or(scoped_fallback),
+        error: if scope_matches {
+            runtime_text_error
+        } else {
+            None
+        },
+        fallback_scope_matches: scope_matches,
+    }
+}
+
 #[component]
 pub fn App() -> Element {
     let desktop_context = dioxus::desktop::use_window();
     let visual_zoom = active_visual_zoom();
     let visual_fixture_mode = active_visual_fixture_id().is_some();
-    let initial_visual_runtime_text_stream = active_visual_runtime_text_stream();
-    let visual_persisted_stream_fixture = initial_visual_runtime_text_stream.is_some();
-    let visual_streaming_fixture = visual_fixture_mode
+    let InitialVisualRuntimeState {
+        state: visual_runtime_state,
+        scope: configured_visual_runtime_scope,
+        stream: initial_visual_runtime_text_stream,
+        error: initial_visual_runtime_error,
+    } = active_visual_runtime_state();
+    let visual_runtime_waiting_for_turn =
+        visual_runtime_state.is_some_and(VisualRuntimeFixtureState::waiting_for_turn);
+    let visual_runtime_busy =
+        visual_runtime_state.is_some_and(VisualRuntimeFixtureState::runtime_busy);
+    let visual_runtime_stop_available =
+        visual_runtime_state.is_some_and(VisualRuntimeFixtureState::stop_available);
+    let visual_runtime_transport_caught_up =
+        visual_runtime_state.is_some_and(VisualRuntimeFixtureState::transport_caught_up);
+    let visual_runtime_follow_latest =
+        visual_runtime_state.is_none_or(VisualRuntimeFixtureState::follow_latest);
+    let visual_runtime_has_unseen =
+        visual_runtime_state.is_some_and(VisualRuntimeFixtureState::has_unseen);
+    let initial_runtime_text_scope =
+        runtime_text_scope_from_projection(initial_visual_runtime_text_stream.as_ref())
+            .or(configured_visual_runtime_scope);
+    let visual_persisted_stream_fixture = visual_runtime_state.is_some();
+    let legacy_visual_streaming_fixture = visual_fixture_mode
         && matches!(
             active_visual_surface_variant().as_deref(),
-            Some("mission-streaming" | "mission-persisted-stream")
+            Some("mission-streaming")
         );
+    let visual_streaming_fixture = legacy_visual_streaming_fixture || visual_runtime_busy;
+    let initial_runtime_progress =
+        initial_visual_runtime_progress(visual_runtime_state, legacy_visual_streaming_fixture);
     use_effect(move || desktop_context.set_zoom_level(visual_zoom));
     let mut surface = use_signal(initial_surface);
     let mut model = use_signal(DesktopUiModel::load);
@@ -652,38 +905,18 @@ pub fn App() -> Element {
     let mut catalog_contract_expanded = use_signal(|| false);
     let mut mission_submitting = use_signal(move || visual_streaming_fixture);
     let mut runtime_retrying = use_signal(|| false);
-    let mut runtime_cancellation =
-        use_signal(move || visual_streaming_fixture.then(DesktopRuntimeCancellation::default));
-    let mut runtime_stop_requested = use_signal(|| false);
-    let mut runtime_progress = use_signal(move || {
-        if visual_streaming_fixture {
-            vec![
-                DesktopRuntimeProgressEvent {
-                    sequence: 1,
-                    phase: DesktopRuntimeProgressPhase::Preparing,
-                },
-                DesktopRuntimeProgressEvent {
-                    sequence: 2,
-                    phase: DesktopRuntimeProgressPhase::Dispatched,
-                },
-                DesktopRuntimeProgressEvent {
-                    sequence: 3,
-                    phase: DesktopRuntimeProgressPhase::TurnStarted,
-                },
-                DesktopRuntimeProgressEvent {
-                    sequence: 4,
-                    phase: DesktopRuntimeProgressPhase::ItemStarted,
-                },
-            ]
-        } else {
-            Vec::new()
-        }
+    let mut runtime_cancellation = use_signal(move || {
+        (legacy_visual_streaming_fixture || visual_runtime_stop_available)
+            .then(DesktopRuntimeCancellation::default)
     });
-    let mut runtime_text_scope = use_signal(|| None::<(ProjectId, MissionId)>);
+    let mut runtime_stop_requested = use_signal(|| false);
+    let mut runtime_progress = use_signal(move || initial_runtime_progress);
+    let mut runtime_execution_paint = use_signal(DesktopRuntimeExecutionPaintState::default);
+    let mut runtime_text_scope = use_signal(move || initial_runtime_text_scope);
     let mut runtime_text_stream = use_signal(move || initial_visual_runtime_text_stream);
-    let mut runtime_text_error = use_signal(|| None::<UiFailure>);
-    let mut runtime_follow_latest = use_signal(|| true);
-    let mut runtime_has_unseen = use_signal(|| false);
+    let mut runtime_text_error = use_signal(move || initial_visual_runtime_error);
+    let mut runtime_follow_latest = use_signal(move || visual_runtime_follow_latest);
+    let mut runtime_has_unseen = use_signal(move || visual_runtime_has_unseen);
     let mut composer_expanded = use_signal(|| false);
     let mut composer_guidance_dismissed = use_signal(|| false);
     let mut human_work_product_selection = use_signal(BTreeSet::<WorkProductId>::new);
@@ -717,9 +950,69 @@ pub fn App() -> Element {
             runtime_follow_latest.set(true);
             runtime_has_unseen.set(false);
         }
+        let selection_change = {
+            let mut paint = runtime_execution_paint.write();
+            paint.reconcile_selection(
+                selected_scope
+                    .as_ref()
+                    .map(|(project_id, mission_id)| (project_id, mission_id)),
+            )
+        };
+        let selection_change = match selection_change {
+            Ok(change) => change,
+            Err(error) => {
+                runtime_text_error.set(Some(UiFailure::from_runtime_subscription_error(error)));
+                return;
+            }
+        };
         let Some((project_id, mission_id)) = selected_scope else {
             return;
         };
+        match selection_change {
+            DesktopRuntimeSelectionChange::Selected(selection) => {
+                runtime_text_stream.set(None);
+                runtime_text_error.set(None);
+                sync_runtime_execution_paint_controls(
+                    RuntimeTextUiSignals {
+                        paint: runtime_execution_paint,
+                        error: runtime_text_error,
+                        follow_latest: runtime_follow_latest,
+                        has_unseen: runtime_has_unseen,
+                    },
+                    &project_id,
+                    &mission_id,
+                );
+                let text_ui = RuntimeTextUiSignals {
+                    paint: runtime_execution_paint,
+                    error: runtime_text_error,
+                    follow_latest: runtime_follow_latest,
+                    has_unseen: runtime_has_unseen,
+                };
+                let command_active = runtime_execution_paint
+                    .read()
+                    .stop_available_for_selection(Some((&project_id, &mission_id)));
+                if !command_active {
+                    begin_read_only_runtime_subscription_monitor(text_ui, selection);
+                }
+                return;
+            }
+            DesktopRuntimeSelectionChange::Unchanged => {
+                runtime_text_stream.set(None);
+                runtime_text_error.set(None);
+                sync_runtime_execution_paint_controls(
+                    RuntimeTextUiSignals {
+                        paint: runtime_execution_paint,
+                        error: runtime_text_error,
+                        follow_latest: runtime_follow_latest,
+                        has_unseen: runtime_has_unseen,
+                    },
+                    &project_id,
+                    &mission_id,
+                );
+                return;
+            }
+            DesktopRuntimeSelectionChange::Untracked => {}
+        }
         spawn(async move {
             let query_project_id = project_id.clone();
             let query_mission_id = mission_id.clone();
@@ -756,6 +1049,63 @@ pub fn App() -> Element {
             }
         });
     });
+    // Dioxus runs this effect after committing the render that consumed the
+    // current signals. Only this post-render fence can exchange a prepared
+    // phase-one receipt for non-Clone Runtime authority.
+    use_effect(move || {
+        if visual_fixture_mode {
+            return;
+        }
+        let pending = runtime_execution_paint.read().pending_paint_commit();
+        let Some(commit) = pending else {
+            return;
+        };
+        let scope = &commit.selection().scope;
+        let snapshot_is_painted = {
+            let current = model.read();
+            current.selected_project_id.as_ref() == Some(scope.project_id())
+                && current.selected_mission_id.as_ref() == Some(scope.mission_id())
+                && current
+                    .current_mission()
+                    .is_some_and(|mission| mission.mission_id == *scope.mission_id())
+        };
+        let awaiting_is_painted = runtime_execution_paint
+            .read()
+            .paint_view(scope.project_id(), scope.mission_id())
+            .is_some_and(|view| view.awaiting_turn() && view.stream().is_none());
+        if !snapshot_is_painted || !awaiting_is_painted {
+            return;
+        }
+        let launch = {
+            let mut paint = runtime_execution_paint.write();
+            acknowledge_runtime_paint_for_dispatch(&mut paint, &commit)
+        };
+        match launch {
+            Ok(launch) => {
+                runtime_text_error.set(None);
+                begin_catalog_runtime_execution_after_paint(
+                    launch,
+                    RuntimeExecutionUiSignals {
+                        text: RuntimeTextUiSignals {
+                            paint: runtime_execution_paint,
+                            error: runtime_text_error,
+                            follow_latest: runtime_follow_latest,
+                            has_unseen: runtime_has_unseen,
+                        },
+                        model,
+                        submitting: mission_submitting,
+                        stop_requested: runtime_stop_requested,
+                        progress: runtime_progress,
+                    },
+                );
+            }
+            Err(error) => {
+                runtime_text_error.set(Some(UiFailure::from_runtime_subscription_error(error)));
+                runtime_stop_requested.set(false);
+                mission_submitting.set(false);
+            }
+        }
+    });
     let view = model.read().clone();
     let current_surface = surface();
     let project = view.current_project().cloned();
@@ -774,7 +1124,64 @@ pub fn App() -> Element {
     let workpad_visible =
         workpad_open() && current_surface == Surface::Orchestrator && mission.is_some();
     let runtime_busy = mission_submitting() || runtime_retrying();
-    let runtime_stop_available = runtime_cancellation.read().is_some();
+    let selected_runtime_scope = project
+        .as_ref()
+        .zip(mission.as_ref())
+        .map(|(project, mission)| (&project.project_id, &mission.mission_id));
+    let selected_runtime_execution_paint =
+        selected_runtime_scope.and_then(|(project_id, mission_id)| {
+            runtime_execution_paint
+                .read()
+                .paint_view(project_id, mission_id)
+        });
+    let (rendered_runtime_text_stream, rendered_runtime_text_error, runtime_fallback_scope_matches) = {
+        let fallback_scope = runtime_text_scope.read();
+        let fallback_stream = runtime_text_stream.read();
+        let fallback_error = runtime_text_error.read();
+        let projection = scoped_runtime_render_projection(
+            selected_runtime_scope,
+            fallback_scope
+                .as_ref()
+                .map(|(project_id, mission_id)| (project_id, mission_id)),
+            selected_runtime_execution_paint
+                .as_ref()
+                .and_then(DesktopRuntimeExecutionPaintView::stream),
+            fallback_stream.as_ref(),
+            fallback_error.as_ref(),
+        );
+        (
+            projection.stream.cloned(),
+            projection.error.cloned(),
+            projection.fallback_scope_matches,
+        )
+    };
+    let runtime_waiting_for_turn = selected_runtime_execution_paint
+        .as_ref()
+        .is_some_and(DesktopRuntimeExecutionPaintView::awaiting_turn)
+        || (visual_runtime_waiting_for_turn && runtime_fallback_scope_matches);
+    let rendered_runtime_transport_caught_up = selected_runtime_execution_paint
+        .as_ref()
+        .is_some_and(DesktopRuntimeExecutionPaintView::transport_caught_up)
+        || (visual_runtime_transport_caught_up && runtime_fallback_scope_matches);
+    let rendered_runtime_follow_latest = match selected_runtime_execution_paint.as_ref() {
+        Some(paint) => paint.follow_latest(),
+        None if runtime_fallback_scope_matches => runtime_follow_latest(),
+        None => true,
+    };
+    let rendered_runtime_has_unseen = match selected_runtime_execution_paint.as_ref() {
+        Some(paint) => paint.has_unseen(),
+        None if runtime_fallback_scope_matches => runtime_has_unseen(),
+        None => false,
+    };
+    let execution_stop_available = runtime_execution_paint.read().stop_available_for_selection(
+        project
+            .as_ref()
+            .zip(mission.as_ref())
+            .map(|(project, mission)| (&project.project_id, &mission.mission_id)),
+    );
+    let runtime_stop_available = execution_stop_available
+        || runtime_cancellation.read().is_some()
+        || (visual_runtime_stop_available && runtime_fallback_scope_matches);
     let project_can_start_mission = view.can_start_mission();
     let evidence = view.product_evidence().cloned();
     let project_storage_status = project
@@ -916,7 +1323,9 @@ pub fn App() -> Element {
         .collect::<Vec<_>>();
     let active_operation_label = runtime_progress_events.last().map_or_else(
         || {
-            if runtime_retrying() {
+            if runtime_waiting_for_turn {
+                "Mission 与执行句柄已持久化，等待首个 Runtime turn"
+            } else if runtime_retrying() {
                 "正在安全恢复本地 Runtime"
             } else if application_route_active {
                 "正在运行确定性 Application Checkpoint"
@@ -1030,6 +1439,43 @@ pub fn App() -> Element {
     let runtime_projection = match &view.backend {
         DesktopBackendState::Ready(snapshot) => Some(snapshot.runtime.clone()),
         DesktopBackendState::Uninitialized(_) | DesktopBackendState::Failed(_) => None,
+    };
+    let operations_projection = AgentOperationsWorkbenchProjection::from_parts(
+        project.as_ref(),
+        mission.as_ref(),
+        runtime_activity.as_ref(),
+        runtime_projection.as_ref(),
+    );
+    let operations_interrupt_available = runtime_busy && runtime_stop_available;
+    let operations_interrupt_requested = runtime_stop_requested();
+    let request_operations_interrupt = move |()| {
+        let selected = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.selected_mission_id.clone())
+        };
+        let disposition = runtime_execution_paint.read().request_stop_for_selection(
+            selected
+                .as_ref()
+                .map(|(project_id, mission_id)| (project_id, mission_id)),
+        );
+        match disposition {
+            DesktopRuntimeStopDisposition::Requested
+            | DesktopRuntimeStopDisposition::AlreadyRequested => {
+                runtime_stop_requested.set(true);
+            }
+            DesktopRuntimeStopDisposition::ScopeMismatch
+            | DesktopRuntimeStopDisposition::NoActiveCommand => {
+                request_desktop_runtime_stop(
+                    runtime_cancellation.read().clone(),
+                    runtime_stop_requested,
+                    runtime_progress,
+                    visual_streaming_fixture,
+                );
+            }
+        }
     };
     let runtime_chip = runtime_projection.as_ref().map_or_else(
         || "Runtime · 数据层未就绪".to_owned(),
@@ -1600,13 +2046,19 @@ pub fn App() -> Element {
                                 project: project.clone(),
                                 mission: mission.clone(),
                                 runtime_activity: runtime_activity.clone(),
-                                runtime_text_stream: runtime_text_stream.read().clone(),
-                                runtime_text_error: runtime_text_error.read().clone(),
+                                runtime_text_stream: rendered_runtime_text_stream.clone(),
+                                runtime_waiting_for_turn,
+                                runtime_text_error: rendered_runtime_text_error.clone(),
+                                runtime_fixture_state: visual_runtime_state,
+                                runtime_transport_caught_up: rendered_runtime_transport_caught_up,
                                 runtime_busy,
                                 runtime_stream_is_fixture: visual_persisted_stream_fixture,
-                                runtime_follow_latest: runtime_follow_latest(),
-                                runtime_has_unseen: runtime_has_unseen(),
+                                runtime_follow_latest: rendered_runtime_follow_latest,
+                                runtime_has_unseen: rendered_runtime_has_unseen,
                                 context_access: context_access.clone(),
+                                operations: operations_projection.clone(),
+                                interrupt_available: operations_interrupt_available,
+                                interrupt_requested: operations_interrupt_requested,
                                 on_initialize: move |_| {
                                     match DesktopDataPlane::discover().and_then(|plane| plane.initialize_os(Utc::now())) {
                                         Ok(snapshot) => model.write().set_ready(snapshot, false),
@@ -1617,15 +2069,56 @@ pub fn App() -> Element {
                                 on_error: move |error| model.write().set_notice(&error),
                                 on_select_mission: move |mission_id| model.write().select_mission(mission_id),
                                 on_open_workpad: move |()| workpad_open.set(true),
+                                on_quick_entry: move |()| {
+                                    composer_expanded.set(true);
+                                    restore_ui_focus("mission-composer-input");
+                                },
+                                on_interrupt: request_operations_interrupt,
                                 on_runtime_scroll: move |near_bottom| {
-                                    runtime_follow_latest.set(near_bottom);
-                                    if near_bottom {
-                                        runtime_has_unseen.set(false);
+                                    let selected = {
+                                        let current = model.read();
+                                        current.selected_project_id.clone().zip(
+                                            current.selected_mission_id.clone(),
+                                        )
+                                    };
+                                    let handled = selected.as_ref().is_some_and(
+                                        |(project_id, mission_id)| {
+                                            runtime_execution_paint
+                                                .write()
+                                                .set_follow_latest(
+                                                    project_id,
+                                                    mission_id,
+                                                    near_bottom,
+                                                )
+                                                .unwrap_or(false)
+                                        },
+                                    );
+                                    if !handled {
+                                        runtime_follow_latest.set(near_bottom);
+                                        if near_bottom {
+                                            runtime_has_unseen.set(false);
+                                        }
                                     }
                                 },
                                 on_follow_latest: move |()| {
-                                    runtime_follow_latest.set(true);
-                                    runtime_has_unseen.set(false);
+                                    let selected = {
+                                        let current = model.read();
+                                        current.selected_project_id.clone().zip(
+                                            current.selected_mission_id.clone(),
+                                        )
+                                    };
+                                    let handled = selected.as_ref().is_some_and(
+                                        |(project_id, mission_id)| {
+                                            runtime_execution_paint
+                                                .write()
+                                                .set_follow_latest(project_id, mission_id, true)
+                                                .unwrap_or(false)
+                                        },
+                                    );
+                                    if !handled {
+                                        runtime_follow_latest.set(true);
+                                        runtime_has_unseen.set(false);
+                                    }
                                     scroll_mission_thread_to_latest();
                                 },
                             }
@@ -2644,47 +3137,64 @@ pub fn App() -> Element {
                                                         budget_minor,
                                                         currency,
                                                     };
-                                                    let cancellation = DesktopRuntimeCancellation::default();
-                                                    runtime_cancellation.set(Some(cancellation.clone()));
+                                                    runtime_cancellation.set(None);
                                                     runtime_stop_requested.set(false);
                                                     runtime_progress.set(Vec::new());
                                                     mission_submitting.set(true);
-                                                    begin_runtime_progress_monitor(
-                                                        cancellation.clone(),
-                                                        runtime_progress,
-                                                        mission_submitting,
-                                                        runtime_retrying,
-                                                    );
                                                     spawn(async move {
                                                         let result = tokio::task::spawn_blocking(move || {
                                                             DesktopDataPlane::discover().and_then(|plane| {
-                                                                plane.start_catalog_mission_and_run_cancellable_os(
+                                                                plane.start_catalog_mission_execution_os(
                                                                     request,
-                                                                    &cancellation,
                                                                     Utc::now(),
                                                                 )
                                                             })
                                                         })
                                                         .await;
                                                         match result {
-                                                            Ok(Ok(submission)) => {
-                                                                model.write().set_ready(submission.snapshot, true);
-                                                                draft.set(String::new());
-                                                                catalog_manifest_id.set(String::new());
-                                                                catalog_mode.set(String::new());
-                                                                catalog_parent_mission_id.set(String::new());
+                                                            Ok(Ok(started)) => {
+                                                                model.write().set_ready(started.snapshot, true);
+                                                                let commit = runtime_execution_paint
+                                                                    .write()
+                                                                    .commit_catalog_start(started.handle);
+                                                                match commit {
+                                                                    Ok(commit) => {
+                                                                        let scope = &commit.selection().scope;
+                                                                        runtime_text_scope.set(Some((
+                                                                            scope.project_id().clone(),
+                                                                            scope.mission_id().clone(),
+                                                                        )));
+                                                                        runtime_text_stream.set(None);
+                                                                        runtime_text_error.set(None);
+                                                                        runtime_follow_latest.set(true);
+                                                                        runtime_has_unseen.set(false);
+                                                                        draft.set(String::new());
+                                                                        catalog_manifest_id.set(String::new());
+                                                                        catalog_mode.set(String::new());
+                                                                        catalog_parent_mission_id.set(String::new());
+                                                                        // The post-render effect owns phase two. This
+                                                                        // async continuation has no Runtime authority.
+                                                                    }
+                                                                    Err(error) => {
+                                                                        runtime_text_error.set(Some(
+                                                                            UiFailure::from_runtime_subscription_error(error),
+                                                                        ));
+                                                                        mission_submitting.set(false);
+                                                                    }
+                                                                }
                                                             }
-                                                            Ok(Err(error)) => model.write().set_notice(&error),
+                                                            Ok(Err(error)) => {
+                                                                model.write().set_notice(&error);
+                                                                mission_submitting.set(false);
+                                                            }
                                                             Err(_) => {
                                                                 model.write().notice = Some(UiFailure {
-                                                                    code: "RUNTIME_COORDINATOR_FAILED".into(),
-                                                                    message: "本地 Runtime 协调任务异常结束；重启读取时会由持久 Turn Ledger 进行 fencing，未声明 Mission 完成。".into(),
+                                                                    code: "CATALOG_START_COORDINATOR_FAILED".into(),
+                                                                    message: "Catalog Mission 原子启动任务异常结束；未获得执行句柄，也未启动 Runtime 或 Effect。".into(),
                                                                 });
+                                                                mission_submitting.set(false);
                                                             }
                                                         }
-                                                        runtime_cancellation.set(None);
-                                                        runtime_stop_requested.set(false);
-                                                        mission_submitting.set(false);
                                                     });
                                                 },
                                                 if mission_submitting() {
@@ -2705,12 +3215,36 @@ pub fn App() -> Element {
                                                 aria_label: if visual_streaming_fixture { "停止 Runtime 交互结构样例" } else if runtime_stop_requested() { "正在等待 Runtime 停止回执" } else { "停止当前 Runtime turn" },
                                                 title: if visual_streaming_fixture { "VISUAL_FIXTURE · 仅切换 Stop 交互状态，不发送真实 interrupt" } else { "停止 exact Runtime attempt；保留已持久化的正文、事件与 Mission 边界" },
                                                 onclick: move |_| {
-                                                    request_desktop_runtime_stop(
-                                                        runtime_cancellation.read().clone(),
-                                                        runtime_stop_requested,
-                                                        runtime_progress,
-                                                        visual_streaming_fixture,
-                                                    );
+                                                    let selected = {
+                                                        let current = model.read();
+                                                        current.selected_project_id.clone().zip(
+                                                            current.selected_mission_id.clone(),
+                                                        )
+                                                    };
+                                                    let disposition = runtime_execution_paint
+                                                        .read()
+                                                        .request_stop_for_selection(
+                                                            selected.as_ref().map(
+                                                                |(project_id, mission_id)| {
+                                                                    (project_id, mission_id)
+                                                                },
+                                                            ),
+                                                        );
+                                                    match disposition {
+                                                        DesktopRuntimeStopDisposition::Requested
+                                                        | DesktopRuntimeStopDisposition::AlreadyRequested => {
+                                                            runtime_stop_requested.set(true);
+                                                        }
+                                                        DesktopRuntimeStopDisposition::ScopeMismatch
+                                                        | DesktopRuntimeStopDisposition::NoActiveCommand => {
+                                                            request_desktop_runtime_stop(
+                                                                runtime_cancellation.read().clone(),
+                                                                runtime_stop_requested,
+                                                                runtime_progress,
+                                                                visual_streaming_fixture,
+                                                            );
+                                                        }
+                                                    }
                                                 },
                                                 UiIcon { name: UiIconName::Square, size: 12 }
                                             }
@@ -4123,23 +4657,306 @@ fn ProjectDispatcherSurface(
 }
 
 #[component]
+fn AgentOperationsWorkbench(
+    projection: AgentOperationsWorkbenchProjection,
+    interrupt_available: bool,
+    interrupt_requested: bool,
+    on_quick_entry: EventHandler<()>,
+    on_interrupt: EventHandler<()>,
+) -> Element {
+    let recovery_required = projection.recovery.status == OperationsStatus::RecoveryRequired;
+    let interrupt_disabled = !interrupt_available || interrupt_requested || recovery_required;
+    let interrupt_label = if recovery_required {
+        "先恢复再中断"
+    } else if interrupt_requested {
+        "等待中断回执"
+    } else if interrupt_available {
+        "Interrupt 当前 turn"
+    } else {
+        "没有可中断 turn"
+    };
+    rsx! {
+        article {
+            class: "agent-operations-workbench",
+            aria_label: "Agent Operations Workbench",
+            tabindex: "-1",
+            header { class: "operations-header",
+                div {
+                    span { class: "operations-eyebrow", "AGENT OPERATIONS" }
+                    h2 { "{projection.project_name}" }
+                    p { "Mission Control · Runtime · Worker Graph · Work Product" }
+                }
+                span {
+                    class: format!("operations-status {}", projection.mission.status.tone()),
+                    role: "status",
+                    aria_live: "polite",
+                    {projection.mission.status.code()}
+                }
+            }
+
+            section { class: "operations-section operations-mission-control", aria_label: "Mission Control",
+                header { class: "operations-section-header",
+                    div {
+                        span { class: "operations-eyebrow", "MISSION CONTROL" }
+                        h3 { "当前 Mission" }
+                    }
+                    span { class: "operations-section-state", "{projection.mission.stage}" }
+                }
+                div { class: "operations-objective",
+                    small { "Objective" }
+                    p { "{projection.mission.objective}" }
+                }
+                div { class: "operations-fact-grid",
+                    div { class: "operations-fact",
+                        small { "Current gate" }
+                        strong { "{projection.mission.current_gate}" }
+                    }
+                    div { class: "operations-fact",
+                        small { "Next todos" }
+                        ul {
+                            for todo in projection.mission.next_todos.iter() {
+                                li { "{todo}" }
+                            }
+                        }
+                    }
+                    div { class: "operations-fact",
+                        small { "Quota" }
+                        strong { "{projection.mission.quota.used} / {projection.mission.quota.limit}" }
+                        span { "{projection.mission.quota.detail}" }
+                    }
+                    div { class: "operations-fact",
+                        small { "Evidence changes" }
+                        strong { "{projection.mission.evidence.evidence_count} evidence · {projection.mission.evidence.work_product_count} artifacts" }
+                        span { "{projection.mission.evidence.verified_effect_count} verified effects" }
+                    }
+                }
+                div { class: "operations-claims",
+                    h4 { "Active claims" }
+                    if projection.mission.active_claims.is_empty() {
+                        p { class: "operations-empty", "没有 active claim；这里不从页面动画推导 worker ownership。" }
+                    } else {
+                        for claim in projection.mission.active_claims.iter() {
+                            div { class: "operations-claim",
+                                span { class: format!("operations-status-dot {}", claim.status.tone()) }
+                                div {
+                                    strong { "{claim.title}" }
+                                    span { "{claim.detail}" }
+                                }
+                                em { "{claim.status.code()}" }
+                            }
+                        }
+                    }
+                }
+            }
+
+            section { class: "operations-section operations-runtime-grid", aria_label: "Runtime configuration and Worker Graph",
+                div { class: "operations-card operations-runtime-card",
+                    header { class: "operations-card-header",
+                        div {
+                            span { class: "operations-eyebrow", "RUNTIME CONFIGURATION" }
+                            h3 { "Provider / Model / Harness" }
+                        }
+                        span { class: format!("operations-status {}", projection.runtime.status.tone()), "{projection.runtime.status.code()}" }
+                    }
+                    div { class: "operations-definition-grid",
+                        div { small { "Provider" } strong { "{projection.runtime.provider}" } }
+                        div { small { "Model" } strong { "{projection.runtime.model}" } }
+                        div { small { "Harness" } strong { "{projection.runtime.harness}" } }
+                        div { small { "Reasoning effort" } strong { "{projection.runtime.reasoning_effort}" } }
+                        div { small { "Service tier" } strong { "{projection.runtime.service_tier}" } }
+                        div { small { "Data boundary" } strong { "{projection.runtime.data_boundary}" } }
+                        div { small { "Pinned release" } strong { "{projection.runtime.pinned_release}" } }
+                    }
+                }
+                div { class: "operations-card operations-workers-card",
+                    header { class: "operations-card-header",
+                        div {
+                            span { class: "operations-eyebrow", "WORKER GRAPH" }
+                            h3 { "Worker state" }
+                        }
+                        span { class: "operations-section-state", "{projection.workers.len()} worker" }
+                    }
+                    if projection.workers.is_empty() {
+                        p { class: "operations-empty", "选择真实 Mission 后显示 worker graph。" }
+                    } else {
+                        for worker in projection.workers.iter() {
+                            div { class: "operations-worker",
+                                div { class: "operations-worker-heading",
+                                    strong { "{worker.worker_type}" }
+                                    span { class: format!("operations-status {}", worker.status.tone()), "{worker.status.code()}" }
+                                }
+                                p { "{worker.task}" }
+                                div { class: "operations-worker-facts",
+                                    span { small { "Lease" } "{worker.lease}" }
+                                    span { small { "Generation" } "{worker.generation}" }
+                                    span { small { "Progress" } "{worker.progress}" }
+                                    span { small { "Budget" } "{worker.budget}" }
+                                    span { small { "Handoff" } "{worker.handoff}" }
+                                    span { small { "Recovery" } "{worker.recovery}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            section { class: "operations-section operations-review-grid", aria_label: "Artifacts approvals browser and recovery",
+                div { class: "operations-card operations-artifacts-card",
+                    header { class: "operations-card-header",
+                        div {
+                            span { class: "operations-eyebrow", "WORK PRODUCT / ARTIFACTS" }
+                            h3 { "Preview and lineage" }
+                        }
+                        span { class: "operations-section-state", "{projection.artifacts.len()} artifacts" }
+                    }
+                    if projection.artifacts.is_empty() {
+                        p { class: "operations-empty", "当前 Mission 尚无持久 Work Product。" }
+                    } else {
+                        for artifact in projection.artifacts.iter() {
+                            article { class: "operations-artifact",
+                                div { class: "operations-artifact-heading",
+                                    div {
+                                        strong { "{artifact.title}" }
+                                        small { "{artifact.kind} · {artifact.revision}" }
+                                    }
+                                    span { class: format!("operations-status {}", artifact.status.tone()), "{artifact.status.code()}" }
+                                }
+                                p { class: "operations-lineage", "{artifact.lineage}" }
+                                pre { class: "operations-preview", "{artifact.preview}" }
+                                div { class: "operations-artifact-actions", aria_label: "Artifact actions",
+                                    button {
+                                        disabled: artifact.actions.diff != OperationsStatus::Ready,
+                                        aria_label: "查看 Artifact diff",
+                                        title: "等待 Artifact owner API",
+                                        "Diff · {artifact.actions.diff.code()}"
+                                    }
+                                    button {
+                                        disabled: artifact.actions.adopt != OperationsStatus::Ready,
+                                        aria_label: "采用 Artifact",
+                                        title: "等待 Artifact owner API",
+                                        "Adopt · {artifact.actions.adopt.code()}"
+                                    }
+                                    button {
+                                        disabled: artifact.actions.reject != OperationsStatus::Ready,
+                                        aria_label: "拒绝 Artifact",
+                                        title: "等待 Artifact owner API",
+                                        "Reject · {artifact.actions.reject.code()}"
+                                    }
+                                    button {
+                                        disabled: artifact.actions.rollback != OperationsStatus::Ready,
+                                        aria_label: "回滚 Artifact",
+                                        title: "等待 Artifact owner API",
+                                        "Rollback · {artifact.actions.rollback.code()}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "operations-card operations-approval-card",
+                    header { class: "operations-card-header",
+                        div {
+                            span { class: "operations-eyebrow", "APPROVAL / EFFECT" }
+                            h3 { "外部动作边界" }
+                        }
+                    }
+                    div { class: "operations-definition-grid",
+                        div { small { "External Effect approvals" } strong { "{projection.approvals.external_approval_count}" } span { "{projection.approvals.external_status.code()}" } }
+                        div { small { "Verified effects" } strong { "{projection.approvals.verified_effect_count}" } span { "不会由本地 Runtime 状态代替" } }
+                        div { small { "Local Runtime approval" } strong { "{projection.approvals.local_runtime_status.code()}" } span { "{projection.approvals.local_runtime_detail}" } }
+                    }
+                }
+                div { class: "operations-card operations-browser-card",
+                    header { class: "operations-card-header",
+                        div {
+                            span { class: "operations-eyebrow", "BROWSER WORKSPACE" }
+                            h3 { "Identity and takeover" }
+                        }
+                        span { class: format!("operations-status {}", projection.browser.status.tone()), "{projection.browser.status.code()}" }
+                    }
+                    div { class: "operations-definition-grid",
+                        div { small { "Identity" } strong { "{projection.browser.identity}" } }
+                        div { small { "Control owner" } strong { "{projection.browser.control_owner}" } }
+                        div { small { "Next action" } strong { "{projection.browser.next_action}" } }
+                    }
+                    div { class: "operations-artifact-actions",
+                        button { disabled: true, aria_label: "接管 Browser Workspace", title: "等待 BW-01 owner API", "Take over · NOT_IMPLEMENTED" }
+                        button { disabled: true, aria_label: "继续 Browser Workspace", title: "等待 BW-01 owner API", "Continue · NOT_IMPLEMENTED" }
+                    }
+                }
+                div { class: "operations-card operations-recovery-card",
+                    header { class: "operations-card-header",
+                        div {
+                            span { class: "operations-eyebrow", "RECOVERY" }
+                            h3 { "Runtime steering" }
+                        }
+                        span { class: format!("operations-status {}", projection.recovery.status.tone()), "{projection.recovery.status.code()}" }
+                    }
+                    p { "{projection.recovery.detail}" }
+                    strong { "{projection.recovery.next_action}" }
+                }
+            }
+
+            footer { class: "operations-quick-entry",
+                div {
+                    span { class: "operations-eyebrow", "QUICK ENTRY" }
+                    p { "{projection.quick_entry.hint}" }
+                }
+                div { class: "operations-quick-entry-actions",
+                    button {
+                        class: "primary-button",
+                        id: "agent-operations-quick-entry",
+                        onclick: move |_| on_quick_entry.call(()),
+                        "Open Quick Entry"
+                    }
+                    button {
+                        class: "quiet-button",
+                        disabled: interrupt_disabled,
+                        aria_label: "中断当前 Runtime turn",
+                        onclick: move |_| on_interrupt.call(()),
+                        "{interrupt_label}"
+                    }
+                    span { class: "operations-live-region", role: "status", aria_live: "polite",
+                        if interrupt_requested {
+                            "停止请求已提交；等待 exact Runtime 回执。"
+                        } else if recovery_required {
+                            "Uncertain 状态已设 recovery fence；不会自动重放。"
+                        } else {
+                            "仅展示持久 projection；此面板不创建 Agent loop。"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn OrchestratorSurface(
     backend: DesktopBackendState,
     project: Option<DesktopProjectProjection>,
     mission: Option<MissionProjection>,
     runtime_activity: Option<MissionRuntimeProjection>,
     runtime_text_stream: Option<DesktopRuntimeTextStreamProjection>,
+    runtime_waiting_for_turn: bool,
     runtime_text_error: Option<UiFailure>,
+    runtime_fixture_state: Option<VisualRuntimeFixtureState>,
+    runtime_transport_caught_up: bool,
     runtime_busy: bool,
     runtime_stream_is_fixture: bool,
     runtime_follow_latest: bool,
     runtime_has_unseen: bool,
     context_access: Option<ProjectContextAccessProjection>,
+    operations: AgentOperationsWorkbenchProjection,
+    interrupt_available: bool,
+    interrupt_requested: bool,
     on_initialize: EventHandler<MouseEvent>,
     on_ready: EventHandler<DesktopSnapshot>,
     on_error: EventHandler<DesktopDataError>,
     on_select_mission: EventHandler<MissionId>,
     on_open_workpad: EventHandler<()>,
+    on_quick_entry: EventHandler<()>,
+    on_interrupt: EventHandler<()>,
     on_runtime_scroll: EventHandler<bool>,
     on_follow_latest: EventHandler<()>,
 ) -> Element {
@@ -4222,6 +5039,13 @@ fn OrchestratorSurface(
             let Some(mission) = mission else {
                 return rsx! {
                     div { class: "surface-scroll",
+                        AgentOperationsWorkbench {
+                            projection: operations.clone(),
+                            interrupt_available: false,
+                            interrupt_requested: false,
+                            on_quick_entry,
+                            on_interrupt,
+                        }
                         ProjectDispatcherSurface { project, on_select_mission }
                     }
                 };
@@ -4325,6 +5149,8 @@ fn OrchestratorSurface(
             });
             let render_stream_turn =
                 runtime_text_stream.is_some() && replayed_message_sequence.is_none();
+            let runtime_fixture_copy = runtime_fixture_state
+                .map(|state| (state.label(), visual_runtime_state_copy(state)));
             rsx! {
                 div {
                     id: "persisted-mission-thread",
@@ -4337,10 +5163,29 @@ fn OrchestratorSurface(
                         ) - event.data.scroll_top();
                         on_runtime_scroll.call(remaining <= 96.0);
                     },
+                    AgentOperationsWorkbench {
+                        projection: operations,
+                        interrupt_available,
+                        interrupt_requested,
+                        on_quick_entry,
+                        on_interrupt,
+                    }
                     PersistedConversationMessages {
                         mission: mission.clone(),
                         runtime_text_stream: runtime_text_stream.clone(),
                         replayed_message_sequence,
+                    }
+                    if let Some((state, copy)) = runtime_fixture_copy {
+                        div {
+                            class: "persisted-system-notice visual-runtime-state",
+                            role: "status",
+                            aria_label: "Runtime 视觉回归状态 {state}",
+                            UiIcon { name: UiIconName::Workflow, size: 13 }
+                            span {
+                                strong { "VISUAL_FIXTURE · {state} · {copy.title}" }
+                                small { "{copy.detail}" }
+                            }
+                        }
                     }
                     if render_stream_turn {
                         if let Some(stream) = runtime_text_stream.clone() {
@@ -4348,8 +5193,11 @@ fn OrchestratorSurface(
                                 stream,
                                 runtime_busy,
                                 visual_fixture: runtime_stream_is_fixture,
+                                transport_caught_up: runtime_transport_caught_up,
                             }
                         }
+                    } else if runtime_waiting_for_turn {
+                        PersistedRuntimeAwaitingTurn {}
                     }
                     if let Some(failure) = runtime_text_error {
                         div { class: "runtime-stream-error", role: "status",
@@ -4493,10 +5341,38 @@ fn PersistedConversationMessages(
 }
 
 #[component]
+fn PersistedRuntimeAwaitingTurn() -> Element {
+    rsx! {
+        article { class: "assistant-turn persisted-assistant-turn runtime-stream-turn is-streaming",
+            header { class: "assistant-byline",
+                img { src: BRAND_MARK_DATA_URL.as_str(), alt: "" }
+                strong { "Hartevo" }
+                time { "等待 Runtime" }
+            }
+            div {
+                class: "assistant-copy runtime-stream-copy",
+                aria_live: "polite",
+                aria_atomic: "false",
+                aria_busy: "true",
+                p { class: "runtime-stream-waiting",
+                    "Mission 与 exact 执行句柄已持久化；尚未收到首个 Runtime turn"
+                    i { class: "runtime-stream-caret", aria_hidden: "true" }
+                }
+            }
+            footer { class: "runtime-stream-receipt",
+                UiIcon { name: UiIconName::FileCheck, size: 12 }
+                span { "AWAITING_TURN · 未据此声明 Runtime 或 Mission 完成" }
+            }
+        }
+    }
+}
+
+#[component]
 fn PersistedRuntimeStreamTurn(
     stream: DesktopRuntimeTextStreamProjection,
     runtime_busy: bool,
     visual_fixture: bool,
+    transport_caught_up: bool,
 ) -> Element {
     let stream_active = stream.turn_status.is_active();
     let last_item_index = stream.items.len().saturating_sub(1);
@@ -4550,6 +5426,9 @@ fn PersistedRuntimeStreamTurn(
                     } else {
                         "从 SQLCipher 重放 {stream.delta_count} 个正文增量"
                     }
+                }
+                if transport_caught_up {
+                    b { class: "runtime-transport-state", "CAUGHT_UP · 仅传输" }
                 }
                 em { "{runtime_turn_status_label(stream.turn_status)} · cursor {stream.last_evidence_sequence.unwrap_or_default()}" }
             }
@@ -6631,14 +7510,25 @@ fn active_visual_surface_variant() -> Option<String> {
     }
 }
 
-fn active_visual_runtime_text_stream() -> Option<DesktopRuntimeTextStreamProjection> {
+fn active_visual_runtime_state() -> InitialVisualRuntimeState {
     #[cfg(feature = "visual-fixtures")]
     {
-        visual_fixture::runtime_text_stream()
+        visual_fixture::runtime_fixture().map_or_else(
+            InitialVisualRuntimeState::default,
+            |fixture| InitialVisualRuntimeState {
+                state: Some(fixture.state),
+                scope: fixture.scope,
+                stream: fixture.stream,
+                error: fixture.error.map(|failure| UiFailure {
+                    code: failure.code.to_owned(),
+                    message: failure.message.to_owned(),
+                }),
+            },
+        )
     }
     #[cfg(not(feature = "visual-fixtures"))]
     {
-        None
+        InitialVisualRuntimeState::default()
     }
 }
 
@@ -6671,6 +7561,446 @@ fn active_visual_zoom() -> f64 {
         }
     }
     1.0
+}
+
+const RUNTIME_SUBSCRIPTION_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(80);
+const RUNTIME_SUBSCRIPTION_ERROR_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(240);
+const RUNTIME_SUBSCRIPTION_MAX_CONSECUTIVE_ERRORS: usize = 3;
+const RUNTIME_SUBSCRIPTION_MAX_POST_RETURN_POLLS: usize = 300;
+
+#[derive(Clone, Copy)]
+struct RuntimeTextUiSignals {
+    paint: Signal<DesktopRuntimeExecutionPaintState>,
+    error: Signal<Option<UiFailure>>,
+    follow_latest: Signal<bool>,
+    has_unseen: Signal<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeExecutionUiSignals {
+    text: RuntimeTextUiSignals,
+    model: Signal<DesktopUiModel>,
+    submitting: Signal<bool>,
+    stop_requested: Signal<bool>,
+    progress: Signal<Vec<DesktopRuntimeProgressEvent>>,
+}
+
+type DesktopRuntimeTaskResult =
+    Result<Result<DesktopMissionSubmission, DesktopDataError>, tokio::task::JoinError>;
+
+async fn observe_finished_runtime_task(
+    mut ui: RuntimeExecutionUiSignals,
+    identity: &DesktopRuntimeCommandIdentity,
+    runtime_task: Option<
+        tokio::task::JoinHandle<Result<DesktopMissionSubmission, DesktopDataError>>,
+    >,
+) -> Result<Option<DesktopRuntimeTaskResult>, RuntimeSubscriptionError> {
+    let task = runtime_task.ok_or(RuntimeSubscriptionError::RuntimeCoordinatorStateMismatch)?;
+    let result = task.await;
+    sync_runtime_execution_progress(ui.text.paint, identity, ui.progress);
+    let observed = {
+        let mut paint = ui.text.paint.write();
+        match &result {
+            Ok(Ok(submission)) => observe_successful_runtime_task_return(
+                &mut paint,
+                identity,
+                &submission.runtime_outcome,
+            ),
+            Ok(Err(_)) | Err(_) => observe_failed_runtime_task_return(&mut paint, identity),
+        }
+    }?;
+    Ok(observed.then_some(result))
+}
+
+fn observe_successful_runtime_task_return(
+    paint: &mut DesktopRuntimeExecutionPaintState,
+    identity: &DesktopRuntimeCommandIdentity,
+    _outcome: &DesktopMissionRuntimeOutcome,
+) -> Result<bool, RuntimeSubscriptionError> {
+    // A successful coordinator return does not imply that a Runtime turn was
+    // created. Treat every typed outcome identically here, then let the
+    // subsequent durable subscription envelope decide whether there is no
+    // turn or whether a terminal turn and final transport acknowledgement are
+    // still required. The lib-level no-turn test passes a concrete NotStarted
+    // outcome through this exact production path.
+    paint.mark_runtime_returned(identity)
+}
+
+fn observe_failed_runtime_task_return(
+    paint: &mut DesktopRuntimeExecutionPaintState,
+    identity: &DesktopRuntimeCommandIdentity,
+) -> Result<bool, RuntimeSubscriptionError> {
+    // Failure also grants no transport shortcut: if a durable active turn is
+    // visible, the reducer must continue through its terminal envelope and
+    // final same-cursor CaughtUp acknowledgement before releasing authority.
+    paint.mark_runtime_returned(identity)
+}
+
+fn acknowledge_runtime_paint_for_dispatch(
+    paint: &mut DesktopRuntimeExecutionPaintState,
+    commit: &DesktopRuntimePaintCommit,
+) -> Result<DesktopRuntimeExecutionLaunch, RuntimeSubscriptionError> {
+    paint.acknowledge_rendered_paint(commit)
+}
+
+fn begin_catalog_runtime_execution_after_paint(
+    launch: DesktopRuntimeExecutionLaunch,
+    ui: RuntimeExecutionUiSignals,
+) {
+    let selection = launch.selection().clone();
+    let identity = launch.identity().clone();
+    begin_runtime_execution_progress_monitor(ui, identity.clone());
+    spawn(async move {
+        let (prepared_selection, identity, coordinator, prepared_sequence, render_ack_sequence) =
+            launch.into_parts();
+        debug_assert_eq!(prepared_selection, selection);
+        debug_assert!(render_ack_sequence > prepared_sequence);
+        let runtime_project_id = selection.scope.project_id().clone();
+        let runtime_mission_id = selection.scope.mission_id().clone();
+        let runtime_task = tokio::task::spawn_blocking(move || {
+            DesktopDataPlane::discover().and_then(|plane| {
+                plane.resume_mission_runtime_cancellable_os(
+                    &runtime_project_id,
+                    &runtime_mission_id,
+                    coordinator.cancellation(),
+                    Utc::now(),
+                )
+            })
+        });
+        coordinate_runtime_and_subscription(ui, identity, runtime_task).await;
+    });
+}
+
+async fn coordinate_runtime_and_subscription(
+    mut ui: RuntimeExecutionUiSignals,
+    identity: DesktopRuntimeCommandIdentity,
+    runtime_task: tokio::task::JoinHandle<Result<DesktopMissionSubmission, DesktopDataError>>,
+) {
+    let mut runtime_task = Some(runtime_task);
+    let mut runtime_result = None::<DesktopRuntimeTaskResult>;
+    let mut consecutive_pull_errors = 0_usize;
+    let mut post_return_polls = 0_usize;
+    loop {
+        if runtime_result.is_none()
+            && runtime_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            match observe_finished_runtime_task(ui, &identity, runtime_task.take()).await {
+                Ok(Some(result)) => runtime_result = Some(result),
+                Ok(None) => {
+                    ui.submitting.set(false);
+                    ui.stop_requested.set(false);
+                    return;
+                }
+                Err(error) => {
+                    abort_runtime_execution_transport(ui, &identity, error);
+                    return;
+                }
+            }
+        }
+
+        let current_selection = ui
+            .text
+            .paint
+            .read()
+            .current_selection_for_command(&identity);
+        let mut next_delay = RUNTIME_SUBSCRIPTION_POLL_INTERVAL;
+        if let Some(current_selection) = current_selection {
+            let command_is_visible = ui
+                .text
+                .paint
+                .read()
+                .selection_is_visible(&current_selection);
+            match pull_runtime_subscription_page(ui.text.paint, &current_selection).await {
+                Ok(effect) => {
+                    consecutive_pull_errors = 0;
+                    if command_is_visible {
+                        ui.text.error.set(None);
+                        sync_runtime_execution_paint_controls(
+                            ui.text,
+                            current_selection.scope.project_id(),
+                            current_selection.scope.mission_id(),
+                        );
+                        apply_runtime_reducer_visual_effect(&effect);
+                    }
+                }
+                Err(failure) => {
+                    consecutive_pull_errors = consecutive_pull_errors.saturating_add(1);
+                    if command_is_visible {
+                        ui.text.error.set(Some(failure));
+                    }
+                    next_delay = RUNTIME_SUBSCRIPTION_ERROR_BACKOFF;
+                }
+            }
+        }
+
+        if runtime_result.is_some() {
+            post_return_polls = post_return_polls.saturating_add(1);
+            if ui.text.paint.read().completion_ready(&identity) {
+                finish_catalog_runtime_execution(ui, &identity, runtime_result.take());
+                return;
+            }
+            if consecutive_pull_errors >= RUNTIME_SUBSCRIPTION_MAX_CONSECUTIVE_ERRORS
+                || post_return_polls >= RUNTIME_SUBSCRIPTION_MAX_POST_RETURN_POLLS
+            {
+                abort_runtime_execution_transport(
+                    ui,
+                    &identity,
+                    RuntimeSubscriptionError::RuntimeCompletionBeforeTransportReady,
+                );
+                return;
+            }
+        }
+        tokio::time::sleep(next_delay).await;
+    }
+}
+
+fn finish_catalog_runtime_execution(
+    mut ui: RuntimeExecutionUiSignals,
+    identity: &DesktopRuntimeCommandIdentity,
+    runtime_result: Option<DesktopRuntimeTaskResult>,
+) {
+    sync_runtime_execution_progress(ui.text.paint, identity, ui.progress);
+    let Some(runtime_result) = runtime_result else {
+        abort_runtime_execution_transport(
+            ui,
+            identity,
+            RuntimeSubscriptionError::RuntimeCoordinatorStateMismatch,
+        );
+        return;
+    };
+    let Some(current_selection) = ui.text.paint.read().current_selection_for_command(identity)
+    else {
+        abort_runtime_execution_transport(
+            ui,
+            identity,
+            RuntimeSubscriptionError::RuntimeCoordinatorStateMismatch,
+        );
+        return;
+    };
+    let completion = ui
+        .text
+        .paint
+        .write()
+        .finish_runtime(identity, &current_selection);
+    match completion {
+        Ok(DesktopRuntimeCompletionDisposition::Accepted(completion)) => {
+            debug_assert!(
+                completion.runtime_completion_sequence() > completion.render_ack_sequence()
+            );
+            match runtime_result {
+                Ok(Ok(submission)) => ui.model.write().set_ready(submission.snapshot, false),
+                Ok(Err(error)) => ui.model.write().set_notice(&error),
+                Err(_) => {
+                    ui.model.write().notice = Some(UiFailure {
+                        code: "RUNTIME_COORDINATOR_FAILED".into(),
+                        message: "本地 Runtime 协调任务异常结束；已持久化 Mission 与正文保持可恢复，未执行或重放外部 Effect。".into(),
+                    });
+                }
+            }
+        }
+        Ok(DesktopRuntimeCompletionDisposition::IgnoredStale) => {}
+        Err(error) => {
+            abort_runtime_execution_transport(ui, identity, error);
+            return;
+        }
+    }
+    ui.submitting.set(false);
+    ui.stop_requested.set(false);
+}
+
+fn abort_runtime_execution_transport(
+    mut ui: RuntimeExecutionUiSignals,
+    identity: &DesktopRuntimeCommandIdentity,
+    error: RuntimeSubscriptionError,
+) {
+    let command_is_visible = ui
+        .text
+        .paint
+        .read()
+        .current_selection_for_command(identity)
+        .is_some_and(|selection| ui.text.paint.read().selection_is_visible(&selection));
+    ui.text.paint.write().abort_runtime_transport(identity).ok();
+    if command_is_visible {
+        ui.text
+            .error
+            .set(Some(UiFailure::from_runtime_subscription_error(error)));
+    }
+    ui.submitting.set(false);
+    ui.stop_requested.set(false);
+}
+
+async fn pull_runtime_subscription_page(
+    mut paint: Signal<DesktopRuntimeExecutionPaintState>,
+    selection: &DesktopRuntimeSelection,
+) -> Result<DesktopRuntimeReducerEffect, UiFailure> {
+    let Some(request) = paint.read().pull_request(selection) else {
+        return Ok(DesktopRuntimeReducerEffect::IgnoredStale);
+    };
+    let producer_request = request.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        DesktopDataPlane::discover().and_then(|plane| {
+            plane.runtime_text_subscription_os(
+                producer_request.handle(),
+                producer_request.producer_cursor(),
+                DESKTOP_RUNTIME_SUBSCRIPTION_PAGE_SIZE,
+                Utc::now(),
+            )
+        })
+    })
+    .await;
+    let batch = match result {
+        Ok(Ok(batch)) => batch,
+        Ok(Err(error)) => return Err(UiFailure::from_error(&error)),
+        Err(_) => {
+            return Err(UiFailure {
+                code: "RUNTIME_SUBSCRIPTION_QUERY_FAILED".into(),
+                message:
+                    "Runtime 增量读取任务异常结束；已持久化正文、Mission 与 Effect ledger 未改变。"
+                        .into(),
+            });
+        }
+    };
+    let delivery = request
+        .into_delivery(batch)
+        .map_err(UiFailure::from_runtime_subscription_error)?;
+    paint
+        .write()
+        .apply_delivery(&delivery)
+        .map_err(UiFailure::from_runtime_subscription_error)
+}
+
+fn begin_read_only_runtime_subscription_monitor(
+    ui: RuntimeTextUiSignals,
+    selection: DesktopRuntimeSelection,
+) {
+    spawn(async move {
+        let mut final_awaiting_recheck = false;
+        loop {
+            let effect = match pull_runtime_subscription_page(ui.paint, &selection).await {
+                Ok(effect) => effect,
+                Err(failure) => {
+                    let mut error = ui.error;
+                    error.set(Some(failure));
+                    break;
+                }
+            };
+            if effect == DesktopRuntimeReducerEffect::IgnoredStale {
+                break;
+            }
+            let mut error = ui.error;
+            error.set(None);
+            sync_runtime_execution_paint_controls(
+                ui,
+                selection.scope.project_id(),
+                selection.scope.mission_id(),
+            );
+            apply_runtime_reducer_visual_effect(&effect);
+            match ui.paint.read().poll_disposition(&selection) {
+                DesktopRuntimePollDisposition::Stale
+                | DesktopRuntimePollDisposition::ReadyToFinalize
+                | DesktopRuntimePollDisposition::Complete => break,
+                DesktopRuntimePollDisposition::PullNow => {}
+                DesktopRuntimePollDisposition::WaitForRuntime
+                | DesktopRuntimePollDisposition::WaitAfterRuntime => {
+                    tokio::time::sleep(RUNTIME_SUBSCRIPTION_POLL_INTERVAL).await;
+                }
+                DesktopRuntimePollDisposition::AwaitingWithoutRuntime => {
+                    if final_awaiting_recheck {
+                        break;
+                    }
+                    final_awaiting_recheck = true;
+                    tokio::time::sleep(RUNTIME_SUBSCRIPTION_POLL_INTERVAL).await;
+                }
+            }
+        }
+    });
+}
+
+fn sync_runtime_execution_paint_controls(
+    mut ui: RuntimeTextUiSignals,
+    project_id: &ProjectId,
+    mission_id: &MissionId,
+) {
+    if let Some((follow_latest, has_unseen)) =
+        ui.paint.read().viewport_controls(project_id, mission_id)
+    {
+        ui.follow_latest.set(follow_latest);
+        ui.has_unseen.set(has_unseen);
+    }
+}
+
+fn apply_runtime_reducer_visual_effect(effect: &DesktopRuntimeReducerEffect) {
+    let should_scroll = matches!(
+        effect,
+        &DesktopRuntimeReducerEffect::Reset {
+            should_scroll: true,
+            ..
+        } | &DesktopRuntimeReducerEffect::Appended {
+            should_scroll: true,
+            ..
+        }
+    );
+    if should_scroll {
+        scroll_mission_thread_to_latest();
+    }
+}
+
+fn begin_runtime_execution_progress_monitor(
+    ui: RuntimeExecutionUiSignals,
+    identity: DesktopRuntimeCommandIdentity,
+) {
+    spawn(async move {
+        let mut cursor = 0_u64;
+        loop {
+            let events = ui.text.paint.read().progress_since(&identity, cursor);
+            let Some(events) = events else {
+                break;
+            };
+            let terminal = events.iter().any(|event| event.phase.is_terminal());
+            if let Some(last) = events.last() {
+                cursor = last.sequence;
+                merge_runtime_progress_events(ui.progress, events);
+            }
+            if terminal || !*ui.submitting.read() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        }
+    });
+}
+
+fn sync_runtime_execution_progress(
+    paint: Signal<DesktopRuntimeExecutionPaintState>,
+    identity: &DesktopRuntimeCommandIdentity,
+    progress: Signal<Vec<DesktopRuntimeProgressEvent>>,
+) {
+    if let Some(events) = paint.read().progress_since(identity, 0) {
+        merge_runtime_progress_events(progress, events);
+    }
+}
+
+fn merge_runtime_progress_events(
+    mut progress: Signal<Vec<DesktopRuntimeProgressEvent>>,
+    events: Vec<DesktopRuntimeProgressEvent>,
+) {
+    let mut projection = progress.write();
+    for event in events {
+        if projection
+            .iter()
+            .all(|existing| existing.sequence != event.sequence)
+        {
+            projection.push(event);
+        }
+    }
+    projection.sort_by_key(|event| event.sequence);
+    if projection.len() > 32 {
+        let overflow = projection.len() - 32;
+        projection.drain(0..overflow);
+    }
 }
 
 fn begin_runtime_progress_monitor(
@@ -7484,7 +8814,437 @@ fn short_digest(digest: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use sha2::Digest as _;
+
     use super::*;
+
+    fn execution_digest(character: char) -> String {
+        character.to_string().repeat(64)
+    }
+
+    fn scoped_render_stream(
+        project_id: &str,
+        mission_id: &str,
+        private_text: &str,
+    ) -> DesktopRuntimeTextStreamProjection {
+        let observed_at = "2026-08-13T10:00:00Z"
+            .parse()
+            .expect("fixed render-scope timestamp");
+        DesktopRuntimeTextStreamProjection {
+            project_id: ProjectId::from(project_id),
+            mission_id: MissionId::from(mission_id),
+            worker_generation: 1,
+            turn_revision: 1,
+            turn_status: RuntimeTurnStatus::Running,
+            last_evidence_sequence: Some(1),
+            delta_count: 1,
+            items: vec![data_plane::DesktopRuntimeTextItemProjection {
+                item_id_digest: execution_digest('4'),
+                text: private_text.to_owned(),
+                delta_count: 1,
+                last_stream_sequence: 1,
+                cumulative_byte_count: u64::try_from(private_text.len())
+                    .expect("private text length fits u64"),
+                observed_at,
+            }],
+            updated_at: observed_at,
+        }
+    }
+
+    fn scoped_render_error() -> UiFailure {
+        UiFailure {
+            code: "RUNTIME_STREAM_QUERY_FAILED".into(),
+            message: "private scoped Runtime error detail".into(),
+        }
+    }
+
+    #[test]
+    fn initial_runtime_projection_derives_exact_scope_without_fixture_bypass() {
+        let stream = scoped_render_stream(
+            "project-initial-scope",
+            "mission-initial-scope",
+            "private initial Runtime text",
+        );
+        let derived = runtime_text_scope_from_projection(Some(&stream));
+        assert!(derived.as_ref().is_some_and(|(project_id, mission_id)| {
+            project_id == &stream.project_id && mission_id == &stream.mission_id
+        }));
+        assert!(runtime_text_scope_from_projection(None).is_none());
+
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn scoped_runtime_render_projection")
+            .expect("production render gate");
+        let end = source[start..]
+            .find("\n#[component]\npub fn App")
+            .map(|offset| start + offset)
+            .expect("render gate source boundary");
+        assert!(!source[start..end].contains("visual_fixture"));
+    }
+
+    #[test]
+    fn runtime_render_scope_gate_allows_only_exact_fallback_and_scoped_error() {
+        let project_id = ProjectId::from("project-exact-render");
+        let mission_id = MissionId::from("mission-exact-render");
+        let stream = scoped_render_stream(
+            project_id.as_str(),
+            mission_id.as_str(),
+            "private exact Runtime text",
+        );
+        let error = scoped_render_error();
+        let render = scoped_runtime_render_projection(
+            Some((&project_id, &mission_id)),
+            Some((&project_id, &mission_id)),
+            None,
+            Some(&stream),
+            Some(&error),
+        );
+        assert!(render.stream.is_some());
+        assert!(render.error.is_some());
+        assert!(render.stream.is_some_and(|visible| {
+            visible.project_id == stream.project_id
+                && visible.mission_id == stream.mission_id
+                && visible.worker_generation == stream.worker_generation
+                && visible.delta_count == stream.delta_count
+        }));
+    }
+
+    #[test]
+    fn runtime_render_scope_gate_hides_missing_same_project_and_cross_project_selection() {
+        let source_project = ProjectId::from("project-source-render");
+        let source_mission = MissionId::from("mission-source-render");
+        let stream = scoped_render_stream(
+            source_project.as_str(),
+            source_mission.as_str(),
+            "private stale Runtime text",
+        );
+        let error = scoped_render_error();
+        let other_mission = MissionId::from("mission-other-render");
+        let other_project = ProjectId::from("project-other-render");
+
+        for selected_scope in [
+            None,
+            Some((&source_project, &other_mission)),
+            Some((&other_project, &source_mission)),
+        ] {
+            let render = scoped_runtime_render_projection(
+                selected_scope,
+                Some((&source_project, &source_mission)),
+                None,
+                Some(&stream),
+                Some(&error),
+            );
+            assert!(render.stream.is_none());
+            assert!(render.error.is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_render_scope_gate_rejects_projection_identity_drift_but_keeps_scoped_error() {
+        let project_id = ProjectId::from("project-drift-render");
+        let mission_id = MissionId::from("mission-drift-render");
+        let error = scoped_render_error();
+        let project_drift = scoped_render_stream(
+            "project-drifted-render",
+            mission_id.as_str(),
+            "private project-drift Runtime text",
+        );
+        let mission_drift = scoped_render_stream(
+            project_id.as_str(),
+            "mission-drifted-render",
+            "private mission-drift Runtime text",
+        );
+
+        for stream in [&project_drift, &mission_drift] {
+            let render = scoped_runtime_render_projection(
+                Some((&project_id, &mission_id)),
+                Some((&project_id, &mission_id)),
+                None,
+                Some(stream),
+                Some(&error),
+            );
+            assert!(render.stream.is_none());
+            assert!(render.error.is_some());
+        }
+    }
+
+    #[test]
+    fn runtime_render_scope_gate_requires_scope_recovery_when_returning_to_old_mission() {
+        let old_project = ProjectId::from("project-return-render");
+        let old_mission = MissionId::from("mission-return-render");
+        let current_mission = MissionId::from("mission-current-render");
+        let old_stream = scoped_render_stream(
+            old_project.as_str(),
+            old_mission.as_str(),
+            "private retained Runtime text",
+        );
+        let error = scoped_render_error();
+        let render = scoped_runtime_render_projection(
+            Some((&old_project, &old_mission)),
+            Some((&old_project, &current_mission)),
+            None,
+            Some(&old_stream),
+            Some(&error),
+        );
+        assert!(render.stream.is_none());
+        assert!(render.error.is_none());
+    }
+
+    #[test]
+    fn runtime_render_scope_gate_prioritizes_exact_selected_paint_projection() {
+        let selected_project = ProjectId::from("project-paint-render");
+        let selected_mission = MissionId::from("mission-paint-render");
+        let stale_project = ProjectId::from("project-stale-render");
+        let paint_stream = scoped_render_stream(
+            selected_project.as_str(),
+            selected_mission.as_str(),
+            "private exact paint text",
+        );
+        let mut stale_fallback = scoped_render_stream(
+            stale_project.as_str(),
+            selected_mission.as_str(),
+            "private stale fallback text",
+        );
+        stale_fallback.worker_generation = 2;
+        stale_fallback.delta_count = 2;
+        let stale_error = scoped_render_error();
+        let render = scoped_runtime_render_projection(
+            Some((&selected_project, &selected_mission)),
+            Some((&stale_project, &selected_mission)),
+            Some(&paint_stream),
+            Some(&stale_fallback),
+            Some(&stale_error),
+        );
+        assert!(render.stream.is_some_and(|visible| {
+            visible.project_id == paint_stream.project_id
+                && visible.mission_id == paint_stream.mission_id
+                && visible.worker_generation == paint_stream.worker_generation
+                && visible.delta_count == paint_stream.delta_count
+                && visible.worker_generation != stale_fallback.worker_generation
+                && visible.delta_count != stale_fallback.delta_count
+        }));
+        assert!(render.error.is_none());
+    }
+
+    #[cfg(feature = "visual-fixtures")]
+    #[test]
+    fn visual_runtime_state_matrix_reuses_production_render_scope_privacy_gate() {
+        let selected_fixture =
+            visual_fixture::runtime_fixture_for_state(VisualRuntimeFixtureState::Awaiting);
+        let (selected_project, selected_mission) = selected_fixture
+            .scope
+            .as_ref()
+            .expect("awaiting fixture exact selected scope");
+
+        for state in VisualRuntimeFixtureState::ALL {
+            let fixture = visual_fixture::runtime_fixture_for_state(state);
+            let failure = fixture.error.map(|failure| UiFailure {
+                code: failure.code.to_owned(),
+                message: failure.message.to_owned(),
+            });
+            let rendered = scoped_runtime_render_projection(
+                Some((selected_project, selected_mission)),
+                fixture
+                    .scope
+                    .as_ref()
+                    .map(|(project_id, mission_id)| (project_id, mission_id)),
+                None,
+                fixture.stream.as_ref(),
+                failure.as_ref(),
+            );
+            let stream_should_be_visible = !matches!(
+                state,
+                VisualRuntimeFixtureState::Awaiting | VisualRuntimeFixtureState::OffscreenReselect
+            );
+            assert_eq!(rendered.stream.is_some(), stream_should_be_visible);
+            assert_eq!(
+                rendered.error.is_some(),
+                state == VisualRuntimeFixtureState::ErrorRetained
+            );
+            assert_eq!(
+                rendered.fallback_scope_matches,
+                state != VisualRuntimeFixtureState::OffscreenReselect
+            );
+        }
+    }
+
+    #[test]
+    fn visual_runtime_progress_matches_transport_state_without_business_completion() {
+        let awaiting =
+            initial_visual_runtime_progress(Some(VisualRuntimeFixtureState::Awaiting), false);
+        assert_eq!(awaiting.len(), 1);
+        assert_eq!(
+            awaiting.last().map(|event| event.phase),
+            Some(DesktopRuntimeProgressPhase::Preparing)
+        );
+
+        for state in [
+            VisualRuntimeFixtureState::FirstAppend,
+            VisualRuntimeFixtureState::RunningCaughtUp,
+            VisualRuntimeFixtureState::OffscreenReselect,
+        ] {
+            let progress = initial_visual_runtime_progress(Some(state), false);
+            assert_eq!(progress.len(), 4);
+            assert_eq!(
+                progress.last().map(|event| event.phase),
+                Some(DesktopRuntimeProgressPhase::ItemStarted)
+            );
+        }
+
+        for state in [
+            VisualRuntimeFixtureState::TerminalBeforeAck,
+            VisualRuntimeFixtureState::FinalCaughtUp,
+        ] {
+            let progress = initial_visual_runtime_progress(Some(state), false);
+            assert_eq!(progress.len(), 6);
+            assert_eq!(
+                progress.last().map(|event| event.phase),
+                Some(DesktopRuntimeProgressPhase::Completed)
+            );
+        }
+
+        let failed =
+            initial_visual_runtime_progress(Some(VisualRuntimeFixtureState::ErrorRetained), false);
+        assert_eq!(
+            failed.last().map(|event| event.phase),
+            Some(DesktopRuntimeProgressPhase::Failed)
+        );
+        assert!(initial_visual_runtime_progress(None, false).is_empty());
+    }
+
+    fn execution_paint_handle() -> hartevo_application::CatalogMissionExecutionHandle {
+        serde_json::from_value(serde_json::json!({
+            "tenantId": "tenant-dioxus-paint",
+            "projectId": "project-dioxus-paint",
+            "missionId": "mission-dioxus-paint",
+            "manifestId": "VM-07",
+            "manifestVersion": 1,
+            "catalogDigest": execution_digest('9'),
+            "conversationId": "mission-conversation:mission-dioxus-paint",
+            "missionCreatedAt": "2026-08-13T10:00:00Z",
+            "contractDigest": execution_digest('8'),
+            "handleDigest": execution_digest('7'),
+        }))
+        .expect("content-free execution handle fixture")
+    }
+
+    fn acknowledged_execution_paint() -> (
+        DesktopRuntimeExecutionPaintState,
+        hartevo_application::CatalogMissionExecutionHandle,
+        DesktopRuntimeSelection,
+        DesktopRuntimeCommandIdentity,
+    ) {
+        let mut paint = DesktopRuntimeExecutionPaintState::default();
+        let handle = execution_paint_handle();
+        let commit = paint
+            .commit_catalog_start(handle.clone())
+            .expect("prepare phase-one paint");
+        let launch = acknowledge_runtime_paint_for_dispatch(&mut paint, &commit)
+            .expect("post-render exact acknowledgement");
+        let selection = launch.selection().clone();
+        let identity = launch.identity().clone();
+        (paint, handle, selection, identity)
+    }
+
+    fn execution_turn_value(
+        revision: u64,
+        status: RuntimeTurnStatus,
+        last_sequence: Option<u64>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "turnIdentityDigest": execution_digest('6'),
+            "workerGeneration": 1,
+            "turnRevision": revision,
+            "turnStatus": status,
+            "lastTextEvidenceSequence": last_sequence,
+        })
+    }
+
+    fn execution_cursor_value(
+        revision: u64,
+        status: RuntimeTurnStatus,
+        after_sequence: Option<u64>,
+        cursor_character: char,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "handleDigest": execution_digest('7'),
+            "turnIdentityDigest": execution_digest('6'),
+            "workerGeneration": 1,
+            "afterEvidenceSequence": after_sequence,
+            "observedTurnRevision": revision,
+            "observedTurnStatus": status,
+            "cursorDigest": execution_digest(cursor_character),
+        })
+    }
+
+    fn execution_delta_value(
+        evidence_sequence: u64,
+        text: &str,
+        cumulative_byte_count: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "evidenceSequence": evidence_sequence,
+            "streamSequence": evidence_sequence,
+            "itemIdentityDigest": execution_digest('4'),
+            "text": text,
+            "textDigest": format!("{:x}", sha2::Sha256::digest(text.as_bytes())),
+            "cumulativeByteCount": cumulative_byte_count,
+            "chainDigest": execution_digest('3'),
+            "evidenceDigest": execution_digest('2'),
+            "observedAt": "2026-08-13T10:00:01Z",
+        })
+    }
+
+    fn execution_page(
+        kind: &str,
+        revision: u64,
+        status: RuntimeTurnStatus,
+        source_last_sequence: u64,
+        cursor_after_sequence: u64,
+        cursor_character: char,
+        deltas: &[serde_json::Value],
+    ) -> hartevo_application::RuntimeTextSubscriptionBatch {
+        serde_json::from_value(serde_json::json!({
+            "kind": kind,
+            "page": {
+                "turn": execution_turn_value(
+                    revision,
+                    status,
+                    Some(source_last_sequence),
+                ),
+                "deltas": deltas,
+                "nextCursor": execution_cursor_value(
+                    revision,
+                    status,
+                    Some(cursor_after_sequence),
+                    cursor_character,
+                ),
+                "hasMore": false,
+            },
+        }))
+        .expect("execution page fixture")
+    }
+
+    fn execution_caught_up(
+        revision: u64,
+        status: RuntimeTurnStatus,
+        sequence: u64,
+        cursor_character: char,
+    ) -> hartevo_application::RuntimeTextSubscriptionBatch {
+        serde_json::from_value(serde_json::json!({
+            "kind": "caught_up",
+            "turn": execution_turn_value(revision, status, Some(sequence)),
+            "cursor": execution_cursor_value(
+                revision,
+                status,
+                Some(sequence),
+                cursor_character,
+            ),
+        }))
+        .expect("execution caught-up fixture")
+    }
 
     #[test]
     fn ui_errors_never_render_sensitive_paths_or_low_level_database_details() {
@@ -7505,6 +9265,177 @@ mod tests {
         assert_eq!(invalid_confirmation.code, "WAITING_USER");
         assert!(!invalid_confirmation.message.contains("SQL"));
         assert!(invalid_confirmation.message.contains("未写入部分状态"));
+    }
+
+    #[test]
+    fn post_render_ack_is_the_only_runtime_resume_dispatch_gate() {
+        let mut paint = DesktopRuntimeExecutionPaintState::default();
+        let commit = paint
+            .commit_catalog_start(execution_paint_handle())
+            .expect("prepare phase-one paint");
+        let scope = &commit.selection().scope;
+        let prepared = paint
+            .paint_view(scope.project_id(), scope.mission_id())
+            .expect("prepared render view");
+        assert!(prepared.awaiting_turn());
+        assert!(prepared.stream().is_none());
+
+        let resume_dispatch_calls = Cell::new(0_usize);
+        assert_eq!(resume_dispatch_calls.get(), 0);
+        let launch = acknowledge_runtime_paint_for_dispatch(&mut paint, &commit)
+            .expect("post-render exact acknowledgement");
+        resume_dispatch_calls.set(resume_dispatch_calls.get() + 1);
+        assert!(launch.render_ack_sequence() > launch.prepared_sequence());
+        assert_eq!(resume_dispatch_calls.get(), 1);
+        assert!(acknowledge_runtime_paint_for_dispatch(&mut paint, &commit).is_err());
+        assert_eq!(resume_dispatch_calls.get(), 1);
+    }
+
+    #[test]
+    fn successful_no_turn_outcome_finalizes_only_after_post_return_awaiting_pull() {
+        let (mut paint, handle, selection, identity) = acknowledged_execution_paint();
+        let outcome = DesktopMissionRuntimeOutcome::NotStarted {
+            availability: DesktopRuntimeAvailabilityStatus::NotConfigured,
+        };
+
+        assert!(
+            observe_successful_runtime_task_return(&mut paint, &identity, &outcome)
+                .expect("observe successful no-turn return")
+        );
+        assert!(!paint.completion_ready(&identity));
+        assert!(paint.stop_available_for_selection(Some((
+            selection.scope.project_id(),
+            selection.scope.mission_id(),
+        ))));
+
+        let awaiting: hartevo_application::RuntimeTextSubscriptionBatch =
+            serde_json::from_value(serde_json::json!({
+                "kind": "awaiting_turn",
+                "handle_digest": handle.handle_digest(),
+            }))
+            .expect("durable no-turn envelope");
+        let delivery = paint
+            .pull_request(&selection)
+            .expect("post-return durable pull")
+            .into_delivery(awaiting)
+            .expect("no-turn delivery");
+        assert_eq!(
+            paint
+                .apply_delivery(&delivery)
+                .expect("apply no-turn delivery"),
+            DesktopRuntimeReducerEffect::Duplicate
+        );
+        assert!(paint.completion_ready(&identity));
+        assert!(matches!(
+            paint
+                .finish_runtime(&identity, &selection)
+                .expect("release no-turn command"),
+            DesktopRuntimeCompletionDisposition::Accepted(_)
+        ));
+        assert!(paint.current_selection_for_command(&identity).is_none());
+        assert!(!paint.stop_available_for_selection(Some((
+            selection.scope.project_id(),
+            selection.scope.mission_id(),
+        ))));
+    }
+
+    #[test]
+    fn failed_return_with_running_turn_waits_for_late_delta_terminal_reset_and_ack() {
+        let (mut paint, _handle, selection, identity) = acknowledged_execution_paint();
+
+        let running_reset = paint
+            .pull_request(&selection)
+            .expect("initial running pull")
+            .into_delivery(execution_page(
+                "reset",
+                1,
+                RuntimeTurnStatus::Running,
+                1,
+                1,
+                '5',
+                &[execution_delta_value(1, "partial", 7)],
+            ))
+            .expect("running reset");
+        paint
+            .apply_delivery(&running_reset)
+            .expect("apply running reset");
+        let running_ack = paint
+            .pull_request(&selection)
+            .expect("running caught-up pull")
+            .into_delivery(execution_caught_up(1, RuntimeTurnStatus::Running, 1, '5'))
+            .expect("running caught-up delivery");
+        paint
+            .apply_delivery(&running_ack)
+            .expect("apply running caught-up");
+
+        assert!(
+            observe_failed_runtime_task_return(&mut paint, &identity)
+                .expect("observe failed Runtime return")
+        );
+        assert!(!paint.completion_ready(&identity));
+        assert!(paint.stop_available_for_selection(Some((
+            selection.scope.project_id(),
+            selection.scope.mission_id(),
+        ))));
+
+        let late_append = paint
+            .pull_request(&selection)
+            .expect("late delta pull")
+            .into_delivery(execution_page(
+                "append",
+                2,
+                RuntimeTurnStatus::Running,
+                2,
+                2,
+                'a',
+                &[execution_delta_value(2, " late", 12)],
+            ))
+            .expect("late append");
+        paint
+            .apply_delivery(&late_append)
+            .expect("apply late append");
+        assert!(!paint.completion_ready(&identity));
+
+        let terminal_reset = paint
+            .pull_request(&selection)
+            .expect("terminal reset pull")
+            .into_delivery(execution_page(
+                "reset",
+                3,
+                RuntimeTurnStatus::Failed,
+                2,
+                2,
+                'b',
+                &[
+                    execution_delta_value(1, "partial", 7),
+                    execution_delta_value(2, " late", 12),
+                ],
+            ))
+            .expect("terminal reset");
+        paint
+            .apply_delivery(&terminal_reset)
+            .expect("apply terminal reset");
+        assert!(!paint.completion_ready(&identity));
+        let terminal_ack = paint
+            .pull_request(&selection)
+            .expect("terminal acknowledgement pull")
+            .into_delivery(execution_caught_up(3, RuntimeTurnStatus::Failed, 2, 'b'))
+            .expect("terminal caught-up delivery");
+        paint
+            .apply_delivery(&terminal_ack)
+            .expect("apply terminal caught-up");
+        assert!(paint.completion_ready(&identity));
+        assert!(matches!(
+            paint
+                .finish_runtime(&identity, &selection)
+                .expect("release failed Runtime command"),
+            DesktopRuntimeCompletionDisposition::Accepted(_)
+        ));
+        assert!(paint.current_selection_for_command(&identity).is_none());
+        assert!(!paint.stop_available_for_selection(Some((
+            selection.scope.project_id(),
+            selection.scope.mission_id(),
+        ))));
     }
 
     #[test]

@@ -14,9 +14,17 @@ mod evidence;
 mod mission_contract;
 mod provider_closure;
 mod route_graph;
+mod route_runtime_authority;
+mod stage_application_route_scope;
 
 pub use evidence::{
-    EvidenceLevel, MissionEvidenceRecord, MissionEvidenceStatus, ReleaseEvidence, ReleaseStage,
+    BrowserEvaluationResultReference, BrowserReferenceEvidenceClass, BrowserReferenceProviderMode,
+    BrowserReferenceValidationAuthority, BrowserReferenceVerdict, EvaluationPartition,
+    EvaluationPrivateAttestationStatus, EvaluationReferenceRunProfile,
+    EvaluationReferenceThresholdStatus, EvaluationRunEvidenceAuthority,
+    EvaluationRunResultReference, EvaluationRunResultReferences, EvaluationRunValidationAuthority,
+    EvaluationSafetyMappingStatus, EvidenceLevel, MissionEvidenceRecord, MissionEvidenceStatus,
+    ReleaseEvidence, ReleaseStage,
 };
 pub use mission_contract::{
     EXPECTED_CAPABILITY_COUNT, EXPECTED_CHECKPOINT_ROUTE_COUNT, validate_mission_contract_closure,
@@ -39,6 +47,31 @@ pub use route_graph::{
     RouteGraphTransitionTarget, RouteGraphTransitionTargetKind, RouteNodeCompletionGate,
     RouteNodeCompletionGateKind, route_graph_node_count, route_graph_normal_edge_count,
     route_graph_redirect_edge_count, route_graph_terminal_count, validate_route_graph_closure,
+};
+use route_runtime_authority::ROUTE_RUNTIME_AUTHORITY_CONTRACT_JSON;
+pub use route_runtime_authority::{
+    ApplicationHandlerRouteTerminalExecutionAuthority,
+    ApplicationHandlerRouteTerminalExecutionAuthorityKind, DefaultTerminalExecutionAuthority,
+    DeniedRouteTerminalExecutionAuthority, DeniedRouteTerminalExecutionAuthorityKind,
+    EXPECTED_DENIED_TERMINAL_TRANSITION_AUTHORITY_COUNT,
+    EXPECTED_IMPLEMENTED_TERMINAL_TRANSITION_AUTHORITY_COUNT,
+    EXPECTED_TERMINAL_TRANSITION_AUTHORITY_COUNT, RouteRuntimeAuthorityContract,
+    RouteTerminalAuthorityExecutor, RouteTerminalCompletionPolicy, RouteTerminalExecutionAuthority,
+    RouteTerminalExecutionBinding, denied_terminal_transition_authority_count,
+    implemented_terminal_transition_authority_count, terminal_transition_authority_count,
+    validate_route_runtime_authority_closure,
+};
+use stage_application_route_scope::STAGE_APPLICATION_ROUTE_SCOPE_CONTRACT_JSON;
+pub use stage_application_route_scope::{
+    EXPECTED_STAGE_APPLICATION_ROUTE_SCOPE_COUNT, StageApplicationHandlerBinding,
+    StageApplicationHandlerStatus, StageApplicationRouteAuthority, StageApplicationRouteBinding,
+    StageApplicationRouteScope, StageApplicationRouteScopeContract,
+    StageApplicationRouteScopeSummary, StageApplicationRouteSelection,
+    StageGenericRuntimeAuthority, StageMissionAnyOfKind, StageMissionAnyOfSelection,
+    StageMissionApplicationRouteScope, StageMissionSelectionBinding,
+    materialize_stage_application_route_scopes,
+    validate_materialized_stage_application_route_scopes,
+    validate_stage_application_route_scope_closure,
 };
 
 const MISSION_CATALOG_JSON: &str = include_str!("../../../contracts/missions/catalog.v1.json");
@@ -338,6 +371,8 @@ pub struct Catalog {
     pub missions: MissionCatalog,
     pub effect_readback_routes: EffectReadbackRouteContract,
     pub route_graphs: RouteGraphContract,
+    pub route_runtime_authority: RouteRuntimeAuthorityContract,
+    pub stage_application_route_scope_contract: StageApplicationRouteScopeContract,
     pub application_handlers: ApplicationHandlerRegistry,
     pub capabilities: CapabilityCatalog,
     pub providers: ProviderCatalog,
@@ -356,6 +391,14 @@ impl Catalog {
             route_graphs: parse_contract(
                 "Mission route graph contract",
                 ROUTE_GRAPH_CONTRACT_JSON,
+            )?,
+            route_runtime_authority: parse_contract(
+                "Mission route runtime authority contract",
+                ROUTE_RUNTIME_AUTHORITY_CONTRACT_JSON,
+            )?,
+            stage_application_route_scope_contract: parse_contract(
+                "stage Application route scope contract",
+                STAGE_APPLICATION_ROUTE_SCOPE_CONTRACT_JSON,
             )?,
             application_handlers: parse_contract(
                 "application handler registry",
@@ -401,6 +444,19 @@ impl Catalog {
         })
     }
 
+    pub fn stage_application_route_scopes(
+        &self,
+    ) -> Result<Vec<StageApplicationRouteScope>, CatalogError> {
+        materialize_stage_application_route_scopes(
+            &self.missions,
+            &self.route_graphs,
+            &self.application_handlers,
+            &self.route_runtime_authority,
+            &self.stage_application_route_scope_contract,
+        )
+        .map_err(CatalogError::Validation)
+    }
+
     fn validate_contracts(&self) -> Result<(), CatalogError> {
         let mut violations = Vec::new();
         if let Err(mut contract_violations) =
@@ -421,6 +477,23 @@ impl Catalog {
             &self.capabilities,
             &self.effect_readback_routes,
             &self.route_graphs,
+        ) {
+            violations.append(&mut contract_violations);
+        }
+        if let Err(mut contract_violations) = validate_route_runtime_authority_closure(
+            &self.missions,
+            &self.route_graphs,
+            &self.application_handlers,
+            &self.route_runtime_authority,
+        ) {
+            violations.append(&mut contract_violations);
+        }
+        if let Err(mut contract_violations) = validate_stage_application_route_scope_closure(
+            &self.missions,
+            &self.route_graphs,
+            &self.application_handlers,
+            &self.route_runtime_authority,
+            &self.stage_application_route_scope_contract,
         ) {
             violations.append(&mut contract_violations);
         }
@@ -953,6 +1026,7 @@ impl Catalog {
             dataset_cases.extend(self.hidden_cases(mission, "V2", &self.datasets.v2_families));
         }
         let cross_cutting_cases = self.cross_cutting_cases();
+        let stage_application_route_scopes = self.stage_application_route_scopes()?;
         let application_route_count = self
             .missions
             .missions
@@ -1003,6 +1077,9 @@ impl Catalog {
             &self.missions,
             &self.effect_readback_routes,
             &self.route_graphs,
+            &self.route_runtime_authority,
+            &self.stage_application_route_scope_contract,
+            &stage_application_route_scopes,
             &self.application_handlers,
             &self.capabilities,
             &self.providers,
