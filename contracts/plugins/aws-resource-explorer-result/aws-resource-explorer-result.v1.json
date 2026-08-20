@@ -1,0 +1,263 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-resource-explorer-result/aws-resource-explorer-result.v1.json",
+  "title": "Hartevo AWS Resource Explorer inventory result Layer-1 contract",
+  "description": "A bounded Search/ListIndexes evidence and Mission proposal seam. It is not an AWS Resource Explorer mutation, credential, deployment, compliance, or kernel authority.",
+  "schemaVersion": "hartevo.aws-resource-explorer-result-contract/v1",
+  "contractVersion": "aws-resource-explorer-result/v1",
+  "pluginVersion": "1.0.0",
+  "layer": "Layer-1",
+  "officialReferences": [
+    "https://docs.aws.amazon.com/resource-explorer/latest/APIReference/API_Search.html",
+    "https://docs.aws.amazon.com/resource-explorer/latest/APIReference/API_ListIndexes.html",
+    "https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsresourcexplorer2.html"
+  ],
+  "service": {
+    "id": "hartevo.aws.resource-explorer.result",
+    "implementation": "AwsResourceExplorerService",
+    "version": "1.0.0",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "restore_registration",
+      "search",
+      "list_indexes",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "liveExecution": false,
+    "externalWrites": false
+  },
+  "provider": {
+    "id": "aws.resource-explorer-2",
+    "implementation": "AwsResourceExplorerProvider",
+    "version": "1.0.0",
+    "apiRevision": "aws-resource-explorer-2-read-r1",
+    "allowlistedOperations": ["Search", "ListIndexes"],
+    "allowlistedMethods": ["POST"],
+    "acceptedTransports": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "native": false,
+    "connected": false,
+    "externalWrites": false,
+    "resolvesCredentials": false,
+    "sigV4Secret": "opaque_non_serializing_reference_only",
+    "arbitraryRoles": false
+  },
+  "consumer": {
+    "id": "mission.aws.resource-explorer.result",
+    "implementation": "MissionAwsResourceExplorerConsumer",
+    "version": "1.0.0",
+    "accountBound": true,
+    "regionBound": true,
+    "indexBound": true,
+    "viewBound": true,
+    "queryBound": true,
+    "resourceBound": true,
+    "missionBound": true,
+    "revisionBound": true,
+    "permissionBound": true,
+    "producesDecisionProposal": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "deployabilityAuthority": false,
+    "complianceAuthority": false
+  },
+  "scope": {
+    "required": [
+      "account_id",
+      "region",
+      "index_id_and_revision",
+      "view_id_and_revision",
+      "query_digest_and_revision",
+      "resource_allowlist_and_revisions",
+      "mission_id_and_revision",
+      "permission_digest",
+      "secret_reference_digest",
+      "scope_digest"
+    ],
+    "target": "one_exact_account_and_region",
+    "secret": "opaque_non_serializing_sigv4_reference_only",
+    "queryRetention": "digest_only",
+    "resourceIdentityRetention": "digest_only",
+    "propertyRetention": "key_and_value_digests_only",
+    "tagRetention": false,
+    "piiRetention": false
+  },
+  "allowlist": {
+    "reads": [
+      {
+        "operation": "Search",
+        "method": "POST",
+        "permission": "resource-explorer-2:Search",
+        "bounded": true,
+        "propertyDigestsOnly": true
+      },
+      {
+        "operation": "ListIndexes",
+        "method": "POST",
+        "permission": "resource-explorer-2:ListIndexes",
+        "bounded": true,
+        "propertyDigestsOnly": true
+      }
+    ],
+    "writes": [],
+    "forbidden": [
+      "CreateIndex",
+      "DeleteIndex",
+      "UpdateIndexType",
+      "CreateView",
+      "DeleteView",
+      "UpdateView",
+      "SearchMutation",
+      "resource_mutation",
+      "tag_mutation",
+      "raw_property_bag",
+      "raw_tags",
+      "raw_pii",
+      "raw_provider_response",
+      "raw_pagination_token",
+      "credential_resolution",
+      "arbitrary_iam_role",
+      "deployability_claim",
+      "compliance_claim",
+      "kernel_authority",
+      "outcome_adoption"
+    ]
+  },
+  "registration": {
+    "boundFields": [
+      "pluginVersion",
+      "versionDigest",
+      "contractVersion",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "evidenceDigest",
+      "secretReferenceDigest",
+      "accountId",
+      "region",
+      "indexDigest",
+      "viewDigest",
+      "queryDigest",
+      "missionDigest"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "plugin_version_drift",
+      "contract_digest_drift",
+      "provider_or_api_revision_drift",
+      "permission_digest_drift",
+      "scope_digest_drift",
+      "evidence_digest_drift",
+      "secret_reference_revocation",
+      "registration_tamper",
+      "pagination_or_query_replay",
+      "raw_property_or_tag_request"
+    ]
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxPages": 4,
+    "pageSize": 50,
+    "maxResources": 256,
+    "maxIndexes": 64,
+    "maxPropertyDigestsPerResource": 32,
+    "maxRequestsPerRead": 6,
+    "maxIdentifierBytes": 128,
+    "maxQueryBytes": 256,
+    "maxCursorBytes": 512
+  },
+  "evidence": {
+    "states": ["complete", "empty", "partial", "access_lost", "provider_unknown"],
+    "digests": [
+      "version",
+      "contract",
+      "provider",
+      "permission",
+      "scope",
+      "query",
+      "evidence",
+      "proposal",
+      "record"
+    ],
+    "retained": [
+      "account_id",
+      "region",
+      "index_digest",
+      "view_digest",
+      "query_digest",
+      "resource_digest",
+      "resource_type_digest",
+      "property_name_digest",
+      "property_value_digest",
+      "page_count",
+      "provider_error_digest",
+      "redacted_provider_state"
+    ],
+    "notRetained": [
+      "raw_query",
+      "raw_resource_arn",
+      "raw_resource_properties",
+      "raw_property_bag",
+      "tags",
+      "pii",
+      "raw_response_body",
+      "next_token",
+      "credential_material",
+      "iam_role_arn"
+    ],
+    "missingOrInsufficientDataFailsClosed": true
+  },
+  "redaction": {
+    "secretMaterial": false,
+    "rawPaginationToken": false,
+    "rawProviderPayload": false,
+    "rawProperties": false,
+    "rawTags": false,
+    "pii": false,
+    "arbitraryRole": false,
+    "errorMessages": false
+  },
+  "authority": {
+    "readOnly": true,
+    "proposalOnly": true,
+    "externalWrites": false,
+    "indexMutation": false,
+    "viewMutation": false,
+    "resourceMutation": false,
+    "tagMutation": false,
+    "rawPropertyBag": false,
+    "credentialResolution": false,
+    "connected": false,
+    "native": false,
+    "durableReceipt": false,
+    "verificationAuthority": false,
+    "deployability": false,
+    "compliance": false,
+    "kernelOutcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "honesty": {
+    "nativeStatus": "BLOCKED_ENV",
+    "blockedEnvironmentIsNative": false,
+    "fixtureIsNative": false,
+    "recordingIsNative": false,
+    "loopbackIsNative": false,
+    "layer1Boundary": "Layer 1 emits bounded digest-only inventory evidence and a Mission decision proposal. Native SigV4 transport and credential resolution, live AWS execution, durable provider receipts, independent readback, deployment/compliance authority, and kernel Outcome adoption remain Layer-2 host authority."
+  },
+  "layer2Gaps": [
+    "native_sigv4_transport_and_credential_resolution",
+    "live_resource_explorer_search_and_list_indexes_execution",
+    "durable_provider_receipt",
+    "independent_post_read_readback",
+    "verified_work_product_adoption",
+    "deployment_authority",
+    "compliance_authority"
+  ]
+}

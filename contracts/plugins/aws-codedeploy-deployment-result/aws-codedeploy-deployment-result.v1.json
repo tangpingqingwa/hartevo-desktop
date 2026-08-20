@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.aws-codedeploy-deployment-result/v1",
+  "title": "Hartevo AWS CodeDeploy deployment-result Layer-1 contract",
+  "description": "Bounded account/region/application/deployment-group/deployment/revision/target lifecycle evidence. Read, proposal, and redacted recording only.",
+  "schemaVersion": "hartevo.aws-codedeploy-deployment-result/v1",
+  "contractVersion": "EXT-AWSCODEDEPLOY-01-L1/v1",
+  "layer": 1,
+  "status": "read_proposal_recording_only",
+  "plugin": {
+    "id": "hartevo.aws-codedeploy-deployment-result",
+    "version": "1.0.0",
+    "reversibleRegistration": true,
+    "revocableRegistration": true,
+    "contractDigestBound": true,
+    "versionDigestBound": true
+  },
+  "service": {
+    "id": "aws.codedeploy.deployment-result.read",
+    "provider": "aws.codedeploy.deployment-result.recording",
+    "consumer": "mission.aws-codedeploy-deployment-result.consumer",
+    "operations": [
+      "describe_service",
+      "read_deployment_evidence",
+      "compile_deployment_result_proposal",
+      "record_deployment_receipt",
+      "verify_deployment_result",
+      "mission_deployment_result_proposal",
+      "registration",
+      "revocation"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "durableProviderReceipt": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "id": "aws.codedeploy.deployment-result.recording",
+    "version": "1.0.0",
+    "apiRevision": "codedeploy-list-deployments-get-deployment-list-deployment-targets-r1",
+    "operations": ["ListDeployments", "GetDeployment", "ListDeploymentTargets"],
+    "allowedTransports": ["recording", "fixture", "loopback", "BLOCKED_ENV"],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "opaqueSecretReferenceOnly": true,
+      "rawCredentialMaterial": false,
+      "nativeResolution": false,
+      "serialized": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "applicationName",
+      "deploymentGroupName",
+      "deploymentId",
+      "revisionIdentity",
+      "projectId",
+      "missionId",
+      "workProductId",
+      "missionRevision",
+      "workProductRevision",
+      "permissionSnapshotDigest",
+      "secretReferenceDigest",
+      "scopeDigest"
+    ],
+    "exactIdentity": true,
+    "revisionFence": true,
+    "targetFence": "deploymentId_and_scope_digest"
+  },
+  "evidence": {
+    "bounded": true,
+    "operations": ["ListDeployments", "GetDeployment", "ListDeploymentTargets"],
+    "retained": [
+      "deploymentStatus",
+      "deploymentLifecycleTimestamps",
+      "revisionDigest",
+      "targetStatus",
+      "targetLifecycleStatus",
+      "targetLifecycleTimestamps",
+      "redactedDiagnosticDigests",
+      "paginationDigests",
+      "providerProvenance",
+      "evidenceDigest"
+    ],
+    "terminalStates": {
+      "deployment": ["Succeeded", "Failed", "Stopped"],
+      "target": ["Succeeded", "Failed", "Skipped"],
+      "lifecycleEvent": ["Succeeded", "Failed"]
+    },
+    "maxPages": 4,
+    "maxDeployments": 64,
+    "maxTargets": 256,
+    "maxResponseBytes": 1048576,
+    "rawProviderPayload": false,
+    "rawLogs": false,
+    "rawScripts": false,
+    "artifactBytes": false,
+    "secretMaterial": false,
+    "authority": "below_truth_consent_effect_receipt_verification_outcome"
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "evidenceDigestBound": true,
+    "secretReferenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "provider_revision_drift",
+      "permission_drift",
+      "scope_drift",
+      "revision_drift",
+      "cursor_replay",
+      "tamper",
+      "registration_revocation"
+    ]
+  },
+  "provenance": {
+    "fixture": "never_connected_or_native",
+    "recording": "never_connected_or_native",
+    "loopback": "never_connected_or_native",
+    "blockedEnv": "never_connected_or_native",
+    "connected": false,
+    "native": false,
+    "providerReceipt": false
+  },
+  "forbidden": [
+    "deployment_create",
+    "deployment_stop",
+    "deployment_rollback",
+    "deployment_mutation",
+    "application_mutation",
+    "deployment_group_mutation",
+    "target_mutation",
+    "log_export",
+    "script_export",
+    "artifact_bytes",
+    "raw_provider_payload",
+    "resolve_live_credentials",
+    "serialize_secret_material",
+    "connected_claim",
+    "native_claim",
+    "kernel_truth",
+    "kernel_effect",
+    "kernel_receipt",
+    "kernel_verification",
+    "kernel_outcome",
+    "outcome_adoption"
+  ],
+  "honesty": {
+    "nativeStatus": "BLOCKED_ENV",
+    "blockedEnvironmentIsNative": false,
+    "fixtureIsNative": false,
+    "recordingIsNative": false,
+    "loopbackIsNative": false,
+    "terminalSuccessIsCertification": false,
+    "layer2Exit": "Native SigV4 resolution, live CodeDeploy HTTPS, durable provider receipt, independent readback, consented deployment effects, and verified Mission/Outcome adoption remain Layer-2 work."
+  },
+  "nativeGaps": [
+    "native_sigv4_credential_resolution",
+    "live_aws_codedeploy_https_reads",
+    "durable_provider_receipt",
+    "independent_deployment_readback",
+    "consented_deployment_effects",
+    "verified_work_product_or_outcome_adoption"
+  ]
+}
