@@ -386,7 +386,7 @@ pub fn query_estimate_cli<T: SorftimeTransport>(
     )
 }
 
-fn estimate_from_response(
+pub(crate) fn estimate_from_response(
     response: SorftimeResponse,
     account: SorftimeAccountId,
     market: SorftimeMarket,

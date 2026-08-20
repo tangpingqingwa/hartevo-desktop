@@ -194,6 +194,7 @@ impl YouTubeProviderResponse {
         }
     }
 
+    #[must_use]
     pub fn with_upload_session(mut self, session: YouTubeUploadSessionReference) -> Self {
         self.upload_session = Some(session);
         self
@@ -259,6 +260,7 @@ pub trait YouTubePublishTransport {
 /// and therefore cannot be passed to the production gate accidentally.
 pub trait YouTubeProductionTransport: YouTubePublishTransport {}
 
+#[derive(Debug)]
 pub struct YouTubeDataApiProvider<T> {
     transport: T,
     provenance: YouTubeEvidenceProvenance,
@@ -591,7 +593,7 @@ fn ensure_success(
                 .and_then(Value::as_str)
         });
     match reason {
-        Some("quotaExceeded") | Some("dailyLimitExceeded") => Err(YouTubeError::QuotaExhausted {
+        Some("quotaExceeded" | "dailyLimitExceeded") => Err(YouTubeError::QuotaExhausted {
             bucket: operation.quota_bucket(),
         }),
         Some("insufficientPermissions") => Err(YouTubeError::MissingScope {
@@ -602,7 +604,7 @@ fn ensure_success(
                 | YouTubeDispatchOperation::UploadChunk => YouTubeOAuthScope::YoutubeUpload,
             },
         }),
-        Some("rateLimitExceeded") | Some("userRateLimitExceeded") => {
+        Some("rateLimitExceeded" | "userRateLimitExceeded") => {
             Err(YouTubeError::RetryAfter(Box::new(rate_limit_receipt(
                 response,
                 operation,

@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-eventbridge-pipe-result/contract.v1.json",
+  "title": "Hartevo AWS EventBridge Pipe state result Layer-1 contract",
+  "description": "A bounded ListPipes/DescribePipe state, proposal, and recording seam. It is not an EventBridge event bus, payload reader, lifecycle-effect executor, delivery verifier, or Hartevo Truth authority.",
+  "schemaVersion": "hartevo.aws-eventbridge-pipe-result/v1",
+  "contractVersion": "EXT-AWS-EVENTBRIDGE-PIPES-01-L1/v1",
+  "pluginId": "aws.eventbridge.pipe-result",
+  "pluginVersion": "1.0.0",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-eventbridge-pipe-result/v1|layer=1|service=aws.eventbridge.pipe-result.read|provider=aws.eventbridge.pipe-result.recording|consumer=mission.aws-eventbridge-pipe.consumer",
+  "contractDigest": "75b91d2fd591bb88b3814dfec42b9badba5890af7970ad5793ed122464c9e008",
+  "officialReferences": [
+    "https://docs.aws.amazon.com/eventbridge/latest/pipes-reference/API_ListPipes.html",
+    "https://docs.aws.amazon.com/eventbridge/latest/pipes-reference/API_DescribePipe.html"
+  ],
+  "service": {
+    "type": "AwsEventBridgePipeService",
+    "id": "aws.eventbridge.pipe-result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register",
+      "read_list_pipes",
+      "read_describe_pipe",
+      "propose",
+      "record",
+      "verify",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "liveExecution": false,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsEventBridgePipeProvider",
+    "id": "aws.eventbridge.pipe-result.recording",
+    "apiRevision": "eventbridge-pipes-list-describe-1",
+    "operations": ["ListPipes", "DescribePipe"],
+    "allowlistedMethods": ["POST"],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false,
+    "eventPayloads": false
+  },
+  "consumer": {
+    "type": "MissionAwsEventBridgePipeConsumer",
+    "id": "mission.aws-eventbridge-pipe.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "awsAccountId",
+      "awsRegion",
+      "pipeName",
+      "pipeArnDigest",
+      "sourceArnDigest",
+      "targetArnDigest"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "certificationAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "pipeName",
+      "pipeArnDigest",
+      "sourceArnDigest",
+      "targetArnDigest",
+      "missionIdAndRevision",
+      "projectIdAndRevision",
+      "permissionSnapshotDigest",
+      "secretReferenceDigest",
+      "scopeDigest"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "sourceAndTargetArns": "digest_only",
+    "rawEventPayloads": false,
+    "rawFilterCriteria": false,
+    "rawEnrichmentConfiguration": false,
+    "rawStateReason": false,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "scopeDigest",
+      "evidenceDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ],
+    "permissions": [
+      "pipes:ListPipes",
+      "pipes:DescribePipe",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "pipes:CreatePipe",
+      "pipes:UpdatePipe",
+      "pipes:DeletePipe",
+      "pipes:StartPipe",
+      "pipes:StopPipe",
+      "iam:PassRole",
+      "events:PutEvents",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "account",
+      "region",
+      "pipe",
+      "sourcePrefix",
+      "targetPrefix",
+      "namePrefix",
+      "currentState",
+      "desiredState",
+      "pageNumber",
+      "filterDigest"
+    ],
+    "filterDriftRejected": true,
+    "scopeDriftRejected": true,
+    "paginationLoopRejected": true,
+    "partialPageIsNonAdoptable": true
+  },
+  "metadata": {
+    "bounded": true,
+    "lifecycle": [
+      "currentState",
+      "desiredState",
+      "creationTime",
+      "lastModifiedTime"
+    ],
+    "sourceArnDigest": true,
+    "targetArnDigest": true,
+    "enrichmentPresence": true,
+    "filterPresence": true,
+    "errorClassification": true,
+    "rawStateReason": false,
+    "rawEventPayload": false,
+    "rawTargetData": false,
+    "rawEventPattern": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "listDigest",
+      "describeDigest",
+      "cursorDigest",
+      "evidenceDigest",
+      "proposalDigest",
+      "recordingDigest"
+    ],
+    "states": [
+      "running",
+      "stopped",
+      "creating",
+      "updating",
+      "starting",
+      "stopping",
+      "deleting",
+      "failed",
+      "not_found",
+      "partial",
+      "access_loss",
+      "throttled",
+      "provider_unknown",
+      "registration_revoked"
+    ],
+    "tamperRejected": true,
+    "revocationRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "stateDriftIsNonAdoptable": true,
+    "sourceTargetMismatchIsNonAdoptable": true,
+    "truncationIsNonAdoptable": true,
+    "malformedIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS account/region/pipe/source/target/Mission/Project scope",
+      "bounded ListPipes and DescribePipe seams",
+      "current and desired lifecycle state projection",
+      "creation and last-modified timestamps",
+      "source and target ARN digests",
+      "enrichment/filter presence and typed error classification",
+      "pagination/filter/scope fences",
+      "version/contract/provider/permission/scope/evidence digests",
+      "reversible registration",
+      "redacted idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live AWS EventBridge HTTPS",
+      "event payloads or delivery proof",
+      "CreatePipe/UpdatePipe/DeletePipe effects",
+      "StartPipe/StopPipe effects",
+      "durable provider receipts",
+      "verified Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live AWS EventBridge Pipes HTTPS",
+    "durable provider receipt",
+    "consented pipe lifecycle effects",
+    "independent event delivery and read-back proof",
+    "Connected/native/first-party evidence",
+    "Hartevo Outcome or Work Product adoption"
+  ],
+  "honesty": {
+    "nativeStatus": "BLOCKED_ENV",
+    "blockedEnvironmentIsNative": false,
+    "fixtureIsNative": false,
+    "recordingIsNative": false,
+    "loopbackIsNative": false,
+    "stateObservationIsDeliveryProof": false,
+    "stateObservationIsCertification": false,
+    "layer1Boundary": "Layer 1 emits bounded Pipe lifecycle evidence and a Mission review proposal only. Native SigV4 execution, durable provider receipts, lifecycle effects, independent delivery read-back, and verified adoption remain Layer-2 host authority."
+  },
+  "forbidden": [
+    "CreatePipe",
+    "UpdatePipe",
+    "DeletePipe",
+    "StartPipe",
+    "StopPipe",
+    "PutEvents",
+    "read_event_payload",
+    "retain_event_payload",
+    "retain_raw_target_data",
+    "retain_raw_filter_criteria",
+    "resolve_live_credentials",
+    "claim_connected",
+    "claim_native",
+    "claim_first_party",
+    "claim_event_delivery",
+    "claim_certification",
+    "adopt_kernel_outcome",
+    "adopt_work_product"
+  ]
+}

@@ -5,6 +5,7 @@
 //! credential store, or Effect authority. A transport implementation resolves
 //! opaque references and returns typed provider observations.
 
+use std::fmt::Write as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -21,12 +22,25 @@ mod consumer;
 mod provider;
 mod service;
 
+#[path = "../youtube.rs"]
+mod read;
+
 pub mod testkit;
 
 pub use consumer::{MissionYouTubePublishConsumer, YouTubeMissionAcceptedPublish};
 pub use provider::{
     YouTubeDataApiProvider, YouTubeHttpMethod, YouTubeProductionTransport, YouTubeProviderRequest,
     YouTubeProviderResponse, YouTubePublishTransport,
+};
+pub use read::{
+    ANALYTICS_API_BASE_URL, DATA_API_BASE_URL, YOUTUBE_ANALYTICS_MONETARY_READONLY_SCOPE,
+    YOUTUBE_ANALYTICS_READONLY_SCOPE, YOUTUBE_MANAGE_SCOPE, YOUTUBE_READONLY_SCOPE,
+    YoutubeAnalyticsDimension, YoutubeAnalyticsMetric, YoutubeAnalyticsQuery,
+    YoutubeChannelProbeObservation, YoutubeCommentModerationFilter, YoutubeCommentObservation,
+    YoutubeModerationState, YoutubeQuotaEntry, YoutubeQuotaLedger, YoutubeQuotaOperation,
+    YoutubeReadError, YoutubeReadObservation, YoutubeReadResult, YoutubeReadTarget, YoutubeScope,
+    YoutubeVideoObservation, YoutubeVisibility, channel_identity_request, parse_channel_identity,
+    parse_read_response,
 };
 pub use service::{YouTubePublishService, YouTubeRealPublishGate, execute_real_publish_gate};
 
@@ -659,6 +673,8 @@ impl fmt::Debug for YouTubeCredential {
             .field("secret_reference", &self.secret_reference)
             .field("binding", &self.binding)
             .field("granted_scopes", &self.granted_scopes)
+            .field("access_token_expires_at", &self.access_token_expires_at)
+            .field("refresh_token_expires_at", &self.refresh_token_expires_at)
             .field("generation", &self.generation)
             .field("revoked_at", &self.revoked_at)
             .field("unmounted_at", &self.unmounted_at)
@@ -1193,9 +1209,7 @@ impl YouTubePublishCheckpoint {
     }
 
     pub fn durable_digest(&self) -> String {
-        serde_json::to_value(self)
-            .map(|value| sha256_json(&value))
-            .unwrap_or_else(|_| "0".repeat(64))
+        serde_json::to_value(self).map_or_else(|_| "0".repeat(64), |value| sha256_json(&value))
     }
 
     pub(crate) fn require_dispatchable(&self) -> Result<(), YouTubeError> {
@@ -1541,7 +1555,7 @@ fn is_sha256(value: &str) -> bool {
 fn hex_digest(bytes: &[u8]) -> String {
     let mut digest = String::with_capacity(64);
     for byte in Sha256::digest(bytes) {
-        digest.push_str(&format!("{byte:02x}"));
+        write!(&mut digest, "{byte:02x}").expect("writing to String cannot fail");
     }
     digest
 }

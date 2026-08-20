@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "hartevo-cargo-metadata-receipt/v1",
+  "target": "aarch64-apple-darwin",
+  "sourceCommit": "1111111111111111111111111111111111111111",
+  "lockfileSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "cargoMetadata": {
+    "packages": [
+      {
+        "id": "path+fixture://hartevo-desktop#hartevo-desktop@0.1.0",
+        "name": "hartevo-desktop",
+        "version": "0.1.0",
+        "source": null
+      }
+    ],
+    "workspace_members": [
+      "path+fixture://hartevo-desktop#hartevo-desktop@0.1.0"
+    ],
+    "resolve": {
+      "root": null,
+      "nodes": [
+        {
+          "id": "path+fixture://hartevo-desktop#hartevo-desktop@0.1.0",
+          "dependencies": [],
+          "deps": []
+        }
+      ]
+    }
+  }
+}

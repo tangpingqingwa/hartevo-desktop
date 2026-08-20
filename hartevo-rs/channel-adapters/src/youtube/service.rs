@@ -50,6 +50,7 @@ impl YouTubeRealPublishGate {
     }
 }
 
+#[derive(Debug)]
 pub struct YouTubePublishService<T> {
     provider: YouTubeDataApiProvider<T>,
     quota: YouTubeQuotaLedger,
@@ -72,7 +73,7 @@ impl<T> YouTubePublishService<T> {
         service
     }
 
-    fn production(transport: T, gate: YouTubeRealPublishGate) -> Self
+    fn production(transport: T, gate: &YouTubeRealPublishGate) -> Self
     where
         T: YouTubeProductionTransport,
     {
@@ -103,6 +104,7 @@ impl<T> YouTubePublishService<T> {
         &mut self.quota
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn dispatch(
         &mut self,
         credential: &YouTubeCredential,
@@ -151,7 +153,7 @@ impl<T> YouTubePublishService<T> {
             ) {
                 Ok(probe) => checkpoint.set_probe(probe),
                 Err(error) => {
-                    return self.handle_provider_error(
+                    return Self::handle_provider_error(
                         checkpoint,
                         YouTubeDispatchOperation::AuthenticatedProbe,
                         error,
@@ -168,7 +170,7 @@ impl<T> YouTubePublishService<T> {
             match self.provider.begin_upload(credential, checkpoint.request()) {
                 Ok(session) => checkpoint.set_session(session),
                 Err(error) => {
-                    return self.handle_provider_error(
+                    return Self::handle_provider_error(
                         checkpoint,
                         YouTubeDispatchOperation::BeginResumableUpload,
                         error,
@@ -207,7 +209,7 @@ impl<T> YouTubePublishService<T> {
                     checkpoint.set_provider_receipt(receipt);
                 }
                 Err(error) => {
-                    return self.handle_provider_error(
+                    return Self::handle_provider_error(
                         checkpoint,
                         YouTubeDispatchOperation::UploadChunk,
                         error,
@@ -231,7 +233,7 @@ impl<T> YouTubePublishService<T> {
         ) {
             Ok(readback) => readback,
             Err(error) => {
-                return self.handle_provider_error(
+                return Self::handle_provider_error(
                     checkpoint,
                     YouTubeDispatchOperation::Readback,
                     error,
@@ -253,8 +255,8 @@ impl<T> YouTubePublishService<T> {
         ))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_provider_error(
-        &self,
         checkpoint: &mut YouTubePublishCheckpoint,
         operation: YouTubeDispatchOperation,
         error: YouTubeError,
@@ -297,7 +299,7 @@ where
     T: YouTubeProductionTransport,
 {
     let gate = YouTubeRealPublishGate::from_env()?;
-    Ok(YouTubePublishService::production(transport, gate))
+    Ok(YouTubePublishService::production(transport, &gate))
 }
 
 #[cfg(test)]
