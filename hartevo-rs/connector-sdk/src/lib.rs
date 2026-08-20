@@ -8,6 +8,8 @@
 //! `hartevo-effect-broker` provider contract types; this crate does not create
 //! a second authority model.
 
+pub mod linkedin;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -16,7 +18,26 @@ use hartevo_effect_broker::{ConnectedAuthority, ConnectedAuthorization};
 pub use hartevo_effect_broker::{
     ProviderAdapterIdentity, ProviderAdapterOperation, ProviderAdapterRegistry,
     ProviderCapabilityKey, ProviderCapabilitySupport, ProviderContractError, ProviderEvidenceClass,
-    ProviderProvenanceClass,
+    ProviderEvidenceSupport, ProviderProvenanceClass,
+};
+pub use linkedin::{
+    CurlHttpsTransport, DurableObservationLog, EnvLinkedInCredentialResolver,
+    InMemoryLinkedInCredentialResolver, LINKEDIN_ACCESS_TOKEN_ENV, LINKEDIN_ADAPTER_ID,
+    LINKEDIN_ADAPTER_VERSION, LINKEDIN_DEFAULT_API_BASE_URL, LINKEDIN_DEFAULT_MARKETING_VERSION,
+    LINKEDIN_INSIGHT_READ_SCHEMA, LINKEDIN_REGISTRATIONS, LINKEDIN_RUN_PROBE_ENV,
+    LinkedInAccessToken, LinkedInAttribution, LinkedInCapabilityProjection, LinkedInCausalStatus,
+    LinkedInClassification, LinkedInConnectionState, LinkedInConnectorError, LinkedInCostReceipt,
+    LinkedInCredentialResolver, LinkedInCursorReceipt, LinkedInDigestReceipt,
+    LinkedInFreshnessReceipt, LinkedInHttpRequest, LinkedInHttpResponse, LinkedInHttpTransport,
+    LinkedInInsightObservation, LinkedInInsightProvider, LinkedInInsightReadRequest,
+    LinkedInInsightRecord, LinkedInInsightScope, LinkedInInsightTarget, LinkedInInsightTargetKind,
+    LinkedInMarketingConfig, LinkedInMarketingOrganizationAdapter, LinkedInMetricValue,
+    LinkedInMount, LinkedInPaginationCursor, LinkedInPermissionObservation,
+    LinkedInProbeObservation, LinkedInProbeRequest, LinkedInProviderPage, LinkedInQuotaReceipt,
+    LinkedInRateLimit, LinkedInReadPolicy, LinkedInRequestEvidence, LinkedInRetryReceipt,
+    LinkedInReviewState, LinkedInTransportError, MissionCapability, MissionCapabilityGrant,
+    MissionInsightResult, MissionPaidSocialInsightConsumer, PaidSocialInsightReadService,
+    env_gated_credentialed_probe,
 };
 use ring::hmac;
 use serde::{Deserialize, Serialize};
@@ -25,6 +46,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub mod authenticated_probe;
+pub mod connection_center;
 
 pub const CONNECTOR_SDK_SCHEMA_VERSION: &str = "hartevo-connector-sdk/v1";
 pub const MAX_CREDENTIAL_LEASE_TTL_SECONDS: i64 = 900;
@@ -33,6 +55,8 @@ pub const MAX_PROBE_TTL_SECONDS: i64 = 120;
 pub const MAX_WORKER_LEASE_TTL_SECONDS: i64 = 900;
 pub const DEFAULT_PAGE_SIZE: u32 = 100;
 pub const MAX_PAGE_SIZE: u32 = 1_000;
+
+pub mod meta;
 
 /// A tenant/project/provider/account scope.  The scope contains identifiers,
 /// never a secret or a provider payload.
@@ -201,7 +225,7 @@ impl SecretReference {
         self.scope.validate()
     }
 
-    fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
         self.revoked_at.is_some_and(|revoked_at| revoked_at <= now)
     }
 }
@@ -315,7 +339,7 @@ impl CredentialLease {
         Ok(())
     }
 
-    fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_revoked_at(&self, now: DateTime<Utc>) -> bool {
         self.revoked_at.is_some_and(|revoked_at| revoked_at <= now)
     }
 }
@@ -1012,7 +1036,7 @@ impl ConnectorTask {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FreshnessWindow {
     observed_at: DateTime<Utc>,
