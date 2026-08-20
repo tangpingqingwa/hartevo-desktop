@@ -1,0 +1,227 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-config-compliance-result/aws-config-compliance-result.v1.json",
+  "title": "Hartevo AWS Config resource-compliance result Layer-1 contract",
+  "description": "A bounded, read/proposal/record/verify-only AWS Config rule-evaluation seam. It is not a Config remediation engine, configuration snapshot reader, certification authority, or Hartevo Truth authority.",
+  "schemaVersion": "hartevo.aws-config-compliance-result.contract/v1",
+  "contractVersion": "aws-config-compliance-result/v1",
+  "pluginVersion": "1.0.0",
+  "layer": "Layer-1",
+  "officialReferences": [
+    "https://docs.aws.amazon.com/config/latest/APIReference/API_GetComplianceDetailsByConfigRule.html",
+    "https://docs.aws.amazon.com/config/latest/APIReference/API_DescribeComplianceByResource.html",
+    "https://docs.aws.amazon.com/config/latest/APIReference/Welcome.html"
+  ],
+  "service": {
+    "id": "hartevo.aws.config.compliance-result",
+    "implementation": "AwsConfigComplianceService",
+    "version": "1.0.0",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "read_bounded",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "liveExecution": false
+  },
+  "provider": {
+    "id": "aws.config",
+    "implementation": "AwsConfigProvider",
+    "version": "1.0.0",
+    "apiRevision": "aws-config-read-r1",
+    "allowlistedOperations": [
+      "GetComplianceDetailsByConfigRule",
+      "DescribeComplianceByResource"
+    ],
+    "allowlistedMethods": ["POST"],
+    "acceptedTransports": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "native": false,
+    "connected": false,
+    "externalWrites": false,
+    "sigV4Secret": "opaque_non_serializing_secret_reference_only"
+  },
+  "consumer": {
+    "id": "mission.aws.config.compliance-result",
+    "implementation": "MissionAwsConfigConsumer",
+    "version": "1.0.0",
+    "deploymentBound": true,
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "revisionBound": true,
+    "permissionBound": true,
+    "producesDecisionProposal": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "certificationAuthority": false
+  },
+  "scope": {
+    "required": [
+      "deployment_id_and_revision",
+      "mission_id_and_revision",
+      "project_id_and_revision",
+      "work_product_id_and_revision",
+      "exact_account_and_region_or_approved_aggregator",
+      "config_rule_name_and_revision",
+      "resource_type_and_id_allowlist",
+      "resource_revision_fences",
+      "permission_digest",
+      "secret_reference_digest",
+      "scope_digest"
+    ],
+    "target": "exactly_one_account_region_or_approved_aggregator",
+    "secret": "opaque_non_serializing_sigv4_reference_only",
+    "rawConfigurationItems": false,
+    "rawRuleCode": false,
+    "rawTags": false,
+    "rawEnvironmentValues": false
+  },
+  "registration": {
+    "pluginVersionBound": true,
+    "providerIdBound": true,
+    "providerVersionBound": true,
+    "providerRevisionBound": true,
+    "providerDigestBound": true,
+    "apiDigestBound": true,
+    "contractVersionBound": true,
+    "contractDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "evidenceDigestBound": true,
+    "secretReferenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "plugin_version_drift",
+      "provider_or_api_revision_drift",
+      "provider_or_contract_digest_drift",
+      "permission_or_scope_digest_drift",
+      "evidence_digest_drift",
+      "secret_reference_revocation",
+      "registration_tamper",
+      "registration_revocation",
+      "cursor_or_filter_replay",
+      "stale_rule_or_resource_revision"
+    ]
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxPages": 4,
+    "pageSize": 50,
+    "maxEvaluations": 256,
+    "maxRequestsPerRead": 6,
+    "maxRetries": 2,
+    "maxIdentifierBytes": 128
+  },
+  "evidence": {
+    "states": [
+      "COMPLIANT",
+      "NON_COMPLIANT",
+      "NOT_APPLICABLE",
+      "INSUFFICIENT_DATA",
+      "partial",
+      "access_loss",
+      "provider_unknown"
+    ],
+    "digests": [
+      "plugin_version",
+      "provider",
+      "api",
+      "contract",
+      "permission",
+      "scope",
+      "evaluation",
+      "evidence",
+      "proposal",
+      "record"
+    ],
+    "retained": [
+      "config_rule_name",
+      "resource_type",
+      "resource_id",
+      "rule_revision",
+      "resource_revision",
+      "evaluation_revision",
+      "compliance_state",
+      "ordering_timestamp",
+      "result_recorded_timestamp"
+    ],
+    "notRetained": [
+      "raw_configuration_item",
+      "custom_rule_code",
+      "annotation",
+      "tags",
+      "environment_values",
+      "provider_payload",
+      "credential_material"
+    ],
+    "missingOrInsufficientDataFailsClosed": true
+  },
+  "redaction": {
+    "secretMaterial": false,
+    "rawNextToken": false,
+    "rawProviderPayload": false,
+    "configurationItems": false,
+    "annotations": false,
+    "tags": false,
+    "environmentValues": false,
+    "errorMessages": false
+  },
+  "authority": {
+    "readOnly": true,
+    "proposalOnly": true,
+    "externalWrites": false,
+    "configRuleMutation": false,
+    "evaluationStart": false,
+    "remediation": false,
+    "resourceMutation": false,
+    "rawConfigurationRead": false,
+    "credentialResolution": false,
+    "certification": false,
+    "connected": false,
+    "native": false,
+    "durableReceipt": false,
+    "verification": false,
+    "kernelOutcomeAdoption": false,
+    "mcp": false
+  },
+  "honesty": {
+    "nativeStatus": "BLOCKED_ENV",
+    "blockedEnvironmentIsNative": false,
+    "fixtureIsNative": false,
+    "recordingIsNative": false,
+    "loopbackIsNative": false,
+    "compliantIsCertification": false,
+    "layer1Boundary": "Layer 1 emits bounded external evidence and a Mission decision proposal only. Native SigV4 execution, durable provider receipts, independent post-deployment readback, consented remediation, configuration snapshots and certification remain Layer-2 host authority."
+  },
+  "layer2Gaps": [
+    "native_sigv4_transport_and_credential_resolution",
+    "durable_provider_receipt",
+    "independent_post_deployment_readback",
+    "consented_config_rule_or_remediation_effects",
+    "verified_work_product_adoption",
+    "compliance_certification_authority"
+  ],
+  "forbidden": [
+    "create_config_rule",
+    "update_config_rule",
+    "delete_config_rule",
+    "start_config_rule_evaluation",
+    "invoke_remediation",
+    "mutate_aws_resource",
+    "read_raw_configuration_item",
+    "serialize_custom_rule_code",
+    "serialize_tags_or_environment_values",
+    "resolve_live_credentials",
+    "claim_connected",
+    "claim_native",
+    "claim_compliance_certification",
+    "adopt_kernel_outcome",
+    "unbounded_evaluation_annotations"
+  ]
+}

@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.example/contracts/plugins/databricks-job-result/v1",
+  "title": "Hartevo Databricks job-result plugin Layer-1 contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "contractVersion",
+    "serviceId",
+    "providerId",
+    "missionConsumerId",
+    "apiRevision",
+    "contractDigest",
+    "authentication",
+    "operations",
+    "registration",
+    "scope",
+    "pagination",
+    "lifecycleResultSeparation",
+    "outputBoundary",
+    "provenance",
+    "authorityBoundary"
+  ],
+  "properties": {
+    "schema": {"const": "hartevo.databricks-job-result/v1"},
+    "contractVersion": {"const": "databricks-job-result-layer-1/v1"},
+    "serviceId": {"const": "databricks.job-result.service"},
+    "providerId": {"const": "databricks.jobs.provider"},
+    "missionConsumerId": {"const": "mission.databricks-job-result.consumer"},
+    "apiRevision": {"const": "jobs-api-2.2"},
+    "contractDigest": {"const": "ce7c089e972c3494fa3224ec51cc6bcaa9d7ae6c4ab9ee15af4c121af312bfca"},
+    "authentication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "grantType", "secretMaterial", "patFallback"],
+      "properties": {
+        "scheme": {"const": "oauth-m2m"},
+        "grantType": {"const": "client-credentials"},
+        "secretMaterial": {"const": "opaque-secret-reference-only"},
+        "patFallback": {"const": false},
+        "requiredPermissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["jobs.read", "runs.read", "run-output.read"]}
+        }
+      }
+    },
+    "operations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "describe_job",
+          "read_run_evidence",
+          "compile_run_proposal",
+          "record_run_receipt",
+          "verify_job_result"
+        ]
+      }
+    },
+    "registration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "contractDigest",
+        "adapterRevision",
+        "apiRevision",
+        "oauthCapabilitySnapshot",
+        "scopeDigest",
+        "reversible",
+        "revocable",
+        "failClosedDriftKinds"
+      ],
+      "properties": {
+        "version": {"type": "string", "minLength": 1},
+        "contractDigest": {"$ref": "#/properties/contractDigest"},
+        "adapterRevision": {"type": "string", "minLength": 1},
+        "apiRevision": {"const": "jobs-api-2.2"},
+        "oauthCapabilitySnapshot": {"type": "object"},
+        "scopeDigest": {"$ref": "#/properties/contractDigest"},
+        "reversible": {"const": true},
+        "revocable": {"const": true},
+        "failClosedDriftKinds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "workspace-host",
+              "service-principal-permission",
+              "job-revision",
+              "registration",
+              "secret-reference"
+            ]
+          }
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accountIdentity",
+        "workspaceHttpsHost",
+        "workspaceId",
+        "jobId",
+        "jobRevision",
+        "allowedTaskKeys",
+        "missionId",
+        "projectId",
+        "workProductId",
+        "consentRevision",
+        "policyRevision"
+      ],
+      "properties": {
+        "accountIdentity": {"type": "string", "minLength": 1},
+        "workspaceHttpsHost": {"type": "string", "pattern": "^https://[^/]+$"},
+        "workspaceId": {"type": "string", "minLength": 1},
+        "jobId": {"type": "integer", "minimum": 1},
+        "jobRevision": {"type": "integer", "minimum": 1},
+        "allowedTaskKeys": {"type": "array", "minItems": 1, "uniqueItems": true},
+        "clusterId": {"type": ["string", "null"]},
+        "sqlWarehouseId": {"type": ["string", "null"]},
+        "runIds": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 1}},
+        "attemptIds": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 1}},
+        "missionId": {"type": "string", "minLength": 1},
+        "projectId": {"type": "string", "minLength": 1},
+        "workProductId": {"type": "string", "minLength": 1},
+        "consentRevision": {"type": "integer", "minimum": 1},
+        "policyRevision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "pagination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpoint", "opaqueNextPageToken", "pageSizeBoundary", "mergeRule", "rejectionRules"],
+      "properties": {
+        "endpoint": {"const": "jobs/runs/get"},
+        "opaqueNextPageToken": {"const": true},
+        "pageSizeBoundary": {"const": 100},
+        "mergeRule": {"const": "merge-only-matching-run-id"},
+        "rejectionRules": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["missing-page", "repeated-page-token", "out-of-scope-run", "out-of-scope-task", "duplicate-attempt"]}
+        },
+        "maxTasks": {"type": "integer", "minimum": 1},
+        "maxRepairAttempts": {"type": "integer", "minimum": 1}
+      }
+    },
+    "lifecycleResultSeparation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lifecycleStates", "resultStates", "terminalLifecycleIsNotSuccess"],
+      "properties": {
+        "lifecycleStates": {
+          "type": "array",
+          "items": {"enum": ["QUEUED", "PENDING", "RUNNING", "TERMINATING", "TERMINATED", "WAITING_FOR_RETRY", "BLOCKED", "SKIPPED", "INTERNAL_ERROR", "PROVIDER_UNKNOWN"]}
+        },
+        "resultStates": {
+          "type": "array",
+          "items": {"enum": ["SUCCESS", "FAILED", "TIMED_OUT", "CANCELED", "NOT_AVAILABLE", "PROVIDER_UNKNOWN"]}
+        },
+        "terminalLifecycleIsNotSuccess": {"const": true}
+      }
+    },
+    "outputBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpoint", "maxCapturedBytes", "rawRetention", "expirySeconds", "truncationIsNonAdoptable"],
+      "properties": {
+        "endpoint": {"const": "jobs/runs/get-output"},
+        "maxCapturedBytes": {"const": 5242880},
+        "rawRetention": {"const": false},
+        "expirySeconds": {"const": 5184000},
+        "truncationIsNonAdoptable": {"const": true},
+        "missingOrExpiredAccess": {"const": "fail-closed-or-partial-evidence"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recording", "fixture", "loopback", "blockedEnv", "nativeConnectedClaim"],
+      "properties": {
+        "recording": {"const": "non-native"},
+        "fixture": {"const": "non-native"},
+        "loopback": {"const": "non-native"},
+        "blockedEnv": {"const": "non-native"},
+        "nativeConnectedClaim": {"const": false}
+      }
+    },
+    "authorityBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["store", "keyring", "browserProfile", "truth", "consent", "effect", "receipt", "verification", "outcome", "parallelToolRegistry"],
+      "properties": {
+        "store": {"const": false},
+        "keyring": {"const": false},
+        "browserProfile": {"const": false},
+        "truth": {"const": false},
+        "consent": {"const": false},
+        "effect": {"const": false},
+        "receipt": {"const": false},
+        "verification": {"const": false},
+        "outcome": {"const": false},
+        "parallelToolRegistry": {"const": false},
+        "mutationOperations": {"const": false},
+        "rawNotebookOutputRetention": {"const": false}
+      }
+    }
+  }
+}

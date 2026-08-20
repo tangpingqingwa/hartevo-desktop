@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/gcp-cloud-deploy-result/gcp-cloud-deploy-result.v1.json",
+  "schemaVersion": "hartevo-gcp-cloud-deploy-result-contract/v1",
+  "contractVersion": "gcp-cloud-deploy-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "gcp.cloud.deploy.result",
+    "version": "1.0.0",
+    "operation": "governed_cloud_deploy_rollout_read_proposal",
+    "readOnly": true,
+    "liveExecution": false
+  },
+  "provider": {
+    "id": "gcp.cloud-deploy.v1.read",
+    "version": "1.0.0",
+    "apiVersion": "v1",
+    "method": "GET",
+    "paths": [
+      "projects.locations.deliveryPipelines.releases",
+      "projects.locations.deliveryPipelines.releases.rollouts",
+      "projects.locations.deliveryPipelines.releases.rollouts.jobRuns"
+    ],
+    "acceptedProvenance": ["recording", "fixture", "fake", "loopback", "blocked_env"],
+    "native": false,
+    "httpsTransport": false,
+    "readback": false
+  },
+  "scope": {
+    "required": [
+      "gcpProjectId",
+      "location",
+      "deliveryPipelineId",
+      "releaseId",
+      "targetId",
+      "commitId",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision",
+      "permissionScope",
+      "consentScope"
+    ],
+    "secret": "opaque_non_serializing_oauth_or_service_account_reference"
+  },
+  "limits": {
+    "maxPageSize": 100,
+    "maxRolloutsPerProposal": 100,
+    "maxJobRunsPerProposal": 100,
+    "maxResponseBytes": 262144,
+    "opaquePagination": true,
+    "retryAttempts": 0
+  },
+  "permissions": [
+    "clouddeploy.releases.get",
+    "clouddeploy.releases.list",
+    "clouddeploy.rollouts.get",
+    "clouddeploy.rollouts.list",
+    "clouddeploy.jobRuns.get",
+    "clouddeploy.jobRuns.list",
+    "clouddeploy.targets.get"
+  ],
+  "states": [
+    "complete",
+    "partial",
+    "unknown",
+    "access_lost",
+    "rate_limited"
+  ],
+  "registration": {
+    "versionDigestBound": true,
+    "apiDigestBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "releaseDigestBound": true,
+    "evidenceDigestBound": true,
+    "reversible": true,
+    "revocable": true
+  },
+  "forbidden": [
+    "release_create",
+    "rollout_create",
+    "rollout_approve",
+    "rollout_advance",
+    "rollout_cancel",
+    "rollout_retry",
+    "rollout_terminate",
+    "raw_logs",
+    "raw_artifacts",
+    "live_credential_resolution",
+    "deployment_success_guarantee",
+    "kernel_outcome_adoption",
+    "consented_external_effects"
+  ],
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "httpsTransport": false,
+    "durableReceipt": false,
+    "independentReadback": false,
+    "adoptedWorkProduct": false,
+    "adoptedOutcome": false,
+    "deploymentSuccessClaimed": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "native_oauth_or_service_account_resolution",
+    "native_https_get",
+    "durable_operation_receipt",
+    "independent_endpoint_readback",
+    "consented_external_effects",
+    "verified_work_product_adoption",
+    "kernel_outcome_adoption"
+  ]
+}
