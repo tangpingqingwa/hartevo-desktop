@@ -1,16 +1,16 @@
 {
   "baseBranch": "bootstrap/macos-r0",
-  "baseCommit": "7bb44d98cebd1d7ded417b48746456474f79d244",
+  "baseCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414",
   "candidateCount": 1,
   "candidates": [
     {
       "baseBranch": "bootstrap/macos-r0",
-      "headBranch": "codex/plugin-invocation-timeline-01",
-      "headCommit": "36f0251b712e43cfaad88253a2b9ca5cddaf56b6",
-      "number": 185
+      "headBranch": "codex/issue-335-launchdarkly-release-layer1",
+      "headCommit": "65c7168ce2f0d566e2b406621b4eaf42014773a9",
+      "number": 362
     }
   ],
-  "createdAt": "2026-08-17T10:44:48Z",
+  "createdAt": "2026-08-20T04:10:09Z",
   "createdBy": "integration-manager",
   "fullMatrixRequired": [
     "ubuntu-24.04",
@@ -21,5 +21,5 @@
   "release": false,
   "repository": "tangpingqingwa/hartevo-desktop",
   "schema": "hartevo-repository-merge-train/v1",
-  "trainBranch": "merge-train/20260817-104437"
+  "trainBranch": "merge-train/20260820-0408-pr362"
 }
