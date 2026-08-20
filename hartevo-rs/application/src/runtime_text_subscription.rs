@@ -6,6 +6,11 @@
 //! not start a Runtime, execute an Effect, append an Event, or mutate an
 //! Outbox.
 
+// The host mount for this support-only Operations slice is intentionally
+// outside this change. Keep the typed provider/consumer available to the
+// module's dedicated contract tests without wiring a new production path.
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -15,8 +20,11 @@ use hartevo_domain_kernel::{
     RuntimeTurnPrivateTextDelta, RuntimeTurnStatus, TenantId,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use hartevo_storage::DomainEventRecord;
 
 use crate::{ApplicationError, ApplicationService, StartCatalogMission};
 
@@ -844,6 +852,972 @@ impl fmt::Debug for ShortDigest<'_> {
     }
 }
 
+const OPERATIONS_PLUGIN_ID: &str = "operations.log-driven/v1";
+const OPERATIONS_MAX_PAGE_SIZE: usize = 32;
+
+/// Exact Project/Mission identity used by the Operations provider. The
+/// provider never accepts a caller-supplied log or a caller-supplied tenant;
+/// this value is constructed from the durable Mission before a service is
+/// mounted.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[allow(clippy::struct_field_names)]
+pub(crate) struct OperationsScope {
+    tenant_id: TenantId,
+    project_id: ProjectId,
+    mission_id: MissionId,
+}
+
+impl OperationsScope {
+    fn from_mission(mission: &Mission) -> Result<Self, OperationsPluginError> {
+        let scope = Self {
+            tenant_id: mission.tenant_id.clone(),
+            project_id: mission.project_id.clone(),
+            mission_id: mission.id.clone(),
+        };
+        if scope.tenant_id.as_str().trim().is_empty()
+            || scope.project_id.as_str().trim().is_empty()
+            || scope.mission_id.as_str().trim().is_empty()
+        {
+            return Err(OperationsPluginError::InvalidScope);
+        }
+        Ok(scope)
+    }
+
+    fn digest(&self) -> Result<String, OperationsPluginError> {
+        digest_json(self).map_err(|_| OperationsPluginError::InvalidSource)
+    }
+}
+
+impl fmt::Debug for OperationsScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scope_digest = self.digest().unwrap_or_else(|_| "invalid".into());
+        formatter
+            .debug_struct("OperationsScope")
+            .field("scope", &ShortDigest(&scope_digest))
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub(crate) enum OperationsPluginError {
+    #[error("Operations plugin page size must be between 1 and 32")]
+    InvalidPageSize,
+    #[error("Operations plugin scope is invalid")]
+    InvalidScope,
+    #[error("durable Mission execution log is unavailable")]
+    SourceUnavailable,
+    #[error("durable Mission execution log failed integrity validation")]
+    InvalidSource,
+    #[error("Operations plugin scope does not match the durable Mission log")]
+    ScopeMismatch,
+    #[error("Operations plugin Mission revision does not match the durable cursor")]
+    RevisionMismatch,
+    #[error("Operations plugin cursor is not canonical for its scope")]
+    CursorMismatch,
+    #[error("Operations plugin cursor is ahead of the durable Mission log")]
+    CursorAhead,
+    #[error("Operations plugin cursor history is missing from the durable Mission log")]
+    CursorHistoryMissing,
+    #[error("Operations plugin selection does not match the durable operation")]
+    SelectionMismatch,
+    #[error("Operations plugin is not mounted")]
+    NotMounted,
+    #[error("Operations plugin has been revoked")]
+    Revoked,
+    #[error("Operations plugin cannot advance its revision")]
+    RevisionOverflow,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperationsOperationKind {
+    Mission,
+    Checkpoint,
+    Runtime,
+    Conversation,
+    Other,
+}
+
+impl OperationsOperationKind {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Mission => "MISSION",
+            Self::Checkpoint => "CHECKPOINT",
+            Self::Runtime => "RUNTIME",
+            Self::Conversation => "CONVERSATION",
+            Self::Other => "OTHER",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperationsOperationStatus {
+    Recorded,
+    Running,
+    Blocked,
+    Completed,
+    Failed,
+    Uncertain,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperationsBusinessStatus {
+    Awaiting,
+    Running,
+    Blocked,
+    Completed,
+    ExpectedRefusal,
+    Failed,
+    Cancelled,
+    Uncertain,
+}
+
+impl OperationsBusinessStatus {
+    const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::ExpectedRefusal | Self::Failed | Self::Cancelled
+        )
+    }
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct OperationsCursor {
+    scope_digest: String,
+    revision: u64,
+    after_sequence: Option<u64>,
+    log_prefix_digest: String,
+    cursor_digest: String,
+}
+
+impl OperationsCursor {
+    fn new(
+        scope: &OperationsScope,
+        revision: u64,
+        after_sequence: Option<u64>,
+        log_prefix_digest: String,
+    ) -> Result<Self, OperationsPluginError> {
+        let scope_digest = scope.digest()?;
+        let mut cursor = Self {
+            scope_digest,
+            revision,
+            after_sequence,
+            log_prefix_digest,
+            cursor_digest: String::new(),
+        };
+        cursor.cursor_digest = cursor.computed_digest()?;
+        Ok(cursor)
+    }
+
+    fn validate_for(
+        &self,
+        scope: &OperationsScope,
+        revision: u64,
+    ) -> Result<(), OperationsPluginError> {
+        let expected_scope = scope.digest()?;
+        if !is_digest(&self.scope_digest)
+            || !is_digest(&self.log_prefix_digest)
+            || !is_digest(&self.cursor_digest)
+            || self.scope_digest != expected_scope
+            || self.revision == 0
+            || self.revision != revision
+            || self.after_sequence == Some(0)
+            || self.computed_digest()? != self.cursor_digest
+        {
+            if self.scope_digest != expected_scope {
+                return Err(OperationsPluginError::ScopeMismatch);
+            }
+            if self.revision != revision {
+                return Err(OperationsPluginError::RevisionMismatch);
+            }
+            return Err(OperationsPluginError::CursorMismatch);
+        }
+        Ok(())
+    }
+
+    fn computed_digest(&self) -> Result<String, OperationsPluginError> {
+        digest_json(&OperationsCursorDigestMaterial {
+            scope_digest: &self.scope_digest,
+            revision: self.revision,
+            after_sequence: self.after_sequence,
+            log_prefix_digest: &self.log_prefix_digest,
+        })
+        .map_err(|_| OperationsPluginError::InvalidSource)
+    }
+}
+
+impl fmt::Debug for OperationsCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OperationsCursor")
+            .field("scope", &ShortDigest(&self.scope_digest))
+            .field("revision", &self.revision)
+            .field("after_sequence", &self.after_sequence)
+            .field("log_prefix", &ShortDigest(&self.log_prefix_digest))
+            .field("cursor", &ShortDigest(&self.cursor_digest))
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationsCursorDigestMaterial<'a> {
+    scope_digest: &'a str,
+    revision: u64,
+    after_sequence: Option<u64>,
+    log_prefix_digest: &'a str,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct OperationsSelection {
+    scope_digest: String,
+    revision: u64,
+    sequence: u64,
+    operation_digest: String,
+    detail_digest: String,
+    selection_digest: String,
+}
+
+impl OperationsSelection {
+    fn new(
+        scope: &OperationsScope,
+        revision: u64,
+        entry: &OperationsLogEntry,
+    ) -> Result<Self, OperationsPluginError> {
+        let mut selection = Self {
+            scope_digest: scope.digest()?,
+            revision,
+            sequence: entry.sequence,
+            operation_digest: entry.operation_digest.clone(),
+            detail_digest: entry.detail_digest.clone(),
+            selection_digest: String::new(),
+        };
+        selection.selection_digest = selection.computed_digest()?;
+        Ok(selection)
+    }
+
+    fn validate_for(
+        &self,
+        scope: &OperationsScope,
+        revision: u64,
+    ) -> Result<(), OperationsPluginError> {
+        let expected_scope = scope.digest()?;
+        if !is_digest(&self.scope_digest)
+            || !is_digest(&self.operation_digest)
+            || !is_digest(&self.detail_digest)
+            || !is_digest(&self.selection_digest)
+            || self.scope_digest != expected_scope
+            || self.revision == 0
+            || self.sequence == 0
+            || self.revision != revision
+            || self.computed_digest()? != self.selection_digest
+        {
+            if self.scope_digest != expected_scope {
+                return Err(OperationsPluginError::ScopeMismatch);
+            }
+            if self.revision != revision {
+                return Err(OperationsPluginError::RevisionMismatch);
+            }
+            return Err(OperationsPluginError::SelectionMismatch);
+        }
+        Ok(())
+    }
+
+    fn computed_digest(&self) -> Result<String, OperationsPluginError> {
+        digest_json(&OperationsSelectionDigestMaterial {
+            scope_digest: &self.scope_digest,
+            revision: self.revision,
+            sequence: self.sequence,
+            operation_digest: &self.operation_digest,
+            detail_digest: &self.detail_digest,
+        })
+        .map_err(|_| OperationsPluginError::InvalidSource)
+    }
+}
+
+impl fmt::Debug for OperationsSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OperationsSelection")
+            .field("scope", &ShortDigest(&self.scope_digest))
+            .field("revision", &self.revision)
+            .field("sequence", &self.sequence)
+            .field("operation", &ShortDigest(&self.operation_digest))
+            .field("detail", &ShortDigest(&self.detail_digest))
+            .field("selection", &ShortDigest(&self.selection_digest))
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationsSelectionDigestMaterial<'a> {
+    scope_digest: &'a str,
+    revision: u64,
+    sequence: u64,
+    operation_digest: &'a str,
+    detail_digest: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperationsLogEntry {
+    sequence: u64,
+    kind: OperationsOperationKind,
+    status: OperationsOperationStatus,
+    operation_digest: String,
+    detail_digest: String,
+    checkpoint_digest: Option<String>,
+    capability_digest: Option<String>,
+    business_status: Option<OperationsBusinessStatus>,
+}
+
+#[derive(Clone, Debug)]
+struct OperationsLogSnapshot {
+    scope: OperationsScope,
+    revision: u64,
+    entries: Vec<OperationsLogEntry>,
+    business_status: OperationsBusinessStatus,
+}
+
+#[derive(Clone, Debug)]
+struct OperationsLogPage {
+    scope: OperationsScope,
+    revision: u64,
+    entries: Vec<OperationsLogEntry>,
+    selected_entry: Option<OperationsLogEntry>,
+    next_cursor: OperationsCursor,
+    has_more: bool,
+    caught_up: bool,
+    business_status: OperationsBusinessStatus,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct OperationsInlineNode {
+    operation_digest: String,
+    kind: OperationsOperationKind,
+    status: OperationsOperationStatus,
+    selection: OperationsSelection,
+    selected: bool,
+    detail_available: bool,
+}
+
+impl OperationsInlineNode {
+    fn from_entry(
+        scope: &OperationsScope,
+        revision: u64,
+        entry: &OperationsLogEntry,
+        selection: Option<&OperationsSelection>,
+    ) -> Result<Self, OperationsPluginError> {
+        let node_selection = OperationsSelection::new(scope, revision, entry)?;
+        Ok(Self {
+            operation_digest: entry.operation_digest.clone(),
+            kind: entry.kind,
+            status: entry.status,
+            selected: selection == Some(&node_selection),
+            selection: node_selection,
+            detail_available: true,
+        })
+    }
+}
+
+impl fmt::Debug for OperationsInlineNode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OperationsInlineNode")
+            .field("operation", &ShortDigest(&self.operation_digest))
+            .field("kind", &self.kind)
+            .field("status", &self.status)
+            .field("selected", &self.selected)
+            .field("detail_available", &self.detail_available)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct OperationsSelectedDetail {
+    operation_digest: String,
+    sequence: u64,
+    kind: OperationsOperationKind,
+    status: OperationsOperationStatus,
+    detail_digest: String,
+    checkpoint_digest: Option<String>,
+    capability_digest: Option<String>,
+    selection: OperationsSelection,
+}
+
+impl fmt::Debug for OperationsSelectedDetail {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OperationsSelectedDetail")
+            .field("operation", &ShortDigest(&self.operation_digest))
+            .field("sequence", &self.sequence)
+            .field("kind", &self.kind)
+            .field("status", &self.status)
+            .field("detail", &ShortDigest(&self.detail_digest))
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct OperationsInlineProjection {
+    plugin_id: String,
+    scope_digest: String,
+    revision: u64,
+    business_status: OperationsBusinessStatus,
+    caught_up: bool,
+    nodes: Vec<OperationsInlineNode>,
+    selected_detail: Option<OperationsSelectedDetail>,
+    next_cursor: OperationsCursor,
+    has_more: bool,
+}
+
+impl OperationsInlineProjection {
+    pub(crate) fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub(crate) fn scope_digest(&self) -> &str {
+        &self.scope_digest
+    }
+
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) const fn business_status(&self) -> OperationsBusinessStatus {
+        self.business_status
+    }
+
+    pub(crate) const fn caught_up(&self) -> bool {
+        self.caught_up
+    }
+
+    pub(crate) const fn business_complete(&self) -> bool {
+        self.business_status.is_terminal()
+    }
+
+    pub(crate) fn nodes(&self) -> &[OperationsInlineNode] {
+        &self.nodes
+    }
+
+    pub(crate) fn selected_detail(&self) -> Option<&OperationsSelectedDetail> {
+        self.selected_detail.as_ref()
+    }
+
+    pub(crate) fn next_cursor(&self) -> &OperationsCursor {
+        &self.next_cursor
+    }
+
+    pub(crate) const fn has_more(&self) -> bool {
+        self.has_more
+    }
+}
+
+impl fmt::Debug for OperationsInlineProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OperationsInlineProjection")
+            .field("plugin_id", &self.plugin_id)
+            .field("scope", &ShortDigest(&self.scope_digest))
+            .field("revision", &self.revision)
+            .field("business_status", &self.business_status)
+            .field("caught_up", &self.caught_up)
+            .field("node_count", &self.nodes.len())
+            .field("selected_detail", &self.selected_detail)
+            .field("next_cursor", &self.next_cursor)
+            .field("has_more", &self.has_more)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperationsPluginLifecycle {
+    Mounted,
+    Unmounted,
+    Revoked,
+}
+
+/// The provider is deliberately log-only. It has no Mission/Runtime state
+/// cache and therefore cannot manufacture an operation from a current status,
+/// a heartbeat, or a synthetic test payload.
+struct OperationsLogProvider<'a> {
+    application: &'a ApplicationService,
+    scope: OperationsScope,
+}
+
+impl<'a> OperationsLogProvider<'a> {
+    fn new(application: &'a ApplicationService, scope: OperationsScope) -> Self {
+        Self { application, scope }
+    }
+
+    fn read_page(
+        &self,
+        cursor: Option<&OperationsCursor>,
+        selection: Option<&OperationsSelection>,
+        page_size: usize,
+    ) -> Result<OperationsLogPage, OperationsPluginError> {
+        if !(1..=OPERATIONS_MAX_PAGE_SIZE).contains(&page_size) {
+            return Err(OperationsPluginError::InvalidPageSize);
+        }
+        let snapshot = self.read_snapshot()?;
+        let (start, previous_sequence) = if let Some(cursor) = cursor {
+            cursor.validate_for(&snapshot.scope, snapshot.revision)?;
+            match cursor.after_sequence {
+                None => {
+                    if cursor.log_prefix_digest != empty_log_prefix_digest()? {
+                        return Err(OperationsPluginError::CursorMismatch);
+                    }
+                    (0, None)
+                }
+                Some(after_sequence) => {
+                    let Some(last) = snapshot.entries.last() else {
+                        return Err(OperationsPluginError::CursorAhead);
+                    };
+                    if after_sequence > last.sequence {
+                        return Err(OperationsPluginError::CursorAhead);
+                    }
+                    let Some(index) = snapshot
+                        .entries
+                        .iter()
+                        .position(|entry| entry.sequence == after_sequence)
+                    else {
+                        return Err(OperationsPluginError::CursorHistoryMissing);
+                    };
+                    let prefix_digest = log_prefix_digest(&snapshot.entries, index + 1)?;
+                    if cursor.log_prefix_digest != prefix_digest {
+                        return Err(OperationsPluginError::CursorMismatch);
+                    }
+                    (
+                        index
+                            .checked_add(1)
+                            .ok_or(OperationsPluginError::RevisionOverflow)?,
+                        Some(after_sequence),
+                    )
+                }
+            }
+        } else {
+            (0, None)
+        };
+        if let Some(selection) = selection {
+            selection.validate_for(&snapshot.scope, snapshot.revision)?;
+        }
+        let end = start
+            .checked_add(page_size)
+            .ok_or(OperationsPluginError::RevisionOverflow)?
+            .min(snapshot.entries.len());
+        let entries = snapshot.entries[start..end].to_vec();
+        let after_sequence = entries
+            .last()
+            .map(|entry| entry.sequence)
+            .or(previous_sequence);
+        let prefix_digest = log_prefix_digest(&snapshot.entries, end)?;
+        let next_cursor = OperationsCursor::new(
+            &snapshot.scope,
+            snapshot.revision,
+            after_sequence,
+            prefix_digest,
+        )?;
+        let selected_entry = selection
+            .map(|selection| {
+                snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.sequence == selection.sequence)
+                    .ok_or(OperationsPluginError::SelectionMismatch)
+                    .and_then(|entry| {
+                        if entry.operation_digest != selection.operation_digest
+                            || entry.detail_digest != selection.detail_digest
+                        {
+                            return Err(OperationsPluginError::SelectionMismatch);
+                        }
+                        Ok(entry.clone())
+                    })
+            })
+            .transpose()?;
+        Ok(OperationsLogPage {
+            scope: snapshot.scope,
+            revision: snapshot.revision,
+            entries,
+            selected_entry,
+            next_cursor,
+            has_more: end < snapshot.entries.len(),
+            caught_up: end == snapshot.entries.len(),
+            business_status: snapshot.business_status,
+        })
+    }
+
+    fn read_snapshot(&self) -> Result<OperationsLogSnapshot, OperationsPluginError> {
+        let mission = self
+            .application
+            .load_mission(&self.scope.project_id, &self.scope.mission_id)
+            .map_err(|_| OperationsPluginError::SourceUnavailable)?;
+        let durable_scope = OperationsScope::from_mission(&mission)?;
+        if durable_scope != self.scope {
+            return Err(OperationsPluginError::ScopeMismatch);
+        }
+        if mission.revision == 0 {
+            return Err(OperationsPluginError::InvalidSource);
+        }
+        let events = self
+            .application
+            .mission_events(&self.scope.project_id, &self.scope.mission_id)
+            .map_err(|_| OperationsPluginError::SourceUnavailable)?;
+        let entries = events
+            .iter()
+            .map(|event| operation_log_entry(&self.scope, event))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut previous_sequence = None;
+        for entry in &entries {
+            if previous_sequence.is_some_and(|previous| entry.sequence <= previous) {
+                return Err(OperationsPluginError::InvalidSource);
+            }
+            previous_sequence = Some(entry.sequence);
+        }
+        let mut business_status = OperationsBusinessStatus::Awaiting;
+        for entry in &entries {
+            if let Some(status) = entry.business_status {
+                business_status = status;
+            }
+        }
+        Ok(OperationsLogSnapshot {
+            scope: self.scope.clone(),
+            revision: mission.revision,
+            entries,
+            business_status,
+        })
+    }
+}
+
+/// Consumer seam for the Conversation inline surface. It accepts only the
+/// content-free provider page and never receives a durable event payload.
+#[derive(Clone, Copy, Debug)]
+struct OperationsConversationConsumer {
+    plugin_id: &'static str,
+}
+
+impl OperationsConversationConsumer {
+    fn project(
+        self,
+        page: OperationsLogPage,
+        selection: Option<&OperationsSelection>,
+    ) -> Result<OperationsInlineProjection, OperationsPluginError> {
+        let nodes = page
+            .entries
+            .iter()
+            .map(|entry| {
+                OperationsInlineNode::from_entry(&page.scope, page.revision, entry, selection)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let selected_detail = page.selected_entry.map(|entry| {
+            let selection = OperationsSelection::new(&page.scope, page.revision, &entry)?;
+            Ok(OperationsSelectedDetail {
+                operation_digest: entry.operation_digest,
+                sequence: entry.sequence,
+                kind: entry.kind,
+                status: entry.status,
+                detail_digest: entry.detail_digest,
+                checkpoint_digest: entry.checkpoint_digest,
+                capability_digest: entry.capability_digest,
+                selection,
+            })
+        });
+        let selected_detail = selected_detail.transpose()?;
+        Ok(OperationsInlineProjection {
+            plugin_id: self.plugin_id.into(),
+            scope_digest: page.scope.digest()?,
+            revision: page.revision,
+            business_status: page.business_status,
+            caught_up: page.caught_up,
+            nodes,
+            selected_detail,
+            next_cursor: page.next_cursor,
+            has_more: page.has_more,
+        })
+    }
+}
+
+/// On-demand Operations service. The only retained private state is the last
+/// content-free projection needed by the inline consumer; unmount and revoke
+/// explicitly drop it before the lifecycle becomes unusable.
+pub(crate) struct OperationsDetailService<'a> {
+    provider: OperationsLogProvider<'a>,
+    consumer: OperationsConversationConsumer,
+    lifecycle: OperationsPluginLifecycle,
+    private_projection: Option<OperationsInlineProjection>,
+}
+
+impl<'a> OperationsDetailService<'a> {
+    fn mount(provider: OperationsLogProvider<'a>) -> Result<Self, OperationsPluginError> {
+        provider.read_snapshot()?;
+        Ok(Self {
+            provider,
+            consumer: OperationsConversationConsumer {
+                plugin_id: OPERATIONS_PLUGIN_ID,
+            },
+            lifecycle: OperationsPluginLifecycle::Mounted,
+            private_projection: None,
+        })
+    }
+
+    pub(crate) fn read(
+        &mut self,
+        cursor: Option<&OperationsCursor>,
+        selection: Option<&OperationsSelection>,
+        page_size: usize,
+    ) -> Result<OperationsInlineProjection, OperationsPluginError> {
+        if self.lifecycle != OperationsPluginLifecycle::Mounted {
+            self.private_projection = None;
+            return Err(match self.lifecycle {
+                OperationsPluginLifecycle::Mounted | OperationsPluginLifecycle::Unmounted => {
+                    OperationsPluginError::NotMounted
+                }
+                OperationsPluginLifecycle::Revoked => OperationsPluginError::Revoked,
+            });
+        }
+        let result = self
+            .provider
+            .read_page(cursor, selection, page_size)
+            .and_then(|page| self.consumer.project(page, selection));
+        match result {
+            Ok(projection) => {
+                self.private_projection = Some(projection.clone());
+                Ok(projection)
+            }
+            Err(error) => {
+                self.private_projection = None;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn mount_again(&mut self) -> Result<(), OperationsPluginError> {
+        self.private_projection = None;
+        if self.lifecycle == OperationsPluginLifecycle::Revoked {
+            return Err(OperationsPluginError::Revoked);
+        }
+        self.lifecycle = OperationsPluginLifecycle::Unmounted;
+        self.provider.read_snapshot()?;
+        self.lifecycle = OperationsPluginLifecycle::Mounted;
+        Ok(())
+    }
+
+    pub(crate) fn unmount(&mut self) {
+        self.private_projection = None;
+        self.lifecycle = OperationsPluginLifecycle::Unmounted;
+    }
+
+    pub(crate) fn revoke(&mut self) {
+        self.private_projection = None;
+        self.lifecycle = OperationsPluginLifecycle::Revoked;
+    }
+
+    #[cfg(test)]
+    fn has_private_projection(&self) -> bool {
+        self.private_projection.is_some()
+    }
+}
+
+impl fmt::Debug for OperationsDetailService<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OperationsDetailService")
+            .field("lifecycle", &self.lifecycle)
+            .field(
+                "private_projection_present",
+                &self.private_projection.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl ApplicationService {
+    pub(crate) fn operations_detail_service(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Result<OperationsDetailService<'_>, OperationsPluginError> {
+        let mission = self
+            .load_mission(project_id, mission_id)
+            .map_err(|_| OperationsPluginError::SourceUnavailable)?;
+        let scope = OperationsScope::from_mission(&mission)?;
+        OperationsDetailService::mount(OperationsLogProvider::new(self, scope))
+    }
+}
+
+fn operation_log_entry(
+    scope: &OperationsScope,
+    event: &DomainEventRecord,
+) -> Result<OperationsLogEntry, OperationsPluginError> {
+    if event.sequence <= 0
+        || event.project_id != scope.project_id
+        || event.mission_id.as_ref() != Some(&scope.mission_id)
+    {
+        return Err(OperationsPluginError::ScopeMismatch);
+    }
+    let sequence =
+        u64::try_from(event.sequence).map_err(|_| OperationsPluginError::InvalidSource)?;
+    let (kind, status, business_status) = classify_operation_event(&event.event_type);
+    let detail_digest = digest_json(&OperationsEventDigestMaterial {
+        event_type: &event.event_type,
+        payload: &event.payload,
+    })
+    .map_err(|_| OperationsPluginError::InvalidSource)?;
+    let scope_digest = scope.digest()?;
+    let operation_digest = digest_json(&OperationsOperationDigestMaterial {
+        scope_digest: &scope_digest,
+        sequence,
+        operation_kind: kind.code(),
+        event_type: &event.event_type,
+        detail_digest: &detail_digest,
+    })
+    .map_err(|_| OperationsPluginError::InvalidSource)?;
+    Ok(OperationsLogEntry {
+        sequence,
+        kind,
+        status,
+        operation_digest,
+        detail_digest,
+        checkpoint_digest: digest_payload_identifier(&event.payload, "checkpointId"),
+        capability_digest: digest_payload_identifier(&event.payload, "capabilityId"),
+        business_status,
+    })
+}
+
+fn classify_operation_event(
+    event_type: &str,
+) -> (
+    OperationsOperationKind,
+    OperationsOperationStatus,
+    Option<OperationsBusinessStatus>,
+) {
+    let kind = if event_type.starts_with("mission.checkpoint") {
+        OperationsOperationKind::Checkpoint
+    } else if event_type.starts_with("mission.") {
+        OperationsOperationKind::Mission
+    } else if event_type.starts_with("context.runtime_turn") {
+        OperationsOperationKind::Runtime
+    } else if event_type.starts_with("conversation.") {
+        OperationsOperationKind::Conversation
+    } else {
+        OperationsOperationKind::Other
+    };
+    let (status, business_status) = match event_type {
+        "mission.completed" => (
+            OperationsOperationStatus::Completed,
+            Some(OperationsBusinessStatus::Completed),
+        ),
+        "mission.expected_refusal" => (
+            OperationsOperationStatus::Completed,
+            Some(OperationsBusinessStatus::ExpectedRefusal),
+        ),
+        "mission.failed" => (
+            OperationsOperationStatus::Failed,
+            Some(OperationsBusinessStatus::Failed),
+        ),
+        "mission.cancelled" => (
+            OperationsOperationStatus::Cancelled,
+            Some(OperationsBusinessStatus::Cancelled),
+        ),
+        "mission.application_checkpoint_blocked" => (
+            OperationsOperationStatus::Blocked,
+            Some(OperationsBusinessStatus::Blocked),
+        ),
+        event_type if event_type.contains("uncertain") || event_type.contains("unverified") => (
+            OperationsOperationStatus::Uncertain,
+            Some(OperationsBusinessStatus::Uncertain),
+        ),
+        event_type
+            if event_type == "mission.started"
+                || event_type == "mission.created"
+                || event_type == "mission.catalog_bound"
+                || event_type == "mission.checkpoint_started"
+                || event_type == "mission.checkpoint_verification_started"
+                || event_type == "mission.partial"
+                || event_type.starts_with("context.runtime_turn") =>
+        {
+            (
+                OperationsOperationStatus::Running,
+                Some(OperationsBusinessStatus::Running),
+            )
+        }
+        "mission.checkpoint_completed" => (
+            OperationsOperationStatus::Completed,
+            Some(OperationsBusinessStatus::Running),
+        ),
+        event_type if event_type.ends_with("_failed") || event_type == "mission.reply_failed" => {
+            (OperationsOperationStatus::Failed, None)
+        }
+        event_type if event_type.ends_with("_completed") || event_type.ends_with("_sent") => {
+            (OperationsOperationStatus::Completed, None)
+        }
+        _ => (OperationsOperationStatus::Recorded, None),
+    };
+    (kind, status, business_status)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationsEventDigestMaterial<'a> {
+    event_type: &'a str,
+    payload: &'a Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationsOperationDigestMaterial<'a> {
+    scope_digest: &'a str,
+    sequence: u64,
+    operation_kind: &'a str,
+    event_type: &'a str,
+    detail_digest: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationsLogPrefixMaterial<'a> {
+    sequence: u64,
+    operation_digest: &'a str,
+    detail_digest: &'a str,
+}
+
+fn digest_payload_identifier(payload: &Value, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())))
+}
+
+fn empty_log_prefix_digest() -> Result<String, OperationsPluginError> {
+    log_prefix_digest(&[], 0)
+}
+
+fn log_prefix_digest(
+    entries: &[OperationsLogEntry],
+    end: usize,
+) -> Result<String, OperationsPluginError> {
+    let material = entries
+        .get(..end)
+        .ok_or(OperationsPluginError::InvalidSource)?
+        .iter()
+        .map(|entry| OperationsLogPrefixMaterial {
+            sequence: entry.sequence,
+            operation_digest: &entry.operation_digest,
+            detail_digest: &entry.detail_digest,
+        })
+        .collect::<Vec<_>>();
+    digest_json(&material).map_err(|_| OperationsPluginError::InvalidSource)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1084,6 +2058,53 @@ mod tests {
 
     fn resign_handle(handle: &mut CatalogMissionExecutionHandle) {
         handle.handle_digest = handle.computed_digest().expect("canonical test handle");
+    }
+
+    fn started_operations_fixture() -> DurableMissionFixture {
+        let mut fixture = DurableMissionFixture::new();
+        fixture
+            .service
+            .start_catalog_mission_execution(fixture.command(), now() + Duration::seconds(1))
+            .expect("Catalog Mission execution start");
+        fixture
+    }
+
+    fn operations_service(fixture: &DurableMissionFixture) -> OperationsDetailService<'_> {
+        fixture
+            .service
+            .operations_detail_service(&fixture.project_id, &fixture.mission_id)
+            .expect("mounted Operations detail service")
+    }
+
+    fn append_durable_operation_event(
+        fixture: &mut DurableMissionFixture,
+        event_type: &str,
+        payload: &Value,
+        offset_seconds: i64,
+    ) {
+        fixture
+            .service
+            .store
+            .append_event(
+                &fixture.project_id,
+                Some(&fixture.mission_id),
+                event_type,
+                payload,
+                now() + Duration::seconds(offset_seconds),
+            )
+            .expect("durable Mission execution event");
+    }
+
+    fn resign_operations_cursor(cursor: &mut OperationsCursor) {
+        cursor.cursor_digest = cursor
+            .computed_digest()
+            .expect("canonical Operations cursor");
+    }
+
+    fn resign_operations_selection(selection: &mut OperationsSelection) {
+        selection.selection_digest = selection
+            .computed_digest()
+            .expect("canonical Operations selection");
     }
 
     #[test]
@@ -1530,5 +2551,200 @@ mod tests {
             assert!(!delta_debug.contains(private));
         }
         assert!(delta_debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn operations_log_projection_is_caught_up_without_claiming_business_completion() {
+        let fixture = started_operations_fixture();
+        let mut service = operations_service(&fixture);
+        let projection = service
+            .read(None, None, OPERATIONS_MAX_PAGE_SIZE)
+            .expect("Operations log projection");
+
+        assert_eq!(projection.plugin_id(), OPERATIONS_PLUGIN_ID);
+        assert!(is_digest(projection.scope_digest()));
+        assert!(projection.revision() > 0);
+        assert!(projection.caught_up());
+        assert!(!projection.business_complete());
+        assert_eq!(
+            projection.business_status(),
+            OperationsBusinessStatus::Running
+        );
+        assert_eq!(projection.nodes().len(), 3);
+        assert!(projection.nodes().iter().all(|node| node.detail_available));
+        assert!(projection.selected_detail().is_none());
+        assert!(!projection.has_more());
+    }
+
+    #[test]
+    fn operations_provider_reselects_exact_detail_and_reads_new_events_from_durable_log() {
+        let mut fixture = started_operations_fixture();
+        let (cursor, selection) = {
+            let mut service = operations_service(&fixture);
+            let first = service.read(None, None, 1).expect("first Operations page");
+            let selection = first.nodes()[0].selection.clone();
+            let cursor = first.next_cursor().clone();
+            let reselected = service
+                .read(Some(&cursor), Some(&selection), 1)
+                .expect("reselected detail");
+            assert_eq!(
+                reselected
+                    .selected_detail()
+                    .expect("selected detail")
+                    .sequence,
+                selection.sequence
+            );
+            (cursor, selection)
+        };
+
+        append_durable_operation_event(
+            &mut fixture,
+            "mission.checkpoint_completed",
+            &serde_json::json!({
+                "checkpointId": "durable-checkpoint",
+                "capabilityId": "durable-capability",
+                "privateBody": PRIVATE_GOAL,
+            }),
+            4,
+        );
+        let mut service = operations_service(&fixture);
+        let next = service
+            .read(Some(&cursor), Some(&selection), OPERATIONS_MAX_PAGE_SIZE)
+            .expect("durable appended Operations page");
+        assert!(next.caught_up());
+        assert!(!next.business_complete());
+        assert_eq!(next.nodes().len(), 3);
+        assert_eq!(
+            next.nodes().last().expect("new operation node").status,
+            OperationsOperationStatus::Completed
+        );
+        assert_eq!(
+            next.selected_detail()
+                .expect("reselected durable detail")
+                .selection,
+            selection
+        );
+    }
+
+    #[test]
+    fn operations_cursor_and_selection_reject_cross_scope_and_revision_reselect() {
+        let fixture = started_operations_fixture();
+        let mut service = operations_service(&fixture);
+        let projection = service
+            .read(None, None, OPERATIONS_MAX_PAGE_SIZE)
+            .expect("Operations projection");
+
+        let mut cross_scope_cursor = projection.next_cursor().clone();
+        let foreign_scope = OperationsScope {
+            tenant_id: TenantId::from("foreign-tenant"),
+            project_id: ProjectId::from("foreign-project"),
+            mission_id: MissionId::from("foreign-mission"),
+        };
+        cross_scope_cursor.scope_digest = foreign_scope.digest().expect("foreign scope digest");
+        resign_operations_cursor(&mut cross_scope_cursor);
+        assert_eq!(
+            service.read(Some(&cross_scope_cursor), None, OPERATIONS_MAX_PAGE_SIZE),
+            Err(OperationsPluginError::ScopeMismatch)
+        );
+
+        let mut stale_revision_cursor = projection.next_cursor().clone();
+        stale_revision_cursor.revision += 1;
+        resign_operations_cursor(&mut stale_revision_cursor);
+        assert_eq!(
+            service.read(Some(&stale_revision_cursor), None, OPERATIONS_MAX_PAGE_SIZE),
+            Err(OperationsPluginError::RevisionMismatch)
+        );
+
+        let selection = projection.nodes()[0].selection.clone();
+        let mut stale_selection = selection;
+        stale_selection.revision += 1;
+        resign_operations_selection(&mut stale_selection);
+        assert_eq!(
+            service.read(
+                Some(projection.next_cursor()),
+                Some(&stale_selection),
+                OPERATIONS_MAX_PAGE_SIZE,
+            ),
+            Err(OperationsPluginError::RevisionMismatch)
+        );
+    }
+
+    #[test]
+    fn operations_log_replay_is_stable_after_sqlcipher_reopen() {
+        let fixture = started_operations_fixture();
+        let first = {
+            let mut service = operations_service(&fixture);
+            service
+                .read(None, None, OPERATIONS_MAX_PAGE_SIZE)
+                .expect("first durable projection")
+        };
+        let DurableMissionFixture {
+            _database_directory: database_directory,
+            _workspace: workspace,
+            database_path,
+            database_key,
+            service,
+            project_id,
+            mission_id,
+        } = fixture;
+        drop(service);
+        let restarted = ApplicationService::new(
+            ProjectStore::open(&database_path, &database_key).expect("reopened SQLCipher store"),
+        );
+        let mut replay = restarted
+            .operations_detail_service(&project_id, &mission_id)
+            .expect("replayed Operations service");
+        let second = replay
+            .read(None, None, OPERATIONS_MAX_PAGE_SIZE)
+            .expect("replayed durable projection");
+        assert_eq!(first, second);
+        drop((database_directory, workspace));
+    }
+
+    #[test]
+    fn operations_unmount_and_revoke_clear_private_projection_and_redact_log_payload() {
+        let mut fixture = started_operations_fixture();
+        append_durable_operation_event(
+            &mut fixture,
+            "mission.checkpoint_started",
+            &serde_json::json!({
+                "checkpointId": "private-checkpoint-id",
+                "capabilityId": "private-capability-id",
+                "privateGoal": PRIVATE_GOAL,
+                "privateText": PRIVATE_DELTA_PREFIX,
+            }),
+            4,
+        );
+        let mut service = operations_service(&fixture);
+        let projection = service
+            .read(None, None, OPERATIONS_MAX_PAGE_SIZE)
+            .expect("redacted Operations projection");
+        let serialized = serde_json::to_string(&projection).expect("serialized inline projection");
+        let debug = format!("{projection:?} {service:?}");
+        for private in [PRIVATE_GOAL, PRIVATE_DELTA_PREFIX, "private-checkpoint-id"] {
+            assert!(!serialized.contains(private));
+            assert!(!debug.contains(private));
+        }
+        assert!(service.has_private_projection());
+
+        service.unmount();
+        assert!(!service.has_private_projection());
+        assert_eq!(
+            service.read(None, None, OPERATIONS_MAX_PAGE_SIZE),
+            Err(OperationsPluginError::NotMounted)
+        );
+
+        service.mount_again().expect("remount Operations service");
+        service
+            .read(None, None, OPERATIONS_MAX_PAGE_SIZE)
+            .expect("projection after remount");
+        assert!(service.has_private_projection());
+        service.revoke();
+        assert!(!service.has_private_projection());
+        assert_eq!(
+            service.read(None, None, OPERATIONS_MAX_PAGE_SIZE),
+            Err(OperationsPluginError::Revoked)
+        );
+        assert_eq!(service.mount_again(), Err(OperationsPluginError::Revoked));
     }
 }
