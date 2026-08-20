@@ -580,6 +580,8 @@ struct SecretRevocationKey {
     credential_revision: u64,
 }
 
+/// A same-process monotonic CAS fence. Durable persistence across process
+/// restart is deliberately not claimed by this Layer 1 crate.
 static SECRET_REVOCATION_LEDGER: OnceLock<Mutex<BTreeMap<SecretRevocationKey, u64>>> =
     OnceLock::new();
 
@@ -4063,6 +4065,12 @@ impl<T: LaunchDarklyReleaseTransport> FeatureReleaseService<T> {
 
 /// Mission consumer that projects a release proposal without claiming an
 /// Outcome or invoking kernel authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MissionApprovalFence {
+    approval: Option<ApprovalEvidence>,
+    status: Option<ApprovalStatus>,
+}
+
 #[derive(Clone, Debug)]
 pub struct MissionFeatureReleaseConsumer {
     scope: FeatureReleaseScope,
@@ -4070,9 +4078,12 @@ pub struct MissionFeatureReleaseConsumer {
     expected_request: Option<FeatureReleaseProposalRequest>,
     expected_read_evidence_digest: Option<Digest>,
     expected_audit_fence: Option<AuditFence>,
+    expected_approval_fence: Option<MissionApprovalFence>,
 }
 
 impl MissionFeatureReleaseConsumer {
+    /// Legacy scope-only construction is retained for compatibility but is
+    /// intentionally non-consumable without trusted read evidence.
     pub fn for_scope(scope: &FeatureReleaseScope, registration_digest: Digest) -> Self {
         Self {
             scope: scope.clone(),
@@ -4080,9 +4091,12 @@ impl MissionFeatureReleaseConsumer {
             expected_request: None,
             expected_read_evidence_digest: None,
             expected_audit_fence: None,
+            expected_approval_fence: None,
         }
     }
 
+    /// Legacy request-only construction is retained for compatibility but is
+    /// intentionally non-consumable without trusted read evidence.
     pub fn for_request(
         scope: &FeatureReleaseScope,
         registration_digest: Digest,
@@ -4095,6 +4109,7 @@ impl MissionFeatureReleaseConsumer {
             expected_request: Some(request),
             expected_read_evidence_digest: None,
             expected_audit_fence: None,
+            expected_approval_fence: None,
         })
     }
 
@@ -4106,12 +4121,17 @@ impl MissionFeatureReleaseConsumer {
     ) -> Result<Self, FeatureReleaseError> {
         request.validate(scope)?;
         evidence.validate_fence(scope, &registration_digest)?;
+        let (approval_status, approval) = select_approval(scope, &evidence.approvals);
         Ok(Self {
             scope: scope.clone(),
             provider_fence: FeatureReleaseProviderFence::for_scope(scope, registration_digest),
             expected_request: Some(request),
             expected_read_evidence_digest: Some(evidence.evidence_digest.clone()),
             expected_audit_fence: Some(AuditFence::from_entries(&evidence.audit_entries)?),
+            expected_approval_fence: Some(MissionApprovalFence {
+                approval,
+                status: approval_status,
+            }),
         })
     }
 
@@ -4119,6 +4139,18 @@ impl MissionFeatureReleaseConsumer {
         &self,
         proposal: &FeatureReleaseResultProposal,
     ) -> Result<MissionFeatureReleaseProposal, FeatureReleaseError> {
+        let (
+            Some(expected_read_evidence_digest),
+            Some(expected_audit_fence),
+            Some(expected_approval_fence),
+        ) = (
+            &self.expected_read_evidence_digest,
+            &self.expected_audit_fence,
+            &self.expected_approval_fence,
+        )
+        else {
+            return Err(FeatureReleaseError::ProposalSemanticMismatch);
+        };
         proposal.validate_digest()?;
         proposal.claims.validate()?;
         proposal.validate_semantics(
@@ -4126,20 +4158,10 @@ impl MissionFeatureReleaseConsumer {
             self.expected_request.as_ref(),
             &self.provider_fence.registration_digest,
         )?;
-        if let (Some(expected_digest), Some(expected_audit_fence)) = (
-            &self.expected_read_evidence_digest,
-            &self.expected_audit_fence,
-        ) {
-            if proposal.read_evidence_digest != *expected_digest
-                || proposal.audit_fence != *expected_audit_fence
-            {
-                return Err(FeatureReleaseError::ProposalSemanticMismatch);
-            }
-        } else if proposal.audit_fence.entry_count != 0
-            || matches!(
-                proposal.status,
-                ReleaseStatus::Applied | ReleaseStatus::Failed | ReleaseStatus::Scheduled
-            )
+        if proposal.read_evidence_digest != *expected_read_evidence_digest
+            || proposal.audit_fence != *expected_audit_fence
+            || proposal.approval != expected_approval_fence.approval
+            || proposal.approval_status != expected_approval_fence.status
         {
             return Err(FeatureReleaseError::ProposalSemanticMismatch);
         }
@@ -4178,6 +4200,11 @@ impl MissionFeatureReleaseConsumer {
             semantic_fence_digest: proposal.semantic_fence_digest.clone(),
             request_digest: proposal.request_digest.clone(),
             read_evidence_digest: proposal.read_evidence_digest.clone(),
+            approval_digest: proposal
+                .approval
+                .as_ref()
+                .map(|approval| approval.evidence_digest.clone()),
+            approval_status: proposal.approval_status,
             provider_fence: provider_fence.clone(),
             mission_id: self.scope.mission_id.clone(),
             project_id: self.scope.project_id.clone(),
@@ -4226,6 +4253,8 @@ pub struct MissionFeatureReleaseProposal {
     pub semantic_fence_digest: Digest,
     pub request_digest: Digest,
     pub read_evidence_digest: Digest,
+    pub approval_digest: Option<Digest>,
+    pub approval_status: Option<ApprovalStatus>,
     pub provider_fence: FeatureReleaseProviderFence,
     pub mission_id: String,
     pub project_id: String,

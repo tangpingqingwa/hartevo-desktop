@@ -175,7 +175,7 @@ fn typed_service_compiles_but_recording_never_becomes_adoptable() {
     assert!(!proposal.recordable);
     assert!(!proposal.dry_run);
     assert_eq!(proposal.claims, EvidenceClaims::layer_one());
-    let mission_proposal = MissionFeatureReleaseConsumer::for_request(
+    let mission_proposal = MissionFeatureReleaseConsumer::for_request_with_evidence(
         &scope,
         service
             .provider()
@@ -183,6 +183,7 @@ fn typed_service_compiles_but_recording_never_becomes_adoptable() {
             .registration_digest
             .clone(),
         request.clone(),
+        &evidence,
     )
     .expect("mission consumer")
     .consume(&proposal)
@@ -192,6 +193,32 @@ fn typed_service_compiles_but_recording_never_becomes_adoptable() {
     assert_eq!(
         mission_proposal.authority_boundary,
         AuthorityBoundary::layer_one()
+    );
+    assert_eq!(
+        MissionFeatureReleaseConsumer::for_request(
+            &scope,
+            service
+                .provider()
+                .registration_receipt()
+                .registration_digest
+                .clone(),
+            request.clone(),
+        )
+        .expect("legacy request consumer")
+        .consume(&proposal),
+        Err(FeatureReleaseError::ProposalSemanticMismatch)
+    );
+    assert_eq!(
+        MissionFeatureReleaseConsumer::for_scope(
+            &scope,
+            service
+                .provider()
+                .registration_receipt()
+                .registration_digest
+                .clone(),
+        )
+        .consume(&proposal),
+        Err(FeatureReleaseError::ProposalSemanticMismatch)
     );
 
     let loopback_provider = LaunchDarklyReleaseProvider::with_defaults(
@@ -217,7 +244,7 @@ fn typed_service_compiles_but_recording_never_becomes_adoptable() {
         .expect("loopback proposal");
     assert_eq!(loopback_proposal.status, ReleaseStatus::Approved);
     assert!(!loopback_proposal.recordable);
-    let loopback_mission = MissionFeatureReleaseConsumer::for_request(
+    let loopback_mission = MissionFeatureReleaseConsumer::for_request_with_evidence(
         &scope,
         loopback_service
             .provider()
@@ -225,6 +252,7 @@ fn typed_service_compiles_but_recording_never_becomes_adoptable() {
             .registration_digest
             .clone(),
         request.clone(),
+        &loopback_evidence,
     )
     .expect("loopback mission consumer")
     .consume(&loopback_proposal)
@@ -455,7 +483,7 @@ fn exact_provider_mission_and_audit_fences_reject_replay() {
         MissionFeatureReleaseConsumer::for_scope(&scope, digest("different-registration"));
     assert_eq!(
         wrong_registration.consume(&proposal),
-        Err(FeatureReleaseError::RegistrationFenceMismatch)
+        Err(FeatureReleaseError::ProposalSemanticMismatch)
     );
     let wrong_account = MissionFeatureReleaseConsumer::for_scope(&other_scope, registration_digest);
     assert_eq!(
@@ -619,6 +647,26 @@ fn approval_and_audit_versions_bind_complete_contract_and_mission() {
     .expect("evidence-bound mission consumer");
     consumer.consume(&proposal).expect("trusted proposal");
 
+    let mut substituted_approval = proposal.clone();
+    substituted_approval.approval = Some(
+        ApprovalEvidence::for_scope(
+            &scope,
+            "approval-fabricated",
+            ApprovalStatus::Approved,
+            scope.flag_version,
+            scope.policy_revision,
+            b"fabricated decision",
+            1_101,
+        )
+        .expect("fabricated approval remains structurally valid"),
+    );
+    substituted_approval.approval_status = Some(ApprovalStatus::Approved);
+    reseal_proposal(&mut substituted_approval);
+    assert_eq!(
+        consumer.consume(&substituted_approval),
+        Err(FeatureReleaseError::ProposalSemanticMismatch)
+    );
+
     let mut fabricated = proposal.clone();
     fabricated.audit_fence.entry_kinds[0] = AuditEventKind::ChangeApplied;
     fabricated.audit_fence.entry_digests[0] = digest("fabricated-audit");
@@ -675,6 +723,62 @@ fn plugin_version_unknown_fields_fail_schema_and_serde() {
 }
 
 #[test]
+fn legacy_mission_consumers_fail_closed_for_empty_audit_statuses() {
+    let scope = scope();
+    let before = flag(&scope, 42, "legacy-mission");
+    let patch = patch(&scope, &before);
+    let dry_run = DryRunEvidence::local_valid(&scope, &before, &patch).expect("dry run");
+    let request = FeatureReleaseProposalRequest::for_scope(&scope, patch, false).expect("request");
+    let cases = vec![
+        (
+            vec![approved(
+                &scope,
+                "approval-legacy-approved",
+                ApprovalStatus::Approved,
+            )],
+            ReleaseStatus::Approved,
+            "approved",
+        ),
+        (Vec::new(), ReleaseStatus::Pending, "pending"),
+    ];
+    for (approvals, expected_status, case_id) in cases {
+        let provider = LaunchDarklyReleaseProvider::with_defaults(
+            RecordingTransport::new(before.clone(), approvals, Vec::new()),
+            scope.clone(),
+            secret_with_id(&scope, &format!("secret-ref-legacy-{case_id}")),
+        )
+        .expect("provider");
+        let mut service = FeatureReleaseService::new(provider);
+        let evidence = service.read_flag_evidence().expect("evidence");
+        let proposal = service
+            .compile_release_proposal(&request, &evidence, &dry_run)
+            .expect("proposal");
+        assert_eq!(proposal.status, expected_status);
+        assert!(proposal.audit_fence.entry_ids.is_empty());
+        let registration_digest = service
+            .provider()
+            .registration_receipt()
+            .registration_digest
+            .clone();
+        assert_eq!(
+            MissionFeatureReleaseConsumer::for_request(
+                &scope,
+                registration_digest.clone(),
+                request.clone(),
+            )
+            .expect("legacy request consumer")
+            .consume(&proposal),
+            Err(FeatureReleaseError::ProposalSemanticMismatch)
+        );
+        assert_eq!(
+            MissionFeatureReleaseConsumer::for_scope(&scope, registration_digest)
+                .consume(&proposal),
+            Err(FeatureReleaseError::ProposalSemanticMismatch)
+        );
+    }
+}
+
+#[test]
 fn mission_denies_recomputed_cross_semantic_proposal() {
     let scope = scope();
     let before = flag(&scope, 42, "before");
@@ -702,8 +806,13 @@ fn mission_denies_recomputed_cross_semantic_proposal() {
         .registration_receipt()
         .registration_digest
         .clone();
-    let consumer = MissionFeatureReleaseConsumer::for_request(&scope, registration_digest, request)
-        .expect("consumer");
+    let consumer = MissionFeatureReleaseConsumer::for_request_with_evidence(
+        &scope,
+        registration_digest,
+        request,
+        &evidence,
+    )
+    .expect("consumer");
 
     let replacement_patch = SemanticPatch::new(
         original_patch.base_flag_version,
@@ -862,7 +971,7 @@ fn blocked_env_is_not_contract_or_mission_evidence() {
     assert_eq!(
         MissionFeatureReleaseConsumer::for_scope(&scope, registration.registration_digest.clone(),)
             .consume(&proposal),
-        Err(FeatureReleaseError::RegistrationFenceMismatch)
+        Err(FeatureReleaseError::ProposalSemanticMismatch)
     );
 }
 
