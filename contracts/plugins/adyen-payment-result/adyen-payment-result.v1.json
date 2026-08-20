@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.adyen-payment-result/v1",
+  "title": "Hartevo Layer 1 Adyen payment outcome result contract",
+  "schemaVersion": "hartevo.adyen-payment-result/v1",
+  "contractVersion": "EXT-ADYEN-PAYMENT-01-L1/v1",
+  "layer": 1,
+  "status": "read_proposal_record_and_readback_verify_only",
+  "plugin": {
+    "id": "hartevo.adyen-payment-result",
+    "version": "1.0.0",
+    "registration": {
+      "providerDigestBound": true,
+      "apiDigestBound": true,
+      "contractDigestBound": true,
+      "permissionDigestBound": true,
+      "scopeDigestBound": true,
+      "evidenceDigestBound": true,
+      "digestBindingFields": [
+        "api_digest",
+        "provider_digest",
+        "contract_digest",
+        "permission_digest",
+        "scope_digest",
+        "evidence_digest"
+      ],
+      "opaqueSecretReferenceOnly": true,
+      "reversible": true,
+      "revocable": true,
+      "failClosedDrift": true
+    }
+  },
+  "service": {
+    "id": "AdyenPaymentResultService",
+    "provider": "AdyenPaymentsProvider",
+    "consumer": "MissionAdyenPaymentConsumer",
+    "operations": [
+      "retrieve_payment",
+      "read_payment_status",
+      "compile_payment_result_proposal",
+      "record_payment_receipt",
+      "read_back_and_verify",
+      "verify_payment_result",
+      "registration",
+      "revocation"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "financialAdvice": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "id": "adyen-payments",
+    "version": "1.0.0",
+    "officialApi": "Adyen Checkout API",
+    "officialApiBaseUrl": "https://checkout-test.adyen.com/v72",
+    "authentication": {
+      "apiKeyHeader": "X-API-Key",
+      "apiKeyReferenceOnly": true,
+      "secretMaterialSerialized": false,
+      "environmentExport": false
+    },
+    "transport": {
+      "readMethods": ["GET"],
+      "paymentLinkRetrieve": true,
+      "sessionStatusRead": true,
+      "boundedResponseBytes": true,
+      "fixtureEvidence": "non_native_non_connected",
+      "recordingEvidence": "non_native_non_connected",
+      "loopbackEvidence": "non_native_non_connected",
+      "blockedEnvEvidence": "not_connected"
+    },
+    "capabilities": [
+      "bounded_payment_retrieve",
+      "bounded_payment_status",
+      "merchant_account_fence",
+      "payment_reference_fence",
+      "amount_currency_fence",
+      "customer_fingerprint_fence",
+      "status_transition_fence",
+      "redacted_payment_evidence",
+      "deterministic_idempotency",
+      "proposal_compilation",
+      "receipt_recording",
+      "readback_verification",
+      "reversible_registration"
+    ],
+    "connectedEvidence": false,
+    "nativeStatus": "BLOCKED_ENV"
+  },
+  "scope": {
+    "required": [
+      "merchant_account",
+      "account_id",
+      "payment_reference",
+      "amount_minor_units",
+      "currency",
+      "customer_fingerprint_digest",
+      "hartevo_project_id",
+      "mission_id",
+      "work_product_id",
+      "mission_revision",
+      "work_product_revision"
+    ],
+    "permissionRegistration": [
+      "payment_link_read",
+      "payment_session_status_read"
+    ],
+    "identityFence": [
+      "merchant_account",
+      "account_id",
+      "payment_reference",
+      "amount_currency",
+      "customer_fingerprint_digest"
+    ],
+    "piiRetention": false,
+    "paymentInstrumentRetention": false
+  },
+  "evidence": {
+    "boundedMetadataOnly": true,
+    "required": [
+      "merchant_account",
+      "account_id",
+      "payment_reference",
+      "amount_minor_units",
+      "currency",
+      "status",
+      "status_digest",
+      "customer_fingerprint_digest",
+      "payment_method_digest",
+      "created_timestamp_digest",
+      "updated_timestamp_digest",
+      "reconciliation_digest",
+      "idempotency_key",
+      "evidence_digest"
+    ],
+    "maxResponseBytes": 1048576,
+    "rawPaymentMethod": false,
+    "rawCustomerFields": false,
+    "rawBodies": false,
+    "apiKeyMaterial": false,
+    "financialAdvice": false,
+    "authority": "below_truth_consent_effect_receipt_verification_outcome"
+  },
+  "semantics": {
+    "statusTransitions": "typed_monotonic_transition_fence",
+    "amountCurrency": "exact_minor_units_and_iso_currency_required",
+    "customer": "digest_only",
+    "idempotency": "deterministic_scope_and_evidence_bound",
+    "readback": "second_bounded_read_must_match_evidence_digest",
+    "tamper": "proposal_receipt_and_evidence_digests_fail_closed",
+    "fixtureRecordingLoopbackBlockedEnvNeverConnected": true
+  },
+  "forbiddenAuthorities": [
+    "store",
+    "keyring",
+    "browser_profile",
+    "kernel_truth",
+    "kernel_consent",
+    "kernel_effect",
+    "kernel_receipt",
+    "kernel_verification",
+    "kernel_outcome",
+    "authorise",
+    "authorise3d",
+    "capture",
+    "refund",
+    "cancel",
+    "cancel_or_refund",
+    "technical_cancel",
+    "webhook_registration",
+    "webhook_delivery",
+    "payment_instrument",
+    "payment_method_raw_data",
+    "customer_pii",
+    "api_key_export",
+    "environment_export",
+    "raw_response_body",
+    "financial_advice",
+    "connected_claim",
+    "native_claim",
+    "durable_payment_receipt",
+    "generic_payment_registry"
+  ],
+  "nativeGaps": [
+    "native_api_key_resolution",
+    "live_adyen_https_reads",
+    "durable_provider_receipt",
+    "independent_readback_authority",
+    "consented_payment_effects",
+    "webhook_verification",
+    "verified_work_product_adoption",
+    "connected_or_first_party_evidence"
+  ],
+  "nonOverlap": [
+    "paddle_subscription_is_provider_specific",
+    "plaid_transaction_is_provider_specific",
+    "ramp_spend_is_provider_specific",
+    "xero_accounting_is_provider_specific",
+    "money_ledger_is_internal_authority"
+  ]
+}
