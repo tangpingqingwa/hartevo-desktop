@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/azure-resource-graph-result/azure-resource-graph-result.v1.json",
+  "title": "Hartevo governed Azure Resource Graph inventory result Layer-1 contract",
+  "schemaVersion": "hartevo.azure-resource-graph-result-contract/v1",
+  "contractVersion": "azure-resource-graph-result/v1",
+  "pluginVersion": "1.0.0",
+  "layer": 1,
+  "service": {
+    "id": "azure-resource-graph.result",
+    "name": "AzureResourceGraphService",
+    "version": "1.0.0",
+    "readOnly": true,
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "restore_registration",
+      "propose_query",
+      "read_inventory",
+      "record_observation_receipt",
+      "verify_proposal",
+      "consume_result"
+    ],
+    "externalWrites": false,
+    "liveExternalIo": false
+  },
+  "provider": {
+    "id": "azure-resource-graph.resources",
+    "name": "AzureResourceGraphProvider",
+    "version": "1.0.0",
+    "apiVersion": "2022-10-01",
+    "path": "/providers/Microsoft.ResourceGraph/resources",
+    "method": "POST",
+    "authentication": "opaque_secret_reference",
+    "transportProvenance": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "arbitraryKql": false,
+    "rawResourcePayload": false,
+    "rawProperties": false,
+    "rawTags": false,
+    "externalWrites": false,
+    "native": false,
+    "connected": false,
+    "reversible": true,
+    "revocable": true
+  },
+  "consumer": {
+    "id": "mission.azure-resource-graph-result",
+    "name": "MissionAzureResourceConsumer",
+    "kind": "mission_resource_inventory_projection",
+    "adoptsOutcome": false,
+    "kernelAuthority": false,
+    "truthAuthority": false
+  },
+  "readOnly": true,
+  "mutatingProviderOperations": [],
+  "authority": {
+    "externalWrites": false,
+    "connected": false,
+    "nativeProvider": false,
+    "durableReceipt": false,
+    "verificationAuthority": false,
+    "kernelAuthority": false,
+    "outcomeAuthority": false,
+    "fleetHealthAuthority": false,
+    "deploymentAuthority": false,
+    "policyAuthority": false,
+    "rawKql": false,
+    "rawProperties": false
+  },
+  "registration": {
+    "boundFields": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "serviceId",
+      "providerId",
+      "providerRevision",
+      "tenantId",
+      "targetScope",
+      "resourceTypeAllowlist",
+      "propertyAllowlist",
+      "queryRevision",
+      "projectMissionWorkProductScope",
+      "permissionSnapshot",
+      "consentScope",
+      "opaqueSecretReference"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "scopeFence": [
+    "tenantId",
+    "subscriptionIdsOrManagementGroupIds",
+    "resourceTypeAllowlist",
+    "propertyAllowlist",
+    "queryRevision",
+    "projectIdAndRevision",
+    "missionIdAndRevision",
+    "workProductIdAndRevision",
+    "permissionDigest",
+    "consentDigest",
+    "registrationDigest"
+  ],
+  "allowlist": {
+    "resourceTypes": [
+      "Microsoft.Compute/virtualMachines",
+      "Microsoft.KeyVault/vaults",
+      "Microsoft.Network/virtualNetworks",
+      "Microsoft.Resources/resourceGroups",
+      "Microsoft.Storage/storageAccounts",
+      "Microsoft.Web/sites"
+    ],
+    "properties": [
+      "kind",
+      "location",
+      "properties.hardwareProfile.vmSize",
+      "properties.provisioningState",
+      "properties.publicNetworkAccess",
+      "properties.sku.name",
+      "properties.storageProfile.osDisk.osType",
+      "properties.managedBy"
+    ],
+    "methods": ["POST"],
+    "path": "/providers/Microsoft.ResourceGraph/resources",
+    "forbidden": [
+      "arbitrary_kql",
+      "resource_mutation",
+      "deployment_action",
+      "policy_action",
+      "raw_resource_payload",
+      "raw_property_value",
+      "raw_tags",
+      "raw_secrets",
+      "unrestricted_cross_tenant_inventory",
+      "fleet_health_claim",
+      "deployability_claim",
+      "kernel_outcome_authority"
+    ]
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxResources": 256,
+    "maxScopes": 16,
+    "maxResourceTypes": 6,
+    "maxProperties": 8,
+    "maxPages": 4,
+    "pageSize": 100,
+    "maxIdentifierBytes": 512,
+    "maxDiagnosticBytes": 512
+  },
+  "transportProvenance": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_entra_https_and_host_authority",
+    "failClosedCases": [
+      "missing_native_entra_authority",
+      "missing_native_access_token",
+      "arbitrary_kql_request",
+      "resource_type_or_property_drift",
+      "subscription_or_management_group_drift",
+      "query_revision_drift",
+      "continuation_token_replay",
+      "partial_or_truncated_result",
+      "provider_tamper_or_revocation",
+      "external_write_request"
+    ]
+  },
+  "honestNativeGap": "Native Microsoft Entra resolution, native HTTPS, Connected status, first-party provider receipts, independent repeat-read, raw Resource Graph payloads, arbitrary KQL, mutation, deployment/policy effects, fleet health, deployability, and kernel Outcome authority remain Layer-2 gaps under host authority. Fixture, recording, loopback, and BLOCKED_ENV evidence never claim native or Connected status."
+}
