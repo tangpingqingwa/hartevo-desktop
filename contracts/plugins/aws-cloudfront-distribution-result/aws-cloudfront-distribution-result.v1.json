@@ -1,0 +1,323 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-cloudfront-distribution-result/aws-cloudfront-distribution-result.v1.json",
+  "title": "Hartevo AWS CloudFront distribution result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-cloudfront-distribution-result/v1",
+  "contractVersion": "EXT-AWS-CLOUDFRONT-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "aws.cloudfront.distribution.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-cloudfront-distribution-result/v1|layer=1|service=aws.cloudfront.distribution.result.read|provider=aws.cloudfront.distribution.result.recording|consumer=mission.aws-cloudfront-distribution.consumer|api=cloudfront-list-distributions-get-distribution-get-distribution-config-2020-05-31-r1",
+  "contractDigest": "3405ab8d6eda76e26f8f3b0c6cfe2252ca8836460e9b1c382d0d57ef18c1345b",
+  "service": {
+    "type": "AwsCloudFrontDistributionService",
+    "id": "aws.cloudfront.distribution.result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "ListDistributions",
+      "GetDistribution",
+      "GetDistributionConfig",
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "propose",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsCloudFrontProvider",
+    "id": "aws.cloudfront.distribution.result.recording",
+    "apiRevision": "cloudfront-list-distributions-get-distribution-get-distribution-config-2020-05-31-r1",
+    "operations": [
+      "ListDistributions",
+      "GetDistribution",
+      "GetDistributionConfig"
+    ],
+    "allowedTransports": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "type": "MissionAwsCloudFrontConsumer",
+    "id": "mission.aws-cloudfront-distribution.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "deploymentId",
+      "deploymentRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "distributionId",
+      "distributionArn",
+      "domainName",
+      "expectedETagDigest",
+      "configRevisionDigest",
+      "aliasesDigest",
+      "originsDigest",
+      "cacheBehaviorsDigest",
+      "tlsDigest",
+      "wafDigest",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "deploymentId",
+      "deploymentRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "rawConfigurationBytes": false,
+    "rawPolicyBodies": false,
+    "maxPages": 8,
+    "maxPageSize": 100,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["reversed"],
+    "bindingDigests": [
+      "versionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision",
+      "registrationDigest"
+    ],
+    "permissions": [
+      "cloudfront:ListDistributions",
+      "cloudfront:GetDistribution",
+      "cloudfront:GetDistributionConfig",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "cloudfront:UpdateDistribution",
+      "cloudfront:CreateInvalidation",
+      "cloudfront:DeleteDistribution",
+      "cloudfront:CreateDistribution",
+      "cloudfront:CreateDistributionWithTags",
+      "cloudfront:SignUrl",
+      "cloudfront:SignCookie",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "style": "Marker_NextMarker",
+    "markerOpaque": true,
+    "markerDigestOnly": true,
+    "cursorBoundTo": [
+      "account",
+      "region",
+      "distributionAllowlist",
+      "pageSize",
+      "pageNumber",
+      "scopeDigest"
+    ],
+    "explicitDistributionAllowlist": true,
+    "loopRejected": true,
+    "filterDriftRejected": true,
+    "truncationIsNonAdoptable": true
+  },
+  "projection": {
+    "distributionIdentity": [
+      "distributionIdentityDigest",
+      "distributionIdDigest",
+      "distributionArnDigest",
+      "domainNameDigest"
+    ],
+    "lifecycle": [
+      "status",
+      "enabled",
+      "lastModifiedTime"
+    ],
+    "revision": [
+      "etagDigest",
+      "configRevisionDigest"
+    ],
+    "metadataDigests": [
+      "aliasesDigest",
+      "originsDigest",
+      "tlsDigest",
+      "wafDigest",
+      "cacheBehaviorsDigest"
+    ],
+    "metadataCounts": [
+      "aliasCount",
+      "originCount",
+      "cacheBehaviorCount"
+    ],
+    "rawDistributionConfig": false,
+    "rawOriginPayload": false,
+    "rawViewerRequests": false,
+    "signedUrlsOrCookies": false
+  },
+  "receipts": {
+    "request": {
+      "redacted": true,
+      "retain": [
+        "operation",
+        "requestDigest",
+        "pathDigest",
+        "scopeDigest",
+        "distributionDigest",
+        "markerDigest",
+        "expectedETagDigest"
+      ],
+      "drop": ["rawMarker", "rawPathWithIdentifier", "authorizationHeader", "credentialMaterial"]
+    },
+    "cost": {
+      "redacted": true,
+      "retain": ["operation", "responseBytes", "boundedRequestUnits", "costDigest"],
+      "estimateOnly": true,
+      "durableProviderReceipt": false
+    }
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "distributionDigest",
+      "listDigest",
+      "getDigest",
+      "configDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "ready",
+      "in_progress",
+      "disabled",
+      "partial",
+      "access_loss",
+      "unauthorized",
+      "forbidden",
+      "not_found",
+      "conflict",
+      "throttled",
+      "timed_out",
+      "config_drift",
+      "pagination_loop",
+      "tampered",
+      "provider_unknown",
+      "registration_revoked"
+    ],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "partialIsNonAdoptable": true,
+    "driftIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "bounded CloudFront ListDistributions/GetDistribution/GetDistributionConfig read seams",
+      "explicit distribution allowlist and marker pagination fences",
+      "distribution identity/status/enabled/last-modified/ETag projections",
+      "alias/origin/TLS/WAF/cache metadata digests",
+      "version/contract/provider/API/permission/scope/evidence digests",
+      "reversible and revocable registration",
+      "redacted request and cost receipts",
+      "Mission-scoped review-only proposal and idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent authority",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live CloudFront HTTPS",
+      "durable provider receipt",
+      "edge URL/read-back reconciliation",
+      "distribution or origin mutation",
+      "behavior, certificate, or WAF mutation",
+      "cache invalidation",
+      "signed URL or signed cookie generation",
+      "viewer-request capture",
+      "raw configuration or policy export",
+      "production availability certification",
+      "verified Work Product adoption"
+    ]
+  },
+  "forbiddenEffects": [
+    "UpdateDistribution",
+    "CreateInvalidation",
+    "mutate_distribution",
+    "generate_signed_url",
+    "generate_signed_cookie",
+    "capture_viewer_request",
+    "export_raw_config",
+    "adopt_verified_work_product"
+  ],
+  "layer2Gaps": [
+    "native SigV4 credential resolution and live CloudFront HTTPS",
+    "durable distribution provider receipt",
+    "independent edge URL/read-back reconciliation",
+    "consented UpdateDistribution or CreateInvalidation effects",
+    "origin/behavior/certificate/WAF mutation",
+    "signed URL/cookie generation and viewer-request capture",
+    "raw policy/config export",
+    "production availability certification",
+    "verified Mission Work Product adoption"
+  ],
+  "honestNativeGap": "Layer-1 uses only recording, fixture, loopback, and BLOCKED_ENV transports. None claims Connected, native, first-party, durable provider receipt, edge availability, or verified adoption. Native SigV4/HTTPS and all mutation or verification exits remain Layer-2 work."
+}
