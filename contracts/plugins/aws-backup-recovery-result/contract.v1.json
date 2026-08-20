@@ -1,0 +1,272 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-backup-recovery-result/contract.v1.json",
+  "title": "Hartevo AWS Backup recovery-point result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-backup-recovery-result/v1",
+  "contractVersion": "EXT-AWSBACKUP-01-L1/v1",
+  "pluginId": "aws.backup.recovery-result",
+  "objectiveType": "recovery_readiness",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-backup-recovery-result/v1|layer=1|service=aws.backup.recovery-result.read|provider=aws.backup.recovery-result.recording|consumer=mission.aws-backup-recovery.consumer",
+  "contractDigest": "104ad7522c4d9cfa617dcce81df7044b1cb0c082e5a2d3c51c88e4b9850b4dbe",
+  "service": {
+    "type": "AwsBackupRecoveryService",
+    "id": "aws.backup.recovery-result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register_scope",
+      "read_recovery_points_by_backup_vault",
+      "describe_recovery_point",
+      "compile_recovery_evidence_proposal",
+      "verify_recovery_evidence",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsBackupProvider",
+    "id": "aws.backup.recovery-result.recording",
+    "apiRevision": "backup-list-recovery-points-describe-recovery-point-1",
+    "operations": [
+      "ListRecoveryPointsByBackupVault",
+      "DescribeRecoveryPoint"
+    ],
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAwsBackupConsumer",
+    "id": "mission.aws-backup-recovery.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false
+  },
+  "credentials": {
+    "boundary": "opaque SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "backupVault",
+      "recoveryPointArn",
+      "protectedResourceArn",
+      "protectedResourceType",
+      "backupPlanArn",
+      "backupPlanId",
+      "backupRule",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "backupPayloadBytes": false,
+    "rawTags": false,
+    "rawKmsMaterial": false,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "permissionSnapshotDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ],
+    "permissions": [
+      "backup:ListRecoveryPointsByBackupVault",
+      "backup:DescribeRecoveryPoint",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "backup:StartBackupJob",
+      "backup:StartRestoreJob",
+      "backup:DeleteRecoveryPoint",
+      "backup:CreateBackupVault",
+      "backup:UpdateBackupVault",
+      "backup:UpdateBackupPlan",
+      "iam:PassRole",
+      "kms:Decrypt",
+      "backup:ListTags",
+      "outcome.adopt"
+    ]
+  },
+  "pagination": {
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": [
+      "account",
+      "region",
+      "backupVault",
+      "resourceArn",
+      "resourceType",
+      "backupPlanId",
+      "createdAfter",
+      "createdBefore",
+      "pageNumber",
+      "filterDigest"
+    ],
+    "filterDriftRejected": true,
+    "vaultDriftRejected": true,
+    "recoveryPointReplacementRejected": true,
+    "partialPageIsNonAdoptable": true
+  },
+  "metadata": {
+    "bounded": true,
+    "lifecycle": [
+      "status",
+      "creationDate",
+      "initiationDate",
+      "completionDate",
+      "moveToColdStorageAt",
+      "deleteAt",
+      "storageClass"
+    ],
+    "completion": true,
+    "expiry": true,
+    "sizeBytesMetadataOnly": true,
+    "encryption": [
+      "isEncrypted",
+      "encryptionKeyType",
+      "encryptionKeyReferenceDigest"
+    ],
+    "rawStatusMessage": false,
+    "rawResourceName": false,
+    "rawRecoveryPayload": false,
+    "rawBackupBytes": false
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "filterDigest",
+      "cursorDigest",
+      "listDigest",
+      "describeDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "completed",
+      "in_progress",
+      "partial",
+      "expired",
+      "deleting",
+      "stopped",
+      "not_found",
+      "access_loss",
+      "throttled",
+      "provider_unknown",
+      "registration_revoked"
+    ],
+    "tamperRejected": true,
+    "revocationRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "expiryIsNonAdoptable": true,
+    "truncationIsNonAdoptable": true,
+    "malformedIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS Backup account/region/vault/recovery-point/resource/plan scope",
+      "bounded ListRecoveryPointsByBackupVault and DescribeRecoveryPoint seams",
+      "lifecycle/completion/expiry/encryption metadata projection",
+      "pagination/filter/cursor fences",
+      "version/contract/provider/permission/consent/scope/evidence digests",
+      "reversible registration",
+      "redacted idempotent recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live AWS Backup HTTPS",
+      "backup start or cancellation",
+      "restore or delete recovery points",
+      "vault or plan mutation",
+      "backup bytes or recovery payloads",
+      "raw tags or KMS material",
+      "recoverability claim",
+      "verified Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live AWS Backup HTTPS",
+    "durable provider receipt",
+    "independent recovery readback",
+    "consented restore effects",
+    "Connected/native/first-party evidence",
+    "Hartevo Outcome or Work Product adoption"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live ListRecoveryPointsByBackupVault/DescribeRecoveryPoint HTTPS, durable provider receipt, independent recovery readback, consented restore effects and verified Mission adoption remain Layer-2 work; recording, fixture, loopback and BLOCKED_ENV never claim Connected, native or first-party evidence. A completed recovery point is not proof that a restore will succeed."
+}

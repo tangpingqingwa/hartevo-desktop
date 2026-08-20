@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.aws-elastic-beanstalk-deployment-result.contract/v1",
+  "schemaVersion": "hartevo.aws-elastic-beanstalk-deployment-result.contract/v1",
+  "contractVersion": "aws-elastic-beanstalk-deployment-result/v1",
+  "pluginVersion": "1.0.0",
+  "layer": "Layer-1",
+  "service": {
+    "id": "hartevo.aws.elastic-beanstalk.deployment-result",
+    "implementation": "AwsElasticBeanstalkDeploymentService",
+    "readOnly": true,
+    "proposalOnly": true,
+    "liveExecution": false,
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "read_bounded",
+      "propose",
+      "record",
+      "verify"
+    ]
+  },
+  "provider": {
+    "id": "aws.elastic-beanstalk",
+    "implementation": "AwsElasticBeanstalkProvider",
+    "version": "1.0.0",
+    "apiRevision": "aws-elastic-beanstalk-read-r1",
+    "native": false,
+    "connected": false,
+    "externalWrites": false,
+    "allowlistedOperations": [
+      "DescribeEnvironments",
+      "DescribeEnvironmentResources",
+      "DescribeEvents"
+    ],
+    "acceptedTransports": ["fixture", "recording", "loopback", "BLOCKED_ENV"]
+  },
+  "consumer": {
+    "id": "mission.aws.elastic-beanstalk.deployment-result",
+    "implementation": "MissionAwsElasticBeanstalkConsumer",
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "connected": false,
+    "native": false
+  },
+  "scope": {
+    "requires": [
+      "mission",
+      "project",
+      "workProduct",
+      "deployment",
+      "accountId",
+      "region",
+      "applicationName",
+      "environmentAllowlist",
+      "versionDigest",
+      "scopeDigest"
+    ],
+    "fences": ["scopeDigest", "versionDigest", "providerDigest", "permissionDigest"]
+  },
+  "registration": {
+    "reversible": true,
+    "states": ["active", "revoked"],
+    "binds": [
+      "mission",
+      "scopeDigest",
+      "versionDigest",
+      "providerDigest",
+      "permissionDigest",
+      "secretReferenceDigest",
+      "contractDigest"
+    ]
+  },
+  "bounds": {
+    "maxPagesPerOperation": 4,
+    "maxItemsPerOperation": 256,
+    "maxPageSize": 50,
+    "maxResponseBytes": 1048576,
+    "maxRequestsPerRead": 12
+  },
+  "evidence": {
+    "digests": [
+      "scopeDigest",
+      "versionDigest",
+      "providerDigest",
+      "permissionDigest",
+      "evidenceDigest"
+    ],
+    "projections": [
+      "redactedEnvironmentRevision",
+      "redactedResourceSummary",
+      "redactedEvent"
+    ],
+    "status": ["complete", "partial", "blockedEnv"]
+  },
+  "redaction": {
+    "revision": "status, health, revision, versionDigest, timestamp only",
+    "resources": "bounded counts and digests only",
+    "events": "timestamp, severity, type, and message digest only",
+    "discarded": [
+      "raw event message",
+      "source bundle",
+      "environment variables",
+      "credentials",
+      "raw provider response",
+      "CNAME"
+    ]
+  },
+  "authority": {
+    "externalWrites": false,
+    "createEnvironment": false,
+    "updateEnvironment": false,
+    "terminateEnvironment": false,
+    "cnameMutation": false,
+    "upload": false,
+    "rawLogs": false,
+    "rawSource": false,
+    "rawEnvironment": false,
+    "credentialResolution": false,
+    "connected": false,
+    "native": false,
+    "kernelOutcomeAdoption": false
+  },
+  "honesty": {
+    "nativeStatus": "BLOCKED_ENV",
+    "connectedClaim": false,
+    "firstPartyEvidence": false,
+    "durableReceipt": false,
+    "deploymentSuccess": false
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution and signing",
+    "live AWS HTTPS transport",
+    "durable provider receipt and independent readback",
+    "deployment mutation, upload, rollback, and CNAME effects",
+    "raw logs, source, and environment-value access",
+    "native Connected or deployment-success authority"
+  ],
+  "forbidden": [
+    "create_environment",
+    "update_environment",
+    "terminate_environment",
+    "mutate_cname",
+    "upload_source_bundle",
+    "read_raw_logs",
+    "read_source_bundle",
+    "read_environment_variables",
+    "resolve_live_credentials",
+    "claim_connected",
+    "claim_deployment_success",
+    "adopt_kernel_outcome"
+  ]
+}
