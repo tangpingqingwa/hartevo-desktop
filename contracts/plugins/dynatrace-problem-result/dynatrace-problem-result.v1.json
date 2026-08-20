@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/dynatrace-problem-result/dynatrace-problem-result.v1.json",
+  "title": "Hartevo Dynatrace governed problem evidence result",
+  "schemaVersion": "hartevo.dynatrace-problem-result-contract/v1",
+  "contractVersion": "dynatrace-problem-result/v1",
+  "pluginVersion": "0.1.0",
+  "layer": 1,
+  "service": {
+    "id": "dynatrace.problem-result",
+    "operations": [
+      "describe",
+      "register",
+      "revoke_registration",
+      "read_problem_list",
+      "read_problem_detail",
+      "consume_observation"
+    ],
+    "nativePostExecution": false,
+    "nativeGetReadback": false
+  },
+  "provider": {
+    "id": "dynatrace.problems-v2",
+    "version": "dynatrace-problems-api-v2-r1",
+    "apiVersion": "v2",
+    "permissions": ["problems.read"],
+    "operations": ["GET /api/v2/problems", "GET /api/v2/problems/{problemId}"],
+    "native": false,
+    "connected": false,
+    "firstParty": false,
+    "transportProvenance": ["fixture", "recording", "loopback", "blocked_env"]
+  },
+  "consumer": {
+    "id": "mission.dynatrace-problem-result",
+    "scope": [
+      "environmentId",
+      "accountId",
+      "managementZoneId",
+      "entitySelector",
+      "problemId",
+      "timeWindow",
+      "projectIdAndRevision",
+      "missionIdAndRevision",
+      "workProductIdAndRevision"
+    ]
+  },
+  "readOnly": true,
+  "mutatingProviderOperations": [],
+  "projection": {
+    "retained": [
+      "problemIdDigest",
+      "state",
+      "status",
+      "severity",
+      "impact",
+      "startTimeMs",
+      "endTimeMs",
+      "affectedEntityTypeDigestAndCount",
+      "scopeDigest",
+      "pageDigest",
+      "resultDigest"
+    ],
+    "forbidden": [
+      "displayName",
+      "title",
+      "evidenceDetails",
+      "impactAnalysis",
+      "recentComments",
+      "topology",
+      "logs",
+      "userIds",
+      "pii"
+    ],
+    "optionalApiFieldsRequested": []
+  },
+  "bounds": {
+    "maxTimeWindowSeconds": 604800,
+    "maxPageSize": 100,
+    "maxPages": 4,
+    "maxProblemsPerPage": 100,
+    "maxAffectedEntityTypes": 32,
+    "maxAffectedEntitiesPerProblem": 1024,
+    "maxResponseBytes": 1048576,
+    "maxEntitySelectorBytes": 2000,
+    "maxNextPageKeyBytes": 256
+  },
+  "digests": {
+    "algorithm": "SHA-256",
+    "scope": true,
+    "problem": true,
+    "page": true,
+    "result": true,
+    "registration": true
+  },
+  "registration": {
+    "boundFields": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerDigest",
+      "environmentId",
+      "accountId",
+      "managementZoneId",
+      "entitySelector",
+      "problemId",
+      "timeWindow",
+      "projectIdAndRevision",
+      "missionIdAndRevision",
+      "workProductIdAndRevision",
+      "opaqueSecretReferenceDigest"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "authority": {
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "truth": false,
+    "consent": false,
+    "effect": false,
+    "receipt": false,
+    "verification": false,
+    "outcome": false,
+    "rootCause": false,
+    "workProductAdoption": false
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_token_https_receipt_readback_verification",
+    "failClosedCases": [
+      "missing_native_access_token",
+      "api_version_drift",
+      "scope_or_revision_drift",
+      "optional_detail_or_comment_fields",
+      "raw_topology_or_log_request",
+      "provider_mutation_request",
+      "provider_unknown_value",
+      "replay_or_digest_tamper"
+    ]
+  },
+  "honestBoundary": "Dynatrace problem observations are bounded provider correlation only. This Layer-1 root does not claim kernel Truth, Consent, Effect, Receipt, Verification, Outcome, root-cause, outage-causality, native evidence, Connected status, or Work Product adoption authority. Native token and HTTPS transport, durable receipt, independent readback, and verified Mission adoption remain Layer 2.",
+  "officialApiBasis": [
+    "https://docs.dynatrace.com/docs/dynatrace-api/environment-api/problems-v2",
+    "https://docs.dynatrace.com/docs/dynatrace-api/environment-api/problems-v2/problems/get-problems-list",
+    "https://docs.dynatrace.com/docs/dynatrace-api/environment-api/problems-v2/problems/get-problem-details"
+  ]
+}
