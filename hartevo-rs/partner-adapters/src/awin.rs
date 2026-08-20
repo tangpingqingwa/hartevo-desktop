@@ -6,7 +6,7 @@
 //! binding, quota admission, and revocation; it does not recreate those SDK
 //! contracts.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -44,8 +44,10 @@ pub const AWIN_API_BASE_URL: &str = "https://api.awin.com";
 pub const AWIN_MAX_WINDOW_DAYS: i64 = 31;
 pub const AWIN_DEFAULT_FRESHNESS_SECONDS: i64 = 60;
 pub const AWIN_RATE_LIMIT_PER_MINUTE: u64 = 20;
+pub const AWIN_RECONCILE_SERVICE_ID: &str = "partner.awin.cursor-reconcile/v1";
 
 const AWIN_SCHEMA_VERSION: &str = "hartevo-awin-authenticated-read/v1";
+const AWIN_RECONCILE_SCHEMA_VERSION: &str = "hartevo-awin-cursor-reconcile/v1";
 const AWIN_ADAPTER_PROBE_TTL_SECONDS: i64 = 90;
 const AWIN_READ_COST_UNITS: i64 = 1;
 
@@ -88,7 +90,7 @@ numeric_id!(AwinProgramId);
 /// Awin account/program scope.  The publisher account is always required;
 /// advertiser and programme identities narrow the same network relationship.
 #[allow(clippy::struct_field_names)]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AwinScope {
     tenant_id: String,
@@ -201,7 +203,7 @@ impl AwinReadResource {
 /// A logical date-range plan.  Awin transaction reads document a maximum
 /// 31-day range, so the adapter advances this plan by durable date windows
 /// rather than inventing an undocumented provider page parameter.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AwinReadPlan {
     resource: AwinReadResource,
@@ -714,6 +716,18 @@ impl AwinHttpTransport {
         })
     }
 
+    #[cfg(test)]
+    fn loopback(base_url: impl Into<String>) -> Result<Self, AwinError> {
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
+        if !base_url.starts_with("http://127.0.0.1:") || base_url.contains('?') {
+            return Err(AwinError::InvalidTransportBaseUrl);
+        }
+        Ok(Self {
+            base_url,
+            agent: Agent::new(),
+        })
+    }
+
     fn get_json(
         &self,
         token: &AwinAccessToken,
@@ -896,6 +910,16 @@ pub enum AwinError {
     Unmounted,
     #[error("Awin cursor drifted from the exact scope/query")]
     CursorDrift,
+    #[error("Awin cursor drifted from the exact provider generation")]
+    GenerationDrift,
+    #[error("Awin page delivery is invalid")]
+    InvalidDelivery,
+    #[error("Awin evidence root is still open")]
+    EvidenceRootOpen,
+    #[error("Awin evidence root is already closed")]
+    EvidenceRootClosed,
+    #[error("Awin reconcile checkpoint is invalid")]
+    InvalidCheckpoint,
     #[error("Awin quota is exhausted")]
     QuotaExceeded,
     #[error("Awin cost boundary is exhausted")]
@@ -1097,6 +1121,1313 @@ pub struct AwinProbeReceipt {
 pub struct AwinReadResult {
     pub connector_observation: ReadObservation,
     pub envelope: AwinResultEnvelope,
+}
+
+/// The exact network generation that produced an authenticated observation.
+/// A cursor is never portable across a credential, probe, or provider-source
+/// generation, even when the logical Awin scope remains unchanged.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AwinProviderGeneration {
+    provider_id: String,
+    publisher_id: AwinPublisherId,
+    advertiser_id: Option<AwinAdvertiserId>,
+    program_id: Option<AwinProgramId>,
+    credential_revision: u64,
+    adapter_id: String,
+    adapter_version: u32,
+    probe_revision: u64,
+    provider_generation: u64,
+    generation_digest: String,
+}
+
+impl AwinProviderGeneration {
+    pub fn from_probe(scope: &AwinScope, probe: &AwinProbeReceipt) -> Result<Self, AwinError> {
+        let scope_digest = scope.digest()?;
+        let observation = &probe.observation;
+        let connector_result = &probe.connector_result;
+        let source_revision = observation.source_revision.ok_or(AwinError::Disconnected)?;
+        let adapter = connector_result.adapter();
+        let exact = observation.status == AwinProbeStatus::Reachable
+            && observation.classification == AwinObservationClassification::FirstParty
+            && observation.provider_id == AWIN_PROVIDER_ID
+            && observation.publisher_id == *scope.publisher_id()
+            && observation.advertiser_id == scope.advertiser_id().cloned()
+            && observation.program_id == scope.program_id().cloned()
+            && observation.credential_revision == probe.credential_revision
+            && connector_result.status() == ProbeStatus::Reachable
+            && connector_result.provenance_class() == ProviderProvenanceClass::ProductionProvider
+            && connector_result.scope() == &scope.connector_scope()?
+            && adapter.adapter_id() == AWIN_ADAPTER_ID
+            && adapter.adapter_version() == AWIN_ADAPTER_VERSION
+            && connector_result.evidence_digest() == observation.evidence_digest
+            && is_sha256(&observation.source_digest)
+            && is_sha256(&observation.evidence_digest);
+        if !exact || source_revision == 0 || connector_result.probe_revision() == 0 {
+            return Err(AwinError::GenerationDrift);
+        }
+        let generation_digest = digest_parts([
+            AWIN_RECONCILE_SCHEMA_VERSION,
+            AWIN_PROVIDER_ID,
+            scope_digest.as_str(),
+            scope.publisher_id().as_str(),
+            scope.advertiser_id().map_or("", AwinAdvertiserId::as_str),
+            scope.program_id().map_or("", AwinProgramId::as_str),
+            &probe.credential_revision.to_string(),
+            adapter.adapter_id(),
+            &adapter.adapter_version().to_string(),
+            &connector_result.probe_revision().to_string(),
+            &source_revision.to_string(),
+            observation.source_digest.as_str(),
+            observation.evidence_digest.as_str(),
+        ]);
+        Ok(Self {
+            provider_id: AWIN_PROVIDER_ID.to_owned(),
+            publisher_id: scope.publisher_id().clone(),
+            advertiser_id: scope.advertiser_id().cloned(),
+            program_id: scope.program_id().cloned(),
+            credential_revision: probe.credential_revision,
+            adapter_id: adapter.adapter_id().to_owned(),
+            adapter_version: adapter.adapter_version(),
+            probe_revision: connector_result.probe_revision(),
+            provider_generation: source_revision,
+            generation_digest,
+        })
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub fn publisher_id(&self) -> &AwinPublisherId {
+        &self.publisher_id
+    }
+
+    pub fn advertiser_id(&self) -> Option<&AwinAdvertiserId> {
+        self.advertiser_id.as_ref()
+    }
+
+    pub fn program_id(&self) -> Option<&AwinProgramId> {
+        self.program_id.as_ref()
+    }
+
+    pub const fn credential_revision(&self) -> u64 {
+        self.credential_revision
+    }
+
+    pub const fn probe_revision(&self) -> u64 {
+        self.probe_revision
+    }
+
+    pub const fn provider_generation(&self) -> u64 {
+        self.provider_generation
+    }
+
+    pub fn adapter_id(&self) -> &str {
+        &self.adapter_id
+    }
+
+    pub const fn adapter_version(&self) -> u32 {
+        self.adapter_version
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.generation_digest
+    }
+
+    fn validate_scope(&self, scope: &AwinScope) -> Result<(), AwinError> {
+        let exact = self.provider_id == AWIN_PROVIDER_ID
+            && self.publisher_id == *scope.publisher_id()
+            && self.advertiser_id == scope.advertiser_id().cloned()
+            && self.program_id == scope.program_id().cloned()
+            && self.adapter_id == AWIN_ADAPTER_ID
+            && self.adapter_version == AWIN_ADAPTER_VERSION
+            && self.credential_revision > 0
+            && self.probe_revision > 0
+            && self.provider_generation > 0
+            && is_sha256(&self.generation_digest);
+        if exact {
+            Ok(())
+        } else {
+            Err(AwinError::GenerationDrift)
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AwinReconcileAuthorityState {
+    active_generation: Option<String>,
+    invalidated: bool,
+    epoch: u64,
+}
+
+/// Shared fencing authority.  A service refresh, revoke, probe replacement,
+/// or unmount invalidates all sessions that hold an older generation-bound
+/// cursor, including sessions reopened after a process crash.
+#[derive(Clone, Debug, Default)]
+pub struct AwinReconcileAuthority {
+    state: Arc<Mutex<AwinReconcileAuthorityState>>,
+}
+
+impl AwinReconcileAuthority {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn bind(&self, generation: &AwinProviderGeneration) -> Result<(), AwinError> {
+        let mut state = self.state.lock().map_err(|_| AwinError::StatePoisoned)?;
+        state.active_generation = Some(generation.digest().to_owned());
+        state.invalidated = false;
+        state.epoch = state.epoch.saturating_add(1);
+        Ok(())
+    }
+
+    fn ensure_generation(&self, generation: &AwinProviderGeneration) -> Result<(), AwinError> {
+        let mut state = self.state.lock().map_err(|_| AwinError::StatePoisoned)?;
+        match state.active_generation.as_deref() {
+            Some(active) if active == generation.digest() => Ok(()),
+            Some(_) => Err(AwinError::GenerationDrift),
+            None if state.invalidated => Err(AwinError::GenerationDrift),
+            None => {
+                state.active_generation = Some(generation.digest().to_owned());
+                state.epoch = state.epoch.saturating_add(1);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn invalidate(&self) -> Result<(), AwinError> {
+        let mut state = self.state.lock().map_err(|_| AwinError::StatePoisoned)?;
+        state.active_generation = None;
+        state.invalidated = true;
+        state.epoch = state.epoch.saturating_add(1);
+        Ok(())
+    }
+
+    fn validate(&self, generation: &AwinProviderGeneration) -> Result<(), AwinError> {
+        let state = self.state.lock().map_err(|_| AwinError::StatePoisoned)?;
+        if state.active_generation.as_deref() == Some(generation.digest()) {
+            Ok(())
+        } else {
+            Err(AwinError::GenerationDrift)
+        }
+    }
+}
+
+/// A durable continuation that binds the first-layer date cursor to the
+/// exact provider/account/advertiser/program and credential generation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AwinReconcileCursor {
+    schema_version: String,
+    resource: AwinReadResource,
+    scope_digest: String,
+    query_digest: String,
+    generation_digest: String,
+    credential_revision: u64,
+    provider_generation: u64,
+    page_cursor: AwinDurableCursor,
+    cursor_digest: String,
+}
+
+impl AwinReconcileCursor {
+    pub fn from_durable(
+        page_cursor: AwinDurableCursor,
+        scope: &AwinScope,
+        plan: &AwinReadPlan,
+        generation: &AwinProviderGeneration,
+    ) -> Result<Self, AwinError> {
+        generation.validate_scope(scope)?;
+        let query_digest = plan.query_digest(scope)?;
+        page_cursor.validate_against(plan, scope, &query_digest)?;
+        let cursor = Self {
+            schema_version: AWIN_RECONCILE_SCHEMA_VERSION.to_owned(),
+            resource: plan.resource,
+            scope_digest: scope.digest()?,
+            query_digest,
+            generation_digest: generation.digest().to_owned(),
+            credential_revision: generation.credential_revision(),
+            provider_generation: generation.provider_generation(),
+            page_cursor,
+            cursor_digest: String::new(),
+        };
+        let cursor_digest = cursor.calculated_cursor_digest();
+        Ok(Self {
+            cursor_digest,
+            ..cursor
+        })
+    }
+
+    pub fn resource(&self) -> AwinReadResource {
+        self.resource
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.page_cursor.sequence()
+    }
+
+    pub fn scope_digest(&self) -> &str {
+        &self.scope_digest
+    }
+
+    pub fn query_digest(&self) -> &str {
+        &self.query_digest
+    }
+
+    pub fn generation_digest(&self) -> &str {
+        &self.generation_digest
+    }
+
+    pub fn cursor_digest(&self) -> &str {
+        &self.cursor_digest
+    }
+
+    pub fn page_cursor(&self) -> &AwinDurableCursor {
+        &self.page_cursor
+    }
+
+    fn validate_against(
+        &self,
+        scope: &AwinScope,
+        plan: &AwinReadPlan,
+        generation: &AwinProviderGeneration,
+    ) -> Result<(), AwinError> {
+        generation.validate_scope(scope)?;
+        let query_digest = plan.query_digest(scope)?;
+        if self.schema_version != AWIN_RECONCILE_SCHEMA_VERSION
+            || self.resource != plan.resource
+            || self.scope_digest != scope.digest()?
+            || self.query_digest != query_digest
+            || self.generation_digest != generation.digest()
+            || self.credential_revision != generation.credential_revision()
+            || self.provider_generation != generation.provider_generation()
+            || !is_sha256(&self.cursor_digest)
+            || self.cursor_digest != self.calculated_cursor_digest()
+        {
+            return Err(AwinError::GenerationDrift);
+        }
+        self.page_cursor
+            .validate_against(plan, scope, &query_digest)
+    }
+
+    fn calculated_cursor_digest(&self) -> String {
+        digest_parts([
+            AWIN_RECONCILE_SCHEMA_VERSION,
+            &format!("{:?}", self.resource),
+            &self.scope_digest,
+            &self.query_digest,
+            &self.generation_digest,
+            &self.credential_revision.to_string(),
+            &self.provider_generation.to_string(),
+            self.page_cursor.cursor_digest(),
+        ])
+    }
+}
+
+/// A first-party page plus all receipt material required to reconcile it
+/// exactly once after retries or process recovery.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AwinPageDelivery {
+    resource: AwinReadResource,
+    sequence: u64,
+    scope_digest: String,
+    generation_digest: String,
+    provider_generation: u64,
+    source_revision: u64,
+    publisher_id: AwinPublisherId,
+    advertiser_id: Option<AwinAdvertiserId>,
+    program_id: Option<AwinProgramId>,
+    input_cursor: Option<AwinReconcileCursor>,
+    next_cursor: Option<AwinReconcileCursor>,
+    observed_at: DateTime<Utc>,
+    valid_until: DateTime<Utc>,
+    source_uri: String,
+    source_digest: String,
+    content_digest: String,
+    result_digest: String,
+    item_count: u32,
+    idempotency_key: String,
+    delivery_digest: String,
+}
+
+impl AwinPageDelivery {
+    #[allow(clippy::too_many_lines)]
+    pub fn from_read(
+        scope: &AwinScope,
+        plan: &AwinReadPlan,
+        generation: &AwinProviderGeneration,
+        input_cursor: Option<&AwinReconcileCursor>,
+        result: &AwinReadResult,
+        at: DateTime<Utc>,
+    ) -> Result<Self, AwinError> {
+        generation.validate_scope(scope)?;
+        let scope_digest = scope.digest()?;
+        let envelope = &result.envelope;
+        let observation = &result.connector_observation;
+        let exact_scope = envelope.scope_digest == scope_digest
+            && envelope.provider_id == AWIN_PROVIDER_ID
+            && envelope.publisher_id == *scope.publisher_id()
+            && envelope.advertiser_id == scope.advertiser_id().cloned()
+            && envelope.program_id == scope.program_id().cloned()
+            && envelope.resource == plan.resource
+            && envelope.query_digest == plan.query_digest(scope)?
+            && envelope.credential_revision == generation.credential_revision()
+            && envelope.source_revision > 0
+            && envelope.classification == AwinObservationClassification::FirstParty
+            && envelope.service_id == AWIN_SERVICE_ID
+            && observation.scope() == &scope.connector_scope()?
+            && observation.adapter().adapter_id() == AWIN_ADAPTER_ID
+            && observation.adapter().adapter_version() == AWIN_ADAPTER_VERSION
+            && observation.provenance_class() == ProviderProvenanceClass::ProductionProvider
+            && observation.request_digest() == envelope.query_digest
+            && observation.response_digest() == envelope.source_digest
+            && observation.content_digest() == envelope.content_digest
+            && observation.page_sequence() > 0
+            && observation.next_cursor().is_some() == envelope.cursor.is_some()
+            && observation.freshness().observed_at() == envelope.observed_at
+            && observation.freshness().valid_until() == envelope.valid_until
+            && at >= envelope.observed_at
+            && at < envelope.valid_until
+            && envelope.valid_until > envelope.observed_at
+            && is_provider_source_uri(&envelope.source_uri)
+            && is_sha256(&envelope.source_digest)
+            && is_sha256(&envelope.content_digest)
+            && is_sha256(&envelope.result_digest)
+            && envelope.content_digest == sha256_json(&envelope.data.payload)
+            && envelope.data.resource == plan.resource;
+        if !exact_scope {
+            return Err(AwinError::InvalidDelivery);
+        }
+        let sequence = observation.page_sequence();
+        let input_cursor = input_cursor.cloned();
+        if sequence == 1 {
+            if input_cursor.is_some() {
+                return Err(AwinError::InvalidDelivery);
+            }
+        } else if input_cursor
+            .as_ref()
+            .is_none_or(|cursor| cursor.sequence().saturating_add(1) != sequence)
+        {
+            return Err(AwinError::InvalidDelivery);
+        }
+        if let Some(cursor) = &input_cursor {
+            cursor.validate_against(scope, plan, generation)?;
+        }
+        let next_cursor = envelope
+            .cursor
+            .clone()
+            .map(|cursor| AwinReconcileCursor::from_durable(cursor, scope, plan, generation))
+            .transpose()?;
+        if next_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.sequence() != sequence)
+        {
+            return Err(AwinError::InvalidDelivery);
+        }
+        let idempotency_key = digest_parts([
+            AWIN_RECONCILE_SCHEMA_VERSION,
+            generation.digest(),
+            &sequence.to_string(),
+            envelope.source_digest.as_str(),
+            envelope.content_digest.as_str(),
+            envelope.result_digest.as_str(),
+        ]);
+        let mut delivery = Self {
+            resource: plan.resource,
+            sequence,
+            scope_digest,
+            generation_digest: generation.digest().to_owned(),
+            provider_generation: generation.provider_generation(),
+            source_revision: envelope.source_revision,
+            publisher_id: scope.publisher_id().clone(),
+            advertiser_id: scope.advertiser_id().cloned(),
+            program_id: scope.program_id().cloned(),
+            input_cursor,
+            next_cursor,
+            observed_at: envelope.observed_at,
+            valid_until: envelope.valid_until,
+            source_uri: envelope.source_uri.clone(),
+            source_digest: envelope.source_digest.clone(),
+            content_digest: envelope.content_digest.clone(),
+            result_digest: envelope.result_digest.clone(),
+            item_count: observation.item_count(),
+            idempotency_key,
+            delivery_digest: String::new(),
+        };
+        delivery.delivery_digest = delivery.calculated_delivery_digest();
+        Ok(delivery)
+    }
+
+    pub fn resource(&self) -> AwinReadResource {
+        self.resource
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn scope_digest(&self) -> &str {
+        &self.scope_digest
+    }
+
+    pub fn generation_digest(&self) -> &str {
+        &self.generation_digest
+    }
+
+    pub const fn provider_generation(&self) -> u64 {
+        self.provider_generation
+    }
+
+    pub const fn source_revision(&self) -> u64 {
+        self.source_revision
+    }
+
+    pub fn input_cursor(&self) -> Option<&AwinReconcileCursor> {
+        self.input_cursor.as_ref()
+    }
+
+    pub fn next_cursor(&self) -> Option<&AwinReconcileCursor> {
+        self.next_cursor.as_ref()
+    }
+
+    pub fn source_digest(&self) -> &str {
+        &self.source_digest
+    }
+
+    pub fn content_digest(&self) -> &str {
+        &self.content_digest
+    }
+
+    pub fn result_digest(&self) -> &str {
+        &self.result_digest
+    }
+
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    pub fn delivery_digest(&self) -> &str {
+        &self.delivery_digest
+    }
+
+    fn validate_against(
+        &self,
+        scope: &AwinScope,
+        plan: &AwinReadPlan,
+        generation: &AwinProviderGeneration,
+    ) -> Result<(), AwinError> {
+        generation.validate_scope(scope)?;
+        let exact = self.resource == plan.resource
+            && self.scope_digest == scope.digest()?
+            && self.generation_digest == generation.digest()
+            && self.provider_generation == generation.provider_generation()
+            && self.source_revision > 0
+            && self.publisher_id == *scope.publisher_id()
+            && self.advertiser_id == scope.advertiser_id().cloned()
+            && self.program_id == scope.program_id().cloned()
+            && self.sequence > 0
+            && self.observed_at < self.valid_until
+            && is_provider_source_uri(&self.source_uri)
+            && is_sha256(&self.source_digest)
+            && is_sha256(&self.content_digest)
+            && is_sha256(&self.result_digest)
+            && is_sha256(&self.idempotency_key)
+            && self.delivery_digest == self.calculated_delivery_digest();
+        if !exact {
+            return Err(AwinError::InvalidDelivery);
+        }
+        if let Some(cursor) = &self.input_cursor {
+            cursor.validate_against(scope, plan, generation)?;
+        }
+        if let Some(cursor) = &self.next_cursor {
+            cursor.validate_against(scope, plan, generation)?;
+            if cursor.sequence() != self.sequence {
+                return Err(AwinError::InvalidDelivery);
+            }
+        }
+        if (self.sequence == 1 && self.input_cursor.is_some())
+            || (self.sequence > 1
+                && self
+                    .input_cursor
+                    .as_ref()
+                    .is_none_or(|cursor| cursor.sequence().saturating_add(1) != self.sequence))
+            || self.idempotency_key != self.calculated_idempotency_key()
+        {
+            return Err(AwinError::InvalidDelivery);
+        }
+        Ok(())
+    }
+
+    fn calculated_idempotency_key(&self) -> String {
+        digest_parts([
+            AWIN_RECONCILE_SCHEMA_VERSION,
+            &self.generation_digest,
+            &self.sequence.to_string(),
+            &self.source_digest,
+            &self.content_digest,
+            &self.result_digest,
+        ])
+    }
+
+    fn calculated_delivery_digest(&self) -> String {
+        digest_parts([
+            AWIN_RECONCILE_SCHEMA_VERSION,
+            &format!("{:?}", self.resource),
+            &self.sequence.to_string(),
+            &self.scope_digest,
+            &self.generation_digest,
+            &self.provider_generation.to_string(),
+            &self.source_revision.to_string(),
+            self.publisher_id.as_str(),
+            self.advertiser_id
+                .as_ref()
+                .map_or("", AwinAdvertiserId::as_str),
+            self.program_id.as_ref().map_or("", AwinProgramId::as_str),
+            self.input_cursor
+                .as_ref()
+                .map_or("", AwinReconcileCursor::cursor_digest),
+            self.next_cursor
+                .as_ref()
+                .map_or("", AwinReconcileCursor::cursor_digest),
+            &self.observed_at.to_rfc3339(),
+            &self.valid_until.to_rfc3339(),
+            &self.source_uri,
+            &self.source_digest,
+            &self.content_digest,
+            &self.result_digest,
+            &self.item_count.to_string(),
+            &self.idempotency_key,
+        ])
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AwinEvidenceNode {
+    sequence: u64,
+    idempotency_key: String,
+    delivery_digest: String,
+    source_uri: String,
+    observed_at: DateTime<Utc>,
+    valid_until: DateTime<Utc>,
+    source_revision: u64,
+    source_digest: String,
+    content_digest: String,
+    node_digest: String,
+}
+
+impl AwinEvidenceNode {
+    fn from_delivery(delivery: &AwinPageDelivery) -> Self {
+        let node_digest = digest_parts([
+            AWIN_RECONCILE_SCHEMA_VERSION,
+            &delivery.sequence.to_string(),
+            &delivery.idempotency_key,
+            &delivery.delivery_digest,
+            &delivery.source_uri,
+            &delivery.observed_at.to_rfc3339(),
+            &delivery.valid_until.to_rfc3339(),
+            &delivery.source_revision.to_string(),
+            &delivery.source_digest,
+            &delivery.content_digest,
+        ]);
+        Self {
+            sequence: delivery.sequence,
+            idempotency_key: delivery.idempotency_key.clone(),
+            delivery_digest: delivery.delivery_digest.clone(),
+            source_uri: delivery.source_uri.clone(),
+            observed_at: delivery.observed_at,
+            valid_until: delivery.valid_until,
+            source_revision: delivery.source_revision,
+            source_digest: delivery.source_digest.clone(),
+            content_digest: delivery.content_digest.clone(),
+            node_digest,
+        }
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn node_digest(&self) -> &str {
+        &self.node_digest
+    }
+
+    fn validate_against_delivery(&self, delivery: &AwinPageDelivery) -> bool {
+        self == &Self::from_delivery(delivery)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AwinEvidenceRoot {
+    schema_version: String,
+    scope_digest: String,
+    generation_digest: String,
+    provider_generation: u64,
+    resource: AwinReadResource,
+    query_digest: String,
+    nodes: Vec<AwinEvidenceNode>,
+    root_digest: String,
+    closed_at: DateTime<Utc>,
+}
+
+impl AwinEvidenceRoot {
+    fn new(
+        scope: &AwinScope,
+        plan: &AwinReadPlan,
+        generation: &AwinProviderGeneration,
+        nodes: Vec<AwinEvidenceNode>,
+        closed_at: DateTime<Utc>,
+    ) -> Result<Self, AwinError> {
+        let scope_digest = scope.digest()?;
+        let query_digest = plan.query_digest(scope)?;
+        let resource = format!("{:?}", plan.resource);
+        let root_digest = digest_parts(
+            std::iter::once(AWIN_RECONCILE_SCHEMA_VERSION)
+                .chain(std::iter::once(scope_digest.as_str()))
+                .chain(std::iter::once(generation.digest()))
+                .chain(std::iter::once(resource.as_str()))
+                .chain(std::iter::once(query_digest.as_str()))
+                .chain(nodes.iter().map(AwinEvidenceNode::node_digest)),
+        );
+        Ok(Self {
+            schema_version: AWIN_RECONCILE_SCHEMA_VERSION.to_owned(),
+            scope_digest,
+            generation_digest: generation.digest().to_owned(),
+            provider_generation: generation.provider_generation(),
+            resource: plan.resource,
+            query_digest,
+            nodes,
+            root_digest,
+            closed_at,
+        })
+    }
+
+    pub fn is_closed(&self) -> bool {
+        true
+    }
+
+    pub fn root_digest(&self) -> &str {
+        &self.root_digest
+    }
+
+    pub fn scope_digest(&self) -> &str {
+        &self.scope_digest
+    }
+
+    pub fn generation_digest(&self) -> &str {
+        &self.generation_digest
+    }
+
+    pub const fn provider_generation(&self) -> u64 {
+        self.provider_generation
+    }
+
+    pub fn resource(&self) -> AwinReadResource {
+        self.resource
+    }
+
+    pub fn query_digest(&self) -> &str {
+        &self.query_digest
+    }
+
+    pub fn nodes(&self) -> &[AwinEvidenceNode] {
+        &self.nodes
+    }
+
+    pub const fn closed_at(&self) -> DateTime<Utc> {
+        self.closed_at
+    }
+
+    fn validate_against(
+        &self,
+        scope: &AwinScope,
+        plan: &AwinReadPlan,
+        generation: &AwinProviderGeneration,
+        nodes: &[AwinEvidenceNode],
+    ) -> Result<(), AwinError> {
+        let expected = Self::new(scope, plan, generation, nodes.to_vec(), self.closed_at)?;
+        if self.schema_version == expected.schema_version
+            && self.scope_digest == expected.scope_digest
+            && self.generation_digest == expected.generation_digest
+            && self.provider_generation == expected.provider_generation
+            && self.resource == expected.resource
+            && self.query_digest == expected.query_digest
+            && self.nodes == expected.nodes
+            && self.root_digest == expected.root_digest
+        {
+            Ok(())
+        } else {
+            Err(AwinError::InvalidCheckpoint)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwinDeliveryStatus {
+    Applied,
+    Duplicate,
+    OutOfOrder,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AwinDeliveryReceipt {
+    status: AwinDeliveryStatus,
+    sequence: u64,
+    expected_sequence: u64,
+    next_sequence: u64,
+    idempotency_key: String,
+    generation_digest: String,
+    evidence_root_digest: Option<String>,
+    receipt_digest: String,
+}
+
+impl AwinDeliveryReceipt {
+    pub fn status(&self) -> &AwinDeliveryStatus {
+        &self.status
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn expected_sequence(&self) -> u64 {
+        self.expected_sequence
+    }
+
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    pub fn evidence_root_digest(&self) -> Option<&str> {
+        self.evidence_root_digest.as_deref()
+    }
+
+    pub fn receipt_digest(&self) -> &str {
+        &self.receipt_digest
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AwinRetryAfterReceipt {
+    sequence: u64,
+    expected_sequence: u64,
+    retry_after: DateTime<Utc>,
+    generation_digest: String,
+    receipt_digest: String,
+}
+
+impl AwinRetryAfterReceipt {
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn expected_sequence(&self) -> u64 {
+        self.expected_sequence
+    }
+
+    pub const fn retry_after(&self) -> DateTime<Utc> {
+        self.retry_after
+    }
+
+    pub fn generation_digest(&self) -> &str {
+        &self.generation_digest
+    }
+
+    pub fn receipt_digest(&self) -> &str {
+        &self.receipt_digest
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwinReconcileOutcome {
+    Applied(AwinDeliveryReceipt),
+    Duplicate(AwinDeliveryReceipt),
+    OutOfOrder(AwinDeliveryReceipt),
+    RetryAfter(AwinRetryAfterReceipt),
+}
+
+/// Crash-safe serialized reconcile state.  It contains only typed cursors
+/// and evidence digests; provider tokens and secret bytes never enter the
+/// checkpoint.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AwinReconcileCheckpoint {
+    schema_version: String,
+    scope: AwinScope,
+    plan: AwinReadPlan,
+    generation: AwinProviderGeneration,
+    next_sequence: u64,
+    pending_cursor: Option<AwinReconcileCursor>,
+    deliveries: BTreeMap<u64, AwinPageDelivery>,
+    evidence_nodes: BTreeMap<u64, AwinEvidenceNode>,
+    retry_after: Option<DateTime<Utc>>,
+    evidence_root: Option<AwinEvidenceRoot>,
+    checkpoint_digest: String,
+}
+
+impl AwinReconcileCheckpoint {
+    pub fn checkpoint_digest(&self) -> &str {
+        &self.checkpoint_digest
+    }
+
+    pub fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    pub fn pending_cursor(&self) -> Option<&AwinReconcileCursor> {
+        self.pending_cursor.as_ref()
+    }
+
+    pub fn evidence_root(&self) -> Option<&AwinEvidenceRoot> {
+        self.evidence_root.as_ref()
+    }
+
+    pub fn validate(&self) -> Result<(), AwinError> {
+        if self.schema_version != AWIN_RECONCILE_SCHEMA_VERSION
+            || self.plan.validate().is_err()
+            || self.generation.validate_scope(&self.scope).is_err()
+            || !is_sha256(&self.checkpoint_digest)
+            || self.checkpoint_digest != self.calculated_checkpoint_digest()?
+        {
+            return Err(AwinError::InvalidCheckpoint);
+        }
+        if self.next_sequence == 0 || self.deliveries.len() as u64 >= self.next_sequence {
+            return Err(AwinError::InvalidCheckpoint);
+        }
+        for (index, delivery) in &self.deliveries {
+            if *index != delivery.sequence
+                || delivery
+                    .validate_against(&self.scope, &self.plan, &self.generation)
+                    .is_err()
+            {
+                return Err(AwinError::InvalidCheckpoint);
+            }
+            let expected_input = if *index == 1 {
+                None
+            } else {
+                self.deliveries
+                    .get(&index.saturating_sub(1))
+                    .and_then(|previous| previous.next_cursor.clone())
+            };
+            if delivery.input_cursor != expected_input {
+                return Err(AwinError::InvalidCheckpoint);
+            }
+            if self
+                .evidence_nodes
+                .get(index)
+                .is_none_or(|node| !node.validate_against_delivery(delivery))
+            {
+                return Err(AwinError::InvalidCheckpoint);
+            }
+        }
+        if self.evidence_nodes.len() != self.deliveries.len() {
+            return Err(AwinError::InvalidCheckpoint);
+        }
+        let expected_pending = self
+            .deliveries
+            .values()
+            .next_back()
+            .and_then(|delivery| delivery.next_cursor.clone());
+        if self.pending_cursor != expected_pending {
+            return Err(AwinError::InvalidCheckpoint);
+        }
+        if let Some(root) = &self.evidence_root {
+            if self.retry_after.is_some()
+                || self.pending_cursor.is_some()
+                || self.next_sequence != self.deliveries.len() as u64 + 1
+            {
+                return Err(AwinError::InvalidCheckpoint);
+            }
+            let nodes = self.evidence_nodes.values().cloned().collect::<Vec<_>>();
+            root.validate_against(&self.scope, &self.plan, &self.generation, &nodes)?;
+        }
+        Ok(())
+    }
+
+    fn calculated_checkpoint_digest(&self) -> Result<String, AwinError> {
+        let mut unsigned = self.clone();
+        unsigned.checkpoint_digest.clear();
+        let value = serde_json::to_value(unsigned).map_err(|_| AwinError::InvalidCheckpoint)?;
+        Ok(sha256_json(&value))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AwinReconcileSession {
+    scope: AwinScope,
+    plan: AwinReadPlan,
+    query_digest: String,
+    generation: AwinProviderGeneration,
+    authority: AwinReconcileAuthority,
+    next_sequence: u64,
+    pending_cursor: Option<AwinReconcileCursor>,
+    deliveries: BTreeMap<u64, AwinPageDelivery>,
+    evidence_nodes: BTreeMap<u64, AwinEvidenceNode>,
+    retry_after: Option<DateTime<Utc>>,
+    evidence_root: Option<AwinEvidenceRoot>,
+}
+
+impl AwinReconcileSession {
+    pub fn new(
+        scope: AwinScope,
+        plan: AwinReadPlan,
+        generation: AwinProviderGeneration,
+        authority: AwinReconcileAuthority,
+    ) -> Result<Self, AwinError> {
+        plan.validate()?;
+        generation.validate_scope(&scope)?;
+        authority.ensure_generation(&generation)?;
+        let query_digest = plan.query_digest(&scope)?;
+        Ok(Self {
+            scope,
+            plan,
+            query_digest,
+            generation,
+            authority,
+            next_sequence: 1,
+            pending_cursor: None,
+            deliveries: BTreeMap::new(),
+            evidence_nodes: BTreeMap::new(),
+            retry_after: None,
+            evidence_root: None,
+        })
+    }
+
+    pub fn scope(&self) -> &AwinScope {
+        &self.scope
+    }
+
+    pub fn plan(&self) -> &AwinReadPlan {
+        &self.plan
+    }
+
+    pub fn query_digest(&self) -> &str {
+        &self.query_digest
+    }
+
+    pub fn generation(&self) -> &AwinProviderGeneration {
+        &self.generation
+    }
+
+    pub fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    pub fn pending_cursor(&self) -> Option<&AwinReconcileCursor> {
+        self.pending_cursor.as_ref()
+    }
+
+    pub fn deliveries(&self) -> impl Iterator<Item = &AwinPageDelivery> {
+        self.deliveries.values()
+    }
+
+    pub fn evidence_root(&self) -> Option<&AwinEvidenceRoot> {
+        self.evidence_root.as_ref()
+    }
+
+    pub fn accept(
+        &mut self,
+        delivery: AwinPageDelivery,
+        at: DateTime<Utc>,
+    ) -> Result<AwinReconcileOutcome, AwinError> {
+        self.authority.validate(&self.generation)?;
+        if self.evidence_root.is_some() {
+            return Err(AwinError::EvidenceRootClosed);
+        }
+        delivery.validate_against(&self.scope, &self.plan, &self.generation)?;
+        if let Some(existing) = self.deliveries.get(&delivery.sequence) {
+            if existing.delivery_digest == delivery.delivery_digest {
+                return Ok(AwinReconcileOutcome::Duplicate(self.delivery_receipt(
+                    AwinDeliveryStatus::Duplicate,
+                    delivery.sequence,
+                    self.next_sequence,
+                    self.next_sequence,
+                    &delivery.idempotency_key,
+                )));
+            }
+            return Err(AwinError::InvalidDelivery);
+        }
+        if self
+            .deliveries
+            .values()
+            .any(|existing| existing.idempotency_key == delivery.idempotency_key)
+        {
+            return Err(AwinError::InvalidDelivery);
+        }
+        if at < delivery.observed_at || at >= delivery.valid_until {
+            return Err(AwinError::Disconnected);
+        }
+        if self.retry_after.is_some_and(|retry_after| at < retry_after) {
+            return Ok(AwinReconcileOutcome::RetryAfter(
+                self.retry_after_receipt(delivery.sequence)?,
+            ));
+        }
+        if delivery.sequence > self.next_sequence {
+            return Ok(AwinReconcileOutcome::OutOfOrder(self.delivery_receipt(
+                AwinDeliveryStatus::OutOfOrder,
+                delivery.sequence,
+                self.next_sequence,
+                self.next_sequence,
+                &delivery.idempotency_key,
+            )));
+        }
+        if delivery.sequence < self.next_sequence {
+            return Err(AwinError::InvalidDelivery);
+        }
+        if delivery.input_cursor != self.pending_cursor {
+            return Err(AwinError::InvalidDelivery);
+        }
+        let sequence = delivery.sequence;
+        let idempotency_key = delivery.idempotency_key.clone();
+        let next_cursor = delivery.next_cursor.clone();
+        let node = AwinEvidenceNode::from_delivery(&delivery);
+        self.evidence_nodes.insert(sequence, node);
+        self.deliveries.insert(sequence, delivery);
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.pending_cursor.clone_from(&next_cursor);
+        self.retry_after = None;
+        Ok(AwinReconcileOutcome::Applied(self.delivery_receipt(
+            AwinDeliveryStatus::Applied,
+            sequence,
+            sequence,
+            self.next_sequence,
+            &idempotency_key,
+        )))
+    }
+
+    pub fn record_rate_limit(
+        &mut self,
+        sequence: u64,
+        retry_after: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> Result<AwinRetryAfterReceipt, AwinError> {
+        self.authority.validate(&self.generation)?;
+        if self.evidence_root.is_some() {
+            return Err(AwinError::EvidenceRootClosed);
+        }
+        if sequence < self.next_sequence || retry_after <= at {
+            return Err(AwinError::RateLimited);
+        }
+        if self
+            .retry_after
+            .is_none_or(|existing| retry_after > existing)
+        {
+            self.retry_after = Some(retry_after);
+        }
+        self.retry_after_receipt(sequence)
+    }
+
+    pub fn close_evidence(&mut self, at: DateTime<Utc>) -> Result<AwinEvidenceRoot, AwinError> {
+        self.authority.validate(&self.generation)?;
+        if self.evidence_root.is_some() {
+            return Err(AwinError::EvidenceRootClosed);
+        }
+        if self.retry_after.is_some()
+            || self.pending_cursor.is_some()
+            || self.deliveries.is_empty()
+            || self.next_sequence != self.deliveries.len() as u64 + 1
+        {
+            return Err(AwinError::EvidenceRootOpen);
+        }
+        let nodes = self.evidence_nodes.values().cloned().collect::<Vec<_>>();
+        if nodes.len() != self.deliveries.len()
+            || nodes
+                .iter()
+                .enumerate()
+                .any(|(index, node)| node.sequence != index as u64 + 1)
+            || nodes
+                .iter()
+                .any(|node| at < node.observed_at || at >= node.valid_until)
+        {
+            return Err(AwinError::EvidenceRootOpen);
+        }
+        let root = AwinEvidenceRoot::new(&self.scope, &self.plan, &self.generation, nodes, at)?;
+        self.evidence_root = Some(root.clone());
+        Ok(root)
+    }
+
+    pub fn closed_evidence_root(&self, at: DateTime<Utc>) -> Result<&AwinEvidenceRoot, AwinError> {
+        self.authority.validate(&self.generation)?;
+        let root = self
+            .evidence_root
+            .as_ref()
+            .ok_or(AwinError::EvidenceRootOpen)?;
+        if at < root.closed_at() {
+            return Err(AwinError::EvidenceRootOpen);
+        }
+        Ok(root)
+    }
+
+    pub fn checkpoint(&self) -> Result<AwinReconcileCheckpoint, AwinError> {
+        self.authority.validate(&self.generation)?;
+        self.validate_state()?;
+        let mut checkpoint = AwinReconcileCheckpoint {
+            schema_version: AWIN_RECONCILE_SCHEMA_VERSION.to_owned(),
+            scope: self.scope.clone(),
+            plan: self.plan.clone(),
+            generation: self.generation.clone(),
+            next_sequence: self.next_sequence,
+            pending_cursor: self.pending_cursor.clone(),
+            deliveries: self.deliveries.clone(),
+            evidence_nodes: self.evidence_nodes.clone(),
+            retry_after: self.retry_after,
+            evidence_root: self.evidence_root.clone(),
+            checkpoint_digest: String::new(),
+        };
+        checkpoint.checkpoint_digest = checkpoint.calculated_checkpoint_digest()?;
+        Ok(checkpoint)
+    }
+
+    pub fn reopen(
+        checkpoint: AwinReconcileCheckpoint,
+        scope: AwinScope,
+        plan: AwinReadPlan,
+        generation: AwinProviderGeneration,
+        authority: AwinReconcileAuthority,
+    ) -> Result<Self, AwinError> {
+        checkpoint.validate()?;
+        if checkpoint.scope != scope
+            || checkpoint.plan != plan
+            || checkpoint.generation != generation
+        {
+            return Err(AwinError::GenerationDrift);
+        }
+        let mut session = Self::new(scope, plan, generation, authority)?;
+        session.next_sequence = checkpoint.next_sequence;
+        session.pending_cursor = checkpoint.pending_cursor;
+        session.deliveries = checkpoint.deliveries;
+        session.evidence_nodes = checkpoint.evidence_nodes;
+        session.retry_after = checkpoint.retry_after;
+        session.evidence_root = checkpoint.evidence_root;
+        session.validate_state()?;
+        Ok(session)
+    }
+
+    fn delivery_receipt(
+        &self,
+        status: AwinDeliveryStatus,
+        sequence: u64,
+        expected_sequence: u64,
+        next_sequence: u64,
+        idempotency_key: &str,
+    ) -> AwinDeliveryReceipt {
+        let status_digest = format!("{status:?}");
+        let evidence_root_digest = self
+            .evidence_root
+            .as_ref()
+            .map(|root| root.root_digest().to_owned());
+        let receipt_digest = digest_parts([
+            AWIN_RECONCILE_SCHEMA_VERSION,
+            &status_digest,
+            &sequence.to_string(),
+            &expected_sequence.to_string(),
+            &next_sequence.to_string(),
+            idempotency_key,
+            self.generation.digest(),
+            evidence_root_digest.as_deref().unwrap_or(""),
+        ]);
+        AwinDeliveryReceipt {
+            status,
+            sequence,
+            expected_sequence,
+            next_sequence,
+            idempotency_key: idempotency_key.to_owned(),
+            generation_digest: self.generation.digest().to_owned(),
+            evidence_root_digest,
+            receipt_digest,
+        }
+    }
+
+    fn retry_after_receipt(&self, sequence: u64) -> Result<AwinRetryAfterReceipt, AwinError> {
+        let retry_after = self.retry_after.ok_or(AwinError::StatePoisoned)?;
+        let receipt_digest = digest_parts([
+            AWIN_RECONCILE_SCHEMA_VERSION,
+            "retry_after",
+            &sequence.to_string(),
+            &self.next_sequence.to_string(),
+            &retry_after.to_rfc3339(),
+            self.generation.digest(),
+        ]);
+        Ok(AwinRetryAfterReceipt {
+            sequence,
+            expected_sequence: self.next_sequence,
+            retry_after,
+            generation_digest: self.generation.digest().to_owned(),
+            receipt_digest,
+        })
+    }
+
+    fn validate_state(&self) -> Result<(), AwinError> {
+        self.plan.validate()?;
+        self.generation.validate_scope(&self.scope)?;
+        if self.query_digest != self.plan.query_digest(&self.scope)?
+            || self.next_sequence == 0
+            || self.deliveries.len() as u64 >= self.next_sequence
+        {
+            return Err(AwinError::InvalidCheckpoint);
+        }
+        for (index, delivery) in &self.deliveries {
+            if *index != delivery.sequence
+                || *index == 0
+                || *index >= self.next_sequence
+                || delivery
+                    .validate_against(&self.scope, &self.plan, &self.generation)
+                    .is_err()
+            {
+                return Err(AwinError::InvalidCheckpoint);
+            }
+            let expected_input = if *index == 1 {
+                None
+            } else {
+                self.deliveries
+                    .get(&index.saturating_sub(1))
+                    .and_then(|previous| previous.next_cursor.clone())
+            };
+            if delivery.input_cursor != expected_input {
+                return Err(AwinError::InvalidCheckpoint);
+            }
+        }
+        if self.evidence_nodes.len() != self.deliveries.len()
+            || self.evidence_nodes.iter().any(|(index, node)| {
+                self.deliveries
+                    .get(index)
+                    .is_none_or(|delivery| !node.validate_against_delivery(delivery))
+            })
+        {
+            return Err(AwinError::InvalidCheckpoint);
+        }
+        let expected_pending = self
+            .deliveries
+            .values()
+            .next_back()
+            .and_then(|delivery| delivery.next_cursor.clone());
+        if self.pending_cursor != expected_pending {
+            return Err(AwinError::InvalidCheckpoint);
+        }
+        if let Some(root) = &self.evidence_root
+            && (self.retry_after.is_some()
+                || self.pending_cursor.is_some()
+                || root.nodes.len() != self.evidence_nodes.len()
+                || root.nodes != self.evidence_nodes.values().cloned().collect::<Vec<_>>())
+        {
+            return Err(AwinError::InvalidCheckpoint);
+        }
+        if let Some(root) = &self.evidence_root {
+            let nodes = self.evidence_nodes.values().cloned().collect::<Vec<_>>();
+            root.validate_against(&self.scope, &self.plan, &self.generation, &nodes)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1559,6 +2890,7 @@ where
     credential_lease: Option<CredentialLease>,
     auth_session: Option<AuthSession>,
     probe_result: Option<ProbeResult>,
+    reconcile_authority: AwinReconcileAuthority,
     mounted: bool,
 }
 
@@ -1627,6 +2959,7 @@ where
             credential_lease: None,
             auth_session: None,
             probe_result: None,
+            reconcile_authority: AwinReconcileAuthority::new(),
             mounted: true,
         })
     }
@@ -1655,6 +2988,10 @@ where
         &self.budget
     }
 
+    pub fn reconcile_authority(&self) -> &AwinReconcileAuthority {
+        &self.reconcile_authority
+    }
+
     pub fn begin_auth(
         &mut self,
         secret_reference: SecretReference,
@@ -1678,6 +3015,7 @@ where
             issued_at,
             expires_at,
         })?;
+        self.reconcile_authority.invalidate()?;
         self.secret_reference = Some(secret_reference);
         self.credential_lease = Some(credential_lease);
         self.auth_session = Some(session.clone());
@@ -1704,6 +3042,7 @@ where
             issued_at,
             expires_at,
         })?;
+        self.reconcile_authority.invalidate()?;
         self.secret_reference = Some(secret_reference);
         self.credential_lease = Some(credential_lease);
         self.auth_session = Some(refreshed.clone());
@@ -1717,6 +3056,7 @@ where
         at: DateTime<Utc>,
     ) -> Result<AwinProbeReceipt, AwinError> {
         self.ensure_mounted()?;
+        self.reconcile_authority.invalidate()?;
         let secret_reference = self
             .secret_reference
             .clone()
@@ -1746,12 +3086,36 @@ where
             .last_probe
             .clone()
             .ok_or(AwinError::Disconnected)?;
-        self.probe_result = Some(connector_result.clone());
-        Ok(AwinProbeReceipt {
+        let receipt = AwinProbeReceipt {
             credential_revision: observation.credential_revision,
             connector_result,
             observation,
-        })
+        };
+        if receipt.observation.status == AwinProbeStatus::Reachable
+            && receipt.observation.classification == AwinObservationClassification::FirstParty
+        {
+            let generation = AwinProviderGeneration::from_probe(&self.scope, &receipt)?;
+            self.reconcile_authority.bind(&generation)?;
+        }
+        self.probe_result = Some(receipt.connector_result.clone());
+        Ok(receipt)
+    }
+
+    pub fn reconcile_session(
+        &self,
+        probe: &AwinProbeReceipt,
+    ) -> Result<AwinReconcileSession, AwinError> {
+        self.ensure_mounted()?;
+        if self.probe_result.as_ref() != Some(&probe.connector_result) {
+            return Err(AwinError::GenerationDrift);
+        }
+        let generation = AwinProviderGeneration::from_probe(&self.scope, probe)?;
+        AwinReconcileSession::new(
+            self.scope.clone(),
+            self.plan.clone(),
+            generation,
+            self.reconcile_authority.clone(),
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1914,6 +3278,7 @@ where
         self.credential_lease = None;
         self.auth_session = None;
         self.probe_result = None;
+        self.reconcile_authority.invalidate()?;
         let scope_digest = self.connector_scope.digest();
         Ok(lifecycle_receipt(
             "revoke",
@@ -1931,6 +3296,7 @@ where
         self.credential_lease = None;
         self.auth_session = None;
         self.probe_result = None;
+        self.reconcile_authority.invalidate()?;
         if let Ok(mut state) = self.state.lock() {
             state.active_credential = None;
             state.last_probe = None;
@@ -2073,6 +3439,31 @@ pub struct AwinMissionReadReceipt {
     pub result_digest: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct AwinMissionReconcileExpectation {
+    pub base: AwinMissionReadExpectation,
+    pub generation_digest: String,
+    pub provider_generation: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AwinMissionReconcileResult {
+    pub mission_id: String,
+    pub mission_revision: u64,
+    pub provider_id: String,
+    pub publisher_id: AwinPublisherId,
+    pub advertiser_id: Option<AwinAdvertiserId>,
+    pub program_id: Option<AwinProgramId>,
+    pub credential_revision: u64,
+    pub probe_revision: u64,
+    pub provider_generation: u64,
+    pub generation_digest: String,
+    pub evidence_root_digest: String,
+    pub page_count: u64,
+    pub result_digest: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AwinMissionConsumer;
 
@@ -2145,6 +3536,83 @@ impl AwinMissionConsumer {
             result_digest: envelope.result_digest.clone(),
         })
     }
+
+    pub fn consume_reconciled(
+        &self,
+        mission: &Mission,
+        scope: &AwinScope,
+        session: &AwinReconcileSession,
+        expected: &AwinMissionReconcileExpectation,
+        at: DateTime<Utc>,
+    ) -> Result<AwinMissionReconcileResult, AwinError> {
+        mission
+            .contract
+            .validate(at)
+            .map_err(|error| AwinError::Mission(error.to_string()))?;
+        let root = session.closed_evidence_root(at)?;
+        let generation = session.generation();
+        let scope_digest = scope.digest()?;
+        let exact =
+            session.scope() == scope
+                && expected.base.mission_id == mission.id.as_str()
+                && expected.base.mission_revision == mission.revision
+                && mission.tenant_id.as_str() == scope.tenant_id()
+                && mission.project_id.as_str() == scope.project_id()
+                && mission
+                    .contract
+                    .enabled_capabilities
+                    .contains(AWIN_MISSION_CAPABILITY)
+                && expected.base.provider_id == AWIN_PROVIDER_ID
+                && expected.base.publisher_id == *scope.publisher_id()
+                && expected.base.advertiser_id == scope.advertiser_id().cloned()
+                && expected.base.program_id == scope.program_id().cloned()
+                && expected.base.capability == session.plan.resource.capability()
+                && expected.base.credential_revision == generation.credential_revision()
+                && expected.base.probe_revision == generation.probe_revision()
+                && session.deliveries.values().next().is_some_and(|delivery| {
+                    expected.base.source_revision == delivery.source_revision
+                })
+                && expected.generation_digest == generation.digest()
+                && expected.provider_generation == generation.provider_generation()
+                && generation.provider_id() == AWIN_PROVIDER_ID
+                && generation.publisher_id() == scope.publisher_id()
+                && generation.advertiser_id() == scope.advertiser_id()
+                && generation.program_id() == scope.program_id()
+                && root.schema_version == AWIN_RECONCILE_SCHEMA_VERSION
+                && root.scope_digest == scope_digest
+                && root.generation_digest == generation.digest()
+                && root.provider_generation == generation.provider_generation()
+                && root.resource == session.plan.resource
+                && root.query_digest == session.query_digest
+                && !root.nodes.is_empty();
+        if !exact {
+            return Err(AwinError::MissionBinding);
+        }
+        let result_digest = digest_parts([
+            AWIN_RECONCILE_SCHEMA_VERSION,
+            mission.id.as_str(),
+            &mission.revision.to_string(),
+            scope_digest.as_str(),
+            generation.digest(),
+            root.root_digest(),
+            &root.nodes.len().to_string(),
+        ]);
+        Ok(AwinMissionReconcileResult {
+            mission_id: mission.id.as_str().to_owned(),
+            mission_revision: mission.revision,
+            provider_id: AWIN_PROVIDER_ID.to_owned(),
+            publisher_id: scope.publisher_id().clone(),
+            advertiser_id: scope.advertiser_id().cloned(),
+            program_id: scope.program_id().cloned(),
+            credential_revision: generation.credential_revision(),
+            probe_revision: generation.probe_revision(),
+            provider_generation: generation.provider_generation(),
+            generation_digest: generation.digest().to_owned(),
+            evidence_root_digest: root.root_digest().to_owned(),
+            page_count: root.nodes.len() as u64,
+            result_digest,
+        })
+    }
 }
 
 fn valid_hartevo_identifier(value: &str) -> bool {
@@ -2153,6 +3621,19 @@ fn valid_hartevo_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn is_provider_source_uri(value: &str) -> bool {
+    value.starts_with(AWIN_API_BASE_URL) || {
+        #[cfg(test)]
+        {
+            value.starts_with("http://127.0.0.1:")
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
 }
 
 fn valid_region(value: &str) -> bool {
@@ -2326,8 +3807,153 @@ mod tests {
     use super::*;
     use hartevo_connector_sdk::ConnectorAuth;
     use hartevo_domain_kernel::{Mission, MissionContract, MissionId, ProjectId, TenantId};
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::{self, JoinHandle};
 
     const NOW: &str = "2026-08-14T00:00:00Z";
+
+    struct LoopbackServer {
+        base_url: String,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl LoopbackServer {
+        fn start(expected_requests: usize) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+            let port = listener.local_addr().expect("loopback address").port();
+            let join = thread::spawn(move || {
+                for _ in 0..expected_requests {
+                    let (mut stream, _) = listener.accept().expect("loopback request");
+                    let request = read_http_request(&mut stream);
+                    let body = loopback_response(&request);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("loopback response");
+                    stream.flush().expect("loopback flush");
+                }
+            });
+            Self {
+                base_url: format!("http://127.0.0.1:{port}"),
+                join: Some(join),
+            }
+        }
+
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        fn finish(mut self) {
+            self.join
+                .take()
+                .expect("loopback join handle")
+                .join()
+                .expect("loopback server");
+        }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer).expect("loopback request bytes");
+            assert!(count > 0, "loopback request ended before headers");
+            bytes.extend_from_slice(&buffer[..count]);
+            assert!(
+                bytes.len() <= 16 * 1024,
+                "loopback request headers too large"
+            );
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(bytes).expect("loopback request utf8")
+    }
+
+    fn loopback_response(request: &str) -> String {
+        let mut lines = request.split("\r\n");
+        let request_line = lines.next().expect("loopback request line");
+        let mut request_parts = request_line.split_whitespace();
+        assert_eq!(request_parts.next(), Some("GET"));
+        let target = request_parts.next().expect("loopback target");
+        assert_eq!(request_parts.next(), Some("HTTP/1.1"));
+        let (path, query) = target.split_once('?').expect("loopback query");
+
+        let headers = lines
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer fixture-token")
+        );
+        assert_eq!(
+            headers.get("accept").map(String::as_str),
+            Some("application/json")
+        );
+
+        let query = form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect::<BTreeMap<_, _>>();
+        match path {
+            "/publishers/123/programmedetails" => {
+                assert_eq!(query.len(), 2);
+                assert_eq!(query.get("advertiserId").map(String::as_str), Some("100"));
+                assert_eq!(query.get("relationship").map(String::as_str), Some("any"));
+                serde_json::json!({
+                    "programmes": [{
+                        "advertiserId": 100,
+                        "publisherId": 123,
+                        "programId": 100
+                    }]
+                })
+            }
+            "/publishers/123/transactions/" => {
+                assert_eq!(query.len(), 5);
+                assert_eq!(query.get("advertiserId").map(String::as_str), Some("100"));
+                assert_eq!(query.get("timezone").map(String::as_str), Some("UTC"));
+                assert_eq!(
+                    query.get("showBasketProducts").map(String::as_str),
+                    Some("false")
+                );
+                let start = DateTime::parse_from_rfc3339(
+                    query.get("startDate").expect("transaction start"),
+                )
+                .expect("transaction start timestamp")
+                .with_timezone(&Utc);
+                let end =
+                    DateTime::parse_from_rfc3339(query.get("endDate").expect("transaction end"))
+                        .expect("transaction end timestamp")
+                        .with_timezone(&Utc);
+                assert_eq!(end - start, Duration::days(31));
+                let sequence = if start == now() {
+                    1
+                } else if start == now() + Duration::days(31) {
+                    2
+                } else {
+                    panic!("unexpected Awin transaction window: {start}");
+                };
+                serde_json::json!({
+                    "data": [{
+                        "advertiserId": 100,
+                        "publisherId": 123,
+                        "programId": 100,
+                        "transactionId": format!("awin-loopback-{sequence}"),
+                        "window": sequence
+                    }]
+                })
+            }
+            _ => panic!("unexpected Awin loopback path: {path}"),
+        }
+        .to_string()
+    }
 
     #[derive(Debug)]
     struct ContractTransport {
@@ -2462,16 +4088,27 @@ mod tests {
     }
 
     fn auth_material(scope: &AwinScope) -> (SecretReference, CredentialLease) {
+        auth_material_with_revision(scope, 7)
+    }
+
+    fn auth_material_with_revision(
+        scope: &AwinScope,
+        credential_revision: u64,
+    ) -> (SecretReference, CredentialLease) {
         let connector_scope = scope.connector_scope().expect("connector scope");
-        let secret = SecretReference::new("secret-ref-awin-test", connector_scope, 7)
-            .expect("secret reference");
+        let secret = SecretReference::new(
+            format!("secret-ref-awin-test-{credential_revision}"),
+            connector_scope,
+            credential_revision,
+        )
+        .expect("secret reference");
         let adapter =
             ProviderAdapterIdentity::new(AWIN_ADAPTER_ID, AWIN_ADAPTER_VERSION).expect("adapter");
         let lease = ConnectorAuth::issue_credential_lease(
             &secret,
             adapter,
-            "lease-awin-test",
-            3,
+            format!("lease-awin-test-{credential_revision}"),
+            credential_revision,
             now(),
             now() + Duration::minutes(10),
         )
@@ -2734,5 +4371,504 @@ mod tests {
             .expect("exact mission binding");
         assert_eq!(receipt.provider_id, AWIN_PROVIDER_ID);
         assert_eq!(receipt.credential_revision, 7);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn official_http_loopback_transaction_windows_reconcile_exactly_once() {
+        let server = LoopbackServer::start(3);
+        assert!(matches!(
+            AwinHttpTransport::new(server.base_url()),
+            Err(AwinError::InvalidTransportBaseUrl)
+        ));
+        let transport = AwinHttpTransport::loopback(server.base_url()).expect("loopback transport");
+        let mut service = AwinService::new(
+            "worker-awin-loopback",
+            scope(),
+            plan(),
+            transport,
+            ContractResolver { available: true },
+            now(),
+            now() + Duration::minutes(10),
+            budget(),
+        )
+        .expect("loopback service");
+        let (secret, lease) = auth_material(service.scope());
+        service
+            .begin_auth(secret, lease, 1, now(), now() + Duration::minutes(5))
+            .expect("loopback auth");
+        let probe = service
+            .probe(1, "probe-result-awin-loopback", now())
+            .expect("loopback probe");
+        assert_eq!(
+            probe.observation.classification,
+            AwinObservationClassification::FirstParty
+        );
+        assert!(
+            probe
+                .observation
+                .source_uri
+                .starts_with("http://127.0.0.1:")
+        );
+
+        let first = service
+            .read(None, 100, now())
+            .expect("loopback first transaction window");
+        let first_cursor = first.envelope.cursor.clone().expect("loopback cursor");
+        let second = service
+            .read(Some(&first_cursor), 100, now())
+            .expect("loopback second transaction window");
+        assert_eq!(first.envelope.publisher_id, *service.scope().publisher_id());
+        assert_eq!(
+            first.envelope.advertiser_id,
+            service.scope().advertiser_id().cloned()
+        );
+        assert_eq!(
+            first.envelope.program_id,
+            service.scope().program_id().cloned()
+        );
+        assert_eq!(
+            first
+                .envelope
+                .cursor
+                .as_ref()
+                .map(AwinDurableCursor::sequence),
+            Some(1)
+        );
+        assert!(second.envelope.cursor.is_none());
+        assert_eq!(service.budget().cost_used_units(), AWIN_READ_COST_UNITS * 2);
+        assert_eq!(first.envelope.cost.cost_units, AWIN_READ_COST_UNITS);
+        assert_eq!(second.envelope.cost.cost_units, AWIN_READ_COST_UNITS);
+
+        let generation =
+            AwinProviderGeneration::from_probe(service.scope(), &probe).expect("generation");
+        let input_cursor = AwinReconcileCursor::from_durable(
+            first_cursor,
+            service.scope(),
+            service.plan(),
+            &generation,
+        )
+        .expect("reconcile cursor");
+        let first_delivery = AwinPageDelivery::from_read(
+            service.scope(),
+            service.plan(),
+            &generation,
+            None,
+            &first,
+            now(),
+        )
+        .expect("first delivery");
+        let second_delivery = AwinPageDelivery::from_read(
+            service.scope(),
+            service.plan(),
+            &generation,
+            Some(&input_cursor),
+            &second,
+            now(),
+        )
+        .expect("second delivery");
+        let mut session = service.reconcile_session(&probe).expect("session");
+        assert!(matches!(
+            session.accept(second_delivery.clone(), now()),
+            Ok(AwinReconcileOutcome::OutOfOrder(_))
+        ));
+        assert!(matches!(
+            session.accept(first_delivery.clone(), now()),
+            Ok(AwinReconcileOutcome::Applied(_))
+        ));
+        assert!(matches!(
+            session.accept(first_delivery, now()),
+            Ok(AwinReconcileOutcome::Duplicate(_))
+        ));
+        assert!(matches!(
+            session.accept(second_delivery.clone(), now()),
+            Ok(AwinReconcileOutcome::Applied(_))
+        ));
+        assert!(matches!(
+            session.accept(second_delivery, now()),
+            Ok(AwinReconcileOutcome::Duplicate(_))
+        ));
+        let root = session.close_evidence(now()).expect("closed evidence");
+        assert!(root.is_closed());
+        assert_eq!(root.nodes().len(), 2);
+
+        let mission = Mission::compile(
+            TenantId::from("tenant-awin"),
+            MissionId::from("mission-awin-loopback"),
+            ProjectId::from("project-awin"),
+            "Reconcile Awin loopback transactions",
+            MissionContract::bootstrap(
+                "Reconcile Awin loopback transactions",
+                [AWIN_MISSION_CAPABILITY.to_owned()],
+                now(),
+            ),
+            now(),
+        )
+        .expect("loopback mission");
+        let expected = AwinMissionReconcileExpectation {
+            base: AwinMissionReadExpectation {
+                mission_id: mission.id.as_str().to_owned(),
+                mission_revision: mission.revision,
+                provider_id: AWIN_PROVIDER_ID.to_owned(),
+                publisher_id: scope().publisher_id().clone(),
+                advertiser_id: scope().advertiser_id().cloned(),
+                program_id: scope().program_id().cloned(),
+                credential_revision: probe.credential_revision,
+                probe_revision: probe.connector_result.probe_revision(),
+                source_revision: first.envelope.source_revision,
+                capability: first.envelope.resource.capability().to_owned(),
+            },
+            generation_digest: generation.digest().to_owned(),
+            provider_generation: generation.provider_generation(),
+        };
+        let result = AwinMissionConsumer
+            .consume_reconciled(&mission, service.scope(), &session, &expected, now())
+            .expect("loopback Mission result");
+        assert_eq!(result.page_count, 2);
+        assert_eq!(result.provider_id, AWIN_PROVIDER_ID);
+        assert_eq!(result.publisher_id, *service.scope().publisher_id());
+        server.finish();
+    }
+
+    #[test]
+    fn reconcile_deduplicates_and_rejects_out_of_order_pages_exactly_once() {
+        let mut service = service(ContractResolver { available: true });
+        let (secret, lease) = auth_material(service.scope());
+        service
+            .begin_auth(secret, lease, 1, now(), now() + Duration::minutes(5))
+            .expect("auth metadata");
+        let probe = service
+            .probe(1, "probe-result-awin-reconcile-order", now())
+            .expect("probe");
+        let generation =
+            AwinProviderGeneration::from_probe(service.scope(), &probe).expect("generation");
+        let first = service.read(None, 100, now()).expect("first read");
+        let first_cursor = first.envelope.cursor.clone().expect("continuation");
+        let second = service
+            .read(Some(&first_cursor), 100, now())
+            .expect("second read");
+        let input_cursor = AwinReconcileCursor::from_durable(
+            first_cursor,
+            service.scope(),
+            service.plan(),
+            &generation,
+        )
+        .expect("input cursor");
+        let first_delivery = AwinPageDelivery::from_read(
+            service.scope(),
+            service.plan(),
+            &generation,
+            None,
+            &first,
+            now(),
+        )
+        .expect("first delivery");
+        let second_delivery = AwinPageDelivery::from_read(
+            service.scope(),
+            service.plan(),
+            &generation,
+            Some(&input_cursor),
+            &second,
+            now(),
+        )
+        .expect("second delivery");
+        let mut session = service.reconcile_session(&probe).expect("session");
+
+        let out_of_order = session
+            .accept(second_delivery.clone(), now())
+            .expect("out-of-order receipt");
+        let AwinReconcileOutcome::OutOfOrder(receipt) = out_of_order else {
+            panic!("page two must not apply before page one");
+        };
+        assert_eq!(receipt.status(), &AwinDeliveryStatus::OutOfOrder);
+        assert_eq!(session.next_sequence(), 1);
+
+        let applied_first = session
+            .accept(first_delivery.clone(), now())
+            .expect("first apply");
+        assert!(matches!(applied_first, AwinReconcileOutcome::Applied(_)));
+        let duplicate_first = session
+            .accept(first_delivery, now())
+            .expect("first duplicate receipt");
+        assert!(matches!(
+            duplicate_first,
+            AwinReconcileOutcome::Duplicate(_)
+        ));
+        let applied_second = session
+            .accept(second_delivery.clone(), now())
+            .expect("second apply");
+        assert!(matches!(applied_second, AwinReconcileOutcome::Applied(_)));
+        let duplicate_second = session
+            .accept(second_delivery, now())
+            .expect("second duplicate receipt");
+        assert!(matches!(
+            duplicate_second,
+            AwinReconcileOutcome::Duplicate(_)
+        ));
+
+        let root = session.close_evidence(now()).expect("closed evidence");
+        assert!(root.is_closed());
+        assert_eq!(root.nodes().len(), 2);
+        assert_eq!(root.nodes()[0].sequence(), 1);
+        assert_eq!(root.nodes()[1].sequence(), 2);
+        assert!(matches!(
+            session.accept(
+                AwinPageDelivery::from_read(
+                    service.scope(),
+                    service.plan(),
+                    &generation,
+                    None,
+                    &first,
+                    now(),
+                )
+                .expect("closed duplicate"),
+                now(),
+            ),
+            Err(AwinError::EvidenceRootClosed)
+        ));
+    }
+
+    #[test]
+    fn reconcile_retry_after_checkpoint_reopen_resumes_without_replaying() {
+        let mut service = service(ContractResolver { available: true });
+        let (secret, lease) = auth_material(service.scope());
+        service
+            .begin_auth(secret, lease, 1, now(), now() + Duration::minutes(5))
+            .expect("auth metadata");
+        let probe = service
+            .probe(1, "probe-result-awin-reconcile-reopen", now())
+            .expect("probe");
+        let generation =
+            AwinProviderGeneration::from_probe(service.scope(), &probe).expect("generation");
+        let first = service.read(None, 100, now()).expect("first read");
+        let first_cursor = first.envelope.cursor.clone().expect("continuation");
+        let second = service
+            .read(Some(&first_cursor), 100, now())
+            .expect("second read");
+        let input_cursor = AwinReconcileCursor::from_durable(
+            first_cursor,
+            service.scope(),
+            service.plan(),
+            &generation,
+        )
+        .expect("input cursor");
+        let first_delivery = AwinPageDelivery::from_read(
+            service.scope(),
+            service.plan(),
+            &generation,
+            None,
+            &first,
+            now(),
+        )
+        .expect("first delivery");
+        let second_delivery = AwinPageDelivery::from_read(
+            service.scope(),
+            service.plan(),
+            &generation,
+            Some(&input_cursor),
+            &second,
+            now(),
+        )
+        .expect("second delivery");
+        let mut session = service.reconcile_session(&probe).expect("session");
+        let retry = session
+            .record_rate_limit(1, now() + Duration::seconds(30), now())
+            .expect("retry receipt");
+        assert_eq!(retry.expected_sequence(), 1);
+        assert_eq!(retry.retry_after(), now() + Duration::seconds(30));
+        assert!(matches!(
+            session.accept(first_delivery.clone(), now() + Duration::seconds(10)),
+            Ok(AwinReconcileOutcome::RetryAfter(_))
+        ));
+        assert!(matches!(
+            session.accept(first_delivery.clone(), now() + Duration::seconds(31)),
+            Ok(AwinReconcileOutcome::Applied(_))
+        ));
+
+        let checkpoint = session.checkpoint().expect("checkpoint");
+        let encoded = serde_json::to_string(&checkpoint).expect("checkpoint encoding");
+        assert!(!encoded.contains("fixture-token"));
+        let mut reopened = AwinReconcileSession::reopen(
+            checkpoint,
+            service.scope().clone(),
+            service.plan().clone(),
+            generation,
+            service.reconcile_authority().clone(),
+        )
+        .expect("reopen");
+        assert_eq!(reopened.next_sequence(), 2);
+        assert!(matches!(
+            reopened.accept(first_delivery, now() + Duration::seconds(31)),
+            Ok(AwinReconcileOutcome::Duplicate(_))
+        ));
+        assert!(matches!(
+            reopened.accept(second_delivery, now() + Duration::seconds(31)),
+            Ok(AwinReconcileOutcome::Applied(_))
+        ));
+        assert_eq!(
+            reopened
+                .close_evidence(now() + Duration::seconds(31))
+                .expect("closed evidence")
+                .nodes()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn mission_reconcile_requires_closed_complete_evidence_root() {
+        let mut service = service(ContractResolver { available: true });
+        let (secret, lease) = auth_material(service.scope());
+        service
+            .begin_auth(secret, lease, 1, now(), now() + Duration::minutes(5))
+            .expect("auth metadata");
+        let probe = service
+            .probe(9, "probe-result-awin-reconcile-mission", now())
+            .expect("probe");
+        let generation =
+            AwinProviderGeneration::from_probe(service.scope(), &probe).expect("generation");
+        let first = service.read(None, 100, now()).expect("first read");
+        let first_cursor = first.envelope.cursor.clone().expect("continuation");
+        let second = service
+            .read(Some(&first_cursor), 100, now())
+            .expect("second read");
+        let input_cursor = AwinReconcileCursor::from_durable(
+            first_cursor,
+            service.scope(),
+            service.plan(),
+            &generation,
+        )
+        .expect("input cursor");
+        let first_delivery = AwinPageDelivery::from_read(
+            service.scope(),
+            service.plan(),
+            &generation,
+            None,
+            &first,
+            now(),
+        )
+        .expect("first delivery");
+        let second_delivery = AwinPageDelivery::from_read(
+            service.scope(),
+            service.plan(),
+            &generation,
+            Some(&input_cursor),
+            &second,
+            now(),
+        )
+        .expect("second delivery");
+        let mut session = service.reconcile_session(&probe).expect("session");
+        session.accept(first_delivery, now()).expect("first apply");
+        session
+            .accept(second_delivery, now())
+            .expect("second apply");
+        let mission = Mission::compile(
+            TenantId::from("tenant-awin"),
+            MissionId::from("mission-awin-reconcile"),
+            ProjectId::from("project-awin"),
+            "Reconcile Awin report",
+            MissionContract::bootstrap(
+                "Reconcile Awin partner data",
+                [AWIN_MISSION_CAPABILITY.to_owned()],
+                now(),
+            ),
+            now(),
+        )
+        .expect("mission");
+        let expected = AwinMissionReconcileExpectation {
+            base: AwinMissionReadExpectation {
+                mission_id: mission.id.as_str().to_owned(),
+                mission_revision: mission.revision,
+                provider_id: AWIN_PROVIDER_ID.to_owned(),
+                publisher_id: scope().publisher_id().clone(),
+                advertiser_id: scope().advertiser_id().cloned(),
+                program_id: scope().program_id().cloned(),
+                credential_revision: generation.credential_revision(),
+                probe_revision: generation.probe_revision(),
+                source_revision: first.envelope.source_revision,
+                capability: first.envelope.resource.capability().to_owned(),
+            },
+            generation_digest: generation.digest().to_owned(),
+            provider_generation: generation.provider_generation(),
+        };
+        assert!(matches!(
+            AwinMissionConsumer.consume_reconciled(
+                &mission,
+                service.scope(),
+                &session,
+                &expected,
+                now(),
+            ),
+            Err(AwinError::EvidenceRootOpen)
+        ));
+        session.close_evidence(now()).expect("evidence close");
+        let result = AwinMissionConsumer
+            .consume_reconciled(&mission, service.scope(), &session, &expected, now())
+            .expect("closed mission result");
+        assert_eq!(result.page_count, 2);
+        assert_eq!(result.provider_id, AWIN_PROVIDER_ID);
+        assert_eq!(result.credential_revision, 7);
+    }
+
+    #[test]
+    fn credential_rotation_revoke_and_unmount_fence_old_reconcile_cursors() {
+        let mut service = service(ContractResolver { available: true });
+        let (secret, lease) = auth_material(service.scope());
+        let auth_session = service
+            .begin_auth(secret, lease, 1, now(), now() + Duration::minutes(5))
+            .expect("auth metadata");
+        let probe = service
+            .probe(1, "probe-result-awin-reconcile-fence", now())
+            .expect("probe");
+        let generation =
+            AwinProviderGeneration::from_probe(service.scope(), &probe).expect("generation");
+        let first = service.read(None, 100, now()).expect("read");
+        let mut session = service.reconcile_session(&probe).expect("session");
+        let first_delivery = AwinPageDelivery::from_read(
+            service.scope(),
+            service.plan(),
+            &generation,
+            None,
+            &first,
+            now(),
+        )
+        .expect("delivery");
+        session.accept(first_delivery, now()).expect("apply");
+        let checkpoint = session.checkpoint().expect("checkpoint");
+        let (rotated_secret, rotated_lease) = auth_material_with_revision(service.scope(), 8);
+        service
+            .refresh_auth(
+                rotated_secret,
+                rotated_lease,
+                auth_session,
+                2,
+                now(),
+                now() + Duration::minutes(5),
+            )
+            .expect("credential rotation");
+        assert!(matches!(
+            session.record_rate_limit(2, now() + Duration::seconds(30), now()),
+            Err(AwinError::GenerationDrift)
+        ));
+        assert!(matches!(
+            AwinReconcileSession::reopen(
+                checkpoint,
+                service.scope().clone(),
+                service.plan().clone(),
+                generation,
+                service.reconcile_authority().clone(),
+            ),
+            Err(AwinError::GenerationDrift)
+        ));
+        service.revoke("rotation-revoke", now()).expect("revoke");
+        assert!(matches!(
+            session.record_rate_limit(2, now() + Duration::seconds(30), now()),
+            Err(AwinError::GenerationDrift)
+        ));
+        service.unmount(now()).expect("unmount");
+        assert!(matches!(
+            session.record_rate_limit(2, now() + Duration::seconds(30), now()),
+            Err(AwinError::GenerationDrift)
+        ));
     }
 }
