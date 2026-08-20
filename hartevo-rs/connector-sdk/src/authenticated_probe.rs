@@ -211,6 +211,8 @@ impl AuthenticatedProbeContract {
     }
 }
 
+pub const MAX_CAPABILITY_LEASE_TTL_SECONDS: i64 = 30;
+
 /// A short-lived secret view returned by a keyring/project-secret resolver.
 ///
 /// The value is intentionally not serializable and its Debug output never
@@ -806,6 +808,259 @@ impl MissionScope {
     }
 }
 
+/// Exact Mission-side requirements for one capability availability lease.
+///
+/// The request carries the complete connector scope and provider digest so a
+/// catalog entry, another account, or a refreshed provider identity cannot
+/// satisfy it by name alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityAvailabilityRequest {
+    mission: MissionScope,
+    scope: ConnectorScope,
+    provider_digest: String,
+    requested_capability: ProviderCapabilityKey,
+    lease_ttl: Duration,
+    quota_units: u64,
+    cost_minor: i64,
+}
+
+impl CapabilityAvailabilityRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mission: MissionScope,
+        scope: ConnectorScope,
+        provider_digest: impl Into<String>,
+        requested_capability: ProviderCapabilityKey,
+        lease_ttl: Duration,
+        quota_units: u64,
+        cost_minor: i64,
+    ) -> Result<Self, AuthenticatedProbeError> {
+        let provider_digest = provider_digest.into();
+        if !super::is_sha256(&provider_digest)
+            || mission.tenant_id() != scope.tenant_id()
+            || mission.project_id() != scope.project_id()
+            || requested_capability.provider_id() != scope.provider_id()
+            || lease_ttl <= Duration::zero()
+            || lease_ttl > Duration::seconds(MAX_CAPABILITY_LEASE_TTL_SECONDS)
+            || quota_units == 0
+            || cost_minor < 0
+        {
+            return Err(AuthenticatedProbeError::InvalidAvailabilityRequest);
+        }
+        Ok(Self {
+            mission,
+            scope,
+            provider_digest,
+            requested_capability,
+            lease_ttl,
+            quota_units,
+            cost_minor,
+        })
+    }
+
+    pub fn mission(&self) -> &MissionScope {
+        &self.mission
+    }
+
+    pub fn scope(&self) -> &ConnectorScope {
+        &self.scope
+    }
+
+    pub fn provider_digest(&self) -> &str {
+        &self.provider_digest
+    }
+
+    pub fn requested_capability(&self) -> &ProviderCapabilityKey {
+        &self.requested_capability
+    }
+
+    pub const fn lease_ttl(&self) -> Duration {
+        self.lease_ttl
+    }
+
+    pub const fn quota_units(&self) -> u64 {
+        self.quota_units
+    }
+
+    pub const fn cost_minor(&self) -> i64 {
+        self.cost_minor
+    }
+}
+
+/// Opaque, generation-fenced permission to invoke one exact Mission
+/// capability.  It is process-local and deliberately not serializable.
+pub struct CapabilityAvailabilityLease {
+    lease_id: String,
+    mission: MissionScope,
+    scope: ConnectorScope,
+    provider_digest: String,
+    requested_capability: ProviderCapabilityKey,
+    source_result_digest: String,
+    availability_digest: String,
+    generation: u64,
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+impl Clone for CapabilityAvailabilityLease {
+    fn clone(&self) -> Self {
+        Self {
+            lease_id: self.lease_id.clone(),
+            mission: self.mission.clone(),
+            scope: self.scope.clone(),
+            provider_digest: self.provider_digest.clone(),
+            requested_capability: self.requested_capability.clone(),
+            source_result_digest: self.source_result_digest.clone(),
+            availability_digest: self.availability_digest.clone(),
+            generation: self.generation,
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+impl PartialEq for CapabilityAvailabilityLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.lease_id == other.lease_id
+            && self.mission == other.mission
+            && self.scope == other.scope
+            && self.provider_digest == other.provider_digest
+            && self.requested_capability == other.requested_capability
+            && self.source_result_digest == other.source_result_digest
+            && self.availability_digest == other.availability_digest
+            && self.generation == other.generation
+            && self.issued_at == other.issued_at
+            && self.expires_at == other.expires_at
+    }
+}
+
+impl Eq for CapabilityAvailabilityLease {}
+
+impl fmt::Debug for CapabilityAvailabilityLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapabilityAvailabilityLease")
+            .field("lease_id", &"[REDACTED]")
+            .field("mission", &self.mission)
+            .field("scope", &self.scope)
+            .field("provider_digest", &self.provider_digest)
+            .field("requested_capability", &self.requested_capability)
+            .field("source_result_digest", &self.source_result_digest)
+            .field("availability_digest", &self.availability_digest)
+            .field("generation", &self.generation)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl CapabilityAvailabilityLease {
+    pub fn mission(&self) -> &MissionScope {
+        &self.mission
+    }
+
+    pub fn scope(&self) -> &ConnectorScope {
+        &self.scope
+    }
+
+    pub fn provider_digest(&self) -> &str {
+        &self.provider_digest
+    }
+
+    pub fn requested_capability(&self) -> &ProviderCapabilityKey {
+        &self.requested_capability
+    }
+
+    pub fn source_result_digest(&self) -> &str {
+        &self.source_result_digest
+    }
+
+    pub fn availability_digest(&self) -> &str {
+        &self.availability_digest
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn issued_at(&self) -> DateTime<Utc> {
+        self.issued_at
+    }
+
+    pub const fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+
+    pub fn digest(&self) -> String {
+        digest_values([self.lease_id.as_str()])
+    }
+}
+
+/// Opaque single invocation token returned after a lease is consumed at
+/// invocation start.  The token is released exactly once at invocation end.
+pub struct CapabilityInvocation {
+    invocation_id: String,
+    lease_id: String,
+    generation: u64,
+    started_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+impl Clone for CapabilityInvocation {
+    fn clone(&self) -> Self {
+        Self {
+            invocation_id: self.invocation_id.clone(),
+            lease_id: self.lease_id.clone(),
+            generation: self.generation,
+            started_at: self.started_at,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+impl PartialEq for CapabilityInvocation {
+    fn eq(&self, other: &Self) -> bool {
+        self.invocation_id == other.invocation_id
+            && self.lease_id == other.lease_id
+            && self.generation == other.generation
+            && self.started_at == other.started_at
+            && self.expires_at == other.expires_at
+    }
+}
+
+impl Eq for CapabilityInvocation {}
+
+impl fmt::Debug for CapabilityInvocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapabilityInvocation")
+            .field("invocation_id", &"[REDACTED]")
+            .field("lease_id", &"[REDACTED]")
+            .field("generation", &self.generation)
+            .field("started_at", &self.started_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl CapabilityInvocation {
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn started_at(&self) -> DateTime<Utc> {
+        self.started_at
+    }
+
+    pub const fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+
+    pub fn digest(&self) -> String {
+        digest_values([self.invocation_id.as_str()])
+    }
+}
+
 /// A Mission-facing projection of authenticated availability.  This is not a
 /// catalog entry: it is bound to one Mission and one live probe result.
 #[derive(Clone, Eq, PartialEq, Serialize)]
@@ -825,6 +1080,7 @@ pub struct MissionCapabilityAvailability {
     provider_identity: ProviderAdapterIdentity,
     provider_digest: String,
     observed_at: DateTime<Utc>,
+    generation: u64,
     availability_digest: String,
 }
 
@@ -908,6 +1164,10 @@ impl MissionCapabilityAvailability {
         self.observed_at
     }
 
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn availability_digest(&self) -> &str {
         &self.availability_digest
     }
@@ -923,7 +1183,11 @@ impl MissionCapabilityAvailability {
             && self.cost.used_minor() < self.cost.limit_minor()
     }
 
-    fn from_result(mission: MissionScope, result: &AuthenticatedProbeResult) -> Self {
+    fn from_result(
+        mission: MissionScope,
+        result: &AuthenticatedProbeResult,
+        generation: u64,
+    ) -> Self {
         let availability_digest = digest_values([
             mission.digest().as_str(),
             result.result_digest(),
@@ -931,6 +1195,7 @@ impl MissionCapabilityAvailability {
             result.registry_digest(),
             result.contract_digest(),
             result.provider_digest(),
+            &generation.to_string(),
         ]);
         Self {
             mission,
@@ -947,6 +1212,7 @@ impl MissionCapabilityAvailability {
             provider_identity: result.provider_identity.clone(),
             provider_digest: result.provider_digest.clone(),
             observed_at: result.observed_at,
+            generation,
             availability_digest,
         }
     }
@@ -957,6 +1223,43 @@ impl MissionCapabilityAvailability {
 pub struct MissionCapabilityConsumer {
     mission: MissionScope,
     availability: BTreeMap<String, MissionCapabilityAvailability>,
+    generations: BTreeMap<String, u64>,
+    leases: BTreeMap<String, CapabilityLeaseRecord>,
+    invocations: BTreeMap<String, CapabilityInvocationRecord>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct CapabilityLeaseRecord {
+    lease: CapabilityAvailabilityLease,
+    in_flight: bool,
+}
+
+impl fmt::Debug for CapabilityLeaseRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapabilityLeaseRecord")
+            .field("lease", &self.lease)
+            .field("in_flight", &self.in_flight)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct CapabilityInvocationRecord {
+    lease_id: String,
+    generation: u64,
+    started_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for CapabilityInvocationRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapabilityInvocationRecord")
+            .field("lease_id", &"[REDACTED]")
+            .field("generation", &self.generation)
+            .field("started_at", &self.started_at)
+            .finish()
+    }
 }
 
 impl MissionCapabilityConsumer {
@@ -964,6 +1267,9 @@ impl MissionCapabilityConsumer {
         Self {
             mission,
             availability: BTreeMap::new(),
+            generations: BTreeMap::new(),
+            leases: BTreeMap::new(),
+            invocations: BTreeMap::new(),
         }
     }
 
@@ -976,14 +1282,37 @@ impl MissionCapabilityConsumer {
         result: &AuthenticatedProbeResult,
         at: DateTime<Utc>,
     ) -> Result<MissionCapabilityAvailability, AuthenticatedProbeError> {
+        self.refresh(result, at)
+    }
+
+    /// Replaces the current availability for the exact provider scope and
+    /// increments its generation, invalidating every older lease first.
+    pub fn refresh(
+        &mut self,
+        result: &AuthenticatedProbeResult,
+        at: DateTime<Utc>,
+    ) -> Result<MissionCapabilityAvailability, AuthenticatedProbeError> {
         result.validate_integrity()?;
-        result.validate_live_at(at)?;
         if result.scope.tenant_id() != self.mission.tenant_id
             || result.scope.project_id() != self.mission.project_id
         {
             return Err(AuthenticatedProbeError::MissionScopeMismatch);
         }
-        let availability = MissionCapabilityAvailability::from_result(self.mission.clone(), result);
+        let source_scope_digest = result.scope.digest();
+        if let Err(error) = result.validate_live_at(at) {
+            self.invalidate_source(&source_scope_digest);
+            return Err(error);
+        }
+        self.invalidate_source(&source_scope_digest);
+        let generation = self
+            .generations
+            .get(&source_scope_digest)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.generations.insert(source_scope_digest, generation);
+        let availability =
+            MissionCapabilityAvailability::from_result(self.mission.clone(), result, generation);
         self.availability
             .insert(result.result_id.clone(), availability.clone());
         Ok(availability)
@@ -1001,6 +1330,14 @@ impl MissionCapabilityConsumer {
         self.availability.len()
     }
 
+    pub fn active_lease_count(&self) -> usize {
+        self.leases.len()
+    }
+
+    pub fn in_flight_invocation_count(&self) -> usize {
+        self.invocations.len()
+    }
+
     pub fn supports(&self, capability: &ProviderCapabilityKey, at: DateTime<Utc>) -> bool {
         self.availability
             .values()
@@ -1009,30 +1346,277 @@ impl MissionCapabilityConsumer {
 
     /// Reclaims expired or exhausted availability projections.
     pub fn reclaim_expired(&mut self, at: DateTime<Utc>) -> usize {
+        let expired_sources = self
+            .availability
+            .values()
+            .filter(|availability| !availability.is_live_at(at))
+            .map(|availability| availability.scope.digest())
+            .collect::<BTreeSet<_>>();
         let before = self.availability.len();
-        self.availability
-            .retain(|_, availability| availability.is_live_at(at));
+        for source in expired_sources {
+            self.invalidate_source(&source);
+        }
+        let expired_leases = self
+            .leases
+            .values()
+            .filter(|record| at >= record.lease.expires_at())
+            .map(|record| record.lease.lease_id.clone())
+            .collect::<Vec<_>>();
+        for lease_id in expired_leases {
+            self.invalidate_lease(&lease_id);
+        }
         before - self.availability.len()
+    }
+
+    /// Produces a lease only from the currently accepted result and only when
+    /// every scope, provider digest, freshness, quota, cost, and capability
+    /// requirement is exact.
+    pub fn issue_lease(
+        &mut self,
+        result: &AuthenticatedProbeResult,
+        request: &CapabilityAvailabilityRequest,
+        at: DateTime<Utc>,
+    ) -> Result<CapabilityAvailabilityLease, AuthenticatedProbeError> {
+        if request.mission != self.mission {
+            return Err(AuthenticatedProbeError::MissionScopeMismatch);
+        }
+        if result.scope() != request.scope() {
+            return Err(AuthenticatedProbeError::ScopeMismatch);
+        }
+        if result.provider_digest() != request.provider_digest() {
+            return Err(AuthenticatedProbeError::ProviderDigestMismatch);
+        }
+        if !result
+            .capabilities()
+            .contains(request.requested_capability())
+        {
+            return Err(AuthenticatedProbeError::RequestedCapabilityMismatch);
+        }
+        if let Err(error) = result.validate_live_at(at) {
+            self.invalidate_source(&result.scope.digest());
+            return Err(error);
+        }
+        let availability = self
+            .availability
+            .get(result.result_id())
+            .ok_or(AuthenticatedProbeError::AvailabilityNotAccepted)?;
+        if availability.source_result_digest() != result.result_digest()
+            || availability.scope() != result.scope()
+            || availability.provider_digest() != result.provider_digest()
+            || availability.generation() == 0
+        {
+            return Err(AuthenticatedProbeError::AvailabilityNotAccepted);
+        }
+        let expires_at = at
+            .checked_add_signed(request.lease_ttl())
+            .ok_or(AuthenticatedProbeError::InvalidAvailabilityRequest)?;
+        if expires_at > result.freshness().valid_until() {
+            return Err(AuthenticatedProbeError::FreshnessInsufficient);
+        }
+        let quota_remaining = result.quota().limit().saturating_sub(result.quota().used());
+        if quota_remaining < request.quota_units() {
+            return Err(AuthenticatedProbeError::QuotaExhausted);
+        }
+        let cost_remaining = result
+            .cost()
+            .limit_minor()
+            .saturating_sub(result.cost().used_minor());
+        if cost_remaining < request.cost_minor() {
+            return Err(AuthenticatedProbeError::CostExhausted);
+        }
+        let lease_id = new_opaque_id(&self.leases)?;
+        let lease = CapabilityAvailabilityLease {
+            lease_id: lease_id.clone(),
+            mission: request.mission.clone(),
+            scope: result.scope.clone(),
+            provider_digest: result.provider_digest.clone(),
+            requested_capability: request.requested_capability.clone(),
+            source_result_digest: result.result_digest.clone(),
+            availability_digest: availability.availability_digest.clone(),
+            generation: availability.generation,
+            issued_at: at,
+            expires_at,
+        };
+        self.leases.insert(
+            lease_id,
+            CapabilityLeaseRecord {
+                lease: lease.clone(),
+                in_flight: false,
+            },
+        );
+        Ok(lease)
+    }
+
+    /// Consumes a lease for one in-flight invocation.
+    pub fn begin_invoke(
+        &mut self,
+        lease: &CapabilityAvailabilityLease,
+        at: DateTime<Utc>,
+    ) -> Result<CapabilityInvocation, AuthenticatedProbeError> {
+        let lease_id = lease.lease_id.clone();
+        let record = self
+            .leases
+            .get(&lease_id)
+            .ok_or(AuthenticatedProbeError::LeaseNotFound)?;
+        if record.lease != *lease {
+            return Err(AuthenticatedProbeError::LeaseInvalidated);
+        }
+        if record.in_flight {
+            return Err(AuthenticatedProbeError::LeaseInFlight);
+        }
+        if at < lease.issued_at() || at >= lease.expires_at() {
+            self.invalidate_lease(&lease_id);
+            return Err(AuthenticatedProbeError::LeaseExpired);
+        }
+        let availability = self
+            .availability
+            .values()
+            .find(|availability| {
+                availability.availability_digest() == lease.availability_digest()
+                    && availability.generation() == lease.generation()
+                    && availability.scope() == lease.scope()
+            })
+            .cloned()
+            .ok_or_else(|| {
+                self.invalidate_lease(&lease_id);
+                AuthenticatedProbeError::LeaseInvalidated
+            })?;
+        if !availability.is_live_at(at) {
+            let error = availability_liveness_error(&availability, at);
+            self.invalidate_source(&availability.scope.digest());
+            return Err(error);
+        }
+        if !availability
+            .capabilities()
+            .contains(lease.requested_capability())
+        {
+            self.invalidate_lease(&lease_id);
+            return Err(AuthenticatedProbeError::RequestedCapabilityMismatch);
+        }
+        let invocation_id = new_opaque_id(&self.invocations)?;
+        self.leases
+            .get_mut(&lease_id)
+            .ok_or(AuthenticatedProbeError::LeaseNotFound)?
+            .in_flight = true;
+        self.invocations.insert(
+            invocation_id.clone(),
+            CapabilityInvocationRecord {
+                lease_id,
+                generation: lease.generation(),
+                started_at: at,
+            },
+        );
+        Ok(CapabilityInvocation {
+            invocation_id,
+            lease_id: lease.lease_id.clone(),
+            generation: lease.generation(),
+            started_at: at,
+            expires_at: lease.expires_at(),
+        })
+    }
+
+    /// Releases a normally completed invocation.  The lease may be consumed
+    /// again until its expiry; a refresh or revocation removes it entirely.
+    pub fn end_invoke(
+        &mut self,
+        invocation: CapabilityInvocation,
+        at: DateTime<Utc>,
+    ) -> Result<(), AuthenticatedProbeError> {
+        let CapabilityInvocation {
+            invocation_id,
+            lease_id,
+            generation,
+            started_at,
+            expires_at: _,
+        } = invocation;
+        let record = self
+            .invocations
+            .remove(&invocation_id)
+            .ok_or(AuthenticatedProbeError::InvocationNotFound)?;
+        if record.lease_id != lease_id
+            || record.generation != generation
+            || record.started_at != started_at
+        {
+            return Err(AuthenticatedProbeError::InvocationInvalidated);
+        }
+        let lease_record = self
+            .leases
+            .get(&record.lease_id)
+            .ok_or(AuthenticatedProbeError::LeaseInvalidated)?;
+        if !lease_record.in_flight {
+            return Err(AuthenticatedProbeError::InvocationInvalidated);
+        }
+        if at < record.started_at {
+            if let Some(lease_record) = self.leases.get_mut(&record.lease_id) {
+                lease_record.in_flight = false;
+            }
+            return Err(AuthenticatedProbeError::InvalidInvocationTime);
+        }
+        if at >= lease_record.lease.expires_at() {
+            let lease_id = lease_record.lease.lease_id.clone();
+            self.invalidate_lease(&lease_id);
+            return Err(AuthenticatedProbeError::LeaseExpired);
+        }
+        self.leases
+            .get_mut(&record.lease_id)
+            .ok_or(AuthenticatedProbeError::LeaseInvalidated)?
+            .in_flight = false;
+        Ok(())
     }
 
     /// Removes every availability sourced from one service mount.
     pub fn unmount(&mut self, mount_digest: &str) -> usize {
+        let sources = self
+            .availability
+            .values()
+            .filter(|availability| availability.source_mount_digest() == mount_digest)
+            .map(|availability| availability.scope.digest())
+            .collect::<BTreeSet<_>>();
         let before = self.availability.len();
-        self.availability
-            .retain(|_, availability| availability.source_mount_digest() != mount_digest);
+        for source in sources {
+            self.invalidate_source(&source);
+        }
         before - self.availability.len()
     }
 
     /// Removes every availability for the exact revoked provider scope.
     pub fn revoke(&mut self, scope: &ConnectorScope) -> usize {
         let before = self.availability.len();
-        self.availability
-            .retain(|_, availability| availability.scope() != scope);
+        self.invalidate_source(&scope.digest());
         before - self.availability.len()
+    }
+
+    /// Fences all existing leases when the provider reports quota exhaustion.
+    pub fn invalidate_quota(&mut self, scope: &ConnectorScope) -> usize {
+        self.revoke(scope)
     }
 
     pub fn clear(&mut self) {
         self.availability.clear();
+        self.leases.clear();
+        self.invocations.clear();
+    }
+
+    fn invalidate_source(&mut self, source_scope_digest: &str) {
+        self.availability
+            .retain(|_, availability| availability.scope.digest() != source_scope_digest);
+        let invalidated_leases = self
+            .leases
+            .iter()
+            .filter(|(_, record)| record.lease.scope.digest() == source_scope_digest)
+            .map(|(lease_id, _)| lease_id.clone())
+            .collect::<BTreeSet<_>>();
+        for lease_id in &invalidated_leases {
+            self.leases.remove(lease_id);
+        }
+        self.invocations
+            .retain(|_, invocation| !invalidated_leases.contains(&invocation.lease_id));
+    }
+
+    fn invalidate_lease(&mut self, lease_id: &str) {
+        self.leases.remove(lease_id);
+        self.invocations
+            .retain(|_, invocation| invocation.lease_id != lease_id);
     }
 }
 
@@ -1489,6 +2073,8 @@ pub enum AuthenticatedProbeError {
     FixtureEvidence,
     #[error("provider probe scope drifted")]
     ScopeDrift,
+    #[error("requested capability scope does not match authenticated availability")]
+    ScopeMismatch,
     #[error("provider capability is not registered")]
     CapabilityNotRegistered,
     #[error("provider probe has expired")]
@@ -1503,6 +2089,30 @@ pub enum AuthenticatedProbeError {
     ProviderRevokeFailed,
     #[error("Mission scope does not match the authenticated probe")]
     MissionScopeMismatch,
+    #[error("capability availability request is invalid")]
+    InvalidAvailabilityRequest,
+    #[error("requested capability does not match authenticated availability")]
+    RequestedCapabilityMismatch,
+    #[error("provider digest does not match authenticated availability")]
+    ProviderDigestMismatch,
+    #[error("Mission capability availability was not accepted")]
+    AvailabilityNotAccepted,
+    #[error("probe freshness is insufficient for the requested lease")]
+    FreshnessInsufficient,
+    #[error("capability lease was not found")]
+    LeaseNotFound,
+    #[error("capability lease was invalidated")]
+    LeaseInvalidated,
+    #[error("capability lease is already in flight")]
+    LeaseInFlight,
+    #[error("capability lease has expired")]
+    LeaseExpired,
+    #[error("capability invocation was not found")]
+    InvocationNotFound,
+    #[error("capability invocation was invalidated")]
+    InvocationInvalidated,
+    #[error("capability invocation ended outside its valid time")]
+    InvalidInvocationTime,
     #[error("secure handle generation failed")]
     EntropyUnavailable,
 }
@@ -1521,6 +2131,10 @@ fn lifecycle_request(mount: &MountedProbe, at: DateTime<Utc>) -> ProbeLifecycleR
 fn new_handle(
     mounts: &BTreeMap<String, MountedProbe>,
 ) -> Result<AuthenticatedProbeHandle, AuthenticatedProbeError> {
+    Ok(AuthenticatedProbeHandle(new_opaque_id(mounts)?))
+}
+
+fn new_opaque_id<T>(occupied: &BTreeMap<String, T>) -> Result<String, AuthenticatedProbeError> {
     let random = SystemRandom::new();
     for _ in 0..4 {
         let mut bytes = [0_u8; HANDLE_BYTES];
@@ -1528,11 +2142,26 @@ fn new_handle(
             .fill(&mut bytes)
             .map_err(|_| AuthenticatedProbeError::EntropyUnavailable)?;
         let candidate = super::hex_encode(&bytes);
-        if !mounts.contains_key(&candidate) {
-            return Ok(AuthenticatedProbeHandle(candidate));
+        if !occupied.contains_key(&candidate) {
+            return Ok(candidate);
         }
     }
     Err(AuthenticatedProbeError::EntropyUnavailable)
+}
+
+fn availability_liveness_error(
+    availability: &MissionCapabilityAvailability,
+    at: DateTime<Utc>,
+) -> AuthenticatedProbeError {
+    if at < availability.observed_at() || at >= availability.freshness().valid_until() {
+        AuthenticatedProbeError::ProbeExpired
+    } else if availability.quota().used() >= availability.quota().limit() {
+        AuthenticatedProbeError::QuotaExhausted
+    } else if availability.cost().used_minor() >= availability.cost().limit_minor() {
+        AuthenticatedProbeError::CostExhausted
+    } else {
+        AuthenticatedProbeError::LeaseInvalidated
+    }
 }
 
 fn map_connector_error(error: &ConnectorError) -> AuthenticatedProbeError {
@@ -1792,6 +2421,23 @@ mod tests {
         MissionScope::new("tenant-test", "project-test", "mission-test", 7).expect("mission")
     }
 
+    fn requested_capability() -> ProviderCapabilityKey {
+        ProviderCapabilityKey::new(PROVIDER_ID, "research.discover").expect("capability")
+    }
+
+    fn availability_request(result: &AuthenticatedProbeResult) -> CapabilityAvailabilityRequest {
+        CapabilityAvailabilityRequest::new(
+            mission(),
+            result.scope().clone(),
+            result.provider_digest(),
+            requested_capability(),
+            Duration::seconds(10),
+            1,
+            1,
+        )
+        .expect("availability request")
+    }
+
     #[test]
     fn authenticated_probe_returns_scoped_result_and_resolves_reference_without_write_effect() {
         let at = now();
@@ -1882,8 +2528,252 @@ mod tests {
             consumer.accept(&result, expired),
             Err(AuthenticatedProbeError::ProbeExpired)
         );
-        assert_eq!(consumer.reclaim_expired(expired), 1);
+        assert_eq!(consumer.reclaim_expired(expired), 0);
         assert_eq!(consumer.availability_count(), 0);
+    }
+
+    #[test]
+    fn exact_authenticated_result_issues_generation_fenced_lease_and_releases_on_end() {
+        let at = now();
+        let mut service = service();
+        let handle = service.mount(scope(), secret(), at).expect("mount");
+        let result = service
+            .probe(&handle, at + Duration::seconds(1))
+            .expect("probe");
+        let mut consumer = MissionCapabilityConsumer::new(mission());
+        let availability = consumer
+            .refresh(&result, at + Duration::seconds(2))
+            .expect("refresh");
+        let request = availability_request(&result);
+        let lease = consumer
+            .issue_lease(&result, &request, at + Duration::seconds(3))
+            .expect("lease");
+
+        assert_eq!(availability.generation(), 1);
+        assert_eq!(lease.generation(), 1);
+        assert_eq!(lease.expires_at(), at + Duration::seconds(13));
+        assert_eq!(consumer.active_lease_count(), 1);
+        assert!(!format!("{lease:?}").contains(&lease.digest()));
+
+        let invocation = consumer
+            .begin_invoke(&lease, at + Duration::seconds(4))
+            .expect("begin");
+        let stale_invocation = invocation.clone();
+        assert_eq!(consumer.in_flight_invocation_count(), 1);
+        assert_eq!(
+            consumer.begin_invoke(&lease, at + Duration::seconds(5)),
+            Err(AuthenticatedProbeError::LeaseInFlight)
+        );
+        consumer
+            .end_invoke(invocation, at + Duration::seconds(6))
+            .expect("end");
+        assert_eq!(consumer.in_flight_invocation_count(), 0);
+        assert_eq!(
+            consumer.end_invoke(stale_invocation, at + Duration::seconds(6)),
+            Err(AuthenticatedProbeError::InvocationNotFound)
+        );
+
+        let second_invocation = consumer
+            .begin_invoke(&lease, at + Duration::seconds(7))
+            .expect("released lease can be invoked again");
+        consumer
+            .end_invoke(second_invocation, at + Duration::seconds(8))
+            .expect("second end");
+        assert_eq!(
+            consumer.begin_invoke(&lease, at + Duration::seconds(13)),
+            Err(AuthenticatedProbeError::LeaseExpired)
+        );
+        assert_eq!(consumer.active_lease_count(), 0);
+    }
+
+    #[test]
+    fn lease_requires_exact_scope_provider_digest_and_requested_capability() {
+        let at = now();
+        let mut service = service();
+        let handle = service.mount(scope(), secret(), at).expect("mount");
+        let result = service
+            .probe(&handle, at + Duration::seconds(1))
+            .expect("probe");
+        let mut consumer = MissionCapabilityConsumer::new(mission());
+        consumer
+            .accept(&result, at + Duration::seconds(2))
+            .expect("accept");
+
+        let wrong_digest = CapabilityAvailabilityRequest::new(
+            mission(),
+            result.scope().clone(),
+            super::digest_values(["wrong-provider-digest"]),
+            requested_capability(),
+            Duration::seconds(10),
+            1,
+            1,
+        )
+        .expect("wrong digest request shape");
+        assert_eq!(
+            consumer.issue_lease(&result, &wrong_digest, at + Duration::seconds(3)),
+            Err(AuthenticatedProbeError::ProviderDigestMismatch)
+        );
+
+        let wrong_capability =
+            ProviderCapabilityKey::new(PROVIDER_ID, "research.other").expect("wrong capability");
+        let wrong_capability_request = CapabilityAvailabilityRequest::new(
+            mission(),
+            result.scope().clone(),
+            result.provider_digest(),
+            wrong_capability,
+            Duration::seconds(10),
+            1,
+            1,
+        )
+        .expect("wrong capability request shape");
+        assert_eq!(
+            consumer.issue_lease(
+                &result,
+                &wrong_capability_request,
+                at + Duration::seconds(3)
+            ),
+            Err(AuthenticatedProbeError::RequestedCapabilityMismatch)
+        );
+
+        let wrong_scope = ConnectorScope::new(
+            "tenant-test",
+            "project-test",
+            PROVIDER_ID,
+            "account-other",
+            ["research.discover".to_owned()],
+        )
+        .expect("wrong account scope");
+        let wrong_scope_request = CapabilityAvailabilityRequest::new(
+            mission(),
+            wrong_scope,
+            result.provider_digest(),
+            requested_capability(),
+            Duration::seconds(10),
+            1,
+            1,
+        )
+        .expect("wrong scope request shape");
+        assert_eq!(
+            consumer.issue_lease(&result, &wrong_scope_request, at + Duration::seconds(3)),
+            Err(AuthenticatedProbeError::ScopeMismatch)
+        );
+    }
+
+    #[test]
+    fn probe_refresh_increments_generation_and_invalidates_old_lease_and_invocation() {
+        let at = now();
+        let mut service = service();
+        let handle = service.mount(scope(), secret(), at).expect("mount");
+        let first_result = service
+            .probe(&handle, at + Duration::seconds(1))
+            .expect("first probe");
+        let mut consumer = MissionCapabilityConsumer::new(mission());
+        consumer
+            .refresh(&first_result, at + Duration::seconds(2))
+            .expect("first refresh");
+        let first_lease = consumer
+            .issue_lease(
+                &first_result,
+                &availability_request(&first_result),
+                at + Duration::seconds(3),
+            )
+            .expect("first lease");
+        let old_invocation = consumer
+            .begin_invoke(&first_lease, at + Duration::seconds(4))
+            .expect("old invocation");
+
+        let refreshed_result = service
+            .probe(&handle, at + Duration::seconds(5))
+            .expect("refreshed probe");
+        let refreshed = consumer
+            .refresh(&refreshed_result, at + Duration::seconds(6))
+            .expect("second refresh");
+        assert_eq!(refreshed.generation(), 2);
+        assert_eq!(consumer.active_lease_count(), 0);
+        assert_eq!(consumer.in_flight_invocation_count(), 0);
+        assert_eq!(
+            consumer.begin_invoke(&first_lease, at + Duration::seconds(7)),
+            Err(AuthenticatedProbeError::LeaseNotFound)
+        );
+        assert_eq!(
+            consumer.end_invoke(old_invocation, at + Duration::seconds(7)),
+            Err(AuthenticatedProbeError::InvocationNotFound)
+        );
+
+        let second_lease = consumer
+            .issue_lease(
+                &refreshed_result,
+                &availability_request(&refreshed_result),
+                at + Duration::seconds(7),
+            )
+            .expect("second lease");
+        assert_eq!(second_lease.generation(), 2);
+    }
+
+    #[test]
+    fn revoke_unmount_and_quota_exhaustion_invalidate_old_leases() {
+        let at = now();
+        let mut service = service();
+        let handle = service.mount(scope(), secret(), at).expect("mount");
+        let result = service
+            .probe(&handle, at + Duration::seconds(1))
+            .expect("probe");
+        let mut consumer = MissionCapabilityConsumer::new(mission());
+        consumer
+            .accept(&result, at + Duration::seconds(2))
+            .expect("accept");
+        let lease = consumer
+            .issue_lease(
+                &result,
+                &availability_request(&result),
+                at + Duration::seconds(3),
+            )
+            .expect("lease");
+
+        assert_eq!(consumer.invalidate_quota(&scope()), 1);
+        assert_eq!(consumer.active_lease_count(), 0);
+        assert_eq!(
+            consumer.begin_invoke(&lease, at + Duration::seconds(4)),
+            Err(AuthenticatedProbeError::LeaseNotFound)
+        );
+
+        let refreshed_result = service
+            .probe(&handle, at + Duration::seconds(5))
+            .expect("refresh probe");
+        consumer
+            .refresh(&refreshed_result, at + Duration::seconds(6))
+            .expect("refresh");
+        let refreshed_lease = consumer
+            .issue_lease(
+                &refreshed_result,
+                &availability_request(&refreshed_result),
+                at + Duration::seconds(7),
+            )
+            .expect("refreshed lease");
+        assert_eq!(consumer.unmount(refreshed_result.mount_digest()), 1);
+        assert_eq!(
+            consumer.begin_invoke(&refreshed_lease, at + Duration::seconds(8)),
+            Err(AuthenticatedProbeError::LeaseNotFound)
+        );
+
+        let final_result = service
+            .probe(&handle, at + Duration::seconds(9))
+            .expect("final probe");
+        consumer
+            .accept(&final_result, at + Duration::seconds(10))
+            .expect("final accept");
+        let final_lease = consumer
+            .issue_lease(
+                &final_result,
+                &availability_request(&final_result),
+                at + Duration::seconds(11),
+            )
+            .expect("final lease");
+        assert_eq!(consumer.revoke(&scope()), 1);
+        assert_eq!(
+            consumer.begin_invoke(&final_lease, at + Duration::seconds(12)),
+            Err(AuthenticatedProbeError::LeaseNotFound)
+        );
     }
 
     #[test]

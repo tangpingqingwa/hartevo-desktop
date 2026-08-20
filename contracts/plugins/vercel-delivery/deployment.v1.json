@@ -1,0 +1,57 @@
+{
+  "schemaVersion": "hartevo-vercel-delivery-plugin-contract/v1",
+  "contractVersion": "vercel-delivery-layer1/v1",
+  "layer": 1,
+  "evidenceLevel": "E1",
+  "plugin": {
+    "id": "hartevo.vercel-delivery",
+    "version": "vercel-delivery/v1",
+    "registration": {
+      "versionBound": true,
+      "digestBound": true,
+      "scopeBound": true,
+      "reversible": true
+    }
+  },
+  "service": {
+    "id": "DeploymentService",
+    "provider": "VercelDeploymentProvider",
+    "consumer": "MissionSelectedResultConsumer",
+    "operations": [
+      "probe_team_project",
+      "read_deployments",
+      "read_deployment",
+      "read_deployment_events",
+      "propose_preview"
+    ]
+  },
+  "provider": {
+    "id": "vercel",
+    "adapterId": "deployment.vercel",
+    "adapterVersion": 1,
+    "officialApiBaseUrl": "https://api.vercel.com",
+    "authentication": "bearer_token_reference_only",
+    "readOnly": true,
+    "externalWrites": false,
+    "deploymentCreation": "forbidden_in_layer_1",
+    "forbiddenAuthorities": [
+      "store",
+      "keyring",
+      "browser_profile",
+      "domain_mutation",
+      "environment_variable_mutation",
+      "deployment_creation"
+    ]
+  },
+  "target": {
+    "environment": "preview",
+    "scope": ["team", "project", "hartevo_project", "mission"]
+  },
+  "states": ["queued", "building", "ready", "error", "cancelled"],
+  "nativeBoundary": {
+    "productionProviderOnly": true,
+    "loopbackIsNative": false,
+    "fixtureIsNative": false,
+    "blockedEnvIsConnected": false
+  }
+}

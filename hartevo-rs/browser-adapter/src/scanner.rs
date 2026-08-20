@@ -4,6 +4,8 @@
 //! a malware engine and does not turn fixture verdicts into production malware
 //! evidence.
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -27,9 +29,9 @@ use crate::file_broker::{FileSafetyScanner, FileScanDecision, FileScanReport, Fi
 use crate::workspace::{digest, digest_json, is_bounded_identifier, is_sha256};
 use crate::{BrowserError, BrowserFileType};
 
-const SCANNER_PROTOCOL: &str = "hartevo-file-scanner-process/v2";
-const VERSION_OPERATION: &str = "version-v2";
-const SCAN_OPERATION: &str = "scan-v2";
+const SCANNER_PROTOCOL: &str = "hartevo-file-scanner-process/v3";
+const VERSION_OPERATION: &str = "version-v3";
+const SCAN_OPERATION: &str = "scan-v3";
 const SCANNER_INPUT_FD: i32 = 3;
 const MAX_PROCESS_TIMEOUT: Duration = Duration::from_mins(5);
 const MIN_OUTPUT_BYTES: usize = 64;
@@ -40,12 +42,16 @@ const READER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const EXECUTABLE_COPY_MODE: u32 = 0o500;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
-/// Exact scanner release and executable digest accepted by the process boundary.
+/// Exact scanner release, executable, and policy accepted by the process boundary.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ScannerReleasePin {
     scanner_id: String,
     scanner_version: String,
     executable_sha256: String,
+    policy_version: String,
+    ruleset_sha256: String,
+    config_sha256: String,
+    policy_digest: String,
     release_digest: String,
 }
 
@@ -54,26 +60,46 @@ impl ScannerReleasePin {
         scanner_id: impl Into<String>,
         scanner_version: impl Into<String>,
         executable_sha256: impl Into<String>,
+        policy_version: impl Into<String>,
+        ruleset_sha256: impl Into<String>,
+        config_sha256: impl Into<String>,
     ) -> Result<Self, BrowserError> {
         let scanner_id = scanner_id.into();
         let scanner_version = scanner_version.into();
         let executable_sha256 = executable_sha256.into();
+        let policy_version = policy_version.into();
+        let ruleset_sha256 = ruleset_sha256.into();
+        let config_sha256 = config_sha256.into();
         if !valid_release_identifier(&scanner_id)
             || !valid_release_identifier(&scanner_version)
             || !is_sha256(&executable_sha256)
+            || !valid_release_identifier(&policy_version)
+            || !is_sha256(&ruleset_sha256)
+            || !is_sha256(&config_sha256)
         {
             return Err(BrowserError::FileScanUnavailable);
         }
+        let policy_digest = digest_json(&serde_json::json!({
+            "protocol": SCANNER_PROTOCOL,
+            "policyVersion": policy_version,
+            "rulesetSha256": ruleset_sha256,
+            "configSha256": config_sha256,
+        }))?;
         let release_digest = digest_json(&serde_json::json!({
             "protocol": SCANNER_PROTOCOL,
             "scannerId": scanner_id,
             "scannerVersion": scanner_version,
             "executableSha256": executable_sha256,
+            "policyDigest": policy_digest,
         }))?;
         Ok(Self {
             scanner_id,
             scanner_version,
             executable_sha256,
+            policy_version,
+            ruleset_sha256,
+            config_sha256,
+            policy_digest,
             release_digest,
         })
     }
@@ -90,6 +116,22 @@ impl ScannerReleasePin {
         &self.executable_sha256
     }
 
+    pub fn policy_version(&self) -> &str {
+        &self.policy_version
+    }
+
+    pub fn ruleset_sha256(&self) -> &str {
+        &self.ruleset_sha256
+    }
+
+    pub fn config_sha256(&self) -> &str {
+        &self.config_sha256
+    }
+
+    pub fn policy_digest(&self) -> &str {
+        &self.policy_digest
+    }
+
     pub fn release_digest(&self) -> &str {
         &self.release_digest
     }
@@ -99,6 +141,9 @@ impl ScannerReleasePin {
             self.scanner_id.clone(),
             self.scanner_version.clone(),
             self.executable_sha256.clone(),
+            self.policy_version.clone(),
+            self.ruleset_sha256.clone(),
+            self.config_sha256.clone(),
         )? != *self
         {
             return Err(BrowserError::FileScanUnavailable);
@@ -114,6 +159,10 @@ impl fmt::Debug for ScannerReleasePin {
             .field("scanner_id", &self.scanner_id)
             .field("scanner_version", &self.scanner_version)
             .field("executable_sha256", &self.executable_sha256)
+            .field("policy_version", &self.policy_version)
+            .field("ruleset_sha256", &self.ruleset_sha256)
+            .field("config_sha256", &self.config_sha256)
+            .field("policy_digest", &self.policy_digest)
             .field("release_digest", &self.release_digest)
             .finish()
     }
@@ -225,6 +274,7 @@ impl ProductionFileScanner {
             "protocol": SCANNER_PROTOCOL,
             "lifecycle": "scanner-process-root",
             "releaseDigest": release_pin.release_digest,
+            "policyDigest": release_pin.policy_digest,
             "executableIdentityDigest": executable_identity_digest,
         }))?;
         let mut scanner = Self {
@@ -248,7 +298,9 @@ impl ProductionFileScanner {
             "protocol": SCANNER_PROTOCOL,
             "operation": VERSION_OPERATION,
             "releaseDigest": scanner.release_pin.release_digest,
+            "policyDigest": scanner.release_pin.policy_digest,
             "executableIdentityDigest": scanner.executable_identity.evidence_digest()?,
+            "invocationContractDigest": probe.identity.launch.invocation_contract_digest,
             "launchIdentityDigest": probe.identity.launch.evidence_digest()?,
             "processObservationDigest": probe.evidence_digest()?,
             "response": {
@@ -256,6 +308,8 @@ impl ProductionFileScanner {
                 "scannerId": version.scanner_id,
                 "scannerVersion": version.scanner_version,
                 "executableSha256": version.executable_sha256,
+                "policyDigest": version.policy_digest,
+                "invocationDigest": version.invocation_digest,
                 "launchDigest": version.launch_digest,
             },
         }))?;
@@ -289,6 +343,14 @@ impl ProductionFileScanner {
             self.poison_process_boundary();
             return Err(BrowserError::FileScanUnavailable);
         };
+        let executable_identity_digest = executable_before.evidence_digest()?;
+        let invocation = ScannerInvocationContract::new(
+            &operation,
+            &self.release_pin,
+            &executable_identity_digest,
+            self.limits,
+        )?;
+        let invocation_contract_digest = invocation.evidence_digest()?;
         let run_directory = TempBuilder::new()
             .prefix("run-")
             .tempdir_in(&self.canonical_runtime_directory)?;
@@ -299,53 +361,68 @@ impl ProductionFileScanner {
         fs::create_dir(&temp_directory)?;
         set_private_directory(&home_directory)?;
         set_private_directory(&temp_directory)?;
+        let directories = ProcessDirectories {
+            working: run_directory.path(),
+            home: &home_directory,
+            temporary: &temp_directory,
+        };
 
         let operation_name = operation.name();
         let mut command = Command::new(&self.executable_path);
 
-        let launch = self.begin_process_launch(operation_name)?;
+        let launch = self.begin_process_launch(
+            operation_name,
+            &executable_identity_digest,
+            &invocation_contract_digest,
+        )?;
         configure_clean_process(
             &mut command,
-            run_directory.path(),
-            &home_directory,
-            &temp_directory,
+            directories.working,
+            directories.home,
+            directories.temporary,
             &self.release_pin,
             &launch,
+            &invocation_contract_digest,
         );
 
-        if let ProcessOperation::Scan { request, input } = operation {
-            command
-                .env("HARTEVO_SCANNER_INPUT_FD", SCANNER_INPUT_FD.to_string())
-                .env("HARTEVO_SCANNER_CONTENT_SHA256", request.content_digest)
-                .env("HARTEVO_SCANNER_BYTE_COUNT", request.byte_count.to_string())
-                .env(
-                    "HARTEVO_SCANNER_DETECTED_TYPE",
-                    file_type_protocol_name(request.detected_type),
-                )
-                .env(
-                    "HARTEVO_SCANNER_OBSERVED_AT",
-                    request.observed_at.to_rfc3339(),
-                );
-            if command
-                .fd_mappings(vec![FdMapping {
-                    parent_fd: OwnedFd::from(input),
-                    child_fd: SCANNER_INPUT_FD,
-                }])
-                .is_err()
-            {
-                let run_directory_removed = run_directory.close().is_ok();
-                let launch_finished = self.finish_process_launch(&launch).is_ok();
-                if !run_directory_removed || !launch_finished {
-                    self.poison_process_boundary();
-                }
-                return Err(BrowserError::FileScanUnavailable);
+        if configure_process_operation(&mut command, operation, &invocation).is_err() {
+            let run_directory_removed = run_directory.close().is_ok();
+            let launch_finished = self.finish_process_launch(&launch).is_ok();
+            if !run_directory_removed || !launch_finished {
+                self.poison_process_boundary();
             }
+            return Err(BrowserError::FileScanUnavailable);
+        }
+
+        if validate_configured_process(
+            &command,
+            &self.executable_path,
+            &directories,
+            &self.release_pin,
+            &launch,
+            &invocation,
+        )
+        .is_err()
+        {
+            let _ = run_directory.close();
+            let _ = self.finish_process_launch(&launch);
+            self.poison_process_boundary();
+            return Err(BrowserError::FileScanUnavailable);
         }
 
         let execution = execute_bounded_process(&mut command, self.limits, &launch);
+        let invocation_after = validate_configured_process(
+            &command,
+            &self.executable_path,
+            &directories,
+            &self.release_pin,
+            &launch,
+            &invocation,
+        );
         let run_directory_removed = run_directory.close().is_ok();
         let executable_after = self.verify_runtime_boundary();
         if execution.is_err()
+            || invocation_after.is_err()
             || !run_directory_removed
             || !matches!(
                 executable_after.as_ref(),
@@ -356,17 +433,25 @@ impl ProductionFileScanner {
             return Err(BrowserError::FileScanUnavailable);
         }
         let execution = execution.map_err(|_| BrowserError::FileScanUnavailable)?;
+        self.finish_process_execution(execution, &launch)
+    }
+
+    fn finish_process_execution(
+        &mut self,
+        execution: ProcessExecution,
+        launch: &ScannerProcessLaunch,
+    ) -> Result<ProcessObservation, BrowserError> {
         match execution {
             ProcessExecution::Completed(observation) => {
-                if !observation.identity.matches_launch(&launch) {
+                if !observation.identity.matches_launch(launch) {
                     self.poison_process_boundary();
                     return Err(BrowserError::FileScanUnavailable);
                 }
-                self.finish_process_launch(&launch)?;
+                self.finish_process_launch(launch)?;
                 Ok(*observation)
             }
             ProcessExecution::ContainedFailure => {
-                self.finish_process_launch(&launch)?;
+                self.finish_process_launch(launch)?;
                 Err(BrowserError::FileScanUnavailable)
             }
         }
@@ -375,6 +460,8 @@ impl ProductionFileScanner {
     fn begin_process_launch(
         &mut self,
         operation: &'static str,
+        executable_identity_digest: &str,
+        invocation_contract_digest: &str,
     ) -> Result<ScannerProcessLaunch, BrowserError> {
         if self.process_boundary_poisoned || self.active_launch_digest.is_some() {
             return Err(BrowserError::FileScanUnavailable);
@@ -387,7 +474,9 @@ impl ProductionFileScanner {
             generation,
             operation,
             &self.release_pin.release_digest,
-            &self.executable_identity.evidence_digest()?,
+            &self.release_pin.policy_digest,
+            executable_identity_digest,
+            invocation_contract_digest,
             &self.last_launch_digest,
         )?;
         self.process_generation = generation;
@@ -421,10 +510,12 @@ impl ProductionFileScanner {
         launch: &ScannerProcessLaunch,
         response: ScannerResponseIdentity<'_>,
     ) -> Result<(), BrowserError> {
-        if response.schema_version != 2
+        if response.schema_version != 3
             || response.scanner_id != self.release_pin.scanner_id
             || response.scanner_version != self.release_pin.scanner_version
             || response.executable_sha256 != self.release_pin.executable_sha256
+            || response.policy_digest != self.release_pin.policy_digest
+            || response.invocation_digest != launch.invocation_contract_digest
             || response.launch_digest != launch.launch_digest
         {
             self.poison_process_boundary();
@@ -516,8 +607,10 @@ impl FileSafetyScanner for ProductionFileScanner {
             "protocol": SCANNER_PROTOCOL,
             "operation": SCAN_OPERATION,
             "releaseDigest": self.release_pin.release_digest,
+            "policyDigest": self.release_pin.policy_digest,
             "versionProbeEvidenceDigest": self.version_probe_evidence_digest,
             "executableIdentityDigest": executable_identity_digest,
+            "invocationContractDigest": process.identity.launch.invocation_contract_digest,
             "launchIdentityDigest": process.identity.launch.evidence_digest()?,
             "request": {
                 "contentDigest": request.content_digest,
@@ -559,11 +652,154 @@ impl ProcessOperation<'_, '_> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct ScannerInvocationInput {
+    content_digest: String,
+    byte_count: u64,
+    detected_type: &'static str,
+    observed_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScannerInvocationContract {
+    operation: &'static str,
+    release_digest: String,
+    policy_digest: String,
+    executable_identity_digest: String,
+    timeout_milliseconds: u64,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+    input: Option<ScannerInvocationInput>,
+}
+
+impl ScannerInvocationContract {
+    fn new(
+        operation: &ProcessOperation<'_, '_>,
+        release_pin: &ScannerReleasePin,
+        executable_identity_digest: &str,
+        limits: ScannerProcessLimits,
+    ) -> Result<Self, BrowserError> {
+        release_pin.validate()?;
+        limits.validate()?;
+        if !is_sha256(executable_identity_digest) {
+            return Err(BrowserError::FileScanUnavailable);
+        }
+        let input = match operation {
+            ProcessOperation::Version => None,
+            ProcessOperation::Scan { request, .. } => {
+                if !is_sha256(request.content_digest) || request.byte_count == 0 {
+                    return Err(BrowserError::FileChanged);
+                }
+                Some(ScannerInvocationInput {
+                    content_digest: request.content_digest.to_owned(),
+                    byte_count: request.byte_count,
+                    detected_type: file_type_protocol_name(request.detected_type),
+                    observed_at: request.observed_at.to_rfc3339(),
+                })
+            }
+        };
+        Ok(Self {
+            operation: operation.name(),
+            release_digest: release_pin.release_digest.clone(),
+            policy_digest: release_pin.policy_digest.clone(),
+            executable_identity_digest: executable_identity_digest.to_owned(),
+            timeout_milliseconds: u64::try_from(limits.timeout.as_millis())
+                .map_err(|_| BrowserError::FileScanUnavailable)?,
+            max_stdout_bytes: limits.max_stdout_bytes,
+            max_stderr_bytes: limits.max_stderr_bytes,
+            input,
+        })
+    }
+
+    fn evidence_digest(&self) -> Result<String, BrowserError> {
+        let environment_keys = if self.input.is_some() {
+            vec![
+                "HARTEVO_SCANNER_BYTE_COUNT",
+                "HARTEVO_SCANNER_CONFIG_SHA256",
+                "HARTEVO_SCANNER_CONTENT_SHA256",
+                "HARTEVO_SCANNER_DETECTED_TYPE",
+                "HARTEVO_SCANNER_EXECUTABLE_SHA256",
+                "HARTEVO_SCANNER_ID",
+                "HARTEVO_SCANNER_INPUT_FD",
+                "HARTEVO_SCANNER_INVOCATION_DIGEST",
+                "HARTEVO_SCANNER_LAUNCH_DIGEST",
+                "HARTEVO_SCANNER_OBSERVED_AT",
+                "HARTEVO_SCANNER_OPERATION",
+                "HARTEVO_SCANNER_POLICY_DIGEST",
+                "HARTEVO_SCANNER_POLICY_VERSION",
+                "HARTEVO_SCANNER_PROCESS_GENERATION",
+                "HARTEVO_SCANNER_PROTOCOL",
+                "HARTEVO_SCANNER_RELEASE_DIGEST",
+                "HARTEVO_SCANNER_RULESET_SHA256",
+                "HARTEVO_SCANNER_VERSION",
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "TMPDIR",
+            ]
+        } else {
+            vec![
+                "HARTEVO_SCANNER_CONFIG_SHA256",
+                "HARTEVO_SCANNER_EXECUTABLE_SHA256",
+                "HARTEVO_SCANNER_ID",
+                "HARTEVO_SCANNER_INVOCATION_DIGEST",
+                "HARTEVO_SCANNER_LAUNCH_DIGEST",
+                "HARTEVO_SCANNER_OPERATION",
+                "HARTEVO_SCANNER_POLICY_DIGEST",
+                "HARTEVO_SCANNER_POLICY_VERSION",
+                "HARTEVO_SCANNER_PROCESS_GENERATION",
+                "HARTEVO_SCANNER_PROTOCOL",
+                "HARTEVO_SCANNER_RELEASE_DIGEST",
+                "HARTEVO_SCANNER_RULESET_SHA256",
+                "HARTEVO_SCANNER_VERSION",
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "TMPDIR",
+            ]
+        };
+        let input = self.input.as_ref().map(|input| {
+            serde_json::json!({
+                "fd": SCANNER_INPUT_FD,
+                "contentDigest": input.content_digest,
+                "byteCount": input.byte_count,
+                "detectedType": input.detected_type,
+                "observedAt": input.observed_at,
+            })
+        });
+        digest_json(&serde_json::json!({
+            "protocol": SCANNER_PROTOCOL,
+            "operation": self.operation,
+            "releaseDigest": self.release_digest,
+            "policyDigest": self.policy_digest,
+            "executableIdentityDigest": self.executable_identity_digest,
+            "arguments": [],
+            "workingDirectory": "private-per-launch",
+            "homeDirectory": "private-per-launch",
+            "temporaryDirectory": "private-per-launch",
+            "stdin": "null",
+            "stdout": {
+                "mode": "bounded-pipe",
+                "maximumBytes": self.max_stdout_bytes,
+            },
+            "stderr": {
+                "mode": "bounded-pipe",
+                "maximumBytes": self.max_stderr_bytes,
+            },
+            "timeoutMilliseconds": self.timeout_milliseconds,
+            "environmentKeys": environment_keys,
+            "input": input,
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ScannerProcessLaunch {
     generation: u64,
     operation: &'static str,
     release_digest: String,
+    policy_digest: String,
     executable_identity_digest: String,
+    invocation_contract_digest: String,
     previous_launch_digest: String,
     launch_digest: String,
 }
@@ -573,22 +809,36 @@ impl ScannerProcessLaunch {
         generation: u64,
         operation: &'static str,
         release_digest: &str,
+        policy_digest: &str,
         executable_identity_digest: &str,
+        invocation_contract_digest: &str,
         previous_launch_digest: &str,
     ) -> Result<Self, BrowserError> {
+        if !is_sha256(release_digest)
+            || !is_sha256(policy_digest)
+            || !is_sha256(executable_identity_digest)
+            || !is_sha256(invocation_contract_digest)
+            || !is_sha256(previous_launch_digest)
+        {
+            return Err(BrowserError::FileScanUnavailable);
+        }
         let launch_digest = digest_json(&serde_json::json!({
             "protocol": SCANNER_PROTOCOL,
             "generation": generation.to_string(),
             "operation": operation,
             "releaseDigest": release_digest,
+            "policyDigest": policy_digest,
             "executableIdentityDigest": executable_identity_digest,
+            "invocationContractDigest": invocation_contract_digest,
             "previousLaunchDigest": previous_launch_digest,
         }))?;
         Ok(Self {
             generation,
             operation,
             release_digest: release_digest.to_owned(),
+            policy_digest: policy_digest.to_owned(),
             executable_identity_digest: executable_identity_digest.to_owned(),
+            invocation_contract_digest: invocation_contract_digest.to_owned(),
             previous_launch_digest: previous_launch_digest.to_owned(),
             launch_digest,
         })
@@ -600,7 +850,9 @@ impl ScannerProcessLaunch {
             "generation": self.generation.to_string(),
             "operation": self.operation,
             "releaseDigest": self.release_digest,
+            "policyDigest": self.policy_digest,
             "executableIdentityDigest": self.executable_identity_digest,
+            "invocationContractDigest": self.invocation_contract_digest,
             "previousLaunchDigest": self.previous_launch_digest,
             "launchDigest": self.launch_digest,
         }))
@@ -633,6 +885,8 @@ struct VersionResponse {
     scanner_id: String,
     scanner_version: String,
     executable_sha256: String,
+    policy_digest: String,
+    invocation_digest: String,
     launch_digest: String,
 }
 
@@ -642,6 +896,8 @@ struct ScannerResponseIdentity<'response> {
     scanner_id: &'response str,
     scanner_version: &'response str,
     executable_sha256: &'response str,
+    policy_digest: &'response str,
+    invocation_digest: &'response str,
     launch_digest: &'response str,
 }
 
@@ -652,6 +908,8 @@ impl VersionResponse {
             scanner_id: &self.scanner_id,
             scanner_version: &self.scanner_version,
             executable_sha256: &self.executable_sha256,
+            policy_digest: &self.policy_digest,
+            invocation_digest: &self.invocation_digest,
             launch_digest: &self.launch_digest,
         }
     }
@@ -671,6 +929,8 @@ struct ScanResponse {
     scanner_id: String,
     scanner_version: String,
     executable_sha256: String,
+    policy_digest: String,
+    invocation_digest: String,
     launch_digest: String,
     decision: ScannerDecision,
 }
@@ -682,6 +942,8 @@ impl ScanResponse {
             scanner_id: &self.scanner_id,
             scanner_version: &self.scanner_version,
             executable_sha256: &self.executable_sha256,
+            policy_digest: &self.policy_digest,
+            invocation_digest: &self.invocation_digest,
             launch_digest: &self.launch_digest,
         }
     }
@@ -1040,6 +1302,7 @@ fn configure_clean_process(
     temp_directory: &Path,
     release_pin: &ScannerReleasePin,
     launch: &ScannerProcessLaunch,
+    invocation_contract_digest: &str,
 ) {
     command
         .current_dir(working_directory)
@@ -1061,13 +1324,115 @@ fn configure_clean_process(
             &release_pin.release_digest,
         )
         .env(
+            "HARTEVO_SCANNER_POLICY_VERSION",
+            &release_pin.policy_version,
+        )
+        .env(
+            "HARTEVO_SCANNER_RULESET_SHA256",
+            &release_pin.ruleset_sha256,
+        )
+        .env("HARTEVO_SCANNER_CONFIG_SHA256", &release_pin.config_sha256)
+        .env("HARTEVO_SCANNER_POLICY_DIGEST", &release_pin.policy_digest)
+        .env(
             "HARTEVO_SCANNER_PROCESS_GENERATION",
             launch.generation.to_string(),
         )
         .env("HARTEVO_SCANNER_LAUNCH_DIGEST", &launch.launch_digest)
+        .env(
+            "HARTEVO_SCANNER_INVOCATION_DIGEST",
+            invocation_contract_digest,
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+}
+
+fn configure_scan_input_environment(command: &mut Command, input: &ScannerInvocationInput) {
+    command
+        .env("HARTEVO_SCANNER_INPUT_FD", SCANNER_INPUT_FD.to_string())
+        .env("HARTEVO_SCANNER_CONTENT_SHA256", &input.content_digest)
+        .env("HARTEVO_SCANNER_BYTE_COUNT", input.byte_count.to_string())
+        .env("HARTEVO_SCANNER_DETECTED_TYPE", input.detected_type)
+        .env("HARTEVO_SCANNER_OBSERVED_AT", &input.observed_at);
+}
+
+fn configure_process_operation(
+    command: &mut Command,
+    operation: ProcessOperation<'_, '_>,
+    invocation: &ScannerInvocationContract,
+) -> Result<(), BrowserError> {
+    match operation {
+        ProcessOperation::Version if invocation.input.is_none() => Ok(()),
+        ProcessOperation::Version => Err(BrowserError::FileScanUnavailable),
+        ProcessOperation::Scan { input, .. } => {
+            let input_contract = invocation
+                .input
+                .as_ref()
+                .ok_or(BrowserError::FileScanUnavailable)?;
+            configure_scan_input_environment(command, input_contract);
+            command
+                .fd_mappings(vec![FdMapping {
+                    parent_fd: OwnedFd::from(input),
+                    child_fd: SCANNER_INPUT_FD,
+                }])
+                .map(|_| ())
+                .map_err(|_| BrowserError::FileScanUnavailable)
+        }
+    }
+}
+
+struct ProcessDirectories<'path> {
+    working: &'path Path,
+    home: &'path Path,
+    temporary: &'path Path,
+}
+
+fn validate_configured_process(
+    command: &Command,
+    executable_path: &Path,
+    directories: &ProcessDirectories<'_>,
+    release_pin: &ScannerReleasePin,
+    launch: &ScannerProcessLaunch,
+    invocation: &ScannerInvocationContract,
+) -> Result<(), BrowserError> {
+    let invocation_contract_digest = invocation.evidence_digest()?;
+    if invocation.operation != launch.operation
+        || invocation.release_digest != release_pin.release_digest
+        || invocation.policy_digest != release_pin.policy_digest
+        || invocation.executable_identity_digest != launch.executable_identity_digest
+        || invocation_contract_digest != launch.invocation_contract_digest
+    {
+        return Err(BrowserError::FileScanUnavailable);
+    }
+
+    let mut expected = Command::new(executable_path);
+    configure_clean_process(
+        &mut expected,
+        directories.working,
+        directories.home,
+        directories.temporary,
+        release_pin,
+        launch,
+        &invocation_contract_digest,
+    );
+    if let Some(input) = invocation.input.as_ref() {
+        configure_scan_input_environment(&mut expected, input);
+    }
+    if command.get_program() != expected.get_program()
+        || command.get_current_dir() != expected.get_current_dir()
+        || !command.get_args().eq(expected.get_args())
+        || command_environment(command) != command_environment(&expected)
+    {
+        return Err(BrowserError::FileScanUnavailable);
+    }
+    Ok(())
+}
+
+fn command_environment(command: &Command) -> BTreeMap<OsString, Option<OsString>> {
+    command
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(OsString::from)))
+        .collect()
 }
 
 fn parse_exact_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, BrowserError> {
@@ -1227,7 +1592,12 @@ struct ScannerResultEnvelope {
     scanner_id: String,
     scanner_version: String,
     executable_sha256: String,
+    policy_version: String,
+    ruleset_sha256: String,
+    config_sha256: String,
+    policy_digest: String,
     executable_identity_digest: String,
+    invocation_contract_digest: String,
     process_identity_digest: String,
     launch_identity_digest: String,
     exit: ExitObservation,
@@ -1257,17 +1627,21 @@ impl ScannerResultEnvelope {
             || !is_sha256(executable_identity_digest)
             || process.identity.launch.operation != SCAN_OPERATION
             || process.identity.launch.release_digest != release_pin.release_digest
+            || process.identity.launch.policy_digest != release_pin.policy_digest
             || process.identity.launch.executable_identity_digest != executable_identity_digest
+            || !is_sha256(&process.identity.launch.invocation_contract_digest)
         {
             return Err(BrowserError::FileScanUnavailable);
         }
 
         let response: ScanResponse = parse_exact_json(&process.stdout.retained)?;
         let identity = response.identity();
-        if identity.schema_version != 2
+        if identity.schema_version != 3
             || identity.scanner_id != release_pin.scanner_id
             || identity.scanner_version != release_pin.scanner_version
             || identity.executable_sha256 != release_pin.executable_sha256
+            || identity.policy_digest != release_pin.policy_digest
+            || identity.invocation_digest != process.identity.launch.invocation_contract_digest
             || identity.launch_digest != process.identity.launch.launch_digest
         {
             return Err(BrowserError::FileScanUnavailable);
@@ -1281,6 +1655,8 @@ impl ScannerResultEnvelope {
             "scannerId": response.scanner_id,
             "scannerVersion": response.scanner_version,
             "executableSha256": response.executable_sha256,
+            "policyDigest": response.policy_digest,
+            "invocationDigest": response.invocation_digest,
             "launchDigest": response.launch_digest,
             "decision": decision,
         }))?;
@@ -1290,7 +1666,12 @@ impl ScannerResultEnvelope {
             scanner_id: release_pin.scanner_id.clone(),
             scanner_version: release_pin.scanner_version.clone(),
             executable_sha256: release_pin.executable_sha256.clone(),
+            policy_version: release_pin.policy_version.clone(),
+            ruleset_sha256: release_pin.ruleset_sha256.clone(),
+            config_sha256: release_pin.config_sha256.clone(),
+            policy_digest: release_pin.policy_digest.clone(),
             executable_identity_digest: executable_identity_digest.to_owned(),
+            invocation_contract_digest: process.identity.launch.invocation_contract_digest.clone(),
             process_identity_digest: process.identity.evidence_digest()?,
             launch_identity_digest: process.identity.launch.evidence_digest()?,
             exit: process.status,
@@ -1314,7 +1695,12 @@ impl ScannerResultEnvelope {
             "scannerId": self.scanner_id,
             "scannerVersion": self.scanner_version,
             "executableSha256": self.executable_sha256,
+            "policyVersion": self.policy_version,
+            "rulesetSha256": self.ruleset_sha256,
+            "configSha256": self.config_sha256,
+            "policyDigest": self.policy_digest,
             "executableIdentityDigest": self.executable_identity_digest,
+            "invocationContractDigest": self.invocation_contract_digest,
             "processIdentityDigest": self.process_identity_digest,
             "launchIdentityDigest": self.launch_identity_digest,
             "exit": {
@@ -1346,9 +1732,17 @@ impl fmt::Debug for ScannerResultEnvelope {
             .field("scanner_id", &self.scanner_id)
             .field("scanner_version", &self.scanner_version)
             .field("executable_sha256", &self.executable_sha256)
+            .field("policy_version", &self.policy_version)
+            .field("ruleset_sha256", &self.ruleset_sha256)
+            .field("config_sha256", &self.config_sha256)
+            .field("policy_digest", &self.policy_digest)
             .field(
                 "executable_identity_digest",
                 &self.executable_identity_digest,
+            )
+            .field(
+                "invocation_contract_digest",
+                &self.invocation_contract_digest,
             )
             .field("process_identity_digest", &self.process_identity_digest)
             .field("launch_identity_digest", &self.launch_identity_digest)
@@ -1709,6 +2103,7 @@ mod tests {
 
     const FIXTURE_SCANNER_ID: &str = "fixture-process-boundary";
     const FIXTURE_SCANNER_VERSION: &str = "fixture-v1";
+    const FIXTURE_POLICY_VERSION: &str = "fixture-policy-v1";
     static SCANNER_PROCESS_TEST_LANE: Mutex<()> = Mutex::new(());
 
     fn sha(byte: char) -> String {
@@ -1849,13 +2244,15 @@ if [ "${{HARTEVO_SCANNER_PROTOCOL-}}" != "{SCANNER_PROTOCOL}" ]; then
   exit 80
 fi
 emit_version() {{
-  printf '{{"schemaVersion":2,"scannerId":"%s","scannerVersion":"%s","executableSha256":"%s","launchDigest":"%s"}}\n' \
+  printf '{{"schemaVersion":3,"scannerId":"%s","scannerVersion":"%s","executableSha256":"%s","policyDigest":"%s","invocationDigest":"%s","launchDigest":"%s"}}\n' \
     "{FIXTURE_SCANNER_ID}" "{FIXTURE_SCANNER_VERSION}" \
-    "$HARTEVO_SCANNER_EXECUTABLE_SHA256" "$HARTEVO_SCANNER_LAUNCH_DIGEST"
+    "$HARTEVO_SCANNER_EXECUTABLE_SHA256" "$HARTEVO_SCANNER_POLICY_DIGEST" \
+    "$HARTEVO_SCANNER_INVOCATION_DIGEST" "$HARTEVO_SCANNER_LAUNCH_DIGEST"
 }}
 emit_scan_with_identity() {{
-  printf '{{"schemaVersion":2,"scannerId":"%s","scannerVersion":"%s","executableSha256":"%s","launchDigest":"%s","decision":"%s"}}\n' \
-    "$1" "$2" "$3" "$4" "$5"
+  printf '{{"schemaVersion":3,"scannerId":"%s","scannerVersion":"%s","executableSha256":"%s","policyDigest":"%s","invocationDigest":"%s","launchDigest":"%s","decision":"%s"}}\n' \
+    "$1" "$2" "$3" "$HARTEVO_SCANNER_POLICY_DIGEST" \
+    "$HARTEVO_SCANNER_INVOCATION_DIGEST" "$4" "$5"
 }}
 emit_scan() {{
   emit_scan_with_identity "{FIXTURE_SCANNER_ID}" "{FIXTURE_SCANNER_VERSION}" \
@@ -1865,10 +2262,17 @@ emit_scan_with_launch() {{
   emit_scan_with_identity "{FIXTURE_SCANNER_ID}" "{FIXTURE_SCANNER_VERSION}" \
     "$HARTEVO_SCANNER_EXECUTABLE_SHA256" "$2" "$1"
 }}
-emit_scan_unknown() {{
-  printf '{{"schemaVersion":2,"scannerId":"%s","scannerVersion":"%s","executableSha256":"%s","launchDigest":"%s","decision":"%s","unknown":true}}\n' \
+emit_scan_with_contract() {{
+  printf '{{"schemaVersion":3,"scannerId":"%s","scannerVersion":"%s","executableSha256":"%s","policyDigest":"%s","invocationDigest":"%s","launchDigest":"%s","decision":"%s"}}\n' \
     "{FIXTURE_SCANNER_ID}" "{FIXTURE_SCANNER_VERSION}" \
-    "$HARTEVO_SCANNER_EXECUTABLE_SHA256" "$HARTEVO_SCANNER_LAUNCH_DIGEST" "$1"
+    "$HARTEVO_SCANNER_EXECUTABLE_SHA256" "$1" "$2" \
+    "$HARTEVO_SCANNER_LAUNCH_DIGEST" "$3"
+}}
+emit_scan_unknown() {{
+  printf '{{"schemaVersion":3,"scannerId":"%s","scannerVersion":"%s","executableSha256":"%s","policyDigest":"%s","invocationDigest":"%s","launchDigest":"%s","decision":"%s","unknown":true}}\n' \
+    "{FIXTURE_SCANNER_ID}" "{FIXTURE_SCANNER_VERSION}" \
+    "$HARTEVO_SCANNER_EXECUTABLE_SHA256" "$HARTEVO_SCANNER_POLICY_DIGEST" \
+    "$HARTEVO_SCANNER_INVOCATION_DIGEST" "$HARTEVO_SCANNER_LAUNCH_DIGEST" "$1"
 }}
 case "${{HARTEVO_SCANNER_OPERATION-}}" in
   {VERSION_OPERATION})
@@ -1901,6 +2305,9 @@ esac
             FIXTURE_SCANNER_ID,
             FIXTURE_SCANNER_VERSION,
             executable_digest,
+            FIXTURE_POLICY_VERSION,
+            sha('a'),
+            sha('b'),
         )
         .expect("release pin");
         let scanner = ProductionFileScanner::new(&path, &fixture.scanner_root, pin, limits)
@@ -1959,14 +2366,31 @@ esac
         command
             .env("PATH", "/ambient/path-must-not-survive")
             .env("HARTEVO_AMBIENT_SECRET", "must-not-survive");
-        let release_pin =
-            ScannerReleasePin::new(FIXTURE_SCANNER_ID, FIXTURE_SCANNER_VERSION, sha('5'))
-                .expect("release pin");
+        let release_pin = ScannerReleasePin::new(
+            FIXTURE_SCANNER_ID,
+            FIXTURE_SCANNER_VERSION,
+            sha('5'),
+            FIXTURE_POLICY_VERSION,
+            sha('a'),
+            sha('b'),
+        )
+        .expect("release pin");
+        let executable_identity_digest = sha('6');
+        let invocation = ScannerInvocationContract::new(
+            &ProcessOperation::Version,
+            &release_pin,
+            &executable_identity_digest,
+            default_limits(),
+        )
+        .expect("invocation contract");
+        let invocation_digest = invocation.evidence_digest().expect("invocation digest");
         let launch = ScannerProcessLaunch::new(
             7,
-            SCAN_OPERATION,
+            VERSION_OPERATION,
             release_pin.release_digest(),
-            &sha('6'),
+            release_pin.policy_digest(),
+            &executable_identity_digest,
+            &invocation_digest,
             &sha('7'),
         )
         .expect("launch identity");
@@ -1977,6 +2401,7 @@ esac
             &temporary,
             &release_pin,
             &launch,
+            &invocation_digest,
         );
         let environment = command
             .get_envs()
@@ -1990,13 +2415,18 @@ esac
         assert_eq!(
             environment.keys().map(String::as_str).collect::<Vec<_>>(),
             vec![
+                "HARTEVO_SCANNER_CONFIG_SHA256",
                 "HARTEVO_SCANNER_EXECUTABLE_SHA256",
                 "HARTEVO_SCANNER_ID",
+                "HARTEVO_SCANNER_INVOCATION_DIGEST",
                 "HARTEVO_SCANNER_LAUNCH_DIGEST",
                 "HARTEVO_SCANNER_OPERATION",
+                "HARTEVO_SCANNER_POLICY_DIGEST",
+                "HARTEVO_SCANNER_POLICY_VERSION",
                 "HARTEVO_SCANNER_PROCESS_GENERATION",
                 "HARTEVO_SCANNER_PROTOCOL",
                 "HARTEVO_SCANNER_RELEASE_DIGEST",
+                "HARTEVO_SCANNER_RULESET_SHA256",
                 "HARTEVO_SCANNER_VERSION",
                 "HOME",
                 "LANG",
@@ -2006,7 +2436,7 @@ esac
         );
         assert_eq!(
             environment["HARTEVO_SCANNER_OPERATION"].as_deref(),
-            Some(SCAN_OPERATION)
+            Some(VERSION_OPERATION)
         );
         assert_eq!(
             environment["HARTEVO_SCANNER_PROTOCOL"].as_deref(),
@@ -2023,6 +2453,81 @@ esac
         assert_eq!(command.get_current_dir(), Some(working.as_path()));
         assert!(!environment.contains_key("PATH"));
         assert!(!environment.contains_key("HARTEVO_AMBIENT_SECRET"));
+    }
+
+    #[test]
+    fn invocation_argument_drift_is_rejected_before_spawn() {
+        let fixture = ScannerFixture::new();
+        let working = fixture.scanner_root.join("argument-drift-run");
+        let home = working.join("home");
+        let temporary = working.join("tmp");
+        for directory in [&working, &home, &temporary] {
+            fs::create_dir(directory).expect("invocation fixture directory");
+        }
+        let release_pin = ScannerReleasePin::new(
+            FIXTURE_SCANNER_ID,
+            FIXTURE_SCANNER_VERSION,
+            sha('5'),
+            FIXTURE_POLICY_VERSION,
+            sha('a'),
+            sha('b'),
+        )
+        .expect("release pin");
+        let executable_identity_digest = sha('6');
+        let invocation = ScannerInvocationContract::new(
+            &ProcessOperation::Version,
+            &release_pin,
+            &executable_identity_digest,
+            default_limits(),
+        )
+        .expect("invocation contract");
+        let invocation_digest = invocation.evidence_digest().expect("invocation digest");
+        let launch = ScannerProcessLaunch::new(
+            7,
+            VERSION_OPERATION,
+            release_pin.release_digest(),
+            release_pin.policy_digest(),
+            &executable_identity_digest,
+            &invocation_digest,
+            &sha('7'),
+        )
+        .expect("launch identity");
+        let mut command = Command::new("/not/executed");
+        configure_clean_process(
+            &mut command,
+            &working,
+            &home,
+            &temporary,
+            &release_pin,
+            &launch,
+            &invocation_digest,
+        );
+        let directories = ProcessDirectories {
+            working: &working,
+            home: &home,
+            temporary: &temporary,
+        };
+        validate_configured_process(
+            &command,
+            Path::new("/not/executed"),
+            &directories,
+            &release_pin,
+            &launch,
+            &invocation,
+        )
+        .expect("exact configured invocation");
+        command.arg("--unexpected-policy-override");
+        assert!(matches!(
+            validate_configured_process(
+                &command,
+                Path::new("/not/executed"),
+                &directories,
+                &release_pin,
+                &launch,
+                &invocation,
+            ),
+            Err(BrowserError::FileScanUnavailable)
+        ));
     }
 
     #[test]
@@ -2073,22 +2578,33 @@ esac
 
     #[test]
     fn result_envelope_binds_identity_version_exit_streams_and_cleanup_without_raw_output() {
-        let release_pin =
-            ScannerReleasePin::new(FIXTURE_SCANNER_ID, FIXTURE_SCANNER_VERSION, sha('5'))
-                .expect("release pin");
+        let release_pin = ScannerReleasePin::new(
+            FIXTURE_SCANNER_ID,
+            FIXTURE_SCANNER_VERSION,
+            sha('5'),
+            FIXTURE_POLICY_VERSION,
+            sha('a'),
+            sha('b'),
+        )
+        .expect("release pin");
         let executable_identity_digest = sha('6');
+        let invocation_digest = sha('8');
         let launch = ScannerProcessLaunch::new(
             9,
             SCAN_OPERATION,
             release_pin.release_digest(),
+            release_pin.policy_digest(),
             &executable_identity_digest,
+            &invocation_digest,
             &sha('7'),
         )
         .expect("launch");
         let stdout = format!(
-            r#"{{"schemaVersion":2,"scannerId":"{FIXTURE_SCANNER_ID}","scannerVersion":"{FIXTURE_SCANNER_VERSION}","executableSha256":"{}","launchDigest":"{}","decision":"clean"}}
+            r#"{{"schemaVersion":3,"scannerId":"{FIXTURE_SCANNER_ID}","scannerVersion":"{FIXTURE_SCANNER_VERSION}","executableSha256":"{}","policyDigest":"{}","invocationDigest":"{}","launchDigest":"{}","decision":"clean"}}
 "#,
             release_pin.executable_sha256(),
+            release_pin.policy_digest(),
+            invocation_digest,
             launch.launch_digest,
         );
         let process = ProcessObservation {
@@ -2108,7 +2624,7 @@ esac
         let input_revalidation = test_input_revalidation();
         let envelope = ScannerResultEnvelope::from_completed_process(
             &release_pin,
-            &sha('8'),
+            &sha('4'),
             &executable_identity_digest,
             &process,
             default_limits(),
@@ -2132,6 +2648,12 @@ esac
         variants.push(changed);
         let mut changed = envelope.clone();
         changed.executable_sha256 = sha('a');
+        variants.push(changed);
+        let mut changed = envelope.clone();
+        changed.policy_digest = sha('c');
+        variants.push(changed);
+        let mut changed = envelope.clone();
+        changed.invocation_contract_digest = sha('d');
         variants.push(changed);
         let mut changed = envelope.clone();
         changed.exit.code = Some(23);
@@ -2164,7 +2686,7 @@ esac
         let cases = [
             (
                 "truncated",
-                r#"    printf '%s' '{"schemaVersion":2,"scannerId":"private-truncated-result'"#,
+                r#"    printf '%s' '{"schemaVersion":3,"scannerId":"private-truncated-result'"#,
             ),
             (
                 "malformed",
@@ -2227,17 +2749,29 @@ esac
         let fixture = ScannerFixture::new();
         let body = "    emit_scan clean";
         let (path, executable_digest) = write_scanner_fixture(&fixture.scanner_root, body);
-        let wrong_pin =
-            ScannerReleasePin::new(FIXTURE_SCANNER_ID, FIXTURE_SCANNER_VERSION, sha('9'))
-                .expect("shaped wrong pin");
+        let wrong_pin = ScannerReleasePin::new(
+            FIXTURE_SCANNER_ID,
+            FIXTURE_SCANNER_VERSION,
+            sha('9'),
+            FIXTURE_POLICY_VERSION,
+            sha('a'),
+            sha('b'),
+        )
+        .expect("shaped wrong pin");
         assert!(matches!(
             ProductionFileScanner::new(&path, &fixture.scanner_root, wrong_pin, default_limits()),
             Err(BrowserError::InvalidExecutable)
         ));
 
-        let wrong_version =
-            ScannerReleasePin::new(FIXTURE_SCANNER_ID, "fixture-v2", executable_digest.clone())
-                .expect("wrong version pin");
+        let wrong_version = ScannerReleasePin::new(
+            FIXTURE_SCANNER_ID,
+            "fixture-v2",
+            executable_digest.clone(),
+            FIXTURE_POLICY_VERSION,
+            sha('a'),
+            sha('b'),
+        )
+        .expect("wrong version pin");
         assert!(matches!(
             ProductionFileScanner::new(
                 &path,
@@ -2252,8 +2786,28 @@ esac
             FIXTURE_SCANNER_ID,
             FIXTURE_SCANNER_VERSION,
             executable_digest,
+            FIXTURE_POLICY_VERSION,
+            sha('a'),
+            sha('b'),
         )
         .expect("good pin");
+        let mut config_drift = good_pin.clone();
+        config_drift.config_sha256 = sha('c');
+        let mut ruleset_drift = good_pin.clone();
+        ruleset_drift.ruleset_sha256 = sha('d');
+        let mut policy_version_drift = good_pin.clone();
+        policy_version_drift.policy_version = "fixture-policy-v2".to_owned();
+        for drifted_policy in [config_drift, ruleset_drift, policy_version_drift] {
+            assert!(matches!(
+                ProductionFileScanner::new(
+                    &path,
+                    &fixture.scanner_root,
+                    drifted_policy,
+                    default_limits()
+                ),
+                Err(BrowserError::FileScanUnavailable)
+            ));
+        }
         let mut scanner =
             ProductionFileScanner::new(&path, &fixture.scanner_root, good_pin, default_limits())
                 .expect("scanner");
@@ -2386,7 +2940,58 @@ esac
     }
 
     #[test]
-    fn every_result_revalidates_scanner_identity_digest_and_version_before_restart() {
+    fn repeated_timeout_restarts_keep_the_process_boundary_unpoisoned() {
+        let fixture = ScannerFixture::new();
+        let launch_count = fixture.temp.path().join("timeout-launch-count.marker");
+        let body = format!(
+            r#"    launch_count=0
+    if [ -f {count} ]; then
+      IFS= read -r launch_count < {count}
+    fi
+    launch_count=$((launch_count + 1))
+    printf '%s\n' "$launch_count" > {count}
+    if [ "$launch_count" -le 2 ]; then
+      /bin/sleep 30 &
+      wait
+    fi
+    emit_scan clean"#,
+            count = shell_quote(&launch_count),
+        );
+        let limits =
+            ScannerProcessLimits::new(Duration::from_secs(2), 4096, 4096).expect("timeout limits");
+        let (mut scanner, _) = scanner_with_limits(&fixture, &body, limits);
+        let mut broker = fixture.broker();
+
+        for (generation, grant_id) in [
+            (2, "grant-timeout-repeat-first"),
+            (3, "grant-timeout-repeat-second"),
+        ] {
+            let source = fixture.source(&format!("timeout-repeat-{generation}.json"), b"{}");
+            let result = fixture.prepare(&mut broker, &mut scanner, grant_id, &source);
+            assert!(matches!(result, Err(BrowserError::FileScanUnavailable)));
+            assert_eq!(scanner.process_generation, generation);
+            assert!(!scanner.process_boundary_poisoned);
+            assert!(scanner.active_launch_digest.is_none());
+            assert_no_run_directory_residue(&scanner);
+        }
+
+        let source = fixture.source("timeout-repeat-clean.json", b"{}");
+        let result = fixture
+            .prepare(
+                &mut broker,
+                &mut scanner,
+                "grant-timeout-repeat-clean",
+                &source,
+            )
+            .expect("fresh scanner process after repeated timeouts");
+        assert_eq!(result.scan_report.decision, FileScanDecision::Clean);
+        assert_eq!(scanner.process_generation, 4);
+        assert!(!scanner.process_boundary_poisoned);
+        assert_no_run_directory_residue(&scanner);
+    }
+
+    #[test]
+    fn every_result_revalidates_scanner_release_policy_and_invocation_before_restart() {
         let cases = [
             (
                 "scanner-id",
@@ -2405,6 +3010,20 @@ esac
                 format!(
                     "    emit_scan_with_identity {FIXTURE_SCANNER_ID} {FIXTURE_SCANNER_VERSION} {} \"$HARTEVO_SCANNER_LAUNCH_DIGEST\" clean",
                     sha('9')
+                ),
+            ),
+            (
+                "policy-digest",
+                format!(
+                    "    emit_scan_with_contract {} \"$HARTEVO_SCANNER_INVOCATION_DIGEST\" clean",
+                    sha('9')
+                ),
+            ),
+            (
+                "invocation-digest",
+                format!(
+                    "    emit_scan_with_contract \"$HARTEVO_SCANNER_POLICY_DIGEST\" {} clean",
+                    sha('8')
                 ),
             ),
         ];

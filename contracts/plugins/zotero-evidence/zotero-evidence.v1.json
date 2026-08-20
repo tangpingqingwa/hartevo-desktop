@@ -1,0 +1,236 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.zotero-evidence/v1",
+  "title": "Hartevo Layer 1 Zotero versioned research evidence and citation proposal contract",
+  "schemaVersion": "hartevo.zotero-evidence/v1",
+  "contractVersion": "EXT-ZOTERO-01-L1/v1",
+  "layer": 1,
+  "plugin": {
+    "id": "zotero.evidence",
+    "version": "1.0.0",
+    "digestBound": true,
+    "registration": {
+      "versioned": true,
+      "scopeBound": true,
+      "reversible": true,
+      "revocation": "registration_digest_rotation"
+    }
+  },
+  "service": {
+    "id": "zotero.evidence.service",
+    "operations": [
+      "probe_library",
+      "read_library_collection_item",
+      "read_since_cursor",
+      "read_conditional",
+      "citation_export_metadata",
+      "propose_research_evidence"
+    ],
+    "effectAuthority": "bounded_read_and_proposal_only",
+    "liveExternalIo": false
+  },
+  "provider": {
+    "id": "zotero.evidence.provider",
+    "webApi": {
+      "baseUrl": "https://api.zotero.org",
+      "version": 3,
+      "requiredHeader": "Zotero-API-Version",
+      "provenance": "web_api_v3",
+      "transportSeam": "https_web_api_v3_get_plan"
+    },
+    "localApi": {
+      "baseUrl": "http://localhost:23119/api",
+      "version": 3,
+      "provenance": "official_local_api_v3",
+      "transportSeam": "official_local_api_v3_get_plan",
+      "connected": false
+    },
+    "secretReferenceOnly": true,
+    "rawSecretsOrBodies": false,
+    "nativeStatus": "BLOCKED_ENV"
+  },
+  "api": {
+    "web": {
+      "baseUrl": "https://api.zotero.org",
+      "version": 3,
+      "provenance": "web_api_v3",
+      "transportSeam": "https_web_api_v3_get_plan"
+    },
+    "local": {
+      "baseUrl": "http://localhost:23119/api",
+      "version": 3,
+      "provenance": "official_local_api_v3",
+      "transportSeam": "official_local_api_v3_get_plan",
+      "connected": false
+    }
+  },
+  "consumer": {
+    "id": "mission.research-evidence.consumer",
+    "binding": [
+      "mission_id",
+      "claim_id",
+      "claim_revision",
+      "result_id",
+      "result_revision",
+      "user_id_or_group_id",
+      "library_id",
+      "collection_key",
+      "item_key",
+      "library_version",
+      "item_version",
+      "last_modified_version",
+      "since_cursor_identity_digest",
+      "conditional_request",
+      "collection_membership_digest",
+      "creators_digest",
+      "title_digest",
+      "date_digest",
+      "identifier_digest",
+      "attachment_metadata_digest",
+      "full_text_reference_digest",
+      "citation_style",
+      "citation_locale",
+      "citation_digest",
+      "evidence_digest",
+      "provider_version",
+      "registration_digest"
+    ],
+    "verifiedAdoption": false,
+    "formattedCitationIsSourceEvidence": false
+  },
+  "scope": {
+    "exactFields": [
+      "user_id_or_group_id",
+      "library_id",
+      "collection_key",
+      "item_key",
+      "mission_id"
+    ],
+    "userAndGroupLibrariesDistinct": true,
+    "scopeBound": true,
+    "crossLibraryMixing": false
+  },
+  "versions": {
+    "libraryAndObjectVersionsOpaque": true,
+    "monotonicNotSequential": true,
+    "lastModifiedVersionHeader": "Last-Modified-Version",
+    "sinceQueryParameter": "since",
+    "conditionalHeader": "If-Modified-Since-Version",
+    "writeConditionalHeaderTypedButNotExecuted": "If-Unmodified-Since-Version",
+    "writeTokenTypedButNotExecuted": "Zotero-Write-Token",
+    "localServerPartitionHeader": "Zotero-Server-ID"
+  },
+  "responses": {
+    "success": [200, 304],
+    "typedErrors": [403, 404, 409, 412, 428, 429],
+    "backoffHeaders": ["Backoff", "Retry-After"],
+    "notModified": {
+      "status": 304,
+      "means": "unchanged_relative_to_supplied_conditional_fence",
+      "sourceTruth": false
+    },
+    "deletionAndAccessLossTyped": true,
+    "providerUnknownTyped": true
+  },
+  "bounds": {
+    "maxPageSize": 100,
+    "maxResponseItems": 100,
+    "maxAttachmentReferences": 128,
+    "maxFormattedCitationBytes": 8192,
+    "maxBackoffSeconds": 86400,
+    "fullText": "reference_digest_only_no_unbounded_content"
+  },
+  "evidence": {
+    "metadataDigests": [
+      "creators_digest",
+      "title_digest",
+      "date_digest",
+      "identifier_digest",
+      "metadata_digest"
+    ],
+    "attachmentAndFullText": [
+      "attachment_metadata_digest",
+      "full_text_reference_digest"
+    ],
+    "citationDigestRequired": true,
+    "evidenceDigestRequired": true,
+    "formattedCitationNotVerified": true,
+    "rawProviderBodiesInReceipts": false
+  },
+  "testSeams": {
+    "fixture": "BLOCKED_ENV",
+    "recording": "BLOCKED_ENV",
+    "loopback": "BLOCKED_ENV",
+    "connected": false,
+    "native": false
+  },
+  "authority": {
+    "externalWrite": false,
+    "delete": false,
+    "upload": false,
+    "oauthExchange": false,
+    "streaming": false,
+    "storeAuthority": false,
+    "keyringAuthority": false,
+    "effectAuthority": false,
+    "connected": false
+  },
+  "native": {
+    "status": "BLOCKED_ENV",
+    "privateAuthentication": "BLOCKED_ENV",
+    "writeDeleteUpload": "BLOCKED_ENV",
+    "streaming": "BLOCKED_ENV",
+    "externalConnectedEvidence": "BLOCKED_ENV"
+  },
+  "layer2": {
+    "versionFencedWrites": "typed_seam_only",
+    "writeTokenReceipts": "typed_seam_only",
+    "attachmentUploadReadback": "not_implemented",
+    "streamingReconciliation": "not_implemented",
+    "ambiguousWriteRecovery": "not_implemented"
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "$id",
+    "schemaVersion",
+    "contractVersion",
+    "layer",
+    "plugin",
+    "service",
+    "provider",
+    "api",
+    "consumer",
+    "scope",
+    "versions",
+    "responses",
+    "bounds",
+    "evidence",
+    "testSeams",
+    "authority",
+    "native",
+    "layer2"
+  ],
+  "properties": {
+    "$schema": { "const": "https://json-schema.org/draft/2020-12/schema" },
+    "$id": { "const": "hartevo.zotero-evidence/v1" },
+    "schemaVersion": { "const": "hartevo.zotero-evidence/v1" },
+    "contractVersion": { "const": "EXT-ZOTERO-01-L1/v1" },
+    "layer": { "const": 1 },
+    "plugin": { "type": "object" },
+    "service": { "type": "object" },
+    "provider": { "type": "object" },
+    "api": { "type": "object" },
+    "consumer": { "type": "object" },
+    "scope": { "type": "object" },
+    "versions": { "type": "object" },
+    "responses": { "type": "object" },
+    "bounds": { "type": "object" },
+    "evidence": { "type": "object" },
+    "testSeams": { "type": "object" },
+    "authority": { "type": "object" },
+    "native": { "type": "object" },
+    "layer2": { "type": "object" }
+  }
+}

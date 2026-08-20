@@ -176,7 +176,11 @@ require_adapter_string_constant() {
 require_contract_shape
 
 write_expected_set "${work_dir}/expected-client-methods" \
-  initialize thread/start thread/resume turn/start turn/interrupt
+  initialize \
+  interpreter/harness/list interpreter/harness/set \
+  interpreter/model/list interpreter/model/set \
+  interpreter/provider/list interpreter/provider/set \
+  thread/start thread/resume turn/start turn/interrupt turn/steer
 write_expected_set "${work_dir}/expected-server-requests" \
   item/commandExecution/requestApproval item/fileChange/requestApproval
 write_expected_set "${work_dir}/expected-server-notifications" \
