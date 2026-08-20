@@ -4,14 +4,27 @@ extern crate self as hartevo_eval;
 
 #[path = "../examples/hartevo-browser-contract/digest.rs"]
 mod digest;
+mod distribution;
+mod evaluation_plugin;
 mod harness_lab;
 #[path = "../examples/hartevo-browser-contract/model.rs"]
 mod model;
+mod progress_trace;
 mod release_reference;
 mod run_receipt;
 #[path = "../examples/hartevo-browser-contract/verifier.rs"]
 mod verifier;
 
+pub use distribution::{
+    export_public_key, generate_keypair, sign_file, validate_gate, verify_file,
+};
+pub use evaluation_plugin::{
+    DurableEvaluationResultProvider, DurableEvaluationService, EVALUATION_PLUGIN_AUTHORITY,
+    EVALUATION_PLUGIN_RELEASE_DECISION, EVALUATION_PLUGIN_SCHEMA_VERSION, EvaluationEvaluator,
+    EvaluationEvidence, EvaluationEvidenceProvenance, EvaluationExecutionStatus,
+    EvaluationMissionConsumer, EvaluationMissionView, EvaluationPluginService,
+    EvaluationPluginState, EvaluationResult, EvaluationResultProvider,
+};
 pub use harness_lab::{
     CandidateIdentity as HarnessCandidateIdentity, CaseObservation as HarnessCaseObservation,
     ComparisonRole as HarnessComparisonRole, CrossLaneLeakageFlags as HarnessCrossLaneLeakageFlags,
@@ -40,6 +53,36 @@ pub use harness_lab::{
     validate_plan as validate_harness_lab_plan,
     validate_plan_with_bindings as validate_harness_lab_plan_with_bindings,
     verify_signed_record as verify_harness_lab_signature,
+};
+pub use progress_trace::{
+    AwaitingDetails as ProgressTraceAwaitingDetails, AwaitingRule as ProgressTraceAwaitingRule,
+    CONTRACT_AUTHORITY as PROGRESS_TRACE_CONTRACT_AUTHORITY,
+    CONTRACT_ID as PROGRESS_TRACE_CONTRACT_ID,
+    CONTRACT_SCHEMA_VERSION as PROGRESS_TRACE_CONTRACT_SCHEMA_VERSION,
+    CaughtUpDetails as ProgressTraceCaughtUpDetails, ClockRule as ProgressTraceClockRule,
+    DeltaDetails as ProgressTraceDeltaDetails, DeltaOperation as ProgressTraceDeltaOperation,
+    FirstUsefulProgressDetails as ProgressTraceFirstUsefulProgressDetails,
+    FirstUsefulProgressRule as ProgressTraceFirstUsefulProgressRule,
+    PersistenceState as ProgressTracePersistenceState,
+    PresentationState as ProgressTracePresentationState,
+    ProgressClass as ProgressTraceProgressClass, ProgressEvent as ProgressTraceEvent,
+    ProgressEventBody as ProgressTraceEventBody, ProgressIdentity as ProgressTraceIdentity,
+    ProgressProvenance as ProgressTraceProvenance, ProgressTrace as ProgressTraceDocument,
+    ProgressTraceContract, ProgressTraceExample, ProgressTraceValidationReport,
+    ProvenanceKind as ProgressTraceProvenanceKind, ProvenanceRule as ProgressTraceProvenanceRule,
+    RELEASE_DECISION as PROGRESS_TRACE_RELEASE_DECISION,
+    RejectionRules as ProgressTraceRejectionRules,
+    RequiredIdentityRule as ProgressTraceRequiredIdentityRule,
+    RestartMarkerDetails as ProgressTraceRestartMarkerDetails,
+    RestartPosition as ProgressTraceRestartPosition, ResumeDetails as ProgressTraceResumeDetails,
+    ResumeMode as ProgressTraceResumeMode, RunningCaughtUpRule as ProgressTraceRunningCaughtUpRule,
+    RunningDetails as ProgressTraceRunningDetails,
+    TerminalEnvelopeDetails as ProgressTraceTerminalEnvelopeDetails,
+    TerminalOperation as ProgressTraceTerminalOperation, TraceClock as ProgressTraceClock,
+    TraceScope as ProgressTraceScope,
+    VALIDATION_SCHEMA_VERSION as PROGRESS_TRACE_VALIDATION_SCHEMA_VERSION,
+    validate_progress_trace_document, validate_progress_trace_example,
+    validate_progress_trace_json,
 };
 pub use release_reference::{
     BrowserEvaluationPayload, validate_evaluation_run_and_browser_result_references,
