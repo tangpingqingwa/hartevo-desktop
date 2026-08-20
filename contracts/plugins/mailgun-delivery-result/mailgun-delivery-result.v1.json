@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/mailgun-delivery-result/mailgun-delivery-result.v1.json",
+  "title": "Hartevo Mailgun delivery-result Layer-1 contract",
+  "description": "Bounded, redacted Mailgun delivery and event evidence for Mission review; never a send, delete, suppression, message-content, native-credential, or Outcome authority.",
+  "schemaVersion": "hartevo.mailgun-delivery-result/v1",
+  "contractVersion": "EXT-MAILGUN-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "mailgun.delivery-result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_record_verify_only",
+  "digestInput": "hartevo.mailgun-delivery-result/v1|layer=1|service=mailgun.delivery.result.read|provider=mailgun.delivery.result.recording|consumer=mission.mailgun.delivery-result.consumer|api=mailgun-events-v3-delivery-status-retry-suppression-r1",
+  "contractDigest": "f995274c726fbcae122c7dc1fc22cca24c06212a3cf16da5871665804771dbfd",
+  "service": {
+    "type": "MailgunDeliveryResultService",
+    "id": "mailgun.delivery.result.read",
+    "access": "read_proposal_record_verify",
+    "operations": [
+      "read_events",
+      "read_delivery_status",
+      "read_retry_metadata",
+      "read_suppression_metadata",
+      "verify_webhook_event",
+      "propose",
+      "record",
+      "verify",
+      "revoke_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "MailgunProvider",
+    "id": "mailgun.delivery.result.recording",
+    "apiRevision": "mailgun-events-v3-delivery-status-retry-suppression-r1",
+    "operations": [
+      "GET /v3/{domain}/events",
+      "GET /v3/{domain}/events/{event-id}",
+      "GET /v3/{domain}/bounces",
+      "verify_webhook_signature"
+    ],
+    "allowedTransports": ["fixture", "recording", "fake", "loopback", "BLOCKED_ENV"],
+    "authentication": {
+      "scheme": "mailgun_api_or_webhook_signing_reference",
+      "secretReference": "opaque_only",
+      "serialized": false,
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "type": "MissionMailgunDeliveryConsumer",
+    "id": "mission.mailgun.delivery-result.consumer",
+    "authority": "proposal_record_verify_below_kernel",
+    "scope": ["project", "mission", "work_product", "source_evidence_digest", "idempotency_digest"],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "kernelAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque non-serializing SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "exactScope": [
+    "account",
+    "domain",
+    "tag_digest",
+    "message_id_digest",
+    "event_id_digest",
+    "recipient_fingerprint",
+    "project",
+    "mission",
+    "work_product",
+    "consent",
+    "scope_revision",
+    "provider_revision"
+  ],
+  "bounds": {
+    "maxPageSize": 100,
+    "maxPages": 8,
+    "maxEventsPerPage": 100,
+    "maxTotalEvents": 800,
+    "maxResponseBytes": 1048576,
+    "maxTags": 16,
+    "maxIdentifierBytes": 256,
+    "maxDiagnosticBytes": 512,
+    "maxRetryAfterSeconds": 86400,
+    "maxWebhookAgeSeconds": 900
+  },
+  "allowlist": {
+    "reads": [
+      {"operation": "delivery_events", "method": "GET", "path": "/v3/{domain}/events", "aggregateOnly": true},
+      {"operation": "delivery_event", "method": "GET", "path": "/v3/{domain}/events/{event-id}", "aggregateOnly": true},
+      {"operation": "suppression_metadata", "method": "GET", "path": "/v3/{domain}/bounces", "aggregateOnly": true},
+      {"operation": "webhook_verification", "method": "VERIFY", "path": "opaque-envelope", "aggregateOnly": true}
+    ],
+    "writes": [],
+    "forbidden": [
+      "send_message",
+      "delete_message",
+      "delete_event",
+      "suppress_recipient",
+      "unsuppress_recipient",
+      "create_bounce",
+      "create_complaint",
+      "raw_message_body",
+      "raw_mime_body",
+      "raw_recipient_pii",
+      "raw_provider_event_payload",
+      "raw_webhook_token",
+      "raw_api_key",
+      "native_https_transport",
+      "durable_provider_receipt",
+      "kernel_receipt",
+      "outcome_adoption",
+      "verified_work_product_adoption"
+    ]
+  },
+  "pagination": {
+    "style": "opaque_cursor",
+    "cursorDigestOnly": true,
+    "cursorBoundTo": ["scope_digest", "consent_digest", "revision_digest", "page_size", "page_number"],
+    "maxPages": 8,
+    "maxEventsPerPage": 100,
+    "loopRejected": true,
+    "filterDriftRejected": true,
+    "truncationIsPartial": true
+  },
+  "projection": {
+    "deliveryStatus": ["accepted", "delivered", "temporary_failure", "permanent_failure", "suppressed", "unknown"],
+    "event": ["event_id_digest", "message_id_digest", "recipient_fingerprint", "kind", "occurred_at", "event_digest"],
+    "retry": ["attempt_count", "retry_after_seconds", "backoff_digest", "exhausted"],
+    "suppression": ["category", "active", "reason_digest"],
+    "rawMessageBody": false,
+    "rawEventPayload": false,
+    "rawRecipient": false,
+    "rawWebhookMaterial": false
+  },
+  "fences": {
+    "consentDigest": true,
+    "scopeRevisionDigest": true,
+    "providerRevisionDigest": true,
+    "cursorDigest": true,
+    "eventDigest": true,
+    "evidenceDigest": true,
+    "registrationDigest": true,
+    "idempotencyDigest": true,
+    "webhookSignatureDigest": true,
+    "replayRejected": true,
+    "tamperRejected": true,
+    "staleRevisionRejected": true,
+    "expiredConsentRejected": true
+  },
+  "receipts": {
+    "request": {
+      "redacted": true,
+      "retain": ["operation", "request_digest", "scope_digest", "cursor_digest", "page", "response_digest", "status_code"],
+      "drop": ["raw_domain", "raw_account", "raw_tag", "raw_message_id", "raw_event_id", "raw_recipient", "authorization_header", "credential_material"]
+    },
+    "rateLimit": ["limit", "remaining", "retry_after_seconds", "throttled"],
+    "backoff": ["attempt", "retryable", "retry_after_seconds", "backoff_digest"],
+    "record": {"idempotencyDigestOnly": true, "durableNativeReceipt": false}
+  },
+  "states": [
+    "ready",
+    "partial",
+    "empty",
+    "denied",
+    "expired",
+    "rate_limited",
+    "provider_unknown",
+    "tampered",
+    "replay_rejected",
+    "pagination_loop",
+    "registration_revoked"
+  ],
+  "honesty": {
+    "fixtureNative": false,
+    "recordingNative": false,
+    "fakeNative": false,
+    "loopbackNative": false,
+    "blockedEnvNative": false,
+    "fixtureConnected": false,
+    "recordingConnected": false,
+    "fakeConnected": false,
+    "loopbackConnected": false,
+    "blockedEnvConnected": false,
+    "nativeCredentialResolution": "layer_2_gap",
+    "liveMailgunHttps": "layer_2_gap",
+    "durableProviderReceipt": "layer_2_gap",
+    "independentDeliveryReadback": "layer_2_gap",
+    "consentedSendEffects": "layer_2_gap",
+    "verifiedAdoption": "layer_2_gap"
+  }
+}

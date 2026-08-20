@@ -1,0 +1,239 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-iot-device-defender-result/contract.v1.json",
+  "title": "Hartevo AWS IoT Device Defender audit result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-iot-device-defender-result/v1",
+  "contractVersion": "EXT-AWS-IOT-DEFENDER-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "aws.iot.device-defender-result",
+  "objectiveType": "connected_device_audit_risk",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-iot-device-defender-result/v1|layer=1|service=aws.iot.device-defender-result.read|provider=aws.iot.device-defender-result.recording|consumer=mission.aws-iot-device-defender.consumer",
+  "contractDigest": "ac0e260cde1170423b05f5251b971764e3bdf154b9f6ac281ab4b31c3b9c552f",
+  "service": {
+    "type": "AwsIotDeviceDefenderService",
+    "id": "aws.iot.device-defender-result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "read_list_audit_tasks",
+      "read_describe_audit_task",
+      "read_list_audit_findings",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "type": "AwsIotDeviceDefenderProvider",
+    "id": "aws.iot.device-defender-result.recording",
+    "apiRevision": "iot-device-defender-list-audit-tasks-describe-audit-task-list-audit-findings-1",
+    "operations": [
+      "ListAuditTasks",
+      "DescribeAuditTask",
+      "ListAuditFindings"
+    ],
+    "allowedTransportProvenance": [
+      "fixture",
+      "recording",
+      "loopback",
+      "blocked_env"
+    ],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAwsIotDeviceDefenderConsumer",
+    "id": "mission.aws-iot-device-defender.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "awsAccountId",
+      "awsRegion",
+      "auditTaskId",
+      "auditTaskRevision",
+      "checkAllowlist",
+      "resourceAllowlist",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "auditTaskId",
+      "auditTaskRevision",
+      "checkAllowlist",
+      "resourceAllowlist",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision",
+      "retentionUntil"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "rawFindingPayloadBytes": false,
+    "certificateIds": false,
+    "roleArns": false,
+    "additionalInfo": false,
+    "rawDeviceData": false,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxChecks": 64,
+    "maxResources": 128,
+    "maxFindings": 512,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "auditTaskDigest",
+      "checkAllowlistDigest",
+      "resourceAllowlistDigest",
+      "secretReferenceDigest",
+      "evidenceContractDigest",
+      "registrationRevision",
+      "status"
+    ],
+    "permissions": [
+      "iot:ListAuditTasks",
+      "iot:DescribeAuditTask",
+      "iot:ListAuditFindings",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "iot:StartAuditTask",
+      "iot:CancelAuditTask",
+      "iot:UpdateAccountAuditConfiguration",
+      "iot:UpdateCACertificate",
+      "iot:UpdateCertificate",
+      "iot:UpdateThing",
+      "iot:UpdateThingGroup",
+      "iot:CreatePolicy",
+      "iot:AttachPolicy",
+      "iot:DetachPolicy",
+      "iot:DeletePolicy",
+      "mitigation",
+      "suppression_mutation",
+      "kernel.outcome.adopt",
+      "work_product.verify"
+    ]
+  },
+  "boundedReads": {
+    "ListAuditTasks": {
+      "method": "POST",
+      "allowlist": "bound audit task",
+      "opaquePagination": true
+    },
+    "DescribeAuditTask": {
+      "method": "POST",
+      "allowlist": "exact bound audit task",
+      "opaquePagination": false
+    },
+    "ListAuditFindings": {
+      "method": "POST",
+      "allowlist": "bound checks and resources",
+      "opaquePagination": true
+    }
+  },
+  "evidence": {
+    "auditStatus": "redacted enum",
+    "checkState": ["compliant", "non_compliant", "unknown"],
+    "severity": ["critical", "high", "medium", "low", "informational", "unknown"],
+    "suppression": "boolean only",
+    "resourceTypes": "bounded SHA-256 digests only",
+    "rawFindingDataRetained": false,
+    "rawProviderPayloadRetained": false,
+    "providerReceipt": false,
+    "reviewEligibleOnlyWhenComplete": true,
+    "adoptable": false
+  },
+  "honesty": {
+    "fixtureConnected": false,
+    "fixtureNative": false,
+    "recordingConnected": false,
+    "recordingNative": false,
+    "loopbackConnected": false,
+    "loopbackNative": false,
+    "blockedEnvConnected": false,
+    "blockedEnvNative": false,
+    "firstParty": false,
+    "kernelAuthority": false
+  },
+  "forbidden": [
+    "start_audit_task",
+    "cancel_audit_task",
+    "audit_configuration_mutation",
+    "mitigation_action",
+    "suppression_mutation",
+    "thing_mutation",
+    "certificate_mutation",
+    "policy_mutation",
+    "raw_finding_export",
+    "raw_device_data",
+    "credential_resolution",
+    "kernel_authority",
+    "durable_native_receipt",
+    "independent_native_reread",
+    "verified_work_product_adoption"
+  ],
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "native HTTPS transport",
+    "durable provider receipt",
+    "independent native reread",
+    "host-owned Consent/Effect/Receipt/Verification",
+    "verified Work Product adoption"
+  ]
+}

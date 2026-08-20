@@ -7,6 +7,7 @@
 
 mod model_tokenizer;
 mod plugin_session;
+pub mod worker_graph;
 
 pub use model_tokenizer::{
     ConservativeByteBudgetTokenizer, PinnedModelTokenizer, PinnedTokenizerSpec,
