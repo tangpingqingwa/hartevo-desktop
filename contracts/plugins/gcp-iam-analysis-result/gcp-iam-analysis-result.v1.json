@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/gcp-iam-analysis-result/gcp-iam-analysis-result.v1.json",
+  "schemaVersion": "hartevo.gcp-iam-analysis-result-contract/v1",
+  "contractVersion": "gcp-iam-analysis-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "gcp.iam-analysis.result",
+    "name": "GcpIamAnalysisService",
+    "version": "1.0.0",
+    "readOnly": true,
+    "native": false,
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "propose_iam_analysis",
+      "record_evidence",
+      "verify_evidence",
+      "consume_observation"
+    ]
+  },
+  "provider": {
+    "id": "gcp.cloud-asset",
+    "name": "GcpCloudAssetProvider",
+    "version": "1.0.0",
+    "providerRevision": "gcp-cloud-asset-iam-analysis-r1",
+    "apiVersion": "v1",
+    "operations": [
+      "searchAllIamPolicies",
+      "analyzeIamPolicy"
+    ],
+    "acceptedProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "native": false,
+    "connected": false,
+    "secretValuesRead": false,
+    "credentialMaterialRetained": false,
+    "liveCredentialResolution": false,
+    "serviceAccountCreation": false,
+    "policyMutation": false,
+    "roleGrantRevoke": false,
+    "effectiveAuthorizationClaim": false
+  },
+  "consumer": {
+    "id": "mission.gcp-iam-analysis",
+    "name": "MissionGcpIamConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "nativeConnected": false,
+    "durableAdoption": false
+  },
+  "scope": {
+    "required": [
+      "organization",
+      "folders",
+      "projects",
+      "resourceName",
+      "resourceAncestry",
+      "principalClass",
+      "principalDigest",
+      "policyBindingFingerprint",
+      "roleFingerprint",
+      "analysisQuery",
+      "missionIdAndRevision",
+      "projectIdAndRevision",
+      "workProductIdAndRevision",
+      "permissionDigest",
+      "consentDigest",
+      "secretReferenceDigest",
+      "credentialRevision",
+      "hierarchyRevision",
+      "policyRevision",
+      "queryDigest"
+    ],
+    "organizationRequired": true,
+    "folderAndProjectAllowlisted": true,
+    "resourceNameNormalized": true,
+    "principalAddressesRetained": false,
+    "rawResourcePayloadRetained": false
+  },
+  "queries": {
+    "searchAllIamPolicies": {
+      "readOnly": true,
+      "scopeBound": true,
+      "pageToken": "opaque_digest_only",
+      "arbitraryResourcePayload": false
+    },
+    "analyzeIamPolicy": {
+      "readOnly": true,
+      "scopeBound": true,
+      "queryBound": true,
+      "pageToken": "opaque_digest_only",
+      "identityAddress": "not_retained",
+      "permissionAllowlist": true
+    }
+  },
+  "evidence": {
+    "digests": [
+      "pluginVersion",
+      "pluginVersionDigest",
+      "contract",
+      "provider",
+      "permission",
+      "scope",
+      "hierarchy",
+      "policy",
+      "query",
+      "registration",
+      "principal",
+      "binding",
+      "role",
+      "response",
+      "analysisGraph",
+      "evidence"
+    ],
+    "retained": [
+      "resourceAncestryDigests",
+      "principalClass",
+      "principalDigest",
+      "roleFingerprint",
+      "policyBindingFingerprint",
+      "accessClassification",
+      "boundedExplanationCodes",
+      "partial",
+      "accessLoss"
+    ],
+    "rawPolicyJson": false,
+    "rawPrincipalAddresses": false,
+    "personalInformation": false,
+    "rawProviderPayload": false,
+    "rawPageToken": false,
+    "rawGraphEdges": false,
+    "bounded": {
+      "maxResponseBytes": 1048576,
+      "maxPagesPerOperation": 8,
+      "maxPageSize": 100,
+      "maxPolicyMatches": 128,
+      "maxAnalysisNodes": 256,
+      "maxAnalysisEdges": 512,
+      "maxExplanationCodes": 32,
+      "maxPermissions": 32,
+      "maxHierarchyItems": 64
+    }
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "permissionDigestBound": true,
+    "scopeDigestBound": true,
+    "policyDigestBound": true,
+    "queryDigestBound": true,
+    "secretReferenceDigestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": [
+      "plugin_version",
+      "contract",
+      "provider_api",
+      "provider_revision",
+      "permission",
+      "consent",
+      "scope",
+      "hierarchy",
+      "policy",
+      "query",
+      "page_cursor",
+      "tamper",
+      "revocation",
+      "partial_graph",
+      "access_loss"
+    ]
+  },
+  "authority": {
+    "connected": false,
+    "nativeProvider": false,
+    "externalWrite": false,
+    "effect": false,
+    "durableReceipt": false,
+    "verification": false,
+    "truthAuthority": false,
+    "outcome": false,
+    "workProductAdoption": false,
+    "effectiveAuthorization": false
+  },
+  "forbidden": [
+    "setIamPolicy",
+    "grant_role",
+    "revoke_role",
+    "create_service_account",
+    "live_credential_resolution",
+    "raw_policy_json",
+    "raw_principal_address",
+    "arbitrary_resource_payload",
+    "native_connected_claim",
+    "durable_adoption",
+    "kernel_truth_or_outcome"
+  ],
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "fixtureRecordingLoopbackAreNative": false,
+    "deferredTo": "layer_2_native_gcp_oauth_service_account_consent_effect_receipt_verification",
+    "failClosedCases": [
+      "missing_native_gcp_authority",
+      "missing_native_credential_resolution",
+      "api_or_provider_revision_drift",
+      "hierarchy_revision_drift",
+      "policy_revision_drift",
+      "permission_or_consent_drift",
+      "query_or_cursor_replay",
+      "tampered_evidence",
+      "partial_or_truncated_graph",
+      "permission_loss",
+      "external_write_request"
+    ]
+  },
+  "layer2Gaps": [
+    "consented_native_cloud_asset_https_transport",
+    "native_oauth_or_service_account_resolution",
+    "durable_provider_receipt",
+    "independent_policy_readback",
+    "execution_time_authorization_recheck",
+    "verified_mission_project_work_product_adoption"
+  ],
+  "honestNativeGap": "Layer 1 is fixture, recording, loopback, or BLOCKED_ENV evidence only. It never claims Connected or native authority, never resolves live credentials, never retains raw IAM policy JSON or principal addresses, never calls setIamPolicy, never creates service accounts, never grants or revokes roles, and never adopts kernel Truth or Outcome. Native Cloud Asset transport, durable receipts, independent readback, execution-time authorization, and consented adoption remain Layer-2 exits."
+}

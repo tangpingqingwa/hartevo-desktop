@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/gcp-memorystore-redis-result/gcp-memorystore-redis-result.v1.json",
+  "title": "Hartevo Google Cloud Memorystore for Redis instance result Layer-1 contract",
+  "schemaVersion": "hartevo.gcp-memorystore-redis-result/v1",
+  "contractVersion": "EXT-GCP-MEMORYSTORE-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "gcp.memorystore.redis.instance.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.gcp-memorystore-redis-result/v1|layer=1|service=gcp.memorystore.redis.instance.result.read|provider=gcp.memorystore.admin|consumer=mission.gcp-memorystore-instance.consumer|api=memorystore-redis-v1-instances-get-list-r1",
+  "contractDigest": "5a459e7a77100fe8608b82d82cf5f888e51a178245251cd9969da73400ed30ad",
+  "service": {
+    "type": "GcpMemorystoreInstanceResultService",
+    "id": "gcp.memorystore.redis.instance.result.read",
+    "access": "read_proposal_recording",
+    "operations": ["instances.list", "instances.get", "describe_capabilities", "register", "revoke_registration", "reverse_registration", "restore_registration", "propose", "verify", "record"],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "liveExternalIo": false,
+    "kernelAuthority": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAdoption": false,
+    "availabilityGuarantee": false
+  },
+  "provider": {
+    "type": "GcpMemorystoreAdminProvider",
+    "id": "gcp.memorystore.admin",
+    "version": "1.0.0",
+    "apiRevision": "memorystore-redis-v1-instances-get-list-r1",
+    "serviceEndpoint": "https://redis.googleapis.com",
+    "operations": ["instances.list", "instances.get"],
+    "allowlistedPaths": ["GET /v1/projects/*/locations/*/instances", "GET /v1/projects/*/locations/*/instances/*"],
+    "exactLocationOnly": true,
+    "wildcardLocationAllowed": false,
+    "allowedTransports": ["recording", "fixture", "fake", "loopback", "blocked_env"],
+    "authentication": {
+      "scheme": "oauth_or_service_account",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false,
+      "oauthScope": "https://www.googleapis.com/auth/cloud-platform"
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "type": "MissionGcpMemorystoreInstanceConsumer",
+    "id": "mission.gcp-memorystore-instance.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": ["missionId", "missionRevision", "projectId", "projectRevision", "workProductId", "workProductRevision", "gcpProjectId", "gcpLocation", "instanceId", "apiRevision"],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "kernelAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque OAuth/service-account SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "rawMaterialRetained": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": ["gcpProjectId", "gcpLocation", "instanceId", "missionId", "missionRevision", "projectId", "projectRevision", "workProductId", "workProductRevision", "labelAllowlistDigest", "permissionDigest", "consentDigest"],
+    "exactProjectLocationInstance": true,
+    "wildcardLocation": false,
+    "identifiersInEvidence": "digest_only",
+    "rawResourceName": false,
+    "rawEndpoints": false,
+    "rawAuthString": false,
+    "rawCertificates": false,
+    "rawLabels": false,
+    "rawRedisKeys": false,
+    "rawRedisValues": false,
+    "rawCommandOutput": false,
+    "rawResponseBody": false,
+    "maxPages": 8,
+    "maxPageSize": 100,
+    "maxResponseBytes": 1048576
+  },
+  "permissions": {
+    "required": ["redis.instances.get", "redis.instances.list", "mission.scope"],
+    "oauthScopes": ["https://www.googleapis.com/auth/cloud-platform"],
+    "forbidden": ["redis.instances.create", "redis.instances.update", "redis.instances.patch", "redis.instances.delete", "redis.instances.failover", "redis.instances.import", "redis.instances.export", "redis.instances.upgrade", "redis.instances.rescheduleMaintenance", "redis.instances.getAuthString", "redis.instances.connect", "redis.keys.read", "redis.keys.write", "outcome.adopt"]
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "bindingDigests": ["pluginVersionDigest", "contractDigest", "providerDigest", "apiDigest", "permissionDigest", "scopeDigest", "secretReferenceDigest", "consentDigest", "registrationRevision", "registrationDigest"]
+  },
+  "pagination": {
+    "style": "nextPageToken",
+    "tokenOpaque": true,
+    "tokenDigestOnly": true,
+    "cursorBoundTo": ["gcpProjectId", "gcpLocation", "instanceId", "pageSize", "pageNumber", "apiRevision", "permissionDigest", "scopeDigest"],
+    "exactLocationOnly": true,
+    "wildcardLocationRejected": true,
+    "loopRejected": true,
+    "tokenDriftRejected": true,
+    "unreachableRejected": true,
+    "truncationIsNonAdoptable": true
+  },
+  "projection": {
+    "identity": ["projectDigest", "locationDigest", "instanceIdDigest", "resourceNameDigest"],
+    "tier": "allowlisted_scalar",
+    "capacity": "bounded_memory_size_gb",
+    "version": "digest_only",
+    "state": "allowlisted_enum",
+    "replicas": "bounded_count",
+    "encryption": ["mode", "authEnabled", "certificateDigest"],
+    "persistence": ["mode", "rdbSnapshotDigest"],
+    "maintenance": ["policyDigest", "scheduleDigest"],
+    "labels": "allowlisted_keys_and_values_digest_only",
+    "endpoints": false,
+    "authStrings": false,
+    "certificates": false,
+    "rawJson": false,
+    "redisDataPlane": false
+  },
+  "receipts": {
+    "request": {
+      "redacted": true,
+      "retain": ["operation", "requestDigest", "pathDigest", "scopeDigest", "projectDigest", "locationDigest", "instanceDigest", "pageTokenDigest", "apiDigest"],
+      "drop": ["rawEndpoint", "rawPath", "rawPageToken", "authorizationHeader", "credentialMaterial"]
+    },
+    "cost": {
+      "redacted": true,
+      "retain": ["operation", "responseBytes", "boundedRequestUnits", "costDigest"],
+      "estimateOnly": true,
+      "durableProviderReceipt": false
+    }
+  },
+  "evidence": {
+    "requiredDigests": ["pluginVersionDigest", "contractDigest", "providerDigest", "apiDigest", "permissionDigest", "scopeDigest", "secretReferenceDigest", "listDigest", "getDigest", "projectionDigest", "evidenceDigest"],
+    "states": ["ready", "stale", "partial", "access_loss", "unauthorized", "forbidden", "not_found", "conflict", "throttled", "timed_out", "unreachable_location", "scope_drift", "api_drift", "pagination_loop", "truncated", "tampered", "provider_unknown", "registration_revoked", "replay_detected"],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "staleStateIsNonAdoptable": true,
+    "accessLossIsNonAdoptable": true,
+    "partialIsNonAdoptable": true,
+    "driftIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": ["bounded v1 instances.list at one exact location", "bounded v1 instances.get for one exact instance", "opaque page-token and exact-scope fences", "redacted tier/capacity/version/state/replica/encryption/persistence/maintenance projection", "version/contract/provider/API/permission/scope/evidence digests", "reversible and revocable registration", "redacted request and cost receipts", "Mission-scoped review-only proposal and idempotent recording"],
+    "doesNotOwn": ["Hartevo Truth", "Hartevo Consent authority", "Hartevo Effect", "Hartevo Receipt", "Hartevo Verification authority", "Hartevo Outcome", "live OAuth or service-account resolution", "live Google HTTPS", "durable provider receipt", "Redis key/value or command access", "instance create/patch/update/delete/failover/import/export/upgrade/maintenance", "AUTH string retrieval", "endpoint or certificate retrieval", "availability guarantee", "verified Work Product adoption"]
+  },
+  "forbiddenEffects": ["instances.create", "instances.patch", "instances.update", "instances.delete", "instances.failover", "instances.import", "instances.export", "instances.upgrade", "instances.rescheduleMaintenance", "instances.getAuthString", "redis_data_plane_read", "redis_data_plane_write", "read_keys_or_values", "capture_command_output", "adopt_verified_work_product"],
+  "layer2Gaps": ["native OAuth or service-account resolution", "live Google HTTPS", "durable Memorystore provider receipt", "independent Redis or instance read-back reconciliation", "host Consent/Effect/Receipt/Verification authority", "production availability certification", "verified Mission Work Product adoption"],
+  "nativeClaims": {"connected": false, "nativeProvider": false, "firstParty": false, "durableProviderReceipt": false, "adoptedOutcome": false, "adoptedWorkProduct": false, "blockedEnvironmentIsNative": false}
+}

@@ -1,0 +1,54 @@
+{
+  "schema": "hartevo.openinterpreter-control-plane/v1",
+  "upstream": {
+    "repository": "https://github.com/openinterpreter/openinterpreter",
+    "release": "rust-v0.0.34",
+    "commit": "52a31019714294add53cafbc5268e1467b471263"
+  },
+  "catalog": {
+    "identity": "sha256(canonical-json)",
+    "providerRevision": "response-entry-digest-when-absent",
+    "modelRevision": "response-entry-digest-when-absent",
+    "harnessRevision": "response-entry-digest-when-absent",
+    "ordering": "provider-id,model-provider-id,model-id,harness-provider-id,harness-model-id,harness-id"
+  },
+  "runtimeConfig": [
+    "providerId",
+    "providerRevision",
+    "modelId",
+    "modelRevision",
+    "harnessId",
+    "harnessRevision",
+    "reasoningEffort",
+    "serviceTier",
+    "endpointClass",
+    "budget",
+    "dataBoundary",
+    "credentialReference",
+    "catalogDigest"
+  ],
+  "credentialBoundary": {
+    "secretMaterial": "resolver-only",
+    "persistentForm": "opaque-reference",
+    "runtimeInjection": "child-environment-only",
+    "debugAndEvidence": "digest-only"
+  },
+  "capabilities": {
+    "negotiated": [
+      "provider-catalog",
+      "model-catalog",
+      "harness-catalog",
+      "local-approval",
+      "interrupt",
+      "steer",
+      "bounded-stream"
+    ],
+    "recovery": "typed-hint-no-automatic-uncertain-replay"
+  },
+  "businessAuthority": {
+    "domainTruth": false,
+    "externalEffect": false,
+    "providerReceipt": false,
+    "businessVerification": false
+  }
+}
