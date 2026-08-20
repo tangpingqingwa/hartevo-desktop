@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "hartevo-plugin-registry/v1",
+  "registryVersion": "desktop-2026-08-14-plugin-registry/v1",
+  "registryEpoch": 0,
+  "registryDigest": "a5fb4734be793e8b64685c2bc47cd811c4119ed93c98623ae01b056098e96281",
+  "catalogPluginIds": ["hartevo.readonly.market-evidence"],
+  "activeRegistrations": [],
+  "trustedProviders": [],
+  "policy": {
+    "registrationMode": "empty_by_default",
+    "emptyRegistryAdmission": "deny",
+    "nativeLoadingAllowed": false,
+    "realProviderExecutionAllowed": false,
+    "fixtureRegistrationsCountAsCapability": false,
+    "catalogEntriesCountAsCapability": false,
+    "releaseDecision": "NOT_EVALUATED"
+  }
+}
