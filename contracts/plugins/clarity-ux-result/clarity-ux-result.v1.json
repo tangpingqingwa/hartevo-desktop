@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/clarity-ux-result/clarity-ux-result.v1.json",
+  "schemaVersion": "hartevo-clarity-ux-result-contract/v1",
+  "contractVersion": "clarity-ux-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "clarity.ux.result",
+    "version": "1.0.0",
+    "operation": "governed_ux_behavior_read_proposal",
+    "readOnly": true,
+    "liveExecution": false
+  },
+  "provider": {
+    "id": "clarity.data-export.project-live-insights",
+    "version": "1.0.0",
+    "method": "GET",
+    "path": "/export-data/api/v1/project-live-insights",
+    "allowlistedParameters": ["numOfDays", "dimension1", "dimension2", "dimension3"],
+    "acceptedProvenance": ["recording", "fixture", "fake", "loopback", "blocked_env"],
+    "native": false,
+    "httpsTransport": false,
+    "readback": false
+  },
+  "scope": {
+    "required": [
+      "projectId",
+      "siteId",
+      "applicationId",
+      "deploymentId",
+      "urlDigest",
+      "timeWindow",
+      "metrics",
+      "dimensions",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "consentScope",
+      "privacyPolicyDigest"
+    ],
+    "secret": "opaque_secret_reference_only"
+  },
+  "limits": {
+    "minDays": 1,
+    "maxDays": 3,
+    "maxDimensions": 3,
+    "maxRows": 1000,
+    "maxResponseBytes": 262144,
+    "maxRequestsPerProjectPerUtcDay": 10,
+    "paginated": false
+  },
+  "allowlist": {
+    "metrics": [
+      "Scroll Depth",
+      "Engagement Time",
+      "Traffic",
+      "Popular Pages",
+      "Browser",
+      "Device",
+      "OS",
+      "Country/Region",
+      "Page Title",
+      "Referrer URL",
+      "Dead Click Count",
+      "Excessive Scroll",
+      "Rage Click Count",
+      "Quickback Click",
+      "Script Error Count",
+      "Error Click Count"
+    ],
+    "dimensions": [
+      "Browser",
+      "Device",
+      "Country/Region",
+      "OS",
+      "Source",
+      "Medium",
+      "Campaign",
+      "Channel",
+      "URL"
+    ],
+    "queryLanguage": false,
+    "arbitraryMetrics": false,
+    "arbitraryDimensions": false
+  },
+  "privacyPolicy": {
+    "version": "clarity-ux-privacy/v1",
+    "requiredRedactions": [
+      "url",
+      "page_title",
+      "campaign",
+      "custom_identifiers",
+      "raw_api_body",
+      "visitor_data",
+      "session_data"
+    ],
+    "retained": ["bounded_aggregate_counts", "bounded_percentages", "safe_dimension_labels"]
+  },
+  "states": [
+    "complete",
+    "partial",
+    "empty",
+    "rate_limited",
+    "expired",
+    "access_lost",
+    "provider_unknown"
+  ],
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerDigestBound": true,
+    "projectBound": true,
+    "timeWindowBound": true,
+    "privacyPolicyDigestBound": true,
+    "consentScopeBound": true,
+    "scopeDigestBound": true,
+    "reversible": true,
+    "revocable": true
+  },
+  "forbidden": [
+    "session_recording_download",
+    "heatmap_download",
+    "dashboard_import",
+    "visitor_profiling",
+    "custom_identifier_lookup",
+    "identify_mutation",
+    "tag_mutation",
+    "event_mutation",
+    "causal_claim",
+    "product_success_claim",
+    "outcome_authority"
+  ],
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "httpsTransport": false,
+    "durableReceipt": false,
+    "readback": false,
+    "adoptedWorkProduct": false,
+    "adoptedOutcome": false,
+    "blockedEnvironmentIsNative": false
+  },
+  "layer2Gaps": [
+    "native_token_resolution",
+    "native_https_get",
+    "durable_provider_receipt",
+    "bounded_repeat_read_reconciliation",
+    "verified_work_product_adoption"
+  ]
+}

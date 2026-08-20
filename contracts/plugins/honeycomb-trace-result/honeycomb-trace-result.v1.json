@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/honeycomb-trace-result/honeycomb-trace-result.v1.json",
+  "title": "Hartevo Honeycomb governed trace-query result Layer-1 contract",
+  "schemaVersion": "hartevo.honeycomb-trace-result.contract/v1",
+  "contractVersion": "honeycomb-trace-result/v1",
+  "pluginVersion": "0.1.0",
+  "layer": "Layer-1",
+  "service": {
+    "id": "honeycomb.trace-result",
+    "version": "1.0.0",
+    "operation": "governed_aggregate_trace_query_result_proposal",
+    "readOnly": true,
+    "nativePostExecution": false,
+    "nativeGetReadback": false
+  },
+  "provider": {
+    "id": "honeycomb.query-result",
+    "implementation": "HoneycombQueryProvider",
+    "apiVersion": "1",
+    "regions": ["us", "eu1"],
+    "v1BaseUrls": {
+      "us": "https://api.honeycomb.io",
+      "eu1": "https://api.eu1.honeycomb.io"
+    },
+    "contentType": "application/json",
+    "permissions": ["Run Queries", "Manage Queries"],
+    "operations": ["typed_query_creation", "typed_query_result_creation", "get_query_result_reconciliation"],
+    "acceptedTransports": ["recording", "fixture", "loopback", "BLOCKED_ENV"],
+    "native": false
+  },
+  "consumer": {
+    "id": "mission.honeycomb-trace-result",
+    "implementation": "MissionHoneycombTraceConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "region",
+      "apiVersion",
+      "team",
+      "environment",
+      "dataset",
+      "query",
+      "queryResult",
+      "deploymentMarker",
+      "timeWindow",
+      "mission",
+      "project",
+      "workProduct",
+      "consent"
+    ],
+    "secret": "opaque_secret_reference_only"
+  },
+  "queryAst": {
+    "calculations": ["COUNT", "RATE", "ERROR_COUNT", "ERROR_RATE", "P50", "P95", "P99"],
+    "approvedFields": ["service.name", "environment", "status_code", "error", "duration_ms", "deployment.id", "span.kind"],
+    "maxCalculations": 4,
+    "maxBreakdowns": 4,
+    "maxFilters": 8,
+    "maxLimit": 1000,
+    "maxTimeRangeSeconds": 604800,
+    "arbitraryDsl": false,
+    "arbitraryField": false
+  },
+  "endpoints": {
+    "queryCreate": "/1/queries/{datasetSlug}",
+    "queryResultCreate": "/1/query_results/{datasetSlug}",
+    "queryResultGet": "/1/query_results/{datasetSlug}/{queryResultId}",
+    "regionBound": true,
+    "apiVersionBound": true,
+    "contentType": "application/json"
+  },
+  "projections": ["queued", "running", "complete", "partial", "empty", "rate_limited", "access_lost", "provider_unknown"],
+  "resultEvidence": {
+    "aggregateOnly": true,
+    "boundedSeries": true,
+    "queryDigest": true,
+    "queryResultDigest": true,
+    "deploymentMarkerDigest": true,
+    "timeWindowDigest": true,
+    "responseDigest": true,
+    "rawEvents": false,
+    "rawSpans": false,
+    "rawLogs": false,
+    "pii": false,
+    "uiLinks": false,
+    "causality": false,
+    "sloAuthority": false,
+    "incidentAuthority": false
+  },
+  "registration": {
+    "boundDigests": ["pluginVersion", "contract", "provider", "permission", "scope", "query", "timeWindow", "consent"],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "transport": {
+    "recording": true,
+    "fixture": true,
+    "loopback": true,
+    "blockedEnv": true,
+    "connected": false,
+    "native": false,
+    "safeBackoff": true
+  },
+  "authority": {
+    "externalWrites": false,
+    "eventIngestion": false,
+    "boardMutation": false,
+    "markerMutation": false,
+    "sloMutation": false,
+    "triggerMutation": false,
+    "dashboardAuthority": false,
+    "connected": false,
+    "nativeProvider": false,
+    "durableNativeReceipt": false,
+    "kernelOutcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "layer2Gaps": [
+    "native_opaque_configuration_key_resolution",
+    "native_post_query_creation",
+    "native_post_query_result_execution",
+    "native_get_query_result_readback",
+    "durable_provider_receipt",
+    "verified_work_product_adoption"
+  ],
+  "honestNativeGap": "Layer 1 only prepares typed, bounded, redacted query and query-result seams and consumes recording, fixture, loopback, or BLOCKED_ENV responses. It never resolves a native key, calls Honeycomb, claims Connected, retains raw telemetry, mutates provider resources, or adopts a Work Product/Outcome."
+}
