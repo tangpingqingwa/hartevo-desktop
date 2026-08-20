@@ -1,0 +1,82 @@
+{
+  "schemaVersion": "hartevo-distribution-dependency-advisory-policy/v1",
+  "policyId": "DIST-SBOM-TARGET-01",
+  "authority": "hartevo-distribution-contract",
+  "releaseDecision": "NOT_EVALUATED",
+  "release": {
+    "passed": false,
+    "deployment": false
+  },
+  "releaseTargets": [
+    "macos-aarch64",
+    "macos-x86_64"
+  ],
+  "targetGraphs": [
+    {
+      "id": "macos-aarch64",
+      "target": "aarch64-apple-darwin",
+      "role": "release",
+      "release": true,
+      "releaseRoots": [
+        "hartevo-desktop"
+      ]
+    },
+    {
+      "id": "macos-x86_64",
+      "target": "x86_64-apple-darwin",
+      "role": "release",
+      "release": true,
+      "releaseRoots": [
+        "hartevo-desktop"
+      ]
+    },
+    {
+      "id": "linux-x86_64-ci",
+      "target": "x86_64-unknown-linux-gnu",
+      "role": "ci",
+      "release": false,
+      "releaseRoots": [
+        "hartevo-desktop"
+      ]
+    }
+  ],
+  "allowedCategories": [
+    "notice",
+    "unmaintained",
+    "unsound",
+    "vulnerability"
+  ],
+  "failureCategories": [
+    "unsound",
+    "vulnerability"
+  ],
+  "unreachableDisposition": "INFORMATIONAL_WARNING",
+  "releaseFailureDisposition": "CODE_FAILURE",
+  "reviewedExceptions": [],
+  "inputContract": {
+    "requiredBindings": [
+      "sourceCommit",
+      "lockfileSha256",
+      "metadataPerTarget",
+      "cargoAuditReceipt"
+    ],
+    "cargoMetadataCommand": "cargo metadata --locked --format-version 1 --filter-platform <target>",
+    "cargoAuditTool": "cargo-audit 0.22.2",
+    "lockDigestAlgorithm": "sha256",
+    "metadataDigestAlgorithm": "sha256",
+    "auditReceiptDigestAlgorithm": "sha256"
+  },
+  "findingRecordFields": [
+    "advisoryId",
+    "category",
+    "package",
+    "dependencyPath",
+    "target",
+    "targetReachability",
+    "releaseImpact",
+    "sourceCommit",
+    "lockfileSha256",
+    "auditReceiptSha256"
+  ],
+  "noBlanketIgnore": true
+}

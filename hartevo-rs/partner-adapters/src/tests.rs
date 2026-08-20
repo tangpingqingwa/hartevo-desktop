@@ -6,7 +6,7 @@ use hartevo_connector_sdk::{
 };
 
 use crate::awin::{AwinAdapter, AwinFixtureWorld};
-use crate::cj::{CjAdapter, CjFixtureWorld};
+use crate::cj_legacy::{CjAdapter, CjFixtureWorld};
 use crate::contract::TypedPartnerNetworkAdapter;
 use crate::impact::{ImpactAdapter, ImpactFixtureWorld};
 use crate::{

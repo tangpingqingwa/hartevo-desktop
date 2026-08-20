@@ -20,6 +20,7 @@ mod support;
 
 pub mod awin;
 pub mod cj;
+pub mod cj_legacy;
 pub mod impact;
 
 pub use hartevo_connector_sdk::{
