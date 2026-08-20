@@ -1,20 +1,21 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_domain_kernel::{
-    AccountId, BrowserControlLeaseId, BrowserProfileId, BrowserTabId, BrowserWorkspaceId, Mission,
-    Project, ProjectId, TenantId,
+    AccountId, BrowserActionBatchId, BrowserControlLeaseId, BrowserProfileId, BrowserTabId,
+    BrowserWorkspaceId, Mission, Project, ProjectId, TenantId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::BrowserError;
+use crate::{BrowserActionBatch, BrowserBatchReceipt, BrowserError};
 
 const BROWSER_SCHEMA_VERSION: u32 = 1;
 const MAX_CONTROL_HISTORY: usize = 4_096;
 const MAX_AGENT_LEASE: Duration = Duration::hours(4);
 const MAX_TABS: usize = 128;
+const MAX_BATCH_RECEIPTS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,6 +286,8 @@ pub struct BrowserWorkspace {
     pub tabs: BTreeSet<BrowserTabId>,
     pub active_tab_id: BrowserTabId,
     pub control_history: Vec<BrowserControlTransition>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub batch_receipts: BTreeMap<BrowserActionBatchId, BrowserBatchReceipt>,
     pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -336,6 +339,7 @@ impl BrowserWorkspace {
             tabs: BTreeSet::from([initial_tab_id.clone()]),
             active_tab_id: initial_tab_id,
             control_history: vec![transition],
+            batch_receipts: BTreeMap::new(),
             revision: 1,
             created_at: now,
             updated_at: now,
@@ -602,6 +606,49 @@ impl BrowserWorkspace {
         self.validate()
     }
 
+    pub fn batch_receipt(&self, batch_id: &BrowserActionBatchId) -> Option<&BrowserBatchReceipt> {
+        self.batch_receipts.get(batch_id)
+    }
+
+    pub fn acknowledge_batch_receipt(
+        &mut self,
+        expected_revision: u64,
+        batch: &BrowserActionBatch,
+        receipt: BrowserBatchReceipt,
+        now: DateTime<Utc>,
+    ) -> Result<bool, BrowserError> {
+        if self.revision != expected_revision {
+            return Err(BrowserError::RevisionMismatch {
+                expected: expected_revision,
+                actual: self.revision,
+            });
+        }
+        receipt.validate_for(batch)?;
+        if batch.workspace_id != self.id
+            || batch.tenant_id != self.tenant_id
+            || batch.project_id != self.project_id
+            || batch.mission_id != self.mission_id
+            || now < self.updated_at
+        {
+            return Err(BrowserError::InvalidBatchReceipt);
+        }
+        match self.batch_receipts.get(&batch.id) {
+            Some(previous) if previous == &receipt => return Ok(false),
+            Some(previous) if !receipt.is_valid_successor_of(previous, batch)? => {
+                return Err(BrowserError::InvalidBatchReceipt);
+            }
+            None if self.batch_receipts.len() >= MAX_BATCH_RECEIPTS => {
+                return Err(BrowserError::InvalidBatchReceipt);
+            }
+            _ => {}
+        }
+        self.batch_receipts.insert(batch.id.clone(), receipt);
+        self.revision = next_revision(self.revision)?;
+        self.updated_at = now;
+        self.validate()?;
+        Ok(true)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "workspace validation reconstructs the complete control-generation history and current lease shape"
@@ -626,10 +673,22 @@ impl BrowserWorkspace {
             || !self.tabs.contains(&self.active_tab_id)
             || self.control_history.is_empty()
             || self.control_history.len() > MAX_CONTROL_HISTORY
+            || self.batch_receipts.len() > MAX_BATCH_RECEIPTS
             || u64::try_from(self.control_history.len()).ok() != Some(self.lease_generation)
             || self.updated_at < self.created_at
         {
             return Err(BrowserError::InvalidWorkspace);
+        }
+        for (batch_id, receipt) in &self.batch_receipts {
+            receipt.validate_scope()?;
+            if *batch_id != receipt.batch_id
+                || receipt.tenant_id != self.tenant_id
+                || receipt.project_id != self.project_id
+                || receipt.mission_id != self.mission_id
+                || receipt.workspace_id != self.id
+            {
+                return Err(BrowserError::InvalidWorkspace);
+            }
         }
         let mut previous: Option<&BrowserControlTransition> = None;
         let mut lease_ids = BTreeSet::new();
@@ -693,14 +752,26 @@ impl BrowserWorkspace {
             && self.control_history.starts_with(&previous.control_history)
             && self.lease_generation == previous.lease_generation.saturating_add(1)
             && self.tabs == previous.tabs
-            && self.active_tab_id == previous.active_tab_id;
+            && self.active_tab_id == previous.active_tab_id
+            && self.batch_receipts == previous.batch_receipts;
         let tab_change = self.control_history == previous.control_history
             && self.control_state == previous.control_state
             && self.lease_id == previous.lease_id
             && self.lease_generation == previous.lease_generation
             && self.agent_lease_expires_at == previous.agent_lease_expires_at
+            && self.batch_receipts == previous.batch_receipts
             && (self.tabs != previous.tabs || self.active_tab_id != previous.active_tab_id);
-        Ok(immutable_scope && exact_revision && (control_change || tab_change))
+        let batch_receipt_change = self.control_history == previous.control_history
+            && self.control_state == previous.control_state
+            && self.lease_id == previous.lease_id
+            && self.lease_generation == previous.lease_generation
+            && self.agent_lease_expires_at == previous.agent_lease_expires_at
+            && self.tabs == previous.tabs
+            && self.active_tab_id == previous.active_tab_id
+            && batch_receipts_follow(&self.batch_receipts, &previous.batch_receipts)?;
+        Ok(immutable_scope
+            && exact_revision
+            && (control_change || tab_change || batch_receipt_change))
     }
 
     pub fn digest(&self) -> Result<String, BrowserError> {
@@ -808,11 +879,44 @@ impl fmt::Debug for BrowserWorkspace {
                 &digest(self.active_tab_id.as_str().as_bytes()),
             )
             .field("control_history_count", &self.control_history.len())
+            .field("batch_receipt_count", &self.batch_receipts.len())
             .field("revision", &self.revision)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .finish()
     }
+}
+
+fn batch_receipts_follow(
+    current: &BTreeMap<BrowserActionBatchId, BrowserBatchReceipt>,
+    previous: &BTreeMap<BrowserActionBatchId, BrowserBatchReceipt>,
+) -> Result<bool, BrowserError> {
+    if current.len() < previous.len() || current.len() > previous.len().saturating_add(1) {
+        return Ok(false);
+    }
+    let mut changes = 0_usize;
+    for (batch_id, prior) in previous {
+        let Some(next) = current.get(batch_id) else {
+            return Ok(false);
+        };
+        if next != prior {
+            if !next.follows_acknowledgement(prior)? {
+                return Ok(false);
+            }
+            changes = changes
+                .checked_add(1)
+                .ok_or(BrowserError::CounterOverflow)?;
+        }
+    }
+    changes = changes
+        .checked_add(
+            current
+                .keys()
+                .filter(|batch_id| !previous.contains_key(*batch_id))
+                .count(),
+        )
+        .ok_or(BrowserError::CounterOverflow)?;
+    Ok(changes == 1)
 }
 
 fn valid_control_edge(from: BrowserControlState, to: BrowserControlState) -> bool {

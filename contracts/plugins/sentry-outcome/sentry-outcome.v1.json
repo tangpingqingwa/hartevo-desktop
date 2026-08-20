@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo.sentry-outcome/v1",
+  "title": "Hartevo Sentry error and release outcome-evidence plugin contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "layer",
+    "authority",
+    "service",
+    "provider",
+    "consumer",
+    "queries",
+    "bounds",
+    "receipts",
+    "transport",
+    "honesty"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "hartevo.sentry-outcome/v1" },
+    "layer": { "const": "sentry_layer_1" },
+    "authority": { "const": "read_only_observational_evidence" },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "access", "contractDigest"],
+      "properties": {
+        "id": { "const": "sentry.outcome-evidence.read" },
+        "version": { "const": "1.0.0" },
+        "access": { "const": "read_only" },
+        "contractDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "serviceId",
+        "version",
+        "implementation",
+        "scope",
+        "authentication",
+        "transport",
+        "reversible"
+      ],
+      "properties": {
+        "id": { "const": "sentry.outcome" },
+        "serviceId": { "const": "sentry.outcome-evidence.read" },
+        "version": { "const": "1.0.0" },
+        "implementation": { "const": "SentryOutcomeProvider" },
+        "scope": {
+          "const": [
+            "organization",
+            "project",
+            "environment",
+            "release",
+            "mission"
+          ]
+        },
+        "authentication": { "const": "secret_reference" },
+        "transport": { "const": "https_only" },
+        "reversible": { "const": true }
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "serviceId", "version", "kind", "binding"],
+      "properties": {
+        "id": { "const": "mission.outcome-evidence.consumer" },
+        "serviceId": { "const": "sentry.outcome-evidence.read" },
+        "version": { "const": "1.0.0" },
+        "kind": { "const": "mission_outcome" },
+        "binding": {
+          "const": [
+            "organization_id",
+            "project_id",
+            "environment",
+            "release",
+            "mission_id",
+            "mission_revision",
+            "deployment_id",
+            "deployment_revision",
+            "query_window",
+            "source_result_digest",
+            "provider_version",
+            "registration_digest"
+          ]
+        }
+      }
+    },
+    "queries": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "allowlisted", "parameterized", "readOnly"],
+        "properties": {
+          "id": { "enum": ["issues", "events", "releases"] },
+          "allowlisted": { "const": true },
+          "parameterized": { "const": true },
+          "readOnly": { "const": true }
+        }
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxWindowSeconds",
+        "maxPageSize",
+        "maxPages",
+        "maxResults",
+        "maxResponseBytes",
+        "maxRetries",
+        "maxBackoffSeconds",
+        "maxRedactedFieldBytes"
+      ],
+      "properties": {
+        "maxWindowSeconds": { "const": 86400 },
+        "maxPageSize": { "const": 100 },
+        "maxPages": { "const": 20 },
+        "maxResults": { "const": 1000 },
+        "maxResponseBytes": { "const": 1048576 },
+        "maxRetries": { "const": 3 },
+        "maxBackoffSeconds": { "const": 30 },
+        "maxRedactedFieldBytes": { "const": 16384 }
+      }
+    },
+    "receipts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["query", "cursor", "rateLimit", "sourceResult", "fingerprint", "registration"],
+      "properties": {
+        "query": { "const": true },
+        "cursor": { "const": true },
+        "rateLimit": { "const": true },
+        "sourceResult": { "const": true },
+        "fingerprint": { "const": true },
+        "registration": { "const": true }
+      }
+    },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["organizationIssuesEndpoint", "organizationEventsEndpoint", "organizationReleasesEndpoint", "token", "writes", "webhooks"],
+      "properties": {
+        "organizationIssuesEndpoint": { "const": true },
+        "organizationEventsEndpoint": { "const": true },
+        "organizationReleasesEndpoint": { "const": true },
+        "token": { "const": "secret_reference" },
+        "writes": { "const": false },
+        "webhooks": { "const": false }
+      }
+    },
+    "honesty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "readOnly",
+        "noHealthClaim",
+        "absenceIsNotSuccess",
+        "fixtureNative",
+        "loopbackNative",
+        "blockedEnvNative",
+        "connectedRequiresNativeHttps"
+      ],
+      "properties": {
+        "readOnly": { "const": true },
+        "noHealthClaim": { "const": true },
+        "absenceIsNotSuccess": { "const": true },
+        "fixtureNative": { "const": false },
+        "loopbackNative": { "const": false },
+        "blockedEnvNative": { "const": false },
+        "connectedRequiresNativeHttps": { "const": true }
+      }
+    }
+  }
+}
