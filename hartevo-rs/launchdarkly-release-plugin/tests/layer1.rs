@@ -95,9 +95,23 @@ fn secret(scope: &FeatureReleaseScope) -> SecretReference {
     SecretReference::for_scope("secret-ref-launchdarkly-read", scope, 1).expect("secret reference")
 }
 
+fn reseal_proposal(proposal: &mut FeatureReleaseResultProposal) {
+    let mut semantic = to_value(&*proposal).expect("proposal json");
+    let object = semantic.as_object_mut().expect("proposal object");
+    object.remove("proposalDigest");
+    object.remove("semanticFenceDigest");
+    proposal.semantic_fence_digest = Digest::from_serialized(&semantic);
+
+    let mut full = to_value(&*proposal).expect("proposal json");
+    full.as_object_mut()
+        .expect("proposal object")
+        .remove("proposalDigest");
+    proposal.proposal_digest = Digest::from_serialized(&full);
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
-fn typed_service_compiles_records_and_verifies_exact_readback_without_native_claims() {
+fn typed_service_compiles_but_recording_never_becomes_adoptable() {
     let scope = scope();
     let before = flag(&scope, 42, "before");
     let approval = approved(&scope, "approval-01", ApprovalStatus::Approved);
@@ -121,25 +135,64 @@ fn typed_service_compiles_records_and_verifies_exact_readback_without_native_cla
         .compile_release_proposal(&request, &evidence, &dry_run)
         .expect("proposal");
     assert_eq!(proposal.status, ReleaseStatus::Approved);
-    assert!(proposal.recordable);
+    assert!(!proposal.recordable);
     assert!(!proposal.dry_run);
     assert_eq!(proposal.claims, EvidenceClaims::layer_one());
-    let mission_proposal = MissionFeatureReleaseConsumer::for_scope(
+    let mission_proposal = MissionFeatureReleaseConsumer::for_request(
         &scope,
         service
             .provider()
             .registration_receipt()
             .registration_digest
             .clone(),
+        request.clone(),
     )
+    .expect("mission consumer")
     .consume(&proposal)
     .expect("mission proposal");
     assert_eq!(mission_proposal.status, ReleaseStatus::Approved);
-    assert!(mission_proposal.adoptable);
+    assert!(!mission_proposal.adoptable);
     assert_eq!(
         mission_proposal.authority_boundary,
         AuthorityBoundary::layer_one()
     );
+
+    let loopback_provider = LaunchDarklyReleaseProvider::with_defaults(
+        LoopbackTransport::new(
+            before.clone(),
+            vec![approved(
+                &scope,
+                "approval-loopback",
+                ApprovalStatus::Approved,
+            )],
+            Vec::new(),
+        ),
+        scope.clone(),
+        secret(&scope),
+    )
+    .expect("loopback provider");
+    let mut loopback_service = FeatureReleaseService::new(loopback_provider);
+    let loopback_evidence = loopback_service
+        .read_flag_evidence()
+        .expect("loopback evidence");
+    let loopback_proposal = loopback_service
+        .compile_release_proposal(&request, &loopback_evidence, &dry_run)
+        .expect("loopback proposal");
+    assert_eq!(loopback_proposal.status, ReleaseStatus::Approved);
+    assert!(!loopback_proposal.recordable);
+    let loopback_mission = MissionFeatureReleaseConsumer::for_request(
+        &scope,
+        loopback_service
+            .provider()
+            .registration_receipt()
+            .registration_digest
+            .clone(),
+        request.clone(),
+    )
+    .expect("loopback mission consumer")
+    .consume(&loopback_proposal)
+    .expect("loopback mission proposal");
+    assert!(!loopback_mission.adoptable);
 
     let after = flag(&scope, 43, "after");
     let applied_audit = AuditEvidence::for_scope_with_bindings(
@@ -174,20 +227,12 @@ fn typed_service_compiles_records_and_verifies_exact_readback_without_native_cla
         TransportProvenance::Recording,
     )
     .expect("read back");
-    let receipt = service
-        .record_release_receipt(&proposal, &readback)
-        .expect("recording receipt");
-    assert!(receipt.recording_only);
-    assert!(!receipt.write_effect);
-    let verified = service
-        .verify_release_result(&receipt, &readback)
-        .expect("verify result");
-    assert!(verified.verified);
-    assert!(!verified.claims.connected);
-    assert!(!verified.claims.native);
-    assert!(!verified.claims.first_party);
+    assert_eq!(
+        service.record_release_receipt(&proposal, &readback),
+        Err(FeatureReleaseError::ApprovalNotApproved)
+    );
 
-    let encoded = to_string(&(&description, &evidence, &proposal, &receipt)).expect("json");
+    let encoded = to_string(&(&description, &evidence, &proposal)).expect("json");
     assert!(!encoded.contains("reviewer@example.invalid"));
     assert!(!encoded.contains("customer@example.invalid"));
     assert!(!encoded.contains("targeting context"));
@@ -274,13 +319,12 @@ fn adversarial_digest_version_conflict_and_redaction_fences_fail_closed() {
     )
     .expect("provider");
     let mut drifted = FeatureReleaseService::new(drifted_provider);
-    let drifted_evidence = drifted.read_flag_evidence().expect("read drift evidence");
-    let request =
-        FeatureReleaseProposalRequest::for_scope(&scope, patch.clone(), false).expect("request");
     assert!(matches!(
-        drifted.compile_release_proposal(&request, &drifted_evidence, &dry_run),
+        drifted.read_flag_evidence(),
         Err(FeatureReleaseError::VersionDrift { .. })
     ));
+    let request =
+        FeatureReleaseProposalRequest::for_scope(&scope, patch.clone(), false).expect("request");
 
     let conflict_transport = RecordingTransport::new(
         before.clone(),
@@ -374,12 +418,12 @@ fn exact_provider_mission_and_audit_fences_reject_replay() {
         MissionFeatureReleaseConsumer::for_scope(&scope, digest("different-registration"));
     assert_eq!(
         wrong_registration.consume(&proposal),
-        Err(FeatureReleaseError::ScopeMismatch)
+        Err(FeatureReleaseError::RegistrationFenceMismatch)
     );
     let wrong_account = MissionFeatureReleaseConsumer::for_scope(&other_scope, registration_digest);
     assert_eq!(
         wrong_account.consume(&proposal),
-        Err(FeatureReleaseError::ScopeMismatch)
+        Err(FeatureReleaseError::ProposalSemanticMismatch)
     );
 
     let cross_scope_audit = audit(
@@ -411,16 +455,103 @@ fn exact_provider_mission_and_audit_fences_reject_replay() {
 }
 
 #[test]
+fn mission_denies_recomputed_cross_semantic_proposal() {
+    let scope = scope();
+    let before = flag(&scope, 42, "before");
+    let original_patch = patch(&scope, &before);
+    let dry_run = DryRunEvidence::local_valid(&scope, &before, &original_patch).expect("dry run");
+    let request = FeatureReleaseProposalRequest::for_scope(&scope, original_patch.clone(), false)
+        .expect("request");
+    let provider = LaunchDarklyReleaseProvider::with_defaults(
+        RecordingTransport::new(
+            before.clone(),
+            vec![approved(&scope, "approval-01", ApprovalStatus::Approved)],
+            Vec::new(),
+        ),
+        scope.clone(),
+        secret(&scope),
+    )
+    .expect("provider");
+    let mut service = FeatureReleaseService::new(provider);
+    let evidence = service.read_flag_evidence().expect("evidence");
+    let proposal = service
+        .compile_release_proposal(&request, &evidence, &dry_run)
+        .expect("proposal");
+    let registration_digest = service
+        .provider()
+        .registration_receipt()
+        .registration_digest
+        .clone();
+    let consumer = MissionFeatureReleaseConsumer::for_request(&scope, registration_digest, request)
+        .expect("consumer");
+
+    let replacement_patch = SemanticPatch::new(
+        original_patch.base_flag_version,
+        original_patch.base_variation_digest.clone(),
+        original_patch.base_targeting_digest.clone(),
+        digest("different-target-variation"),
+        original_patch.target_targeting_digest.clone(),
+        original_patch.operations.clone(),
+    )
+    .expect("replacement patch");
+    let mut tampered_patch = proposal.clone();
+    tampered_patch.patch = replacement_patch;
+    reseal_proposal(&mut tampered_patch);
+    assert_eq!(
+        consumer.consume(&tampered_patch),
+        Err(FeatureReleaseError::ProposalSemanticMismatch)
+    );
+
+    let mut tampered_approval = proposal;
+    tampered_approval.approval_status = Some(ApprovalStatus::Declined);
+    reseal_proposal(&mut tampered_approval);
+    assert_eq!(
+        consumer.consume(&tampered_approval),
+        Err(FeatureReleaseError::ProposalSemanticMismatch)
+    );
+}
+
+#[test]
 fn secret_tamper_revoke_and_retry_bounds_fail_closed() {
     let scope = scope();
     let before = flag(&scope, 42, "before");
-    let mut tampered_secret = to_value(secret(&scope)).expect("secret json");
+    let original_secret = secret(&scope);
+    let original_secret_json = to_value(&original_secret).expect("secret json");
+    let mut tampered_secret = original_secret_json.clone();
     tampered_secret["metadataDigest"] = json!(digest("tampered").to_string());
     let tampered_secret: SecretReference =
         serde_json::from_value(tampered_secret).expect("secret reference json");
     assert_eq!(
         tampered_secret.validate(),
         Err(FeatureReleaseError::SecretReferenceTampered)
+    );
+
+    let mut registration = FeatureReleaseRegistration::new(
+        &scope,
+        &original_secret,
+        PluginVersion::new(1, 0, 0),
+        DEFAULT_ADAPTER_REVISION,
+        DEFAULT_API_REVISION,
+        PermissionSnapshot::read_only(&scope),
+    )
+    .expect("registration");
+    let mut revoked_secret = original_secret.clone();
+    revoked_secret.revoke().expect("revoke secret");
+    assert_ne!(
+        original_secret.reference_digest(),
+        revoked_secret.reference_digest()
+    );
+    registration
+        .record_secret_revocation(&scope, &revoked_secret)
+        .expect("persist revocation tombstone");
+    let rolled_back: SecretReference =
+        serde_json::from_value(original_secret_json).expect("old secret snapshot");
+    rolled_back
+        .validate()
+        .expect("old snapshot remains well formed");
+    assert_eq!(
+        registration.reregister(&scope, &rolled_back),
+        Err(FeatureReleaseError::SecretReferenceRevoked)
     );
 
     let mut provider = LaunchDarklyReleaseProvider::with_defaults(
@@ -536,6 +667,10 @@ fn bounded_429_retries_and_405_400_401_403_404_409_statuses_are_transparent() {
     )
     .expect("fixture provider");
     let mut fixture_service = FeatureReleaseService::new(fixture_provider);
+    assert_eq!(
+        fixture_service.describe_release().availability,
+        EvidenceAvailability::BlockedEnv
+    );
     assert_eq!(
         fixture_service.read_flag_evidence(),
         Err(FeatureReleaseError::ProvenanceForbidden)

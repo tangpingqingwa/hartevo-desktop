@@ -15,6 +15,11 @@ The Rust crate under `hartevo-rs/launchdarkly-release-plugin` is a standalone
 nested workspace. It has no live LaunchDarkly transport. Fixture, recording,
 loopback, and `BLOCKED_ENV` transports always report recording-only evidence and
 never assert Connected, native, or first-party status.
+Recording and loopback evidence may be inspected or used to compile a
+non-adoptable proposal, but it cannot become `recordable` or Mission
+`adoptable` without an independently attested native canary. Secret revocation
+is persisted as a monotonic registration tombstone; an older deserialized
+`revoked=false` snapshot cannot re-register that identity.
 
 ## Layer 2 native exit plan (not executed)
 
