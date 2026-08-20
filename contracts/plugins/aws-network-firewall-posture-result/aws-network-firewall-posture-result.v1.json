@@ -1,0 +1,271 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-network-firewall-posture-result/aws-network-firewall-posture-result.v1.json",
+  "title": "Hartevo AWS Network Firewall posture result Layer-1 contract",
+  "description": "A bounded read/proposal/record/verify-only AWS Network Firewall posture seam. It does not become a firewall, policy, rule-group, VPC, packet-log, credential, Truth, Consent, Effect, Receipt, Verification, Outcome, or Work Product authority.",
+  "schemaVersion": "hartevo.aws-network-firewall-posture-result.contract/v1",
+  "contractVersion": "aws-network-firewall-posture-result/v1",
+  "pluginVersion": "1.0.0",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "contractDigestInput": "hartevo.aws-network-firewall-posture-result.contract/v1|layer=1|service=hartevo.aws.network-firewall.posture-result|provider=aws.network-firewall.read|consumer=mission.aws.network-firewall.posture|api=2018-02-08",
+  "contractDigest": "8be2c7cbdfe7bc7f59c832f4f2e3230e13f1710dc3bbe619b15dbcf3669505ff",
+  "service": {
+    "id": "hartevo.aws.network-firewall.posture-result",
+    "implementation": "AwsNetworkFirewallPostureService",
+    "operations": [
+      "describe_capabilities",
+      "register",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration",
+      "list_firewalls",
+      "describe_firewall",
+      "describe_firewall_policy",
+      "propose",
+      "record",
+      "verify"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "liveExecution": false,
+    "externalWrites": false,
+    "kernelAuthority": false
+  },
+  "provider": {
+    "id": "aws.network-firewall.read",
+    "implementation": "AwsNetworkFirewallProvider",
+    "version": "aws-network-firewall-provider/v1",
+    "apiVersion": "2018-02-08",
+    "apiRevision": "aws-network-firewall-read-r1",
+    "allowlistedOperations": [
+      "ListFirewalls",
+      "DescribeFirewall",
+      "DescribeFirewallPolicy"
+    ],
+    "allowedTransports": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
+    "native": false,
+    "connected": false,
+    "firstParty": false,
+    "externalWrites": false,
+    "sigV4SecretReference": "opaque_non_serializing_only"
+  },
+  "consumer": {
+    "id": "mission.aws.network-firewall.posture",
+    "implementation": "MissionAwsNetworkFirewallConsumer",
+    "scope": [
+      "account",
+      "region",
+      "vpc",
+      "firewall_allowlist",
+      "firewall_policy_allowlist",
+      "endpoint_subnet_attachment_allowlist",
+      "mission_and_revision",
+      "project_and_revision",
+      "work_product_and_revision"
+    ],
+    "producesDecisionProposal": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "effectiveAuthorization": false,
+    "certificationAuthority": false
+  },
+  "registration": {
+    "boundDigests": [
+      "pluginVersionDigest",
+      "serviceVersionDigest",
+      "providerDigest",
+      "apiDigest",
+      "contractDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "policyDigest",
+      "secretReferenceDigest",
+      "registrationDigest"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOn": [
+      "version_drift",
+      "provider_or_api_drift",
+      "contract_drift",
+      "permission_drift",
+      "scope_drift",
+      "policy_revision_drift",
+      "secret_reference_revocation",
+      "registration_tamper",
+      "registration_revocation",
+      "cursor_or_filter_replay"
+    ]
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "vpcId",
+      "firewallAllowlist",
+      "firewallPolicyAllowlistAndRevision",
+      "endpointSubnetAttachmentAllowlist",
+      "missionIdAndRevision",
+      "projectIdAndRevision",
+      "workProductIdAndRevision",
+      "permissionDigest",
+      "policyDigest",
+      "scopeDigest"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "policyPayload": false,
+    "ruleText": false,
+    "ruleIps": false,
+    "packetPayloads": false,
+    "flowLogs": false,
+    "tags": false,
+    "secretMaterial": false
+  },
+  "bounds": {
+    "maxResponseBytes": 1048576,
+    "maxPages": 4,
+    "maxPageSize": 100,
+    "maxFirewalls": 128,
+    "maxEndpoints": 128,
+    "maxRuleGroupReferences": 256,
+    "maxRequestsPerRead": 8,
+    "opaqueCursor": true,
+    "opaqueUpdateToken": true
+  },
+  "reads": {
+    "ListFirewalls": {
+      "method": "POST",
+      "input": ["VpcIds", "MaxResults", "NextToken"],
+      "output": ["FirewallArnDigest", "FirewallNameDigest", "VpcIdDigest", "NextTokenDigest"]
+    },
+    "DescribeFirewall": {
+      "method": "POST",
+      "input": ["FirewallArnOrName"],
+      "output": ["status", "policyReferenceDigest", "endpointAttachmentPosture", "updateTokenDigest"]
+    },
+    "DescribeFirewallPolicy": {
+      "method": "POST",
+      "input": ["FirewallPolicyArnOrName"],
+      "output": ["policyStatus", "updateTokenDigest", "statefulActionSummary", "statelessActionSummary", "ruleGroupReferenceDigests"]
+    },
+    "record": "normalized_bounded_pages_only",
+    "verify": [
+      "requestDigest",
+      "opaqueCursorDigest",
+      "versionDigest",
+      "providerDigest",
+      "apiDigest",
+      "contractDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "policyDigest",
+      "completePagination",
+      "endpointVpcAllowlist",
+      "policyRevisionFence",
+      "evidenceDigest"
+    ]
+  },
+  "evidence": {
+    "statuses": ["complete", "partial", "access_loss", "provider_unknown", "policy_revision_drift", "registration_revoked"],
+    "retained": [
+      "firewallAndPolicyReferenceDigests",
+      "vpcDigest",
+      "status",
+      "endpointAndAttachmentPosture",
+      "statefulAndStatelessActionSummaries",
+      "ruleGroupReferenceDigests",
+      "policyUpdateTokenDigest",
+      "paginationTokenDigests",
+      "all_required_digests"
+    ],
+    "notRetained": [
+      "rawNextToken",
+      "rawUpdateToken",
+      "rawPolicyDocument",
+      "rawRuleText",
+      "rawRuleIpOrCidr",
+      "packetPayload",
+      "flowLog",
+      "endpointIp",
+      "subnetMetadata",
+      "tags",
+      "credentialMaterial",
+      "providerErrorMessage"
+    ],
+    "missingOrInsufficientDataFailsClosed": true,
+    "tamperRejected": true
+  },
+  "redaction": {
+    "rawIdentifiers": false,
+    "rawNextTokens": false,
+    "rawUpdateTokens": false,
+    "rawPolicyObjects": false,
+    "rawRuleText": false,
+    "rawRuleIps": false,
+    "packetPayloads": false,
+    "flowLogs": false,
+    "secretMaterial": false,
+    "providerErrorMessages": false
+  },
+  "authority": {
+    "readOnly": true,
+    "proposalOnly": true,
+    "externalWrites": false,
+    "firewallMutation": false,
+    "firewallPolicyMutation": false,
+    "ruleGroupMutation": false,
+    "vpcAttachmentMutation": false,
+    "packetOrFlowLogRead": false,
+    "credentialResolution": false,
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "durableReceipt": false,
+    "verificationAuthority": false,
+    "kernelOutcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "firstParty": false,
+    "durableReceipt": false,
+    "effectiveAuthorization": false,
+    "policyTruthAuthority": false,
+    "blockedEnvironmentIsNative": false,
+    "fixtureIsNative": false,
+    "recordingIsNative": false,
+    "loopbackIsNative": false
+  },
+  "forbidden": [
+    "CreateFirewall",
+    "UpdateFirewall",
+    "DeleteFirewall",
+    "AssociateFirewallPolicy",
+    "DisassociateFirewallPolicy",
+    "UpdateFirewallPolicy",
+    "CreateRuleGroup",
+    "UpdateRuleGroup",
+    "DeleteRuleGroup",
+    "mutate_vpc_attachment",
+    "read_packet_payload",
+    "read_flow_logs",
+    "retain_raw_rules_or_ips",
+    "resolve_live_sigv4_secret",
+    "claim_connected",
+    "claim_native",
+    "claim_first_party",
+    "adopt_kernel_outcome",
+    "adopt_verified_work_product"
+  ],
+  "layer2Gaps": [
+    "host_owned_sigv4_resolution_and_native_transport",
+    "durable_provider_receipt",
+    "independent_posture_readback",
+    "consented_firewall_or_policy_effects",
+    "verified_work_product_adoption",
+    "native_connected_evidence"
+  ]
+}
