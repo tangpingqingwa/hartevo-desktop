@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/cohere-inference-result/cohere-inference-result.v1.json",
+  "title": "Hartevo Cohere inference result Layer-1 contract",
+  "description": "A provider-specific, scoped and redacted Cohere inference-result seam. It is not a native connector, kernel Receipt, Verification, Truth, Effect or Outcome authority.",
+  "schemaVersion": "hartevo.cohere-inference-result.contract/v1",
+  "contractVersion": "cohere-inference-result/v1",
+  "pluginVersion": "0.1.0",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "serviceId": "hartevo.cohere.inference.result",
+  "providerId": "cohere",
+  "consumerId": "mission.cohere.inference.result",
+  "service": {
+    "id": "hartevo.cohere.inference.result",
+    "version": "0.1.0",
+    "operation": "governed_inference_result_proposal",
+    "readOnly": true,
+    "liveExecution": false,
+    "emitsKernelReceipt": false,
+    "adoptsOutcome": false
+  },
+  "provider": {
+    "id": "cohere",
+    "version": "0.1.0",
+    "endpoints": ["POST /v2/chat", "POST /v1/generate", "POST /v2/embed"],
+    "tasks": ["chat", "generate", "embed"],
+    "acceptedTransports": ["fixture", "recording", "fake", "loopback", "BLOCKED_ENV"],
+    "native": false,
+    "connected": false,
+    "firstParty": false,
+    "secret": "opaque_non_serializing_secret_reference_only"
+  },
+  "consumer": {
+    "id": "mission.cohere.inference.result",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "consentBound": true,
+    "proposalOnly": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": [
+      "apiEndpoint",
+      "account",
+      "opaqueSecretReference",
+      "model",
+      "immutableModelRevision",
+      "task",
+      "providerRoute",
+      "project",
+      "mission",
+      "workProduct",
+      "consent",
+      "requestRevision",
+      "policyRevision"
+    ],
+    "exactScope": ["Project", "Mission", "Work Product"],
+    "digestFences": [
+      "version",
+      "contract",
+      "provider",
+      "endpoint",
+      "model",
+      "task",
+      "scope",
+      "permission",
+      "consent",
+      "policy",
+      "request",
+      "result",
+      "idempotency"
+    ],
+    "secret": "opaque_non_serializing_secret_reference_only"
+  },
+  "allowlist": {
+    "chat": {
+      "messages": ["system", "user", "assistant"],
+      "content": "text_only",
+      "tools": false,
+      "streaming": false
+    },
+    "generate": {
+      "input": "bounded_text_only",
+      "tools": false,
+      "streaming": false
+    },
+    "embed": {
+      "input": "bounded_text_batch",
+      "vectors": "digest_and_dimension_only"
+    }
+  },
+  "redaction": {
+    "prompts": "digest_and_shape_only",
+    "completions": "digest_and_byte_length_only",
+    "embeddings": "digest_and_dimension_only",
+    "rawResponseBody": "never_retained",
+    "toolArguments": "never_retained",
+    "providerErrors": "class_status_retryable_digest_only"
+  },
+  "lifecycle": {
+    "states": ["submitted", "queued", "running", "completed", "failed", "partial", "timeout", "expired", "provider_unknown"],
+    "completionDoesNotProve": ["factualCorrectness", "taskSuccess", "outcomeAdoption"]
+  },
+  "registration": {
+    "versionBound": true,
+    "contractBound": true,
+    "providerBound": true,
+    "endpointBound": true,
+    "modelBound": true,
+    "taskBound": true,
+    "scopeBound": true,
+    "permissionBound": true,
+    "consentBound": true,
+    "policyBound": true,
+    "digestBound": true,
+    "reversible": true,
+    "revocable": true,
+    "singleUseRecordings": true
+  },
+  "authority": {
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "externalWrites": false,
+    "toolExecution": false,
+    "modelMutation": false,
+    "durableNativeReceipt": false,
+    "independentReadBack": false,
+    "kernelTruth": false,
+    "kernelConsent": false,
+    "kernelEffect": false,
+    "kernelReceipt": false,
+    "kernelVerification": false,
+    "kernelOutcomeAdoption": false
+  },
+  "evidence": {
+    "bounded": ["model", "task", "requestRevision", "resultRevision", "finishReason", "usage", "latency", "contentDigest", "embeddingDigest", "errorDigest"],
+    "rawPrompt": false,
+    "rawCompletion": false,
+    "rawEmbedding": false,
+    "rawResponse": false,
+    "durableNativeReceipt": false,
+    "independentReadBack": false
+  },
+  "evidenceModes": ["fixture", "recording", "fake", "loopback", "BLOCKED_ENV"],
+  "forbidden": [
+    "raw_token_serialization",
+    "raw_prompt_or_completion_retention",
+    "hidden_reasoning_retention",
+    "tool_call_execution",
+    "file_or_document_authority",
+    "model_or_endpoint_mutation",
+    "external_write",
+    "silent_provider_failover",
+    "native_connected_claim"
+  ],
+  "layer2Gaps": [
+    "host_owned_credential_resolution",
+    "consented_live_inference_effect",
+    "durable_provider_receipt",
+    "independent_native_read_back",
+    "verified_work_product_adoption",
+    "tool_execution",
+    "model_or_endpoint_mutation"
+  ],
+  "officialApiBasis": ["https://docs.cohere.com/reference/about"]
+}
