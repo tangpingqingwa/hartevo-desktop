@@ -1,0 +1,232 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/azure-monitor-logs-result/azure-monitor-logs-result.v1.json",
+  "title": "Hartevo Azure Monitor Logs governed result Layer-1 contract",
+  "schemaVersion": "hartevo.azure-monitor-logs-result-contract/v1",
+  "contractVersion": "EXT-AZURE-MONITOR-LOGS-01-L1/v1",
+  "pluginId": "azure.monitor.logs.result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "bounded_read_proposal_only",
+  "service": {
+    "type": "AzureMonitorLogsResultService",
+    "id": "azure.monitor.logs.result",
+    "operation": "bounded_aggregate_query",
+    "endpoint": "/v1/workspaces/{workspaceId}/query",
+    "readOnly": true,
+    "nonMutatingOperation": "POST /query",
+    "liveExecution": false,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAuthority": false
+  },
+  "provider": {
+    "type": "AzureMonitorLogsProvider",
+    "id": "azure.monitor.logs.query",
+    "apiRevision": "logs-query-v1",
+    "endpoint": "https://api.loganalytics.azure.com/v1/workspaces/{workspaceId}/query",
+    "operations": ["query"],
+    "transportProvenance": ["fixture", "recording", "loopback", "blocked_env"],
+    "acceptedAuthentication": "opaque_entra_secret_reference",
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false
+  },
+  "consumer": {
+    "type": "MissionAzureMonitorLogsConsumer",
+    "id": "mission.azure-monitor-logs.result",
+    "projectBound": true,
+    "missionBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "consentAuthority": false
+  },
+  "scope": {
+    "required": [
+      "tenantId",
+      "subscriptionId",
+      "workspaceId",
+      "table",
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "permissionDigest",
+      "consentDigest"
+    ],
+    "providerResourceExact": true,
+    "crossWorkspace": "rejected_unless_exactly_registered",
+    "secret": "opaque_non_serializing_secret_reference_only"
+  },
+  "queryPolicy": {
+    "endpoint": "POST /query",
+    "mandatoryTimeRange": true,
+    "allowlistedAst": [
+      "count",
+      "sum",
+      "avg",
+      "min",
+      "max",
+      "dcount",
+      "bounded_group_by",
+      "parameterized_equality",
+      "parameterized_in_set"
+    ],
+    "deny": [
+      "arbitrary_kql",
+      "multi_statement",
+      "cross_workspace_without_registration",
+      "join",
+      "union",
+      "externaldata",
+      "evaluate",
+      "plugin",
+      "dynamic_property_bag",
+      "raw_log_body",
+      "raw_event_body",
+      "user_identifier",
+      "unbounded_text",
+      "ingestion",
+      "dashboard_mutation",
+      "alert_mutation"
+    ]
+  },
+  "bounds": {
+    "maxRows": 256,
+    "maxResponseBytes": 1048576,
+    "maxDurationMs": 120000,
+    "maxCostMicrounits": 1000000,
+    "maxQueryBytes": 16384,
+    "maxParameters": 32,
+    "maxGroupByColumns": 8,
+    "maxAggregates": 8,
+    "maxCellTextBytes": 128,
+    "maxWindowDays": 31
+  },
+  "digests": {
+    "required": [
+      "contract",
+      "scope",
+      "queryTemplate",
+      "query",
+      "parameters",
+      "timeWindow",
+      "schema",
+      "rowSet",
+      "result",
+      "registration"
+    ],
+    "algorithm": "sha256",
+    "encoding": "lowercase_hex",
+    "canonicalization": "length_prefixed_domain_fields"
+  },
+  "statuses": [
+    "COMPLETE",
+    "EMPTY",
+    "PARTIAL",
+    "TRUNCATED",
+    "TIMEOUT",
+    "ACCESS_LOST",
+    "PROVIDER_UNKNOWN",
+    "TAMPERED",
+    "REVOKED"
+  ],
+  "registration": {
+    "boundFields": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "tenantId",
+      "subscriptionId",
+      "workspaceId",
+      "table",
+      "scopeDigest",
+      "queryTemplateDigest",
+      "queryDigest",
+      "parameterDigest",
+      "timeWindowDigest",
+      "projectIdAndRevision",
+      "missionIdAndRevision",
+      "workProductIdAndRevision",
+      "permissionDigest",
+      "consentDigest",
+      "secretReferenceDigest",
+      "credentialRevision",
+      "registrationRevision"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true,
+    "crossWorkspaceRequiresNewRegistration": true
+  },
+  "provenance": {
+    "fixture": {"connected": false, "native": false, "firstParty": false},
+    "recording": {"connected": false, "native": false, "firstParty": false},
+    "loopback": {"connected": false, "native": false, "firstParty": false},
+    "blocked_env": {"connected": false, "native": false, "firstParty": false}
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed Azure tenant/subscription/workspace/table scope",
+      "exact Project/Mission/Work Product revision binding",
+      "allowlisted aggregate query planning",
+      "bounded schema and aggregate-cell projection",
+      "query/parameter/schema/row-set/result digests",
+      "reversible and revocable registration",
+      "recording and fixture failure taxonomy"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification",
+      "Hartevo Outcome",
+      "native Entra resolution",
+      "native HTTPS execution",
+      "connected status",
+      "first-party evidence",
+      "raw log or event bodies",
+      "ingestion",
+      "dashboard or alert mutation",
+      "verified Work Product adoption"
+    ]
+  },
+  "nativeGap": {
+    "status": "BLOCKED_ENV",
+    "deferredTo": "layer_2_native_entra_and_connected",
+    "requires": [
+      "native Entra credential resolution",
+      "credentialed HTTPS POST /query",
+      "durable provider receipt",
+      "independent reconciliation",
+      "exact read-back",
+      "verified adoption"
+    ],
+    "failClosedCases": [
+      "missing_native_entra_authority",
+      "missing_native_access_token",
+      "workspace_or_scope_drift",
+      "query_template_or_parameter_drift",
+      "time_range_missing_or_unbounded",
+      "schema_drift",
+      "raw_log_or_user_identifier_request",
+      "provider_unknown",
+      "registration_revoked"
+    ]
+  },
+  "honestLayer2Gap": "Fixture, recording, loopback, and BLOCKED_ENV evidence never claims Connected, native, first-party, Truth, Consent, Effect, Receipt, Verification, Outcome, or Work Product authority. Native Entra/HTTPS, durable receipt, independent reconciliation, exact read-back, and verified adoption remain Layer 2."
+}
