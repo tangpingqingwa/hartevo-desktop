@@ -278,6 +278,57 @@ CREATE TABLE IF NOT EXISTS hartevo_cell.sync_mutations (
             (cell, tenant_id, project_id, sequence)
 );
 
+-- Region transfer receipts contain only encrypted bundle bytes and routing,
+-- version, and digest metadata.  A source receipt is prepared in the source
+-- Cell; a target consumer adopts the exact immutable request in one local
+-- transaction.  Plaintext Project/Mission content and key material never
+-- cross this boundary.
+CREATE TABLE IF NOT EXISTS hartevo_cell.region_transfer_receipts (
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL CHECK (length(btrim(project_id)) > 0),
+    transfer_id TEXT NOT NULL CHECK (length(btrim(transfer_id)) > 0),
+    mission_id TEXT NOT NULL CHECK (length(btrim(mission_id)) > 0),
+    source_cell TEXT NOT NULL CHECK (source_cell IN ('us', 'eu')),
+    target_cell TEXT NOT NULL CHECK (target_cell IN ('us', 'eu')),
+    request_json JSONB NOT NULL CHECK (jsonb_typeof(request_json) = 'object'),
+    request_digest TEXT NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    idempotency_key_digest TEXT NOT NULL CHECK (
+        idempotency_key_digest ~ '^[0-9a-f]{64}$'
+    ),
+    status TEXT NOT NULL CHECK (status IN ('prepared', 'adopted', 'revoked', 'crashed')),
+    adopted_revision BIGINT CHECK (adopted_revision IS NULL OR adopted_revision > 0),
+    receipt_digest TEXT NOT NULL CHECK (receipt_digest ~ '^[0-9a-f]{64}$'),
+    recorded_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (cell, tenant_id, project_id, transfer_id),
+    UNIQUE (cell, tenant_id, project_id, idempotency_key_digest),
+    FOREIGN KEY (cell, tenant_id, project_id)
+        REFERENCES hartevo_cell.projects (cell, tenant_id, project_id),
+    CHECK (source_cell <> target_cell),
+    CHECK (
+        (status = 'adopted' AND adopted_revision IS NOT NULL)
+        OR (status <> 'adopted' AND adopted_revision IS NULL)
+    ),
+    CHECK (recorded_at <= updated_at)
+);
+
+CREATE TABLE IF NOT EXISTS hartevo_cell.region_transfer_events (
+    sequence BIGSERIAL PRIMARY KEY,
+    cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    transfer_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('prepared', 'adopted', 'revoked', 'crashed')),
+    event_type TEXT NOT NULL CHECK (length(btrim(event_type)) > 0),
+    request_digest TEXT NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    receipt_digest TEXT NOT NULL CHECK (receipt_digest ~ '^[0-9a-f]{64}$'),
+    observed_at TIMESTAMPTZ NOT NULL,
+    FOREIGN KEY (cell, tenant_id, project_id, transfer_id)
+        REFERENCES hartevo_cell.region_transfer_receipts
+            (cell, tenant_id, project_id, transfer_id)
+);
+
 CREATE TABLE IF NOT EXISTS hartevo_cell.remote_worker_mailbox_messages (
     cell TEXT NOT NULL CHECK (cell IN ('us', 'eu')),
     tenant_id TEXT NOT NULL,
@@ -935,6 +986,9 @@ CREATE INDEX IF NOT EXISTS scheduler_attempt_reconcile_idx
 CREATE INDEX IF NOT EXISTS sync_versions_replay_idx
     ON hartevo_cell.sync_object_versions
         (cell, tenant_id, project_id, recorded_at, object_id, revision);
+CREATE INDEX IF NOT EXISTS region_transfer_event_lookup_idx
+    ON hartevo_cell.region_transfer_events
+        (cell, tenant_id, project_id, transfer_id, sequence);
 CREATE INDEX IF NOT EXISTS remote_worker_claim_idx
     ON hartevo_cell.remote_worker_mailbox_messages
         (cell, tenant_id, project_id, worker_id, status, enqueued_at, task_id);
@@ -977,6 +1031,10 @@ ALTER TABLE hartevo_cell.scheduler_attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.scheduler_attempts FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.sync_mutations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.sync_mutations FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.region_transfer_receipts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.region_transfer_receipts FORCE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.region_transfer_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE hartevo_cell.region_transfer_events FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.remote_worker_mailbox_messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.remote_worker_mailbox_messages FORCE ROW LEVEL SECURITY;
 ALTER TABLE hartevo_cell.remote_worker_claims ENABLE ROW LEVEL SECURITY;
@@ -1034,6 +1092,8 @@ BEGIN
         'scheduler_lease_takeovers',
         'scheduler_attempts',
         'sync_mutations',
+        'region_transfer_receipts',
+        'region_transfer_events',
         'remote_worker_mailbox_messages',
         'remote_worker_claims',
         'device_public_key_versions',

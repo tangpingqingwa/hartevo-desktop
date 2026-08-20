@@ -1,0 +1,239 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/aws-neptune-graph-result/aws-neptune-graph-result.v1.json",
+  "title": "Hartevo AWS Neptune graph-query result Layer-1 contract",
+  "schemaVersion": "hartevo.aws-neptune-graph-result/v1",
+  "contractVersion": "EXT-AWS-NEPTUNE-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "aws.neptune.graph.result",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.aws-neptune-graph-result/v1|layer=1|service=aws.neptune.graph.result.read|provider=aws.neptune.graph.result.recording|consumer=mission.aws-neptune-graph-result.consumer|api=neptune-execute-open-cypher-query-2022-11-30-r1",
+  "contractDigest": "723c20505fe006f776ba4fa771ff00ff792abdb90f77abe49f7e4087daca4bd2",
+  "service": {
+    "type": "AwsNeptuneGraphResultService",
+    "id": "aws.neptune.graph.result.read",
+    "access": "read_proposal_recording",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register",
+      "execute_open_cypher_query",
+      "propose",
+      "verify",
+      "record",
+      "revoke_registration",
+      "reverse_registration",
+      "restore_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "AwsNeptuneProvider",
+    "id": "aws.neptune.graph.result.recording",
+    "apiRevision": "neptune-execute-open-cypher-query-2022-11-30-r1",
+    "operation": "ExecuteOpenCypherQuery",
+    "allowedTransports": ["recording", "fixture", "loopback", "blocked_env"],
+    "authentication": {
+      "scheme": "aws_sigv4",
+      "secretReference": "opaque_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false,
+      "signedHeadersRetained": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "type": "MissionAwsNeptuneConsumer",
+    "id": "mission.aws-neptune-graph-result.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": [
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque non-serializing SigV4 SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "signedHeadersRetained": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": [
+      "awsAccountId",
+      "awsRegion",
+      "vpcEndpoint",
+      "neptuneCluster",
+      "graphNamespace",
+      "queryTemplateDigest",
+      "parameterDigest",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "projectRevision",
+      "workProductId",
+      "workProductRevision"
+    ],
+    "identifiersInEvidence": "digest_only",
+    "rawEndpoint": false,
+    "rawCluster": false,
+    "rawGraphPayload": false,
+    "maxRows": 512,
+    "maxBytes": 1048576,
+    "maxTimeMs": 30000,
+    "maxPages": 8
+  },
+  "queryPolicy": {
+    "allow": [
+      "parameterized_fixed_length_match_node",
+      "parameterized_fixed_length_match_relationship",
+      "bounded_projection",
+      "ExecuteOpenCypherQuery"
+    ],
+    "arbitraryQueryText": false,
+    "writes": false,
+    "deletes": false,
+    "loads": false,
+    "s3Reads": false,
+    "variableLengthTraversals": false,
+    "unboundedOutput": false,
+    "positionalParameters": false,
+    "multiStatement": false
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "terminalStatuses": ["revoked", "reversed"],
+    "binding": [
+      "pluginVersion",
+      "contractVersion",
+      "contractDigest",
+      "providerId",
+      "providerRevision",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "evidenceDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ],
+    "permissions": [
+      "neptune-db:ExecuteOpenCypherQuery",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "neptune-db:ExecuteGremlinQuery",
+      "neptune-db:ExecuteSparqlQuery",
+      "neptune-db:GetPropertygraphSummary",
+      "neptune-db:CancelOpenCypherQuery",
+      "neptune-db:ReadDataViaS3",
+      "neptune-db:LoadDataViaS3",
+      "neptune-db:WriteData",
+      "neptune-db:DeleteData",
+      "outcome.adopt"
+    ]
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "scopeDigest",
+      "queryTemplateDigest",
+      "parameterDigest",
+      "queryDigest",
+      "resultDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "PRESENT",
+      "EMPTY",
+      "PARTIAL",
+      "TIMEOUT",
+      "ACCESS_LOST",
+      "PROVIDER_UNKNOWN",
+      "TAMPERED",
+      "REVOKED",
+      "BAD_REQUEST",
+      "CONFLICT",
+      "THROTTLED",
+      "SERVER_ERROR"
+    ],
+    "rowBounded": true,
+    "byteBounded": true,
+    "timeBounded": true,
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "rawNodes": false,
+    "rawEdges": false,
+    "rawProperties": false,
+    "rawErrors": false
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed AWS account/region/VPC endpoint/cluster/graph scope",
+      "predeclared parameterized fixed-length openCypher AST",
+      "bounded ExecuteOpenCypherQuery proposal seam",
+      "row/byte/time/page limits",
+      "digest-only node and edge projections",
+      "version/contract/provider/API/permission/scope/evidence digests",
+      "reversible registration",
+      "redacted replay-safe recording"
+    ],
+    "doesNotOwn": [
+      "Hartevo Truth",
+      "Hartevo Consent",
+      "Hartevo Effect",
+      "Hartevo Receipt",
+      "Hartevo Verification authority",
+      "Hartevo Outcome",
+      "live SigV4 credential resolution",
+      "live HTTPS or VPC connectivity",
+      "graph writes, deletes, loads, or S3 reads",
+      "raw graph identifiers, properties, or payload export",
+      "verified Work Product adoption"
+    ]
+  },
+  "layer2Gaps": [
+    "native SigV4 credential resolution",
+    "live Neptune HTTPS/VPC ExecuteOpenCypherQuery",
+    "durable provider receipt",
+    "independent repeat-read and reconciliation",
+    "verified Work Product adoption"
+  ],
+  "honestNativeGap": "Native SigV4 resolution, live ExecuteOpenCypherQuery HTTPS/VPC access, durable provider receipt, independent repeat-read/reconciliation, and verified Work Product adoption remain Layer-2 work; fixture, recording, loopback, and BLOCKED_ENV never claim Connected, native, or first-party evidence."
+}

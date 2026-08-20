@@ -1,0 +1,43 @@
+{
+  "database": {
+    "advisory-count": 2
+  },
+  "lockfile": {
+    "dependency-count": 5
+  },
+  "vulnerabilities": {
+    "found": false,
+    "count": 0,
+    "list": []
+  },
+  "warnings": {
+    "unsound": [
+      {
+        "kind": "unsound",
+        "package": {
+          "name": "glib",
+          "version": "0.18.5",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        "advisory": {
+          "id": "RUSTSEC-2024-0429",
+          "package": "glib",
+          "informational": "unsound"
+        }
+      },
+      {
+        "kind": "unsound",
+        "package": {
+          "name": "rand",
+          "version": "0.7.3",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        "advisory": {
+          "id": "RUSTSEC-2026-0097",
+          "package": "rand",
+          "informational": "unsound"
+        }
+      }
+    ]
+  }
+}
