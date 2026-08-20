@@ -1,0 +1,89 @@
+{
+  "schemaVersion": "hartevo-plugin-fixture/v1",
+  "fixtureId": "readonly-market-plugin-mount/v1",
+  "fixtureClass": "contract_fixture",
+  "pluginId": "hartevo.readonly.market-evidence",
+  "pluginVersion": "1.0.0",
+  "pluginDefinitionDigest": "efb8f0fe578f8436bc01546790c32d75253b69674ca53b9d11b836bb50be6cf9",
+  "hostComposition": {
+    "compositionId": "fixture.host.readonly-market",
+    "scopeKind": "host",
+    "scopeDigest": "9e9bfd862b119ea1f77b967f5c56af085710b87fb3e9de14ee20ef28ac21df31",
+    "generation": 7,
+    "registrationState": "mounted",
+    "registrations": [
+      {"registrationId": "host.service.market-evidence", "contributionKind": "service_definition", "contributionId": "market.evidence.read", "sequence": 1},
+      {"registrationId": "host.provider.market-evidence", "contributionKind": "provider", "contributionId": "market.evidence.real-provider", "sequence": 2}
+    ],
+    "mountReceipt": {
+      "receiptId": "fixture-mount-host-7",
+      "generation": 7,
+      "atomic": true,
+      "reverseOrderUnmount": true,
+      "contributionIds": ["market.evidence.read", "market.evidence.real-provider"],
+      "receiptDigest": "a68da66e25869270e83888d88a0a5d04ece50321baf7134efa84f38b41870bb1"
+    },
+    "unmountReceipt": {
+      "receiptId": "fixture-unmount-host-7",
+      "generation": 7,
+      "atomic": true,
+      "reverseOrder": ["market.evidence.real-provider", "market.evidence.read"],
+      "remainingRegistrationCount": 0,
+      "receiptDigest": "39976f04b2d47d921eb661ae0c60b3410faa44bad3378e409087c93267537bcd"
+    }
+  },
+  "projectMissionCompositions": [
+    {
+      "compositionId": "fixture.project-mission.readonly-market",
+      "scopeKind": "project_mission",
+      "scope": {
+        "tenantIdDigest": "d6ef2227bcb6cc9f0e31eab08139f3ba3ad5540bb448233dc3f08f76614db306",
+        "projectIdDigest": "bfe2f7701afb2d2b5b03a479025e68b1f669cb461542e1440218b216ef31ddba",
+        "missionIdDigest": "3f22b264a825864108ede9d1f8f8f90c05b1219da4e41aea1c2b7d07ebd598fc"
+      },
+      "scopeDigest": "15b4d31832f6165508833f47e9e52a459bd93af17280d64705f2d0207aae744c",
+      "generation": 11,
+      "registrationState": "mounted",
+      "registrations": [
+        {"registrationId": "mission.consumer.market-evidence", "contributionKind": "consumer", "contributionId": "market.evidence.inspect", "sequence": 1},
+        {"registrationId": "mission.surface.conversation", "contributionKind": "surface", "contributionId": "market.evidence.conversation", "sequence": 2},
+        {"registrationId": "mission.surface.result", "contributionKind": "surface", "contributionId": "market.evidence.result", "sequence": 3}
+      ],
+      "mountReceipt": {
+        "receiptId": "fixture-mount-project-11",
+        "generation": 11,
+        "atomic": true,
+        "reverseOrderUnmount": true,
+        "contributionIds": ["market.evidence.inspect", "market.evidence.conversation", "market.evidence.result"],
+        "receiptDigest": "af3994cd1f7f5e05dfa5c142136e468eba19db89c8b233109b03c0b9e6d0cce1"
+      },
+      "unmountReceipt": {
+        "receiptId": "fixture-unmount-project-11",
+        "generation": 11,
+        "atomic": true,
+        "reverseOrder": ["market.evidence.result", "market.evidence.conversation", "market.evidence.inspect"],
+        "remainingRegistrationCount": 0,
+        "receiptDigest": "32114fe5431bdb7b8d934473b04b8cdcd3870334a537f537cf154726bcc19e04"
+      }
+    }
+  ],
+  "lifecycleTrace": [
+    {"sequence": 1, "state": "defined", "generation": 7, "scopeKind": "host"},
+    {"sequence": 2, "state": "mounted", "generation": 7, "scopeKind": "host"},
+    {"sequence": 3, "state": "stopping", "generation": 7, "scopeKind": "host"},
+    {"sequence": 4, "state": "stopped", "generation": 7, "scopeKind": "host"}
+  ],
+  "durableEvents": [
+    {"sequence": 1, "eventId": "fixture-event-input-1", "eventKind": "input", "scopeKind": "project_mission", "scopeDigest": "15b4d31832f6165508833f47e9e52a459bd93af17280d64705f2d0207aae744c", "definitionDigest": "f15c61b8333ebbd7e1df035c2020cd74fb64b1ed46dbc9f176cc200f0399b261", "modelVisible": true, "payloadDigest": "5167424ffee3fb00c02baedde5cb5dd346d20bdc6d3127a7f0348b6cfc860960", "eventDigest": "79a0fa840db70b4695839ec9d5d12942e1f6f1e8b8efa21f0bb36ea91a6554ba"},
+    {"sequence": 2, "eventId": "fixture-event-output-1", "eventKind": "output", "scopeKind": "project_mission", "scopeDigest": "15b4d31832f6165508833f47e9e52a459bd93af17280d64705f2d0207aae744c", "definitionDigest": "f15c61b8333ebbd7e1df035c2020cd74fb64b1ed46dbc9f176cc200f0399b261", "modelVisible": true, "payloadDigest": "5148b8494e5eb459b18b71baa3eca4434a14512c5f1ca81c84a89519cbb3b646", "eventDigest": "fa9279c103992ca1f09258d64e3acae4e9fec68e5a5494acf89e3401890690be"},
+    {"sequence": 3, "eventId": "fixture-event-stop-1", "eventKind": "lifecycle", "scopeKind": "host", "scopeDigest": "9e9bfd862b119ea1f77b967f5c56af085710b87fb3e9de14ee20ef28ac21df31", "definitionDigest": "efb8f0fe578f8436bc01546790c32d75253b69674ca53b9d11b836bb50be6cf9", "modelVisible": false, "payloadDigest": "36a3b41a6d0abf5c25b10a38cecfbf263c281667128dfc4ddaf8ad597821081e", "eventDigest": "e43a15c4c195239ef32ef14132d82a94aad216f03d656af6560eb076149209d1"}
+  ],
+  "observation": {
+    "registrationCount": 0,
+    "realProviderCount": 0,
+    "nativeCalls": 0,
+    "providerExecution": false,
+    "status": "NOT_EVALUATED",
+    "releaseDecision": "NOT_EVALUATED"
+  }
+}

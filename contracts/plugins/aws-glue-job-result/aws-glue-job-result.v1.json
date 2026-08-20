@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/aws-glue-job-result/aws-glue-job-result.v1.json",
+  "schemaVersion": "hartevo.aws-glue-job-result.contract/v1",
+  "contractVersion": "aws-glue-job-result-e1/v1",
+  "pluginVersion": "0.1.0",
+  "layer": "Layer-1",
+  "service": {
+    "id": "aws.glue.job-result",
+    "implementation": "AwsGlueJobResultService",
+    "operations": ["describe_capabilities", "register", "revoke_registration", "read_bounded", "propose", "record", "verify"],
+    "readOnly": true,
+    "proposalOnly": true,
+    "liveExecution": false
+  },
+  "provider": {
+    "id": "aws.glue.job-runs",
+    "implementation": "AwsGlueProvider",
+    "allowlistedOperations": ["GetJobRun", "GetJobRuns", "GetJob"],
+    "acceptedProvenance": ["fixture", "recording", "fake", "loopback", "blocked_env"],
+    "native": false,
+    "connected": false,
+    "externalWrites": false,
+    "sigv4": "layer2-only"
+  },
+  "consumer": {
+    "id": "mission.aws-glue-job.result.consumer",
+    "implementation": "MissionAwsGlueJobConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "required": ["awsAccount", "region", "catalog", "allowlistedJobs", "mission", "project", "workProduct", "workProductRevision", "permissionDigest", "consentDigest"],
+    "jobRunFence": ["jobName", "runId", "attempt"],
+    "secret": "opaque_non_serializing_sigv4_reference"
+  },
+  "bounds": {
+    "maxRuns": 256,
+    "maxPages": 16,
+    "maxPageSize": 100,
+    "maxTimeoutSeconds": 86400,
+    "newestFirst": true,
+    "opaqueCursor": true
+  },
+  "evidence": {
+    "retains": ["jobName", "runId", "attempt", "state", "timestamps", "boundedCapacity", "boundedCounters"],
+    "digestOnly": ["jobArguments", "scriptOrSource", "artifacts", "diagnostics", "paginationCursor"],
+    "digests": ["provider", "api", "contract", "permission", "scope", "job", "run", "evidence"],
+    "retryProjection": true,
+    "timeoutProjection": true,
+    "truncationProjection": true
+  },
+  "registration": {
+    "providerBound": true,
+    "apiBound": true,
+    "contractBound": true,
+    "versionBound": true,
+    "permissionBound": true,
+    "scopeBound": true,
+    "reversible": true,
+    "revocable": true
+  },
+  "authority": {
+    "connected": false,
+    "native": false,
+    "durableReceipt": false,
+    "startJobRun": false,
+    "stopJobRun": false,
+    "jobMutation": false,
+    "triggerMutation": false,
+    "rawArguments": false,
+    "rawScriptOrSource": false,
+    "cloudWatchLogs": false,
+    "dataRows": false,
+    "transformationAuthority": false,
+    "dataQualityAuthority": false,
+    "kernelOutcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "honesty": {
+    "fixtureIsConnected": false,
+    "recordingIsNative": false,
+    "loopbackIsFirstParty": false,
+    "blockedEnvironmentIsNative": false,
+    "credentialResolution": false
+  },
+  "forbidden": ["StartJobRun", "BatchStopJobRun", "resetBookmarks", "mutateJob", "mutateTrigger", "rawJobArguments", "scriptSource", "cloudWatchLogs", "dataRows", "transformationClaim", "dataQualityClaim", "resolveLiveCredentials", "adoptKernelOutcome"],
+  "layer2Gaps": ["native_sigv4_https_transport", "durable_provider_receipt", "independent_artifact_or_table_readback", "consented_execution_effects", "verified_work_product_adoption"]
+}
