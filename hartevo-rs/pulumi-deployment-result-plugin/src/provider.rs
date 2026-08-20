@@ -94,6 +94,7 @@ where
         if secret_reference.is_revoked()
             || secret_reference.scope_digest() != Some(&scope_digest)
             || secret_reference.reference_digest() != &registration.secret_reference_digest
+            || secret_reference.credential_revision() != registration.credential_revision
         {
             return Err(PulumiDeploymentResultError::AuthScopeMismatch);
         }
@@ -322,6 +323,7 @@ where
     }
 
     pub fn revoke(&mut self) -> Result<RegistrationRevocation, PulumiDeploymentResultError> {
+        self.ensure_active()?;
         let revocation = self.registration.revoke("operator-requested-revocation")?;
         self.state = PulumiCloudProviderState::Revoked;
         Ok(revocation)
@@ -338,10 +340,14 @@ where
     fn ensure_active(&self) -> Result<(), PulumiDeploymentResultError> {
         if !self.registration.is_active() || self.state == PulumiCloudProviderState::Revoked {
             Err(PulumiDeploymentResultError::RegistrationRevoked)
-        } else if self.secret_reference.is_revoked() {
-            Err(PulumiDeploymentResultError::CredentialRevoked)
         } else {
-            Ok(())
+            self.registration
+                .validate(&self.scope, &self.secret_reference)?;
+            if self.secret_reference.is_revoked() {
+                Err(PulumiDeploymentResultError::CredentialRevoked)
+            } else {
+                Ok(())
+            }
         }
     }
 

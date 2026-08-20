@@ -200,6 +200,23 @@ fn contract_registration_and_authority_are_layer_one_only() {
         contract["properties"]["nativeGap"]["properties"]["status"]["const"],
         "BLOCKED_ENV"
     );
+    assert_eq!(
+        contract["properties"]["nativeGap"]["properties"]["planStatus"]["const"],
+        "NOT_PROVEN"
+    );
+    assert_eq!(
+        contract["properties"]["nativeGap"]["properties"]["exitPlan"]["properties"]["executionStatus"]
+            ["const"],
+        "NOT_PROVEN"
+    );
+    assert_eq!(
+        contract["properties"]["provider"]["properties"]["nativeProofStatus"]["const"],
+        "NOT_PROVEN"
+    );
+    assert_eq!(
+        contract["properties"]["registration"]["properties"]["credentialRevisionBound"]["const"],
+        true
+    );
     assert!(!ReadOnlyAuthority::store());
     assert!(!ReadOnlyAuthority::keyring());
     assert!(!ReadOnlyAuthority::external_writes());
@@ -218,7 +235,59 @@ fn contract_registration_and_authority_are_layer_one_only() {
         *scope.permissions.digest()
     );
     assert_eq!(registration.auth_kind, AuthKind::AccessToken);
+    assert_eq!(registration.credential_revision, 2);
     assert!(registration.is_active());
+}
+
+#[test]
+fn credential_revision_is_bound_to_secret_registration_and_fences() {
+    let scope = scope();
+    let revision_two = secret(&scope);
+    let revision_one =
+        SecretReference::for_scope("pulumi-secret-reference", 1, scope.digest().as_str())
+            .expect("rollback reference");
+    let revision_three =
+        SecretReference::for_scope("pulumi-secret-reference", 3, scope.digest().as_str())
+            .expect("new reference revision");
+
+    assert_ne!(
+        revision_one.reference_digest(),
+        revision_two.reference_digest()
+    );
+    assert_ne!(
+        revision_two.reference_digest(),
+        revision_three.reference_digest()
+    );
+
+    let registration_two =
+        PulumiDeploymentResultRegistration::new(&scope, &revision_two, "adapter-r1", 1)
+            .expect("revision two registration");
+    let registration_one =
+        PulumiDeploymentResultRegistration::new(&scope, &revision_one, "adapter-r1", 1)
+            .expect("rollback registration");
+    assert_ne!(
+        registration_one.registration_digest,
+        registration_two.registration_digest
+    );
+    assert_eq!(registration_two.credential_revision, 2);
+
+    let mut tampered = registration_two.clone();
+    tampered.credential_revision = 3;
+    assert!(matches!(
+        tampered.validate(&scope, &revision_two),
+        Err(PulumiDeploymentResultError::RegistrationDrift)
+    ));
+    assert!(matches!(
+        tampered.revoke("tampered-revision"),
+        Err(PulumiDeploymentResultError::RegistrationDrift)
+    ));
+
+    let transport = RecordingPulumiCloudTransport::recording();
+    let resolver = StaticPulumiCredentialResolver::new("super-secret-pulumi-token");
+    assert!(matches!(
+        PulumiCloudProvider::new(registration_two, revision_three, transport, resolver),
+        Err(PulumiDeploymentResultError::RegistrationDrift)
+    ));
 }
 
 #[test]
@@ -383,6 +452,37 @@ fn every_provider_status_is_typed_without_becoming_connected() {
         proposal.verification_status,
         ResultVerificationStatus::ProviderUnknown
     );
+}
+
+#[test]
+fn skipped_or_not_applicable_policy_never_verifies_succeeded_deployment() {
+    for status in [
+        PulumiPolicyStatus::Skipped,
+        PulumiPolicyStatus::NotApplicable,
+    ] {
+        let mut service = service_with_status(PulumiDeploymentStatus::Succeeded);
+        let mut policy = policy(service.scope());
+        policy.status = status;
+        assert!(!policy.passed());
+        service
+            .provider_mut()
+            .transport_mut()
+            .set_policy(Ok(policy));
+
+        let evidence = service
+            .read_deployment_evidence()
+            .expect("policy status remains typed evidence");
+        let receipt = service
+            .record_deployment_receipt(&evidence)
+            .expect("record policy evidence");
+        let proposal = service
+            .verify_deployment_result(&evidence, &receipt)
+            .expect("failed verification proposal");
+        assert_eq!(
+            proposal.verification_status,
+            ResultVerificationStatus::Failed
+        );
+    }
 }
 
 #[test]

@@ -25,10 +25,11 @@ pub const CONTRACT_JSON: &str = include_str!(
     "../../../contracts/plugins/pulumi-deployment-result/pulumi-deployment-result.v1.schema.json"
 );
 
-/// Layer-1's honest native boundary. No current path claims Connected/native
-/// evidence or performs a deployment effect, mutation, raw export, or Outcome
-/// adoption.
-pub const NATIVE_GAP: &str = "BLOCKED_ENV: native Pulumi credential resolution, durable deployment effects, terminal reconciliation, independent resource read-back, and verified Mission Outcome adoption are optional Layer 2 gaps";
+/// Layer-1's honest native boundary and the concrete, unexecuted Layer-2 exit
+/// plan. No current path claims Connected/native evidence or performs a
+/// deployment effect, mutation, raw export, or Outcome adoption.
+pub const NATIVE_PLAN_STATUS: &str = "NOT_PROVEN";
+pub const NATIVE_GAP: &str = "BLOCKED_ENV / NOT_PROVEN: Layer 2 canary plan only (not executed in Layer 1): resolve the opaque access-token/OIDC SecretReference in a host-owned credential boundary without serializing, logging, or persisting secret material; prove the exact read-only Pulumi permission snapshot and reject organization, project, stack, policy, and permission revision drift; run a bounded read-only stack/deployment probe with declared page, item, redaction, timeout, and request caps; perform an independently authorized read-back of deployment identity, source/commit, update, status, policy, and audit evidence; persist and verify a durable redacted receipt outside Layer 1; accept native only after all checks plus redaction, replay/tamper, revocation, and failure-invalidation tests pass; on drift, revocation, timeout, read-back mismatch, receipt failure, cleanup failure, or any native claim, mark NOT_PROVEN/BLOCKED_ENV, revoke the reference and registration, invalidate the receipt, and remove host-owned canary artifacts.";
 
 pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
     use sha2::{Digest as Sha2Digest, Sha256};
@@ -110,10 +111,30 @@ mod tests {
             BLOCKED_ENV
         );
         assert_eq!(
+            contract["properties"]["provider"]["properties"]["nativeProofStatus"]["const"],
+            NATIVE_PLAN_STATUS
+        );
+        assert_eq!(
             contract["properties"]["provider"]["properties"]["connectedEvidence"]["const"],
             false
         );
+        assert_eq!(
+            contract["properties"]["nativeGap"]["properties"]["planStatus"]["const"],
+            NATIVE_PLAN_STATUS
+        );
+        assert_eq!(
+            contract["properties"]["nativeGap"]["properties"]["exitPlan"]["properties"]["executionStatus"]
+                ["const"],
+            NATIVE_PLAN_STATUS
+        );
         assert_eq!(contract_digest().len(), 71);
-        assert!(NATIVE_GAP.starts_with(BLOCKED_ENV));
+        assert!(NATIVE_GAP.starts_with("BLOCKED_ENV / NOT_PROVEN"));
+        assert!(NATIVE_GAP.contains("credential boundary"));
+        assert!(NATIVE_GAP.contains("permission snapshot"));
+        assert!(NATIVE_GAP.contains("bounded read-only"));
+        assert!(NATIVE_GAP.contains("independently authorized read-back"));
+        assert!(NATIVE_GAP.contains("durable redacted receipt"));
+        assert!(NATIVE_GAP.contains("failure-invalidation"));
+        assert!(NATIVE_GAP.contains("not executed in Layer 1"));
     }
 }

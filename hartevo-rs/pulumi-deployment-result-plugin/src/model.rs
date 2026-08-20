@@ -114,6 +114,13 @@ pub enum AuthKind {
     Oidc,
 }
 
+#[derive(Serialize)]
+struct SecretReferenceDigestMaterial<'a> {
+    reference_id: &'a str,
+    credential_revision: u64,
+    kind: AuthKind,
+}
+
 /// Opaque identity for a Pulumi access token or OIDC credential supplied by a
 /// host. The actual credential is never stored, serialized, or included in a
 /// provider request record.
@@ -196,8 +203,13 @@ impl SecretReference {
         if !valid_identifier(reference_id, MAX_IDENTIFIER_BYTES) || credential_revision == 0 {
             return Err(PulumiDeploymentResultError::InvalidSecretReference);
         }
+
         Ok(Self {
-            reference_digest: Digest::from_text(reference_id),
+            reference_digest: Digest::from_serializable(&SecretReferenceDigestMaterial {
+                reference_id,
+                credential_revision,
+                kind,
+            }),
             scope_digest: None,
             credential_revision,
             kind,
@@ -608,6 +620,7 @@ pub struct PulumiDeploymentResultRegistration {
     pub permission_snapshot_digest: Digest,
     pub scope_digest: Digest,
     pub secret_reference_digest: Digest,
+    pub credential_revision: u64,
     pub auth_kind: AuthKind,
     pub registration_revision: u64,
     pub state: RegistrationState,
@@ -635,6 +648,7 @@ impl PulumiDeploymentResultRegistration {
             permission_snapshot_digest: scope.permissions.digest().clone(),
             scope_digest: scope.digest(),
             secret_reference_digest: secret_reference.reference_digest().clone(),
+            credential_revision: secret_reference.credential_revision(),
             auth_kind: secret_reference.kind(),
             registration_revision,
             state: RegistrationState::Active,
@@ -659,6 +673,7 @@ impl PulumiDeploymentResultRegistration {
             || self.scope != *scope
             || self.permission_snapshot_digest != *scope.permissions.digest()
             || self.secret_reference_digest != *secret_reference.reference_digest()
+            || self.credential_revision != secret_reference.credential_revision()
             || self.auth_kind != secret_reference.kind()
             || self.contract_digest.as_str() != crate::contract_digest()
             || self.registration_digest != self.compute_digest()
@@ -732,6 +747,7 @@ impl PulumiDeploymentResultRegistration {
             || !valid_digest(self.permission_snapshot_digest.as_str())
             || !valid_digest(self.scope_digest.as_str())
             || !valid_digest(self.secret_reference_digest.as_str())
+            || self.credential_revision == 0
             || self.registration_revision == 0
         {
             return Err(PulumiDeploymentResultError::InvalidRegistration);
@@ -752,6 +768,7 @@ impl PulumiDeploymentResultRegistration {
             permission_snapshot_digest: &'a Digest,
             scope_digest: &'a Digest,
             secret_reference_digest: &'a Digest,
+            credential_revision: u64,
             auth_kind: AuthKind,
             registration_revision: u64,
             state: RegistrationState,
@@ -767,6 +784,7 @@ impl PulumiDeploymentResultRegistration {
             permission_snapshot_digest: &self.permission_snapshot_digest,
             scope_digest: &self.scope_digest,
             secret_reference_digest: &self.secret_reference_digest,
+            credential_revision: self.credential_revision,
             auth_kind: self.auth_kind,
             registration_revision: self.registration_revision,
             state: self.state,
@@ -1067,10 +1085,7 @@ impl PulumiPolicyEvidence {
     }
 
     pub fn passed(&self) -> bool {
-        matches!(
-            self.status,
-            PulumiPolicyStatus::Passed | PulumiPolicyStatus::Skipped
-        ) && self.violation_count == 0
+        self.status == PulumiPolicyStatus::Passed && self.violation_count == 0
     }
 }
 

@@ -69,7 +69,7 @@
     "provider": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "version", "officialApi", "readMethods", "secretReferenceOnly", "authorizationObscured404", "connectedEvidence", "nativeStatus"],
+      "required": ["id", "version", "officialApi", "readMethods", "secretReferenceOnly", "authorizationObscured404", "connectedEvidence", "nativeStatus", "nativeProofStatus"],
       "properties": {
         "id": { "const": "pulumi.cloud.deployment" },
         "version": { "const": "1.0.0" },
@@ -78,7 +78,8 @@
         "secretReferenceOnly": { "const": true },
         "authorizationObscured404": { "const": "not_found_or_unauthorized" },
         "connectedEvidence": { "const": false },
-        "nativeStatus": { "const": "BLOCKED_ENV" }
+        "nativeStatus": { "const": "BLOCKED_ENV" },
+        "nativeProofStatus": { "const": "NOT_PROVEN" }
       }
     },
     "scopeFence": {
@@ -108,6 +109,7 @@
           "mission_revision",
           "work_product_revision",
           "consent_revision",
+          "credential_revision",
           "permission_snapshot"
         ]
       }
@@ -133,13 +135,14 @@
     "registration": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["versionBound", "contractDigestBound", "providerBound", "permissionSnapshotBound", "scopeDigestBound", "opaqueSecretReferenceOnly", "reversible", "revocable", "failClosedDrift"],
+      "required": ["versionBound", "contractDigestBound", "providerBound", "permissionSnapshotBound", "scopeDigestBound", "credentialRevisionBound", "opaqueSecretReferenceOnly", "reversible", "revocable", "failClosedDrift"],
       "properties": {
         "versionBound": { "const": true },
         "contractDigestBound": { "const": true },
         "providerBound": { "const": true },
         "permissionSnapshotBound": { "const": true },
         "scopeDigestBound": { "const": true },
+        "credentialRevisionBound": { "const": true },
         "opaqueSecretReferenceOnly": { "const": true },
         "reversible": { "const": true },
         "revocable": { "const": true },
@@ -182,14 +185,64 @@
     "nativeGap": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "deferredTo", "gaps"],
+      "required": ["status", "planStatus", "deferredTo", "gaps", "exitPlan"],
       "properties": {
         "status": { "const": "BLOCKED_ENV" },
+        "planStatus": { "const": "NOT_PROVEN" },
         "deferredTo": { "const": "optional_layer_2_draft" },
         "gaps": {
           "type": "array",
           "uniqueItems": true,
-          "items": { "type": "string", "minLength": 1 }
+          "minItems": 7,
+          "items": {
+            "enum": [
+              "native_credential_resolution",
+              "read_only_permission_proof",
+              "bounded_read_probe",
+              "independent_readback",
+              "durable_receipt",
+              "acceptance_criteria",
+              "invalidation_cleanup"
+            ]
+          }
+        },
+        "exitPlan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "executionStatus",
+            "credentialResolution",
+            "permissionProof",
+            "boundedProbe",
+            "independentReadback",
+            "durableReceipt",
+            "acceptanceCriteria",
+            "invalidationCleanup"
+          ],
+          "properties": {
+            "executionStatus": { "const": "NOT_PROVEN" },
+            "credentialResolution": {
+              "const": "Resolve the opaque access-token/OIDC SecretReference in a host-owned credential boundary without serializing, logging, or persisting secret material."
+            },
+            "permissionProof": {
+              "const": "Prove the exact read-only Pulumi permission snapshot and reject organization, project, stack, policy, and permission revision drift."
+            },
+            "boundedProbe": {
+              "const": "Run a bounded read-only stack/deployment probe with declared page, item, redaction, timeout, and request caps; perform no create, cancel, resume, or mutation."
+            },
+            "independentReadback": {
+              "const": "Perform an independently authorized read-back of deployment identity, source/commit, update, status, policy, and audit evidence and compare revision fences."
+            },
+            "durableReceipt": {
+              "const": "Persist a redacted receipt in a host-owned durable store and verify its digest/read-back without treating Layer 1 recording as durable native evidence."
+            },
+            "acceptanceCriteria": {
+              "const": "Accept native only when credential resolution, permission proof, bounded probe, independent read-back, durable receipt, redaction, replay/tamper, revocation, and failure-invalidation tests all pass."
+            },
+            "invalidationCleanup": {
+              "const": "On drift, revocation, timeout, redaction failure, read-back mismatch, receipt failure, cleanup failure, or any native claim, mark NOT_PROVEN/BLOCKED_ENV, revoke the reference and registration, invalidate the receipt, and remove host-owned canary artifacts."
+            }
+          }
         }
       }
     }
