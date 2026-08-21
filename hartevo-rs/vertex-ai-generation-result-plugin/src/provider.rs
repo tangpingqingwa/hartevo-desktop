@@ -13,9 +13,10 @@ use crate::{
     VERTEX_AI_GENERATION_PROVIDER_ID, digest_bytes, digest_serializable,
     model::{
         CandidateSummary, FinishReason, GenerationResultEvidence, GenerationResultProposal,
-        PromptFeedback, ProviderErrorProjection, ProviderFailureClass, ProviderMode, ResponseState,
-        SafetyBlockReason, SafetyCategory, SafetyProbability, SafetyRating, SafetySeverity,
-        UsageMetadata, VertexAiCandidate, VertexAiGenerationError, VertexAiResponse,
+        PromptFeedback, ProviderErrorProjection, ProviderFailureClass, ProviderMode,
+        ResponseByteAccounting, ResponseState, SafetyBlockReason, SafetyCategory,
+        SafetyProbability, SafetyRating, SafetySeverity, UsageMetadata, VertexAiCandidate,
+        VertexAiGenerationError, VertexAiResponse,
     },
 };
 
@@ -55,31 +56,7 @@ pub enum VertexAiResponseFrame {
     ErrorBody,
 }
 
-/// Raw HTTP byte accounting is exact only when this crate received the raw
-/// body. Typed fixtures deliberately carry `Unknown` instead of fabricating a
-/// zero-byte count.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResponseBodyAccounting {
-    bytes: Option<usize>,
-}
-
-impl ResponseBodyAccounting {
-    pub const fn unknown() -> Self {
-        Self { bytes: None }
-    }
-
-    pub const fn bytes(self) -> Option<usize> {
-        self.bytes
-    }
-
-    pub const fn is_unknown(self) -> bool {
-        self.bytes.is_none()
-    }
-
-    fn exact(bytes: usize) -> Self {
-        Self { bytes: Some(bytes) }
-    }
-}
+pub type ResponseBodyAccounting = ResponseByteAccounting;
 
 /// Sealed typed HTTP ingress. Its private fields and keyed fence prevent a
 /// caller from manufacturing a status/size/digest/frame tuple and resealing
@@ -104,13 +81,13 @@ fn response_frame_digest(frame: &VertexAiResponseFrame) -> crate::model::Digest 
 
 fn response_ingress_fence(
     status: u16,
-    body_accounting: ResponseBodyAccounting,
+    body_accounting: ResponseByteAccounting,
     response_digest: &crate::model::Digest,
     frame: &VertexAiResponseFrame,
 ) -> crate::model::Digest {
     let mut material = b"hartevo-vertex-ai-response-ingress/v1".to_vec();
     material.extend_from_slice(&status.to_be_bytes());
-    match body_accounting.bytes() {
+    match body_accounting.exact_bytes() {
         Some(bytes) => {
             material.push(1);
             material.extend_from_slice(&bytes.to_be_bytes());
@@ -124,7 +101,7 @@ fn response_ingress_fence(
 
 impl TrustedHttpResponse {
     fn from_raw(status: u16, body: &[u8], frame: VertexAiResponseFrame) -> Self {
-        let body_accounting = ResponseBodyAccounting::exact(body.len());
+        let body_accounting = ResponseByteAccounting::exact_from_raw(body.len() as u64);
         let response_digest = digest_bytes(body);
         let integrity_fence =
             response_ingress_fence(status, body_accounting, &response_digest, &frame);
@@ -138,7 +115,7 @@ impl TrustedHttpResponse {
     }
 
     fn from_typed_fixture(response: VertexAiResponse) -> Self {
-        let body_accounting = ResponseBodyAccounting::unknown();
+        let body_accounting = ResponseByteAccounting::unknown();
         let response_digest = response.response_digest();
         let frame = VertexAiResponseFrame::Parsed(response);
         let integrity_fence =
@@ -163,8 +140,8 @@ impl TrustedHttpResponse {
         {
             return Err(VertexAiGenerationError::ResponseIngressTampered);
         }
-        if self.body_accounting.bytes().is_some_and(|bytes| {
-            bytes > max_response_bytes || bytes > DEFAULT_PROVIDER_RESPONSE_BYTES
+        if self.body_accounting.exact_bytes().is_some_and(|bytes| {
+            bytes > max_response_bytes as u64 || bytes > DEFAULT_PROVIDER_RESPONSE_BYTES as u64
         }) {
             return Err(VertexAiGenerationError::ResponseTooLarge);
         }
@@ -196,7 +173,7 @@ impl TrustedHttpResponse {
         &self.frame
     }
 
-    fn body_accounting(&self) -> ResponseBodyAccounting {
+    fn body_accounting(&self) -> ResponseByteAccounting {
         self.body_accounting
     }
 }
@@ -532,6 +509,13 @@ impl RecordedVertexAiResponse {
         }
     }
 
+    pub fn response_byte_accounting(&self) -> ResponseByteAccounting {
+        match &self.outcome {
+            ProviderResponseOutcome::Http(response) => response.body_accounting(),
+            _ => ResponseByteAccounting::unknown(),
+        }
+    }
+
     pub fn response_digest(&self) -> Option<&crate::model::Digest> {
         match &self.outcome {
             ProviderResponseOutcome::Http(response) => Some(response.response_digest()),
@@ -644,6 +628,7 @@ impl VertexAiGenerationProvider {
             ProviderResponseOutcome::Http(http) => {
                 let status = http.status();
                 let response_digest = http.response_digest();
+                let response_byte_accounting = http.body_accounting();
                 let frame = http.frame();
                 if (200..300).contains(&status) {
                     if self.mode == ProviderMode::BlockedEnv {
@@ -673,6 +658,7 @@ impl VertexAiGenerationProvider {
                         Some(parsed.response_id.clone()),
                         Some(parsed.model_version.clone()),
                         response_digest.clone(),
+                        response_byte_accounting,
                         parsed.output_digest(),
                         candidates,
                         parsed.prompt_feedback.clone(),
@@ -687,6 +673,7 @@ impl VertexAiGenerationProvider {
                         self.mode,
                         proposal,
                         response_digest.clone(),
+                        response_byte_accounting,
                         state,
                         class,
                         retryable,
@@ -699,6 +686,7 @@ impl VertexAiGenerationProvider {
                 self.mode,
                 proposal,
                 digest_bytes(b"vertex-ai-timeout"),
+                ResponseByteAccounting::unknown(),
                 ResponseState::Expired,
                 ProviderFailureClass::Timeout,
                 true,
@@ -709,6 +697,7 @@ impl VertexAiGenerationProvider {
                 self.mode,
                 proposal,
                 digest_bytes(b"vertex-ai-cancelled"),
+                ResponseByteAccounting::unknown(),
                 ResponseState::Cancelled,
                 ProviderFailureClass::Cancelled,
                 false,
@@ -719,6 +708,7 @@ impl VertexAiGenerationProvider {
                 self.mode,
                 proposal,
                 digest_bytes(b"vertex-ai-expired"),
+                ResponseByteAccounting::unknown(),
                 ResponseState::Expired,
                 ProviderFailureClass::Expired,
                 true,
@@ -729,6 +719,7 @@ impl VertexAiGenerationProvider {
                 self.mode,
                 proposal,
                 digest_bytes(b"vertex-ai-access-lost"),
+                ResponseByteAccounting::unknown(),
                 ResponseState::AccessLost,
                 ProviderFailureClass::Unauthorized,
                 false,
@@ -739,6 +730,7 @@ impl VertexAiGenerationProvider {
                 self.mode,
                 proposal,
                 digest_bytes(b"vertex-ai-transport-unavailable"),
+                ResponseByteAccounting::unknown(),
                 ResponseState::ProviderUnknown,
                 ProviderFailureClass::TransportUnavailable,
                 true,
@@ -756,6 +748,7 @@ impl VertexAiGenerationProvider {
                     self.mode,
                     proposal,
                     response_digest,
+                    ResponseByteAccounting::unknown(),
                     ResponseState::ProviderUnknown,
                     ProviderFailureClass::TransportUnavailable,
                     true,
@@ -913,6 +906,7 @@ fn error_evidence(
     mode: ProviderMode,
     proposal: &GenerationResultProposal,
     response_digest: crate::model::Digest,
+    response_byte_accounting: ResponseByteAccounting,
     state: ResponseState,
     class: ProviderFailureClass,
     retryable: bool,
@@ -925,6 +919,7 @@ fn error_evidence(
         None,
         None,
         response_digest.clone(),
+        response_byte_accounting,
         None,
         Vec::new(),
         None,

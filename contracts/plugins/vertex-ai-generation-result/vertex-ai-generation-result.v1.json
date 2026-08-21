@@ -87,8 +87,17 @@
     "fileBytes": false
   },
   "responseAccounting": {
+    "marker": "Exact(u64)|Unknown",
+    "evidenceField": "responseByteAccounting",
     "rawHttp": "exact_body_bytes_and_raw_body_sha256",
     "typedFixture": "unknown_body_bytes_explicitly_marked",
+    "nonHttp": "unknown_body_bytes_explicitly_marked",
+    "trustedBinding": {
+      "scope": "service_process_shared",
+      "sharedAcrossServiceClones": true,
+      "durable": false,
+      "failClosed": true
+    },
     "forgedStatusSizeDigestTuple": "rejected_before_recording"
   },
   "registration": {

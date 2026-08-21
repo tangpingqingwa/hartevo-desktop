@@ -544,6 +544,27 @@ fn mission_consumer_is_proposal_only() {
         result.request_source_fence,
         *proposal.request().source_fence()
     );
+    assert_eq!(
+        result.response_accounting_policy_digest,
+        *proposal.response_accounting_policy_digest()
+    );
+    assert_eq!(
+        result.response_byte_accounting,
+        vertex::ResponseByteAccounting::Exact(success_body().len() as u64)
+    );
+    let mission_json = serde_json::to_value(&result).expect("mission JSON");
+    assert_eq!(
+        mission_json["responseByteAccounting"]["exact"],
+        json!(success_body().len() as u64)
+    );
+    result.verify_integrity().expect("mission integrity");
+
+    let mut tampered_result = result.clone();
+    tampered_result.response_byte_accounting = vertex::ResponseByteAccounting::Unknown;
+    assert_eq!(
+        tampered_result.verify_integrity(),
+        Err(vertex::VertexAiGenerationError::EvidenceTampered)
+    );
 }
 
 #[test]
@@ -842,12 +863,36 @@ fn response_serde_and_ingress_revalidate_ceiling_and_metadata() {
 
     let response = success_response("truthful-body-bytes");
     assert_eq!(response.body_bytes(), Some(success_body().len()));
+    assert_eq!(
+        response.response_byte_accounting(),
+        vertex::ResponseByteAccounting::Exact(success_body().len() as u64)
+    );
     assert!(response.response_digest().is_some());
 
     let mut service = service();
     let proposal = service
         .compile_generation_proposal(&request())
         .expect("proposal");
+    let raw_evidence = service
+        .record_generation_result(&proposal, &success_response("raw-accounting-evidence"))
+        .expect("raw evidence");
+    assert_eq!(
+        raw_evidence.response_byte_accounting,
+        vertex::ResponseByteAccounting::Exact(success_body().len() as u64)
+    );
+    assert_eq!(
+        raw_evidence.response_accounting_policy_digest,
+        *proposal.response_accounting_policy_digest()
+    );
+    let raw_evidence_json = serde_json::to_value(&raw_evidence).expect("raw evidence JSON");
+    assert_eq!(
+        raw_evidence_json["responseByteAccounting"]["exact"],
+        json!(success_body().len() as u64)
+    );
+    service
+        .verify_generation_result(&proposal, &raw_evidence)
+        .expect("raw evidence verification");
+
     let parsed = vertex::VertexAiResponse::from_json(success_body()).expect("parsed response");
     let typed_fixture = vertex::RecordedVertexAiResponse::from_response(
         "typed-fixture-unknown-bytes",
@@ -861,10 +906,47 @@ fn response_serde_and_ingress_revalidate_ceiling_and_metadata() {
         0,
     );
     assert_eq!(typed_fixture.body_bytes(), None);
+    assert_eq!(
+        typed_fixture.response_byte_accounting(),
+        vertex::ResponseByteAccounting::Unknown
+    );
     let typed_evidence = service
         .record_generation_result(&proposal, &typed_fixture)
         .expect("typed fixture evidence");
     assert_eq!(typed_evidence.response_digest, parsed.response_digest());
+    assert_eq!(
+        typed_evidence.response_byte_accounting,
+        vertex::ResponseByteAccounting::Unknown
+    );
+    let mut missing_accounting = serde_json::to_value(&typed_evidence).expect("evidence JSON");
+    assert_eq!(
+        missing_accounting["responseByteAccounting"],
+        json!("unknown")
+    );
+    missing_accounting
+        .as_object_mut()
+        .expect("evidence object")
+        .remove("responseByteAccounting");
+    assert!(
+        serde_json::from_value::<vertex::GenerationResultEvidence>(missing_accounting).is_err()
+    );
+
+    let mut unknown_resealed_as_exact = typed_evidence.clone();
+    unknown_resealed_as_exact.response_byte_accounting = vertex::ResponseByteAccounting::Exact(0);
+    unknown_resealed_as_exact.evidence_digest = unknown_resealed_as_exact.compute_digest();
+    assert_eq!(
+        service.verify_generation_result(&proposal, &unknown_resealed_as_exact),
+        Err(vertex::VertexAiGenerationError::EvidenceTampered)
+    );
+
+    let mut exact_count_mismatch = raw_evidence.clone();
+    exact_count_mismatch.response_byte_accounting =
+        vertex::ResponseByteAccounting::Exact(success_body().len() as u64 + 1);
+    exact_count_mismatch.evidence_digest = exact_count_mismatch.compute_digest();
+    assert_eq!(
+        service.verify_generation_result(&proposal, &exact_count_mismatch),
+        Err(vertex::VertexAiGenerationError::EvidenceTampered)
+    );
 
     let oversized_proposal = service
         .compile_generation_proposal(&request())

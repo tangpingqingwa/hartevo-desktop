@@ -137,8 +137,36 @@ mod contract_document_tests {
             "exact_body_bytes_and_raw_body_sha256"
         );
         assert_eq!(
+            contract["responseAccounting"]["marker"],
+            "Exact(u64)|Unknown"
+        );
+        assert_eq!(
+            contract["responseAccounting"]["evidenceField"],
+            "responseByteAccounting"
+        );
+        assert_eq!(
             contract["responseAccounting"]["typedFixture"],
             "unknown_body_bytes_explicitly_marked"
+        );
+        assert_eq!(
+            contract["responseAccounting"]["nonHttp"],
+            "unknown_body_bytes_explicitly_marked"
+        );
+        assert_eq!(
+            contract["responseAccounting"]["trustedBinding"]["scope"],
+            "service_process_shared"
+        );
+        assert_eq!(
+            contract["responseAccounting"]["trustedBinding"]["sharedAcrossServiceClones"],
+            true
+        );
+        assert_eq!(
+            contract["responseAccounting"]["trustedBinding"]["durable"],
+            false
+        );
+        assert_eq!(
+            contract["responseAccounting"]["trustedBinding"]["failClosed"],
+            true
         );
         assert_eq!(
             contract["responseAccounting"]["forgedStatusSizeDigestTuple"],

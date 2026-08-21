@@ -8,8 +8,9 @@ use std::{
 use crate::{
     model::{
         GenerationRequest, GenerationResultEvidence, GenerationResultProposal, InputPart,
-        ModelDescription, PluginRegistration, ProviderMode, RequestFingerprint, Revocation,
-        RevocationReason, VertexAiGenerationError, VertexAiGenerationScope,
+        ModelDescription, PluginRegistration, ProviderMode, RequestFingerprint,
+        ResponseByteAccounting, Revocation, RevocationReason, VertexAiGenerationError,
+        VertexAiGenerationScope,
     },
     provider::{BlockedEnvCode, RecordedVertexAiResponse, VertexAiGenerationProvider},
 };
@@ -22,6 +23,7 @@ pub struct VertexAiGenerationResultService {
     registration: PluginRegistration,
     provider: VertexAiGenerationProvider,
     trusted_requests: Arc<Mutex<BTreeMap<crate::model::Digest, GenerationRequest>>>,
+    trusted_evidence_accounting: Arc<Mutex<BTreeMap<crate::model::Digest, ResponseByteAccounting>>>,
 }
 
 impl VertexAiGenerationResultService {
@@ -36,6 +38,7 @@ impl VertexAiGenerationResultService {
             registration,
             provider,
             trusted_requests: Arc::new(Mutex::new(BTreeMap::new())),
+            trusted_evidence_accounting: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -100,6 +103,21 @@ impl VertexAiGenerationResultService {
             &self.scope,
         )?;
         evidence.verify_integrity()?;
+        let mut trusted_evidence_accounting =
+            self.trusted_evidence_accounting.lock().map_err(|_| {
+                VertexAiGenerationError::BlockedEnvironment(
+                    "trusted response accounting binding is unavailable",
+                )
+            })?;
+        if let Some(existing) = trusted_evidence_accounting.get(&evidence.evidence_digest)
+            && *existing != evidence.response_byte_accounting
+        {
+            return Err(VertexAiGenerationError::EvidenceTampered);
+        }
+        trusted_evidence_accounting.insert(
+            evidence.evidence_digest.clone(),
+            evidence.response_byte_accounting,
+        );
         Ok(evidence)
     }
 
@@ -148,9 +166,26 @@ impl VertexAiGenerationResultService {
         self.ensure_active()?;
         self.validate_proposal_binding(proposal)?;
         evidence.verify_integrity()?;
+        let trusted_accounting = {
+            let trusted_evidence_accounting =
+                self.trusted_evidence_accounting.lock().map_err(|_| {
+                    VertexAiGenerationError::BlockedEnvironment(
+                        "trusted response accounting binding is unavailable",
+                    )
+                })?;
+            trusted_evidence_accounting
+                .get(&evidence.evidence_digest)
+                .copied()
+        }
+        .ok_or(VertexAiGenerationError::EvidenceTampered)?;
+        if trusted_accounting != evidence.response_byte_accounting {
+            return Err(VertexAiGenerationError::EvidenceTampered);
+        }
         if evidence.proposal_digest != proposal.proposal_digest
             || evidence.request_digest != *proposal.request.request_digest()
             || evidence.request_source_fence != *proposal.request.source_fence()
+            || evidence.response_accounting_policy_digest
+                != proposal.response_accounting_policy_digest
             || evidence.contract_digest != *self.registration.contract_digest()
             || evidence.registration_digest != *self.registration.registration_digest()
             || evidence.provider_digest != self.scope.provider_digest()

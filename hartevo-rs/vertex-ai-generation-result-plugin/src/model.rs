@@ -2618,6 +2618,65 @@ struct RegistrationMaterial<'a> {
     consent_digest: &'a Digest,
 }
 
+/// Exact raw HTTP body accounting or an explicit marker that no raw body was
+/// available. Unknown is never represented as zero.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseByteAccounting {
+    Exact(u64),
+    Unknown,
+}
+
+impl ResponseByteAccounting {
+    pub const fn unknown() -> Self {
+        Self::Unknown
+    }
+
+    pub const fn exact_bytes(self) -> Option<u64> {
+        match self {
+            Self::Exact(bytes) => Some(bytes),
+            Self::Unknown => None,
+        }
+    }
+
+    /// Compatibility view for callers that previously requested an exact
+    /// platform-sized byte count. Unknown remains `None`; it is never zero.
+    pub const fn bytes(self) -> Option<usize> {
+        match self {
+            Self::Exact(bytes) if bytes <= usize::MAX as u64 => Some(bytes as usize),
+            Self::Exact(_) | Self::Unknown => None,
+        }
+    }
+
+    pub const fn is_unknown(self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    pub(crate) const fn exact_from_raw(bytes: u64) -> Self {
+        Self::Exact(bytes)
+    }
+
+    pub(crate) fn validate_metadata(self) -> Result<(), VertexAiGenerationError> {
+        if self
+            .exact_bytes()
+            .is_some_and(|bytes| bytes > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(VertexAiGenerationError::EvidenceTampered);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn response_accounting_policy_digest() -> Digest {
+    digest_serializable(&(
+        "vertex-ai-response-byte-accounting-policy/v1",
+        ("raw_http", "exact_u64"),
+        ("typed_fixture", "unknown"),
+        ("non_http", "unknown"),
+        MAX_RESPONSE_BYTES,
+    ))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestFingerprint {
@@ -2785,6 +2844,7 @@ pub struct GenerationResultProposal {
     pub(crate) input_policy_digest: Digest,
     pub(crate) safety_policy_digest: Digest,
     pub(crate) tool_grounding_policy_digest: Digest,
+    pub(crate) response_accounting_policy_digest: Digest,
     pub(crate) response_digest: Digest,
     pub(crate) registration_digest: Digest,
     pub(crate) proposal_digest: Digest,
@@ -2816,6 +2876,7 @@ impl GenerationResultProposal {
             input_policy_digest: scope.input_policy_digest(),
             safety_policy_digest: scope.safety_policy_digest(),
             tool_grounding_policy_digest: scope.tool_grounding_policy_digest(),
+            response_accounting_policy_digest: response_accounting_policy_digest(),
             response_digest: scope.response_digest(),
             registration_digest: registration.registration_digest.clone(),
             proposal_digest: digest_bytes(b"uninitialized-vertex-proposal-digest"),
@@ -2845,6 +2906,7 @@ impl GenerationResultProposal {
             input_policy_digest: &self.input_policy_digest,
             safety_policy_digest: &self.safety_policy_digest,
             tool_grounding_policy_digest: &self.tool_grounding_policy_digest,
+            response_accounting_policy_digest: &self.response_accounting_policy_digest,
             response_digest: &self.response_digest,
             registration_digest: &self.registration_digest,
         })
@@ -2852,6 +2914,9 @@ impl GenerationResultProposal {
 
     pub fn verify_integrity(&self) -> Result<(), VertexAiGenerationError> {
         self.request.validate_bounds()?;
+        if self.response_accounting_policy_digest != response_accounting_policy_digest() {
+            return Err(VertexAiGenerationError::ProposalTampered);
+        }
         if self.request.source_fence
             != expected_request_source_fence(&self.scope_digest, &self.request.request_digest)
         {
@@ -2870,6 +2935,10 @@ impl GenerationResultProposal {
 
     pub fn request(&self) -> &RequestFingerprint {
         &self.request
+    }
+
+    pub fn response_accounting_policy_digest(&self) -> &Digest {
+        &self.response_accounting_policy_digest
     }
 }
 
@@ -2894,6 +2963,7 @@ struct ProposalMaterial<'a> {
     input_policy_digest: &'a Digest,
     safety_policy_digest: &'a Digest,
     tool_grounding_policy_digest: &'a Digest,
+    response_accounting_policy_digest: &'a Digest,
     response_digest: &'a Digest,
     registration_digest: &'a Digest,
 }
@@ -3491,6 +3561,7 @@ pub struct GenerationResultEvidence {
     pub proposal_digest: Digest,
     pub request_digest: Digest,
     pub request_source_fence: Digest,
+    pub response_accounting_policy_digest: Digest,
     pub contract_digest: Digest,
     pub registration_digest: Digest,
     pub provider_digest: Digest,
@@ -3507,6 +3578,7 @@ pub struct GenerationResultEvidence {
     pub response_id: Option<String>,
     pub model_version: Option<String>,
     pub response_digest: Digest,
+    pub response_byte_accounting: ResponseByteAccounting,
     pub output_digest: Option<Digest>,
     pub candidates: Vec<CandidateSummary>,
     pub prompt_feedback: Option<PromptFeedback>,
@@ -3527,6 +3599,7 @@ impl GenerationResultEvidence {
         response_id: Option<String>,
         model_version: Option<String>,
         response_digest: Digest,
+        response_byte_accounting: ResponseByteAccounting,
         output_digest: Option<Digest>,
         candidates: Vec<CandidateSummary>,
         prompt_feedback: Option<PromptFeedback>,
@@ -3541,6 +3614,7 @@ impl GenerationResultEvidence {
             proposal_digest: proposal.proposal_digest.clone(),
             request_digest: proposal.request.request_digest.clone(),
             request_source_fence: proposal.request.source_fence.clone(),
+            response_accounting_policy_digest: proposal.response_accounting_policy_digest.clone(),
             contract_digest: proposal.contract_digest.clone(),
             registration_digest: proposal.registration_digest.clone(),
             provider_digest: proposal.provider_digest.clone(),
@@ -3557,6 +3631,7 @@ impl GenerationResultEvidence {
             response_id,
             model_version,
             response_digest,
+            response_byte_accounting,
             output_digest,
             candidates,
             prompt_feedback,
@@ -3578,6 +3653,7 @@ impl GenerationResultEvidence {
             proposal_digest: &self.proposal_digest,
             request_digest: &self.request_digest,
             request_source_fence: &self.request_source_fence,
+            response_accounting_policy_digest: &self.response_accounting_policy_digest,
             contract_digest: &self.contract_digest,
             registration_digest: &self.registration_digest,
             provider_digest: &self.provider_digest,
@@ -3594,6 +3670,7 @@ impl GenerationResultEvidence {
             response_id: self.response_id.as_deref(),
             model_version: self.model_version.as_deref(),
             response_digest: &self.response_digest,
+            response_byte_accounting: self.response_byte_accounting,
             output_digest: self.output_digest.as_ref(),
             candidates: &self.candidates,
             prompt_feedback: self.prompt_feedback.as_ref(),
@@ -3628,6 +3705,7 @@ impl GenerationResultEvidence {
             || !self.proposal_digest.is_sha256()
             || !self.request_digest.is_sha256()
             || !self.request_source_fence.is_sha256()
+            || self.response_accounting_policy_digest != response_accounting_policy_digest()
             || !self.contract_digest.is_sha256()
             || !self.registration_digest.is_sha256()
             || !self.provider_digest.is_sha256()
@@ -3645,6 +3723,7 @@ impl GenerationResultEvidence {
         {
             return Err(VertexAiGenerationError::EvidenceTampered);
         }
+        self.response_byte_accounting.validate_metadata()?;
         if self.request_source_fence
             != expected_request_source_fence(&self.scope_digest, &self.request_digest)
         {
@@ -3699,6 +3778,7 @@ struct EvidenceMaterial<'a> {
     proposal_digest: &'a Digest,
     request_digest: &'a Digest,
     request_source_fence: &'a Digest,
+    response_accounting_policy_digest: &'a Digest,
     contract_digest: &'a Digest,
     registration_digest: &'a Digest,
     provider_digest: &'a Digest,
@@ -3715,6 +3795,7 @@ struct EvidenceMaterial<'a> {
     response_id: Option<&'a str>,
     model_version: Option<&'a str>,
     response_digest: &'a Digest,
+    response_byte_accounting: ResponseByteAccounting,
     output_digest: Option<&'a Digest>,
     candidates: &'a [CandidateSummary],
     prompt_feedback: Option<&'a PromptFeedback>,
