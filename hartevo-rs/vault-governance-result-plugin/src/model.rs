@@ -5,7 +5,12 @@
 //! native credential handle.  Opaque references are reduced to digests at the
 //! boundary and are never serializable.
 
-use std::{collections::BTreeSet, fmt};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize, de::Error as DeError};
 use sha2::{Digest as ShaDigest, Sha256};
@@ -60,6 +65,10 @@ pub enum ModelError {
     InvalidResponse,
     #[error("request must select at least one bounded observation")]
     EmptyRequest,
+    #[error("evidence has no provider-issued origin seal")]
+    OriginUnavailable,
+    #[error("evidence provider origin or lifecycle binding drifted")]
+    OriginMismatch,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1350,6 +1359,14 @@ impl From<VaultLeaseMetadata> for VaultLeaseEvidence {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EvidenceOriginSeal {
+    mac: Digest,
+    lifecycle_generation: u64,
+    registration_digest: Digest,
+    scope_digest: Digest,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VaultGovernanceEvidence {
@@ -1364,6 +1381,7 @@ pub struct VaultGovernanceEvidence {
     pub consumer_id: String,
     pub scope_digest: Digest,
     pub registration_digest: Digest,
+    pub lifecycle_generation: u64,
     pub secret_reference_digest: Digest,
     pub credential_revision: Revision,
     pub secret_role: VaultSecretRole,
@@ -1386,6 +1404,8 @@ pub struct VaultGovernanceEvidence {
     pub token_material_retained: bool,
     pub raw_provider_payload_retained: bool,
     pub evidence_digest: Digest,
+    #[serde(skip)]
+    pub(crate) origin_seal: Option<EvidenceOriginSeal>,
 }
 
 #[derive(Deserialize)]
@@ -1402,6 +1422,7 @@ struct VaultGovernanceEvidenceWire {
     consumer_id: String,
     scope_digest: Digest,
     registration_digest: Digest,
+    lifecycle_generation: u64,
     secret_reference_digest: Digest,
     credential_revision: Revision,
     secret_role: VaultSecretRole,
@@ -1444,6 +1465,7 @@ impl<'de> Deserialize<'de> for VaultGovernanceEvidence {
             consumer_id: wire.consumer_id,
             scope_digest: wire.scope_digest,
             registration_digest: wire.registration_digest,
+            lifecycle_generation: wire.lifecycle_generation,
             secret_reference_digest: wire.secret_reference_digest,
             credential_revision: wire.credential_revision,
             secret_role: wire.secret_role,
@@ -1466,6 +1488,7 @@ impl<'de> Deserialize<'de> for VaultGovernanceEvidence {
             token_material_retained: wire.token_material_retained,
             raw_provider_payload_retained: wire.raw_provider_payload_retained,
             evidence_digest: wire.evidence_digest,
+            origin_seal: None,
         };
         evidence.validate().map_err(DeError::custom)?;
         Ok(evidence)
@@ -1473,6 +1496,78 @@ impl<'de> Deserialize<'de> for VaultGovernanceEvidence {
 }
 
 impl VaultGovernanceEvidence {
+    fn origin_key() -> &'static [u8; 32] {
+        static ORIGIN_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+        ORIGIN_KEY.get_or_init(|| {
+            let mut material = Vec::new();
+            material.extend_from_slice(&std::process::id().to_be_bytes());
+            material.extend_from_slice(
+                &SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+                    .to_be_bytes(),
+            );
+            Sha256::digest(material).into()
+        })
+    }
+
+    fn origin_mac(
+        &self,
+        lifecycle_generation: u64,
+        registration_digest: &Digest,
+        scope_digest: &Digest,
+    ) -> Digest {
+        let mut material = Vec::new();
+        material.extend_from_slice(Self::origin_key());
+        material.extend_from_slice(&lifecycle_generation.to_be_bytes());
+        material.extend_from_slice(registration_digest.as_str().as_bytes());
+        material.extend_from_slice(scope_digest.as_str().as_bytes());
+        let mut canonical = self.clone();
+        canonical.evidence_digest = Digest::zero();
+        canonical.origin_seal = None;
+        material.extend(serde_json::to_vec(&canonical).expect("bounded Vault evidence serializes"));
+        Digest::from_bytes(&material)
+    }
+
+    pub(crate) fn seal_from_provider(
+        &mut self,
+        lifecycle_generation: u64,
+    ) -> Result<(), ModelError> {
+        if lifecycle_generation == 0 || self.origin_seal.is_some() {
+            return Err(ModelError::OriginMismatch);
+        }
+        let registration_digest = self.registration_digest.clone();
+        let scope_digest = self.scope_digest.clone();
+        let mac = self.origin_mac(lifecycle_generation, &registration_digest, &scope_digest);
+        self.origin_seal = Some(EvidenceOriginSeal {
+            mac,
+            lifecycle_generation,
+            registration_digest,
+            scope_digest,
+        });
+        Ok(())
+    }
+
+    fn validate_origin(&self) -> Result<(), ModelError> {
+        let Some(origin) = &self.origin_seal else {
+            return Err(ModelError::OriginUnavailable);
+        };
+        if origin.lifecycle_generation != self.lifecycle_generation
+            || origin.registration_digest != self.registration_digest
+            || origin.scope_digest != self.scope_digest
+            || origin.mac
+                != self.origin_mac(
+                    self.lifecycle_generation,
+                    &self.registration_digest,
+                    &self.scope_digest,
+                )
+        {
+            return Err(ModelError::OriginMismatch);
+        }
+        Ok(())
+    }
+
     pub(crate) fn compute_evidence_digest(&self) -> Digest {
         let mut material = self.clone();
         material.evidence_digest = Digest::zero();
@@ -1489,11 +1584,8 @@ impl VaultGovernanceEvidence {
         }
     }
 
-    pub fn refresh_digest(&mut self) {
-        self.evidence_digest = self.compute_evidence_digest();
-    }
-
     pub fn validate(&self) -> Result<(), ModelError> {
+        self.validate_origin()?;
         if self.schema_version != VAULT_GOVERNANCE_RESULT_SCHEMA_VERSION
             || self.contract_version != VAULT_GOVERNANCE_RESULT_CONTRACT_VERSION
             || self.service_id != VAULT_GOVERNANCE_RESULT_SERVICE_ID
@@ -1506,6 +1598,7 @@ impl VaultGovernanceEvidence {
             || self.secret_reference_digest.is_zero()
             || self.scope_digest.is_zero()
             || self.registration_digest.is_zero()
+            || self.lifecycle_generation == 0
             || self.valid_until_unix_seconds <= self.valid_from_unix_seconds
             || self.observed_at_unix_seconds < self.valid_from_unix_seconds
             || self.observed_at_unix_seconds >= self.valid_until_unix_seconds

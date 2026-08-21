@@ -104,38 +104,50 @@ fn fixture_read_record_verify_and_mission_consume_are_bounded() {
         .expect("capability request")
         .lookup_lease(lease);
     let proposal = service.propose(&mut provider, &request).expect("proposal");
-    assert_eq!(proposal.evidence.provenance, ProviderProvenance::Fixture);
+    assert_eq!(proposal.evidence().provenance, ProviderProvenance::Fixture);
     assert_eq!(
-        proposal.evidence.health.as_ref().unwrap().status,
+        proposal.evidence().health.as_ref().unwrap().status,
         HealthStatus::Active
     );
     assert_eq!(
-        proposal.evidence.token.as_ref().unwrap().status,
+        proposal.evidence().token.as_ref().unwrap().status,
         TokenStatus::Active
     );
     assert_eq!(
-        proposal.evidence.lease.as_ref().unwrap().status,
+        proposal.evidence().lease.as_ref().unwrap().status,
         LeaseStatus::Active
     );
-    assert!(!proposal.evidence.native_evidence);
-    assert!(!proposal.evidence.secret_values_retained);
-    assert!(!proposal.evidence.token_material_retained);
+    assert!(!proposal.evidence().native_evidence);
+    assert!(!proposal.evidence().secret_values_retained);
+    assert!(!proposal.evidence().token_material_retained);
+    assert_eq!(
+        proposal.evidence().lifecycle_generation,
+        proposal.lifecycle_generation()
+    );
     assert!(!provider.is_connected());
 
     let record = service.record(proposal).expect("record");
     let verification = service.verify(&record, &scope).expect("verification");
     assert!(verification.verified);
+    assert_eq!(
+        verification.lifecycle_generation,
+        record.lifecycle_generation()
+    );
     assert!(!verification.native_authority);
     assert!(!verification.truth_authority);
 
     let consumer = MissionVaultGovernanceConsumer::new(
         scope.clone(),
-        record.evidence.registration_digest.clone(),
+        record.evidence().registration_digest.clone(),
     );
     let result = consumer.consume(&record).expect("mission result");
     assert_eq!(result.observation.mission_id.as_str(), "mission-1");
     assert_eq!(result.observation.project_id.as_str(), "project-1");
     assert_eq!(result.adoption, AdoptionAvailability::NotAdoptedLayer2);
+    assert_eq!(
+        result.observation.lifecycle_generation,
+        record.lifecycle_generation()
+    );
     assert!(!result.observation.adopted_outcome);
     result.validate(&scope).expect("result validation");
 }
@@ -339,14 +351,9 @@ fn tamper_partial_provider_unknown_timeout_and_blocked_env_fail_closed() {
     let proposal = service()
         .propose(&mut provider, &VaultReadRequest::health_only(14))
         .expect("proposal");
-    let mut tampered = proposal.evidence.clone();
+    let mut tampered = proposal.evidence().clone();
     tampered.provider_version = "9.9.9".to_owned();
-    assert!(matches!(
-        service().verify_evidence(&tampered, &scope),
-        Err(VaultGovernanceError::Model(ModelError::DigestMismatch)
-            | VaultGovernanceError::Provider(VaultProviderError::InvalidPayload)
-            | VaultGovernanceError::EvidenceDigestMismatch,)
-    ));
+    assert!(service().verify_evidence(&tampered, &scope).is_err());
 
     let mut partial_transport = RecordingVaultTransport::default();
     partial_transport.push_response(response(
@@ -551,6 +558,104 @@ fn shared_revocation_fence_rejects_snapshots_and_replay() {
 }
 
 #[test]
+fn current_generation_fences_pre_revocation_artifacts_and_stale_clones() {
+    let scope = bind_scope(
+        VaultScope::new(
+            "team/generation",
+            "kv",
+            [VaultPath::new("apps/generation/config").expect("path")],
+            "mission-generation",
+            101,
+            "project-generation",
+            101,
+        )
+        .expect("scope"),
+    );
+    let service = service();
+    let mut provider = service
+        .register(
+            scope.clone(),
+            secret(&scope),
+            FixtureVaultTransport::default(),
+        )
+        .expect("provider");
+    let mut stale_clone = VaultProvider::from_registration(
+        provider.registration().clone(),
+        FixtureVaultTransport::default(),
+    )
+    .expect("stale clone");
+    let proposal = service
+        .propose(&mut provider, &VaultReadRequest::health_only(50))
+        .expect("proposal");
+    let record = service.record(proposal.clone()).expect("record");
+    let consumer = MissionVaultGovernanceConsumer::new(
+        scope.clone(),
+        record.evidence().registration_digest.clone(),
+    );
+    assert_eq!(
+        proposal.evidence().lifecycle_generation,
+        record.evidence().lifecycle_generation
+    );
+
+    service
+        .revoke_registration(&mut provider, 51)
+        .expect("revoke");
+
+    assert!(
+        stale_clone
+            .read(&VaultReadRequest::health_only(52))
+            .is_err()
+    );
+    assert!(proposal.validate().is_err());
+    assert!(service.record(proposal.clone()).is_err());
+    assert!(record.validate().is_err());
+    assert!(service.verify(&record, &scope).is_err());
+    assert!(service.verify_evidence(record.evidence(), &scope).is_err());
+    assert!(consumer.consume(&record).is_err());
+    assert!(
+        consumer
+            .consume_evidence(record.evidence().clone())
+            .is_err()
+    );
+}
+
+#[test]
+fn provider_origin_seal_rejects_mutation_resealing_and_mission_tampering() {
+    let scope = scope();
+    let service = service();
+    let mut provider = service
+        .register(
+            scope.clone(),
+            secret(&scope),
+            FixtureVaultTransport::default(),
+        )
+        .expect("provider");
+    let proposal = service
+        .propose(&mut provider, &VaultReadRequest::health_only(53))
+        .expect("proposal");
+    let record = service.record(proposal.clone()).expect("record");
+    let mut tampered = proposal.evidence().clone();
+    tampered.provider_version = "caller-resealed-provider".to_owned();
+    tampered.evidence_digest = Digest::from_text("caller-resealed-digest");
+    assert!(tampered.validate().is_err());
+    assert!(service.verify_evidence(&tampered, &scope).is_err());
+    let serialized = serde_json::to_value(proposal.evidence()).expect("evidence json");
+    assert!(serde_json::from_value::<VaultGovernanceEvidence>(serialized).is_err());
+
+    let consumer = MissionVaultGovernanceConsumer::new(
+        scope.clone(),
+        record.evidence().registration_digest.clone(),
+    );
+    let result = consumer.consume(&record).expect("mission result");
+    let mut observation_tampered = result.clone();
+    observation_tampered.observation.evidence_digest = Digest::from_text("observation-tamper");
+    assert!(observation_tampered.validate(&scope).is_err());
+    let mut evidence_tampered = result;
+    evidence_tampered.evidence.provider_digest = Digest::from_text("origin-tamper");
+    assert!(evidence_tampered.validate(&scope).is_err());
+}
+
+#[test]
 fn exact_provider_registration_and_mission_bindings_are_verified() {
     let mut definition = VaultProviderDefinition::new(
         VAULT_GOVERNANCE_RESULT_SERVICE_VERSION,
@@ -573,11 +678,7 @@ fn exact_provider_registration_and_mission_bindings_are_verified() {
         .expect("evidence");
     let mut tampered = evidence;
     tampered.provider_digest = Digest::from_text("tampered-provider");
-    tampered.refresh_digest();
-    assert!(matches!(
-        service().verify_evidence(&tampered, &scope),
-        Err(VaultGovernanceError::EvidenceDigestMismatch)
-    ));
+    assert!(service().verify_evidence(&tampered, &scope).is_err());
 
     let consumer = MissionVaultGovernanceConsumer::new(scope, Digest::from_text("wrong"));
     let record = service()

@@ -10,7 +10,9 @@ use crate::model::{
     Digest, SecretReference, VaultGovernanceEvidence, VaultReadRequest, VaultScope,
     digest_serializable,
 };
-use crate::provider::{VaultProvider, VaultProviderDefinition, VaultRegistration};
+use crate::provider::{
+    VaultProvider, VaultProviderDefinition, VaultRegistration, validate_lifecycle_generation,
+};
 use crate::transport::VaultTransport;
 use crate::{
     MISSION_VAULT_GOVERNANCE_CONSUMER_ID, VAULT_GOVERNANCE_RESULT_CONTRACT_VERSION,
@@ -231,7 +233,11 @@ impl VaultGovernanceResultService {
     ) -> Result<VaultVerification, VaultGovernanceError> {
         self.validate()?;
         record.validate()?;
-        let evidence = &record.evidence;
+        let evidence = record.evidence();
+        validate_lifecycle_generation(
+            &evidence.registration_digest,
+            evidence.lifecycle_generation,
+        )?;
         if evidence.scope_digest != scope.scope_digest()
             || !scope.is_secret_bound()
             || evidence.secret_reference_digest
@@ -283,6 +289,7 @@ impl VaultGovernanceResultService {
             provider_digest: record.evidence.provider_digest.clone(),
             scope_digest: record.evidence.scope_digest.clone(),
             evidence_digest: record.evidence.evidence_digest.clone(),
+            lifecycle_generation: evidence.lifecycle_generation,
             native_authority: false,
             truth_authority: false,
             adopted_outcome: false,
@@ -301,23 +308,38 @@ impl VaultGovernanceResultService {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VaultGovernanceProposal {
-    pub evidence: VaultGovernanceEvidence,
-    pub proposal_digest: Digest,
+    evidence: VaultGovernanceEvidence,
+    proposal_digest: Digest,
+    lifecycle_generation: u64,
 }
 
 impl VaultGovernanceProposal {
     fn new(evidence: VaultGovernanceEvidence) -> Self {
-        let proposal_digest = digest_serializable(&(&evidence, "vault-governance-proposal/v1"));
+        let lifecycle_generation = evidence.lifecycle_generation;
+        let proposal_digest = digest_serializable(&(
+            &evidence,
+            lifecycle_generation,
+            "vault-governance-proposal/v1",
+        ));
         Self {
             evidence,
             proposal_digest,
+            lifecycle_generation,
         }
     }
 
     pub fn validate(&self) -> Result<(), VaultGovernanceError> {
         self.evidence.validate()?;
-        if digest_serializable(&(&self.evidence, "vault-governance-proposal/v1"))
-            != self.proposal_digest
+        validate_lifecycle_generation(
+            &self.evidence.registration_digest,
+            self.lifecycle_generation,
+        )?;
+        if self.evidence.lifecycle_generation != self.lifecycle_generation
+            || digest_serializable(&(
+                &self.evidence,
+                self.lifecycle_generation,
+                "vault-governance-proposal/v1",
+            )) != self.proposal_digest
         {
             return Err(VaultGovernanceError::EvidenceDigestMismatch);
         }
@@ -326,28 +348,51 @@ impl VaultGovernanceProposal {
 
     pub fn evidence(&self) -> &VaultGovernanceEvidence {
         &self.evidence
+    }
+
+    pub fn proposal_digest(&self) -> &Digest {
+        &self.proposal_digest
+    }
+
+    pub const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VaultGovernanceRecord {
-    pub evidence: VaultGovernanceEvidence,
-    pub record_digest: Digest,
+    evidence: VaultGovernanceEvidence,
+    record_digest: Digest,
+    lifecycle_generation: u64,
 }
 
 impl VaultGovernanceRecord {
     fn new(evidence: VaultGovernanceEvidence) -> Self {
-        let record_digest = digest_serializable(&(&evidence, "vault-governance-record/v1"));
+        let lifecycle_generation = evidence.lifecycle_generation;
+        let record_digest = digest_serializable(&(
+            &evidence,
+            lifecycle_generation,
+            "vault-governance-record/v1",
+        ));
         Self {
             evidence,
             record_digest,
+            lifecycle_generation,
         }
     }
 
     pub fn validate(&self) -> Result<(), VaultGovernanceError> {
         self.evidence.validate()?;
-        if digest_serializable(&(&self.evidence, "vault-governance-record/v1"))
-            != self.record_digest
+        validate_lifecycle_generation(
+            &self.evidence.registration_digest,
+            self.lifecycle_generation,
+        )?;
+        if self.evidence.lifecycle_generation != self.lifecycle_generation
+            || digest_serializable(&(
+                &self.evidence,
+                self.lifecycle_generation,
+                "vault-governance-record/v1",
+            )) != self.record_digest
         {
             return Err(VaultGovernanceError::EvidenceDigestMismatch);
         }
@@ -356,6 +401,14 @@ impl VaultGovernanceRecord {
 
     pub fn evidence(&self) -> &VaultGovernanceEvidence {
         &self.evidence
+    }
+
+    pub fn record_digest(&self) -> &Digest {
+        &self.record_digest
+    }
+
+    pub const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation
     }
 }
 
@@ -367,6 +420,7 @@ pub struct VaultVerification {
     pub provider_digest: Digest,
     pub scope_digest: Digest,
     pub evidence_digest: Digest,
+    pub lifecycle_generation: u64,
     pub native_authority: bool,
     pub truth_authority: bool,
     pub adopted_outcome: bool,

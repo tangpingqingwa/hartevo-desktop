@@ -86,6 +86,8 @@
       "credentialRevision",
       "secretRole",
       "timeWindow",
+      "lifecycleGeneration",
+      "originSeal",
       "evidence"
     ],
     "retained": ["ttl", "status", "httpStatus", "boundedCapabilityClasses"],
@@ -111,10 +113,14 @@
     "credentialRevisionBound": true,
     "secretRoleBound": true,
     "timeWindowBound": true,
+    "providerOriginSealBound": true,
     "lifecycle": {
       "mode": "process_shared_non_durable",
       "restart": "BLOCKED_ENV_fail_closed",
-      "snapshotReplay": "shared_revocation_fence"
+      "snapshotReplay": "shared_revocation_fence",
+      "generationBound": true,
+      "crossProcess": "NOT_PROVEN",
+      "origin": "provider_private_process_bound"
     },
     "reversible": true,
     "revocable": true,
@@ -143,6 +149,10 @@
       "scope_or_revision_drift",
       "provider_revision_drift",
       "missing_process_shared_lifecycle_fence",
+      "missing_lifecycle_generation",
+      "revoked_pre_revoke_evidence",
+      "caller_resealed_evidence",
+      "cross_process_or_restart_lifecycle_not_proven",
       "restart_without_durable_native_lifecycle",
       "tampered_or_partial_evidence"
     ]
@@ -154,5 +164,5 @@
     "independent_policy_readback",
     "verified_mission_or_work_product_adoption"
   ],
-  "honestNativeGap": "Layer 1 is fixture, recording, loopback, or BLOCKED_ENV evidence only. Registration revocation is process-shared through a monotonic in-memory fence; it is not restart-durable, and a missing fence fails closed. It never claims Connected/native authority, never reads secret values, never serializes token material, never logs in, never mutates policy, and never renews or revokes leases. Native Vault authentication/HTTPS, durable lifecycle and provider receipts, independent policy readback, and verified adoption remain Layer-2 exits under Hartevo Consent/Effect/Receipt/Verification authority."
+  "honestNativeGap": "Layer 1 is fixture, recording, loopback, or BLOCKED_ENV evidence only. Registration revocation is process-shared through a monotonic in-memory generation fence and provider-private process-bound origin seal; it is not cross-process and not restart-durable, and a missing fence or origin seal fails closed. It never claims Connected/native authority, never reads secret values, never serializes token material, never logs in, never mutates policy, and never renews or revokes leases. Native Vault authentication/HTTPS, durable lifecycle and provider receipts, independent policy readback, and verified adoption remain Layer-2 exits under Hartevo Consent/Effect/Receipt/Verification authority."
 }

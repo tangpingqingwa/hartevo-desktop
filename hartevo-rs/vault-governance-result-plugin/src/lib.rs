@@ -156,6 +156,43 @@ impl VaultGovernanceResultContract {
             "validFromUnixSeconds",
             "validUntilUnixSeconds",
         ];
+        let required_evidence_digests = [
+            "contract",
+            "provider",
+            "scope",
+            "registration",
+            "token",
+            "policy",
+            "path",
+            "lease",
+            "response",
+            "providerRevision",
+            "secretReference",
+            "credentialRevision",
+            "secretRole",
+            "timeWindow",
+            "lifecycleGeneration",
+            "originSeal",
+            "evidence",
+        ];
+        let required_fail_closed_cases = [
+            "missing_native_vault_authority",
+            "missing_short_lived_access_token",
+            "namespace_or_path_traversal",
+            "root_token_path_request",
+            "secret_value_request",
+            "policy_mutation_request",
+            "lease_renew_or_revoke_request",
+            "scope_or_revision_drift",
+            "provider_revision_drift",
+            "missing_process_shared_lifecycle_fence",
+            "missing_lifecycle_generation",
+            "revoked_pre_revoke_evidence",
+            "caller_resealed_evidence",
+            "cross_process_or_restart_lifecycle_not_proven",
+            "restart_without_durable_native_lifecycle",
+            "tampered_or_partial_evidence",
+        ];
         let layer2_gaps = self
             .document
             .get("layer2Gaps")
@@ -221,6 +258,11 @@ impl VaultGovernanceResultContract {
             && self.document["scope"]["rootNamespace"] == Value::Bool(false)
             && self.document["scope"]["rootTokenPaths"] == Value::Bool(false)
             && self.document["scope"]["pathTraversal"] == Value::Bool(false)
+            && required_evidence_digests.iter().all(|field| {
+                self.document["evidence"]["digests"]
+                    .as_array()
+                    .is_some_and(|values| values.iter().any(|item| item == field))
+            })
             && self.document["evidence"]["secretValues"] == Value::Bool(false)
             && self.document["evidence"]["rawProviderPayload"] == Value::Bool(false)
             && self.document["evidence"]["tokenMaterial"] == Value::Bool(false)
@@ -232,12 +274,22 @@ impl VaultGovernanceResultContract {
             && self.document["registration"]["credentialRevisionBound"] == Value::Bool(true)
             && self.document["registration"]["secretRoleBound"] == Value::Bool(true)
             && self.document["registration"]["timeWindowBound"] == Value::Bool(true)
+            && self.document["registration"]["providerOriginSealBound"] == Value::Bool(true)
             && self.document["registration"]["lifecycle"]["mode"] == "process_shared_non_durable"
             && self.document["registration"]["lifecycle"]["restart"] == "BLOCKED_ENV_fail_closed"
             && self.document["registration"]["lifecycle"]["snapshotReplay"]
                 == "shared_revocation_fence"
+            && self.document["registration"]["lifecycle"]["generationBound"] == Value::Bool(true)
+            && self.document["registration"]["lifecycle"]["crossProcess"] == "NOT_PROVEN"
+            && self.document["registration"]["lifecycle"]["origin"]
+                == "provider_private_process_bound"
             && authority_is_false
             && self.document["nativeGap"]["status"] == VAULT_GOVERNANCE_RESULT_BLOCKED_ENV
+            && required_fail_closed_cases.iter().all(|case| {
+                self.document["nativeGap"]["failClosedCases"]
+                    .as_array()
+                    .is_some_and(|values| values.iter().any(|item| item == case))
+            })
             && layer2_gaps
             && honest_gap.contains("BLOCKED_ENV")
             && honest_gap.contains("secret values")
@@ -246,6 +298,9 @@ impl VaultGovernanceResultContract {
             && honest_gap.contains("renew")
             && honest_gap.contains("revoke")
             && honest_gap.contains("process-shared")
+            && honest_gap.contains("generation fence")
+            && honest_gap.contains("origin seal")
+            && honest_gap.contains("not cross-process")
             && honest_gap.contains("not restart-durable")
             && honest_gap.contains("fails closed");
         if valid {

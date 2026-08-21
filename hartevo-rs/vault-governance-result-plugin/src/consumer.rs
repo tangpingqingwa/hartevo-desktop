@@ -30,6 +30,7 @@ pub struct MissionVaultGovernanceObservation {
     pub mission_id: MissionId,
     pub project_id: ProjectId,
     pub scope_digest: Digest,
+    pub lifecycle_generation: u64,
     pub evidence_digest: Digest,
     pub health_status: Option<HealthStatus>,
     pub token_status: Option<TokenStatus>,
@@ -51,8 +52,35 @@ pub struct MissionVaultGovernanceResult {
 }
 
 impl MissionVaultGovernanceResult {
+    fn observation_digest(observation: &MissionVaultGovernanceObservation) -> Digest {
+        digest_serializable(&(
+            (
+                &observation.contract_version,
+                &observation.contract_digest,
+                &observation.consumer_id,
+                &observation.consumer_version,
+                &observation.mission_id,
+                &observation.project_id,
+                &observation.scope_digest,
+                observation.lifecycle_generation,
+                &observation.evidence_digest,
+                observation.health_status,
+                observation.token_status,
+                observation.lease_status,
+                &observation.capability_digest,
+                observation.state,
+            ),
+            (
+                observation.native_authority,
+                observation.truth_authority,
+                observation.adopted_outcome,
+            ),
+        ))
+    }
+
     pub fn validate(&self, scope: &VaultScope) -> Result<(), VaultGovernanceError> {
         self.evidence.validate()?;
+        VaultGovernanceResultService::new().verify_evidence(&self.evidence, scope)?;
         if self.evidence.scope_digest != scope.scope_digest()
             || self.evidence.secret_reference_digest
                 != *scope
@@ -75,6 +103,7 @@ impl MissionVaultGovernanceResult {
                     .valid_until_unix_seconds()
                     .ok_or(VaultGovernanceError::ScopeMismatch)?
             || self.observation.scope_digest != scope.scope_digest()
+            || self.observation.lifecycle_generation != self.evidence.lifecycle_generation
             || self.observation.evidence_digest != self.evidence.evidence_digest
             || self.observation.contract_digest != contract_digest()
             || self.observation.contract_version != VAULT_GOVERNANCE_RESULT_CONTRACT_VERSION
@@ -84,6 +113,7 @@ impl MissionVaultGovernanceResult {
             || self.observation.truth_authority
             || self.observation.adopted_outcome
             || self.adoption.is_adopted()
+            || self.observation.observation_digest != Self::observation_digest(&self.observation)
         {
             return Err(VaultGovernanceError::StaleEvidence);
         }
@@ -124,7 +154,7 @@ impl MissionVaultGovernanceConsumer {
         record: &VaultGovernanceRecord,
     ) -> Result<MissionVaultGovernanceResult, VaultGovernanceError> {
         record.validate()?;
-        self.consume_evidence(record.evidence.clone())
+        self.consume_evidence(record.evidence().clone())
     }
 
     pub fn consume_evidence(
@@ -154,6 +184,7 @@ impl MissionVaultGovernanceConsumer {
             mission_id: self.scope.mission_id().clone(),
             project_id: self.scope.project_id().clone(),
             scope_digest: self.scope.scope_digest(),
+            lifecycle_generation: evidence.lifecycle_generation,
             evidence_digest: evidence.evidence_digest.clone(),
             health_status: evidence.health.as_ref().map(|health| health.status),
             token_status: evidence.token.as_ref().map(|token| token.status),
@@ -165,24 +196,8 @@ impl MissionVaultGovernanceConsumer {
             adopted_outcome: false,
             observation_digest: Digest::zero(),
         };
-        observation.observation_digest = digest_serializable(&(
-            &observation.contract_version,
-            &observation.contract_digest,
-            &observation.consumer_id,
-            &observation.consumer_version,
-            &observation.mission_id,
-            &observation.project_id,
-            &observation.scope_digest,
-            &observation.evidence_digest,
-            observation.health_status,
-            observation.token_status,
-            observation.lease_status,
-            &observation.capability_digest,
-            observation.state,
-            observation.native_authority,
-            observation.truth_authority,
-            observation.adopted_outcome,
-        ));
+        observation.observation_digest =
+            MissionVaultGovernanceResult::observation_digest(&observation);
         let result = MissionVaultGovernanceResult {
             observation,
             evidence,

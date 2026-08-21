@@ -367,6 +367,28 @@ fn registration_lifecycle() -> &'static Mutex<BTreeMap<String, LifecycleFence>> 
     REGISTRATION_LIFECYCLE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+pub(crate) fn validate_lifecycle_generation(
+    registration_digest: &Digest,
+    lifecycle_generation: u64,
+) -> Result<(), VaultProviderError> {
+    if lifecycle_generation == 0 {
+        return Err(VaultProviderError::RegistrationReplay);
+    }
+    let lifecycle = registration_lifecycle()
+        .lock()
+        .map_err(|_| VaultProviderError::LifecycleUnavailable)?;
+    let Some(fence) = lifecycle.get(registration_digest.as_str()) else {
+        return Err(VaultProviderError::LifecycleUnavailable);
+    };
+    if fence.epoch != lifecycle_generation {
+        return Err(VaultProviderError::RegistrationReplay);
+    }
+    if fence.state != RegistrationState::Active {
+        return Err(VaultProviderError::RegistrationRevoked);
+    }
+    Ok(())
+}
+
 fn lifecycle_fence(
     contract_digest: &Digest,
     provider_digest: &Digest,
@@ -607,6 +629,10 @@ impl VaultRegistration {
         &self.registration_digest
     }
 
+    pub(crate) const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_epoch
+    }
+
     pub const fn state(&self) -> RegistrationState {
         self.state
     }
@@ -692,16 +718,7 @@ impl VaultRegistration {
         {
             return Err(VaultProviderError::RegistrationDrift);
         }
-        let lifecycle = registration_lifecycle()
-            .lock()
-            .map_err(|_| VaultProviderError::LifecycleUnavailable)?;
-        let Some(fence) = lifecycle.get(self.registration_digest.as_str()) else {
-            return Err(VaultProviderError::LifecycleUnavailable);
-        };
-        if fence.epoch != self.lifecycle_epoch || fence.state != RegistrationState::Active {
-            return Err(VaultProviderError::RegistrationRevoked);
-        }
-        Ok(())
+        validate_lifecycle_generation(&self.registration_digest, self.lifecycle_epoch)
     }
 }
 
@@ -935,6 +952,7 @@ where
             consumer_id: MISSION_VAULT_GOVERNANCE_CONSUMER_ID.to_owned(),
             scope_digest: self.registration.scope.scope_digest(),
             registration_digest: self.registration.registration_digest.clone(),
+            lifecycle_generation: self.registration.lifecycle_generation(),
             secret_reference_digest: self
                 .registration
                 .secret_reference
@@ -964,7 +982,11 @@ where
             token_material_retained: false,
             raw_provider_payload_retained: false,
             evidence_digest: Digest::zero(),
+            origin_seal: None,
         };
+        evidence
+            .seal_from_provider(self.registration.lifecycle_generation())
+            .map_err(|_| VaultProviderError::InvalidPayload)?;
         evidence.evidence_digest = evidence.compute_evidence_digest();
         evidence
             .validate()
