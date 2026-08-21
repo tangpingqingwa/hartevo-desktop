@@ -54,6 +54,26 @@ impl MissionVaultGovernanceResult {
     pub fn validate(&self, scope: &VaultScope) -> Result<(), VaultGovernanceError> {
         self.evidence.validate()?;
         if self.evidence.scope_digest != scope.scope_digest()
+            || self.evidence.secret_reference_digest
+                != *scope
+                    .secret_reference_digest()
+                    .ok_or(VaultGovernanceError::ScopeMismatch)?
+            || self.evidence.credential_revision
+                != scope
+                    .credential_revision()
+                    .ok_or(VaultGovernanceError::ScopeMismatch)?
+            || self.evidence.secret_role
+                != scope
+                    .secret_role()
+                    .ok_or(VaultGovernanceError::ScopeMismatch)?
+            || self.evidence.valid_from_unix_seconds
+                != scope
+                    .valid_from_unix_seconds()
+                    .ok_or(VaultGovernanceError::ScopeMismatch)?
+            || self.evidence.valid_until_unix_seconds
+                != scope
+                    .valid_until_unix_seconds()
+                    .ok_or(VaultGovernanceError::ScopeMismatch)?
             || self.observation.scope_digest != scope.scope_digest()
             || self.observation.evidence_digest != self.evidence.evidence_digest
             || self.observation.contract_digest != contract_digest()
@@ -75,22 +95,16 @@ impl MissionVaultGovernanceResult {
 pub struct MissionVaultGovernanceConsumer {
     scope: VaultScope,
     contract_digest: Digest,
-    registration_digest: Option<Digest>,
+    registration_digest: Digest,
 }
 
 impl MissionVaultGovernanceConsumer {
-    pub fn new(scope: VaultScope) -> Self {
+    pub fn new(scope: VaultScope, registration_digest: Digest) -> Self {
         Self {
             scope,
             contract_digest: contract_digest(),
-            registration_digest: None,
+            registration_digest,
         }
-    }
-
-    #[must_use]
-    pub fn with_registration_digest(mut self, registration_digest: Digest) -> Self {
-        self.registration_digest = Some(registration_digest);
-        self
     }
 
     pub fn scope(&self) -> &VaultScope {
@@ -101,8 +115,8 @@ impl MissionVaultGovernanceConsumer {
         &self.contract_digest
     }
 
-    pub fn registration_digest(&self) -> Option<&Digest> {
-        self.registration_digest.as_ref()
+    pub fn registration_digest(&self) -> &Digest {
+        &self.registration_digest
     }
 
     pub fn consume(
@@ -118,14 +132,12 @@ impl MissionVaultGovernanceConsumer {
         evidence: VaultGovernanceEvidence,
     ) -> Result<MissionVaultGovernanceResult, VaultGovernanceError> {
         evidence.validate()?;
+        VaultGovernanceResultService::new().verify_evidence(&evidence, &self.scope)?;
         if evidence.scope_digest != self.scope.scope_digest()
             || evidence.contract_digest != self.contract_digest
             || evidence.contract_version != VAULT_GOVERNANCE_RESULT_CONTRACT_VERSION
             || evidence.consumer_id != MISSION_VAULT_GOVERNANCE_CONSUMER_ID
-            || self
-                .registration_digest
-                .as_ref()
-                .is_some_and(|digest| digest != &evidence.registration_digest)
+            || evidence.registration_digest != self.registration_digest
         {
             return Err(VaultGovernanceError::StaleEvidence);
         }

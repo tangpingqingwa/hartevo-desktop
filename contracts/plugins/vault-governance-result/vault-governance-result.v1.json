@@ -61,7 +61,10 @@
       "missionIdAndRevision",
       "projectIdAndRevision",
       "secretReferenceDigest",
-      "credentialRevision"
+      "credentialRevision",
+      "secretRole",
+      "validFromUnixSeconds",
+      "validUntilUnixSeconds"
     ],
     "rootNamespace": false,
     "rootTokenPaths": false,
@@ -78,6 +81,11 @@
       "path",
       "lease",
       "response",
+      "providerRevision",
+      "secretReference",
+      "credentialRevision",
+      "secretRole",
+      "timeWindow",
       "evidence"
     ],
     "retained": ["ttl", "status", "httpStatus", "boundedCapabilityClasses"],
@@ -100,6 +108,14 @@
     "providerDigestBound": true,
     "scopeBound": true,
     "secretReferenceDigestBound": true,
+    "credentialRevisionBound": true,
+    "secretRoleBound": true,
+    "timeWindowBound": true,
+    "lifecycle": {
+      "mode": "process_shared_non_durable",
+      "restart": "BLOCKED_ENV_fail_closed",
+      "snapshotReplay": "shared_revocation_fence"
+    },
     "reversible": true,
     "revocable": true,
     "failClosedOnDrift": true
@@ -126,6 +142,8 @@
       "lease_renew_or_revoke_request",
       "scope_or_revision_drift",
       "provider_revision_drift",
+      "missing_process_shared_lifecycle_fence",
+      "restart_without_durable_native_lifecycle",
       "tampered_or_partial_evidence"
     ]
   },
@@ -136,5 +154,5 @@
     "independent_policy_readback",
     "verified_mission_or_work_product_adoption"
   ],
-  "honestNativeGap": "Layer 1 is fixture, recording, loopback, or BLOCKED_ENV evidence only. It never claims Connected/native authority, never reads secret values, never serializes token material, never logs in, never mutates policy, and never renews or revokes leases. Native Vault authentication/HTTPS, durable provider receipts, independent policy readback, and verified adoption remain Layer-2 exits under Hartevo Consent/Effect/Receipt/Verification authority."
+  "honestNativeGap": "Layer 1 is fixture, recording, loopback, or BLOCKED_ENV evidence only. Registration revocation is process-shared through a monotonic in-memory fence; it is not restart-durable, and a missing fence fails closed. It never claims Connected/native authority, never reads secret values, never serializes token material, never logs in, never mutates policy, and never renews or revokes leases. Native Vault authentication/HTTPS, durable lifecycle and provider receipts, independent policy readback, and verified adoption remain Layer-2 exits under Hartevo Consent/Effect/Receipt/Verification authority."
 }

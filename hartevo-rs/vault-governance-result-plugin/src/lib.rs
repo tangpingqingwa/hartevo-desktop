@@ -152,6 +152,9 @@ impl VaultGovernanceResultContract {
             "projectIdAndRevision",
             "secretReferenceDigest",
             "credentialRevision",
+            "secretRole",
+            "validFromUnixSeconds",
+            "validUntilUnixSeconds",
         ];
         let layer2_gaps = self
             .document
@@ -226,6 +229,13 @@ impl VaultGovernanceResultContract {
             && self.document["registration"]["reversible"] == Value::Bool(true)
             && self.document["registration"]["revocable"] == Value::Bool(true)
             && self.document["registration"]["failClosedOnDrift"] == Value::Bool(true)
+            && self.document["registration"]["credentialRevisionBound"] == Value::Bool(true)
+            && self.document["registration"]["secretRoleBound"] == Value::Bool(true)
+            && self.document["registration"]["timeWindowBound"] == Value::Bool(true)
+            && self.document["registration"]["lifecycle"]["mode"] == "process_shared_non_durable"
+            && self.document["registration"]["lifecycle"]["restart"] == "BLOCKED_ENV_fail_closed"
+            && self.document["registration"]["lifecycle"]["snapshotReplay"]
+                == "shared_revocation_fence"
             && authority_is_false
             && self.document["nativeGap"]["status"] == VAULT_GOVERNANCE_RESULT_BLOCKED_ENV
             && layer2_gaps
@@ -234,7 +244,10 @@ impl VaultGovernanceResultContract {
             && honest_gap.contains("logs in")
             && honest_gap.contains("policy")
             && honest_gap.contains("renew")
-            && honest_gap.contains("revoke");
+            && honest_gap.contains("revoke")
+            && honest_gap.contains("process-shared")
+            && honest_gap.contains("not restart-durable")
+            && honest_gap.contains("fails closed");
         if valid {
             Ok(())
         } else {

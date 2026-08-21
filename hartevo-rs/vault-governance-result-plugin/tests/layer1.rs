@@ -2,7 +2,7 @@ use hartevo_vault_governance_result_plugin::*;
 
 const PROVIDER_REVISION: &str = VAULT_GOVERNANCE_RESULT_PROVIDER_REVISION;
 
-fn scope() -> VaultScope {
+fn base_scope() -> VaultScope {
     VaultScope::new(
         "team/production",
         "kv",
@@ -18,9 +18,51 @@ fn scope() -> VaultScope {
     .expect("scope")
 }
 
+fn bind_scope(scope: VaultScope) -> VaultScope {
+    let reference =
+        SecretReference::new("s.super-secret-token-material", &scope, 4).expect("secret reference");
+    scope
+        .bind_secret_reference(&reference)
+        .expect("secret binding")
+}
+
+fn scope() -> VaultScope {
+    bind_scope(base_scope())
+}
+
+fn revocation_scope() -> VaultScope {
+    bind_scope(
+        VaultScope::new(
+            "team/production",
+            "kv",
+            [VaultPath::new("apps/hartevo/config").expect("path")],
+            "mission-revocation",
+            99,
+            "project-revocation",
+            99,
+        )
+        .expect("revocation scope"),
+    )
+}
+
+fn reversible_scope() -> VaultScope {
+    bind_scope(
+        VaultScope::new(
+            "team/production",
+            "kv",
+            [VaultPath::new("apps/hartevo/config").expect("path")],
+            "mission-reversible",
+            98,
+            "project-reversible",
+            98,
+        )
+        .expect("reversible scope"),
+    )
+}
+
 fn scope_with_lease() -> (VaultScope, LeaseReference) {
     let lease = LeaseReference::new("database/creds/hartevo/opaque-lease").expect("lease");
-    (scope().bind_lease(&lease), lease)
+    (bind_scope(base_scope().bind_lease(&lease)), lease)
 }
 
 fn secret(scope: &VaultScope) -> SecretReference {
@@ -29,6 +71,18 @@ fn secret(scope: &VaultScope) -> SecretReference {
 
 fn service() -> VaultGovernanceResultService {
     VaultGovernanceResultService::new()
+}
+
+fn response(
+    scope: &VaultScope,
+    endpoint: VaultEndpoint,
+    status: u16,
+    response_size: usize,
+    payload: VaultResponsePayload,
+) -> VaultHttpResponse {
+    let request = VaultRequest::new(scope, endpoint);
+    VaultHttpResponse::for_request(&request, status, response_size, PROVIDER_REVISION, payload)
+        .expect("response")
 }
 
 #[test]
@@ -74,8 +128,10 @@ fn fixture_read_record_verify_and_mission_consume_are_bounded() {
     assert!(!verification.native_authority);
     assert!(!verification.truth_authority);
 
-    let consumer = MissionVaultGovernanceConsumer::new(scope.clone())
-        .with_registration_digest(record.evidence.registration_digest.clone());
+    let consumer = MissionVaultGovernanceConsumer::new(
+        scope.clone(),
+        record.evidence.registration_digest.clone(),
+    );
     let result = consumer.consume(&record).expect("mission result");
     assert_eq!(result.observation.mission_id.as_str(), "mission-1");
     assert_eq!(result.observation.project_id.as_str(), "project-1");
@@ -133,17 +189,16 @@ fn sealed_and_standby_health_statuses_are_normalized_without_native_claims() {
     ] {
         metadata.sealed = expected == HealthStatus::Sealed;
         metadata.standby = expected == HealthStatus::Standby;
-        let response = VaultHttpResponse::new(
-            VaultOperation::SysHealth,
+        let scope = scope();
+        let response = response(
+            &scope,
+            VaultEndpoint::SysHealth,
             status,
             512,
-            PROVIDER_REVISION,
             VaultResponsePayload::Health(metadata),
-        )
-        .expect("response");
+        );
         let mut transport = RecordingVaultTransport::default();
         transport.push_response(response);
-        let scope = scope();
         let mut provider = service()
             .register(scope.clone(), secret(&scope), transport)
             .expect("provider");
@@ -158,11 +213,12 @@ fn sealed_and_standby_health_statuses_are_normalized_without_native_claims() {
 #[test]
 fn permission_conflict_rate_limit_and_server_statuses_are_distinct() {
     for status in [401, 403, 404, 409, 429, 500, 503] {
-        let response = VaultHttpResponse::new(
-            VaultOperation::AuthTokenLookupSelf,
+        let scope = scope();
+        let response = response(
+            &scope,
+            VaultEndpoint::AuthTokenLookupSelf,
             status,
             128,
-            PROVIDER_REVISION,
             VaultResponsePayload::TokenSelf(
                 VaultTokenSelfMetadata::new(
                     Digest::from_text("token"),
@@ -174,11 +230,9 @@ fn permission_conflict_rate_limit_and_server_statuses_are_distinct() {
                 )
                 .expect("token metadata"),
             ),
-        )
-        .expect("response");
+        );
         let mut transport = RecordingVaultTransport::default();
         transport.push_response(response);
-        let scope = scope();
         let mut provider = service()
             .register(scope.clone(), secret(&scope), transport)
             .expect("provider");
@@ -211,17 +265,18 @@ fn permission_conflict_rate_limit_and_server_statuses_are_distinct() {
 fn capability_mismatch_and_expired_lease_are_fail_closed_and_bounded() {
     let (scope, lease) = scope_with_lease();
     let path = VaultPath::new("apps/hartevo/config").expect("path");
-    let mismatched = VaultHttpResponse::new(
-        VaultOperation::SysCapabilitiesSelfAllowlisted,
+    let mismatched = response(
+        &scope,
+        VaultEndpoint::SysCapabilitiesSelf {
+            path_digests: vec![path.path_digest()],
+        },
         200,
         256,
-        PROVIDER_REVISION,
         VaultResponsePayload::CapabilitiesSelf(vec![
             VaultCapabilityMetadata::new(path.path_digest(), vec![CapabilityClass::Read])
                 .expect("capability"),
         ]),
-    )
-    .expect("response");
+    );
     let mut transport = RecordingVaultTransport::default();
     transport.push_response(mismatched);
     let mut provider = service()
@@ -237,11 +292,13 @@ fn capability_mismatch_and_expired_lease_are_fail_closed_and_bounded() {
         Err(VaultProviderError::CapabilityMismatch { .. })
     ));
 
-    let expired = VaultHttpResponse::new(
-        VaultOperation::SysLeasesLookupMetadata,
+    let expired = response(
+        &scope,
+        VaultEndpoint::SysLeasesLookup {
+            lease_digest: lease.reference_digest().clone(),
+        },
         200,
         256,
-        PROVIDER_REVISION,
         VaultResponsePayload::LeaseLookup(VaultLeaseMetadata::new(
             lease.reference_digest().clone(),
             scope.mount().mount_digest(),
@@ -249,8 +306,7 @@ fn capability_mismatch_and_expired_lease_are_fail_closed_and_bounded() {
             0,
             true,
         )),
-    )
-    .expect("response");
+    );
     let mut transport = RecordingVaultTransport::default();
     transport.push_response(expired);
     let mut provider = service()
@@ -293,16 +349,13 @@ fn tamper_partial_provider_unknown_timeout_and_blocked_env_fail_closed() {
     ));
 
     let mut partial_transport = RecordingVaultTransport::default();
-    partial_transport.push_response(
-        VaultHttpResponse::new(
-            VaultOperation::SysHealth,
-            200,
-            128,
-            PROVIDER_REVISION,
-            VaultResponsePayload::Health(VaultHealthMetadata::default()),
-        )
-        .expect("response"),
-    );
+    partial_transport.push_response(response(
+        &scope,
+        VaultEndpoint::SysHealth,
+        200,
+        128,
+        VaultResponsePayload::Health(VaultHealthMetadata::default()),
+    ));
     partial_transport.push_error(VaultTransportError::Timeout);
     let mut partial_provider = service()
         .register(scope.clone(), secret(&scope), partial_transport)
@@ -361,7 +414,7 @@ fn loopback_recording_and_fixture_provenance_are_explicitly_non_native() {
 
 #[test]
 fn registration_is_reversible_and_revocation_fails_closed() {
-    let scope = scope();
+    let scope = reversible_scope();
     let mut provider = service()
         .register(
             scope.clone(),
@@ -383,4 +436,189 @@ fn registration_is_reversible_and_revocation_fails_closed() {
             VaultProviderError::RegistrationRevoked
         ))
     ));
+}
+
+#[test]
+fn serde_rechecks_constructor_invariants_and_nested_unknown_fields() {
+    assert!(serde_json::from_str::<Digest>("\"not-a-digest\"").is_err());
+    assert!(serde_json::from_str::<Revision>("0").is_err());
+    assert!(serde_json::from_str::<ProjectId>("\"mission id\"").is_err());
+    assert!(serde_json::from_str::<VaultPath>("\"apps/../secret\"").is_err());
+
+    let scope = scope();
+    let mut serialized = serde_json::to_value(&scope).expect("scope json");
+    serialized["allowlistedPaths"][0] = serde_json::json!("apps/../secret");
+    assert!(serde_json::from_value::<VaultScope>(serialized).is_err());
+
+    let mut serialized = serde_json::to_value(&scope).expect("scope json");
+    serialized["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<VaultScope>(serialized).is_err());
+
+    let token = VaultTokenSelfMetadata::new(
+        Digest::from_text("token-serde"),
+        Digest::from_text("accessor-serde"),
+        None,
+        60,
+        false,
+        vec![PolicyClass::ReadOnly],
+    )
+    .expect("token");
+    let mut token_json = serde_json::to_value(token).expect("token json");
+    token_json["policyDigest"] = serde_json::json!(Digest::from_text("wrong").as_str());
+    assert!(serde_json::from_value::<VaultTokenSelfMetadata>(token_json).is_err());
+
+    let mut provider = service()
+        .register(
+            scope.clone(),
+            secret(&scope),
+            FixtureVaultTransport::default(),
+        )
+        .expect("provider");
+    let evidence = provider
+        .read(&VaultReadRequest::health_only(30))
+        .expect("evidence");
+    let mut evidence_json = serde_json::to_value(evidence).expect("evidence json");
+    evidence_json["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<VaultGovernanceEvidence>(evidence_json).is_err());
+}
+
+#[test]
+fn request_and_response_digests_are_nonzero_exact_and_recomputed() {
+    let scope = scope();
+    let request = VaultRequest::new(&scope, VaultEndpoint::SysHealth);
+    let request_json = serde_json::to_value(&request).expect("request json");
+    assert_ne!(
+        request_json["requestDigest"],
+        serde_json::json!("0000000000000000000000000000000000000000000000000000000000000000")
+    );
+
+    let unbound = VaultHttpResponse::new(
+        VaultOperation::SysHealth,
+        200,
+        128,
+        PROVIDER_REVISION,
+        VaultResponsePayload::Health(VaultHealthMetadata::default()),
+    )
+    .expect("unbound response");
+    let mut transport = RecordingVaultTransport::default();
+    transport.push_response(unbound);
+    let mut provider = service()
+        .register(scope.clone(), secret(&scope), transport)
+        .expect("provider");
+    assert!(matches!(
+        provider.read(&VaultReadRequest::health_only(31)),
+        Err(VaultProviderError::RequestDigestMismatch)
+    ));
+
+    let valid = response(
+        &scope,
+        VaultEndpoint::SysHealth,
+        200,
+        128,
+        VaultResponsePayload::Health(VaultHealthMetadata::default()),
+    );
+    let mut response_json = serde_json::to_value(valid).expect("response json");
+    response_json["responseSize"] = serde_json::json!(129);
+    assert!(serde_json::from_value::<VaultHttpResponse>(response_json).is_err());
+}
+
+#[test]
+fn shared_revocation_fence_rejects_snapshots_and_replay() {
+    let scope = revocation_scope();
+    let mut provider = service()
+        .register(
+            scope.clone(),
+            secret(&scope),
+            FixtureVaultTransport::default(),
+        )
+        .expect("provider");
+    let snapshot = provider.registration().clone();
+    provider.revoke_registration(40).expect("revoke");
+    assert!(matches!(
+        VaultProvider::from_registration(snapshot, FixtureVaultTransport::default()),
+        Err(VaultProviderError::RegistrationRevoked | VaultProviderError::RegistrationReplay)
+    ));
+    assert!(matches!(
+        service().register(
+            scope.clone(),
+            secret(&scope),
+            FixtureVaultTransport::default()
+        ),
+        Err(VaultGovernanceError::Provider(
+            VaultProviderError::RegistrationReplay
+        ))
+    ));
+}
+
+#[test]
+fn exact_provider_registration_and_mission_bindings_are_verified() {
+    let mut definition = VaultProviderDefinition::new(
+        VAULT_GOVERNANCE_RESULT_SERVICE_VERSION,
+        ProviderProvenance::Fixture,
+    )
+    .expect("definition");
+    definition.provider_digest = Digest::from_text("tampered-provider");
+    assert!(definition.validate().is_err());
+
+    let scope = scope();
+    let mut provider = service()
+        .register(
+            scope.clone(),
+            secret(&scope),
+            FixtureVaultTransport::default(),
+        )
+        .expect("provider");
+    let evidence = provider
+        .read(&VaultReadRequest::health_only(41))
+        .expect("evidence");
+    let mut tampered = evidence;
+    tampered.provider_digest = Digest::from_text("tampered-provider");
+    tampered.refresh_digest();
+    assert!(matches!(
+        service().verify_evidence(&tampered, &scope),
+        Err(VaultGovernanceError::EvidenceDigestMismatch)
+    ));
+
+    let consumer = MissionVaultGovernanceConsumer::new(scope, Digest::from_text("wrong"));
+    let record = service()
+        .record(
+            service()
+                .propose(&mut provider, &VaultReadRequest::health_only(42))
+                .expect("proposal"),
+        )
+        .expect("record");
+    assert!(matches!(
+        consumer.consume(&record),
+        Err(VaultGovernanceError::StaleEvidence | VaultGovernanceError::EvidenceDigestMismatch)
+    ));
+}
+
+#[test]
+fn secret_revision_role_and_time_window_are_scope_fences() {
+    let base = VaultScope::new(
+        "team/window",
+        "kv",
+        [VaultPath::new("apps/window/config").expect("path")],
+        "mission-window",
+        1,
+        "project-window",
+        1,
+    )
+    .expect("base scope");
+    let reference = SecretReference::new_with_window(
+        "s.window-secret",
+        &base,
+        8,
+        VaultSecretRole::ObservationOnly,
+        100,
+        200,
+    )
+    .expect("reference");
+    let scope = base.bind_secret_reference(&reference).expect("bound scope");
+    let mut provider = service()
+        .register(scope.clone(), reference, FixtureVaultTransport::default())
+        .expect("provider");
+    assert!(provider.read(&VaultReadRequest::health_only(99)).is_err());
+    assert!(provider.read(&VaultReadRequest::health_only(100)).is_ok());
+    assert!(provider.read(&VaultReadRequest::health_only(200)).is_err());
 }

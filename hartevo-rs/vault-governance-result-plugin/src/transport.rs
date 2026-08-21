@@ -6,14 +6,15 @@
 
 use std::{collections::VecDeque, fmt};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as DeError};
 use thiserror::Error;
 
 use crate::VAULT_GOVERNANCE_RESULT_PROVIDER_REVISION;
+use crate::model::MAX_ALLOWLISTED_PATHS;
 use crate::model::{
     CapabilityClass, Digest, PolicyClass, ProviderProvenance, VaultCapabilityMetadata,
     VaultHealthMetadata, VaultLeaseMetadata, VaultOperation, VaultResponsePayload, VaultScope,
-    VaultTokenSelfMetadata, digest_serializable, mount_digest, response_digest,
+    VaultTokenSelfMetadata, digest_serializable, mount_digest,
 };
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -61,7 +62,7 @@ impl VaultEndpoint {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VaultRequest {
     endpoint: VaultEndpoint,
@@ -71,11 +72,39 @@ pub struct VaultRequest {
     request_digest: Digest,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VaultRequestWire {
+    endpoint: VaultEndpoint,
+    namespace_digest: Digest,
+    mount_digest: Digest,
+    scope_digest: Digest,
+    request_digest: Digest,
+}
+
+impl<'de> Deserialize<'de> for VaultRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = VaultRequestWire::deserialize(deserializer)?;
+        let request = Self {
+            endpoint: wire.endpoint,
+            namespace_digest: wire.namespace_digest,
+            mount_digest: wire.mount_digest,
+            scope_digest: wire.scope_digest,
+            request_digest: wire.request_digest,
+        };
+        request.verify_digest().map_err(DeError::custom)?;
+        Ok(request)
+    }
+}
+
 impl VaultRequest {
-    pub(crate) fn new(scope: &VaultScope, endpoint: VaultEndpoint) -> Self {
+    pub fn new(scope: &VaultScope, endpoint: VaultEndpoint) -> Self {
         let request_digest = digest_serializable(&(
             &endpoint,
-            scope.namespace().as_str(),
+            Digest::from_text(scope.namespace().as_str()),
             mount_digest(scope.mount()),
             scope.scope_digest(),
         ));
@@ -115,9 +144,38 @@ impl VaultRequest {
     pub fn request_digest(&self) -> &Digest {
         &self.request_digest
     }
+
+    pub fn expected_request_digest(&self) -> Digest {
+        digest_serializable(&(
+            &self.endpoint,
+            &self.namespace_digest,
+            &self.mount_digest,
+            &self.scope_digest,
+        ))
+    }
+
+    pub fn verify_digest(&self) -> Result<(), VaultTransportError> {
+        let endpoint_is_bounded = match &self.endpoint {
+            VaultEndpoint::SysHealth | VaultEndpoint::AuthTokenLookupSelf => true,
+            VaultEndpoint::SysCapabilitiesSelf { path_digests } => {
+                !path_digests.is_empty()
+                    && path_digests.len() <= MAX_ALLOWLISTED_PATHS
+                    && path_digests.iter().all(|digest| !digest.is_zero())
+            }
+            VaultEndpoint::SysLeasesLookup { lease_digest } => !lease_digest.is_zero(),
+        };
+        if !endpoint_is_bounded
+            || self.request_digest.is_zero()
+            || self.expected_request_digest() != self.request_digest
+        {
+            Err(VaultTransportError::InvalidRequest)
+        } else {
+            Ok(())
+        }
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VaultHttpResponse {
     operation: VaultOperation,
@@ -127,6 +185,38 @@ pub struct VaultHttpResponse {
     provider_revision: String,
     payload: VaultResponsePayload,
     response_digest: Digest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VaultHttpResponseWire {
+    operation: VaultOperation,
+    request_digest: Digest,
+    status: u16,
+    response_size: usize,
+    provider_revision: String,
+    payload: VaultResponsePayload,
+    response_digest: Digest,
+}
+
+impl<'de> Deserialize<'de> for VaultHttpResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = VaultHttpResponseWire::deserialize(deserializer)?;
+        let response = Self {
+            operation: wire.operation,
+            request_digest: wire.request_digest,
+            status: wire.status,
+            response_size: wire.response_size,
+            provider_revision: wire.provider_revision,
+            payload: wire.payload,
+            response_digest: wire.response_digest,
+        };
+        response.verify_digest().map_err(DeError::custom)?;
+        Ok(response)
+    }
 }
 
 impl VaultHttpResponse {
@@ -141,10 +231,18 @@ impl VaultHttpResponse {
         if provider_revision.is_empty() {
             return Err(VaultTransportError::InvalidRequest);
         }
-        let response_digest = response_digest(operation, status, &payload);
+        let request_digest = Digest::from_text("vault-response-unbound/v1");
+        let response_digest = Self::compute_response_digest_for(
+            operation,
+            &request_digest,
+            status,
+            response_size,
+            &provider_revision,
+            &payload,
+        );
         Ok(Self {
             operation,
-            request_digest: Digest::zero(),
+            request_digest,
             status,
             response_size,
             provider_revision,
@@ -168,12 +266,14 @@ impl VaultHttpResponse {
             payload,
         )?;
         response.request_digest = request.request_digest().clone();
+        response.response_digest = response.expected_response_digest();
         Ok(response)
     }
 
     #[must_use]
     pub fn bound_to(mut self, request_digest: Digest) -> Self {
         self.request_digest = request_digest;
+        self.response_digest = self.expected_response_digest();
         self
     }
 
@@ -203,6 +303,44 @@ impl VaultHttpResponse {
 
     pub fn response_digest(&self) -> &Digest {
         &self.response_digest
+    }
+
+    fn compute_response_digest_for(
+        operation: VaultOperation,
+        request_digest: &Digest,
+        status: u16,
+        response_size: usize,
+        provider_revision: &str,
+        payload: &VaultResponsePayload,
+    ) -> Digest {
+        digest_serializable(&(
+            operation,
+            request_digest,
+            status,
+            response_size,
+            provider_revision,
+            payload,
+        ))
+    }
+
+    pub fn expected_response_digest(&self) -> Digest {
+        Self::compute_response_digest_for(
+            self.operation,
+            &self.request_digest,
+            self.status,
+            self.response_size,
+            &self.provider_revision,
+            &self.payload,
+        )
+    }
+
+    pub fn verify_digest(&self) -> Result<(), VaultTransportError> {
+        if self.request_digest.is_zero() || self.expected_response_digest() != self.response_digest
+        {
+            Err(VaultTransportError::Decode)
+        } else {
+            Ok(())
+        }
     }
 }
 

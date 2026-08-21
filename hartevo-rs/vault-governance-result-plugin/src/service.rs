@@ -10,7 +10,7 @@ use crate::model::{
     Digest, SecretReference, VaultGovernanceEvidence, VaultReadRequest, VaultScope,
     digest_serializable,
 };
-use crate::provider::VaultProvider;
+use crate::provider::{VaultProvider, VaultProviderDefinition, VaultRegistration};
 use crate::transport::VaultTransport;
 use crate::{
     MISSION_VAULT_GOVERNANCE_CONSUMER_ID, VAULT_GOVERNANCE_RESULT_CONTRACT_VERSION,
@@ -231,8 +231,51 @@ impl VaultGovernanceResultService {
     ) -> Result<VaultVerification, VaultGovernanceError> {
         self.validate()?;
         record.validate()?;
-        if record.evidence.scope_digest != scope.scope_digest() {
+        let evidence = &record.evidence;
+        if evidence.scope_digest != scope.scope_digest()
+            || !scope.is_secret_bound()
+            || evidence.secret_reference_digest
+                != *scope
+                    .secret_reference_digest()
+                    .ok_or(VaultGovernanceError::ScopeMismatch)?
+            || evidence.credential_revision
+                != scope
+                    .credential_revision()
+                    .ok_or(VaultGovernanceError::ScopeMismatch)?
+            || evidence.secret_role
+                != scope
+                    .secret_role()
+                    .ok_or(VaultGovernanceError::ScopeMismatch)?
+            || evidence.valid_from_unix_seconds
+                != scope
+                    .valid_from_unix_seconds()
+                    .ok_or(VaultGovernanceError::ScopeMismatch)?
+            || evidence.valid_until_unix_seconds
+                != scope
+                    .valid_until_unix_seconds()
+                    .ok_or(VaultGovernanceError::ScopeMismatch)?
+            || evidence.contract_digest != contract_digest()
+            || evidence.provider_revision != crate::VAULT_GOVERNANCE_RESULT_PROVIDER_REVISION
+        {
             return Err(VaultGovernanceError::ScopeMismatch);
+        }
+        let provider_definition =
+            VaultProviderDefinition::new(evidence.provider_version.clone(), evidence.provenance)
+                .map_err(|error| VaultGovernanceError::Provider(error.into()))?;
+        if provider_definition.provider_digest != evidence.provider_digest {
+            return Err(VaultGovernanceError::EvidenceDigestMismatch);
+        }
+        let expected_registration = VaultRegistration::expected_registration_digest(
+            scope,
+            &provider_definition.provider_digest,
+            &evidence.secret_reference_digest,
+            evidence.credential_revision.get(),
+            evidence.secret_role,
+            evidence.valid_from_unix_seconds,
+            evidence.valid_until_unix_seconds,
+        );
+        if expected_registration != evidence.registration_digest {
+            return Err(VaultGovernanceError::EvidenceDigestMismatch);
         }
         Ok(VaultVerification {
             verified: true,

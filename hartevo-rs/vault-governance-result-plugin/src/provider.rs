@@ -1,15 +1,22 @@
 //! Typed Vault provider and reversible Layer-1 registration.
 
-use std::fmt;
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as DeError};
 use thiserror::Error;
 
 use crate::model::{
     Digest, HealthStatus, MAX_RESPONSE_BYTES, ProviderProvenance, SecretReference,
     VaultCapabilityEvidence, VaultCapabilityMetadata, VaultGovernanceEvidence, VaultHealthEvidence,
     VaultHealthMetadata, VaultLeaseEvidence, VaultOperation, VaultReadRequest,
-    VaultResponsePayload, VaultResponseReceipt, VaultScope, VaultTokenEvidence,
+    VaultResponsePayload, VaultResponseReceipt, VaultScope, VaultSecretRole, VaultTokenEvidence,
 };
 use crate::transport::{
     VaultEndpoint, VaultHttpResponse, VaultRequest, VaultTransport, VaultTransportError,
@@ -86,6 +93,16 @@ pub enum VaultProviderError {
     Timeout,
     #[error("Vault transport failed")]
     TransportFailure,
+    #[error("Vault registration lifecycle fence is unavailable; operation failed closed")]
+    LifecycleUnavailable,
+    #[error("Vault registration replayed a revoked or conflicting lifecycle fence")]
+    RegistrationReplay,
+    #[error("Vault response request digest does not match the canonical request")]
+    RequestDigestMismatch,
+    #[error("Vault response digest does not match the canonical response")]
+    ResponseDigestMismatch,
+    #[error("Vault secret reference, credential, role, or time-window binding drifted")]
+    SecretBindingMismatch,
 }
 
 impl From<VaultTransportError> for VaultProviderError {
@@ -106,23 +123,35 @@ impl From<VaultTransportError> for VaultProviderError {
 pub enum ProviderDefinitionError {
     #[error("provider version is empty")]
     EmptyVersion,
+    #[error("provider version is not the checked-in Layer-1 version")]
+    VersionDrift,
     #[error("provider revision is not the checked-in Layer-1 revision")]
     RevisionDrift,
     #[error("Layer 1 cannot register a native provider")]
     NativeProviderForbidden,
+    #[error("provider capability digest does not match its canonical definition")]
+    CapabilityDigestMismatch,
+    #[error("provider digest does not match its canonical definition")]
+    ProviderDigestMismatch,
+    #[error("provider identity does not match the checked-in contract")]
+    IdentityDrift,
 }
 
 impl From<ProviderDefinitionError> for VaultProviderError {
     fn from(error: ProviderDefinitionError) -> Self {
         match error {
             ProviderDefinitionError::EmptyVersion => Self::InvalidRequest,
+            ProviderDefinitionError::VersionDrift
+            | ProviderDefinitionError::NativeProviderForbidden
+            | ProviderDefinitionError::CapabilityDigestMismatch
+            | ProviderDefinitionError::ProviderDigestMismatch
+            | ProviderDefinitionError::IdentityDrift => Self::RegistrationDrift,
             ProviderDefinitionError::RevisionDrift => Self::ProviderRevisionMismatch,
-            ProviderDefinitionError::NativeProviderForbidden => Self::RegistrationDrift,
         }
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VaultProviderDefinition {
     pub schema_version: String,
@@ -142,24 +171,62 @@ pub struct VaultProviderDefinition {
     pub root_token_paths: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VaultProviderDefinitionWire {
+    schema_version: String,
+    provider_id: String,
+    provider_version: String,
+    provider_revision: String,
+    capability_digest: Digest,
+    provider_digest: Digest,
+    provenance: ProviderProvenance,
+    native: bool,
+    secret_values_read: bool,
+    token_material_retained: bool,
+    login: bool,
+    policy_mutation: bool,
+    lease_renew: bool,
+    lease_revoke: bool,
+    root_token_paths: bool,
+}
+
+impl<'de> Deserialize<'de> for VaultProviderDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = VaultProviderDefinitionWire::deserialize(deserializer)?;
+        let definition = Self {
+            schema_version: wire.schema_version,
+            provider_id: wire.provider_id,
+            provider_version: wire.provider_version,
+            provider_revision: wire.provider_revision,
+            capability_digest: wire.capability_digest,
+            provider_digest: wire.provider_digest,
+            provenance: wire.provenance,
+            native: wire.native,
+            secret_values_read: wire.secret_values_read,
+            token_material_retained: wire.token_material_retained,
+            login: wire.login,
+            policy_mutation: wire.policy_mutation,
+            lease_renew: wire.lease_renew,
+            lease_revoke: wire.lease_revoke,
+            root_token_paths: wire.root_token_paths,
+        };
+        definition.validate().map_err(DeError::custom)?;
+        Ok(definition)
+    }
+}
+
 impl VaultProviderDefinition {
-    pub fn new(
-        provider_version: impl Into<String>,
-        provenance: ProviderProvenance,
-    ) -> Result<Self, ProviderDefinitionError> {
-        let provider_version = provider_version.into();
-        if provider_version.is_empty() {
-            return Err(ProviderDefinitionError::EmptyVersion);
-        }
-        if provenance.is_native() {
-            return Err(ProviderDefinitionError::NativeProviderForbidden);
-        }
-        let capability_digest = Digest::from_fields(
+    fn expected_capability_digest(provider_version: &str) -> Digest {
+        Digest::from_fields(
             "vault-provider-capabilities/v1",
             &[
                 VAULT_GOVERNANCE_RESULT_SCHEMA_VERSION.to_owned(),
                 VAULT_GOVERNANCE_RESULT_PROVIDER_ID.to_owned(),
-                provider_version.clone(),
+                provider_version.to_owned(),
                 VAULT_GOVERNANCE_RESULT_PROVIDER_REVISION.to_owned(),
                 "sys_health".to_owned(),
                 "auth_token_lookup_self".to_owned(),
@@ -168,19 +235,50 @@ impl VaultProviderDefinition {
                 "native=false".to_owned(),
                 "secret_values_read=false".to_owned(),
                 "token_material_retained=false".to_owned(),
+                "login=false".to_owned(),
+                "policy_mutation=false".to_owned(),
+                "lease_renew=false".to_owned(),
+                "lease_revoke=false".to_owned(),
+                "root_token_paths=false".to_owned(),
             ],
-        );
-        let provider_digest = Digest::from_fields(
+        )
+    }
+
+    fn expected_provider_digest(
+        provider_version: &str,
+        provenance: ProviderProvenance,
+        capability_digest: &Digest,
+    ) -> Digest {
+        Digest::from_fields(
             "vault-provider-definition/v1",
             &[
                 VAULT_GOVERNANCE_RESULT_SCHEMA_VERSION.to_owned(),
                 VAULT_GOVERNANCE_RESULT_PROVIDER_ID.to_owned(),
-                provider_version.clone(),
+                provider_version.to_owned(),
                 VAULT_GOVERNANCE_RESULT_PROVIDER_REVISION.to_owned(),
                 capability_digest.as_str().to_owned(),
                 format!("{provenance:?}"),
             ],
-        );
+        )
+    }
+
+    pub fn new(
+        provider_version: impl Into<String>,
+        provenance: ProviderProvenance,
+    ) -> Result<Self, ProviderDefinitionError> {
+        let provider_version = provider_version.into();
+        if provider_version.is_empty() {
+            return Err(ProviderDefinitionError::EmptyVersion);
+        }
+        if provider_version != VAULT_GOVERNANCE_RESULT_SERVICE_VERSION {
+            return Err(ProviderDefinitionError::VersionDrift);
+        }
+        if provenance.is_native() {
+            return Err(ProviderDefinitionError::NativeProviderForbidden);
+        }
+        let capability_digest = Self::expected_capability_digest(&provider_version);
+        let provider_digest =
+            Self::expected_provider_digest(&provider_version, provenance, &capability_digest);
         Ok(Self {
             schema_version: VAULT_GOVERNANCE_RESULT_SCHEMA_VERSION.to_owned(),
             provider_id: VAULT_GOVERNANCE_RESULT_PROVIDER_ID.to_owned(),
@@ -201,6 +299,12 @@ impl VaultProviderDefinition {
     }
 
     pub fn validate(&self) -> Result<(), ProviderDefinitionError> {
+        if self.schema_version != VAULT_GOVERNANCE_RESULT_SCHEMA_VERSION
+            || self.provider_id != VAULT_GOVERNANCE_RESULT_PROVIDER_ID
+            || self.provider_version != VAULT_GOVERNANCE_RESULT_SERVICE_VERSION
+        {
+            return Err(ProviderDefinitionError::IdentityDrift);
+        }
         if self.provider_revision != VAULT_GOVERNANCE_RESULT_PROVIDER_REVISION {
             return Err(ProviderDefinitionError::RevisionDrift);
         }
@@ -214,6 +318,18 @@ impl VaultProviderDefinition {
             || self.root_token_paths
         {
             return Err(ProviderDefinitionError::NativeProviderForbidden);
+        }
+        if self.capability_digest != Self::expected_capability_digest(&self.provider_version) {
+            return Err(ProviderDefinitionError::CapabilityDigestMismatch);
+        }
+        if self.provider_digest
+            != Self::expected_provider_digest(
+                &self.provider_version,
+                self.provenance,
+                &self.capability_digest,
+            )
+        {
+            return Err(ProviderDefinitionError::ProviderDigestMismatch);
         }
         Ok(())
     }
@@ -230,6 +346,69 @@ pub enum RegistrationState {
     Revoked,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LifecycleFence {
+    epoch: u64,
+    state: RegistrationState,
+    contract_digest: Digest,
+    provider_digest: Digest,
+    scope_digest: Digest,
+    secret_reference_digest: Digest,
+    credential_revision: u64,
+    secret_role: VaultSecretRole,
+    valid_from_unix_seconds: u64,
+    valid_until_unix_seconds: u64,
+}
+
+static REGISTRATION_LIFECYCLE: OnceLock<Mutex<BTreeMap<String, LifecycleFence>>> = OnceLock::new();
+static NEXT_LIFECYCLE_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn registration_lifecycle() -> &'static Mutex<BTreeMap<String, LifecycleFence>> {
+    REGISTRATION_LIFECYCLE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn lifecycle_fence(
+    contract_digest: &Digest,
+    provider_digest: &Digest,
+    scope: &VaultScope,
+    secret_reference: &SecretReference,
+) -> Result<LifecycleFence, VaultProviderError> {
+    let epoch = NEXT_LIFECYCLE_EPOCH
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| VaultProviderError::LifecycleUnavailable)?;
+    Ok(LifecycleFence {
+        epoch,
+        state: RegistrationState::Active,
+        contract_digest: contract_digest.clone(),
+        provider_digest: provider_digest.clone(),
+        scope_digest: scope.scope_digest(),
+        secret_reference_digest: secret_reference.reference_digest().clone(),
+        credential_revision: secret_reference.credential_revision().get(),
+        secret_role: secret_reference.secret_role(),
+        valid_from_unix_seconds: secret_reference.valid_from_unix_seconds(),
+        valid_until_unix_seconds: secret_reference.valid_until_unix_seconds(),
+    })
+}
+
+fn same_fence(
+    fence: &LifecycleFence,
+    contract_digest: &Digest,
+    provider_digest: &Digest,
+    scope: &VaultScope,
+    secret_reference: &SecretReference,
+) -> bool {
+    fence.contract_digest == *contract_digest
+        && fence.provider_digest == *provider_digest
+        && fence.scope_digest == scope.scope_digest()
+        && fence.secret_reference_digest == *secret_reference.reference_digest()
+        && fence.credential_revision == secret_reference.credential_revision().get()
+        && fence.secret_role == secret_reference.secret_role()
+        && fence.valid_from_unix_seconds == secret_reference.valid_from_unix_seconds()
+        && fence.valid_until_unix_seconds == secret_reference.valid_until_unix_seconds()
+}
+
 /// A reversible, digest-bound registration.  It is not serializable because
 /// it contains the opaque SecretReference authority object.
 pub struct VaultRegistration {
@@ -240,6 +419,7 @@ pub struct VaultRegistration {
     secret_reference: SecretReference,
     provider_definition: VaultProviderDefinition,
     registration_digest: Digest,
+    lifecycle_epoch: u64,
     state: RegistrationState,
     revoked_at_unix_seconds: Option<u64>,
 }
@@ -254,6 +434,7 @@ impl Clone for VaultRegistration {
             secret_reference: self.secret_reference.clone(),
             provider_definition: self.provider_definition.clone(),
             registration_digest: self.registration_digest.clone(),
+            lifecycle_epoch: self.lifecycle_epoch,
             state: self.state,
             revoked_at_unix_seconds: self.revoked_at_unix_seconds,
         }
@@ -271,6 +452,7 @@ impl fmt::Debug for VaultRegistration {
             .field("secret_reference", &self.secret_reference)
             .field("provider_digest", &self.provider_definition.provider_digest)
             .field("registration_digest", &self.registration_digest)
+            .field("lifecycle_epoch", &self.lifecycle_epoch)
             .field("state", &self.state)
             .field("revoked_at_unix_seconds", &self.revoked_at_unix_seconds)
             .finish()
@@ -286,6 +468,7 @@ impl PartialEq for VaultRegistration {
             && self.secret_reference == other.secret_reference
             && self.provider_definition == other.provider_definition
             && self.registration_digest == other.registration_digest
+            && self.lifecycle_epoch == other.lifecycle_epoch
             && self.state == other.state
             && self.revoked_at_unix_seconds == other.revoked_at_unix_seconds
     }
@@ -294,6 +477,35 @@ impl PartialEq for VaultRegistration {
 impl Eq for VaultRegistration {}
 
 impl VaultRegistration {
+    pub(crate) fn expected_registration_digest(
+        scope: &VaultScope,
+        provider_digest: &Digest,
+        secret_reference_digest: &Digest,
+        credential_revision: u64,
+        secret_role: VaultSecretRole,
+        valid_from_unix_seconds: u64,
+        valid_until_unix_seconds: u64,
+    ) -> Digest {
+        Digest::from_fields(
+            "vault-registration/v2",
+            &[
+                VAULT_GOVERNANCE_RESULT_SERVICE_ID.to_owned(),
+                VAULT_GOVERNANCE_RESULT_PROVIDER_ID.to_owned(),
+                MISSION_VAULT_GOVERNANCE_CONSUMER_ID.to_owned(),
+                VAULT_GOVERNANCE_RESULT_SERVICE_VERSION.to_owned(),
+                VAULT_GOVERNANCE_RESULT_CONTRACT_VERSION.to_owned(),
+                contract_digest().as_str().to_owned(),
+                provider_digest.as_str().to_owned(),
+                scope.scope_digest().as_str().to_owned(),
+                secret_reference_digest.as_str().to_owned(),
+                credential_revision.to_string(),
+                secret_role.as_str().to_owned(),
+                valid_from_unix_seconds.to_string(),
+                valid_until_unix_seconds.to_string(),
+            ],
+        )
+    }
+
     pub fn new(
         scope: VaultScope,
         secret_reference: SecretReference,
@@ -302,26 +514,57 @@ impl VaultRegistration {
         provider_definition
             .validate()
             .map_err(|_| VaultProviderError::ProviderRevisionMismatch)?;
-        if secret_reference.scope_digest() != &scope.scope_digest() || secret_reference.is_revoked()
+        if !scope.is_secret_bound()
+            || scope.secret_reference_digest() != Some(secret_reference.reference_digest())
+            || scope.credential_revision() != Some(secret_reference.credential_revision())
+            || scope.secret_role() != Some(secret_reference.secret_role())
+            || scope.valid_from_unix_seconds() != Some(secret_reference.valid_from_unix_seconds())
+            || scope.valid_until_unix_seconds() != Some(secret_reference.valid_until_unix_seconds())
+            || secret_reference.scope_identity_digest() != &scope.identity_digest()
+            || secret_reference.is_revoked()
         {
             return Err(VaultProviderError::RegistrationDrift);
         }
         let contract_digest = contract_digest();
-        let registration_digest = Digest::from_fields(
-            "vault-registration/v1",
-            &[
-                VAULT_GOVERNANCE_RESULT_SERVICE_ID.to_owned(),
-                VAULT_GOVERNANCE_RESULT_PROVIDER_ID.to_owned(),
-                MISSION_VAULT_GOVERNANCE_CONSUMER_ID.to_owned(),
-                VAULT_GOVERNANCE_RESULT_SERVICE_VERSION.to_owned(),
-                VAULT_GOVERNANCE_RESULT_CONTRACT_VERSION.to_owned(),
-                contract_digest.as_str().to_owned(),
-                provider_definition.provider_digest.as_str().to_owned(),
-                scope.scope_digest().as_str().to_owned(),
-                secret_reference.reference_digest().as_str().to_owned(),
-                secret_reference.credential_revision().get().to_string(),
-            ],
+        let registration_digest = Self::expected_registration_digest(
+            &scope,
+            &provider_definition.provider_digest,
+            secret_reference.reference_digest(),
+            secret_reference.credential_revision().get(),
+            secret_reference.secret_role(),
+            secret_reference.valid_from_unix_seconds(),
+            secret_reference.valid_until_unix_seconds(),
         );
+        let lifecycle_epoch = {
+            let mut lifecycle = registration_lifecycle()
+                .lock()
+                .map_err(|_| VaultProviderError::LifecycleUnavailable)?;
+            if let Some(existing) = lifecycle.get(registration_digest.as_str()) {
+                if existing.state == RegistrationState::Revoked {
+                    return Err(VaultProviderError::RegistrationReplay);
+                }
+                if !same_fence(
+                    existing,
+                    &contract_digest,
+                    &provider_definition.provider_digest,
+                    &scope,
+                    &secret_reference,
+                ) {
+                    return Err(VaultProviderError::RegistrationReplay);
+                }
+                existing.epoch
+            } else {
+                let fence = lifecycle_fence(
+                    &contract_digest,
+                    &provider_definition.provider_digest,
+                    &scope,
+                    &secret_reference,
+                )?;
+                let epoch = fence.epoch;
+                lifecycle.insert(registration_digest.as_str().to_owned(), fence);
+                epoch
+            }
+        };
         Ok(Self {
             plugin_version: VAULT_GOVERNANCE_RESULT_SERVICE_VERSION.to_owned(),
             contract_version: VAULT_GOVERNANCE_RESULT_CONTRACT_VERSION.to_owned(),
@@ -330,6 +573,7 @@ impl VaultRegistration {
             secret_reference,
             provider_definition,
             registration_digest,
+            lifecycle_epoch,
             state: RegistrationState::Active,
             revoked_at_unix_seconds: None,
         })
@@ -375,17 +619,87 @@ impl VaultRegistration {
         if self.state == RegistrationState::Revoked {
             return Err(VaultProviderError::RegistrationRevoked);
         }
+        let mut lifecycle = registration_lifecycle()
+            .lock()
+            .map_err(|_| VaultProviderError::LifecycleUnavailable)?;
+        let Some(fence) = lifecycle.get_mut(self.registration_digest.as_str()) else {
+            return Err(VaultProviderError::LifecycleUnavailable);
+        };
+        if fence.epoch != self.lifecycle_epoch {
+            return Err(VaultProviderError::RegistrationReplay);
+        }
+        if fence.state == RegistrationState::Revoked {
+            return Err(VaultProviderError::RegistrationRevoked);
+        }
+        fence.state = RegistrationState::Revoked;
         self.state = RegistrationState::Revoked;
         self.revoked_at_unix_seconds = Some(at_unix_seconds);
         Ok(())
     }
 
-    fn validate_active(&self, scope: &VaultScope) -> Result<(), VaultProviderError> {
+    fn validate_integrity(&self) -> Result<(), VaultProviderError> {
+        self.provider_definition
+            .validate()
+            .map_err(VaultProviderError::from)?;
+        if self.plugin_version != VAULT_GOVERNANCE_RESULT_SERVICE_VERSION
+            || self.contract_version != VAULT_GOVERNANCE_RESULT_CONTRACT_VERSION
+            || self.contract_digest != contract_digest()
+            || !self.scope.is_secret_bound()
+            || self.scope.secret_reference_digest()
+                != Some(self.secret_reference.reference_digest())
+            || self.scope.credential_revision() != Some(self.secret_reference.credential_revision())
+            || self.scope.secret_role() != Some(self.secret_reference.secret_role())
+            || self.scope.valid_from_unix_seconds()
+                != Some(self.secret_reference.valid_from_unix_seconds())
+            || self.scope.valid_until_unix_seconds()
+                != Some(self.secret_reference.valid_until_unix_seconds())
+            || self.secret_reference.scope_identity_digest() != &self.scope.identity_digest()
+            || self.secret_reference.is_revoked()
+            || self.registration_digest
+                != Self::expected_registration_digest(
+                    &self.scope,
+                    &self.provider_definition.provider_digest,
+                    self.secret_reference.reference_digest(),
+                    self.secret_reference.credential_revision().get(),
+                    self.secret_reference.secret_role(),
+                    self.secret_reference.valid_from_unix_seconds(),
+                    self.secret_reference.valid_until_unix_seconds(),
+                )
+        {
+            return Err(VaultProviderError::RegistrationDrift);
+        }
+        Ok(())
+    }
+
+    fn validate_active(
+        &self,
+        scope: &VaultScope,
+        observed_at_unix_seconds: u64,
+    ) -> Result<(), VaultProviderError> {
         if self.state == RegistrationState::Revoked {
             return Err(VaultProviderError::RegistrationRevoked);
         }
-        if &self.scope != scope || self.contract_digest != contract_digest() {
+        self.validate_integrity()?;
+        let (Some(valid_from), Some(valid_until)) = (
+            scope.valid_from_unix_seconds(),
+            scope.valid_until_unix_seconds(),
+        ) else {
+            return Err(VaultProviderError::SecretBindingMismatch);
+        };
+        if &self.scope != scope
+            || observed_at_unix_seconds < valid_from
+            || observed_at_unix_seconds >= valid_until
+        {
             return Err(VaultProviderError::RegistrationDrift);
+        }
+        let lifecycle = registration_lifecycle()
+            .lock()
+            .map_err(|_| VaultProviderError::LifecycleUnavailable)?;
+        let Some(fence) = lifecycle.get(self.registration_digest.as_str()) else {
+            return Err(VaultProviderError::LifecycleUnavailable);
+        };
+        if fence.epoch != self.lifecycle_epoch || fence.state != RegistrationState::Active {
+            return Err(VaultProviderError::RegistrationRevoked);
         }
         Ok(())
     }
@@ -444,7 +758,11 @@ where
         registration: VaultRegistration,
         transport: T,
     ) -> Result<Self, VaultProviderError> {
-        registration.provider_definition.validate()?;
+        let observed_at = registration
+            .scope
+            .valid_from_unix_seconds()
+            .ok_or(VaultProviderError::SecretBindingMismatch)?;
+        registration.validate_active(&registration.scope, observed_at)?;
         Ok(Self {
             registration,
             transport,
@@ -475,8 +793,10 @@ where
         &mut self,
         request: &VaultReadRequest,
     ) -> Result<VaultGovernanceEvidence, VaultProviderError> {
-        self.registration
-            .validate_active(self.registration.scope())?;
+        self.registration.validate_active(
+            self.registration.scope(),
+            request.observed_at_unix_seconds(),
+        )?;
         request
             .validate(self.registration.scope())
             .map_err(|_| VaultProviderError::InvalidRequest)?;
@@ -602,6 +922,11 @@ where
                 .provider_definition
                 .provider_version
                 .clone(),
+            provider_revision: self
+                .registration
+                .provider_definition
+                .provider_revision
+                .clone(),
             provider_digest: self
                 .registration
                 .provider_definition
@@ -610,6 +935,18 @@ where
             consumer_id: MISSION_VAULT_GOVERNANCE_CONSUMER_ID.to_owned(),
             scope_digest: self.registration.scope.scope_digest(),
             registration_digest: self.registration.registration_digest.clone(),
+            secret_reference_digest: self
+                .registration
+                .secret_reference
+                .reference_digest()
+                .clone(),
+            credential_revision: self.registration.secret_reference.credential_revision(),
+            secret_role: self.registration.secret_reference.secret_role(),
+            valid_from_unix_seconds: self.registration.secret_reference.valid_from_unix_seconds(),
+            valid_until_unix_seconds: self
+                .registration
+                .secret_reference
+                .valid_until_unix_seconds(),
             provenance: self.transport.provenance(),
             observed_at_unix_seconds: request.observed_at_unix_seconds(),
             operations,
@@ -646,10 +983,17 @@ where
         if response.response_size() > MAX_RESPONSE_BYTES {
             return Err(VaultProviderError::ResponseTooLarge);
         }
-        if response.request_digest() != &Digest::zero()
-            && response.request_digest() != request.request_digest()
-        {
-            return Err(VaultProviderError::RegistrationDrift);
+        request
+            .verify_digest()
+            .map_err(|_| VaultProviderError::RequestDigestMismatch)?;
+        if response.request_digest() != request.request_digest() {
+            return Err(VaultProviderError::RequestDigestMismatch);
+        }
+        response
+            .verify_digest()
+            .map_err(|_| VaultProviderError::ResponseDigestMismatch)?;
+        if response.response_digest().is_zero() {
+            return Err(VaultProviderError::ResponseDigestMismatch);
         }
         Ok(())
     }

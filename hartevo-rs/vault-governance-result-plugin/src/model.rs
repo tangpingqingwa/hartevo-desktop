@@ -7,7 +7,7 @@
 
 use std::{collections::BTreeSet, fmt};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as DeError};
 use sha2::{Digest as ShaDigest, Sha256};
 use thiserror::Error;
 
@@ -62,9 +62,19 @@ pub enum ModelError {
     EmptyRequest,
 }
 
-#[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Digest(String);
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(DeError::custom)
+    }
+}
 
 impl Digest {
     pub fn from_bytes(bytes: &[u8]) -> Self {
@@ -99,6 +109,10 @@ impl Digest {
 
     pub(crate) fn zero() -> Self {
         Self("0".repeat(64))
+    }
+
+    pub(crate) fn is_zero(&self) -> bool {
+        self.0.as_bytes().iter().all(|byte| *byte == b'0')
     }
 }
 
@@ -175,9 +189,19 @@ fn validate_opaque(value: &str, field: &'static str) -> Result<(), ModelError> {
 
 macro_rules! bounded_identifier {
     ($name:ident, $field:literal) => {
-        #[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+        #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(DeError::custom)
+            }
+        }
 
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
@@ -205,9 +229,18 @@ macro_rules! bounded_identifier {
 bounded_identifier!(ProjectId, "project id");
 bounded_identifier!(MissionId, "mission id");
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Revision(u64);
+
+impl<'de> Deserialize<'de> for Revision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(u64::deserialize(deserializer)?).map_err(DeError::custom)
+    }
+}
 
 impl Revision {
     pub fn new(value: u64) -> Result<Self, ModelError> {
@@ -223,9 +256,18 @@ impl Revision {
     }
 }
 
-#[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct VaultNamespace(String);
+
+impl<'de> Deserialize<'de> for VaultNamespace {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(DeError::custom)
+    }
+}
 
 impl VaultNamespace {
     pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
@@ -251,9 +293,18 @@ impl fmt::Debug for VaultNamespace {
     }
 }
 
-#[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct VaultMount(String);
+
+impl<'de> Deserialize<'de> for VaultMount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(DeError::custom)
+    }
+}
 
 impl VaultMount {
     pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
@@ -280,9 +331,18 @@ impl fmt::Debug for VaultMount {
     }
 }
 
-#[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct VaultPath(String);
+
+impl<'de> Deserialize<'de> for VaultPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(DeError::custom)
+    }
+}
 
 impl VaultPath {
     pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
@@ -316,8 +376,22 @@ impl fmt::Debug for VaultPath {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VaultSecretRole {
+    ObservationOnly,
+}
+
+impl VaultSecretRole {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ObservationOnly => "observation_only",
+        }
+    }
+}
+
 /// A scope fence for one exact Mission/Project revision pair.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VaultScope {
     namespace: VaultNamespace,
@@ -329,6 +403,57 @@ pub struct VaultScope {
     mission_revision: Revision,
     project_id: ProjectId,
     project_revision: Revision,
+    secret_reference_digest: Option<Digest>,
+    credential_revision: Option<Revision>,
+    secret_role: Option<VaultSecretRole>,
+    valid_from_unix_seconds: Option<u64>,
+    valid_until_unix_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VaultScopeWire {
+    namespace: VaultNamespace,
+    mount: VaultMount,
+    allowlisted_paths: Vec<VaultPath>,
+    policy_digest: Digest,
+    lease_scope_digest: Digest,
+    mission_id: MissionId,
+    mission_revision: Revision,
+    project_id: ProjectId,
+    project_revision: Revision,
+    secret_reference_digest: Option<Digest>,
+    credential_revision: Option<Revision>,
+    secret_role: Option<VaultSecretRole>,
+    valid_from_unix_seconds: Option<u64>,
+    valid_until_unix_seconds: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for VaultScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = VaultScopeWire::deserialize(deserializer)?;
+        let scope = Self {
+            namespace: wire.namespace,
+            mount: wire.mount,
+            allowlisted_paths: wire.allowlisted_paths,
+            policy_digest: wire.policy_digest,
+            lease_scope_digest: wire.lease_scope_digest,
+            mission_id: wire.mission_id,
+            mission_revision: wire.mission_revision,
+            project_id: wire.project_id,
+            project_revision: wire.project_revision,
+            secret_reference_digest: wire.secret_reference_digest,
+            credential_revision: wire.credential_revision,
+            secret_role: wire.secret_role,
+            valid_from_unix_seconds: wire.valid_from_unix_seconds,
+            valid_until_unix_seconds: wire.valid_until_unix_seconds,
+        };
+        scope.validate_shape().map_err(DeError::custom)?;
+        Ok(scope)
+    }
 }
 
 impl VaultScope {
@@ -376,7 +501,47 @@ impl VaultScope {
             mission_revision,
             project_id,
             project_revision,
+            secret_reference_digest: None,
+            credential_revision: None,
+            secret_role: None,
+            valid_from_unix_seconds: None,
+            valid_until_unix_seconds: None,
         })
+    }
+
+    fn validate_shape(&self) -> Result<(), ModelError> {
+        if self.allowlisted_paths.is_empty() || self.allowlisted_paths.len() > MAX_ALLOWLISTED_PATHS
+        {
+            return Err(ModelError::BoundExceeded {
+                field: "allowlisted paths",
+            });
+        }
+        if self.allowlisted_paths.iter().collect::<BTreeSet<_>>().len()
+            != self.allowlisted_paths.len()
+        {
+            return Err(ModelError::Duplicate {
+                field: "allowlisted paths",
+            });
+        }
+        let binding_fields = [
+            self.secret_reference_digest.is_some(),
+            self.credential_revision.is_some(),
+            self.secret_role.is_some(),
+            self.valid_from_unix_seconds.is_some(),
+            self.valid_until_unix_seconds.is_some(),
+        ];
+        if binding_fields.iter().any(|present| *present)
+            && binding_fields.iter().any(|present| !*present)
+        {
+            return Err(ModelError::InvalidScope);
+        }
+        if let (Some(valid_from), Some(valid_until)) =
+            (self.valid_from_unix_seconds, self.valid_until_unix_seconds)
+            && valid_until <= valid_from
+        {
+            return Err(ModelError::InvalidScope);
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -395,6 +560,25 @@ impl VaultScope {
     pub fn bind_lease(mut self, lease: &LeaseReference) -> Self {
         self.lease_scope_digest = lease.reference_digest().clone();
         self
+    }
+
+    pub fn bind_secret_reference(
+        mut self,
+        secret_reference: &SecretReference,
+    ) -> Result<Self, ModelError> {
+        if secret_reference.scope_identity_digest() != &self.identity_digest() {
+            return Err(ModelError::ScopeMismatch);
+        }
+        if self.is_secret_bound() {
+            return Err(ModelError::InvalidScope);
+        }
+        self.secret_reference_digest = Some(secret_reference.reference_digest().clone());
+        self.credential_revision = Some(secret_reference.credential_revision());
+        self.secret_role = Some(secret_reference.secret_role());
+        self.valid_from_unix_seconds = Some(secret_reference.valid_from_unix_seconds());
+        self.valid_until_unix_seconds = Some(secret_reference.valid_until_unix_seconds());
+        self.validate_shape()?;
+        Ok(self)
     }
 
     pub fn namespace(&self) -> &VaultNamespace {
@@ -433,11 +617,35 @@ impl VaultScope {
         self.project_revision
     }
 
+    pub fn secret_reference_digest(&self) -> Option<&Digest> {
+        self.secret_reference_digest.as_ref()
+    }
+
+    pub const fn credential_revision(&self) -> Option<Revision> {
+        self.credential_revision
+    }
+
+    pub const fn secret_role(&self) -> Option<VaultSecretRole> {
+        self.secret_role
+    }
+
+    pub const fn valid_from_unix_seconds(&self) -> Option<u64> {
+        self.valid_from_unix_seconds
+    }
+
+    pub const fn valid_until_unix_seconds(&self) -> Option<u64> {
+        self.valid_until_unix_seconds
+    }
+
+    pub const fn is_secret_bound(&self) -> bool {
+        self.secret_reference_digest.is_some()
+    }
+
     pub fn contains_path(&self, path: &VaultPath) -> bool {
         self.allowlisted_paths.contains(path)
     }
 
-    pub fn scope_digest(&self) -> Digest {
+    pub fn identity_digest(&self) -> Digest {
         let mut fields = vec![
             self.namespace.as_str().to_owned(),
             self.mount.as_str().to_owned(),
@@ -453,7 +661,33 @@ impl VaultScope {
                 .iter()
                 .map(|path| path.as_str().to_owned()),
         );
-        Digest::from_fields("vault-governance-scope/v1", &fields)
+        Digest::from_fields("vault-governance-scope-identity/v1", &fields)
+    }
+
+    pub fn scope_digest(&self) -> Digest {
+        let mut fields = vec![self.identity_digest().as_str().to_owned()];
+        fields.push(
+            self.secret_reference_digest
+                .as_ref()
+                .map_or_else(|| "unbound".to_owned(), |digest| digest.as_str().to_owned()),
+        );
+        fields.push(self.credential_revision.map_or_else(
+            || "unbound".to_owned(),
+            |revision| revision.get().to_string(),
+        ));
+        fields.push(
+            self.secret_role
+                .map_or_else(|| "unbound".to_owned(), |role| role.as_str().to_owned()),
+        );
+        fields.push(
+            self.valid_from_unix_seconds
+                .map_or_else(|| "unbound".to_owned(), |value| value.to_string()),
+        );
+        fields.push(
+            self.valid_until_unix_seconds
+                .map_or_else(|| "unbound".to_owned(), |value| value.to_string()),
+        );
+        Digest::from_fields("vault-governance-scope/v2", &fields)
     }
 }
 
@@ -461,8 +695,11 @@ impl VaultScope {
 /// immediately dropped; this type intentionally does not implement Serialize.
 pub struct SecretReference {
     reference_digest: Digest,
-    scope_digest: Digest,
+    scope_identity_digest: Digest,
     credential_revision: Revision,
+    secret_role: VaultSecretRole,
+    valid_from_unix_seconds: u64,
+    valid_until_unix_seconds: u64,
     revoked: bool,
 }
 
@@ -470,8 +707,11 @@ impl Clone for SecretReference {
     fn clone(&self) -> Self {
         Self {
             reference_digest: self.reference_digest.clone(),
-            scope_digest: self.scope_digest.clone(),
+            scope_identity_digest: self.scope_identity_digest.clone(),
             credential_revision: self.credential_revision,
+            secret_role: self.secret_role,
+            valid_from_unix_seconds: self.valid_from_unix_seconds,
+            valid_until_unix_seconds: self.valid_until_unix_seconds,
             revoked: self.revoked,
         }
     }
@@ -482,8 +722,11 @@ impl fmt::Debug for SecretReference {
         formatter
             .debug_struct("SecretReference")
             .field("reference_digest", &self.reference_digest)
-            .field("scope_digest", &self.scope_digest)
+            .field("scope_identity_digest", &self.scope_identity_digest)
             .field("credential_revision", &self.credential_revision)
+            .field("secret_role", &self.secret_role)
+            .field("valid_from_unix_seconds", &self.valid_from_unix_seconds)
+            .field("valid_until_unix_seconds", &self.valid_until_unix_seconds)
             .field("revoked", &self.revoked)
             .finish()
     }
@@ -492,8 +735,11 @@ impl fmt::Debug for SecretReference {
 impl PartialEq for SecretReference {
     fn eq(&self, other: &Self) -> bool {
         self.reference_digest == other.reference_digest
-            && self.scope_digest == other.scope_digest
+            && self.scope_identity_digest == other.scope_identity_digest
             && self.credential_revision == other.credential_revision
+            && self.secret_role == other.secret_role
+            && self.valid_from_unix_seconds == other.valid_from_unix_seconds
+            && self.valid_until_unix_seconds == other.valid_until_unix_seconds
             && self.revoked == other.revoked
     }
 }
@@ -506,22 +752,49 @@ impl SecretReference {
         scope: &VaultScope,
         credential_revision: u64,
     ) -> Result<Self, ModelError> {
+        Self::new_with_window(
+            reference_id,
+            scope,
+            credential_revision,
+            VaultSecretRole::ObservationOnly,
+            0,
+            u64::MAX,
+        )
+    }
+
+    pub fn new_with_window(
+        reference_id: impl Into<String>,
+        scope: &VaultScope,
+        credential_revision: u64,
+        secret_role: VaultSecretRole,
+        valid_from_unix_seconds: u64,
+        valid_until_unix_seconds: u64,
+    ) -> Result<Self, ModelError> {
         let reference_id = reference_id.into();
         validate_opaque(&reference_id, "secret reference")?;
         let credential_revision = Revision::new(credential_revision)?;
-        let scope_digest = scope.scope_digest();
+        if valid_until_unix_seconds <= valid_from_unix_seconds {
+            return Err(ModelError::InvalidSecretReference);
+        }
+        let scope_identity_digest = scope.identity_digest();
         let reference_digest = Digest::from_fields(
             "vault-secret-reference/v1",
             &[
                 reference_id,
-                scope_digest.as_str().to_owned(),
+                scope_identity_digest.as_str().to_owned(),
                 credential_revision.get().to_string(),
+                secret_role.as_str().to_owned(),
+                valid_from_unix_seconds.to_string(),
+                valid_until_unix_seconds.to_string(),
             ],
         );
         Ok(Self {
             reference_digest,
-            scope_digest,
+            scope_identity_digest,
             credential_revision,
+            secret_role,
+            valid_from_unix_seconds,
+            valid_until_unix_seconds,
             revoked: false,
         })
     }
@@ -531,11 +804,27 @@ impl SecretReference {
     }
 
     pub fn scope_digest(&self) -> &Digest {
-        &self.scope_digest
+        &self.scope_identity_digest
+    }
+
+    pub fn scope_identity_digest(&self) -> &Digest {
+        &self.scope_identity_digest
     }
 
     pub const fn credential_revision(&self) -> Revision {
         self.credential_revision
+    }
+
+    pub const fn secret_role(&self) -> VaultSecretRole {
+        self.secret_role
+    }
+
+    pub const fn valid_from_unix_seconds(&self) -> u64 {
+        self.valid_from_unix_seconds
+    }
+
+    pub const fn valid_until_unix_seconds(&self) -> u64 {
+        self.valid_until_unix_seconds
     }
 
     pub const fn is_revoked(&self) -> bool {
@@ -679,6 +968,23 @@ pub enum PolicyClass {
     Unknown,
 }
 
+impl PolicyClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::ReadOnly => "read_only",
+            Self::Metadata => "metadata",
+            Self::TokenSelfLookup => "token_self_lookup",
+            Self::LeaseMetadata => "lease_metadata",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    const fn is_bounded(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityClass {
@@ -694,6 +1000,20 @@ pub enum CapabilityClass {
 }
 
 impl CapabilityClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Read => "read",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::List => "list",
+            Self::Patch => "patch",
+            Self::Sudo => "sudo",
+            Self::Deny => "deny",
+            Self::Unknown => "unknown",
+        }
+    }
+
     pub const fn is_bounded(self) -> bool {
         !matches!(self, Self::Unknown)
     }
@@ -743,7 +1063,7 @@ impl Default for VaultHealthMetadata {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VaultTokenSelfMetadata {
     pub token_digest: Digest,
@@ -753,6 +1073,40 @@ pub struct VaultTokenSelfMetadata {
     pub renewable: bool,
     pub policy_classes: Vec<PolicyClass>,
     pub policy_digest: Digest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VaultTokenSelfMetadataWire {
+    token_digest: Digest,
+    accessor_digest: Digest,
+    entity_id_digest: Option<Digest>,
+    ttl_seconds: u64,
+    renewable: bool,
+    policy_classes: Vec<PolicyClass>,
+    policy_digest: Digest,
+}
+
+impl<'de> Deserialize<'de> for VaultTokenSelfMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = VaultTokenSelfMetadataWire::deserialize(deserializer)?;
+        let metadata = Self::new(
+            wire.token_digest,
+            wire.accessor_digest,
+            wire.entity_id_digest,
+            wire.ttl_seconds,
+            wire.renewable,
+            wire.policy_classes,
+        )
+        .map_err(DeError::custom)?;
+        if metadata.policy_digest != wire.policy_digest {
+            return Err(DeError::custom(ModelError::DigestMismatch));
+        }
+        Ok(metadata)
+    }
 }
 
 impl VaultTokenSelfMetadata {
@@ -769,13 +1123,16 @@ impl VaultTokenSelfMetadata {
                 field: "policy classes",
             });
         }
+        if policy_classes.iter().any(|class| !class.is_bounded()) {
+            return Err(ModelError::InvalidCapability);
+        }
         policy_classes.sort_unstable();
         policy_classes.dedup();
         let policy_digest = Digest::from_fields(
             "vault-policy-classes/v1",
             &policy_classes
                 .iter()
-                .map(|class| format!("{class:?}"))
+                .map(|class| class.as_str().to_owned())
                 .collect::<Vec<_>>(),
         );
         Ok(Self {
@@ -798,12 +1155,35 @@ impl VaultTokenSelfMetadata {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VaultCapabilityMetadata {
     pub path_digest: Digest,
     pub capability_classes: Vec<CapabilityClass>,
     pub capability_digest: Digest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VaultCapabilityMetadataWire {
+    path_digest: Digest,
+    capability_classes: Vec<CapabilityClass>,
+    capability_digest: Digest,
+}
+
+impl<'de> Deserialize<'de> for VaultCapabilityMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = VaultCapabilityMetadataWire::deserialize(deserializer)?;
+        let metadata =
+            Self::new(wire.path_digest, wire.capability_classes).map_err(DeError::custom)?;
+        if metadata.capability_digest != wire.capability_digest {
+            return Err(DeError::custom(ModelError::DigestMismatch));
+        }
+        Ok(metadata)
+    }
 }
 
 impl VaultCapabilityMetadata {
@@ -818,7 +1198,7 @@ impl VaultCapabilityMetadata {
                 path_digest.as_str().to_owned(),
                 capability_classes
                     .iter()
-                    .map(|class| format!("{class:?}"))
+                    .map(|class| class.as_str())
                     .collect::<Vec<_>>()
                     .join(","),
             ],
@@ -970,7 +1350,7 @@ impl From<VaultLeaseMetadata> for VaultLeaseEvidence {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VaultGovernanceEvidence {
     pub schema_version: String,
@@ -979,10 +1359,16 @@ pub struct VaultGovernanceEvidence {
     pub service_id: String,
     pub provider_id: String,
     pub provider_version: String,
+    pub provider_revision: String,
     pub provider_digest: Digest,
     pub consumer_id: String,
     pub scope_digest: Digest,
     pub registration_digest: Digest,
+    pub secret_reference_digest: Digest,
+    pub credential_revision: Revision,
+    pub secret_role: VaultSecretRole,
+    pub valid_from_unix_seconds: u64,
+    pub valid_until_unix_seconds: u64,
     pub provenance: ProviderProvenance,
     pub observed_at_unix_seconds: u64,
     pub operations: Vec<VaultOperation>,
@@ -1002,6 +1388,90 @@ pub struct VaultGovernanceEvidence {
     pub evidence_digest: Digest,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VaultGovernanceEvidenceWire {
+    schema_version: String,
+    contract_version: String,
+    contract_digest: Digest,
+    service_id: String,
+    provider_id: String,
+    provider_version: String,
+    provider_revision: String,
+    provider_digest: Digest,
+    consumer_id: String,
+    scope_digest: Digest,
+    registration_digest: Digest,
+    secret_reference_digest: Digest,
+    credential_revision: Revision,
+    secret_role: VaultSecretRole,
+    valid_from_unix_seconds: u64,
+    valid_until_unix_seconds: u64,
+    provenance: ProviderProvenance,
+    observed_at_unix_seconds: u64,
+    operations: Vec<VaultOperation>,
+    receipts: Vec<VaultResponseReceipt>,
+    health: Option<VaultHealthEvidence>,
+    token: Option<VaultTokenEvidence>,
+    capabilities: Vec<VaultCapabilityEvidence>,
+    lease: Option<VaultLeaseEvidence>,
+    partial: bool,
+    provider_unknown: bool,
+    read_only: bool,
+    native_evidence: bool,
+    external_write_performed: bool,
+    secret_values_retained: bool,
+    token_material_retained: bool,
+    raw_provider_payload_retained: bool,
+    evidence_digest: Digest,
+}
+
+impl<'de> Deserialize<'de> for VaultGovernanceEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = VaultGovernanceEvidenceWire::deserialize(deserializer)?;
+        let evidence = Self {
+            schema_version: wire.schema_version,
+            contract_version: wire.contract_version,
+            contract_digest: wire.contract_digest,
+            service_id: wire.service_id,
+            provider_id: wire.provider_id,
+            provider_version: wire.provider_version,
+            provider_revision: wire.provider_revision,
+            provider_digest: wire.provider_digest,
+            consumer_id: wire.consumer_id,
+            scope_digest: wire.scope_digest,
+            registration_digest: wire.registration_digest,
+            secret_reference_digest: wire.secret_reference_digest,
+            credential_revision: wire.credential_revision,
+            secret_role: wire.secret_role,
+            valid_from_unix_seconds: wire.valid_from_unix_seconds,
+            valid_until_unix_seconds: wire.valid_until_unix_seconds,
+            provenance: wire.provenance,
+            observed_at_unix_seconds: wire.observed_at_unix_seconds,
+            operations: wire.operations,
+            receipts: wire.receipts,
+            health: wire.health,
+            token: wire.token,
+            capabilities: wire.capabilities,
+            lease: wire.lease,
+            partial: wire.partial,
+            provider_unknown: wire.provider_unknown,
+            read_only: wire.read_only,
+            native_evidence: wire.native_evidence,
+            external_write_performed: wire.external_write_performed,
+            secret_values_retained: wire.secret_values_retained,
+            token_material_retained: wire.token_material_retained,
+            raw_provider_payload_retained: wire.raw_provider_payload_retained,
+            evidence_digest: wire.evidence_digest,
+        };
+        evidence.validate().map_err(DeError::custom)?;
+        Ok(evidence)
+    }
+}
+
 impl VaultGovernanceEvidence {
     pub(crate) fn compute_evidence_digest(&self) -> Digest {
         let mut material = self.clone();
@@ -1019,6 +1489,10 @@ impl VaultGovernanceEvidence {
         }
     }
 
+    pub fn refresh_digest(&mut self) {
+        self.evidence_digest = self.compute_evidence_digest();
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.schema_version != VAULT_GOVERNANCE_RESULT_SCHEMA_VERSION
             || self.contract_version != VAULT_GOVERNANCE_RESULT_CONTRACT_VERSION
@@ -1026,7 +1500,15 @@ impl VaultGovernanceEvidence {
             || self.provider_id != VAULT_GOVERNANCE_RESULT_PROVIDER_ID
             || self.consumer_id != MISSION_VAULT_GOVERNANCE_CONSUMER_ID
             || self.provider_version.is_empty()
-            || self.provider_digest.as_str().len() != 64
+            || self.provider_revision != VAULT_GOVERNANCE_RESULT_PROVIDER_REVISION
+            || self.provider_digest.is_zero()
+            || self.contract_digest != crate::contract_digest()
+            || self.secret_reference_digest.is_zero()
+            || self.scope_digest.is_zero()
+            || self.registration_digest.is_zero()
+            || self.valid_until_unix_seconds <= self.valid_from_unix_seconds
+            || self.observed_at_unix_seconds < self.valid_from_unix_seconds
+            || self.observed_at_unix_seconds >= self.valid_until_unix_seconds
             || !self.read_only
             || self.native_evidence
             || self.external_write_performed
@@ -1057,7 +1539,17 @@ impl VaultGovernanceEvidence {
                 || receipt.token_material_retained
                 || receipt.response_size > MAX_RESPONSE_BYTES
                 || receipt.provider_revision != VAULT_GOVERNANCE_RESULT_PROVIDER_REVISION
+                || receipt.request_digest.is_zero()
+                || receipt.response_digest.is_zero()
         }) {
+            return Err(ModelError::InvalidResponse);
+        }
+        if self
+            .receipts
+            .iter()
+            .zip(self.operations.iter())
+            .any(|(receipt, operation)| receipt.operation != *operation)
+        {
             return Err(ModelError::InvalidResponse);
         }
         for capability in &self.capabilities {
@@ -1077,6 +1569,38 @@ impl VaultGovernanceEvidence {
             return Err(ModelError::BoundExceeded {
                 field: "policy classes",
             });
+        }
+        if let Some(token) = &self.token {
+            let expected = Digest::from_fields(
+                "vault-policy-classes/v1",
+                &token
+                    .policy_classes
+                    .iter()
+                    .map(|class| class.as_str().to_owned())
+                    .collect::<Vec<_>>(),
+            );
+            if token.policy_digest != expected
+                || token.policy_classes.iter().any(|class| !class.is_bounded())
+            {
+                return Err(ModelError::InvalidResponse);
+            }
+        }
+        if self.capabilities.iter().any(|capability| {
+            capability.capability_digest
+                != Digest::from_fields(
+                    "vault-capabilities/v1",
+                    &[
+                        capability.path_digest.as_str().to_owned(),
+                        capability
+                            .capability_classes
+                            .iter()
+                            .map(|class| class.as_str())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ],
+                )
+        }) {
+            return Err(ModelError::InvalidResponse);
         }
         self.verify_digest()
     }
@@ -1198,6 +1722,17 @@ impl VaultReadRequest {
     }
 
     pub(crate) fn validate(&self, scope: &VaultScope) -> Result<(), ModelError> {
+        let Some(valid_from) = scope.valid_from_unix_seconds() else {
+            return Err(ModelError::InvalidScope);
+        };
+        let Some(valid_until) = scope.valid_until_unix_seconds() else {
+            return Err(ModelError::InvalidScope);
+        };
+        if self.observed_at_unix_seconds < valid_from
+            || self.observed_at_unix_seconds >= valid_until
+        {
+            return Err(ModelError::ScopeMismatch);
+        }
         if !self.include_health
             && !self.include_token_self
             && self.capability_checks.is_empty()
@@ -1244,14 +1779,6 @@ impl AdoptionAvailability {
 
 pub(crate) fn digest_serializable<T: Serialize + ?Sized>(value: &T) -> Digest {
     Digest::from_bytes(&serde_json::to_vec(value).expect("bounded Vault value serializes"))
-}
-
-pub(crate) fn response_digest(
-    operation: VaultOperation,
-    status: u16,
-    payload: &VaultResponsePayload,
-) -> Digest {
-    digest_serializable(&(operation, status, payload))
 }
 
 pub(crate) fn mount_digest(mount: &VaultMount) -> Digest {
