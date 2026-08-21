@@ -4,13 +4,13 @@
 //! does not adopt a Work Product, change Consent, issue an Effect, or grant
 //! kernel Truth/Outcome authority.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use thiserror::Error;
 
 use crate::model::{
     ConsentEvidenceStatus, Digest, OneTrustConsentScope, OneTrustEvidenceProposal,
-    OneTrustRegistration, RegistrationState, Revision,
+    OneTrustRegistration, RegistrationUseFence, Revision,
 };
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -62,6 +62,7 @@ pub struct MissionOneTrustConsentConsumer {
     scope: OneTrustConsentScope,
     registration_digest: Digest,
     registration_revision: Revision,
+    registration_fence: Arc<RegistrationUseFence>,
     active: bool,
 }
 
@@ -72,7 +73,8 @@ impl fmt::Debug for MissionOneTrustConsentConsumer {
             .field("scope_digest", &self.scope.scope_digest())
             .field("registration_digest", &self.registration_digest)
             .field("registration_revision", &self.registration_revision)
-            .field("active", &self.active)
+            .field("registration_fence", &"<shared>")
+            .field("active", &self.is_active())
             .finish()
     }
 }
@@ -82,15 +84,14 @@ impl MissionOneTrustConsentConsumer {
         scope: OneTrustConsentScope,
         registration: &OneTrustRegistration,
     ) -> Result<Self, OneTrustConsumerError> {
-        if registration.state != RegistrationState::Active
-            || registration.scope_digest != scope.scope_digest()
-        {
+        if !registration.is_active() || registration.scope_digest != scope.scope_digest() {
             return Err(OneTrustConsumerError::RegistrationMismatch);
         }
         Ok(Self {
             scope,
             registration_digest: registration.registration_digest.clone(),
             registration_revision: registration.registration_revision,
+            registration_fence: registration.active_use_fence(),
             active: true,
         })
     }
@@ -103,12 +104,12 @@ impl MissionOneTrustConsentConsumer {
         &self.registration_digest
     }
 
-    pub const fn is_active(&self) -> bool {
-        self.active
+    pub fn is_active(&self) -> bool {
+        self.active && self.registration_fence.is_active()
     }
 
     pub fn revoke(&mut self) -> Result<(), OneTrustConsumerError> {
-        if !self.active {
+        if !self.is_active() {
             return Err(OneTrustConsumerError::Revoked);
         }
         self.active = false;
@@ -192,7 +193,7 @@ impl MissionOneTrustConsentConsumer {
         &self,
         proposal: &OneTrustEvidenceProposal,
     ) -> Result<(), OneTrustConsumerError> {
-        if !self.active {
+        if !self.is_active() {
             return Err(OneTrustConsumerError::Revoked);
         }
         if proposal.registration_digest != self.registration_digest
@@ -210,6 +211,15 @@ impl MissionOneTrustConsentConsumer {
             || proposal.work_product_revision != self.scope.work_product.revision
         {
             return Err(OneTrustConsumerError::ScopeMismatch);
+        }
+        if proposal.evidence.validate_integrity(&self.scope).is_err()
+            || proposal.evidence.status != proposal.projection.status
+            || proposal.evidence.observations.len() != proposal.projection.observed_record_count
+            || proposal.evidence.provenance != proposal.provenance
+            || proposal.evidence.read_only != proposal.read_only
+            || proposal.evidence.proposal_only != proposal.proposal_only
+        {
+            return Err(OneTrustConsumerError::StaleProposal);
         }
         if proposal.proposal_digest
             != proposal

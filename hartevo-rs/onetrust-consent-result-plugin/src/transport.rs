@@ -19,6 +19,10 @@ use crate::model::{
 };
 use crate::{ONETRUST_MAX_OBSERVATIONS, ONETRUST_MAX_RESPONSE_BYTES};
 
+mod sealed {
+    pub trait OneTrustTransport {}
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum OneTrustTransportError {
     #[error("BLOCKED_ENV: OneTrust native credential and network authority is unavailable")]
@@ -37,7 +41,7 @@ pub enum OneTrustTransportError {
 
 /// Abstract HTTPS/auth transport seam owned by the provider. Layer 1 ships
 /// deterministic fixture, recording, loopback, and BLOCKED_ENV adapters only.
-pub trait OneTrustTransport: fmt::Debug {
+pub trait OneTrustTransport: sealed::OneTrustTransport + fmt::Debug {
     fn provenance(&self) -> crate::TransportProvenance;
 
     fn send(
@@ -104,6 +108,8 @@ impl RecordingOneTrustTransport {
     }
 }
 
+impl sealed::OneTrustTransport for RecordingOneTrustTransport {}
+
 impl OneTrustTransport for RecordingOneTrustTransport {
     fn provenance(&self) -> crate::TransportProvenance {
         self.provenance
@@ -132,6 +138,8 @@ pub type LoopbackOneTrustTransport = RecordingOneTrustTransport;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BlockedEnvOneTrustTransport;
+
+impl sealed::OneTrustTransport for BlockedEnvOneTrustTransport {}
 
 impl OneTrustTransport for BlockedEnvOneTrustTransport {
     fn provenance(&self) -> crate::TransportProvenance {
@@ -246,15 +254,14 @@ fn parse_status(value: Option<&str>) -> ConsentEvidenceStatus {
 fn parse_identifier<T>(
     object: &serde_json::Map<String, Value>,
     keys: &[&str],
-    fallback: &T,
     field: &'static str,
 ) -> Result<T, OneTrustModelError>
 where
-    T: Clone + FromStrLike,
+    T: FromStrLike,
 {
     match first_string(object, keys) {
         Some(value) => T::from_str_like(value).map_err(|_| OneTrustModelError::Invalid { field }),
-        None => Ok(fallback.clone()),
+        None => Err(OneTrustModelError::Invalid { field }),
     }
 }
 
@@ -285,28 +292,21 @@ fn parse_observations(
         let Some(object) = value.as_object() else {
             continue;
         };
-        let purpose_id = parse_identifier(
-            object,
-            &["purposeId", "purposeID", "purpose"],
-            &request.purpose_id,
-            "purpose id",
-        )?;
+        let purpose_id =
+            parse_identifier(object, &["purposeId", "purposeID", "purpose"], "purpose id")?;
         let purpose_version = parse_identifier(
             object,
             &["purposeVersion", "purposeRevision", "version"],
-            &request.purpose_version,
             "purpose version",
         )?;
         let collection_point = parse_identifier(
             object,
             &["collectionPoint", "collectionPointId", "collectionPointID"],
-            &request.collection_point,
             "collection point",
         )?;
         let policy_revision = parse_identifier(
             object,
             &["policyRevision", "policyVersion", "policy"],
-            &request.policy_revision,
             "policy revision",
         )?;
         let status = parse_status(first_string(

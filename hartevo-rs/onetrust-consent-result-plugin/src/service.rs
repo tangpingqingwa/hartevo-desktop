@@ -420,6 +420,18 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
         proposal: &OneTrustEvidenceProposal,
     ) -> Result<OneTrustVerification, OneTrustConsentResultError> {
         self.ensure_registration()?;
+        proposal
+            .evidence
+            .validate_integrity(&self.scope)
+            .map_err(|_| OneTrustConsentResultError::StaleEvidence)?;
+        if proposal.evidence.status != proposal.projection.status
+            || proposal.evidence.observations.len() != proposal.projection.observed_record_count
+            || proposal.evidence.provenance != proposal.provenance
+            || proposal.evidence.read_only != proposal.read_only
+            || proposal.evidence.proposal_only != proposal.proposal_only
+        {
+            return Err(OneTrustConsentResultError::StaleEvidence);
+        }
         if proposal.proposal_digest != proposal.recompute_digest()? {
             return Err(OneTrustConsentResultError::StaleProposal);
         }
@@ -591,7 +603,11 @@ fn project_status(
     observed_at: DateTime<Utc>,
 ) -> ConsentEvidenceStatus {
     let mut failure_status = None;
-    for failure in &bundle.failures {
+    let failures = bundle
+        .failures
+        .iter()
+        .chain(bundle.reads.iter().flat_map(|read| read.failures.iter()));
+    for failure in failures {
         let candidate = match failure.kind {
             OneTrustProviderErrorKind::Unauthenticated
             | OneTrustProviderErrorKind::PermissionDenied => ConsentEvidenceStatus::AccessLost,
@@ -692,33 +708,7 @@ fn compile_evidence(
                 .flat_map(|read| read.failures.iter().cloned()),
         )
         .collect::<Vec<_>>();
-    let mut source_fields = bundle
-        .reads
-        .iter()
-        .flat_map(|read| [read.source_digest.as_str(), read.result_digest.as_str()])
-        .chain(failures.iter().map(|failure| failure.error_digest.as_str()))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    source_fields.push(format!("{:?}", bundle.provenance));
-    let source_digest = Digest::from_fields(source_fields);
-    let result_digest = crate::digest_serializable(&(
-        &scope.scope_digest(),
-        status,
-        observed_at,
-        &observations,
-        &page_cursor_digests,
-        &request_receipt_digests,
-        &response_receipt_digests,
-        &failures,
-        &source_digest,
-    ))?;
-    let evidence_digest = Digest::from_fields([
-        "hartevo-onetrust-evidence-v1",
-        bundle.evidence_digest.as_str(),
-        result_digest.as_str(),
-        source_digest.as_str(),
-    ]);
-    Ok(OneTrustConsentEvidence {
+    let mut evidence = OneTrustConsentEvidence {
         status,
         scope_digest: scope.scope_digest(),
         subject_reference: scope.subject_reference.clone(),
@@ -731,9 +721,9 @@ fn compile_evidence(
         response_receipt_digests,
         failures,
         provenance: bundle.provenance,
-        source_digest,
-        result_digest,
-        evidence_digest,
+        source_digest: Digest::zero(),
+        result_digest: Digest::zero(),
+        evidence_digest: Digest::zero(),
         read_only: true,
         proposal_only: true,
         native: false,
@@ -742,7 +732,11 @@ fn compile_evidence(
         raw_subject_identifier_retained: false,
         raw_jwt_retained: false,
         raw_pii_retained: false,
-    })
+    };
+    evidence.source_digest = evidence.recompute_source_digest()?;
+    evidence.result_digest = evidence.recompute_result_digest()?;
+    evidence.evidence_digest = evidence.recompute_evidence_digest()?;
+    Ok(evidence)
 }
 
 #[allow(dead_code)]

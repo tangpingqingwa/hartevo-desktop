@@ -263,12 +263,9 @@ impl<T: OneTrustTransport> OneTrustConsentProvider<T> {
                 .transport
                 .send(&http_request)
                 .map_err(OneTrustProviderError::from)?;
-            if response.receipt.request_digest != http_request.request_digest
+            if response.receipt.validate().is_err()
+                || response.receipt.request_digest != http_request.request_digest
                 || response.receipt.status_code != response.status_code
-                || response.receipt.raw_provider_payload_retained
-                || response.receipt.raw_preference_payload_retained
-                || response.receipt.raw_pii_retained
-                || response.receipt.raw_jwt_retained
                 || response.receipt.provider_revision != self.definition.provider_revision
             {
                 return Err(OneTrustProviderError::Tampered);
@@ -294,8 +291,11 @@ impl<T: OneTrustTransport> OneTrustConsentProvider<T> {
                 observations.push(observation.clone());
             }
             pages_observed += 1;
-            request_receipt_digests
-                .push(crate::OneTrustRequestReceipt::from_request(&http_request).digest());
+            let request_receipt = crate::OneTrustRequestReceipt::from_request(&http_request);
+            if request_receipt.validate().is_err() {
+                return Err(OneTrustProviderError::Tampered);
+            }
+            request_receipt_digests.push(request_receipt.digest());
             response_receipt_digests.push(response.receipt.digest());
             if let Some(next_cursor) = response.next_cursor {
                 let next_digest = next_cursor.digest();
@@ -365,6 +365,9 @@ fn validate_observation(
     if observation.policy_revision != request.policy_revision {
         return Err(OneTrustProviderError::StalePolicyRevision);
     }
+    observation
+        .validate_against_window(&request.consent_window)
+        .map_err(|error| OneTrustProviderError::Model(error.to_string()))?;
     let recomputed = crate::digest_serializable(&(
         &observation.purpose_id,
         &observation.purpose_version,

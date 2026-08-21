@@ -4,7 +4,14 @@
 //! consent metadata, opaque subject hashes, bounded cursor digests, and
 //! cryptographic request/response receipts cross the provider boundary.
 
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
@@ -887,6 +894,18 @@ impl OneTrustRequestReceipt {
     pub fn digest(&self) -> Digest {
         digest_serializable(self).unwrap_or_else(|_| Digest::zero())
     }
+
+    pub fn validate(&self) -> Result<(), OneTrustModelError> {
+        if self.request_digest.as_str() == Digest::zero().as_str()
+            || self.raw_subject_identifier_retained
+            || self.raw_jwt_retained
+        {
+            return Err(OneTrustModelError::Invalid {
+                field: "OneTrust request receipt",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -906,6 +925,22 @@ pub struct OneTrustResponseReceipt {
 impl OneTrustResponseReceipt {
     pub fn digest(&self) -> Digest {
         digest_serializable(self).unwrap_or_else(|_| Digest::zero())
+    }
+
+    pub fn validate(&self) -> Result<(), OneTrustModelError> {
+        if self.response_size_bytes > ONETRUST_MAX_RESPONSE_BYTES
+            || self.request_digest.as_str() == Digest::zero().as_str()
+            || self.response_digest.as_str() == Digest::zero().as_str()
+            || self.raw_provider_payload_retained
+            || self.raw_preference_payload_retained
+            || self.raw_pii_retained
+            || self.raw_jwt_retained
+        {
+            return Err(OneTrustModelError::Invalid {
+                field: "OneTrust response receipt",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1060,6 +1095,7 @@ impl OneTrustConsentObservation {
         if self.policy_revision != scope.policy_revision {
             return Err(OneTrustModelError::StalePolicyRevision);
         }
+        self.validate_against_window(&scope.consent_window)?;
         let recomputed = digest_serializable(&(
             &self.purpose_id,
             &self.purpose_version,
@@ -1076,6 +1112,22 @@ impl OneTrustConsentObservation {
         if recomputed != self.result_digest {
             return Err(OneTrustModelError::Invalid {
                 field: "consent evidence result digest",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_window(
+        &self,
+        window: &ConsentWindow,
+    ) -> Result<(), OneTrustModelError> {
+        if [self.consented_at, self.withdrawn_at, self.expires_at]
+            .into_iter()
+            .flatten()
+            .any(|instant| !window.contains(instant))
+        {
+            return Err(OneTrustModelError::Invalid {
+                field: "consent evidence event window",
             });
         }
         Ok(())
@@ -1211,7 +1263,7 @@ impl OneTrustReadEvidence {
             pages_observed,
             &source_digest,
         ))?;
-        Ok(Self {
+        let evidence = Self {
             endpoint,
             scope_digest,
             subject_reference,
@@ -1224,7 +1276,64 @@ impl OneTrustReadEvidence {
             source_digest,
             result_digest,
             provenance,
-        })
+        };
+        evidence.validate_integrity()?;
+        Ok(evidence)
+    }
+
+    pub fn recompute_source_digest(&self) -> Result<Digest, OneTrustModelError> {
+        digest_serializable(&(
+            self.endpoint,
+            &self.scope_digest,
+            &self.subject_reference,
+            &self.request_receipt_digests,
+            &self.response_receipt_digests,
+            &self.failures,
+            self.provenance,
+        ))
+    }
+
+    pub fn recompute_result_digest(&self) -> Result<Digest, OneTrustModelError> {
+        let source_digest = self.recompute_source_digest()?;
+        digest_serializable(&(
+            &self.observations,
+            &self.page_cursor_digests,
+            self.pages_observed,
+            &source_digest,
+        ))
+    }
+
+    pub fn validate_integrity(&self) -> Result<(), OneTrustModelError> {
+        if self.pages_observed == 0
+            || self.pages_observed > ONETRUST_MAX_PAGES
+            || self.request_receipt_digests.len() != usize::from(self.pages_observed)
+            || self.response_receipt_digests.len() != usize::from(self.pages_observed)
+            || self.page_cursor_digests.len() > usize::from(self.pages_observed)
+            || self
+                .page_cursor_digests
+                .iter()
+                .any(|digest| digest.as_str() == Digest::zero().as_str())
+            || self
+                .request_receipt_digests
+                .iter()
+                .chain(self.response_receipt_digests.iter())
+                .any(|digest| digest.as_str() == Digest::zero().as_str())
+        {
+            return Err(OneTrustModelError::Invalid {
+                field: "OneTrust read receipt digest fence",
+            });
+        }
+        if self.source_digest != self.recompute_source_digest()? {
+            return Err(OneTrustModelError::Invalid {
+                field: "OneTrust read source digest",
+            });
+        }
+        if self.result_digest != self.recompute_result_digest()? {
+            return Err(OneTrustModelError::Invalid {
+                field: "OneTrust read result digest",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1257,12 +1366,18 @@ impl OneTrustEvidenceBundle {
             });
         }
         let scope_digest = scope.scope_digest();
-        if reads.iter().any(|read| {
-            read.scope_digest != scope_digest || read.subject_reference != scope.subject_reference
-        }) {
-            return Err(OneTrustModelError::Invalid {
-                field: "evidence scope fence",
-            });
+        for read in &reads {
+            if read.scope_digest != scope_digest
+                || read.subject_reference != scope.subject_reference
+            {
+                return Err(OneTrustModelError::Invalid {
+                    field: "evidence scope fence",
+                });
+            }
+            read.validate_integrity()?;
+            for observation in &read.observations {
+                observation.validate_against(scope)?;
+            }
         }
         let evidence_digest = digest_serializable(&(
             &scope_digest,
@@ -1314,6 +1429,162 @@ pub struct OneTrustConsentEvidence {
     pub raw_pii_retained: bool,
 }
 
+impl OneTrustConsentEvidence {
+    pub fn recompute_source_digest(&self) -> Result<Digest, OneTrustModelError> {
+        digest_serializable(&(
+            "hartevo-onetrust-evidence-source-v2",
+            &self.scope_digest,
+            self.status,
+            self.observed_at,
+            &self.observations,
+            self.pages_observed,
+            &self.page_cursor_digests,
+            &self.request_receipt_digests,
+            &self.response_receipt_digests,
+            &self.failures,
+            self.provenance,
+        ))
+    }
+
+    pub fn recompute_result_digest(&self) -> Result<Digest, OneTrustModelError> {
+        let source_digest = self.recompute_source_digest()?;
+        digest_serializable(&(
+            "hartevo-onetrust-evidence-result-v2",
+            &self.scope_digest,
+            self.status,
+            self.observed_at,
+            &self.observations,
+            self.pages_observed,
+            &self.page_cursor_digests,
+            &self.request_receipt_digests,
+            &self.response_receipt_digests,
+            &self.failures,
+            &source_digest,
+        ))
+    }
+
+    pub fn recompute_evidence_digest(&self) -> Result<Digest, OneTrustModelError> {
+        let source_digest = self.recompute_source_digest()?;
+        let result_digest = self.recompute_result_digest()?;
+        digest_serializable(&(
+            "hartevo-onetrust-evidence-v2",
+            &self.scope_digest,
+            self.status,
+            self.observed_at,
+            &source_digest,
+            &result_digest,
+            self.read_only,
+            self.proposal_only,
+            self.native,
+            self.connected,
+            self.raw_preference_payload_retained,
+            self.raw_subject_identifier_retained,
+            self.raw_jwt_retained,
+            self.raw_pii_retained,
+        ))
+    }
+
+    pub fn validate_integrity(
+        &self,
+        scope: &OneTrustConsentScope,
+    ) -> Result<(), OneTrustModelError> {
+        let pages_observed = usize::from(self.pages_observed);
+        let has_reads = pages_observed != 0;
+        if self.scope_digest != scope.scope_digest()
+            || self.subject_reference != scope.subject_reference
+            || self.policy_revision != scope.policy_revision
+            || self.observations.len() > ONETRUST_MAX_OBSERVATIONS
+            || pages_observed > usize::from(ONETRUST_MAX_PAGES) * OneTrustEndpoint::ALL.len()
+            || (has_reads
+                && (self.request_receipt_digests.len() != pages_observed
+                    || self.response_receipt_digests.len() != pages_observed))
+            || (!has_reads
+                && (!self.observations.is_empty()
+                    || !self.page_cursor_digests.is_empty()
+                    || !self.request_receipt_digests.is_empty()
+                    || !self.response_receipt_digests.is_empty()))
+            || self.page_cursor_digests.len() > pages_observed
+            || !self.read_only
+            || !self.proposal_only
+            || self.native
+            || self.connected
+            || self.raw_preference_payload_retained
+            || self.raw_subject_identifier_retained
+            || self.raw_jwt_retained
+            || self.raw_pii_retained
+        {
+            return Err(OneTrustModelError::Invalid {
+                field: "OneTrust evidence authority or scope fence",
+            });
+        }
+        for observation in &self.observations {
+            observation.validate_against(scope)?;
+        }
+        if self
+            .request_receipt_digests
+            .iter()
+            .chain(self.response_receipt_digests.iter())
+            .any(|digest| digest.as_str() == Digest::zero().as_str())
+            || self
+                .page_cursor_digests
+                .iter()
+                .any(|digest| digest.as_str() == Digest::zero().as_str())
+        {
+            return Err(OneTrustModelError::Invalid {
+                field: "OneTrust evidence receipt digest fence",
+            });
+        }
+        if self.source_digest != self.recompute_source_digest()?
+            || self.result_digest != self.recompute_result_digest()?
+            || self.evidence_digest != self.recompute_evidence_digest()?
+        {
+            return Err(OneTrustModelError::Invalid {
+                field: "OneTrust evidence digest fence",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RegistrationUseFence {
+    generation: AtomicU64,
+}
+
+impl Default for RegistrationUseFence {
+    fn default() -> Self {
+        Self {
+            generation: AtomicU64::new(1),
+        }
+    }
+}
+
+impl PartialEq for RegistrationUseFence {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation.load(Ordering::Acquire) == other.generation.load(Ordering::Acquire)
+    }
+}
+
+impl Eq for RegistrationUseFence {}
+
+impl RegistrationUseFence {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.generation.load(Ordering::Acquire) == 1
+    }
+
+    fn revoke(&self) {
+        let _ = self
+            .generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                Some(generation.saturating_add(1))
+            });
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RegistrationState {
@@ -1345,6 +1616,8 @@ pub struct OneTrustRegistration {
     pub secret_reference_digest: Digest,
     pub evidence_digest_fence: Digest,
     pub state: RegistrationState,
+    #[serde(skip)]
+    active_use_fence: Arc<RegistrationUseFence>,
 }
 
 impl OneTrustRegistration {
@@ -1387,13 +1660,14 @@ impl OneTrustRegistration {
             secret_reference_digest: secret_reference.digest().clone(),
             evidence_digest_fence,
             state: RegistrationState::Active,
+            active_use_fence: RegistrationUseFence::new(),
         };
         registration.registration_digest = registration.recompute_digest()?;
         Ok(registration)
     }
 
     pub fn is_active(&self) -> bool {
-        self.state == RegistrationState::Active
+        self.state == RegistrationState::Active && self.active_use_fence.is_active()
     }
 
     pub fn revoke(&mut self) -> Result<(), OneTrustModelError> {
@@ -1401,7 +1675,12 @@ impl OneTrustRegistration {
             return Err(OneTrustModelError::AlreadyRevoked);
         }
         self.state = RegistrationState::Revoked;
+        self.active_use_fence.revoke();
         Ok(())
+    }
+
+    pub(crate) fn active_use_fence(&self) -> Arc<RegistrationUseFence> {
+        self.active_use_fence.clone()
     }
 
     pub fn recompute_digest(&self) -> Result<Digest, OneTrustModelError> {

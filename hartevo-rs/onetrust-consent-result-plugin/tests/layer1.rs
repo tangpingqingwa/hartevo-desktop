@@ -4,11 +4,12 @@ use hartevo_onetrust_consent_result_plugin::{
     ConsentId, ConsentWindow, Digest, MissionBinding, MissionId, MissionOneTrustConsentConsumer,
     ONETRUST_MAX_PAGES, ONETRUST_PAGE_SIZE, ONETRUST_PROVIDER_REVISION_TEXT,
     OneTrustConsentEvidenceService, OneTrustConsentObservation, OneTrustConsentResultContract,
-    OneTrustConsentScope, OneTrustEndpoint, OneTrustEvidenceProposalRequest, OneTrustHttpRequest,
-    OneTrustHttpResponse, OneTrustReadRequest, OneTrustResponseBody, OneTrustTransport,
-    OneTrustTransportError, PolicyRevision, ProjectBinding, ProjectId, ProviderRevision,
-    RecordingOneTrustTransport, Region, Revision, SecretReference, SubjectReferenceHash, TenantId,
-    TransportProvenance, WorkProductBinding, WorkProductId,
+    OneTrustConsentScope, OneTrustEndpoint, OneTrustEvidenceBundle,
+    OneTrustEvidenceProposalRequest, OneTrustHttpRequest, OneTrustHttpResponse,
+    OneTrustReadRequest, OneTrustResponseBody, OneTrustTransport, OneTrustTransportError,
+    PolicyRevision, ProjectBinding, ProjectId, ProviderRevision, RecordingOneTrustTransport,
+    Region, Revision, SecretReference, SubjectReferenceHash, TenantId, TransportProvenance,
+    WorkProductBinding, WorkProductId,
 };
 
 fn at() -> chrono::DateTime<Utc> {
@@ -670,4 +671,214 @@ fn transport_request_receipts_are_scope_bound_and_recording_is_typed() {
     assert_eq!(transport.requests()[0].scope_digest, scope.scope_digest());
     assert!(transport.requests()[0].body_digest.is_some());
     assert!(!format!("{transport:?}").contains("alice@example.com"));
+}
+
+#[test]
+fn read_level_partial_failures_project_fail_closed() {
+    let scope = scope();
+    let endpoint = OneTrustEndpoint::DataSubjectDetailsV4;
+    let read = OneTrustReadRequest::new(endpoint, &scope, ONETRUST_PAGE_SIZE, 1, at())
+        .expect("bounded one-page read");
+    let request = OneTrustHttpRequest::from_read(&read).expect("HTTP request");
+    let response = OneTrustHttpResponse::from_body(
+        &request,
+        200,
+        OneTrustResponseBody::new(vec![observation(&scope, ConsentEvidenceStatus::Granted)])
+            .expect("body"),
+        provider_revision(),
+        Some(
+            hartevo_onetrust_consent_result_plugin::OpaqueCursor::new("next-page").expect("cursor"),
+        ),
+    )
+    .expect("response");
+    let provider = hartevo_onetrust_consent_result_plugin::OneTrustConsentProvider::new(
+        RecordingOneTrustTransport::fixture([Ok(response)]),
+    )
+    .expect("provider");
+    let mut service =
+        OneTrustConsentEvidenceService::new(scope.clone(), secret(), provider).expect("service");
+    let read_evidence = service
+        .read(endpoint, ONETRUST_PAGE_SIZE, 1, at())
+        .expect("partial read evidence");
+    assert!(read_evidence.failures.iter().any(|failure| failure.kind
+        == hartevo_onetrust_consent_result_plugin::OneTrustProviderErrorKind::Partial));
+
+    let bundle = OneTrustEvidenceBundle::new(
+        &scope,
+        service.registration().registration_digest.clone(),
+        service.provider().provider_digest().clone(),
+        service.provider().provider_revision().clone(),
+        vec![read_evidence],
+        Vec::new(),
+        service.provider().provenance(),
+    )
+    .expect("bundle");
+    let proposal = service
+        .compile_evidence_proposal(bundle, at())
+        .expect("proposal");
+    assert_eq!(proposal.status(), ConsentEvidenceStatus::Partial);
+    assert!(proposal.projection.partial);
+    assert!(proposal.projection.fail_closed);
+}
+
+#[test]
+fn observations_outside_requested_window_fail_closed() {
+    let scope = scope();
+    for (consented_at, withdrawn_at, expires_at) in [
+        (Some(at() + Duration::seconds(1)), None, None),
+        (None, Some(at() + Duration::seconds(1)), None),
+        (None, None, Some(at() + Duration::seconds(1))),
+    ] {
+        let observation = OneTrustConsentObservation::new(
+            scope.purpose_id.clone(),
+            scope.purpose_version.clone(),
+            ConsentEvidenceStatus::Granted,
+            consented_at,
+            withdrawn_at,
+            expires_at,
+            scope.collection_point.clone(),
+            None,
+            scope.policy_revision.clone(),
+            scope.subject_reference.clone(),
+            Digest::from_text("outside-window-source"),
+        );
+        assert!(observation.validate_against(&scope).is_err());
+    }
+
+    let endpoint = OneTrustEndpoint::DataSubjectDetailsV4;
+    let response = response_for(
+        &scope,
+        endpoint,
+        200,
+        OneTrustResponseBody::new(vec![OneTrustConsentObservation::new(
+            scope.purpose_id.clone(),
+            scope.purpose_version.clone(),
+            ConsentEvidenceStatus::Granted,
+            Some(at() + Duration::seconds(1)),
+            None,
+            None,
+            scope.collection_point.clone(),
+            None,
+            scope.policy_revision.clone(),
+            scope.subject_reference.clone(),
+            Digest::from_text("provider-outside-window-source"),
+        )])
+        .expect("body"),
+        None,
+    );
+    let provider = hartevo_onetrust_consent_result_plugin::OneTrustConsentProvider::new(
+        RecordingOneTrustTransport::new([Ok(response)]),
+    )
+    .expect("provider");
+    let mut service =
+        OneTrustConsentEvidenceService::new(scope, secret(), provider).expect("service");
+    assert!(
+        service
+            .read(endpoint, ONETRUST_PAGE_SIZE, ONETRUST_MAX_PAGES, at())
+            .is_err()
+    );
+}
+
+#[test]
+fn proposal_verification_recomputes_nested_digests_and_redaction_flags() {
+    let mut service = service_with_fixture(scope(), ConsentEvidenceStatus::Granted);
+    let proposal = service
+        .propose(OneTrustEvidenceProposalRequest::new(at()))
+        .expect("proposal");
+
+    let mut nested_tamper = proposal.clone();
+    nested_tamper.evidence.observations[0].status = ConsentEvidenceStatus::Denied;
+    nested_tamper.proposal_digest = nested_tamper.recompute_digest().expect("outer digest");
+    assert!(service.verify(&nested_tamper).is_err());
+
+    let mut receipt_tamper = proposal.clone();
+    receipt_tamper.evidence.request_receipt_digests[0] = Digest::from_text("tampered-receipt");
+    receipt_tamper.proposal_digest = receipt_tamper.recompute_digest().expect("outer digest");
+    assert!(service.verify(&receipt_tamper).is_err());
+
+    let mut pagination_tamper = proposal.clone();
+    pagination_tamper.evidence.pages_observed = 0;
+    pagination_tamper.evidence.source_digest = pagination_tamper
+        .evidence
+        .recompute_source_digest()
+        .expect("source digest");
+    pagination_tamper.evidence.result_digest = pagination_tamper
+        .evidence
+        .recompute_result_digest()
+        .expect("result digest");
+    pagination_tamper.evidence.evidence_digest = pagination_tamper
+        .evidence
+        .recompute_evidence_digest()
+        .expect("evidence digest");
+    pagination_tamper.proposal_digest = pagination_tamper.recompute_digest().expect("outer digest");
+    assert!(service.verify(&pagination_tamper).is_err());
+
+    let mut encoded = serde_json::to_value(&proposal).expect("proposal JSON");
+    encoded["evidence"]["rawPiiRetained"] = serde_json::Value::Bool(true);
+    let redaction_tamper = serde_json::from_value(encoded).expect("tampered proposal JSON");
+    assert!(service.verify(&redaction_tamper).is_err());
+
+    let mut encoded = serde_json::to_value(&proposal).expect("proposal JSON");
+    encoded["evidence"]["resultDigest"] =
+        serde_json::Value::String(Digest::from_text("tampered-result").as_str().to_owned());
+    let digest_tamper = serde_json::from_value(encoded).expect("tampered proposal JSON");
+    assert!(service.verify(&digest_tamper).is_err());
+}
+
+#[test]
+fn registration_revocation_reaches_existing_mission_consumers() {
+    let mut service = service_with_fixture(scope(), ConsentEvidenceStatus::Granted);
+    let consumer =
+        MissionOneTrustConsentConsumer::new(service.scope().clone(), service.registration())
+            .expect("consumer");
+    let proposal = service
+        .propose(OneTrustEvidenceProposalRequest::new(at()))
+        .expect("proposal");
+    assert!(consumer.is_active());
+    service.revoke_registration().expect("registration revoke");
+    assert!(!consumer.is_active());
+    assert!(matches!(
+        consumer.consume(&proposal),
+        Err(hartevo_onetrust_consent_result_plugin::OneTrustConsumerError::Revoked)
+    ));
+}
+
+#[test]
+fn response_missing_scope_identifiers_never_fall_back_to_request_scope() {
+    let scope = scope();
+    let endpoint = OneTrustEndpoint::RealtimePreferencesV2;
+    let read = OneTrustReadRequest::new(
+        endpoint,
+        &scope,
+        ONETRUST_PAGE_SIZE,
+        ONETRUST_MAX_PAGES,
+        at(),
+    )
+    .expect("read");
+    let request = OneTrustHttpRequest::from_read(&read).expect("HTTP request");
+    for missing in [
+        "purposeId",
+        "purposeVersion",
+        "collectionPoint",
+        "policyRevision",
+    ] {
+        let mut record = serde_json::json!({
+            "purposeId": "purpose-1",
+            "purposeVersion": "v2",
+            "status": "granted",
+            "collectionPoint": "web-checkout",
+            "policyRevision": "policy-7",
+        });
+        record
+            .as_object_mut()
+            .expect("record object")
+            .remove(missing);
+        let raw =
+            serde_json::to_vec(&serde_json::json!({ "data": [record] })).expect("response JSON");
+        assert!(
+            OneTrustHttpResponse::from_json(&request, 200, &raw, provider_revision(), None)
+                .is_err(),
+            "missing {missing} must fail closed"
+        );
+    }
 }
