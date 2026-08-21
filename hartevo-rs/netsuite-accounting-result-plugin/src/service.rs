@@ -482,6 +482,7 @@ impl NetSuiteAccountingProposalRequest {
         window: ObservationWindow,
         work_product_revision: Revision,
     ) -> Result<Self, NetSuiteServiceError> {
+        bounds.validate()?;
         let operations = operations.into_iter().collect::<Vec<_>>();
         if operations.is_empty() || operations.len() > 3 || operations.iter().any(|op| !op.is_get())
         {
@@ -530,6 +531,7 @@ impl NetSuiteAccountingProposalRequest {
     }
 
     pub fn recompute_digest(&self) -> Result<Digest, NetSuiteServiceError> {
+        self.bounds.validate()?;
         let material = NetSuiteProposalRequestMaterial {
             operations: self.operations.clone(),
             bounds: self.bounds.clone(),
@@ -1084,6 +1086,7 @@ impl<T: crate::transport::NetSuiteTransport> NetSuiteAccountingResultService<T> 
         at: DateTime<Utc>,
     ) -> Result<NetSuiteAccountingProposal, NetSuiteServiceError> {
         self.ensure_active()?;
+        request.bounds().validate()?;
         if request.window() != self.scope.observation_window()
             || request.work_product_revision() != self.scope.work_product_revision()
             || request.request_digest != request.recompute_digest()?
@@ -1194,6 +1197,7 @@ impl<T: crate::transport::NetSuiteTransport> NetSuiteAccountingResultService<T> 
         at: DateTime<Utc>,
     ) -> Result<NetSuiteSuiteQlProposal, NetSuiteServiceError> {
         self.ensure_active()?;
+        bounds.validate()?;
         if !self
             .scope
             .consent_scope()

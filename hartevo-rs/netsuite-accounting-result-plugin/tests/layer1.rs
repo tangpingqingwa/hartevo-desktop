@@ -6,12 +6,13 @@ use hartevo_netsuite_accounting_result_plugin::{
     CollectionFilterOperator, CollectionFilterValue, ConsentScope, DataCenter, Digest,
     FixtureNetSuiteTransport, LoopbackNetSuiteTransport, MissionId,
     MissionNetSuiteAccountingConsumer, NETSUITE_ACCOUNTING_RESULT_CONTRACT_VERSION,
-    NETSUITE_ACCOUNTING_RESULT_PLUGIN_VERSION, NetSuiteAccountingProposal,
-    NetSuiteAccountingProposalRequest, NetSuiteAccountingResultService, NetSuiteAccountingStatus,
-    NetSuiteBounds, NetSuiteCollectionSummary, NetSuiteGetRequest, NetSuiteHttpMethod,
-    NetSuiteProviderError, NetSuiteReadOperation, NetSuiteRecordMetadata, NetSuiteRecordStatus,
-    NetSuiteRecordType, NetSuiteSafeRecordField, NetSuiteScope, NetSuiteSelectedRecordSummary,
-    NetSuiteSnapshot, NetSuiteSuiteQlField, NetSuiteSuiteTalkProvider, NetSuiteTransportError,
+    NETSUITE_ACCOUNTING_RESULT_PLUGIN_VERSION, NETSUITE_MAX_PAGES, NETSUITE_MAX_RESPONSE_BYTES,
+    NETSUITE_PAGE_SIZE, NetSuiteAccountingProposal, NetSuiteAccountingProposalRequest,
+    NetSuiteAccountingResultService, NetSuiteAccountingStatus, NetSuiteBounds,
+    NetSuiteCollectionSummary, NetSuiteGetRequest, NetSuiteHttpMethod, NetSuiteProviderError,
+    NetSuiteReadOperation, NetSuiteRecordMetadata, NetSuiteRecordStatus, NetSuiteRecordType,
+    NetSuiteSafeRecordField, NetSuiteScope, NetSuiteSelectedRecordSummary, NetSuiteSnapshot,
+    NetSuiteSuiteQlField, NetSuiteSuiteTalkProvider, NetSuiteTransportError,
     NetSuiteTransportProvenance, ObservationWindow, OpaqueCursor, ProjectId,
     ProviderDefinitionError, RecordingNetSuiteTransport, Revision, RoleId, SecretReference,
     WorkProductId, contract_digest,
@@ -717,4 +718,100 @@ fn provider_revision_and_observation_window_bounds_fail_closed() {
         mismatched_provider.read(&metadata_request, NetSuiteBounds::default()),
         Err(NetSuiteProviderError::RevisionMismatch)
     ));
+}
+
+#[test]
+fn bounds_serde_rejects_invalid_limits_before_model_visible_evidence() {
+    let json = |max_pages: u16,
+                page_size: u16,
+                max_records: u32,
+                max_response_bytes: usize,
+                max_retry_attempts: u8| {
+        format!(
+            "{{\"maxPages\":{max_pages},\"pageSize\":{page_size},\"maxRecords\":{max_records},\"maxResponseBytes\":{max_response_bytes},\"maxRetryAttempts\":{max_retry_attempts}}}"
+        )
+    };
+
+    let serialized = serde_json::to_string(&NetSuiteBounds::default()).expect("bounds JSON");
+    let rehydrated: NetSuiteBounds =
+        serde_json::from_str(&serialized).expect("default bounds rehydrate");
+    assert_eq!(rehydrated, NetSuiteBounds::default());
+    assert!(
+        serde_json::from_str::<NetSuiteBounds>(&json(
+            NETSUITE_MAX_PAGES,
+            NETSUITE_PAGE_SIZE,
+            200,
+            NETSUITE_MAX_RESPONSE_BYTES,
+            4,
+        ))
+        .is_ok()
+    );
+
+    let invalid = [
+        json(0, NETSUITE_PAGE_SIZE, 200, NETSUITE_MAX_RESPONSE_BYTES, 4),
+        json(
+            NETSUITE_MAX_PAGES + 1,
+            NETSUITE_PAGE_SIZE,
+            200,
+            NETSUITE_MAX_RESPONSE_BYTES,
+            4,
+        ),
+        json(1, 0, 200, NETSUITE_MAX_RESPONSE_BYTES, 4),
+        json(
+            1,
+            NETSUITE_PAGE_SIZE + 1,
+            200,
+            NETSUITE_MAX_RESPONSE_BYTES,
+            4,
+        ),
+        json(1, NETSUITE_PAGE_SIZE, 0, NETSUITE_MAX_RESPONSE_BYTES, 4),
+        json(1, NETSUITE_PAGE_SIZE, 201, NETSUITE_MAX_RESPONSE_BYTES, 4),
+        json(1, NETSUITE_PAGE_SIZE, 200, 0, 4),
+        json(
+            1,
+            NETSUITE_PAGE_SIZE,
+            200,
+            NETSUITE_MAX_RESPONSE_BYTES + 1,
+            4,
+        ),
+        json(1, NETSUITE_PAGE_SIZE, 200, NETSUITE_MAX_RESPONSE_BYTES, 0),
+        json(1, NETSUITE_PAGE_SIZE, 200, NETSUITE_MAX_RESPONSE_BYTES, 5),
+    ];
+    for candidate in invalid {
+        assert!(
+            serde_json::from_str::<NetSuiteBounds>(&candidate).is_err(),
+            "invalid bounds accepted: {candidate}"
+        );
+    }
+    let unknown = format!(
+        "{}\n,\"unknown\":true}}",
+        json(1, NETSUITE_PAGE_SIZE, 200, NETSUITE_MAX_RESPONSE_BYTES, 4).trim_end_matches('}')
+    );
+    assert!(serde_json::from_str::<NetSuiteBounds>(&unknown).is_err());
+
+    let fixture = fixture();
+    let proposal_request = NetSuiteAccountingProposalRequest::new(
+        [
+            NetSuiteReadOperation::RecordMetadata,
+            NetSuiteReadOperation::RecordCollectionFilter,
+            NetSuiteReadOperation::SelectedRecord,
+        ],
+        rehydrated,
+        fixture.window.clone(),
+        fixture.scope.work_product_revision(),
+    )
+    .expect("rehydrated bounds request");
+    let provider = NetSuiteSuiteTalkProvider::new(
+        FixtureNetSuiteTransport::new(fixture.snapshot),
+        "suitetalk-recording-r1",
+        NetSuiteTransportProvenance::Fixture,
+    )
+    .expect("fixture provider");
+    let mut service = NetSuiteAccountingResultService::new(fixture.scope, fixture.secret, provider)
+        .expect("fixture service");
+    let proposal = service
+        .propose(proposal_request, at())
+        .expect("rehydrated bounds proposal");
+    assert_eq!(proposal.status, NetSuiteAccountingStatus::Observed);
+    assert_eq!(proposal.evidence.receipts.len(), 3);
 }

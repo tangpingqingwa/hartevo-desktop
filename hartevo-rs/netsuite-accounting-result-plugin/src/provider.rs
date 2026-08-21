@@ -353,6 +353,7 @@ impl<T: NetSuiteTransport> NetSuiteSuiteTalkProvider<T> {
         request: &NetSuiteGetRequest,
         bounds: NetSuiteBounds,
     ) -> Result<NetSuiteProviderRead, NetSuiteProviderError> {
+        bounds.validate().map_err(NetSuiteProviderError::Model)?;
         if !request.operation().is_get()
             || request.method() != NetSuiteHttpMethod::Get
             || request.page_number() == 0
@@ -453,6 +454,7 @@ impl<T: NetSuiteTransport> NetSuiteSuiteTalkProvider<T> {
         response: &NetSuiteGetResponse,
         provider_revision: &str,
     ) -> Result<(), NetSuiteProviderError> {
+        bounds.validate().map_err(NetSuiteProviderError::Model)?;
         response
             .validate_integrity()
             .map_err(|_| NetSuiteProviderError::ResponseIntegrity)?;

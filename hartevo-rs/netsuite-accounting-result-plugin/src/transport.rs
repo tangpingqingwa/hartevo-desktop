@@ -278,6 +278,7 @@ impl NetSuiteGetRequest {
         page_number: u16,
         cursor: Option<OpaqueCursor>,
     ) -> Result<Self, ModelError> {
+        bounds.validate()?;
         if scope.validate_digest().is_err()
             || !operation.is_get()
             || page_number == 0

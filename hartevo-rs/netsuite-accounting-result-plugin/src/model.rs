@@ -659,7 +659,7 @@ impl ConsentScope {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetSuiteBounds {
     max_pages: u16,
@@ -667,6 +667,33 @@ pub struct NetSuiteBounds {
     max_records: u32,
     max_response_bytes: usize,
     max_retry_attempts: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NetSuiteBoundsSerde {
+    max_pages: u16,
+    page_size: u16,
+    max_records: u32,
+    max_response_bytes: usize,
+    max_retry_attempts: u8,
+}
+
+impl<'de> Deserialize<'de> for NetSuiteBounds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let values = NetSuiteBoundsSerde::deserialize(deserializer)?;
+        Self::new(
+            values.max_pages,
+            values.page_size,
+            values.max_records,
+            values.max_response_bytes,
+            values.max_retry_attempts,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl NetSuiteBounds {
@@ -677,26 +704,32 @@ impl NetSuiteBounds {
         max_response_bytes: usize,
         max_retry_attempts: u8,
     ) -> Result<Self, ModelError> {
-        if max_pages == 0
-            || max_pages > MAX_PAGES
-            || page_size == 0
-            || page_size > MAX_PAGE_SIZE
-            || max_records == 0
-            || max_records > MAX_RECORDS
-            || max_response_bytes == 0
-            || max_response_bytes > MAX_RESPONSE_BYTES
-            || max_retry_attempts == 0
-            || max_retry_attempts > MAX_RETRY_ATTEMPTS
-        {
-            return Err(ModelError::InvalidBounds);
-        }
-        Ok(Self {
+        let bounds = Self {
             max_pages,
             page_size,
             max_records,
             max_response_bytes,
             max_retry_attempts,
-        })
+        };
+        bounds.validate()?;
+        Ok(bounds)
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.max_pages == 0
+            || self.max_pages > MAX_PAGES
+            || self.page_size == 0
+            || self.page_size > MAX_PAGE_SIZE
+            || self.max_records == 0
+            || self.max_records > MAX_RECORDS
+            || self.max_response_bytes == 0
+            || self.max_response_bytes > MAX_RESPONSE_BYTES
+            || self.max_retry_attempts == 0
+            || self.max_retry_attempts > MAX_RETRY_ATTEMPTS
+        {
+            return Err(ModelError::InvalidBounds);
+        }
+        Ok(())
     }
 
     pub const fn max_pages(&self) -> u16 {
