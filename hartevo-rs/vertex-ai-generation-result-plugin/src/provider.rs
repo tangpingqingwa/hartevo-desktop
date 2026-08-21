@@ -1,6 +1,10 @@
 //! Non-native provider seam for recorded Vertex AI response frames.
 
-use std::fmt;
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Mutex, OnceLock},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -16,6 +20,12 @@ use crate::{
 };
 
 pub const DEFAULT_PROVIDER_RESPONSE_BYTES: usize = crate::model::MAX_RESPONSE_BYTES;
+
+/// Process-global monotonic recording tombstones. This is shared by cloned
+/// and freshly constructed services in one process, but intentionally is not
+/// durable across process restarts; Layer-1 never claims a durable receipt.
+static RECORDING_TOMBSTONES: OnceLock<Mutex<BTreeMap<String, crate::model::Digest>>> =
+    OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -206,6 +216,8 @@ impl RecordedVertexAiResponse {
         response: VertexAiResponse,
         latency_ms: u64,
     ) -> Self {
+        // No raw body was supplied to this typed fixture constructor, so zero
+        // truthfully means that raw HTTP byte accounting is unavailable.
         let response_digest = response.response_digest();
         Self::new(
             recording_id,
@@ -439,6 +451,11 @@ impl VertexAiGenerationProvider {
         false
     }
 
+    /// The replay fence is process-global but not durable storage.
+    pub const fn replay_fence_durable(&self) -> bool {
+        false
+    }
+
     pub fn describe_model(
         &self,
         scope: &crate::model::VertexAiGenerationScope,
@@ -474,6 +491,7 @@ impl VertexAiGenerationProvider {
     ) -> Result<GenerationResultEvidence, VertexAiGenerationError> {
         proposal.verify_integrity()?;
         validate_recording_identity(proposal, response)?;
+        claim_recording(response.recording_id(), &proposal.proposal_digest)?;
         match &response.outcome {
             ProviderResponseOutcome::Http {
                 status,
@@ -481,7 +499,9 @@ impl VertexAiGenerationProvider {
                 response_digest,
                 frame,
             } => {
-                if *body_bytes > self.max_response_bytes {
+                if *body_bytes > self.max_response_bytes
+                    || *body_bytes > DEFAULT_PROVIDER_RESPONSE_BYTES
+                {
                     return Err(VertexAiGenerationError::ResponseTooLarge);
                 }
                 if (200..300).contains(status) {
@@ -491,10 +511,15 @@ impl VertexAiGenerationProvider {
                         ));
                     }
                     let VertexAiResponseFrame::Parsed(parsed) = frame else {
-                        return Err(VertexAiGenerationError::MalformedResponse(
-                            "successful response frame is not a complete typed response",
-                        ));
+                        return Err(if matches!(frame, VertexAiResponseFrame::Oversized) {
+                            VertexAiGenerationError::ResponseTooLarge
+                        } else {
+                            VertexAiGenerationError::MalformedResponse(
+                                "successful response frame is not a complete typed response",
+                            )
+                        });
                     };
+                    parsed.validate_metadata()?;
                     validate_response(scope, proposal, parsed)?;
                     let candidates = parsed
                         .candidates
@@ -607,7 +632,10 @@ fn validate_recording_identity(
 ) -> Result<(), VertexAiGenerationError> {
     if response.recording_id.trim().is_empty()
         || response.recording_id.len() > crate::model::MAX_IDENTIFIER_BYTES
-        || response.recording_id.chars().any(char::is_control)
+        || response
+            .recording_id
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
     {
         return Err(VertexAiGenerationError::InvalidField {
             field: "recording_id",
@@ -635,11 +663,27 @@ fn validate_recording_identity(
     Ok(())
 }
 
+fn claim_recording(
+    recording_id: &str,
+    proposal_digest: &crate::model::Digest,
+) -> Result<(), VertexAiGenerationError> {
+    let tombstones = RECORDING_TOMBSTONES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut tombstones = tombstones.lock().map_err(|_| {
+        VertexAiGenerationError::BlockedEnvironment("recording replay fence is unavailable")
+    })?;
+    if tombstones.contains_key(recording_id) {
+        return Err(VertexAiGenerationError::ReplayDetected);
+    }
+    tombstones.insert(recording_id.to_owned(), proposal_digest.clone());
+    Ok(())
+}
+
 fn validate_response(
     scope: Option<&crate::model::VertexAiGenerationScope>,
     proposal: &GenerationResultProposal,
     response: &VertexAiResponse,
 ) -> Result<(), VertexAiGenerationError> {
+    response.validate_metadata()?;
     if response.model_version != proposal.model.expected_model_version() {
         return Err(VertexAiGenerationError::ModelSnapshotDrift);
     }
@@ -658,8 +702,11 @@ fn validate_response(
     let output_bytes = response
         .candidates
         .iter()
-        .map(|candidate| candidate.content_byte_length)
-        .sum::<usize>();
+        .try_fold(0_usize, |total, candidate| {
+            total
+                .checked_add(candidate.content_byte_length)
+                .ok_or(VertexAiGenerationError::ResponseContentTooLarge)
+        })?;
     if output_bytes > max_output_bytes {
         return Err(VertexAiGenerationError::ResponseContentTooLarge);
     }
@@ -757,6 +804,9 @@ impl VertexAiResponse {
     /// candidate text is hashed and discarded before this method returns.
     pub fn from_json(body: impl AsRef<[u8]>) -> Result<Self, VertexAiGenerationError> {
         let body = body.as_ref();
+        if body.len() > DEFAULT_PROVIDER_RESPONSE_BYTES {
+            return Err(VertexAiGenerationError::ResponseTooLarge);
+        }
         let value: Value = serde_json::from_slice(body)
             .map_err(|_| VertexAiGenerationError::MalformedResponse("body is not valid JSON"))?;
         reject_forbidden_fields(&value)?;

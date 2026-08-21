@@ -108,5 +108,16 @@ mod contract_document_tests {
         assert_eq!(contract["allowlist"]["grounding"], false);
         assert_eq!(contract["registration"]["reversible"], true);
         assert_eq!(contract["registration"]["revocable"], true);
+        assert_eq!(
+            contract["registration"]["replayFence"]["scope"],
+            "process_global"
+        );
+        assert_eq!(
+            contract["registration"]["replayFence"]["sharedAcrossServices"],
+            true
+        );
+        assert_eq!(contract["registration"]["replayFence"]["monotonic"], true);
+        assert_eq!(contract["registration"]["replayFence"]["durable"], false);
+        assert_eq!(contract["registration"]["replayFence"]["failClosed"], true);
     }
 }

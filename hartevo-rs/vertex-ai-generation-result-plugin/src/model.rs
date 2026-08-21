@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeSet, fmt};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -132,7 +132,7 @@ pub enum VertexAiGenerationError {
 }
 
 /// SHA-256 digest used to fence every externally meaningful binding.
-#[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Digest(String);
 
@@ -163,6 +163,16 @@ impl Digest {
 
     pub(crate) fn from_hex(bytes: impl AsRef<[u8]>) -> Self {
         Self(crate::hex_encode(bytes))
+    }
+}
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -204,7 +214,9 @@ fn valid_revision(value: &str) -> bool {
 fn valid_scoped_id(value: &str) -> bool {
     !value.trim().is_empty()
         && value.len() <= MAX_IDENTIFIER_BYTES
-        && value.chars().all(|character| !character.is_control())
+        && value
+            .chars()
+            .all(|character| !character.is_control() && !character.is_whitespace())
 }
 
 fn validate_scoped_id(
@@ -321,11 +333,28 @@ impl SecretReference {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GoogleCloudProject {
     project_id: String,
     revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GoogleCloudProjectWire {
+    project_id: String,
+    revision: u64,
+}
+
+impl<'de> Deserialize<'de> for GoogleCloudProject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GoogleCloudProjectWire::deserialize(deserializer)?;
+        Self::new(wire.project_id, wire.revision).map_err(serde::de::Error::custom)
+    }
 }
 
 impl GoogleCloudProject {
@@ -373,9 +402,18 @@ impl GoogleCloudProject {
     }
 }
 
-#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct VertexLocation(String);
+
+impl<'de> Deserialize<'de> for VertexLocation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
 
 impl VertexLocation {
     pub fn new(value: impl Into<String>) -> Result<Self, VertexAiGenerationError> {
@@ -464,8 +502,8 @@ fn allowlisted_model_id(value: &str) -> bool {
     };
     version.contains('.')
         && version
-            .chars()
-            .all(|character| character.is_ascii_digit() || character == '.')
+            .split('.')
+            .all(|segment| !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()))
         && !family.is_empty()
         && family
             .chars()
@@ -477,11 +515,28 @@ fn allowlisted_model_id(value: &str) -> bool {
         && !value.ends_with("-latest")
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelSnapshot {
     model_id: String,
     immutable_snapshot: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ModelSnapshotWire {
+    model_id: String,
+    immutable_snapshot: String,
+}
+
+impl<'de> Deserialize<'de> for ModelSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ModelSnapshotWire::deserialize(deserializer)?;
+        Self::new(wire.model_id, wire.immutable_snapshot).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ModelSnapshot {
@@ -533,11 +588,28 @@ impl ModelSnapshot {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectScope {
     id: String,
     revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectScopeWire {
+    id: String,
+    revision: u64,
+}
+
+impl<'de> Deserialize<'de> for ProjectScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ProjectScopeWire::deserialize(deserializer)?;
+        Self::new(wire.id, wire.revision).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ProjectScope {
@@ -559,11 +631,28 @@ impl ProjectScope {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MissionScope {
     id: String,
     revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MissionScopeWire {
+    id: String,
+    revision: u64,
+}
+
+impl<'de> Deserialize<'de> for MissionScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = MissionScopeWire::deserialize(deserializer)?;
+        Self::new(wire.id, wire.revision).map_err(serde::de::Error::custom)
+    }
 }
 
 impl MissionScope {
@@ -585,11 +674,28 @@ impl MissionScope {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkProductScope {
     id: String,
     revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkProductScopeWire {
+    id: String,
+    revision: u64,
+}
+
+impl<'de> Deserialize<'de> for WorkProductScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WorkProductScopeWire::deserialize(deserializer)?;
+        Self::new(wire.id, wire.revision).map_err(serde::de::Error::custom)
+    }
 }
 
 impl WorkProductScope {
@@ -694,7 +800,7 @@ pub enum InputModality {
     DocumentReference,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InputPolicy {
     revision: String,
@@ -704,6 +810,37 @@ pub struct InputPolicy {
     max_text_bytes: usize,
     max_image_bytes: usize,
     max_document_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InputPolicyWire {
+    revision: String,
+    allowed_modalities: BTreeSet<InputModality>,
+    max_input_bytes: usize,
+    max_parts: usize,
+    max_text_bytes: usize,
+    max_image_bytes: usize,
+    max_document_bytes: usize,
+}
+
+impl<'de> Deserialize<'de> for InputPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = InputPolicyWire::deserialize(deserializer)?;
+        Self::new(
+            wire.revision,
+            wire.max_input_bytes,
+            wire.max_parts,
+            wire.max_text_bytes,
+            wire.max_image_bytes,
+            wire.max_document_bytes,
+        )
+        .and_then(|policy| policy.with_modalities(wire.allowed_modalities))
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl InputPolicy {
@@ -728,10 +865,13 @@ impl InputPolicy {
             || max_parts > MAX_INPUT_PARTS
             || max_text_bytes == 0
             || max_text_bytes > MAX_TEXT_INPUT_BYTES
+            || max_text_bytes > max_input_bytes
             || max_image_bytes == 0
             || max_image_bytes > MAX_IMAGE_REFERENCE_BYTES
+            || max_image_bytes > max_input_bytes
             || max_document_bytes == 0
             || max_document_bytes > MAX_DOCUMENT_REFERENCE_BYTES
+            || max_document_bytes > max_input_bytes
         {
             return Err(VertexAiGenerationError::InvalidField {
                 field: "input_policy_bounds",
@@ -825,7 +965,7 @@ const ALLOWED_DOCUMENT_MEDIA_TYPES: &[&str] = &[
     "text/plain",
 ];
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum InputPart {
     Text {
@@ -842,6 +982,62 @@ pub enum InputPart {
         media_type: String,
         byte_length: usize,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+enum InputPartWire {
+    Text {
+        content_digest: Digest,
+        byte_length: usize,
+    },
+    ImageReference {
+        reference_digest: Digest,
+        media_type: String,
+        byte_length: usize,
+    },
+    DocumentReference {
+        reference_digest: Digest,
+        media_type: String,
+        byte_length: usize,
+    },
+}
+
+impl<'de> Deserialize<'de> for InputPart {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let part = match InputPartWire::deserialize(deserializer)? {
+            InputPartWire::Text {
+                content_digest,
+                byte_length,
+            } => Self::Text {
+                content_digest,
+                byte_length,
+            },
+            InputPartWire::ImageReference {
+                reference_digest,
+                media_type,
+                byte_length,
+            } => Self::ImageReference {
+                reference_digest,
+                media_type,
+                byte_length,
+            },
+            InputPartWire::DocumentReference {
+                reference_digest,
+                media_type,
+                byte_length,
+            } => Self::DocumentReference {
+                reference_digest,
+                media_type,
+                byte_length,
+            },
+        };
+        part.validate_metadata().map_err(serde::de::Error::custom)?;
+        Ok(part)
+    }
 }
 
 impl InputPart {
@@ -923,6 +1119,68 @@ impl InputPart {
     pub fn digest(&self) -> Digest {
         digest_serializable(self)
     }
+
+    fn validate_metadata(&self) -> Result<(), VertexAiGenerationError> {
+        match self {
+            Self::Text {
+                content_digest,
+                byte_length,
+            } => {
+                if !content_digest.is_sha256() {
+                    return Err(VertexAiGenerationError::InvalidField {
+                        field: "text_content_digest",
+                        reason: "must be a SHA-256 digest",
+                    });
+                }
+                if *byte_length == 0 || *byte_length > MAX_TEXT_INPUT_BYTES {
+                    return Err(VertexAiGenerationError::InputPartTooLarge);
+                }
+            }
+            Self::ImageReference {
+                reference_digest,
+                media_type,
+                byte_length,
+            } => {
+                if !reference_digest.is_sha256() {
+                    return Err(VertexAiGenerationError::InvalidField {
+                        field: "image_reference_digest",
+                        reason: "must be a SHA-256 digest",
+                    });
+                }
+                if !ALLOWED_IMAGE_MEDIA_TYPES.contains(&media_type.as_str()) {
+                    return Err(VertexAiGenerationError::InvalidField {
+                        field: "media_type",
+                        reason: "must be an allowlisted image media type",
+                    });
+                }
+                if *byte_length == 0 || *byte_length > MAX_IMAGE_REFERENCE_BYTES {
+                    return Err(VertexAiGenerationError::InputPartTooLarge);
+                }
+            }
+            Self::DocumentReference {
+                reference_digest,
+                media_type,
+                byte_length,
+            } => {
+                if !reference_digest.is_sha256() {
+                    return Err(VertexAiGenerationError::InvalidField {
+                        field: "document_reference_digest",
+                        reason: "must be a SHA-256 digest",
+                    });
+                }
+                if !ALLOWED_DOCUMENT_MEDIA_TYPES.contains(&media_type.as_str()) {
+                    return Err(VertexAiGenerationError::InvalidField {
+                        field: "media_type",
+                        reason: "must be an allowlisted document media type",
+                    });
+                }
+                if *byte_length == 0 || *byte_length > MAX_DOCUMENT_REFERENCE_BYTES {
+                    return Err(VertexAiGenerationError::InputPartTooLarge);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn validate_media_reference(
@@ -955,7 +1213,7 @@ fn media_reference_digest(kind: &str, reference: &str, media_type: &str) -> Dige
     digest_serializable(&("vertex-media-reference/v1", kind, reference, media_type))
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GenerationInput {
     parts: Vec<InputPart>,
@@ -963,21 +1221,33 @@ pub struct GenerationInput {
     input_digest: Digest,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GenerationInputWire {
+    parts: Vec<InputPart>,
+    total_bytes: usize,
+    input_digest: Digest,
+}
+
+impl<'de> Deserialize<'de> for GenerationInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GenerationInputWire::deserialize(deserializer)?;
+        let input = Self {
+            parts: wire.parts,
+            total_bytes: wire.total_bytes,
+            input_digest: wire.input_digest,
+        };
+        input.verify_integrity().map_err(serde::de::Error::custom)?;
+        Ok(input)
+    }
+}
+
 impl GenerationInput {
     pub fn new(parts: Vec<InputPart>) -> Result<Self, VertexAiGenerationError> {
-        if parts.is_empty() {
-            return Err(VertexAiGenerationError::InvalidField {
-                field: "input_parts",
-                reason: "must contain at least one text, image reference, or document reference",
-            });
-        }
-        if parts.len() > MAX_INPUT_PARTS {
-            return Err(VertexAiGenerationError::InputPartCountExceeded);
-        }
-        let total_bytes = parts.iter().map(InputPart::byte_length).sum::<usize>();
-        if total_bytes > MAX_INPUT_BYTES {
-            return Err(VertexAiGenerationError::InputTooLarge);
-        }
+        let total_bytes = validate_input_parts(&parts)?;
         let input_digest = digest_serializable(&("vertex-generation-input/v1", &parts));
         Ok(Self {
             parts,
@@ -1040,6 +1310,10 @@ impl GenerationInput {
     }
 
     pub fn verify_integrity(&self) -> Result<(), VertexAiGenerationError> {
+        let expected_total_bytes = validate_input_parts(&self.parts)?;
+        if expected_total_bytes != self.total_bytes {
+            return Err(VertexAiGenerationError::ProposalTampered);
+        }
         let expected = digest_serializable(&("vertex-generation-input/v1", &self.parts));
         if expected == self.input_digest {
             Ok(())
@@ -1047,6 +1321,29 @@ impl GenerationInput {
             Err(VertexAiGenerationError::ProposalTampered)
         }
     }
+}
+
+fn validate_input_parts(parts: &[InputPart]) -> Result<usize, VertexAiGenerationError> {
+    if parts.is_empty() {
+        return Err(VertexAiGenerationError::InvalidField {
+            field: "input_parts",
+            reason: "must contain at least one text, image reference, or document reference",
+        });
+    }
+    if parts.len() > MAX_INPUT_PARTS {
+        return Err(VertexAiGenerationError::InputPartCountExceeded);
+    }
+    let mut total_bytes = 0_usize;
+    for part in parts {
+        part.validate_metadata()?;
+        total_bytes = total_bytes
+            .checked_add(part.byte_length())
+            .ok_or(VertexAiGenerationError::InputTooLarge)?;
+    }
+    if total_bytes > MAX_INPUT_BYTES {
+        return Err(VertexAiGenerationError::InputTooLarge);
+    }
+    Ok(total_bytes)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1149,13 +1446,43 @@ impl GenerationRequest {
     pub fn output_schema(&self) -> Option<&OutputSchema> {
         self.output_schema.as_ref()
     }
+
+    pub(crate) fn validate_bounds(&self) -> Result<(), VertexAiGenerationError> {
+        if self.max_output_tokens == 0 || self.max_output_tokens > MAX_OUTPUT_TOKENS {
+            return Err(VertexAiGenerationError::OutputTokenBudgetExceeded);
+        }
+        if self.candidate_count == 0 || self.candidate_count > MAX_CANDIDATES {
+            return Err(VertexAiGenerationError::CandidateCountExceeded);
+        }
+        if let Some(schema) = &self.output_schema {
+            schema.validate_metadata()?;
+        }
+        Ok(())
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutputSchema {
     name: String,
     schema_digest: Digest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OutputSchemaWire {
+    name: String,
+    schema_digest: Digest,
+}
+
+impl<'de> Deserialize<'de> for OutputSchema {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = OutputSchemaWire::deserialize(deserializer)?;
+        Self::from_digest(wire.name, wire.schema_digest).map_err(serde::de::Error::custom)
+    }
 }
 
 impl OutputSchema {
@@ -1216,6 +1543,13 @@ impl OutputSchema {
     pub fn digest(&self) -> Digest {
         digest_serializable(self)
     }
+
+    fn validate_metadata(&self) -> Result<(), VertexAiGenerationError> {
+        if !valid_token(&self.name, MAX_SCHEMA_NAME_BYTES) || !self.schema_digest.is_sha256() {
+            return Err(VertexAiGenerationError::SchemaTooLarge);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1224,7 +1558,7 @@ pub enum RedactionMode {
     DigestOnly,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedactionPolicy {
     mode: RedactionMode,
@@ -1234,6 +1568,43 @@ pub struct RedactionPolicy {
     retain_grounding_chunks: bool,
     retain_tool_arguments: bool,
     retain_file_bytes: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RedactionPolicyWire {
+    mode: RedactionMode,
+    retain_raw_prompts: bool,
+    retain_raw_outputs: bool,
+    retain_hidden_reasoning: bool,
+    retain_grounding_chunks: bool,
+    retain_tool_arguments: bool,
+    retain_file_bytes: bool,
+}
+
+impl<'de> Deserialize<'de> for RedactionPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RedactionPolicyWire::deserialize(deserializer)?;
+        if wire.mode != RedactionMode::DigestOnly
+            || wire.retain_raw_prompts
+            || wire.retain_raw_outputs
+            || wire.retain_hidden_reasoning
+            || wire.retain_grounding_chunks
+            || wire.retain_tool_arguments
+            || wire.retain_file_bytes
+        {
+            return Err(serde::de::Error::custom(
+                VertexAiGenerationError::InvalidField {
+                    field: "redaction_policy",
+                    reason: "Layer-1 redaction must be digest-only and retain no raw content",
+                },
+            ));
+        }
+        Ok(Self::digest_only())
+    }
 }
 
 impl RedactionPolicy {
@@ -1262,7 +1633,7 @@ impl RedactionPolicy {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResponseScope {
     revision: String,
@@ -1271,6 +1642,35 @@ pub struct ResponseScope {
     max_output_tokens: u32,
     output_schema: Option<OutputSchema>,
     redaction: RedactionPolicy,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResponseScopeWire {
+    revision: String,
+    max_candidates: usize,
+    max_output_bytes: usize,
+    max_output_tokens: u32,
+    output_schema: Option<OutputSchema>,
+    redaction: RedactionPolicy,
+}
+
+impl<'de> Deserialize<'de> for ResponseScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ResponseScopeWire::deserialize(deserializer)?;
+        Self::new(
+            wire.revision,
+            wire.max_candidates,
+            wire.max_output_bytes,
+            wire.max_output_tokens,
+            wire.output_schema,
+            wire.redaction,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl ResponseScope {
@@ -1402,12 +1802,31 @@ impl SafetySetting {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SafetyPolicy {
     revision: String,
     settings: Vec<SafetySetting>,
     block_on_unspecified: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SafetyPolicyWire {
+    revision: String,
+    settings: Vec<SafetySetting>,
+    block_on_unspecified: bool,
+}
+
+impl<'de> Deserialize<'de> for SafetyPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SafetyPolicyWire::deserialize(deserializer)?;
+        Self::new(wire.revision, wire.settings, wire.block_on_unspecified)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl SafetyPolicy {
@@ -1492,7 +1911,7 @@ impl SafetyPolicy {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolGroundingPolicy {
     revision: String,
@@ -1500,6 +1919,33 @@ pub struct ToolGroundingPolicy {
     allow_grounding: bool,
     allow_search_grounding: bool,
     allow_maps_grounding: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ToolGroundingPolicyWire {
+    revision: String,
+    allow_tool_calls: bool,
+    allow_grounding: bool,
+    allow_search_grounding: bool,
+    allow_maps_grounding: bool,
+}
+
+impl<'de> Deserialize<'de> for ToolGroundingPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ToolGroundingPolicyWire::deserialize(deserializer)?;
+        Self::new(
+            wire.revision,
+            wire.allow_tool_calls,
+            wire.allow_grounding,
+            wire.allow_search_grounding,
+            wire.allow_maps_grounding,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl ToolGroundingPolicy {
@@ -1558,12 +2004,38 @@ impl ToolGroundingPolicy {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConsentScope {
     consent_digest: Digest,
     revision: u64,
     purpose: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConsentScopeWire {
+    consent_digest: Digest,
+    revision: u64,
+    purpose: String,
+}
+
+impl<'de> Deserialize<'de> for ConsentScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ConsentScopeWire::deserialize(deserializer)?;
+        if wire.purpose != "vertex_ai_gemini_generation" {
+            return Err(serde::de::Error::custom(
+                VertexAiGenerationError::InvalidField {
+                    field: "consent_purpose",
+                    reason: "must be the Vertex AI Gemini generation purpose",
+                },
+            ));
+        }
+        Self::from_digest(wire.consent_digest, wire.revision).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ConsentScope {
@@ -2069,6 +2541,14 @@ impl PluginRegistration {
         {
             return Err(VertexAiGenerationError::RegistrationTampered);
         }
+        match &self.status {
+            RegistrationStatus::Revoked { revision, .. }
+                if *revision == 0 || *revision != self.revocation_revision =>
+            {
+                return Err(VertexAiGenerationError::RegistrationTampered);
+            }
+            RegistrationStatus::Active | RegistrationStatus::Revoked { .. } => {}
+        }
         if !self.is_active() {
             return Err(VertexAiGenerationError::RegistrationRevoked);
         }
@@ -2167,6 +2647,31 @@ impl RequestFingerprint {
             options: request.options,
             output_schema_digest: request.output_schema.as_ref().map(|schema| schema.digest()),
         }
+    }
+
+    fn validate_bounds(&self) -> Result<(), VertexAiGenerationError> {
+        if self.input_bytes == 0 || self.input_bytes > MAX_INPUT_BYTES {
+            return Err(VertexAiGenerationError::InputTooLarge);
+        }
+        if self.modalities.is_empty() || self.modalities.len() > 3 {
+            return Err(VertexAiGenerationError::ModalityForbidden);
+        }
+        let unique_modalities = self.modalities.iter().collect::<BTreeSet<_>>();
+        if unique_modalities.len() != self.modalities.len() {
+            return Err(VertexAiGenerationError::ModalityForbidden);
+        }
+        if self.max_output_tokens == 0 || self.max_output_tokens > MAX_OUTPUT_TOKENS {
+            return Err(VertexAiGenerationError::OutputTokenBudgetExceeded);
+        }
+        if self.candidate_count == 0 || self.candidate_count > MAX_CANDIDATES {
+            return Err(VertexAiGenerationError::CandidateCountExceeded);
+        }
+        if let Some(schema_digest) = &self.output_schema_digest
+            && !schema_digest.is_sha256()
+        {
+            return Err(VertexAiGenerationError::SchemaMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -2268,6 +2773,7 @@ impl GenerationResultProposal {
     }
 
     pub fn verify_integrity(&self) -> Result<(), VertexAiGenerationError> {
+        self.request.validate_bounds()?;
         if self.proposal_digest == self.compute_digest() {
             Ok(())
         } else {
@@ -2368,11 +2874,28 @@ pub enum SafetyBlockReason {
     Other,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PromptFeedback {
     pub block_reason: Option<SafetyBlockReason>,
     pub safety_ratings: Vec<SafetyRating>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PromptFeedbackWire {
+    block_reason: Option<SafetyBlockReason>,
+    safety_ratings: Vec<SafetyRating>,
+}
+
+impl<'de> Deserialize<'de> for PromptFeedback {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PromptFeedbackWire::deserialize(deserializer)?;
+        Self::new(wire.block_reason, wire.safety_ratings).map_err(serde::de::Error::custom)
+    }
 }
 
 impl PromptFeedback {
@@ -2394,9 +2917,18 @@ impl PromptFeedback {
     pub fn is_blocked(&self) -> bool {
         self.block_reason.is_some() || self.safety_ratings.iter().any(|rating| rating.blocked)
     }
+
+    pub(crate) fn validate_metadata(&self) -> Result<(), VertexAiGenerationError> {
+        if self.safety_ratings.len() > MAX_SAFETY_RATINGS {
+            return Err(VertexAiGenerationError::MalformedResponse(
+                "too many prompt safety ratings",
+            ));
+        }
+        Ok(())
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UsageMetadata {
     pub prompt_token_count: u64,
@@ -2404,6 +2936,33 @@ pub struct UsageMetadata {
     pub total_token_count: u64,
     pub cached_content_token_count: Option<u64>,
     pub thoughts_token_count: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UsageMetadataWire {
+    prompt_token_count: u64,
+    candidates_token_count: u64,
+    total_token_count: u64,
+    cached_content_token_count: Option<u64>,
+    thoughts_token_count: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for UsageMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = UsageMetadataWire::deserialize(deserializer)?;
+        Self::new(
+            wire.prompt_token_count,
+            wire.candidates_token_count,
+            wire.total_token_count,
+            wire.cached_content_token_count,
+            wire.thoughts_token_count,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl UsageMetadata {
@@ -2414,7 +2973,10 @@ impl UsageMetadata {
         cached_content_token_count: Option<u64>,
         thoughts_token_count: Option<u64>,
     ) -> Result<Self, VertexAiGenerationError> {
-        if prompt_token_count.saturating_add(candidates_token_count) > total_token_count {
+        if prompt_token_count
+            .checked_add(candidates_token_count)
+            .is_none_or(|sum| sum > total_token_count)
+        {
             return Err(VertexAiGenerationError::MalformedResponse(
                 "usage total is smaller than prompt plus candidates tokens",
             ));
@@ -2427,9 +2989,22 @@ impl UsageMetadata {
             thoughts_token_count,
         })
     }
+
+    pub(crate) fn validate_metadata(&self) -> Result<(), VertexAiGenerationError> {
+        if self
+            .prompt_token_count
+            .checked_add(self.candidates_token_count)
+            .is_none_or(|sum| sum > self.total_token_count)
+        {
+            return Err(VertexAiGenerationError::MalformedResponse(
+                "usage total is smaller than prompt plus candidates tokens",
+            ));
+        }
+        Ok(())
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VertexAiCandidate {
     pub index: u32,
@@ -2437,6 +3012,33 @@ pub struct VertexAiCandidate {
     pub content_byte_length: usize,
     pub finish_reason: FinishReason,
     pub safety_ratings: Vec<SafetyRating>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VertexAiCandidateWire {
+    index: u32,
+    content_digest: Digest,
+    content_byte_length: usize,
+    finish_reason: FinishReason,
+    safety_ratings: Vec<SafetyRating>,
+}
+
+impl<'de> Deserialize<'de> for VertexAiCandidate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = VertexAiCandidateWire::deserialize(deserializer)?;
+        Self::new(
+            wire.index,
+            wire.content_digest,
+            wire.content_byte_length,
+            wire.finish_reason,
+            wire.safety_ratings,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl VertexAiCandidate {
@@ -2447,7 +3049,11 @@ impl VertexAiCandidate {
         finish_reason: FinishReason,
         safety_ratings: Vec<SafetyRating>,
     ) -> Result<Self, VertexAiGenerationError> {
-        if !content_digest.is_sha256() || safety_ratings.len() > MAX_SAFETY_RATINGS {
+        if !content_digest.is_sha256()
+            || content_byte_length == 0
+            || content_byte_length > MAX_OUTPUT_BYTES
+            || safety_ratings.len() > MAX_SAFETY_RATINGS
+        {
             return Err(VertexAiGenerationError::MalformedResponse(
                 "candidate metadata is malformed",
             ));
@@ -2485,9 +3091,20 @@ impl VertexAiCandidate {
     pub fn digest(&self) -> Digest {
         digest_serializable(self)
     }
+
+    pub(crate) fn validate_metadata(&self) -> Result<(), VertexAiGenerationError> {
+        Self::new(
+            self.index,
+            self.content_digest.clone(),
+            self.content_byte_length,
+            self.finish_reason,
+            self.safety_ratings.clone(),
+        )
+        .map(|_| ())
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VertexAiResponse {
     pub response_id: String,
@@ -2495,6 +3112,33 @@ pub struct VertexAiResponse {
     pub candidates: Vec<VertexAiCandidate>,
     pub prompt_feedback: Option<PromptFeedback>,
     pub usage_metadata: Option<UsageMetadata>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VertexAiResponseWire {
+    response_id: String,
+    model_version: String,
+    candidates: Vec<VertexAiCandidate>,
+    prompt_feedback: Option<PromptFeedback>,
+    usage_metadata: Option<UsageMetadata>,
+}
+
+impl<'de> Deserialize<'de> for VertexAiResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = VertexAiResponseWire::deserialize(deserializer)?;
+        Self::new(
+            wire.response_id,
+            wire.model_version,
+            wire.candidates,
+            wire.prompt_feedback,
+            wire.usage_metadata,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl VertexAiResponse {
@@ -2517,25 +3161,15 @@ impl VertexAiResponse {
                 "model version is missing or invalid",
             ));
         }
-        if candidates.len() > MAX_CANDIDATES {
-            return Err(VertexAiGenerationError::ResponseCandidateCountExceeded);
-        }
-        if candidates.is_empty()
-            && prompt_feedback
-                .as_ref()
-                .is_none_or(|feedback| !feedback.is_blocked())
-        {
-            return Err(VertexAiGenerationError::MalformedResponse(
-                "response has neither candidates nor a safety block",
-            ));
-        }
-        Ok(Self {
+        let response = Self {
             response_id,
             model_version,
             candidates,
             prompt_feedback,
             usage_metadata,
-        })
+        };
+        response.validate_metadata()?;
+        Ok(response)
     }
 
     pub fn state(&self) -> ResponseState {
@@ -2577,6 +3211,49 @@ impl VertexAiResponse {
 
     pub fn response_digest(&self) -> Digest {
         digest_serializable(self)
+    }
+
+    pub(crate) fn validate_metadata(&self) -> Result<(), VertexAiGenerationError> {
+        if !valid_token(&self.response_id, MAX_RESPONSE_ID_BYTES) {
+            return Err(VertexAiGenerationError::MalformedResponse(
+                "response id is missing or invalid",
+            ));
+        }
+        if !valid_token(&self.model_version, MAX_IDENTIFIER_BYTES) {
+            return Err(VertexAiGenerationError::MalformedResponse(
+                "model version is missing or invalid",
+            ));
+        }
+        if self.candidates.len() > MAX_CANDIDATES {
+            return Err(VertexAiGenerationError::ResponseCandidateCountExceeded);
+        }
+        let mut output_bytes = 0_usize;
+        for candidate in &self.candidates {
+            candidate.validate_metadata()?;
+            output_bytes = output_bytes
+                .checked_add(candidate.content_byte_length)
+                .ok_or(VertexAiGenerationError::ResponseContentTooLarge)?;
+        }
+        if output_bytes > MAX_OUTPUT_BYTES {
+            return Err(VertexAiGenerationError::ResponseContentTooLarge);
+        }
+        if let Some(feedback) = &self.prompt_feedback {
+            feedback.validate_metadata()?;
+        }
+        if let Some(usage) = &self.usage_metadata {
+            usage.validate_metadata()?;
+        }
+        if self.candidates.is_empty()
+            && self
+                .prompt_feedback
+                .as_ref()
+                .is_none_or(|feedback| !feedback.is_blocked())
+        {
+            return Err(VertexAiGenerationError::MalformedResponse(
+                "response has neither candidates nor a safety block",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2644,7 +3321,7 @@ impl EvidenceAuthority {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CandidateSummary {
     pub index: u32,
@@ -2652,6 +3329,34 @@ pub struct CandidateSummary {
     pub content_byte_length: usize,
     pub finish_reason: FinishReason,
     pub safety_ratings: Vec<SafetyRating>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CandidateSummaryWire {
+    index: u32,
+    content_digest: Digest,
+    content_byte_length: usize,
+    finish_reason: FinishReason,
+    safety_ratings: Vec<SafetyRating>,
+}
+
+impl<'de> Deserialize<'de> for CandidateSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CandidateSummaryWire::deserialize(deserializer)?;
+        VertexAiCandidate::new(
+            wire.index,
+            wire.content_digest,
+            wire.content_byte_length,
+            wire.finish_reason,
+            wire.safety_ratings,
+        )
+        .map(|candidate| Self::from(&candidate))
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl From<&VertexAiCandidate> for CandidateSummary {
@@ -2663,6 +3368,19 @@ impl From<&VertexAiCandidate> for CandidateSummary {
             finish_reason: candidate.finish_reason,
             safety_ratings: candidate.safety_ratings.clone(),
         }
+    }
+}
+
+impl CandidateSummary {
+    fn validate_metadata(&self) -> Result<(), VertexAiGenerationError> {
+        VertexAiCandidate::new(
+            self.index,
+            self.content_digest.clone(),
+            self.content_byte_length,
+            self.finish_reason,
+            self.safety_ratings.clone(),
+        )
+        .map(|_| ())
     }
 }
 
@@ -2792,7 +3510,8 @@ impl GenerationResultEvidence {
     }
 
     pub fn verify_integrity(&self) -> Result<(), VertexAiGenerationError> {
-        if self.authority.connected
+        if self.validate_metadata().is_err()
+            || self.authority.connected
             || self.authority.native
             || self.authority.durable_receipt
             || self.authority.independent_read_back
@@ -2805,6 +3524,64 @@ impl GenerationResultEvidence {
         } else {
             Ok(())
         }
+    }
+
+    fn validate_metadata(&self) -> Result<(), VertexAiGenerationError> {
+        if self.evidence_version != "vertex-ai-generation-result-evidence/v1"
+            || !self.proposal_digest.is_sha256()
+            || !self.contract_digest.is_sha256()
+            || !self.registration_digest.is_sha256()
+            || !self.provider_digest.is_sha256()
+            || !self.permission_digest.is_sha256()
+            || !self.scope_digest.is_sha256()
+            || !self.project_digest.is_sha256()
+            || !self.mission_digest.is_sha256()
+            || !self.work_product_digest.is_sha256()
+            || !self.consent_digest.is_sha256()
+            || !self.response_digest.is_sha256()
+            || self
+                .output_digest
+                .as_ref()
+                .is_some_and(|digest| !digest.is_sha256())
+        {
+            return Err(VertexAiGenerationError::EvidenceTampered);
+        }
+        if self
+            .response_id
+            .as_deref()
+            .is_some_and(|value| !valid_token(value, MAX_RESPONSE_ID_BYTES))
+            || self
+                .model_version
+                .as_deref()
+                .is_some_and(|value| !valid_token(value, MAX_IDENTIFIER_BYTES))
+        {
+            return Err(VertexAiGenerationError::EvidenceTampered);
+        }
+        if self.candidates.len() > MAX_CANDIDATES {
+            return Err(VertexAiGenerationError::EvidenceTampered);
+        }
+        let mut output_bytes = 0_usize;
+        for candidate in &self.candidates {
+            candidate.validate_metadata()?;
+            output_bytes = output_bytes
+                .checked_add(candidate.content_byte_length)
+                .ok_or(VertexAiGenerationError::EvidenceTampered)?;
+        }
+        if output_bytes > MAX_OUTPUT_BYTES {
+            return Err(VertexAiGenerationError::EvidenceTampered);
+        }
+        if let Some(feedback) = &self.prompt_feedback {
+            feedback.validate_metadata()?;
+        }
+        if let Some(usage) = &self.usage_metadata {
+            usage.validate_metadata()?;
+        }
+        if let Some(error) = &self.provider_error
+            && !error.error_digest.is_sha256()
+        {
+            return Err(VertexAiGenerationError::EvidenceTampered);
+        }
+        Ok(())
     }
 
     pub fn content_digest(&self) -> Option<&Digest> {

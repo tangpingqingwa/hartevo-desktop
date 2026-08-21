@@ -1,9 +1,6 @@
 //! Typed service seam and reversible registration lifecycle.
 
-use std::collections::BTreeMap;
-
 use crate::{
-    digest_serializable,
     model::{
         GenerationRequest, GenerationResultEvidence, GenerationResultProposal, InputPart,
         ModelDescription, PluginRegistration, ProviderMode, Revocation, RevocationReason,
@@ -19,7 +16,6 @@ pub struct VertexAiGenerationResultService {
     scope: VertexAiGenerationScope,
     registration: PluginRegistration,
     provider: VertexAiGenerationProvider,
-    replay_guard: BTreeMap<crate::model::Digest, crate::model::Digest>,
 }
 
 impl VertexAiGenerationResultService {
@@ -33,7 +29,6 @@ impl VertexAiGenerationResultService {
             scope,
             registration,
             provider,
-            replay_guard: BTreeMap::new(),
         })
     }
 
@@ -92,7 +87,6 @@ impl VertexAiGenerationResultService {
             &self.scope,
         )?;
         evidence.verify_integrity()?;
-        self.remember_recording(response, &evidence)?;
         Ok(evidence)
     }
 
@@ -227,24 +221,6 @@ impl VertexAiGenerationResultService {
         }
         Ok(())
     }
-
-    fn remember_recording(
-        &mut self,
-        response: &RecordedVertexAiResponse,
-        evidence: &GenerationResultEvidence,
-    ) -> Result<(), VertexAiGenerationError> {
-        let recording_key = digest_serializable(&(
-            "vertex-ai-recording/v1",
-            response.recording_id(),
-            evidence.proposal_digest.as_str(),
-        ));
-        if self.replay_guard.contains_key(&recording_key) {
-            return Err(VertexAiGenerationError::ReplayDetected);
-        }
-        self.replay_guard
-            .insert(recording_key, evidence.evidence_digest.clone());
-        Ok(())
-    }
 }
 
 fn validate_request(
@@ -252,6 +228,7 @@ fn validate_request(
     request: &GenerationRequest,
 ) -> Result<(), VertexAiGenerationError> {
     request.input().verify_integrity()?;
+    request.validate_bounds()?;
     if request.input().parts().len() > scope.input_policy().max_parts() {
         return Err(VertexAiGenerationError::InputPartCountExceeded);
     }

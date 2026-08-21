@@ -95,6 +95,13 @@
     "digestBound": true,
     "reversible": true,
     "revocable": true,
+    "replayFence": {
+      "scope": "process_global",
+      "sharedAcrossServices": true,
+      "monotonic": true,
+      "durable": false,
+      "failClosed": true
+    },
     "failClosedOn": [
       "project_drift",
       "location_drift",

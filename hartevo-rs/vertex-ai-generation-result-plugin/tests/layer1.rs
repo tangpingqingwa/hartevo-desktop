@@ -1,5 +1,5 @@
 use hartevo_vertex_ai_generation_result_plugin as vertex;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn scope() -> vertex::VertexAiGenerationScope {
     let secret = vertex::SecretReference::new(
@@ -295,7 +295,7 @@ fn safety_block_and_partial_response_are_visible() {
         .record_generation_result(
             &blocked_proposal,
             &vertex::RecordedVertexAiResponse::success(
-                "blocked-recording",
+                "safety-block-recording",
                 vertex::VERTEX_AI_GENERATION_PROVIDER_ID,
                 "project-1",
                 "us-central1",
@@ -502,7 +502,7 @@ fn tamper_replay_revocation_and_blocked_env_fail_closed() {
     let blocked = blocked_service
         .record_blocked_env(
             &blocked_proposal,
-            "blocked-recording",
+            "blocked-env-recording",
             vertex::BlockedEnvCode::CredentialResolutionUnavailable,
             0,
         )
@@ -549,4 +549,267 @@ fn contract_is_versioned_and_non_native() {
     assert_eq!(contract["authority"]["connected"], false);
     assert_eq!(contract["authority"]["native"], false);
     assert_eq!(contract["layer2Gaps"].as_array().map(Vec::len), Some(6));
+}
+
+#[test]
+fn serde_revalidates_nested_scopes_and_policy_bounds() {
+    assert!(
+        serde_json::from_value::<vertex::GoogleCloudProject>(json!({
+            "projectId": "Project-1",
+            "revision": 1
+        }))
+        .is_err()
+    );
+    assert!(serde_json::from_value::<vertex::VertexLocation>(json!("global")).is_err());
+    assert!(
+        serde_json::from_value::<vertex::ModelSnapshot>(json!({
+            "modelId": "text-bison",
+            "immutableSnapshot": "001"
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<vertex::ModelSnapshot>(json!({
+            "modelId": "gemini-2.5-flash",
+            "immutableSnapshot": "latest"
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<vertex::ProjectScope>(json!({
+            "id": "project-scope",
+            "revision": 0
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<vertex::MissionScope>(json!({
+            "id": "mission",
+            "revision": 0
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<vertex::WorkProductScope>(json!({
+            "id": "work-product",
+            "revision": 0
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<vertex::InputPolicy>(json!({
+            "revision": "latest",
+            "allowedModalities": ["text"],
+            "maxInputBytes": 1,
+            "maxParts": 1,
+            "maxTextBytes": 1,
+            "maxImageBytes": 1,
+            "maxDocumentBytes": 1
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<vertex::SafetyPolicy>(json!({
+            "revision": "latest",
+            "settings": [],
+            "blockOnUnspecified": true
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<vertex::ToolGroundingPolicy>(json!({
+            "revision": "tool/v1",
+            "allowToolCalls": true,
+            "allowGrounding": false,
+            "allowSearchGrounding": false,
+            "allowMapsGrounding": false
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<vertex::ResponseScope>(json!({
+            "revision": "response/v1",
+            "maxCandidates": 0,
+            "maxOutputBytes": 1,
+            "maxOutputTokens": 1,
+            "outputSchema": null,
+            "redaction": {
+                "mode": "digest_only",
+                "retainRawPrompts": false,
+                "retainRawOutputs": false,
+                "retainHiddenReasoning": false,
+                "retainGroundingChunks": false,
+                "retainToolArguments": false,
+                "retainFileBytes": false
+            }
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<vertex::ConsentScope>(json!({
+            "consentDigest": vertex::Digest::sha256("consent"),
+            "revision": 1,
+            "purpose": "wrong-purpose"
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn serde_generation_input_recomputes_bounds_count_total_and_digest() {
+    let input = vertex::GenerationInput::text("bounded input").expect("input");
+    let mut forged_total = serde_json::to_value(&input).expect("input JSON");
+    forged_total["totalBytes"] = json!(0);
+    assert!(serde_json::from_value::<vertex::GenerationInput>(forged_total).is_err());
+
+    let mut forged_part = serde_json::to_value(&input).expect("input JSON");
+    forged_part["parts"][0]["byteLength"] = json!(vertex::MAX_TEXT_INPUT_BYTES + 1);
+    assert!(serde_json::from_value::<vertex::GenerationInput>(forged_part).is_err());
+
+    let mut forged_digest = serde_json::to_value(&input).expect("input JSON");
+    forged_digest["inputDigest"] = json!(vertex::Digest::sha256("wrong-input"));
+    assert!(serde_json::from_value::<vertex::GenerationInput>(forged_digest).is_err());
+
+    let image = vertex::GenerationInput::image_reference("image-handle", "image/png", 4)
+        .expect("image input");
+    let mut forged_media = serde_json::to_value(&image).expect("image JSON");
+    forged_media["parts"][0]["mediaType"] = json!("image/gif");
+    assert!(serde_json::from_value::<vertex::GenerationInput>(forged_media).is_err());
+}
+
+#[test]
+fn recording_tombstone_is_global_across_clones_and_resealed_scopes() {
+    let mut first_service = service();
+    let first_proposal = first_service
+        .compile_generation_proposal(&request())
+        .expect("first proposal");
+    first_service
+        .record_generation_result(&first_proposal, &success_response("global-replay-clone"))
+        .expect("first recording");
+
+    let mut cloned_service = first_service.clone();
+    assert_eq!(
+        cloned_service
+            .record_generation_result(&first_proposal, &success_response("global-replay-clone"),),
+        Err(vertex::VertexAiGenerationError::ReplayDetected)
+    );
+
+    let base = scope();
+    let resealed_scope = vertex::VertexAiGenerationScope::new(
+        base.google_cloud_project().clone(),
+        base.location().clone(),
+        base.publisher(),
+        base.model().clone(),
+        base.input_policy().clone(),
+        base.safety_policy().clone(),
+        base.tool_grounding_policy().clone(),
+        base.response().clone(),
+        vertex::MissionScope::new("mission-1", 99).expect("resealed Mission"),
+        base.project().clone(),
+        vertex::WorkProductScope::new("work-product-1", 100).expect("resealed Work Product"),
+        base.consent().clone(),
+        base.permission().clone(),
+    )
+    .expect("resealed scope");
+    let mut fresh_service = vertex::VertexAiGenerationResultService::new(
+        resealed_scope,
+        vertex::VertexAiGenerationProvider::recording(),
+    )
+    .expect("fresh service");
+    let resealed_proposal = fresh_service
+        .compile_generation_proposal(&request())
+        .expect("resealed proposal");
+    assert_ne!(
+        resealed_proposal.proposal_digest,
+        first_proposal.proposal_digest
+    );
+    assert_eq!(
+        fresh_service.record_generation_result(
+            &resealed_proposal,
+            &success_response("global-replay-clone"),
+        ),
+        Err(vertex::VertexAiGenerationError::ReplayDetected)
+    );
+    assert!(!vertex::VertexAiGenerationProvider::recording().replay_fence_durable());
+}
+
+#[test]
+fn response_serde_and_ingress_revalidate_ceiling_and_metadata() {
+    let candidate = json!({
+        "index": 0,
+        "contentDigest": vertex::Digest::sha256("candidate"),
+        "contentByteLength": vertex::MAX_OUTPUT_BYTES + 1,
+        "finishReason": "stop",
+        "safetyRatings": []
+    });
+    assert!(serde_json::from_value::<vertex::VertexAiCandidate>(candidate.clone()).is_err());
+    assert!(
+        serde_json::from_value::<vertex::VertexAiResponse>(json!({
+            "responseId": "response",
+            "modelVersion": "gemini-2.5-flash-001",
+            "candidates": [candidate],
+            "promptFeedback": null,
+            "usageMetadata": null
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<vertex::UsageMetadata>(json!({
+            "promptTokenCount": 5,
+            "candidatesTokenCount": 5,
+            "totalTokenCount": 1,
+            "cachedContentTokenCount": null,
+            "thoughtsTokenCount": null
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<vertex::UsageMetadata>(json!({
+            "promptTokenCount": u64::MAX,
+            "candidatesTokenCount": 1,
+            "totalTokenCount": u64::MAX,
+            "cachedContentTokenCount": null,
+            "thoughtsTokenCount": null
+        }))
+        .is_err()
+    );
+
+    let oversized = vec![b' '; vertex::MAX_RESPONSE_BYTES + 1];
+    assert_eq!(
+        vertex::VertexAiResponse::from_json(&oversized),
+        Err(vertex::VertexAiGenerationError::ResponseTooLarge)
+    );
+
+    let response = success_response("truthful-body-bytes");
+    if let vertex::ProviderResponseOutcome::Http { body_bytes, .. } = response.outcome() {
+        assert_eq!(*body_bytes, success_body().len());
+    } else {
+        panic!("expected HTTP response frame");
+    }
+
+    let mut service = service();
+    let proposal = service
+        .compile_generation_proposal(&request())
+        .expect("proposal");
+    let parsed = vertex::VertexAiResponse::from_json(success_body()).expect("parsed response");
+    let forged_frame = vertex::RecordedVertexAiResponse::new(
+        "forged-response-ceiling",
+        vertex::VERTEX_AI_GENERATION_PROVIDER_ID,
+        "project-1",
+        "us-central1",
+        "google",
+        "gemini-2.5-flash",
+        "001",
+        0,
+        vertex::ProviderResponseOutcome::Http {
+            status: 200,
+            body_bytes: vertex::MAX_RESPONSE_BYTES + 1,
+            response_digest: vertex::Digest::sha256("forged-body"),
+            frame: vertex::VertexAiResponseFrame::Parsed(parsed),
+        },
+    );
+    assert_eq!(
+        service.record_generation_result(&proposal, &forged_frame),
+        Err(vertex::VertexAiGenerationError::ResponseTooLarge)
+    );
 }
