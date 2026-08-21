@@ -2,15 +2,17 @@ use std::collections::BTreeSet;
 
 use chrono::{TimeZone, Utc};
 use hartevo_browserstack_test_result_plugin::{
-    BrowserStackBuildPayload, BrowserStackEndpoint, BrowserStackHttpRequest,
-    BrowserStackHttpResponse, BrowserStackMatrixEntry, BrowserStackProduct, BrowserStackProvider,
+    BrowserStackBuildPayload, BrowserStackBuildProjection, BrowserStackCredentialLease,
+    BrowserStackEndpoint, BrowserStackHttpRequest, BrowserStackHttpResponse,
+    BrowserStackMatrixEntry, BrowserStackProduct, BrowserStackProvider,
     BrowserStackProviderDefinition, BrowserStackReadRequest, BrowserStackRegistrationRequest,
-    BrowserStackResponseBody, BrowserStackScope, BrowserStackScopeInput,
-    BrowserStackSessionPayload, BrowserStackSessionProjection, BrowserStackTestResultContract,
-    BrowserStackTestResultError, BrowserStackTransportError, EvidenceStatus,
-    FixtureCredentialResolver, MissionBrowserStackTestConsumer, OutcomeCounts, PartialReason,
-    PermissionSnapshot, ProviderFailure, RecordingBrowserStackTransport, RequestBounds,
-    SecretReference, TransportProvenance,
+    BrowserStackResponseBody, BrowserStackResponseReceipt, BrowserStackScope,
+    BrowserStackScopeInput, BrowserStackSessionPayload, BrowserStackSessionProjection,
+    BrowserStackTestResultContract, BrowserStackTestResultError, BrowserStackTransport,
+    BrowserStackTransportError, EvidenceStatus, FixtureCredentialResolver,
+    MissionBrowserStackTestConsumer, OutcomeCounts, PartialReason, PermissionSnapshot,
+    ProviderFailure, RecordingBrowserStackTransport, RequestBounds, SecretReference,
+    TransportProvenance,
 };
 
 const BUILD_ID: &str = "build-42";
@@ -18,6 +20,27 @@ const SESSION_1: &str = "session-1";
 const SESSION_2: &str = "session-2";
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const ARTIFACT: &str = "artifact-42";
+
+#[derive(Debug)]
+struct UnattestedIoTransport;
+
+impl BrowserStackTransport for UnattestedIoTransport {
+    fn execute(
+        &mut self,
+        _credential: &BrowserStackCredentialLease,
+        _request: &BrowserStackHttpRequest,
+    ) -> Result<BrowserStackHttpResponse, BrowserStackTransportError> {
+        Err(BrowserStackTransportError::BlockedEnv)
+    }
+
+    fn provenance(&self) -> TransportProvenance {
+        TransportProvenance::Fixture
+    }
+
+    fn is_native(&self) -> bool {
+        true
+    }
+}
 
 fn at() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 15, 1, 0, 0)
@@ -177,6 +200,33 @@ fn contract_and_registration_are_digest_bound_and_layer_one_only() {
     assert!(!provider.is_native());
     assert!(provider.scope().digest().is_sha256());
     assert!(provider.scope().permission().digest().is_sha256());
+}
+
+#[test]
+fn transport_provenance_is_attested_and_caller_relabeling_fails_closed() {
+    let unattested = BrowserStackProvider::new(
+        scope(None),
+        SecretReference::new("user", "key", 1).expect("secret"),
+        UnattestedIoTransport,
+        FixtureCredentialResolver,
+    );
+    assert!(matches!(
+        unattested,
+        Err(BrowserStackTestResultError::UnattestedTransport)
+    ));
+
+    let relabeled = RecordingBrowserStackTransport::fixture(Vec::new())
+        .with_provenance(TransportProvenance::Recording);
+    let provider = BrowserStackProvider::new(
+        scope(None),
+        SecretReference::new("user", "key", 1).expect("secret"),
+        relabeled,
+        FixtureCredentialResolver,
+    );
+    assert!(matches!(
+        provider,
+        Err(BrowserStackTestResultError::UnattestedTransport)
+    ));
 }
 
 #[test]
@@ -707,4 +757,102 @@ fn request_bounds_and_all_matrix_fields_are_validated_at_serde_and_registration_
     let mut bad_revision = baseline;
     bad_revision["revision"] = serde_json::json!(0);
     assert!(serde_json::from_value::<BrowserStackSessionProjection>(bad_revision).is_err());
+}
+
+#[test]
+fn direct_serde_ingress_rejects_payload_projection_receipt_and_nested_drift() {
+    let build_baseline = serde_json::to_value(build_payload()).expect("build json");
+    let mut bad_build_id = build_baseline.clone();
+    bad_build_id["id"] = serde_json::json!("");
+    assert!(serde_json::from_value::<BrowserStackBuildPayload>(bad_build_id).is_err());
+    let mut bad_build_revision = build_baseline.clone();
+    bad_build_revision["revision"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<BrowserStackBuildPayload>(bad_build_revision).is_err());
+    let mut bad_session_count = build_baseline.clone();
+    bad_session_count["sessionCount"] = serde_json::json!(129);
+    assert!(serde_json::from_value::<BrowserStackBuildPayload>(bad_session_count).is_err());
+    let mut unknown_build_field = build_baseline;
+    unknown_build_field["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<BrowserStackBuildPayload>(unknown_build_field).is_err());
+
+    let build_projection = BrowserStackBuildProjection::from(build_payload());
+    let projection_baseline = serde_json::to_value(build_projection).expect("projection json");
+    let mut bad_projection_id = projection_baseline.clone();
+    bad_projection_id["id"] = serde_json::json!("");
+    assert!(serde_json::from_value::<BrowserStackBuildProjection>(bad_projection_id).is_err());
+    let mut bad_projection_revision = projection_baseline;
+    bad_projection_revision["revision"] = serde_json::json!(0);
+    assert!(
+        serde_json::from_value::<BrowserStackBuildProjection>(bad_projection_revision).is_err()
+    );
+
+    let receipt_baseline = serde_json::to_value(build_response().receipt()).expect("receipt json");
+    let mut bad_receipt_size = receipt_baseline.clone();
+    bad_receipt_size["responseSize"] = serde_json::json!(1_048_577);
+    assert!(serde_json::from_value::<BrowserStackResponseReceipt>(bad_receipt_size).is_err());
+    let mut bad_receipt_flags = receipt_baseline.clone();
+    bad_receipt_flags["rawLogsRetained"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<BrowserStackResponseReceipt>(bad_receipt_flags).is_err());
+    let mut bad_receipt_revision = receipt_baseline.clone();
+    bad_receipt_revision["providerRevision"] = serde_json::json!("old");
+    assert!(serde_json::from_value::<BrowserStackResponseReceipt>(bad_receipt_revision).is_err());
+    let mut bad_receipt_digest = receipt_baseline.clone();
+    bad_receipt_digest["responseDigest"] = serde_json::json!("not-a-digest");
+    assert!(serde_json::from_value::<BrowserStackResponseReceipt>(bad_receipt_digest).is_err());
+    let mut unknown_receipt_field = receipt_baseline;
+    unknown_receipt_field["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<BrowserStackResponseReceipt>(unknown_receipt_field).is_err());
+
+    assert!(
+        serde_json::from_value::<hartevo_browserstack_test_result_plugin::BuildId>(
+            serde_json::json!("")
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<hartevo_browserstack_test_result_plugin::Digest>(
+            serde_json::json!("not-a-digest")
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<hartevo_browserstack_test_result_plugin::Revision>(
+            serde_json::json!(0)
+        )
+        .is_err()
+    );
+    assert!(serde_json::from_value::<BrowserStackProduct>(serde_json::json!("unknown")).is_err());
+    assert!(
+        serde_json::from_value::<OutcomeCounts>(serde_json::json!({
+            "total": 1,
+            "passed": 10001,
+            "failed": 0,
+            "skipped": 0,
+            "timedOut": 0,
+            "unknown": 0
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<BrowserStackReadRequest>(serde_json::json!({
+            "expectedBuildRevision": 0,
+            "expectedSessionRevision": null
+        }))
+        .is_err()
+    );
+
+    let mut invalid_ingress_build = build_payload();
+    invalid_ingress_build.id.clear();
+    let build_request = request(BrowserStackEndpoint::Build {
+        product: BrowserStackProduct::Automate,
+        project_id: "bs-project-7".to_owned(),
+        build_id: BUILD_ID.to_owned(),
+    });
+    assert!(
+        BrowserStackHttpResponse::from_body(
+            &build_request,
+            BrowserStackResponseBody::Build(invalid_ingress_build)
+        )
+        .is_err()
+    );
 }

@@ -39,8 +39,8 @@ pub use service::{
 };
 pub use transport::{
     BlockedEnvTransport, BrowserStackEndpoint, BrowserStackHttpRequest, BrowserStackHttpResponse,
-    BrowserStackTransport, BrowserStackTransportError, FakeBrowserStackTransport,
-    LoopbackBrowserStackTransport, RecordingBrowserStackTransport,
+    BrowserStackTransport, BrowserStackTransportAttestation, BrowserStackTransportError,
+    FakeBrowserStackTransport, LoopbackBrowserStackTransport, RecordingBrowserStackTransport,
 };
 
 pub const BROWSERSTACK_SCHEMA_VERSION: &str = "hartevo.browserstack-test-result.contract/v1";
@@ -306,6 +306,10 @@ impl BrowserStackTestResultContract {
                     "service_revocation".to_owned(),
                     "bounds_drift".to_owned(),
                     "matrix_invalid".to_owned(),
+                    "unattested_transport".to_owned(),
+                    "provenance_override".to_owned(),
+                    "response_integrity".to_owned(),
+                    "serde_invalid".to_owned(),
                 ]
     }
 
@@ -342,6 +346,10 @@ impl BrowserStackTestResultContract {
                     "evidence_replay".to_owned(),
                     "service_revocation".to_owned(),
                     "external_write_request".to_owned(),
+                    "unattested_transport".to_owned(),
+                    "provenance_override".to_owned(),
+                    "response_integrity".to_owned(),
+                    "serde_invalid".to_owned(),
                 ]
             && !self
                 .native_gap
@@ -349,6 +357,7 @@ impl BrowserStackTestResultContract {
             && !self.native_gap.connected_claim
             && self.honest_native_gap.contains("never claims Connected")
             && self.honest_native_gap.contains("raw provider payloads")
+            && self.honest_native_gap.contains("attested")
             && self.honest_native_gap.contains("process-local")
     }
 
@@ -428,6 +437,8 @@ pub enum BrowserStackTestResultError {
     Decode(String),
     #[error("BrowserStack transport failed: {0}")]
     Transport(String),
+    #[error("BrowserStack transport is unattested for Layer 1")]
+    UnattestedTransport,
     #[error("BrowserStack pagination exceeded its bound or repeated an offset")]
     PaginationLoop,
     #[error("BrowserStack session bound exceeded")]

@@ -21,7 +21,7 @@ use crate::model::{
 };
 use crate::transport::{
     BrowserStackEndpoint, BrowserStackHttpRequest, BrowserStackHttpResponse, BrowserStackTransport,
-    BrowserStackTransportError,
+    BrowserStackTransportAttestation, BrowserStackTransportError, trusted_transport_attestation,
 };
 use crate::{
     BROWSERSTACK_CONTRACT_VERSION, BROWSERSTACK_PLUGIN_VERSION_TEXT, BROWSERSTACK_PROVIDER_ID,
@@ -710,6 +710,7 @@ pub struct BrowserStackProvider<
     transport: T,
     credential_resolver: R,
     bounds: RequestBounds,
+    attestation: BrowserStackTransportAttestation,
 }
 
 impl<T, R> fmt::Debug for BrowserStackProvider<T, R>
@@ -726,7 +727,7 @@ where
                 "registration_digest",
                 &self.registration.registration_digest,
             )
-            .field("provenance", &self.transport.provenance())
+            .field("provenance", &self.attestation.provenance())
             .field("bounds", &self.bounds)
             .finish_non_exhaustive()
     }
@@ -744,8 +745,9 @@ where
         transport: T,
         credential_resolver: R,
     ) -> Result<Self, BrowserStackTestResultError> {
+        let attestation = trusted_transport_attestation(&transport)?;
         let definition =
-            BrowserStackProviderDefinition::new(scope.product(), transport.provenance())?;
+            BrowserStackProviderDefinition::new(scope.product(), attestation.provenance())?;
         let request = BrowserStackRegistrationRequest::baseline(
             scope.clone(),
             secret_reference.clone(),
@@ -766,8 +768,9 @@ where
         bounds: RequestBounds,
     ) -> Result<Self, BrowserStackTestResultError> {
         bounds.validate()?;
+        let attestation = trusted_transport_attestation(&transport)?;
         let definition =
-            BrowserStackProviderDefinition::new(request.scope.product(), transport.provenance())?;
+            BrowserStackProviderDefinition::new(request.scope.product(), attestation.provenance())?;
         if request.provider_digest != definition.provider_digest {
             return Err(BrowserStackTestResultError::RegistrationDrift(
                 "registration provider digest does not match the transport definition".to_owned(),
@@ -786,6 +789,7 @@ where
             transport,
             credential_resolver,
             bounds,
+            attestation,
         })
     }
 
@@ -1091,7 +1095,7 @@ where
                         self.scope.digest().clone(),
                         self.scope.permission().digest().clone(),
                         self.registration.registration_digest.clone(),
-                        self.transport.provenance(),
+                        self.attestation.provenance(),
                         status,
                         partial_reason,
                         Some(build_projection),
@@ -1128,7 +1132,7 @@ where
             self.scope.digest().clone(),
             self.scope.permission().digest().clone(),
             self.registration.registration_digest.clone(),
-            self.transport.provenance(),
+            self.attestation.provenance(),
             status,
             partial_reason,
             Some(build_projection),
@@ -1151,6 +1155,7 @@ where
             || evidence.scope_digest != *self.scope.digest()
             || evidence.permission_digest != *self.scope.permission().digest()
             || evidence.registration_digest != *self.registration.registration_digest()
+            || evidence.provenance != self.attestation.provenance()
         {
             return Err(BrowserStackTestResultError::StaleEvidence);
         }
@@ -1194,11 +1199,7 @@ where
         response: &BrowserStackHttpResponse,
         request: &BrowserStackHttpRequest,
     ) -> Result<(), BrowserStackTestResultError> {
-        if response.receipt().request_digest != request.digest()? {
-            return Err(BrowserStackTestResultError::RegistrationDrift(
-                "response receipt is not bound to the issued request".to_owned(),
-            ));
-        }
+        response.validate_against(request)?;
         if response.receipt().provider_revision != BROWSERSTACK_PROVIDER_REVISION {
             return Err(BrowserStackTestResultError::ProviderRevisionDrift {
                 expected: BROWSERSTACK_PROVIDER_REVISION.to_owned(),
@@ -1210,7 +1211,6 @@ where
                 size: response.receipt().response_size,
             });
         }
-        response.receipt().validate()?;
         Ok(())
     }
 
@@ -1362,7 +1362,7 @@ where
             self.scope.digest().clone(),
             self.scope.permission().digest().clone(),
             self.registration.registration_digest.clone(),
-            self.transport.provenance(),
+            self.attestation.provenance(),
             status,
             partial_reason,
             build,
@@ -1429,12 +1429,7 @@ fn failure_receipt(
     request: &BrowserStackHttpRequest,
     error: &BrowserStackTransportError,
 ) -> Result<BrowserStackResponseReceipt, BrowserStackTestResultError> {
-    let response = BrowserStackHttpResponse::new(
-        request,
-        error.status_code().unwrap_or(0),
-        None,
-        0,
-        error.diagnostic_digest(),
-    )?;
+    let response =
+        BrowserStackHttpResponse::from_status(request, error.status_code().unwrap_or(0))?;
     Ok(response.receipt().clone())
 }

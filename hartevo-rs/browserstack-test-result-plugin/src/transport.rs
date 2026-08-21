@@ -4,7 +4,7 @@
 //! only the fields allowed by the contract. Layer-2 secret resolution and live
 //! HTTPS reads are intentionally outside this root.
 
-use std::{collections::VecDeque, fmt};
+use std::{any::Any, collections::VecDeque, fmt};
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -26,6 +26,8 @@ use crate::{
 pub enum BrowserStackTransportError {
     #[error("BrowserStack credential is unavailable")]
     CredentialUnavailable,
+    #[error("BrowserStack transport provenance is not trusted for Layer 1")]
+    Unattested,
     #[error("BLOCKED_ENV: BrowserStack transport is disabled")]
     BlockedEnv,
     #[error("BrowserStack returned HTTP status {status}")]
@@ -38,6 +40,8 @@ pub enum BrowserStackTransportError {
     InvalidRequest(String),
     #[error("BrowserStack response body is unexpected for the endpoint")]
     UnexpectedBody,
+    #[error("BrowserStack response receipt does not match its normalized response")]
+    ResponseIntegrityMismatch,
     #[error("BrowserStack response could not be decoded: {0}")]
     Decode(String),
     #[error("BrowserStack HTTPS transport failed: {detail}")]
@@ -62,8 +66,10 @@ impl BrowserStackTransportError {
             Self::Status { retryable, .. } | Self::Transport { retryable, .. } => *retryable,
             Self::BlockedEnv
             | Self::CredentialUnavailable
+            | Self::Unattested
             | Self::InvalidRequest(_)
             | Self::UnexpectedBody
+            | Self::ResponseIntegrityMismatch
             | Self::Decode(_) => false,
         }
     }
@@ -82,6 +88,8 @@ impl BrowserStackTransportError {
             } => diagnostic_digest.clone(),
             Self::BlockedEnv => Digest::from_text("BLOCKED_ENV"),
             Self::CredentialUnavailable => Digest::from_text("credential-unavailable"),
+            Self::Unattested => Digest::from_text("unattested-transport"),
+            Self::ResponseIntegrityMismatch => Digest::from_text("response-integrity-mismatch"),
             Self::InvalidRequest(value) | Self::Decode(value) => Digest::from_text(value),
             Self::UnexpectedBody => Digest::from_text("unexpected-body"),
         }
@@ -103,6 +111,7 @@ impl From<BrowserStackTransportError> for BrowserStackTestResultError {
             BrowserStackTransportError::CredentialUnavailable => {
                 Self::Credential("credential unavailable".to_owned())
             }
+            BrowserStackTransportError::Unattested => Self::UnattestedTransport,
             BrowserStackTransportError::Status { status, .. } => Self::UnexpectedStatus { status },
             BrowserStackTransportError::InvalidRequest(detail)
             | BrowserStackTransportError::Decode(detail)
@@ -110,6 +119,40 @@ impl From<BrowserStackTransportError> for BrowserStackTestResultError {
             BrowserStackTransportError::UnexpectedBody => {
                 Self::Decode("unexpected BrowserStack response body".to_owned())
             }
+            BrowserStackTransportError::ResponseIntegrityMismatch => Self::StaleEvidence,
+        }
+    }
+}
+
+/// A process-local, non-native transport attestation. Its fields are private
+/// so external transports cannot manufacture a trusted provenance claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BrowserStackTransportAttestation {
+    provenance: TransportProvenance,
+    native_io: bool,
+}
+
+impl BrowserStackTransportAttestation {
+    fn trusted(provenance: TransportProvenance) -> Self {
+        Self {
+            provenance,
+            native_io: false,
+        }
+    }
+
+    pub const fn provenance(self) -> TransportProvenance {
+        self.provenance
+    }
+
+    pub const fn native_io(self) -> bool {
+        self.native_io
+    }
+
+    fn validate(self) -> Result<Self, BrowserStackTransportError> {
+        if self.native_io {
+            Err(BrowserStackTransportError::Unattested)
+        } else {
+            Ok(self)
         }
     }
 }
@@ -262,13 +305,27 @@ impl BrowserStackHttpRequest {
                 "response bound is outside the Layer-1 maximum".to_owned(),
             ));
         }
-        endpoint.path_and_query()?;
-        Ok(Self {
+        let request = Self {
             endpoint,
             api_revision: BROWSERSTACK_PROVIDER_REVISION.to_owned(),
             max_response_bytes,
             observed_at,
-        })
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> Result<(), BrowserStackTransportError> {
+        if self.api_revision != BROWSERSTACK_PROVIDER_REVISION
+            || self.max_response_bytes == 0
+            || self.max_response_bytes > BROWSERSTACK_MAX_RESPONSE_BYTES
+        {
+            return Err(BrowserStackTransportError::InvalidRequest(
+                "BrowserStack request identity or response bound is invalid".to_owned(),
+            ));
+        }
+        self.endpoint.path_and_query()?;
+        Ok(())
     }
 
     pub fn path_and_query(&self) -> Result<String, BrowserStackTransportError> {
@@ -277,6 +334,9 @@ impl BrowserStackHttpRequest {
 
     pub fn digest(&self) -> Result<Digest, BrowserStackTransportError> {
         let canonical = json!({
+            "schemaVersion": crate::BROWSERSTACK_SCHEMA_VERSION,
+            "serviceId": crate::BROWSERSTACK_SERVICE_ID,
+            "providerId": crate::BROWSERSTACK_PROVIDER_ID,
             "endpoint": self.path_and_query()?,
             "apiRevision": self.api_revision,
             "maxResponseBytes": self.max_response_bytes,
@@ -310,6 +370,7 @@ impl BrowserStackHttpResponse {
         request: &BrowserStackHttpRequest,
         bytes: &[u8],
     ) -> Result<Self, BrowserStackTransportError> {
+        request.validate()?;
         if bytes.len() > request.max_response_bytes {
             return Err(BrowserStackTransportError::InvalidRequest(
                 "BrowserStack response exceeds the configured bound".to_owned(),
@@ -318,46 +379,57 @@ impl BrowserStackHttpResponse {
         let value = serde_json::from_slice::<Value>(bytes)
             .map_err(|error| BrowserStackTransportError::Decode(error.to_string()))?;
         let body = decode_body(&request.endpoint, &value)?;
-        Self::new(request, 200, Some(body), bytes.len(), sha256_digest(bytes))
+        let normalized = normalized_body_bytes(Some(&body))?;
+        if normalized.len() > request.max_response_bytes {
+            return Err(BrowserStackTransportError::InvalidRequest(
+                "normalized BrowserStack response exceeds the configured bound".to_owned(),
+            ));
+        }
+        let response_digest =
+            canonical_response_digest(request, 200, normalized.len(), &normalized)?;
+        Self::new(request, 200, Some(body), normalized.len(), &response_digest)
     }
 
     pub fn from_body(
         request: &BrowserStackHttpRequest,
         body: BrowserStackResponseBody,
     ) -> Result<Self, BrowserStackTransportError> {
-        let bytes = serde_json::to_vec(&body)
-            .map_err(|error| BrowserStackTransportError::InvalidRequest(error.to_string()))?;
-        Self::new(request, 200, Some(body), bytes.len(), sha256_digest(&bytes))
+        let normalized = normalized_body_bytes(Some(&body))?;
+        let response_digest =
+            canonical_response_digest(request, 200, normalized.len(), &normalized)?;
+        Self::new(request, 200, Some(body), normalized.len(), &response_digest)
     }
 
     pub fn from_status(
         request: &BrowserStackHttpRequest,
         status: u16,
     ) -> Result<Self, BrowserStackTransportError> {
-        Self::new(
-            request,
-            status,
-            None,
-            0,
-            Digest::from_text(format!("http-{status}")),
-        )
+        let response_digest = canonical_response_digest(request, status, 0, &[])?;
+        Self::new(request, status, None, 0, &response_digest)
     }
 
-    pub fn new(
+    fn new(
         request: &BrowserStackHttpRequest,
         status: u16,
         body: Option<BrowserStackResponseBody>,
         response_size: usize,
-        response_digest: Digest,
+        response_digest: &Digest,
     ) -> Result<Self, BrowserStackTransportError> {
-        if response_size > request.max_response_bytes {
+        validate_response_shape(request, status, body.as_ref())?;
+        let normalized = normalized_body_bytes(body.as_ref())?;
+        if normalized.len() > request.max_response_bytes {
             return Err(BrowserStackTransportError::InvalidRequest(
-                "response exceeds the request bound".to_owned(),
+                "normalized BrowserStack response exceeds the request bound".to_owned(),
             ));
+        }
+        let expected_digest =
+            canonical_response_digest(request, status, normalized.len(), &normalized)?;
+        if response_size != normalized.len() || response_digest != &expected_digest {
+            return Err(BrowserStackTransportError::ResponseIntegrityMismatch);
         }
         let receipt = BrowserStackResponseReceipt {
             request_digest: request.digest()?,
-            response_digest,
+            response_digest: expected_digest,
             endpoint: request.path_and_query()?,
             product: request.endpoint.product(),
             status,
@@ -379,6 +451,33 @@ impl BrowserStackHttpResponse {
         Ok(Self { body, receipt })
     }
 
+    pub fn validate_against(
+        &self,
+        request: &BrowserStackHttpRequest,
+    ) -> Result<(), BrowserStackTransportError> {
+        validate_response_shape(request, self.receipt.status, self.body.as_ref())?;
+        let normalized = normalized_body_bytes(self.body.as_ref())?;
+        if normalized.len() > request.max_response_bytes {
+            return Err(BrowserStackTransportError::InvalidRequest(
+                "normalized BrowserStack response exceeds the request bound".to_owned(),
+            ));
+        }
+        let expected_digest =
+            canonical_response_digest(request, self.receipt.status, normalized.len(), &normalized)?;
+        if self.receipt.request_digest != request.digest()?
+            || self.receipt.endpoint != request.path_and_query()?
+            || self.receipt.product != request.endpoint.product()
+            || self.receipt.provider_revision != request.api_revision
+            || self.receipt.response_size != normalized.len()
+            || self.receipt.response_digest != expected_digest
+            || self.receipt.offset != request.endpoint.offset()
+            || self.receipt.limit != request.endpoint.limit()
+        {
+            return Err(BrowserStackTransportError::ResponseIntegrityMismatch);
+        }
+        self.receipt.validate().map_err(model_decode_error)
+    }
+
     pub fn body(&self) -> Option<&BrowserStackResponseBody> {
         self.body.as_ref()
     }
@@ -392,20 +491,153 @@ impl BrowserStackHttpResponse {
     }
 }
 
+fn normalized_body_bytes(
+    body: Option<&BrowserStackResponseBody>,
+) -> Result<Vec<u8>, BrowserStackTransportError> {
+    body.map(serde_json::to_vec)
+        .transpose()
+        .map_err(|error| BrowserStackTransportError::InvalidRequest(error.to_string()))
+        .map(Option::unwrap_or_default)
+}
+
+fn canonical_response_digest(
+    request: &BrowserStackHttpRequest,
+    status: u16,
+    normalized_size: usize,
+    normalized_body: &[u8],
+) -> Result<Digest, BrowserStackTransportError> {
+    let body_digest = sha256_digest(normalized_body);
+    Ok(Digest::from_fields(
+        "browserstack-response/v2",
+        &[
+            request.digest()?.as_str().to_owned(),
+            request.path_and_query()?,
+            request.api_revision.clone(),
+            format!("{:?}", request.endpoint.product()),
+            status.to_string(),
+            normalized_size.to_string(),
+            body_digest.as_str().to_owned(),
+        ],
+    ))
+}
+
+fn validate_response_shape(
+    request: &BrowserStackHttpRequest,
+    status: u16,
+    body: Option<&BrowserStackResponseBody>,
+) -> Result<(), BrowserStackTransportError> {
+    if (status == 200) != body.is_some() {
+        return Err(BrowserStackTransportError::UnexpectedBody);
+    }
+    let Some(body) = body else {
+        return Ok(());
+    };
+    match (&request.endpoint, body) {
+        (
+            BrowserStackEndpoint::Build {
+                product,
+                project_id,
+                build_id,
+            },
+            BrowserStackResponseBody::Build(payload),
+        ) => {
+            payload.validate().map_err(model_decode_error)?;
+            if payload.product != *product
+                || payload.id != *build_id
+                || payload
+                    .project_id
+                    .as_deref()
+                    .is_some_and(|value| value != project_id)
+            {
+                return Err(BrowserStackTransportError::UnexpectedBody);
+            }
+        }
+        (
+            BrowserStackEndpoint::Sessions {
+                product,
+                project_id,
+                build_id,
+                limit,
+                ..
+            },
+            BrowserStackResponseBody::Sessions(payloads),
+        ) => {
+            if payloads.len() > *limit as usize {
+                return Err(BrowserStackTransportError::InvalidRequest(
+                    "session page exceeds its requested bound".to_owned(),
+                ));
+            }
+            for payload in payloads {
+                payload.validate().map_err(model_decode_error)?;
+                if payload.product != *product
+                    || payload.build_id != *build_id
+                    || payload
+                        .project_id
+                        .as_deref()
+                        .is_some_and(|value| value != project_id)
+                {
+                    return Err(BrowserStackTransportError::UnexpectedBody);
+                }
+            }
+        }
+        (
+            BrowserStackEndpoint::Session {
+                product,
+                project_id,
+                build_id,
+                session_id,
+            },
+            BrowserStackResponseBody::Session(payload),
+        ) => {
+            payload.validate().map_err(model_decode_error)?;
+            if payload.product != *product
+                || payload.id != *session_id
+                || payload.build_id != *build_id
+                || payload
+                    .project_id
+                    .as_deref()
+                    .is_some_and(|value| value != project_id)
+            {
+                return Err(BrowserStackTransportError::UnexpectedBody);
+            }
+        }
+        _ => return Err(BrowserStackTransportError::UnexpectedBody),
+    }
+    Ok(())
+}
+
 /// A narrow GET-only authenticated transport. The credential lease is
 /// borrowed for the call and is never copied into the request or response.
-pub trait BrowserStackTransport: fmt::Debug {
+pub trait BrowserStackTransport: Any + fmt::Debug {
     fn execute(
         &mut self,
         credential: &BrowserStackCredentialLease,
         request: &BrowserStackHttpRequest,
     ) -> Result<BrowserStackHttpResponse, BrowserStackTransportError>;
 
+    /// Untrusted diagnostic metadata. Provider authority is derived from the
+    /// concrete built-in transport type, never from this caller-controlled claim.
     fn provenance(&self) -> TransportProvenance;
 
+    /// Untrusted diagnostic metadata. Layer 1 never uses this to establish
+    /// native or connected authority.
     fn is_native(&self) -> bool {
         false
     }
+}
+
+pub(crate) fn trusted_transport_attestation<T: BrowserStackTransport>(
+    transport: &T,
+) -> Result<BrowserStackTransportAttestation, BrowserStackTransportError> {
+    let transport = transport as &dyn Any;
+    if let Some(recording) = transport.downcast_ref::<RecordingBrowserStackTransport>() {
+        return recording.trusted_attestation();
+    }
+    if transport.is::<BlockedEnvTransport>() {
+        return BrowserStackTransportAttestation::trusted(TransportProvenance::BlockedEnv)
+            .validate();
+    }
+    Err(BrowserStackTransportError::Unattested)
 }
 
 #[derive(Clone, Debug)]
@@ -413,6 +645,7 @@ pub struct RecordingBrowserStackTransport {
     responses: VecDeque<Result<BrowserStackHttpResponse, BrowserStackTransportError>>,
     requests: Vec<BrowserStackHttpRequest>,
     provenance: TransportProvenance,
+    provenance_override: Option<TransportProvenance>,
 }
 
 impl RecordingBrowserStackTransport {
@@ -425,6 +658,7 @@ impl RecordingBrowserStackTransport {
             responses: responses.into_iter().collect(),
             requests: Vec::new(),
             provenance: TransportProvenance::Recording,
+            provenance_override: None,
         }
     }
 
@@ -437,6 +671,7 @@ impl RecordingBrowserStackTransport {
             responses: responses.into_iter().collect(),
             requests: Vec::new(),
             provenance: TransportProvenance::Fixture,
+            provenance_override: None,
         }
     }
 
@@ -449,12 +684,13 @@ impl RecordingBrowserStackTransport {
             responses: responses.into_iter().collect(),
             requests: Vec::new(),
             provenance: TransportProvenance::Loopback,
+            provenance_override: None,
         }
     }
 
     #[must_use]
     pub fn with_provenance(mut self, provenance: TransportProvenance) -> Self {
-        self.provenance = provenance;
+        self.provenance_override = Some(provenance);
         self
     }
 
@@ -502,6 +738,20 @@ impl BrowserStackTransport for RecordingBrowserStackTransport {
 
     fn provenance(&self) -> TransportProvenance {
         self.provenance
+    }
+}
+
+impl RecordingBrowserStackTransport {
+    fn trusted_attestation(
+        &self,
+    ) -> Result<BrowserStackTransportAttestation, BrowserStackTransportError> {
+        if self
+            .provenance_override
+            .is_some_and(|claimed| claimed != self.provenance)
+        {
+            return Err(BrowserStackTransportError::Unattested);
+        }
+        BrowserStackTransportAttestation::trusted(self.provenance).validate()
     }
 }
 
@@ -813,4 +1063,82 @@ fn response_body_kind(body: &BrowserStackResponseBody) -> &'static str {
 #[allow(dead_code)]
 fn _bounded_request_shape(bounds: RequestBounds, revision: Revision) -> (RequestBounds, Revision) {
     (bounds, revision)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_request(max_response_bytes: usize) -> BrowserStackHttpRequest {
+        BrowserStackHttpRequest::new(
+            BrowserStackEndpoint::Build {
+                product: BrowserStackProduct::Automate,
+                project_id: "project".to_owned(),
+                build_id: "build".to_owned(),
+            },
+            Utc::now(),
+            max_response_bytes,
+        )
+        .expect("request")
+    }
+
+    fn build_body() -> BrowserStackResponseBody {
+        BrowserStackResponseBody::Build(
+            BrowserStackBuildPayload::new("build", BrowserStackProduct::Automate, "done", 1)
+                .expect("build"),
+        )
+    }
+
+    #[test]
+    fn response_ingress_rejects_reported_size_digest_and_bound_drift() {
+        let request = build_request(BROWSERSTACK_MAX_RESPONSE_BYTES);
+        let body = build_body();
+        let normalized = normalized_body_bytes(Some(&body)).expect("normalized body");
+        let digest = canonical_response_digest(&request, 200, normalized.len(), &normalized)
+            .expect("canonical digest");
+
+        assert!(
+            BrowserStackHttpResponse::new(
+                &request,
+                200,
+                Some(body.clone()),
+                normalized.len() + 1,
+                &digest,
+            )
+            .is_err()
+        );
+        assert!(
+            BrowserStackHttpResponse::new(
+                &request,
+                200,
+                Some(body.clone()),
+                normalized.len(),
+                &Digest::from_text("caller-reported"),
+            )
+            .is_err()
+        );
+
+        let tiny_request = build_request(1);
+        assert!(BrowserStackHttpResponse::from_body(&tiny_request, body).is_err());
+        assert!(BrowserStackHttpResponse::from_json(&tiny_request, br"{}").is_err());
+
+        let mut forged_request = request;
+        forged_request.api_revision = "caller-controlled-revision".to_owned();
+        assert!(BrowserStackHttpResponse::from_status(&forged_request, 404).is_err());
+    }
+
+    #[test]
+    fn response_receipt_is_canonical_and_revalidates_against_request() {
+        let request = build_request(BROWSERSTACK_MAX_RESPONSE_BYTES);
+        let body = build_body();
+        let normalized = normalized_body_bytes(Some(&body)).expect("normalized body");
+        let response = BrowserStackHttpResponse::from_body(&request, body).expect("response");
+
+        assert_eq!(response.receipt().response_size, normalized.len());
+        assert_eq!(response.validate_against(&request), Ok(()));
+        assert_ne!(
+            response.receipt().response_digest,
+            sha256_digest(&normalized)
+        );
+    }
 }

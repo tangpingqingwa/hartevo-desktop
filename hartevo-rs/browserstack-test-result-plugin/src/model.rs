@@ -7,7 +7,7 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
 use thiserror::Error;
 
@@ -108,9 +108,19 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), ModelError> {
 
 macro_rules! identifier_type {
     ($name:ident, $field:literal) => {
-        #[derive(Clone, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+        #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
 
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
@@ -151,9 +161,19 @@ identifier_type!(MissionId, "Mission id");
 identifier_type!(WorkProductId, "Work Product id");
 identifier_type!(ArtifactId, "BrowserStack artifact id");
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Revision(u64);
+
+impl<'de> Deserialize<'de> for Revision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl Revision {
     pub fn new(value: u64) -> Result<Self, ModelError> {
@@ -166,9 +186,19 @@ impl Revision {
     }
 }
 
-#[derive(Clone, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Digest(String);
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl Digest {
     pub fn parse(value: impl Into<String>) -> Result<Self, ModelError> {
@@ -326,7 +356,11 @@ impl WorkProductScope {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "PermissionSnapshotWire"
+)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct PermissionSnapshot {
     account_read: bool,
@@ -336,6 +370,36 @@ pub struct PermissionSnapshot {
     session_read: bool,
     revision: Revision,
     digest: Digest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PermissionSnapshotWire {
+    account_read: bool,
+    group_read: bool,
+    project_read: bool,
+    build_read: bool,
+    session_read: bool,
+    revision: Revision,
+    digest: Digest,
+}
+
+impl TryFrom<PermissionSnapshotWire> for PermissionSnapshot {
+    type Error = ModelError;
+
+    fn try_from(value: PermissionSnapshotWire) -> Result<Self, Self::Error> {
+        let snapshot = Self {
+            account_read: value.account_read,
+            group_read: value.group_read,
+            project_read: value.project_read,
+            build_read: value.build_read,
+            session_read: value.session_read,
+            revision: value.revision,
+            digest: value.digest,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
 }
 
 impl PermissionSnapshot {
@@ -558,9 +622,27 @@ pub type BrowserStackSecretReference = SecretReference;
 pub type BrowserStackPermissionSnapshot = PermissionSnapshot;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "CommitReferenceWire"
+)]
 pub struct CommitReference {
     value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommitReferenceWire {
+    value: String,
+}
+
+impl TryFrom<CommitReferenceWire> for CommitReference {
+    type Error = ModelError;
+
+    fn try_from(value: CommitReferenceWire) -> Result<Self, Self::Error> {
+        Self::new(value.value)
+    }
 }
 
 impl CommitReference {
@@ -764,10 +846,34 @@ impl BrowserStackScope {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "BrowserStackReadRequestWire"
+)]
 pub struct BrowserStackReadRequest {
     pub expected_build_revision: Option<u64>,
     pub expected_session_revision: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserStackReadRequestWire {
+    expected_build_revision: Option<u64>,
+    expected_session_revision: Option<u64>,
+}
+
+impl TryFrom<BrowserStackReadRequestWire> for BrowserStackReadRequest {
+    type Error = ModelError;
+
+    fn try_from(value: BrowserStackReadRequestWire) -> Result<Self, Self::Error> {
+        let request = Self {
+            expected_build_revision: value.expected_build_revision,
+            expected_session_revision: value.expected_session_revision,
+        };
+        request.validate()?;
+        Ok(request)
+    }
 }
 
 impl BrowserStackReadRequest {
@@ -788,6 +894,21 @@ impl BrowserStackReadRequest {
         validate_positive(revision, "expected session revision")?;
         self.expected_session_revision = Some(revision);
         Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self
+            .expected_build_revision
+            .is_some_and(|revision| revision == 0)
+            || self
+                .expected_session_revision
+                .is_some_and(|revision| revision == 0)
+        {
+            return Err(ModelError::MustBePositive {
+                field: "expected revision",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -978,7 +1099,11 @@ impl TryFrom<BrowserStackMatrixEntryWire> for BrowserStackMatrixEntry {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "OutcomeCountsWire"
+)]
 pub struct OutcomeCounts {
     pub total: u32,
     pub passed: u32,
@@ -986,6 +1111,32 @@ pub struct OutcomeCounts {
     pub skipped: u32,
     pub timed_out: u32,
     pub unknown: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OutcomeCountsWire {
+    total: u32,
+    passed: u32,
+    failed: u32,
+    skipped: u32,
+    timed_out: u32,
+    unknown: u32,
+}
+
+impl TryFrom<OutcomeCountsWire> for OutcomeCounts {
+    type Error = ModelError;
+
+    fn try_from(value: OutcomeCountsWire) -> Result<Self, Self::Error> {
+        Self::new(
+            value.total,
+            value.passed,
+            value.failed,
+            value.skipped,
+            value.timed_out,
+            value.unknown,
+        )
+    }
 }
 
 impl OutcomeCounts {
@@ -1077,7 +1228,11 @@ impl OutcomeCounts {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "BrowserStackBuildPayloadWire"
+)]
 pub struct BrowserStackBuildPayload {
     pub id: String,
     pub revision: Revision,
@@ -1093,6 +1248,46 @@ pub struct BrowserStackBuildPayload {
     pub product: BrowserStackProduct,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserStackBuildPayloadWire {
+    id: String,
+    revision: Revision,
+    project_id: Option<String>,
+    name: Option<String>,
+    status: String,
+    duration_seconds: Option<u64>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    commit: Option<String>,
+    artifact: Option<String>,
+    session_count: Option<u32>,
+    product: BrowserStackProduct,
+}
+
+impl TryFrom<BrowserStackBuildPayloadWire> for BrowserStackBuildPayload {
+    type Error = ModelError;
+
+    fn try_from(value: BrowserStackBuildPayloadWire) -> Result<Self, Self::Error> {
+        let payload = Self {
+            id: value.id,
+            revision: value.revision,
+            project_id: value.project_id,
+            name: value.name,
+            status: value.status,
+            duration_seconds: value.duration_seconds,
+            started_at: value.started_at,
+            finished_at: value.finished_at,
+            commit: value.commit,
+            artifact: value.artifact,
+            session_count: value.session_count,
+            product: value.product,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+}
+
 impl BrowserStackBuildPayload {
     pub fn new(
         id: impl Into<String>,
@@ -1102,7 +1297,7 @@ impl BrowserStackBuildPayload {
     ) -> Result<Self, ModelError> {
         let status = status.into();
         validate_text(&status, "build status", true)?;
-        Ok(Self {
+        let payload = Self {
             id: id.into(),
             revision: Revision::new(revision)?,
             project_id: None,
@@ -1115,7 +1310,9 @@ impl BrowserStackBuildPayload {
             artifact: None,
             session_count: None,
             product,
-        })
+        };
+        payload.validate()?;
+        Ok(payload)
     }
 
     pub fn validate(&self) -> Result<(), ModelError> {
@@ -1143,7 +1340,11 @@ impl BrowserStackBuildPayload {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "BrowserStackSessionPayloadWire"
+)]
 pub struct BrowserStackSessionPayload {
     pub id: String,
     pub revision: Revision,
@@ -1161,6 +1362,50 @@ pub struct BrowserStackSessionPayload {
     pub product: BrowserStackProduct,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserStackSessionPayloadWire {
+    id: String,
+    revision: Revision,
+    build_id: String,
+    project_id: Option<String>,
+    name: Option<String>,
+    status: String,
+    duration_seconds: Option<u64>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    matrix: BrowserStackMatrixEntry,
+    commit: Option<String>,
+    artifact: Option<String>,
+    outcomes: OutcomeCounts,
+    product: BrowserStackProduct,
+}
+
+impl TryFrom<BrowserStackSessionPayloadWire> for BrowserStackSessionPayload {
+    type Error = ModelError;
+
+    fn try_from(value: BrowserStackSessionPayloadWire) -> Result<Self, Self::Error> {
+        let payload = Self {
+            id: value.id,
+            revision: value.revision,
+            build_id: value.build_id,
+            project_id: value.project_id,
+            name: value.name,
+            status: value.status,
+            duration_seconds: value.duration_seconds,
+            started_at: value.started_at,
+            finished_at: value.finished_at,
+            matrix: value.matrix,
+            commit: value.commit,
+            artifact: value.artifact,
+            outcomes: value.outcomes,
+            product: value.product,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+}
+
 impl BrowserStackSessionPayload {
     pub fn new(
         id: impl Into<String>,
@@ -1174,7 +1419,7 @@ impl BrowserStackSessionPayload {
         let status = status.into();
         validate_text(&status, "session status", true)?;
         outcomes.validate()?;
-        Ok(Self {
+        let payload = Self {
             id: id.into(),
             revision: Revision::new(revision)?,
             build_id: build_id.into(),
@@ -1189,7 +1434,9 @@ impl BrowserStackSessionPayload {
             artifact: None,
             outcomes,
             product,
-        })
+        };
+        payload.validate()?;
+        Ok(payload)
     }
 
     pub fn validate(&self) -> Result<(), ModelError> {
@@ -1215,7 +1462,11 @@ pub enum BrowserStackResponseBody {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "BrowserStackResponseReceiptWire"
+)]
 pub struct BrowserStackResponseReceipt {
     pub request_digest: Digest,
     pub response_digest: Digest,
@@ -1237,13 +1488,67 @@ pub struct BrowserStackResponseReceipt {
     pub observed_at: DateTime<Utc>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserStackResponseReceiptWire {
+    request_digest: Digest,
+    response_digest: Digest,
+    endpoint: String,
+    product: BrowserStackProduct,
+    status: u16,
+    response_size: usize,
+    provider_revision: String,
+    offset: Option<u32>,
+    limit: Option<u16>,
+    raw_payload_retained: bool,
+    raw_logs_retained: bool,
+    raw_network_retained: bool,
+    raw_har_retained: bool,
+    raw_video_retained: bool,
+    raw_screenshots_retained: bool,
+    arbitrary_capabilities_retained: bool,
+    credential_material_retained: bool,
+    observed_at: DateTime<Utc>,
+}
+
+impl TryFrom<BrowserStackResponseReceiptWire> for BrowserStackResponseReceipt {
+    type Error = ModelError;
+
+    fn try_from(value: BrowserStackResponseReceiptWire) -> Result<Self, Self::Error> {
+        let receipt = Self {
+            request_digest: value.request_digest,
+            response_digest: value.response_digest,
+            endpoint: value.endpoint,
+            product: value.product,
+            status: value.status,
+            response_size: value.response_size,
+            provider_revision: value.provider_revision,
+            offset: value.offset,
+            limit: value.limit,
+            raw_payload_retained: value.raw_payload_retained,
+            raw_logs_retained: value.raw_logs_retained,
+            raw_network_retained: value.raw_network_retained,
+            raw_har_retained: value.raw_har_retained,
+            raw_video_retained: value.raw_video_retained,
+            raw_screenshots_retained: value.raw_screenshots_retained,
+            arbitrary_capabilities_retained: value.arbitrary_capabilities_retained,
+            credential_material_retained: value.credential_material_retained,
+            observed_at: value.observed_at,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+}
+
 impl BrowserStackResponseReceipt {
     pub fn validate(&self) -> Result<(), ModelError> {
         validate_digest(self.request_digest.as_str(), "request digest")?;
         validate_digest(self.response_digest.as_str(), "response digest")?;
         validate_text(&self.endpoint, "response endpoint", true)?;
         validate_text(&self.provider_revision, "provider revision", false)?;
-        if self.response_size > BROWSERSTACK_MAX_RESPONSE_BYTES
+        if (self.status != 0 && !(100..=599).contains(&self.status))
+            || self.provider_revision != BROWSERSTACK_PROVIDER_REVISION
+            || self.response_size > BROWSERSTACK_MAX_RESPONSE_BYTES
             || self.raw_payload_retained
             || self.raw_logs_retained
             || self.raw_network_retained
@@ -1265,7 +1570,11 @@ impl BrowserStackResponseReceipt {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "BrowserStackBuildProjectionWire"
+)]
 pub struct BrowserStackBuildProjection {
     pub id: String,
     pub revision: Revision,
@@ -1279,6 +1588,46 @@ pub struct BrowserStackBuildProjection {
     pub artifact: Option<String>,
     pub session_count: Option<u32>,
     pub product: BrowserStackProduct,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserStackBuildProjectionWire {
+    id: String,
+    revision: Revision,
+    project_id: Option<String>,
+    name: Option<String>,
+    status: String,
+    duration_seconds: Option<u64>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    commit: Option<String>,
+    artifact: Option<String>,
+    session_count: Option<u32>,
+    product: BrowserStackProduct,
+}
+
+impl TryFrom<BrowserStackBuildProjectionWire> for BrowserStackBuildProjection {
+    type Error = ModelError;
+
+    fn try_from(value: BrowserStackBuildProjectionWire) -> Result<Self, Self::Error> {
+        let projection = Self {
+            id: value.id,
+            revision: value.revision,
+            project_id: value.project_id,
+            name: value.name,
+            status: value.status,
+            duration_seconds: value.duration_seconds,
+            started_at: value.started_at,
+            finished_at: value.finished_at,
+            commit: value.commit,
+            artifact: value.artifact,
+            session_count: value.session_count,
+            product: value.product,
+        };
+        projection.validate()?;
+        Ok(projection)
+    }
 }
 
 impl From<BrowserStackBuildPayload> for BrowserStackBuildProjection {
@@ -1769,7 +2118,32 @@ impl BrowserStackReadProposal {
     }
 
     pub fn verify_integrity(&self) -> Result<(), ModelError> {
+        self.request.validate()?;
         self.bounds.validate()?;
+        if self.contract_version != BROWSERSTACK_CONTRACT_VERSION
+            || self.plugin_version != BROWSERSTACK_PLUGIN_VERSION_TEXT
+            || self.service_id != BROWSERSTACK_SERVICE_ID
+            || self.provider_id != BROWSERSTACK_PROVIDER_ID
+            || self.provider_revision != BROWSERSTACK_PROVIDER_REVISION
+            || self.contract_digest != crate::contract_digest()
+            || !self.provider_digest.is_sha256()
+            || !self.scope_digest.is_sha256()
+            || !self.permission_digest.is_sha256()
+            || !self.registration_digest.is_sha256()
+            || !self.request_digest.is_sha256()
+            || !self.proposal_digest.is_sha256()
+        {
+            return Err(ModelError::Invalid {
+                field: "proposal identity",
+            });
+        }
+        let expected_request_digest =
+            digest_serializable(&(&self.scope_digest, &self.request, self.bounds))?;
+        if expected_request_digest != self.request_digest {
+            return Err(ModelError::DigestMismatch {
+                field: "proposal request",
+            });
+        }
         if self.compute_digest()? == self.proposal_digest {
             Ok(())
         } else {
