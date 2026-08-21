@@ -55,22 +55,161 @@ pub enum VertexAiResponseFrame {
     ErrorBody,
 }
 
+/// Raw HTTP byte accounting is exact only when this crate received the raw
+/// body. Typed fixtures deliberately carry `Unknown` instead of fabricating a
+/// zero-byte count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResponseBodyAccounting {
+    bytes: Option<usize>,
+}
+
+impl ResponseBodyAccounting {
+    pub const fn unknown() -> Self {
+        Self { bytes: None }
+    }
+
+    pub const fn bytes(self) -> Option<usize> {
+        self.bytes
+    }
+
+    pub const fn is_unknown(self) -> bool {
+        self.bytes.is_none()
+    }
+
+    fn exact(bytes: usize) -> Self {
+        Self { bytes: Some(bytes) }
+    }
+}
+
+/// Sealed typed HTTP ingress. Its private fields and keyed fence prevent a
+/// caller from manufacturing a status/size/digest/frame tuple and resealing
+/// it without going through trusted raw-body or typed-fixture constructors.
+#[derive(Clone, Debug)]
+pub struct TrustedHttpResponse {
+    status: u16,
+    body_accounting: ResponseBodyAccounting,
+    response_digest: crate::model::Digest,
+    frame: VertexAiResponseFrame,
+    integrity_fence: crate::model::Digest,
+}
+
+fn response_frame_digest(frame: &VertexAiResponseFrame) -> crate::model::Digest {
+    match frame {
+        VertexAiResponseFrame::Parsed(response) => response.response_digest(),
+        VertexAiResponseFrame::Malformed => digest_bytes(b"vertex-ai-frame/malformed"),
+        VertexAiResponseFrame::Oversized => digest_bytes(b"vertex-ai-frame/oversized"),
+        VertexAiResponseFrame::ErrorBody => digest_bytes(b"vertex-ai-frame/error-body"),
+    }
+}
+
+fn response_ingress_fence(
+    status: u16,
+    body_accounting: ResponseBodyAccounting,
+    response_digest: &crate::model::Digest,
+    frame: &VertexAiResponseFrame,
+) -> crate::model::Digest {
+    let mut material = b"hartevo-vertex-ai-response-ingress/v1".to_vec();
+    material.extend_from_slice(&status.to_be_bytes());
+    match body_accounting.bytes() {
+        Some(bytes) => {
+            material.push(1);
+            material.extend_from_slice(&bytes.to_be_bytes());
+        }
+        None => material.push(0),
+    }
+    material.extend_from_slice(response_digest.as_str().as_bytes());
+    material.extend_from_slice(response_frame_digest(frame).as_str().as_bytes());
+    digest_bytes(&material)
+}
+
+impl TrustedHttpResponse {
+    fn from_raw(status: u16, body: &[u8], frame: VertexAiResponseFrame) -> Self {
+        let body_accounting = ResponseBodyAccounting::exact(body.len());
+        let response_digest = digest_bytes(body);
+        let integrity_fence =
+            response_ingress_fence(status, body_accounting, &response_digest, &frame);
+        Self {
+            status,
+            body_accounting,
+            response_digest,
+            frame,
+            integrity_fence,
+        }
+    }
+
+    fn from_typed_fixture(response: VertexAiResponse) -> Self {
+        let body_accounting = ResponseBodyAccounting::unknown();
+        let response_digest = response.response_digest();
+        let frame = VertexAiResponseFrame::Parsed(response);
+        let integrity_fence =
+            response_ingress_fence(200, body_accounting, &response_digest, &frame);
+        Self {
+            status: 200,
+            body_accounting,
+            response_digest,
+            frame,
+            integrity_fence,
+        }
+    }
+
+    fn validate(&self, max_response_bytes: usize) -> Result<(), VertexAiGenerationError> {
+        if self.integrity_fence
+            != response_ingress_fence(
+                self.status,
+                self.body_accounting,
+                &self.response_digest,
+                &self.frame,
+            )
+        {
+            return Err(VertexAiGenerationError::ResponseIngressTampered);
+        }
+        if self.body_accounting.bytes().is_some_and(|bytes| {
+            bytes > max_response_bytes || bytes > DEFAULT_PROVIDER_RESPONSE_BYTES
+        }) {
+            return Err(VertexAiGenerationError::ResponseTooLarge);
+        }
+        if self.body_accounting.is_unknown() {
+            let VertexAiResponseFrame::Parsed(response) = &self.frame else {
+                return Err(VertexAiGenerationError::MalformedResponse(
+                    "unknown byte accounting requires a typed parsed response",
+                ));
+            };
+            if self.response_digest != response.response_digest() {
+                return Err(VertexAiGenerationError::ResponseIngressTampered);
+            }
+        }
+        if let VertexAiResponseFrame::Parsed(response) = &self.frame {
+            response.validate_metadata()?;
+        }
+        Ok(())
+    }
+
+    fn status(&self) -> u16 {
+        self.status
+    }
+
+    fn response_digest(&self) -> &crate::model::Digest {
+        &self.response_digest
+    }
+
+    fn frame(&self) -> &VertexAiResponseFrame {
+        &self.frame
+    }
+
+    fn body_accounting(&self) -> ResponseBodyAccounting {
+        self.body_accounting
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ProviderResponseOutcome {
-    Http {
-        status: u16,
-        body_bytes: usize,
-        response_digest: crate::model::Digest,
-        frame: VertexAiResponseFrame,
-    },
+    Http(Box<TrustedHttpResponse>),
     Timeout,
     Cancelled,
     Expired,
     AccessLost,
     TransportUnavailable,
-    BlockedEnv {
-        code: BlockedEnvCode,
-    },
+    BlockedEnv { code: BlockedEnvCode },
 }
 
 /// A recording frame never retains its raw HTTP body. Successful JSON is
@@ -109,7 +248,7 @@ impl fmt::Debug for RecordedVertexAiResponse {
 
 impl RecordedVertexAiResponse {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new(
         recording_id: impl Into<String>,
         provider_id: impl Into<String>,
         google_cloud_project_id: impl Into<String>,
@@ -163,12 +302,9 @@ impl RecordedVertexAiResponse {
             model_id,
             model_snapshot,
             latency_ms,
-            ProviderResponseOutcome::Http {
-                status: 200,
-                body_bytes: body.len(),
-                response_digest: digest_bytes(body),
-                frame,
-            },
+            ProviderResponseOutcome::Http(Box::new(TrustedHttpResponse::from_raw(
+                200, body, frame,
+            ))),
         )
     }
 
@@ -195,12 +331,11 @@ impl RecordedVertexAiResponse {
             model_id,
             model_snapshot,
             latency_ms,
-            ProviderResponseOutcome::Http {
+            ProviderResponseOutcome::Http(Box::new(TrustedHttpResponse::from_raw(
                 status,
-                body_bytes: body.len(),
-                response_digest: digest_bytes(body),
-                frame: VertexAiResponseFrame::ErrorBody,
-            },
+                body,
+                VertexAiResponseFrame::ErrorBody,
+            ))),
         )
     }
 
@@ -216,9 +351,6 @@ impl RecordedVertexAiResponse {
         response: VertexAiResponse,
         latency_ms: u64,
     ) -> Self {
-        // No raw body was supplied to this typed fixture constructor, so zero
-        // truthfully means that raw HTTP byte accounting is unavailable.
-        let response_digest = response.response_digest();
         Self::new(
             recording_id,
             provider_id,
@@ -228,12 +360,9 @@ impl RecordedVertexAiResponse {
             model_id,
             model_snapshot,
             latency_ms,
-            ProviderResponseOutcome::Http {
-                status: 200,
-                body_bytes: 0,
-                response_digest,
-                frame: VertexAiResponseFrame::Parsed(response),
-            },
+            ProviderResponseOutcome::Http(Box::new(TrustedHttpResponse::from_typed_fixture(
+                response,
+            ))),
         )
     }
 
@@ -393,6 +522,22 @@ impl RecordedVertexAiResponse {
     pub fn outcome(&self) -> &ProviderResponseOutcome {
         &self.outcome
     }
+
+    /// Returns exact raw ingress bytes when a raw body was received. Typed
+    /// fixtures return `None` because their raw HTTP size is unknown.
+    pub fn body_bytes(&self) -> Option<usize> {
+        match &self.outcome {
+            ProviderResponseOutcome::Http(response) => response.body_accounting().bytes(),
+            _ => None,
+        }
+    }
+
+    pub fn response_digest(&self) -> Option<&crate::model::Digest> {
+        match &self.outcome {
+            ProviderResponseOutcome::Http(response) => Some(response.response_digest()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -491,20 +636,16 @@ impl VertexAiGenerationProvider {
     ) -> Result<GenerationResultEvidence, VertexAiGenerationError> {
         proposal.verify_integrity()?;
         validate_recording_identity(proposal, response)?;
+        if let ProviderResponseOutcome::Http(http) = &response.outcome {
+            http.validate(self.max_response_bytes)?;
+        }
         claim_recording(response.recording_id(), &proposal.proposal_digest)?;
         match &response.outcome {
-            ProviderResponseOutcome::Http {
-                status,
-                body_bytes,
-                response_digest,
-                frame,
-            } => {
-                if *body_bytes > self.max_response_bytes
-                    || *body_bytes > DEFAULT_PROVIDER_RESPONSE_BYTES
-                {
-                    return Err(VertexAiGenerationError::ResponseTooLarge);
-                }
-                if (200..300).contains(status) {
+            ProviderResponseOutcome::Http(http) => {
+                let status = http.status();
+                let response_digest = http.response_digest();
+                let frame = http.frame();
+                if (200..300).contains(&status) {
                     if self.mode == ProviderMode::BlockedEnv {
                         return Err(VertexAiGenerationError::BlockedEnvironment(
                             "BLOCKED_ENV cannot assert a successful provider response",
@@ -541,7 +682,7 @@ impl VertexAiGenerationProvider {
                         redaction,
                     ))
                 } else {
-                    let (state, class, retryable) = failure_for_status(*status)?;
+                    let (state, class, retryable) = failure_for_status(status)?;
                     Ok(error_evidence(
                         self.mode,
                         proposal,
@@ -549,7 +690,7 @@ impl VertexAiGenerationProvider {
                         state,
                         class,
                         retryable,
-                        Some(*status),
+                        Some(status),
                         redaction,
                     ))
                 }
@@ -717,8 +858,8 @@ fn validate_response(
     {
         return Err(VertexAiGenerationError::OutputTokenBudgetExceeded);
     }
-    if proposal.request.max_output_tokens > max_output_tokens
-        || proposal.request.candidate_count > max_candidates
+    if proposal.request.max_output_tokens() > max_output_tokens
+        || proposal.request.candidate_count() > max_candidates
     {
         return Err(VertexAiGenerationError::ScopeMismatch(
             "proposal exceeds the response policy",
@@ -1174,4 +1315,52 @@ pub const fn native_execution_available() -> bool {
 
 pub const fn provider_identity() -> &'static str {
     VERTEX_AI_GENERATION_PROVIDER_ID
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::*;
+
+    fn typed_response() -> VertexAiResponse {
+        VertexAiResponse::new(
+            "response",
+            "gemini-2.5-flash-001",
+            vec![
+                VertexAiCandidate::from_text(0, "output", FinishReason::Stop, Vec::new())
+                    .expect("candidate"),
+            ],
+            None,
+            None,
+        )
+        .expect("bounded typed response")
+    }
+
+    #[test]
+    fn ingress_fence_rejects_digest_self_reseal() {
+        let mut ingress = TrustedHttpResponse::from_typed_fixture(typed_response());
+        ingress.response_digest = digest_bytes(b"forged-response-digest");
+        assert_eq!(
+            ingress.validate(DEFAULT_PROVIDER_RESPONSE_BYTES),
+            Err(VertexAiGenerationError::ResponseIngressTampered)
+        );
+    }
+
+    #[test]
+    fn ingress_fence_rejects_status_and_size_self_reseal() {
+        let mut ingress =
+            TrustedHttpResponse::from_raw(200, b"{}", VertexAiResponseFrame::Malformed);
+        ingress.status = 201;
+        assert_eq!(
+            ingress.validate(DEFAULT_PROVIDER_RESPONSE_BYTES),
+            Err(VertexAiGenerationError::ResponseIngressTampered)
+        );
+
+        let oversized = vec![b' '; DEFAULT_PROVIDER_RESPONSE_BYTES + 1];
+        let ingress =
+            TrustedHttpResponse::from_raw(200, &oversized, VertexAiResponseFrame::Oversized);
+        assert_eq!(
+            ingress.validate(DEFAULT_PROVIDER_RESPONSE_BYTES),
+            Err(VertexAiGenerationError::ResponseTooLarge)
+        );
+    }
 }

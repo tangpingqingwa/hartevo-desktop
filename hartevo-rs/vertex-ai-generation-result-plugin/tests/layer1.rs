@@ -239,7 +239,7 @@ fn optional_schema_is_digest_bound() {
     let proposal = service
         .compile_generation_proposal(&request)
         .expect("schema proposal");
-    assert!(proposal.request.output_schema_digest.is_some());
+    assert!(proposal.request().output_schema_digest().is_some());
 }
 
 #[test]
@@ -455,13 +455,19 @@ fn project_location_model_and_mission_drift_are_rejected() {
 fn tamper_replay_revocation_and_blocked_env_fail_closed() {
     let mut service = service();
     let request = request();
-    let mut proposal = service
+    let proposal = service
         .compile_generation_proposal(&request)
         .expect("proposal");
-    proposal.request.input_bytes += 1;
+    let mut fresh_service = vertex::VertexAiGenerationResultService::new(
+        scope(),
+        vertex::VertexAiGenerationProvider::recording(),
+    )
+    .expect("fresh service");
     assert_eq!(
-        service.record_generation_result(&proposal, &success_response("tampered")),
-        Err(vertex::VertexAiGenerationError::ProposalTampered)
+        fresh_service.record_generation_result(&proposal, &success_response("tampered")),
+        Err(vertex::VertexAiGenerationError::ScopeMismatch(
+            "proposal has no trusted canonical request source"
+        ))
     );
 
     let proposal = service
@@ -533,6 +539,11 @@ fn mission_consumer_is_proposal_only() {
     assert!(!result.independent_read_back);
     assert!(!result.adopted_outcome);
     assert_eq!(result.mission_revision, 4);
+    assert_eq!(result.request_digest, *proposal.request().request_digest());
+    assert_eq!(
+        result.request_source_fence,
+        *proposal.request().source_fence()
+    );
 }
 
 #[test]
@@ -720,8 +731,8 @@ fn recording_tombstone_is_global_across_clones_and_resealed_scopes() {
         .compile_generation_proposal(&request())
         .expect("resealed proposal");
     assert_ne!(
-        resealed_proposal.proposal_digest,
-        first_proposal.proposal_digest
+        resealed_proposal.proposal_digest(),
+        first_proposal.proposal_digest()
     );
     assert_eq!(
         fresh_service.record_generation_result(
@@ -731,6 +742,55 @@ fn recording_tombstone_is_global_across_clones_and_resealed_scopes() {
         Err(vertex::VertexAiGenerationError::ReplayDetected)
     );
     assert!(!vertex::VertexAiGenerationProvider::recording().replay_fence_durable());
+}
+
+#[test]
+fn canonical_request_source_binding_rejects_cross_request_and_fresh_service_use() {
+    let mut service = service();
+    let first_request = request();
+    let second_request = request().with_max_output_tokens(128);
+    let first_proposal = service
+        .compile_generation_proposal(&first_request)
+        .expect("first proposal");
+    let second_proposal = service
+        .compile_generation_proposal(&second_request)
+        .expect("second proposal");
+    assert_ne!(
+        first_proposal.request().request_digest(),
+        second_proposal.request().request_digest()
+    );
+    assert_ne!(
+        first_proposal.request().source_fence(),
+        second_proposal.request().source_fence()
+    );
+
+    let evidence = service
+        .record_generation_result(
+            &first_proposal,
+            &success_response("canonical-request-binding"),
+        )
+        .expect("first evidence");
+    assert_eq!(
+        evidence.request_digest,
+        *first_proposal.request().request_digest()
+    );
+    assert_eq!(
+        evidence.request_source_fence,
+        *first_proposal.request().source_fence()
+    );
+
+    let mut fresh_service = vertex::VertexAiGenerationResultService::new(
+        scope(),
+        vertex::VertexAiGenerationProvider::recording(),
+    )
+    .expect("fresh service");
+    assert_eq!(
+        fresh_service
+            .record_generation_result(&first_proposal, &success_response("fresh-source-binding"),),
+        Err(vertex::VertexAiGenerationError::ScopeMismatch(
+            "proposal has no trusted canonical request source"
+        ))
+    );
 }
 
 #[test]
@@ -781,18 +841,35 @@ fn response_serde_and_ingress_revalidate_ceiling_and_metadata() {
     );
 
     let response = success_response("truthful-body-bytes");
-    if let vertex::ProviderResponseOutcome::Http { body_bytes, .. } = response.outcome() {
-        assert_eq!(*body_bytes, success_body().len());
-    } else {
-        panic!("expected HTTP response frame");
-    }
+    assert_eq!(response.body_bytes(), Some(success_body().len()));
+    assert!(response.response_digest().is_some());
 
     let mut service = service();
     let proposal = service
         .compile_generation_proposal(&request())
         .expect("proposal");
     let parsed = vertex::VertexAiResponse::from_json(success_body()).expect("parsed response");
-    let forged_frame = vertex::RecordedVertexAiResponse::new(
+    let typed_fixture = vertex::RecordedVertexAiResponse::from_response(
+        "typed-fixture-unknown-bytes",
+        vertex::VERTEX_AI_GENERATION_PROVIDER_ID,
+        "project-1",
+        "us-central1",
+        "google",
+        "gemini-2.5-flash",
+        "001",
+        parsed.clone(),
+        0,
+    );
+    assert_eq!(typed_fixture.body_bytes(), None);
+    let typed_evidence = service
+        .record_generation_result(&proposal, &typed_fixture)
+        .expect("typed fixture evidence");
+    assert_eq!(typed_evidence.response_digest, parsed.response_digest());
+
+    let oversized_proposal = service
+        .compile_generation_proposal(&request())
+        .expect("oversized proposal");
+    let oversized_response = vertex::RecordedVertexAiResponse::success(
         "forged-response-ceiling",
         vertex::VERTEX_AI_GENERATION_PROVIDER_ID,
         "project-1",
@@ -800,16 +877,15 @@ fn response_serde_and_ingress_revalidate_ceiling_and_metadata() {
         "google",
         "gemini-2.5-flash",
         "001",
+        vec![b' '; vertex::MAX_RESPONSE_BYTES + 1],
         0,
-        vertex::ProviderResponseOutcome::Http {
-            status: 200,
-            body_bytes: vertex::MAX_RESPONSE_BYTES + 1,
-            response_digest: vertex::Digest::sha256("forged-body"),
-            frame: vertex::VertexAiResponseFrame::Parsed(parsed),
-        },
     );
     assert_eq!(
-        service.record_generation_result(&proposal, &forged_frame),
+        oversized_response.body_bytes(),
+        Some(vertex::MAX_RESPONSE_BYTES + 1)
+    );
+    assert_eq!(
+        service.record_generation_result(&oversized_proposal, &oversized_response),
         Err(vertex::VertexAiGenerationError::ResponseTooLarge)
     );
 }

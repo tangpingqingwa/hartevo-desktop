@@ -1,10 +1,15 @@
 //! Typed service seam and reversible registration lifecycle.
 
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
 use crate::{
     model::{
         GenerationRequest, GenerationResultEvidence, GenerationResultProposal, InputPart,
-        ModelDescription, PluginRegistration, ProviderMode, Revocation, RevocationReason,
-        VertexAiGenerationError, VertexAiGenerationScope,
+        ModelDescription, PluginRegistration, ProviderMode, RequestFingerprint, Revocation,
+        RevocationReason, VertexAiGenerationError, VertexAiGenerationScope,
     },
     provider::{BlockedEnvCode, RecordedVertexAiResponse, VertexAiGenerationProvider},
 };
@@ -16,6 +21,7 @@ pub struct VertexAiGenerationResultService {
     scope: VertexAiGenerationScope,
     registration: PluginRegistration,
     provider: VertexAiGenerationProvider,
+    trusted_requests: Arc<Mutex<BTreeMap<crate::model::Digest, GenerationRequest>>>,
 }
 
 impl VertexAiGenerationResultService {
@@ -29,6 +35,7 @@ impl VertexAiGenerationResultService {
             scope,
             registration,
             provider,
+            trusted_requests: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -61,6 +68,12 @@ impl VertexAiGenerationResultService {
         validate_request(&self.scope, request)?;
         let proposal = GenerationResultProposal::new(&self.scope, &self.registration, request);
         proposal.verify_integrity()?;
+        let mut trusted_requests = self.trusted_requests.lock().map_err(|_| {
+            VertexAiGenerationError::BlockedEnvironment(
+                "trusted request source binding is unavailable",
+            )
+        })?;
+        trusted_requests.insert(proposal.proposal_digest.clone(), request.clone());
         Ok(proposal)
     }
 
@@ -136,6 +149,8 @@ impl VertexAiGenerationResultService {
         self.validate_proposal_binding(proposal)?;
         evidence.verify_integrity()?;
         if evidence.proposal_digest != proposal.proposal_digest
+            || evidence.request_digest != *proposal.request.request_digest()
+            || evidence.request_source_fence != *proposal.request.source_fence()
             || evidence.contract_digest != *self.registration.contract_digest()
             || evidence.registration_digest != *self.registration.registration_digest()
             || evidence.provider_digest != self.scope.provider_digest()
@@ -195,6 +210,22 @@ impl VertexAiGenerationResultService {
         proposal: &GenerationResultProposal,
     ) -> Result<(), VertexAiGenerationError> {
         proposal.verify_integrity()?;
+        let trusted_request = {
+            let trusted_requests = self.trusted_requests.lock().map_err(|_| {
+                VertexAiGenerationError::BlockedEnvironment(
+                    "trusted request source binding is unavailable",
+                )
+            })?;
+            trusted_requests.get(&proposal.proposal_digest).cloned()
+        }
+        .ok_or(VertexAiGenerationError::ScopeMismatch(
+            "proposal has no trusted canonical request source",
+        ))?;
+        validate_request(&self.scope, &trusted_request)?;
+        let expected_request = RequestFingerprint::from_request(&self.scope, &trusted_request);
+        if proposal.request != expected_request {
+            return Err(VertexAiGenerationError::ProposalTampered);
+        }
         if proposal.service_id != crate::VERTEX_AI_GENERATION_SERVICE_ID
             || proposal.contract_digest != *self.registration.contract_digest()
             || proposal.registration_digest != *self.registration.registration_digest()

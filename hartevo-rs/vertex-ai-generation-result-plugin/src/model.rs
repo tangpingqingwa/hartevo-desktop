@@ -1,6 +1,11 @@
 //! Typed, bounded, and redacted contract models for the Vertex AI seam.
 
-use std::{collections::BTreeSet, fmt};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -113,6 +118,8 @@ pub enum VertexAiGenerationError {
     SchemaTooLarge,
     #[error("response is too large for the configured Layer-1 bound")]
     ResponseTooLarge,
+    #[error("recorded response ingress binding is tampered")]
+    ResponseIngressTampered,
     #[error("response has too many candidates")]
     ResponseCandidateCountExceeded,
     #[error("response candidate content exceeds the configured bound")]
@@ -2611,17 +2618,43 @@ struct RegistrationMaterial<'a> {
     consent_digest: &'a Digest,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestFingerprint {
-    pub request_digest: Digest,
-    pub input_digest: Digest,
-    pub input_bytes: usize,
-    pub modalities: Vec<InputModality>,
-    pub max_output_tokens: u32,
-    pub candidate_count: usize,
-    pub options: RequestOptions,
-    pub output_schema_digest: Option<Digest>,
+    request_digest: Digest,
+    input_digest: Digest,
+    input_bytes: usize,
+    modalities: Vec<InputModality>,
+    max_output_tokens: u32,
+    candidate_count: usize,
+    options: RequestOptions,
+    output_schema_digest: Option<Digest>,
+    source_fence: Digest,
+}
+
+static REQUEST_SOURCE_KEY: OnceLock<Digest> = OnceLock::new();
+
+fn request_source_key() -> &'static Digest {
+    REQUEST_SOURCE_KEY.get_or_init(|| {
+        let mut material = b"hartevo-vertex-ai-request-source-key/v1".to_vec();
+        material.extend_from_slice(&std::process::id().to_be_bytes());
+        if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
+            material.extend_from_slice(&elapsed.as_secs().to_be_bytes());
+            material.extend_from_slice(&elapsed.subsec_nanos().to_be_bytes());
+        }
+        digest_bytes(&material)
+    })
+}
+
+pub(crate) fn expected_request_source_fence(
+    scope_digest: &Digest,
+    request_digest: &Digest,
+) -> Digest {
+    let mut material = b"hartevo-vertex-ai-request-source-fence/v1".to_vec();
+    material.extend_from_slice(request_source_key().as_str().as_bytes());
+    material.extend_from_slice(scope_digest.as_str().as_bytes());
+    material.extend_from_slice(request_digest.as_str().as_bytes());
+    digest_bytes(&material)
 }
 
 impl RequestFingerprint {
@@ -2629,16 +2662,19 @@ impl RequestFingerprint {
         scope: &VertexAiGenerationScope,
         request: &GenerationRequest,
     ) -> Self {
+        let scope_digest = scope.digest();
         let request_material = RequestDigestMaterial {
-            scope_digest: scope.digest(),
+            scope_digest: scope_digest.clone(),
             input: &request.input,
             max_output_tokens: request.max_output_tokens,
             candidate_count: request.candidate_count,
             options: request.options,
             output_schema: request.output_schema.as_ref(),
         };
+        let request_digest = digest_serializable(&request_material);
         Self {
-            request_digest: digest_serializable(&request_material),
+            source_fence: expected_request_source_fence(&scope_digest, &request_digest),
+            request_digest,
             input_digest: request.input.input_digest().clone(),
             input_bytes: request.input.total_bytes(),
             modalities: request.input.modalities(),
@@ -2647,6 +2683,42 @@ impl RequestFingerprint {
             options: request.options,
             output_schema_digest: request.output_schema.as_ref().map(|schema| schema.digest()),
         }
+    }
+
+    pub fn request_digest(&self) -> &Digest {
+        &self.request_digest
+    }
+
+    pub fn input_digest(&self) -> &Digest {
+        &self.input_digest
+    }
+
+    pub const fn input_bytes(&self) -> usize {
+        self.input_bytes
+    }
+
+    pub fn modalities(&self) -> &[InputModality] {
+        &self.modalities
+    }
+
+    pub const fn max_output_tokens(&self) -> u32 {
+        self.max_output_tokens
+    }
+
+    pub const fn candidate_count(&self) -> usize {
+        self.candidate_count
+    }
+
+    pub const fn options(&self) -> RequestOptions {
+        self.options
+    }
+
+    pub fn output_schema_digest(&self) -> Option<&Digest> {
+        self.output_schema_digest.as_ref()
+    }
+
+    pub fn source_fence(&self) -> &Digest {
+        &self.source_fence
     }
 
     fn validate_bounds(&self) -> Result<(), VertexAiGenerationError> {
@@ -2671,6 +2743,12 @@ impl RequestFingerprint {
         {
             return Err(VertexAiGenerationError::SchemaMismatch);
         }
+        if !self.request_digest.is_sha256()
+            || !self.input_digest.is_sha256()
+            || !self.source_fence.is_sha256()
+        {
+            return Err(VertexAiGenerationError::ProposalTampered);
+        }
         Ok(())
     }
 }
@@ -2685,31 +2763,31 @@ struct RequestDigestMaterial<'a> {
     output_schema: Option<&'a OutputSchema>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GenerationResultProposal {
-    pub proposal_version: String,
-    pub service_id: String,
-    pub google_cloud_project: GoogleCloudProject,
-    pub location: VertexLocation,
-    pub api_version: VertexApiVersion,
-    pub publisher: VertexPublisher,
-    pub model: ModelSnapshot,
-    pub request: RequestFingerprint,
-    pub contract_digest: Digest,
-    pub provider_digest: Digest,
-    pub permission_digest: Digest,
-    pub scope_digest: Digest,
-    pub project_digest: Digest,
-    pub mission_digest: Digest,
-    pub work_product_digest: Digest,
-    pub consent_digest: Digest,
-    pub input_policy_digest: Digest,
-    pub safety_policy_digest: Digest,
-    pub tool_grounding_policy_digest: Digest,
-    pub response_digest: Digest,
-    pub registration_digest: Digest,
-    pub proposal_digest: Digest,
+    pub(crate) proposal_version: String,
+    pub(crate) service_id: String,
+    pub(crate) google_cloud_project: GoogleCloudProject,
+    pub(crate) location: VertexLocation,
+    pub(crate) api_version: VertexApiVersion,
+    pub(crate) publisher: VertexPublisher,
+    pub(crate) model: ModelSnapshot,
+    pub(crate) request: RequestFingerprint,
+    pub(crate) contract_digest: Digest,
+    pub(crate) provider_digest: Digest,
+    pub(crate) permission_digest: Digest,
+    pub(crate) scope_digest: Digest,
+    pub(crate) project_digest: Digest,
+    pub(crate) mission_digest: Digest,
+    pub(crate) work_product_digest: Digest,
+    pub(crate) consent_digest: Digest,
+    pub(crate) input_policy_digest: Digest,
+    pub(crate) safety_policy_digest: Digest,
+    pub(crate) tool_grounding_policy_digest: Digest,
+    pub(crate) response_digest: Digest,
+    pub(crate) registration_digest: Digest,
+    pub(crate) proposal_digest: Digest,
 }
 
 impl GenerationResultProposal {
@@ -2746,7 +2824,7 @@ impl GenerationResultProposal {
         proposal
     }
 
-    pub fn compute_digest(&self) -> Digest {
+    pub(crate) fn compute_digest(&self) -> Digest {
         digest_serializable(&ProposalMaterial {
             proposal_version: &self.proposal_version,
             service_id: &self.service_id,
@@ -2774,11 +2852,24 @@ impl GenerationResultProposal {
 
     pub fn verify_integrity(&self) -> Result<(), VertexAiGenerationError> {
         self.request.validate_bounds()?;
+        if self.request.source_fence
+            != expected_request_source_fence(&self.scope_digest, &self.request.request_digest)
+        {
+            return Err(VertexAiGenerationError::ProposalTampered);
+        }
         if self.proposal_digest == self.compute_digest() {
             Ok(())
         } else {
             Err(VertexAiGenerationError::ProposalTampered)
         }
+    }
+
+    pub fn proposal_digest(&self) -> &Digest {
+        &self.proposal_digest
+    }
+
+    pub fn request(&self) -> &RequestFingerprint {
+        &self.request
     }
 }
 
@@ -3398,6 +3489,8 @@ pub struct ProviderErrorProjection {
 pub struct GenerationResultEvidence {
     pub evidence_version: String,
     pub proposal_digest: Digest,
+    pub request_digest: Digest,
+    pub request_source_fence: Digest,
     pub contract_digest: Digest,
     pub registration_digest: Digest,
     pub provider_digest: Digest,
@@ -3446,6 +3539,8 @@ impl GenerationResultEvidence {
         let mut evidence = Self {
             evidence_version: "vertex-ai-generation-result-evidence/v1".to_owned(),
             proposal_digest: proposal.proposal_digest.clone(),
+            request_digest: proposal.request.request_digest.clone(),
+            request_source_fence: proposal.request.source_fence.clone(),
             contract_digest: proposal.contract_digest.clone(),
             registration_digest: proposal.registration_digest.clone(),
             provider_digest: proposal.provider_digest.clone(),
@@ -3481,6 +3576,8 @@ impl GenerationResultEvidence {
         digest_serializable(&EvidenceMaterial {
             evidence_version: &self.evidence_version,
             proposal_digest: &self.proposal_digest,
+            request_digest: &self.request_digest,
+            request_source_fence: &self.request_source_fence,
             contract_digest: &self.contract_digest,
             registration_digest: &self.registration_digest,
             provider_digest: &self.provider_digest,
@@ -3529,6 +3626,8 @@ impl GenerationResultEvidence {
     fn validate_metadata(&self) -> Result<(), VertexAiGenerationError> {
         if self.evidence_version != "vertex-ai-generation-result-evidence/v1"
             || !self.proposal_digest.is_sha256()
+            || !self.request_digest.is_sha256()
+            || !self.request_source_fence.is_sha256()
             || !self.contract_digest.is_sha256()
             || !self.registration_digest.is_sha256()
             || !self.provider_digest.is_sha256()
@@ -3543,6 +3642,11 @@ impl GenerationResultEvidence {
                 .output_digest
                 .as_ref()
                 .is_some_and(|digest| !digest.is_sha256())
+        {
+            return Err(VertexAiGenerationError::EvidenceTampered);
+        }
+        if self.request_source_fence
+            != expected_request_source_fence(&self.scope_digest, &self.request_digest)
         {
             return Err(VertexAiGenerationError::EvidenceTampered);
         }
@@ -3593,6 +3697,8 @@ impl GenerationResultEvidence {
 struct EvidenceMaterial<'a> {
     evidence_version: &'a str,
     proposal_digest: &'a Digest,
+    request_digest: &'a Digest,
+    request_source_fence: &'a Digest,
     contract_digest: &'a Digest,
     registration_digest: &'a Digest,
     provider_digest: &'a Digest,

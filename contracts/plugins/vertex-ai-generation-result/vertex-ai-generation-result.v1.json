@@ -86,6 +86,11 @@
     "toolArguments": false,
     "fileBytes": false
   },
+  "responseAccounting": {
+    "rawHttp": "exact_body_bytes_and_raw_body_sha256",
+    "typedFixture": "unknown_body_bytes_explicitly_marked",
+    "forgedStatusSizeDigestTuple": "rejected_before_recording"
+  },
   "registration": {
     "versionBound": true,
     "contractBound": true,
@@ -99,6 +104,13 @@
       "scope": "process_global",
       "sharedAcrossServices": true,
       "monotonic": true,
+      "durable": false,
+      "failClosed": true
+    },
+    "requestBinding": {
+      "source": "service_owned_canonical_request_snapshot",
+      "fence": "process_keyed",
+      "sharedAcrossServiceClones": true,
       "durable": false,
       "failClosed": true
     },

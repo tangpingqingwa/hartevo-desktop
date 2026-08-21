@@ -37,7 +37,7 @@ pub use mission::{MissionResultProjection, MissionVertexAiResult, MissionVertexA
 pub use model::*;
 pub use provider::{
     BlockedEnvCode, ProviderResponseOutcome, RecordedProviderResponse, RecordedVertexAiResponse,
-    VertexAiGenerationProvider, VertexAiResponseFrame,
+    ResponseBodyAccounting, TrustedHttpResponse, VertexAiGenerationProvider, VertexAiResponseFrame,
 };
 pub use service::VertexAiGenerationResultService;
 
@@ -119,5 +119,30 @@ mod contract_document_tests {
         assert_eq!(contract["registration"]["replayFence"]["monotonic"], true);
         assert_eq!(contract["registration"]["replayFence"]["durable"], false);
         assert_eq!(contract["registration"]["replayFence"]["failClosed"], true);
+        assert_eq!(
+            contract["registration"]["requestBinding"]["source"],
+            "service_owned_canonical_request_snapshot"
+        );
+        assert_eq!(
+            contract["registration"]["requestBinding"]["fence"],
+            "process_keyed"
+        );
+        assert_eq!(
+            contract["registration"]["requestBinding"]["sharedAcrossServiceClones"],
+            true
+        );
+        assert_eq!(contract["registration"]["requestBinding"]["durable"], false);
+        assert_eq!(
+            contract["responseAccounting"]["rawHttp"],
+            "exact_body_bytes_and_raw_body_sha256"
+        );
+        assert_eq!(
+            contract["responseAccounting"]["typedFixture"],
+            "unknown_body_bytes_explicitly_marked"
+        );
+        assert_eq!(
+            contract["responseAccounting"]["forgedStatusSizeDigestTuple"],
+            "rejected_before_recording"
+        );
     }
 }
