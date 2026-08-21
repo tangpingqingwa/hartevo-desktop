@@ -1888,6 +1888,42 @@ where
         self.schedules.get(schedule_id_digest)
     }
 
+    /// Returns the exact token currently owned by a schedule.  A host adapter
+    /// may use this after receiving a typed wake event; token construction
+    /// remains scheduler-owned so callers cannot mint a token for another
+    /// Project/Mission, revision, lease, or provider epoch.
+    pub fn wake_token_for(
+        &self,
+        schedule_id_digest: &str,
+    ) -> Result<Option<DispatchWakeToken>, RecurringScheduleError> {
+        let record = self
+            .schedules
+            .get(schedule_id_digest)
+            .ok_or(RecurringScheduleError::ScheduleNotFound)?;
+        if record.status == MissionScheduleStatus::Dispatching {
+            return Ok(record
+                .pending_dispatch
+                .as_ref()
+                .map(|pending| pending.token.clone()));
+        }
+        if record.status != MissionScheduleStatus::Active {
+            return Ok(None);
+        }
+        let occurrence = record
+            .next_occurrence
+            .as_ref()
+            .ok_or(RecurringScheduleError::RecurrenceExhausted)?;
+        let token = DispatchWakeToken::issue(record, occurrence)?;
+        let armed = record
+            .armed_wake
+            .as_ref()
+            .ok_or(RecurringScheduleError::WakeNotArmed)?;
+        if armed.token_digest != token.token_digest {
+            return Err(RecurringScheduleError::StaleWakeToken);
+        }
+        Ok(Some(token))
+    }
+
     pub fn model_receipts(&self) -> &[MissionScheduleModelReceipt] {
         &self.model_receipts
     }
