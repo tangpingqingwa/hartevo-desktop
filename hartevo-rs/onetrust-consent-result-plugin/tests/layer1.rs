@@ -6,10 +6,10 @@ use hartevo_onetrust_consent_result_plugin::{
     OneTrustConsentEvidenceService, OneTrustConsentObservation, OneTrustConsentResultContract,
     OneTrustConsentScope, OneTrustEndpoint, OneTrustEvidenceBundle,
     OneTrustEvidenceProposalRequest, OneTrustHttpRequest, OneTrustHttpResponse,
-    OneTrustReadRequest, OneTrustResponseBody, OneTrustTransport, OneTrustTransportError,
-    PolicyRevision, ProjectBinding, ProjectId, ProviderRevision, RecordingOneTrustTransport,
-    Region, Revision, SecretReference, SubjectReferenceHash, TenantId, TransportProvenance,
-    WorkProductBinding, WorkProductId,
+    OneTrustReadEvidence, OneTrustReadRequest, OneTrustResponseBody, OneTrustTransport,
+    OneTrustTransportError, PolicyRevision, ProjectBinding, ProjectId, ProviderRevision,
+    RecordingOneTrustTransport, Region, Revision, SecretReference, SubjectReferenceHash, TenantId,
+    TransportProvenance, WorkProductBinding, WorkProductId,
 };
 
 fn at() -> chrono::DateTime<Utc> {
@@ -880,5 +880,192 @@ fn response_missing_scope_identifiers_never_fall_back_to_request_scope() {
                 .is_err(),
             "missing {missing} must fail closed"
         );
+    }
+}
+
+#[test]
+fn recording_rejects_duplicate_resealed_and_tampered_receipt_replays() {
+    let mut service = service_with_fixture(scope(), ConsentEvidenceStatus::Granted);
+    let proposal = service
+        .propose(OneTrustEvidenceProposalRequest::new(at()))
+        .expect("proposal");
+    let receipt = service.record(&proposal).expect("first recording");
+    service
+        .verify_recording_receipt(&proposal, &receipt)
+        .expect("recording receipt fence");
+    assert!(matches!(
+        service.record(&proposal),
+        Err(hartevo_onetrust_consent_result_plugin::OneTrustConsentResultError::RecordingReplay)
+    ));
+
+    let mut resealed = proposal.clone();
+    resealed.projection.rationale_digest = Digest::from_text("resealed-rationale");
+    resealed.proposal_digest = resealed
+        .recompute_digest()
+        .expect("resealed proposal digest");
+    assert!(service.record(&resealed).is_err());
+
+    let mut tampered_receipt = receipt.clone();
+    tampered_receipt.replay_digest = Digest::from_text("tampered-replay");
+    assert!(
+        service
+            .verify_recording_receipt(&proposal, &tampered_receipt)
+            .is_err()
+    );
+}
+
+#[test]
+fn secret_revocation_reaches_existing_mission_consumers() {
+    let mut service = service_with_fixture(scope(), ConsentEvidenceStatus::Granted);
+    let consumer =
+        MissionOneTrustConsentConsumer::new(service.scope().clone(), service.registration())
+            .expect("consumer");
+    let proposal = service
+        .propose(OneTrustEvidenceProposalRequest::new(at()))
+        .expect("proposal");
+    assert!(consumer.is_active());
+    service.revoke_secret().expect("secret revoke");
+    assert!(!consumer.is_active());
+    assert!(matches!(
+        consumer.consume(&proposal),
+        Err(hartevo_onetrust_consent_result_plugin::OneTrustConsumerError::Revoked)
+    ));
+}
+
+#[test]
+fn mission_consumer_rejects_origin_and_resealed_registration_drift() {
+    let mut service = service_with_fixture(scope(), ConsentEvidenceStatus::Granted);
+    let consumer =
+        MissionOneTrustConsentConsumer::new(service.scope().clone(), service.registration())
+            .expect("consumer");
+    let proposal = service
+        .propose(OneTrustEvidenceProposalRequest::new(at()))
+        .expect("proposal");
+
+    let mut wrong_contract = proposal.clone();
+    wrong_contract.contract_version = "other-contract/v1".to_owned();
+    wrong_contract.proposal_digest = wrong_contract.recompute_digest().expect("outer digest");
+    assert!(consumer.consume(&wrong_contract).is_err());
+
+    let mut wrong_provider = proposal.clone();
+    wrong_provider.provider_id = "other.provider".to_owned();
+    wrong_provider.proposal_digest = wrong_provider.recompute_digest().expect("outer digest");
+    assert!(consumer.consume(&wrong_provider).is_err());
+
+    let mut wrong_provenance = proposal.clone();
+    wrong_provenance.provenance = TransportProvenance::Recording;
+    wrong_provenance.evidence.provenance = TransportProvenance::Recording;
+    wrong_provenance.evidence.source_digest = wrong_provenance
+        .evidence
+        .recompute_source_digest()
+        .expect("source digest");
+    wrong_provenance.evidence.result_digest = wrong_provenance
+        .evidence
+        .recompute_result_digest()
+        .expect("result digest");
+    wrong_provenance.evidence.evidence_digest = wrong_provenance
+        .evidence
+        .recompute_evidence_digest()
+        .expect("evidence digest");
+    wrong_provenance.projection.rationale_digest = wrong_provenance
+        .projection
+        .recompute_rationale_digest(&wrong_provenance.evidence);
+    wrong_provenance.proposal_digest = wrong_provenance.recompute_digest().expect("outer digest");
+    assert!(consumer.consume(&wrong_provenance).is_err());
+
+    let mut resealed_registration = service.registration().clone();
+    resealed_registration.provider_id = "other.provider".to_owned();
+    resealed_registration.registration_digest = resealed_registration
+        .recompute_digest()
+        .expect("registration digest");
+    assert!(
+        MissionOneTrustConsentConsumer::new(service.scope().clone(), &resealed_registration)
+            .is_err()
+    );
+}
+
+#[test]
+fn aggregate_observation_bound_truncates_partial_and_final_validation_holds() {
+    let scope = scope();
+    let service = service_with_fixture(scope.clone(), ConsentEvidenceStatus::Granted);
+    let reads = OneTrustEndpoint::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(index, endpoint)| {
+            OneTrustReadEvidence::new(
+                endpoint,
+                scope.scope_digest(),
+                scope.subject_reference.clone(),
+                vec![
+                    observation(&scope, ConsentEvidenceStatus::Granted);
+                    hartevo_onetrust_consent_result_plugin::ONETRUST_MAX_OBSERVATIONS
+                ],
+                1,
+                Vec::new(),
+                vec![Digest::from_text(format!("aggregate-request-{index}"))],
+                vec![Digest::from_text(format!("aggregate-response-{index}"))],
+                Vec::new(),
+                TransportProvenance::Fixture,
+            )
+            .expect("bounded read evidence")
+        })
+        .collect::<Vec<_>>();
+    let bundle = OneTrustEvidenceBundle::new(
+        &scope,
+        service.registration().registration_digest.clone(),
+        service.provider().provider_digest().clone(),
+        service.provider().provider_revision().clone(),
+        reads,
+        Vec::new(),
+        TransportProvenance::Fixture,
+    )
+    .expect("aggregate bundle");
+    let proposal = service
+        .compile_evidence_proposal(bundle, at())
+        .expect("partial aggregate proposal");
+    assert_eq!(
+        proposal.evidence.observations.len(),
+        hartevo_onetrust_consent_result_plugin::ONETRUST_MAX_OBSERVATIONS
+    );
+    assert_eq!(proposal.evidence.read_count, 3);
+    assert_eq!(proposal.status(), ConsentEvidenceStatus::Partial);
+    assert!(proposal.projection.partial);
+    assert!(proposal.projection.fail_closed);
+    assert!(proposal.evidence.failures.iter().any(|failure| failure.kind
+        == hartevo_onetrust_consent_result_plugin::OneTrustProviderErrorKind::Partial));
+    service
+        .verify(&proposal)
+        .expect("final proposal validation");
+    let consumer =
+        MissionOneTrustConsentConsumer::new(scope, service.registration()).expect("consumer");
+    let adoption = consumer.consume(&proposal).expect("Mission validation");
+    assert_eq!(
+        adoption.decision,
+        hartevo_onetrust_consent_result_plugin::MissionConsentDecision::FailClosed
+    );
+}
+
+#[test]
+fn proposal_digest_binds_all_projection_outcomes_after_resealing() {
+    let mut service = service_with_fixture(scope(), ConsentEvidenceStatus::Granted);
+    let proposal = service
+        .propose(OneTrustEvidenceProposalRequest::new(at()))
+        .expect("proposal");
+    let mut cases = Vec::new();
+    let mut partial = proposal.clone();
+    partial.projection.partial = true;
+    cases.push(partial);
+    let mut fail_closed = proposal.clone();
+    fail_closed.projection.fail_closed = true;
+    cases.push(fail_closed);
+    let mut read_count = proposal.clone();
+    read_count.projection.read_count = 2;
+    cases.push(read_count);
+    let mut rationale = proposal.clone();
+    rationale.projection.rationale_digest = Digest::from_text("tampered-rationale");
+    cases.push(rationale);
+    for mut tampered in cases {
+        tampered.proposal_digest = tampered.recompute_digest().expect("resealed digest");
+        assert!(service.verify(&tampered).is_err());
     }
 }

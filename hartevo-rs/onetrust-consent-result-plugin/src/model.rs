@@ -624,7 +624,7 @@ impl ConsentEvidenceStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OneTrustEndpoint {
     DataSubjectDetailsV4,
@@ -1306,6 +1306,7 @@ impl OneTrustReadEvidence {
     pub fn validate_integrity(&self) -> Result<(), OneTrustModelError> {
         if self.pages_observed == 0
             || self.pages_observed > ONETRUST_MAX_PAGES
+            || self.observations.len() > ONETRUST_MAX_OBSERVATIONS
             || self.request_receipt_digests.len() != usize::from(self.pages_observed)
             || self.response_receipt_digests.len() != usize::from(self.pages_observed)
             || self.page_cursor_digests.len() > usize::from(self.pages_observed)
@@ -1365,6 +1366,16 @@ impl OneTrustEvidenceBundle {
                 field: "provider reads",
             });
         }
+        let mut reads = reads;
+        reads.sort_by_key(|read| read.endpoint);
+        if reads
+            .windows(2)
+            .any(|pair| pair[0].endpoint == pair[1].endpoint)
+        {
+            return Err(OneTrustModelError::Invalid {
+                field: "duplicate provider read endpoint",
+            });
+        }
         let scope_digest = scope.scope_digest();
         for read in &reads {
             if read.scope_digest != scope_digest
@@ -1399,6 +1410,10 @@ impl OneTrustEvidenceBundle {
             evidence_digest,
         })
     }
+
+    pub fn observation_count(&self) -> usize {
+        self.reads.iter().map(|read| read.observations.len()).sum()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1411,6 +1426,7 @@ pub struct OneTrustConsentEvidence {
     pub observed_at: DateTime<Utc>,
     pub observations: Vec<OneTrustConsentObservation>,
     pub pages_observed: u16,
+    pub read_count: usize,
     pub page_cursor_digests: Vec<Digest>,
     pub request_receipt_digests: Vec<Digest>,
     pub response_receipt_digests: Vec<Digest>,
@@ -1438,6 +1454,7 @@ impl OneTrustConsentEvidence {
             self.observed_at,
             &self.observations,
             self.pages_observed,
+            self.read_count,
             &self.page_cursor_digests,
             &self.request_receipt_digests,
             &self.response_receipt_digests,
@@ -1455,6 +1472,7 @@ impl OneTrustConsentEvidence {
             self.observed_at,
             &self.observations,
             self.pages_observed,
+            self.read_count,
             &self.page_cursor_digests,
             &self.request_receipt_digests,
             &self.response_receipt_digests,
@@ -1471,6 +1489,8 @@ impl OneTrustConsentEvidence {
             &self.scope_digest,
             self.status,
             self.observed_at,
+            self.pages_observed,
+            self.read_count,
             &source_digest,
             &result_digest,
             self.read_only,
@@ -1489,17 +1509,21 @@ impl OneTrustConsentEvidence {
         scope: &OneTrustConsentScope,
     ) -> Result<(), OneTrustModelError> {
         let pages_observed = usize::from(self.pages_observed);
-        let has_reads = pages_observed != 0;
+        let has_reads = self.read_count != 0;
         if self.scope_digest != scope.scope_digest()
             || self.subject_reference != scope.subject_reference
             || self.policy_revision != scope.policy_revision
             || self.observations.len() > ONETRUST_MAX_OBSERVATIONS
-            || pages_observed > usize::from(ONETRUST_MAX_PAGES) * OneTrustEndpoint::ALL.len()
+            || self.read_count > OneTrustEndpoint::ALL.len()
+            || (has_reads
+                && (pages_observed == 0
+                    || pages_observed > usize::from(ONETRUST_MAX_PAGES) * self.read_count))
             || (has_reads
                 && (self.request_receipt_digests.len() != pages_observed
                     || self.response_receipt_digests.len() != pages_observed))
             || (!has_reads
-                && (!self.observations.is_empty()
+                && (pages_observed != 0
+                    || !self.observations.is_empty()
                     || !self.page_cursor_digests.is_empty()
                     || !self.request_receipt_digests.is_empty()
                     || !self.response_receipt_digests.is_empty()))
@@ -1546,6 +1570,9 @@ impl OneTrustConsentEvidence {
     }
 }
 
+/// Monotonic live-use fence shared by a registration and every Mission
+/// consumer created from it. It is intentionally process-lifecycle bounded:
+/// the serde-skipped atomics do not claim restart-durable revocation state.
 #[derive(Debug)]
 pub(crate) struct RegistrationUseFence {
     generation: AtomicU64,
@@ -1592,6 +1619,10 @@ pub enum RegistrationState {
     Revoked,
 }
 
+fn default_registration_provenance() -> TransportProvenance {
+    TransportProvenance::Fixture
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OneTrustRegistration {
@@ -1607,6 +1638,8 @@ pub struct OneTrustRegistration {
     pub provider_version: String,
     pub provider_revision: ProviderRevision,
     pub provider_digest: Digest,
+    #[serde(default = "default_registration_provenance")]
+    pub provenance: TransportProvenance,
     pub scope_digest: Digest,
     pub permission_digest: Digest,
     pub mission_revision: Revision,
@@ -1632,6 +1665,31 @@ impl OneTrustRegistration {
         provider_digest: Digest,
         contract_digest: Digest,
     ) -> Result<Self, OneTrustModelError> {
+        Self::new_with_provenance(
+            scope,
+            secret_reference,
+            provider_id,
+            provider_implementation,
+            provider_version,
+            provider_revision,
+            provider_digest,
+            contract_digest,
+            TransportProvenance::Fixture,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_provenance(
+        scope: &OneTrustConsentScope,
+        secret_reference: &SecretReference,
+        provider_id: impl Into<String>,
+        provider_implementation: impl Into<String>,
+        provider_version: impl Into<String>,
+        provider_revision: ProviderRevision,
+        provider_digest: Digest,
+        contract_digest: Digest,
+        provenance: TransportProvenance,
+    ) -> Result<Self, OneTrustModelError> {
         let evidence_digest_fence = Digest::from_fields([
             "hartevo-onetrust-registration-evidence-fence-v1",
             scope.scope_digest().as_str(),
@@ -1651,6 +1709,7 @@ impl OneTrustRegistration {
             provider_version: provider_version.into(),
             provider_revision,
             provider_digest,
+            provenance,
             scope_digest: scope.scope_digest(),
             permission_digest: scope.permission_digest.clone(),
             mission_revision: scope.mission.revision,
@@ -1696,6 +1755,7 @@ impl OneTrustRegistration {
             self.provider_version.clone(),
             self.provider_revision.as_str().to_owned(),
             self.provider_digest.as_str().to_owned(),
+            format!("{:?}", self.provenance),
             self.scope_digest.as_str().to_owned(),
             self.permission_digest.as_str().to_owned(),
             self.mission_revision.get().to_string(),
@@ -1720,6 +1780,71 @@ impl OneTrustRegistration {
         provider_digest: &Digest,
         contract_digest: &Digest,
     ) -> Result<(), OneTrustModelError> {
+        self.validate_with_provenance(
+            scope,
+            secret_reference,
+            provider_id,
+            provider_implementation,
+            provider_version,
+            provider_revision,
+            provider_digest,
+            contract_digest,
+            self.provenance,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_with_provenance(
+        &self,
+        scope: &OneTrustConsentScope,
+        secret_reference: &SecretReference,
+        provider_id: &str,
+        provider_implementation: &str,
+        provider_version: &str,
+        provider_revision: &ProviderRevision,
+        provider_digest: &Digest,
+        contract_digest: &Digest,
+        provenance: TransportProvenance,
+    ) -> Result<(), OneTrustModelError> {
+        if self
+            .validate_identity(
+                scope,
+                provider_id,
+                provider_implementation,
+                provider_version,
+                provider_revision,
+                provider_digest,
+                contract_digest,
+                provenance,
+            )
+            .is_err()
+            || self.secret_reference_digest != *secret_reference.digest()
+        {
+            return Err(OneTrustModelError::Invalid {
+                field: "OneTrust registration fence",
+            });
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_identity(
+        &self,
+        scope: &OneTrustConsentScope,
+        provider_id: &str,
+        provider_implementation: &str,
+        provider_version: &str,
+        provider_revision: &ProviderRevision,
+        provider_digest: &Digest,
+        contract_digest: &Digest,
+        provenance: TransportProvenance,
+    ) -> Result<(), OneTrustModelError> {
+        let expected_evidence_digest_fence = Digest::from_fields([
+            "hartevo-onetrust-registration-evidence-fence-v1",
+            scope.scope_digest().as_str(),
+            provider_digest.as_str(),
+            contract_digest.as_str(),
+        ]);
         if self.registration_digest != self.recompute_digest()?
             || self.plugin_version != ONETRUST_PLUGIN_VERSION_TEXT
             || self.contract_version != ONETRUST_CONTRACT_VERSION
@@ -1731,19 +1856,24 @@ impl OneTrustRegistration {
             || self.provider_version != provider_version
             || &self.provider_revision != provider_revision
             || &self.provider_digest != provider_digest
+            || self.provenance != provenance
             || self.scope_digest != scope.scope_digest()
             || self.permission_digest != scope.permission_digest
             || self.mission_revision != scope.mission.revision
             || self.project_revision != scope.project.revision
             || self.consent_revision != scope.consent.revision
             || self.work_product_revision != scope.work_product.revision
-            || self.secret_reference_digest != *secret_reference.digest()
+            || self.evidence_digest_fence != expected_evidence_digest_fence
         {
             return Err(OneTrustModelError::Invalid {
-                field: "OneTrust registration fence",
+                field: "OneTrust registration identity fence",
             });
         }
         Ok(())
+    }
+
+    pub(crate) fn revoke_active_use(&self) {
+        self.active_use_fence.revoke();
     }
 }
 
@@ -1756,6 +1886,44 @@ pub struct OneTrustConsentProjection {
     pub partial: bool,
     pub fail_closed: bool,
     pub rationale_digest: Digest,
+}
+
+impl OneTrustConsentProjection {
+    pub fn recompute_rationale_digest(&self, evidence: &OneTrustConsentEvidence) -> Digest {
+        Digest::from_fields([
+            "hartevo-onetrust-projection-v2".to_owned(),
+            evidence.scope_digest.as_str().to_owned(),
+            format!("{:?}", self.status),
+            self.observed_record_count.to_string(),
+            self.read_count.to_string(),
+            self.partial.to_string(),
+            self.fail_closed.to_string(),
+            evidence.evidence_digest.as_str().to_owned(),
+            evidence.result_digest.as_str().to_owned(),
+        ])
+    }
+
+    pub fn validate_integrity(
+        &self,
+        evidence: &OneTrustConsentEvidence,
+    ) -> Result<(), OneTrustModelError> {
+        let partial = evidence
+            .failures
+            .iter()
+            .any(|failure| failure.kind == OneTrustProviderErrorKind::Partial);
+        if self.status != evidence.status
+            || self.observed_record_count != evidence.observations.len()
+            || self.read_count != evidence.read_count
+            || self.partial != partial
+            || self.fail_closed != (self.status != ConsentEvidenceStatus::Granted || partial)
+            || self.rationale_digest != self.recompute_rationale_digest(evidence)
+        {
+            return Err(OneTrustModelError::Invalid {
+                field: "OneTrust projection fence",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1813,6 +1981,9 @@ impl OneTrustEvidenceProposal {
             format!("{:?}", self.projection.status),
             self.projection.observed_record_count.to_string(),
             self.projection.read_count.to_string(),
+            self.projection.partial.to_string(),
+            self.projection.fail_closed.to_string(),
+            self.projection.rationale_digest.as_str().to_owned(),
             self.evidence.evidence_digest.as_str().to_owned(),
             self.evidence.result_digest.as_str().to_owned(),
             format!("{:?}", self.provenance),
@@ -1827,6 +1998,74 @@ impl OneTrustEvidenceProposal {
         ]))
     }
 
+    pub fn validate_integrity(
+        &self,
+        scope: &OneTrustConsentScope,
+    ) -> Result<(), OneTrustModelError> {
+        self.evidence.validate_integrity(scope)?;
+        if self.plugin_version != ONETRUST_PLUGIN_VERSION_TEXT
+            || self.scope_digest != scope.scope_digest()
+            || self.permission_digest != scope.permission_digest
+            || self.mission_revision != scope.mission.revision
+            || self.project_revision != scope.project.revision
+            || self.consent_revision != scope.consent.revision
+            || self.work_product_revision != scope.work_product.revision
+            || self.evidence.scope_digest != self.scope_digest
+            || self.evidence.provenance != self.provenance
+            || self.evidence.status != self.projection.status
+            || self.evidence.read_only != self.read_only
+            || self.evidence.proposal_only != self.proposal_only
+        {
+            return Err(OneTrustModelError::Invalid {
+                field: "OneTrust proposal scope or authority fence",
+            });
+        }
+        self.projection.validate_integrity(&self.evidence)
+    }
+
+    pub fn replay_digest(&self, scope: &OneTrustConsentScope) -> Digest {
+        Digest::from_fields([
+            "hartevo-onetrust-record-replay-v1".to_owned(),
+            self.contract_version.clone(),
+            self.contract_digest.as_str().to_owned(),
+            self.provider_id.clone(),
+            self.provider_implementation.clone(),
+            self.provider_version.clone(),
+            self.provider_revision.as_str().to_owned(),
+            self.provider_digest.as_str().to_owned(),
+            format!("{:?}", self.provenance),
+            self.registration_digest.as_str().to_owned(),
+            self.registration_revision.get().to_string(),
+            scope.tenant.as_str().to_owned(),
+            scope.region.as_str().to_owned(),
+            scope.purpose_id.as_str().to_owned(),
+            scope.purpose_version.as_str().to_owned(),
+            scope.collection_point.as_str().to_owned(),
+            scope.consent_window.start.to_rfc3339(),
+            scope.consent_window.end.to_rfc3339(),
+            scope.subject_reference.scope_digest().as_str().to_owned(),
+            scope.subject_reference.digest().as_str().to_owned(),
+            scope.policy_revision.as_str().to_owned(),
+            scope.mission.id.as_str().to_owned(),
+            scope.mission.revision.get().to_string(),
+            scope.project.id.as_str().to_owned(),
+            scope.project.revision.get().to_string(),
+            scope.consent.id.as_str().to_owned(),
+            scope.consent.revision.get().to_string(),
+            scope.consent.digest.as_str().to_owned(),
+            scope.work_product.id.as_str().to_owned(),
+            scope.work_product.revision.get().to_string(),
+            scope.permission_digest.as_str().to_owned(),
+            self.evidence.observed_at.to_rfc3339(),
+            self.evidence.pages_observed.to_string(),
+            self.evidence.read_count.to_string(),
+            self.evidence.source_digest.as_str().to_owned(),
+            self.evidence.result_digest.as_str().to_owned(),
+            self.evidence.evidence_digest.as_str().to_owned(),
+            self.proposal_digest.as_str().to_owned(),
+        ])
+    }
+
     pub fn status(&self) -> ConsentEvidenceStatus {
         self.projection.status
     }
@@ -1837,11 +2076,26 @@ impl OneTrustEvidenceProposal {
 pub struct OneTrustRecordingReceipt {
     pub contract_version: String,
     pub contract_digest: Digest,
+    pub provider_id: String,
+    pub provider_implementation: String,
+    pub provider_version: String,
+    pub provider_revision: ProviderRevision,
+    pub provider_digest: Digest,
     pub registration_digest: Digest,
+    pub registration_revision: Revision,
     pub scope_digest: Digest,
+    pub mission_id: MissionId,
+    pub mission_revision: Revision,
+    pub project_id: ProjectId,
+    pub project_revision: Revision,
+    pub consent_id: ConsentId,
+    pub consent_revision: Revision,
+    pub work_product_id: WorkProductId,
+    pub work_product_revision: Revision,
     pub proposal_digest: Digest,
     pub evidence_digest: Digest,
     pub provenance: TransportProvenance,
+    pub replay_digest: Digest,
     pub recorded: bool,
     pub raw_provider_payload_retained: bool,
     pub raw_subject_identifier_retained: bool,
@@ -1850,6 +2104,51 @@ pub struct OneTrustRecordingReceipt {
     pub preference_updated: bool,
     pub native: bool,
     pub connected: bool,
+}
+
+impl OneTrustRecordingReceipt {
+    pub fn validate(
+        &self,
+        scope: &OneTrustConsentScope,
+        proposal: &OneTrustEvidenceProposal,
+    ) -> Result<(), OneTrustModelError> {
+        if self.contract_version != proposal.contract_version
+            || self.contract_digest != proposal.contract_digest
+            || self.provider_id != proposal.provider_id
+            || self.provider_implementation != proposal.provider_implementation
+            || self.provider_version != proposal.provider_version
+            || self.provider_revision != proposal.provider_revision
+            || self.provider_digest != proposal.provider_digest
+            || self.registration_digest != proposal.registration_digest
+            || self.registration_revision != proposal.registration_revision
+            || self.scope_digest != scope.scope_digest()
+            || self.mission_id != scope.mission.id
+            || self.mission_revision != scope.mission.revision
+            || self.project_id != scope.project.id
+            || self.project_revision != scope.project.revision
+            || self.consent_id != scope.consent.id
+            || self.consent_revision != scope.consent.revision
+            || self.work_product_id != scope.work_product.id
+            || self.work_product_revision != scope.work_product.revision
+            || self.proposal_digest != proposal.proposal_digest
+            || self.evidence_digest != proposal.evidence.evidence_digest
+            || self.provenance != proposal.provenance
+            || self.replay_digest != proposal.replay_digest(scope)
+            || !self.recorded
+            || self.raw_provider_payload_retained
+            || self.raw_subject_identifier_retained
+            || self.raw_jwt_retained
+            || self.consent_receipt_created
+            || self.preference_updated
+            || self.native
+            || self.connected
+        {
+            return Err(OneTrustModelError::Invalid {
+                field: "OneTrust recording receipt fence",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -1,6 +1,6 @@
 //! OneTrust consent-evidence service orchestration.
 
-use std::{fmt, time::SystemTime};
+use std::{collections::BTreeSet, fmt, sync::Mutex, time::SystemTime};
 
 use chrono::{DateTime, Utc};
 use hartevo_plugin_runtime::{
@@ -19,10 +19,10 @@ use crate::model::{
 use crate::provider::{OneTrustConsentProvider, OneTrustProviderError};
 use crate::transport::OneTrustTransport;
 use crate::{
-    ONETRUST_CONTRACT_VERSION, ONETRUST_MAX_PAGES, ONETRUST_PAGE_SIZE,
-    ONETRUST_PLUGIN_VERSION_TEXT, ONETRUST_PROVIDER_ID, ONETRUST_SERVICE_ID, ONETRUST_SERVICE_NAME,
-    ONETRUST_SERVICE_SCHEMA, OneTrustConsentResultContract, OneTrustConsentResultError,
-    contract_digest, plugin_version,
+    ONETRUST_CONTRACT_VERSION, ONETRUST_MAX_PAGES, ONETRUST_MAX_RECORDING_REPLAY_KEYS,
+    ONETRUST_PAGE_SIZE, ONETRUST_PLUGIN_VERSION_TEXT, ONETRUST_PROVIDER_ID, ONETRUST_SERVICE_ID,
+    ONETRUST_SERVICE_NAME, ONETRUST_SERVICE_SCHEMA, OneTrustConsentResultContract,
+    OneTrustConsentResultError, contract_digest, plugin_version,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -94,6 +94,9 @@ pub struct OneTrustConsentEvidenceService<T> {
     secret_revoked: bool,
     registration: OneTrustRegistration,
     provider: OneTrustConsentProvider<T>,
+    /// Process-lifecycle bounded replay state. It is not persisted or claimed
+    /// to survive a host restart in Layer 1.
+    recording_replay_digests: Mutex<BTreeSet<Digest>>,
 }
 
 impl<T: fmt::Debug> fmt::Debug for OneTrustConsentEvidenceService<T> {
@@ -105,6 +108,14 @@ impl<T: fmt::Debug> fmt::Debug for OneTrustConsentEvidenceService<T> {
             .field("secret_revoked", &self.secret_revoked)
             .field("registration", &self.registration)
             .field("provider", &self.provider)
+            .field(
+                "recording_replay_count",
+                &self
+                    .recording_replay_digests
+                    .lock()
+                    .map(|digests| digests.len())
+                    .unwrap_or_default(),
+            )
             .finish()
     }
 }
@@ -118,7 +129,7 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
         scope.validate()?;
         OneTrustConsentResultContract::baseline()?;
         let definition = provider.definition();
-        let registration = OneTrustRegistration::new(
+        let registration = OneTrustRegistration::new_with_provenance(
             &scope,
             &secret_reference,
             definition.provider_id.clone(),
@@ -127,8 +138,9 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
             definition.provider_revision.clone(),
             definition.provider_digest.clone(),
             contract_digest(),
+            provider.provenance(),
         )?;
-        registration.validate(
+        registration.validate_with_provenance(
             &scope,
             &secret_reference,
             &definition.provider_id,
@@ -137,6 +149,7 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
             &definition.provider_revision,
             &definition.provider_digest,
             &contract_digest(),
+            provider.provenance(),
         )?;
         Ok(Self {
             scope,
@@ -144,6 +157,7 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
             secret_revoked: false,
             registration,
             provider,
+            recording_replay_digests: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -197,6 +211,7 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
             return Err(OneTrustConsentResultError::SecretRevoked);
         }
         self.secret_revoked = true;
+        self.registration.revoke_active_use();
         Ok(())
     }
 
@@ -332,21 +347,28 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
     ) -> Result<OneTrustEvidenceProposal, OneTrustConsentResultError> {
         self.ensure_registration()?;
         self.validate_bundle(&bundle)?;
-        let status = project_status(&bundle, observed_at);
+        let projected_status = project_status(&bundle, observed_at);
+        let aggregate_limited = bundle.observation_count() > crate::ONETRUST_MAX_OBSERVATIONS;
+        let status = if aggregate_limited && projected_status == ConsentEvidenceStatus::Granted {
+            ConsentEvidenceStatus::Partial
+        } else {
+            projected_status
+        };
         let evidence = compile_evidence(&self.scope, &bundle, status, observed_at)?;
+        let partial = evidence
+            .failures
+            .iter()
+            .any(|failure| failure.kind == OneTrustProviderErrorKind::Partial);
         let projection = OneTrustConsentProjection {
             status,
             observed_record_count: evidence.observations.len(),
-            read_count: bundle.reads.len(),
-            partial: status == ConsentEvidenceStatus::Partial,
-            fail_closed: status != ConsentEvidenceStatus::Granted,
-            rationale_digest: Digest::from_fields([
-                "hartevo-onetrust-projection-v1",
-                bundle.evidence_digest.as_str(),
-                evidence.result_digest.as_str(),
-                &format!("{status:?}"),
-            ]),
+            read_count: evidence.read_count,
+            partial,
+            fail_closed: status != ConsentEvidenceStatus::Granted || partial,
+            rationale_digest: Digest::zero(),
         };
+        let mut projection = projection;
+        projection.rationale_digest = projection.recompute_rationale_digest(&evidence);
         let mut proposal = OneTrustEvidenceProposal {
             plugin_version: ONETRUST_PLUGIN_VERSION_TEXT.to_owned(),
             contract_version: ONETRUST_CONTRACT_VERSION.to_owned(),
@@ -378,6 +400,7 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
             proposal_digest: Digest::zero(),
         };
         proposal.proposal_digest = proposal.recompute_digest()?;
+        proposal.validate_integrity(&self.scope)?;
         Ok(proposal)
     }
 
@@ -396,14 +419,39 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
     ) -> Result<OneTrustRecordingReceipt, OneTrustConsentResultError> {
         self.ensure_registration()?;
         self.verify(proposal)?;
-        Ok(OneTrustRecordingReceipt {
+        let replay_digest = proposal.replay_digest(&self.scope);
+        let mut replay_state = self
+            .recording_replay_digests
+            .lock()
+            .map_err(|_| OneTrustConsentResultError::RecordingReplay)?;
+        if replay_state.contains(&replay_digest)
+            || replay_state.len() >= ONETRUST_MAX_RECORDING_REPLAY_KEYS
+        {
+            return Err(OneTrustConsentResultError::RecordingReplay);
+        }
+        let receipt = OneTrustRecordingReceipt {
             contract_version: ONETRUST_CONTRACT_VERSION.to_owned(),
             contract_digest: contract_digest(),
+            provider_id: proposal.provider_id.clone(),
+            provider_implementation: proposal.provider_implementation.clone(),
+            provider_version: proposal.provider_version.clone(),
+            provider_revision: proposal.provider_revision.clone(),
+            provider_digest: proposal.provider_digest.clone(),
             registration_digest: self.registration.registration_digest.clone(),
+            registration_revision: self.registration.registration_revision,
             scope_digest: self.scope.scope_digest(),
+            mission_id: self.scope.mission.id.clone(),
+            mission_revision: self.scope.mission.revision,
+            project_id: self.scope.project.id.clone(),
+            project_revision: self.scope.project.revision,
+            consent_id: self.scope.consent.id.clone(),
+            consent_revision: self.scope.consent.revision,
+            work_product_id: self.scope.work_product.id.clone(),
+            work_product_revision: self.scope.work_product.revision,
             proposal_digest: proposal.proposal_digest.clone(),
             evidence_digest: proposal.evidence.evidence_digest.clone(),
             provenance: proposal.provenance,
+            replay_digest,
             recorded: true,
             raw_provider_payload_retained: false,
             raw_subject_identifier_retained: false,
@@ -412,7 +460,28 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
             preference_updated: false,
             native: false,
             connected: false,
-        })
+        };
+        receipt.validate(&self.scope, proposal)?;
+        replay_state.insert(receipt.replay_digest.clone());
+        Ok(receipt)
+    }
+
+    pub fn verify_recording_receipt(
+        &self,
+        proposal: &OneTrustEvidenceProposal,
+        receipt: &OneTrustRecordingReceipt,
+    ) -> Result<(), OneTrustConsentResultError> {
+        self.ensure_registration()?;
+        self.verify(proposal)?;
+        receipt.validate(&self.scope, proposal)?;
+        let replay_state = self
+            .recording_replay_digests
+            .lock()
+            .map_err(|_| OneTrustConsentResultError::RecordingReplay)?;
+        if !replay_state.contains(&receipt.replay_digest) {
+            return Err(OneTrustConsentResultError::RecordingReplay);
+        }
+        Ok(())
     }
 
     pub fn verify(
@@ -421,27 +490,20 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
     ) -> Result<OneTrustVerification, OneTrustConsentResultError> {
         self.ensure_registration()?;
         proposal
-            .evidence
             .validate_integrity(&self.scope)
             .map_err(|_| OneTrustConsentResultError::StaleEvidence)?;
-        if proposal.evidence.status != proposal.projection.status
-            || proposal.evidence.observations.len() != proposal.projection.observed_record_count
-            || proposal.evidence.provenance != proposal.provenance
-            || proposal.evidence.read_only != proposal.read_only
-            || proposal.evidence.proposal_only != proposal.proposal_only
-        {
-            return Err(OneTrustConsentResultError::StaleEvidence);
-        }
         if proposal.proposal_digest != proposal.recompute_digest()? {
             return Err(OneTrustConsentResultError::StaleProposal);
         }
         if proposal.contract_digest != contract_digest()
+            || proposal.plugin_version != ONETRUST_PLUGIN_VERSION_TEXT
             || proposal.contract_version != ONETRUST_CONTRACT_VERSION
             || proposal.provider_id != ONETRUST_PROVIDER_ID
             || proposal.provider_implementation != crate::ONETRUST_PROVIDER_NAME
             || proposal.provider_version != self.provider.definition().version
             || proposal.provider_revision != *self.provider.provider_revision()
             || proposal.provider_digest != *self.provider.provider_digest()
+            || proposal.provenance != self.provider.provenance()
             || proposal.registration_digest != self.registration.registration_digest
             || proposal.registration_revision != self.registration.registration_revision
             || proposal.scope_digest != self.scope.scope_digest()
@@ -501,15 +563,15 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
     }
 
     fn ensure_registration(&self) -> Result<(), OneTrustConsentResultError> {
-        if !self.registration.is_active() {
-            return Err(OneTrustConsentResultError::RegistrationRevoked);
-        }
         if self.secret_revoked {
             return Err(OneTrustConsentResultError::SecretRevoked);
         }
+        if !self.registration.is_active() {
+            return Err(OneTrustConsentResultError::RegistrationRevoked);
+        }
         let definition = self.provider.definition();
         self.registration
-            .validate(
+            .validate_with_provenance(
                 &self.scope,
                 &self.secret_reference,
                 &definition.provider_id,
@@ -518,6 +580,7 @@ impl<T: OneTrustTransport> OneTrustConsentEvidenceService<T> {
                 &definition.provider_revision,
                 &definition.provider_digest,
                 &contract_digest(),
+                self.provider.provenance(),
             )
             .map_err(|_| {
                 OneTrustConsentResultError::RegistrationDrift(
@@ -676,12 +739,19 @@ fn compile_evidence(
     status: ConsentEvidenceStatus,
     observed_at: DateTime<Utc>,
 ) -> Result<OneTrustConsentEvidence, OneTrustConsentResultError> {
-    let observations = bundle
-        .reads
-        .iter()
-        .flat_map(|read| read.observations.iter().cloned())
-        .collect::<Vec<_>>();
+    let mut observations = Vec::new();
+    let mut aggregate_limited = false;
+    for read in &bundle.reads {
+        for observation in &read.observations {
+            if observations.len() < crate::ONETRUST_MAX_OBSERVATIONS {
+                observations.push(observation.clone());
+            } else {
+                aggregate_limited = true;
+            }
+        }
+    }
     let pages_observed = bundle.reads.iter().map(|read| read.pages_observed).sum();
+    let read_count = bundle.reads.len();
     let page_cursor_digests = bundle
         .reads
         .iter()
@@ -697,7 +767,7 @@ fn compile_evidence(
         .iter()
         .flat_map(|read| read.response_receipt_digests.iter().cloned())
         .collect::<Vec<_>>();
-    let failures = bundle
+    let mut failures = bundle
         .failures
         .iter()
         .cloned()
@@ -708,6 +778,15 @@ fn compile_evidence(
                 .flat_map(|read| read.failures.iter().cloned()),
         )
         .collect::<Vec<_>>();
+    if aggregate_limited {
+        failures.push(OneTrustProviderErrorEvidence::new(
+            "aggregate_consent_evidence",
+            OneTrustProviderErrorKind::Partial,
+            None,
+            "maximum aggregate observation bound reached",
+            None,
+        ));
+    }
     let mut evidence = OneTrustConsentEvidence {
         status,
         scope_digest: scope.scope_digest(),
@@ -716,6 +795,7 @@ fn compile_evidence(
         observed_at,
         observations,
         pages_observed,
+        read_count,
         page_cursor_digests,
         request_receipt_digests,
         response_receipt_digests,
@@ -736,6 +816,7 @@ fn compile_evidence(
     evidence.source_digest = evidence.recompute_source_digest()?;
     evidence.result_digest = evidence.recompute_result_digest()?;
     evidence.evidence_digest = evidence.recompute_evidence_digest()?;
+    evidence.validate_integrity(scope)?;
     Ok(evidence)
 }
 

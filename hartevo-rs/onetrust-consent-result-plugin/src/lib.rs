@@ -57,6 +57,7 @@ pub const ONETRUST_MAX_RESPONSE_BYTES: usize = 1_048_576;
 pub const ONETRUST_MAX_PAGES: u16 = 4;
 pub const ONETRUST_PAGE_SIZE: u16 = 50;
 pub const ONETRUST_MAX_REQUESTS_PER_MINUTE: u8 = 5;
+pub const ONETRUST_MAX_RECORDING_REPLAY_KEYS: usize = 256;
 pub const ONETRUST_MAX_CONSENT_WINDOW_HOURS: i64 = 24;
 pub const ONETRUST_CONSENT_WINDOW_HOURS: i64 = ONETRUST_MAX_CONSENT_WINDOW_HOURS;
 pub const ONETRUST_MAX_OBSERVATIONS: usize = 256;
@@ -86,6 +87,8 @@ pub enum OneTrustConsentResultError {
     StaleProposal,
     #[error("OneTrust consent result evidence is stale or tampered")]
     StaleEvidence,
+    #[error("OneTrust consent result recording replay or resealing was rejected")]
+    RecordingReplay,
     #[error("OneTrust consent result provider is not compatible")]
     ProviderMismatch,
     #[error(
@@ -194,6 +197,7 @@ impl OneTrustConsentResultContract {
             "consumer",
             "scope",
             "registration",
+            "recording",
             "bounds",
             "evidence",
             "projections",
@@ -368,6 +372,7 @@ impl OneTrustConsentResultContract {
             "providerVersionBound",
             "providerRevisionBound",
             "providerDigestBound",
+            "provenanceBound",
             "scopeDigestBound",
             "permissionDigestBound",
             "missionRevisionBound",
@@ -375,6 +380,7 @@ impl OneTrustConsentResultContract {
             "consentRevisionBound",
             "workProductRevisionBound",
             "evidenceDigestBound",
+            "sharedLiveRevocationFence",
             "reversible",
             "revocable",
         ];
@@ -400,6 +406,8 @@ impl OneTrustConsentResultContract {
                 != Some(ONETRUST_MAX_CONSENT_WINDOW_HOURS)
             || bounds.get("maxObservations").and_then(Value::as_u64)
                 != Some(ONETRUST_MAX_OBSERVATIONS as u64)
+            || bounds.get("maxRecordingReplayKeys").and_then(Value::as_u64)
+                != Some(crate::ONETRUST_MAX_RECORDING_REPLAY_KEYS as u64)
         {
             return Err(OneTrustConsentResultError::Contract(
                 "OneTrust bounds drifted".to_owned(),
@@ -466,6 +474,7 @@ impl OneTrustConsentResultContract {
         if projections.get("failClosed") != Some(&Value::Bool(true))
             || projections.get("adopted") != Some(&Value::Bool(false))
             || projections.get("kernelAuthority") != Some(&Value::Bool(false))
+            || projections.get("partial") != Some(&Value::Bool(true))
         {
             return Err(OneTrustConsentResultError::Contract(
                 "OneTrust projection boundary drifted".to_owned(),
@@ -491,6 +500,25 @@ impl OneTrustConsentResultContract {
         {
             return Err(OneTrustConsentResultError::Contract(
                 "OneTrust honesty boundary drifted".to_owned(),
+            ));
+        }
+        let recording = object
+            .get("recording")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                OneTrustConsentResultError::Contract("recording fence is missing".to_owned())
+            })?;
+        if recording.get("replayFence").and_then(Value::as_str)
+            != Some("registration_request_proposal_receipt_mission_tuple")
+            || recording.get("duplicateReplay").and_then(Value::as_str) != Some("reject")
+            || recording.get("resealedReplay").and_then(Value::as_str) != Some("reject")
+            || recording.get("maxReplayKeys").and_then(Value::as_u64)
+                != Some(crate::ONETRUST_MAX_RECORDING_REPLAY_KEYS as u64)
+            || recording.get("stateDurability").and_then(Value::as_str)
+                != Some("process_lifecycle_bounded_not_restart_durable")
+        {
+            return Err(OneTrustConsentResultError::Contract(
+                "OneTrust recording replay fence drifted".to_owned(),
             ));
         }
         Ok(())

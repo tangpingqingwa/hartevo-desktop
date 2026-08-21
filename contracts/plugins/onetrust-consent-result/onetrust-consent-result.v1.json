@@ -93,6 +93,7 @@
     "providerVersionBound": true,
     "providerRevisionBound": true,
     "providerDigestBound": true,
+    "provenanceBound": true,
     "scopeDigestBound": true,
     "permissionDigestBound": true,
     "missionRevisionBound": true,
@@ -100,6 +101,7 @@
     "consentRevisionBound": true,
     "workProductRevisionBound": true,
     "evidenceDigestBound": true,
+    "sharedLiveRevocationFence": true,
     "reversible": true,
     "revocable": true,
     "failClosedOn": [
@@ -114,6 +116,13 @@
       "secret_reference_revocation"
     ]
   },
+  "recording": {
+    "replayFence": "registration_request_proposal_receipt_mission_tuple",
+    "duplicateReplay": "reject",
+    "resealedReplay": "reject",
+    "maxReplayKeys": 256,
+    "stateDurability": "process_lifecycle_bounded_not_restart_durable"
+  },
   "bounds": {
     "maxResponseBytes": 1048576,
     "maxPages": 4,
@@ -122,7 +131,8 @@
     "maxConsentWindowHours": 24,
     "maxObservations": 256,
     "maxIdentifierBytes": 128,
-    "maxCursorBytes": 256
+    "maxCursorBytes": 256,
+    "maxRecordingReplayKeys": 256
   },
   "evidence": {
     "allowlistedFields": [
@@ -140,6 +150,10 @@
       "boundedPaginationCursorDigest",
       "requestReceiptDigest",
       "responseReceiptDigest",
+      "readCount",
+      "partialProjection",
+      "rationaleDigest",
+      "replayDigest",
       "sourceDigest",
       "resultDigest",
       "subjectReferenceHash"
@@ -164,7 +178,8 @@
     ],
     "failClosed": true,
     "adopted": false,
-    "kernelAuthority": false
+    "kernelAuthority": false,
+    "partial": true
   },
   "authority": {
     "readOnly": true,
@@ -194,6 +209,7 @@
   },
   "honesty": {
     "nativeStatus": "BLOCKED_ENV",
+    "replayStateDurability": "process_lifecycle_bounded_not_restart_durable",
     "blockedEnvironmentIsNative": false,
     "fixtureIsNative": false,
     "recordingIsNative": false,
@@ -210,6 +226,7 @@
     "preference_center_or_data_subject_mutation",
     "independent_provider_readback",
     "verified_work_product_adoption",
+    "restart_durable_replay_and_revocation_state",
     "host_owned_kernel_consent_and_effect_authority"
   ],
   "forbidden": [
