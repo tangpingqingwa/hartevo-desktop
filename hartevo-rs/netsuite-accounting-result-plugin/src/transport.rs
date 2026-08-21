@@ -8,7 +8,7 @@ use crate::model::{
     NetSuiteRecordType, NetSuiteScope, NetSuiteSelectedRecordSummary, ObservationWindow, ProjectId,
     RecordId, Revision, RoleId, SecretReference, WorkProductId, digest_serializable,
 };
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
 pub(crate) const MAX_CURSOR_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_PROVIDER_REVISION_BYTES: usize = 64;
@@ -66,8 +66,7 @@ impl Serialize for OpaqueCursor {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum NetSuiteSuiteTalkEndpoint {
     RecordMetadata {
         record_type: NetSuiteRecordType,
@@ -82,6 +81,27 @@ pub enum NetSuiteSuiteTalkEndpoint {
 }
 
 impl NetSuiteSuiteTalkEndpoint {
+    fn redacted_identity(&self) -> (&'static str, NetSuiteRecordType, Option<Digest>, Digest) {
+        let (kind, record_type, record_id_digest) = match self {
+            Self::RecordMetadata { record_type } => ("record_metadata", *record_type, None),
+            Self::RecordCollection { record_type } => ("record_collection", *record_type, None),
+            Self::SelectedRecord {
+                record_type,
+                record_id,
+            } => (
+                "selected_record",
+                *record_type,
+                Some(Digest::from_text(record_id.as_str())),
+            ),
+        };
+        (
+            kind,
+            record_type,
+            record_id_digest,
+            Digest::from_text(self.path()),
+        )
+    }
+
     pub fn path(&self) -> String {
         match self {
             Self::RecordMetadata { .. } => "/services/rest/record/v1/metadata-catalog".to_owned(),
@@ -100,14 +120,41 @@ impl NetSuiteSuiteTalkEndpoint {
     }
 }
 
+impl fmt::Debug for NetSuiteSuiteTalkEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (kind, record_type, record_id_digest, endpoint_digest) = self.redacted_identity();
+        formatter
+            .debug_struct("NetSuiteSuiteTalkEndpoint")
+            .field("kind", &kind)
+            .field("record_type", &record_type)
+            .field("record_id_digest", &record_id_digest)
+            .field("endpoint_digest", &endpoint_digest)
+            .finish()
+    }
+}
+
+impl Serialize for NetSuiteSuiteTalkEndpoint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (kind, record_type, record_id_digest, endpoint_digest) = self.redacted_identity();
+        let mut state = serializer.serialize_struct("NetSuiteSuiteTalkEndpoint", 4)?;
+        state.serialize_field("kind", kind)?;
+        state.serialize_field("recordType", &record_type)?;
+        state.serialize_field("recordIdDigest", &record_id_digest)?;
+        state.serialize_field("endpointDigest", &endpoint_digest)?;
+        state.end()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum NetSuiteHttpMethod {
     Get,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct NetSuiteGetRequest {
     operation: NetSuiteReadOperation,
     endpoint: NetSuiteSuiteTalkEndpoint,
@@ -133,6 +180,92 @@ pub struct NetSuiteGetRequest {
     cursor: Option<OpaqueCursor>,
     window: ObservationWindow,
     secret_reference_digest: Digest,
+}
+
+impl fmt::Debug for NetSuiteGetRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let account_id_digest = Digest::from_text(self.account_id.as_str());
+        let data_center_digest = Digest::from_text(self.data_center.as_str());
+        let role_id_digest = Digest::from_text(self.role_id.as_str());
+        let record_id_digest = self
+            .record_id
+            .as_ref()
+            .map(|record_id| Digest::from_text(record_id.as_str()));
+        let project_id_digest = Digest::from_text(self.project_id.as_str());
+        let mission_id_digest = Digest::from_text(self.mission_id.as_str());
+        let work_product_id_digest = Digest::from_text(self.work_product_id.as_str());
+        formatter
+            .debug_struct("NetSuiteGetRequest")
+            .field("operation", &self.operation)
+            .field("endpoint", &self.endpoint)
+            .field("method", &self.method)
+            .field("account_id_digest", &account_id_digest)
+            .field("data_center_digest", &data_center_digest)
+            .field("role_id_digest", &role_id_digest)
+            .field("record_type", &self.record_type)
+            .field("record_id_digest", &record_id_digest)
+            .field("collection_filter_digest", &self.collection_filter.digest())
+            .field("scope_digest", &self.scope_digest)
+            .field("permission_digest", &self.permission_digest)
+            .field("consent_digest", &self.consent_digest)
+            .field("project_id_digest", &project_id_digest)
+            .field("project_revision", &self.project_revision)
+            .field("mission_id_digest", &mission_id_digest)
+            .field("mission_revision", &self.mission_revision)
+            .field("work_product_id_digest", &work_product_id_digest)
+            .field("work_product_revision", &self.work_product_revision)
+            .field("credential_revision", &self.credential_revision)
+            .field("page_number", &self.page_number)
+            .field("page_size", &self.page_size)
+            .field("cursor", &self.cursor)
+            .field("window", &self.window)
+            .field("secret_reference_digest", &self.secret_reference_digest)
+            .finish()
+    }
+}
+
+impl Serialize for NetSuiteGetRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let account_id_digest = Digest::from_text(self.account_id.as_str());
+        let data_center_digest = Digest::from_text(self.data_center.as_str());
+        let role_id_digest = Digest::from_text(self.role_id.as_str());
+        let record_id_digest = self
+            .record_id
+            .as_ref()
+            .map(|record_id| Digest::from_text(record_id.as_str()));
+        let project_id_digest = Digest::from_text(self.project_id.as_str());
+        let mission_id_digest = Digest::from_text(self.mission_id.as_str());
+        let work_product_id_digest = Digest::from_text(self.work_product_id.as_str());
+        let mut state = serializer.serialize_struct("NetSuiteGetRequest", 24)?;
+        state.serialize_field("operation", &self.operation)?;
+        state.serialize_field("endpoint", &self.endpoint)?;
+        state.serialize_field("method", &self.method)?;
+        state.serialize_field("accountIdDigest", &account_id_digest)?;
+        state.serialize_field("dataCenterDigest", &data_center_digest)?;
+        state.serialize_field("roleIdDigest", &role_id_digest)?;
+        state.serialize_field("recordType", &self.record_type)?;
+        state.serialize_field("recordIdDigest", &record_id_digest)?;
+        state.serialize_field("collectionFilterDigest", &self.collection_filter.digest())?;
+        state.serialize_field("scopeDigest", &self.scope_digest)?;
+        state.serialize_field("permissionDigest", &self.permission_digest)?;
+        state.serialize_field("consentDigest", &self.consent_digest)?;
+        state.serialize_field("projectIdDigest", &project_id_digest)?;
+        state.serialize_field("projectRevision", &self.project_revision)?;
+        state.serialize_field("missionIdDigest", &mission_id_digest)?;
+        state.serialize_field("missionRevision", &self.mission_revision)?;
+        state.serialize_field("workProductIdDigest", &work_product_id_digest)?;
+        state.serialize_field("workProductRevision", &self.work_product_revision)?;
+        state.serialize_field("credentialRevision", &self.credential_revision)?;
+        state.serialize_field("pageNumber", &self.page_number)?;
+        state.serialize_field("pageSize", &self.page_size)?;
+        state.serialize_field("cursor", &self.cursor)?;
+        state.serialize_field("window", &self.window)?;
+        state.serialize_field("secretReferenceDigest", &self.secret_reference_digest)?;
+        state.end()
+    }
 }
 
 impl NetSuiteGetRequest {
@@ -303,8 +436,7 @@ impl NetSuiteGetRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct NetSuiteGetResponse {
     operation: NetSuiteReadOperation,
     endpoint: NetSuiteSuiteTalkEndpoint,
@@ -324,6 +456,66 @@ pub struct NetSuiteGetResponse {
     provider_revision: String,
     next_cursor: Option<OpaqueCursor>,
     response_digest: Digest,
+}
+
+impl fmt::Debug for NetSuiteGetResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let project_id_digest = Digest::from_text(self.project_id.as_str());
+        let mission_id_digest = Digest::from_text(self.mission_id.as_str());
+        let work_product_id_digest = Digest::from_text(self.work_product_id.as_str());
+        formatter
+            .debug_struct("NetSuiteGetResponse")
+            .field("operation", &self.operation)
+            .field("endpoint", &self.endpoint)
+            .field("payload", &self.payload)
+            .field("scope_digest", &self.scope_digest)
+            .field("permission_digest", &self.permission_digest)
+            .field("consent_digest", &self.consent_digest)
+            .field("project_id_digest", &project_id_digest)
+            .field("project_revision", &self.project_revision)
+            .field("mission_id_digest", &mission_id_digest)
+            .field("mission_revision", &self.mission_revision)
+            .field("work_product_id_digest", &work_product_id_digest)
+            .field("work_product_revision", &self.work_product_revision)
+            .field("credential_revision", &self.credential_revision)
+            .field("status", &self.status)
+            .field("response_size", &self.response_size)
+            .field("provider_revision", &self.provider_revision)
+            .field("next_cursor", &self.next_cursor)
+            .field("response_digest", &self.response_digest)
+            .finish()
+    }
+}
+
+impl Serialize for NetSuiteGetResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let project_id_digest = Digest::from_text(self.project_id.as_str());
+        let mission_id_digest = Digest::from_text(self.mission_id.as_str());
+        let work_product_id_digest = Digest::from_text(self.work_product_id.as_str());
+        let mut state = serializer.serialize_struct("NetSuiteGetResponse", 18)?;
+        state.serialize_field("operation", &self.operation)?;
+        state.serialize_field("endpoint", &self.endpoint)?;
+        state.serialize_field("payload", &self.payload)?;
+        state.serialize_field("scopeDigest", &self.scope_digest)?;
+        state.serialize_field("permissionDigest", &self.permission_digest)?;
+        state.serialize_field("consentDigest", &self.consent_digest)?;
+        state.serialize_field("projectIdDigest", &project_id_digest)?;
+        state.serialize_field("projectRevision", &self.project_revision)?;
+        state.serialize_field("missionIdDigest", &mission_id_digest)?;
+        state.serialize_field("missionRevision", &self.mission_revision)?;
+        state.serialize_field("workProductIdDigest", &work_product_id_digest)?;
+        state.serialize_field("workProductRevision", &self.work_product_revision)?;
+        state.serialize_field("credentialRevision", &self.credential_revision)?;
+        state.serialize_field("status", &self.status)?;
+        state.serialize_field("responseSize", &self.response_size)?;
+        state.serialize_field("providerRevision", &self.provider_revision)?;
+        state.serialize_field("nextCursor", &self.next_cursor)?;
+        state.serialize_field("responseDigest", &self.response_digest)?;
+        state.end()
+    }
 }
 
 impl NetSuiteGetResponse {

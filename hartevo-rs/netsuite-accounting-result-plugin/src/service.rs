@@ -4,8 +4,9 @@ use std::{
     collections::BTreeSet,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{DateTime, Utc};
@@ -105,6 +106,27 @@ pub enum NetSuiteServiceError {
     Model(#[from] ModelError),
 }
 
+static REGISTRATION_LIFECYCLE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn next_registration_lifecycle_fence() -> Result<Digest, NetSuiteServiceError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| NetSuiteServiceError::Model(ModelError::RevocationFenceUnavailable))?;
+    let sequence = REGISTRATION_LIFECYCLE_SEQUENCE
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| NetSuiteServiceError::Model(ModelError::RevocationFenceUnavailable))?;
+    Ok(Digest::from_fields(
+        "netsuite-registration-lifecycle/v1",
+        &[
+            elapsed.as_nanos().to_string(),
+            std::process::id().to_string(),
+            sequence.to_string(),
+        ],
+    ))
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetSuiteRegistration {
@@ -128,6 +150,11 @@ pub struct NetSuiteRegistration {
     registration_digest: Digest,
     #[serde(skip)]
     bound_secret_reference: SecretReference,
+    #[serde(skip)]
+    // Process-lifecycle fence: clones retain it, while a fresh/restarted
+    // registration receives a different value and rejects old proposals.
+    // It is intentionally not serialized; Layer 1 makes no durable replay claim.
+    lifecycle_fence: Digest,
     #[serde(skip)]
     revocation: Arc<AtomicBool>,
     #[serde(skip)]
@@ -154,6 +181,7 @@ impl PartialEq for NetSuiteRegistration {
             && self.contract_digest == other.contract_digest
             && self.state == other.state
             && self.registration_digest == other.registration_digest
+            && self.lifecycle_fence == other.lifecycle_fence
     }
 }
 
@@ -183,6 +211,7 @@ impl NetSuiteRegistration {
                 "only a non-native, non-connected provider may register".to_owned(),
             ));
         }
+        let lifecycle_fence = next_registration_lifecycle_fence()?;
         let service = NetSuiteServiceDefinition::default();
         let mut registration = Self {
             plugin_id: NETSUITE_ACCOUNTING_RESULT_PLUGIN_ID.to_owned(),
@@ -204,6 +233,7 @@ impl NetSuiteRegistration {
             state: NetSuiteRegistrationState::Active,
             registration_digest: Digest::from_text("uninitialized-netsuite-registration"),
             bound_secret_reference: secret_reference.clone(),
+            lifecycle_fence,
             revocation: Arc::new(AtomicBool::new(false)),
             replay_fence: Arc::new(Mutex::new(BTreeSet::new())),
         };
@@ -388,6 +418,10 @@ impl NetSuiteRegistration {
 
     pub fn registration_digest(&self) -> &Digest {
         &self.registration_digest
+    }
+
+    pub(crate) fn lifecycle_fence(&self) -> &Digest {
+        &self.lifecycle_fence
     }
 
     pub const fn state(&self) -> NetSuiteRegistrationState {
@@ -613,6 +647,7 @@ impl NetSuiteAccountingEvidence {
         &self,
         scope: &NetSuiteScope,
         credential_revision: Revision,
+        provider_revision: &str,
     ) -> Result<(), NetSuiteServiceError> {
         scope.validate_digest()?;
         if self.evidence_digest != self.recompute_digest()? {
@@ -651,6 +686,7 @@ impl NetSuiteAccountingEvidence {
                 || receipt.permission_digest != *scope.permission_digest()
                 || receipt.consent_digest != *scope.consent_scope().digest()
                 || receipt.credential_revision != credential_revision
+                || receipt.provider_revision != provider_revision
             {
                 return Err(NetSuiteServiceError::ScopeMismatch(
                     "receipt fence does not match the typed scope".to_owned(),
@@ -696,6 +732,7 @@ struct NetSuiteEvidenceMaterial {
 pub struct NetSuiteAccountingProposal {
     pub request: NetSuiteAccountingProposalRequest,
     pub registration_digest: Digest,
+    pub lifecycle_fence_digest: Digest,
     pub scope_digest: Digest,
     pub status: NetSuiteAccountingStatus,
     pub evidence: NetSuiteAccountingEvidence,
@@ -722,6 +759,7 @@ impl NetSuiteAccountingProposal {
         let mut proposal = Self {
             request,
             registration_digest: registration.registration_digest().clone(),
+            lifecycle_fence_digest: registration.lifecycle_fence().clone(),
             scope_digest: scope.digest(),
             status,
             evidence,
@@ -743,6 +781,7 @@ impl NetSuiteAccountingProposal {
         let material = NetSuiteProposalMaterial {
             request: self.request.clone(),
             registration_digest: self.registration_digest.clone(),
+            lifecycle_fence_digest: self.lifecycle_fence_digest.clone(),
             scope_digest: self.scope_digest.clone(),
             status: self.status,
             evidence: self.evidence.clone(),
@@ -770,6 +809,7 @@ impl NetSuiteAccountingProposal {
         if !registration.is_active()
             || registration.validate_digest().is_err()
             || self.registration_digest != *registration.registration_digest()
+            || self.lifecycle_fence_digest != *registration.lifecycle_fence()
             || self.scope_digest != scope.digest()
             || self.request.request_digest != self.request.recompute_digest()?
             || self.proposal_digest != self.recompute_digest()?
@@ -785,8 +825,11 @@ impl NetSuiteAccountingProposal {
         {
             return Err(NetSuiteServiceError::StaleEvidence);
         }
-        self.evidence
-            .validate(scope, registration.credential_revision())
+        self.evidence.validate(
+            scope,
+            registration.credential_revision(),
+            registration.provider_version(),
+        )
     }
 
     pub const fn is_adopted(&self) -> bool {
@@ -799,6 +842,7 @@ impl NetSuiteAccountingProposal {
 struct NetSuiteProposalMaterial {
     request: NetSuiteAccountingProposalRequest,
     registration_digest: Digest,
+    lifecycle_fence_digest: Digest,
     scope_digest: Digest,
     status: NetSuiteAccountingStatus,
     evidence: NetSuiteAccountingEvidence,
@@ -821,6 +865,7 @@ pub struct NetSuiteSuiteQlProposal {
     pub provider_definition_digest: Digest,
     pub provenance: NetSuiteTransportProvenance,
     pub scope_digest: Digest,
+    pub lifecycle_fence_digest: Digest,
     pub permission_digest: Digest,
     pub consent_digest: Digest,
     pub registration_digest: Digest,
@@ -842,6 +887,7 @@ struct NetSuiteSuiteQlProposalMaterial {
     provider_definition_digest: Digest,
     provenance: NetSuiteTransportProvenance,
     scope_digest: Digest,
+    lifecycle_fence_digest: Digest,
     permission_digest: Digest,
     consent_digest: Digest,
     registration_digest: Digest,
@@ -867,6 +913,7 @@ impl NetSuiteSuiteQlProposal {
             provider_definition_digest: provider.provider_digest(),
             provenance: provider.provenance(),
             scope_digest: scope.digest(),
+            lifecycle_fence_digest: registration.lifecycle_fence().clone(),
             permission_digest: scope.permission_digest().clone(),
             consent_digest: scope.consent_scope().digest().clone(),
             registration_digest: registration.registration_digest().clone(),
@@ -890,6 +937,7 @@ impl NetSuiteSuiteQlProposal {
             provider_definition_digest: self.provider_definition_digest.clone(),
             provenance: self.provenance,
             scope_digest: self.scope_digest.clone(),
+            lifecycle_fence_digest: self.lifecycle_fence_digest.clone(),
             permission_digest: self.permission_digest.clone(),
             consent_digest: self.consent_digest.clone(),
             registration_digest: self.registration_digest.clone(),
@@ -916,6 +964,7 @@ impl NetSuiteSuiteQlProposal {
             || registration.validate_digest().is_err()
             || self.registration_digest != *registration.registration_digest()
             || self.scope_digest != scope.digest()
+            || self.lifecycle_fence_digest != *registration.lifecycle_fence()
             || self.permission_digest != *scope.permission_digest()
             || self.consent_digest != *scope.consent_scope().digest()
             || self.provider_id != registration.provider_id()

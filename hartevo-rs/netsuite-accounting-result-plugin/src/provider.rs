@@ -403,7 +403,12 @@ impl<T: NetSuiteTransport> NetSuiteSuiteTalkProvider<T> {
             attempts = attempts.saturating_add(1);
             match self.transport.execute(request) {
                 Ok(response) => {
-                    Self::validate_response(request, &bounds, &response)?;
+                    Self::validate_response(
+                        request,
+                        &bounds,
+                        &response,
+                        self.definition.provider_version(),
+                    )?;
                     let receipt = NetSuiteReadReceipt {
                         operation: request.operation(),
                         endpoint_identity: NetSuiteEndpointIdentity::from_endpoint(
@@ -446,6 +451,7 @@ impl<T: NetSuiteTransport> NetSuiteSuiteTalkProvider<T> {
         request: &NetSuiteGetRequest,
         bounds: &NetSuiteBounds,
         response: &NetSuiteGetResponse,
+        provider_revision: &str,
     ) -> Result<(), NetSuiteProviderError> {
         response
             .validate_integrity()
@@ -459,6 +465,9 @@ impl<T: NetSuiteTransport> NetSuiteSuiteTalkProvider<T> {
             || response.consent_digest() != request.consent_digest()
         {
             return Err(NetSuiteProviderError::ScopeMismatch);
+        }
+        if response.provider_revision() != provider_revision {
+            return Err(NetSuiteProviderError::RevisionMismatch);
         }
         if request
             .collection_filter()
