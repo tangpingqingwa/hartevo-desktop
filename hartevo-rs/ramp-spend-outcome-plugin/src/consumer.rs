@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use crate::RampSpendOutcomeError;
 use crate::model::{
-    Digest, EvidenceVerification, MissionBinding, OutcomeProposal, ProjectBinding, SpendEvidence,
-    WorkProductBinding, canonical_digest, validate_digest,
+    Digest, EvidenceVerification, MissionBinding, OutcomeProposal, ProjectBinding,
+    SourceEnvelopeStatus, SpendEvidence, WorkProductBinding, canonical_digest, validate_digest,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -75,10 +75,18 @@ impl MissionRampSpendConsumer {
             || proposal.spend_total_minor != evidence.spend_total_minor
             || proposal.max_spend_total_minor != evidence.max_spend_total_minor
             || proposal.expected_spend_total_minor != evidence.expected_spend_total_minor
+            || proposal.source_envelope != evidence.source_envelope
+            || proposal.response_bytes != evidence.response_bytes
+            || proposal.record_bytes != evidence.record_bytes
+            || proposal.raw_record_bytes != evidence.raw_record_bytes
             || verification.evidence_digest != evidence.evidence_digest
             || verification.scope_digest != proposal.scope_digest
             || verification.provider_digest != proposal.provider_digest
             || verification.contract_digest != proposal.contract_digest
+            || verification.source_envelope != evidence.source_envelope
+            || verification.response_bytes != evidence.response_bytes
+            || verification.record_bytes != evidence.record_bytes
+            || verification.raw_record_bytes != evidence.raw_record_bytes
             || verification.evidence_status != crate::EvidenceStatus::Complete
             || !verification.independent_state_valid
             || !verification.verified
@@ -126,6 +134,10 @@ pub struct MissionRampSpendAdoptionProposal {
     pub source_contract_digest: Digest,
     pub source_evidence_digest: Digest,
     pub source_verification_digest: Digest,
+    pub source_envelope: SourceEnvelopeStatus,
+    pub source_response_bytes: usize,
+    pub source_record_bytes: usize,
+    pub source_raw_record_bytes: usize,
     pub policy_revision: u64,
     pub truth_authority: bool,
     pub consent_authority: bool,
@@ -156,6 +168,10 @@ impl MissionRampSpendAdoptionProposal {
             source_contract_digest: proposal.contract_digest.clone(),
             source_evidence_digest: proposal.evidence_digest.clone(),
             source_verification_digest: verification.verification_digest.clone(),
+            source_envelope: proposal.source_envelope,
+            source_response_bytes: proposal.response_bytes,
+            source_record_bytes: proposal.record_bytes,
+            source_raw_record_bytes: proposal.raw_record_bytes,
             policy_revision: proposal.policy_revision,
             truth_authority: false,
             consent_authority: false,
@@ -183,6 +199,10 @@ impl MissionRampSpendAdoptionProposal {
             || self.native
             || self.connected
             || self.mutates_provider
+            || self.source_envelope != SourceEnvelopeStatus::Present
+            || self.source_response_bytes > crate::MAX_TOTAL_RESPONSE_BYTES
+            || self.source_record_bytes > crate::MAX_TOTAL_RECORD_BYTES
+            || self.source_raw_record_bytes > crate::MAX_TOTAL_RECORD_BYTES
             || self.adoption_digest != self.computed_digest()
         {
             return Err(RampSpendOutcomeError::ConsumerBindingMismatch);
@@ -218,6 +238,10 @@ impl MissionRampSpendAdoptionProposal {
             source_contract_digest: &self.source_contract_digest,
             source_evidence_digest: &self.source_evidence_digest,
             source_verification_digest: &self.source_verification_digest,
+            source_envelope: self.source_envelope,
+            source_response_bytes: self.source_response_bytes,
+            source_record_bytes: self.source_record_bytes,
+            source_raw_record_bytes: self.source_raw_record_bytes,
             policy_revision: self.policy_revision,
             truth_authority: self.truth_authority,
             consent_authority: self.consent_authority,
@@ -245,6 +269,10 @@ struct AdoptionFingerprint<'a> {
     source_contract_digest: &'a str,
     source_evidence_digest: &'a str,
     source_verification_digest: &'a str,
+    source_envelope: SourceEnvelopeStatus,
+    source_response_bytes: usize,
+    source_record_bytes: usize,
+    source_raw_record_bytes: usize,
     policy_revision: u64,
     truth_authority: bool,
     consent_authority: bool,

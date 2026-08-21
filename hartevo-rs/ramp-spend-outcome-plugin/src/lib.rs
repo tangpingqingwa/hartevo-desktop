@@ -29,8 +29,8 @@ pub use model::{
     IdentityBinding, MerchantEvidence, MissionBinding, OutcomeProposal, PermissionSnapshot,
     ProjectBinding, RampReadScope, RampSpendScope, RampSpendScopeSpec, RefundState,
     RegistrationReceipt, RegistrationStatus, ReleaseBinding, ReplayFenceDurability, ResourceKind,
-    RevocationReceipt, SecretKind, SecretReference, SpendConstraints, SpendEvidence,
-    TransactionEvidence, TransactionState, TransportProvenance, WorkProductBinding,
+    RevocationReceipt, SecretKind, SecretReference, SourceEnvelopeStatus, SpendConstraints,
+    SpendEvidence, TransactionEvidence, TransactionState, TransportProvenance, WorkProductBinding,
     canonical_digest, sha256_digest,
 };
 pub use provider::RampProvider;
@@ -73,6 +73,7 @@ pub const MAX_CATEGORY_VALUES: usize = 32;
 pub const MAX_RESPONSE_BYTES: usize = 1_048_576;
 pub const MAX_PAGE_BYTES: usize = 1_048_576;
 pub const MAX_RECORD_BYTES: usize = 65_536;
+pub const MAX_NESTED_REFERENCES: usize = 32;
 pub const MAX_TOTAL_RESPONSE_BYTES: usize = 4_194_304;
 pub const MAX_TOTAL_RECORD_BYTES: usize = 1_048_576;
 pub const MAX_SPEND_TOTAL_MINOR: i64 = 9_000_000_000_000;
@@ -480,6 +481,7 @@ pub fn validate_contract_document() -> Result<(), RampSpendOutcomeError> {
     };
     let expected_bounds = [
         ("maxCategoryValues", MAX_CATEGORY_VALUES as u64),
+        ("maxNestedReferences", MAX_NESTED_REFERENCES as u64),
         ("maxResponseBytes", MAX_RESPONSE_BYTES as u64),
         ("maxPageBytes", MAX_PAGE_BYTES as u64),
         ("maxRecordBytes", MAX_RECORD_BYTES as u64),
@@ -506,10 +508,17 @@ pub fn validate_contract_document() -> Result<(), RampSpendOutcomeError> {
             == Some(true)
     };
     if !section_true("scope", "currencyCategoryTotalBound")
+        || !section_true("scope", "ingressByteAccountingBound")
+        || !section_true("scope", "sourceEnvelopeCompletenessBound")
         || !section_true("transport", "rawResponseBodyBounds")
         || !section_true("transport", "rawRecordBounds")
         || !section_true("transport", "globalByteBudget")
         || !section_true("transport", "processSharedReplayFence")
+        || !section_true("transport", "authenticatedIngressByteAccounting")
+        || !section_true("transport", "preRetentionCardinalityBounds")
+        || !section_true("transport", "missingEnvelopeFailClosed")
+        || !section_true("projections", "byteAccountingExplicit")
+        || !section_true("projections", "sourceEnvelopeCompletenessExplicit")
     {
         return Err(RampSpendOutcomeError::InvalidResponse);
     }

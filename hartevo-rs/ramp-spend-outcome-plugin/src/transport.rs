@@ -4,23 +4,27 @@
 use std::{
     collections::VecDeque,
     fmt,
+    marker::PhantomData,
     sync::{Arc, Mutex},
 };
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
 use thiserror::Error;
 
 use crate::model::{
-    BoundIdentifier, DateWindow, Digest, RampSpendScope, RefundState, TransportProvenance,
-    canonical_digest, sha256_digest, validate_bounded_text, validate_currency_code,
-    validate_cursor, validate_event_type, validate_high_water, validate_identifier,
-    validate_page_size,
+    BoundIdentifier, DateWindow, Digest, RampSpendScope, RefundState, SourceEnvelopeStatus,
+    TransportProvenance, canonical_digest, sha256_digest, validate_bounded_text,
+    validate_currency_code, validate_cursor, validate_event_type, validate_high_water,
+    validate_identifier, validate_page_size,
 };
 use crate::{
     MAX_AUDIT_EVENTS, MAX_CURSOR_BYTES, MAX_EVENT_TYPE_BYTES, MAX_IDENTIFIER_BYTES, MAX_MERCHANTS,
-    MAX_PAGE_BYTES, MAX_PAGE_SIZE, MAX_PAGES, MAX_RECORD_BYTES, MAX_RESPONSE_BYTES,
-    MAX_TOTAL_RESPONSE_BYTES, MAX_TRANSACTIONS,
+    MAX_NESTED_REFERENCES, MAX_PAGE_BYTES, MAX_PAGE_SIZE, MAX_PAGES, MAX_RECORD_BYTES,
+    MAX_RESPONSE_BYTES, MAX_TOTAL_RESPONSE_BYTES, MAX_TRANSACTIONS,
 };
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -61,6 +65,8 @@ pub enum RampTransportError {
     RecordTooLarge,
     #[error("Ramp response page exceeded the bounded byte cap")]
     PageTooLarge,
+    #[error("Ramp nested response collection exceeded the bounded cardinality cap")]
+    NestedCollectionTooLarge,
 }
 
 impl RampTransportError {
@@ -860,6 +866,35 @@ impl RampAuditEventInput {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+enum ByteCount {
+    Exact(usize),
+    Unknown,
+}
+
+impl ByteCount {
+    fn validate(
+        self,
+        field: &'static str,
+        maximum: usize,
+    ) -> Result<(), crate::RampSpendOutcomeError> {
+        match self {
+            Self::Exact(value) if value <= maximum => Ok(()),
+            Self::Exact(_) => Err(crate::RampSpendOutcomeError::BoundExceeded { field, maximum }),
+            Self::Unknown => Err(crate::RampSpendOutcomeError::PartialEvidence),
+        }
+    }
+
+    fn exact(self) -> Result<usize, crate::RampSpendOutcomeError> {
+        match self {
+            Self::Exact(value) => Ok(value),
+            Self::Unknown => Err(crate::RampSpendOutcomeError::PartialEvidence),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RampApiPage {
     pub endpoint: RampEndpoint,
@@ -869,9 +904,10 @@ pub struct RampApiPage {
     pub audit_events: Vec<RampAuditEventInput>,
     pub next_cursor: Option<String>,
     pub high_water_mark: String,
-    pub response_bytes: usize,
-    pub record_bytes: usize,
-    pub raw_record_bytes: usize,
+    pub source_envelope: SourceEnvelopeStatus,
+    response_bytes: ByteCount,
+    record_bytes: usize,
+    raw_record_bytes: ByteCount,
     pub response_digest: Digest,
 }
 
@@ -886,6 +922,7 @@ impl fmt::Debug for RampApiPage {
             .field("audit_event_count", &self.audit_events.len())
             .field("next_cursor", &self.next_cursor)
             .field("high_water_mark", &"<redacted>")
+            .field("source_envelope", &self.source_envelope)
             .field("response_bytes", &self.response_bytes)
             .field("record_bytes", &self.record_bytes)
             .field("raw_record_bytes", &self.raw_record_bytes)
@@ -904,7 +941,6 @@ impl RampApiPage {
         next_cursor: Option<String>,
         high_water_mark: impl Into<String>,
     ) -> Result<Self, crate::RampSpendOutcomeError> {
-        let business_id = BoundIdentifier::new(business_id, "business id")?;
         if transactions.len() > MAX_PAGE_SIZE
             || merchants.len() > MAX_PAGE_SIZE
             || audit_events.len() > MAX_PAGE_SIZE
@@ -938,6 +974,88 @@ impl RampApiPage {
                 maximum: MAX_RESPONSE_BYTES,
             });
         }
+        Self::new_with_accounting(
+            endpoint,
+            business_id,
+            transactions,
+            merchants,
+            audit_events,
+            next_cursor,
+            high_water_mark,
+            SourceEnvelopeStatus::Present,
+            ByteCount::Exact(response_bytes),
+            ByteCount::Exact(record_bytes),
+        )
+    }
+
+    pub(crate) fn from_official_ingress(
+        endpoint: RampEndpoint,
+        business_id: impl Into<String>,
+        transactions: Vec<RampTransactionInput>,
+        merchants: Vec<RampMerchantInput>,
+        audit_events: Vec<RampAuditEventInput>,
+        next_cursor: Option<String>,
+        high_water_mark: impl Into<String>,
+        source_envelope: SourceEnvelopeStatus,
+        response_bytes: usize,
+        raw_record_bytes: usize,
+    ) -> Result<Self, crate::RampSpendOutcomeError> {
+        Self::new_with_accounting(
+            endpoint,
+            business_id,
+            transactions,
+            merchants,
+            audit_events,
+            next_cursor,
+            high_water_mark,
+            source_envelope,
+            ByteCount::Exact(response_bytes),
+            ByteCount::Exact(raw_record_bytes),
+        )
+    }
+
+    fn new_with_accounting(
+        endpoint: RampEndpoint,
+        business_id: impl Into<String>,
+        transactions: Vec<RampTransactionInput>,
+        merchants: Vec<RampMerchantInput>,
+        audit_events: Vec<RampAuditEventInput>,
+        next_cursor: Option<String>,
+        high_water_mark: impl Into<String>,
+        source_envelope: SourceEnvelopeStatus,
+        response_bytes: ByteCount,
+        raw_record_bytes: ByteCount,
+    ) -> Result<Self, crate::RampSpendOutcomeError> {
+        let business_id = BoundIdentifier::new(business_id, "business id")?;
+        if transactions.len() > MAX_PAGE_SIZE
+            || merchants.len() > MAX_PAGE_SIZE
+            || audit_events.len() > MAX_PAGE_SIZE
+        {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "page records",
+                maximum: MAX_PAGE_SIZE,
+            });
+        }
+        if let Some(next_cursor) = &next_cursor {
+            validate_cursor(next_cursor)?;
+        }
+        let high_water_mark = high_water_mark.into();
+        validate_high_water(&high_water_mark)?;
+        let record_bytes = transactions
+            .iter()
+            .map(RampTransactionInput::record_bytes)
+            .chain(merchants.iter().map(RampMerchantInput::record_bytes))
+            .chain(audit_events.iter().map(RampAuditEventInput::record_bytes))
+            .fold(0usize, usize::saturating_add);
+        if record_bytes > MAX_PAGE_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "page bytes",
+                maximum: MAX_PAGE_BYTES,
+            });
+        }
+        response_bytes.validate("response bytes", MAX_RESPONSE_BYTES)?;
+        response_bytes.validate("response bytes", MAX_PAGE_BYTES)?;
+        raw_record_bytes.validate("raw record bytes", MAX_PAGE_BYTES)?;
         let mut page = Self {
             endpoint,
             business_id,
@@ -946,9 +1064,10 @@ impl RampApiPage {
             audit_events,
             next_cursor,
             high_water_mark,
+            source_envelope,
             response_bytes,
             record_bytes,
-            raw_record_bytes: record_bytes,
+            raw_record_bytes,
             response_digest: String::new(),
         };
         page.response_digest = page.computed_digest();
@@ -956,36 +1075,17 @@ impl RampApiPage {
         Ok(page)
     }
 
-    pub fn with_response_bytes(
-        mut self,
-        response_bytes: usize,
-    ) -> Result<Self, crate::RampSpendOutcomeError> {
-        if response_bytes > MAX_RESPONSE_BYTES || response_bytes > MAX_PAGE_BYTES {
-            return Err(crate::RampSpendOutcomeError::BoundExceeded {
-                field: "response bytes",
-                maximum: MAX_RESPONSE_BYTES,
-            });
-        }
-        self.response_bytes = response_bytes;
-        self.response_digest = self.computed_digest();
-        self.validate()?;
-        Ok(self)
+    pub fn response_byte_count(&self) -> Result<usize, crate::RampSpendOutcomeError> {
+        self.response_bytes.exact()
     }
 
-    pub fn with_raw_record_bytes(
-        mut self,
-        raw_record_bytes: usize,
-    ) -> Result<Self, crate::RampSpendOutcomeError> {
-        if raw_record_bytes > MAX_PAGE_BYTES {
-            return Err(crate::RampSpendOutcomeError::BoundExceeded {
-                field: "record bytes",
-                maximum: MAX_PAGE_BYTES,
-            });
-        }
-        self.raw_record_bytes = raw_record_bytes;
-        self.response_digest = self.computed_digest();
-        self.validate()?;
-        Ok(self)
+    #[must_use]
+    pub const fn record_byte_count(&self) -> usize {
+        self.record_bytes
+    }
+
+    pub fn raw_record_byte_count(&self) -> Result<usize, crate::RampSpendOutcomeError> {
+        self.raw_record_bytes.exact()
     }
 
     pub fn validate(&self) -> Result<(), crate::RampSpendOutcomeError> {
@@ -998,22 +1098,16 @@ impl RampApiPage {
                 maximum: MAX_PAGE_SIZE,
             });
         }
+        self.response_bytes
+            .validate("response bytes", MAX_RESPONSE_BYTES)?;
+        self.response_bytes
+            .validate("response bytes", MAX_PAGE_BYTES)?;
+        self.raw_record_bytes
+            .validate("raw record bytes", MAX_PAGE_BYTES)?;
         if self.record_bytes > MAX_PAGE_BYTES {
             return Err(crate::RampSpendOutcomeError::BoundExceeded {
                 field: "page bytes",
                 maximum: MAX_PAGE_BYTES,
-            });
-        }
-        if self.raw_record_bytes > MAX_PAGE_BYTES {
-            return Err(crate::RampSpendOutcomeError::BoundExceeded {
-                field: "raw record bytes",
-                maximum: MAX_PAGE_BYTES,
-            });
-        }
-        if self.response_bytes > MAX_RESPONSE_BYTES || self.response_bytes > MAX_PAGE_BYTES {
-            return Err(crate::RampSpendOutcomeError::BoundExceeded {
-                field: "response bytes",
-                maximum: MAX_RESPONSE_BYTES,
             });
         }
         validate_high_water(&self.high_water_mark)?;
@@ -1067,6 +1161,7 @@ impl RampApiPage {
                 .collect(),
             next_cursor: &self.next_cursor,
             high_water_mark: &self.high_water_mark,
+            source_envelope: self.source_envelope,
             response_bytes: self.response_bytes,
             record_bytes: self.record_bytes,
             raw_record_bytes: self.raw_record_bytes,
@@ -1084,9 +1179,10 @@ struct PageFingerprint<'a> {
     audit_events: Vec<Digest>,
     next_cursor: &'a Option<String>,
     high_water_mark: &'a str,
-    response_bytes: usize,
+    source_envelope: SourceEnvelopeStatus,
+    response_bytes: ByteCount,
     record_bytes: usize,
-    raw_record_bytes: usize,
+    raw_record_bytes: ByteCount,
 }
 
 pub trait RampTransport: fmt::Debug + Send + Sync {
@@ -1284,17 +1380,74 @@ impl OfficialRampApiTransport {
     }
 }
 
+#[derive(Debug)]
+struct BoundedVec<T, const MAX: usize>(Vec<T>);
+
+impl<T, const MAX: usize> BoundedVec<T, MAX> {
+    fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+}
+
+impl<'de, T, const MAX: usize> Deserialize<'de> for BoundedVec<T, MAX>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BoundedVecVisitor<T, const MAX: usize>(PhantomData<T>);
+
+        impl<'de, T, const MAX: usize> Visitor<'de> for BoundedVecVisitor<T, MAX>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = BoundedVec<T, MAX>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "an array with at most {MAX} items")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::with_capacity(MAX);
+                loop {
+                    if values.len() == MAX {
+                        if sequence.next_element::<IgnoredAny>()?.is_some() {
+                            let message = if MAX == MAX_NESTED_REFERENCES {
+                                "ramp nested collection cardinality cap"
+                            } else {
+                                "ramp page cardinality cap"
+                            };
+                            return Err(de::Error::custom(message));
+                        }
+                        break;
+                    }
+                    let Some(value) = sequence.next_element::<T>()? else {
+                        break;
+                    };
+                    values.push(value);
+                }
+                Ok(BoundedVec(values))
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedVecVisitor(PhantomData))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PageWire {
-    #[serde(default)]
     next: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TransactionsEnvelope {
-    #[serde(default)]
-    data: Vec<TransactionWire>,
-    page: PageWire,
+    data: Option<BoundedVec<TransactionWire, MAX_PAGE_SIZE>>,
+    page: Option<PageWire>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1318,9 +1471,8 @@ struct TransactionWire {
 
 #[derive(Debug, Deserialize)]
 struct MerchantsEnvelope {
-    #[serde(default)]
-    data: Vec<MerchantWire>,
-    page: PageWire,
+    data: Option<BoundedVec<MerchantWire, MAX_PAGE_SIZE>>,
+    page: Option<PageWire>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1332,9 +1484,8 @@ struct MerchantWire {
 
 #[derive(Debug, Deserialize)]
 struct AuditEnvelope {
-    #[serde(default)]
-    data: Vec<AuditWire>,
-    page: PageWire,
+    data: Option<BoundedVec<AuditWire, MAX_PAGE_SIZE>>,
+    page: Option<PageWire>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1343,19 +1494,116 @@ struct AuditWire {
     event_type: String,
     actor_type: String,
     event_time: String,
-    #[serde(default)]
     event_details: Option<AuditDetailsWire>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AuditDetailsWire {
-    #[serde(default)]
-    references: Vec<AuditReferenceWire>,
+    references: Option<BoundedVec<AuditReferenceWire, MAX_NESTED_REFERENCES>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AuditReferenceWire {
     resource_name: String,
+}
+
+#[derive(Debug)]
+struct RawDataScan {
+    raw_record_bytes: usize,
+}
+
+impl<'de> Deserialize<'de> for RawDataScan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RawDataScanVisitor;
+
+        impl<'de> Visitor<'de> for RawDataScanVisitor {
+            type Value = RawDataScan;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded official Ramp data array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut count = 0usize;
+                let mut raw_record_bytes = 0usize;
+                loop {
+                    if count == MAX_PAGE_SIZE {
+                        if sequence.next_element::<IgnoredAny>()?.is_some() {
+                            return Err(de::Error::custom("ramp page cardinality cap"));
+                        }
+                        break;
+                    }
+                    let Some(value) = sequence.next_element::<&serde_json::value::RawValue>()?
+                    else {
+                        break;
+                    };
+                    let record_bytes = value.get().len();
+                    if record_bytes > MAX_RECORD_BYTES {
+                        return Err(de::Error::custom("ramp raw record byte cap"));
+                    }
+                    raw_record_bytes = raw_record_bytes.saturating_add(record_bytes);
+                    if raw_record_bytes > MAX_PAGE_BYTES {
+                        return Err(de::Error::custom("ramp raw page byte cap"));
+                    }
+                    count = count.saturating_add(1);
+                }
+                Ok(RawDataScan { raw_record_bytes })
+            }
+        }
+
+        deserializer.deserialize_seq(RawDataScanVisitor)
+    }
+}
+
+#[derive(Debug)]
+struct RawEnvelopeScan {
+    data_seen: bool,
+    data: Option<RawDataScan>,
+}
+
+impl<'de> Deserialize<'de> for RawEnvelopeScan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RawEnvelopeScanVisitor;
+
+        impl<'de> Visitor<'de> for RawEnvelopeScanVisitor {
+            type Value = RawEnvelopeScan;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an official Ramp response object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut data_seen = false;
+                let mut data = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "data" {
+                        if data_seen {
+                            return Err(de::Error::duplicate_field("data"));
+                        }
+                        data_seen = true;
+                        data = map.next_value::<Option<RawDataScan>>()?;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(RawEnvelopeScan { data_seen, data })
+            }
+        }
+
+        deserializer.deserialize_map(RawEnvelopeScanVisitor)
+    }
 }
 
 /// Parse the allowlisted part of an official Ramp Developer API response.
@@ -1371,16 +1619,19 @@ pub fn parse_official_json_page(
     if body.len() > MAX_RESPONSE_BYTES {
         return Err(RampTransportError::ResponseTooLarge);
     }
-    let raw_record_bytes = validate_raw_response_records(body)?;
-    let page = (match endpoint {
+    let (source_envelope, raw_record_bytes) = validate_raw_response_records(body)?;
+    (match endpoint {
         RampEndpoint::Transactions => {
             let envelope: TransactionsEnvelope =
-                serde_json::from_str(body).map_err(|_| RampTransportError::InvalidResponse)?;
-            if envelope.data.len() > MAX_PAGE_SIZE {
-                return Err(RampTransportError::PageTooLarge);
-            }
+                serde_json::from_str(body).map_err(map_json_transport_error)?;
+            let next_cursor = envelope
+                .page
+                .ok_or(RampTransportError::InvalidResponse)?
+                .next;
             let transactions = envelope
                 .data
+                .map(BoundedVec::into_inner)
+                .unwrap_or_default()
                 .into_iter()
                 .map(|item| {
                     let category_id = item.sk_category_id.map(|value| value.to_string());
@@ -1405,24 +1656,30 @@ pub fn parse_official_json_page(
                     .map_err(|_| RampTransportError::InvalidResponse)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            RampApiPage::new(
+            RampApiPage::from_official_ingress(
                 endpoint,
                 business_id,
                 transactions,
                 Vec::new(),
                 Vec::new(),
-                envelope.page.next,
+                next_cursor,
                 high_water_mark,
+                source_envelope,
+                body.len(),
+                raw_record_bytes,
             )
         }
         RampEndpoint::Merchants => {
             let envelope: MerchantsEnvelope =
-                serde_json::from_str(body).map_err(|_| RampTransportError::InvalidResponse)?;
-            if envelope.data.len() > MAX_PAGE_SIZE {
-                return Err(RampTransportError::PageTooLarge);
-            }
+                serde_json::from_str(body).map_err(map_json_transport_error)?;
+            let next_cursor = envelope
+                .page
+                .ok_or(RampTransportError::InvalidResponse)?
+                .next;
             let merchants = envelope
                 .data
+                .map(BoundedVec::into_inner)
+                .unwrap_or_default()
                 .into_iter()
                 .map(|item| {
                     RampMerchantInput::from_spec(RampMerchantInputSpec {
@@ -1433,29 +1690,49 @@ pub fn parse_official_json_page(
                     .map_err(|_| RampTransportError::InvalidResponse)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            RampApiPage::new(
+            RampApiPage::from_official_ingress(
                 endpoint,
                 business_id,
                 Vec::new(),
                 merchants,
                 Vec::new(),
-                envelope.page.next,
+                next_cursor,
                 high_water_mark,
+                source_envelope,
+                body.len(),
+                raw_record_bytes,
             )
         }
         RampEndpoint::AuditLogs => {
             let envelope: AuditEnvelope =
-                serde_json::from_str(body).map_err(|_| RampTransportError::InvalidResponse)?;
-            if envelope.data.len() > MAX_PAGE_SIZE {
-                return Err(RampTransportError::PageTooLarge);
-            }
+                serde_json::from_str(body).map_err(map_json_transport_error)?;
+            let next_cursor = envelope
+                .page
+                .ok_or(RampTransportError::InvalidResponse)?
+                .next;
+            let mut source_envelope = source_envelope;
             let events = envelope
                 .data
+                .map(BoundedVec::into_inner)
+                .unwrap_or_default()
                 .into_iter()
                 .map(|item| {
+                    if item.event_details.is_none()
+                        || item
+                            .event_details
+                            .as_ref()
+                            .is_some_and(|details| details.references.is_none())
+                    {
+                        source_envelope = SourceEnvelopeStatus::Missing;
+                    }
                     let resource_name = item
                         .event_details
-                        .and_then(|details| details.references.into_iter().next())
+                        .and_then(|details| {
+                            details
+                                .references
+                                .map(BoundedVec::into_inner)
+                                .and_then(|references| references.into_iter().next())
+                        })
                         .map_or_else(
                             || "provider_unknown".to_owned(),
                             |reference| reference.resource_name,
@@ -1471,48 +1748,51 @@ pub fn parse_official_json_page(
                     .map_err(|_| RampTransportError::InvalidResponse)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            RampApiPage::new(
+            RampApiPage::from_official_ingress(
                 endpoint,
                 business_id,
                 Vec::new(),
                 Vec::new(),
                 events,
-                envelope.page.next,
+                next_cursor,
                 high_water_mark,
+                source_envelope,
+                body.len(),
+                raw_record_bytes,
             )
         }
     })
-    .map_err(map_model_transport_error)?;
-    let page = page
-        .with_response_bytes(body.len())
-        .map_err(map_model_transport_error)?;
-    page.with_raw_record_bytes(raw_record_bytes)
-        .map_err(map_model_transport_error)
+    .map_err(map_model_transport_error)
 }
 
-fn validate_raw_response_records(body: &str) -> Result<usize, RampTransportError> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).map_err(|_| RampTransportError::InvalidResponse)?;
-    let Some(records) = value.get("data").and_then(serde_json::Value::as_array) else {
-        return Ok(0);
+fn validate_raw_response_records(
+    body: &str,
+) -> Result<(SourceEnvelopeStatus, usize), RampTransportError> {
+    let scan: RawEnvelopeScan = serde_json::from_str(body).map_err(map_json_transport_error)?;
+    let source_envelope = if scan.data_seen && scan.data.is_some() {
+        SourceEnvelopeStatus::Present
+    } else {
+        SourceEnvelopeStatus::Missing
     };
-    if records.len() > MAX_PAGE_SIZE {
-        return Err(RampTransportError::PageTooLarge);
+    Ok((
+        source_envelope,
+        scan.data.map_or(0, |data| data.raw_record_bytes),
+    ))
+}
+
+fn map_json_transport_error(error: serde_json::Error) -> RampTransportError {
+    let message = error.to_string();
+    if message.contains("ramp page cardinality cap") {
+        RampTransportError::PageTooLarge
+    } else if message.contains("ramp nested collection cardinality cap") {
+        RampTransportError::NestedCollectionTooLarge
+    } else if message.contains("ramp raw record byte cap") {
+        RampTransportError::RecordTooLarge
+    } else if message.contains("ramp raw page byte cap") {
+        RampTransportError::PageTooLarge
+    } else {
+        RampTransportError::InvalidResponse
     }
-    let mut page_record_bytes = 0usize;
-    for record in records {
-        let record_bytes = serde_json::to_vec(record)
-            .map_err(|_| RampTransportError::InvalidResponse)?
-            .len();
-        if record_bytes > MAX_RECORD_BYTES {
-            return Err(RampTransportError::RecordTooLarge);
-        }
-        page_record_bytes = page_record_bytes.saturating_add(record_bytes);
-        if page_record_bytes > MAX_PAGE_BYTES {
-            return Err(RampTransportError::PageTooLarge);
-        }
-    }
-    Ok(page_record_bytes)
 }
 
 fn map_model_transport_error(error: crate::RampSpendOutcomeError) -> RampTransportError {
@@ -1615,4 +1895,32 @@ fn _bounded_constants_are_used() -> usize {
         + MAX_TRANSACTIONS
         + MAX_MERCHANTS
         + MAX_AUDIT_EVENTS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_byte_accounting_never_becomes_zero_or_valid() {
+        let mut page = RampApiPage::new(
+            RampEndpoint::Transactions,
+            "business-1",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            "high-water",
+        )
+        .expect("bounded page");
+        page.response_bytes = ByteCount::Unknown;
+        assert_eq!(
+            page.response_byte_count(),
+            Err(crate::RampSpendOutcomeError::PartialEvidence)
+        );
+        assert_eq!(
+            page.validate(),
+            Err(crate::RampSpendOutcomeError::PartialEvidence)
+        );
+    }
 }

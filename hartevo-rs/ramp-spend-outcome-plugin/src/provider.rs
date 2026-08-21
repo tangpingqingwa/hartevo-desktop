@@ -62,13 +62,19 @@ struct ReadBudget {
     pages: usize,
     response_bytes: usize,
     record_bytes: usize,
+    raw_record_bytes: usize,
 }
 
 impl ReadBudget {
     fn consume(&mut self, page: &RampApiPage) -> Result<(), RampSpendOutcomeError> {
         let next_pages = self.pages.saturating_add(1);
-        let next_response_bytes = self.response_bytes.saturating_add(page.response_bytes);
-        let next_record_bytes = self.record_bytes.saturating_add(page.raw_record_bytes);
+        let next_response_bytes = self
+            .response_bytes
+            .saturating_add(page.response_byte_count()?);
+        let next_record_bytes = self.record_bytes.saturating_add(page.record_byte_count());
+        let next_raw_record_bytes = self
+            .raw_record_bytes
+            .saturating_add(page.raw_record_byte_count()?);
         if next_pages > crate::MAX_PAGES {
             return Err(RampSpendOutcomeError::BoundExceeded {
                 field: "total pages",
@@ -81,7 +87,9 @@ impl ReadBudget {
                 maximum: crate::MAX_TOTAL_RESPONSE_BYTES,
             });
         }
-        if next_record_bytes > crate::MAX_TOTAL_RECORD_BYTES {
+        if next_record_bytes > crate::MAX_TOTAL_RECORD_BYTES
+            || next_raw_record_bytes > crate::MAX_TOTAL_RECORD_BYTES
+        {
             return Err(RampSpendOutcomeError::BoundExceeded {
                 field: "total record bytes",
                 maximum: crate::MAX_TOTAL_RECORD_BYTES,
@@ -90,6 +98,7 @@ impl ReadBudget {
         self.pages = next_pages;
         self.response_bytes = next_response_bytes;
         self.record_bytes = next_record_bytes;
+        self.raw_record_bytes = next_raw_record_bytes;
         Ok(())
     }
 }
@@ -435,6 +444,10 @@ where
             audit_evidence,
             high_water_mark_digest,
             page_count as u16,
+            crate::SourceEnvelopeStatus::Present,
+            budget.response_bytes,
+            budget.record_bytes,
+            budget.raw_record_bytes,
             request_receipt_digest,
             response_receipt_digest,
             self.provenance(),
@@ -494,6 +507,10 @@ where
             provider_digest: evidence.provider_digest.clone(),
             contract_digest: evidence.contract_digest.clone(),
             evidence_status: evidence.status,
+            source_envelope: evidence.source_envelope,
+            response_bytes: evidence.response_bytes,
+            record_bytes: evidence.record_bytes,
+            raw_record_bytes: evidence.raw_record_bytes,
             provenance: evidence.provenance,
             independent_state_valid: true,
             verified: true,
@@ -546,6 +563,9 @@ where
                 return Err(RampSpendOutcomeError::ScopeMismatch);
             }
             page.validate()?;
+            if page.source_envelope != crate::SourceEnvelopeStatus::Present {
+                return Err(RampSpendOutcomeError::PartialEvidence);
+            }
             budget.consume(&page)?;
             for item in &page.transactions {
                 observed_records.push(self.replay_lease.observe_record(

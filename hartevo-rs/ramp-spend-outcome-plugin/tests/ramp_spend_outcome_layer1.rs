@@ -6,15 +6,15 @@ use std::{
 use chrono::{DateTime, Utc};
 use hartevo_ramp_spend_outcome_plugin::{
     AccessMode, BlockedEnvRampTransport, DateWindow, EvidenceStatus, FixtureRampTransport,
-    IdentityBinding, LoopbackRampTransport, MAX_PAGE_SIZE, MAX_RECORD_BYTES, MAX_RESPONSE_BYTES,
-    MAX_TOTAL_RECORD_BYTES, MAX_TOTAL_RESPONSE_BYTES, MissionRampSpendConsumer,
+    IdentityBinding, LoopbackRampTransport, MAX_NESTED_REFERENCES, MAX_PAGE_SIZE, MAX_RECORD_BYTES,
+    MAX_RESPONSE_BYTES, MAX_TOTAL_RECORD_BYTES, MAX_TOTAL_RESPONSE_BYTES, MissionRampSpendConsumer,
     OfficialRampApiResponseSpec, OfficialRampApiTransport, PermissionSnapshot, RampApiPage,
     RampAuditEventInput, RampAuditEventInputSpec, RampEndpoint, RampMerchantInput,
     RampMerchantInputSpec, RampProvider, RampSpendOutcomeError, RampSpendOutcomePluginDefinition,
     RampSpendOutcomeService, RampSpendScope, RampSpendScopeSpec, RampTransactionInput,
     RampTransactionInputSpec, RampTransport, RampTransportError, ReadOperation,
-    RecordingRampTransport, RefundState, RetryPolicy, SecretReference, SpendConstraints,
-    TransactionState, TransportProvenance, canonical_digest, sha256_digest,
+    RecordingRampTransport, RefundState, RetryPolicy, SecretReference, SourceEnvelopeStatus,
+    SpendConstraints, TransactionState, TransportProvenance, canonical_digest, sha256_digest,
     validate_contract_document,
 };
 
@@ -262,6 +262,10 @@ fn bounded_read_proposal_record_verify_and_mission_projection_are_non_mutating()
     assert!(!evidence.native);
     assert!(!evidence.connected);
     assert_eq!(evidence.provenance, TransportProvenance::Loopback);
+    assert_eq!(evidence.source_envelope, SourceEnvelopeStatus::Present);
+    assert!(evidence.response_bytes > 0);
+    assert!(evidence.record_bytes > 0);
+    assert!(evidence.raw_record_bytes > 0);
     assert!(
         serde_json::to_string(&evidence)
             .expect("evidence serializes")
@@ -276,6 +280,10 @@ fn bounded_read_proposal_record_verify_and_mission_projection_are_non_mutating()
     assert_eq!(proposal.mission, scope.mission);
     assert_eq!(proposal.work_product, scope.work_product);
     assert!(!proposal.effect_requested);
+    assert_eq!(proposal.source_envelope, evidence.source_envelope);
+    assert_eq!(proposal.response_bytes, evidence.response_bytes);
+    assert_eq!(proposal.record_bytes, evidence.record_bytes);
+    assert_eq!(proposal.raw_record_bytes, evidence.raw_record_bytes);
 
     let receipt = service.record_evidence(&evidence).expect("receipt");
     let verification = service
@@ -284,6 +292,10 @@ fn bounded_read_proposal_record_verify_and_mission_projection_are_non_mutating()
     assert!(verification.verified);
     assert!(!verification.adoptable);
     assert!(!verification.native);
+    assert_eq!(verification.source_envelope, evidence.source_envelope);
+    assert_eq!(verification.response_bytes, evidence.response_bytes);
+    assert_eq!(verification.record_bytes, evidence.record_bytes);
+    assert_eq!(verification.raw_record_bytes, evidence.raw_record_bytes);
 
     let consumer = MissionRampSpendConsumer::from_evidence_scope(&scope).expect("consumer");
     let adoption = consumer
@@ -297,6 +309,35 @@ fn bounded_read_proposal_record_verify_and_mission_projection_are_non_mutating()
     assert!(!adoption.verification_authority);
     assert!(!adoption.outcome_authority);
     assert!(!adoption.mutates_provider);
+    assert_eq!(adoption.source_envelope, SourceEnvelopeStatus::Present);
+    assert_eq!(adoption.source_response_bytes, evidence.response_bytes);
+    assert_eq!(adoption.source_record_bytes, evidence.record_bytes);
+    assert_eq!(adoption.source_raw_record_bytes, evidence.raw_record_bytes);
+
+    let mut tampered_evidence = evidence.clone();
+    tampered_evidence.raw_record_bytes = 0;
+    assert!(matches!(
+        tampered_evidence.validate(),
+        Err(RampSpendOutcomeError::ResponseTampered)
+    ));
+    let mut tampered_proposal = proposal.clone();
+    tampered_proposal.response_bytes = 0;
+    assert!(matches!(
+        tampered_proposal.validate(),
+        Err(RampSpendOutcomeError::ConsumerBindingMismatch)
+    ));
+    let mut tampered_receipt = receipt.clone();
+    tampered_receipt.record_bytes = 0;
+    assert!(matches!(
+        tampered_receipt.validate(),
+        Err(RampSpendOutcomeError::ReceiptTampered)
+    ));
+    let mut tampered_adoption = adoption.clone();
+    tampered_adoption.source_raw_record_bytes = 0;
+    assert!(matches!(
+        tampered_adoption.validate(),
+        Err(RampSpendOutcomeError::ConsumerBindingMismatch)
+    ));
 }
 
 #[test]
@@ -845,6 +886,20 @@ fn raw_body_page_record_and_global_byte_caps_fail_before_accumulation() {
         Err(RampTransportError::RecordTooLarge)
     ));
 
+    let whitespace_record = format!(
+        r#"{{"data":[{{"id":"transaction-whitespace","state":"CLEARED","amount":1,"currency_code":"USD","created_at":"2026-08-14T00:30:00Z"{}}}],"page":{{"next":null}}}}"#,
+        " ".repeat(MAX_RECORD_BYTES)
+    );
+    assert!(matches!(
+        hartevo_ramp_spend_outcome_plugin::parse_official_json_page(
+            RampEndpoint::Transactions,
+            "business-1",
+            &whitespace_record,
+            "high-water",
+        ),
+        Err(RampTransportError::RecordTooLarge)
+    ));
+
     let record = r#"{"id":"transaction-1","state":"CLEARED","amount":1,"currency_code":"USD","created_at":"2026-08-14T00:30:00Z"}"#;
     let too_many_records = format!(
         r#"{{"data":[{}],"page":{{"next":null}}}}"#,
@@ -880,41 +935,36 @@ fn raw_body_page_record_and_global_byte_caps_fail_before_accumulation() {
         })
     ));
 
+    let heavy_page = |start: usize, next: Option<&str>| {
+        let records = (start..start + 9)
+            .map(|index| {
+                format!(
+                    r#"{{"id":"transaction-byte-{index}","state":"CLEARED","amount":1,"currency_code":"USD","entity_id":"entity-1","spend_program_id":"spend-program-1","card_id":"card-1","merchant_id":"merchant-1","created_at":"2026-08-14T00:30:00Z","padding":"{}"}}"#,
+                    "x".repeat(60_000)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"data":[{records}],"page":{{"next":{}}}}}"#,
+            next.map_or_else(|| "null".to_owned(), |cursor| format!("\"{cursor}\""))
+        )
+    };
+    let page_one = hartevo_ramp_spend_outcome_plugin::parse_official_json_page(
+        RampEndpoint::Transactions,
+        "business-1",
+        &heavy_page(1, Some("byte-next")),
+        "high-water-transactions",
+    )
+    .expect("byte page one");
+    let page_two = hartevo_ramp_spend_outcome_plugin::parse_official_json_page(
+        RampEndpoint::Transactions,
+        "business-1",
+        &heavy_page(10, None),
+        "high-water-transactions",
+    )
+    .expect("byte page two");
     let (scope, secret) = scope_and_secret();
-    let page_one = RampApiPage::new(
-        RampEndpoint::Transactions,
-        "business-1",
-        vec![transaction(
-            "transaction-byte-1",
-            "CLEARED",
-            Some(1),
-            "2026-08-14T00:30:00Z",
-        )],
-        Vec::new(),
-        Vec::new(),
-        Some("byte-next".to_owned()),
-        "high-water-transactions",
-    )
-    .expect("byte page one")
-    .with_raw_record_bytes(MAX_TOTAL_RECORD_BYTES / 2 + 1)
-    .expect("bounded raw page one");
-    let page_two = RampApiPage::new(
-        RampEndpoint::Transactions,
-        "business-1",
-        vec![transaction(
-            "transaction-byte-2",
-            "CLEARED",
-            Some(1),
-            "2026-08-14T01:30:00Z",
-        )],
-        Vec::new(),
-        Vec::new(),
-        None,
-        "high-water-transactions",
-    )
-    .expect("byte page two")
-    .with_raw_record_bytes(MAX_TOTAL_RECORD_BYTES / 2 + 1)
-    .expect("bounded raw page two");
     let provider = RampProvider::new(
         LoopbackRampTransport::from_pages(vec![page_one, page_two]),
         scope,
@@ -929,6 +979,74 @@ fn raw_body_page_record_and_global_byte_caps_fail_before_accumulation() {
             field: "total record bytes",
             maximum: MAX_TOTAL_RECORD_BYTES,
         })
+    ));
+}
+
+#[test]
+fn official_missing_envelopes_and_nested_cardinality_never_become_complete() {
+    let missing_data = hartevo_ramp_spend_outcome_plugin::parse_official_json_page(
+        RampEndpoint::Transactions,
+        "business-1",
+        r#"{"page":{"next":null}}"#,
+        "high-water",
+    )
+    .expect("missing data is represented as a bounded page");
+    assert_eq!(missing_data.source_envelope, SourceEnvelopeStatus::Missing);
+    assert!(missing_data.transactions.is_empty());
+    missing_data
+        .validate()
+        .expect("missing status is digest-valid");
+
+    let present_empty = hartevo_ramp_spend_outcome_plugin::parse_official_json_page(
+        RampEndpoint::Transactions,
+        "business-1",
+        r#"{"data":[],"page":{"next":null}}"#,
+        "high-water",
+    )
+    .expect("present empty data");
+    assert_eq!(present_empty.source_envelope, SourceEnvelopeStatus::Present);
+
+    let nested_references = (0..=MAX_NESTED_REFERENCES)
+        .map(|_| r#"{"resource_name":"Transaction"}"#)
+        .collect::<Vec<_>>()
+        .join(",");
+    let oversized_nested = format!(
+        r#"{{"data":[{{"id":"audit-oversized","event_type":"transaction","actor_type":"user","event_time":"2026-08-14T03:00:00Z","event_details":{{"references":[{nested_references}]}}}}],"page":{{"next":null}}}}"#
+    );
+    assert!(matches!(
+        hartevo_ramp_spend_outcome_plugin::parse_official_json_page(
+            RampEndpoint::AuditLogs,
+            "business-1",
+            &oversized_nested,
+            "high-water",
+        ),
+        Err(RampTransportError::NestedCollectionTooLarge)
+    ));
+
+    let missing_nested = hartevo_ramp_spend_outcome_plugin::parse_official_json_page(
+        RampEndpoint::AuditLogs,
+        "business-1",
+        r#"{"data":[{"id":"audit-missing","event_type":"transaction","actor_type":"user","event_time":"2026-08-14T03:00:00Z","event_details":{}}],"page":{"next":null}}"#,
+        "high-water",
+    )
+    .expect("missing nested data is explicit");
+    assert_eq!(
+        missing_nested.source_envelope,
+        SourceEnvelopeStatus::Missing
+    );
+
+    let (scope, secret) = scope_and_secret();
+    let provider = RampProvider::new(
+        LoopbackRampTransport::from_page(missing_data),
+        scope,
+        secret,
+        1,
+        1,
+    )
+    .expect("missing-envelope provider");
+    assert!(matches!(
+        provider.read_evidence(window()),
+        Err(RampSpendOutcomeError::PartialEvidence)
     ));
 }
 

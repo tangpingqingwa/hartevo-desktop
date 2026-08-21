@@ -175,7 +175,9 @@
         "revisionBound",
         "currencyCategoryTotalBound",
         "requestedReadScopesBound",
-        "providerContractEvidenceDigestsBound"
+        "providerContractEvidenceDigestsBound",
+        "ingressByteAccountingBound",
+        "sourceEnvelopeCompletenessBound"
       ],
       "properties": {
         "businessBound": { "const": true },
@@ -190,7 +192,9 @@
         "revisionBound": { "const": true },
         "currencyCategoryTotalBound": { "const": true },
         "requestedReadScopesBound": { "const": true },
-        "providerContractEvidenceDigestsBound": { "const": true }
+        "providerContractEvidenceDigestsBound": { "const": true },
+        "ingressByteAccountingBound": { "const": true },
+        "sourceEnvelopeCompletenessBound": { "const": true }
       }
     },
     "bounds": {
@@ -207,6 +211,7 @@
         "maxIdentifierBytes",
         "maxEventTypeBytes",
         "maxCategoryValues",
+        "maxNestedReferences",
         "maxResponseBytes",
         "maxPageBytes",
         "maxRecordBytes",
@@ -228,6 +233,7 @@
         "maxIdentifierBytes": { "const": 256 },
         "maxEventTypeBytes": { "const": 128 },
         "maxCategoryValues": { "const": 32 },
+        "maxNestedReferences": { "const": 32 },
         "maxResponseBytes": { "const": 1048576 },
         "maxPageBytes": { "const": 1048576 },
         "maxRecordBytes": { "const": 65536 },
@@ -302,6 +308,8 @@
         "currencyCategoryConstraintsExplicit",
         "boundedSpendTotalsExplicit",
         "replayFencesExplicit",
+        "byteAccountingExplicit",
+        "sourceEnvelopeCompletenessExplicit",
         "emptyIsNotEvidence",
         "partialIsNotSuccess",
         "providerUnknownIsNotSuccess"
@@ -322,6 +330,8 @@
         "currencyCategoryConstraintsExplicit": { "const": true },
         "boundedSpendTotalsExplicit": { "const": true },
         "replayFencesExplicit": { "const": true },
+        "byteAccountingExplicit": { "const": true },
+        "sourceEnvelopeCompletenessExplicit": { "const": true },
         "emptyIsNotEvidence": { "const": true },
         "partialIsNotSuccess": { "const": true },
         "providerUnknownIsNotSuccess": { "const": true }
@@ -353,7 +363,10 @@
         "rawResponseBodyBounds",
         "rawRecordBounds",
         "globalByteBudget",
-        "processSharedReplayFence"
+        "processSharedReplayFence",
+        "authenticatedIngressByteAccounting",
+        "preRetentionCardinalityBounds",
+        "missingEnvelopeFailClosed"
       ],
       "properties": {
         "officialRampDeveloperApi": { "const": true },
@@ -378,7 +391,10 @@
         "rawResponseBodyBounds": { "const": true },
         "rawRecordBounds": { "const": true },
         "globalByteBudget": { "const": true },
-        "processSharedReplayFence": { "const": true }
+        "processSharedReplayFence": { "const": true },
+        "authenticatedIngressByteAccounting": { "const": true },
+        "preRetentionCardinalityBounds": { "const": true },
+        "missingEnvelopeFailClosed": { "const": true }
       }
     },
     "honesty": {

@@ -14,7 +14,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 use crate::{
     MAX_AUDIT_EVENTS, MAX_CATEGORY_VALUES, MAX_CURSOR_BYTES, MAX_DATE_WINDOW_SECONDS,
     MAX_EVENT_TYPE_BYTES, MAX_IDENTIFIER_BYTES, MAX_MERCHANTS, MAX_PAGE_SIZE, MAX_PAGES,
-    MAX_SPEND_TOTAL_MINOR, MAX_TRANSACTIONS,
+    MAX_SPEND_TOTAL_MINOR, MAX_TOTAL_RECORD_BYTES, MAX_TOTAL_RESPONSE_BYTES, MAX_TRANSACTIONS,
 };
 
 pub type Digest = String;
@@ -845,6 +845,17 @@ pub enum EvidenceStatus {
     ProviderUnknown,
 }
 
+/// Whether the official provider envelope supplied the required collection.
+/// Missing and unknown are deliberately distinct from a present empty array;
+/// neither may participate in a complete evidence result.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceEnvelopeStatus {
+    Present,
+    Missing,
+    Unknown,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportProvenance {
@@ -972,6 +983,7 @@ impl AuditEventEvidence {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SpendEvidence {
     pub status: EvidenceStatus,
+    pub source_envelope: SourceEnvelopeStatus,
     pub scope_digest: Digest,
     pub registration_digest: Digest,
     pub provider_digest: Digest,
@@ -988,6 +1000,9 @@ pub struct SpendEvidence {
     pub audit_events: Vec<AuditEventEvidence>,
     pub high_water_mark_digest: Digest,
     pub page_count: u16,
+    pub response_bytes: usize,
+    pub record_bytes: usize,
+    pub raw_record_bytes: usize,
     pub request_receipt_digest: Digest,
     pub response_receipt_digest: Digest,
     pub provenance: TransportProvenance,
@@ -1012,6 +1027,10 @@ impl SpendEvidence {
         audit_events: Vec<AuditEventEvidence>,
         high_water_mark_digest: Digest,
         page_count: u16,
+        source_envelope: SourceEnvelopeStatus,
+        response_bytes: usize,
+        record_bytes: usize,
+        raw_record_bytes: usize,
         request_receipt_digest: Digest,
         response_receipt_digest: Digest,
         provenance: TransportProvenance,
@@ -1043,6 +1062,21 @@ impl SpendEvidence {
                 field: "pages",
                 maximum: MAX_PAGES,
             });
+        }
+        if response_bytes > MAX_TOTAL_RESPONSE_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "total response bytes",
+                maximum: MAX_TOTAL_RESPONSE_BYTES,
+            });
+        }
+        if record_bytes > MAX_TOTAL_RECORD_BYTES || raw_record_bytes > MAX_TOTAL_RECORD_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "total record bytes",
+                maximum: MAX_TOTAL_RECORD_BYTES,
+            });
+        }
+        if source_envelope != SourceEnvelopeStatus::Present {
+            return Err(crate::RampSpendOutcomeError::PartialEvidence);
         }
         validate_digest(&scope_digest, "scope")?;
         validate_digest(&registration_digest, "registration")?;
@@ -1091,6 +1125,7 @@ impl SpendEvidence {
         }
         let mut evidence = Self {
             status: EvidenceStatus::Complete,
+            source_envelope,
             scope_digest,
             registration_digest,
             provider_digest,
@@ -1107,6 +1142,9 @@ impl SpendEvidence {
             audit_events,
             high_water_mark_digest,
             page_count,
+            response_bytes,
+            record_bytes,
+            raw_record_bytes,
             request_receipt_digest,
             response_receipt_digest,
             provenance,
@@ -1120,6 +1158,7 @@ impl SpendEvidence {
 
     pub fn validate(&self) -> Result<(), crate::RampSpendOutcomeError> {
         if self.status != EvidenceStatus::Complete
+            || self.source_envelope != SourceEnvelopeStatus::Present
             || self.native
             || self.connected
             || self.provenance.is_native()
@@ -1145,6 +1184,9 @@ impl SpendEvidence {
             || self.page_count as usize > MAX_PAGES
             || self.category_id_digests.len() > MAX_CATEGORY_VALUES
             || self.category_name_digests.len() > MAX_CATEGORY_VALUES
+            || self.response_bytes > MAX_TOTAL_RESPONSE_BYTES
+            || self.record_bytes > MAX_TOTAL_RECORD_BYTES
+            || self.raw_record_bytes > MAX_TOTAL_RECORD_BYTES
             || self.max_spend_total_minor <= 0
             || self.max_spend_total_minor > MAX_SPEND_TOTAL_MINOR
             || self.spend_total_minor.unsigned_abs() > self.max_spend_total_minor as u64
@@ -1219,6 +1261,7 @@ impl SpendEvidence {
     fn computed_digest(&self) -> Digest {
         canonical_digest(&EvidenceFingerprint {
             status: self.status,
+            source_envelope: self.source_envelope,
             scope_digest: &self.scope_digest,
             registration_digest: &self.registration_digest,
             provider_digest: &self.provider_digest,
@@ -1235,6 +1278,9 @@ impl SpendEvidence {
             audit_events: &self.audit_events,
             high_water_mark_digest: &self.high_water_mark_digest,
             page_count: self.page_count,
+            response_bytes: self.response_bytes,
+            record_bytes: self.record_bytes,
+            raw_record_bytes: self.raw_record_bytes,
             request_receipt_digest: &self.request_receipt_digest,
             response_receipt_digest: &self.response_receipt_digest,
             provenance: self.provenance,
@@ -1248,6 +1294,7 @@ impl SpendEvidence {
 #[serde(rename_all = "camelCase")]
 struct EvidenceFingerprint<'a> {
     status: EvidenceStatus,
+    source_envelope: SourceEnvelopeStatus,
     scope_digest: &'a str,
     registration_digest: &'a str,
     provider_digest: &'a str,
@@ -1264,6 +1311,9 @@ struct EvidenceFingerprint<'a> {
     audit_events: &'a [AuditEventEvidence],
     high_water_mark_digest: &'a str,
     page_count: u16,
+    response_bytes: usize,
+    record_bytes: usize,
+    raw_record_bytes: usize,
     request_receipt_digest: &'a str,
     response_receipt_digest: &'a str,
     provenance: TransportProvenance,
@@ -1294,6 +1344,10 @@ pub struct OutcomeProposal {
     pub transaction_states: Vec<TransactionState>,
     pub refund_states: Vec<RefundState>,
     pub audit_event_count: u16,
+    pub source_envelope: SourceEnvelopeStatus,
+    pub response_bytes: usize,
+    pub record_bytes: usize,
+    pub raw_record_bytes: usize,
     pub native: bool,
     pub connected: bool,
     pub effect_requested: bool,
@@ -1335,6 +1389,10 @@ impl OutcomeProposal {
                 .map(|item| item.refund_state)
                 .collect(),
             audit_event_count: evidence.audit_events.len() as u16,
+            source_envelope: evidence.source_envelope,
+            response_bytes: evidence.response_bytes,
+            record_bytes: evidence.record_bytes,
+            raw_record_bytes: evidence.raw_record_bytes,
             native: false,
             connected: false,
             effect_requested: false,
@@ -1349,6 +1407,7 @@ impl OutcomeProposal {
             || self.native
             || self.connected
             || self.effect_requested
+            || self.source_envelope != SourceEnvelopeStatus::Present
             || self.proposal_digest != self.computed_digest()
         {
             return Err(crate::RampSpendOutcomeError::ConsumerBindingMismatch);
@@ -1367,6 +1426,9 @@ impl OutcomeProposal {
             || self.audit_event_count as usize > MAX_AUDIT_EVENTS
             || self.category_id_digests.len() > MAX_CATEGORY_VALUES
             || self.category_name_digests.len() > MAX_CATEGORY_VALUES
+            || self.response_bytes > MAX_TOTAL_RESPONSE_BYTES
+            || self.record_bytes > MAX_TOTAL_RECORD_BYTES
+            || self.raw_record_bytes > MAX_TOTAL_RECORD_BYTES
             || self.policy_revision == 0
         {
             return Err(crate::RampSpendOutcomeError::ConsumerBindingMismatch);
@@ -1415,6 +1477,10 @@ impl OutcomeProposal {
             transaction_states: &self.transaction_states,
             refund_states: &self.refund_states,
             audit_event_count: self.audit_event_count,
+            source_envelope: self.source_envelope,
+            response_bytes: self.response_bytes,
+            record_bytes: self.record_bytes,
+            raw_record_bytes: self.raw_record_bytes,
             native: self.native,
             connected: self.connected,
             effect_requested: self.effect_requested,
@@ -1445,6 +1511,10 @@ struct ProposalFingerprint<'a> {
     transaction_states: &'a [TransactionState],
     refund_states: &'a [RefundState],
     audit_event_count: u16,
+    source_envelope: SourceEnvelopeStatus,
+    response_bytes: usize,
+    record_bytes: usize,
+    raw_record_bytes: usize,
     native: bool,
     connected: bool,
     effect_requested: bool,
@@ -1463,6 +1533,10 @@ pub struct EvidenceReceipt {
     pub currency_code: Option<String>,
     pub spend_total_minor: i64,
     pub max_spend_total_minor: i64,
+    pub source_envelope: SourceEnvelopeStatus,
+    pub response_bytes: usize,
+    pub record_bytes: usize,
+    pub raw_record_bytes: usize,
     pub provenance: TransportProvenance,
     pub durable: bool,
     pub native: bool,
@@ -1486,6 +1560,10 @@ impl EvidenceReceipt {
             currency_code: evidence.currency_code.clone(),
             spend_total_minor: evidence.spend_total_minor,
             max_spend_total_minor: evidence.max_spend_total_minor,
+            source_envelope: evidence.source_envelope,
+            response_bytes: evidence.response_bytes,
+            record_bytes: evidence.record_bytes,
+            raw_record_bytes: evidence.raw_record_bytes,
             provenance: evidence.provenance,
             durable: false,
             native: false,
@@ -1501,6 +1579,7 @@ impl EvidenceReceipt {
             || self.durable
             || self.native
             || self.connected
+            || self.source_envelope != SourceEnvelopeStatus::Present
             || self.receipt_digest != self.computed_digest()
         {
             return Err(crate::RampSpendOutcomeError::ReceiptTampered);
@@ -1517,6 +1596,9 @@ impl EvidenceReceipt {
         if self.max_spend_total_minor <= 0
             || self.max_spend_total_minor > MAX_SPEND_TOTAL_MINOR
             || self.spend_total_minor.unsigned_abs() > self.max_spend_total_minor as u64
+            || self.response_bytes > MAX_TOTAL_RESPONSE_BYTES
+            || self.record_bytes > MAX_TOTAL_RECORD_BYTES
+            || self.raw_record_bytes > MAX_TOTAL_RECORD_BYTES
         {
             return Err(crate::RampSpendOutcomeError::ReceiptTampered);
         }
@@ -1538,6 +1620,10 @@ impl EvidenceReceipt {
             || self.currency_code != evidence.currency_code
             || self.spend_total_minor != evidence.spend_total_minor
             || self.max_spend_total_minor != evidence.max_spend_total_minor
+            || self.source_envelope != evidence.source_envelope
+            || self.response_bytes != evidence.response_bytes
+            || self.record_bytes != evidence.record_bytes
+            || self.raw_record_bytes != evidence.raw_record_bytes
             || self.provenance != evidence.provenance
             || evidence.status != EvidenceStatus::Complete
             || evidence.native
@@ -1560,6 +1646,10 @@ impl EvidenceReceipt {
             currency_code: &self.currency_code,
             spend_total_minor: self.spend_total_minor,
             max_spend_total_minor: self.max_spend_total_minor,
+            source_envelope: self.source_envelope,
+            response_bytes: self.response_bytes,
+            record_bytes: self.record_bytes,
+            raw_record_bytes: self.raw_record_bytes,
             provenance: self.provenance,
             durable: self.durable,
             native: self.native,
@@ -1581,6 +1671,10 @@ struct ReceiptFingerprint<'a> {
     currency_code: &'a Option<String>,
     spend_total_minor: i64,
     max_spend_total_minor: i64,
+    source_envelope: SourceEnvelopeStatus,
+    response_bytes: usize,
+    record_bytes: usize,
+    raw_record_bytes: usize,
     provenance: TransportProvenance,
     durable: bool,
     native: bool,
@@ -1597,6 +1691,10 @@ pub struct EvidenceVerification {
     pub provider_digest: Digest,
     pub contract_digest: Digest,
     pub evidence_status: EvidenceStatus,
+    pub source_envelope: SourceEnvelopeStatus,
+    pub response_bytes: usize,
+    pub record_bytes: usize,
+    pub raw_record_bytes: usize,
     pub provenance: TransportProvenance,
     pub independent_state_valid: bool,
     pub verified: bool,
@@ -1620,6 +1718,13 @@ impl EvidenceVerification {
         validate_digest(&self.provider_digest, "provider")?;
         validate_digest(&self.contract_digest, "contract")?;
         validate_digest(&self.verification_digest, "verification")?;
+        if self.source_envelope != SourceEnvelopeStatus::Present
+            || self.response_bytes > MAX_TOTAL_RESPONSE_BYTES
+            || self.record_bytes > MAX_TOTAL_RECORD_BYTES
+            || self.raw_record_bytes > MAX_TOTAL_RECORD_BYTES
+        {
+            return Err(crate::RampSpendOutcomeError::ReceiptTampered);
+        }
         if self.verification_digest != self.computed_digest() {
             return Err(crate::RampSpendOutcomeError::ReceiptTampered);
         }
@@ -1640,6 +1745,10 @@ impl EvidenceVerification {
             || self.provider_digest != evidence.provider_digest
             || self.contract_digest != evidence.contract_digest
             || self.evidence_status != EvidenceStatus::Complete
+            || self.source_envelope != evidence.source_envelope
+            || self.response_bytes != evidence.response_bytes
+            || self.record_bytes != evidence.record_bytes
+            || self.raw_record_bytes != evidence.raw_record_bytes
             || self.provenance != evidence.provenance
             || !self.independent_state_valid
             || !self.verified
@@ -1661,6 +1770,10 @@ impl EvidenceVerification {
             provider_digest: &self.provider_digest,
             contract_digest: &self.contract_digest,
             evidence_status: self.evidence_status,
+            source_envelope: self.source_envelope,
+            response_bytes: self.response_bytes,
+            record_bytes: self.record_bytes,
+            raw_record_bytes: self.raw_record_bytes,
             provenance: self.provenance,
             independent_state_valid: self.independent_state_valid,
             verified: self.verified,
@@ -1681,6 +1794,10 @@ struct VerificationFingerprint<'a> {
     provider_digest: &'a str,
     contract_digest: &'a str,
     evidence_status: EvidenceStatus,
+    source_envelope: SourceEnvelopeStatus,
+    response_bytes: usize,
+    record_bytes: usize,
+    raw_record_bytes: usize,
     provenance: TransportProvenance,
     independent_state_valid: bool,
     verified: bool,
