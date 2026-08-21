@@ -126,6 +126,7 @@
     "contentBytes": false,
     "downloadUrls": false,
     "maxResponseBytes": 1048576,
+    "maxResponseFieldBytes": 4096,
     "maxChildren": 256,
     "maxSearchHits": 128,
     "maxVersions": 64,

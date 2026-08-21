@@ -2,7 +2,8 @@ use hartevo_sharepoint_knowledge_result_plugin::{
     BlockedEnvCredentialResolver, BlockedEnvTransport, ConsentScope, DeltaChange, DriveId,
     DriveItemDeltaPayload, DriveItemId, DriveItemKind, DriveItemMetadataPayload,
     DriveItemReadRequest, DriveItemSearchPayload, DriveItemVersionPayload, EntraSecretReference,
-    FixtureSharePointTransport, ItemVersionId, ListId, LoopbackSharePointTransport,
+    FixtureSharePointTransport, ItemVersionId, ListId, LoopbackSharePointTransport, MAX_CHILDREN,
+    MAX_DELTA_ENTRIES, MAX_RESPONSE_BYTES, MAX_RESPONSE_FIELD_BYTES, MAX_SEARCH_HITS, MAX_VERSIONS,
     MicrosoftGraphRequest, MicrosoftGraphResponse, MicrosoftGraphResponseBody,
     MicrosoftGraphSharePointProvider, MicrosoftGraphSharePointTransport, MissionWorkProduct,
     NativeProbeStatus, OpaqueGraphNextLink, ProjectId, ProviderProvenance,
@@ -10,8 +11,9 @@ use hartevo_sharepoint_knowledge_result_plugin::{
     SharePointKnowledgeEvidence, SharePointKnowledgeResultError, SharePointKnowledgeResultService,
     SharePointKnowledgeScope, SharePointKnowledgeScopeInput, SharePointSearchRequest,
     SharePointTransportError, SiteId, StaticEntraCredentialResolver, TenantId, WorkProductId,
-    contract_digest, native_probe_from_environment, sha256_digest,
+    canonical_digest, contract_digest, native_probe_from_environment, sha256_digest,
 };
+use serde_json::Value;
 
 fn scope() -> SharePointKnowledgeScope {
     SharePointKnowledgeScope::new(SharePointKnowledgeScopeInput {
@@ -85,6 +87,187 @@ fn provider(
         StaticEntraCredentialResolver::new("fixture-token-never-retained"),
     )
     .expect("provider")
+}
+
+type FixtureProvider =
+    MicrosoftGraphSharePointProvider<FixtureSharePointTransport, StaticEntraCredentialResolver>;
+
+#[allow(clippy::too_many_lines)]
+fn full_evidence(
+    scope: &SharePointKnowledgeScope,
+) -> (FixtureProvider, SharePointKnowledgeEvidence) {
+    let search_hit = DriveItemSearchPayload {
+        site_id: scope.site_id.clone(),
+        drive_id: scope.drive_id.clone(),
+        list_id: scope.list_id.clone(),
+        item_id: DriveItemId::new("search-item-1").expect("search item"),
+        name: String::from("safe search name"),
+        path: String::from("/safe/path.docx"),
+        version: scope.item_version.clone(),
+        rank: 1,
+        permission_digest: scope.permission_digest.clone(),
+    };
+    let version = DriveItemVersionPayload {
+        site_id: scope.site_id.clone(),
+        drive_id: scope.drive_id.clone(),
+        list_id: scope.list_id.clone(),
+        item_id: scope.item_id.clone(),
+        version_id: ItemVersionId::new("version-6").expect("version"),
+        modified_at_epoch_seconds: 1_787_000_000,
+        version_digest: sha256_digest("version-payload"),
+        permission_digest: scope.permission_digest.clone(),
+    };
+    let delta = DriveItemDeltaPayload {
+        site_id: scope.site_id.clone(),
+        drive_id: scope.drive_id.clone(),
+        list_id: scope.list_id.clone(),
+        item_id: scope.item_id.clone(),
+        change: DeltaChange::Upserted,
+        item_digest: sha256_digest("delta-item"),
+        version: Some(scope.item_version.clone()),
+        permission_digest: scope.permission_digest.clone(),
+    };
+    let responses = vec![
+        Ok(response(
+            scope,
+            SharePointGraphOperation::DriveItemMetadata,
+            MicrosoftGraphResponseBody::Metadata(metadata_payload(scope, "safe metadata name")),
+        )),
+        Ok(response(
+            scope,
+            SharePointGraphOperation::DriveItemChildren,
+            MicrosoftGraphResponseBody::Children {
+                items: vec![child_payload(scope, "child-1", "safe child")],
+                next_link: None,
+            },
+        )),
+        Ok(response(
+            scope,
+            SharePointGraphOperation::DriveItemSearch,
+            MicrosoftGraphResponseBody::Search {
+                hits: vec![search_hit],
+                next_link: None,
+            },
+        )),
+        Ok(response(
+            scope,
+            SharePointGraphOperation::DriveItemVersions,
+            MicrosoftGraphResponseBody::Versions {
+                versions: vec![version],
+                next_link: None,
+            },
+        )),
+        Ok(response(
+            scope,
+            SharePointGraphOperation::DriveItemDelta,
+            MicrosoftGraphResponseBody::Delta {
+                entries: vec![delta],
+                next_link: None,
+            },
+        )),
+    ];
+    let mut provider = provider(scope.clone(), responses);
+    let read_request = DriveItemReadRequest::new(scope.clone());
+    let metadata = provider
+        .read_drive_item_metadata(&read_request)
+        .expect("metadata");
+    let children = provider
+        .read_drive_item_children(&read_request)
+        .expect("children");
+    let search = provider
+        .search_drive_items(
+            &SharePointSearchRequest::new(scope.clone(), "safe query").expect("search request"),
+        )
+        .expect("search");
+    let versions = provider
+        .read_drive_item_versions(&read_request)
+        .expect("versions");
+    let delta = provider
+        .read_drive_item_delta(&read_request)
+        .expect("delta");
+    let mut evidence = SharePointKnowledgeEvidence {
+        scope: scope.clone(),
+        metadata,
+        children: Some(children),
+        search: Some(search),
+        versions: Some(versions),
+        delta: Some(delta),
+        provider_manifest_digest: provider.provider_manifest().digest(),
+        registration_digest: provider.registration().registration_digest.clone(),
+        evidence_source: ProviderProvenance::Fixture,
+        native_connected: false,
+        raw_bytes_retained: false,
+        download_url_retained: false,
+        pii_retained: false,
+        evidence_digest: String::new(),
+    };
+    evidence.evidence_digest = evidence.calculate_digest();
+    (provider, evidence)
+}
+
+fn work_product() -> MissionWorkProduct {
+    MissionWorkProduct {
+        project_id: ProjectId::new("project-1").expect("project"),
+        mission_id: hartevo_sharepoint_knowledge_result_plugin::MissionId::new("mission-1")
+            .expect("mission"),
+        work_product_id: WorkProductId::new("work-product-1").expect("work product"),
+        revision: 4,
+        content_digest: sha256_digest("work product content"),
+    }
+}
+
+fn refresh_evidence_digests(evidence: &mut SharePointKnowledgeEvidence) {
+    if let Some(children) = &mut evidence.children {
+        children.evidence_digest = canonical_digest(&(
+            &children.envelope,
+            &children.item_id,
+            &children.children,
+            children.page_count,
+            &children.cursor_digests,
+        ));
+    }
+    if let Some(search) = &mut evidence.search {
+        search.evidence_digest = canonical_digest(&(
+            &search.envelope,
+            &search.query_digest,
+            &search.hits,
+            search.page_count,
+            &search.cursor_digests,
+        ));
+    }
+    if let Some(versions) = &mut evidence.versions {
+        versions.evidence_digest = canonical_digest(&(
+            &versions.envelope,
+            &versions.item_id,
+            &versions.versions,
+            versions.page_count,
+            &versions.cursor_digests,
+        ));
+    }
+    if let Some(delta) = &mut evidence.delta {
+        delta.evidence_digest = canonical_digest(&(
+            &delta.envelope,
+            &delta.item_id,
+            &delta.entries,
+            delta.page_count,
+            &delta.cursor_digests,
+        ));
+    }
+    evidence.evidence_digest = evidence.calculate_digest();
+}
+
+fn assert_replayed_evidence_rejected(
+    provider: &mut FixtureProvider,
+    mut evidence: SharePointKnowledgeEvidence,
+) {
+    refresh_evidence_digests(&mut evidence);
+    let replayed: SharePointKnowledgeEvidence =
+        serde_json::from_value(serde_json::to_value(evidence).expect("evidence JSON"))
+            .expect("replayed evidence");
+    assert!(matches!(
+        provider.compile_knowledge_result(&replayed, work_product()),
+        Err(SharePointKnowledgeResultError::InvalidEvidence)
+    ));
 }
 
 #[test]
@@ -292,6 +475,174 @@ fn all_graph_v1_read_seams_are_bounded_and_redacted() {
         next_link_json,
         format!(r#"{{"present":true,"digest":"{}"}}"#, next_link.digest())
     );
+}
+
+#[test]
+fn serde_replay_revalidates_scope_opaque_ids_and_hostname() {
+    for field in [
+        "tenantId",
+        "siteId",
+        "driveId",
+        "listId",
+        "itemId",
+        "itemVersion",
+        "projectId",
+        "missionId",
+        "workProductId",
+    ] {
+        let mut value = serde_json::to_value(scope()).expect("scope JSON");
+        value[field] = Value::String(String::new());
+        let replayed: SharePointKnowledgeScope =
+            serde_json::from_value(value).expect("deserialized scope");
+        assert!(replayed.validate().is_err(), "invalid {field} was accepted");
+    }
+
+    let mut hostname = serde_json::to_value(scope()).expect("scope JSON");
+    hostname["siteHostname"] = Value::String(String::from("CONTOSO.SHAREPOINT.COM"));
+    let replayed: SharePointKnowledgeScope =
+        serde_json::from_value(hostname).expect("deserialized hostname");
+    assert!(
+        replayed.validate().is_err(),
+        "non-canonical hostname accepted"
+    );
+
+    let mut nested_item = serde_json::to_value(scope()).expect("scope JSON");
+    nested_item["searchScope"]["rootItemId"] = Value::String(String::new());
+    let replayed: SharePointKnowledgeScope =
+        serde_json::from_value(nested_item).expect("deserialized search scope");
+    assert!(
+        replayed.validate().is_err(),
+        "invalid search root item accepted"
+    );
+
+    let mut nested_consent = serde_json::to_value(scope()).expect("scope JSON");
+    nested_consent["consentScope"]["consentId"] = Value::String(String::new());
+    let replayed: SharePointKnowledgeScope =
+        serde_json::from_value(nested_consent).expect("deserialized consent scope");
+    assert!(replayed.validate().is_err(), "invalid consent id accepted");
+}
+
+#[test]
+fn replayed_evidence_cannot_bypass_projection_caps_before_compile() {
+    let scope = scope();
+    let (mut provider, evidence) = full_evidence(&scope);
+
+    let mut oversized_children = evidence.clone();
+    let child = oversized_children
+        .children
+        .as_ref()
+        .expect("children")
+        .children[0]
+        .clone();
+    oversized_children
+        .children
+        .as_mut()
+        .expect("children")
+        .children = vec![child; MAX_CHILDREN + 1];
+    assert_replayed_evidence_rejected(&mut provider, oversized_children);
+
+    let mut oversized_search = evidence.clone();
+    let hit = oversized_search.search.as_ref().expect("search").hits[0].clone();
+    oversized_search.search.as_mut().expect("search").hits = vec![hit; MAX_SEARCH_HITS + 1];
+    assert_replayed_evidence_rejected(&mut provider, oversized_search);
+
+    let mut oversized_versions = evidence.clone();
+    let version = oversized_versions
+        .versions
+        .as_ref()
+        .expect("versions")
+        .versions[0]
+        .clone();
+    oversized_versions
+        .versions
+        .as_mut()
+        .expect("versions")
+        .versions = vec![version; MAX_VERSIONS + 1];
+    assert_replayed_evidence_rejected(&mut provider, oversized_versions);
+
+    let mut oversized_delta = evidence;
+    let entry = oversized_delta.delta.as_ref().expect("delta").entries[0].clone();
+    oversized_delta.delta.as_mut().expect("delta").entries = vec![entry; MAX_DELTA_ENTRIES + 1];
+    assert_replayed_evidence_rejected(&mut provider, oversized_delta);
+}
+
+#[test]
+fn graph_response_ingress_binds_actual_size_and_text_fields() {
+    let scope = scope();
+
+    let mut long_name = metadata_payload(&scope, "safe");
+    long_name.name = "n".repeat(MAX_RESPONSE_FIELD_BYTES + 1);
+    assert!(matches!(
+        MicrosoftGraphResponse::new(
+            &request(&scope, SharePointGraphOperation::DriveItemMetadata),
+            200,
+            MicrosoftGraphResponseBody::Metadata(long_name),
+            1,
+        ),
+        Err(SharePointTransportError::Decode)
+    ));
+
+    let mut long_etag = metadata_payload(&scope, "safe");
+    long_etag.e_tag = "e".repeat(MAX_RESPONSE_FIELD_BYTES + 1);
+    assert!(matches!(
+        MicrosoftGraphResponse::new(
+            &request(&scope, SharePointGraphOperation::DriveItemMetadata),
+            200,
+            MicrosoftGraphResponseBody::Metadata(long_etag),
+            1,
+        ),
+        Err(SharePointTransportError::Decode)
+    ));
+
+    let long_path = DriveItemSearchPayload {
+        site_id: scope.site_id.clone(),
+        drive_id: scope.drive_id.clone(),
+        list_id: scope.list_id.clone(),
+        item_id: DriveItemId::new("search-item-1").expect("search item"),
+        name: String::from("safe"),
+        path: "p".repeat(MAX_RESPONSE_FIELD_BYTES + 1),
+        version: scope.item_version.clone(),
+        rank: 1,
+        permission_digest: scope.permission_digest.clone(),
+    };
+    assert!(matches!(
+        MicrosoftGraphResponse::new(
+            &request(&scope, SharePointGraphOperation::DriveItemSearch),
+            200,
+            MicrosoftGraphResponseBody::Search {
+                hits: vec![long_path],
+                next_link: None,
+            },
+            1,
+        ),
+        Err(SharePointTransportError::Decode)
+    ));
+
+    let body = MicrosoftGraphResponseBody::Metadata(metadata_payload(&scope, "safe"));
+    let response = MicrosoftGraphResponse::new(
+        &request(&scope, SharePointGraphOperation::DriveItemMetadata),
+        200,
+        body,
+        1,
+    )
+    .expect("actual response size");
+    assert!(response.response_size > 1);
+
+    let mut large_payload = metadata_payload(&scope, &"n".repeat(MAX_RESPONSE_FIELD_BYTES));
+    large_payload.e_tag = "e".repeat(MAX_RESPONSE_FIELD_BYTES);
+    let body = MicrosoftGraphResponseBody::Children {
+        items: vec![large_payload; MAX_RESPONSE_BYTES / (MAX_RESPONSE_FIELD_BYTES * 2) + 1],
+        next_link: None,
+    };
+    assert!(matches!(
+        MicrosoftGraphResponse::new(
+            &request(&scope, SharePointGraphOperation::DriveItemChildren),
+            200,
+            body,
+            1,
+        ),
+        Err(SharePointTransportError::Truncated)
+    ));
 }
 
 #[test]

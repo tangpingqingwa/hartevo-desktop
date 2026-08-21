@@ -12,6 +12,7 @@ pub const SHAREPOINT_PLUGIN_VERSION: &str = "1.0.0";
 pub const SHAREPOINT_CONTRACT_VERSION: &str = "EXT-SHAREPOINT-KNOWLEDGE-01-L1/v1";
 pub const SHAREPOINT_PROVIDER_REVISION: &str = "microsoft-graph-v1.0-sharepoint-r1";
 pub const MAX_RESPONSE_BYTES: usize = 1_048_576;
+pub const MAX_RESPONSE_FIELD_BYTES: usize = 4_096;
 pub const MAX_PAGES: u16 = 4;
 pub const PAGE_SIZE: u16 = 50;
 pub const MAX_CHILDREN: usize = 256;
@@ -74,6 +75,12 @@ macro_rules! opaque_id {
 
             pub fn digest(&self) -> Digest {
                 sha256_digest(self.0.as_bytes())
+            }
+
+            pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
+                Self::new(self.0.clone())
+                    .map(|_| ())
+                    .map_err(|_| SharePointKnowledgeResultError::InvalidScope)
             }
         }
 
@@ -236,6 +243,15 @@ impl SiteHostname {
     pub fn digest(&self) -> Digest {
         sha256_digest(self.0.as_bytes())
     }
+
+    pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
+        let canonical =
+            Self::new(self.0.clone()).map_err(|_| SharePointKnowledgeResultError::InvalidScope)?;
+        if canonical != *self {
+            return Err(SharePointKnowledgeResultError::InvalidScope);
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for SiteHostname {
@@ -357,7 +373,8 @@ impl ConsentScope {
     }
 
     pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
-        if self.policy_revision == 0
+        if self.consent_id.validate().is_err()
+            || self.policy_revision == 0
             || self.capabilities.is_empty()
             || self
                 .capabilities
@@ -425,6 +442,13 @@ impl SharePointSearchScope {
     }
 
     pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
+        if self
+            .root_item_id
+            .as_ref()
+            .is_some_and(|item_id| item_id.validate().is_err())
+        {
+            return Err(SharePointKnowledgeResultError::InvalidScope);
+        }
         let expected = Self::new(
             self.root_item_id.clone(),
             self.allow_name_match,
@@ -570,13 +594,21 @@ impl SharePointKnowledgeScope {
     }
 
     pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
-        if self.work_product_revision == 0
-            || !is_sha256(&self.permission_digest)
-            || self.search_scope.validate().is_err()
-            || self.consent_scope.validate().is_err()
-        {
+        self.tenant_id.validate()?;
+        self.site_id.validate()?;
+        self.site_hostname.validate()?;
+        self.drive_id.validate()?;
+        self.list_id.validate()?;
+        self.item_id.validate()?;
+        self.item_version.validate()?;
+        self.project_id.validate()?;
+        self.mission_id.validate()?;
+        self.work_product_id.validate()?;
+        if self.work_product_revision == 0 || !is_sha256(&self.permission_digest) {
             return Err(SharePointKnowledgeResultError::InvalidScope);
         }
+        self.search_scope.validate()?;
+        self.consent_scope.validate()?;
         Ok(())
     }
 
@@ -1206,6 +1238,25 @@ impl SharePointKnowledgeEvidence {
     pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
         self.scope.validate()?;
         self.metadata.envelope.validate()?;
+        if self
+            .children
+            .as_ref()
+            .is_some_and(|value| value.children.len() > MAX_CHILDREN)
+            || self
+                .search
+                .as_ref()
+                .is_some_and(|value| value.hits.len() > MAX_SEARCH_HITS)
+            || self
+                .versions
+                .as_ref()
+                .is_some_and(|value| value.versions.len() > MAX_VERSIONS)
+            || self
+                .delta
+                .as_ref()
+                .is_some_and(|value| value.entries.len() > MAX_DELTA_ENTRIES)
+        {
+            return Err(SharePointKnowledgeResultError::InvalidEvidence);
+        }
         if !is_sha256(&self.provider_manifest_digest)
             || !is_sha256(&self.registration_digest)
             || self.metadata.envelope.scope_digest != self.scope.digest()

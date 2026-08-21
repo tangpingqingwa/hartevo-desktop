@@ -10,9 +10,9 @@ use crate::{
     error::SharePointTransportError,
     model::{
         DeltaChange, Digest, DriveId, DriveItemId, DriveItemKind, GRAPH_API_VERSION, ItemVersionId,
-        ListId, MAX_RESPONSE_BYTES, NationalCloud, OpaqueGraphNextLink, ProviderProvenance,
-        SHAREPOINT_PROVIDER_REVISION, SharePointKnowledgeScope, SharePointSearchRequest, SiteId,
-        canonical_digest, digest_parts, sha256_digest,
+        ListId, MAX_RESPONSE_BYTES, MAX_RESPONSE_FIELD_BYTES, NationalCloud, OpaqueGraphNextLink,
+        ProviderProvenance, SHAREPOINT_PROVIDER_REVISION, SharePointKnowledgeScope,
+        SharePointSearchRequest, SiteId, canonical_digest, digest_parts, sha256_digest,
     },
 };
 
@@ -384,6 +384,135 @@ impl MicrosoftGraphResponseBody {
             }
         }
     }
+
+    fn actual_payload_size(&self) -> Result<usize, SharePointTransportError> {
+        let mut size = 0_usize;
+        match self {
+            Self::Metadata(payload) => add_metadata_payload_size(&mut size, payload)?,
+            Self::Children { items, .. } => {
+                for item in items {
+                    add_metadata_payload_size(&mut size, item)?;
+                }
+            }
+            Self::Search { hits, .. } => {
+                for hit in hits {
+                    add_search_payload_size(&mut size, hit)?;
+                }
+            }
+            Self::Versions { versions, .. } => {
+                for version in versions {
+                    add_version_payload_size(&mut size, version)?;
+                }
+            }
+            Self::Delta { entries, .. } => {
+                for entry in entries {
+                    add_delta_payload_size(&mut size, entry)?;
+                }
+            }
+        }
+        if let Some(next_link) = self.next_link() {
+            add_response_text_size(&mut size, next_link.digest())?;
+        }
+        add_response_size(&mut size, RESPONSE_ENVELOPE_OVERHEAD)?;
+        if size > MAX_RESPONSE_BYTES {
+            return Err(SharePointTransportError::Truncated);
+        }
+        Ok(size)
+    }
+}
+
+const RESPONSE_ENVELOPE_OVERHEAD: usize = 128;
+const RESPONSE_RECORD_OVERHEAD: usize = 512;
+
+fn add_response_size(total: &mut usize, amount: usize) -> Result<(), SharePointTransportError> {
+    *total = total
+        .checked_add(amount)
+        .ok_or(SharePointTransportError::Truncated)?;
+    Ok(())
+}
+
+fn add_response_text_size(total: &mut usize, value: &str) -> Result<(), SharePointTransportError> {
+    if value.len() > MAX_RESPONSE_FIELD_BYTES || value.chars().any(char::is_control) {
+        return Err(SharePointTransportError::Decode);
+    }
+    let encoded_size = value.len()
+        + 2
+        + value
+            .bytes()
+            .filter(|byte| matches!(byte, b'"' | b'\\'))
+            .count();
+    add_response_size(total, encoded_size)
+}
+
+fn add_metadata_payload_size(
+    total: &mut usize,
+    payload: &DriveItemMetadataPayload,
+) -> Result<(), SharePointTransportError> {
+    add_response_size(total, RESPONSE_RECORD_OVERHEAD)?;
+    add_response_text_size(total, payload.site_id.as_ref())?;
+    add_response_text_size(total, payload.drive_id.as_ref())?;
+    add_response_text_size(total, payload.list_id.as_ref())?;
+    add_response_text_size(total, payload.item_id.as_ref())?;
+    if let Some(parent_item_id) = &payload.parent_item_id {
+        add_response_text_size(total, parent_item_id.as_ref())?;
+    }
+    add_response_text_size(total, &payload.name)?;
+    add_response_text_size(total, &format!("{:?}", payload.kind))?;
+    if let Some(size_bytes) = payload.size_bytes {
+        add_response_text_size(total, &size_bytes.to_string())?;
+    }
+    add_response_text_size(total, &payload.e_tag)?;
+    add_response_text_size(total, payload.version.as_ref())?;
+    add_response_text_size(total, &payload.permission_digest)?;
+    add_response_text_size(total, &payload.has_download_url.to_string())
+}
+
+fn add_search_payload_size(
+    total: &mut usize,
+    payload: &DriveItemSearchPayload,
+) -> Result<(), SharePointTransportError> {
+    add_response_size(total, RESPONSE_RECORD_OVERHEAD)?;
+    add_response_text_size(total, payload.site_id.as_ref())?;
+    add_response_text_size(total, payload.drive_id.as_ref())?;
+    add_response_text_size(total, payload.list_id.as_ref())?;
+    add_response_text_size(total, payload.item_id.as_ref())?;
+    add_response_text_size(total, &payload.name)?;
+    add_response_text_size(total, &payload.path)?;
+    add_response_text_size(total, payload.version.as_ref())?;
+    add_response_text_size(total, &payload.rank.to_string())?;
+    add_response_text_size(total, &payload.permission_digest)
+}
+
+fn add_version_payload_size(
+    total: &mut usize,
+    payload: &DriveItemVersionPayload,
+) -> Result<(), SharePointTransportError> {
+    add_response_size(total, RESPONSE_RECORD_OVERHEAD)?;
+    add_response_text_size(total, payload.site_id.as_ref())?;
+    add_response_text_size(total, payload.drive_id.as_ref())?;
+    add_response_text_size(total, payload.list_id.as_ref())?;
+    add_response_text_size(total, payload.item_id.as_ref())?;
+    add_response_text_size(total, payload.version_id.as_ref())?;
+    add_response_text_size(total, &payload.modified_at_epoch_seconds.to_string())?;
+    add_response_text_size(total, &payload.version_digest)?;
+    add_response_text_size(total, &payload.permission_digest)
+}
+
+fn add_delta_payload_size(
+    total: &mut usize,
+    payload: &DriveItemDeltaPayload,
+) -> Result<(), SharePointTransportError> {
+    add_response_size(total, RESPONSE_RECORD_OVERHEAD)?;
+    add_response_text_size(total, payload.site_id.as_ref())?;
+    add_response_text_size(total, payload.drive_id.as_ref())?;
+    add_response_text_size(total, payload.list_id.as_ref())?;
+    add_response_text_size(total, payload.item_id.as_ref())?;
+    add_response_text_size(total, &format!("{:?}", payload.change))?;
+    add_response_text_size(total, &payload.item_digest)?;
+    if let Some(version) = &payload.version {
+        add_response_text_size(total, version.as_ref())?;
+    }
+    add_response_text_size(total, &payload.permission_digest)
 }
 
 fn payload_digest_parts(payload: &DriveItemMetadataPayload) -> Vec<String> {
@@ -480,14 +609,12 @@ impl MicrosoftGraphResponse {
         request: &MicrosoftGraphRequest,
         status: u16,
         body: MicrosoftGraphResponseBody,
-        response_size: usize,
+        _reported_response_size: usize,
     ) -> Result<Self, SharePointTransportError> {
-        if response_size > MAX_RESPONSE_BYTES {
-            return Err(SharePointTransportError::Truncated);
-        }
         if body.operation() != request.operation {
             return Err(SharePointTransportError::Decode);
         }
+        let response_size = body.actual_payload_size()?;
         Ok(Self {
             operation: request.operation,
             status,

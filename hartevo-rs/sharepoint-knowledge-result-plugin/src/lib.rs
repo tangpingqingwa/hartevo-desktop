@@ -84,6 +84,7 @@ mod contract_tests {
         assert_eq!(contract["scope"]["tenantFenced"], true);
         assert_eq!(contract["scope"]["nationalCloudFenced"], true);
         assert_eq!(contract["scope"]["permissionFenced"], true);
+        assert_eq!(contract["readBoundaries"]["maxResponseFieldBytes"], 4096);
         assert_eq!(contract["redaction"]["rawBytes"], false);
         assert_eq!(contract["redaction"]["downloadUrls"], false);
         assert_eq!(contract["redaction"]["pii"], false);
