@@ -73,6 +73,31 @@ fn validate_positive(value: u64, field: &'static str) -> Result<(), ModelError> 
     }
 }
 
+fn validate_optional_text(
+    value: Option<&String>,
+    field: &'static str,
+    allow_internal_whitespace: bool,
+) -> Result<(), ModelError> {
+    if let Some(value) = value {
+        validate_text(value, field, allow_internal_whitespace)?;
+    }
+    Ok(())
+}
+
+fn validate_optional_commit(value: Option<&String>) -> Result<(), ModelError> {
+    if let Some(value) = value {
+        CommitReference::new(value.clone())?;
+    }
+    Ok(())
+}
+
+fn validate_optional_artifact(value: Option<&String>) -> Result<(), ModelError> {
+    if let Some(value) = value {
+        ArtifactReference::new(value.clone())?;
+    }
+    Ok(())
+}
+
 fn validate_digest(value: &str, field: &'static str) -> Result<(), ModelError> {
     if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
@@ -779,7 +804,6 @@ pub enum TransportProvenance {
     Recording,
     Loopback,
     BlockedEnv,
-    ProductionRead,
 }
 
 impl TransportProvenance {
@@ -865,7 +889,11 @@ impl ProviderFailure {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "BrowserStackMatrixEntryWire"
+)]
 pub struct BrowserStackMatrixEntry {
     pub device: Option<String>,
     pub browser: Option<String>,
@@ -901,6 +929,51 @@ impl BrowserStackMatrixEntry {
             operating_system,
             operating_system_version,
         })
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        validate_optional_text(self.device.as_ref(), "device matrix value", true)?;
+        validate_optional_text(self.browser.as_ref(), "browser matrix value", true)?;
+        validate_optional_text(
+            self.browser_version.as_ref(),
+            "browser version matrix value",
+            true,
+        )?;
+        validate_optional_text(
+            self.operating_system.as_ref(),
+            "operating-system matrix value",
+            true,
+        )?;
+        validate_optional_text(
+            self.operating_system_version.as_ref(),
+            "operating-system version matrix value",
+            true,
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserStackMatrixEntryWire {
+    device: Option<String>,
+    browser: Option<String>,
+    browser_version: Option<String>,
+    operating_system: Option<String>,
+    operating_system_version: Option<String>,
+}
+
+impl TryFrom<BrowserStackMatrixEntryWire> for BrowserStackMatrixEntry {
+    type Error = ModelError;
+
+    fn try_from(value: BrowserStackMatrixEntryWire) -> Result<Self, Self::Error> {
+        Self::new(
+            value.device,
+            value.browser,
+            value.browser_version,
+            value.operating_system,
+            value.operating_system_version,
+        )
     }
 }
 
@@ -1047,7 +1120,12 @@ impl BrowserStackBuildPayload {
 
     pub fn validate(&self) -> Result<(), ModelError> {
         validate_text(&self.id, "build id", false)?;
+        validate_positive(self.revision.get(), "build revision")?;
+        validate_optional_text(self.project_id.as_ref(), "build project id", false)?;
+        validate_optional_text(self.name.as_ref(), "build name", true)?;
         validate_text(&self.status, "build status", true)?;
+        validate_optional_commit(self.commit.as_ref())?;
+        validate_optional_artifact(self.artifact.as_ref())?;
         if self.status.len() > MAX_STATUS_BYTES {
             return Err(ModelError::TooLong {
                 field: "build status",
@@ -1116,8 +1194,14 @@ impl BrowserStackSessionPayload {
 
     pub fn validate(&self) -> Result<(), ModelError> {
         validate_text(&self.id, "session id", false)?;
+        validate_positive(self.revision.get(), "session revision")?;
         validate_text(&self.build_id, "session build id", false)?;
+        validate_optional_text(self.project_id.as_ref(), "session project id", false)?;
+        validate_optional_text(self.name.as_ref(), "session name", true)?;
         validate_text(&self.status, "session status", true)?;
+        self.matrix.validate()?;
+        validate_optional_commit(self.commit.as_ref())?;
+        validate_optional_artifact(self.artifact.as_ref())?;
         self.outcomes.validate()
     }
 }
@@ -1168,6 +1252,9 @@ impl BrowserStackResponseReceipt {
             || self.raw_screenshots_retained
             || self.arbitrary_capabilities_retained
             || self.credential_material_retained
+            || self
+                .limit
+                .is_some_and(|limit| limit == 0 || limit > BROWSERSTACK_MAX_PAGE_SIZE)
         {
             return Err(ModelError::Invalid {
                 field: "response receipt safety fence",
@@ -1213,8 +1300,36 @@ impl From<BrowserStackBuildPayload> for BrowserStackBuildProjection {
     }
 }
 
+impl BrowserStackBuildProjection {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        validate_text(&self.id, "build projection id", false)?;
+        validate_positive(self.revision.get(), "build projection revision")?;
+        validate_optional_text(
+            self.project_id.as_ref(),
+            "build projection project id",
+            false,
+        )?;
+        validate_optional_text(self.name.as_ref(), "build projection name", true)?;
+        validate_text(&self.status, "build projection status", true)?;
+        validate_optional_commit(self.commit.as_ref())?;
+        validate_optional_artifact(self.artifact.as_ref())?;
+        if self.session_count.is_some_and(|count| {
+            usize::try_from(count).unwrap_or(usize::MAX) > BROWSERSTACK_MAX_SESSIONS
+        }) {
+            return Err(ModelError::BoundExceeded {
+                field: "build projection session count",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "BrowserStackSessionProjectionWire"
+)]
 pub struct BrowserStackSessionProjection {
     pub id: String,
     pub revision: Revision,
@@ -1230,6 +1345,50 @@ pub struct BrowserStackSessionProjection {
     pub artifact: Option<String>,
     pub outcomes: OutcomeCounts,
     pub product: BrowserStackProduct,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserStackSessionProjectionWire {
+    id: String,
+    revision: Revision,
+    build_id: String,
+    project_id: Option<String>,
+    name: Option<String>,
+    status: String,
+    duration_seconds: Option<u64>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    matrix: BrowserStackMatrixEntry,
+    commit: Option<String>,
+    artifact: Option<String>,
+    outcomes: OutcomeCounts,
+    product: BrowserStackProduct,
+}
+
+impl TryFrom<BrowserStackSessionProjectionWire> for BrowserStackSessionProjection {
+    type Error = ModelError;
+
+    fn try_from(value: BrowserStackSessionProjectionWire) -> Result<Self, Self::Error> {
+        let projection = Self {
+            id: value.id,
+            revision: value.revision,
+            build_id: value.build_id,
+            project_id: value.project_id,
+            name: value.name,
+            status: value.status,
+            duration_seconds: value.duration_seconds,
+            started_at: value.started_at,
+            finished_at: value.finished_at,
+            matrix: value.matrix,
+            commit: value.commit,
+            artifact: value.artifact,
+            outcomes: value.outcomes,
+            product: value.product,
+        };
+        projection.validate()?;
+        Ok(projection)
+    }
 }
 
 impl From<BrowserStackSessionPayload> for BrowserStackSessionProjection {
@@ -1250,6 +1409,25 @@ impl From<BrowserStackSessionPayload> for BrowserStackSessionProjection {
             outcomes: payload.outcomes,
             product: payload.product,
         }
+    }
+}
+
+impl BrowserStackSessionProjection {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        validate_text(&self.id, "session projection id", false)?;
+        validate_positive(self.revision.get(), "session projection revision")?;
+        validate_text(&self.build_id, "session projection build id", false)?;
+        validate_optional_text(
+            self.project_id.as_ref(),
+            "session projection project id",
+            false,
+        )?;
+        validate_optional_text(self.name.as_ref(), "session projection name", true)?;
+        validate_text(&self.status, "session projection status", true)?;
+        self.matrix.validate()?;
+        validate_optional_commit(self.commit.as_ref())?;
+        validate_optional_artifact(self.artifact.as_ref())?;
+        self.outcomes.validate()
     }
 }
 
@@ -1330,6 +1508,9 @@ impl BrowserStackTestResultEvidence {
             return Err(ModelError::BoundExceeded {
                 field: "session evidence",
             });
+        }
+        if let Some(build) = &build {
+            build.validate()?;
         }
         if failures.len() > MAX_FAILURES || receipts.len() > BROWSERSTACK_MAX_RECEIPTS {
             return Err(ModelError::BoundExceeded {
@@ -1438,6 +1619,11 @@ impl BrowserStackTestResultEvidence {
             || self.service_id != BROWSERSTACK_SERVICE_ID
             || self.provider_id != BROWSERSTACK_PROVIDER_ID
             || self.provider_revision != BROWSERSTACK_PROVIDER_REVISION
+            || self.contract_digest != crate::contract_digest()
+            || !self.provider_digest.is_sha256()
+            || !self.scope_digest.is_sha256()
+            || !self.permission_digest.is_sha256()
+            || !self.registration_digest.is_sha256()
             || !self.redaction_applied
             || self.authority != Authority::default()
             || self.sessions.len() > BROWSERSTACK_MAX_SESSIONS
@@ -1449,6 +1635,27 @@ impl BrowserStackTestResultEvidence {
             });
         }
         self.outcome_counts.validate()?;
+        if let Some(build) = &self.build {
+            build.validate()?;
+        }
+        if self.matrix.iter().any(|matrix| matrix.validate().is_err()) {
+            return Err(ModelError::Invalid {
+                field: "evidence device/browser/OS matrix",
+            });
+        }
+        let mut expected_matrix = Vec::new();
+        let mut expected_outcomes = OutcomeCounts::default();
+        for session in &self.sessions {
+            if !expected_matrix.contains(&session.matrix) {
+                expected_matrix.push(session.matrix.clone());
+            }
+            expected_outcomes.add(session.outcomes)?;
+        }
+        if expected_matrix != self.matrix || expected_outcomes != self.outcome_counts {
+            return Err(ModelError::DigestMismatch {
+                field: "evidence projection",
+            });
+        }
         for receipt in &self.receipts {
             receipt.validate()?;
         }
@@ -1493,15 +1700,6 @@ struct EvidenceDigestMaterial<'a> {
     redaction_applied: bool,
     authority: Authority,
     digests: &'a EvidenceDigests,
-}
-
-impl BrowserStackSessionProjection {
-    fn validate(&self) -> Result<(), ModelError> {
-        validate_text(&self.id, "session id", false)?;
-        validate_text(&self.build_id, "session build id", false)?;
-        validate_text(&self.status, "session status", true)?;
-        self.outcomes.validate()
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1571,6 +1769,7 @@ impl BrowserStackReadProposal {
     }
 
     pub fn verify_integrity(&self) -> Result<(), ModelError> {
+        self.bounds.validate()?;
         if self.compute_digest()? == self.proposal_digest {
             Ok(())
         } else {
@@ -1580,7 +1779,11 @@ impl BrowserStackReadProposal {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "RequestBoundsWire"
+)]
 pub struct RequestBounds {
     pub max_response_bytes: usize,
     pub max_pages: u16,
@@ -1588,6 +1791,32 @@ pub struct RequestBounds {
     pub max_sessions: usize,
     pub max_outcome_count: u32,
     pub max_receipts: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RequestBoundsWire {
+    max_response_bytes: usize,
+    max_pages: u16,
+    page_size: u16,
+    max_sessions: usize,
+    max_outcome_count: u32,
+    max_receipts: usize,
+}
+
+impl TryFrom<RequestBoundsWire> for RequestBounds {
+    type Error = ModelError;
+
+    fn try_from(value: RequestBoundsWire) -> Result<Self, Self::Error> {
+        Self::new(
+            value.max_response_bytes,
+            value.max_pages,
+            value.page_size,
+            value.max_sessions,
+            value.max_outcome_count,
+            value.max_receipts,
+        )
+    }
 }
 
 impl Default for RequestBounds {
@@ -1612,30 +1841,36 @@ impl RequestBounds {
         max_outcome_count: u32,
         max_receipts: usize,
     ) -> Result<Self, ModelError> {
-        if max_response_bytes == 0
-            || max_response_bytes > BROWSERSTACK_MAX_RESPONSE_BYTES
-            || max_pages == 0
-            || max_pages > BROWSERSTACK_MAX_PAGES
-            || page_size == 0
-            || page_size > BROWSERSTACK_MAX_PAGE_SIZE
-            || max_sessions == 0
-            || max_sessions > BROWSERSTACK_MAX_SESSIONS
-            || max_outcome_count == 0
-            || max_outcome_count > BROWSERSTACK_MAX_OUTCOME_COUNT
-            || max_receipts == 0
-            || max_receipts > BROWSERSTACK_MAX_RECEIPTS
-        {
-            return Err(ModelError::Invalid {
-                field: "BrowserStack request bounds",
-            });
-        }
-        Ok(Self {
+        let bounds = Self {
             max_response_bytes,
             max_pages,
             page_size,
             max_sessions,
             max_outcome_count,
             max_receipts,
-        })
+        };
+        bounds.validate()?;
+        Ok(bounds)
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.max_response_bytes == 0
+            || self.max_response_bytes > BROWSERSTACK_MAX_RESPONSE_BYTES
+            || self.max_pages == 0
+            || self.max_pages > BROWSERSTACK_MAX_PAGES
+            || self.page_size == 0
+            || self.page_size > BROWSERSTACK_MAX_PAGE_SIZE
+            || self.max_sessions == 0
+            || self.max_sessions > BROWSERSTACK_MAX_SESSIONS
+            || self.max_outcome_count == 0
+            || self.max_outcome_count > BROWSERSTACK_MAX_OUTCOME_COUNT
+            || self.max_receipts == 0
+            || self.max_receipts > BROWSERSTACK_MAX_RECEIPTS
+        {
+            return Err(ModelError::Invalid {
+                field: "BrowserStack request bounds",
+            });
+        }
+        Ok(())
     }
 }

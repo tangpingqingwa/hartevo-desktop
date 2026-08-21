@@ -1,13 +1,11 @@
 //! GET-only BrowserStack Automate/App Automate transport.
 //!
-//! The production transport reads a bounded JSON body, normalizes only the
-//! fields allowed by the contract, and drops the provider JSON before the
-//! response is returned. It has no method for upload, launch, mutation, or
-//! debugging-media download.
+//! Fixture, recording, loopback, and blocked-environment transports normalize
+//! only the fields allowed by the contract. Layer-2 secret resolution and live
+//! HTTPS reads are intentionally outside this root.
 
-use std::{collections::VecDeque, fmt, time::Duration as StdDuration};
+use std::{collections::VecDeque, fmt};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -21,8 +19,7 @@ use crate::model::{
 };
 use crate::provider::BrowserStackCredentialLease;
 use crate::{
-    BROWSERSTACK_AUTOMATE_API_ORIGIN, BROWSERSTACK_MAX_RESPONSE_BYTES,
-    BROWSERSTACK_PROVIDER_REVISION, BrowserStackTestResultError,
+    BROWSERSTACK_MAX_RESPONSE_BYTES, BROWSERSTACK_PROVIDER_REVISION, BrowserStackTestResultError,
 };
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -525,176 +522,6 @@ impl BrowserStackTransport for BlockedEnvTransport {
 
     fn provenance(&self) -> TransportProvenance {
         TransportProvenance::BlockedEnv
-    }
-}
-
-/// Production read transport for the official Automate and App Automate
-/// JSON endpoints. It remains Layer-1 evidence and never grants Connected or
-/// native authority.
-pub struct UreqBrowserStackTransport {
-    origin: Option<String>,
-    agent: ureq::Agent,
-}
-
-impl fmt::Debug for UreqBrowserStackTransport {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("UreqBrowserStackTransport")
-            .field("origin", &self.origin)
-            .finish_non_exhaustive()
-    }
-}
-
-impl UreqBrowserStackTransport {
-    pub fn new(origin: impl Into<String>) -> Result<Self, BrowserStackTestResultError> {
-        let origin = origin.into().trim_end_matches('/').to_owned();
-        let parsed = Url::parse(&origin).map_err(|error| {
-            BrowserStackTestResultError::InvalidInput(format!(
-                "BrowserStack origin is invalid: {error}"
-            ))
-        })?;
-        if parsed.scheme() != "https"
-            || parsed.host_str().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.path() != ""
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
-            return Err(BrowserStackTestResultError::InvalidInput(
-                "BrowserStack origin must be HTTPS without credentials, path, or query".to_owned(),
-            ));
-        }
-        let agent = ureq::Agent::config_builder()
-            .user_agent("hartevo-browserstack-test-result/1")
-            .timeout_global(Some(StdDuration::from_secs(30)))
-            .build()
-            .into();
-        Ok(Self {
-            origin: Some(origin),
-            agent,
-        })
-    }
-
-    pub fn for_product(product: BrowserStackProduct) -> Result<Self, BrowserStackTestResultError> {
-        Self::new(product.api_origin())
-    }
-
-    pub fn browserstack() -> Result<Self, BrowserStackTestResultError> {
-        Self::new(BROWSERSTACK_AUTOMATE_API_ORIGIN)
-    }
-
-    fn endpoint_url(
-        &self,
-        endpoint: &BrowserStackEndpoint,
-    ) -> Result<String, BrowserStackTransportError> {
-        let origin = self.origin.as_deref().ok_or_else(|| {
-            BrowserStackTransportError::InvalidRequest("transport origin is unavailable".to_owned())
-        })?;
-        let mut url =
-            Url::parse(origin).map_err(|error| BrowserStackTransportError::Transport {
-                detail: error.to_string(),
-                retryable: false,
-                timeout: false,
-                diagnostic_digest: Digest::from_text(error.to_string()),
-            })?;
-        let relative = Url::parse(&endpoint.path_and_query()?).map_err(|error| {
-            BrowserStackTransportError::Transport {
-                detail: error.to_string(),
-                retryable: false,
-                timeout: false,
-                diagnostic_digest: Digest::from_text(error.to_string()),
-            }
-        })?;
-        url.set_path(relative.path());
-        url.set_query(relative.query());
-        Ok(url.to_string())
-    }
-
-    fn get_json(
-        &self,
-        credential: &BrowserStackCredentialLease,
-        request: &BrowserStackHttpRequest,
-    ) -> Result<BrowserStackHttpResponse, BrowserStackTransportError> {
-        let url = self.endpoint_url(&request.endpoint)?;
-        let auth_value = format!("{}:{}", credential.username(), credential.access_key());
-        let authorization = format!("Basic {}", BASE64_STANDARD.encode(auth_value.as_bytes()));
-        let mut response = self
-            .agent
-            .get(&url)
-            .header("Authorization", authorization)
-            .header("Accept", "application/json")
-            .call()
-            .map_err(classify_ureq_error)?;
-        let status = response.status().as_u16();
-        let response_limit = u64::try_from(request.max_response_bytes)
-            .map_err(|error| BrowserStackTransportError::InvalidRequest(error.to_string()))?
-            .saturating_add(1);
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(response_limit)
-            .read_to_string()
-            .map_err(classify_ureq_error)?;
-        let response_size = body.len();
-        if response_size > request.max_response_bytes {
-            return Err(BrowserStackTransportError::InvalidRequest(
-                "BrowserStack response exceeds the configured bound".to_owned(),
-            ));
-        }
-        let response_digest = sha256_digest(body.as_bytes());
-        let value = serde_json::from_str::<Value>(&body)
-            .map_err(|error| BrowserStackTransportError::Decode(error.to_string()))?;
-        let normalized_body = decode_body(&request.endpoint, &value)?;
-        BrowserStackHttpResponse::new(
-            request,
-            status,
-            Some(normalized_body),
-            response_size,
-            response_digest,
-        )
-    }
-}
-
-impl BrowserStackTransport for UreqBrowserStackTransport {
-    fn execute(
-        &mut self,
-        credential: &BrowserStackCredentialLease,
-        request: &BrowserStackHttpRequest,
-    ) -> Result<BrowserStackHttpResponse, BrowserStackTransportError> {
-        if credential.username().trim().is_empty()
-            || credential.access_key().trim().is_empty()
-            || credential.username().chars().any(char::is_control)
-            || credential.access_key().chars().any(char::is_control)
-        {
-            return Err(BrowserStackTransportError::CredentialUnavailable);
-        }
-        if request.api_revision != BROWSERSTACK_PROVIDER_REVISION {
-            return Err(BrowserStackTransportError::InvalidRequest(
-                "BrowserStack provider revision is unsupported".to_owned(),
-            ));
-        }
-        self.get_json(credential, request)
-    }
-
-    fn provenance(&self) -> TransportProvenance {
-        TransportProvenance::ProductionRead
-    }
-}
-
-fn classify_ureq_error(error: ureq::Error) -> BrowserStackTransportError {
-    match error {
-        ureq::Error::StatusCode(status) => BrowserStackTransportError::status(status),
-        other => {
-            let detail = other.to_string();
-            let timeout = detail.to_ascii_lowercase().contains("timeout");
-            BrowserStackTransportError::Transport {
-                retryable: true,
-                timeout,
-                diagnostic_digest: Digest::from_text(&detail),
-                detail,
-            }
-        }
     }
 }
 

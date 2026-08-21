@@ -31,9 +31,8 @@ pub use model::*;
 pub use provider::{
     BlockedEnvCredentialResolver, BrowserStackCredentialError, BrowserStackCredentialLease,
     BrowserStackCredentialResolver, BrowserStackProvider, BrowserStackProviderDefinition,
-    BrowserStackRegistration, BrowserStackRegistrationRequest,
-    EnvironmentBrowserStackCredentialResolver, FixtureCredentialResolver, RegistrationRevocation,
-    RegistrationState,
+    BrowserStackRegistration, BrowserStackRegistrationRequest, FixtureCredentialResolver,
+    RegistrationRevocation, RegistrationState,
 };
 pub use service::{
     BrowserStackCapability, BrowserStackTestResultOperation, BrowserStackTestResultService,
@@ -41,7 +40,7 @@ pub use service::{
 pub use transport::{
     BlockedEnvTransport, BrowserStackEndpoint, BrowserStackHttpRequest, BrowserStackHttpResponse,
     BrowserStackTransport, BrowserStackTransportError, FakeBrowserStackTransport,
-    LoopbackBrowserStackTransport, RecordingBrowserStackTransport, UreqBrowserStackTransport,
+    LoopbackBrowserStackTransport, RecordingBrowserStackTransport,
 };
 
 pub const BROWSERSTACK_SCHEMA_VERSION: &str = "hartevo.browserstack-test-result.contract/v1";
@@ -67,9 +66,6 @@ pub const BROWSERSTACK_MAX_PAGE_SIZE: u16 = 100;
 pub const BROWSERSTACK_MAX_SESSIONS: usize = 128;
 pub const BROWSERSTACK_MAX_OUTCOME_COUNT: u32 = 10_000;
 pub const BROWSERSTACK_MAX_RECEIPTS: usize = 32;
-pub const BROWSERSTACK_NATIVE_PROBE_ENV: &str = "HARTEVO_BROWSERSTACK_NATIVE_PROBE";
-pub const BROWSERSTACK_USERNAME_ENV: &str = "HARTEVO_BROWSERSTACK_USERNAME";
-pub const BROWSERSTACK_ACCESS_KEY_ENV: &str = "HARTEVO_BROWSERSTACK_ACCESS_KEY";
 
 pub const BROWSERSTACK_TEST_RESULT_CONTRACT_JSON: &str = include_str!(
     "../../../contracts/plugins/browserstack-test-result/browserstack-test-result.v1.json"
@@ -156,6 +152,7 @@ pub struct BrowserStackTestResultContract {
     pub registration: BrowserStackRegistrationContract,
     pub bounds: BrowserStackBoundsContract,
     pub evidence: BrowserStackEvidenceContract,
+    pub replay_fence: BrowserStackReplayFenceContract,
     pub forbidden: Vec<String>,
     pub native_gap: BrowserStackNativeGapContract,
     pub honest_native_gap: String,
@@ -236,6 +233,15 @@ pub struct BrowserStackNativeGapContract {
     pub fail_closed_cases: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserStackReplayFenceContract {
+    pub scope: String,
+    pub shared_across_sibling_consumers: bool,
+    pub monotonic_use_revision: bool,
+    pub restart_persistence: bool,
+}
+
 impl BrowserStackTestResultContract {
     pub fn baseline() -> Result<Self, BrowserStackTestResultError> {
         let contract = serde_json::from_str::<Self>(BROWSERSTACK_TEST_RESULT_CONTRACT_JSON)
@@ -248,20 +254,9 @@ impl BrowserStackTestResultContract {
         contract_digest()
     }
 
-    pub fn validate(&self) -> Result<(), BrowserStackTestResultError> {
-        let expected_products = vec!["automate".to_owned(), "app_automate".to_owned()];
-        let expected_apis = BTreeMap::from([
-            (
-                "appAutomate".to_owned(),
-                BROWSERSTACK_APP_AUTOMATE_API_ORIGIN.to_owned() + "/app-automate",
-            ),
-            (
-                "automate".to_owned(),
-                BROWSERSTACK_AUTOMATE_API_ORIGIN.to_owned() + "/automate",
-            ),
-        ]);
+    fn authority_is_empty(&self) -> bool {
         let authority = &self.authority;
-        let no_authority = [
+        [
             authority.connected,
             authority.native,
             authority.external_writes,
@@ -282,7 +277,93 @@ impl BrowserStackTestResultContract {
             authority.verification,
             authority.outcome,
             authority.work_product_adoption,
-        ];
+        ]
+        .into_iter()
+        .all(|flag| !flag)
+    }
+
+    fn registration_is_bound(&self) -> bool {
+        self.registration.version_bound
+            && self.registration.contract_digest_bound
+            && self.registration.provider_digest_bound
+            && self.registration.scope_digest_bound
+            && self.registration.permission_digest_bound
+            && self.registration.secret_reference_digest_bound
+            && self.registration.reversible
+            && self.registration.revocable
+            && self.registration.fail_closed_on
+                == vec![
+                    "provider_revision_drift".to_owned(),
+                    "scope_drift".to_owned(),
+                    "build_revision_drift".to_owned(),
+                    "session_revision_drift".to_owned(),
+                    "commit_mismatch".to_owned(),
+                    "artifact_mismatch".to_owned(),
+                    "permission_drift".to_owned(),
+                    "registration_tamper".to_owned(),
+                    "registration_revocation".to_owned(),
+                    "evidence_replay".to_owned(),
+                    "service_revocation".to_owned(),
+                    "bounds_drift".to_owned(),
+                    "matrix_invalid".to_owned(),
+                ]
+    }
+
+    fn evidence_is_bounded(&self) -> bool {
+        self.bounds.max_response_bytes == BROWSERSTACK_MAX_RESPONSE_BYTES
+            && self.bounds.max_pages == BROWSERSTACK_MAX_PAGES
+            && self.bounds.max_page_size == BROWSERSTACK_MAX_PAGE_SIZE
+            && self.bounds.max_sessions == BROWSERSTACK_MAX_SESSIONS
+            && self.bounds.max_outcome_count == BROWSERSTACK_MAX_OUTCOME_COUNT
+            && self.bounds.max_receipts == BROWSERSTACK_MAX_RECEIPTS
+            && self.bounds.max_identifier_bytes == model::MAX_IDENTIFIER_BYTES
+            && self.evidence.pagination == "bounded_offset_loop_with_repeat_detection"
+            && self.evidence.rate_limits == vec![401, 403, 404, 409, 429, 500, 502, 503, 504]
+            && self.evidence.response_digest
+            && !self.evidence.raw_provider_payload_retained
+            && !self.evidence.credential_material_retained
+    }
+
+    fn replay_and_native_gap_are_fenced(&self) -> bool {
+        self.replay_fence.scope == "process_local"
+            && self.replay_fence.shared_across_sibling_consumers
+            && self.replay_fence.monotonic_use_revision
+            && !self.replay_fence.restart_persistence
+            && self.native_gap.status == "BLOCKED_ENV"
+            && self.native_gap.fail_closed_cases
+                == vec![
+                    "missing_secret_authority".to_owned(),
+                    "scope_or_revision_drift".to_owned(),
+                    "artifact_or_commit_mismatch".to_owned(),
+                    "provider_deletion_or_access_loss".to_owned(),
+                    "retention_expiry".to_owned(),
+                    "partial_page_or_rate_limit".to_owned(),
+                    "tampered_or_unredacted_recording".to_owned(),
+                    "evidence_replay".to_owned(),
+                    "service_revocation".to_owned(),
+                    "external_write_request".to_owned(),
+                ]
+            && !self
+                .native_gap
+                .fixture_recording_loopback_blocked_env_are_native
+            && !self.native_gap.connected_claim
+            && self.honest_native_gap.contains("never claims Connected")
+            && self.honest_native_gap.contains("raw provider payloads")
+            && self.honest_native_gap.contains("process-local")
+    }
+
+    pub fn validate(&self) -> Result<(), BrowserStackTestResultError> {
+        let expected_products = vec!["automate".to_owned(), "app_automate".to_owned()];
+        let expected_apis = BTreeMap::from([
+            (
+                "appAutomate".to_owned(),
+                BROWSERSTACK_APP_AUTOMATE_API_ORIGIN.to_owned() + "/app-automate",
+            ),
+            (
+                "automate".to_owned(),
+                BROWSERSTACK_AUTOMATE_API_ORIGIN.to_owned() + "/automate",
+            ),
+        ]);
         if self.schema_version != BROWSERSTACK_SCHEMA_VERSION
             || self.contract_version != BROWSERSTACK_CONTRACT_VERSION
             || self.plugin_version != BROWSERSTACK_PLUGIN_VERSION_TEXT
@@ -292,36 +373,19 @@ impl BrowserStackTestResultContract {
             || self.consumer_id != MISSION_BROWSERSTACK_CONSUMER_ID
             || self.products != expected_products
             || self.official_rest_apis != expected_apis
+            || self.transport_provenance
+                != vec![
+                    "fixture".to_owned(),
+                    "recording".to_owned(),
+                    "loopback".to_owned(),
+                    "BLOCKED_ENV".to_owned(),
+                ]
             || !self.read_only
             || !self.mutating_provider_operations.is_empty()
-            || no_authority.into_iter().any(std::convert::identity)
-            || !self.registration.version_bound
-            || !self.registration.contract_digest_bound
-            || !self.registration.provider_digest_bound
-            || !self.registration.scope_digest_bound
-            || !self.registration.permission_digest_bound
-            || !self.registration.secret_reference_digest_bound
-            || !self.registration.reversible
-            || !self.registration.revocable
-            || self.bounds.max_response_bytes != BROWSERSTACK_MAX_RESPONSE_BYTES
-            || self.bounds.max_pages != BROWSERSTACK_MAX_PAGES
-            || self.bounds.max_page_size != BROWSERSTACK_MAX_PAGE_SIZE
-            || self.bounds.max_sessions != BROWSERSTACK_MAX_SESSIONS
-            || self.bounds.max_outcome_count != BROWSERSTACK_MAX_OUTCOME_COUNT
-            || self.bounds.max_receipts != BROWSERSTACK_MAX_RECEIPTS
-            || self.bounds.max_identifier_bytes != model::MAX_IDENTIFIER_BYTES
-            || self.evidence.pagination != "bounded_offset_loop_with_repeat_detection"
-            || self.evidence.rate_limits != vec![401, 403, 404, 409, 429, 500, 502, 503, 504]
-            || !self.evidence.response_digest
-            || self.evidence.raw_provider_payload_retained
-            || self.evidence.credential_material_retained
-            || self.native_gap.status != "BLOCKED_ENV"
-            || self
-                .native_gap
-                .fixture_recording_loopback_blocked_env_are_native
-            || self.native_gap.connected_claim
-            || !self.honest_native_gap.contains("never claims Connected")
-            || !self.honest_native_gap.contains("raw provider payloads")
+            || !self.authority_is_empty()
+            || !self.registration_is_bound()
+            || !self.evidence_is_bounded()
+            || !self.replay_and_native_gap_are_fenced()
         {
             return Err(BrowserStackTestResultError::Contract(
                 "BrowserStack test-result contract does not match the checked-in Layer-1 baseline"
@@ -390,6 +454,8 @@ pub enum BrowserStackTestResultError {
     EvidenceDigestMismatch,
     #[error("BrowserStack evidence is stale or tampered")]
     StaleEvidence,
+    #[error("BrowserStack evidence has already been consumed for this registration")]
+    EvidenceReplay,
     #[error("BrowserStack consumer is revoked")]
     ConsumerRevoked,
     #[error("BrowserStack consumer registration mismatch")]

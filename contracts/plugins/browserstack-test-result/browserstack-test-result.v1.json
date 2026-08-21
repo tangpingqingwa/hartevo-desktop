@@ -15,7 +15,7 @@
     "automate": "https://api.browserstack.com/automate",
     "appAutomate": "https://api-cloud.browserstack.com/app-automate"
   },
-  "transportProvenance": ["fixture", "recording", "loopback", "BLOCKED_ENV", "production_read"],
+  "transportProvenance": ["fixture", "recording", "loopback", "BLOCKED_ENV"],
   "operations": [
     "describe_capabilities",
     "register",
@@ -101,7 +101,11 @@
       "artifact_mismatch",
       "permission_drift",
       "registration_tamper",
-      "registration_revocation"
+      "registration_revocation",
+      "evidence_replay",
+      "service_revocation",
+      "bounds_drift",
+      "matrix_invalid"
     ]
   },
   "bounds": {
@@ -122,6 +126,12 @@
     "responseDigest": true,
     "rawProviderPayloadRetained": false,
     "credentialMaterialRetained": false
+  },
+  "replayFence": {
+    "scope": "process_local",
+    "sharedAcrossSiblingConsumers": true,
+    "monotonicUseRevision": true,
+    "restartPersistence": false
   },
   "forbidden": [
     "upload",
@@ -151,13 +161,15 @@
     "failClosedCases": [
       "missing_secret_authority",
       "scope_or_revision_drift",
-      "artifact_or_commit_mismatch",
-      "provider_deletion_or_access_loss",
-      "retention_expiry",
-      "partial_page_or_rate_limit",
-      "tampered_or_unredacted_recording",
-      "external_write_request"
+    "artifact_or_commit_mismatch",
+    "provider_deletion_or_access_loss",
+    "retention_expiry",
+    "partial_page_or_rate_limit",
+    "tampered_or_unredacted_recording",
+    "evidence_replay",
+    "service_revocation",
+    "external_write_request"
     ]
   },
-  "honestNativeGap": "This root records bounded typed read evidence from official BrowserStack Automate/App Automate REST shapes only. It never claims Connected or native status, never retains raw provider payloads or debugging media, and never authorizes kernel Truth, Consent, Effect, Receipt, Verification, Outcome, or Work Product adoption."
+  "honestNativeGap": "This root records bounded typed read evidence from official BrowserStack Automate/App Automate REST shapes only. It never claims Connected or native status, never retains raw provider payloads or debugging media, and never authorizes kernel Truth, Consent, Effect, Receipt, Verification, Outcome, or Work Product adoption. Replay/use fencing is process-local and is not restart-persistent."
 }

@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{
     Authority, BrowserStackReadProposal, BrowserStackScope, BrowserStackTestResultEvidence, Digest,
-    EvidenceStatus, TransportProvenance,
+    EvidenceStatus, Revision, TransportProvenance,
 };
 use crate::provider::BrowserStackCredentialResolver;
-use crate::provider::{BrowserStackProvider, BrowserStackRegistration, RegistrationState};
+use crate::provider::{BrowserStackProvider, BrowserStackRegistration};
 use crate::transport::BrowserStackTransport;
 use crate::{
     BROWSERSTACK_CONTRACT_VERSION, BROWSERSTACK_PLUGIN_VERSION_TEXT, BrowserStackTestResultError,
@@ -42,6 +42,8 @@ pub struct BrowserStackObservation {
     pub external_write_performed: bool,
     pub kernel_authority: Authority,
     pub observation_digest: Digest,
+    #[serde(skip, default)]
+    live_seal: bool,
 }
 
 impl BrowserStackObservation {
@@ -65,25 +67,58 @@ impl BrowserStackObservation {
             external_write_performed: false,
             kernel_authority: Authority::default(),
             observation_digest: Digest::from_text("pending"),
+            live_seal: true,
         };
-        observation.observation_digest = crate::model::digest_serializable(&(
-            &observation.contract_version,
-            &observation.contract_digest,
-            &observation.consumer_id,
-            &observation.consumer_version,
-            &observation.scope_digest,
-            &observation.permission_digest,
-            &observation.registration_digest,
-            &observation.evidence_digest,
-            observation.provenance,
-            observation.read_only,
-            observation.proposal_only,
-            observation.connected,
-            observation.native,
-            observation.external_write_performed,
-            observation.kernel_authority,
-        ))?;
+        observation.observation_digest = observation.compute_digest()?;
+        observation.validate(evidence)?;
         Ok(observation)
+    }
+
+    fn compute_digest(&self) -> Result<Digest, BrowserStackTestResultError> {
+        Ok(crate::model::digest_serializable(&(
+            &self.contract_version,
+            &self.contract_digest,
+            &self.consumer_id,
+            &self.consumer_version,
+            &self.scope_digest,
+            &self.permission_digest,
+            &self.registration_digest,
+            &self.evidence_digest,
+            self.provenance,
+            self.read_only,
+            self.proposal_only,
+            self.connected,
+            self.native,
+            self.external_write_performed,
+            self.kernel_authority,
+        ))?)
+    }
+
+    pub fn validate(
+        &self,
+        evidence: &BrowserStackTestResultEvidence,
+    ) -> Result<(), BrowserStackTestResultError> {
+        if !self.live_seal
+            || self.contract_version != BROWSERSTACK_CONTRACT_VERSION
+            || self.contract_digest != contract_digest()
+            || self.consumer_id != MISSION_BROWSERSTACK_CONSUMER_ID
+            || self.consumer_version != BROWSERSTACK_PLUGIN_VERSION_TEXT
+            || self.scope_digest != evidence.scope_digest
+            || self.permission_digest != evidence.permission_digest
+            || self.registration_digest != evidence.registration_digest
+            || self.evidence_digest != evidence.evidence_digest
+            || self.provenance != evidence.provenance
+            || !self.read_only
+            || !self.proposal_only
+            || self.connected
+            || self.native
+            || self.external_write_performed
+            || self.kernel_authority != Authority::default()
+            || self.observation_digest != self.compute_digest()?
+        {
+            return Err(BrowserStackTestResultError::StaleEvidence);
+        }
+        Ok(())
     }
 }
 
@@ -98,30 +133,25 @@ pub struct MissionBrowserStackTestResult {
     pub work_product_revision: u64,
     pub state: MissionBrowserStackResultState,
     pub status: EvidenceStatus,
+    pub consumption_revision: Revision,
     pub proposal_only: bool,
     pub connected: bool,
     pub native: bool,
     pub evidence: BrowserStackTestResultEvidence,
     pub observation: BrowserStackObservation,
+    #[serde(skip, default)]
+    live_seal: bool,
 }
 
 impl MissionBrowserStackTestResult {
     pub fn validate(&self, scope: &BrowserStackScope) -> Result<(), BrowserStackTestResultError> {
         self.evidence.validate()?;
-        if self.evidence.scope_digest != *scope.digest()
+        self.observation.validate(&self.evidence)?;
+        if !self.live_seal
+            || self.evidence.scope_digest != *scope.digest()
             || self.evidence.permission_digest != *scope.permission().digest()
             || self.observation.scope_digest != *scope.digest()
             || self.observation.permission_digest != *scope.permission().digest()
-            || self.observation.evidence_digest != self.evidence.evidence_digest
-            || self.observation.contract_digest != contract_digest()
-            || self.observation.contract_version != BROWSERSTACK_CONTRACT_VERSION
-            || self.observation.consumer_id != MISSION_BROWSERSTACK_CONSUMER_ID
-            || !self.observation.read_only
-            || !self.observation.proposal_only
-            || self.observation.connected
-            || self.observation.native
-            || self.observation.external_write_performed
-            || self.observation.kernel_authority != Authority::default()
             || !self.proposal_only
             || self.connected
             || self.native
@@ -133,10 +163,49 @@ impl MissionBrowserStackTestResult {
             || self.work_product_id != scope.work_product().id()
             || self.work_product_revision != scope.work_product().revision().get()
             || self.status != self.evidence.status
+            || self.state != expected_state(self.status)
+            || self.consumption_revision.get() == 0
         {
             return Err(BrowserStackTestResultError::StaleEvidence);
         }
         Ok(())
+    }
+
+    fn validate_with_registration(
+        &self,
+        scope: &BrowserStackScope,
+        registration: &BrowserStackRegistration,
+    ) -> Result<(), BrowserStackTestResultError> {
+        self.validate(scope)?;
+        registration.validate_identity()?;
+        registration.ensure_active()?;
+        if self.evidence.registration_digest != *registration.registration_digest()
+            || self.evidence.provider_digest != registration.provider_digest
+            || self.evidence.scope_digest != *registration.scope_digest()
+            || self.evidence.permission_digest != registration.permission_digest
+        {
+            return Err(BrowserStackTestResultError::ConsumerRegistrationMismatch);
+        }
+        registration
+            .validate_evidence_use(&self.evidence.evidence_digest, self.consumption_revision)
+    }
+
+    pub fn validate_against_registration(
+        &self,
+        scope: &BrowserStackScope,
+        registration: &BrowserStackRegistration,
+    ) -> Result<(), BrowserStackTestResultError> {
+        self.validate_with_registration(scope, registration)
+    }
+}
+
+fn expected_state(status: EvidenceStatus) -> MissionBrowserStackResultState {
+    match status {
+        EvidenceStatus::Complete => MissionBrowserStackResultState::PendingDecision,
+        EvidenceStatus::Partial
+        | EvidenceStatus::AccessLost
+        | EvidenceStatus::Expired
+        | EvidenceStatus::ProviderUnknown => MissionBrowserStackResultState::Layer2AdoptionRequired,
     }
 }
 
@@ -165,8 +234,9 @@ impl MissionBrowserStackTestConsumer {
         scope: BrowserStackScope,
         registration: &BrowserStackRegistration,
     ) -> Result<Self, BrowserStackTestResultError> {
-        if registration.state != RegistrationState::Active
-            || registration.scope_digest != *scope.digest()
+        registration.validate_identity()?;
+        registration.ensure_active()?;
+        if registration.scope_digest != *scope.digest()
             || registration.permission_digest != *scope.permission().digest()
         {
             return Err(BrowserStackTestResultError::ConsumerRegistrationMismatch);
@@ -186,8 +256,8 @@ impl MissionBrowserStackTestConsumer {
         &self.registration
     }
 
-    pub const fn is_active(&self) -> bool {
-        self.active
+    pub fn is_active(&self) -> bool {
+        self.active && self.registration.ensure_active().is_ok()
     }
 
     pub fn revoke(&mut self) -> Result<(), BrowserStackTestResultError> {
@@ -195,7 +265,7 @@ impl MissionBrowserStackTestConsumer {
             return Err(BrowserStackTestResultError::ConsumerRevoked);
         }
         self.active = false;
-        self.registration.state = RegistrationState::Revoked;
+        self.registration.revoke()?;
         Ok(())
     }
 
@@ -206,7 +276,9 @@ impl MissionBrowserStackTestConsumer {
         if !self.active {
             return Err(BrowserStackTestResultError::ConsumerRevoked);
         }
+        self.registration.ensure_active()?;
         if evidence.registration_digest != self.registration.registration_digest
+            || evidence.provider_digest != self.registration.provider_digest
             || evidence.scope_digest != self.registration.scope_digest
             || evidence.permission_digest != self.registration.permission_digest
         {
@@ -214,6 +286,9 @@ impl MissionBrowserStackTestConsumer {
         }
         evidence.validate()?;
         let observation = BrowserStackObservation::from_evidence(&evidence)?;
+        let consumption_revision = self
+            .registration
+            .claim_evidence_use(&evidence.evidence_digest)?;
         let result = MissionBrowserStackTestResult {
             hartevo_project_id: self.scope.hartevo_project().id().to_owned(),
             hartevo_project_revision: self.scope.hartevo_project().revision().get(),
@@ -221,23 +296,17 @@ impl MissionBrowserStackTestConsumer {
             mission_revision: self.scope.mission().revision().get(),
             work_product_id: self.scope.work_product().id().to_owned(),
             work_product_revision: self.scope.work_product().revision().get(),
-            state: match evidence.status {
-                EvidenceStatus::Complete => MissionBrowserStackResultState::PendingDecision,
-                EvidenceStatus::Partial
-                | EvidenceStatus::AccessLost
-                | EvidenceStatus::Expired
-                | EvidenceStatus::ProviderUnknown => {
-                    MissionBrowserStackResultState::Layer2AdoptionRequired
-                }
-            },
+            state: expected_state(evidence.status),
             status: evidence.status,
+            consumption_revision,
             proposal_only: true,
             connected: false,
             native: false,
             evidence,
             observation,
+            live_seal: true,
         };
-        result.validate(&self.scope)?;
+        result.validate_with_registration(&self.scope, &self.registration)?;
         Ok(result)
     }
 
@@ -272,7 +341,9 @@ impl MissionBrowserStackTestConsumer {
         T: BrowserStackTransport,
         R: BrowserStackCredentialResolver,
     {
-        if provider.scope() != &self.scope {
+        if provider.scope() != &self.scope
+            || provider.registration().registration_digest != self.registration.registration_digest
+        {
             return Err(BrowserStackTestResultError::ScopeMismatch(
                 "Mission consumer and BrowserStack provider scopes differ".to_owned(),
             ));

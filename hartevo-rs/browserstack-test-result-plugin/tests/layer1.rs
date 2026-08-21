@@ -6,11 +6,11 @@ use hartevo_browserstack_test_result_plugin::{
     BrowserStackHttpResponse, BrowserStackMatrixEntry, BrowserStackProduct, BrowserStackProvider,
     BrowserStackProviderDefinition, BrowserStackReadRequest, BrowserStackRegistrationRequest,
     BrowserStackResponseBody, BrowserStackScope, BrowserStackScopeInput,
-    BrowserStackSessionPayload, BrowserStackTestResultContract, BrowserStackTestResultError,
-    BrowserStackTransportError, EvidenceStatus, FixtureCredentialResolver,
-    MissionBrowserStackTestConsumer, OutcomeCounts, PartialReason, PermissionSnapshot,
-    ProviderFailure, RecordingBrowserStackTransport, RequestBounds, SecretReference,
-    TransportProvenance,
+    BrowserStackSessionPayload, BrowserStackSessionProjection, BrowserStackTestResultContract,
+    BrowserStackTestResultError, BrowserStackTransportError, EvidenceStatus,
+    FixtureCredentialResolver, MissionBrowserStackTestConsumer, OutcomeCounts, PartialReason,
+    PermissionSnapshot, ProviderFailure, RecordingBrowserStackTransport, RequestBounds,
+    SecretReference, TransportProvenance,
 };
 
 const BUILD_ID: &str = "build-42";
@@ -146,6 +146,19 @@ fn contract_and_registration_are_digest_bound_and_layer_one_only() {
     let contract = BrowserStackTestResultContract::baseline().expect("contract");
     assert_eq!(contract.layer, 1);
     assert!(contract.digest().is_sha256());
+    assert_eq!(
+        contract.transport_provenance,
+        vec![
+            "fixture".to_owned(),
+            "recording".to_owned(),
+            "loopback".to_owned(),
+            "BLOCKED_ENV".to_owned()
+        ]
+    );
+    assert_eq!(contract.replay_fence.scope, "process_local");
+    assert!(contract.replay_fence.shared_across_sibling_consumers);
+    assert!(contract.replay_fence.monotonic_use_revision);
+    assert!(!contract.replay_fence.restart_persistence);
 
     let provider = provider_with_responses(
         scope(None),
@@ -505,4 +518,193 @@ fn evidence_failure_can_be_constructed_for_retention_redaction_and_tamper_classe
     );
     let classes = [failure.class, failure2.class];
     assert_eq!(classes.into_iter().collect::<BTreeSet<_>>().len(), 2);
+}
+
+#[test]
+fn shared_replay_fence_is_monotonic_and_service_revocation_reaches_siblings() {
+    let mut provider = provider_with_responses(
+        scope(None),
+        vec![
+            Ok(build_response()),
+            Ok(sessions_response(
+                0,
+                vec![session_payload(SESSION_1, "Pixel 8", "passed", 1)],
+            )),
+        ],
+    );
+    let proposal = provider
+        .propose(BrowserStackReadRequest::default())
+        .expect("proposal");
+    let evidence = provider.read(&proposal, at()).expect("evidence");
+    let registration = provider.registration().clone();
+    let consumer_a =
+        MissionBrowserStackTestConsumer::new(scope(None), &registration).expect("consumer a");
+    let consumer_b =
+        MissionBrowserStackTestConsumer::new(scope(None), &registration).expect("consumer b");
+
+    let result = consumer_a
+        .consume(evidence.clone())
+        .expect("first consumption");
+    assert_eq!(result.consumption_revision.get(), 1);
+    assert_eq!(
+        consumer_b.consume(evidence),
+        Err(BrowserStackTestResultError::EvidenceReplay)
+    );
+
+    let service = provider.service().clone();
+    let mut service_registration = provider.registration().clone();
+    service
+        .revoke_registration(&mut service_registration)
+        .expect("service revocation");
+    assert!(!consumer_a.is_active());
+    assert!(!consumer_b.is_active());
+    assert_eq!(
+        consumer_a.consume(result.evidence),
+        Err(BrowserStackTestResultError::RegistrationRevoked)
+    );
+}
+
+#[test]
+fn registration_and_observation_resealing_is_rejected() {
+    let mut provider = provider_with_responses(
+        scope(None),
+        vec![
+            Ok(build_response()),
+            Ok(sessions_response(
+                0,
+                vec![session_payload(SESSION_1, "Pixel 8", "passed", 1)],
+            )),
+        ],
+    );
+    let proposal = provider
+        .propose(BrowserStackReadRequest::default())
+        .expect("proposal");
+    let evidence = provider.read(&proposal, at()).expect("evidence");
+    let consumer = MissionBrowserStackTestConsumer::new(scope(None), provider.registration())
+        .expect("consumer");
+    let result = consumer.consume(evidence).expect("result");
+
+    let mut changed_version = result.clone();
+    changed_version.observation.consumer_version = "9.9.9".to_owned();
+    assert!(changed_version.validate(consumer.scope()).is_err());
+
+    let mut changed_observation = result.clone();
+    changed_observation.observation.registration_digest =
+        hartevo_browserstack_test_result_plugin::Digest::from_text("resealed");
+    assert!(changed_observation.validate(consumer.scope()).is_err());
+
+    let mut changed_state = result.clone();
+    changed_state.state =
+        hartevo_browserstack_test_result_plugin::MissionBrowserStackResultState::Layer2AdoptionRequired;
+    assert!(changed_state.validate(consumer.scope()).is_err());
+
+    let mut changed_registration = provider.registration().clone();
+    changed_registration.provider_id = "resealed-provider".to_owned();
+    assert!(MissionBrowserStackTestConsumer::new(scope(None), &changed_registration).is_err());
+
+    let mut serialized_registration =
+        serde_json::to_value(provider.registration()).expect("registration json");
+    serialized_registration["providerId"] = serde_json::json!("resealed-provider");
+    let deserialized_registration: hartevo_browserstack_test_result_plugin::BrowserStackRegistration =
+        serde_json::from_value(serialized_registration).expect("registration deserialization");
+    assert!(deserialized_registration.validate_identity().is_err());
+    assert!(MissionBrowserStackTestConsumer::new(scope(None), &deserialized_registration).is_err());
+
+    let serialized_result = serde_json::to_value(&result).expect("result json");
+    let deserialized_result: hartevo_browserstack_test_result_plugin::MissionBrowserStackTestResult =
+        serde_json::from_value(serialized_result).expect("result deserialization");
+    assert!(deserialized_result.validate(consumer.scope()).is_err());
+}
+
+#[test]
+fn request_bounds_and_all_matrix_fields_are_validated_at_serde_and_registration_ingress() {
+    let defaults = RequestBounds::default();
+    let invalid_bounds = [
+        RequestBounds {
+            max_response_bytes: 0,
+            ..defaults
+        },
+        RequestBounds {
+            max_response_bytes: defaults.max_response_bytes + 1,
+            ..defaults
+        },
+        RequestBounds {
+            max_pages: 0,
+            ..defaults
+        },
+        RequestBounds {
+            page_size: 101,
+            ..defaults
+        },
+        RequestBounds {
+            max_sessions: 0,
+            ..defaults
+        },
+        RequestBounds {
+            max_outcome_count: 10_001,
+            ..defaults
+        },
+        RequestBounds {
+            max_receipts: 0,
+            ..defaults
+        },
+    ];
+    for bounds in invalid_bounds {
+        assert!(bounds.validate().is_err());
+    }
+    assert!(
+        serde_json::from_value::<RequestBounds>(serde_json::json!({
+            "maxResponseBytes": 1_048_576,
+            "maxPages": 4,
+            "pageSize": 0,
+            "maxSessions": 128,
+            "maxOutcomeCount": 10000,
+            "maxReceipts": 32
+        }))
+        .is_err()
+    );
+
+    let definition = BrowserStackProviderDefinition::new(
+        BrowserStackProduct::Automate,
+        TransportProvenance::Fixture,
+    )
+    .expect("definition");
+    let registration = BrowserStackRegistrationRequest::baseline(
+        scope(None),
+        SecretReference::new("user", "key", 1).expect("secret"),
+        definition.provider_digest.clone(),
+    )
+    .expect("registration");
+    let mut provider_bounds = defaults;
+    provider_bounds.max_pages = 0;
+    assert!(
+        BrowserStackProvider::from_registration_request(
+            registration,
+            RecordingBrowserStackTransport::fixture(Vec::new()),
+            FixtureCredentialResolver,
+            provider_bounds,
+        )
+        .is_err()
+    );
+
+    let projection =
+        BrowserStackSessionProjection::from(session_payload(SESSION_1, "Pixel 8", "passed", 1));
+    let baseline = serde_json::to_value(&projection).expect("projection json");
+    for field in [
+        "device",
+        "browser",
+        "browserVersion",
+        "operatingSystem",
+        "operatingSystemVersion",
+    ] {
+        let mut malformed = baseline.clone();
+        malformed["matrix"][field] = serde_json::json!("");
+        assert!(
+            serde_json::from_value::<BrowserStackSessionProjection>(malformed).is_err(),
+            "field {field}"
+        );
+    }
+    let mut bad_revision = baseline;
+    bad_revision["revision"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<BrowserStackSessionProjection>(bad_revision).is_err());
 }

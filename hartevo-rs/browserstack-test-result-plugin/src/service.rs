@@ -6,6 +6,7 @@ use hartevo_plugin_runtime::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::provider::{BrowserStackRegistration, RegistrationRevocation};
 use crate::{
     BROWSERSTACK_SERVICE_ID, BROWSERSTACK_SERVICE_NAME, BROWSERSTACK_SERVICE_SCHEMA,
     BrowserStackTestResultError,
@@ -151,6 +152,14 @@ impl BrowserStackTestResultService {
 
     pub fn describe_capabilities(&self) -> Vec<BrowserStackCapability> {
         self.capabilities.clone()
+    }
+
+    pub fn revoke_registration(
+        &self,
+        registration: &mut BrowserStackRegistration,
+    ) -> Result<RegistrationRevocation, BrowserStackTestResultError> {
+        self.validate()?;
+        registration.revoke()
     }
 
     pub fn runtime_definition(&self) -> Result<ServiceDefinition, BrowserStackTestResultError> {

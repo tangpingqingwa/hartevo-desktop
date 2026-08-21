@@ -1,6 +1,10 @@
 //! BrowserStack provider and reversible Layer-1 registration.
 
-use std::{env, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,10 +24,9 @@ use crate::transport::{
     BrowserStackTransportError,
 };
 use crate::{
-    BROWSERSTACK_ACCESS_KEY_ENV, BROWSERSTACK_CONTRACT_VERSION, BROWSERSTACK_NATIVE_PROBE_ENV,
-    BROWSERSTACK_PLUGIN_VERSION_TEXT, BROWSERSTACK_PROVIDER_ID, BROWSERSTACK_PROVIDER_NAME,
-    BROWSERSTACK_PROVIDER_REVISION, BROWSERSTACK_SCHEMA_VERSION, BROWSERSTACK_SERVICE_ID,
-    BROWSERSTACK_USERNAME_ENV, BrowserStackTestResultError, BrowserStackTestResultService,
+    BROWSERSTACK_CONTRACT_VERSION, BROWSERSTACK_PLUGIN_VERSION_TEXT, BROWSERSTACK_PROVIDER_ID,
+    BROWSERSTACK_PROVIDER_NAME, BROWSERSTACK_PROVIDER_REVISION, BROWSERSTACK_SCHEMA_VERSION,
+    BROWSERSTACK_SERVICE_ID, BrowserStackTestResultError, BrowserStackTestResultService,
     contract_digest,
 };
 
@@ -83,7 +86,7 @@ impl fmt::Debug for BrowserStackCredentialLease {
 }
 
 impl BrowserStackCredentialLease {
-    pub fn new(
+    pub(crate) fn new(
         username: impl Into<String>,
         access_key: impl Into<String>,
         reference: &SecretReference,
@@ -112,7 +115,7 @@ impl BrowserStackCredentialLease {
         })
     }
 
-    pub fn fixture(
+    pub(crate) fn fixture(
         reference: &SecretReference,
         at: DateTime<Utc>,
     ) -> Result<Self, BrowserStackCredentialError> {
@@ -125,11 +128,11 @@ impl BrowserStackCredentialLease {
         )
     }
 
-    pub fn username(&self) -> &str {
+    pub(crate) fn username(&self) -> &str {
         &self.username
     }
 
-    pub fn access_key(&self) -> &str {
+    pub(crate) fn access_key(&self) -> &str {
         &self.access_key
     }
 
@@ -203,64 +206,6 @@ impl BrowserStackCredentialResolver for FixtureCredentialResolver {
     }
 }
 
-/// Optional environment resolver for an explicitly enabled host seam. It is
-/// still Layer-1 and does not turn the provider into Connected/native.
-#[derive(Clone, Debug)]
-#[allow(clippy::struct_field_names)]
-pub struct EnvironmentBrowserStackCredentialResolver {
-    gate_env: String,
-    username_env: String,
-    access_key_env: String,
-}
-
-impl Default for EnvironmentBrowserStackCredentialResolver {
-    fn default() -> Self {
-        Self {
-            gate_env: BROWSERSTACK_NATIVE_PROBE_ENV.to_owned(),
-            username_env: BROWSERSTACK_USERNAME_ENV.to_owned(),
-            access_key_env: BROWSERSTACK_ACCESS_KEY_ENV.to_owned(),
-        }
-    }
-}
-
-impl EnvironmentBrowserStackCredentialResolver {
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn new(
-        gate_env: impl Into<String>,
-        username_env: impl Into<String>,
-        access_key_env: impl Into<String>,
-    ) -> Self {
-        Self {
-            gate_env: gate_env.into(),
-            username_env: username_env.into(),
-            access_key_env: access_key_env.into(),
-        }
-    }
-}
-
-impl BrowserStackCredentialResolver for EnvironmentBrowserStackCredentialResolver {
-    fn resolve(
-        &mut self,
-        reference: &SecretReference,
-        at: DateTime<Utc>,
-    ) -> Result<BrowserStackCredentialLease, BrowserStackCredentialError> {
-        if env::var(&self.gate_env).ok().as_deref() != Some("1") {
-            return Err(BrowserStackCredentialError::BlockedEnv);
-        }
-        let username =
-            env::var(&self.username_env).map_err(|_| BrowserStackCredentialError::Unavailable)?;
-        let access_key =
-            env::var(&self.access_key_env).map_err(|_| BrowserStackCredentialError::Unavailable)?;
-        BrowserStackCredentialLease::new(
-            username,
-            access_key,
-            reference,
-            at - Duration::seconds(1),
-            at + Duration::minutes(5),
-        )
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserStackProviderDefinition {
@@ -278,6 +223,22 @@ pub struct BrowserStackProviderDefinition {
 }
 
 impl BrowserStackProviderDefinition {
+    fn canonical_digest(&self) -> Digest {
+        Digest::from_fields(
+            "browserstack-provider-definition/v1",
+            &[
+                self.schema_version.clone(),
+                self.provider_id.clone(),
+                self.provider_revision.clone(),
+                format!("{:?}", self.product),
+                format!("{:?}", self.provenance),
+                self.capabilities.join(","),
+                format!("read_only={}", self.read_only),
+                format!("native={}", self.native),
+            ],
+        )
+    }
+
     pub fn new(
         product: BrowserStackProduct,
         provenance: TransportProvenance,
@@ -329,6 +290,7 @@ impl BrowserStackProviderDefinition {
             || !self.read_only
             || self.native
             || self.capabilities.is_empty()
+            || self.provider_digest != self.canonical_digest()
         {
             return Err(BrowserStackTestResultError::InvalidInput(
                 "BrowserStack provider definition drifted".to_owned(),
@@ -345,7 +307,7 @@ pub enum RegistrationState {
     Revoked,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserStackRegistration {
     pub schema_version: String,
@@ -363,7 +325,80 @@ pub struct BrowserStackRegistration {
     pub revision: Revision,
     pub registration_digest: Digest,
     pub state: RegistrationState,
+    #[serde(skip, default = "new_registration_shared_state")]
+    shared: Arc<RegistrationSharedState>,
+    #[serde(skip, default)]
+    live_seal: bool,
 }
+
+impl Clone for BrowserStackRegistration {
+    fn clone(&self) -> Self {
+        Self {
+            schema_version: self.schema_version.clone(),
+            contract_version: self.contract_version.clone(),
+            plugin_version: self.plugin_version.clone(),
+            service_id: self.service_id.clone(),
+            provider_id: self.provider_id.clone(),
+            consumer_id: self.consumer_id.clone(),
+            provider_revision: self.provider_revision.clone(),
+            contract_digest: self.contract_digest.clone(),
+            provider_digest: self.provider_digest.clone(),
+            scope_digest: self.scope_digest.clone(),
+            permission_digest: self.permission_digest.clone(),
+            secret_reference_digest: self.secret_reference_digest.clone(),
+            revision: self.revision,
+            registration_digest: self.registration_digest.clone(),
+            state: self.state,
+            shared: Arc::clone(&self.shared),
+            live_seal: self.live_seal,
+        }
+    }
+}
+
+impl fmt::Debug for BrowserStackRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrowserStackRegistration")
+            .field("schema_version", &self.schema_version)
+            .field("contract_version", &self.contract_version)
+            .field("plugin_version", &self.plugin_version)
+            .field("service_id", &self.service_id)
+            .field("provider_id", &self.provider_id)
+            .field("consumer_id", &self.consumer_id)
+            .field("provider_revision", &self.provider_revision)
+            .field("contract_digest", &self.contract_digest)
+            .field("provider_digest", &self.provider_digest)
+            .field("scope_digest", &self.scope_digest)
+            .field("permission_digest", &self.permission_digest)
+            .field("secret_reference_digest", &self.secret_reference_digest)
+            .field("revision", &self.revision)
+            .field("registration_digest", &self.registration_digest)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for BrowserStackRegistration {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.contract_version == other.contract_version
+            && self.plugin_version == other.plugin_version
+            && self.service_id == other.service_id
+            && self.provider_id == other.provider_id
+            && self.consumer_id == other.consumer_id
+            && self.provider_revision == other.provider_revision
+            && self.contract_digest == other.contract_digest
+            && self.provider_digest == other.provider_digest
+            && self.scope_digest == other.scope_digest
+            && self.permission_digest == other.permission_digest
+            && self.secret_reference_digest == other.secret_reference_digest
+            && self.revision == other.revision
+            && self.registration_digest == other.registration_digest
+            && self.state == other.state
+    }
+}
+
+impl Eq for BrowserStackRegistration {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -381,6 +416,34 @@ pub struct BrowserStackRegistrationRequest {
     pub provider_revision: String,
     pub contract_digest: Digest,
     pub provider_digest: Digest,
+}
+
+#[derive(Debug)]
+struct RegistrationUseState {
+    revoked: bool,
+    next_use_revision: u64,
+    consumed_evidence: BTreeMap<String, Revision>,
+}
+
+impl Default for RegistrationUseState {
+    fn default() -> Self {
+        Self {
+            revoked: false,
+            next_use_revision: 1,
+            consumed_evidence: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RegistrationSharedState {
+    use_state: Mutex<RegistrationUseState>,
+}
+
+fn new_registration_shared_state() -> Arc<RegistrationSharedState> {
+    Arc::new(RegistrationSharedState {
+        use_state: Mutex::new(RegistrationUseState::default()),
+    })
 }
 
 impl BrowserStackRegistrationRequest {
@@ -409,6 +472,7 @@ impl BrowserStackRegistration {
         }
         if request.contract_digest != contract_digest()
             || request.provider_revision != BROWSERSTACK_PROVIDER_REVISION
+            || !request.provider_digest.is_sha256()
         {
             return Err(BrowserStackTestResultError::RegistrationDrift(
                 "registration request contract/provider revision is not current".to_owned(),
@@ -437,7 +501,7 @@ impl BrowserStackRegistration {
                 revision.get().to_string(),
             ],
         );
-        Ok(Self {
+        let registration = Self {
             schema_version: BROWSERSTACK_SCHEMA_VERSION.to_owned(),
             contract_version: BROWSERSTACK_CONTRACT_VERSION.to_owned(),
             plugin_version: BROWSERSTACK_PLUGIN_VERSION_TEXT.to_owned(),
@@ -453,19 +517,84 @@ impl BrowserStackRegistration {
             revision,
             registration_digest,
             state: RegistrationState::Active,
+            shared: new_registration_shared_state(),
+            live_seal: true,
+        };
+        registration.validate_identity()?;
+        Ok(registration)
+    }
+
+    fn canonical_registration_digest(&self) -> Digest {
+        Digest::from_fields(
+            "browserstack-registration/v1",
+            &[
+                self.schema_version.clone(),
+                self.contract_version.clone(),
+                self.plugin_version.clone(),
+                self.service_id.clone(),
+                self.provider_id.clone(),
+                self.consumer_id.clone(),
+                self.provider_revision.clone(),
+                self.contract_digest.as_str().to_owned(),
+                self.provider_digest.as_str().to_owned(),
+                self.scope_digest.as_str().to_owned(),
+                self.permission_digest.as_str().to_owned(),
+                self.secret_reference_digest.as_str().to_owned(),
+                self.revision.get().to_string(),
+            ],
+        )
+    }
+
+    pub fn validate_identity(&self) -> Result<(), BrowserStackTestResultError> {
+        let digests = [
+            &self.contract_digest,
+            &self.provider_digest,
+            &self.scope_digest,
+            &self.permission_digest,
+            &self.secret_reference_digest,
+            &self.registration_digest,
+        ];
+        if !self.live_seal
+            || self.schema_version != BROWSERSTACK_SCHEMA_VERSION
+            || self.contract_version != BROWSERSTACK_CONTRACT_VERSION
+            || self.plugin_version != BROWSERSTACK_PLUGIN_VERSION_TEXT
+            || self.service_id != BROWSERSTACK_SERVICE_ID
+            || self.provider_id != BROWSERSTACK_PROVIDER_ID
+            || self.consumer_id != crate::MISSION_BROWSERSTACK_CONSUMER_ID
+            || self.provider_revision != BROWSERSTACK_PROVIDER_REVISION
+            || self.revision.get() == 0
+            || digests.iter().any(|digest| !digest.is_sha256())
+            || self.registration_digest != self.canonical_registration_digest()
+        {
+            return Err(BrowserStackTestResultError::RegistrationDrift(
+                "registration immutable identity or digest tuple is invalid".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn shared_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, RegistrationUseState>, BrowserStackTestResultError> {
+        self.shared.use_state.lock().map_err(|_| {
+            BrowserStackTestResultError::RegistrationDrift(
+                "registration shared state is poisoned".to_owned(),
+            )
         })
     }
 
     pub fn ensure_active(&self) -> Result<(), BrowserStackTestResultError> {
-        if self.state == RegistrationState::Active {
-            Ok(())
-        } else {
+        self.validate_identity()?;
+        if self.state != RegistrationState::Active || self.shared_state()?.revoked {
             Err(BrowserStackTestResultError::RegistrationRevoked)
+        } else {
+            Ok(())
         }
     }
 
     pub fn revoke(&mut self) -> Result<RegistrationRevocation, BrowserStackTestResultError> {
         self.ensure_active()?;
+        self.shared_state()?.revoked = true;
         self.state = RegistrationState::Revoked;
         let revocation_digest = Digest::from_fields(
             "browserstack-registration-revocation/v1",
@@ -503,6 +632,54 @@ impl BrowserStackRegistration {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn claim_evidence_use(
+        &self,
+        evidence_digest: &Digest,
+    ) -> Result<Revision, BrowserStackTestResultError> {
+        self.validate_identity()?;
+        let mut shared = self.shared_state()?;
+        if self.state != RegistrationState::Active || shared.revoked {
+            return Err(BrowserStackTestResultError::RegistrationRevoked);
+        }
+        if shared
+            .consumed_evidence
+            .contains_key(evidence_digest.as_str())
+        {
+            return Err(BrowserStackTestResultError::EvidenceReplay);
+        }
+        let revision = Revision::new(shared.next_use_revision).map_err(|_| {
+            BrowserStackTestResultError::RegistrationDrift(
+                "registration use revision overflowed".to_owned(),
+            )
+        })?;
+        shared.next_use_revision = shared.next_use_revision.checked_add(1).ok_or_else(|| {
+            BrowserStackTestResultError::RegistrationDrift(
+                "registration use revision overflowed".to_owned(),
+            )
+        })?;
+        shared
+            .consumed_evidence
+            .insert(evidence_digest.as_str().to_owned(), revision);
+        Ok(revision)
+    }
+
+    pub(crate) fn validate_evidence_use(
+        &self,
+        evidence_digest: &Digest,
+        use_revision: Revision,
+    ) -> Result<(), BrowserStackTestResultError> {
+        self.validate_identity()?;
+        let shared = self.shared_state()?;
+        if self.state != RegistrationState::Active || shared.revoked {
+            return Err(BrowserStackTestResultError::RegistrationRevoked);
+        }
+        if shared.consumed_evidence.get(evidence_digest.as_str()) == Some(&use_revision) {
+            Ok(())
+        } else {
+            Err(BrowserStackTestResultError::StaleEvidence)
+        }
     }
 
     pub fn registration_digest(&self) -> &Digest {
@@ -588,6 +765,7 @@ where
         credential_resolver: R,
         bounds: RequestBounds,
     ) -> Result<Self, BrowserStackTestResultError> {
+        bounds.validate()?;
         let definition =
             BrowserStackProviderDefinition::new(request.scope.product(), transport.provenance())?;
         if request.provider_digest != definition.provider_digest {
@@ -973,7 +1151,6 @@ where
             || evidence.scope_digest != *self.scope.digest()
             || evidence.permission_digest != *self.scope.permission().digest()
             || evidence.registration_digest != *self.registration.registration_digest()
-            || evidence.provenance == TransportProvenance::ProductionRead && evidence.is_native()
         {
             return Err(BrowserStackTestResultError::StaleEvidence);
         }
@@ -996,9 +1173,11 @@ where
             || proposal.permission_digest != *self.scope.permission().digest()
             || proposal.registration_digest != *self.registration.registration_digest()
             || proposal.provider_revision != BROWSERSTACK_PROVIDER_REVISION
+            || proposal.bounds != self.bounds
         {
             return Err(BrowserStackTestResultError::RegistrationDigestMismatch);
         }
+        proposal.bounds.validate()?;
         Ok(())
     }
 
