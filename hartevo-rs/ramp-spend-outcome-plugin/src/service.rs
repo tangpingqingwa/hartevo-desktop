@@ -72,8 +72,9 @@ where
     pub fn verify_evidence(
         &self,
         receipt: &EvidenceReceipt,
+        evidence: &SpendEvidence,
     ) -> Result<EvidenceVerification, RampSpendOutcomeError> {
-        self.provider.verify_evidence(receipt)
+        self.provider.verify_evidence(receipt, evidence)
     }
 
     pub fn revoke_registration(&self) -> Result<crate::RevocationReceipt, RampSpendOutcomeError> {

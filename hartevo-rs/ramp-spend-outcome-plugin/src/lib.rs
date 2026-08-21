@@ -28,9 +28,10 @@ pub use model::{
     DeploymentBinding, Digest, EvidenceReceipt, EvidenceStatus, EvidenceVerification,
     IdentityBinding, MerchantEvidence, MissionBinding, OutcomeProposal, PermissionSnapshot,
     ProjectBinding, RampReadScope, RampSpendScope, RampSpendScopeSpec, RefundState,
-    RegistrationReceipt, RegistrationStatus, ReleaseBinding, ResourceKind, RevocationReceipt,
-    SecretKind, SecretReference, SpendEvidence, TransactionEvidence, TransactionState,
-    TransportProvenance, WorkProductBinding, canonical_digest, sha256_digest,
+    RegistrationReceipt, RegistrationStatus, ReleaseBinding, ReplayFenceDurability, ResourceKind,
+    RevocationReceipt, SecretKind, SecretReference, SpendConstraints, SpendEvidence,
+    TransactionEvidence, TransactionState, TransportProvenance, WorkProductBinding,
+    canonical_digest, sha256_digest,
 };
 pub use provider::RampProvider;
 pub use service::RampSpendOutcomeService;
@@ -68,6 +69,16 @@ pub const MAX_AUDIT_EVENTS: usize = 1_000;
 pub const MAX_CURSOR_BYTES: usize = 512;
 pub const MAX_IDENTIFIER_BYTES: usize = 256;
 pub const MAX_EVENT_TYPE_BYTES: usize = 128;
+pub const MAX_CATEGORY_VALUES: usize = 32;
+pub const MAX_RESPONSE_BYTES: usize = 1_048_576;
+pub const MAX_PAGE_BYTES: usize = 1_048_576;
+pub const MAX_RECORD_BYTES: usize = 65_536;
+pub const MAX_TOTAL_RESPONSE_BYTES: usize = 4_194_304;
+pub const MAX_TOTAL_RECORD_BYTES: usize = 1_048_576;
+pub const MAX_SPEND_TOTAL_MINOR: i64 = 9_000_000_000_000;
+pub const MAX_REPLAY_SCOPES: usize = 256;
+pub const MAX_REPLAY_IDENTITIES: usize = MAX_TRANSACTIONS + MAX_MERCHANTS + MAX_AUDIT_EVENTS;
+pub const MAX_REPLAY_RECEIPTS: usize = MAX_PAGES;
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum RampSpendOutcomeError {
@@ -129,6 +140,12 @@ pub enum RampSpendOutcomeError {
     NativeClassificationMismatch,
     #[error("Ramp provider response is invalid")]
     InvalidResponse,
+    #[error("Ramp evidence contains contradictory currency, category, or spend totals")]
+    ContradictoryEvidence,
+    #[error("Ramp evidence or receipt record identity was replayed")]
+    ReplayDetected,
+    #[error("independently validated provider/evidence state is required")]
+    EvidenceStateRequired,
     #[error("Ramp transport failed: {0}")]
     Transport(#[from] RampTransportError),
 }
@@ -252,10 +269,16 @@ impl RampSpendOutcomePluginDefinition {
                     "release_id".to_owned(),
                     "release_revision".to_owned(),
                     "policy_revision".to_owned(),
+                    "currency_code_constraint".to_owned(),
+                    "category_id_constraint".to_owned(),
+                    "category_name_constraint".to_owned(),
+                    "max_spend_total_minor".to_owned(),
+                    "expected_spend_total_minor".to_owned(),
                     "requested_read_scopes".to_owned(),
                     "permission_digest".to_owned(),
                     "secret_reference_digest".to_owned(),
                     "registration_digest".to_owned(),
+                    "replay_fence_durability".to_owned(),
                 ],
                 authentication: vec![
                     "oauth_secret_reference".to_owned(),
@@ -299,6 +322,8 @@ impl RampSpendOutcomePluginDefinition {
                     "provider_digest".to_owned(),
                     "contract_digest".to_owned(),
                     "evidence_digest".to_owned(),
+                    "spend_constraints_digest".to_owned(),
+                    "verification_digest".to_owned(),
                     "policy_revision".to_owned(),
                 ],
             },
@@ -312,6 +337,59 @@ impl RampSpendOutcomePluginDefinition {
     }
 
     pub fn validate(&self) -> Result<(), RampSpendOutcomeError> {
+        let expected_provider_scope = vec![
+            "business_id_digest",
+            "entity_id_digest",
+            "spend_program_id_digest",
+            "card_id_digest",
+            "vendor_id_digest",
+            "transaction_id_digest",
+            "audit_event_id_digest",
+            "date_window",
+            "project_id",
+            "project_revision",
+            "mission_id",
+            "mission_revision",
+            "work_product_id",
+            "work_product_revision",
+            "deployment_id",
+            "deployment_revision",
+            "release_id",
+            "release_revision",
+            "policy_revision",
+            "currency_code_constraint",
+            "category_id_constraint",
+            "category_name_constraint",
+            "max_spend_total_minor",
+            "expected_spend_total_minor",
+            "requested_read_scopes",
+            "permission_digest",
+            "secret_reference_digest",
+            "registration_digest",
+            "replay_fence_durability",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let expected_consumer_binding = vec![
+            "project_id",
+            "project_revision",
+            "mission_id",
+            "mission_revision",
+            "work_product_id",
+            "work_product_revision",
+            "scope_digest",
+            "registration_digest",
+            "provider_digest",
+            "contract_digest",
+            "evidence_digest",
+            "spend_constraints_digest",
+            "verification_digest",
+            "policy_revision",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
         if self.schema_version != RAMP_SPEND_OUTCOME_SCHEMA_VERSION
             || self.plugin_id != RAMP_PROVIDER_ID
             || self.version != PluginVersion::V1
@@ -327,11 +405,13 @@ impl RampSpendOutcomePluginDefinition {
             || self.provider.implementation != RAMP_PROVIDER_IMPLEMENTATION
             || self.provider.authentication.len() != 2
             || self.provider.transport.len() != 5
+            || self.provider.scope != expected_provider_scope
             || !self.provider.reversible
             || !self.provider.revocable
             || self.consumer.id != MISSION_RAMP_SPEND_CONSUMER_ID
             || self.consumer.service_id != self.service.id
             || self.consumer.version != PluginVersion::V1
+            || self.consumer.binding != expected_consumer_binding
             || !self.reversible
             || self.writes
             || self.arbitrary_queries
@@ -388,6 +468,58 @@ pub fn validate_contract_document() -> Result<(), RampSpendOutcomeError> {
         || layer != Some("ramp_spend_outcome_layer_1")
         || authority != Some("read_only_observational_spend_evidence")
     {
+        return Err(RampSpendOutcomeError::InvalidResponse);
+    }
+    let bound_const = |name: &str| {
+        properties
+            .get("bounds")
+            .and_then(|bounds| bounds.get("properties"))
+            .and_then(|bounds| bounds.get(name))
+            .and_then(|bound| bound.get("const"))
+            .and_then(serde_json::Value::as_u64)
+    };
+    let expected_bounds = [
+        ("maxCategoryValues", MAX_CATEGORY_VALUES as u64),
+        ("maxResponseBytes", MAX_RESPONSE_BYTES as u64),
+        ("maxPageBytes", MAX_PAGE_BYTES as u64),
+        ("maxRecordBytes", MAX_RECORD_BYTES as u64),
+        ("maxTotalResponseBytes", MAX_TOTAL_RESPONSE_BYTES as u64),
+        ("maxTotalRecordBytes", MAX_TOTAL_RECORD_BYTES as u64),
+        ("maxSpendTotalMinor", MAX_SPEND_TOTAL_MINOR as u64),
+        ("maxReplayScopes", MAX_REPLAY_SCOPES as u64),
+        ("maxReplayIdentities", MAX_REPLAY_IDENTITIES as u64),
+        ("maxReplayReceipts", MAX_REPLAY_RECEIPTS as u64),
+    ];
+    if expected_bounds
+        .iter()
+        .any(|(name, expected)| bound_const(name) != Some(*expected))
+    {
+        return Err(RampSpendOutcomeError::InvalidResponse);
+    }
+    let section_true = |section: &str, name: &str| {
+        properties
+            .get(section)
+            .and_then(|value| value.get("properties"))
+            .and_then(|value| value.get(name))
+            .and_then(|value| value.get("const"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    };
+    if !section_true("scope", "currencyCategoryTotalBound")
+        || !section_true("transport", "rawResponseBodyBounds")
+        || !section_true("transport", "rawRecordBounds")
+        || !section_true("transport", "globalByteBudget")
+        || !section_true("transport", "processSharedReplayFence")
+    {
+        return Err(RampSpendOutcomeError::InvalidResponse);
+    }
+    let replay_durability = properties
+        .get("honesty")
+        .and_then(|value| value.get("properties"))
+        .and_then(|value| value.get("replayFenceDurability"))
+        .and_then(|value| value.get("const"))
+        .and_then(serde_json::Value::as_str);
+    if replay_durability != Some("process_shared_non_durable") {
         return Err(RampSpendOutcomeError::InvalidResponse);
     }
     RampSpendOutcomePluginDefinition::layer1().map(|_| ())

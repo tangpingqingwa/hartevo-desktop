@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use crate::RampSpendOutcomeError;
 use crate::model::{
-    Digest, MissionBinding, OutcomeProposal, ProjectBinding, SpendEvidence, WorkProductBinding,
-    canonical_digest,
+    Digest, EvidenceVerification, MissionBinding, OutcomeProposal, ProjectBinding, SpendEvidence,
+    WorkProductBinding, canonical_digest, validate_digest,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -26,9 +26,9 @@ impl MissionRampSpendConsumer {
         mission: MissionBinding,
         work_product: WorkProductBinding,
     ) -> Result<Self, RampSpendOutcomeError> {
-        if project.revision == 0 || mission.revision == 0 || work_product.revision == 0 {
-            return Err(RampSpendOutcomeError::ConsumerBindingMismatch);
-        }
+        project.validate("project id")?;
+        mission.validate("mission id")?;
+        work_product.validate("work product id")?;
         Ok(Self {
             project,
             mission,
@@ -46,18 +46,59 @@ impl MissionRampSpendConsumer {
         )
     }
 
+    pub fn validate(&self) -> Result<(), RampSpendOutcomeError> {
+        self.project.validate("project id")?;
+        self.mission.validate("mission id")?;
+        self.work_product.validate("work product id")?;
+        Ok(())
+    }
+
     pub fn compile_adoption_proposal(
         &self,
         proposal: &OutcomeProposal,
+        evidence: &SpendEvidence,
+        verification: &EvidenceVerification,
     ) -> Result<MissionRampSpendAdoptionProposal, RampSpendOutcomeError> {
+        self.validate()?;
         proposal.validate()?;
+        evidence.validate()?;
+        verification.validate()?;
+        if proposal.scope_digest != evidence.scope_digest
+            || proposal.registration_digest != evidence.registration_digest
+            || proposal.provider_digest != evidence.provider_digest
+            || proposal.contract_digest != evidence.contract_digest
+            || proposal.evidence_digest != evidence.evidence_digest
+            || proposal.spend_constraints_digest != evidence.spend_constraints_digest
+            || proposal.currency_code != evidence.currency_code
+            || proposal.category_id_digests != evidence.category_id_digests
+            || proposal.category_name_digests != evidence.category_name_digests
+            || proposal.spend_total_minor != evidence.spend_total_minor
+            || proposal.max_spend_total_minor != evidence.max_spend_total_minor
+            || proposal.expected_spend_total_minor != evidence.expected_spend_total_minor
+            || verification.evidence_digest != evidence.evidence_digest
+            || verification.scope_digest != proposal.scope_digest
+            || verification.provider_digest != proposal.provider_digest
+            || verification.contract_digest != proposal.contract_digest
+            || verification.evidence_status != crate::EvidenceStatus::Complete
+            || !verification.independent_state_valid
+            || !verification.verified
+            || verification.adoptable
+            || verification.native
+            || verification.connected
+        {
+            return Err(RampSpendOutcomeError::EvidenceStateRequired);
+        }
         if proposal.project != self.project
             || proposal.mission != self.mission
             || proposal.work_product != self.work_product
         {
             return Err(RampSpendOutcomeError::ConsumerBindingMismatch);
         }
-        Ok(MissionRampSpendAdoptionProposal::from_parts(self, proposal))
+        Ok(MissionRampSpendAdoptionProposal::from_parts(
+            self,
+            proposal,
+            verification,
+        ))
     }
 
     pub fn compile_adoption_proposal_from_evidence(
@@ -66,7 +107,9 @@ impl MissionRampSpendConsumer {
         service: &crate::RampSpendOutcomeService<impl crate::RampTransport>,
     ) -> Result<MissionRampSpendAdoptionProposal, RampSpendOutcomeError> {
         let outcome = service.compile_outcome_proposal(evidence)?;
-        self.compile_adoption_proposal(&outcome)
+        let receipt = service.record_evidence(evidence)?;
+        let verification = service.verify_evidence(&receipt, evidence)?;
+        self.compile_adoption_proposal(&outcome, evidence, &verification)
     }
 }
 
@@ -82,6 +125,7 @@ pub struct MissionRampSpendAdoptionProposal {
     pub source_provider_digest: Digest,
     pub source_contract_digest: Digest,
     pub source_evidence_digest: Digest,
+    pub source_verification_digest: Digest,
     pub policy_revision: u64,
     pub truth_authority: bool,
     pub consent_authority: bool,
@@ -96,7 +140,11 @@ pub struct MissionRampSpendAdoptionProposal {
 }
 
 impl MissionRampSpendAdoptionProposal {
-    fn from_parts(consumer: &MissionRampSpendConsumer, proposal: &OutcomeProposal) -> Self {
+    fn from_parts(
+        consumer: &MissionRampSpendConsumer,
+        proposal: &OutcomeProposal,
+        verification: &EvidenceVerification,
+    ) -> Self {
         let mut adoption = Self {
             proposal_kind: "mission_ramp_spend_evidence_adoption_proposal".to_owned(),
             project: consumer.project.clone(),
@@ -107,6 +155,7 @@ impl MissionRampSpendAdoptionProposal {
             source_provider_digest: proposal.provider_digest.clone(),
             source_contract_digest: proposal.contract_digest.clone(),
             source_evidence_digest: proposal.evidence_digest.clone(),
+            source_verification_digest: verification.verification_digest.clone(),
             policy_revision: proposal.policy_revision,
             truth_authority: false,
             consent_authority: false,
@@ -138,6 +187,22 @@ impl MissionRampSpendAdoptionProposal {
         {
             return Err(RampSpendOutcomeError::ConsumerBindingMismatch);
         }
+        self.project.validate("project id")?;
+        self.mission.validate("mission id")?;
+        self.work_product.validate("work product id")?;
+        if self.policy_revision == 0 {
+            return Err(RampSpendOutcomeError::ConsumerBindingMismatch);
+        }
+        for (field, digest) in [
+            ("scope", &self.source_scope_digest),
+            ("registration", &self.source_registration_digest),
+            ("provider", &self.source_provider_digest),
+            ("contract", &self.source_contract_digest),
+            ("evidence", &self.source_evidence_digest),
+            ("verification", &self.source_verification_digest),
+        ] {
+            validate_digest(digest, field)?;
+        }
         Ok(())
     }
 
@@ -152,6 +217,7 @@ impl MissionRampSpendAdoptionProposal {
             source_provider_digest: &self.source_provider_digest,
             source_contract_digest: &self.source_contract_digest,
             source_evidence_digest: &self.source_evidence_digest,
+            source_verification_digest: &self.source_verification_digest,
             policy_revision: self.policy_revision,
             truth_authority: self.truth_authority,
             consent_authority: self.consent_authority,
@@ -178,6 +244,7 @@ struct AdoptionFingerprint<'a> {
     source_provider_digest: &'a str,
     source_contract_digest: &'a str,
     source_evidence_digest: &'a str,
+    source_verification_digest: &'a str,
     policy_revision: u64,
     truth_authority: bool,
     consent_authority: bool,

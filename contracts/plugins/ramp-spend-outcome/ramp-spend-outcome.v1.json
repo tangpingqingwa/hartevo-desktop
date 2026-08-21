@@ -77,10 +77,16 @@
             "release_id",
             "release_revision",
             "policy_revision",
+            "currency_code_constraint",
+            "category_id_constraint",
+            "category_name_constraint",
+            "max_spend_total_minor",
+            "expected_spend_total_minor",
             "requested_read_scopes",
             "permission_digest",
             "secret_reference_digest",
-            "registration_digest"
+            "registration_digest",
+            "replay_fence_durability"
           ]
         },
         "authentication": {
@@ -134,6 +140,8 @@
             "provider_digest",
             "contract_digest",
             "evidence_digest",
+            "spend_constraints_digest",
+            "verification_digest",
             "policy_revision"
           ]
         }
@@ -165,6 +173,7 @@
         "dateWindowBound",
         "projectMissionWorkProductBound",
         "revisionBound",
+        "currencyCategoryTotalBound",
         "requestedReadScopesBound",
         "providerContractEvidenceDigestsBound"
       ],
@@ -179,6 +188,7 @@
         "dateWindowBound": { "const": true },
         "projectMissionWorkProductBound": { "const": true },
         "revisionBound": { "const": true },
+        "currencyCategoryTotalBound": { "const": true },
         "requestedReadScopesBound": { "const": true },
         "providerContractEvidenceDigestsBound": { "const": true }
       }
@@ -195,7 +205,17 @@
         "maxAuditEvents",
         "maxCursorBytes",
         "maxIdentifierBytes",
-        "maxEventTypeBytes"
+        "maxEventTypeBytes",
+        "maxCategoryValues",
+        "maxResponseBytes",
+        "maxPageBytes",
+        "maxRecordBytes",
+        "maxTotalResponseBytes",
+        "maxTotalRecordBytes",
+        "maxSpendTotalMinor",
+        "maxReplayScopes",
+        "maxReplayIdentities",
+        "maxReplayReceipts"
       ],
       "properties": {
         "maxDateWindowSeconds": { "const": 7776000 },
@@ -206,7 +226,17 @@
         "maxAuditEvents": { "const": 1000 },
         "maxCursorBytes": { "const": 512 },
         "maxIdentifierBytes": { "const": 256 },
-        "maxEventTypeBytes": { "const": 128 }
+        "maxEventTypeBytes": { "const": 128 },
+        "maxCategoryValues": { "const": 32 },
+        "maxResponseBytes": { "const": 1048576 },
+        "maxPageBytes": { "const": 1048576 },
+        "maxRecordBytes": { "const": 65536 },
+        "maxTotalResponseBytes": { "const": 4194304 },
+        "maxTotalRecordBytes": { "const": 1048576 },
+        "maxSpendTotalMinor": { "const": 9000000000000 },
+        "maxReplayScopes": { "const": 256 },
+        "maxReplayIdentities": { "const": 2500 },
+        "maxReplayReceipts": { "const": 100 }
       }
     },
     "registration": {
@@ -251,7 +281,13 @@
             "version",
             "permission",
             "high_water_mark",
-            "retention"
+            "retention",
+            "currency",
+            "category",
+            "spend_total",
+            "replay_identity",
+            "replay_receipt",
+            "byte_budget"
           ]
         }
       }
@@ -263,6 +299,9 @@
         "states",
         "refundTransitionsExplicit",
         "auditProvenanceExplicit",
+        "currencyCategoryConstraintsExplicit",
+        "boundedSpendTotalsExplicit",
+        "replayFencesExplicit",
         "emptyIsNotEvidence",
         "partialIsNotSuccess",
         "providerUnknownIsNotSuccess"
@@ -280,6 +319,9 @@
         },
         "refundTransitionsExplicit": { "const": true },
         "auditProvenanceExplicit": { "const": true },
+        "currencyCategoryConstraintsExplicit": { "const": true },
+        "boundedSpendTotalsExplicit": { "const": true },
+        "replayFencesExplicit": { "const": true },
         "emptyIsNotEvidence": { "const": true },
         "partialIsNotSuccess": { "const": true },
         "providerUnknownIsNotSuccess": { "const": true }
@@ -307,7 +349,11 @@
         "reimbursements",
         "transfers",
         "webhookSetup",
-        "pageResponders"
+        "pageResponders",
+        "rawResponseBodyBounds",
+        "rawRecordBounds",
+        "globalByteBudget",
+        "processSharedReplayFence"
       ],
       "properties": {
         "officialRampDeveloperApi": { "const": true },
@@ -328,7 +374,11 @@
         "reimbursements": { "const": false },
         "transfers": { "const": false },
         "webhookSetup": { "const": false },
-        "pageResponders": { "const": false }
+        "pageResponders": { "const": false },
+        "rawResponseBodyBounds": { "const": true },
+        "rawRecordBounds": { "const": true },
+        "globalByteBudget": { "const": true },
+        "processSharedReplayFence": { "const": true }
       }
     },
     "honesty": {
@@ -346,7 +396,8 @@
         "loopbackConnected",
         "blockedEnvConnected",
         "webhookChangeSignalOnly",
-        "nativeHttpsLayer"
+        "nativeHttpsLayer",
+        "replayFenceDurability"
       ],
       "properties": {
         "readOnly": { "const": true },
@@ -360,7 +411,8 @@
         "loopbackConnected": { "const": false },
         "blockedEnvConnected": { "const": false },
         "webhookChangeSignalOnly": { "const": true },
-        "nativeHttpsLayer": { "const": "layer_2_gap" }
+        "nativeHttpsLayer": { "const": "layer_2_gap" },
+        "replayFenceDurability": { "const": "process_shared_non_durable" }
       }
     },
     "nonGoals": {
@@ -387,6 +439,7 @@
       "type": "array",
       "const": [
         "native_oauth_and_client_credential_resolution",
+        "durable_replay_fence",
         "host_store_or_keyring_wiring",
         "native_https_transactions_merchants_audit_reads",
         "durable_provider_receipts",

@@ -13,12 +13,14 @@ use thiserror::Error;
 
 use crate::model::{
     BoundIdentifier, DateWindow, Digest, RampSpendScope, RefundState, TransportProvenance,
-    canonical_digest, sha256_digest, validate_bounded_text, validate_cursor, validate_event_type,
-    validate_high_water, validate_identifier, validate_page_size,
+    canonical_digest, sha256_digest, validate_bounded_text, validate_currency_code,
+    validate_cursor, validate_event_type, validate_high_water, validate_identifier,
+    validate_page_size,
 };
 use crate::{
     MAX_AUDIT_EVENTS, MAX_CURSOR_BYTES, MAX_EVENT_TYPE_BYTES, MAX_IDENTIFIER_BYTES, MAX_MERCHANTS,
-    MAX_PAGE_SIZE, MAX_PAGES, MAX_TRANSACTIONS,
+    MAX_PAGE_BYTES, MAX_PAGE_SIZE, MAX_PAGES, MAX_RECORD_BYTES, MAX_RESPONSE_BYTES,
+    MAX_TOTAL_RESPONSE_BYTES, MAX_TRANSACTIONS,
 };
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -53,6 +55,12 @@ pub enum RampTransportError {
     InvalidResponse,
     #[error("Ramp response fingerprint was tampered")]
     ResponseTampered,
+    #[error("Ramp response body exceeded the bounded byte cap")]
+    ResponseTooLarge,
+    #[error("Ramp response record exceeded the bounded byte cap")]
+    RecordTooLarge,
+    #[error("Ramp response page exceeded the bounded byte cap")]
+    PageTooLarge,
 }
 
 impl RampTransportError {
@@ -279,8 +287,17 @@ impl RampReadRequest {
             || self.page_size == 0
             || self.page_size > MAX_PAGE_SIZE
             || self.attempt == 0
+            || self.backoff_seconds > 300
         {
             return Err(crate::RampSpendOutcomeError::InvalidResponse);
+        }
+        self.date_window.validate()?;
+        crate::model::validate_digest(&self.scope_digest, "scope")?;
+        if let Some(cursor) = &self.cursor {
+            validate_cursor(cursor)?;
+        }
+        if let Some(high_water_mark) = &self.high_water_mark {
+            validate_high_water(high_water_mark)?;
         }
         let expected = canonical_digest(&RequestFingerprint::from(self));
         if expected != self.request_digest {
@@ -450,6 +467,9 @@ impl RampTransactionInput {
             spec.original_transaction_id.as_deref(),
             "original transaction id",
         )?;
+        if let Some(currency_code) = &spec.currency_code {
+            validate_currency_code(currency_code)?;
+        }
         validate_optional_text(
             spec.merchant_name.as_deref(),
             "merchant name",
@@ -462,6 +482,12 @@ impl RampTransactionInput {
         )?;
         if spec.transaction_time.is_none() {
             return Err(crate::RampSpendOutcomeError::InvalidResponse);
+        }
+        if transaction_record_bytes(&spec) > MAX_RECORD_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "record bytes",
+                maximum: MAX_RECORD_BYTES,
+            });
         }
         Ok(Self {
             id: spec.id,
@@ -532,7 +558,7 @@ impl RampTransactionInput {
         self.refund_state
     }
 
-    fn fingerprint_digest(&self) -> Digest {
+    pub(crate) fn fingerprint_digest(&self) -> Digest {
         canonical_digest(&TransactionInputFingerprint {
             id_digest: sha256_digest(self.id.as_bytes()),
             state: &self.state,
@@ -570,6 +596,27 @@ impl RampTransactionInput {
                 .original_transaction_id
                 .as_deref()
                 .map(|value| sha256_digest(value.as_bytes())),
+            transaction_time: self.transaction_time,
+            updated_at: self.updated_at,
+            settlement_date: self.settlement_date,
+            refund_state: self.refund_state,
+        })
+    }
+
+    fn record_bytes(&self) -> usize {
+        transaction_record_bytes(&RampTransactionInputSpec {
+            id: self.id.clone(),
+            state: self.state.clone(),
+            amount_minor: self.amount_minor,
+            currency_code: self.currency_code.clone(),
+            entity_id: self.entity_id.clone(),
+            spend_program_id: self.spend_program_id.clone(),
+            card_id: self.card_id.clone(),
+            merchant_id: self.merchant_id.clone(),
+            merchant_name: self.merchant_name.clone(),
+            category_id: self.category_id.clone(),
+            category_name: self.category_name.clone(),
+            original_transaction_id: self.original_transaction_id.clone(),
             transaction_time: self.transaction_time,
             updated_at: self.updated_at,
             settlement_date: self.settlement_date,
@@ -650,6 +697,12 @@ impl RampMerchantInput {
             "merchant category",
             MAX_IDENTIFIER_BYTES,
         )?;
+        if merchant_record_bytes(&spec) > MAX_RECORD_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "record bytes",
+                maximum: MAX_RECORD_BYTES,
+            });
+        }
         Ok(Self {
             id: spec.id,
             merchant_name: spec.merchant_name,
@@ -667,7 +720,7 @@ impl RampMerchantInput {
         self.category_name.as_deref()
     }
 
-    fn fingerprint_digest(&self) -> Digest {
+    pub(crate) fn fingerprint_digest(&self) -> Digest {
         canonical_digest(&(
             sha256_digest(self.id.as_bytes()),
             sha256_digest(self.merchant_name.as_bytes()),
@@ -675,6 +728,14 @@ impl RampMerchantInput {
                 .as_deref()
                 .map(|value| sha256_digest(value.as_bytes())),
         ))
+    }
+
+    fn record_bytes(&self) -> usize {
+        merchant_record_bytes(&RampMerchantInputSpec {
+            id: self.id.clone(),
+            merchant_name: self.merchant_name.clone(),
+            category_name: self.category_name.clone(),
+        })
     }
 }
 
@@ -739,6 +800,12 @@ impl RampAuditEventInput {
         validate_bounded_text(&spec.actor_type, "actor type", MAX_EVENT_TYPE_BYTES)?;
         validate_bounded_text(&spec.resource_name, "resource name", MAX_EVENT_TYPE_BYTES)?;
         validate_optional_identifier(spec.resource_id.as_deref(), "audit resource id")?;
+        if audit_record_bytes(&spec) > MAX_RECORD_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "record bytes",
+                maximum: MAX_RECORD_BYTES,
+            });
+        }
         Ok(Self {
             id: spec.id,
             event_type: spec.event_type,
@@ -768,7 +835,7 @@ impl RampAuditEventInput {
         self.event_time
     }
 
-    fn fingerprint_digest(&self) -> Digest {
+    pub(crate) fn fingerprint_digest(&self) -> Digest {
         canonical_digest(&(
             sha256_digest(self.id.as_bytes()),
             sha256_digest(self.event_type.as_bytes()),
@@ -779,6 +846,17 @@ impl RampAuditEventInput {
                 .map(|value| sha256_digest(value.as_bytes())),
             self.event_time,
         ))
+    }
+
+    fn record_bytes(&self) -> usize {
+        audit_record_bytes(&RampAuditEventInputSpec {
+            id: self.id.clone(),
+            event_type: self.event_type.clone(),
+            actor_type: self.actor_type.clone(),
+            resource_name: self.resource_name.clone(),
+            resource_id: self.resource_id.clone(),
+            event_time: self.event_time,
+        })
     }
 }
 
@@ -791,6 +869,9 @@ pub struct RampApiPage {
     pub audit_events: Vec<RampAuditEventInput>,
     pub next_cursor: Option<String>,
     pub high_water_mark: String,
+    pub response_bytes: usize,
+    pub record_bytes: usize,
+    pub raw_record_bytes: usize,
     pub response_digest: Digest,
 }
 
@@ -805,6 +886,9 @@ impl fmt::Debug for RampApiPage {
             .field("audit_event_count", &self.audit_events.len())
             .field("next_cursor", &self.next_cursor)
             .field("high_water_mark", &"<redacted>")
+            .field("response_bytes", &self.response_bytes)
+            .field("record_bytes", &self.record_bytes)
+            .field("raw_record_bytes", &self.raw_record_bytes)
             .field("response_digest", &self.response_digest)
             .finish()
     }
@@ -835,6 +919,25 @@ impl RampApiPage {
         }
         let high_water_mark = high_water_mark.into();
         validate_high_water(&high_water_mark)?;
+        let record_bytes = transactions
+            .iter()
+            .map(RampTransactionInput::record_bytes)
+            .chain(merchants.iter().map(RampMerchantInput::record_bytes))
+            .chain(audit_events.iter().map(RampAuditEventInput::record_bytes))
+            .fold(0usize, usize::saturating_add);
+        if record_bytes > MAX_PAGE_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "page bytes",
+                maximum: MAX_PAGE_BYTES,
+            });
+        }
+        let response_bytes = record_bytes.saturating_add(256);
+        if response_bytes > MAX_RESPONSE_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "response bytes",
+                maximum: MAX_RESPONSE_BYTES,
+            });
+        }
         let mut page = Self {
             endpoint,
             business_id,
@@ -843,11 +946,46 @@ impl RampApiPage {
             audit_events,
             next_cursor,
             high_water_mark,
+            response_bytes,
+            record_bytes,
+            raw_record_bytes: record_bytes,
             response_digest: String::new(),
         };
         page.response_digest = page.computed_digest();
         page.validate()?;
         Ok(page)
+    }
+
+    pub fn with_response_bytes(
+        mut self,
+        response_bytes: usize,
+    ) -> Result<Self, crate::RampSpendOutcomeError> {
+        if response_bytes > MAX_RESPONSE_BYTES || response_bytes > MAX_PAGE_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "response bytes",
+                maximum: MAX_RESPONSE_BYTES,
+            });
+        }
+        self.response_bytes = response_bytes;
+        self.response_digest = self.computed_digest();
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_raw_record_bytes(
+        mut self,
+        raw_record_bytes: usize,
+    ) -> Result<Self, crate::RampSpendOutcomeError> {
+        if raw_record_bytes > MAX_PAGE_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "record bytes",
+                maximum: MAX_PAGE_BYTES,
+            });
+        }
+        self.raw_record_bytes = raw_record_bytes;
+        self.response_digest = self.computed_digest();
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), crate::RampSpendOutcomeError> {
@@ -860,11 +998,43 @@ impl RampApiPage {
                 maximum: MAX_PAGE_SIZE,
             });
         }
+        if self.record_bytes > MAX_PAGE_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "page bytes",
+                maximum: MAX_PAGE_BYTES,
+            });
+        }
+        if self.raw_record_bytes > MAX_PAGE_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "raw record bytes",
+                maximum: MAX_PAGE_BYTES,
+            });
+        }
+        if self.response_bytes > MAX_RESPONSE_BYTES || self.response_bytes > MAX_PAGE_BYTES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "response bytes",
+                maximum: MAX_RESPONSE_BYTES,
+            });
+        }
         validate_high_water(&self.high_water_mark)?;
         if let Some(cursor) = &self.next_cursor {
             validate_cursor(cursor)?;
         }
         if self.response_digest != self.computed_digest() {
+            return Err(crate::RampSpendOutcomeError::ResponseTampered);
+        }
+        let recomputed_record_bytes = self
+            .transactions
+            .iter()
+            .map(RampTransactionInput::record_bytes)
+            .chain(self.merchants.iter().map(RampMerchantInput::record_bytes))
+            .chain(
+                self.audit_events
+                    .iter()
+                    .map(RampAuditEventInput::record_bytes),
+            )
+            .fold(0usize, usize::saturating_add);
+        if recomputed_record_bytes != self.record_bytes {
             return Err(crate::RampSpendOutcomeError::ResponseTampered);
         }
         Ok(())
@@ -897,6 +1067,9 @@ impl RampApiPage {
                 .collect(),
             next_cursor: &self.next_cursor,
             high_water_mark: &self.high_water_mark,
+            response_bytes: self.response_bytes,
+            record_bytes: self.record_bytes,
+            raw_record_bytes: self.raw_record_bytes,
         })
     }
 }
@@ -911,6 +1084,9 @@ struct PageFingerprint<'a> {
     audit_events: Vec<Digest>,
     next_cursor: &'a Option<String>,
     high_water_mark: &'a str,
+    response_bytes: usize,
+    record_bytes: usize,
+    raw_record_bytes: usize,
 }
 
 pub trait RampTransport: fmt::Debug + Send + Sync {
@@ -1081,18 +1257,29 @@ impl OfficialRampApiTransport {
     pub fn from_json_pages(
         specs: Vec<OfficialRampApiResponseSpec>,
     ) -> Result<Self, crate::RampSpendOutcomeError> {
-        let pages = specs
-            .into_iter()
-            .map(|spec| {
-                parse_official_json_page(
-                    spec.endpoint,
-                    spec.business_id,
-                    &spec.body,
-                    spec.high_water_mark,
-                )
-                .map_err(crate::RampSpendOutcomeError::from)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        if specs.len() > MAX_PAGES {
+            return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                field: "pages",
+                maximum: MAX_PAGES,
+            });
+        }
+        let mut total_response_bytes = 0usize;
+        let mut pages = Vec::with_capacity(specs.len());
+        for spec in specs {
+            total_response_bytes = total_response_bytes.saturating_add(spec.body.len());
+            if total_response_bytes > MAX_TOTAL_RESPONSE_BYTES {
+                return Err(crate::RampSpendOutcomeError::BoundExceeded {
+                    field: "total response bytes",
+                    maximum: MAX_TOTAL_RESPONSE_BYTES,
+                });
+            }
+            pages.push(parse_official_json_page(
+                spec.endpoint,
+                spec.business_id,
+                &spec.body,
+                spec.high_water_mark,
+            )?);
+        }
         Ok(Self::from_pages(pages))
     }
 }
@@ -1181,10 +1368,17 @@ pub fn parse_official_json_page(
     body: &str,
     high_water_mark: impl Into<String>,
 ) -> Result<RampApiPage, RampTransportError> {
-    (match endpoint {
+    if body.len() > MAX_RESPONSE_BYTES {
+        return Err(RampTransportError::ResponseTooLarge);
+    }
+    let raw_record_bytes = validate_raw_response_records(body)?;
+    let page = (match endpoint {
         RampEndpoint::Transactions => {
             let envelope: TransactionsEnvelope =
                 serde_json::from_str(body).map_err(|_| RampTransportError::InvalidResponse)?;
+            if envelope.data.len() > MAX_PAGE_SIZE {
+                return Err(RampTransportError::PageTooLarge);
+            }
             let transactions = envelope
                 .data
                 .into_iter()
@@ -1224,6 +1418,9 @@ pub fn parse_official_json_page(
         RampEndpoint::Merchants => {
             let envelope: MerchantsEnvelope =
                 serde_json::from_str(body).map_err(|_| RampTransportError::InvalidResponse)?;
+            if envelope.data.len() > MAX_PAGE_SIZE {
+                return Err(RampTransportError::PageTooLarge);
+            }
             let merchants = envelope
                 .data
                 .into_iter()
@@ -1249,6 +1446,9 @@ pub fn parse_official_json_page(
         RampEndpoint::AuditLogs => {
             let envelope: AuditEnvelope =
                 serde_json::from_str(body).map_err(|_| RampTransportError::InvalidResponse)?;
+            if envelope.data.len() > MAX_PAGE_SIZE {
+                return Err(RampTransportError::PageTooLarge);
+            }
             let events = envelope
                 .data
                 .into_iter()
@@ -1282,7 +1482,56 @@ pub fn parse_official_json_page(
             )
         }
     })
-    .map_err(|_| RampTransportError::InvalidResponse)
+    .map_err(map_model_transport_error)?;
+    let page = page
+        .with_response_bytes(body.len())
+        .map_err(map_model_transport_error)?;
+    page.with_raw_record_bytes(raw_record_bytes)
+        .map_err(map_model_transport_error)
+}
+
+fn validate_raw_response_records(body: &str) -> Result<usize, RampTransportError> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| RampTransportError::InvalidResponse)?;
+    let Some(records) = value.get("data").and_then(serde_json::Value::as_array) else {
+        return Ok(0);
+    };
+    if records.len() > MAX_PAGE_SIZE {
+        return Err(RampTransportError::PageTooLarge);
+    }
+    let mut page_record_bytes = 0usize;
+    for record in records {
+        let record_bytes = serde_json::to_vec(record)
+            .map_err(|_| RampTransportError::InvalidResponse)?
+            .len();
+        if record_bytes > MAX_RECORD_BYTES {
+            return Err(RampTransportError::RecordTooLarge);
+        }
+        page_record_bytes = page_record_bytes.saturating_add(record_bytes);
+        if page_record_bytes > MAX_PAGE_BYTES {
+            return Err(RampTransportError::PageTooLarge);
+        }
+    }
+    Ok(page_record_bytes)
+}
+
+fn map_model_transport_error(error: crate::RampSpendOutcomeError) -> RampTransportError {
+    match error {
+        crate::RampSpendOutcomeError::BoundExceeded {
+            field: "record bytes",
+            ..
+        } => RampTransportError::RecordTooLarge,
+        crate::RampSpendOutcomeError::BoundExceeded {
+            field: "page bytes",
+            ..
+        } => RampTransportError::PageTooLarge,
+        crate::RampSpendOutcomeError::BoundExceeded {
+            field: "response bytes",
+            ..
+        } => RampTransportError::ResponseTooLarge,
+        crate::RampSpendOutcomeError::Transport(error) => error,
+        _ => RampTransportError::InvalidResponse,
+    }
 }
 
 fn parse_timestamp(value: Option<&str>) -> Result<DateTime<Utc>, RampTransportError> {
@@ -1314,6 +1563,46 @@ fn validate_optional_text(
     maximum: usize,
 ) -> Result<(), crate::RampSpendOutcomeError> {
     value.map_or(Ok(()), |value| validate_bounded_text(value, field, maximum))
+}
+
+fn optional_text_bytes(value: Option<&str>) -> usize {
+    value.map_or(0, str::len)
+}
+
+fn transaction_record_bytes(spec: &RampTransactionInputSpec) -> usize {
+    spec.id
+        .len()
+        .saturating_add(spec.state.len())
+        .saturating_add(spec.amount_minor.map_or(0, |_| 20))
+        .saturating_add(optional_text_bytes(spec.currency_code.as_deref()))
+        .saturating_add(optional_text_bytes(spec.entity_id.as_deref()))
+        .saturating_add(optional_text_bytes(spec.spend_program_id.as_deref()))
+        .saturating_add(optional_text_bytes(spec.card_id.as_deref()))
+        .saturating_add(optional_text_bytes(spec.merchant_id.as_deref()))
+        .saturating_add(optional_text_bytes(spec.merchant_name.as_deref()))
+        .saturating_add(optional_text_bytes(spec.category_id.as_deref()))
+        .saturating_add(optional_text_bytes(spec.category_name.as_deref()))
+        .saturating_add(optional_text_bytes(spec.original_transaction_id.as_deref()))
+        .saturating_add(spec.transaction_time.map_or(0, |_| 32))
+        .saturating_add(spec.updated_at.map_or(0, |_| 32))
+        .saturating_add(spec.settlement_date.map_or(0, |_| 32))
+}
+
+fn merchant_record_bytes(spec: &RampMerchantInputSpec) -> usize {
+    spec.id
+        .len()
+        .saturating_add(spec.merchant_name.len())
+        .saturating_add(optional_text_bytes(spec.category_name.as_deref()))
+}
+
+fn audit_record_bytes(spec: &RampAuditEventInputSpec) -> usize {
+    spec.id
+        .len()
+        .saturating_add(spec.event_type.len())
+        .saturating_add(spec.actor_type.len())
+        .saturating_add(spec.resource_name.len())
+        .saturating_add(optional_text_bytes(spec.resource_id.as_deref()))
+        .saturating_add(32)
 }
 
 #[allow(dead_code)]

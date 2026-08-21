@@ -1,16 +1,21 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use chrono::{DateTime, Utc};
 use hartevo_ramp_spend_outcome_plugin::{
     AccessMode, BlockedEnvRampTransport, DateWindow, EvidenceStatus, FixtureRampTransport,
-    IdentityBinding, LoopbackRampTransport, MissionRampSpendConsumer, OfficialRampApiResponseSpec,
-    OfficialRampApiTransport, PermissionSnapshot, RampApiPage, RampAuditEventInput,
-    RampAuditEventInputSpec, RampEndpoint, RampMerchantInput, RampMerchantInputSpec, RampProvider,
-    RampSpendOutcomeError, RampSpendOutcomePluginDefinition, RampSpendOutcomeService,
-    RampSpendScope, RampSpendScopeSpec, RampTransactionInput, RampTransactionInputSpec,
-    RampTransport, RampTransportError, ReadOperation, RecordingRampTransport, RefundState,
-    RetryPolicy, SecretReference, TransactionState, TransportProvenance, canonical_digest,
-    sha256_digest, validate_contract_document,
+    IdentityBinding, LoopbackRampTransport, MAX_PAGE_SIZE, MAX_RECORD_BYTES, MAX_RESPONSE_BYTES,
+    MAX_TOTAL_RECORD_BYTES, MAX_TOTAL_RESPONSE_BYTES, MissionRampSpendConsumer,
+    OfficialRampApiResponseSpec, OfficialRampApiTransport, PermissionSnapshot, RampApiPage,
+    RampAuditEventInput, RampAuditEventInputSpec, RampEndpoint, RampMerchantInput,
+    RampMerchantInputSpec, RampProvider, RampSpendOutcomeError, RampSpendOutcomePluginDefinition,
+    RampSpendOutcomeService, RampSpendScope, RampSpendScopeSpec, RampTransactionInput,
+    RampTransactionInputSpec, RampTransport, RampTransportError, ReadOperation,
+    RecordingRampTransport, RefundState, RetryPolicy, SecretReference, SpendConstraints,
+    TransactionState, TransportProvenance, canonical_digest, sha256_digest,
+    validate_contract_document,
 };
 
 fn at(value: &str) -> DateTime<Utc> {
@@ -29,6 +34,7 @@ fn identity(id: &str, revision: u64, field: &'static str) -> IdentityBinding {
 }
 
 fn scope_spec() -> RampSpendScopeSpec {
+    static NEXT_POLICY_REVISION: AtomicU64 = AtomicU64::new(6);
     let mut spec = RampSpendScopeSpec {
         business_id: "business-1".to_owned(),
         entity_id: Some("entity-1".to_owned()),
@@ -43,7 +49,14 @@ fn scope_spec() -> RampSpendScopeSpec {
         work_product: identity("work-product-1", 12, "work product id"),
         deployment: Some(identity("deployment-1", 2, "deployment id")),
         release: Some(identity("release-1", 3, "release id")),
-        policy_revision: 6,
+        policy_revision: NEXT_POLICY_REVISION.fetch_add(1, Ordering::Relaxed),
+        spend_constraints: SpendConstraints {
+            currency_code: Some("USD".to_owned()),
+            category_id: Some("category-42".to_owned()),
+            category_name: Some("software".to_owned()),
+            max_total_minor: 100_000,
+            expected_total_minor: Some(10_000),
+        },
         permissions: PermissionSnapshot {
             requested: BTreeSet::new(),
             granted: BTreeSet::new(),
@@ -67,18 +80,38 @@ fn transaction(
     amount_minor: Option<i64>,
     transaction_time: &str,
 ) -> RampTransactionInput {
+    transaction_with_currency_category(
+        id,
+        state,
+        amount_minor,
+        transaction_time,
+        "USD",
+        "category-42",
+        "software",
+    )
+}
+
+fn transaction_with_currency_category(
+    id: &str,
+    state: &str,
+    amount_minor: Option<i64>,
+    transaction_time: &str,
+    currency_code: &str,
+    category_id: &str,
+    category_name: &str,
+) -> RampTransactionInput {
     RampTransactionInput::from_spec(RampTransactionInputSpec {
         id: id.to_owned(),
         state: state.to_owned(),
         amount_minor,
-        currency_code: Some("USD".to_owned()),
+        currency_code: Some(currency_code.to_owned()),
         entity_id: Some("entity-1".to_owned()),
         spend_program_id: Some("spend-program-1".to_owned()),
         card_id: Some("card-1".to_owned()),
         merchant_id: Some("merchant-1".to_owned()),
         merchant_name: Some("Example Merchant".to_owned()),
-        category_id: Some("category-42".to_owned()),
-        category_name: Some("software".to_owned()),
+        category_id: Some(category_id.to_owned()),
+        category_name: Some(category_name.to_owned()),
         original_transaction_id: None,
         transaction_time: Some(at(transaction_time)),
         updated_at: Some(at("2026-08-14T01:00:00Z")),
@@ -110,16 +143,20 @@ fn audit_event() -> RampAuditEventInput {
 }
 
 fn page_set() -> Vec<RampApiPage> {
+    page_set_with_first(transaction(
+        "transaction-1",
+        "AUTHORIZED",
+        Some(12_500),
+        "2026-08-14T00:30:00Z",
+    ))
+}
+
+fn page_set_with_first(first: RampTransactionInput) -> Vec<RampApiPage> {
     vec![
         RampApiPage::new(
             RampEndpoint::Transactions,
             "business-1",
-            vec![transaction(
-                "transaction-1",
-                "AUTHORIZED",
-                Some(12_500),
-                "2026-08-14T00:30:00Z",
-            )],
+            vec![first],
             Vec::new(),
             Vec::new(),
             Some("cursor-1".to_owned()),
@@ -241,14 +278,16 @@ fn bounded_read_proposal_record_verify_and_mission_projection_are_non_mutating()
     assert!(!proposal.effect_requested);
 
     let receipt = service.record_evidence(&evidence).expect("receipt");
-    let verification = service.verify_evidence(&receipt).expect("verification");
+    let verification = service
+        .verify_evidence(&receipt, &evidence)
+        .expect("verification");
     assert!(verification.verified);
     assert!(!verification.adoptable);
     assert!(!verification.native);
 
     let consumer = MissionRampSpendConsumer::from_evidence_scope(&scope).expect("consumer");
     let adoption = consumer
-        .compile_adoption_proposal(&proposal)
+        .compile_adoption_proposal(&proposal, &evidence, &verification)
         .expect("adoption proposal");
     adoption.validate().expect("adoption validates");
     assert!(!adoption.truth_authority);
@@ -643,7 +682,7 @@ fn tampered_receipts_and_consumer_revision_drift_fail_closed() {
     let mut tampered = receipt.clone();
     tampered.evidence_digest = sha256_digest(b"changed");
     assert!(matches!(
-        service.verify_evidence(&tampered),
+        service.verify_evidence(&tampered, &evidence),
         Err(RampSpendOutcomeError::ReceiptTampered)
     ));
 
@@ -657,7 +696,13 @@ fn tampered_receipts_and_consumer_revision_drift_fail_closed() {
         .compile_outcome_proposal(&evidence)
         .expect("proposal");
     assert!(matches!(
-        consumer.compile_adoption_proposal(&proposal),
+        consumer.compile_adoption_proposal(
+            &proposal,
+            &evidence,
+            &service
+                .verify_evidence(&receipt, &evidence)
+                .expect("verification"),
+        ),
         Err(RampSpendOutcomeError::ConsumerBindingMismatch)
     ));
 }
@@ -700,4 +745,293 @@ fn digest_helpers_are_stable_and_read_operations_are_endpoint_bound() {
         RampEndpoint::AuditLogs.path(),
         "/developer/v1/audit-logs/events"
     );
+}
+
+#[test]
+fn exact_currency_category_and_total_constraints_reject_contradictions() {
+    let (scope, secret) = scope_and_secret();
+    let wrong_currency = transaction_with_currency_category(
+        "transaction-1",
+        "AUTHORIZED",
+        Some(12_500),
+        "2026-08-14T00:30:00Z",
+        "EUR",
+        "category-42",
+        "software",
+    );
+    let provider = RampProvider::new(
+        LoopbackRampTransport::from_pages(page_set_with_first(wrong_currency)),
+        scope,
+        secret,
+        1,
+        1,
+    )
+    .expect("currency provider");
+    assert!(matches!(
+        provider.read_evidence(window()),
+        Err(RampSpendOutcomeError::ContradictoryEvidence)
+    ));
+
+    let (scope, secret) = scope_and_secret();
+    let wrong_category = transaction_with_currency_category(
+        "transaction-1",
+        "AUTHORIZED",
+        Some(12_500),
+        "2026-08-14T00:30:00Z",
+        "USD",
+        "category-99",
+        "travel",
+    );
+    let provider = RampProvider::new(
+        LoopbackRampTransport::from_pages(page_set_with_first(wrong_category)),
+        scope,
+        secret,
+        1,
+        1,
+    )
+    .expect("category provider");
+    assert!(matches!(
+        provider.read_evidence(window()),
+        Err(RampSpendOutcomeError::ContradictoryEvidence)
+    ));
+
+    let mut spec = scope_spec();
+    spec.spend_constraints.max_total_minor = 5_000;
+    spec.spend_constraints.expected_total_minor = None;
+    let secret = SecretReference::oauth("opaque-total-bound", 7).expect("secret ref");
+    let scope = RampSpendScope::new(spec, &secret).expect("bounded total scope");
+    let provider = RampProvider::new(
+        LoopbackRampTransport::from_pages(page_set()),
+        scope,
+        secret,
+        1,
+        1,
+    )
+    .expect("total provider");
+    assert!(matches!(
+        provider.read_evidence(window()),
+        Err(RampSpendOutcomeError::ContradictoryEvidence)
+    ));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn raw_body_page_record_and_global_byte_caps_fail_before_accumulation() {
+    let oversized_body = format!(
+        r#"{{"data":[],"page":{{"next":null}},"padding":"{}"}}"#,
+        "x".repeat(MAX_RESPONSE_BYTES)
+    );
+    assert!(matches!(
+        hartevo_ramp_spend_outcome_plugin::parse_official_json_page(
+            RampEndpoint::Transactions,
+            "business-1",
+            &oversized_body,
+            "high-water",
+        ),
+        Err(RampTransportError::ResponseTooLarge)
+    ));
+
+    let oversized_record = format!(
+        r#"{{"data":[{{"id":"transaction-1","state":"CLEARED","amount":1,"currency_code":"USD","created_at":"2026-08-14T00:30:00Z","memo":"{}"}}],"page":{{"next":null}}}}"#,
+        "x".repeat(MAX_RECORD_BYTES)
+    );
+    assert!(matches!(
+        hartevo_ramp_spend_outcome_plugin::parse_official_json_page(
+            RampEndpoint::Transactions,
+            "business-1",
+            &oversized_record,
+            "high-water",
+        ),
+        Err(RampTransportError::RecordTooLarge)
+    ));
+
+    let record = r#"{"id":"transaction-1","state":"CLEARED","amount":1,"currency_code":"USD","created_at":"2026-08-14T00:30:00Z"}"#;
+    let too_many_records = format!(
+        r#"{{"data":[{}],"page":{{"next":null}}}}"#,
+        vec![record; MAX_PAGE_SIZE + 1].join(",")
+    );
+    assert!(matches!(
+        hartevo_ramp_spend_outcome_plugin::parse_official_json_page(
+            RampEndpoint::Transactions,
+            "business-1",
+            &too_many_records,
+            "high-water",
+        ),
+        Err(RampTransportError::PageTooLarge)
+    ));
+
+    let padding = "x".repeat(900_000);
+    let body = format!(r#"{{"data":[],"page":{{"next":null}},"padding":"{padding}"}}"#);
+    let specs = (0..5)
+        .map(|_| {
+            OfficialRampApiResponseSpec::new(
+                RampEndpoint::Transactions,
+                "business-1",
+                body.clone(),
+                "high-water",
+            )
+        })
+        .collect();
+    assert!(matches!(
+        OfficialRampApiTransport::from_json_pages(specs),
+        Err(RampSpendOutcomeError::BoundExceeded {
+            field: "total response bytes",
+            maximum: MAX_TOTAL_RESPONSE_BYTES,
+        })
+    ));
+
+    let (scope, secret) = scope_and_secret();
+    let page_one = RampApiPage::new(
+        RampEndpoint::Transactions,
+        "business-1",
+        vec![transaction(
+            "transaction-byte-1",
+            "CLEARED",
+            Some(1),
+            "2026-08-14T00:30:00Z",
+        )],
+        Vec::new(),
+        Vec::new(),
+        Some("byte-next".to_owned()),
+        "high-water-transactions",
+    )
+    .expect("byte page one")
+    .with_raw_record_bytes(MAX_TOTAL_RECORD_BYTES / 2 + 1)
+    .expect("bounded raw page one");
+    let page_two = RampApiPage::new(
+        RampEndpoint::Transactions,
+        "business-1",
+        vec![transaction(
+            "transaction-byte-2",
+            "CLEARED",
+            Some(1),
+            "2026-08-14T01:30:00Z",
+        )],
+        Vec::new(),
+        Vec::new(),
+        None,
+        "high-water-transactions",
+    )
+    .expect("byte page two")
+    .with_raw_record_bytes(MAX_TOTAL_RECORD_BYTES / 2 + 1)
+    .expect("bounded raw page two");
+    let provider = RampProvider::new(
+        LoopbackRampTransport::from_pages(vec![page_one, page_two]),
+        scope,
+        secret,
+        1,
+        1,
+    )
+    .expect("global record provider");
+    assert!(matches!(
+        provider.read_evidence(window()),
+        Err(RampSpendOutcomeError::BoundExceeded {
+            field: "total record bytes",
+            maximum: MAX_TOTAL_RECORD_BYTES,
+        })
+    ));
+}
+
+#[test]
+fn shared_replay_fences_reject_fresh_cursor_cross_instance_and_receipt_replay() {
+    let (scope, secret) = scope_and_secret();
+    let transport = LoopbackRampTransport::from_pages(page_set());
+    let provider = RampProvider::new(transport.clone(), scope.clone(), secret.clone(), 1, 1)
+        .expect("replay provider");
+    provider.read_evidence(window()).expect("first evidence");
+    for page in page_set_with_first(transaction(
+        "transaction-1",
+        "AUTHORIZED",
+        Some(12_500),
+        "2026-08-14T00:30:00Z",
+    )) {
+        transport.push_page(page).expect("fresh-cursor page");
+    }
+    assert!(matches!(
+        provider.read_evidence(window()),
+        Err(RampSpendOutcomeError::ReplayDetected)
+    ));
+
+    let second_provider = RampProvider::new(
+        LoopbackRampTransport::from_pages(page_set()),
+        scope,
+        secret,
+        1,
+        2,
+    )
+    .expect("second replay provider");
+    assert!(matches!(
+        second_provider.read_evidence(window()),
+        Err(RampSpendOutcomeError::ReplayDetected)
+    ));
+
+    let (provider, _scope, _secret) = provider_with_loopback();
+    let service = RampSpendOutcomeService::new(provider);
+    let evidence = service.read_spend_evidence(window()).expect("evidence");
+    let receipt = service.record_evidence(&evidence).expect("receipt");
+    assert!(matches!(
+        service.record_evidence(&evidence),
+        Err(RampSpendOutcomeError::ReplayDetected)
+    ));
+    let verification = service
+        .verify_evidence(&receipt, &evidence)
+        .expect("independent verification");
+    assert!(verification.independent_state_valid);
+    assert_eq!(verification.evidence_status, EvidenceStatus::Complete);
+}
+
+#[test]
+fn adoption_requires_independent_state_and_serde_boundaries_revalidate_public_fields() {
+    let (provider, scope, _) = provider_with_loopback();
+    let service = RampSpendOutcomeService::new(provider);
+    let evidence = service.read_spend_evidence(window()).expect("evidence");
+    let proposal = service
+        .compile_outcome_proposal(&evidence)
+        .expect("proposal");
+    let receipt = service.record_evidence(&evidence).expect("receipt");
+    let mut invalid_verification = service
+        .verify_evidence(&receipt, &evidence)
+        .expect("verification");
+    invalid_verification.independent_state_valid = false;
+    let consumer = MissionRampSpendConsumer::from_evidence_scope(&scope).expect("consumer");
+    assert!(matches!(
+        consumer.compile_adoption_proposal(&proposal, &evidence, &invalid_verification),
+        Err(RampSpendOutcomeError::ReceiptTampered)
+    ));
+
+    assert!(serde_json::from_str::<IdentityBinding>(r#"{"id":" invalid","revision":1}"#).is_err());
+    assert!(
+        serde_json::from_str::<DateWindow>(
+            r#"{"from":"2026-08-15T00:00:00Z","to":"2026-08-14T00:00:00Z"}"#
+        )
+        .is_err()
+    );
+    assert!(serde_json::from_str::<SpendConstraints>(
+        r#"{"currencyCode":"usd","categoryId":null,"categoryName":null,"maxTotalMinor":10,"expectedTotalMinor":null}"#
+    )
+    .is_err());
+    assert!(
+        serde_json::from_str::<PermissionSnapshot>(
+            r#"{"requested":["business_read"],"granted":[],"revision":1}"#
+        )
+        .is_err()
+    );
+
+    let mut tampered_scope = scope;
+    tampered_scope.project.id = " invalid-project".to_owned();
+    assert!(matches!(
+        tampered_scope.validate(),
+        Err(RampSpendOutcomeError::InvalidIdentifier { .. })
+    ));
+
+    let (provider, _scope, _secret) = provider_with_loopback();
+    let transport = provider.transport().clone();
+    let service = RampSpendOutcomeService::new(provider);
+    service.read_spend_evidence(window()).expect("evidence");
+    let mut request = transport.requests().first().expect("request").clone();
+    request.cursor = Some("replayed-cursor".to_owned());
+    assert!(matches!(
+        request.validate(),
+        Err(RampSpendOutcomeError::RequestTampered)
+    ));
 }

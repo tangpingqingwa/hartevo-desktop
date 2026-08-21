@@ -2,16 +2,16 @@
 //! fail-closed evidence normalization.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use crate::model::{
     ActorClass, AuditEventEvidence, Capabilities, DateWindow, EvidenceReceipt,
     EvidenceVerification, MerchantEvidence, OutcomeProposal, RampReadScope, RampSpendScope,
-    RegistrationReceipt, ResourceKind, RevocationReceipt, SpendEvidence, TransactionEvidence,
-    TransactionState, amount_evidence, canonical_digest, refund_state,
+    RegistrationReceipt, ReplayFenceDurability, ResourceKind, RevocationReceipt, SpendEvidence,
+    TransactionEvidence, TransactionState, amount_evidence, canonical_digest, refund_state,
 };
 use crate::transport::{
     BlockedEnvRampTransport, RampApiPage, RampEndpoint, RampTransport, RampTransportError,
@@ -36,6 +36,145 @@ where
     secret_reference: crate::SecretReference,
     retry_policy: RetryPolicy,
     registration: Arc<Mutex<RegistrationReceipt>>,
+    replay_lease: ReplayLease,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ReplayKey {
+    resource: ResourceKind,
+    identity_digest: String,
+}
+
+#[derive(Default)]
+struct ReplayScopeState {
+    records: BTreeMap<ReplayKey, String>,
+    receipts: BTreeSet<String>,
+}
+
+static REPLAY_REGISTRY: OnceLock<Mutex<BTreeMap<String, ReplayScopeState>>> = OnceLock::new();
+
+struct ReplayLease {
+    scope_digest: String,
+}
+
+#[derive(Default)]
+struct ReadBudget {
+    pages: usize,
+    response_bytes: usize,
+    record_bytes: usize,
+}
+
+impl ReadBudget {
+    fn consume(&mut self, page: &RampApiPage) -> Result<(), RampSpendOutcomeError> {
+        let next_pages = self.pages.saturating_add(1);
+        let next_response_bytes = self.response_bytes.saturating_add(page.response_bytes);
+        let next_record_bytes = self.record_bytes.saturating_add(page.raw_record_bytes);
+        if next_pages > crate::MAX_PAGES {
+            return Err(RampSpendOutcomeError::BoundExceeded {
+                field: "total pages",
+                maximum: crate::MAX_PAGES,
+            });
+        }
+        if next_response_bytes > crate::MAX_TOTAL_RESPONSE_BYTES {
+            return Err(RampSpendOutcomeError::BoundExceeded {
+                field: "total response bytes",
+                maximum: crate::MAX_TOTAL_RESPONSE_BYTES,
+            });
+        }
+        if next_record_bytes > crate::MAX_TOTAL_RECORD_BYTES {
+            return Err(RampSpendOutcomeError::BoundExceeded {
+                field: "total record bytes",
+                maximum: crate::MAX_TOTAL_RECORD_BYTES,
+            });
+        }
+        self.pages = next_pages;
+        self.response_bytes = next_response_bytes;
+        self.record_bytes = next_record_bytes;
+        Ok(())
+    }
+}
+
+impl ReplayLease {
+    fn acquire(scope_digest: String) -> Result<Self, RampSpendOutcomeError> {
+        let registry = REPLAY_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut registry = registry
+            .lock()
+            .map_err(|_| RampSpendOutcomeError::TransportPoisoned)?;
+        if !registry.contains_key(&scope_digest) && registry.len() >= crate::MAX_REPLAY_SCOPES {
+            return Err(RampSpendOutcomeError::BoundExceeded {
+                field: "replay scopes",
+                maximum: crate::MAX_REPLAY_SCOPES,
+            });
+        }
+        registry.entry(scope_digest.clone()).or_default();
+        Ok(Self { scope_digest })
+    }
+
+    fn observe_record(
+        &self,
+        resource: ResourceKind,
+        identity_digest: String,
+        fingerprint: String,
+    ) -> Result<ReplayKey, RampSpendOutcomeError> {
+        let registry = REPLAY_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut registry = registry
+            .lock()
+            .map_err(|_| RampSpendOutcomeError::TransportPoisoned)?;
+        let state = registry
+            .get_mut(&self.scope_digest)
+            .ok_or(RampSpendOutcomeError::ReplayDetected)?;
+        let key = ReplayKey {
+            resource,
+            identity_digest,
+        };
+        if !state.records.contains_key(&key) && state.records.len() >= crate::MAX_REPLAY_IDENTITIES
+        {
+            return Err(RampSpendOutcomeError::BoundExceeded {
+                field: "replay identities",
+                maximum: crate::MAX_REPLAY_IDENTITIES,
+            });
+        }
+        if state.records.insert(key.clone(), fingerprint).is_some() {
+            return Err(RampSpendOutcomeError::ReplayDetected);
+        }
+        Ok(key)
+    }
+
+    fn observe_receipt(&self, receipt_digest: String) -> Result<(), RampSpendOutcomeError> {
+        let registry = REPLAY_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut registry = registry
+            .lock()
+            .map_err(|_| RampSpendOutcomeError::TransportPoisoned)?;
+        let state = registry
+            .get_mut(&self.scope_digest)
+            .ok_or(RampSpendOutcomeError::ReplayDetected)?;
+        if !state.receipts.contains(&receipt_digest)
+            && state.receipts.len() >= crate::MAX_REPLAY_RECEIPTS
+        {
+            return Err(RampSpendOutcomeError::BoundExceeded {
+                field: "replay receipts",
+                maximum: crate::MAX_REPLAY_RECEIPTS,
+            });
+        }
+        if !state.receipts.insert(receipt_digest) {
+            return Err(RampSpendOutcomeError::ReplayDetected);
+        }
+        Ok(())
+    }
+
+    fn rollback_records(&self, keys: &[ReplayKey]) {
+        let Some(registry) = REPLAY_REGISTRY.get() else {
+            return;
+        };
+        let Ok(mut registry) = registry.lock() else {
+            return;
+        };
+        if let Some(state) = registry.get_mut(&self.scope_digest) {
+            for key in keys {
+                state.records.remove(key);
+            }
+        }
+    }
 }
 
 impl<T> fmt::Debug for RampProvider<T>
@@ -51,7 +190,7 @@ where
             .field("secret_reference", &self.secret_reference)
             .field("retry_policy", &self.retry_policy)
             .field("registration", &"<redacted-registration>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -81,6 +220,7 @@ where
             provider_revision,
             registration_revision,
         )?;
+        let replay_lease = ReplayLease::acquire(scope.digest())?;
         Ok(Self {
             transport,
             definition,
@@ -88,6 +228,7 @@ where
             secret_reference,
             retry_policy: RetryPolicy::default(),
             registration: Arc::new(Mutex::new(registration)),
+            replay_lease,
         })
     }
 
@@ -136,6 +277,7 @@ where
                 "verify_evidence".to_owned(),
             ],
             transport: self.provenance(),
+            replay_fence_durability: ReplayFenceDurability::ProcessSharedNonDurable,
         }
     }
 
@@ -158,15 +300,35 @@ where
         &self,
         window: DateWindow,
     ) -> Result<SpendEvidence, RampSpendOutcomeError> {
+        let mut observed_records = Vec::new();
+        let result = self.read_evidence_inner(window, &mut observed_records);
+        if result.is_err() {
+            self.replay_lease.rollback_records(&observed_records);
+        }
+        result
+    }
+
+    fn read_evidence_inner(
+        &self,
+        window: DateWindow,
+        observed_records: &mut Vec<ReplayKey>,
+    ) -> Result<SpendEvidence, RampSpendOutcomeError> {
         let registration = self.active_registration()?;
         window.validate()?;
         if window != self.scope.date_window {
             return Err(RampSpendOutcomeError::DateWindowMismatch);
         }
 
-        let transactions = self.read_endpoint(ReadOperation::ReadTransactions)?;
-        let merchants = self.read_endpoint(ReadOperation::ReadMerchants)?;
-        let audit_events = self.read_endpoint(ReadOperation::ReadAuditLogs)?;
+        let mut budget = ReadBudget::default();
+        let transactions = self.read_endpoint(
+            ReadOperation::ReadTransactions,
+            &mut budget,
+            observed_records,
+        )?;
+        let merchants =
+            self.read_endpoint(ReadOperation::ReadMerchants, &mut budget, observed_records)?;
+        let audit_events =
+            self.read_endpoint(ReadOperation::ReadAuditLogs, &mut budget, observed_records)?;
 
         let page_count =
             transactions.pages.len() + merchants.pages.len() + audit_events.pages.len();
@@ -220,12 +382,54 @@ where
             .map(|item| self.normalize_audit_event(item, &window))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let spend_total_minor = transactions
+            .pages
+            .iter()
+            .flat_map(|page| page.transactions.iter())
+            .try_fold(0_i64, |total, item| {
+                let amount = item
+                    .amount_minor()
+                    .ok_or(RampSpendOutcomeError::PartialEvidence)?;
+                total
+                    .checked_add(amount)
+                    .ok_or(RampSpendOutcomeError::ContradictoryEvidence)
+            })?;
+        let mut currency_codes = BTreeSet::new();
+        for transaction in &transaction_evidence {
+            currency_codes.insert(transaction.currency_code.clone());
+        }
+        if currency_codes.len() > 1 {
+            return Err(RampSpendOutcomeError::ContradictoryEvidence);
+        }
+        if !transaction_evidence.is_empty() && currency_codes.contains(&None) {
+            return Err(RampSpendOutcomeError::PartialEvidence);
+        }
+        let currency_code = currency_codes.into_iter().flatten().next();
+        let category_id_digests = transaction_evidence
+            .iter()
+            .filter_map(|item| item.category_id_digest.clone())
+            .collect::<Vec<_>>();
+        let category_name_digests = transaction_evidence
+            .iter()
+            .filter_map(|item| item.category_name_digest.clone())
+            .chain(
+                merchant_evidence
+                    .iter()
+                    .filter_map(|item| item.category_name_digest.clone()),
+            )
+            .collect::<Vec<_>>();
+
         self.require_exact_bindings(&transaction_evidence, &merchant_evidence, &audit_evidence)?;
         SpendEvidence::new(
             self.scope.digest(),
             registration.registration_digest,
             self.definition.provider_digest(),
             self.definition.contract_digest.clone(),
+            &self.scope.spend_constraints,
+            currency_code,
+            category_id_digests,
+            category_name_digests,
+            spend_total_minor,
             transaction_evidence,
             merchant_evidence,
             audit_evidence,
@@ -242,6 +446,7 @@ where
         evidence: &SpendEvidence,
     ) -> Result<OutcomeProposal, RampSpendOutcomeError> {
         let registration = self.active_registration()?;
+        evidence.validate_against_scope(&self.scope)?;
         if evidence.registration_digest != registration.registration_digest
             || evidence.provider_digest != self.definition.provider_digest()
             || evidence.contract_digest != self.definition.contract_digest
@@ -256,18 +461,24 @@ where
         evidence: &SpendEvidence,
     ) -> Result<EvidenceReceipt, RampSpendOutcomeError> {
         let registration = self.active_registration()?;
+        evidence.validate_against_scope(&self.scope)?;
         if evidence.registration_digest != registration.registration_digest {
             return Err(RampSpendOutcomeError::RegistrationMismatch);
         }
-        EvidenceReceipt::from_evidence(evidence)
+        let receipt = EvidenceReceipt::from_evidence(evidence)?;
+        self.replay_lease
+            .observe_receipt(receipt.receipt_digest.clone())?;
+        Ok(receipt)
     }
 
     pub fn verify_evidence(
         &self,
         receipt: &EvidenceReceipt,
+        evidence: &SpendEvidence,
     ) -> Result<EvidenceVerification, RampSpendOutcomeError> {
         let registration = self.active_registration()?;
-        receipt.validate()?;
+        evidence.validate_against_scope(&self.scope)?;
+        receipt.validate_against(evidence)?;
         if receipt.scope_digest != self.scope.digest()
             || receipt.registration_digest != registration.registration_digest
             || receipt.provider_digest != self.definition.provider_digest()
@@ -279,11 +490,19 @@ where
             receipt_digest: receipt.receipt_digest.clone(),
             evidence_digest: receipt.evidence_digest.clone(),
             registration_digest: registration.registration_digest,
+            scope_digest: evidence.scope_digest.clone(),
+            provider_digest: evidence.provider_digest.clone(),
+            contract_digest: evidence.contract_digest.clone(),
+            evidence_status: evidence.status,
+            provenance: evidence.provenance,
+            independent_state_valid: true,
             verified: true,
             native: false,
             connected: false,
             adoptable: false,
-        })
+            verification_digest: String::new(),
+        }
+        .seal())
     }
 
     fn active_registration(&self) -> Result<RegistrationReceipt, RampSpendOutcomeError> {
@@ -302,6 +521,8 @@ where
     fn read_endpoint(
         &self,
         operation: ReadOperation,
+        budget: &mut ReadBudget,
+        observed_records: &mut Vec<ReplayKey>,
     ) -> Result<EndpointRead, RampSpendOutcomeError> {
         let endpoint = operation.endpoint();
         self.scope.permissions.require(endpoint.required_scope())?;
@@ -325,6 +546,28 @@ where
                 return Err(RampSpendOutcomeError::ScopeMismatch);
             }
             page.validate()?;
+            budget.consume(&page)?;
+            for item in &page.transactions {
+                observed_records.push(self.replay_lease.observe_record(
+                    ResourceKind::Transaction,
+                    sha256_digest(item.id().as_bytes()),
+                    item.fingerprint_digest(),
+                )?);
+            }
+            for item in &page.merchants {
+                observed_records.push(self.replay_lease.observe_record(
+                    ResourceKind::VendorMerchant,
+                    sha256_digest(item.id().as_bytes()),
+                    item.fingerprint_digest(),
+                )?);
+            }
+            for item in &page.audit_events {
+                observed_records.push(self.replay_lease.observe_record(
+                    ResourceKind::AuditEvent,
+                    sha256_digest(item.id().as_bytes()),
+                    item.fingerprint_digest(),
+                )?);
+            }
             if let Some(previous) = &high_water_mark
                 && page.high_water_mark != *previous
             {
@@ -418,6 +661,21 @@ where
         }
         let (amount_bucket, amount_digest, currency_code) =
             amount_evidence(item.amount_minor(), item.currency_code())?;
+        if let Some(expected_currency) = &self.scope.spend_constraints.currency_code
+            && currency_code.as_deref() != Some(expected_currency.as_str())
+        {
+            return Err(RampSpendOutcomeError::ContradictoryEvidence);
+        }
+        if let Some(expected_category_id) = &self.scope.spend_constraints.category_id
+            && item.category_id() != Some(expected_category_id.as_str())
+        {
+            return Err(RampSpendOutcomeError::ContradictoryEvidence);
+        }
+        if let Some(expected_category_name) = &self.scope.spend_constraints.category_name
+            && item.category_name() != Some(expected_category_name.as_str())
+        {
+            return Err(RampSpendOutcomeError::ContradictoryEvidence);
+        }
         let refund_state = refund_state(state, item.amount_minor(), item.refund_state());
         if refund_state == crate::RefundState::ProviderUnknown {
             return Err(RampSpendOutcomeError::ProviderUnknown);
@@ -451,6 +709,11 @@ where
             && expected.raw() != item.id()
         {
             return Err(RampSpendOutcomeError::ScopeMismatch);
+        }
+        if let Some(expected_category_name) = &self.scope.spend_constraints.category_name
+            && item.category_name() != Some(expected_category_name.as_str())
+        {
+            return Err(RampSpendOutcomeError::ContradictoryEvidence);
         }
         Ok(MerchantEvidence {
             merchant_id_digest: sha256_digest(item.id().as_bytes()),
