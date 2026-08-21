@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AppStoreConnectScope, Digest};
+use crate::model::{AppStoreConnectScope, Digest, Identifier};
 use crate::provider::{AppStoreConnectResultProjection, ProjectionCompleteness, ProjectionStatus};
 use crate::service::AppStoreConnectRegistration;
 use crate::{
@@ -12,7 +12,7 @@ use crate::{
     contract_digest,
 };
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MobileReleaseEvidenceProposal {
     pub contract_version: String,
@@ -49,6 +49,94 @@ pub struct MobileReleaseEvidenceProposal {
     pub outcome_adopted: bool,
     pub work_product_adopted: bool,
     pub proposal_digest: Digest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MobileReleaseEvidenceProposalWire {
+    contract_version: String,
+    contract_digest: Digest,
+    consumer_id: String,
+    consumer_version: String,
+    registration_digest: Digest,
+    scope_digest: Digest,
+    project_id: String,
+    project_revision: u64,
+    mission_id: String,
+    mission_revision: u64,
+    work_product_id: String,
+    work_product_revision: u64,
+    team_id: String,
+    app_id: String,
+    bundle_id: String,
+    platform: crate::Platform,
+    pre_release_version_id: String,
+    build_id: String,
+    app_store_version_id: String,
+    beta_group_id: Option<String>,
+    review_id: Option<String>,
+    release_id: String,
+    artifact_digest: Digest,
+    result_digest: Digest,
+    status: ProjectionStatus,
+    completeness: ProjectionCompleteness,
+    provenance: crate::TransportProvenance,
+    idempotency_key_digest: Digest,
+    review_only: bool,
+    connected: bool,
+    native: bool,
+    outcome_adopted: bool,
+    work_product_adopted: bool,
+    proposal_digest: Digest,
+}
+
+impl<'de> Deserialize<'de> for MobileReleaseEvidenceProposal {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = MobileReleaseEvidenceProposalWire::deserialize(deserializer)?;
+        let proposal = Self {
+            contract_version: value.contract_version,
+            contract_digest: value.contract_digest,
+            consumer_id: value.consumer_id,
+            consumer_version: value.consumer_version,
+            registration_digest: value.registration_digest,
+            scope_digest: value.scope_digest,
+            project_id: value.project_id,
+            project_revision: value.project_revision,
+            mission_id: value.mission_id,
+            mission_revision: value.mission_revision,
+            work_product_id: value.work_product_id,
+            work_product_revision: value.work_product_revision,
+            team_id: value.team_id,
+            app_id: value.app_id,
+            bundle_id: value.bundle_id,
+            platform: value.platform,
+            pre_release_version_id: value.pre_release_version_id,
+            build_id: value.build_id,
+            app_store_version_id: value.app_store_version_id,
+            beta_group_id: value.beta_group_id,
+            review_id: value.review_id,
+            release_id: value.release_id,
+            artifact_digest: value.artifact_digest,
+            result_digest: value.result_digest,
+            status: value.status,
+            completeness: value.completeness,
+            provenance: value.provenance,
+            idempotency_key_digest: value.idempotency_key_digest,
+            review_only: value.review_only,
+            connected: value.connected,
+            native: value.native,
+            outcome_adopted: value.outcome_adopted,
+            work_product_adopted: value.work_product_adopted,
+            proposal_digest: value.proposal_digest,
+        };
+        proposal
+            .validate()
+            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        Ok(proposal)
+    }
 }
 
 impl MobileReleaseEvidenceProposal {
@@ -109,9 +197,36 @@ impl MobileReleaseEvidenceProposal {
             || self.native
             || self.outcome_adopted
             || self.work_product_adopted
+            || self.project_revision == 0
+            || self.mission_revision == 0
+            || self.work_product_revision == 0
             || self.proposal_digest != self.calculate_digest()
         {
             return Err(AppStoreConnectReleaseResultError::InvalidProposal);
+        }
+        for (value, field) in [
+            (&self.project_id, "Project id"),
+            (&self.mission_id, "Mission id"),
+            (&self.work_product_id, "Work Product id"),
+            (&self.team_id, "team id"),
+            (&self.app_id, "app id"),
+            (&self.bundle_id, "bundle id"),
+            (&self.pre_release_version_id, "pre-release version id"),
+            (&self.build_id, "build id"),
+            (&self.app_store_version_id, "app-store-version id"),
+            (&self.release_id, "release id"),
+        ] {
+            crate::validate_identifier(value, field)
+                .map_err(|_| AppStoreConnectReleaseResultError::InvalidProposal)?;
+        }
+        for (value, field) in [
+            (&self.beta_group_id, "beta group id"),
+            (&self.review_id, "review id"),
+        ] {
+            if let Some(value) = value {
+                crate::validate_identifier(value, field)
+                    .map_err(|_| AppStoreConnectReleaseResultError::InvalidProposal)?;
+            }
         }
         self.contract_digest.validate()?;
         self.registration_digest.validate()?;
@@ -147,8 +262,20 @@ impl MobileReleaseEvidenceProposal {
                 ),
                 ("scope".to_owned(), self.scope_digest.to_string()),
                 ("project".to_owned(), self.project_id.clone()),
+                (
+                    "project_revision".to_owned(),
+                    self.project_revision.to_string(),
+                ),
                 ("mission".to_owned(), self.mission_id.clone()),
+                (
+                    "mission_revision".to_owned(),
+                    self.mission_revision.to_string(),
+                ),
                 ("work_product".to_owned(), self.work_product_id.clone()),
+                (
+                    "work_product_revision".to_owned(),
+                    self.work_product_revision.to_string(),
+                ),
                 ("team".to_owned(), self.team_id.clone()),
                 ("app".to_owned(), self.app_id.clone()),
                 ("bundle".to_owned(), self.bundle_id.clone()),
@@ -185,6 +312,26 @@ impl MobileReleaseEvidenceProposal {
                 ),
             ],
         )
+    }
+
+    fn matches_scope(&self, scope: &AppStoreConnectScope) -> bool {
+        self.project_id == scope.project.id.as_str()
+            && self.project_revision == scope.project.revision
+            && self.mission_id == scope.mission.id.as_str()
+            && self.mission_revision == scope.mission.revision
+            && self.work_product_id == scope.work_product.id.as_str()
+            && self.work_product_revision == scope.work_product.revision
+            && self.team_id == scope.team.id.as_str()
+            && self.app_id == scope.app.id.as_str()
+            && self.bundle_id == scope.app.bundle_id.as_str()
+            && self.platform == scope.platform
+            && self.pre_release_version_id == scope.pre_release_version.id.as_str()
+            && self.build_id == scope.build.id.as_str()
+            && self.app_store_version_id == scope.app_store_version.id.as_str()
+            && self.beta_group_id.as_deref() == scope.beta_group.id.as_ref().map(Identifier::as_str)
+            && self.review_id.as_deref() == scope.review.id.as_ref().map(Identifier::as_str)
+            && self.release_id == scope.release.id.as_str()
+            && self.artifact_digest == scope.artifact.digest
     }
 }
 
@@ -347,6 +494,7 @@ impl MissionMobileReleaseConsumer {
         proposal.validate()?;
         if proposal.registration_digest != self.registration_digest
             || proposal.scope_digest != self.scope.digest()
+            || !proposal.matches_scope(&self.scope)
         {
             return Err(AppStoreConnectReleaseResultError::ScopeMismatch);
         }
@@ -374,6 +522,7 @@ impl MissionMobileReleaseConsumer {
             && projection.scope_digest == self.scope.digest()
             && proposal.registration_digest == self.registration_digest
             && proposal.scope_digest == self.scope.digest()
+            && proposal.matches_scope(&self.scope)
             && proposal.result_digest == projection.evidence_digest
             && !projection.connected
             && !projection.native

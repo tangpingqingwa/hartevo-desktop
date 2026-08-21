@@ -1,16 +1,17 @@
 use hartevo_appstoreconnect_release_result_plugin::{
     AppPayload, AppScope, AppStoreConnectEndpoint, AppStoreConnectHttpRequest,
-    AppStoreConnectProvider, AppStoreConnectProviderState, AppStoreConnectReleaseResultError,
-    AppStoreConnectReleaseService, AppStoreConnectResponseBody, AppStoreConnectScope,
-    AppStoreConnectTransportError, AppStoreState, AppStoreVersionPayload, AppStoreVersionScope,
-    ArtifactScope, BetaAppReviewSubmissionPayload, BetaGroupPayload, BetaGroupScope,
-    BetaReviewState, BuildPayload, BuildProcessingState, BuildScope, Digest,
-    FixtureAppStoreConnectTransport, JwtRedaction, LinkagePayload,
-    LoopbackAppStoreConnectTransport, MissionMobileReleaseConsumer, MissionScope, Page, PageToken,
-    PermissionSnapshot, Platform, PreReleaseVersionPayload, PreReleaseVersionScope, ProjectScope,
-    ProjectionStatus, RecordingAppStoreConnectTransport, ReleaseScope, ReleaseState, ReviewScope,
-    ReviewState, ReviewSubmissionPayload, SecretReference, TeamScope, TransportProvenance,
-    WorkProductScope, validate_contract_document,
+    AppStoreConnectHttpResponse, AppStoreConnectProvider, AppStoreConnectProviderState,
+    AppStoreConnectReleaseResultError, AppStoreConnectReleaseService, AppStoreConnectResponseBody,
+    AppStoreConnectScope, AppStoreConnectTransport, AppStoreConnectTransportError, AppStoreState,
+    AppStoreVersionPayload, AppStoreVersionScope, ArtifactScope, BetaAppReviewSubmissionPayload,
+    BetaGroupPayload, BetaGroupScope, BetaReviewState, BuildPayload, BuildProcessingState,
+    BuildScope, Digest, FixtureAppStoreConnectTransport, JwtRedaction, LinkagePayload,
+    LoopbackAppStoreConnectTransport, MAX_PAGES, MAX_RELATIONSHIP_DEPTH, MAX_RELATIONSHIPS,
+    MissionMobileReleaseConsumer, MissionScope, Page, PageToken, PermissionSnapshot, Platform,
+    PreReleaseVersionPayload, PreReleaseVersionScope, ProjectScope, ProjectionStatus,
+    RecordingAppStoreConnectTransport, ReleaseScope, ReleaseState, ReviewScope, ReviewState,
+    ReviewSubmissionPayload, SecretReference, TeamScope, TransportProvenance, WorkProductScope,
+    validate_contract_document,
 };
 
 const ORIGIN: &str = "https://api.appstoreconnect.apple.com";
@@ -349,6 +350,75 @@ fn recording_provider() -> AppStoreConnectProvider<RecordingAppStoreConnectTrans
     ))
     .expect("recording transport");
     AppStoreConnectProvider::new(registration, transport).expect("provider")
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResponseTamper {
+    Path,
+    Authorization,
+    ResponseBytes,
+    ResponseDigest,
+    BodyDigest,
+    RedactionDigest,
+}
+
+#[derive(Clone, Debug)]
+struct TamperedResponseTransport {
+    tamper: ResponseTamper,
+}
+
+impl AppStoreConnectTransport for TamperedResponseTransport {
+    fn provenance(&self) -> TransportProvenance {
+        TransportProvenance::Recording
+    }
+
+    fn get(
+        &mut self,
+        request: &AppStoreConnectHttpRequest,
+    ) -> Result<AppStoreConnectHttpResponse, AppStoreConnectTransportError> {
+        let mut response = AppStoreConnectHttpResponse::from_body(
+            request,
+            AppStoreConnectResponseBody::App(AppPayload {
+                id: APP_ID.to_owned(),
+                team_id: "team-1".to_owned(),
+                bundle_id: BUNDLE_ID.to_owned(),
+                revision: 3,
+                removed: false,
+            }),
+            TransportProvenance::Recording,
+        )?;
+        match self.tamper {
+            ResponseTamper::Path => {
+                response.receipt.request_path_and_query = String::from("tampered-path");
+            }
+            ResponseTamper::Authorization => {
+                response.receipt.authorization =
+                    JwtRedaction::from_es256("other-key", "other-issuer", "other-jwt")
+                        .expect("alternate authorization");
+            }
+            ResponseTamper::ResponseBytes => {
+                response.receipt.response_bytes += 1;
+            }
+            ResponseTamper::ResponseDigest => {
+                response.receipt.response_digest =
+                    Digest::from_text("tampered-response").expect("digest");
+            }
+            ResponseTamper::BodyDigest => {
+                response.body = Some(AppStoreConnectResponseBody::App(AppPayload {
+                    id: APP_ID.to_owned(),
+                    team_id: "team-1".to_owned(),
+                    bundle_id: BUNDLE_ID.to_owned(),
+                    revision: 999,
+                    removed: false,
+                }));
+            }
+            ResponseTamper::RedactionDigest => {
+                response.receipt.redaction_digest =
+                    Digest::from_text("tampered-redaction").expect("digest");
+            }
+        }
+        Ok(response)
+    }
 }
 
 #[test]
@@ -937,4 +1007,308 @@ fn request_is_get_only_and_endpoint_paths_are_official_shapes() {
             .expect("request serialization")
             .contains("PRIVATE")
     );
+}
+
+fn reseal_proposal(
+    proposal: &mut hartevo_appstoreconnect_release_result_plugin::MobileReleaseEvidenceProposal,
+) {
+    proposal.proposal_digest = Digest::from_parts(
+        "appstoreconnect-release-result/proposal/v1",
+        [
+            ("contract".to_owned(), proposal.contract_version.clone()),
+            (
+                "contract_digest".to_owned(),
+                proposal.contract_digest.to_string(),
+            ),
+            ("consumer".to_owned(), proposal.consumer_id.clone()),
+            (
+                "consumer_version".to_owned(),
+                proposal.consumer_version.clone(),
+            ),
+            (
+                "registration".to_owned(),
+                proposal.registration_digest.to_string(),
+            ),
+            ("scope".to_owned(), proposal.scope_digest.to_string()),
+            ("project".to_owned(), proposal.project_id.clone()),
+            (
+                "project_revision".to_owned(),
+                proposal.project_revision.to_string(),
+            ),
+            ("mission".to_owned(), proposal.mission_id.clone()),
+            (
+                "mission_revision".to_owned(),
+                proposal.mission_revision.to_string(),
+            ),
+            ("work_product".to_owned(), proposal.work_product_id.clone()),
+            (
+                "work_product_revision".to_owned(),
+                proposal.work_product_revision.to_string(),
+            ),
+            ("team".to_owned(), proposal.team_id.clone()),
+            ("app".to_owned(), proposal.app_id.clone()),
+            ("bundle".to_owned(), proposal.bundle_id.clone()),
+            ("platform".to_owned(), proposal.platform.as_str().to_owned()),
+            (
+                "pre_release_version".to_owned(),
+                proposal.pre_release_version_id.clone(),
+            ),
+            ("build".to_owned(), proposal.build_id.clone()),
+            (
+                "app_store_version".to_owned(),
+                proposal.app_store_version_id.clone(),
+            ),
+            (
+                "beta_group".to_owned(),
+                proposal.beta_group_id.clone().unwrap_or_default(),
+            ),
+            (
+                "review".to_owned(),
+                proposal.review_id.clone().unwrap_or_default(),
+            ),
+            ("release".to_owned(), proposal.release_id.clone()),
+            ("artifact".to_owned(), proposal.artifact_digest.to_string()),
+            ("result".to_owned(), proposal.result_digest.to_string()),
+            ("status".to_owned(), proposal.status.as_str().to_owned()),
+            (
+                "completeness".to_owned(),
+                format!("{:?}", proposal.completeness),
+            ),
+            (
+                "provenance".to_owned(),
+                proposal.provenance.as_str().to_owned(),
+            ),
+            (
+                "idempotency".to_owned(),
+                proposal.idempotency_key_digest.to_string(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn proposal_revisions_are_digest_bound_and_resealed_scope_drift_fails_closed() {
+    let mut provider = recording_provider();
+    let projection = provider.read_result().expect("projection");
+    let consumer = MissionMobileReleaseConsumer::new(provider.registration()).expect("consumer");
+    let proposal = consumer
+        .compile_proposal(&projection, "revision-binding")
+        .expect("proposal");
+    assert_eq!(proposal.project_revision, scope().project.revision);
+    assert_eq!(proposal.mission_revision, scope().mission.revision);
+    assert_eq!(
+        proposal.work_product_revision,
+        scope().work_product.revision
+    );
+
+    let mut log =
+        hartevo_appstoreconnect_release_result_plugin::MobileReleaseRecordingLog::default();
+    let mut stale_json = serde_json::to_value(&proposal).expect("proposal JSON");
+    stale_json["projectRevision"] = serde_json::json!(proposal.project_revision - 1);
+    assert!(
+        serde_json::from_value::<
+            hartevo_appstoreconnect_release_result_plugin::MobileReleaseEvidenceProposal,
+        >(stale_json)
+        .is_err()
+    );
+
+    let mut zero_json = serde_json::to_value(&proposal).expect("proposal JSON");
+    zero_json["missionRevision"] = serde_json::json!(0);
+    assert!(
+        serde_json::from_value::<
+            hartevo_appstoreconnect_release_result_plugin::MobileReleaseEvidenceProposal,
+        >(zero_json)
+        .is_err()
+    );
+
+    let mut resealed = proposal.clone();
+    resealed.work_product_revision += 1;
+    reseal_proposal(&mut resealed);
+    let resealed: hartevo_appstoreconnect_release_result_plugin::MobileReleaseEvidenceProposal =
+        serde_json::from_value(serde_json::to_value(resealed).expect("resealed JSON"))
+            .expect("resealed proposal");
+    assert_eq!(
+        consumer
+            .record(&resealed, &mut log)
+            .expect_err("resealed scope drift"),
+        AppStoreConnectReleaseResultError::ScopeMismatch
+    );
+    assert!(
+        !consumer
+            .verify(&projection, &resealed)
+            .expect("resealed verification")
+    );
+}
+
+#[test]
+fn deserialized_read_request_bounds_are_canonical_and_provider_validates_ingress() {
+    let request =
+        hartevo_appstoreconnect_release_result_plugin::AppStoreConnectReadRequest::new(scope())
+            .expect("request");
+    let mut pages_json = serde_json::to_value(&request).expect("request JSON");
+    pages_json["maxPages"] = serde_json::json!(MAX_PAGES + 1);
+    assert!(
+        serde_json::from_value::<
+            hartevo_appstoreconnect_release_result_plugin::AppStoreConnectReadRequest,
+        >(pages_json)
+        .is_err()
+    );
+
+    let mut depth_json = serde_json::to_value(&request).expect("request JSON");
+    depth_json["maxRelationshipDepth"] = serde_json::json!(MAX_RELATIONSHIP_DEPTH + 1);
+    assert!(
+        serde_json::from_value::<
+            hartevo_appstoreconnect_release_result_plugin::AppStoreConnectReadRequest,
+        >(depth_json)
+        .is_err()
+    );
+
+    let mut provider = recording_provider();
+    let mut caller_request = request;
+    caller_request.max_pages = MAX_PAGES + 1;
+    assert_eq!(
+        provider
+            .read_release_result(&caller_request)
+            .expect_err("caller-carried page bound"),
+        AppStoreConnectReleaseResultError::PaginationLimit
+    );
+}
+
+#[test]
+fn relationship_vectors_are_bounded_at_construction_serde_and_fixture_replay() {
+    let oversized_build_ids = (0..=MAX_RELATIONSHIPS)
+        .map(|index| format!("build-{index}"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        BetaGroupPayload::new(BETA_GROUP_ID, APP_ID, oversized_build_ids.clone(), 1, false,)
+            .expect_err("oversized beta-group relationship"),
+        AppStoreConnectReleaseResultError::PaginationLimit
+    );
+
+    let beta_json = serde_json::to_value(BetaGroupPayload {
+        id: BETA_GROUP_ID.to_owned(),
+        app_id: APP_ID.to_owned(),
+        build_ids: oversized_build_ids,
+        revision: 1,
+        removed: false,
+    })
+    .expect("beta JSON");
+    assert!(serde_json::from_value::<BetaGroupPayload>(beta_json).is_err());
+
+    let oversized_links = (0..=MAX_RELATIONSHIPS)
+        .map(
+            |index| hartevo_appstoreconnect_release_result_plugin::RelationshipLink {
+                resource_type: "builds".to_owned(),
+                resource_id: format!("build-{index}"),
+            },
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(
+        hartevo_appstoreconnect_release_result_plugin::RelationshipPayload::new(
+            "builds",
+            BUILD_ID,
+            "preReleaseVersion",
+            oversized_links.clone(),
+            None,
+        )
+        .expect_err("oversized relationship links"),
+        AppStoreConnectReleaseResultError::PaginationLimit
+    );
+
+    let relationship_json = serde_json::to_value(
+        hartevo_appstoreconnect_release_result_plugin::RelationshipPayload {
+            source_type: "builds".to_owned(),
+            source_id: BUILD_ID.to_owned(),
+            relationship: "preReleaseVersion".to_owned(),
+            links: oversized_links.clone(),
+            next: None,
+        },
+    )
+    .expect("relationship JSON");
+    assert!(serde_json::from_value::<
+        hartevo_appstoreconnect_release_result_plugin::RelationshipPayload,
+    >(relationship_json)
+    .is_err());
+
+    let mut fixture = FixtureAppStoreConnectTransport::empty();
+    assert_eq!(
+        fixture
+            .insert(
+                AppStoreConnectEndpoint::BuildPreReleaseVersion {
+                    origin: ORIGIN.to_owned(),
+                    build_id: BUILD_ID.to_owned(),
+                },
+                AppStoreConnectResponseBody::Relationships(
+                    hartevo_appstoreconnect_release_result_plugin::RelationshipPayload {
+                        source_type: "builds".to_owned(),
+                        source_id: BUILD_ID.to_owned(),
+                        relationship: "preReleaseVersion".to_owned(),
+                        links: oversized_links,
+                        next: None,
+                    },
+                ),
+            )
+            .expect_err("oversized replay body"),
+        AppStoreConnectTransportError::MalformedResponse
+    );
+}
+
+#[test]
+fn provider_transport_ingress_rejects_caller_carried_request_and_receipt_mismatches() {
+    let registration = registration();
+    let mut request = AppStoreConnectHttpRequest::new(
+        AppStoreConnectEndpoint::App {
+            origin: ORIGIN.to_owned(),
+            app_id: APP_ID.to_owned(),
+        },
+        1_048_576,
+        JwtRedaction::for_secret_reference(&registration.secret_reference),
+    )
+    .expect("request");
+    request.endpoint = AppStoreConnectEndpoint::Build {
+        origin: ORIGIN.to_owned(),
+        build_id: BUILD_ID.to_owned(),
+    };
+    assert_eq!(
+        request.validate().expect_err("caller-carried path"),
+        AppStoreConnectTransportError::InvalidRequest
+    );
+
+    let mut authorization_request = AppStoreConnectHttpRequest::new(
+        AppStoreConnectEndpoint::App {
+            origin: ORIGIN.to_owned(),
+            app_id: APP_ID.to_owned(),
+        },
+        1_048_576,
+        JwtRedaction::for_secret_reference(&registration.secret_reference),
+    )
+    .expect("request");
+    authorization_request.authorization =
+        JwtRedaction::from_es256("other-key", "other-issuer", "other-jwt")
+            .expect("alternate authorization");
+    assert_eq!(
+        authorization_request
+            .validate()
+            .expect_err("caller-carried authorization"),
+        AppStoreConnectTransportError::InvalidRequest
+    );
+
+    for tamper in [
+        ResponseTamper::Path,
+        ResponseTamper::Authorization,
+        ResponseTamper::ResponseBytes,
+        ResponseTamper::ResponseDigest,
+        ResponseTamper::BodyDigest,
+        ResponseTamper::RedactionDigest,
+    ] {
+        let mut provider = AppStoreConnectProvider::new(
+            registration.clone(),
+            TamperedResponseTransport { tamper },
+        )
+        .expect("tampered provider");
+        assert_eq!(
+            provider.read_result().expect_err("tampered response"),
+            AppStoreConnectReleaseResultError::TamperedEvidence
+        );
+    }
 }

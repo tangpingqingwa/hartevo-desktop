@@ -4,7 +4,7 @@
 
 use std::{fmt, str::FromStr};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as _};
 
 use crate::{
     AppStoreConnectReleaseResultError, MAX_IDENTIFIER_BYTES, MAX_ITEMS_PER_PAGE, MAX_RELATIONSHIPS,
@@ -930,7 +930,7 @@ pub struct AppStoreVersionPayload {
     pub removed: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BetaGroupPayload {
     pub id: String,
@@ -938,6 +938,68 @@ pub struct BetaGroupPayload {
     pub build_ids: Vec<String>,
     pub revision: u64,
     pub removed: bool,
+}
+
+impl BetaGroupPayload {
+    pub fn new(
+        id: impl Into<String>,
+        app_id: impl Into<String>,
+        build_ids: Vec<String>,
+        revision: u64,
+        removed: bool,
+    ) -> Result<Self> {
+        let value = Self {
+            id: id.into(),
+            app_id: app_id.into(),
+            build_ids,
+            revision,
+            removed,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_payload_identifier(&self.id, "beta group id")?;
+        validate_payload_identifier(&self.app_id, "beta group app id")?;
+        if self.build_ids.len() > MAX_RELATIONSHIPS {
+            return Err(AppStoreConnectReleaseResultError::PaginationLimit);
+        }
+        for build_id in &self.build_ids {
+            validate_payload_identifier(build_id, "beta group build id")?;
+        }
+        if self.revision == 0 {
+            return Err(AppStoreConnectReleaseResultError::MalformedProviderData);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BetaGroupPayloadWire {
+    id: String,
+    app_id: String,
+    build_ids: Vec<String>,
+    revision: u64,
+    removed: bool,
+}
+
+impl<'de> Deserialize<'de> for BetaGroupPayload {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = BetaGroupPayloadWire::deserialize(deserializer)?;
+        Self::new(
+            value.id,
+            value.app_id,
+            value.build_ids,
+            value.revision,
+            value.removed,
+        )
+        .map_err(|error| D::Error::custom(error.to_string()))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -983,7 +1045,7 @@ pub struct RelationshipLink {
     pub resource_id: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RelationshipPayload {
     pub source_type: String,
@@ -991,6 +1053,67 @@ pub struct RelationshipPayload {
     pub relationship: String,
     pub links: Vec<RelationshipLink>,
     pub next: Option<PageToken>,
+}
+
+impl RelationshipPayload {
+    pub fn new(
+        source_type: impl Into<String>,
+        source_id: impl Into<String>,
+        relationship: impl Into<String>,
+        links: Vec<RelationshipLink>,
+        next: Option<PageToken>,
+    ) -> Result<Self> {
+        let value = Self {
+            source_type: source_type.into(),
+            source_id: source_id.into(),
+            relationship: relationship.into(),
+            links,
+            next,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_identifier(&self.source_type, "relationship source type")?;
+        validate_identifier(&self.source_id, "relationship source id")?;
+        validate_identifier(&self.relationship, "relationship name")?;
+        if self.links.len() > MAX_RELATIONSHIPS {
+            return Err(AppStoreConnectReleaseResultError::PaginationLimit);
+        }
+        for link in &self.links {
+            validate_identifier(&link.resource_type, "relationship resource type")?;
+            validate_identifier(&link.resource_id, "relationship resource id")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RelationshipPayloadWire {
+    source_type: String,
+    source_id: String,
+    relationship: String,
+    links: Vec<RelationshipLink>,
+    next: Option<PageToken>,
+}
+
+impl<'de> Deserialize<'de> for RelationshipPayload {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = RelationshipPayloadWire::deserialize(deserializer)?;
+        Self::new(
+            value.source_type,
+            value.source_id,
+            value.relationship,
+            value.links,
+            value.next,
+        )
+        .map_err(|error| D::Error::custom(error.to_string()))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1030,6 +1153,32 @@ pub enum AppStoreConnectResponseBody {
 }
 
 impl AppStoreConnectResponseBody {
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Apps(page) => validate_collection_len(&page.items),
+            Self::PreReleaseVersions(page) => validate_collection_len(&page.items),
+            Self::Builds(page) => validate_collection_len(&page.items),
+            Self::AppStoreVersions(page) => validate_collection_len(&page.items),
+            Self::BetaGroups(page) => {
+                validate_collection_len(&page.items)?;
+                for value in &page.items {
+                    value.validate()?;
+                }
+                Ok(())
+            }
+            Self::ReviewSubmissions(page) => validate_collection_len(&page.items),
+            Self::BetaGroup(value) => value.validate(),
+            Self::Relationships(value) => value.validate(),
+            Self::App(_)
+            | Self::PreReleaseVersion(_)
+            | Self::Build(_)
+            | Self::AppStoreVersion(_)
+            | Self::BetaReviewSubmission(_)
+            | Self::ReviewSubmission(_)
+            | Self::Linkage(_) => Ok(()),
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Apps(_) => "apps",
@@ -1064,17 +1213,7 @@ pub(crate) fn validate_collection_len<T>(values: &[T]) -> Result<()> {
 }
 
 pub(crate) fn validate_relationships(value: &RelationshipPayload) -> Result<()> {
-    validate_identifier(&value.source_type, "relationship source type")?;
-    validate_identifier(&value.source_id, "relationship source id")?;
-    validate_identifier(&value.relationship, "relationship name")?;
-    if value.links.len() > MAX_RELATIONSHIPS {
-        return Err(AppStoreConnectReleaseResultError::PaginationLimit);
-    }
-    for link in &value.links {
-        validate_identifier(&link.resource_type, "relationship resource type")?;
-        validate_identifier(&link.resource_id, "relationship resource id")?;
-    }
-    Ok(())
+    value.validate()
 }
 
 pub(crate) fn validate_payload_identifier(value: &str, field: &'static str) -> Result<()> {

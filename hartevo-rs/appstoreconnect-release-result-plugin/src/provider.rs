@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as _};
 
 use crate::model::{
     AppPayload, AppStoreConnectResponseBody, AppStoreConnectScope, AppStoreState,
@@ -65,7 +65,7 @@ pub enum ProjectionCompleteness {
     Partial,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AppStoreConnectReadRequest {
     pub scope: AppStoreConnectScope,
@@ -76,13 +76,12 @@ pub struct AppStoreConnectReadRequest {
 
 impl AppStoreConnectReadRequest {
     pub fn new(scope: AppStoreConnectScope) -> Result<Self> {
-        scope.validate()?;
-        Ok(Self {
+        Self::with_bounds_and_relationship_depth(
             scope,
-            max_pages: MAX_PAGES,
-            max_response_bytes: MAX_RESPONSE_BYTES,
-            max_relationship_depth: MAX_RELATIONSHIP_DEPTH,
-        })
+            MAX_PAGES,
+            MAX_RESPONSE_BYTES,
+            MAX_RELATIONSHIP_DEPTH,
+        )
     }
 
     pub fn with_bounds(
@@ -105,18 +104,64 @@ impl AppStoreConnectReadRequest {
         max_relationship_depth: usize,
     ) -> Result<Self> {
         scope.validate()?;
-        if max_pages == 0 || max_pages > MAX_PAGES || max_relationship_depth == 0 {
+        if max_pages == 0
+            || max_pages > MAX_PAGES
+            || max_relationship_depth == 0
+            || max_relationship_depth > MAX_RELATIONSHIP_DEPTH
+        {
             return Err(AppStoreConnectReleaseResultError::PaginationLimit);
         }
         if max_response_bytes == 0 || max_response_bytes > MAX_RESPONSE_BYTES {
             return Err(AppStoreConnectReleaseResultError::ResponseTooLarge);
         }
-        Ok(Self {
+        let request = Self {
             scope,
             max_pages,
             max_response_bytes,
             max_relationship_depth,
-        })
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.scope.validate()?;
+        if self.max_pages == 0
+            || self.max_pages > MAX_PAGES
+            || self.max_relationship_depth == 0
+            || self.max_relationship_depth > MAX_RELATIONSHIP_DEPTH
+        {
+            return Err(AppStoreConnectReleaseResultError::PaginationLimit);
+        }
+        if self.max_response_bytes == 0 || self.max_response_bytes > MAX_RESPONSE_BYTES {
+            return Err(AppStoreConnectReleaseResultError::ResponseTooLarge);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AppStoreConnectReadRequestWire {
+    scope: AppStoreConnectScope,
+    max_pages: usize,
+    max_response_bytes: usize,
+    max_relationship_depth: usize,
+}
+
+impl<'de> Deserialize<'de> for AppStoreConnectReadRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = AppStoreConnectReadRequestWire::deserialize(deserializer)?;
+        Self::with_bounds_and_relationship_depth(
+            value.scope,
+            value.max_pages,
+            value.max_response_bytes,
+            value.max_relationship_depth,
+        )
+        .map_err(|error| D::Error::custom(error.to_string()))
     }
 }
 
@@ -435,6 +480,7 @@ where
         &mut self,
         request: &AppStoreConnectReadRequest,
     ) -> Result<AppStoreConnectResultProjection> {
+        request.validate()?;
         if request.scope != self.registration.scope {
             return Err(AppStoreConnectReleaseResultError::ScopeMismatch);
         }
@@ -1093,6 +1139,7 @@ where
         if page_index > 0 {
             http_request = http_request.with_page(page_index, page_token)?;
         }
+        http_request.validate()?;
         let response = match self.transport.get(&http_request) {
             Ok(response) => response,
             Err(error) => {
@@ -1111,7 +1158,8 @@ where
                     AppStoreConnectTransportError::InvalidEndpoint
                     | AppStoreConnectTransportError::MalformedResponse
                     | AppStoreConnectTransportError::PaginationLimit
-                    | AppStoreConnectTransportError::InvalidAuthorization => {
+                    | AppStoreConnectTransportError::InvalidAuthorization
+                    | AppStoreConnectTransportError::InvalidRequest => {
                         return Err(AppStoreConnectReleaseResultError::Transport(error));
                     }
                     AppStoreConnectTransportError::FixtureMissing
@@ -1123,6 +1171,7 @@ where
                 return Ok(FetchOutcome::Status(status));
             }
         };
+        response.validate_against(&http_request)?;
         response.receipt.validate()?;
         if response.receipt.provenance != self.transport.provenance()
             || response.receipt.method != "GET"
@@ -1377,15 +1426,7 @@ fn validate_app_store_version(value: &crate::model::AppStoreVersionPayload) -> R
 }
 
 fn validate_beta_group(value: &BetaGroupPayload) -> Result<()> {
-    validate_payload_identifier(&value.id, "beta group id")?;
-    validate_payload_identifier(&value.app_id, "beta group app id")?;
-    for build_id in &value.build_ids {
-        validate_payload_identifier(build_id, "beta group build id")?;
-    }
-    if value.revision == 0 {
-        return Err(AppStoreConnectReleaseResultError::MalformedProviderData);
-    }
-    Ok(())
+    value.validate()
 }
 
 fn validate_beta_review(value: &BetaAppReviewSubmissionPayload) -> Result<()> {

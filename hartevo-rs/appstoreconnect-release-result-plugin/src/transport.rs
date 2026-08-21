@@ -441,7 +441,7 @@ impl AppStoreConnectHttpRequest {
                 ),
             ],
         );
-        Ok(Self {
+        let request = Self {
             method: AppStoreConnectHttpMethod::Get,
             endpoint,
             page_index: 0,
@@ -449,7 +449,9 @@ impl AppStoreConnectHttpRequest {
             max_response_bytes,
             authorization,
             request_digest,
-        })
+        };
+        request.validate()?;
+        Ok(request)
     }
 
     pub fn with_page(
@@ -481,11 +483,60 @@ impl AppStoreConnectHttpRequest {
                 ),
             ],
         );
+        self.validate()?;
         Ok(self)
     }
 
     pub fn path_and_query(&self) -> std::result::Result<String, AppStoreConnectTransportError> {
         self.endpoint.path_and_query()
+    }
+
+    fn expected_digest(&self) -> std::result::Result<Digest, AppStoreConnectTransportError> {
+        let path = self.endpoint.path_and_query()?;
+        let mut fields = vec![
+            ("method".to_owned(), self.method.as_str().to_owned()),
+            ("path".to_owned(), path),
+            ("page".to_owned(), self.page_index.to_string()),
+        ];
+        if self.page_index > 0 {
+            fields.push((
+                "page_token".to_owned(),
+                self.page_token
+                    .as_ref()
+                    .map_or_else(String::new, |value| value.digest().to_string()),
+            ));
+        }
+        fields.push((
+            "authorization".to_owned(),
+            digest_serialized(&self.authorization),
+        ));
+        Ok(Digest::from_parts(
+            "appstoreconnect-release-result/request/v1",
+            fields,
+        ))
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), AppStoreConnectTransportError> {
+        if self.max_response_bytes == 0 || self.max_response_bytes > MAX_RESPONSE_BYTES {
+            return Err(AppStoreConnectTransportError::ResponseTooLarge);
+        }
+        self.authorization
+            .validate()
+            .map_err(|_| AppStoreConnectTransportError::InvalidAuthorization)?;
+        if self.page_index > crate::MAX_PAGES || (self.page_index == 0 && self.page_token.is_some())
+        {
+            return Err(AppStoreConnectTransportError::PaginationLimit);
+        }
+        if let Some(page_token) = &self.page_token {
+            page_token
+                .digest()
+                .validate()
+                .map_err(|_| AppStoreConnectTransportError::InvalidRequest)?;
+        }
+        if self.request_digest != self.expected_digest()? {
+            return Err(AppStoreConnectTransportError::InvalidRequest);
+        }
+        Ok(())
     }
 }
 
@@ -511,6 +562,25 @@ pub struct AppStoreConnectReceipt {
 }
 
 impl AppStoreConnectReceipt {
+    fn expected_redaction_digest(
+        path: &str,
+        status: u16,
+        response_digest: &Digest,
+        provenance: TransportProvenance,
+        authorization: &JwtRedaction,
+    ) -> Digest {
+        Digest::from_parts(
+            "appstoreconnect-release-result/receipt-redaction/v1",
+            [
+                ("path".to_owned(), path.to_owned()),
+                ("status".to_owned(), status.to_string()),
+                ("response".to_owned(), response_digest.as_str().to_owned()),
+                ("provenance".to_owned(), provenance.as_str().to_owned()),
+                ("authorization".to_owned(), digest_serialized(authorization)),
+            ],
+        )
+    }
+
     fn new(
         request: &AppStoreConnectHttpRequest,
         status: u16,
@@ -518,19 +588,14 @@ impl AppStoreConnectReceipt {
         response_digest: Digest,
         provenance: TransportProvenance,
     ) -> std::result::Result<Self, AppStoreConnectTransportError> {
+        request.validate()?;
         let path = request.path_and_query()?;
-        let redaction_digest = Digest::from_parts(
-            "appstoreconnect-release-result/receipt-redaction/v1",
-            [
-                ("path".to_owned(), path.clone()),
-                ("status".to_owned(), status.to_string()),
-                ("response".to_owned(), response_digest.as_str().to_owned()),
-                ("provenance".to_owned(), provenance.as_str().to_owned()),
-                (
-                    "authorization".to_owned(),
-                    digest_serialized(&request.authorization),
-                ),
-            ],
+        let redaction_digest = Self::expected_redaction_digest(
+            &path,
+            status,
+            &response_digest,
+            provenance,
+            &request.authorization,
         );
         Ok(Self {
             method: request.method.as_str().to_owned(),
@@ -567,6 +632,43 @@ impl AppStoreConnectReceipt {
         }
         Ok(())
     }
+
+    pub fn validate_against(
+        &self,
+        request: &AppStoreConnectHttpRequest,
+        status: u16,
+        response_bytes: usize,
+        response_digest: &Digest,
+    ) -> Result<()> {
+        request
+            .validate()
+            .map_err(AppStoreConnectReleaseResultError::Transport)?;
+        self.validate()
+            .map_err(|_| AppStoreConnectReleaseResultError::TamperedEvidence)?;
+        let path = request
+            .path_and_query()
+            .map_err(AppStoreConnectReleaseResultError::Transport)?;
+        if self.method != request.method.as_str()
+            || self.request_path_and_query != path
+            || self.request_digest != request.request_digest
+            || self.authorization != request.authorization
+            || self.status != status
+            || self.response_bytes != response_bytes
+            || self.response_digest != *response_digest
+            || response_bytes > request.max_response_bytes
+            || self.redaction_digest
+                != Self::expected_redaction_digest(
+                    &self.request_path_and_query,
+                    status,
+                    response_digest,
+                    self.provenance,
+                    &request.authorization,
+                )
+        {
+            return Err(AppStoreConnectReleaseResultError::TamperedEvidence);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -582,13 +684,17 @@ impl AppStoreConnectHttpResponse {
         body: AppStoreConnectResponseBody,
         provenance: TransportProvenance,
     ) -> std::result::Result<Self, AppStoreConnectTransportError> {
-        let response_bytes = serde_json::to_vec(&body)
-            .map_err(|_| AppStoreConnectTransportError::MalformedResponse)?
-            .len();
+        request.validate()?;
+        body.validate()
+            .map_err(|_| AppStoreConnectTransportError::MalformedResponse)?;
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|_| AppStoreConnectTransportError::MalformedResponse)?;
+        let response_bytes = body_bytes.len();
         if response_bytes > request.max_response_bytes {
             return Err(AppStoreConnectTransportError::ResponseTooLarge);
         }
-        let response_digest = body.digest();
+        let response_digest = Digest::from_bytes(&body_bytes)
+            .map_err(|_| AppStoreConnectTransportError::MalformedResponse)?;
         Ok(Self {
             status: 200,
             body: Some(body),
@@ -607,6 +713,7 @@ impl AppStoreConnectHttpResponse {
         status: u16,
         provenance: TransportProvenance,
     ) -> std::result::Result<Self, AppStoreConnectTransportError> {
+        request.validate()?;
         let response_digest = Digest::from_text(&format!("appstoreconnect-http-status:{status}"))
             .map_err(|_| AppStoreConnectTransportError::MalformedResponse)?;
         Ok(Self {
@@ -614,6 +721,33 @@ impl AppStoreConnectHttpResponse {
             body: None,
             receipt: AppStoreConnectReceipt::new(request, status, 0, response_digest, provenance)?,
         })
+    }
+
+    pub fn validate_against(&self, request: &AppStoreConnectHttpRequest) -> Result<()> {
+        request
+            .validate()
+            .map_err(AppStoreConnectReleaseResultError::Transport)?;
+        let (response_bytes, response_digest) = match &self.body {
+            Some(body) => {
+                body.validate()
+                    .map_err(|_| AppStoreConnectReleaseResultError::TamperedEvidence)?;
+                let bytes = serde_json::to_vec(body)
+                    .map_err(|_| AppStoreConnectReleaseResultError::TamperedEvidence)?;
+                let digest = Digest::from_bytes(&bytes)
+                    .map_err(|_| AppStoreConnectReleaseResultError::TamperedEvidence)?;
+                (bytes.len(), digest)
+            }
+            None => (
+                0,
+                Digest::from_text(&format!("appstoreconnect-http-status:{}", self.status))
+                    .map_err(|_| AppStoreConnectReleaseResultError::TamperedEvidence)?,
+            ),
+        };
+        if response_bytes > request.max_response_bytes {
+            return Err(AppStoreConnectReleaseResultError::ResponseTooLarge);
+        }
+        self.receipt
+            .validate_against(request, self.status, response_bytes, &response_digest)
     }
 }
 
@@ -631,6 +765,8 @@ pub enum AppStoreConnectTransportError {
     PaginationLimit,
     #[error("invalid redacted authorization metadata")]
     InvalidAuthorization,
+    #[error("request metadata did not match its canonical encoding")]
+    InvalidRequest,
     #[error("BLOCKED_ENV")]
     BlockedEnv,
     #[error("transport timeout")]
@@ -707,6 +843,8 @@ impl FixtureAppStoreConnectTransport {
         endpoint
             .path_and_query()
             .map_err(|_| AppStoreConnectTransportError::InvalidEndpoint)?;
+        body.validate()
+            .map_err(|_| AppStoreConnectTransportError::MalformedResponse)?;
         self.replies.insert(
             FixtureKey {
                 endpoint,
@@ -771,6 +909,7 @@ impl FixtureAppStoreConnectTransport {
         request: &AppStoreConnectHttpRequest,
         provenance: TransportProvenance,
     ) -> std::result::Result<AppStoreConnectHttpResponse, AppStoreConnectTransportError> {
+        request.validate()?;
         let key = FixtureKey {
             endpoint: request.endpoint.clone(),
             page_index: request.page_index,
@@ -779,7 +918,7 @@ impl FixtureAppStoreConnectTransport {
         let Some(reply) = self.replies.get(&key) else {
             return Err(AppStoreConnectTransportError::FixtureMissing);
         };
-        match reply {
+        let response = match reply {
             FixtureReply::Body(body) => {
                 AppStoreConnectHttpResponse::from_body(request, body.clone(), provenance)
             }
@@ -787,7 +926,11 @@ impl FixtureAppStoreConnectTransport {
                 AppStoreConnectHttpResponse::status(request, *status, provenance)
             }
             FixtureReply::Error(error) => Err(error.clone()),
-        }
+        }?;
+        response
+            .validate_against(request)
+            .map_err(|_| AppStoreConnectTransportError::MalformedResponse)?;
+        Ok(response)
     }
 }
 
@@ -922,8 +1065,9 @@ impl AppStoreConnectTransport for BlockedEnvAppStoreConnectTransport {
 
     fn get(
         &mut self,
-        _request: &AppStoreConnectHttpRequest,
+        request: &AppStoreConnectHttpRequest,
     ) -> std::result::Result<AppStoreConnectHttpResponse, AppStoreConnectTransportError> {
+        request.validate()?;
         Err(AppStoreConnectTransportError::BlockedEnv)
     }
 }
