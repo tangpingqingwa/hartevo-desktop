@@ -102,6 +102,10 @@ pub enum FilterCompileError {
     TooManyClauses,
     #[error("filter field is not in the governed allowlist")]
     FieldNotAllowlisted,
+    #[error("dataset-digest filters require a non-empty canonical dataset allowlist")]
+    DatasetDigestAllowlistRequired,
+    #[error("dataset-digest filter literal is malformed")]
+    MalformedDatasetDigest,
     #[error("operator is not valid for this filter field")]
     UnsupportedOperator,
     #[error("filter literal is empty, too large, or contains a control sequence")]
@@ -328,19 +332,27 @@ impl FilterClause {
         Ok(())
     }
 
-    fn dataset_digests_are_allowlisted(&self, scope: &MlflowScope) -> bool {
+    fn dataset_digests_are_allowlisted(
+        &self,
+        scope: &MlflowScope,
+    ) -> Result<(), FilterCompileError> {
         if !matches!(self.field, FilterField::DatasetDigest) {
-            return true;
+            return Ok(());
         }
-        let mut values =
-            self.value
-                .iter()
-                .chain(self.values.iter())
-                .filter_map(|value| match &value.literal {
-                    Literal::Text(text) => DatasetDigest::new(text.clone()).ok(),
-                    Literal::Number(_) => None,
-                });
-        values.all(|digest| scope.allows_dataset_digest(&digest))
+        if scope.allowlisted_dataset_digests().is_empty() {
+            return Err(FilterCompileError::DatasetDigestAllowlistRequired);
+        }
+        for value in self.value.iter().chain(self.values.iter()) {
+            let Literal::Text(text) = &value.literal else {
+                return Err(FilterCompileError::MalformedDatasetDigest);
+            };
+            let digest = DatasetDigest::new(text.clone())
+                .map_err(|_| FilterCompileError::MalformedDatasetDigest)?;
+            if !scope.allows_dataset_digest(&digest) {
+                return Err(FilterCompileError::FieldNotAllowlisted);
+            }
+        }
+        Ok(())
     }
 
     fn digest_fields(&self) -> Vec<String> {
@@ -442,9 +454,7 @@ impl MlflowFilter {
             if !clause.field.allowlisted(scope) {
                 return Err(FilterCompileError::FieldNotAllowlisted);
             }
-            if !clause.dataset_digests_are_allowlisted(scope) {
-                return Err(FilterCompileError::FieldNotAllowlisted);
-            }
+            clause.dataset_digests_are_allowlisted(scope)?;
         }
         let rendered = clauses
             .iter()

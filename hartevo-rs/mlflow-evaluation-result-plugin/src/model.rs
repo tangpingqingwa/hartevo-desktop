@@ -1,4 +1,11 @@
-use std::{collections::BTreeSet, fmt};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
@@ -20,6 +27,14 @@ pub(crate) const MAX_METRIC_HISTORY: u32 = 10_000;
 pub(crate) const MAX_PAGES: u8 = 32;
 pub(crate) const MAX_PAGE_SIZE: u32 = 1_000;
 pub(crate) const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_SCOPE_ALLOWLIST_ENTRIES: usize = 4_096;
+pub(crate) const MAX_EXPERIMENT_TAGS_PER_RECORD: usize = 32;
+pub(crate) const MAX_RUN_METRICS_PER_RECORD: usize = 256;
+pub(crate) const MAX_RUN_PARAMS_PER_RECORD: usize = 128;
+pub(crate) const MAX_RUN_TAGS_PER_RECORD: usize = 128;
+pub(crate) const MAX_RUN_DATASETS_PER_RECORD: usize = 64;
+pub(crate) const MAX_PROVIDER_ERRORS: usize = 64;
+pub(crate) const MAX_RETRIES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelError {
@@ -49,9 +64,19 @@ pub enum ModelError {
     AlreadyRevoked,
 }
 
-#[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Digest(String);
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(|error| serde::de::Error::custom(error.to_string()))
+    }
+}
 
 impl Digest {
     pub fn from_bytes(bytes: &[u8]) -> Self {
@@ -132,9 +157,19 @@ fn valid_dataset_digest(value: &str) -> bool {
 
 macro_rules! string_identifier {
     ($name:ident, $validator:ident, $error:expr) => {
-        #[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+        #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(|error| serde::de::Error::custom(error.to_string()))
+            }
+        }
 
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
@@ -182,9 +217,19 @@ string_identifier!(MetricKey, valid_key, ModelError::InvalidKey);
 string_identifier!(ParamKey, valid_key, ModelError::InvalidKey);
 string_identifier!(TagKey, valid_key, ModelError::InvalidKey);
 
-#[derive(Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct DatasetDigest(String);
+
+impl<'de> Deserialize<'de> for DatasetDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(|error| serde::de::Error::custom(error.to_string()))
+    }
+}
 
 impl DatasetDigest {
     pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
@@ -210,9 +255,19 @@ impl fmt::Debug for DatasetDigest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Revision(u64);
+
+impl<'de> Deserialize<'de> for Revision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        Self::new(value).map_err(|error| serde::de::Error::custom(error.to_string()))
+    }
+}
 
 impl Revision {
     pub fn new(value: u64) -> Result<Self, ModelError> {
@@ -236,6 +291,73 @@ pub enum MlflowAuthKind {
     ServicePrincipal,
 }
 
+/// A live, monotonic revocation fence shared by all in-process snapshots.
+///
+/// This is deliberately an in-memory fence. It detects revocation across
+/// cloned service/consumer handles in one process; it is not durable storage
+/// and therefore cannot claim restart-safe revocation.
+#[derive(Clone)]
+pub struct LiveRevocationFence {
+    generation: Arc<AtomicU64>,
+}
+
+impl fmt::Debug for LiveRevocationFence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LiveRevocationFence")
+            .field("generation", &self.generation())
+            .field("durable", &false)
+            .finish()
+    }
+}
+
+impl PartialEq for LiveRevocationFence {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.generation, &other.generation)
+    }
+}
+
+impl Eq for LiveRevocationFence {}
+
+impl LiveRevocationFence {
+    pub(crate) fn new() -> Self {
+        Self {
+            generation: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.generation() % 2 == 1
+    }
+
+    pub const fn durable() -> bool {
+        false
+    }
+
+    pub fn revoke(&self) -> Result<(), ModelError> {
+        let mut current = self.generation();
+        loop {
+            if current.is_multiple_of(2) {
+                return Err(ModelError::AlreadyRevoked);
+            }
+            let next = current.checked_add(1).ok_or(ModelError::AlreadyRevoked)?;
+            match self.generation.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
 /// An opaque reference into host-managed secret storage.
 ///
 /// The reference identifier is hashed at construction and is never retained,
@@ -247,6 +369,7 @@ pub struct SecretReference {
     credential_revision: Revision,
     auth_kind: MlflowAuthKind,
     revoked: bool,
+    revocation_fence: LiveRevocationFence,
 }
 
 impl Clone for SecretReference {
@@ -257,6 +380,7 @@ impl Clone for SecretReference {
             credential_revision: self.credential_revision,
             auth_kind: self.auth_kind,
             revoked: self.revoked,
+            revocation_fence: self.revocation_fence.clone(),
         }
     }
 }
@@ -270,6 +394,7 @@ impl fmt::Debug for SecretReference {
             .field("credential_revision", &self.credential_revision)
             .field("auth_kind", &self.auth_kind)
             .field("revoked", &self.revoked)
+            .field("revocation_fence", &self.revocation_fence)
             .finish()
     }
 }
@@ -314,6 +439,7 @@ impl SecretReference {
             credential_revision,
             auth_kind,
             revoked: false,
+            revocation_fence: LiveRevocationFence::new(),
         })
     }
 
@@ -333,14 +459,23 @@ impl SecretReference {
         self.auth_kind
     }
 
-    pub const fn is_revoked(&self) -> bool {
-        self.revoked
+    pub fn is_revoked(&self) -> bool {
+        self.revoked || !self.revocation_fence.is_active()
+    }
+
+    pub fn revocation_fence(&self) -> LiveRevocationFence {
+        self.revocation_fence.clone()
+    }
+
+    pub fn revocation_generation(&self) -> u64 {
+        self.revocation_fence.generation()
     }
 
     pub fn revoke(&mut self) -> Result<(), ModelError> {
         if self.revoked {
             Err(ModelError::AlreadyRevoked)
         } else {
+            self.revocation_fence.revoke()?;
             self.revoked = true;
             Ok(())
         }
@@ -348,6 +483,7 @@ impl SecretReference {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialOrd, Ord, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeRevisions {
     pub experiment: Revision,
     pub run: Revision,
@@ -423,6 +559,15 @@ impl MlflowScope {
         let allowlisted_dataset_digests = allowlisted_dataset_digests
             .into_iter()
             .collect::<BTreeSet<_>>();
+        if allowlisted_experiments.len() > MAX_EXPERIMENTS as usize
+            || allowlisted_runs.len() > MAX_RUNS as usize
+            || allowlisted_metrics.len() > MAX_SCOPE_ALLOWLIST_ENTRIES
+            || allowlisted_params.len() > MAX_SCOPE_ALLOWLIST_ENTRIES
+            || allowlisted_tags.len() > MAX_SCOPE_ALLOWLIST_ENTRIES
+            || allowlisted_dataset_digests.len() > MAX_SCOPE_ALLOWLIST_ENTRIES
+        {
+            return Err(ModelError::InvalidScope);
+        }
         let scope_digest = Digest::from_fields(
             "mlflow-scope/v1",
             &[
@@ -779,6 +924,14 @@ impl RedactedAttribute {
         }
         Ok(Self { key, value_digest })
     }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if valid_key(&self.key) && is_digest(self.value_digest.as_str()) {
+            Ok(())
+        } else {
+            Err(ModelError::InvalidRecord)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -992,6 +1145,9 @@ impl ExperimentRecord {
     }
 
     pub fn validate_digest(&self) -> Result<(), ModelError> {
+        for tag in &self.redacted_tags {
+            tag.validate()?;
+        }
         if Self::compute_digest(
             &self.experiment_id,
             &self.name_digest,
@@ -1095,6 +1251,9 @@ impl RunRecord {
     }
 
     pub fn validate_digest(&self) -> Result<(), ModelError> {
+        for attribute in self.redacted_params.iter().chain(self.redacted_tags.iter()) {
+            attribute.validate()?;
+        }
         if self
             .metrics
             .iter()
@@ -1334,6 +1493,8 @@ pub struct MlflowRegistration {
     pub registration_digest: Digest,
     pub revision: Revision,
     pub state: RegistrationState,
+    #[serde(skip)]
+    revocation_fence: LiveRevocationFence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1352,7 +1513,12 @@ impl MlflowRegistration {
         capability_digest: Digest,
     ) -> Result<Self, ModelError> {
         let provider_version = provider_version.into();
-        if provider_version.is_empty() || !is_digest(scope_digest.as_str()) {
+        if provider_version.is_empty()
+            || provider_version.len() > MAX_IDENTIFIER_BYTES
+            || provider_version.chars().any(char::is_control)
+            || provider_version.chars().any(char::is_whitespace)
+            || !is_digest(scope_digest.as_str())
+        {
             return Err(ModelError::InvalidRegistration);
         }
         let service_id = ServiceId::new(MLFLOW_EVALUATION_RESULT_SERVICE_ID)
@@ -1379,11 +1545,12 @@ impl MlflowRegistration {
             registration_digest,
             revision,
             state: RegistrationState::Active,
+            revocation_fence: LiveRevocationFence::new(),
         })
     }
 
     pub fn ensure_active(&self) -> Result<(), ModelError> {
-        if self.state == RegistrationState::Active {
+        if self.state == RegistrationState::Active && self.revocation_fence.is_active() {
             Ok(())
         } else {
             Err(ModelError::AlreadyRevoked)
@@ -1392,6 +1559,7 @@ impl MlflowRegistration {
 
     pub fn revoke(&mut self) -> Result<RegistrationRevocation, ModelError> {
         self.ensure_active()?;
+        self.revocation_fence.revoke()?;
         self.state = RegistrationState::Revoked;
         let revocation_digest = Digest::from_fields(
             "mlflow-registration-revocation/v1",
@@ -1407,6 +1575,14 @@ impl MlflowRegistration {
             revision: self.revision,
             revocation_digest,
         })
+    }
+
+    pub fn revocation_fence(&self) -> LiveRevocationFence {
+        self.revocation_fence.clone()
+    }
+
+    pub fn revocation_generation(&self) -> u64 {
+        self.revocation_fence.generation()
     }
 
     fn compute_digest(

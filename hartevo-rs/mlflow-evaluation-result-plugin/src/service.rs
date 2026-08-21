@@ -6,10 +6,12 @@ use thiserror::Error;
 use crate::filter::MlflowFilter;
 use crate::model::{
     AdoptionAvailability, DatasetDigest, Digest, EvidenceDigests, ExperimentId, ExperimentRecord,
-    MAX_METRICS, MetricHistoryPoint, MetricKey, MlflowOperation, MlflowRegistration, MlflowScope,
-    ModelError, OpaquePageToken, PartialReason, ProviderErrorEvidence, ProviderErrorKind,
-    ProviderProvenance, RegistrationRevocation, ResultBounds, ResultStatus, RetryEvidence,
-    Revision, RunId, RunRecord, ScopeRevisions, SecretReference,
+    MAX_EXPERIMENT_TAGS_PER_RECORD, MAX_METRICS, MAX_PROVIDER_ERRORS, MAX_RETRIES,
+    MAX_RUN_DATASETS_PER_RECORD, MAX_RUN_METRICS_PER_RECORD, MAX_RUN_PARAMS_PER_RECORD,
+    MAX_RUN_TAGS_PER_RECORD, MetricHistoryPoint, MetricKey, MlflowOperation, MlflowRegistration,
+    MlflowScope, ModelError, OpaquePageToken, PartialReason, ProviderErrorEvidence,
+    ProviderErrorKind, ProviderProvenance, RegistrationRevocation, ResultBounds, ResultStatus,
+    RetryEvidence, Revision, RunId, RunRecord, ScopeRevisions, SecretReference,
 };
 use crate::provider::{
     MlflowProvider, MlflowProviderDefinition, MlflowResponsePage, TransportError,
@@ -322,6 +324,10 @@ pub struct MlflowReadProposal {
     secret_reference_digest: Digest,
     credential_revision: Revision,
     provider_version: String,
+    registration_digest: Digest,
+    registration_revision: Revision,
+    registration_generation: u64,
+    secret_generation: u64,
     proposal_digest: Digest,
 }
 
@@ -353,6 +359,7 @@ impl MlflowReadProposal {
         scope: &MlflowScope,
         secret: &SecretReference,
         provider: &MlflowProviderDefinition,
+        registration: &MlflowRegistration,
         request: MlflowReadRequest,
     ) -> Result<Self, ServiceError> {
         validate_request(scope, &request)?;
@@ -384,26 +391,26 @@ impl MlflowReadProposal {
                 request.bounds().max_response_bytes().to_string(),
             ],
         );
-        let proposal_digest = Digest::from_fields(
-            "mlflow-read-proposal/v1",
-            &[
-                scope_digest.as_str().to_owned(),
-                version_digest.as_str().to_owned(),
-                provider.provider_digest.as_str().to_owned(),
-                contract_digest.as_str().to_owned(),
-                query_digest.as_str().to_owned(),
-                config_digest.as_str().to_owned(),
-                scope.permission_digest().as_str().to_owned(),
-                scope.consent_digest().as_str().to_owned(),
-                secret.reference_digest().as_str().to_owned(),
-                secret.credential_revision().get().to_string(),
-                scope.revisions().experiment.get().to_string(),
-                scope.revisions().run.get().to_string(),
-                scope.revisions().dataset.get().to_string(),
-                scope.revisions().mission.get().to_string(),
-                scope.revisions().project.get().to_string(),
-                scope.revisions().work_product.get().to_string(),
-            ],
+        let registration_digest = registration.registration_digest.clone();
+        let registration_revision = registration.revision;
+        let registration_generation = registration.revocation_generation();
+        let secret_generation = secret.revocation_generation();
+        let proposal_digest = Self::compute_digest(
+            &scope_digest,
+            &version_digest,
+            &provider.provider_digest,
+            &contract_digest,
+            &query_digest,
+            &config_digest,
+            scope.permission_digest(),
+            scope.consent_digest(),
+            secret.reference_digest(),
+            secret.credential_revision(),
+            scope.revisions(),
+            &registration_digest,
+            registration_revision,
+            registration_generation,
+            secret_generation,
         );
         Ok(Self {
             request,
@@ -420,6 +427,10 @@ impl MlflowReadProposal {
             secret_reference_digest: secret.reference_digest().clone(),
             credential_revision: secret.credential_revision(),
             provider_version: provider.provider_version.clone(),
+            registration_digest,
+            registration_revision,
+            registration_generation,
+            secret_generation,
             proposal_digest,
         })
     }
@@ -484,12 +495,98 @@ impl MlflowReadProposal {
         &self.proposal_digest
     }
 
+    pub fn registration_digest(&self) -> &Digest {
+        &self.registration_digest
+    }
+
+    pub const fn registration_revision(&self) -> Revision {
+        self.registration_revision
+    }
+
+    pub const fn registration_generation(&self) -> u64 {
+        self.registration_generation
+    }
+
+    pub const fn secret_generation(&self) -> u64 {
+        self.secret_generation
+    }
+
+    pub fn validate_digest(&self) -> Result<(), ServiceError> {
+        let expected = Self::compute_digest(
+            &self.scope_digest,
+            &self.version_digest,
+            &self.provider_digest,
+            &self.contract_digest,
+            &self.query_digest,
+            &self.config_digest,
+            &self.permission_digest,
+            &self.consent_digest,
+            &self.secret_reference_digest,
+            self.credential_revision,
+            self.revisions,
+            &self.registration_digest,
+            self.registration_revision,
+            self.registration_generation,
+            self.secret_generation,
+        );
+        if expected == self.proposal_digest {
+            Ok(())
+        } else {
+            Err(ServiceError::ProposalMismatch)
+        }
+    }
+
     pub fn bounds(&self) -> ResultBounds {
         self.request.bounds()
     }
 
     fn initial_page_token(&self) -> Option<&OpaquePageToken> {
         self.request.initial_page_token()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compute_digest(
+        scope_digest: &Digest,
+        version_digest: &Digest,
+        provider_digest: &Digest,
+        contract_digest: &Digest,
+        query_digest: &Digest,
+        config_digest: &Digest,
+        permission_digest: &Digest,
+        consent_digest: &Digest,
+        secret_reference_digest: &Digest,
+        credential_revision: Revision,
+        revisions: ScopeRevisions,
+        registration_digest: &Digest,
+        registration_revision: Revision,
+        registration_generation: u64,
+        secret_generation: u64,
+    ) -> Digest {
+        Digest::from_fields(
+            "mlflow-read-proposal/v1",
+            &[
+                scope_digest.as_str().to_owned(),
+                version_digest.as_str().to_owned(),
+                provider_digest.as_str().to_owned(),
+                contract_digest.as_str().to_owned(),
+                query_digest.as_str().to_owned(),
+                config_digest.as_str().to_owned(),
+                permission_digest.as_str().to_owned(),
+                consent_digest.as_str().to_owned(),
+                secret_reference_digest.as_str().to_owned(),
+                credential_revision.get().to_string(),
+                revisions.experiment.get().to_string(),
+                revisions.run.get().to_string(),
+                revisions.dataset.get().to_string(),
+                revisions.mission.get().to_string(),
+                revisions.project.get().to_string(),
+                revisions.work_product.get().to_string(),
+                registration_digest.as_str().to_owned(),
+                registration_revision.get().to_string(),
+                registration_generation.to_string(),
+                secret_generation.to_string(),
+            ],
+        )
     }
 }
 
@@ -522,6 +619,9 @@ fn validate_request(scope: &MlflowScope, request: &MlflowReadRequest) -> Result<
             }
         }
         MlflowReadRequest::SearchRuns { experiment_ids, .. } => {
+            if experiment_ids.len() > crate::model::MAX_EXPERIMENTS as usize {
+                return Err(ServiceError::BoundExceeded);
+            }
             if experiment_ids.iter().all(|id| scope.allows_experiment(id)) {
                 Ok(())
             } else {
@@ -536,6 +636,35 @@ fn validate_request(scope: &MlflowScope, request: &MlflowReadRequest) -> Result<
                 Err(ServiceError::ScopeMismatch)
             }
         }
+    }
+}
+
+fn validate_exact_cardinality(
+    proposal: &MlflowReadProposal,
+    status: ResultStatus,
+    evidence: &MlflowEvidence,
+) -> Result<(), ServiceError> {
+    if status != ResultStatus::Complete {
+        return Ok(());
+    }
+    match proposal.request() {
+        MlflowReadRequest::GetExperiment { experiment_id, .. }
+            if evidence.experiments.len() != 1
+                || evidence.experiments[0].experiment_id != *experiment_id
+                || !evidence.runs.is_empty()
+                || !evidence.metric_history.is_empty() =>
+        {
+            Err(ServiceError::InvalidResponseShape)
+        }
+        MlflowReadRequest::GetRun { run_id, .. }
+            if evidence.runs.len() != 1
+                || evidence.runs[0].run_id != *run_id
+                || !evidence.experiments.is_empty()
+                || !evidence.metric_history.is_empty() =>
+        {
+            Err(ServiceError::InvalidResponseShape)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -623,6 +752,13 @@ pub struct MlflowEvidence {
     pub permission_digest: Digest,
     pub consent_digest: Digest,
     pub revisions: ScopeRevisions,
+    pub proposal_digest: Digest,
+    pub registration_digest: Digest,
+    pub registration_revision: Revision,
+    pub registration_generation: u64,
+    pub secret_reference_digest: Digest,
+    pub secret_generation: u64,
+    pub credential_revision: Revision,
     pub pages_observed: u8,
     pub response_bytes: u64,
     pub page_token_digests: Vec<Digest>,
@@ -637,6 +773,7 @@ pub struct MlflowEvidence {
 
 impl MlflowEvidence {
     pub fn validate_digest(&self) -> Result<(), ServiceError> {
+        self.validate_global_bounds()?;
         for experiment in &self.experiments {
             experiment
                 .validate_digest()
@@ -658,6 +795,13 @@ impl MlflowEvidence {
             &self.permission_digest,
             &self.consent_digest,
             self.revisions,
+            &self.proposal_digest,
+            &self.registration_digest,
+            self.registration_revision,
+            self.registration_generation,
+            &self.secret_reference_digest,
+            self.secret_generation,
+            self.credential_revision,
             &self.provider_version,
             &self.experiments,
             &self.runs,
@@ -680,6 +824,50 @@ impl MlflowEvidence {
         } else {
             Ok(())
         }
+    }
+
+    pub fn validate_bounds(&self, bounds: ResultBounds) -> Result<(), ServiceError> {
+        self.validate_global_bounds()?;
+        if self.experiments.len() > bounds.max_experiments() as usize
+            || self.runs.len() > bounds.max_runs() as usize
+            || self.metric_history.len() > bounds.max_metric_history() as usize
+            || self.response_bytes > bounds.max_response_bytes()
+        {
+            return Err(ServiceError::BoundExceeded);
+        }
+        if self.runs.iter().map(|run| run.metrics.len()).sum::<usize>() > MAX_METRICS as usize {
+            return Err(ServiceError::BoundExceeded);
+        }
+        Ok(())
+    }
+
+    fn validate_global_bounds(&self) -> Result<(), ServiceError> {
+        if self.experiments.len() > crate::model::MAX_EXPERIMENTS as usize
+            || self.runs.len() > crate::model::MAX_RUNS as usize
+            || self.metric_history.len() > crate::model::MAX_METRIC_HISTORY as usize
+            || self.pages_observed > crate::model::MAX_PAGES
+            || self.response_bytes > crate::model::MAX_RESPONSE_BYTES
+            || self.page_token_digests.len() > crate::model::MAX_PAGES as usize
+            || self.provider_errors.len() > MAX_PROVIDER_ERRORS
+            || self.retries.len() > MAX_RETRIES
+        {
+            return Err(ServiceError::BoundExceeded);
+        }
+        if self
+            .experiments
+            .iter()
+            .any(|experiment| experiment.redacted_tags.len() > MAX_EXPERIMENT_TAGS_PER_RECORD)
+            || self.runs.iter().any(|run| {
+                run.metrics.len() > MAX_RUN_METRICS_PER_RECORD
+                    || run.metrics.len() > MAX_METRICS as usize
+                    || run.redacted_params.len() > MAX_RUN_PARAMS_PER_RECORD
+                    || run.redacted_tags.len() > MAX_RUN_TAGS_PER_RECORD
+                    || run.datasets.len() > MAX_RUN_DATASETS_PER_RECORD
+            })
+        {
+            return Err(ServiceError::BoundExceeded);
+        }
+        Ok(())
     }
 }
 
@@ -790,8 +978,9 @@ impl<P: MlflowProvider> MlflowEvaluationResultService<P> {
     }
 
     pub fn revoke_registration(&mut self) -> Result<RegistrationRevocation, ServiceError> {
+        let revocation = self.registration.revoke().map_err(ServiceError::from)?;
         self.active = false;
-        self.registration.revoke().map_err(ServiceError::from)
+        Ok(revocation)
     }
 
     pub fn revoke_secret(&mut self) -> Result<(), ServiceError> {
@@ -804,6 +993,7 @@ impl<P: MlflowProvider> MlflowEvaluationResultService<P> {
             &self.scope,
             &self.secret,
             self.provider.definition(),
+            &self.registration,
             request,
         )
     }
@@ -858,7 +1048,11 @@ impl<P: MlflowProvider> MlflowEvaluationResultService<P> {
             let Some(page) = response else {
                 break;
             };
-            accumulator.add_page(&page, &self.scope, &proposal)?;
+            let retain_next_page = accumulator.add_page(&page, &self.scope, &proposal)?;
+            if !retain_next_page {
+                terminated = true;
+                break;
+            }
             let next_page_token = page.next_page_token.clone();
             if next_page_token.is_none() {
                 if !page.complete {
@@ -903,6 +1097,13 @@ impl<P: MlflowProvider> MlflowEvaluationResultService<P> {
             || result.registration_revision != self.registration.revision
             || result.proposal_digest != *proposal.proposal_digest()
             || result.operation != proposal.operation()
+            || result.evidence.proposal_digest != *proposal.proposal_digest()
+            || result.evidence.registration_digest != *proposal.registration_digest()
+            || result.evidence.registration_revision != proposal.registration_revision()
+            || result.evidence.registration_generation != proposal.registration_generation()
+            || result.evidence.secret_reference_digest != *proposal.secret_reference_digest()
+            || result.evidence.secret_generation != proposal.secret_generation()
+            || result.evidence.credential_revision != proposal.credential_revision()
         {
             return Err(ServiceError::ProposalMismatch);
         }
@@ -912,6 +1113,7 @@ impl<P: MlflowProvider> MlflowEvaluationResultService<P> {
             || result.evidence.consent_digest != *proposal.consent_digest()
             || result.evidence.revisions != proposal.revisions()
             || result.evidence.provider_version != proposal.provider_version()
+            || result.evidence.credential_revision != proposal.credential_revision()
             || result.evidence.digests.scope_digest != *proposal.scope_digest()
             || result.evidence.digests.version_digest != *proposal.version_digest()
             || result.evidence.digests.provider_digest != *proposal.provider_digest()
@@ -926,15 +1128,22 @@ impl<P: MlflowProvider> MlflowEvaluationResultService<P> {
         if result.status != result.evidence.status {
             return Err(ServiceError::TamperedEvidence);
         }
+        result.evidence.validate_bounds(proposal.bounds())?;
+        validate_exact_cardinality(proposal, result.status, &result.evidence)?;
         result.evidence.validate_digest()
     }
 
     fn validate_proposal(&self, proposal: &MlflowReadProposal) -> Result<(), ServiceError> {
+        proposal.validate_digest()?;
         if proposal.scope_digest() != &self.scope.scope_digest()
             || proposal.provider_version() != self.provider.definition().provider_version
             || proposal.provider_digest() != &self.provider.definition().provider_digest
             || proposal.secret_reference_digest() != self.secret.reference_digest()
             || proposal.credential_revision() != self.secret.credential_revision()
+            || proposal.registration_digest() != &self.registration.registration_digest
+            || proposal.registration_revision() != self.registration.revision
+            || proposal.registration_generation() != self.registration.revocation_generation()
+            || proposal.secret_generation() != self.secret.revocation_generation()
             || proposal.permission_digest() != self.scope.permission_digest()
             || proposal.consent_digest() != self.scope.consent_digest()
         {
@@ -966,6 +1175,13 @@ struct EvidenceAccumulator {
     permission_digest: Digest,
     consent_digest: Digest,
     revisions: ScopeRevisions,
+    proposal_digest: Digest,
+    registration_digest: Digest,
+    registration_revision: Revision,
+    registration_generation: u64,
+    secret_reference_digest: Digest,
+    secret_generation: u64,
+    credential_revision: Revision,
     bounds: ResultBounds,
     query_digest: Digest,
     config_digest: Digest,
@@ -978,6 +1194,7 @@ struct EvidenceAccumulator {
     experiments: Vec<ExperimentRecord>,
     runs: Vec<RunRecord>,
     metric_history: Vec<MetricHistoryPoint>,
+    metric_values_observed: usize,
     dataset_digests: BTreeSet<DatasetDigest>,
     provider_errors: Vec<ProviderErrorEvidence>,
     retries: Vec<RetryEvidence>,
@@ -994,6 +1211,13 @@ impl EvidenceAccumulator {
             permission_digest: proposal.permission_digest().clone(),
             consent_digest: proposal.consent_digest().clone(),
             revisions: proposal.revisions(),
+            proposal_digest: proposal.proposal_digest().clone(),
+            registration_digest: proposal.registration_digest().clone(),
+            registration_revision: proposal.registration_revision(),
+            registration_generation: proposal.registration_generation(),
+            secret_reference_digest: proposal.secret_reference_digest().clone(),
+            secret_generation: proposal.secret_generation(),
+            credential_revision: proposal.credential_revision(),
             bounds: proposal.bounds(),
             query_digest: proposal.query_digest().clone(),
             config_digest: proposal.config_digest().clone(),
@@ -1006,6 +1230,7 @@ impl EvidenceAccumulator {
             experiments: Vec::new(),
             runs: Vec::new(),
             metric_history: Vec::new(),
+            metric_values_observed: 0,
             dataset_digests: BTreeSet::new(),
             provider_errors: Vec::new(),
             retries: Vec::new(),
@@ -1014,10 +1239,18 @@ impl EvidenceAccumulator {
     }
 
     fn record_page_token(&mut self, token: &OpaquePageToken) {
-        self.page_token_digests.push(token.digest());
+        if self.page_token_digests.len() < crate::model::MAX_PAGES as usize {
+            self.page_token_digests.push(token.digest());
+        } else {
+            self.partial(PartialReason::PageLimit);
+        }
     }
 
     fn record_retry(&mut self, operation: MlflowOperation, attempt: u8, error: &TransportError) {
+        if self.retries.len() >= MAX_RETRIES {
+            self.partial(PartialReason::PageLimit);
+            return;
+        }
         self.retries.push(RetryEvidence {
             operation,
             attempt,
@@ -1028,7 +1261,11 @@ impl EvidenceAccumulator {
     }
 
     fn record_provider_error(&mut self, error: &TransportError, attempt: u8) {
-        self.provider_errors.push(error.evidence(attempt));
+        if self.provider_errors.len() < MAX_PROVIDER_ERRORS {
+            self.provider_errors.push(error.evidence(attempt));
+        } else {
+            self.partial(PartialReason::PageLimit);
+        }
     }
 
     fn provider_failure(&mut self, error: &TransportError) {
@@ -1070,7 +1307,7 @@ impl EvidenceAccumulator {
         page: &MlflowResponsePage,
         scope: &MlflowScope,
         proposal: &MlflowReadProposal,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<bool, ServiceError> {
         page.validate_digest()
             .map_err(|_| ServiceError::TamperedEvidence)?;
         if page.operation != self.operation
@@ -1084,10 +1321,18 @@ impl EvidenceAccumulator {
             return Err(ServiceError::FenceMismatch);
         }
         self.pages_observed = self.pages_observed.saturating_add(1);
-        self.response_bytes = self.response_bytes.saturating_add(page.response_bytes);
-        if self.response_bytes > self.bounds.max_response_bytes() {
+        let Some(next_response_bytes) = self.response_bytes.checked_add(page.response_bytes) else {
             self.partial(PartialReason::ResponseBytesLimit);
+            return Ok(false);
+        };
+        if page.response_bytes > self.bounds.max_response_bytes()
+            || next_response_bytes > self.bounds.max_response_bytes()
+        {
+            self.response_bytes = self.bounds.max_response_bytes();
+            self.partial(PartialReason::ResponseBytesLimit);
+            return Ok(false);
         }
+        self.response_bytes = next_response_bytes;
         if !page.experiments.is_empty()
             && !matches!(
                 self.operation,
@@ -1107,6 +1352,29 @@ impl EvidenceAccumulator {
         if !page.metric_history.is_empty() && self.operation != MlflowOperation::GetMetricHistory {
             return Err(ServiceError::InvalidResponseShape);
         }
+        match proposal.request() {
+            MlflowReadRequest::GetExperiment { experiment_id, .. }
+                if !page.complete
+                    || page.next_page_token.is_some()
+                    || page.experiments.len() != 1
+                    || !page.runs.is_empty()
+                    || !page.metric_history.is_empty()
+                    || page.experiments[0].experiment_id != *experiment_id =>
+            {
+                return Err(ServiceError::InvalidResponseShape);
+            }
+            MlflowReadRequest::GetRun { run_id, .. }
+                if !page.complete
+                    || page.next_page_token.is_some()
+                    || page.runs.len() != 1
+                    || !page.experiments.is_empty()
+                    || !page.metric_history.is_empty()
+                    || page.runs[0].run_id != *run_id =>
+            {
+                return Err(ServiceError::InvalidResponseShape);
+            }
+            _ => {}
+        }
         let page_size = self.bounds.page_size() as usize;
         if page.experiments.len() > page_size {
             self.partial(PartialReason::ExperimentLimit);
@@ -1117,9 +1385,13 @@ impl EvidenceAccumulator {
         if page.metric_history.len() > page_size {
             self.partial(PartialReason::MetricHistoryLimit);
         }
+        let mut page_truncated = page.experiments.len() > page_size
+            || page.runs.len() > page_size
+            || page.metric_history.len() > page_size;
         for experiment in page.experiments.iter().take(page_size) {
             if !scope.allows_experiment(&experiment.experiment_id)
                 || experiment.revision != self.revisions.experiment
+                || experiment.redacted_tags.len() > MAX_EXPERIMENT_TAGS_PER_RECORD
                 || experiment.redacted_tags.iter().any(|tag| {
                     scope
                         .allowlisted_tags()
@@ -1136,8 +1408,25 @@ impl EvidenceAccumulator {
             self.experiments.push(experiment.clone());
         }
         for run in page.runs.iter().take(page_size) {
-            if run.metrics.len() > MAX_METRICS as usize {
+            if run.metrics.len() > MAX_RUN_METRICS_PER_RECORD
+                || run.metrics.len() > MAX_METRICS as usize
+                || run.redacted_params.len() > MAX_RUN_PARAMS_PER_RECORD
+                || run.redacted_tags.len() > MAX_RUN_TAGS_PER_RECORD
+                || run.datasets.len() > MAX_RUN_DATASETS_PER_RECORD
+            {
                 return Err(ServiceError::BoundExceeded);
+            }
+            let Some(next_metric_count) =
+                self.metric_values_observed.checked_add(run.metrics.len())
+            else {
+                self.partial(PartialReason::MetricLimit);
+                page_truncated = true;
+                break;
+            };
+            if next_metric_count > MAX_METRICS as usize {
+                self.partial(PartialReason::MetricLimit);
+                page_truncated = true;
+                break;
             }
             if !scope.allows_run(&run.run_id)
                 || !scope.allows_experiment(&run.experiment_id)
@@ -1178,6 +1467,7 @@ impl EvidenceAccumulator {
                     .iter()
                     .filter_map(|metric| metric.dataset_digest.as_ref()),
             );
+            self.metric_values_observed = next_metric_count;
             self.runs.push(run.clone());
         }
         for point in page.metric_history.iter().take(page_size) {
@@ -1204,7 +1494,13 @@ impl EvidenceAccumulator {
             }
             self.metric_history.push(point.clone());
         }
-        Ok(())
+        if self.experiments.len() > self.bounds.max_experiments() as usize
+            || self.runs.len() > self.bounds.max_runs() as usize
+            || self.metric_history.len() > self.bounds.max_metric_history() as usize
+        {
+            return Err(ServiceError::BoundExceeded);
+        }
+        Ok(!page_truncated)
     }
 
     fn collect_datasets<'a>(&mut self, digests: impl IntoIterator<Item = &'a DatasetDigest>) {
@@ -1221,6 +1517,13 @@ impl EvidenceAccumulator {
             &self.permission_digest,
             &self.consent_digest,
             self.revisions,
+            &self.proposal_digest,
+            &self.registration_digest,
+            self.registration_revision,
+            self.registration_generation,
+            &self.secret_reference_digest,
+            self.secret_generation,
+            self.credential_revision,
             &self.provider_version,
             &self.experiments,
             &self.runs,
@@ -1247,6 +1550,13 @@ impl EvidenceAccumulator {
             permission_digest: self.permission_digest,
             consent_digest: self.consent_digest,
             revisions: self.revisions,
+            proposal_digest: self.proposal_digest,
+            registration_digest: self.registration_digest,
+            registration_revision: self.registration_revision,
+            registration_generation: self.registration_generation,
+            secret_reference_digest: self.secret_reference_digest,
+            secret_generation: self.secret_generation,
+            credential_revision: self.credential_revision,
             pages_observed: self.pages_observed,
             response_bytes: self.response_bytes,
             page_token_digests: self.page_token_digests,
@@ -1268,6 +1578,13 @@ impl EvidenceAccumulator {
         permission_digest: &Digest,
         consent_digest: &Digest,
         revisions: ScopeRevisions,
+        proposal_digest: &Digest,
+        registration_digest: &Digest,
+        registration_revision: Revision,
+        registration_generation: u64,
+        secret_reference_digest: &Digest,
+        secret_generation: u64,
+        credential_revision: Revision,
         provider_version: &str,
         experiments: &[ExperimentRecord],
         runs: &[RunRecord],
@@ -1318,6 +1635,13 @@ impl EvidenceAccumulator {
             &[
                 operation_name(operation).to_owned(),
                 format!("{status:?}"),
+                proposal_digest.as_str().to_owned(),
+                registration_digest.as_str().to_owned(),
+                registration_revision.get().to_string(),
+                registration_generation.to_string(),
+                secret_reference_digest.as_str().to_owned(),
+                secret_generation.to_string(),
+                credential_revision.get().to_string(),
                 experiment_set_digest.as_str().to_owned(),
                 run_set_digest.as_str().to_owned(),
                 metric_history_digest.as_str().to_owned(),

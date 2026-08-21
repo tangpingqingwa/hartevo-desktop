@@ -40,12 +40,13 @@ pub use filter::{
 };
 pub use model::{
     AdoptionAvailability, DatasetDigest, DatasetReference, Digest, ErrorSeverity, EvidenceDigests,
-    ExperimentId, ExperimentLifecycle, ExperimentRecord, MetricHistoryPoint, MetricKey,
-    MetricValue, MissionId, MlflowAuthKind, MlflowAuthority, MlflowOperation, MlflowRegistration,
-    MlflowScope, ModelError, OpaquePageToken, ParamKey, PartialReason, PermissionFence, ProjectId,
-    ProviderErrorEvidence, ProviderErrorKind, ProviderId, ProviderProvenance, RedactedAttribute,
-    RegistrationRevocation, RegistrationState, ResultBounds, ResultStatus, Revision, RunId,
-    RunRecord, RunStatus, ScopeRevisions, SecretReference, ServiceId, TagKey, WorkProductId,
+    ExperimentId, ExperimentLifecycle, ExperimentRecord, LiveRevocationFence, MetricHistoryPoint,
+    MetricKey, MetricValue, MissionId, MlflowAuthKind, MlflowAuthority, MlflowOperation,
+    MlflowRegistration, MlflowScope, ModelError, OpaquePageToken, ParamKey, PartialReason,
+    PermissionFence, ProjectId, ProviderErrorEvidence, ProviderErrorKind, ProviderId,
+    ProviderProvenance, RedactedAttribute, RegistrationRevocation, RegistrationState, ResultBounds,
+    ResultStatus, Revision, RunId, RunRecord, RunStatus, ScopeRevisions, SecretReference,
+    ServiceId, TagKey, WorkProductId,
 };
 pub use provider::{
     BlockedEnvMlflowProvider, FakeMlflowProvider, FixtureMlflowProvider, LoopbackMlflowProvider,
@@ -154,6 +155,19 @@ mod contract_document_tests {
         );
         assert!(
             !document["nativeClaims"]["truthAuthority"]
+                .as_bool()
+                .unwrap_or(true)
+        );
+        assert_eq!(
+            document["service"]["exactCardinality"]["getRun"],
+            "exactly_one_expected_identity"
+        );
+        assert_eq!(
+            document["registration"]["revocationFence"],
+            "live_monotonic_generation_in_memory_only"
+        );
+        assert!(
+            !document["registration"]["restartDurable"]
                 .as_bool()
                 .unwrap_or(true)
         );

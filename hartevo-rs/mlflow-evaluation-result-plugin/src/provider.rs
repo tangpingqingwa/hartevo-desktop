@@ -8,7 +8,7 @@ use crate::{
     ProviderErrorKind, ProviderProvenance, Revision, RunRecord,
 };
 
-use crate::model::{MetricHistoryPoint, ProviderErrorEvidence};
+use crate::model::{MAX_IDENTIFIER_BYTES, MetricHistoryPoint, ProviderErrorEvidence};
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ProviderDefinitionError {
@@ -35,7 +35,11 @@ impl MlflowProviderDefinition {
         provenance: ProviderProvenance,
     ) -> Result<Self, ProviderDefinitionError> {
         let provider_version = provider_version.into();
-        if provider_version.is_empty() {
+        if provider_version.is_empty()
+            || provider_version.len() > MAX_IDENTIFIER_BYTES
+            || provider_version.chars().any(char::is_control)
+            || provider_version.chars().any(char::is_whitespace)
+        {
             return Err(ProviderDefinitionError::EmptyVersion);
         }
         let provider_digest = Digest::from_fields(
@@ -466,6 +470,14 @@ impl MlflowProvider for LoopbackMlflowProvider {
         proposal: &MlflowReadProposal,
         _page_token: Option<&OpaquePageToken>,
     ) -> Result<MlflowResponsePage, TransportError> {
+        if matches!(
+            proposal.operation(),
+            MlflowOperation::GetExperiment | MlflowOperation::GetRun
+        ) {
+            return Err(TransportError::provider_unknown(
+                "loopback-exact-cardinality-unavailable",
+            ));
+        }
         Ok(MlflowResponsePage::empty(proposal))
     }
 }
