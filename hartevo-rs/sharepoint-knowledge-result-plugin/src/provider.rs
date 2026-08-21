@@ -214,10 +214,12 @@ where
     ) -> Result<Self, SharePointKnowledgeResultError> {
         let scope = registration_scope(&registration)?;
         let manifest = SharePointProviderManifest::layer1(&scope);
+        let provenance = transport.provenance();
         if registration.provider_manifest_digest != manifest.digest()
             || registration.entra_secret_reference_digest != secret_reference.digest()
-            || transport.provenance().is_native()
-            || transport.provenance().is_connected()
+            || !provenance.is_layer1_sealed()
+            || provenance.is_native()
+            || provenance.is_connected()
         {
             return Err(SharePointKnowledgeResultError::ExternalWriteAuthority);
         }
@@ -311,6 +313,7 @@ where
         request: &DriveItemReadRequest,
     ) -> Result<DriveItemMetadataEvidence, SharePointKnowledgeResultError> {
         self.ensure_registration()?;
+        request.validate()?;
         self.ensure_scope(&request.scope)?;
         if request.expected_version != request.scope.item_version {
             return Err(MicrosoftGraphSharePointProviderError::VersionDrift.into());
@@ -326,7 +329,7 @@ where
         );
         let response = self.execute(&graph_request)?;
         let next_link_digest = response.next_link_digest();
-        let MicrosoftGraphResponseBody::Metadata(payload) = response.body else {
+        let MicrosoftGraphResponseBody::Metadata(payload) = response.into_body() else {
             return Err(MicrosoftGraphSharePointProviderError::InvalidResponse.into());
         };
         let metadata = Self::project_metadata(payload, &request.scope)?;
@@ -351,6 +354,7 @@ where
         request: &DriveItemReadRequest,
     ) -> Result<DriveItemChildrenEvidence, SharePointKnowledgeResultError> {
         self.ensure_registration()?;
+        request.validate()?;
         self.ensure_scope(&request.scope)?;
         Self::ensure_capability(&request.scope, SharePointCapability::ReadDriveItemChildren)?;
         self.authenticate()?;
@@ -367,7 +371,8 @@ where
                 None,
             );
             let response = self.execute(&graph_request)?;
-            let MicrosoftGraphResponseBody::Children { items, next_link } = response.body else {
+            let MicrosoftGraphResponseBody::Children { items, next_link } = response.into_body()
+            else {
                 return Err(MicrosoftGraphSharePointProviderError::InvalidResponse.into());
             };
             if items.len() > crate::model::PAGE_SIZE as usize
@@ -415,6 +420,7 @@ where
         request: &SharePointSearchRequest,
     ) -> Result<DriveItemSearchEvidence, SharePointKnowledgeResultError> {
         self.ensure_registration()?;
+        request.validate()?;
         self.ensure_scope(&request.scope)?;
         Self::ensure_capability(&request.scope, SharePointCapability::SearchDriveItems)?;
         self.authenticate()?;
@@ -435,7 +441,7 @@ where
             let MicrosoftGraphResponseBody::Search {
                 hits: page_hits,
                 next_link,
-            } = response.body
+            } = response.into_body()
             else {
                 return Err(MicrosoftGraphSharePointProviderError::InvalidResponse.into());
             };
@@ -483,6 +489,7 @@ where
         request: &DriveItemReadRequest,
     ) -> Result<DriveItemVersionsEvidence, SharePointKnowledgeResultError> {
         self.ensure_registration()?;
+        request.validate()?;
         self.ensure_scope(&request.scope)?;
         Self::ensure_capability(&request.scope, SharePointCapability::ReadDriveItemVersions)?;
         self.authenticate()?;
@@ -502,7 +509,7 @@ where
             let MicrosoftGraphResponseBody::Versions {
                 versions: page_versions,
                 next_link,
-            } = response.body
+            } = response.into_body()
             else {
                 return Err(MicrosoftGraphSharePointProviderError::InvalidResponse.into());
             };
@@ -550,6 +557,7 @@ where
         request: &DriveItemReadRequest,
     ) -> Result<DriveItemDeltaEvidence, SharePointKnowledgeResultError> {
         self.ensure_registration()?;
+        request.validate()?;
         self.ensure_scope(&request.scope)?;
         Self::ensure_capability(&request.scope, SharePointCapability::ReadDriveItemDelta)?;
         self.authenticate()?;
@@ -569,7 +577,7 @@ where
             let MicrosoftGraphResponseBody::Delta {
                 entries: page_entries,
                 next_link,
-            } = response.body
+            } = response.into_body()
             else {
                 return Err(MicrosoftGraphSharePointProviderError::InvalidResponse.into());
             };
@@ -617,6 +625,7 @@ where
         request: &SharePointKnowledgeReadRequest,
     ) -> Result<SharePointKnowledgeEvidence, SharePointKnowledgeResultError> {
         self.ensure_registration()?;
+        request.validate()?;
         self.ensure_scope(&request.scope)?;
         let read_request = DriveItemReadRequest::new(request.scope.clone());
         let metadata = self.read_drive_item_metadata(&read_request)?;
@@ -671,6 +680,9 @@ where
             SharePointCapability::CompileKnowledgeResult,
         )?;
         evidence.validate()?;
+        if evidence.evidence_source != self.provenance() {
+            return Err(SharePointKnowledgeResultError::ExternalWriteAuthority);
+        }
         work_product.validate()?;
         if work_product.project_id != evidence.scope.project_id
             || work_product.mission_id != evidence.scope.mission_id
@@ -790,18 +802,21 @@ where
             }
             provider_error
         })?;
-        if response.status >= 400 {
-            return Err(status_error(response.status).into());
+        response
+            .validate(request)
+            .map_err(MicrosoftGraphSharePointProviderError::from)?;
+        if response.status() >= 400 {
+            return Err(status_error(response.status()).into());
         }
-        if response.status < 200
-            || response.api_version != GRAPH_API_VERSION
-            || response.provider_revision != SHAREPOINT_PROVIDER_REVISION
-            || response.response_size > crate::model::MAX_RESPONSE_BYTES
-            || response.operation != request.operation
+        if response.status() < 200
+            || response.api_version() != GRAPH_API_VERSION
+            || response.provider_revision() != SHAREPOINT_PROVIDER_REVISION
+            || response.response_size() > crate::model::MAX_RESPONSE_BYTES
+            || response.operation() != request.operation
         {
-            return Err(if response.api_version != GRAPH_API_VERSION {
+            return Err(if response.api_version() != GRAPH_API_VERSION {
                 MicrosoftGraphSharePointProviderError::ApiVersionDrift
-            } else if response.provider_revision != SHAREPOINT_PROVIDER_REVISION {
+            } else if response.provider_revision() != SHAREPOINT_PROVIDER_REVISION {
                 MicrosoftGraphSharePointProviderError::ProviderRevisionDrift
             } else {
                 MicrosoftGraphSharePointProviderError::InvalidResponse

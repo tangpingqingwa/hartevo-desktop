@@ -217,6 +217,11 @@ fn work_product() -> MissionWorkProduct {
 }
 
 fn refresh_evidence_digests(evidence: &mut SharePointKnowledgeEvidence) {
+    evidence.metadata.evidence_digest = canonical_digest(&(
+        &evidence.metadata.envelope,
+        &evidence.metadata.metadata,
+        &evidence.metadata.next_link_digest,
+    ));
     if let Some(children) = &mut evidence.children {
         children.evidence_digest = canonical_digest(&(
             &children.envelope,
@@ -567,6 +572,66 @@ fn replayed_evidence_cannot_bypass_projection_caps_before_compile() {
 }
 
 #[test]
+fn replayed_nested_ids_and_derived_digests_fail_closed() {
+    let scope = scope();
+    let (mut provider, evidence) = full_evidence(&scope);
+
+    let mut invalid_id = serde_json::to_value(&evidence).expect("evidence JSON");
+    let child = &mut invalid_id["children"]["children"][0];
+    child["itemId"] = Value::String(String::new());
+    child["itemDigest"] = Value::String(canonical_digest(&serde_json::json!([
+        child["itemId"].clone(),
+        child["parentItemId"].clone(),
+        child["kind"].clone(),
+        child["sizeBytes"].clone(),
+        child["nameDigest"].clone(),
+        child["eTagDigest"].clone(),
+        child["version"].clone(),
+        child["permissionDigest"].clone(),
+    ])));
+    let mut invalid_id: SharePointKnowledgeEvidence =
+        serde_json::from_value(invalid_id).expect("replayed nested id");
+    refresh_evidence_digests(&mut invalid_id);
+    assert!(matches!(
+        provider.compile_knowledge_result(&invalid_id, work_product()),
+        Err(SharePointKnowledgeResultError::EvidenceDigestMismatch)
+    ));
+
+    let mut tampered_digest = evidence;
+    tampered_digest.metadata.metadata.metadata_digest = sha256_digest("tampered");
+    refresh_evidence_digests(&mut tampered_digest);
+    assert!(matches!(
+        provider.compile_knowledge_result(&tampered_digest, work_product()),
+        Err(SharePointKnowledgeResultError::EvidenceDigestMismatch)
+    ));
+}
+
+#[test]
+fn provider_provenance_mismatch_cannot_become_compile_evidence() {
+    let scope = scope();
+    let (mut provider, mut evidence) = full_evidence(&scope);
+    evidence.evidence_source = ProviderProvenance::Recording;
+    evidence.metadata.envelope.evidence_source = ProviderProvenance::Recording;
+    if let Some(children) = &mut evidence.children {
+        children.envelope.evidence_source = ProviderProvenance::Recording;
+    }
+    if let Some(search) = &mut evidence.search {
+        search.envelope.evidence_source = ProviderProvenance::Recording;
+    }
+    if let Some(versions) = &mut evidence.versions {
+        versions.envelope.evidence_source = ProviderProvenance::Recording;
+    }
+    if let Some(delta) = &mut evidence.delta {
+        delta.envelope.evidence_source = ProviderProvenance::Recording;
+    }
+    refresh_evidence_digests(&mut evidence);
+    assert!(matches!(
+        provider.compile_knowledge_result(&evidence, work_product()),
+        Err(SharePointKnowledgeResultError::ExternalWriteAuthority)
+    ));
+}
+
+#[test]
 fn graph_response_ingress_binds_actual_size_and_text_fields() {
     let scope = scope();
 
@@ -626,7 +691,7 @@ fn graph_response_ingress_binds_actual_size_and_text_fields() {
         1,
     )
     .expect("actual response size");
-    assert!(response.response_size > 1);
+    assert!(response.response_size() > 1);
 
     let mut large_payload = metadata_payload(&scope, &"n".repeat(MAX_RESPONSE_FIELD_BYTES));
     large_payload.e_tag = "e".repeat(MAX_RESPONSE_FIELD_BYTES);

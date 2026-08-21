@@ -272,6 +272,13 @@ pub enum ProviderProvenance {
 }
 
 impl ProviderProvenance {
+    pub const fn is_layer1_sealed(self) -> bool {
+        matches!(
+            self,
+            Self::Recording | Self::Fixture | Self::Loopback | Self::BlockedEnv
+        )
+    }
+
     pub const fn is_native(self) -> bool {
         false
     }
@@ -694,6 +701,7 @@ impl SharePointProviderManifest {
         &self,
         scope: &SharePointKnowledgeScope,
     ) -> Result<(), SharePointKnowledgeResultError> {
+        scope.validate()?;
         let expected = Self::layer1(scope);
         if self != &expected {
             return Err(SharePointKnowledgeResultError::InvalidProviderManifest);
@@ -1107,7 +1115,11 @@ impl EvidenceEnvelope {
     }
 
     pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
-        if self.provider_revision != SHAREPOINT_PROVIDER_REVISION
+        if !is_sha256(&self.scope_digest)
+            || !is_sha256(&self.provider_manifest_digest)
+            || !is_sha256(&self.registration_digest)
+            || !self.evidence_source.is_layer1_sealed()
+            || self.provider_revision != SHAREPOINT_PROVIDER_REVISION
             || self.evidence_source.is_native()
             || self.evidence_source.is_connected()
             || self.native_transport
@@ -1267,6 +1279,7 @@ impl SharePointKnowledgeEvidence {
             || self.raw_bytes_retained
             || self.download_url_retained
             || self.pii_retained
+            || !self.evidence_source.is_layer1_sealed()
             || self.metadata.metadata.list_id != self.scope.list_id
             || self.metadata.metadata.item.item_id != self.scope.item_id
             || self.metadata.metadata.item.version != self.scope.item_version
@@ -1313,7 +1326,8 @@ impl SharePointKnowledgeEvidence {
             return Err(SharePointKnowledgeResultError::EvidenceDigestMismatch);
         }
         if let Some(children) = &self.children {
-            if children.item_id != self.scope.item_id
+            if children.item_id.validate().is_err()
+                || children.item_id != self.scope.item_id
                 || children
                     .children
                     .iter()
@@ -1333,7 +1347,9 @@ impl SharePointKnowledgeEvidence {
         if let Some(search) = &self.search {
             if !is_sha256(&search.query_digest)
                 || search.hits.iter().any(|hit| {
-                    !is_sha256(&hit.name_digest)
+                    hit.item_id.validate().is_err()
+                        || hit.version.validate().is_err()
+                        || !is_sha256(&hit.name_digest)
                         || !is_sha256(&hit.path_digest)
                         || !is_sha256(&hit.hit_digest)
                         || hit.permission_digest != self.scope.permission_digest
@@ -1362,7 +1378,9 @@ impl SharePointKnowledgeEvidence {
         if let Some(versions) = &self.versions {
             if versions.item_id != self.scope.item_id
                 || versions.versions.iter().any(|version| {
-                    !is_sha256(&version.version_digest)
+                    version.item_id.validate().is_err()
+                        || version.version_id.validate().is_err()
+                        || !is_sha256(&version.version_digest)
                         || version.item_id != self.scope.item_id
                         || version.permission_digest != self.scope.permission_digest
                 })
@@ -1381,7 +1399,12 @@ impl SharePointKnowledgeEvidence {
         if let Some(delta) = &self.delta {
             if delta.item_id != self.scope.item_id
                 || delta.entries.iter().any(|entry| {
-                    !is_sha256(&entry.item_digest)
+                    entry.item_id.validate().is_err()
+                        || entry
+                            .version
+                            .as_ref()
+                            .is_some_and(|version| version.validate().is_err())
+                        || !is_sha256(&entry.item_digest)
                         || entry.item_id != self.scope.item_id
                         || entry.permission_digest != self.scope.permission_digest
                 })
@@ -1429,7 +1452,13 @@ fn valid_cursor_digests(projection: Option<(&[Digest], u16)>) -> bool {
 }
 
 fn valid_summary(summary: &DriveItemSummary, permission_digest: &str) -> bool {
-    is_sha256(&summary.name_digest)
+    summary.item_id.validate().is_ok()
+        && summary
+            .parent_item_id
+            .as_ref()
+            .is_none_or(|item_id| item_id.validate().is_ok())
+        && summary.version.validate().is_ok()
+        && is_sha256(&summary.name_digest)
         && is_sha256(&summary.e_tag_digest)
         && is_sha256(&summary.permission_digest)
         && summary.permission_digest == permission_digest
@@ -1461,7 +1490,12 @@ pub struct MissionWorkProduct {
 
 impl MissionWorkProduct {
     pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
-        if self.revision == 0 || !is_sha256(&self.content_digest) {
+        if self.project_id.validate().is_err()
+            || self.mission_id.validate().is_err()
+            || self.work_product_id.validate().is_err()
+            || self.revision == 0
+            || !is_sha256(&self.content_digest)
+        {
             return Err(SharePointKnowledgeResultError::InvalidInput {
                 field: "work product",
                 reason: String::from("revision and content digest are required"),
@@ -1533,14 +1567,36 @@ impl SharePointKnowledgeResultProposal {
     }
 
     pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
-        if self.proposal_id.is_empty()
+        if self.proposal_id.trim().is_empty()
+            || self.proposal_id.len() > 256
+            || self.proposal_id.chars().any(char::is_control)
             || !is_sha256(&self.proposal_digest)
             || !is_sha256(&self.scope_digest)
             || !is_sha256(&self.evidence_digest)
             || !is_sha256(&self.metadata_digest)
             || !is_sha256(&self.provider_manifest_digest)
             || !is_sha256(&self.registration_digest)
+            || self.project_id.validate().is_err()
+            || self.mission_id.validate().is_err()
+            || self.work_product_id.validate().is_err()
+            || self
+                .children_digest
+                .as_ref()
+                .is_some_and(|digest| !is_sha256(digest))
+            || self
+                .search_digest
+                .as_ref()
+                .is_some_and(|digest| !is_sha256(digest))
+            || self
+                .versions_digest
+                .as_ref()
+                .is_some_and(|digest| !is_sha256(digest))
+            || self
+                .delta_digest
+                .as_ref()
+                .is_some_and(|digest| !is_sha256(digest))
             || self.work_product_revision == 0
+            || !self.evidence_source.is_layer1_sealed()
             || self.evidence_source.is_native()
             || self.evidence_source.is_connected()
             || !self.non_mutating
@@ -1569,7 +1625,12 @@ pub struct SharePointScopeDescription {
 
 impl SharePointScopeDescription {
     pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
-        if self.scope.digest() != self.scope_digest
+        self.scope.validate()?;
+        if !is_sha256(&self.scope_digest)
+            || !is_sha256(&self.provider_manifest_digest)
+            || !is_sha256(&self.permission_digest)
+            || !self.evidence_source.is_layer1_sealed()
+            || self.scope.digest() != self.scope_digest
             || self.permission_digest != self.scope.permission_digest
             || self.evidence_source.is_native()
             || self.evidence_source.is_connected()
@@ -1605,6 +1666,20 @@ impl SharePointKnowledgeReadRequest {
             search_query_digest: None,
         }
     }
+
+    pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
+        self.scope.validate()?;
+        if self
+            .search_query_digest
+            .as_ref()
+            .is_some_and(|digest| !is_sha256(digest))
+        {
+            return Err(SharePointKnowledgeResultError::InvalidDigest {
+                field: "searchQueryDigest",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1621,6 +1696,15 @@ impl DriveItemReadRequest {
             scope,
         }
     }
+
+    pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
+        self.scope.validate()?;
+        self.expected_version.validate()?;
+        if self.expected_version != self.scope.item_version {
+            return Err(SharePointKnowledgeResultError::InvalidScope);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1636,6 +1720,7 @@ impl SharePointSearchRequest {
         scope: SharePointKnowledgeScope,
         query: impl Into<String>,
     ) -> Result<Self, SharePointKnowledgeResultError> {
+        scope.validate()?;
         let query = SearchQuery::new(query)?;
         if query.as_str().len() > scope.search_scope.max_query_bytes {
             return Err(SharePointKnowledgeResultError::InvalidInput {
@@ -1649,6 +1734,20 @@ impl SharePointSearchRequest {
             page_size: PAGE_SIZE,
             cursor: None,
         })
+    }
+
+    pub fn validate(&self) -> Result<(), SharePointKnowledgeResultError> {
+        self.scope.validate()?;
+        if self.query.as_str().len() > self.scope.search_scope.max_query_bytes
+            || self.page_size == 0
+            || self.page_size > PAGE_SIZE
+        {
+            return Err(SharePointKnowledgeResultError::InvalidInput {
+                field: "search request",
+                reason: String::from("request exceeds the registered search bounds"),
+            });
+        }
+        Ok(())
     }
 
     #[must_use]

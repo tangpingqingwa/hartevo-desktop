@@ -16,6 +16,10 @@ use crate::{
     },
 };
 
+mod sealed {
+    pub trait SharePointTransportSealed {}
+}
+
 /// Graph operation names are limited to the five read-only v1.0 seams.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -580,13 +584,13 @@ fn delta_payload_digest_parts(payload: &DriveItemDeltaPayload) -> Vec<String> {
 
 #[derive(Clone)]
 pub struct MicrosoftGraphResponse {
-    pub operation: SharePointGraphOperation,
-    pub status: u16,
-    pub api_version: String,
-    pub provider_revision: String,
-    pub response_size: usize,
-    pub response_digest: Digest,
-    pub body: MicrosoftGraphResponseBody,
+    operation: SharePointGraphOperation,
+    status: u16,
+    api_version: String,
+    provider_revision: String,
+    response_size: usize,
+    response_digest: Digest,
+    body: MicrosoftGraphResponseBody,
 }
 
 impl fmt::Debug for MicrosoftGraphResponse {
@@ -624,6 +628,48 @@ impl MicrosoftGraphResponse {
             response_digest: body.digest(),
             body,
         })
+    }
+
+    pub fn operation(&self) -> SharePointGraphOperation {
+        self.operation
+    }
+
+    pub const fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn api_version(&self) -> &str {
+        &self.api_version
+    }
+
+    pub fn provider_revision(&self) -> &str {
+        &self.provider_revision
+    }
+
+    pub const fn response_size(&self) -> usize {
+        self.response_size
+    }
+
+    pub fn response_digest(&self) -> &str {
+        &self.response_digest
+    }
+
+    pub(crate) fn into_body(self) -> MicrosoftGraphResponseBody {
+        self.body
+    }
+
+    pub fn validate(
+        &self,
+        request: &MicrosoftGraphRequest,
+    ) -> Result<(), SharePointTransportError> {
+        if self.operation != request.operation
+            || self.body.operation() != self.operation
+            || self.response_size != self.body.actual_payload_size()?
+            || self.response_digest != self.body.digest()
+        {
+            return Err(SharePointTransportError::Decode);
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -684,7 +730,9 @@ impl SharePointFixture {
 }
 
 /// Layer 1 transport seam. No implementation performs native HTTPS.
-pub trait MicrosoftGraphSharePointTransport: fmt::Debug + Send {
+pub trait MicrosoftGraphSharePointTransport:
+    sealed::SharePointTransportSealed + fmt::Debug + Send
+{
     fn execute(
         &mut self,
         request: &MicrosoftGraphRequest,
@@ -734,6 +782,8 @@ macro_rules! scripted_transport {
                     .finish()
             }
         }
+
+        impl sealed::SharePointTransportSealed for $name {}
 
         impl $name {
             pub fn new(
@@ -816,6 +866,8 @@ pub type RecordingMicrosoftGraphTransport = RecordingSharePointTransport;
 #[derive(Clone, Debug, Default)]
 pub struct BlockedEnvTransport;
 
+impl sealed::SharePointTransportSealed for BlockedEnvTransport {}
+
 impl MicrosoftGraphSharePointTransport for BlockedEnvTransport {
     fn execute(
         &mut self,
@@ -847,6 +899,65 @@ fn _transport_redaction_markers(
     search: &SharePointSearchRequest,
 ) {
     let _ = canonical_digest(request);
-    let _ = response.response_digest.as_str();
+    let _ = response.response_digest();
     let _ = search.query.digest();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{DriveId, DriveItemId, ItemVersionId, ListId, SiteId};
+
+    fn request() -> MicrosoftGraphRequest {
+        MicrosoftGraphRequest {
+            operation: MicrosoftGraphOperation::DriveItemMetadata,
+            api_version: "v1.0".to_string(),
+            national_cloud: NationalCloud::Global,
+            site_id: SiteId::new("site-1").unwrap(),
+            drive_id: DriveId::new("drive-1").unwrap(),
+            list_id: ListId::new("list-1").unwrap(),
+            item_id: DriveItemId::new("item-1").unwrap(),
+            scope_digest: sha256_digest("scope"),
+            page: 1,
+            page_size: 50,
+            cursor_digest: None,
+            search_digest: None,
+        }
+    }
+
+    fn body() -> MicrosoftGraphResponseBody {
+        MicrosoftGraphResponseBody::Metadata(DriveItemMetadataPayload {
+            site_id: SiteId::new("site-1").unwrap(),
+            drive_id: DriveId::new("drive-1").unwrap(),
+            list_id: ListId::new("list-1").unwrap(),
+            item_id: DriveItemId::new("item-1").unwrap(),
+            parent_item_id: None,
+            name: "safe.txt".to_string(),
+            kind: DriveItemKind::File,
+            size_bytes: Some(1),
+            e_tag: "etag-1".to_string(),
+            version: ItemVersionId::new("version-1").unwrap(),
+            permission_digest: sha256_digest("permission"),
+            has_download_url: false,
+        })
+    }
+
+    #[test]
+    fn response_seal_recomputes_size_and_digest_at_use() {
+        let request = request();
+
+        let mut size_tampered = MicrosoftGraphResponse::new(&request, 200, body(), 0).unwrap();
+        size_tampered.response_size += 1;
+        assert_eq!(
+            size_tampered.validate(&request),
+            Err(SharePointTransportError::Decode)
+        );
+
+        let mut digest_tampered = MicrosoftGraphResponse::new(&request, 200, body(), 0).unwrap();
+        digest_tampered.response_digest = sha256_digest("tampered");
+        assert_eq!(
+            digest_tampered.validate(&request),
+            Err(SharePointTransportError::Decode)
+        );
+    }
 }
