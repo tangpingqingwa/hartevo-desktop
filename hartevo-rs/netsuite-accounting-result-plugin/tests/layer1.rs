@@ -4,15 +4,17 @@ use chrono::{DateTime, Duration, Utc};
 use hartevo_netsuite_accounting_result_plugin::{
     AccountId, BlockedEnvNetSuiteTransport, CollectionFilter, CollectionFilterField,
     CollectionFilterOperator, CollectionFilterValue, ConsentScope, DataCenter, Digest,
-    FixtureNetSuiteTransport, MissionId, MissionNetSuiteAccountingConsumer,
-    NETSUITE_ACCOUNTING_RESULT_CONTRACT_VERSION, NETSUITE_ACCOUNTING_RESULT_PLUGIN_VERSION,
-    NetSuiteAccountingProposal, NetSuiteAccountingProposalRequest, NetSuiteAccountingResultService,
-    NetSuiteAccountingStatus, NetSuiteBounds, NetSuiteCollectionSummary, NetSuiteGetRequest,
-    NetSuiteHttpMethod, NetSuiteReadOperation, NetSuiteRecordMetadata, NetSuiteRecordStatus,
-    NetSuiteRecordType, NetSuiteSafeRecordField, NetSuiteScope, NetSuiteSelectedRecordSummary,
-    NetSuiteSnapshot, NetSuiteSuiteQlField, NetSuiteSuiteTalkProvider, NetSuiteTransportError,
+    FixtureNetSuiteTransport, LoopbackNetSuiteTransport, MissionId,
+    MissionNetSuiteAccountingConsumer, NETSUITE_ACCOUNTING_RESULT_CONTRACT_VERSION,
+    NETSUITE_ACCOUNTING_RESULT_PLUGIN_VERSION, NetSuiteAccountingProposal,
+    NetSuiteAccountingProposalRequest, NetSuiteAccountingResultService, NetSuiteAccountingStatus,
+    NetSuiteBounds, NetSuiteCollectionSummary, NetSuiteGetRequest, NetSuiteHttpMethod,
+    NetSuiteReadOperation, NetSuiteRecordMetadata, NetSuiteRecordStatus, NetSuiteRecordType,
+    NetSuiteSafeRecordField, NetSuiteScope, NetSuiteSelectedRecordSummary, NetSuiteSnapshot,
+    NetSuiteSuiteQlField, NetSuiteSuiteTalkProvider, NetSuiteTransportError,
     NetSuiteTransportProvenance, ObservationWindow, OpaqueCursor, ProjectId,
-    RecordingNetSuiteTransport, Revision, RoleId, SecretReference, WorkProductId, contract_digest,
+    ProviderDefinitionError, RecordingNetSuiteTransport, Revision, RoleId, SecretReference,
+    WorkProductId, contract_digest,
 };
 
 const AT: &str = "2026-08-14T12:00:00Z";
@@ -94,7 +96,7 @@ fn fixture() -> Fixture {
             NetSuiteSafeRecordField::Amount,
         ],
         revision(20),
-        now - Duration::minutes(10),
+        now - Duration::minutes(90),
     )
     .expect("metadata summary");
     let mut statuses = BTreeMap::new();
@@ -106,7 +108,7 @@ fn fixture() -> Fixture {
         NetSuiteRecordType::Invoice,
         scope.record_id().expect("selected id"),
         NetSuiteRecordStatus::Open,
-        now - Duration::minutes(5),
+        now - Duration::minutes(80),
         revision(21),
     );
     let snapshot = NetSuiteSnapshot::new(
@@ -130,7 +132,7 @@ fn fixture() -> Fixture {
 fn fixture_service() -> NetSuiteAccountingResultService<FixtureNetSuiteTransport> {
     let fixture = fixture();
     let provider = NetSuiteSuiteTalkProvider::new(
-        FixtureNetSuiteTransport::new(fixture.snapshot),
+        FixtureNetSuiteTransport::new(fixture.snapshot.clone()),
         "suitetalk-recording-r1",
         NetSuiteTransportProvenance::Fixture,
     )
@@ -292,7 +294,7 @@ fn recording_retries_are_bounded_and_receipts_are_digest_bound() {
 fn suiteql_is_allowlisted_parameterized_and_never_executed() {
     let fixture = fixture();
     let provider = NetSuiteSuiteTalkProvider::new(
-        FixtureNetSuiteTransport::new(fixture.snapshot.clone()),
+        LoopbackNetSuiteTransport::new(fixture.snapshot.clone()),
         "suitetalk-loopback-r1",
         NetSuiteTransportProvenance::Loopback,
     )
@@ -330,7 +332,7 @@ fn suiteql_is_allowlisted_parameterized_and_never_executed() {
     assert!(!proposal.statement.query_template().contains("invoice-17"));
     assert!(!proposal.statement.executed());
     let record = service
-        .record_suiteql_proposal(&proposal, at())
+        .record_suiteql_proposal(&proposal, fixture.window.end())
         .expect("record proposal");
     assert!(!record.executed);
     assert!(!record.connected);
@@ -410,4 +412,232 @@ fn contract_registration_and_endpoints_are_exactly_bound() {
         "/services/rest/record/v1/invoice/invoice-17"
     );
     assert_eq!(selected.method(), NetSuiteHttpMethod::Get);
+}
+
+#[test]
+fn transport_boundary_is_sealed_and_provenance_bound() {
+    let fixture = fixture();
+    let result = NetSuiteSuiteTalkProvider::new(
+        FixtureNetSuiteTransport::new(fixture.snapshot.clone()),
+        "suitetalk-mismatch-r1",
+        NetSuiteTransportProvenance::Loopback,
+    );
+    assert!(matches!(
+        result,
+        Err(ProviderDefinitionError::ProvenanceMismatch)
+    ));
+}
+
+#[test]
+fn receipt_and_proposal_debug_json_redact_record_identity_and_endpoint() {
+    let fixture = fixture();
+    let provider = NetSuiteSuiteTalkProvider::new(
+        FixtureNetSuiteTransport::new(fixture.snapshot.clone()),
+        "suitetalk-recording-r1",
+        NetSuiteTransportProvenance::Fixture,
+    )
+    .expect("provider");
+    let mut service = NetSuiteAccountingResultService::new(
+        fixture.scope.clone(),
+        fixture.secret.clone(),
+        provider,
+    )
+    .expect("service");
+    let proposal = service.propose(request(&fixture), at()).expect("proposal");
+    let json = serde_json::to_string(&proposal).expect("proposal JSON");
+    let debug = format!("{proposal:?}");
+    for rendered in [json, debug] {
+        assert!(!rendered.contains("invoice-17"));
+        assert!(!rendered.contains("/services/rest/record/v1/invoice/invoice-17"));
+    }
+    assert!(
+        proposal.evidence.receipts[2]
+            .endpoint_identity
+            .record_id_digest
+            .is_some()
+    );
+    assert!(
+        proposal.evidence.receipts[2]
+            .endpoint_identity
+            .endpoint_digest
+            .as_str()
+            .len()
+            == 64
+    );
+}
+
+#[test]
+fn mission_boundary_rejects_claim_tampering_for_accounting_and_suiteql() {
+    let fixture = fixture();
+    let provider = NetSuiteSuiteTalkProvider::new(
+        FixtureNetSuiteTransport::new(fixture.snapshot.clone()),
+        "suitetalk-repair-r1",
+        NetSuiteTransportProvenance::Fixture,
+    )
+    .expect("provider");
+    let mut service = NetSuiteAccountingResultService::new(
+        fixture.scope.clone(),
+        fixture.secret.clone(),
+        provider,
+    )
+    .expect("service");
+    let proposal = service.propose(request(&fixture), at()).expect("proposal");
+    let consumer = MissionNetSuiteAccountingConsumer::new(
+        fixture.scope.clone(),
+        service.registration().clone(),
+    )
+    .expect("consumer");
+    let wrong_secret = SecretReference::new(
+        "netsuite-repair-wrong-secret",
+        &fixture.scope,
+        revision(3),
+        hartevo_netsuite_accounting_result_plugin::NetSuiteAuthKind::OAuth2,
+    )
+    .expect("wrong secret shape");
+    assert!(
+        MissionNetSuiteAccountingConsumer::new_with_secret(
+            fixture.scope.clone(),
+            wrong_secret,
+            service.registration().clone(),
+        )
+        .is_err()
+    );
+
+    let mut accounting_flags = proposal.clone();
+    accounting_flags.connected = true;
+    assert!(consumer.validate_only(&accounting_flags).is_err());
+
+    let mut accounting_provider = proposal;
+    accounting_provider.provider_id = "untrusted-provider".to_owned();
+    assert!(consumer.validate_only(&accounting_provider).is_err());
+
+    let suiteql = service
+        .compile_parameterized_suiteql_proposal(
+            vec![NetSuiteSuiteQlField::InternalId],
+            NetSuiteBounds::default(),
+            fixture.window.clone(),
+            at(),
+        )
+        .expect("SuiteQL proposal");
+    let mut suiteql_flags = suiteql.clone();
+    suiteql_flags.native = true;
+    assert!(consumer.validate_suiteql_only(&suiteql_flags).is_err());
+
+    let mut suiteql_authority = suiteql.clone();
+    suiteql_authority.outcome_authority = true;
+    assert!(consumer.validate_suiteql_only(&suiteql_authority).is_err());
+
+    let mut suiteql_provider = suiteql;
+    suiteql_provider.provider_definition_digest = Digest::from_text("tampered-provider-definition");
+    assert!(consumer.validate_suiteql_only(&suiteql_provider).is_err());
+}
+
+#[test]
+fn revocation_and_replay_fences_are_monotonic_across_clones_and_consumers() {
+    let fixture = fixture();
+    let provider = NetSuiteSuiteTalkProvider::new(
+        FixtureNetSuiteTransport::new(fixture.snapshot.clone()),
+        "suitetalk-replay-r1",
+        NetSuiteTransportProvenance::Fixture,
+    )
+    .expect("provider");
+    let mut service = NetSuiteAccountingResultService::new(
+        fixture.scope.clone(),
+        fixture.secret.clone(),
+        provider,
+    )
+    .expect("service");
+    let proposal = service.propose(request(&fixture), at()).expect("proposal");
+    let registration = service.registration().clone();
+    let mut first =
+        MissionNetSuiteAccountingConsumer::new(fixture.scope.clone(), registration.clone())
+            .expect("first consumer");
+    let mut second = MissionNetSuiteAccountingConsumer::new(fixture.scope.clone(), registration)
+        .expect("cloned-registration consumer");
+    first.consume(proposal.clone()).expect("first consume");
+    assert!(second.consume(proposal).is_err());
+
+    let revocation_secret = SecretReference::new(
+        "netsuite-repair-revocation-secret",
+        &fixture.scope,
+        revision(3),
+        hartevo_netsuite_accounting_result_plugin::NetSuiteAuthKind::OAuth2,
+    )
+    .expect("revocation secret");
+    let revocation_secret_clone = revocation_secret.clone();
+    let revocation_provider = NetSuiteSuiteTalkProvider::new(
+        FixtureNetSuiteTransport::new(fixture.snapshot),
+        "suitetalk-revocation-r1",
+        NetSuiteTransportProvenance::Fixture,
+    )
+    .expect("revocation provider");
+    let mut revocation_service = NetSuiteAccountingResultService::new(
+        fixture.scope.clone(),
+        revocation_secret,
+        revocation_provider,
+    )
+    .expect("revocation service");
+    revocation_service.revoke_secret().expect("revoke secret");
+    assert!(revocation_secret_clone.is_revoked());
+    assert!(
+        SecretReference::new(
+            "netsuite-repair-revocation-secret",
+            &fixture.scope,
+            revision(3),
+            hartevo_netsuite_accounting_result_plugin::NetSuiteAuthKind::OAuth2,
+        )
+        .is_err()
+    );
+
+    let mut registration_clone = revocation_service.registration().clone();
+    registration_clone
+        .revoke()
+        .expect("revoke cloned registration");
+    assert!(!revocation_service.registration().is_active());
+}
+
+#[test]
+fn provider_revision_and_observation_window_bounds_fail_closed() {
+    let fixture = fixture();
+    let outside_timestamp = fixture.window.end() + Duration::seconds(1);
+    let outside_filter = CollectionFilter::new(
+        CollectionFilterField::LastModifiedDate,
+        CollectionFilterOperator::OnOrAfter,
+        CollectionFilterValue::Timestamp(outside_timestamp),
+    )
+    .expect("filter shape");
+    assert!(outside_filter.validate_for_window(&fixture.window).is_err());
+
+    let outside_metadata = NetSuiteRecordMetadata::new(
+        NetSuiteRecordType::Invoice,
+        vec![NetSuiteSafeRecordField::RecordType],
+        revision(30),
+        outside_timestamp,
+    )
+    .expect("metadata shape");
+    assert!(
+        NetSuiteSnapshot::new(
+            &fixture.scope,
+            &fixture.secret,
+            "suitetalk-window-r1",
+            Some(outside_metadata),
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .is_err()
+    );
+
+    assert!(
+        NetSuiteSnapshot::new(
+            &fixture.scope,
+            &fixture.secret,
+            "r".repeat(65),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .is_err()
+    );
 }

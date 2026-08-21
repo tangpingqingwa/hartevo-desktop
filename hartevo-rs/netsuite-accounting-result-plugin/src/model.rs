@@ -3,6 +3,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use chrono::{DateTime, Utc};
@@ -23,6 +27,8 @@ pub(crate) const MAX_RETRY_ATTEMPTS: u8 = 4;
 pub(crate) const MAX_SUITEQL_FIELDS: usize = 12;
 pub(crate) const MAX_SUITEQL_PARAMETERS: usize = 8;
 pub(crate) const MAX_SUITEQL_BYTES: usize = 16 * 1024;
+
+static REVOCATION_TOMBSTONES: OnceLock<RwLock<BTreeSet<Digest>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ModelError {
@@ -54,6 +60,8 @@ pub enum ModelError {
     InvalidSecretReference,
     #[error("secret reference is already revoked")]
     AlreadyRevoked,
+    #[error("revocation fence is unavailable")]
+    RevocationFenceUnavailable,
     #[error("digest does not match immutable fields")]
     DigestMismatch,
     #[error("duplicate field or operation")]
@@ -114,6 +122,33 @@ fn is_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn revocation_tombstones() -> &'static RwLock<BTreeSet<Digest>> {
+    REVOCATION_TOMBSTONES.get_or_init(|| RwLock::new(BTreeSet::new()))
+}
+
+fn revocation_key(domain: &str, digest: &Digest) -> Digest {
+    Digest::from_fields(domain, &[digest.as_str().to_owned()])
+}
+
+pub(crate) fn is_revocation_tombstoned(domain: &str, digest: &Digest) -> bool {
+    let key = revocation_key(domain, digest);
+    revocation_tombstones()
+        .read()
+        .map_or(true, |tombstones| tombstones.contains(&key))
+}
+
+pub(crate) fn tombstone_revocation(domain: &str, digest: &Digest) -> Result<(), ModelError> {
+    let key = revocation_key(domain, digest);
+    let mut tombstones = revocation_tombstones()
+        .write()
+        .map_err(|_| ModelError::RevocationFenceUnavailable)?;
+    if tombstones.insert(key) {
+        Ok(())
+    } else {
+        Err(ModelError::AlreadyRevoked)
+    }
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -534,6 +569,19 @@ impl CollectionFilter {
             Err(ModelError::DigestMismatch)
         }
     }
+
+    pub fn validate_for_window(&self, window: &ObservationWindow) -> Result<(), ModelError> {
+        self.validate_digest()?;
+        let valid = match &self.value {
+            CollectionFilterValue::Timestamp(timestamp) => window.contains(*timestamp),
+            CollectionFilterValue::RecordId(_) | CollectionFilterValue::Status(_) => true,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ModelError::InvalidFilter)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -711,6 +759,7 @@ pub struct SecretReference {
     credential_revision: Revision,
     auth_kind: NetSuiteAuthKind,
     revoked: bool,
+    revocation: Arc<AtomicBool>,
 }
 
 impl Clone for SecretReference {
@@ -721,6 +770,7 @@ impl Clone for SecretReference {
             credential_revision: self.credential_revision,
             auth_kind: self.auth_kind,
             revoked: self.revoked,
+            revocation: Arc::clone(&self.revocation),
         }
     }
 }
@@ -733,7 +783,11 @@ impl fmt::Debug for SecretReference {
             .field("scope_digest", &self.scope_digest)
             .field("credential_revision", &self.credential_revision)
             .field("auth_kind", &self.auth_kind)
-            .field("revoked", &self.revoked)
+            .field("revoked", &self.is_revoked())
+            .field(
+                "revocation_fenced",
+                &self.revocation.load(Ordering::Acquire),
+            )
             .finish()
     }
 }
@@ -744,7 +798,7 @@ impl PartialEq for SecretReference {
             && self.scope_digest == other.scope_digest
             && self.credential_revision == other.credential_revision
             && self.auth_kind == other.auth_kind
-            && self.revoked == other.revoked
+            && self.is_revoked() == other.is_revoked()
     }
 }
 
@@ -771,12 +825,16 @@ impl SecretReference {
                 auth_kind.as_str().to_owned(),
             ],
         );
+        if is_revocation_tombstoned("netsuite-secret-reference", &reference_digest) {
+            return Err(ModelError::AlreadyRevoked);
+        }
         Ok(Self {
             reference_digest,
             scope_digest,
             credential_revision,
             auth_kind,
             revoked: false,
+            revocation: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -796,16 +854,27 @@ impl SecretReference {
         self.auth_kind
     }
 
-    pub const fn is_revoked(&self) -> bool {
+    pub fn is_revoked(&self) -> bool {
         self.revoked
+            || self.revocation.load(Ordering::Acquire)
+            || is_revocation_tombstoned("netsuite-secret-reference", &self.reference_digest)
     }
 
     pub fn revoke(&mut self) -> Result<(), ModelError> {
-        if self.revoked {
-            Err(ModelError::AlreadyRevoked)
-        } else {
-            self.revoked = true;
-            Ok(())
+        if self.is_revoked() {
+            return Err(ModelError::AlreadyRevoked);
+        }
+        if self
+            .revocation
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(ModelError::AlreadyRevoked);
+        }
+        self.revoked = true;
+        match tombstone_revocation("netsuite-secret-reference", &self.reference_digest) {
+            Ok(()) | Err(ModelError::AlreadyRevoked) => Ok(()),
+            Err(error) => Err(error),
         }
     }
 }
@@ -853,6 +922,7 @@ impl NetSuiteScope {
         if consent_scope.operations().is_empty() {
             return Err(ModelError::InvalidScope);
         }
+        collection_filter.validate_for_window(&observation_window)?;
         let scope_digest = Digest::from_fields(
             "netsuite-accounting-scope/v1",
             &[
@@ -966,6 +1036,66 @@ impl NetSuiteScope {
     pub fn digest(&self) -> Digest {
         self.scope_digest.clone()
     }
+
+    pub fn validate_digest(&self) -> Result<(), ModelError> {
+        if !valid_identifier(self.account_id.as_str())
+            || !valid_data_center(self.data_center.as_str())
+            || !valid_identifier(self.role_id.as_str())
+            || !valid_identifier(self.project_id.as_str())
+            || !valid_identifier(self.mission_id.as_str())
+            || !valid_identifier(self.work_product_id.as_str())
+            || self
+                .record_id
+                .as_ref()
+                .is_some_and(|record_id| !valid_record_id(record_id.as_str()))
+            || self.project_revision.get() == 0
+            || self.mission_revision.get() == 0
+            || self.work_product_revision.get() == 0
+            || self.consent_scope.operations().is_empty()
+            || !is_digest(self.permission_digest.as_str())
+            || !is_digest(self.consent_scope.digest().as_str())
+        {
+            return Err(ModelError::InvalidScope);
+        }
+        let expected = Digest::from_fields(
+            "netsuite-accounting-scope/v1",
+            &[
+                self.account_id.as_str().to_owned(),
+                self.data_center.as_str().to_owned(),
+                self.role_id.as_str().to_owned(),
+                self.record_type.as_str().to_owned(),
+                self.record_id
+                    .as_ref()
+                    .map_or_else(|| "<collection>".to_owned(), |id| id.as_str().to_owned()),
+                self.collection_filter.digest().as_str().to_owned(),
+                self.observation_window.start.to_rfc3339(),
+                self.observation_window.end.to_rfc3339(),
+                self.permission_digest.as_str().to_owned(),
+                self.project_id.as_str().to_owned(),
+                self.project_revision.get().to_string(),
+                self.mission_id.as_str().to_owned(),
+                self.mission_revision.get().to_string(),
+                self.work_product_id.as_str().to_owned(),
+                self.work_product_revision.get().to_string(),
+                self.consent_scope
+                    .operations()
+                    .iter()
+                    .map(|operation| format!("{operation:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                self.consent_scope.expires_at().to_rfc3339(),
+                self.consent_scope.digest().as_str().to_owned(),
+            ],
+        );
+        if self.scope_digest != expected
+            || ObservationWindow::new(self.observation_window.start, self.observation_window.end)
+                .is_err()
+        {
+            return Err(ModelError::DigestMismatch);
+        }
+        self.collection_filter
+            .validate_for_window(&self.observation_window)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1049,6 +1179,7 @@ impl NetSuiteSuiteQlStatement {
         if fields.is_empty() || fields.len() > MAX_SUITEQL_FIELDS || max_rows == 0 {
             return Err(ModelError::InvalidSuiteQl);
         }
+        filter.validate_for_window(&observation_window)?;
         let mut unique_fields = BTreeSet::new();
         for field in &fields {
             if !unique_fields.insert(*field) {

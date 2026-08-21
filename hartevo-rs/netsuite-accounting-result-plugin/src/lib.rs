@@ -40,9 +40,10 @@ pub use consumer::{
 };
 pub use model::*;
 pub use provider::{
-    NetSuiteProviderDefinition, NetSuiteProviderError, NetSuiteProviderRead,
-    NetSuiteProviderRevision, NetSuiteReadFailure, NetSuiteReadReceipt, NetSuiteRetryEvidence,
-    NetSuiteSuiteTalkProvider, NetSuiteTransportProvenance, ProviderDefinitionError,
+    NetSuiteEndpointIdentity, NetSuiteEndpointKind, NetSuiteProviderDefinition,
+    NetSuiteProviderError, NetSuiteProviderRead, NetSuiteProviderRevision, NetSuiteReadFailure,
+    NetSuiteReadReceipt, NetSuiteRetryEvidence, NetSuiteSuiteTalkProvider,
+    NetSuiteTransportProvenance, ProviderDefinitionError,
 };
 pub use service::{
     NetSuiteAccountingEvidence, NetSuiteAccountingProposal, NetSuiteAccountingProposalRequest,

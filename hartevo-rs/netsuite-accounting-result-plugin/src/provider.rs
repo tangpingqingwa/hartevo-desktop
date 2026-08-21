@@ -7,7 +7,10 @@ use thiserror::Error;
 
 use crate::{
     NETSUITE_ACCOUNTING_RESULT_SCHEMA_VERSION, NETSUITE_PROVIDER_ID,
-    model::{Digest, ModelError, NetSuiteBounds, NetSuitePayload, NetSuiteReadOperation, Revision},
+    model::{
+        Digest, ModelError, NetSuiteBounds, NetSuitePayload, NetSuiteReadOperation,
+        NetSuiteRecordType, Revision,
+    },
     transport::{
         NetSuiteGetRequest, NetSuiteGetResponse, NetSuiteHttpMethod, NetSuiteSuiteTalkEndpoint,
         NetSuiteTransport, NetSuiteTransportError, NetSuiteTransportErrorKind,
@@ -46,6 +49,8 @@ pub enum ProviderDefinitionError {
     EmptyVersion,
     #[error("Layer 1 cannot register a native or Connected NetSuite provider")]
     NativeProviderForbidden,
+    #[error("transport provenance does not match the provider claim")]
+    ProvenanceMismatch,
     #[error(transparent)]
     Model(#[from] ModelError),
 }
@@ -53,15 +58,15 @@ pub enum ProviderDefinitionError {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetSuiteProviderDefinition {
-    pub schema_version: String,
-    pub provider_id: String,
-    pub provider_version: String,
-    pub capability_digest: Digest,
-    pub provenance: NetSuiteTransportProvenance,
-    pub operations: Vec<NetSuiteReadOperation>,
-    pub native: bool,
-    pub connected: bool,
-    pub live_execution: bool,
+    schema_version: String,
+    provider_id: String,
+    provider_version: String,
+    capability_digest: Digest,
+    provenance: NetSuiteTransportProvenance,
+    operations: Vec<NetSuiteReadOperation>,
+    native: bool,
+    connected: bool,
+    live_execution: bool,
 }
 
 impl NetSuiteProviderDefinition {
@@ -132,13 +137,93 @@ impl NetSuiteProviderDefinition {
             ],
         )
     }
+
+    pub fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub fn provider_version(&self) -> &str {
+        &self.provider_version
+    }
+
+    pub fn capability_digest(&self) -> &Digest {
+        &self.capability_digest
+    }
+
+    pub const fn provenance(&self) -> NetSuiteTransportProvenance {
+        self.provenance
+    }
+
+    pub fn operations(&self) -> &[NetSuiteReadOperation] {
+        &self.operations
+    }
+
+    pub const fn is_native(&self) -> bool {
+        self.native
+    }
+
+    pub const fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    pub const fn live_execution(&self) -> bool {
+        self.live_execution
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetSuiteEndpointKind {
+    RecordMetadata,
+    RecordCollection,
+    SelectedRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetSuiteEndpointIdentity {
+    pub kind: NetSuiteEndpointKind,
+    pub record_type: NetSuiteRecordType,
+    pub record_id_digest: Option<Digest>,
+    pub endpoint_digest: Digest,
+}
+
+impl NetSuiteEndpointIdentity {
+    fn from_endpoint(endpoint: &NetSuiteSuiteTalkEndpoint) -> Self {
+        let (kind, record_type, record_id_digest) = match endpoint {
+            NetSuiteSuiteTalkEndpoint::RecordMetadata { record_type } => {
+                (NetSuiteEndpointKind::RecordMetadata, *record_type, None)
+            }
+            NetSuiteSuiteTalkEndpoint::RecordCollection { record_type } => {
+                (NetSuiteEndpointKind::RecordCollection, *record_type, None)
+            }
+            NetSuiteSuiteTalkEndpoint::SelectedRecord {
+                record_type,
+                record_id,
+            } => (
+                NetSuiteEndpointKind::SelectedRecord,
+                *record_type,
+                Some(Digest::from_text(record_id.as_str())),
+            ),
+        };
+        Self {
+            kind,
+            record_type,
+            record_id_digest,
+            endpoint_digest: Digest::from_text(endpoint.path()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetSuiteReadReceipt {
     pub operation: NetSuiteReadOperation,
-    pub endpoint: NetSuiteSuiteTalkEndpoint,
+    pub endpoint_identity: NetSuiteEndpointIdentity,
     pub method: NetSuiteHttpMethod,
     pub request_digest: Digest,
     pub response_status: u16,
@@ -225,6 +310,9 @@ impl<T: NetSuiteTransport> NetSuiteSuiteTalkProvider<T> {
         provider_version: impl Into<String>,
         provenance: NetSuiteTransportProvenance,
     ) -> Result<Self, ProviderDefinitionError> {
+        if transport.declared_provenance() != provenance {
+            return Err(ProviderDefinitionError::ProvenanceMismatch);
+        }
         let definition = NetSuiteProviderDefinition::new(provider_version, provenance)?;
         Ok(Self {
             transport,
@@ -249,7 +337,7 @@ impl<T: NetSuiteTransport> NetSuiteSuiteTalkProvider<T> {
     }
 
     pub fn provenance(&self) -> NetSuiteTransportProvenance {
-        self.definition.provenance
+        self.definition.provenance()
     }
 
     pub fn transport(&self) -> &T {
@@ -270,7 +358,7 @@ impl<T: NetSuiteTransport> NetSuiteSuiteTalkProvider<T> {
             || request.page_number() == 0
             || request.page_number() > bounds.max_pages()
             || request.page_size() > bounds.page_size()
-            || !self.definition.operations.contains(&request.operation())
+            || !self.definition.operations().contains(&request.operation())
         {
             return Err(NetSuiteProviderError::Request(
                 "only bounded allowlisted GET requests are accepted".to_owned(),
@@ -318,7 +406,9 @@ impl<T: NetSuiteTransport> NetSuiteSuiteTalkProvider<T> {
                     Self::validate_response(request, &bounds, &response)?;
                     let receipt = NetSuiteReadReceipt {
                         operation: request.operation(),
-                        endpoint: request.endpoint().clone(),
+                        endpoint_identity: NetSuiteEndpointIdentity::from_endpoint(
+                            request.endpoint(),
+                        ),
                         method: request.method(),
                         request_digest: request.request_digest()?,
                         response_status: response.status(),
@@ -370,6 +460,13 @@ impl<T: NetSuiteTransport> NetSuiteSuiteTalkProvider<T> {
         {
             return Err(NetSuiteProviderError::ScopeMismatch);
         }
+        if request
+            .collection_filter()
+            .validate_for_window(request.window())
+            .is_err()
+        {
+            return Err(NetSuiteProviderError::ScopeMismatch);
+        }
         if response.project_id() != request.project_id()
             || response.mission_id() != request.mission_id()
             || response.work_product_id() != request.work_product_id()
@@ -395,7 +492,8 @@ impl<T: NetSuiteTransport> NetSuiteSuiteTalkProvider<T> {
         }
         match (request.operation(), response.payload()) {
             (NetSuiteReadOperation::RecordMetadata, NetSuitePayload::RecordMetadata(metadata))
-                if metadata.record_type() == request.record_type() =>
+                if metadata.record_type() == request.record_type()
+                    && request.window().contains(metadata.observed_at()) =>
             {
                 metadata
                     .validate_digest()
@@ -417,6 +515,7 @@ impl<T: NetSuiteTransport> NetSuiteSuiteTalkProvider<T> {
             }
             (NetSuiteReadOperation::SelectedRecord, NetSuitePayload::SelectedRecord(selected))
                 if selected.record_type() == request.record_type()
+                    && request.window().contains(selected.observed_at())
                     && request.record_id().is_some_and(|record_id| {
                         selected.record_id_digest() == &Digest::from_text(record_id.as_str())
                     }) =>

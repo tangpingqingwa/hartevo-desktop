@@ -11,6 +11,19 @@ use crate::model::{
 use serde::{Deserialize, Serialize, Serializer};
 
 pub(crate) const MAX_CURSOR_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_PROVIDER_REVISION_BYTES: usize = 64;
+
+mod sealed {
+    pub trait NetSuiteTransportSealed {}
+}
+
+fn valid_provider_revision(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PROVIDER_REVISION_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
 
 /// Cursor values are retained only by a transport and cross public boundaries
 /// as their digest.
@@ -132,7 +145,8 @@ impl NetSuiteGetRequest {
         page_number: u16,
         cursor: Option<OpaqueCursor>,
     ) -> Result<Self, ModelError> {
-        if !operation.is_get()
+        if scope.validate_digest().is_err()
+            || !operation.is_get()
             || page_number == 0
             || page_number > bounds.max_pages()
             || window != *scope.observation_window()
@@ -321,10 +335,29 @@ impl NetSuiteGetResponse {
         next_cursor: Option<OpaqueCursor>,
     ) -> Result<Self, NetSuiteTransportError> {
         let provider_revision = provider_revision.into();
-        if provider_revision.is_empty() {
+        if !valid_provider_revision(&provider_revision) {
             return Err(NetSuiteTransportError::invalid_response(
-                "empty provider revision",
+                "provider revision is empty, malformed, or too long",
             ));
+        }
+        match &payload {
+            NetSuitePayload::RecordMetadata(metadata)
+                if !request.window().contains(metadata.observed_at()) =>
+            {
+                return Err(NetSuiteTransportError::invalid_response(
+                    "record metadata timestamp is outside the observation window",
+                ));
+            }
+            NetSuitePayload::SelectedRecord(selected)
+                if !request.window().contains(selected.observed_at()) =>
+            {
+                return Err(NetSuiteTransportError::invalid_response(
+                    "selected record timestamp is outside the observation window",
+                ));
+            }
+            NetSuitePayload::RecordMetadata(_)
+            | NetSuitePayload::RecordCollection(_)
+            | NetSuitePayload::SelectedRecord(_) => {}
         }
         let response_size = serde_json::to_vec(&payload)
             .map_err(|error| NetSuiteTransportError::invalid_response(error.to_string()))?
@@ -515,7 +548,16 @@ impl NetSuiteSnapshot {
         selected_record: Option<NetSuiteSelectedRecordSummary>,
     ) -> Result<Self, NetSuiteTransportError> {
         let provider_revision = provider_revision.into();
-        if provider_revision.is_empty() || collection_pages.len() != collection_cursors.len() {
+        if !valid_provider_revision(&provider_revision)
+            || collection_pages.len() != collection_cursors.len()
+            || scope.validate_digest().is_err()
+            || metadata
+                .as_ref()
+                .is_some_and(|value| !scope.observation_window().contains(value.observed_at()))
+            || selected_record
+                .as_ref()
+                .is_some_and(|value| !scope.observation_window().contains(value.observed_at()))
+        {
             return Err(NetSuiteTransportError::invalid_response(
                 "invalid fixture snapshot",
             ));
@@ -710,7 +752,9 @@ impl NetSuiteTransportError {
     }
 }
 
-pub trait NetSuiteTransport: fmt::Debug {
+pub trait NetSuiteTransport: fmt::Debug + sealed::NetSuiteTransportSealed {
+    fn declared_provenance(&self) -> crate::provider::NetSuiteTransportProvenance;
+
     fn execute(
         &mut self,
         request: &NetSuiteGetRequest,
@@ -722,6 +766,8 @@ pub struct FixtureNetSuiteTransport {
     snapshot: NetSuiteSnapshot,
 }
 
+impl sealed::NetSuiteTransportSealed for FixtureNetSuiteTransport {}
+
 impl FixtureNetSuiteTransport {
     pub fn new(snapshot: NetSuiteSnapshot) -> Self {
         Self { snapshot }
@@ -729,6 +775,10 @@ impl FixtureNetSuiteTransport {
 }
 
 impl NetSuiteTransport for FixtureNetSuiteTransport {
+    fn declared_provenance(&self) -> crate::provider::NetSuiteTransportProvenance {
+        crate::provider::NetSuiteTransportProvenance::Fixture
+    }
+
     fn execute(
         &mut self,
         request: &NetSuiteGetRequest,
@@ -744,6 +794,8 @@ pub struct LoopbackNetSuiteTransport {
     snapshot: NetSuiteSnapshot,
 }
 
+impl sealed::NetSuiteTransportSealed for LoopbackNetSuiteTransport {}
+
 impl LoopbackNetSuiteTransport {
     pub fn new(snapshot: NetSuiteSnapshot) -> Self {
         Self { snapshot }
@@ -751,6 +803,10 @@ impl LoopbackNetSuiteTransport {
 }
 
 impl NetSuiteTransport for LoopbackNetSuiteTransport {
+    fn declared_provenance(&self) -> crate::provider::NetSuiteTransportProvenance {
+        crate::provider::NetSuiteTransportProvenance::Loopback
+    }
+
     fn execute(
         &mut self,
         request: &NetSuiteGetRequest,
@@ -767,6 +823,8 @@ pub struct RecordingNetSuiteTransport {
     requests: Vec<NetSuiteGetRequest>,
 }
 
+impl sealed::NetSuiteTransportSealed for RecordingNetSuiteTransport {}
+
 impl RecordingNetSuiteTransport {
     pub fn push_response(&mut self, response: NetSuiteGetResponse) {
         self.queue.push_back(Ok(response));
@@ -782,6 +840,10 @@ impl RecordingNetSuiteTransport {
 }
 
 impl NetSuiteTransport for RecordingNetSuiteTransport {
+    fn declared_provenance(&self) -> crate::provider::NetSuiteTransportProvenance {
+        crate::provider::NetSuiteTransportProvenance::Recording
+    }
+
     fn execute(
         &mut self,
         request: &NetSuiteGetRequest,
@@ -798,7 +860,13 @@ impl NetSuiteTransport for RecordingNetSuiteTransport {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BlockedEnvNetSuiteTransport;
 
+impl sealed::NetSuiteTransportSealed for BlockedEnvNetSuiteTransport {}
+
 impl NetSuiteTransport for BlockedEnvNetSuiteTransport {
+    fn declared_provenance(&self) -> crate::provider::NetSuiteTransportProvenance {
+        crate::provider::NetSuiteTransportProvenance::BlockedEnv
+    }
+
     fn execute(
         &mut self,
         _request: &NetSuiteGetRequest,

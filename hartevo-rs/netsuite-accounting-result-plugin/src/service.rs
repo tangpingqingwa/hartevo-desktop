@@ -1,6 +1,12 @@
 //! Mission-scoped accounting-result proposal service.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -15,6 +21,7 @@ use crate::{
         Digest, ModelError, NetSuiteBounds, NetSuitePayload, NetSuiteReadOperation, NetSuiteScope,
         NetSuiteSelectedRecordSummary, NetSuiteSuiteQlField, NetSuiteSuiteQlStatement,
         ObservationWindow, Revision, SecretReference, digest_serializable,
+        is_revocation_tombstoned, tombstone_revocation,
     },
     provider::{
         NetSuiteProviderDefinition, NetSuiteProviderError, NetSuiteReadFailure,
@@ -63,6 +70,12 @@ impl Default for NetSuiteServiceDefinition {
     }
 }
 
+impl NetSuiteServiceDefinition {
+    pub fn digest(&self) -> Result<Digest, ModelError> {
+        digest_serializable(self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetSuiteRegistrationState {
@@ -92,25 +105,59 @@ pub enum NetSuiteServiceError {
     Model(#[from] ModelError),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetSuiteRegistration {
-    pub plugin_id: String,
-    pub plugin_version: String,
-    pub contract_version: String,
-    pub service_id: String,
-    pub provider_id: String,
-    pub provider_version: String,
-    pub provider_definition_digest: Digest,
-    pub permission_digest: Digest,
-    pub scope_digest: Digest,
-    pub consent_digest: Digest,
-    pub secret_reference_digest: Digest,
-    pub credential_revision: Revision,
-    pub contract_digest: Digest,
-    pub state: NetSuiteRegistrationState,
-    pub registration_digest: Digest,
+    plugin_id: String,
+    plugin_version: String,
+    contract_version: String,
+    service_id: String,
+    service_version: String,
+    service_definition_digest: Digest,
+    provider_id: String,
+    provider_version: String,
+    provider_provenance: NetSuiteTransportProvenance,
+    provider_definition_digest: Digest,
+    permission_digest: Digest,
+    scope_digest: Digest,
+    consent_digest: Digest,
+    secret_reference_digest: Digest,
+    credential_revision: Revision,
+    contract_digest: Digest,
+    state: NetSuiteRegistrationState,
+    registration_digest: Digest,
+    #[serde(skip)]
+    bound_secret_reference: SecretReference,
+    #[serde(skip)]
+    revocation: Arc<AtomicBool>,
+    #[serde(skip)]
+    replay_fence: Arc<Mutex<BTreeSet<Digest>>>,
 }
+
+impl PartialEq for NetSuiteRegistration {
+    fn eq(&self, other: &Self) -> bool {
+        self.plugin_id == other.plugin_id
+            && self.plugin_version == other.plugin_version
+            && self.contract_version == other.contract_version
+            && self.service_id == other.service_id
+            && self.service_version == other.service_version
+            && self.service_definition_digest == other.service_definition_digest
+            && self.provider_id == other.provider_id
+            && self.provider_version == other.provider_version
+            && self.provider_provenance == other.provider_provenance
+            && self.provider_definition_digest == other.provider_definition_digest
+            && self.permission_digest == other.permission_digest
+            && self.scope_digest == other.scope_digest
+            && self.consent_digest == other.consent_digest
+            && self.secret_reference_digest == other.secret_reference_digest
+            && self.credential_revision == other.credential_revision
+            && self.contract_digest == other.contract_digest
+            && self.state == other.state
+            && self.registration_digest == other.registration_digest
+    }
+}
+
+impl Eq for NetSuiteRegistration {}
 
 impl NetSuiteRegistration {
     pub fn new(
@@ -127,22 +174,26 @@ impl NetSuiteRegistration {
         if secret_reference.is_revoked() {
             return Err(NetSuiteServiceError::SecretRevoked);
         }
-        if provider.provider_id != NETSUITE_PROVIDER_ID
-            || provider.native
-            || provider.connected
-            || provider.live_execution
+        if provider.provider_id() != NETSUITE_PROVIDER_ID
+            || provider.is_native()
+            || provider.is_connected()
+            || provider.live_execution()
         {
             return Err(NetSuiteServiceError::ScopeMismatch(
                 "only a non-native, non-connected provider may register".to_owned(),
             ));
         }
+        let service = NetSuiteServiceDefinition::default();
         let mut registration = Self {
             plugin_id: NETSUITE_ACCOUNTING_RESULT_PLUGIN_ID.to_owned(),
             plugin_version: NETSUITE_ACCOUNTING_RESULT_PLUGIN_VERSION.to_owned(),
             contract_version: NETSUITE_ACCOUNTING_RESULT_CONTRACT_VERSION.to_owned(),
             service_id: NETSUITE_ACCOUNTING_RESULT_SERVICE_ID.to_owned(),
-            provider_id: provider.provider_id.clone(),
-            provider_version: provider.provider_version.clone(),
+            service_version: service.version.clone(),
+            service_definition_digest: service.digest()?,
+            provider_id: provider.provider_id().to_owned(),
+            provider_version: provider.provider_version().to_owned(),
+            provider_provenance: provider.provenance(),
             provider_definition_digest: provider.provider_digest(),
             permission_digest: scope.permission_digest().clone(),
             scope_digest: scope.digest(),
@@ -152,19 +203,28 @@ impl NetSuiteRegistration {
             contract_digest,
             state: NetSuiteRegistrationState::Active,
             registration_digest: Digest::from_text("uninitialized-netsuite-registration"),
+            bound_secret_reference: secret_reference.clone(),
+            revocation: Arc::new(AtomicBool::new(false)),
+            replay_fence: Arc::new(Mutex::new(BTreeSet::new())),
         };
         registration.registration_digest = registration.recompute_digest()?;
+        if is_revocation_tombstoned("netsuite-registration", &registration.registration_digest) {
+            return Err(NetSuiteServiceError::RegistrationRevoked);
+        }
         Ok(registration)
     }
 
-    pub fn recompute_digest(&self) -> Result<Digest, NetSuiteServiceError> {
+    fn recompute_digest(&self) -> Result<Digest, NetSuiteServiceError> {
         let material = NetSuiteRegistrationMaterial {
             plugin_id: self.plugin_id.clone(),
             plugin_version: self.plugin_version.clone(),
             contract_version: self.contract_version.clone(),
             service_id: self.service_id.clone(),
+            service_version: self.service_version.clone(),
+            service_definition_digest: self.service_definition_digest.clone(),
             provider_id: self.provider_id.clone(),
             provider_version: self.provider_version.clone(),
+            provider_provenance: self.provider_provenance,
             provider_definition_digest: self.provider_definition_digest.clone(),
             permission_digest: self.permission_digest.clone(),
             scope_digest: self.scope_digest.clone(),
@@ -185,17 +245,167 @@ impl NetSuiteRegistration {
         }
     }
 
-    pub fn revoke(&mut self) -> Result<(), NetSuiteServiceError> {
-        if self.state == NetSuiteRegistrationState::Revoked {
+    pub fn validate_canonical(
+        &self,
+        scope: &NetSuiteScope,
+        secret_reference: &SecretReference,
+    ) -> Result<(), NetSuiteServiceError> {
+        if !self.is_active() {
             return Err(NetSuiteServiceError::RegistrationRevoked);
         }
+        self.validate_digest()?;
+        scope.validate_digest()?;
+        if secret_reference.is_revoked() {
+            return Err(NetSuiteServiceError::SecretRevoked);
+        }
+        if secret_reference.scope_digest() != &scope.digest()
+            || self.plugin_id != NETSUITE_ACCOUNTING_RESULT_PLUGIN_ID
+            || self.plugin_version != NETSUITE_ACCOUNTING_RESULT_PLUGIN_VERSION
+            || self.contract_version != NETSUITE_ACCOUNTING_RESULT_CONTRACT_VERSION
+            || self.service_id != NETSUITE_ACCOUNTING_RESULT_SERVICE_ID
+            || self.service_version != NETSUITE_ACCOUNTING_RESULT_PLUGIN_VERSION
+            || self.service_definition_digest != NetSuiteServiceDefinition::default().digest()?
+            || self.provider_id != NETSUITE_PROVIDER_ID
+            || self.contract_digest != crate::contract_digest()
+            || self.permission_digest != *scope.permission_digest()
+            || self.scope_digest != scope.digest()
+            || self.consent_digest != *scope.consent_scope().digest()
+            || self.secret_reference_digest != *secret_reference.reference_digest()
+            || self.credential_revision != secret_reference.credential_revision()
+        {
+            return Err(NetSuiteServiceError::ScopeMismatch(
+                "canonical NetSuite registration integrity fence failed".to_owned(),
+            ));
+        }
+        let provider = NetSuiteProviderDefinition::new(
+            self.provider_version.clone(),
+            self.provider_provenance,
+        )
+        .map_err(|error| NetSuiteServiceError::ScopeMismatch(error.to_string()))?;
+        if provider.provider_id() != self.provider_id
+            || provider.provider_version() != self.provider_version
+            || provider.provider_digest() != self.provider_definition_digest
+            || provider.is_native()
+            || provider.is_connected()
+            || provider.live_execution()
+        {
+            return Err(NetSuiteServiceError::ScopeMismatch(
+                "provider definition does not match canonical registration".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn revoke(&mut self) -> Result<(), NetSuiteServiceError> {
+        if !self.is_active()
+            || self
+                .revocation
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(NetSuiteServiceError::RegistrationRevoked);
+        }
+        tombstone_revocation("netsuite-registration", &self.registration_digest).map_err(
+            |error| match error {
+                ModelError::AlreadyRevoked => NetSuiteServiceError::RegistrationRevoked,
+                other => NetSuiteServiceError::Model(other),
+            },
+        )?;
         self.state = NetSuiteRegistrationState::Revoked;
         self.registration_digest = self.recompute_digest()?;
         Ok(())
     }
 
-    pub const fn is_active(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         matches!(self.state, NetSuiteRegistrationState::Active)
+            && !self.revocation.load(Ordering::Acquire)
+            && !is_revocation_tombstoned("netsuite-registration", &self.registration_digest)
+    }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub fn plugin_version(&self) -> &str {
+        &self.plugin_version
+    }
+
+    pub fn contract_version(&self) -> &str {
+        &self.contract_version
+    }
+
+    pub fn service_id(&self) -> &str {
+        &self.service_id
+    }
+
+    pub fn service_version(&self) -> &str {
+        &self.service_version
+    }
+
+    pub fn service_definition_digest(&self) -> &Digest {
+        &self.service_definition_digest
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub fn provider_version(&self) -> &str {
+        &self.provider_version
+    }
+
+    pub const fn provider_provenance(&self) -> NetSuiteTransportProvenance {
+        self.provider_provenance
+    }
+
+    pub fn provider_definition_digest(&self) -> &Digest {
+        &self.provider_definition_digest
+    }
+
+    pub fn permission_digest(&self) -> &Digest {
+        &self.permission_digest
+    }
+
+    pub fn scope_digest(&self) -> &Digest {
+        &self.scope_digest
+    }
+
+    pub fn consent_digest(&self) -> &Digest {
+        &self.consent_digest
+    }
+
+    pub fn secret_reference_digest(&self) -> &Digest {
+        &self.secret_reference_digest
+    }
+
+    pub const fn credential_revision(&self) -> Revision {
+        self.credential_revision
+    }
+
+    pub fn contract_digest(&self) -> &Digest {
+        &self.contract_digest
+    }
+
+    pub fn registration_digest(&self) -> &Digest {
+        &self.registration_digest
+    }
+
+    pub const fn state(&self) -> NetSuiteRegistrationState {
+        self.state
+    }
+
+    pub(crate) fn bound_secret_reference(&self) -> &SecretReference {
+        &self.bound_secret_reference
+    }
+
+    pub(crate) fn claim_proposal(&self, digest: &Digest) -> Result<bool, NetSuiteServiceError> {
+        if !self.is_active() {
+            return Err(NetSuiteServiceError::RegistrationRevoked);
+        }
+        self.replay_fence
+            .lock()
+            .map_err(|_| NetSuiteServiceError::StaleEvidence)
+            .map(|mut fence| fence.insert(digest.clone()))
     }
 }
 
@@ -206,8 +416,11 @@ struct NetSuiteRegistrationMaterial {
     plugin_version: String,
     contract_version: String,
     service_id: String,
+    service_version: String,
+    service_definition_digest: Digest,
     provider_id: String,
     provider_version: String,
+    provider_provenance: NetSuiteTransportProvenance,
     provider_definition_digest: Digest,
     permission_digest: Digest,
     scope_digest: Digest,
@@ -401,6 +614,7 @@ impl NetSuiteAccountingEvidence {
         scope: &NetSuiteScope,
         credential_revision: Revision,
     ) -> Result<(), NetSuiteServiceError> {
+        scope.validate_digest()?;
         if self.evidence_digest != self.recompute_digest()? {
             return Err(NetSuiteServiceError::StaleEvidence);
         }
@@ -417,6 +631,16 @@ impl NetSuiteAccountingEvidence {
                 .selected_record
                 .as_ref()
                 .is_some_and(|selected| selected.record_type() != scope.record_type())
+            || scope
+                .collection_filter()
+                .validate_for_window(scope.observation_window())
+                .is_err()
+            || self.metadata.as_ref().is_some_and(|metadata| {
+                !scope.observation_window().contains(metadata.observed_at())
+            })
+            || self.selected_record.as_ref().is_some_and(|selected| {
+                !scope.observation_window().contains(selected.observed_at())
+            })
         {
             return Err(NetSuiteServiceError::ScopeMismatch(
                 "evidence does not match the typed scope".to_owned(),
@@ -475,11 +699,15 @@ pub struct NetSuiteAccountingProposal {
     pub scope_digest: Digest,
     pub status: NetSuiteAccountingStatus,
     pub evidence: NetSuiteAccountingEvidence,
+    pub provider_id: String,
+    pub provider_version: String,
+    pub provider_definition_digest: Digest,
+    pub provenance: NetSuiteTransportProvenance,
     pub connected: bool,
     pub native_evidence: bool,
     pub outcome_authority: bool,
     pub work_product_adoption: bool,
-    pub proposal_digest: Digest,
+    proposal_digest: Digest,
 }
 
 impl NetSuiteAccountingProposal {
@@ -489,13 +717,18 @@ impl NetSuiteAccountingProposal {
         scope: &NetSuiteScope,
         status: NetSuiteAccountingStatus,
         evidence: NetSuiteAccountingEvidence,
+        provider: &NetSuiteProviderDefinition,
     ) -> Result<Self, NetSuiteServiceError> {
         let mut proposal = Self {
             request,
-            registration_digest: registration.registration_digest.clone(),
+            registration_digest: registration.registration_digest().clone(),
             scope_digest: scope.digest(),
             status,
             evidence,
+            provider_id: provider.provider_id().to_owned(),
+            provider_version: provider.provider_version().to_owned(),
+            provider_definition_digest: provider.provider_digest(),
+            provenance: provider.provenance(),
             connected: false,
             native_evidence: false,
             outcome_authority: false,
@@ -506,19 +739,27 @@ impl NetSuiteAccountingProposal {
         Ok(proposal)
     }
 
-    pub fn recompute_digest(&self) -> Result<Digest, NetSuiteServiceError> {
+    fn recompute_digest(&self) -> Result<Digest, NetSuiteServiceError> {
         let material = NetSuiteProposalMaterial {
             request: self.request.clone(),
             registration_digest: self.registration_digest.clone(),
             scope_digest: self.scope_digest.clone(),
             status: self.status,
             evidence: self.evidence.clone(),
+            provider_id: self.provider_id.clone(),
+            provider_version: self.provider_version.clone(),
+            provider_definition_digest: self.provider_definition_digest.clone(),
+            provenance: self.provenance,
             connected: self.connected,
             native_evidence: self.native_evidence,
             outcome_authority: self.outcome_authority,
             work_product_adoption: self.work_product_adoption,
         };
         digest_serializable(&material).map_err(NetSuiteServiceError::Model)
+    }
+
+    pub fn proposal_digest(&self) -> &Digest {
+        &self.proposal_digest
     }
 
     pub fn validate_bindings(
@@ -528,15 +769,24 @@ impl NetSuiteAccountingProposal {
     ) -> Result<(), NetSuiteServiceError> {
         if !registration.is_active()
             || registration.validate_digest().is_err()
-            || self.registration_digest != registration.registration_digest
+            || self.registration_digest != *registration.registration_digest()
             || self.scope_digest != scope.digest()
             || self.request.request_digest != self.request.recompute_digest()?
             || self.proposal_digest != self.recompute_digest()?
+            || self.provider_id != registration.provider_id()
+            || self.provider_version != registration.provider_version()
+            || self.provider_definition_digest != *registration.provider_definition_digest()
+            || self.provenance != registration.provider_provenance()
+            || self.evidence.provenance != self.provenance
+            || self.connected
+            || self.native_evidence
+            || self.outcome_authority
+            || self.work_product_adoption
         {
             return Err(NetSuiteServiceError::StaleEvidence);
         }
         self.evidence
-            .validate(scope, registration.credential_revision)
+            .validate(scope, registration.credential_revision())
     }
 
     pub const fn is_adopted(&self) -> bool {
@@ -552,6 +802,10 @@ struct NetSuiteProposalMaterial {
     scope_digest: Digest,
     status: NetSuiteAccountingStatus,
     evidence: NetSuiteAccountingEvidence,
+    provider_id: String,
+    provider_version: String,
+    provider_definition_digest: Digest,
+    provenance: NetSuiteTransportProvenance,
     connected: bool,
     native_evidence: bool,
     outcome_authority: bool,
@@ -573,7 +827,10 @@ pub struct NetSuiteSuiteQlProposal {
     pub executed: bool,
     pub connected: bool,
     pub native: bool,
-    pub proposal_digest: Digest,
+    pub native_evidence: bool,
+    pub outcome_authority: bool,
+    pub work_product_adoption: bool,
+    proposal_digest: Digest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -591,6 +848,9 @@ struct NetSuiteSuiteQlProposalMaterial {
     executed: bool,
     connected: bool,
     native: bool,
+    native_evidence: bool,
+    outcome_authority: bool,
+    work_product_adoption: bool,
 }
 
 impl NetSuiteSuiteQlProposal {
@@ -602,24 +862,27 @@ impl NetSuiteSuiteQlProposal {
     ) -> Result<Self, NetSuiteServiceError> {
         let mut proposal = Self {
             statement,
-            provider_id: provider.provider_id.clone(),
-            provider_version: provider.provider_version.clone(),
+            provider_id: provider.provider_id().to_owned(),
+            provider_version: provider.provider_version().to_owned(),
             provider_definition_digest: provider.provider_digest(),
-            provenance: provider.provenance,
+            provenance: provider.provenance(),
             scope_digest: scope.digest(),
             permission_digest: scope.permission_digest().clone(),
             consent_digest: scope.consent_scope().digest().clone(),
-            registration_digest: registration.registration_digest.clone(),
+            registration_digest: registration.registration_digest().clone(),
             executed: false,
             connected: false,
             native: false,
+            native_evidence: false,
+            outcome_authority: false,
+            work_product_adoption: false,
             proposal_digest: Digest::from_text("uninitialized-netsuite-suiteql-proposal"),
         };
         proposal.proposal_digest = proposal.recompute_digest()?;
         Ok(proposal)
     }
 
-    pub fn recompute_digest(&self) -> Result<Digest, NetSuiteServiceError> {
+    fn recompute_digest(&self) -> Result<Digest, NetSuiteServiceError> {
         let material = NetSuiteSuiteQlProposalMaterial {
             statement: self.statement.clone(),
             provider_id: self.provider_id.clone(),
@@ -633,8 +896,15 @@ impl NetSuiteSuiteQlProposal {
             executed: self.executed,
             connected: self.connected,
             native: self.native,
+            native_evidence: self.native_evidence,
+            outcome_authority: self.outcome_authority,
+            work_product_adoption: self.work_product_adoption,
         };
         digest_serializable(&material).map_err(NetSuiteServiceError::Model)
+    }
+
+    pub fn proposal_digest(&self) -> &Digest {
+        &self.proposal_digest
     }
 
     pub fn validate_bindings(
@@ -643,18 +913,39 @@ impl NetSuiteSuiteQlProposal {
         registration: &NetSuiteRegistration,
     ) -> Result<(), NetSuiteServiceError> {
         if !registration.is_active()
-            || self.registration_digest != registration.registration_digest
+            || registration.validate_digest().is_err()
+            || self.registration_digest != *registration.registration_digest()
             || self.scope_digest != scope.digest()
             || self.permission_digest != *scope.permission_digest()
             || self.consent_digest != *scope.consent_scope().digest()
+            || self.provider_id != registration.provider_id()
+            || self.provider_version != registration.provider_version()
+            || self.provider_definition_digest != *registration.provider_definition_digest()
+            || self.provenance != registration.provider_provenance()
             || self.executed
             || self.connected
             || self.native
+            || self.native_evidence
+            || self.outcome_authority
+            || self.work_product_adoption
             || self.proposal_digest != self.recompute_digest()?
         {
             return Err(NetSuiteServiceError::StaleEvidence);
         }
         self.statement.validate_digest()?;
+        if self.statement.record_type() != scope.record_type()
+            || self.statement.filter().digest() != scope.collection_filter().digest()
+            || self.statement.observation_window() != scope.observation_window()
+            || self
+                .statement
+                .filter()
+                .validate_for_window(scope.observation_window())
+                .is_err()
+        {
+            return Err(NetSuiteServiceError::ScopeMismatch(
+                "SuiteQL statement is outside the registered scope".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -699,6 +990,7 @@ impl<T: crate::transport::NetSuiteTransport> NetSuiteAccountingResultService<T> 
             provider.definition(),
             crate::contract_digest(),
         )?;
+        registration.validate_canonical(&scope, &secret_reference)?;
         Ok(Self {
             scope,
             secret_reference,
@@ -835,7 +1127,14 @@ impl<T: crate::transport::NetSuiteTransport> NetSuiteAccountingResultService<T> 
             failures,
             bounded_truncation,
         )?;
-        NetSuiteAccountingProposal::new(request, &self.registration, &scope, status, evidence)
+        NetSuiteAccountingProposal::new(
+            request,
+            &self.registration,
+            &scope,
+            status,
+            evidence,
+            self.provider.definition(),
+        )
     }
 
     pub fn compile_parameterized_suiteql_proposal(
@@ -900,15 +1199,20 @@ impl<T: crate::transport::NetSuiteTransport> NetSuiteAccountingResultService<T> 
         let record_digest = Digest::from_fields(
             "netsuite-suiteql-record/v1",
             &[
-                proposal.proposal_digest.as_str().to_owned(),
+                proposal.proposal_digest().as_str().to_owned(),
                 proposal.statement.query_digest().as_str().to_owned(),
                 proposal.scope_digest.as_str().to_owned(),
                 at.to_rfc3339(),
                 "executed=false".to_owned(),
             ],
         );
+        if !self.scope.observation_window().contains(at) {
+            return Err(NetSuiteServiceError::ScopeMismatch(
+                "SuiteQL record timestamp is outside the registered observation window".to_owned(),
+            ));
+        }
         Ok(NetSuiteSuiteQlRecord {
-            proposal_digest: proposal.proposal_digest.clone(),
+            proposal_digest: proposal.proposal_digest().clone(),
             statement_digest: proposal.statement.query_digest().clone(),
             provider_id: proposal.provider_id.clone(),
             provenance: proposal.provenance,
@@ -922,24 +1226,8 @@ impl<T: crate::transport::NetSuiteTransport> NetSuiteAccountingResultService<T> 
     }
 
     fn ensure_active(&self) -> Result<(), NetSuiteServiceError> {
-        if !self.registration.is_active() {
-            return Err(NetSuiteServiceError::RegistrationRevoked);
-        }
-        self.registration.validate_digest()?;
-        if self.secret_reference.is_revoked() {
-            return Err(NetSuiteServiceError::SecretRevoked);
-        }
-        if self.secret_reference.scope_digest() != &self.scope.digest()
-            || self.registration.scope_digest != self.scope.digest()
-            || self.registration.permission_digest != *self.scope.permission_digest()
-            || self.registration.consent_digest != *self.scope.consent_scope().digest()
-            || self.registration.credential_revision != self.secret_reference.credential_revision()
-        {
-            return Err(NetSuiteServiceError::ScopeMismatch(
-                "registration or credential fence drifted".to_owned(),
-            ));
-        }
-        Ok(())
+        self.registration
+            .validate_canonical(&self.scope, &self.secret_reference)
     }
 }
 

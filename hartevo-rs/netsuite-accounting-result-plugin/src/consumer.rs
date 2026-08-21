@@ -1,13 +1,13 @@
 //! Mission-scoped consumer for bounded NetSuite accounting evidence.
 
-use std::{collections::BTreeSet, fmt};
+use std::fmt;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    model::{Digest, NetSuiteScope},
+    model::{Digest, NetSuiteScope, SecretReference},
     provider::NetSuiteTransportProvenance,
     service::{
         NetSuiteAccountingProposal, NetSuiteAccountingStatus, NetSuiteRegistration,
@@ -69,7 +69,7 @@ impl MissionNetSuiteAccountingResult {
             "netsuite-mission-accounting-result/v1",
             &[
                 proposal.scope_digest.as_str().to_owned(),
-                proposal.proposal_digest.as_str().to_owned(),
+                proposal.proposal_digest().as_str().to_owned(),
                 proposal.evidence.evidence_digest.as_str().to_owned(),
                 format!("{state:?}"),
                 format!("{:?}", proposal.evidence.provenance),
@@ -90,7 +90,7 @@ impl MissionNetSuiteAccountingResult {
             status: proposal.status,
             provenance: proposal.evidence.provenance,
             evidence_digest: proposal.evidence.evidence_digest.clone(),
-            proposal_digest: proposal.proposal_digest.clone(),
+            proposal_digest: proposal.proposal_digest().clone(),
             connected: false,
             native_evidence: false,
             outcome_authority: false,
@@ -119,8 +119,8 @@ pub struct MissionNetSuiteSuiteQlResult {
 #[derive(Clone)]
 pub struct MissionNetSuiteAccountingConsumer {
     scope: NetSuiteScope,
+    secret_reference: SecretReference,
     registration: NetSuiteRegistration,
-    consumed_proposals: BTreeSet<Digest>,
 }
 
 impl fmt::Debug for MissionNetSuiteAccountingConsumer {
@@ -128,11 +128,11 @@ impl fmt::Debug for MissionNetSuiteAccountingConsumer {
         formatter
             .debug_struct("MissionNetSuiteAccountingConsumer")
             .field("scope_digest", &self.scope.digest())
+            .field("secret_reference", &self.secret_reference)
             .field(
                 "registration_digest",
-                &self.registration.registration_digest,
+                self.registration.registration_digest(),
             )
-            .field("consumed_proposals", &self.consumed_proposals.len())
             .finish()
     }
 }
@@ -142,18 +142,22 @@ impl MissionNetSuiteAccountingConsumer {
         scope: NetSuiteScope,
         registration: NetSuiteRegistration,
     ) -> Result<Self, ConsumerError> {
-        if !registration.is_active()
-            || registration.validate_digest().is_err()
-            || registration.scope_digest != scope.digest()
-            || registration.permission_digest != *scope.permission_digest()
-            || registration.consent_digest != *scope.consent_scope().digest()
-        {
-            return Err(ConsumerError::InvalidRegistration);
-        }
+        let secret_reference = registration.bound_secret_reference().clone();
+        Self::new_with_secret(scope, secret_reference, registration)
+    }
+
+    pub fn new_with_secret(
+        scope: NetSuiteScope,
+        secret_reference: SecretReference,
+        registration: NetSuiteRegistration,
+    ) -> Result<Self, ConsumerError> {
+        registration
+            .validate_canonical(&scope, &secret_reference)
+            .map_err(|_| ConsumerError::InvalidRegistration)?;
         Ok(Self {
             scope,
+            secret_reference,
             registration,
-            consumed_proposals: BTreeSet::new(),
         })
     }
 
@@ -161,6 +165,9 @@ impl MissionNetSuiteAccountingConsumer {
         &self,
         proposal: &NetSuiteAccountingProposal,
     ) -> Result<(), ConsumerError> {
+        self.registration
+            .validate_canonical(&self.scope, &self.secret_reference)
+            .map_err(|_| ConsumerError::InvalidRegistration)?;
         proposal
             .validate_bindings(&self.scope, &self.registration)
             .map_err(|error| match error {
@@ -175,8 +182,9 @@ impl MissionNetSuiteAccountingConsumer {
     ) -> Result<MissionNetSuiteAccountingResult, ConsumerError> {
         self.validate_only(&proposal)?;
         if !self
-            .consumed_proposals
-            .insert(proposal.proposal_digest.clone())
+            .registration
+            .claim_proposal(proposal.proposal_digest())
+            .map_err(ConsumerError::Service)?
         {
             return Err(ConsumerError::DuplicateProposal);
         }
@@ -187,6 +195,9 @@ impl MissionNetSuiteAccountingConsumer {
         &self,
         proposal: &NetSuiteSuiteQlProposal,
     ) -> Result<(), ConsumerError> {
+        self.registration
+            .validate_canonical(&self.scope, &self.secret_reference)
+            .map_err(|_| ConsumerError::InvalidRegistration)?;
         proposal
             .validate_bindings(&self.scope, &self.registration)
             .map_err(|error| match error {
@@ -201,9 +212,13 @@ impl MissionNetSuiteAccountingConsumer {
         recorded_at: DateTime<Utc>,
     ) -> Result<MissionNetSuiteSuiteQlResult, ConsumerError> {
         self.validate_suiteql_only(proposal)?;
+        if !self.scope.observation_window().contains(recorded_at) {
+            return Err(ConsumerError::StaleEvidence);
+        }
         if !self
-            .consumed_proposals
-            .insert(proposal.proposal_digest.clone())
+            .registration
+            .claim_proposal(proposal.proposal_digest())
+            .map_err(ConsumerError::Service)?
         {
             return Err(ConsumerError::DuplicateProposal);
         }
@@ -211,7 +226,7 @@ impl MissionNetSuiteAccountingConsumer {
             "netsuite-mission-suiteql-result/v1",
             &[
                 self.scope.digest().as_str().to_owned(),
-                proposal.proposal_digest.as_str().to_owned(),
+                proposal.proposal_digest().as_str().to_owned(),
                 proposal.statement.query_digest().as_str().to_owned(),
                 recorded_at.to_rfc3339(),
                 "executed=false".to_owned(),
@@ -223,7 +238,7 @@ impl MissionNetSuiteAccountingConsumer {
             project_id: self.scope.project_id().clone(),
             mission_id: self.scope.mission_id().clone(),
             work_product_id: self.scope.work_product_id().clone(),
-            proposal_digest: proposal.proposal_digest.clone(),
+            proposal_digest: proposal.proposal_digest().clone(),
             statement_digest: proposal.statement.query_digest().clone(),
             provenance: proposal.provenance,
             recorded_at,
