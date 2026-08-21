@@ -26,10 +26,13 @@ DEFAULT_BRANCH = "bootstrap/macos-r0"
 RULESET_NAME = "Hartevo protected integration branches"
 MERGE_QUEUE_RULESET_NAME = "Hartevo bootstrap merge queue"
 MERGE_TRAIN_BRANCH_PREFIX = "merge-train/"
-MERGE_TRAIN_MANIFEST = ".github/merge-train/current.json"
+MERGE_TRAIN_MANIFEST_DIRECTORY = ".github/merge-train/manifests"
+TRUSTED_ADMISSION_WORKFLOW = Path(".github/workflows/governance-admission.yml")
 GITHUB_ACTIONS_INTEGRATION_ID = 15368
 EXPECTED_STATUS_CHECKS = (
     "PR / Workflow policy",
+    "Governance / PR admission",
+    "Governance / Train-only merge",
     "PR / Scope plan",
     "PR / Fast Rust matrix / PR / Fast Rust / fmt",
     "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
@@ -163,6 +166,15 @@ def verify(path: Path = POLICY) -> dict[str, object]:
         raise ValueError("branch policy repository drift")
     if policy.get("defaultBranch") != DEFAULT_BRANCH:
         raise ValueError("bootstrap/macos-r0 must remain the repository default branch")
+    if policy.get("repositorySettings") != {
+        "deleteBranchOnMerge": True,
+        "allowUpdateBranch": True,
+        "allowMergeCommit": True,
+        "allowSquashMerge": False,
+        "allowRebaseMerge": False,
+        "allowAutoMerge": False,
+    }:
+        raise ValueError("repository settings must preserve merge-commit-only train integration and branch lifecycle cleanup")
     hosted_enforcement = policy.get("hostedEnforcement")
     if hosted_enforcement not in {UNAPPLIED, ACTIVE}:
         raise ValueError("hosted enforcement must be desired-active or active")
@@ -220,7 +232,7 @@ def verify(path: Path = POLICY) -> dict[str, object]:
     expected_train = {
         "enforcement": "active",
         "branchPrefix": MERGE_TRAIN_BRANCH_PREFIX,
-        "manifestPath": MERGE_TRAIN_MANIFEST,
+        "manifestDirectory": MERGE_TRAIN_MANIFEST_DIRECTORY,
         "baseBranch": DEFAULT_BRANCH,
         "maximumCandidateCount": 4,
     }
@@ -233,7 +245,7 @@ def verify(path: Path = POLICY) -> dict[str, object]:
         "ready",
         "root-bootstrap-base",
         "exact-current-head",
-        "required-checks-success",
+        "candidate-checks-success-excluding-intentional-train-only-block",
     }:
         raise ValueError("repository merge-train candidate requirements drifted")
     if not isinstance(composite_requirements, list) or set(composite_requirements) != {
@@ -352,6 +364,32 @@ def hosted_repository(repo: str) -> dict[str, object]:
     return response
 
 
+def require_trusted_admission_on_protected(repo: str) -> None:
+    """Refuse to require train-only checks before their trusted workflow exists."""
+    if not TRUSTED_ADMISSION_WORKFLOW.is_file():
+        raise ValueError("trusted governance admission workflow is missing locally")
+    local_blob = subprocess.run(
+        ["git", "hash-object", str(TRUSTED_ADMISSION_WORKFLOW)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    try:
+        hosted = gh_api(
+            f"repos/{repo}/contents/{TRUSTED_ADMISSION_WORKFLOW.as_posix()}?ref={DEFAULT_BRANCH}"
+        )
+    except ValueError as error:
+        raise ValueError(
+            "trusted governance admission is not yet installed on bootstrap/macos-r0; "
+            "merge the control-plane PR before applying its required checks"
+        ) from error
+    if not isinstance(hosted, dict) or hosted.get("sha") != local_blob:
+        raise ValueError(
+            "protected governance admission workflow does not match the local desired policy"
+        )
+
+
 def probe(repo: str) -> int:
     local = verify()
     policy = load()
@@ -365,6 +403,32 @@ def probe(repo: str) -> int:
         return 2 if status == "BLOCKED_ENV" else 1
     if repository.get("default_branch") != DEFAULT_BRANCH:
         print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_DEFAULT_BRANCH_MISMATCH", "observedDefaultBranch": repository.get("default_branch")}, sort_keys=True))
+        return 1
+    expected_settings = {
+        "delete_branch_on_merge": True,
+        "allow_update_branch": True,
+        "allow_merge_commit": True,
+        "allow_squash_merge": False,
+        "allow_rebase_merge": False,
+        "allow_auto_merge": False,
+    }
+    if any(repository.get(key) is not value for key, value in expected_settings.items()):
+        print(
+            json.dumps(
+                {
+                    **local,
+                    "status": "FAIL",
+                    "code": "HOSTED_REPOSITORY_LIFECYCLE_SETTINGS_MISMATCH",
+                    "deleteBranchOnMerge": repository.get("delete_branch_on_merge"),
+                    "allowUpdateBranch": repository.get("allow_update_branch"),
+                    "allowMergeCommit": repository.get("allow_merge_commit"),
+                    "allowSquashMerge": repository.get("allow_squash_merge"),
+                    "allowRebaseMerge": repository.get("allow_rebase_merge"),
+                    "allowAutoMerge": repository.get("allow_auto_merge"),
+                },
+                sort_keys=True,
+            )
+        )
         return 1
     if not isinstance(response, list):
         print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_LIST_INVALID"}, sort_keys=True))
@@ -407,6 +471,10 @@ def probe(repo: str) -> int:
                 print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_DETAIL_UNAVAILABLE", "message": str(error)}, sort_keys=True))
                 return 1
         if not ruleset_matches(observed, desired):
+            if desired["name"] == RULESET_NAME and policy.get("hostedEnforcement") == UNAPPLIED:
+                pending.append(str(desired["name"]))
+                observed_rulesets.append({"id": observed.get("id"), "name": observed.get("name"), "enforcement": observed.get("enforcement"), "state": "PREVIOUS_POLICY_ACTIVE"})
+                continue
             print(json.dumps({**local, "status": "FAIL", "code": "HOSTED_RULESET_MISMATCH", "hostedRuleset": observed}, sort_keys=True))
             return 1
         observed_rulesets.append({"id": observed.get("id"), "name": observed.get("name"), "enforcement": observed.get("enforcement")})
@@ -415,7 +483,10 @@ def probe(repo: str) -> int:
         if hosted_queue:
             print(json.dumps({**local, "status": "FAIL", "code": "UNEXPECTED_HOSTED_MERGE_QUEUE_RULESET", "hostedQueueRulesets": len(hosted_queue)}, sort_keys=True))
             return 1
-        print(json.dumps({**local, "status": "VERIFIED", "code": "HOSTED_MERGE_QUEUE_BLOCKED_FALLBACK_ACTIVE", "observedOwnerType": owner_type, "hostedRulesets": observed_rulesets, "repositoryMergeTrain": "ACTIVE"}, sort_keys=True))
+        if pending:
+            print(json.dumps({**local, "status": "DESIRED_ACTIVE", "code": "TRUSTED_ADMISSION_ROLLOUT_PENDING", "pendingRulesets": pending, "hostedRulesets": observed_rulesets, "repositoryMergeTrain": "PENDING_REQUIRED_CHECK_ACTIVATION", "mergeMethod": "MERGE_COMMIT_ONLY"}, sort_keys=True))
+            return 2
+        print(json.dumps({**local, "status": "VERIFIED", "code": "HOSTED_MERGE_QUEUE_BLOCKED_FALLBACK_ACTIVE", "observedOwnerType": owner_type, "hostedRulesets": observed_rulesets, "repositoryMergeTrain": "ACTIVE", "deleteBranchOnMerge": True, "allowUpdateBranch": True, "mergeMethod": "MERGE_COMMIT_ONLY"}, sort_keys=True))
         return 0
     if pending:
         print(json.dumps({**local, "status": "DESIRED_ACTIVE", "code": "HOSTED_MERGE_QUEUE_NOT_APPLIED", "pendingRulesets": pending, "hostedRulesets": observed_rulesets}, sort_keys=True))
@@ -435,6 +506,26 @@ def apply(repo: str) -> int:
         repository = gh_api(f"repos/{repo}", "PATCH", {"default_branch": DEFAULT_BRANCH})
         if not isinstance(repository, dict) or repository.get("default_branch") != DEFAULT_BRANCH:
             raise ValueError("failed to enforce bootstrap/macos-r0 as the repository default branch")
+    expected_settings = {
+        "delete_branch_on_merge": True,
+        "allow_update_branch": True,
+        "allow_merge_commit": True,
+        "allow_squash_merge": False,
+        "allow_rebase_merge": False,
+        "allow_auto_merge": False,
+    }
+    if any(repository.get(key) is not value for key, value in expected_settings.items()):
+        repository = gh_api(
+            f"repos/{repo}",
+            "PATCH",
+            expected_settings,
+        )
+        if (
+            not isinstance(repository, dict)
+            or any(repository.get(key) is not value for key, value in expected_settings.items())
+        ):
+            raise ValueError("failed to enforce repository integration and branch lifecycle settings")
+    require_trusted_admission_on_protected(repo)
     protected = policy.get("ruleset")
     merge_queue = policy.get("mergeQueue")
     queue_desired = merge_queue.get("ruleset") if isinstance(merge_queue, dict) else None
@@ -469,7 +560,7 @@ def apply(repo: str) -> int:
         if not isinstance(applied, dict) or not isinstance(applied.get("id"), int):
             raise ValueError("GitHub ruleset apply response has no numeric id")
         operations.append({"operation": operation, "rulesetId": applied["id"], "rulesetName": applied.get("name")})
-    print(json.dumps({**local, "status": "APPLIED", "operations": operations, "observedOwnerType": owner_type, "nativeMergeQueue": "BLOCKED_ENV" if merge_queue_enforcement == BLOCKED_OWNER else "ACTIVE", "repositoryMergeTrain": "ACTIVE"}, sort_keys=True))
+    print(json.dumps({**local, "status": "APPLIED", "operations": operations, "observedOwnerType": owner_type, "nativeMergeQueue": "BLOCKED_ENV" if merge_queue_enforcement == BLOCKED_OWNER else "ACTIVE", "repositoryMergeTrain": "ACTIVE", "deleteBranchOnMerge": True, "allowUpdateBranch": True, "mergeMethod": "MERGE_COMMIT_ONLY"}, sort_keys=True))
     return 0
 
 
@@ -523,6 +614,22 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("self-test accepted main as the default development branch")
+    mutated = json.loads(json.dumps(policy))
+    mutated["repositorySettings"]["deleteBranchOnMerge"] = False
+    try:
+        verify_policy_value(mutated)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("self-test accepted disabled post-merge branch deletion")
+    mutated = json.loads(json.dumps(policy))
+    mutated["repositorySettings"]["allowSquashMerge"] = True
+    try:
+        verify_policy_value(mutated)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("self-test accepted a merge method that bypasses exact train topology")
     print(json.dumps({"schema": "hartevo-ci-branch-policy-self-test/v1", "status": "PASS"}, sort_keys=True))
 
 

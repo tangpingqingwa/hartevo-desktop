@@ -684,8 +684,25 @@ def validate_checkout_safety(path: Path, text: str) -> None:
 
 
 def validate_pr_secrets(path: Path, text: str) -> None:
-    if "pull_request_target" in text or "workflow_run:" in text:
-        raise PolicyError(f"{path} uses a privileged event path")
+    if "workflow_run:" in text:
+        raise PolicyError(f"{path} uses a privileged workflow_run event path")
+    if "pull_request_target" in text:
+        if path.name != "governance-admission.yml":
+            raise PolicyError(f"{path} uses an unauthorized pull_request_target event path")
+        required = (
+            "ref: ${{ github.event.pull_request.base.sha }}",
+            "persist-credentials: false",
+            "git fetch --no-tags --no-write-fetch-head origin \"$HEAD_SHA\"",
+            "--trusted-base",
+            "Require one repository-owned merge-train branch",
+            "git worktree add --detach",
+            "trusted_verifier=\"$GITHUB_WORKSPACE/scripts/ci-merge-train.py\"",
+            "verify-hosted",
+        )
+        if any(item not in text for item in required):
+            raise PolicyError(f"{path} is missing the non-executing trusted-base admission contract")
+        if re.search(r"\bsecrets\b|secrets\.", text):
+            raise PolicyError(f"{path} exposes secrets to a privileged PR event")
     if "pull_request:" in text or "pull_request_review:" in text:
         if re.search(r"\bsecrets\b|secrets\.", text):
             raise PolicyError(f"{path} exposes secrets to an untrusted PR event")
@@ -728,6 +745,7 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             "ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}",
             "scripts/ci-scope.py",
             "scripts/ci-merge-train.py verify-hosted",
+            "scripts/ci-merge-train.py discover-manifest",
             "repository_merge_train_full",
             "rust-reusable.yml",
             "run_rust: ${{ needs.scope.outputs.rust == 'true' }}",
@@ -736,6 +754,8 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
             "--planned-scope macos",
             "--planned-job-name",
             "scripts/ci-workflow-policy.py",
+            "scripts/repository_governance.py verify-repository",
+            "scripts/repository_governance.py verify-pr-event",
             "scripts/ci-result.py",
             "PR / Result taxonomy",
         )
@@ -748,13 +768,49 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
         if "branches: [main]" in text or "branches: [bootstrap/macos-r0]" in text:
             raise PolicyError(f"{path} must not run the integration push tier")
     elif path.name == "integration.yml":
-        required = ("bootstrap/macos-r0", "workflow_dispatch:", "run_rust: true", "run_macos: true", "HARTEVO_TEST_POSTGRES_URL", "postgres:18.4", "check-evidence-doc-truth.sh", "check-openinterpreter-schema.sh", "check-dioxus-toolchain.sh", "catalog export", "evidence baseline", "Integration / Result taxonomy")
+        required = ("bootstrap/macos-r0", "workflow_dispatch:", "ci-merge-train.py verify-bootstrap-push", "run_rust: true", "run_macos: true", "HARTEVO_TEST_POSTGRES_URL", "postgres:18.4", "check-evidence-doc-truth.sh", "check-openinterpreter-schema.sh", "check-dioxus-toolchain.sh", "catalog export", "evidence baseline", "Integration / Result taxonomy")
         if any(item not in text for item in required):
             raise PolicyError(f"{path} is missing a required integration contract")
         if "pull_request_review:" in text:
             raise PolicyError(f"{path} must not run the full Integration matrix on review events")
         validate_dependency_audit_contract(path, text)
         validate_dioxus_artifact_contract(path, text)
+    elif path.name == "governance.yml":
+        required = (
+            "workflow_dispatch:",
+            "schedule:",
+            "*/5 * * * *",
+            "hartevo-repository-governance-inventory",
+            "repository_governance.py verify-repository",
+            "repository_governance.py snapshot",
+            "repository_governance.py plan",
+            "ci-branch-policy.py probe",
+            "READY_TO_TRAIN_SLA_BREACH",
+            "manualCountsAccepted",
+            "DISABLED_WITHOUT_EXACT_APPROVAL",
+            "governance-inventory-${{ github.run_id }}",
+        )
+        if any(item not in text for item in required):
+            raise PolicyError(f"{path} is missing the read-only governance inventory contract")
+        if re.search(r"\b(contents|issues|pull-requests):\s*write\b", text):
+            raise PolicyError(f"{path} governance inventory workflow must remain read-only")
+    elif path.name == "governance-admission.yml":
+        required = (
+            "pull_request_target:",
+            "Governance / PR admission",
+            "Governance / Train-only merge",
+            "github.event.pull_request.base.sha",
+            "github.event.pull_request.head.sha",
+            "repository_governance.py verify-pr-event",
+            "--trusted-base",
+            "ci-merge-train.py",
+            "discover-manifest",
+            "verify-hosted",
+        )
+        if any(item not in text for item in required):
+            raise PolicyError(f"{path} is missing the trusted governance admission contract")
+        if re.search(r"\b(contents|issues|pull-requests):\s*write\b", text):
+            raise PolicyError(f"{path} trusted admission workflow must remain read-only")
     elif path.name == "release-promotion.yml":
         required = ("workflow_dispatch:", "environment: release-promotion", "id-token: write", "source_commit", "refs/heads/main", "release-baseline", "releaseCommit", "passed", "sha256", "rollback", "release: false", "ci-distribution-hook.sh", "ci-oidc-interface")
         if any(item not in text for item in required):
@@ -787,8 +843,8 @@ def validate_required_workflow_contract(path: Path, text: str) -> None:
 def verify(root: Path) -> dict[str, object]:
     pins = action_pin_map(root)
     files = workflow_files(root)
-    if {path.name for path in files} != {"ci.yml", "integration.yml", "release-promotion.yml", "rust-reusable.yml"}:
-        raise PolicyError("workflow set must be exactly the PR, integration, release, and reusable workflows")
+    if {path.name for path in files} != {"ci.yml", "governance-admission.yml", "governance.yml", "integration.yml", "release-promotion.yml", "rust-reusable.yml"}:
+        raise PolicyError("workflow set must be exactly the PR, trusted admission, governance, integration, release, and reusable workflows")
     if not (root / "scripts/ci-merge-train.py").is_file():
         raise PolicyError("repository merge-train verifier is missing")
     all_actions: list[str] = []

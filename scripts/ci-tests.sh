@@ -7,6 +7,8 @@ bash scripts/ci-workflow-syntax.sh self-test
 python3 scripts/ci-workflow-policy.py self-test
 python3 scripts/ci-branch-policy.py self-test
 python3 scripts/ci-merge-train.py self-test
+python3 scripts/repository_governance.py self-test
+python3 -m unittest discover -s scripts/tests -p 'test_repository_governance.py' -v
 python3 scripts/ci-result.py self-test
 python3 scripts/ci-dependency-audit.py self-test
 python3 scripts/ci-promotion.py self-test
