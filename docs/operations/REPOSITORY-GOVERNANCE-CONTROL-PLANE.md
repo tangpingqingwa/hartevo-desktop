@@ -138,11 +138,12 @@ ready work is recorded as `TRAIN_READY_DEFERRED_BY_GLOBAL_PAUSE`; it is not
 misreported as integration throughput.
 
 The workflow token cannot see repository lifecycle booleans in the REST
-repository response even for this public repository. The policy probe therefore
-uses the authenticated GraphQL repository fields when REST returns `null`, and
-still fails closed if either source cannot provide every boolean. `null` is
-reported as an observability failure, never mislabeled as confirmed setting
-drift and never treated as a passing value.
+repository response even for this public repository. Both the policy probe and
+the Inventory snapshot therefore use the authenticated GraphQL repository
+fields when REST returns `null`, record `GRAPHQL_READ_FALLBACK` as the evidence
+source, and still fail closed if either source cannot provide every boolean.
+`null` is reported as an observability failure, never mislabeled as confirmed
+setting drift and never treated as a passing value.
 
 ## Inventory and lifecycle cleanup
 

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -87,6 +88,58 @@ class RepositoryGovernanceTests(unittest.TestCase):
     def test_checked_in_policy_and_ledger_are_valid_and_paused(self) -> None:
         self.assertEqual(governance.verify_policy_value(self.policy)["status"], "PASS")
         self.assertTrue(governance.global_paused(self.events))
+
+    def test_repository_lifecycle_settings_prefer_complete_rest_truth(self) -> None:
+        repository = {
+            "default_branch": governance.BASE_BRANCH,
+            "delete_branch_on_merge": True,
+            "allow_update_branch": True,
+            "allow_merge_commit": True,
+            "allow_squash_merge": False,
+            "allow_rebase_merge": False,
+            "allow_auto_merge": False,
+        }
+        with mock.patch.object(governance, "gh_json", return_value=repository) as github:
+            observed, source = governance.hosted_repository(governance.REPOSITORY)
+        self.assertEqual(source, "REST")
+        self.assertEqual(observed, repository)
+        github.assert_called_once_with("api", f"repos/{governance.REPOSITORY}")
+
+    def test_repository_lifecycle_settings_fall_back_to_graphql(self) -> None:
+        repository = {
+            "default_branch": governance.BASE_BRANCH,
+            **{field: None for field in governance.REPOSITORY_LIFECYCLE_FIELDS},
+        }
+        graph_values = {
+            "deleteBranchOnMerge": True,
+            "allowUpdateBranch": True,
+            "mergeCommitAllowed": True,
+            "squashMergeAllowed": False,
+            "rebaseMergeAllowed": False,
+            "autoMergeAllowed": False,
+        }
+        graph = {"data": {"repository": graph_values}}
+        with mock.patch.object(governance, "gh_json", side_effect=[repository, graph]) as github:
+            observed, source = governance.hosted_repository(governance.REPOSITORY)
+        self.assertEqual(source, "GRAPHQL_READ_FALLBACK")
+        for rest_field, graph_field in governance.REPOSITORY_LIFECYCLE_FIELDS.items():
+            self.assertEqual(observed[rest_field], graph_values[graph_field])
+        self.assertEqual(github.call_count, 2)
+        self.assertEqual(github.call_args_list[1].args, ("api", "graphql"))
+        self.assertEqual(
+            github.call_args_list[1].kwargs["input_value"]["variables"],
+            {"owner": "tangpingqingwa", "name": "hartevo-desktop"},
+        )
+
+    def test_repository_lifecycle_settings_fail_closed_when_graphql_is_incomplete(self) -> None:
+        repository = {
+            "default_branch": governance.BASE_BRANCH,
+            **{field: None for field in governance.REPOSITORY_LIFECYCLE_FIELDS},
+        }
+        graph = {"data": {"repository": {"deleteBranchOnMerge": True}}}
+        with mock.patch.object(governance, "gh_json", side_effect=[repository, graph]):
+            with self.assertRaisesRegex(governance.GovernanceError, "allow_update_branch is unavailable"):
+                governance.hosted_repository(governance.REPOSITORY)
 
     def test_pause_blocks_feature_and_preserves_governance_recovery(self) -> None:
         accepted = governance.verify_admission_value(

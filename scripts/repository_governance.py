@@ -45,6 +45,14 @@ ZERO_DIGEST = "0" * 64
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 ADMISSION_BLOCK = re.compile(r"<!--\s*hartevo-governance\s*(\{.*?\})\s*-->", re.DOTALL)
+REPOSITORY_LIFECYCLE_FIELDS = {
+    "delete_branch_on_merge": "deleteBranchOnMerge",
+    "allow_update_branch": "allowUpdateBranch",
+    "allow_merge_commit": "mergeCommitAllowed",
+    "allow_squash_merge": "squashMergeAllowed",
+    "allow_rebase_merge": "rebaseMergeAllowed",
+    "allow_auto_merge": "autoMergeAllowed",
+}
 
 
 class GovernanceError(ValueError):
@@ -140,6 +148,62 @@ def gh_pages(endpoint: str) -> list[dict[str, object]]:
             raise GovernanceError(f"paginated response for {endpoint} contains an invalid page")
         flattened.extend(item for item in page if isinstance(item, dict))
     return flattened
+
+
+def merge_repository_lifecycle_settings(
+    repository: dict[str, object], graph_repository: dict[str, object]
+) -> dict[str, object]:
+    """Fill REST-invisible lifecycle booleans from authenticated GraphQL truth."""
+    merged = dict(repository)
+    for rest_field, graph_field in REPOSITORY_LIFECYCLE_FIELDS.items():
+        value = merged.get(rest_field)
+        if not isinstance(value, bool):
+            value = graph_repository.get(graph_field)
+        if not isinstance(value, bool):
+            raise GovernanceError(f"GitHub repository lifecycle field {rest_field} is unavailable")
+        merged[rest_field] = value
+    return merged
+
+
+def hosted_repository(repo: str) -> tuple[dict[str, object], str]:
+    repository = gh_json("api", f"repos/{repo}")
+    if not isinstance(repository, dict):
+        raise GovernanceError("live repository response is invalid")
+    if not isinstance(repository.get("default_branch"), str):
+        raise GovernanceError("GitHub repository default branch is unavailable")
+    missing = [field for field in REPOSITORY_LIFECYCLE_FIELDS if not isinstance(repository.get(field), bool)]
+    if not missing:
+        return repository, "REST"
+    try:
+        owner, name = repo.split("/", 1)
+    except ValueError as error:
+        raise GovernanceError("GitHub repository must be owner/name") from error
+    graph = gh_json(
+        "api",
+        "graphql",
+        input_value={
+            "query": """
+                query RepositoryLifecycle($owner: String!, $name: String!) {
+                  repository(owner: $owner, name: $name) {
+                    deleteBranchOnMerge
+                    allowUpdateBranch
+                    mergeCommitAllowed
+                    squashMergeAllowed
+                    rebaseMergeAllowed
+                    autoMergeAllowed
+                  }
+                }
+            """,
+            "variables": {"owner": owner, "name": name},
+        },
+    )
+    if not isinstance(graph, dict) or graph.get("errors"):
+        raise GovernanceError("GitHub GraphQL repository lifecycle response is unavailable")
+    data = graph.get("data")
+    graph_repository = data.get("repository") if isinstance(data, dict) else None
+    if not isinstance(graph_repository, dict):
+        raise GovernanceError("GitHub GraphQL repository lifecycle response must contain a repository")
+    return merge_repository_lifecycle_settings(repository, graph_repository), "GRAPHQL_READ_FALLBACK"
 
 
 def read_json(path: Path) -> object:
@@ -807,10 +871,10 @@ def live_snapshot(repo: str, observed_at: dt.datetime) -> dict[str, object]:
     pulls = gh_pages(f"repos/{repo}/pulls?state=open&per_page=100")
     issues = [item for item in gh_pages(f"repos/{repo}/issues?state=open&per_page=100") if "pull_request" not in item]
     branches = gh_pages(f"repos/{repo}/branches?per_page=100")
-    repository = gh_json("api", f"repos/{repo}")
+    repository, repository_settings_source = hosted_repository(repo)
     rulesets = gh_json("api", f"repos/{repo}/rulesets?per_page=100")
-    if not isinstance(repository, dict) or not isinstance(rulesets, list):
-        raise GovernanceError("live repository or ruleset response is invalid")
+    if not isinstance(rulesets, list):
+        raise GovernanceError("live ruleset response is invalid")
     records: list[dict[str, object]] = []
     open_heads: set[str] = set()
     for item in pulls:
@@ -913,6 +977,7 @@ def live_snapshot(repo: str, observed_at: dt.datetime) -> dict[str, object]:
         "orphanBranches": orphan_branches,
         "openTrains": open_trains,
         "repositorySettings": settings,
+        "repositorySettingsSource": repository_settings_source,
         "rulesets": [
             {"id": item.get("id"), "name": item.get("name"), "enforcement": item.get("enforcement")}
             for item in rulesets
