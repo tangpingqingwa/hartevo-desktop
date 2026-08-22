@@ -390,6 +390,18 @@ def validate_reusable_scope_contract(path: Path, text: str) -> None:
         raise PolicyError(f"{path} Ubuntu aggregate must always evaluate its shard dependency")
     if "needs.test-ubuntu-shards.result" not in result_block or "!= success" not in result_block or "exit 1" not in result_block:
         raise PolicyError(f"{path} Ubuntu aggregate must accept only a successful shard dependency")
+    result_marker = re.search(
+        r"(?ms)^      - name: Planned scope skip marker\s*\n.*?(?=^      - name:|\Z)",
+        result_block,
+    )
+    if not result_marker or ("if: " + github_expression + " !inputs.run_rust }}") not in result_marker.group(0):
+        raise PolicyError(f"{path} Ubuntu aggregate must expose a planned Rust-scope marker")
+    result_gate = re.search(
+        r"(?ms)^      - name: Require successful Ubuntu shards\s*\n.*?(?=^      - name:|\Z)",
+        result_block,
+    )
+    if not result_gate or not re.search(r"^        if:\s*inputs\.run_rust\s*$", result_gate.group(0), re.MULTILINE):
+        raise PolicyError(f"{path} Ubuntu aggregate shard gate must run only for Rust scope")
     if re.search(r"actions/checkout@|actions/cache@|\b(?:curl|wget)\b|https?://", result_block, re.IGNORECASE):
         raise PolicyError(f"{path} Ubuntu aggregate must be local and side-effect free")
 
@@ -1059,6 +1071,14 @@ jobs:
     )
     expect_scope_rejection("an aggregate without always", scope_fixture.replace("always()", "success()", 1))
     expect_scope_rejection("an aggregate accepting failure", scope_fixture.replace("!= success", "== failure", 1))
+    expect_scope_rejection(
+        "an aggregate without its planned Rust-scope marker",
+        scope_fixture.replace("      - name: Planned scope skip marker\n        if: ${{ !inputs.run_rust }}\n        run: echo \"Rust scope is empty; the Ubuntu aggregate confirms the planned shard markers only.\"\n", "", 1),
+    )
+    expect_scope_rejection(
+        "an aggregate shard gate that runs for empty Rust scope",
+        scope_fixture.replace("      - name: Require successful Ubuntu shards\n        if: inputs.run_rust\n", "      - name: Require successful Ubuntu shards\n", 1),
+    )
 
     scope_skip_plan = reusable_rust_scope_plan("PR / Fast Rust", False)
     assert [item["name"] for item in scope_skip_plan] == [
