@@ -41,6 +41,14 @@ EXPECTED_STATUS_CHECKS = (
     "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
     "PR / Result taxonomy",
 )
+REPOSITORY_LIFECYCLE_FIELDS = {
+    "delete_branch_on_merge": "deleteBranchOnMerge",
+    "allow_update_branch": "allowUpdateBranch",
+    "allow_merge_commit": "mergeCommitAllowed",
+    "allow_squash_merge": "squashMergeAllowed",
+    "allow_rebase_merge": "rebaseMergeAllowed",
+    "allow_auto_merge": "autoMergeAllowed",
+}
 
 
 def load(path: Path = POLICY) -> dict[str, object]:
@@ -352,6 +360,20 @@ def ruleset_matches(actual: object, desired: dict[str, object]) -> bool:
     return {item.get("context") for item in actual_checks if isinstance(item, dict)} == {item.get("context") for item in desired_checks if isinstance(item, dict)}
 
 
+def merge_lifecycle_settings(
+    repository: dict[str, object], graph_repository: dict[str, object]
+) -> dict[str, object]:
+    merged = dict(repository)
+    for rest_field, graph_field in REPOSITORY_LIFECYCLE_FIELDS.items():
+        value = merged.get(rest_field)
+        if not isinstance(value, bool):
+            value = graph_repository.get(graph_field)
+        if not isinstance(value, bool):
+            raise ValueError(f"GitHub repository lifecycle field {rest_field} is unavailable")
+        merged[rest_field] = value
+    return merged
+
+
 def hosted_repository(repo: str) -> dict[str, object]:
     response = gh_api(f"repos/{repo}")
     if not isinstance(response, dict):
@@ -361,6 +383,40 @@ def hosted_repository(repo: str) -> dict[str, object]:
         raise ValueError("GitHub repository owner type is unavailable")
     if not isinstance(response.get("default_branch"), str):
         raise ValueError("GitHub repository default branch is unavailable")
+    missing = [field for field in REPOSITORY_LIFECYCLE_FIELDS if not isinstance(response.get(field), bool)]
+    if missing:
+        try:
+            owner_name, repository_name = repo.split("/", 1)
+        except ValueError as error:
+            raise ValueError("GitHub repository must be owner/name") from error
+        graph = gh_api(
+            "graphql",
+            payload={
+                "query": """
+                    query RepositoryLifecycle($owner: String!, $name: String!) {
+                      repository(owner: $owner, name: $name) {
+                        deleteBranchOnMerge
+                        allowUpdateBranch
+                        mergeCommitAllowed
+                        squashMergeAllowed
+                        rebaseMergeAllowed
+                        autoMergeAllowed
+                      }
+                    }
+                """,
+                "variables": {"owner": owner_name, "name": repository_name},
+            },
+        )
+        if not isinstance(graph, dict) or graph.get("errors"):
+            raise ValueError("GitHub GraphQL repository lifecycle response is unavailable")
+        data = graph.get("data")
+        graph_repository = data.get("repository") if isinstance(data, dict) else None
+        if not isinstance(graph_repository, dict):
+            raise ValueError("GitHub GraphQL repository lifecycle response must contain a repository")
+        response = merge_lifecycle_settings(response, graph_repository)
+        response["_lifecycle_settings_source"] = "GRAPHQL_READ_FALLBACK"
+    else:
+        response["_lifecycle_settings_source"] = "REST"
     return response
 
 
@@ -419,6 +475,7 @@ def probe(repo: str) -> int:
                     **local,
                     "status": "FAIL",
                     "code": "HOSTED_REPOSITORY_LIFECYCLE_SETTINGS_MISMATCH",
+                    "lifecycleSettingsSource": repository.get("_lifecycle_settings_source"),
                     "deleteBranchOnMerge": repository.get("delete_branch_on_merge"),
                     "allowUpdateBranch": repository.get("allow_update_branch"),
                     "allowMergeCommit": repository.get("allow_merge_commit"),
@@ -484,14 +541,14 @@ def probe(repo: str) -> int:
             print(json.dumps({**local, "status": "FAIL", "code": "UNEXPECTED_HOSTED_MERGE_QUEUE_RULESET", "hostedQueueRulesets": len(hosted_queue)}, sort_keys=True))
             return 1
         if pending:
-            print(json.dumps({**local, "status": "DESIRED_ACTIVE", "code": "TRUSTED_ADMISSION_ROLLOUT_PENDING", "pendingRulesets": pending, "hostedRulesets": observed_rulesets, "repositoryMergeTrain": "PENDING_REQUIRED_CHECK_ACTIVATION", "mergeMethod": "MERGE_COMMIT_ONLY"}, sort_keys=True))
+            print(json.dumps({**local, "status": "DESIRED_ACTIVE", "code": "TRUSTED_ADMISSION_ROLLOUT_PENDING", "pendingRulesets": pending, "hostedRulesets": observed_rulesets, "repositoryMergeTrain": "PENDING_REQUIRED_CHECK_ACTIVATION", "mergeMethod": "MERGE_COMMIT_ONLY", "lifecycleSettingsSource": repository.get("_lifecycle_settings_source")}, sort_keys=True))
             return 2
-        print(json.dumps({**local, "status": "VERIFIED", "code": "HOSTED_MERGE_QUEUE_BLOCKED_FALLBACK_ACTIVE", "observedOwnerType": owner_type, "hostedRulesets": observed_rulesets, "repositoryMergeTrain": "ACTIVE", "deleteBranchOnMerge": True, "allowUpdateBranch": True, "mergeMethod": "MERGE_COMMIT_ONLY"}, sort_keys=True))
+        print(json.dumps({**local, "status": "VERIFIED", "code": "HOSTED_MERGE_QUEUE_BLOCKED_FALLBACK_ACTIVE", "observedOwnerType": owner_type, "hostedRulesets": observed_rulesets, "repositoryMergeTrain": "ACTIVE", "deleteBranchOnMerge": True, "allowUpdateBranch": True, "mergeMethod": "MERGE_COMMIT_ONLY", "lifecycleSettingsSource": repository.get("_lifecycle_settings_source")}, sort_keys=True))
         return 0
     if pending:
-        print(json.dumps({**local, "status": "DESIRED_ACTIVE", "code": "HOSTED_MERGE_QUEUE_NOT_APPLIED", "pendingRulesets": pending, "hostedRulesets": observed_rulesets}, sort_keys=True))
+        print(json.dumps({**local, "status": "DESIRED_ACTIVE", "code": "HOSTED_MERGE_QUEUE_NOT_APPLIED", "pendingRulesets": pending, "hostedRulesets": observed_rulesets, "lifecycleSettingsSource": repository.get("_lifecycle_settings_source")}, sort_keys=True))
         return 2
-    print(json.dumps({**local, "status": "VERIFIED", "hostedRulesets": observed_rulesets}, sort_keys=True))
+    print(json.dumps({**local, "status": "VERIFIED", "hostedRulesets": observed_rulesets, "lifecycleSettingsSource": repository.get("_lifecycle_settings_source")}, sort_keys=True))
     return 0
 
 
@@ -630,6 +687,32 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("self-test accepted a merge method that bypasses exact train topology")
+    rest_hidden = {field: None for field in REPOSITORY_LIFECYCLE_FIELDS}
+    graph_visible = {
+        "deleteBranchOnMerge": True,
+        "allowUpdateBranch": True,
+        "mergeCommitAllowed": True,
+        "squashMergeAllowed": False,
+        "rebaseMergeAllowed": False,
+        "autoMergeAllowed": False,
+    }
+    projected = merge_lifecycle_settings(rest_hidden, graph_visible)
+    expected = {
+        "delete_branch_on_merge": True,
+        "allow_update_branch": True,
+        "allow_merge_commit": True,
+        "allow_squash_merge": False,
+        "allow_rebase_merge": False,
+        "allow_auto_merge": False,
+    }
+    if projected != expected:
+        raise AssertionError("self-test failed the GraphQL lifecycle settings projection")
+    try:
+        merge_lifecycle_settings(rest_hidden, {})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("self-test accepted unavailable lifecycle settings")
     print(json.dumps({"schema": "hartevo-ci-branch-policy-self-test/v1", "status": "PASS"}, sort_keys=True))
 
 
