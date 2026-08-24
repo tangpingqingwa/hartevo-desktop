@@ -2627,6 +2627,67 @@ body.resizing-workpad {
   padding: 0 10px;
 }
 
+.connection-table-row {
+  display: grid;
+  min-height: 72px;
+  grid-template-columns: 1.3fr 0.8fr 1fr 0.7fr 0.8fr;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  font-size: 8.5px;
+}
+
+.connection-table-row > div {
+  min-width: 0;
+  padding: 9px 10px;
+}
+
+.connection-table-row strong,
+.connection-table-row small,
+.connection-table-row em {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.connection-table-row small,
+.connection-table-row em {
+  margin-top: 3px;
+  color: #85868b;
+  font-size: 8px;
+  font-style: normal;
+  line-height: 1.35;
+}
+
+.connection-status.verified strong {
+  color: var(--green);
+}
+
+.connection-status.warning strong {
+  color: var(--gold-strong);
+}
+
+.connection-status.danger strong,
+.connection-status.blocked strong {
+  color: var(--red);
+}
+
+.connection-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.connection-row-actions .surface-button {
+  min-height: 22px;
+  padding: 0 6px;
+  font-size: 8px;
+}
+
+.surface-button.danger {
+  color: var(--red);
+  border-color: rgb(181 64 58 / 38%);
+}
+
 .overlay-backdrop,
 .overlay-dismiss {
   position: fixed;

@@ -12,18 +12,19 @@ use dioxus_icons::lucide::{
     WalletCards, Workflow, X,
 };
 use hartevo_application::{
-    ApplicationCheckpointHandlerStatus, ApplicationError, DesktopProjectProjection,
-    MissionProjection, MissionRuntimeProjection, ProjectEncryptionReadiness,
+    ApplicationCheckpointHandlerStatus, ApplicationError, DesktopConnectionProjection,
+    DesktopProjectProjection, MissionProjection, MissionRuntimeProjection,
+    ProjectEncryptionReadiness,
 };
 use hartevo_catalog::{EvidenceLevel, MissionEvidenceStatus};
 use hartevo_domain_kernel::{
-    CadenceTriggerKind, KpiContract, KpiDirection, MissionCheckpointCompletionPolicy,
-    MissionCheckpointExecutor, MissionCheckpointStatus, MissionConversationMessageId,
-    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionScheduleStatus,
-    MissionStage, Money, OperatingMode, OutcomeDecision, OutcomeReviewCaveat,
-    OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus, ProjectEncryptionMode, ProjectId,
-    RuntimeProcessClaimStatus, RuntimeRecoveryStatus, RuntimeTurnStatus, StorageMode,
-    WorkProductId, WorkProductStatus,
+    CadenceTriggerKind, ConnectionId, ConnectionStatus, KpiContract, KpiDirection,
+    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionCheckpointStatus,
+    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
+    MissionId, MissionScheduleStatus, MissionStage, Money, OperatingMode, OutcomeDecision,
+    OutcomeReviewCaveat, OutcomeReviewDecisionGateStatus, OutcomeReviewGateStatus,
+    ProjectEncryptionMode, ProjectId, RuntimeProcessClaimStatus, RuntimeRecoveryStatus,
+    RuntimeTurnStatus, StorageMode, WorkProductId, WorkProductStatus,
 };
 use rust_decimal::Decimal;
 use zeroize::Zeroizing;
@@ -600,6 +601,21 @@ impl DesktopUiModel {
         snapshot.context_access_for(project_id)
     }
 
+    fn current_connections(&self) -> Vec<DesktopConnectionProjection> {
+        let DesktopBackendState::Ready(snapshot) = &self.backend else {
+            return Vec::new();
+        };
+        let Some(project_id) = self.selected_project_id.as_ref() else {
+            return Vec::new();
+        };
+        snapshot
+            .connections
+            .iter()
+            .filter(|connection| &connection.project_id == project_id)
+            .cloned()
+            .collect()
+    }
+
     fn current_runtime_activity(&self) -> Option<&MissionRuntimeProjection> {
         let DesktopBackendState::Ready(snapshot) = &self.backend else {
             return None;
@@ -1111,6 +1127,31 @@ pub fn App() -> Element {
     let project = view.current_project().cloned();
     let mission = view.current_mission().cloned();
     let context_access = view.current_context_access().cloned();
+    let connections = view.current_connections();
+    let connection_project_id = project.as_ref().map(|project| project.project_id.clone());
+    let on_revoke_connection = move |connection_id: ConnectionId| {
+        let Some(project_id) = connection_project_id.clone() else {
+            return;
+        };
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::discover().and_then(|plane| {
+                    plane.revoke_connection_os(&project_id, &connection_id, Utc::now())
+                })
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => model.write().set_ready(snapshot, false),
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "CONNECTION_REVOKE_COORDINATOR_FAILED".into(),
+                        message: "撤销连接的协调器异常结束；当前 Connection projection 未改变，请刷新后重试。".into(),
+                    });
+                }
+            }
+        });
+    };
     let runtime_activity = view.current_runtime_activity().cloned();
     let project_name = project
         .as_ref()
@@ -2136,7 +2177,12 @@ pub fn App() -> Element {
                         } else if current_surface == Surface::Partners {
                             PartnersSurface { project: project.clone(), mission: mission.clone() }
                         } else if current_surface == Surface::Connections {
-                            ConnectionsSurface { project: project.clone(), context_access: context_access.clone() }
+                            ConnectionsSurface {
+                                project: project.clone(),
+                                context_access: context_access.clone(),
+                                connections: connections.clone(),
+                                on_revoke: on_revoke_connection,
+                            }
                         } else if current_surface == Surface::Outcomes {
                             OutcomesSurface { project: project.clone(), mission: mission.clone() }
                         } else if current_surface == Surface::Settings {
@@ -7039,10 +7085,56 @@ fn SettingsRow(
     }
 }
 
+fn connection_status_copy(
+    connection: &DesktopConnectionProjection,
+    now: chrono::DateTime<Utc>,
+) -> (&'static str, &'static str, &'static str) {
+    if connection.has_live_probe(now) {
+        return ("已验证可用", "LIVE_PROBE", "verified");
+    }
+    match connection.status {
+        ConnectionStatus::PendingAuth => ("待授权", "PENDING_AUTH", "waiting"),
+        ConnectionStatus::Probing => ("Probe 中", "PROBING", "waiting"),
+        ConnectionStatus::Connected => ("Probe 未验证", "BLOCKED_ENV", "blocked"),
+        ConnectionStatus::Degraded => ("服务降级", "DEGRADED", "warning"),
+        ConnectionStatus::Expired => ("已过期", "EXPIRED", "danger"),
+        ConnectionStatus::Revoked => ("已撤销", "REVOKED", "danger"),
+        ConnectionStatus::WrongAccount => ("账号不匹配", "WRONG_ACCOUNT", "danger"),
+        ConnectionStatus::MissingScopes => ("Scope 不足", "MISSING_SCOPES", "danger"),
+    }
+}
+
+fn connection_scope_summary(connection: &DesktopConnectionProjection) -> String {
+    if connection.required_scopes.is_empty() {
+        return "无 required Scope".to_owned();
+    }
+    connection
+        .required_scopes
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn connection_probe_label(
+    connection: &DesktopConnectionProjection,
+    now: chrono::DateTime<Utc>,
+) -> &'static str {
+    if connection.has_live_probe(now) {
+        "Probe 有效"
+    } else if connection.last_probe_at.is_some() {
+        "Probe 需复核"
+    } else {
+        "Probe 未执行"
+    }
+}
+
 #[component]
 fn ConnectionsSurface(
     project: Option<DesktopProjectProjection>,
     context_access: Option<ProjectContextAccessProjection>,
+    connections: Vec<DesktopConnectionProjection>,
+    on_revoke: EventHandler<ConnectionId>,
 ) -> Element {
     #[cfg(feature = "visual-fixtures")]
     if let Some(page) = visual_fixture::page("connections") {
@@ -7058,10 +7150,34 @@ fn ConnectionsSurface(
     let mut active_tab = use_signal(|| "overview");
     let mut flow_open = use_signal(|| false);
     let mut flow_step = use_signal(|| 1_u8);
+    let mut reauth_target = use_signal(|| None::<String>);
+    let mut pending_revoke = use_signal(|| None::<ConnectionId>);
     let Some(project) = project else {
         return rsx! { EmptyState { code: "EMPTY", title: "没有项目连接范围", detail: "连接必须绑定 Tenant/Project/Account；未选择项目时不会展示假连接。" } };
     };
     let revision = project.revision;
+    let now = Utc::now();
+    let live_count = connections
+        .iter()
+        .filter(|connection| connection.has_live_probe(now))
+        .count();
+    let reconnect_count = connections
+        .iter()
+        .filter(|connection| {
+            matches!(
+                connection.status,
+                ConnectionStatus::Expired
+                    | ConnectionStatus::Revoked
+                    | ConnectionStatus::WrongAccount
+                    | ConnectionStatus::MissingScopes
+                    | ConnectionStatus::Degraded
+            )
+        })
+        .count();
+    let probe_count = connections
+        .iter()
+        .filter(|connection| connection.last_probe_at.is_some())
+        .count();
     rsx! {
         div { class: "surface-scroll business-surface connections-surface",
             header { class: "surface-head",
@@ -7088,11 +7204,22 @@ fn ConnectionsSurface(
                         ContextAccessCard { access: context_access }
                         section { class: "surface-section",
                             div { class: "surface-section-head", h2 { "Mission 需要的连接" } p { "Provider Probe" } }
-                            div { class: "state-canvas compact",
-                                UiIcon { name: UiIconName::Plug, size: 22 }
-                                span { class: "honesty-badge", "NOT_IMPLEMENTED" }
-                                h3 { "尚无 Connection Projection" }
-                                p { "当前 Desktop 数据面没有读取 Provider 凭据，也没有把 Catalog 中的 Provider 目标声明为 Connected。" }
+                            if connections.is_empty() {
+                                div { class: "state-canvas compact",
+                                    UiIcon { name: UiIconName::Plug, size: 22 }
+                                    span { class: "honesty-badge", "EMPTY" }
+                                    h3 { "尚无 Connection Projection" }
+                                    p { "当前项目没有持久连接；Provider 目标不会被 Catalog 声明为 Connected。" }
+                                }
+                            } else {
+                                div { class: "connection-readiness",
+                                    UiIcon { name: UiIconName::Target, size: 18 }
+                                    span {
+                                        strong { "{live_count} 个连接已验证可用" }
+                                        small { "只有当前账号、最小 Scope、有效期与实时 Probe 同时匹配时才进入该计数。" }
+                                    }
+                                    em { if live_count == 0 { "BLOCKED_ENV" } else { "LIVE_PROBE" } }
+                                }
                             }
                         }
                     }
@@ -7109,7 +7236,93 @@ fn ConnectionsSurface(
                 section { class: "surface-section",
                     div { class: "surface-section-head", h2 { "全部连接" } p { "Tenant / Project / Account scoped" } }
                     div { class: "connection-table-header", span { "服务与账号" } span { "用途" } span { "Scope" } span { "状态" } span { "最近验证" } }
-                    div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "没有可展示的真实 Connection" } p { "Provider Adapter 与 Secret Store 投影接线后才会出现行。" } }
+                    if connections.is_empty() {
+                        div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "没有可展示的真实 Connection" } p { "Provider Adapter 与 Secret Store 投影接线后才会出现行；当前没有假连接。" } }
+                    } else {
+                        for connection in connections.iter().cloned() {
+                            {
+                                let (status_label, status_code, status_class) = connection_status_copy(&connection, now);
+                                let scope_summary = connection_scope_summary(&connection);
+                                let probe_label = connection_probe_label(&connection, now);
+                                let revoke_id = connection.id.clone();
+                                let confirm_id = connection.id.clone();
+                                let reauth_provider = connection.provider.clone();
+                                let is_pending_revoke = pending_revoke().as_ref() == Some(&connection.id);
+                                rsx! {
+                                    div { class: "connection-table-row",
+                                        div {
+                                            strong { "{connection.provider}" }
+                                            small { "{connection.external_account_id}" }
+                                            em { "tenant {connection.tenant_id} · project {connection.project_id}" }
+                                        }
+                                        div {
+                                            strong { "当前 Project" }
+                                            small { "account {connection.account_id}" }
+                                        }
+                                        div {
+                                            strong { "{scope_summary}" }
+                                            small { "required {connection.required_scopes.len()} · granted {connection.granted_scopes.len()}" }
+                                        }
+                                        div { class: "connection-status {status_class}",
+                                            strong { "{status_label}" }
+                                            small { "{status_code}" }
+                                        }
+                                        div {
+                                            strong { "{probe_label}" }
+                                            small { "revision {connection.revision}" }
+                                            div { class: "connection-row-actions",
+                                                if is_pending_revoke {
+                                                    button {
+                                                        class: "surface-button danger",
+                                                        aria_label: "确认撤销连接",
+                                                        onclick: move |_| {
+                                                            pending_revoke.set(None);
+                                                            on_revoke.call(confirm_id.clone());
+                                                        },
+                                                        "确认撤销"
+                                                    }
+                                                    button {
+                                                        class: "surface-button",
+                                                        aria_label: "取消撤销连接",
+                                                        onclick: move |_| pending_revoke.set(None),
+                                                        "取消"
+                                                    }
+                                                } else {
+                                                    if connection.status != ConnectionStatus::Revoked {
+                                                        button {
+                                                            class: "surface-button danger",
+                                                            aria_label: "撤销连接",
+                                                            onclick: move |_| pending_revoke.set(Some(revoke_id.clone())),
+                                                            "撤销"
+                                                        }
+                                                    }
+                                                    if matches!(
+                                                        connection.status,
+                                                        ConnectionStatus::Expired
+                                                            | ConnectionStatus::Revoked
+                                                            | ConnectionStatus::WrongAccount
+                                                            | ConnectionStatus::MissingScopes
+                                                            | ConnectionStatus::Degraded
+                                                    ) {
+                                                        button {
+                                                            class: "surface-button",
+                                                            aria_label: "重新授权连接",
+                                                            onclick: move |_| {
+                                                                reauth_target.set(Some(reauth_provider.clone()));
+                                                                flow_step.set(1);
+                                                                flow_open.set(true);
+                                                            },
+                                                            "重新授权"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             } else if active_tab() == "policies" {
                 section { class: "surface-section",
@@ -7125,16 +7338,24 @@ fn ConnectionsSurface(
             } else {
                 section { class: "surface-section",
                     div { class: "surface-section-head", h2 { "连接活动" } p { "Audit projection" } }
-                    div { class: "state-canvas compact", span { class: "honesty-badge", "EMPTY" } h3 { "暂无持久连接事件" } p { "不会复制原型中的 Twenty、X、WordPress 或 Chatwoot 演示活动。" } }
+                    div { class: "connection-readiness",
+                        UiIcon { name: UiIconName::Refresh, size: 18 }
+                        span {
+                            strong { "{probe_count} 条连接已有 Probe 记录" }
+                            small { "活动视图只展示去标识状态；callback state、nonce、授权 code 和凭据不进入 DOM、AX 或日志。" }
+                        }
+                        em { if reconnect_count == 0 { "NO_ACTION_REQUIRED" } else { "REAUTH_REQUIRED" } }
+                    }
+                    div { class: "state-canvas compact", span { class: "honesty-badge", "AUDIT_BOUNDARY" } h3 { "连接活动按 projection 保持诚实" } p { "完整 Provider audit event 仍等待 Connector SDK；当前不会复制原型中的 Twenty、X、WordPress 或 Chatwoot 演示活动。" } }
                 }
             }
 
             if flow_open() {
-                button { class: "overlay-backdrop", aria_label: "关闭连接流程", onclick: move |_| flow_open.set(false) }
+                button { class: "overlay-backdrop", aria_label: "关闭连接流程", onclick: move |_| { flow_open.set(false); reauth_target.set(None); } }
                 section { class: "connection-flow", role: "dialog", aria_modal: "true", aria_label: "连接服务流程",
                     header {
                         span { strong { "连接服务" } small { "FLOW CONTRACT · 不触发 OAuth" } }
-                        button { aria_label: "关闭", onclick: move |_| flow_open.set(false), UiIcon { name: UiIconName::X, size: 15 } }
+                        button { aria_label: "关闭", onclick: move |_| { flow_open.set(false); reauth_target.set(None); }, UiIcon { name: UiIconName::X, size: 15 } }
                     }
                     div { class: "flow-progress",
                         for step in 1_u8..=4 {
@@ -7143,8 +7364,13 @@ fn ConnectionsSurface(
                     }
                     div { class: "flow-body",
                         if flow_step() == 1 {
-                            h2 { "为什么需要连接" }
-                            p { "Hartevo 只会为当前 Mission 明确需要的 Capability 请求连接；当前没有选定 Provider，因此不会开始授权。" }
+                            if let Some(provider) = reauth_target() {
+                                h2 { "重新授权 {provider}" }
+                                p { "授权会重新绑定当前 Tenant / Project / Account；旧 Connection 不会被静默升级为 Connected。" }
+                            } else {
+                                h2 { "为什么需要连接" }
+                                p { "Hartevo 只会为当前 Mission 明确需要的 Capability 请求连接；当前没有选定 Provider，因此不会开始授权。" }
+                            }
                             div { class: "context-note", header { UiIcon { name: UiIconName::Target, size: 14 } strong { "Project scoped" } } p { "{project.name} · Connection 必须绑定 tenant/project/provider/account。" } }
                         } else if flow_step() == 2 {
                             h2 { "审阅最小权限" }
@@ -7156,12 +7382,12 @@ fn ConnectionsSurface(
                             }
                         } else if flow_step() == 3 {
                             h2 { "确认真实账号" }
-                            p { "OAuth callback、state/nonce 和实时 Probe 尚未接入 Desktop；不能选择或声称账号已连接。" }
-                            div { class: "state-canvas compact", span { class: "honesty-badge", "BLOCKED_ENV" } h3 { "Provider 授权环境未配置" } }
+                            p { "OAuth callback 会先校验 provider、state/nonce 和当前 Project scope，再进入账号选择；原始 callback 不会渲染到页面。" }
+                            div { class: "state-canvas compact", span { class: "honesty-badge", "AWAITING_CALLBACK" } h3 { "等待 Provider callback" } p { "Connector SDK 未在当前基线发布；Desktop 不会伪造账号或保存授权 code。" } }
                         } else {
                             h2 { "独立验证" }
-                            p { "只有实时 Probe 返回匹配的 tenant/project/provider/account 与最小 Scope，连接才能显示 Connected。" }
-                            div { class: "state-canvas compact", span { class: "honesty-badge", "NOT_IMPLEMENTED" } h3 { "尚无 Probe Receipt" } }
+                            p { "只有实时 Probe 返回匹配的 tenant/project/provider/account、最小 Scope、有效期和证据，连接才能显示已验证可用。" }
+                            div { class: "state-canvas compact", span { class: "honesty-badge", "PROBE_REQUIRED" } h3 { "Probe 是 Connected 的唯一权威" } p { "授权成功、回调成功或存在 Connection row 都不会单独变成 Connected。" } }
                         }
                     }
                     footer {
@@ -7170,7 +7396,7 @@ fn ConnectionsSurface(
                         if flow_step() < 4 {
                             button { class: "surface-button primary", onclick: move |_| flow_step.set(flow_step() + 1), "继续" }
                         } else {
-                            button { class: "surface-button primary", onclick: move |_| flow_open.set(false), "关闭" }
+                            button { class: "surface-button primary", onclick: move |_| { flow_open.set(false); reauth_target.set(None); }, "关闭" }
                         }
                     }
                 }
@@ -10097,5 +10323,97 @@ mod tests {
             &MissionStage::Running,
             Some(&completed)
         ));
+    }
+
+    fn connection_projection_for_status(
+        status: ConnectionStatus,
+        probe: bool,
+    ) -> DesktopConnectionProjection {
+        let observed_at = "2026-08-13T09:00:00Z"
+            .parse()
+            .expect("fixed connection timestamp");
+        DesktopConnectionProjection {
+            id: ConnectionId::from("connection-ui-1"),
+            tenant_id: hartevo_domain_kernel::TenantId::from("tenant-ui-1"),
+            project_id: ProjectId::from("project-ui-1"),
+            provider: "provider-neutral".into(),
+            account_id: hartevo_domain_kernel::AccountId::from("account-ui-1"),
+            external_account_id: "account@example.test".into(),
+            required_scopes: BTreeSet::from(["read.accounts".into()]),
+            granted_scopes: if probe {
+                BTreeSet::from(["read.accounts".into()])
+            } else {
+                BTreeSet::new()
+            },
+            status,
+            last_probe_at: probe.then_some(observed_at),
+            probe_valid_until: probe.then_some(observed_at + chrono::Duration::minutes(10)),
+            credential_expires_at: probe.then_some(observed_at + chrono::Duration::hours(1)),
+            probe_evidence_digest: probe.then_some("a".repeat(64)),
+            revision: 2,
+            updated_at: observed_at,
+        }
+    }
+
+    #[test]
+    fn connection_status_rendering_requires_a_live_probe_for_connected() {
+        let now = "2026-08-13T09:01:00Z"
+            .parse()
+            .expect("fixed status timestamp");
+        let live = connection_projection_for_status(ConnectionStatus::Connected, true);
+        assert_eq!(
+            connection_status_copy(&live, now),
+            ("已验证可用", "LIVE_PROBE", "verified")
+        );
+
+        let forged = connection_projection_for_status(ConnectionStatus::Connected, false);
+        assert_eq!(
+            connection_status_copy(&forged, now),
+            ("Probe 未验证", "BLOCKED_ENV", "blocked")
+        );
+        assert!(!forged.has_live_probe(now));
+
+        let mut missing_scope = connection_projection_for_status(ConnectionStatus::Connected, true);
+        missing_scope.granted_scopes.clear();
+        assert_eq!(
+            connection_status_copy(&missing_scope, now),
+            ("Probe 未验证", "BLOCKED_ENV", "blocked")
+        );
+
+        let expired = connection_projection_for_status(ConnectionStatus::Expired, true);
+        assert_eq!(
+            connection_status_copy(&expired, now),
+            ("已过期", "EXPIRED", "danger")
+        );
+        assert!(!expired.has_live_probe(now));
+    }
+
+    #[test]
+    fn connection_center_exposes_restart_reauthorize_revoke_and_error_boundaries() {
+        let source = include_str!("lib.rs");
+        for contract in [
+            "AWAITING_CALLBACK",
+            "PROBE_REQUIRED",
+            "重新授权",
+            "确认撤销",
+            "撤销连接的协调器异常结束",
+            "callback state、nonce、授权 code 和凭据不进入 DOM、AX 或日志",
+        ] {
+            assert!(
+                source.contains(contract),
+                "missing connection UX contract {contract}"
+            );
+        }
+        for forbidden_identifier in [
+            ["raw", "_uri"].concat(),
+            ["pending", "_code"].concat(),
+            ["state", "_secret"].concat(),
+            ["nonce", "_secret"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden_identifier),
+                "handshake material leaked into the Connection DOM source: {forbidden_identifier}"
+            );
+        }
     }
 }

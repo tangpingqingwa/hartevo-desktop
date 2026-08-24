@@ -1,8 +1,14 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod connection_authorization;
 mod observation_evidence_pack;
 mod plugin_invocation_timeline;
 mod runtime_text_subscription;
+
+pub use connection_authorization::{
+    ConnectionAuthorizationCode, ConnectionAuthorizationError, ConnectionAuthorizationErrorCode,
+    ConnectionAuthorizationRequest, ConnectionAuthorizationSession, ConnectionAuthorizationState,
+};
 
 pub use observation_evidence_pack::{
     ObservationClassification, ObservationEvidencePack, ObservationPackConsumer,
@@ -58,8 +64,8 @@ use hartevo_domain_kernel::{
     BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId, BrowserRecipeId, BrowserTabId,
     BrowserWorkspaceId, Cadence, CadenceTriggerKind, Campaign, CampaignId,
     CampaignSendAuthorization, CommissionId, CommissionRecord, Company, CompanyId, Connection,
-    ConnectionError, ConnectionId, ConnectionProbe, ConnectionSnapshot, ConsentPurpose,
-    ConsentRecord, ConsentRecordId, ConsentRequirement, ConsentState, Constraint,
+    ConnectionError, ConnectionId, ConnectionProbe, ConnectionSnapshot, ConnectionStatus,
+    ConsentPurpose, ConsentRecord, ConsentRecordId, ConsentRequirement, ConsentState, Constraint,
     ContextAssemblyId, ContextBranch, ContextBranchId, ContextBranchMerge, ContextBranchMergeId,
     ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleId, ContextCapsuleStatus,
     ContextCheckpoint, ContextCheckpointId, ContextCompactionRecord, ContextCompactionRecordId,
@@ -4450,6 +4456,71 @@ pub struct DesktopProjectProjection {
     pub workspace_root_count: usize,
     pub encryption: ProjectEncryptionReadiness,
     pub missions: Vec<MissionProjection>,
+}
+
+/// Metadata-only Connection projection for the Desktop shell. It contains
+/// provider/account/scope and Probe evidence metadata, never a credential or
+/// callback value. `status` is evaluated at the requested projection time so
+/// an expired Probe cannot remain green after a restart.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopConnectionProjection {
+    pub id: ConnectionId,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub provider: String,
+    pub account_id: AccountId,
+    pub external_account_id: String,
+    pub required_scopes: BTreeSet<String>,
+    pub granted_scopes: BTreeSet<String>,
+    pub status: ConnectionStatus,
+    pub last_probe_at: Option<DateTime<Utc>>,
+    pub probe_valid_until: Option<DateTime<Utc>>,
+    pub credential_expires_at: Option<DateTime<Utc>>,
+    pub probe_evidence_digest: Option<String>,
+    pub revision: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl DesktopConnectionProjection {
+    pub fn from_connection(connection: &Connection, now: DateTime<Utc>) -> Self {
+        let snapshot = connection.snapshot();
+        let status = connection.effective_status(now);
+        let probe = snapshot.last_probe.as_ref();
+        Self {
+            id: snapshot.id,
+            tenant_id: snapshot.tenant_id,
+            project_id: snapshot.project_id,
+            provider: snapshot.provider,
+            account_id: snapshot.account_id,
+            external_account_id: snapshot.expected_external_account_id,
+            required_scopes: snapshot.required_scopes,
+            granted_scopes: snapshot.granted_scopes,
+            status,
+            last_probe_at: probe.map(|probe| probe.probed_at),
+            probe_valid_until: probe.map(|probe| probe.valid_until),
+            credential_expires_at: probe.map(|probe| probe.credential_expires_at),
+            probe_evidence_digest: probe.map(|probe| probe.evidence_digest.clone()),
+            revision: snapshot.revision,
+            updated_at: snapshot.updated_at,
+        }
+    }
+
+    pub fn has_live_probe(&self, now: DateTime<Utc>) -> bool {
+        self.status == ConnectionStatus::Connected
+            && !self.required_scopes.is_empty()
+            && self.required_scopes.is_subset(&self.granted_scopes)
+            && self.last_probe_at.is_some_and(|probed_at| probed_at <= now)
+            && self
+                .probe_valid_until
+                .is_some_and(|valid_until| valid_until > now)
+            && self
+                .credential_expires_at
+                .is_some_and(|expires_at| expires_at > now)
+            && self.probe_evidence_digest.as_ref().is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -16939,6 +17010,25 @@ impl ApplicationService {
             });
         }
         Ok(DesktopInventoryProjection { projects })
+    }
+
+    /// Projects only Connection metadata for the Desktop shell. The current
+    /// effective status is evaluated at `now`, so expired credentials cannot
+    /// survive a restart as a stale Connected badge.
+    pub fn desktop_connection_projections(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<DesktopConnectionProjection>, ApplicationError> {
+        let mut connections = Vec::new();
+        for project in self.store.list_projects()? {
+            for connection in self.store.list_connections(&project.id)? {
+                connections.push(DesktopConnectionProjection::from_connection(
+                    &connection,
+                    now,
+                ));
+            }
+        }
+        Ok(connections)
     }
 
     /// Projects the latest durable Runtime recovery and turn evidence for each
@@ -35316,6 +35406,26 @@ sleep 30"#
             .load_connection(&fixture.project, revoked.id())
             .expect("projected connection");
         assert!(!projected.is_connected(now() + Duration::minutes(5)));
+    }
+
+    #[test]
+    fn desktop_connection_projection_recomputes_probe_liveness_at_projection_time() {
+        let mut fixture = setup_team_key_fixture();
+        complete_local_project_registration(&mut fixture);
+        let connected = establish_connected_connection(&mut fixture);
+        let projection =
+            DesktopConnectionProjection::from_connection(&connected, now() + Duration::minutes(4));
+        assert_eq!(projection.status, ConnectionStatus::Connected);
+        assert!(projection.has_live_probe(now() + Duration::minutes(4)));
+
+        let expired =
+            DesktopConnectionProjection::from_connection(&connected, now() + Duration::hours(2));
+        assert_eq!(expired.status, ConnectionStatus::Expired);
+        assert!(!expired.has_live_probe(now() + Duration::hours(2)));
+
+        let mut incomplete = projection;
+        incomplete.granted_scopes.clear();
+        assert!(!incomplete.has_live_probe(now() + Duration::minutes(4)));
     }
 
     #[test]
