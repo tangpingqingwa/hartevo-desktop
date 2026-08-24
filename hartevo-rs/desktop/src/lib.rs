@@ -30,6 +30,7 @@ use zeroize::Zeroizing;
 
 mod agent_operations;
 pub mod data_plane;
+pub mod gm01_intent;
 mod runtime_plane;
 mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
