@@ -16,6 +16,7 @@ pub mod keys {
     pub const TOOLS: &str = "tools";
     pub const LLM: &str = "llm";
     pub const SESSIONS: &str = "sessions";
+    pub const AGENTS: &str = "agents";
     pub const DOMAIN: &str = "domain";
     pub const EFFECT_BROKER: &str = "effect_broker";
     pub const RUNTIME: &str = "runtime";
@@ -92,6 +93,11 @@ impl Context {
     #[must_use]
     pub fn sessions<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         self.get(keys::SESSIONS)
+    }
+
+    #[must_use]
+    pub fn agents<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::AGENTS)
     }
 
     #[must_use]
@@ -379,6 +385,23 @@ impl Context {
         self.events.mode(name)
     }
 
+    /// Lock `name` to one dispatch mode without installing a listener.
+    ///
+    /// Reversed on teardown when no listeners remain for `name`. Re-locking an
+    /// already-locked name is a no-op and does not stack another disposer.
+    pub fn lock_event(&mut self, name: &str, mode: DispatchMode) -> Result<(), CordisError> {
+        let already = self.events.mode(name) == Some(mode);
+        self.events
+            .lock(name, mode)
+            .map_err(|locked| conflict(name, locked, mode))?;
+        if !already {
+            self.effects.push(Registration::EventLock {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Run disposers newest-first, then drop remaining registrations. The context is reusable.
     pub fn teardown(&mut self) {
         while let Some(registration) = self.effects.pop() {
@@ -408,6 +431,9 @@ impl Context {
                 },
                 Registration::Listener { name, id } => {
                     self.events.remove_listener(&name, id);
+                }
+                Registration::EventLock { name } => {
+                    self.events.unlock(&name);
                 }
             }
         }
