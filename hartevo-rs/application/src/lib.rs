@@ -7486,6 +7486,31 @@ impl ApplicationService {
         Ok(record)
     }
 
+    pub fn load_consent_record(
+        &self,
+        project_id: &ProjectId,
+        record_id: &ConsentRecordId,
+    ) -> Result<ConsentRecord, ApplicationError> {
+        Ok(self.store.load_consent_record(project_id, record_id)?)
+    }
+
+    /// Application-owned consent inventory for one Project. Desktop binds the
+    /// live Domain Kernel record from this list; it never invents a second store.
+    pub fn list_consent_records(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<ConsentRecord>, ApplicationError> {
+        Ok(self.store.list_consent_records(project_id)?)
+    }
+
+    pub fn list_missions(&self, project_id: &ProjectId) -> Result<Vec<Mission>, ApplicationError> {
+        Ok(self.store.list_missions(project_id)?)
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<Project>, ApplicationError> {
+        Ok(self.store.list_projects()?)
+    }
+
     pub fn open_conversation(
         &mut self,
         conversation: Conversation,
