@@ -63,6 +63,7 @@ fn typed_slots_round_trip_well_known_keys() {
     ctx.provide(keys::TOOLS, Marker("tools"));
     ctx.provide(keys::LLM, Marker("llm"));
     ctx.provide(keys::SESSIONS, Marker("sessions"));
+    ctx.provide(keys::AGENTS, Marker("agents"));
     ctx.provide(keys::DOMAIN, Marker("domain"));
     ctx.provide(keys::EFFECT_BROKER, Marker("effect_broker"));
     ctx.provide(keys::RUNTIME, Marker("runtime"));
@@ -78,6 +79,7 @@ fn typed_slots_round_trip_well_known_keys() {
         ctx.sessions::<Marker>().as_deref(),
         Some(&Marker("sessions"))
     );
+    assert_eq!(ctx.agents::<Marker>().as_deref(), Some(&Marker("agents")));
     assert_eq!(ctx.domain::<Marker>().as_deref(), Some(&Marker("domain")));
     assert_eq!(
         ctx.effect_broker::<Marker>().as_deref(),

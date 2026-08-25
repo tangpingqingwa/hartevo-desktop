@@ -189,6 +189,14 @@ impl EventBus {
         }
     }
 
+    pub(crate) fn unlock(&mut self, name: &str) {
+        if let Some(slot) = self.slots.get(name)
+            && slot.listeners.is_empty()
+        {
+            self.slots.remove(name);
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         self.slots.clear();
     }
