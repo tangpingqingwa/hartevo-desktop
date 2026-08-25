@@ -30,6 +30,7 @@ use zeroize::Zeroizing;
 
 mod agent_operations;
 mod cordis_host;
+pub use cordis_host::{bind_live_domain_kernel, mount_cordis_host};
 pub mod data_plane;
 mod runtime_plane;
 mod runtime_subscription;

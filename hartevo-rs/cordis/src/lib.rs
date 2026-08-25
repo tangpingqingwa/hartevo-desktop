@@ -10,6 +10,7 @@ mod effect;
 mod event;
 mod host;
 mod invariants;
+mod kernel;
 mod loader;
 mod service;
 mod surface;
@@ -25,6 +26,10 @@ pub use host::{
 };
 pub use invariants::{
     InvariantGate, OPENINTERPRETER, apply_effect, enforce_invariants, missing as invariant_missing,
+};
+pub use kernel::{
+    KernelApproval, KernelApprovalDecision, KernelConsentRecord, KernelConsentState,
+    KernelConsentStatus, bind_domain_kernel_facts,
 };
 pub use loader::{
     EnvironmentOverlay, LoadReport, Loader, LoaderContext, OverlayAction, OverlayLayer,

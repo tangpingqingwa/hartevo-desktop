@@ -1,15 +1,20 @@
 //! Desktop-facing Cordis host. Mounts SurfaceMapping, AgentLoop, and
 //! InvariantGate so the live loop is [`run_agent_step`], not OpenInterpreter.
 
+use chrono::{DateTime, Utc};
+
 use crate::agent::{AgentLoop, AgentStep, AgentStepResult, run_agent_step};
 use crate::context::{Context, CordisError, keys};
 use crate::invariants::{InvariantGate, OPENINTERPRETER, apply_effect, enforce_invariants};
+use crate::kernel::{
+    KernelApproval, KernelConsentRecord, KernelConsentState, bind_domain_kernel_facts,
+};
 use crate::loader::{
     EnvironmentOverlay, LoadReport, LoaderContext, PluginId, PluginSpec, load_plugins,
 };
 use crate::service::Service;
 use crate::surface::{
-    AgentsSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces, RuntimeSurface,
+    AgentsSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces, LlmSurface, RuntimeSurface,
     SurfaceMapping, SurfaceOwner, ToolsSurface,
 };
 
@@ -53,10 +58,10 @@ impl CordisHost {
         openinterpreter: bool,
     ) -> Result<(Self, LoadReport), CordisError> {
         let mut ctx = Context::new();
-        let mapping_surfaces = surfaces.clone();
+        let mapping_surfaces = *surfaces;
         let mapping = PluginSpec::new("surfaces", move |_config, ctx| {
             SurfaceMapping {
-                surfaces: mapping_surfaces.clone(),
+                surfaces: mapping_surfaces,
             }
             .apply(ctx);
         });
@@ -89,6 +94,8 @@ impl CordisHost {
     }
 
     /// Fail closed, then run one Cordis-hosted agent step.
+    ///
+    /// Consent and approval are step-time invariants, not boot stamps.
     pub fn step(&mut self, step: AgentStep) -> Result<AgentStepResult, CordisError> {
         enforce_invariants(&self.ctx)?;
         run_agent_step(&mut self.ctx, step)
@@ -97,6 +104,28 @@ impl CordisHost {
     /// External write path. Invariants must pass; OpenInterpreter cannot write.
     pub fn apply_effect(&self) -> Result<(), CordisError> {
         apply_effect(&self.ctx)
+    }
+
+    /// Bind live Domain Kernel facts onto the already-mounted DomainSurface.
+    ///
+    /// Production boot stays fail-closed. After ApplicationService has a
+    /// project/mission with live Consent/Approval, desktop calls this before
+    /// `step` / `apply_effect`. Missing facts leave both flags false.
+    pub fn bind_domain_kernel(
+        &mut self,
+        consent: KernelConsentState,
+        record: Option<KernelConsentRecord>,
+        approval: Option<KernelApproval>,
+        now: DateTime<Utc>,
+    ) -> Result<(), CordisError> {
+        let Some(mounted) = self.ctx.domain::<DomainSurface>() else {
+            return Err(CordisError::MissingDependencies(vec![
+                keys::DOMAIN.to_string(),
+            ]));
+        };
+        let bound = bind_domain_kernel_facts(*mounted, consent, record, approval, now);
+        self.ctx.replace(keys::DOMAIN, bound);
+        Ok(())
     }
 
     #[must_use]
@@ -125,14 +154,12 @@ impl CordisHost {
 }
 
 /// Default host surfaces. OpenInterpreter may occupy the runtime plugin slot.
+///
+/// Consent and approval stay fail-closed (`DomainSurface::default()`). Live
+/// Domain Kernel facts are bound after boot, before `step` / `apply_effect`.
 #[must_use]
 pub fn desktop_surfaces(openinterpreter: bool) -> HartevoSurfaces {
     HartevoSurfaces {
-        domain: DomainSurface {
-            consent: true,
-            approved: true,
-            ..DomainSurface::default()
-        },
         runtime: RuntimeSurface {
             owner: SurfaceOwner::Hartevo,
             plugin: openinterpreter.then_some(OPENINTERPRETER),
@@ -141,7 +168,11 @@ pub fn desktop_surfaces(openinterpreter: bool) -> HartevoSurfaces {
     }
 }
 
-/// Assert the three host services are live and OpenInterpreter is not the loop.
+/// Boot-time host check: the seven keys, Hartevo ownership of Domain/Effect,
+/// Receipt ≠ Verification, and local-first/sqlcipher/eval_gate.
+///
+/// Consent and approval are *not* required here. They are step-time
+/// invariants of [`CordisHost::step`] / [`apply_effect`].
 pub fn host_is_cordis_loop(host: &CordisHost) -> Result<(), CordisError> {
     for key in host.mounted_keys() {
         if !host.ctx.has(key) {
@@ -151,6 +182,11 @@ pub fn host_is_cordis_loop(host: &CordisHost) -> Result<(), CordisError> {
     if host.ctx.tools::<ToolsSurface>().is_none() {
         return Err(CordisError::MissingDependencies(vec![
             keys::TOOLS.to_string(),
+        ]));
+    }
+    if host.ctx.llm::<LlmSurface>().is_none() {
+        return Err(CordisError::MissingDependencies(vec![
+            keys::LLM.to_string(),
         ]));
     }
     if host.ctx.agents::<AgentsSurface>().is_none() {
@@ -168,6 +204,21 @@ pub fn host_is_cordis_loop(host: &CordisHost) -> Result<(), CordisError> {
             keys::DOMAIN.to_string(),
         ]));
     }
+    if !domain.local_first {
+        return Err(CordisError::MissingDependencies(vec![
+            crate::invariants::missing::LOCAL_FIRST.to_string(),
+        ]));
+    }
+    if !domain.sqlcipher {
+        return Err(CordisError::MissingDependencies(vec![
+            crate::invariants::missing::SQLCIPHER.to_string(),
+        ]));
+    }
+    if !domain.eval_gate {
+        return Err(CordisError::MissingDependencies(vec![
+            crate::invariants::missing::EVAL.to_string(),
+        ]));
+    }
     let Some(broker) = host.ctx.effect_broker::<EffectBrokerSurface>() else {
         return Err(CordisError::MissingDependencies(vec![
             keys::EFFECT_BROKER.to_string(),
@@ -183,7 +234,7 @@ pub fn host_is_cordis_loop(host: &CordisHost) -> Result<(), CordisError> {
             crate::invariants::missing::VERIFICATION.to_string(),
         ]));
     }
-    enforce_invariants(&host.ctx)
+    Ok(())
 }
 
 #[must_use]

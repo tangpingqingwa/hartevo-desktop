@@ -127,6 +127,13 @@ impl Context {
         self.effects.push(Registration::Service { key, previous });
     }
 
+    /// Replace a mounted service in place. Does not push a disposer, so host
+    /// teardown still reverses the original mount rather than this live bind.
+    pub(crate) fn replace<T: Any + Send + Sync>(&mut self, key: &str, value: T) -> Option<Arc<T>> {
+        let previous = self.services.insert(key.to_string(), Arc::new(value));
+        previous.and_then(|value| value.downcast::<T>().ok())
+    }
+
     /// Set a plugin-context interpolation variable. Reversed on teardown.
     ///
     /// Used after `inject` when expanding plugin `config`. Not the loader
