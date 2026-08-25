@@ -30,14 +30,14 @@ use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
 };
 use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblyStatus};
-use hartevo_cordis::CordisHost;
+use hartevo_cordis::{CordisError, CordisHost};
 use hartevo_domain_kernel::{
-    ActorId, CurrencyCode, DeviceId, KeyManagementError, KeyRecipient, KpiContract,
-    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionConversationMessageId,
-    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionStage, Money,
-    OperatingMode, OutcomeDecision, ProjectEncryptionMode, ProjectId, ProjectKeyring,
-    RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId, RuntimeTurnStatus,
-    StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
+    ActorId, Approval, ConsentRecord, ConsentState, CurrencyCode, DeviceId, KeyManagementError,
+    KeyRecipient, KpiContract, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
+    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
+    MissionId, MissionStage, Money, OperatingMode, OutcomeDecision, ProjectEncryptionMode,
+    ProjectId, ProjectKeyring, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId,
+    RuntimeTurnStatus, StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
 };
 use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand};
 use hartevo_storage::{
@@ -49,7 +49,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::cordis_host::mount_cordis_host;
+use crate::cordis_host::{bind_live_domain_kernel, mount_cordis_host};
 use crate::runtime_plane::{
     DesktopRuntimeAvailabilityStatus, DesktopRuntimeConfiguration, DesktopRuntimeProjection,
     discover_runtime, ensure_project_runtime_home,
@@ -547,6 +547,20 @@ impl DesktopDataPlane {
     /// Cordis-hosted live loop. OpenInterpreter is never this loop.
     pub fn cordis_host(&mut self) -> &mut CordisHost {
         &mut self.cordis
+    }
+
+    /// Bind live Domain Kernel consent/approval onto the mounted host.
+    ///
+    /// Production `desktop_surfaces()` stays fail-closed. `step` / `apply_effect`
+    /// still require these facts; this never stamps `true` at boot.
+    pub fn bind_live_domain_kernel(
+        &mut self,
+        consent: &ConsentState,
+        record: Option<&ConsentRecord>,
+        approval: Option<&Approval>,
+        now: DateTime<Utc>,
+    ) -> Result<(), CordisError> {
+        bind_live_domain_kernel(&mut self.cordis, consent, record, approval, now)
     }
 
     pub fn at_data_root(root: impl AsRef<Path>) -> Result<Self, DesktopDataError> {
@@ -7394,28 +7408,38 @@ sleep 30"#;
 
     #[test]
     fn data_plane_mounts_cordis_host_as_the_live_loop() {
+        use chrono::{Duration, TimeZone, Utc};
         use hartevo_cordis::{
-            AgentStep, DomainSurface, OPENINTERPRETER, SurfaceOwner, host_is_cordis_loop,
+            AgentStep, CordisError, DomainSurface, OPENINTERPRETER, SurfaceOwner,
+            host_is_cordis_loop, invariant_missing,
+        };
+        use hartevo_domain_kernel::{
+            ActorId, Approval, ApprovalDecision, ApprovalId, ConsentState,
         };
 
         let directory = tempfile::tempdir().expect("directory");
         let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         host_is_cordis_loop(plane.cordis_host()).unwrap();
+        let domain = plane
+            .cordis_host()
+            .context()
+            .domain::<DomainSurface>()
+            .unwrap();
+        assert_eq!(domain.owner, SurfaceOwner::Hartevo);
+        assert!(!domain.consent);
+        assert!(!domain.approved);
         assert_eq!(
             plane
                 .cordis_host()
-                .context()
-                .domain::<DomainSurface>()
-                .unwrap()
-                .owner,
-            SurfaceOwner::Hartevo
+                .step(AgentStep::new("mission-plane", "plan"))
+                .unwrap_err(),
+            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
         );
-        let out = plane
-            .cordis_host()
-            .step(AgentStep::new("mission-plane", "plan"))
-            .unwrap();
-        assert_eq!(out.id, "mission-plane");
+        assert_eq!(
+            plane.cordis_host().apply_effect().unwrap_err(),
+            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+        );
         assert!(
             plane
                 .cordis_host()
@@ -7424,6 +7448,29 @@ sleep 30"#;
                 .is_none()
                 || plane.cordis_host().runtime_plugin() == Some(OPENINTERPRETER)
         );
+
+        let now = Utc.with_ymd_and_hms(2026, 8, 25, 13, 34, 33).unwrap();
+        plane
+            .bind_live_domain_kernel(
+                &ConsentState::Confirmed,
+                None,
+                Some(&Approval {
+                    id: ApprovalId::from("approval-plane"),
+                    decision: ApprovalDecision::Approved,
+                    decided_by: ActorId::from("user-plane"),
+                    decided_at: now,
+                    valid_until: now + Duration::minutes(5),
+                    scope_digest: "a".repeat(64),
+                    permission_digest: "b".repeat(64),
+                }),
+                now,
+            )
+            .unwrap();
+        let out = plane
+            .cordis_host()
+            .step(AgentStep::new("mission-plane", "plan"))
+            .unwrap();
+        assert_eq!(out.id, "mission-plane");
         plane.cordis_host().apply_effect().unwrap();
     }
 

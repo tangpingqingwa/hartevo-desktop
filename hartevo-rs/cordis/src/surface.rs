@@ -213,7 +213,7 @@ impl AgentsSurface {
 /// Cordis does not reimplement Domain Kernel. These flags are the host-side
 /// fail-closed view of consent, approval, local-first, SQLCipher, and eval.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DomainSurface {
     pub owner: SurfaceOwner,
     pub consent: bool,
@@ -239,7 +239,7 @@ impl Default for DomainSurface {
 /// Hartevo Effect Broker handle. The only external-write path.
 ///
 /// `receipt_is_verification` stays false: Receipt ≠ Verification.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EffectBrokerSurface {
     pub owner: SurfaceOwner,
     pub receipt_is_verification: bool,
@@ -247,20 +247,20 @@ pub struct EffectBrokerSurface {
 
 /// Optional runtime plugin slot. OpenInterpreter may sit here as an adapter
 /// plugin; it still does not own Mission, Truth, or Effect.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeSurface {
     pub owner: SurfaceOwner,
     pub plugin: Option<&'static str>,
 }
 
 /// Desktop shell handle. Hartevo-owned; not an OpenInterpreter surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesktopSurface {
     pub owner: SurfaceOwner,
 }
 
 /// Bundle of Hartevo-owned surfaces. Mapping, not a second host.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HartevoSurfaces {
     pub domain: DomainSurface,
     pub effect_broker: EffectBrokerSurface,
