@@ -101,7 +101,7 @@
     {"claimId": "DMT-DESKTOP-EXECUTION-PAINT-01", "value": true},
     {"claimId": "DMT-DESKTOP-SUBSCRIPTION-API-01", "value": true},
     {"claimId": "DMT-DESKTOP-SUBSCRIPTION-CALLER-01", "value": true},
-    {"claimId": "DMT-DESKTOP-VM11-EIGHTH-CALLER-01", "value": false}
+    {"claimId": "DMT-DESKTOP-VM11-EIGHTH-CALLER-01", "value": true}
   ]
 }
 ```

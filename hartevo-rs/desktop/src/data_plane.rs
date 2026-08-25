@@ -21,9 +21,10 @@ use hartevo_application::{
     MissionCheckpointDispatchState, MissionRuntimeProjection, ObserveContextRuntimeTurn,
     PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
     ProvisionProjectEncryption, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
-    ResearchPacket, RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime,
-    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTurnDispatchDisposition,
-    StartCatalogMission, StartMission,
+    ResearchPacket, ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
+    RetryContextWorkerRuntime, RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor,
+    RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission,
+    Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
@@ -388,6 +389,20 @@ impl fmt::Debug for DesktopVm11OutcomeDecisionRequest {
             )
             .finish()
     }
+}
+
+/// Route-specific CAS for VM-11 `next_contract_or_valid_terminal`. The frozen
+/// decision digest and parent-contract digest must come from the SQLCipher
+/// projection; the window cannot substitute a replacement contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopVm11NextContractResolutionRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub expected_mission_revision: u64,
+    pub expected_checkpoint_revision: u64,
+    pub expected_decision_digest: String,
+    pub expected_parent_mission_revision: u64,
+    pub expected_parent_contract_digest: String,
 }
 
 #[cfg(test)]
@@ -1289,6 +1304,115 @@ impl DesktopDataPlane {
         )
     }
 
+    /// Resolves VM-11's frozen Continue/Stop/Scale/Test into the typed next
+    /// contract or valid terminal. This is a first-class Desktop action: the
+    /// generic Application completion path is rejected for this route, and no
+    /// Runtime or Provider Effect is constructed.
+    pub fn resolve_vm11_next_contract_or_valid_terminal_os(
+        &self,
+        request: DesktopVm11NextContractResolutionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.resolve_vm11_next_contract_or_valid_terminal_with(&secret_store, request, now)
+    }
+
+    pub fn resolve_vm11_next_contract_or_valid_terminal_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopVm11NextContractResolutionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        if request.expected_decision_digest.len() != 64
+            || request.expected_parent_contract_digest.len() != 64
+            || request.expected_mission_revision == 0
+            || request.expected_checkpoint_revision == 0
+            || request.expected_parent_mission_revision == 0
+        {
+            return Err(DesktopDataError::InvalidVm11NextContractResolution);
+        }
+        let project_id = request.project_id.clone();
+        let mission_id = request.mission_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let runtime_outcome =
+            match service.resolve_vm11_next_contract_or_valid_terminal(
+                ResolveVm11NextContractOrValidTerminal {
+                    project_id: project_id.clone(),
+                    mission_id: mission_id.clone(),
+                    expected_mission_revision: request.expected_mission_revision,
+                    expected_checkpoint_revision: request.expected_checkpoint_revision,
+                    expected_decision_digest: request.expected_decision_digest,
+                    expected_parent_mission_revision: request.expected_parent_mission_revision,
+                    expected_parent_contract_digest: request.expected_parent_contract_digest,
+                },
+                now,
+            )? {
+                Vm11NextContractOrValidTerminalResult::Resolved {
+                    next_dispatch: Some(dispatch),
+                    ..
+                } => DesktopMissionRuntimeOutcome::CheckpointRouted {
+                    checkpoint_id: dispatch.checkpoint_id,
+                    capability_id: dispatch.capability_id,
+                    executor: dispatch.executor,
+                    oracle_ids: dispatch.oracle_ids,
+                    completion_policy: dispatch.completion_policy,
+                    state: dispatch.state,
+                },
+                Vm11NextContractOrValidTerminalResult::Resolved {
+                    mission,
+                    next_dispatch: None,
+                    ..
+                } => DesktopMissionRuntimeOutcome::ApplicationCheckpointCompleted {
+                    checkpoint_id: "next_contract_or_valid_terminal".into(),
+                    evidence_digest: mission
+                        .definition
+                        .as_ref()
+                        .and_then(|definition| {
+                            definition.checkpoints.iter().find(|checkpoint| {
+                                checkpoint.id == "next_contract_or_valid_terminal"
+                            })
+                        })
+                        .and_then(|checkpoint| checkpoint.completion.as_ref())
+                        .map(|completion| completion.evidence_digest.clone())
+                        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+                },
+                Vm11NextContractOrValidTerminalResult::WaitingUser { mission, .. } => {
+                    let checkpoint = mission
+                        .definition
+                        .as_ref()
+                        .and_then(|definition| {
+                            definition.checkpoints.iter().find(|checkpoint| {
+                                checkpoint.id == "next_contract_or_valid_terminal"
+                            })
+                        })
+                        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+                    let route = checkpoint
+                        .route
+                        .as_ref()
+                        .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?;
+                    DesktopMissionRuntimeOutcome::CheckpointRouted {
+                        checkpoint_id: checkpoint.id.clone(),
+                        capability_id: route.capability_id.clone(),
+                        executor: route.executor,
+                        oracle_ids: route.oracle_ids.clone(),
+                        completion_policy: route
+                            .completion_policy
+                            .ok_or(ApplicationError::MissionCheckpointDispatchUnavailable)?,
+                        state: MissionCheckpointDispatchState::WaitingUser,
+                    }
+                }
+            };
+        self.finish_mission_submission(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            mission_id,
+            runtime_outcome,
+            now,
+        )
+    }
+
     fn continue_mission_and_run_with(
         &self,
         secret_store: &impl SecretStore,
@@ -1502,6 +1626,11 @@ impl DesktopDataPlane {
             let mut dispatch =
                 service.dispatch_current_mission_checkpoint(project_id, &mission_id, now)?;
             if dispatch.executor == MissionCheckpointExecutor::Application {
+                if dispatch.checkpoint_id == "next_contract_or_valid_terminal" {
+                    return Err(
+                        ApplicationError::Vm11NextContractRouteSpecificCommandRequired.into(),
+                    );
+                }
                 match service.execute_application_mission_checkpoint(
                     ExecuteApplicationMissionCheckpoint {
                         project_id: project_id.clone(),
@@ -2929,6 +3058,10 @@ pub enum DesktopDataError {
         "VM-11 outcome decision requires a typed action, private rationale, actor, and exact frozen review digests"
     )]
     InvalidVm11OutcomeDecision,
+    #[error(
+        "VM-11 next_contract_or_valid_terminal requires the frozen decision digest, parent contract digest, and exact Mission/Checkpoint revisions"
+    )]
+    InvalidVm11NextContractResolution,
     #[error("project name cannot be empty")]
     EmptyProjectName,
     #[error("recovery key must be exactly 32 bytes encoded as 64 hexadecimal characters")]
@@ -4032,7 +4165,7 @@ sleep 30"#;
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the Desktop data-plane Journey proves seven deterministic Application handlers, honest empty-ledger blocking, source-verified KPI/attribution/settlement/review recovery, atomic Human next-route handoff, and zero Runtime construction"
+        reason = "the Desktop data-plane Journey proves eight deterministic Application handlers, honest empty-ledger blocking, source-verified KPI/attribution/settlement/review recovery, atomic Human next-route handoff, typed next-contract resolution, and zero Runtime construction"
     )]
     fn vm11_application_handlers_recover_and_advance_without_constructing_runtime() {
         let (_directory, plane, secrets, project_id) = ready_personal_fixture();
@@ -4236,7 +4369,7 @@ sleep 30"#;
                     id: OutcomeEventId::from("desktop-vm11-order-event"),
                     tenant_id,
                     project_id: project_id.clone(),
-                    mission_id: parent_mission_id,
+                    mission_id: parent_mission_id.clone(),
                     kind: OutcomeEventKind::OrderPlaced,
                     provider: "user-review".into(),
                     connection_id: Some(outcome_connection_id),
@@ -4944,6 +5077,152 @@ sleep 30"#;
         .expect("VM-11 event JSON");
         assert!(event_json.contains("mission.outcome_review_decided"));
         assert!(!event_json.contains("one-off parent contract"));
+
+        assert!(matches!(
+            plane.resume_mission_runtime_with(
+                &secrets,
+                &project_id,
+                &started.mission_id,
+                Some(DesktopRuntimeSource::Fixture {
+                    provider: "must-not-run".into(),
+                    model: "must-not-run".into(),
+                    command_builder: Box::new(|_, _| {
+                        panic!("eighth Application handler must not construct Runtime")
+                    }),
+                }),
+                DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
+                observed_at() + Duration::minutes(16),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::Vm11NextContractRouteSpecificCommandRequired
+            ))
+        ));
+        let parent_projection = decided.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == parent_mission_id)
+            .expect("parent Mission projection");
+        let persisted_decision_digest = persisted_decision
+            .digest()
+            .expect("structured decision digest");
+        let next_contract_request = DesktopVm11NextContractResolutionRequest {
+            project_id: project_id.clone(),
+            mission_id: started.mission_id.clone(),
+            expected_mission_revision: decided_projection.revision,
+            expected_checkpoint_revision: decided_projection
+                .current_checkpoint_revision
+                .expect("next-contract Checkpoint revision"),
+            expected_decision_digest: persisted_decision_digest,
+            expected_parent_mission_revision: parent_projection.revision,
+            expected_parent_contract_digest: review_decision_projection
+                .review
+                .source_contract_digest
+                .clone(),
+        };
+        let resolved = plane
+            .resolve_vm11_next_contract_or_valid_terminal_with(
+                &secrets,
+                next_contract_request.clone(),
+                observed_at() + Duration::minutes(17),
+            )
+            .expect("Desktop Stop typed terminal");
+        assert!(matches!(
+            resolved.runtime_outcome,
+            DesktopMissionRuntimeOutcome::ApplicationCheckpointCompleted {
+                checkpoint_id,
+                ..
+            } if checkpoint_id == "next_contract_or_valid_terminal"
+        ));
+        let resolved_projection = resolved.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("resolved VM-11 projection");
+        assert_eq!(resolved_projection.stage, MissionStage::Completed);
+        assert_eq!(resolved_projection.completed_checkpoint_count, 9);
+        assert_eq!(resolved_projection.current_checkpoint_id, None);
+        assert!(resolved.snapshot.runtime_activity.iter().all(|activity| {
+            activity.mission_id != started.mission_id
+                || (activity.process_claim_status.is_none()
+                    && activity.recovery_status.is_none()
+                    && activity.turn_status.is_none())
+        }));
+        let replayed_terminal = plane
+            .resolve_vm11_next_contract_or_valid_terminal_with(
+                &secrets,
+                next_contract_request.clone(),
+                observed_at() + Duration::minutes(18),
+            )
+            .expect("exact Desktop terminal replay");
+        let replayed_terminal_projection = replayed_terminal.snapshot.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == started.mission_id)
+            .expect("replayed terminal projection");
+        assert_eq!(
+            replayed_terminal_projection.revision,
+            resolved_projection.revision
+        );
+        let mut drifted = next_contract_request;
+        drifted.expected_parent_contract_digest = "f".repeat(64);
+        assert!(matches!(
+            plane.resolve_vm11_next_contract_or_valid_terminal_with(
+                &secrets,
+                drifted,
+                observed_at() + Duration::minutes(19),
+            ),
+            Err(DesktopDataError::Application(
+                ApplicationError::Vm11NextContractCommandMismatch
+            ))
+        ));
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(20))
+            .expect("reopen typed terminal");
+        let terminal_mission = service
+            .load_mission(&project_id, &started.mission_id)
+            .expect("durable typed terminal");
+        assert_eq!(terminal_mission.stage, MissionStage::Completed);
+        assert_eq!(terminal_mission.effects.len(), 0);
+        let terminal_completion = terminal_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "next_contract_or_valid_terminal")
+            })
+            .and_then(|checkpoint| checkpoint.completion.as_ref())
+            .expect("durable eighth-handler completion");
+        assert_eq!(
+            terminal_completion
+                .application_evidence
+                .as_ref()
+                .map(|evidence| evidence.handler_id.as_str()),
+            Some("vm11.next-contract-or-valid-terminal/v1")
+        );
+        let candidate_learning = terminal_mission
+            .definition
+            .as_ref()
+            .and_then(|definition| {
+                definition
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == "candidate_learning")
+            })
+            .expect("durable skipped candidate_learning");
+        assert_eq!(
+            candidate_learning.status,
+            hartevo_domain_kernel::MissionCheckpointStatus::Skipped
+        );
+        let terminal_event_json = serde_json::to_string(
+            &service
+                .mission_events(&project_id, &started.mission_id)
+                .expect("content-free eighth-handler events"),
+        )
+        .expect("eighth-handler event JSON");
+        assert!(terminal_event_json.contains("mission.next_contract_or_valid_terminal_resolved"));
+        assert!(!terminal_event_json.contains("one-off parent contract"));
     }
 
     #[test]
