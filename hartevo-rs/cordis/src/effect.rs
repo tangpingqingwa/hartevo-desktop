@@ -21,4 +21,7 @@ pub(crate) enum Registration {
         name: String,
         id: u64,
     },
+    EventLock {
+        name: String,
+    },
 }
