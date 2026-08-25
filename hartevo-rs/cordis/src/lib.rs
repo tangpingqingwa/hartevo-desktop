@@ -1,6 +1,8 @@
 //! Rust Cordis kernel: service container, plugin inject/apply, reversible
-//! effects, typed events, loader/overlay interpolation, and Hartevo surface mapping.
+//! effects, typed events, loader/overlay interpolation, Hartevo surface mapping,
+//! and a Cordis-hosted agent loop.
 
+mod agent;
 mod config;
 mod context;
 mod effect;
@@ -9,6 +11,7 @@ mod loader;
 mod service;
 mod surface;
 
+pub use agent::{AGENT_LOOP_KEYS, AgentLoop, AgentStep, AgentStepResult, run_agent_step};
 pub use config::{ConfigValue, InterpolateError};
 pub use context::{Context, CordisError, keys};
 pub use effect::Disposer;
