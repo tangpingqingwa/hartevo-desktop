@@ -2315,6 +2315,7 @@ dependencies = [
  "hartevo-context-fabric",
  "hartevo-cordis",
  "hartevo-domain-kernel",
+ "hartevo-effect-broker",
  "hartevo-runtime-adapter",
  "hartevo-storage",
  "hex",

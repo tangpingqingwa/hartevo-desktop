@@ -438,7 +438,8 @@ impl UiFailure {
             },
             DesktopDataError::Storage(_)
             | DesktopDataError::Application(_)
-            | DesktopDataError::Catalog(_) => Self {
+            | DesktopDataError::Catalog(_)
+            | DesktopDataError::Cordis(_) => Self {
                 code: "INTEGRITY_ERROR".into(),
                 message: "持久状态或机器合同未通过完整性校验；Hartevo 已停止继续执行。".into(),
             },
@@ -467,7 +468,7 @@ impl DesktopUiModel {
         if let Some(model) = visual_fixture::load_from_environment() {
             return model;
         }
-        match DesktopDataPlane::discover().and_then(|plane| plane.load_os(Utc::now())) {
+        match DesktopDataPlane::discover().and_then(|mut plane| plane.load_os(Utc::now())) {
             Ok(DesktopLoadState::Uninitialized { product_evidence }) => Self {
                 backend: DesktopBackendState::Uninitialized(product_evidence),
                 selected_project_id: None,
@@ -2095,7 +2096,7 @@ pub fn App() -> Element {
                                 interrupt_available: operations_interrupt_available,
                                 interrupt_requested: operations_interrupt_requested,
                                 on_initialize: move |_| {
-                                    match DesktopDataPlane::discover().and_then(|plane| plane.initialize_os(Utc::now())) {
+                                    match DesktopDataPlane::discover().and_then(|mut plane| plane.initialize_os(Utc::now())) {
                                         Ok(snapshot) => model.write().set_ready(snapshot, false),
                                         Err(error) => model.write().set_notice(&error),
                                     }
