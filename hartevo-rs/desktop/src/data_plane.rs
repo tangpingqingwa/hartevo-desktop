@@ -30,14 +30,15 @@ use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
 };
 use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblyStatus};
-use hartevo_cordis::{CordisError, CordisHost};
+use hartevo_cordis::{AgentStep, AgentStepResult, CordisError, CordisHost};
 use hartevo_domain_kernel::{
-    ActorId, Approval, ConsentRecord, ConsentState, CurrencyCode, DeviceId, KeyManagementError,
-    KeyRecipient, KpiContract, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
-    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
-    MissionId, MissionStage, Money, OperatingMode, OutcomeDecision, ProjectEncryptionMode,
-    ProjectId, ProjectKeyring, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId,
-    RuntimeTurnStatus, StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
+    ActorId, Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus, CurrencyCode,
+    DeviceId, KeyManagementError, KeyRecipient, KpiContract, MissionCheckpointCompletionPolicy,
+    MissionCheckpointExecutor, MissionConversationMessageId, MissionConversationMessageKind,
+    MissionConversationRole, MissionId, MissionStage, Money, OperatingMode, OutcomeDecision,
+    ProjectEncryptionMode, ProjectId, ProjectKeyring, RuntimeRecoveryStatus, RuntimeResumeStrategy,
+    RuntimeTurnAttemptId, RuntimeTurnStatus, StorageMode, TaskId, TenantId, WorkProductId,
+    WorkerHandleStatus,
 };
 use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand};
 use hartevo_storage::{
@@ -563,6 +564,29 @@ impl DesktopDataPlane {
         bind_live_domain_kernel(&mut self.cordis, consent, record, approval, now)
     }
 
+    /// Production Cordis step. Live Domain Kernel facts are rebound from
+    /// ApplicationService before the host may plan; missing facts stay fail-closed.
+    pub fn step(
+        &mut self,
+        secret_store: &impl SecretStore,
+        step: AgentStep,
+        now: DateTime<Utc>,
+    ) -> Result<AgentStepResult, DesktopDataError> {
+        self.bind_live_domain_kernel_from_store(secret_store, now)?;
+        Ok(self.cordis.step(step)?)
+    }
+
+    /// Production Effect write path. Live Domain Kernel facts are rebound
+    /// first; OpenInterpreter still cannot own Domain or Effect.
+    pub fn apply_effect(
+        &mut self,
+        secret_store: &impl SecretStore,
+        now: DateTime<Utc>,
+    ) -> Result<(), DesktopDataError> {
+        self.bind_live_domain_kernel_from_store(secret_store, now)?;
+        Ok(self.cordis.apply_effect()?)
+    }
+
     pub fn at_data_root(root: impl AsRef<Path>) -> Result<Self, DesktopDataError> {
         let root = root.as_ref();
         if !root.is_absolute() {
@@ -602,18 +626,21 @@ impl DesktopDataPlane {
         })
     }
 
-    pub fn load_os(&self, now: DateTime<Utc>) -> Result<DesktopLoadState, DesktopDataError> {
+    pub fn load_os(&mut self, now: DateTime<Utc>) -> Result<DesktopLoadState, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         self.load_with(&secret_store, now)
     }
 
-    pub fn initialize_os(&self, now: DateTime<Utc>) -> Result<DesktopSnapshot, DesktopDataError> {
+    pub fn initialize_os(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         self.initialize_with(&secret_store, now)
     }
 
     pub fn load_with(
-        &self,
+        &mut self,
         secret_store: &impl SecretStore,
         now: DateTime<Utc>,
     ) -> Result<DesktopLoadState, DesktopDataError> {
@@ -623,6 +650,7 @@ impl DesktopDataPlane {
             Ok(secret) => {
                 let (service, runtime_reconciliation) =
                     self.open_application_from_secret(&secret, now)?;
+                self.bind_live_domain_kernel_from_service(&service, now)?;
                 Ok(DesktopLoadState::Ready(Box::new(self.build_snapshot(
                     &service,
                     secret_store,
@@ -720,7 +748,7 @@ impl DesktopDataPlane {
     /// onboarding action. A key that survived an interrupted first open is
     /// reused; an existing database is never silently rebound to a new key.
     pub fn initialize_with(
-        &self,
+        &mut self,
         secret_store: &impl SecretStore,
         now: DateTime<Utc>,
     ) -> Result<DesktopSnapshot, DesktopDataError> {
@@ -739,6 +767,7 @@ impl DesktopDataPlane {
             Err(error) => return Err(error.into()),
         };
         let (service, runtime_reconciliation) = self.open_application_from_secret(&secret, now)?;
+        self.bind_live_domain_kernel_from_service(&service, now)?;
         let product_evidence = load_product_evidence(now)?;
         self.build_snapshot(
             &service,
@@ -2819,6 +2848,42 @@ impl DesktopDataPlane {
         Ok(ApplicationService::new(store))
     }
 
+    fn bind_live_domain_kernel_from_store(
+        &mut self,
+        secret_store: &impl SecretStore,
+        now: DateTime<Utc>,
+    ) -> Result<(), DesktopDataError> {
+        self.revalidate_database_entry()?;
+        match secret_store.get(&self.database_key_reference) {
+            Ok(secret) => {
+                let service = self.open_read_application_from_secret(&secret)?;
+                self.bind_live_domain_kernel_from_service(&service, now)
+            }
+            Err(SecretStoreError::SecretNotFound) => {
+                // Uninitialized / missing key: host stays mounted and fail-closed.
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn bind_live_domain_kernel_from_service(
+        &mut self,
+        service: &ApplicationService,
+        now: DateTime<Utc>,
+    ) -> Result<(), DesktopDataError> {
+        let Some(facts) = live_domain_kernel_facts(service, now)? else {
+            return Ok(());
+        };
+        self.bind_live_domain_kernel(
+            &facts.consent,
+            facts.record.as_ref(),
+            facts.approval.as_ref(),
+            now,
+        )?;
+        Ok(())
+    }
+
     fn revalidate_database_entry(&self) -> Result<(), DesktopDataError> {
         reject_symlink(&self.data_root)?;
         reject_symlink(&self.database_path)
@@ -2843,6 +2908,72 @@ impl DesktopDataPlane {
     fn database_key_reference(&self) -> &SecretReference {
         &self.database_key_reference
     }
+}
+
+struct LiveDomainKernelFacts {
+    consent: ConsentState,
+    record: Option<ConsentRecord>,
+    approval: Option<Approval>,
+}
+
+fn live_domain_kernel_facts(
+    service: &ApplicationService,
+    now: DateTime<Utc>,
+) -> Result<Option<LiveDomainKernelFacts>, DesktopDataError> {
+    let projects = service.list_projects()?;
+    let Some(project) = projects.first() else {
+        return Ok(None);
+    };
+    let records = service.list_consent_records(&project.id)?;
+    let record = records.into_iter().max_by_key(|record| {
+        (
+            record.revision,
+            record.granted_at.unwrap_or(DateTime::<Utc>::MIN_UTC),
+            record.id.as_str().to_owned(),
+        )
+    });
+    let consent = record
+        .as_ref()
+        .map_or(ConsentState::Missing, |record| match record.status {
+            ConsentStatus::Granted
+                if record.permits(
+                    &record.person_id,
+                    &record.purpose,
+                    &record.channel,
+                    &record.market,
+                    now,
+                ) =>
+            {
+                ConsentState::Confirmed
+            }
+            ConsentStatus::Withdrawn => ConsentState::Withdrawn,
+            ConsentStatus::Granted | ConsentStatus::Denied | ConsentStatus::Expired => {
+                ConsentState::Missing
+            }
+        });
+    let missions = service.list_missions(&project.id)?;
+    let approval = missions
+        .iter()
+        .flat_map(|mission| mission.effects.iter())
+        .filter_map(|effect| effect.approval.as_ref())
+        .filter(|candidate| {
+            candidate.decision == ApprovalDecision::Approved && now < candidate.valid_until
+        })
+        .max_by_key(|candidate| (candidate.valid_until, candidate.decided_at))
+        .cloned()
+        .or_else(|| {
+            missions
+                .iter()
+                .flat_map(|mission| mission.effects.iter())
+                .filter_map(|effect| effect.approval.as_ref())
+                .max_by_key(|candidate| (candidate.valid_until, candidate.decided_at))
+                .cloned()
+        });
+    Ok(Some(LiveDomainKernelFacts {
+        consent,
+        record,
+        approval,
+    }))
 }
 
 fn no_runtime_turn_startup_reconciliation() -> RuntimeTurnStartupReconciliation {
@@ -3097,6 +3228,8 @@ pub enum DesktopDataError {
     #[error("Runtime text subscription context does not match the authorized Tenant and Project")]
     RuntimeSubscriptionContextMismatch,
     #[error(transparent)]
+    Cordis(#[from] CordisError),
+    #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
     SecretStore(#[from] SecretStoreError),
@@ -3114,18 +3247,20 @@ mod tests {
 
     use chrono::Duration;
     use hartevo_application::{
-        CreateProject, EvidenceInput, ProvisionProjectEncryption, ResearchPacket,
-        RuntimeTextSubscriptionError, StartRelationshipMission,
+        CreateProject, EvidenceInput, ProposePreviewEffect, ProvisionProjectEncryption,
+        ResearchPacket, RuntimeTextSubscriptionError, StartMission, StartRelationshipMission,
     };
     use hartevo_domain_kernel::{
-        AccountId, ActorId, Connection, ConnectionId, ConnectionProbe, ContextBranchStatus,
-        ContextCapsuleStatus, EvidenceId, ExternalIdentity, IdentityLink, IdentityLinkId,
-        IdentitySubject, KeyRecipient, KpiDirection, MissionCheckpointExecutor,
-        MissionScheduleStatus, MissionStage, OrderId, OutcomeDecision, OutcomeEvent,
-        OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification, OutcomeVerificationMethod,
-        Person, PersonId, ProbeOutcome, ProjectEncryptionMode, StorageMode, TaskId, TaskStatus,
-        WorkProductId, WorkerLeaseStatus,
+        AccountId, ActorId, Connection, ConnectionId, ConnectionProbe, ConsentPurpose,
+        ConsentRecordId, ConsentRequirement, ContactChannel, ContextBranchStatus,
+        ContextCapsuleStatus, EffectClass, EffectId, EvidenceId, ExternalIdentity, IdentityLink,
+        IdentityLinkId, IdentitySubject, KeyRecipient, KpiDirection, LegalBasis,
+        MissionCheckpointExecutor, MissionScheduleStatus, MissionStage, OrderId, OutcomeDecision,
+        OutcomeEvent, OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification,
+        OutcomeVerificationMethod, Person, PersonId, ProbeOutcome, ProjectEncryptionMode,
+        StorageMode, TaskId, TaskStatus, WorkProductId, WorkerLeaseStatus,
     };
+    use hartevo_effect_broker::{EffectBroker, EffectPolicy, EffectRateLimit};
     use hartevo_storage::MemorySecretStore;
     use rust_decimal::Decimal;
 
@@ -3140,6 +3275,244 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-08-11T10:00:00Z")
             .expect("valid fixture time")
             .with_timezone(&Utc)
+    }
+
+    fn production_preview_broker() -> EffectBroker {
+        EffectBroker::new(
+            EffectPolicy {
+                version: "policy-v1".into(),
+                allowed_capabilities: BTreeSet::from(["channel.preview".into()]),
+                allowed_classes: BTreeSet::from([EffectClass::ExternalWrite]),
+                max_amounts_minor: BTreeMap::from([(CurrencyCode::parse("CNY").expect("CNY"), 0)]),
+                rate_limits: vec![EffectRateLimit {
+                    rule_id: "desktop-preview-per-minute".into(),
+                    provider: "fixture-provider".into(),
+                    capability: "channel.preview".into(),
+                    max_executions: 10,
+                    window_seconds: 60,
+                }],
+            },
+            "desktop-kernel-bind-worker",
+        )
+        .with_lease_for(Duration::days(36_500))
+    }
+
+    fn assert_host_fail_closed_on_consent(plane: &mut DesktopDataPlane) {
+        use hartevo_cordis::{
+            DomainSurface, OPENINTERPRETER, SurfaceOwner, host_is_cordis_loop, invariant_missing,
+        };
+
+        host_is_cordis_loop(plane.cordis_host()).unwrap();
+        let domain = plane
+            .cordis_host()
+            .context()
+            .domain::<DomainSurface>()
+            .unwrap();
+        assert_eq!(domain.owner, SurfaceOwner::Hartevo);
+        assert!(!domain.consent);
+        assert!(!domain.approved);
+        assert!(
+            !plane
+                .cordis_host()
+                .context()
+                .effect_broker::<hartevo_cordis::EffectBrokerSurface>()
+                .unwrap()
+                .receipt_is_verification
+        );
+        assert_eq!(
+            plane
+                .cordis_host()
+                .step(AgentStep::new("mission-unbound", "plan"))
+                .unwrap_err(),
+            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+        );
+        assert_eq!(
+            plane.cordis_host().apply_effect().unwrap_err(),
+            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+        );
+        assert!(
+            plane
+                .cordis_host()
+                .context()
+                .get::<String>(OPENINTERPRETER)
+                .is_none()
+                || plane.cordis_host().runtime_plugin() == Some(OPENINTERPRETER)
+        );
+    }
+
+    fn create_kernel_bind_project(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_root: &Path,
+        suffix: &str,
+        now: DateTime<Utc>,
+    ) -> (ProjectId, TenantId) {
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let tenant_id = TenantId::from_stable(format!("desktop-kernel-tenant-{suffix}"));
+        let project_id = ProjectId::from_stable(format!("desktop-kernel-project-{suffix}"));
+        service
+            .create_project(
+                CreateProject {
+                    tenant_id: tenant_id.clone(),
+                    id: project_id.clone(),
+                    name: format!("Kernel bind {suffix}"),
+                    description: String::new(),
+                    workspace_root: project_root.to_path_buf(),
+                    storage_mode: StorageMode::LocalExisting,
+                },
+                now,
+            )
+            .expect("project");
+        (project_id, tenant_id)
+    }
+
+    struct LiveConsentGrant<'a> {
+        plane: &'a DesktopDataPlane,
+        secrets: &'a MemorySecretStore,
+        project_id: &'a ProjectId,
+        tenant_id: &'a TenantId,
+        suffix: &'a str,
+        now: DateTime<Utc>,
+        consent_until: Option<DateTime<Utc>>,
+    }
+
+    fn grant_live_consent(input: &LiveConsentGrant<'_>) -> (PersonId, ConsentRecordId, MissionId) {
+        let database_secret = input
+            .secrets
+            .get(input.plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = input
+            .plane
+            .open_application_from_secret(&database_secret, input.now)
+            .expect("application");
+        let person_id = PersonId::from_stable(format!("desktop-kernel-person-{}", input.suffix));
+        let consent_id =
+            ConsentRecordId::from_stable(format!("desktop-kernel-consent-{}", input.suffix));
+        let mission_id = MissionId::from_stable(format!("desktop-kernel-mission-{}", input.suffix));
+        service
+            .create_person(
+                Person::create(
+                    person_id.clone(),
+                    input.tenant_id.clone(),
+                    input.project_id.clone(),
+                    "Kernel bind contact",
+                    None,
+                    vec![],
+                )
+                .expect("person"),
+                input.now,
+            )
+            .expect("persist person");
+        service
+            .grant_consent(
+                ConsentRecord::grant(
+                    consent_id.clone(),
+                    input.tenant_id.clone(),
+                    input.project_id.clone(),
+                    person_id.clone(),
+                    ConsentPurpose::DirectOutreach,
+                    ContactChannel::Email,
+                    "US",
+                    LegalBasis::ExplicitConsent,
+                    "desktop-kernel-bind",
+                    "e".repeat(64),
+                    input.now,
+                    input.consent_until,
+                )
+                .expect("granted consent"),
+                input.now,
+            )
+            .expect("persist consent");
+        service
+            .start_mission(
+                StartMission {
+                    id: mission_id.clone(),
+                    research_task_id: TaskId::from_stable(format!(
+                        "desktop-kernel-task-{}",
+                        input.suffix
+                    )),
+                    project_id: input.project_id.clone(),
+                    title: Some("Kernel bind Mission".into()),
+                    prompt: "研究当前增长约束；不得执行外部动作".into(),
+                },
+                input.now,
+            )
+            .expect("mission");
+        (person_id, consent_id, mission_id)
+    }
+
+    struct LivePreviewApproval<'a> {
+        plane: &'a DesktopDataPlane,
+        secrets: &'a MemorySecretStore,
+        project_id: &'a ProjectId,
+        person_id: PersonId,
+        consent_id: &'a ConsentRecordId,
+        mission_id: &'a MissionId,
+        suffix: &'a str,
+        now: DateTime<Utc>,
+    }
+
+    fn approve_live_preview(input: &LivePreviewApproval<'_>) {
+        let database_secret = input
+            .secrets
+            .get(input.plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = input
+            .plane
+            .open_application_from_secret(&database_secret, input.now)
+            .expect("application");
+        let effect_id = EffectId::from_stable(format!("desktop-kernel-effect-{}", input.suffix));
+        service
+            .propose_preview_effect(
+                input.project_id,
+                input.mission_id,
+                ProposePreviewEffect {
+                    effect_id: effect_id.clone(),
+                    actor_id: ActorId::from("desktop-kernel-actor"),
+                    capability: "channel.preview".into(),
+                    provider: "fixture-provider".into(),
+                    connection_id: None,
+                    account_id: None,
+                    required_scopes: BTreeSet::new(),
+                    description: "Bind live Domain Kernel approval".into(),
+                    target_resource: "preview://desktop-kernel".into(),
+                    audience_digest: None,
+                    payload_digest: "1".repeat(64),
+                    asset_digests: BTreeSet::new(),
+                    scheduled_for: None,
+                    timezone: "UTC".into(),
+                    consent: ConsentState::Confirmed,
+                    consent_record_id: Some(input.consent_id.clone()),
+                    consent_requirement: Some(ConsentRequirement {
+                        person_id: input.person_id.clone(),
+                        purpose: ConsentPurpose::DirectOutreach,
+                        channel: ContactChannel::Email,
+                        market: "US".into(),
+                    }),
+                    policy_version: "policy-v1".into(),
+                    amount: Money::zero(CurrencyCode::parse("CNY").expect("CNY")),
+                    idempotency_key: format!("desktop-kernel-{}", input.suffix),
+                    expires_in: Duration::hours(1),
+                },
+                input.now + Duration::seconds(1),
+            )
+            .expect("effect");
+        let broker = production_preview_broker();
+        service
+            .approve_effect(
+                &broker,
+                input.project_id,
+                input.mission_id,
+                &effect_id,
+                ActorId::from("desktop-kernel-approver"),
+                input.now + Duration::seconds(2),
+            )
+            .expect("approval");
     }
 
     fn catalog_count_kpis() -> BTreeMap<String, KpiContract> {
@@ -3193,7 +3566,7 @@ mod tests {
         ProjectId,
     ) {
         let directory = tempfile::tempdir().expect("directory");
-        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -3999,7 +4372,7 @@ sleep 30"#;
         reason = "the Desktop Journey verifies rejected routing, exact Catalog binding, private Contract persistence, and redacted evidence in one user flow"
     )]
     fn catalog_dispatch_persists_exact_vm_route_without_cross_executor_runtime() {
-        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let (_directory, mut plane, secrets, project_id) = ready_personal_fixture();
         let DesktopLoadState::Ready(before_invalid) = plane
             .load_with(&secrets, observed_at() + Duration::minutes(1))
             .expect("ready fixture inventory")
@@ -7012,7 +7385,7 @@ sleep 30"#;
         reason = "the restart journey proves bounded same-generation retry, atomic authority retirement, generation replacement, replay suppression, and absence of fake Mission or Effect completion"
     )]
     fn desktop_runtime_retry_exhaustion_retires_generation_and_completes_same_mission() {
-        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let (_directory, mut plane, secrets, project_id) = ready_personal_fixture();
         let first = plane
             .start_mission_and_run_with(
                 &secrets,
@@ -7475,12 +7848,296 @@ sleep 30"#;
     }
 
     #[test]
+    fn uninitialized_and_fresh_initialize_keep_host_mounted_and_fail_closed() {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("data plane");
+        let secrets = MemorySecretStore::default();
+        let DesktopLoadState::Uninitialized { .. } = plane
+            .load_with(&secrets, observed_at())
+            .expect("honest first-run state")
+        else {
+            panic!("first run must not create a database or key implicitly");
+        };
+        assert_host_fail_closed_on_consent(&mut plane);
+        assert_eq!(
+            plane
+                .step(
+                    &secrets,
+                    AgentStep::new("mission-uninitialized", "plan"),
+                    observed_at(),
+                )
+                .unwrap_err()
+                .to_string(),
+            DesktopDataError::Cordis(CordisError::MissingDependencies(vec![
+                hartevo_cordis::invariant_missing::CONSENT.to_string()
+            ]))
+            .to_string()
+        );
+        assert_eq!(
+            plane
+                .apply_effect(&secrets, observed_at())
+                .unwrap_err()
+                .to_string(),
+            DesktopDataError::Cordis(CordisError::MissingDependencies(vec![
+                hartevo_cordis::invariant_missing::CONSENT.to_string()
+            ]))
+            .to_string()
+        );
+
+        plane
+            .initialize_with(&secrets, observed_at())
+            .expect("explicit initialization");
+        assert_host_fail_closed_on_consent(&mut plane);
+        assert!(matches!(
+            plane.step(
+                &secrets,
+                AgentStep::new("mission-initialized", "plan"),
+                observed_at(),
+            ),
+            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
+                if missing == [hartevo_cordis::invariant_missing::CONSENT]
+        ));
+        assert!(matches!(
+            plane.apply_effect(&secrets, observed_at()),
+            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
+                if missing == [hartevo_cordis::invariant_missing::CONSENT]
+        ));
+    }
+
+    #[test]
+    fn production_load_binds_live_grant_and_in_window_approval() {
+        use hartevo_cordis::{DomainSurface, host_is_cordis_loop, invariant_missing};
+
+        let directory = tempfile::tempdir().expect("directory");
+        let data_root = directory.path().join("desktop-data");
+        let project_root = directory.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let mut plane = DesktopDataPlane::at_data_root(&data_root).expect("data plane");
+        let secrets = MemorySecretStore::default();
+        plane
+            .initialize_with(&secrets, observed_at())
+            .expect("initialize");
+        let (project_id, tenant_id) = create_kernel_bind_project(
+            &plane,
+            &secrets,
+            &project_root,
+            "live",
+            observed_at() + Duration::minutes(1),
+        );
+        let (person_id, consent_id, mission_id) = grant_live_consent(&LiveConsentGrant {
+            plane: &plane,
+            secrets: &secrets,
+            project_id: &project_id,
+            tenant_id: &tenant_id,
+            suffix: "live",
+            now: observed_at() + Duration::minutes(2),
+            consent_until: Some(observed_at() + Duration::days(30)),
+        });
+        approve_live_preview(&LivePreviewApproval {
+            plane: &plane,
+            secrets: &secrets,
+            project_id: &project_id,
+            person_id,
+            consent_id: &consent_id,
+            mission_id: &mission_id,
+            suffix: "live",
+            now: observed_at() + Duration::minutes(2),
+        });
+
+        let DesktopLoadState::Ready(_) = plane
+            .load_with(&secrets, observed_at() + Duration::minutes(3))
+            .expect("reload binds live kernel facts")
+        else {
+            panic!("initialized database must reopen");
+        };
+        host_is_cordis_loop(plane.cordis_host()).unwrap();
+        let domain = plane
+            .cordis_host()
+            .context()
+            .domain::<DomainSurface>()
+            .unwrap();
+        assert!(domain.consent);
+        assert!(domain.approved);
+        let out = plane
+            .step(
+                &secrets,
+                AgentStep::new("mission-live", "plan"),
+                observed_at() + Duration::minutes(3),
+            )
+            .expect("production step after live bind");
+        assert_eq!(out.id, "mission-live");
+        plane
+            .apply_effect(&secrets, observed_at() + Duration::minutes(3))
+            .expect("production apply_effect after live bind");
+
+        let mut consent_only =
+            DesktopDataPlane::at_data_root(directory.path().join("consent-only"))
+                .expect("consent-only plane");
+        let consent_secrets = MemorySecretStore::default();
+        consent_only
+            .initialize_with(&consent_secrets, observed_at())
+            .expect("initialize");
+        let consent_root = directory.path().join("consent-only-project");
+        fs::create_dir(&consent_root).expect("consent-only project root");
+        let (consent_project, consent_tenant) = create_kernel_bind_project(
+            &consent_only,
+            &consent_secrets,
+            &consent_root,
+            "consent-only",
+            observed_at() + Duration::minutes(1),
+        );
+        grant_live_consent(&LiveConsentGrant {
+            plane: &consent_only,
+            secrets: &consent_secrets,
+            project_id: &consent_project,
+            tenant_id: &consent_tenant,
+            suffix: "consent-only",
+            now: observed_at() + Duration::minutes(2),
+            consent_until: Some(observed_at() + Duration::days(30)),
+        });
+        consent_only
+            .load_with(&consent_secrets, observed_at() + Duration::minutes(3))
+            .expect("reload consent-only");
+        assert!(matches!(
+            consent_only.step(
+                &consent_secrets,
+                AgentStep::new("mission-consent-only", "plan"),
+                observed_at() + Duration::minutes(3),
+            ),
+            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
+                if missing == [invariant_missing::APPROVAL]
+        ));
+    }
+
+    #[test]
+    fn withdrawn_kernel_facts_stay_fail_closed() {
+        use hartevo_cordis::invariant_missing;
+
+        let directory = tempfile::tempdir().expect("directory");
+        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("data plane");
+        let secrets = MemorySecretStore::default();
+        plane
+            .initialize_with(&secrets, observed_at())
+            .expect("initialize");
+        let project_root = directory.path().join("project");
+        fs::create_dir(&project_root).expect("project root");
+        let (project_id, tenant_id) = create_kernel_bind_project(
+            &plane,
+            &secrets,
+            &project_root,
+            "withdrawn",
+            observed_at() + Duration::minutes(1),
+        );
+        let (person_id, consent_id, mission_id) = grant_live_consent(&LiveConsentGrant {
+            plane: &plane,
+            secrets: &secrets,
+            project_id: &project_id,
+            tenant_id: &tenant_id,
+            suffix: "withdrawn",
+            now: observed_at() + Duration::minutes(2),
+            consent_until: Some(observed_at() + Duration::days(30)),
+        });
+        approve_live_preview(&LivePreviewApproval {
+            plane: &plane,
+            secrets: &secrets,
+            project_id: &project_id,
+            person_id,
+            consent_id: &consent_id,
+            mission_id: &mission_id,
+            suffix: "withdrawn",
+            now: observed_at() + Duration::minutes(2),
+        });
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, observed_at() + Duration::minutes(3))
+            .expect("application");
+        service
+            .withdraw_consent(
+                &project_id,
+                &consent_id,
+                observed_at() + Duration::minutes(4),
+            )
+            .expect("withdraw");
+        drop(service);
+        plane
+            .load_with(&secrets, observed_at() + Duration::minutes(5))
+            .expect("reload withdrawn");
+        assert!(matches!(
+            plane.step(
+                &secrets,
+                AgentStep::new("mission-withdrawn", "plan"),
+                observed_at() + Duration::minutes(5),
+            ),
+            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
+                if missing == [invariant_missing::CONSENT]
+        ));
+    }
+
+    #[test]
+    fn expired_kernel_facts_stay_fail_closed() {
+        use hartevo_cordis::invariant_missing;
+
+        let directory = tempfile::tempdir().expect("directory");
+        let mut expired = DesktopDataPlane::at_data_root(directory.path().join("expired"))
+            .expect("expired plane");
+        let expired_secrets = MemorySecretStore::default();
+        expired
+            .initialize_with(&expired_secrets, observed_at())
+            .expect("initialize");
+        let expired_root = directory.path().join("expired-project");
+        fs::create_dir(&expired_root).expect("expired project root");
+        let (expired_project, expired_tenant) = create_kernel_bind_project(
+            &expired,
+            &expired_secrets,
+            &expired_root,
+            "expired",
+            observed_at() + Duration::minutes(1),
+        );
+        let (person_id, consent_id, mission_id) = grant_live_consent(&LiveConsentGrant {
+            plane: &expired,
+            secrets: &expired_secrets,
+            project_id: &expired_project,
+            tenant_id: &expired_tenant,
+            suffix: "expired",
+            now: observed_at() + Duration::minutes(2),
+            consent_until: Some(observed_at() + Duration::minutes(3)),
+        });
+        approve_live_preview(&LivePreviewApproval {
+            plane: &expired,
+            secrets: &expired_secrets,
+            project_id: &expired_project,
+            person_id,
+            consent_id: &consent_id,
+            mission_id: &mission_id,
+            suffix: "expired",
+            now: observed_at() + Duration::minutes(2),
+        });
+        expired
+            .load_with(&expired_secrets, observed_at() + Duration::minutes(4))
+            .expect("reload expired");
+        assert!(matches!(
+            expired.step(
+                &expired_secrets,
+                AgentStep::new("mission-expired", "plan"),
+                observed_at() + Duration::minutes(4),
+            ),
+            Err(DesktopDataError::Cordis(CordisError::MissingDependencies(missing)))
+                if missing == [invariant_missing::CONSENT]
+                    || missing == [invariant_missing::APPROVAL]
+        ));
+    }
+
+    #[test]
     fn explicit_initialization_and_application_inventory_survive_restart() {
         let directory = tempfile::tempdir().expect("directory");
         let data_root = directory.path().join("desktop-data");
         let project_root = directory.path().join("project");
         fs::create_dir(&project_root).expect("project root");
-        let plane = DesktopDataPlane::at_data_root(&data_root).expect("data plane");
+        let mut plane = DesktopDataPlane::at_data_root(&data_root).expect("data plane");
         let secrets = MemorySecretStore::default();
 
         let DesktopLoadState::Uninitialized { product_evidence } = plane
@@ -7577,7 +8234,7 @@ sleep 30"#;
         let data_root = directory.path().join("desktop-data");
         let project_root = directory.path().join("project");
         fs::create_dir(&project_root).expect("project root");
-        let plane = DesktopDataPlane::at_data_root(&data_root).expect("data plane");
+        let mut plane = DesktopDataPlane::at_data_root(&data_root).expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
             .initialize_with(&secrets, observed_at())
@@ -7670,7 +8327,7 @@ sleep 30"#;
     #[test]
     fn existing_database_without_its_os_vault_key_fails_closed() {
         let directory = tempfile::tempdir().expect("directory");
-        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -7691,7 +8348,7 @@ sleep 30"#;
     #[test]
     fn substituted_database_key_is_rejected_without_rewriting_ciphertext() {
         let directory = tempfile::tempdir().expect("directory");
-        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -7718,7 +8375,7 @@ sleep 30"#;
     #[test]
     fn exported_recovery_kit_creates_ready_personal_project_without_escrow_and_restarts() {
         let directory = tempfile::tempdir().expect("directory");
-        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -7780,7 +8437,7 @@ sleep 30"#;
     #[test]
     fn invalid_recovery_kit_fails_before_project_or_workspace_creation() {
         let directory = tempfile::tempdir().expect("directory");
-        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -7810,7 +8467,7 @@ sleep 30"#;
     #[test]
     fn interrupted_unprovisioned_project_can_resume_once_with_saved_recovery_kit() {
         let directory = tempfile::tempdir().expect("directory");
-        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -7882,7 +8539,7 @@ sleep 30"#;
     #[test]
     fn missing_or_foreign_device_key_blocks_new_missions_without_hiding_inventory() {
         let directory = tempfile::tempdir().expect("directory");
-        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane

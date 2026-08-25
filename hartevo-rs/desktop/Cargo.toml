@@ -30,6 +30,7 @@ tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+hartevo-effect-broker = { path = "../effect-broker" }
 serde_json.workspace = true
 tempfile.workspace = true
 
