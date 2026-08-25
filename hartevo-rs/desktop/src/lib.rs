@@ -42,8 +42,9 @@ use data_plane::{
     DesktopHumanCheckpointConfirmationRequest, DesktopLoadState, DesktopMissionContinuationRequest,
     DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopRuntimeCancellation,
     DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
-    DesktopSnapshot, DesktopVm11OutcomeDecisionRequest, ProductEvidenceProjection,
-    ProjectContextAccessProjection, ProjectContextAccessStatus, RecoveryKitDraft,
+    DesktopSnapshot, DesktopVm11NextContractRequest, DesktopVm11OutcomeDecisionRequest,
+    ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
+    RecoveryKitDraft,
 };
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 use runtime_subscription::{
@@ -381,9 +382,10 @@ impl UiFailure {
                 code: "WAITING_USER".into(),
                 message: "Human Checkpoint 确认必须绑定当前 Mission/Checkpoint revision、持久 Conversation、非空确认和稳定幂等键；未写入部分状态。".into(),
             },
-            DesktopDataError::InvalidVm11OutcomeDecision => Self {
+            DesktopDataError::InvalidVm11OutcomeDecision
+            | DesktopDataError::InvalidVm11NextContractCommand => Self {
                 code: "WAITING_USER".into(),
-                message: "VM-11 决策必须选择一个当前可用的结构化动作，填写私密理由，并绑定冻结 Review 与当前 CAS revision；未写入部分状态。".into(),
+                message: "VM-11 Continue/Stop/Scale/Test 必须绑定冻结决策、父合同 digest 与当前 CAS revision；未写入部分状态，也不会退化为通用 Application completion。".into(),
             },
             DesktopDataError::InvalidRecoveryKey => Self {
                 code: "WAITING_USER".into(),
@@ -417,18 +419,21 @@ impl UiFailure {
             },
             DesktopDataError::Application(
                 ApplicationError::StructuredOutcomeDecisionRequired
-                | ApplicationError::StructuredOutcomeDecisionCommandMismatch,
+                | ApplicationError::StructuredOutcomeDecisionCommandMismatch
+                | ApplicationError::Vm11NextContractRouteSpecificCommandRequired,
             ) => Self {
                 code: "WAITING_USER".into(),
-                message: "该 VM-11 Checkpoint 不接受自由文本冒充决策；请选择 Continue、Stop、Scale 或 Test，并填写理由。".into(),
+                message: "该 VM-11 Checkpoint 不接受自由文本或通用 Application completion；请提交冻结 Continue/Stop/Scale/Test 决策，再解析下一合同。".into(),
             },
             DesktopDataError::Application(
                 ApplicationError::StructuredOutcomeDecisionUnavailable
                 | ApplicationError::StructuredOutcomeDecisionReviewMismatch
-                | ApplicationError::StructuredOutcomeDecisionReplayMismatch,
+                | ApplicationError::StructuredOutcomeDecisionReplayMismatch
+                | ApplicationError::Vm11NextContractCommandMismatch
+                | ApplicationError::Vm11NextContractReplayMismatch,
             ) => Self {
                 code: "STALE_DECISION".into(),
-                message: "冻结 Outcome Review 或 Mission/Conversation revision 已变化；请刷新后重新审阅，旧决策未被写入或重放。".into(),
+                message: "冻结 Outcome Review、下一合同 revision 或父合同 digest 已变化；请刷新后重新审阅，旧决策或分辨率未被写入或重放。".into(),
             },
             DesktopDataError::Storage(_)
             | DesktopDataError::Application(_)
@@ -1290,8 +1295,34 @@ pub fn App() -> Element {
             && mission.current_checkpoint_revision.is_some()
             && mission.conversation_revision.is_some()
     });
+    let vm11_next_contract_route_active = mission.as_ref().is_some_and(|mission| {
+        mission.manifest_id.as_deref() == Some("VM-11")
+            && mission.current_checkpoint_id.as_deref() == Some("next_contract_or_valid_terminal")
+            && mission.current_checkpoint_executor == Some(MissionCheckpointExecutor::Application)
+            && mission.current_checkpoint_application_handler_status
+                == Some(ApplicationCheckpointHandlerStatus::Implemented)
+            && mission.current_checkpoint_application_handler_id.as_deref()
+                == Some("vm11.next-contract-or-valid-terminal/v1")
+            && mission.current_checkpoint_completion_policy
+                == Some(MissionCheckpointCompletionPolicy::DeterministicEvidence)
+            && matches!(
+                mission.current_checkpoint_status,
+                Some(
+                    MissionCheckpointStatus::Running
+                        | MissionCheckpointStatus::Blocked
+                        | MissionCheckpointStatus::WaitingUser
+                )
+            )
+            && mission.current_checkpoint_revision.is_some()
+            && mission
+                .vm11_outcome_review
+                .as_ref()
+                .and_then(|projection| projection.decision.as_ref())
+                .is_some()
+    });
     let application_route_active = mission.as_ref().is_some_and(|mission| {
-        mission.current_checkpoint_executor == Some(MissionCheckpointExecutor::Application)
+        !vm11_next_contract_route_active
+            && mission.current_checkpoint_executor == Some(MissionCheckpointExecutor::Application)
             && mission.current_checkpoint_application_handler_status
                 == Some(ApplicationCheckpointHandlerStatus::Implemented)
             && mission.current_checkpoint_completion_policy
@@ -1328,6 +1359,8 @@ pub fn App() -> Element {
                 "Mission 与执行句柄已持久化，等待首个 Runtime turn"
             } else if runtime_retrying() {
                 "正在安全恢复本地 Runtime"
+            } else if vm11_next_contract_route_active {
+                "正在按冻结 Continue/Stop/Scale/Test 决策解析下一合同或合法终态"
             } else if application_route_active {
                 "正在运行确定性 Application Checkpoint"
             } else if human_route_active {
@@ -1377,6 +1410,19 @@ pub fn App() -> Element {
     let vm11_outcome_review = mission
         .as_ref()
         .and_then(|mission| mission.vm11_outcome_review.clone());
+    let vm11_frozen_decision_label = vm11_outcome_review
+        .as_ref()
+        .and_then(|projection| projection.decision.as_ref())
+        .map(|decision| outcome_decision_label(&decision.action).to_owned());
+    let vm11_frozen_decision_digest = vm11_outcome_review
+        .as_ref()
+        .and_then(|projection| projection.decision.as_ref())
+        .and_then(|decision| decision.digest().ok())
+        .unwrap_or_default();
+    let vm11_frozen_parent_contract_digest = vm11_outcome_review
+        .as_ref()
+        .map(|projection| projection.review.source_contract_digest.clone())
+        .unwrap_or_default();
     let selected_vm11_action =
         vm11_outcome_action
             .read()
@@ -1419,8 +1465,11 @@ pub fn App() -> Element {
         && !draft.read().trim().is_empty();
     let can_execute_application_route =
         project_can_start_mission && application_route_active && !runtime_busy;
+    let can_resolve_vm11_next_contract =
+        project_can_start_mission && vm11_next_contract_route_active && !runtime_busy;
     let can_edit_continuation = project_can_start_mission
         && !human_route_active
+        && !vm11_next_contract_route_active
         && mission.as_ref().is_some_and(|mission| {
             mission.conversation_revision.is_some()
                 && matches!(
@@ -2157,6 +2206,7 @@ pub fn App() -> Element {
                                     || catalog_contract_expanded()
                                     || runtime_busy
                                     || human_route_active
+                                    || vm11_next_contract_route_active
                                     || application_route_active
                                     || application_route_not_implemented
                                     || application_route_catalog_mismatch
@@ -2485,6 +2535,27 @@ pub fn App() -> Element {
                                         span { "Mission 保持原 revision；不会运行模型、伪造 Oracle 证据或自动跳到下一 Checkpoint。" }
                                     }
                                 }
+                                if vm11_next_contract_route_active {
+                                    section { class: "human-checkpoint-confirmation", aria_label: "VM-11 下一合同或合法终态",
+                                        strong { "解析冻结 Continue / Stop / Scale / Test 的下一合同" }
+                                        span {
+                                            "Checkpoint {application_checkpoint_id_label} · Oracle {human_oracle_label}"
+                                        }
+                                        if let Some(action_label) = &vm11_frozen_decision_label {
+                                            div { class: "outcome-review-summary",
+                                                span { "已冻结动作 {action_label}" }
+                                                span { "决策 digest {short_digest(&vm11_frozen_decision_digest)}" }
+                                                span { "父合同 digest {short_digest(&vm11_frozen_parent_contract_digest)}" }
+                                            }
+                                            small { "该动作不会运行模型或执行 Provider Effect。Stop 形成 typed 终态；Continue 只复用仍为当前的冻结父合同；Scale/Test 保持 WaitingUser，直到完整 replacement contract 被独立批准。" }
+                                        } else {
+                                            div { class: "catalog-route-note application-handler-boundary", role: "status",
+                                                span { class: "honesty-badge", "BLOCKED_DATA" }
+                                                span { "next_contract_or_valid_terminal 已就绪，但当前 SQLCipher 没有可验证的冻结决策。不会退化为通用 Application completion。" }
+                                            }
+                                        }
+                                    }
+                                }
                                 if human_route_active {
                                     section { class: "human-checkpoint-confirmation", aria_label: "Human Checkpoint 精确确认",
                                         if vm11_outcome_decision_active {
@@ -2710,6 +2781,83 @@ pub fn App() -> Element {
                                         }
                                     }
                                     div { class: "composer-actions",
+                                        if vm11_next_contract_route_active {
+                                            button {
+                                                class: "application-checkpoint-button",
+                                                disabled: !can_resolve_vm11_next_contract,
+                                                aria_label: "按冻结 Continue/Stop/Scale/Test 决策解析下一合同或合法终态",
+                                                onclick: move |_| {
+                                                    let selection = {
+                                                        let model = model.read();
+                                                        model.selected_project_id.clone().zip(
+                                                            model.current_mission().and_then(|mission| {
+                                                                let review = mission.vm11_outcome_review.as_ref()?;
+                                                                let decision = review.decision.as_ref()?;
+                                                                Some((
+                                                                    mission.mission_id.clone(),
+                                                                    mission.revision,
+                                                                    mission.current_checkpoint_revision?,
+                                                                    decision.digest().ok()?,
+                                                                    decision.source_mission_revision,
+                                                                    review.review.source_contract_digest.clone(),
+                                                                ))
+                                                            }),
+                                                        )
+                                                    };
+                                                    let Some((project_id, (mission_id, expected_mission_revision, expected_checkpoint_revision, expected_decision_digest, expected_parent_mission_revision, expected_parent_contract_digest))) = selection else {
+                                                        model.write().notice = Some(UiFailure {
+                                                            code: "BLOCKED_DATA".into(),
+                                                            message: "冻结决策、父合同 digest 或当前 CAS revision 不完整；未解析下一合同。".into(),
+                                                        });
+                                                        return;
+                                                    };
+                                                    let request = DesktopVm11NextContractRequest {
+                                                        project_id,
+                                                        mission_id,
+                                                        expected_mission_revision,
+                                                        expected_checkpoint_revision,
+                                                        expected_decision_digest,
+                                                        expected_parent_mission_revision,
+                                                        expected_parent_contract_digest,
+                                                    };
+                                                    mission_submitting.set(true);
+                                                    spawn(async move {
+                                                        let result = tokio::task::spawn_blocking(move || {
+                                                            DesktopDataPlane::discover().and_then(|plane| {
+                                                                plane.resolve_vm11_next_contract_or_valid_terminal_os(
+                                                                    request,
+                                                                    Utc::now(),
+                                                                )
+                                                            })
+                                                        })
+                                                        .await;
+                                                        match result {
+                                                            Ok(Ok(submission)) => {
+                                                                model.write().set_ready(submission.snapshot, false);
+                                                            }
+                                                            Ok(Err(error)) => model.write().set_notice(&error),
+                                                            Err(_) => {
+                                                                model.write().notice = Some(UiFailure {
+                                                                    code: "VM11_NEXT_CONTRACT_COORDINATOR_FAILED".into(),
+                                                                    message: "下一合同解析协调异常结束；冻结决策、父合同 digest 与 Mission CAS 仍生效，未运行 Runtime 或 Provider Effect。".into(),
+                                                                });
+                                                            }
+                                                        }
+                                                        mission_submitting.set(false);
+                                                    });
+                                                },
+                                                if mission_submitting() {
+                                                    "正在绑定冻结决策并解析下一合同…"
+                                                } else if mission.as_ref().is_some_and(|mission| {
+                                                    mission.current_checkpoint_status
+                                                        == Some(MissionCheckpointStatus::WaitingUser)
+                                                }) {
+                                                    "重新核验合同授权边界"
+                                                } else {
+                                                    "解析下一合同或合法终态"
+                                                }
+                                            }
+                                        }
                                         if application_route_active {
                                             button {
                                                 class: "application-checkpoint-button",
