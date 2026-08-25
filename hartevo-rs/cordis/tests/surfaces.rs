@@ -40,15 +40,11 @@ fn mapped_keys_are_provided_and_looked_up() {
     assert!(ctx.sessions::<u32>().is_none());
     assert_eq!(
         ctx.domain::<DomainSurface>().as_deref(),
-        Some(&DomainSurface {
-            owner: SurfaceOwner::Hartevo
-        })
+        Some(&DomainSurface::default())
     );
     assert_eq!(
         ctx.effect_broker::<EffectBrokerSurface>().as_deref(),
-        Some(&EffectBrokerSurface {
-            owner: SurfaceOwner::Hartevo
-        })
+        Some(&EffectBrokerSurface::default())
     );
     assert_eq!(
         ctx.runtime::<RuntimeSurface>().as_deref(),
@@ -424,6 +420,7 @@ fn openinterpreter_cannot_own_domain() {
         HartevoSurfaces {
             domain: DomainSurface {
                 owner: SurfaceOwner::OpenInterpreter,
+                ..DomainSurface::default()
             },
             ..HartevoSurfaces::default()
         },

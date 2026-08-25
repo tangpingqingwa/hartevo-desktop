@@ -8,9 +8,24 @@ use hartevo_cordis::{
     run_agent_step,
 };
 
+fn consented_domain() -> DomainSurface {
+    DomainSurface {
+        consent: true,
+        approved: true,
+        ..DomainSurface::default()
+    }
+}
+
+fn consented_surfaces() -> HartevoSurfaces {
+    HartevoSurfaces {
+        domain: consented_domain(),
+        ..HartevoSurfaces::default()
+    }
+}
+
 fn mapped() -> Context {
     let mut ctx = Context::new();
-    ctx.mount(SurfaceMapping::default()).unwrap();
+    map_surfaces(&mut ctx, consented_surfaces()).unwrap();
     ctx.mount(AgentLoop).unwrap();
     ctx
 }
@@ -117,6 +132,7 @@ fn openinterpreter_runtime_plugin_does_not_own_domain_or_effect() {
     map_surfaces(
         &mut ctx,
         HartevoSurfaces {
+            domain: consented_domain(),
             runtime: RuntimeSurface {
                 owner: SurfaceOwner::Hartevo,
                 plugin: Some("openinterpreter"),
@@ -154,15 +170,11 @@ fn openinterpreter_runtime_plugin_does_not_own_domain_or_effect() {
     );
     assert_eq!(
         ctx.domain::<DomainSurface>().as_deref(),
-        Some(&DomainSurface {
-            owner: SurfaceOwner::Hartevo
-        })
+        Some(&consented_domain())
     );
     assert_eq!(
         ctx.effect_broker::<EffectBrokerSurface>().as_deref(),
-        Some(&EffectBrokerSurface {
-            owner: SurfaceOwner::Hartevo
-        })
+        Some(&EffectBrokerSurface::default())
     );
 }
 
@@ -197,7 +209,10 @@ fn teardown_undoes_agents_and_loop_listeners() {
     assert_eq!(ctx.event_mode(events::AGENT_CREATED), None);
     assert_eq!(ctx.event_mode(events::AGENT_DISPOSED), None);
 
-    ctx.mount(SurfaceMapping::default()).unwrap();
+    ctx.mount(SurfaceMapping {
+        surfaces: consented_surfaces(),
+    })
+    .unwrap();
     ctx.mount(AgentLoop).unwrap();
     run_agent_step(&mut ctx, AgentStep::new("mission-2", "retry")).unwrap();
     assert_eq!(
@@ -214,7 +229,10 @@ fn overlay_still_selects_surface_mapping_then_agent_loop() {
     let overlay = EnvironmentOverlay::new("macos-dev");
     let loader = LoaderContext::new();
     let mapping = PluginSpec::new("surfaces", |_config, ctx| {
-        SurfaceMapping::default().apply(ctx);
+        SurfaceMapping {
+            surfaces: consented_surfaces(),
+        }
+        .apply(ctx);
     });
     let loop_plugin = PluginSpec::new("agent-loop", |_config, ctx| {
         AgentLoop.apply(ctx);

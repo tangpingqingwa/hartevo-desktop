@@ -2,11 +2,11 @@
 //! never the loop and never the owner of Domain or Effect.
 
 use crate::context::{Context, CordisError, keys};
+use crate::invariants::enforce_invariants;
 use crate::service::Service;
 use crate::surface::{
     AgentRef, AgentsSurface, DomainSurface, EffectBrokerSurface, LlmStream, LlmSurface,
-    RuntimeSurface, SurfaceOwner, ToolCall, ToolsSurface, events, register_agent,
-    run_tools_pipeline, stream_llm,
+    RuntimeSurface, ToolCall, ToolsSurface, events, register_agent, run_tools_pipeline, stream_llm,
 };
 
 /// Inject keys the loop looks up. Runtime is optional at apply time.
@@ -72,22 +72,7 @@ pub struct AgentStepResult {
 /// then read Domain facts and write externally only through Effect Broker.
 pub fn run_agent_step(ctx: &mut Context, step: AgentStep) -> Result<AgentStepResult, CordisError> {
     require_loop_surfaces(ctx)?;
-    let domain = ctx
-        .domain::<DomainSurface>()
-        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::DOMAIN.to_string()]))?;
-    if domain.owner != SurfaceOwner::Hartevo {
-        return Err(CordisError::MissingDependencies(vec![
-            keys::DOMAIN.to_string(),
-        ]));
-    }
-    let broker = ctx
-        .effect_broker::<EffectBrokerSurface>()
-        .ok_or_else(|| CordisError::MissingDependencies(vec![keys::EFFECT_BROKER.to_string()]))?;
-    if broker.owner != SurfaceOwner::Hartevo {
-        return Err(CordisError::MissingDependencies(vec![
-            keys::EFFECT_BROKER.to_string(),
-        ]));
-    }
+    enforce_invariants(ctx)?;
     // Runtime may name OpenInterpreter as an adapter plugin; it is not the loop.
     let _runtime = ctx.runtime::<RuntimeSurface>();
 
