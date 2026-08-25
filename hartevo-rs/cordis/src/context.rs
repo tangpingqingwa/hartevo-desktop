@@ -16,6 +16,7 @@ pub mod keys {
     pub const TOOLS: &str = "tools";
     pub const LLM: &str = "llm";
     pub const SESSIONS: &str = "sessions";
+    pub const AGENTS: &str = "agents";
     pub const DOMAIN: &str = "domain";
     pub const EFFECT_BROKER: &str = "effect_broker";
     pub const RUNTIME: &str = "runtime";
@@ -92,6 +93,11 @@ impl Context {
     #[must_use]
     pub fn sessions<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         self.get(keys::SESSIONS)
+    }
+
+    #[must_use]
+    pub fn agents<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.get(keys::AGENTS)
     }
 
     #[must_use]
