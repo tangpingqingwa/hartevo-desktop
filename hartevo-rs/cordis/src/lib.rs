@@ -1,12 +1,14 @@
 //! Rust Cordis kernel: service container, plugin inject/apply, reversible
 //! effects, typed events, loader/overlay interpolation, Hartevo surface mapping,
-//! a Cordis-hosted agent loop, and a fail-closed Domain Kernel invariant gate.
+//! a Cordis-hosted agent loop, a fail-closed Domain Kernel invariant gate, and
+//! the desktop host that mounts those three services.
 
 mod agent;
 mod config;
 mod context;
 mod effect;
 mod event;
+mod host;
 mod invariants;
 mod loader;
 mod service;
@@ -17,6 +19,10 @@ pub use config::{ConfigValue, InterpolateError};
 pub use context::{Context, CordisError, keys};
 pub use effect::Disposer;
 pub use event::{DispatchMode, WaterfallNext};
+pub use host::{
+    CordisHost, HOST_PLUGIN_IDS, OPENINTERPRETER_PLUGIN_ID, desktop_surfaces, host_is_cordis_loop,
+    host_plugin_ids,
+};
 pub use invariants::{
     InvariantGate, OPENINTERPRETER, apply_effect, enforce_invariants, missing as invariant_missing,
 };

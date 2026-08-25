@@ -1,6 +1,6 @@
 [package]
 name = "hartevo-cordis"
-description = "Rust Cordis kernel: Context, Service, inject, reversible effects, typed events, loader overlay, Hartevo surface mapping, agent loop, Domain Kernel invariant gate"
+description = "Rust Cordis kernel: Context, Service, inject, reversible effects, typed events, loader overlay, Hartevo surface mapping, agent loop, Domain Kernel invariant gate, desktop host"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

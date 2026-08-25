@@ -29,6 +29,7 @@ use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
 };
 use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblyStatus};
+use hartevo_cordis::CordisHost;
 use hartevo_domain_kernel::{
     ActorId, CurrencyCode, DeviceId, KeyManagementError, KeyRecipient, KpiContract,
     MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionConversationMessageId,
@@ -47,6 +48,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::cordis_host::mount_cordis_host;
 use crate::runtime_plane::{
     DesktopRuntimeAvailabilityStatus, DesktopRuntimeConfiguration, DesktopRuntimeProjection,
     discover_runtime, ensure_project_runtime_home,
@@ -514,17 +516,22 @@ impl fmt::Debug for RecoveryKitDraft {
     }
 }
 
-#[derive(Clone)]
 pub struct DesktopDataPlane {
     data_root: PathBuf,
     database_path: PathBuf,
     database_key_reference: SecretReference,
     device_id: DeviceId,
+    cordis: CordisHost,
 }
 
 impl DesktopDataPlane {
     pub fn discover() -> Result<Self, DesktopDataError> {
         Self::at_data_root(default_data_root()?)
+    }
+
+    /// Cordis-hosted live loop. OpenInterpreter is never this loop.
+    pub fn cordis_host(&mut self) -> &mut CordisHost {
+        &mut self.cordis
     }
 
     pub fn at_data_root(root: impl AsRef<Path>) -> Result<Self, DesktopDataError> {
@@ -555,11 +562,14 @@ impl DesktopDataPlane {
             version: 1,
         };
         let device_id = DeviceId::from_stable(format!("desktop-device:{root_digest}"));
+        let cordis = mount_cordis_host(&discover_runtime().projection)
+            .expect("Cordis host mounts SurfaceMapping, AgentLoop, and InvariantGate");
         Ok(Self {
             data_root,
             database_path,
             database_key_reference,
             device_id,
+            cordis,
         })
     }
 
@@ -7101,6 +7111,41 @@ sleep 30"#;
         ));
         assert_device_fenced_projection(&recovered, preview, private_body, true);
         recovered
+    }
+
+    #[test]
+    fn data_plane_mounts_cordis_host_as_the_live_loop() {
+        use hartevo_cordis::{
+            AgentStep, DomainSurface, OPENINTERPRETER, SurfaceOwner, host_is_cordis_loop,
+        };
+
+        let directory = tempfile::tempdir().expect("directory");
+        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("data plane");
+        host_is_cordis_loop(plane.cordis_host()).unwrap();
+        assert_eq!(
+            plane
+                .cordis_host()
+                .context()
+                .domain::<DomainSurface>()
+                .unwrap()
+                .owner,
+            SurfaceOwner::Hartevo
+        );
+        let out = plane
+            .cordis_host()
+            .step(AgentStep::new("mission-plane", "plan"))
+            .unwrap();
+        assert_eq!(out.id, "mission-plane");
+        assert!(
+            plane
+                .cordis_host()
+                .context()
+                .get::<String>(OPENINTERPRETER)
+                .is_none()
+                || plane.cordis_host().runtime_plugin() == Some(OPENINTERPRETER)
+        );
+        plane.cordis_host().apply_effect().unwrap();
     }
 
     #[test]
