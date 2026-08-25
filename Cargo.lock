@@ -2312,6 +2312,7 @@ dependencies = [
  "hartevo-application",
  "hartevo-catalog",
  "hartevo-context-fabric",
+ "hartevo-cordis",
  "hartevo-domain-kernel",
  "hartevo-runtime-adapter",
  "hartevo-storage",

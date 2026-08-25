@@ -29,6 +29,7 @@ use rust_decimal::Decimal;
 use zeroize::Zeroizing;
 
 mod agent_operations;
+mod cordis_host;
 pub mod data_plane;
 mod runtime_plane;
 mod runtime_subscription;

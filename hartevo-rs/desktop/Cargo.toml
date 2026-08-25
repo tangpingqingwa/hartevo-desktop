@@ -14,6 +14,7 @@ dioxus-icons = "0.1"
 hartevo-application = { path = "../application" }
 hartevo-catalog = { path = "../catalog" }
 hartevo-context-fabric = { path = "../context-fabric" }
+hartevo-cordis = { path = "../cordis" }
 hartevo-domain-kernel = { path = "../domain-kernel" }
 hartevo-runtime-adapter = { path = "../runtime-adapter" }
 hartevo-storage = { path = "../storage" }
