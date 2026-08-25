@@ -7486,6 +7486,40 @@ impl ApplicationService {
         Ok(record)
     }
 
+    pub fn load_consent_record(
+        &self,
+        project_id: &ProjectId,
+        record_id: &ConsentRecordId,
+    ) -> Result<ConsentRecord, ApplicationError> {
+        Ok(self.store.load_consent_record(project_id, record_id)?)
+    }
+
+    pub fn list_consent_records(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<ConsentRecord>, ApplicationError> {
+        Ok(self.store.list_consent_records(project_id)?)
+    }
+
+    pub fn expire_consent(
+        &mut self,
+        project_id: &ProjectId,
+        record_id: &ConsentRecordId,
+        now: DateTime<Utc>,
+    ) -> Result<ConsentRecord, ApplicationError> {
+        let mut record = self.store.load_consent_record(project_id, record_id)?;
+        let expected_revision = record.revision;
+        record.expire(now)?;
+        self.store.update_consent_record(
+            &record,
+            expected_revision,
+            "consent.expired",
+            &serde_json::json!({"consentRecordId": record_id}),
+            now,
+        )?;
+        Ok(record)
+    }
+
     pub fn open_conversation(
         &mut self,
         conversation: Conversation,

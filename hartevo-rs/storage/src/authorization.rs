@@ -248,6 +248,27 @@ impl ProjectStore {
         Ok(record)
     }
 
+    /// Reloads every consent record for a Project by stable id. The list query
+    /// is not treated as authoritative state.
+    pub fn list_consent_records(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<ConsentRecord>, StorageError> {
+        self.load_project(project_id)?;
+        let record_ids = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT id FROM consent_records WHERE project_id = ?1 ORDER BY id")?;
+            statement
+                .query_map([project_id.as_str()], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        record_ids
+            .into_iter()
+            .map(|id| self.load_consent_record(project_id, &ConsentRecordId::from_stable(id)))
+            .collect()
+    }
+
     pub fn create_truth_fact(
         &mut self,
         fact: &TruthFact,

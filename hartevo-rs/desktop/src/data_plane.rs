@@ -30,14 +30,15 @@ use hartevo_catalog::{
     Catalog, CatalogError, EvidenceLevel, MissionEvidenceStatus, ReleaseEvidence,
 };
 use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblyStatus};
-use hartevo_cordis::{CordisError, CordisHost};
+use hartevo_cordis::{AgentStep, AgentStepResult, CordisError, CordisHost};
 use hartevo_domain_kernel::{
-    ActorId, Approval, ConsentRecord, ConsentState, CurrencyCode, DeviceId, KeyManagementError,
-    KeyRecipient, KpiContract, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
-    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
-    MissionId, MissionStage, Money, OperatingMode, OutcomeDecision, ProjectEncryptionMode,
-    ProjectId, ProjectKeyring, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId,
-    RuntimeTurnStatus, StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
+    ActorId, Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus, CurrencyCode,
+    DeviceId, KeyManagementError, KeyRecipient, KpiContract, Mission,
+    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionConversationMessageId,
+    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionStage, Money,
+    OperatingMode, OutcomeDecision, ProjectEncryptionMode, ProjectId, ProjectKeyring,
+    RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId, RuntimeTurnStatus,
+    StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
 };
 use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand};
 use hartevo_storage::{
@@ -49,7 +50,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::cordis_host::{bind_live_domain_kernel, mount_cordis_host};
+use crate::cordis_host::{
+    LiveDomainKernelFacts, apply_effect_with_live_domain_kernel, bind_live_domain_kernel,
+    mount_cordis_host, step_with_live_domain_kernel,
+};
 use crate::runtime_plane::{
     DesktopRuntimeAvailabilityStatus, DesktopRuntimeConfiguration, DesktopRuntimeProjection,
     discover_runtime, ensure_project_runtime_home,
@@ -563,6 +567,33 @@ impl DesktopDataPlane {
         bind_live_domain_kernel(&mut self.cordis, consent, record, approval, now)
     }
 
+    /// Bind SQLCipher Domain Kernel facts for the current Project/Mission, then
+    /// run one Cordis-hosted step. Missing facts stay fail-closed.
+    pub fn step(
+        &mut self,
+        secret_store: &impl SecretStore,
+        project_id: Option<&ProjectId>,
+        mission_id: Option<&MissionId>,
+        step: AgentStep,
+        now: DateTime<Utc>,
+    ) -> Result<AgentStepResult, DesktopDataError> {
+        let facts = self.live_domain_kernel_facts(secret_store, project_id, mission_id, now)?;
+        step_with_live_domain_kernel(&mut self.cordis, &facts, step, now).map_err(Into::into)
+    }
+
+    /// Bind SQLCipher Domain Kernel facts for the current Project/Mission, then
+    /// take the Effect write path. Missing facts stay fail-closed.
+    pub fn apply_effect(
+        &mut self,
+        secret_store: &impl SecretStore,
+        project_id: Option<&ProjectId>,
+        mission_id: Option<&MissionId>,
+        now: DateTime<Utc>,
+    ) -> Result<(), DesktopDataError> {
+        let facts = self.live_domain_kernel_facts(secret_store, project_id, mission_id, now)?;
+        apply_effect_with_live_domain_kernel(&mut self.cordis, &facts, now).map_err(Into::into)
+    }
+
     pub fn at_data_root(root: impl AsRef<Path>) -> Result<Self, DesktopDataError> {
         let root = root.as_ref();
         if !root.is_absolute() {
@@ -610,6 +641,27 @@ impl DesktopDataPlane {
     pub fn initialize_os(&self, now: DateTime<Utc>) -> Result<DesktopSnapshot, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         self.initialize_with(&secret_store, now)
+    }
+
+    pub fn step_os(
+        &mut self,
+        project_id: Option<&ProjectId>,
+        mission_id: Option<&MissionId>,
+        step: AgentStep,
+        now: DateTime<Utc>,
+    ) -> Result<AgentStepResult, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.step(&secret_store, project_id, mission_id, step, now)
+    }
+
+    pub fn apply_effect_os(
+        &mut self,
+        project_id: Option<&ProjectId>,
+        mission_id: Option<&MissionId>,
+        now: DateTime<Utc>,
+    ) -> Result<(), DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.apply_effect(&secret_store, project_id, mission_id, now)
     }
 
     pub fn load_with(
@@ -2819,6 +2871,23 @@ impl DesktopDataPlane {
         Ok(ApplicationService::new(store))
     }
 
+    fn live_domain_kernel_facts(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: Option<&ProjectId>,
+        mission_id: Option<&MissionId>,
+        now: DateTime<Utc>,
+    ) -> Result<LiveDomainKernelFacts, DesktopDataError> {
+        match secret_store.get(&self.database_key_reference) {
+            Ok(secret) => {
+                let service = self.open_read_application_from_secret(&secret)?;
+                live_domain_kernel_facts_from_service(&service, project_id, mission_id, now)
+            }
+            Err(SecretStoreError::SecretNotFound) => Ok(LiveDomainKernelFacts::missing()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn revalidate_database_entry(&self) -> Result<(), DesktopDataError> {
         reject_symlink(&self.data_root)?;
         reject_symlink(&self.database_path)
@@ -2843,6 +2912,238 @@ impl DesktopDataPlane {
     fn database_key_reference(&self) -> &SecretReference {
         &self.database_key_reference
     }
+
+    #[cfg(test)]
+    fn create_person_with(
+        &self,
+        secret_store: &impl SecretStore,
+        person: hartevo_domain_kernel::Person,
+        now: DateTime<Utc>,
+    ) -> Result<hartevo_domain_kernel::Person, DesktopDataError> {
+        let secret = self.database_secret(secret_store)?;
+        let (mut service, _) = self.open_application_from_secret(&secret, now)?;
+        Ok(service.create_person(person, now)?)
+    }
+
+    #[cfg(test)]
+    fn grant_consent_with(
+        &self,
+        secret_store: &impl SecretStore,
+        record: ConsentRecord,
+        now: DateTime<Utc>,
+    ) -> Result<ConsentRecord, DesktopDataError> {
+        let secret = self.database_secret(secret_store)?;
+        let (mut service, _) = self.open_application_from_secret(&secret, now)?;
+        Ok(service.grant_consent(record, now)?)
+    }
+
+    #[cfg(test)]
+    fn withdraw_consent_with(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        record_id: &hartevo_domain_kernel::ConsentRecordId,
+        now: DateTime<Utc>,
+    ) -> Result<ConsentRecord, DesktopDataError> {
+        let secret = self.database_secret(secret_store)?;
+        let (mut service, _) = self.open_application_from_secret(&secret, now)?;
+        Ok(service.withdraw_consent(project_id, record_id, now)?)
+    }
+
+    #[cfg(test)]
+    fn expire_consent_with(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        record_id: &hartevo_domain_kernel::ConsentRecordId,
+        now: DateTime<Utc>,
+    ) -> Result<ConsentRecord, DesktopDataError> {
+        let secret = self.database_secret(secret_store)?;
+        let (mut service, _) = self.open_application_from_secret(&secret, now)?;
+        Ok(service.expire_consent(project_id, record_id, now)?)
+    }
+
+    #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "test fixture keeps SQLCipher grant, propose, and in-window Approval on one plane"
+    )]
+    fn propose_and_approve_preview_effect_with(
+        &self,
+        secret_store: &impl SecretStore,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+        consent: ConsentState,
+        consent_record: Option<&ConsentRecord>,
+        now: DateTime<Utc>,
+    ) -> Result<Mission, DesktopDataError> {
+        use hartevo_application::ProposePreviewEffect;
+        use hartevo_domain_kernel::{ConsentRequirement, EffectClass, EffectId};
+        use hartevo_effect_broker::{EffectPolicy, EffectRateLimit};
+
+        let secret = self.database_secret(secret_store)?;
+        let (mut service, _) = self.open_application_from_secret(&secret, now)?;
+        let currency = CurrencyCode::parse("USD").expect("USD");
+        let effect_id = EffectId::from_stable(format!("effect-cordis-{mission_id}"));
+        let consent_requirement = consent_record.map(|record| ConsentRequirement {
+            person_id: record.person_id.clone(),
+            purpose: record.purpose.clone(),
+            channel: record.channel.clone(),
+            market: record.market.clone(),
+        });
+        service.propose_preview_effect(
+            project_id,
+            mission_id,
+            ProposePreviewEffect {
+                effect_id: effect_id.clone(),
+                actor_id: ActorId::from("user-cordis"),
+                capability: "channel.preview".into(),
+                provider: "fixture-provider".into(),
+                connection_id: None,
+                account_id: None,
+                required_scopes: BTreeSet::new(),
+                description: "Publish exact preview".into(),
+                target_resource: "preview://cordis".into(),
+                audience_digest: None,
+                payload_digest: "1".repeat(64),
+                asset_digests: BTreeSet::new(),
+                scheduled_for: None,
+                timezone: "UTC".into(),
+                consent,
+                consent_record_id: consent_record.map(|record| record.id.clone()),
+                consent_requirement,
+                policy_version: "policy-v1".into(),
+                amount: Money::zero(currency.clone()),
+                idempotency_key: format!("preview-cordis-{mission_id}"),
+                expires_in: Duration::hours(1),
+            },
+            now,
+        )?;
+        let broker = hartevo_effect_broker::EffectBroker::new(
+            EffectPolicy {
+                version: "policy-v1".into(),
+                allowed_capabilities: BTreeSet::from(["channel.preview".into()]),
+                allowed_classes: BTreeSet::from([EffectClass::ExternalWrite]),
+                max_amounts_minor: BTreeMap::from([(currency, 0)]),
+                rate_limits: vec![EffectRateLimit {
+                    rule_id: "preview-cordis-per-minute".into(),
+                    provider: "fixture-provider".into(),
+                    capability: "channel.preview".into(),
+                    max_executions: 10,
+                    window_seconds: 60,
+                }],
+            },
+            "desktop-cordis-worker",
+        )
+        .with_lease_for(Duration::days(36_500));
+        Ok(service.approve_effect(
+            &broker,
+            project_id,
+            mission_id,
+            &effect_id,
+            ActorId::from("approver-cordis"),
+            now,
+        )?)
+    }
+}
+
+fn live_domain_kernel_facts_from_service(
+    service: &ApplicationService,
+    project_id: Option<&ProjectId>,
+    mission_id: Option<&MissionId>,
+    now: DateTime<Utc>,
+) -> Result<LiveDomainKernelFacts, DesktopDataError> {
+    let Some(project_id) = project_id else {
+        return Ok(LiveDomainKernelFacts::missing());
+    };
+    let Some(mission_id) = mission_id else {
+        return Ok(LiveDomainKernelFacts::missing());
+    };
+    let mission = match service.load_mission(project_id, mission_id) {
+        Ok(mission) => mission,
+        Err(ApplicationError::Storage(StorageError::MissionNotFound { .. })) => {
+            return Ok(LiveDomainKernelFacts::missing());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(live_domain_kernel_facts_from_mission(
+        service, &mission, now,
+    )?)
+}
+
+fn live_domain_kernel_facts_from_mission(
+    service: &ApplicationService,
+    mission: &Mission,
+    now: DateTime<Utc>,
+) -> Result<LiveDomainKernelFacts, ApplicationError> {
+    let mut facts = LiveDomainKernelFacts::missing();
+    let Some(effect) = current_mission_effect(mission) else {
+        return Ok(facts);
+    };
+    facts.consent = effect.consent.clone();
+    if let Some(record_id) = &effect.consent_record_id {
+        match service.load_consent_record(&mission.project_id, record_id) {
+            Ok(record) => facts.record = Some(record),
+            Err(ApplicationError::Storage(StorageError::ScopedRecordNotFound {
+                kind: "consent",
+                ..
+            })) => {}
+            Err(error) => return Err(error),
+        }
+    } else {
+        facts.record = live_granted_consent_for_project(service, &mission.project_id, now)?;
+    }
+    if let Some(record) = &facts.record
+        && !consent_record_is_live_granted(record, now)
+    {
+        facts.consent = match record.status {
+            ConsentStatus::Withdrawn => ConsentState::Withdrawn,
+            ConsentStatus::Granted | ConsentStatus::Denied | ConsentStatus::Expired => {
+                ConsentState::Missing
+            }
+        };
+    }
+    facts.approval = effect.approval.clone().filter(|approval| {
+        approval.decision == ApprovalDecision::Approved && now < approval.valid_until
+    });
+    Ok(facts)
+}
+
+fn current_mission_effect(mission: &Mission) -> Option<&hartevo_domain_kernel::Effect> {
+    mission
+        .effects
+        .iter()
+        .rev()
+        .find(|effect| effect.approval.is_some())
+        .or_else(|| mission.effects.last())
+}
+
+fn live_granted_consent_for_project(
+    service: &ApplicationService,
+    project_id: &ProjectId,
+    now: DateTime<Utc>,
+) -> Result<Option<ConsentRecord>, ApplicationError> {
+    let mut live = None;
+    for record in service.list_consent_records(project_id)? {
+        if !consent_record_is_live_granted(&record, now) {
+            continue;
+        }
+        if live
+            .as_ref()
+            .is_none_or(|current: &ConsentRecord| record.revision > current.revision)
+        {
+            live = Some(record);
+        }
+    }
+    Ok(live)
+}
+
+fn consent_record_is_live_granted(record: &ConsentRecord, now: DateTime<Utc>) -> bool {
+    record.status == ConsentStatus::Granted
+        && record.withdrawn_at.is_none()
+        && record.granted_at.is_some_and(|granted| granted <= now)
+        && record.valid_until.is_none_or(|until| until > now)
 }
 
 fn no_runtime_turn_startup_reconciliation() -> RuntimeTurnStartupReconciliation {
@@ -3106,6 +3407,8 @@ pub enum DesktopDataError {
     Application(#[from] ApplicationError),
     #[error(transparent)]
     Catalog(#[from] CatalogError),
+    #[error(transparent)]
+    Cordis(#[from] CordisError),
 }
 
 #[cfg(test)]
@@ -3117,10 +3420,12 @@ mod tests {
         CreateProject, EvidenceInput, ProvisionProjectEncryption, ResearchPacket,
         RuntimeTextSubscriptionError, StartRelationshipMission,
     };
+    use hartevo_cordis::{AgentStep, DomainSurface, host_is_cordis_loop, invariant_missing};
     use hartevo_domain_kernel::{
-        AccountId, ActorId, Connection, ConnectionId, ConnectionProbe, ContextBranchStatus,
+        AccountId, ActorId, Connection, ConnectionId, ConnectionProbe, ConsentPurpose,
+        ConsentRecord, ConsentRecordId, ConsentState, ContactChannel, ContextBranchStatus,
         ContextCapsuleStatus, EvidenceId, ExternalIdentity, IdentityLink, IdentityLinkId,
-        IdentitySubject, KeyRecipient, KpiDirection, MissionCheckpointExecutor,
+        IdentitySubject, KeyRecipient, KpiDirection, LegalBasis, MissionCheckpointExecutor,
         MissionScheduleStatus, MissionStage, OrderId, OutcomeDecision, OutcomeEvent,
         OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification, OutcomeVerificationMethod,
         Person, PersonId, ProbeOutcome, ProjectEncryptionMode, StorageMode, TaskId, TaskStatus,
@@ -7406,20 +7711,68 @@ sleep 30"#;
         recovered
     }
 
+    fn assert_cordis_missing_consent(error: DesktopDataError) {
+        match error {
+            DesktopDataError::Cordis(CordisError::MissingDependencies(missing)) => {
+                assert_eq!(missing, vec![invariant_missing::CONSENT.to_string()]);
+            }
+            other => panic!("expected missing consent, got {other:?}"),
+        }
+    }
+
+    fn grant_live_consent(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        tenant_id: &TenantId,
+        suffix: &str,
+        now: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+    ) -> ConsentRecord {
+        let person_id = PersonId::from_stable(format!("person-cordis-{suffix}"));
+        plane
+            .create_person_with(
+                secrets,
+                Person::create(
+                    person_id.clone(),
+                    tenant_id.clone(),
+                    project_id.clone(),
+                    format!("Cordis contact {suffix}"),
+                    None,
+                    vec![],
+                )
+                .expect("person"),
+                now,
+            )
+            .expect("persist person");
+        let record = ConsentRecord::grant(
+            ConsentRecordId::from_stable(format!("consent-cordis-{suffix}")),
+            tenant_id.clone(),
+            project_id.clone(),
+            person_id,
+            ConsentPurpose::DirectOutreach,
+            ContactChannel::Email,
+            "US",
+            LegalBasis::ExplicitConsent,
+            "signed desktop consent",
+            "e".repeat(64),
+            now,
+            Some(valid_until),
+        )
+        .expect("granted consent");
+        plane
+            .grant_consent_with(secrets, record, now)
+            .expect("persist consent")
+    }
+
     #[test]
     fn data_plane_mounts_cordis_host_as_the_live_loop() {
-        use chrono::{Duration, TimeZone, Utc};
-        use hartevo_cordis::{
-            AgentStep, CordisError, DomainSurface, OPENINTERPRETER, SurfaceOwner,
-            host_is_cordis_loop, invariant_missing,
-        };
-        use hartevo_domain_kernel::{
-            ActorId, Approval, ApprovalDecision, ApprovalId, ConsentState,
-        };
+        use hartevo_cordis::{OPENINTERPRETER, SurfaceOwner};
 
         let directory = tempfile::tempdir().expect("directory");
         let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
+        let secrets = MemorySecretStore::default();
         host_is_cordis_loop(plane.cordis_host()).unwrap();
         let domain = plane
             .cordis_host()
@@ -7429,16 +7782,21 @@ sleep 30"#;
         assert_eq!(domain.owner, SurfaceOwner::Hartevo);
         assert!(!domain.consent);
         assert!(!domain.approved);
-        assert_eq!(
+        assert_cordis_missing_consent(
             plane
-                .cordis_host()
-                .step(AgentStep::new("mission-plane", "plan"))
+                .step(
+                    &secrets,
+                    None,
+                    None,
+                    AgentStep::new("mission-plane", "plan"),
+                    observed_at(),
+                )
                 .unwrap_err(),
-            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
         );
-        assert_eq!(
-            plane.cordis_host().apply_effect().unwrap_err(),
-            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+        assert_cordis_missing_consent(
+            plane
+                .apply_effect(&secrets, None, None, observed_at())
+                .unwrap_err(),
         );
         assert!(
             plane
@@ -7448,30 +7806,238 @@ sleep 30"#;
                 .is_none()
                 || plane.cordis_host().runtime_plugin() == Some(OPENINTERPRETER)
         );
+    }
 
-        let now = Utc.with_ymd_and_hms(2026, 8, 25, 13, 34, 33).unwrap();
-        plane
-            .bind_live_domain_kernel(
-                &ConsentState::Confirmed,
-                None,
-                Some(&Approval {
-                    id: ApprovalId::from("approval-plane"),
-                    decision: ApprovalDecision::Approved,
-                    decided_by: ActorId::from("user-plane"),
-                    decided_at: now,
-                    valid_until: now + Duration::minutes(5),
-                    scope_digest: "a".repeat(64),
-                    permission_digest: "b".repeat(64),
-                }),
-                now,
-            )
-            .unwrap();
-        let out = plane
+    #[test]
+    fn production_load_and_initialize_without_kernel_facts_keep_host_fail_closed() {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+            .expect("data plane");
+        let secrets = MemorySecretStore::default();
+        let DesktopLoadState::Uninitialized { .. } = plane
+            .load_with(&secrets, observed_at())
+            .expect("honest first-run state")
+        else {
+            panic!("first run must not create a database or key implicitly");
+        };
+        host_is_cordis_loop(plane.cordis_host()).unwrap();
+        let domain = plane
             .cordis_host()
-            .step(AgentStep::new("mission-plane", "plan"))
+            .context()
+            .domain::<DomainSurface>()
             .unwrap();
-        assert_eq!(out.id, "mission-plane");
-        plane.cordis_host().apply_effect().unwrap();
+        assert!(!domain.consent);
+        assert!(!domain.approved);
+        assert_cordis_missing_consent(
+            plane
+                .step(
+                    &secrets,
+                    None,
+                    None,
+                    AgentStep::new("mission-uninitialized", "plan"),
+                    observed_at(),
+                )
+                .unwrap_err(),
+        );
+        assert_cordis_missing_consent(
+            plane
+                .apply_effect(&secrets, None, None, observed_at())
+                .unwrap_err(),
+        );
+
+        plane
+            .initialize_with(&secrets, observed_at())
+            .expect("explicit initialization");
+        host_is_cordis_loop(plane.cordis_host()).unwrap();
+        let domain = plane
+            .cordis_host()
+            .context()
+            .domain::<DomainSurface>()
+            .unwrap();
+        assert!(!domain.consent);
+        assert!(!domain.approved);
+        assert_cordis_missing_consent(
+            plane
+                .step(
+                    &secrets,
+                    None,
+                    None,
+                    AgentStep::new("mission-initialized", "plan"),
+                    observed_at(),
+                )
+                .unwrap_err(),
+        );
+        assert_cordis_missing_consent(
+            plane
+                .apply_effect(&secrets, None, None, observed_at())
+                .unwrap_err(),
+        );
+    }
+
+    fn persist_live_kernel_mission(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        suffix: &str,
+        goal: &str,
+        grant_at: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+    ) -> (MissionId, ConsentRecord) {
+        let started = plane
+            .start_mission_with(secrets, project_id, goal, grant_at - Duration::minutes(1))
+            .expect("persisted mission");
+        let mission_id = started.inventory.projects[0]
+            .missions
+            .last()
+            .expect("mission")
+            .mission_id
+            .clone();
+        let tenant_id = {
+            let secret = secrets
+                .get(plane.database_key_reference())
+                .expect("database secret");
+            let (service, _) = plane
+                .open_application_from_secret(&secret, grant_at)
+                .expect("application");
+            service
+                .load_mission(project_id, &mission_id)
+                .expect("mission")
+                .tenant_id
+        };
+        let consent = grant_live_consent(
+            plane,
+            secrets,
+            project_id,
+            &tenant_id,
+            suffix,
+            grant_at,
+            valid_until,
+        );
+        plane
+            .propose_and_approve_preview_effect_with(
+                secrets,
+                project_id,
+                &mission_id,
+                ConsentState::Confirmed,
+                Some(&consent),
+                grant_at + Duration::seconds(1),
+            )
+            .expect("in-window approval");
+        (mission_id, consent)
+    }
+
+    #[test]
+    fn production_step_and_effect_succeed_after_grant_consent_and_in_window_approval() {
+        let (_directory, mut plane, secrets, project_id) = ready_personal_fixture();
+        let grant_at = observed_at() + Duration::minutes(3);
+        let (mission_id, _consent) = persist_live_kernel_mission(
+            &plane,
+            &secrets,
+            &project_id,
+            "live",
+            "研究当前增长约束；不得执行外部动作",
+            grant_at,
+            grant_at + Duration::minutes(30),
+        );
+        let live_at = grant_at + Duration::minutes(1);
+        let out = plane
+            .step(
+                &secrets,
+                Some(&project_id),
+                Some(&mission_id),
+                AgentStep::new("mission-live", "plan"),
+                live_at,
+            )
+            .expect("live kernel facts open the gate");
+        assert_eq!(out.id, "mission-live");
+        plane
+            .apply_effect(&secrets, Some(&project_id), Some(&mission_id), live_at)
+            .expect("live kernel facts allow effect");
+    }
+
+    #[test]
+    fn production_step_and_effect_fail_closed_after_withdrawn_or_expired_consent() {
+        let (_directory, mut plane, secrets, project_id) = ready_personal_fixture();
+        let grant_at = observed_at() + Duration::minutes(3);
+        let (mission_id, consent) = persist_live_kernel_mission(
+            &plane,
+            &secrets,
+            &project_id,
+            "withdrawn",
+            "研究当前增长约束；不得执行外部动作",
+            grant_at,
+            grant_at + Duration::minutes(30),
+        );
+        let live_at = grant_at + Duration::minutes(1);
+        plane
+            .withdraw_consent_with(
+                &secrets,
+                &project_id,
+                &consent.id,
+                live_at + Duration::minutes(1),
+            )
+            .expect("withdraw");
+        assert_cordis_missing_consent(
+            plane
+                .step(
+                    &secrets,
+                    Some(&project_id),
+                    Some(&mission_id),
+                    AgentStep::new("mission-withdrawn", "plan"),
+                    live_at + Duration::minutes(2),
+                )
+                .unwrap_err(),
+        );
+        assert_cordis_missing_consent(
+            plane
+                .apply_effect(
+                    &secrets,
+                    Some(&project_id),
+                    Some(&mission_id),
+                    live_at + Duration::minutes(2),
+                )
+                .unwrap_err(),
+        );
+
+        let expired_until = grant_at + Duration::minutes(4);
+        let (expired_mission_id, expired) = persist_live_kernel_mission(
+            &plane,
+            &secrets,
+            &project_id,
+            "expired",
+            "研究过期 Consent 路径；不得执行外部动作",
+            grant_at + Duration::minutes(3),
+            expired_until,
+        );
+        plane
+            .expire_consent_with(
+                &secrets,
+                &project_id,
+                &expired.id,
+                expired_until + Duration::seconds(1),
+            )
+            .expect("expire");
+        assert_cordis_missing_consent(
+            plane
+                .step(
+                    &secrets,
+                    Some(&project_id),
+                    Some(&expired_mission_id),
+                    AgentStep::new("mission-expired", "plan"),
+                    expired_until + Duration::seconds(2),
+                )
+                .unwrap_err(),
+        );
+        assert_cordis_missing_consent(
+            plane
+                .apply_effect(
+                    &secrets,
+                    Some(&project_id),
+                    Some(&expired_mission_id),
+                    expired_until + Duration::seconds(2),
+                )
+                .unwrap_err(),
+        );
     }
 
     #[test]

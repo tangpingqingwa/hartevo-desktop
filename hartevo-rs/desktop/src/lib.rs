@@ -30,7 +30,10 @@ use zeroize::Zeroizing;
 
 mod agent_operations;
 mod cordis_host;
-pub use cordis_host::{bind_live_domain_kernel, mount_cordis_host};
+pub use cordis_host::{
+    LiveDomainKernelFacts, apply_effect_with_live_domain_kernel, bind_live_domain_kernel,
+    mount_cordis_host, step_with_live_domain_kernel,
+};
 pub mod data_plane;
 mod runtime_plane;
 mod runtime_subscription;
@@ -438,7 +441,8 @@ impl UiFailure {
             },
             DesktopDataError::Storage(_)
             | DesktopDataError::Application(_)
-            | DesktopDataError::Catalog(_) => Self {
+            | DesktopDataError::Catalog(_)
+            | DesktopDataError::Cordis(_) => Self {
                 code: "INTEGRITY_ERROR".into(),
                 message: "持久状态或机器合同未通过完整性校验；Hartevo 已停止继续执行。".into(),
             },

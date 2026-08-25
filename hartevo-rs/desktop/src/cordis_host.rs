@@ -7,8 +7,9 @@
 
 use chrono::{DateTime, Utc};
 use hartevo_cordis::{
-    CordisError, CordisHost, KernelApproval, KernelApprovalDecision, KernelConsentRecord,
-    KernelConsentState, KernelConsentStatus, desktop_surfaces, host_is_cordis_loop,
+    AgentStep, AgentStepResult, CordisError, CordisHost, KernelApproval, KernelApprovalDecision,
+    KernelConsentRecord, KernelConsentState, KernelConsentStatus, desktop_surfaces,
+    host_is_cordis_loop,
 };
 use hartevo_domain_kernel::{
     Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus,
@@ -93,6 +94,59 @@ pub fn bind_live_domain_kernel(
     )
 }
 
+/// Fail-closed Domain Kernel facts for one Project/Mission. Absence, expiry,
+/// withdrawal, and rejection stay `None`; this never invents `true`.
+#[derive(Debug, Clone)]
+pub struct LiveDomainKernelFacts {
+    pub consent: ConsentState,
+    pub record: Option<ConsentRecord>,
+    pub approval: Option<Approval>,
+}
+
+impl LiveDomainKernelFacts {
+    #[must_use]
+    pub fn missing() -> Self {
+        Self {
+            consent: ConsentState::Missing,
+            record: None,
+            approval: None,
+        }
+    }
+}
+
+/// Bind whatever live facts exist, then run one Cordis-hosted step.
+pub fn step_with_live_domain_kernel(
+    host: &mut CordisHost,
+    facts: &LiveDomainKernelFacts,
+    step: AgentStep,
+    now: DateTime<Utc>,
+) -> Result<AgentStepResult, CordisError> {
+    bind_live_domain_kernel(
+        host,
+        &facts.consent,
+        facts.record.as_ref(),
+        facts.approval.as_ref(),
+        now,
+    )?;
+    host.step(step)
+}
+
+/// Bind whatever live facts exist, then take the Effect write path.
+pub fn apply_effect_with_live_domain_kernel(
+    host: &mut CordisHost,
+    facts: &LiveDomainKernelFacts,
+    now: DateTime<Utc>,
+) -> Result<(), CordisError> {
+    bind_live_domain_kernel(
+        host,
+        &facts.consent,
+        facts.record.as_ref(),
+        facts.approval.as_ref(),
+        now,
+    )?;
+    host.apply_effect()
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone, Utc};
@@ -107,7 +161,10 @@ mod tests {
     };
     use hartevo_runtime_adapter::OPENINTERPRETER_RELEASE;
 
-    use super::{bind_live_domain_kernel, mount_cordis_host, openinterpreter_runtime_plugin};
+    use super::{
+        LiveDomainKernelFacts, apply_effect_with_live_domain_kernel, bind_live_domain_kernel,
+        mount_cordis_host, openinterpreter_runtime_plugin, step_with_live_domain_kernel,
+    };
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 
     fn projection(status: DesktopRuntimeAvailabilityStatus) -> DesktopRuntimeProjection {
@@ -408,5 +465,31 @@ mod tests {
         .unwrap();
         host.step(AgentStep::new("mission-granted-record", "plan"))
             .unwrap();
+    }
+
+    #[test]
+    fn missing_live_facts_keep_step_and_effect_fail_closed() {
+        let mut host =
+            mount_cordis_host(&projection(DesktopRuntimeAvailabilityStatus::NotConfigured))
+                .unwrap();
+        assert_eq!(
+            step_with_live_domain_kernel(
+                &mut host,
+                &LiveDomainKernelFacts::missing(),
+                AgentStep::new("mission-missing", "plan"),
+                now(),
+            )
+            .unwrap_err(),
+            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+        );
+        assert_eq!(
+            apply_effect_with_live_domain_kernel(
+                &mut host,
+                &LiveDomainKernelFacts::missing(),
+                now(),
+            )
+            .unwrap_err(),
+            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+        );
     }
 }
