@@ -44,8 +44,9 @@ pub mod events {
 /// Who currently owns a mapped surface. OpenInterpreter never owns Mission,
 /// Truth, or Effect, and is not a valid owner for domain / effect_broker /
 /// runtime / desktop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SurfaceOwner {
+    #[default]
     Hartevo,
     OpenInterpreter,
 }
@@ -208,15 +209,40 @@ impl AgentsSurface {
 }
 
 /// Hartevo Domain Kernel handle. OpenInterpreter never owns this key.
+///
+/// Cordis does not reimplement Domain Kernel. These flags are the host-side
+/// fail-closed view of consent, approval, local-first, SQLCipher, and eval.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainSurface {
     pub owner: SurfaceOwner,
+    pub consent: bool,
+    pub approved: bool,
+    pub local_first: bool,
+    pub sqlcipher: bool,
+    pub eval_gate: bool,
+}
+
+impl Default for DomainSurface {
+    fn default() -> Self {
+        Self {
+            owner: SurfaceOwner::Hartevo,
+            consent: false,
+            approved: false,
+            local_first: true,
+            sqlcipher: true,
+            eval_gate: true,
+        }
+    }
 }
 
 /// Hartevo Effect Broker handle. The only external-write path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `receipt_is_verification` stays false: Receipt ≠ Verification.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EffectBrokerSurface {
     pub owner: SurfaceOwner,
+    pub receipt_is_verification: bool,
 }
 
 /// Optional runtime plugin slot. OpenInterpreter may sit here as an adapter
@@ -245,12 +271,8 @@ pub struct HartevoSurfaces {
 impl Default for HartevoSurfaces {
     fn default() -> Self {
         Self {
-            domain: DomainSurface {
-                owner: SurfaceOwner::Hartevo,
-            },
-            effect_broker: EffectBrokerSurface {
-                owner: SurfaceOwner::Hartevo,
-            },
+            domain: DomainSurface::default(),
+            effect_broker: EffectBrokerSurface::default(),
             runtime: RuntimeSurface {
                 owner: SurfaceOwner::Hartevo,
                 plugin: None,
