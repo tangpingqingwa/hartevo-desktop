@@ -1,6 +1,8 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::config::ConfigValue;
+
 /// Cleanup callback registered via [`crate::Context::effect`].
 pub type Disposer = Box<dyn FnOnce() + Send + 'static>;
 
@@ -10,6 +12,10 @@ pub(crate) enum Registration {
     Service {
         key: String,
         previous: Option<Arc<dyn Any + Send + Sync>>,
+    },
+    Var {
+        key: String,
+        previous: Option<ConfigValue>,
     },
     Listener {
         name: String,

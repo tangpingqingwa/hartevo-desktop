@@ -6,6 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::config::ConfigValue;
 use crate::effect::{Disposer, Registration};
 use crate::event::{BoxedPayload, DispatchMode, EventBus, WaterfallContinuation, WaterfallNext};
 use crate::service::Service;
@@ -38,11 +39,15 @@ pub enum CordisError {
     Serial { name: String, message: String },
     #[error("event `{name}` payload type mismatch")]
     PayloadType { name: String },
+    #[error(transparent)]
+    Interpolate(#[from] crate::config::InterpolateError),
 }
 
 /// Service container and plugin host.
 pub struct Context {
     services: HashMap<String, Arc<dyn Any + Send + Sync>>,
+    /// Plugin-context interpolation source. Distinct from the loader context.
+    vars: ConfigValue,
     effects: Vec<Registration>,
     events: EventBus,
 }
@@ -58,6 +63,7 @@ impl Context {
     pub fn new() -> Self {
         Self {
             services: HashMap::new(),
+            vars: ConfigValue::default(),
             effects: Vec::new(),
             events: EventBus::new(),
         }
@@ -113,6 +119,35 @@ impl Context {
         let key = key.into();
         let previous = self.services.insert(key.clone(), Arc::new(value));
         self.effects.push(Registration::Service { key, previous });
+    }
+
+    /// Set a plugin-context interpolation variable. Reversed on teardown.
+    ///
+    /// Used after `inject` when expanding plugin `config`. Not the loader
+    /// context used for `disabled`.
+    pub fn set_var(&mut self, key: impl Into<String>, value: impl Into<ConfigValue>) {
+        let key = key.into();
+        let value = value.into();
+        let previous = match &mut self.vars {
+            ConfigValue::Object(map) => map.insert(key.clone(), value),
+            other => {
+                let previous = Some(other.clone());
+                *other = ConfigValue::object([(key.clone(), value)]);
+                previous
+            }
+        };
+        self.effects.push(Registration::Var { key, previous });
+    }
+
+    #[must_use]
+    pub fn var(&self, key: &str) -> Option<&ConfigValue> {
+        self.vars.lookup(key)
+    }
+
+    /// Interpolation source for plugin `config` (plugin context, after inject).
+    #[must_use]
+    pub fn plugin_interpolation_source(&self) -> &ConfigValue {
+        &self.vars
     }
 
     /// Start `plugin` once every `inject` key is present. Missing deps do not start it.
@@ -357,12 +392,27 @@ impl Context {
                         self.services.remove(&key);
                     }
                 },
+                Registration::Var { key, previous } => match &mut self.vars {
+                    ConfigValue::Object(map) => match previous {
+                        Some(value) => {
+                            map.insert(key, value);
+                        }
+                        None => {
+                            map.remove(&key);
+                        }
+                    },
+                    other => match previous {
+                        Some(value) => *other = value,
+                        None => *other = ConfigValue::default(),
+                    },
+                },
                 Registration::Listener { name, id } => {
                     self.events.remove_listener(&name, id);
                 }
             }
         }
         self.services.clear();
+        self.vars = ConfigValue::default();
         self.events.clear();
     }
 }
@@ -389,6 +439,7 @@ impl fmt::Debug for Context {
         listener_events.sort();
         f.debug_struct("Context")
             .field("services", &services)
+            .field("vars", &self.vars)
             .field("effects", &self.effects.len())
             .field("listeners", &listener_events)
             .field("next_listener_id", &self.events.next_id())
