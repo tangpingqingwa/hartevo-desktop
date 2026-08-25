@@ -1,15 +1,20 @@
+use chrono::{TimeZone, Utc};
+
 use hartevo_cordis::{
     AgentLoop, AgentStep, Context, CordisError, DomainSurface, EffectBrokerSurface,
     HartevoSurfaces, InvariantGate, OPENINTERPRETER, RuntimeSurface, SurfaceMapping, SurfaceOwner,
     apply_effect, enforce_invariants, invariant_missing, keys, map_surfaces, run_agent_step,
+    testing,
 };
 
+fn now() -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 8, 10, 8, 0, 0)
+        .single()
+        .expect("valid time")
+}
+
 fn consented_domain() -> DomainSurface {
-    DomainSurface {
-        consent: true,
-        approved: true,
-        ..DomainSurface::default()
-    }
+    DomainSurface::from_kernel_facts(testing::permitted_kernel_facts(now()), now())
 }
 
 fn mapped_consented() -> Context {
@@ -67,14 +72,13 @@ fn missing_consent_or_approval_fails_closed() {
     );
 
     ctx.teardown();
+    let mut facts = testing::permitted_kernel_facts(now());
+    facts.effect.as_mut().expect("effect").approval = None;
+    facts.effect.as_mut().expect("effect").status = hartevo_domain_kernel::EffectStatus::Proposed;
     map_surfaces(
         &mut ctx,
         HartevoSurfaces {
-            domain: DomainSurface {
-                consent: true,
-                approved: false,
-                ..DomainSurface::default()
-            },
+            domain: DomainSurface::from_kernel_facts(facts, now()),
             ..HartevoSurfaces::default()
         },
     )
@@ -150,9 +154,7 @@ fn openinterpreter_cannot_own_domain_without_map_surfaces_panic() {
         keys::DOMAIN,
         DomainSurface {
             owner: SurfaceOwner::OpenInterpreter,
-            consent: true,
-            approved: true,
-            ..DomainSurface::default()
+            ..consented_domain()
         },
     );
     ctx.provide(keys::EFFECT_BROKER, EffectBrokerSurface::default());
@@ -174,6 +176,49 @@ fn openinterpreter_cannot_be_the_write_path() {
     assert_eq!(
         apply_effect(&ctx).unwrap_err(),
         CordisError::MissingDependencies(vec![keys::DOMAIN.to_string()])
+    );
+}
+
+#[test]
+fn not_required_kernel_consent_still_requires_live_approval() {
+    let mut ctx = Context::new();
+    map_surfaces(
+        &mut ctx,
+        HartevoSurfaces {
+            domain: DomainSurface::from_kernel_facts(
+                testing::not_required_kernel_facts(now()),
+                now(),
+            ),
+            ..HartevoSurfaces::default()
+        },
+    )
+    .unwrap();
+    enforce_invariants(&ctx).unwrap();
+    apply_effect(&ctx).unwrap();
+}
+
+#[test]
+fn host_stamp_without_kernel_facts_fails_closed() {
+    let mut ctx = Context::new();
+    map_surfaces(
+        &mut ctx,
+        HartevoSurfaces {
+            domain: DomainSurface {
+                consent: true,
+                approved: true,
+                ..DomainSurface::default()
+            },
+            ..HartevoSurfaces::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        enforce_invariants(&ctx).unwrap_err(),
+        CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+    );
+    assert_eq!(
+        apply_effect(&ctx).unwrap_err(),
+        CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
     );
 }
 

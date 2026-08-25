@@ -3,7 +3,8 @@
 //! The live loop is [`hartevo_cordis::CordisHost::step`] → `run_agent_step`
 //! after `enforce_invariants`. OpenInterpreter may occupy
 //! `RuntimeSurface.plugin`; it is never the loop and never owns Domain or
-//! Effect.
+//! Effect. Production `desktop_surfaces` does not stamp consent or approval;
+//! those keys come from [`hartevo_cordis::CordisHost::bind_domain_kernel_facts`].
 
 use hartevo_cordis::{CordisError, CordisHost, desktop_surfaces, host_is_cordis_loop};
 
@@ -28,13 +29,26 @@ pub fn mount_cordis_host(runtime: &DesktopRuntimeProjection) -> Result<CordisHos
 
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeZone, Utc};
     use hartevo_cordis::{
-        AgentStep, DomainSurface, OPENINTERPRETER, SurfaceOwner, enforce_invariants, keys,
+        AgentStep, CordisError, DomainSurface, OPENINTERPRETER, SurfaceOwner, enforce_invariants,
+        invariant_missing, keys, testing,
     };
     use hartevo_runtime_adapter::OPENINTERPRETER_RELEASE;
 
     use super::{mount_cordis_host, openinterpreter_runtime_plugin};
     use crate::runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
+
+    fn now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 10, 8, 0, 0)
+            .single()
+            .expect("valid time")
+    }
+
+    fn bind_kernel(host: &mut hartevo_cordis::CordisHost) {
+        host.bind_domain_kernel_facts(testing::permitted_kernel_facts(now()), now())
+            .unwrap();
+    }
 
     fn projection(status: DesktopRuntimeAvailabilityStatus) -> DesktopRuntimeProjection {
         DesktopRuntimeProjection {
@@ -66,10 +80,15 @@ mod tests {
 
     #[test]
     fn ready_runtime_keeps_openinterpreter_as_optional_plugin() {
-        let host = mount_cordis_host(&projection(
+        let mut host = mount_cordis_host(&projection(
             DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
         ))
         .unwrap();
+        assert_eq!(
+            enforce_invariants(host.context()).unwrap_err(),
+            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+        );
+        bind_kernel(&mut host);
         assert!(openinterpreter_runtime_plugin(&projection(
             DesktopRuntimeAvailabilityStatus::ReadyDevelopment
         )));
@@ -91,6 +110,12 @@ mod tests {
             DesktopRuntimeAvailabilityStatus::ReadyDistribution,
         ))
         .unwrap();
+        assert_eq!(
+            host.step(AgentStep::new("mission-desktop", "plan"))
+                .unwrap_err(),
+            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+        );
+        bind_kernel(&mut host);
         let out = host
             .step(AgentStep::new("mission-desktop", "plan"))
             .unwrap();

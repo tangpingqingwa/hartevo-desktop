@@ -7394,14 +7394,38 @@ sleep 30"#;
 
     #[test]
     fn data_plane_mounts_cordis_host_as_the_live_loop() {
+        use chrono::{TimeZone, Utc};
         use hartevo_cordis::{
-            AgentStep, DomainSurface, OPENINTERPRETER, SurfaceOwner, host_is_cordis_loop,
+            AgentStep, CordisError, DomainSurface, OPENINTERPRETER, SurfaceOwner,
+            host_is_cordis_loop, invariant_missing, testing,
         };
 
         let directory = tempfile::tempdir().expect("directory");
         let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         host_is_cordis_loop(plane.cordis_host()).unwrap();
+        let domain = plane
+            .cordis_host()
+            .context()
+            .domain::<DomainSurface>()
+            .unwrap();
+        assert!(!domain.consent);
+        assert!(!domain.approved);
+        assert_eq!(
+            plane
+                .cordis_host()
+                .step(AgentStep::new("mission-plane", "plan"))
+                .unwrap_err(),
+            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+        );
+        let now = Utc
+            .with_ymd_and_hms(2026, 8, 10, 8, 0, 0)
+            .single()
+            .expect("valid time");
+        plane
+            .cordis_host()
+            .bind_domain_kernel_facts(testing::permitted_kernel_facts(now), now)
+            .unwrap();
         assert_eq!(
             plane
                 .cordis_host()

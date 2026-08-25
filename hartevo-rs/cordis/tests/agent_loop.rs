@@ -1,19 +1,23 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chrono::{TimeZone, Utc};
+
 use hartevo_cordis::{
     AgentLoop, AgentRef, AgentStep, Context, CordisError, DomainSurface, EffectBrokerSurface,
     EnvironmentOverlay, HartevoSurfaces, LlmStream, LoaderContext, PluginSpec, RuntimeSurface,
     Service, SurfaceMapping, SurfaceOwner, ToolCall, events, keys, load_plugins, map_surfaces,
-    run_agent_step,
+    run_agent_step, testing,
 };
 
+fn now() -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 8, 10, 8, 0, 0)
+        .single()
+        .expect("valid time")
+}
+
 fn consented_domain() -> DomainSurface {
-    DomainSurface {
-        consent: true,
-        approved: true,
-        ..DomainSurface::default()
-    }
+    DomainSurface::from_kernel_facts(testing::permitted_kernel_facts(now()), now())
 }
 
 fn consented_surfaces() -> HartevoSurfaces {

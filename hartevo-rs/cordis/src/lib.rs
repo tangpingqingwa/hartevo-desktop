@@ -1,7 +1,8 @@
 //! Rust Cordis kernel: service container, plugin inject/apply, reversible
 //! effects, typed events, loader/overlay interpolation, Hartevo surface mapping,
 //! a Cordis-hosted agent loop, a fail-closed Domain Kernel invariant gate, and
-//! the desktop host that mounts those three services.
+//! the desktop host that mounts those three services. Consent and approval are
+//! live Domain Kernel facts, not a production `desktop_surfaces` stamp.
 
 mod agent;
 mod config;
@@ -13,6 +14,9 @@ mod invariants;
 mod loader;
 mod service;
 mod surface;
+
+/// Test-only Domain Kernel facts. Not a production consent/approval grant.
+pub mod testing;
 
 pub use agent::{AGENT_LOOP_KEYS, AgentLoop, AgentStep, AgentStepResult, run_agent_step};
 pub use config::{ConfigValue, InterpolateError};
@@ -32,8 +36,8 @@ pub use loader::{
 };
 pub use service::Service;
 pub use surface::{
-    AgentRef, AgentsSurface, DesktopSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces,
-    LlmStream, LlmSurface, MAPPED_KEYS, RuntimeSurface, SurfaceMapping, SurfaceOwner, ToolCall,
-    ToolsSurface, events, expected_mode, map_surfaces, register_agent, register_llm_stream,
-    register_tool, run_tools_pipeline, stream_llm,
+    AgentRef, AgentsSurface, DesktopSurface, DomainKernelFacts, DomainSurface, EffectBrokerSurface,
+    HartevoSurfaces, LlmStream, LlmSurface, MAPPED_KEYS, RuntimeSurface, SurfaceMapping,
+    SurfaceOwner, ToolCall, ToolsSurface, events, expected_mode, map_surfaces, register_agent,
+    register_llm_stream, register_tool, run_tools_pipeline, stream_llm,
 };

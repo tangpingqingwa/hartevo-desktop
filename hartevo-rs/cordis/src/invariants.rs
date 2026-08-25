@@ -37,6 +37,9 @@ impl Service for InvariantGate {
 
 /// Fail closed if the host is missing Hartevo-owned surfaces or tries to
 /// bypass Domain Kernel invariants.
+///
+/// Consent and approval are live kernel facts, not a `desktop_surfaces` stamp.
+/// A host bool of `true` without matching kernel records still fail-closes.
 pub fn enforce_invariants(ctx: &Context) -> Result<(), CordisError> {
     let Some(domain) = ctx.domain::<DomainSurface>() else {
         return Err(missing_dep(keys::DOMAIN));
@@ -55,10 +58,10 @@ pub fn enforce_invariants(ctx: &Context) -> Result<(), CordisError> {
     if broker.receipt_is_verification {
         return Err(missing_dep(missing::VERIFICATION));
     }
-    if !domain.consent {
+    if !domain.kernel_consent_permits() {
         return Err(missing_dep(missing::CONSENT));
     }
-    if !domain.approved {
+    if !domain.kernel_approval_permits() {
         return Err(missing_dep(missing::APPROVAL));
     }
     if !domain.local_first {

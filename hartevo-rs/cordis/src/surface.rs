@@ -8,6 +8,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
+
 use crate::context::{Context, CordisError, keys};
 use crate::event::DispatchMode;
 use crate::service::Service;
@@ -208,10 +210,22 @@ impl AgentsSurface {
     }
 }
 
-/// Hartevo Domain Kernel handle. OpenInterpreter never owns this key.
+/// Live Domain Kernel facts the host may project onto [`DomainSurface`].
 ///
-/// Cordis does not reimplement Domain Kernel. These flags are the host-side
-/// fail-closed view of consent, approval, local-first, SQLCipher, and eval.
+/// Cordis does not mint consent or approval. These are copies of kernel
+/// [`hartevo_domain_kernel::ConsentRecord`] / [`hartevo_domain_kernel::Effect`]
+/// fields. The host gate reads them; it never stamps `true` on its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DomainKernelFacts {
+    pub consent: Option<hartevo_domain_kernel::ConsentRecord>,
+    pub effect: Option<hartevo_domain_kernel::Effect>,
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
+/// Host-side fail-closed view of Domain Kernel consent and approval.
+///
+/// `consent` / `approved` are computed from [`DomainKernelFacts`], never from a
+/// Cordis mount stamp. Local-first, SQLCipher, and eval stay host-owned.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainSurface {
@@ -221,6 +235,7 @@ pub struct DomainSurface {
     pub local_first: bool,
     pub sqlcipher: bool,
     pub eval_gate: bool,
+    pub kernel: DomainKernelFacts,
 }
 
 impl Default for DomainSurface {
@@ -232,8 +247,89 @@ impl Default for DomainSurface {
             local_first: true,
             sqlcipher: true,
             eval_gate: true,
+            kernel: DomainKernelFacts::default(),
         }
     }
+}
+
+impl DomainSurface {
+    /// Project live kernel facts. Consent and approval stay false until the
+    /// kernel record actually permits the effect at `now`.
+    #[must_use]
+    pub fn from_kernel_facts(facts: DomainKernelFacts, now: DateTime<Utc>) -> Self {
+        Self::default().with_kernel_facts(facts, now)
+    }
+
+    /// Replace the kernel projection. Host bools follow the new facts.
+    #[must_use]
+    pub fn with_kernel_facts(mut self, mut facts: DomainKernelFacts, now: DateTime<Utc>) -> Self {
+        facts.observed_at = Some(now);
+        self.consent = kernel_consent_permits(&facts, now);
+        self.approved = kernel_approval_permits(&facts, now);
+        self.kernel = facts;
+        self
+    }
+
+    #[must_use]
+    pub fn kernel_consent_permits(&self) -> bool {
+        let Some(now) = self.kernel.observed_at else {
+            return false;
+        };
+        kernel_consent_permits(&self.kernel, now)
+    }
+
+    #[must_use]
+    pub fn kernel_approval_permits(&self) -> bool {
+        let Some(now) = self.kernel.observed_at else {
+            return false;
+        };
+        kernel_approval_permits(&self.kernel, now)
+    }
+}
+
+fn kernel_consent_permits(facts: &DomainKernelFacts, now: DateTime<Utc>) -> bool {
+    let Some(effect) = facts.effect.as_ref() else {
+        return false;
+    };
+    match effect.consent {
+        hartevo_domain_kernel::ConsentState::NotRequired => {
+            effect.consent_record_id.is_none() && effect.consent_requirement.is_none()
+        }
+        hartevo_domain_kernel::ConsentState::Confirmed => {
+            let Some(record) = facts.consent.as_ref() else {
+                return false;
+            };
+            let Some(requirement) = effect.consent_requirement.as_ref() else {
+                return false;
+            };
+            effect.consent_record_id.as_ref() == Some(&record.id)
+                && record.tenant_id == effect.tenant_id
+                && record.project_id == effect.project_id
+                && record.validate().is_ok()
+                && record.permits_requirement(requirement, now)
+        }
+        hartevo_domain_kernel::ConsentState::Missing
+        | hartevo_domain_kernel::ConsentState::Withdrawn => false,
+    }
+}
+
+fn kernel_approval_permits(facts: &DomainKernelFacts, now: DateTime<Utc>) -> bool {
+    let Some(effect) = facts.effect.as_ref() else {
+        return false;
+    };
+    let Some(approval) = effect.approval.as_ref() else {
+        return false;
+    };
+    matches!(
+        effect.status,
+        hartevo_domain_kernel::EffectStatus::Approved
+            | hartevo_domain_kernel::EffectStatus::Executing
+    ) && matches!(
+        approval.decision,
+        hartevo_domain_kernel::ApprovalDecision::Approved
+    ) && approval.scope_digest == effect.approval_digest()
+        && now < approval.valid_until
+        && now < effect.expires_at
 }
 
 /// Hartevo Effect Broker handle. The only external-write path.

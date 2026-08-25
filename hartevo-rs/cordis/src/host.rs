@@ -1,6 +1,8 @@
 //! Desktop-facing Cordis host. Mounts SurfaceMapping, AgentLoop, and
 //! InvariantGate so the live loop is [`run_agent_step`], not OpenInterpreter.
 
+use chrono::{DateTime, Utc};
+
 use crate::agent::{AgentLoop, AgentStep, AgentStepResult, run_agent_step};
 use crate::context::{Context, CordisError, keys};
 use crate::invariants::{InvariantGate, OPENINTERPRETER, apply_effect, enforce_invariants};
@@ -9,8 +11,8 @@ use crate::loader::{
 };
 use crate::service::Service;
 use crate::surface::{
-    AgentsSurface, DomainSurface, EffectBrokerSurface, HartevoSurfaces, RuntimeSurface,
-    SurfaceMapping, SurfaceOwner, ToolsSurface,
+    AgentsSurface, DomainKernelFacts, DomainSurface, EffectBrokerSurface, HartevoSurfaces,
+    RuntimeSurface, SurfaceMapping, SurfaceOwner, ToolsSurface,
 };
 
 /// Overlay-selected plugin ids the desktop host starts.
@@ -122,17 +124,39 @@ impl CordisHost {
     pub fn teardown(&mut self) {
         self.ctx.teardown();
     }
+
+    /// Bind live Domain Kernel consent/approval onto the mounted domain surface.
+    ///
+    /// Replaces the previous host-side stamp. Missing, withdrawn, expired, or
+    /// scope-mismatched facts leave the gate fail-closed.
+    pub fn bind_domain_kernel_facts(
+        &mut self,
+        facts: DomainKernelFacts,
+        now: DateTime<Utc>,
+    ) -> Result<(), CordisError> {
+        let Some(current) = self.ctx.domain::<DomainSurface>() else {
+            return Err(CordisError::MissingDependencies(vec![
+                keys::DOMAIN.to_string(),
+            ]));
+        };
+        if current.owner != SurfaceOwner::Hartevo {
+            return Err(CordisError::MissingDependencies(vec![
+                keys::DOMAIN.to_string(),
+            ]));
+        }
+        let next = (*current).clone().with_kernel_facts(facts, now);
+        self.ctx.provide(keys::DOMAIN, next);
+        Ok(())
+    }
 }
 
-/// Default host surfaces. OpenInterpreter may occupy the runtime plugin slot.
+/// Production host surfaces. OpenInterpreter may occupy the runtime plugin slot.
+///
+/// Consent and approval stay false until [`CordisHost::bind_domain_kernel_facts`]
+/// projects live Domain Kernel records. The host never pre-grants those keys.
 #[must_use]
 pub fn desktop_surfaces(openinterpreter: bool) -> HartevoSurfaces {
     HartevoSurfaces {
-        domain: DomainSurface {
-            consent: true,
-            approved: true,
-            ..DomainSurface::default()
-        },
         runtime: RuntimeSurface {
             owner: SurfaceOwner::Hartevo,
             plugin: openinterpreter.then_some(OPENINTERPRETER),
@@ -183,7 +207,22 @@ pub fn host_is_cordis_loop(host: &CordisHost) -> Result<(), CordisError> {
             crate::invariants::missing::VERIFICATION.to_string(),
         ]));
     }
-    enforce_invariants(&host.ctx)
+    if !domain.local_first {
+        return Err(CordisError::MissingDependencies(vec![
+            crate::invariants::missing::LOCAL_FIRST.to_string(),
+        ]));
+    }
+    if !domain.sqlcipher {
+        return Err(CordisError::MissingDependencies(vec![
+            crate::invariants::missing::SQLCIPHER.to_string(),
+        ]));
+    }
+    if !domain.eval_gate {
+        return Err(CordisError::MissingDependencies(vec![
+            crate::invariants::missing::EVAL.to_string(),
+        ]));
+    }
+    Ok(())
 }
 
 #[must_use]
