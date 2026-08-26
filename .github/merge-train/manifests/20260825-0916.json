@@ -1,0 +1,38 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "0eed001f7b334bb684d9ecee2f5e731706dbb3d7",
+  "candidateCount": 1,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "0eed001f7b334bb684d9ecee2f5e731706dbb3d7",
+      "headBranch": "feat/cordis-agent-loop-pr6-0eed001f7-1787648196",
+      "headCommit": "dac23c0a16eadbc282286c404980258442e29125",
+      "number": 953,
+      "review": {
+        "authorTaskId": "01a0381b-0cbb-7ec0-a734-7a923b9af945",
+        "exactPaths": [
+          "hartevo-rs/cordis/src/agent.rs",
+          "hartevo-rs/cordis/src/lib.rs",
+          "hartevo-rs/cordis/tests/agent_loop.rs"
+        ],
+        "receiptDigest": "c82eed5218cca682bea609c6bdcb4d97967d170c82a7fdcbbe4919324f8f679e",
+        "receiptPath": ".github/governance/reviews/pr-953.json",
+        "reviewedHeadSha": "9a65ccd2256dbbc24f1ba131c3894d06970b2170",
+        "reviewerTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737"
+      }
+    }
+  ],
+  "createdAt": "2026-08-25T09:16:43Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260825-0916"
+}
