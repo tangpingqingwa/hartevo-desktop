@@ -1,0 +1,89 @@
+name: Governance / Trusted admission
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: hartevo-governance-admission-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  admission:
+    name: Governance / PR admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout trusted protected governance policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha }}
+      - name: Fetch the exact untrusted head without checking it out
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git fetch --no-tags --no-write-fetch-head origin "$HEAD_SHA"
+      - name: Verify exact admission from trusted base code
+        run: |
+          python3 scripts/repository_governance.py verify-pr-event \
+            --event "$GITHUB_EVENT_PATH" \
+            --event-name pull_request \
+            --trusted-base
+
+  train-only:
+    name: Governance / Train-only merge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout trusted protected train verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha }}
+      - name: Require one repository-owned merge-train branch
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+        run: |
+          head_repository="$(jq -r '.pull_request.head.repo.full_name // ""' "$GITHUB_EVENT_PATH")"
+          head_branch="$(jq -r '.pull_request.head.ref // ""' "$GITHUB_EVENT_PATH")"
+          if [[ "$head_repository" != "$EXPECTED_REPOSITORY" || "$head_branch" != merge-train/* ]]; then
+            echo '{"schema":"hartevo-train-only-admission/v1","status":"BLOCKED","reason":"ordinary candidates must enter through the bounded merge train"}'
+            exit 1
+          fi
+      - name: Fetch and materialize the exact train without executing its code
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --no-write-fetch-head origin "$HEAD_SHA"
+          git worktree add --detach "$RUNNER_TEMP/hartevo-train-$GITHUB_RUN_ID" "$HEAD_SHA"
+      - name: Verify exact receipts, history, tree, paths, and candidate checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          TRAIN_ROOT: ${{ runner.temp }}/hartevo-train-${{ github.run_id }}
+        run: |
+          trusted_verifier="$GITHUB_WORKSPACE/scripts/ci-merge-train.py"
+          cd "$TRAIN_ROOT"
+          manifest="$(python3 "$trusted_verifier" discover-manifest \
+            --head "$HEAD_SHA" \
+            --branch "$HEAD_BRANCH")"
+          python3 "$trusted_verifier" verify-hosted \
+            --repo "$GITHUB_REPOSITORY" \
+            --manifest "$manifest" \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --branch "$HEAD_BRANCH"
