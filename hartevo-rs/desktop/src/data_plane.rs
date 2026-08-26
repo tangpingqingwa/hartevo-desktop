@@ -13,15 +13,16 @@ use std::time::Duration as StdDuration;
 use chrono::{DateTime, Duration, Utc};
 use hartevo_application::{
     AdoptRuntimeTurnDraft, AppendMissionConversationMessage, ApplicationError,
-    ApplicationMissionCheckpointExecution, ApplicationService, CatalogMissionExecutionHandle,
-    ConfirmHumanMissionCheckpoint, CreateProject, DecideVm11OutcomeReview,
-    DesktopInventoryProjection, DesktopUnlockedProjectProjection, DispatchContextRuntimeTurn,
-    EnsureFailedLocalMissionRuntimeGenerationRetired, ExecuteApplicationMissionCheckpoint,
-    FenceOrphanedContextRuntimeTurn, InterruptContextRuntimeTurn, KeyAdministrationAuthorization,
-    MissionCheckpointDispatchState, MissionRuntimeProjection, ObserveContextRuntimeTurn,
-    PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
-    ProvisionProjectEncryption, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
-    ResearchPacket, ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
+    ApplicationMissionCheckpointExecution, ApplicationService, ApproveProposedEffect,
+    CatalogMissionExecutionHandle, ConfirmHumanMissionCheckpoint, CreateProject,
+    DecideVm11OutcomeReview, DesktopInventoryProjection, DesktopUnlockedProjectProjection,
+    DispatchContextRuntimeTurn, EnsureFailedLocalMissionRuntimeGenerationRetired,
+    ExecuteApplicationMissionCheckpoint, FenceOrphanedContextRuntimeTurn,
+    InterruptContextRuntimeTurn, KeyAdministrationAuthorization, MissionCheckpointDispatchState,
+    MissionRuntimeProjection, ObserveContextRuntimeTurn, PrepareLocalMissionRuntimeContext,
+    ProjectContextMaterialSession, ProjectEncryptionReadiness, ProvisionProjectEncryption,
+    RecoverContextWorkerRuntime, RecoverPersonalProjectDevice, ResearchPacket,
+    ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
     RetryContextWorkerRuntime, RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor,
     RuntimeTurnDispatchDisposition, StartCatalogMission, StartMission,
     Vm11NextContractOrValidTerminalResult,
@@ -33,13 +34,14 @@ use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblySta
 use hartevo_cordis::{AgentStep, AgentStepResult, CordisError, CordisHost};
 use hartevo_domain_kernel::{
     ActorId, Approval, ApprovalDecision, ConsentRecord, ConsentState, ConsentStatus, CurrencyCode,
-    DeviceId, KeyManagementError, KeyRecipient, KpiContract, MissionCheckpointCompletionPolicy,
-    MissionCheckpointExecutor, MissionConversationMessageId, MissionConversationMessageKind,
-    MissionConversationRole, MissionId, MissionStage, Money, OperatingMode, OutcomeDecision,
-    ProjectEncryptionMode, ProjectId, ProjectKeyring, RuntimeRecoveryStatus, RuntimeResumeStrategy,
-    RuntimeTurnAttemptId, RuntimeTurnStatus, StorageMode, TaskId, TenantId, WorkProductId,
-    WorkerHandleStatus,
+    DeviceId, EffectClass, EffectId, KeyManagementError, KeyRecipient, KpiContract,
+    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionConversationMessageId,
+    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionStage, Money,
+    OperatingMode, OutcomeDecision, ProjectEncryptionMode, ProjectId, ProjectKeyring,
+    RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId, RuntimeTurnStatus,
+    StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
 };
+use hartevo_effect_broker::{EffectBroker, EffectPolicy, EffectRateLimit};
 use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand};
 use hartevo_storage::{
     ContextMaterialStoreError, DatabaseKey, KeyMaterial, OsSecretStore, ProjectStore,
@@ -404,6 +406,18 @@ pub struct DesktopVm11NextContractResolutionRequest {
     pub expected_decision_digest: String,
     pub expected_parent_mission_revision: u64,
     pub expected_parent_contract_digest: String,
+}
+
+/// Window-bound ApprovalGrant for one Proposed Effect. The frozen digest and
+/// Mission revision must come from the SQLCipher projection; the window cannot
+/// stamp a SAMPLE digest or execute the Effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopWaitingApprovalGrantRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub expected_scope_digest: String,
+    pub expected_mission_revision: u64,
 }
 
 #[cfg(test)]
@@ -1452,6 +1466,60 @@ impl DesktopDataPlane {
             runtime_reconciliation,
             mission_id,
             runtime_outcome,
+            now,
+        )
+    }
+
+    /// Grants Domain Kernel Approval for one Proposed Effect without executing
+    /// it. The frozen digest and Mission revision must match SQLCipher; a
+    /// fixture SAMPLE digest is refused.
+    pub fn grant_waiting_approval_os(
+        &self,
+        request: DesktopWaitingApprovalGrantRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.grant_waiting_approval_with(&secret_store, request, now)
+    }
+
+    pub fn grant_waiting_approval_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopWaitingApprovalGrantRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if request.expected_mission_revision == 0
+            || request.effect_id.as_str().trim().is_empty()
+            || request.expected_scope_digest.len() != 64
+            || !request
+                .expected_scope_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(DesktopDataError::InvalidWaitingApprovalGrant);
+        }
+        let project_id = request.project_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let broker = Self::waiting_approval_broker();
+        service.approve_proposed_effect(
+            &broker,
+            ApproveProposedEffect {
+                project_id,
+                mission_id: request.mission_id,
+                effect_id: request.effect_id,
+                expected_scope_digest: request.expected_scope_digest,
+                expected_mission_revision: request.expected_mission_revision,
+            },
+            ActorId::from_stable(format!("desktop-local-operator:{}", self.device_id)),
+            now,
+        )?;
+        let product_evidence = load_product_evidence(now)?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
             now,
         )
     }
@@ -2574,6 +2642,26 @@ impl DesktopDataPlane {
         &self.data_root
     }
 
+    fn waiting_approval_broker() -> EffectBroker {
+        EffectBroker::new(
+            EffectPolicy {
+                version: "policy-v1".into(),
+                allowed_capabilities: BTreeSet::from(["channel.preview".into()]),
+                allowed_classes: BTreeSet::from([EffectClass::ExternalWrite]),
+                max_amounts_minor: BTreeMap::from([(CurrencyCode::parse("CNY").expect("CNY"), 0)]),
+                rate_limits: vec![EffectRateLimit {
+                    rule_id: "desktop-preview-per-minute".into(),
+                    provider: "fixture-provider".into(),
+                    capability: "channel.preview".into(),
+                    max_executions: 10,
+                    window_seconds: 60,
+                }],
+            },
+            "desktop-waiting-approval-worker",
+        )
+        .with_lease_for(Duration::days(36_500))
+    }
+
     fn finish_mission_submission(
         &self,
         service: &ApplicationService,
@@ -3207,6 +3295,10 @@ pub enum DesktopDataError {
         "VM-11 next_contract_or_valid_terminal requires the frozen decision digest, parent contract digest, and exact Mission/Checkpoint revisions"
     )]
     InvalidVm11NextContractResolution,
+    #[error(
+        "WaitingApproval grant requires an exact Proposed Effect digest and Mission CAS revision"
+    )]
+    InvalidWaitingApprovalGrant,
     #[error("project name cannot be empty")]
     EmptyProjectName,
     #[error("recovery key must be exactly 32 bytes encoded as 64 hexadecimal characters")]
@@ -3251,16 +3343,16 @@ mod tests {
         ResearchPacket, RuntimeTextSubscriptionError, StartMission, StartRelationshipMission,
     };
     use hartevo_domain_kernel::{
-        AccountId, ActorId, Connection, ConnectionId, ConnectionProbe, ConsentPurpose,
-        ConsentRecordId, ConsentRequirement, ContactChannel, ContextBranchStatus,
-        ContextCapsuleStatus, EffectClass, EffectId, EvidenceId, ExternalIdentity, IdentityLink,
-        IdentityLinkId, IdentitySubject, KeyRecipient, KpiDirection, LegalBasis,
-        MissionCheckpointExecutor, MissionScheduleStatus, MissionStage, OrderId, OutcomeDecision,
-        OutcomeEvent, OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification,
-        OutcomeVerificationMethod, Person, PersonId, ProbeOutcome, ProjectEncryptionMode,
-        StorageMode, TaskId, TaskStatus, WorkProductId, WorkerLeaseStatus,
+        AccountId, ActorId, ApprovalDecision, Connection, ConnectionId, ConnectionProbe,
+        ConsentPurpose, ConsentRecordId, ConsentRequirement, ConsentState, ContactChannel,
+        ContextBranchStatus, ContextCapsuleStatus, EffectId, EffectStatus, EvidenceId,
+        ExternalIdentity, IdentityLink, IdentityLinkId, IdentitySubject, KeyRecipient,
+        KpiDirection, LegalBasis, MissionCheckpointExecutor, MissionScheduleStatus, MissionStage,
+        OrderId, OutcomeDecision, OutcomeEvent, OutcomeEventId, OutcomeEventKind,
+        OutcomeSourceVerification, OutcomeVerificationMethod, Person, PersonId, ProbeOutcome,
+        ProjectEncryptionMode, StorageMode, TaskId, TaskStatus, WorkProductId, WorkerLeaseStatus,
     };
-    use hartevo_effect_broker::{EffectBroker, EffectPolicy, EffectRateLimit};
+    use hartevo_effect_broker::EffectBroker;
     use hartevo_storage::MemorySecretStore;
     use rust_decimal::Decimal;
 
@@ -3278,23 +3370,7 @@ mod tests {
     }
 
     fn production_preview_broker() -> EffectBroker {
-        EffectBroker::new(
-            EffectPolicy {
-                version: "policy-v1".into(),
-                allowed_capabilities: BTreeSet::from(["channel.preview".into()]),
-                allowed_classes: BTreeSet::from([EffectClass::ExternalWrite]),
-                max_amounts_minor: BTreeMap::from([(CurrencyCode::parse("CNY").expect("CNY"), 0)]),
-                rate_limits: vec![EffectRateLimit {
-                    rule_id: "desktop-preview-per-minute".into(),
-                    provider: "fixture-provider".into(),
-                    capability: "channel.preview".into(),
-                    max_executions: 10,
-                    window_seconds: 60,
-                }],
-            },
-            "desktop-kernel-bind-worker",
-        )
-        .with_lease_for(Duration::days(36_500))
+        DesktopDataPlane::waiting_approval_broker()
     }
 
     fn assert_host_fail_closed_on_consent(plane: &mut DesktopDataPlane) {
@@ -8656,5 +8732,267 @@ sleep 30"#;
             DesktopDataPlane::at_data_root(&link_root),
             Err(DesktopDataError::InvalidDataRoot(path)) if path == link_root
         ));
+    }
+
+    fn propose_waiting_approval_preview(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        suffix: &str,
+        now: DateTime<Utc>,
+    ) -> (MissionId, EffectId, String, u64) {
+        let started = plane
+            .start_mission_with(
+                secrets,
+                project_id,
+                "准备受控预览；等待精确 digest 审批，禁止执行外部动作",
+                now,
+            )
+            .expect("WaitingApproval Mission");
+        let mission_id = started.inventory.projects[0].missions[0].mission_id.clone();
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(1))
+            .expect("application");
+        let effect_id = EffectId::from_stable(format!("desktop-waiting-approval-{suffix}"));
+        service
+            .propose_preview_effect(
+                project_id,
+                &mission_id,
+                ProposePreviewEffect {
+                    effect_id: effect_id.clone(),
+                    actor_id: ActorId::from("desktop-waiting-approval-actor"),
+                    capability: "channel.preview".into(),
+                    provider: "fixture-provider".into(),
+                    connection_id: None,
+                    account_id: None,
+                    required_scopes: BTreeSet::new(),
+                    description: "Publish exact preview after window grant".into(),
+                    target_resource: "preview://desktop-waiting-approval".into(),
+                    audience_digest: None,
+                    payload_digest: "1".repeat(64),
+                    asset_digests: BTreeSet::new(),
+                    scheduled_for: None,
+                    timezone: "UTC".into(),
+                    consent: ConsentState::NotRequired,
+                    consent_record_id: None,
+                    consent_requirement: None,
+                    policy_version: "policy-v1".into(),
+                    amount: Money::zero(CurrencyCode::parse("CNY").expect("CNY")),
+                    idempotency_key: format!("desktop-waiting-approval-{suffix}"),
+                    expires_in: Duration::hours(1),
+                },
+                now + Duration::seconds(2),
+            )
+            .expect("proposed Effect");
+        let mission = service
+            .load_mission(project_id, &mission_id)
+            .expect("WaitingApproval Mission after propose");
+        let effect = mission.effect(&effect_id).expect("proposed Effect");
+        assert_eq!(mission.stage, MissionStage::WaitingApproval);
+        assert_eq!(effect.status, EffectStatus::Proposed);
+        (
+            mission_id,
+            effect_id,
+            effect.approval_digest(),
+            mission.revision,
+        )
+    }
+
+    #[test]
+    fn waiting_approval_window_grant_records_approval_without_executing_effect() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(2);
+        let (mission_id, effect_id, scope_digest, revision) =
+            propose_waiting_approval_preview(&plane, &secrets, &project_id, "grant", now);
+        let request = DesktopWaitingApprovalGrantRequest {
+            project_id: project_id.clone(),
+            mission_id: mission_id.clone(),
+            effect_id: effect_id.clone(),
+            expected_scope_digest: scope_digest.clone(),
+            expected_mission_revision: revision,
+        };
+        let granted = plane
+            .grant_waiting_approval_with(&secrets, request.clone(), now + Duration::seconds(3))
+            .expect("production WaitingApproval grant");
+        let projected = granted.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == mission_id)
+            .expect("granted Mission projection");
+        assert_eq!(projected.stage, MissionStage::Running);
+        assert_eq!(projected.pending_approval_count, 0);
+        assert!(projected.pending_effects.is_empty());
+        assert_eq!(projected.verified_effect_count, 0);
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(4))
+            .expect("reopen after grant");
+        let mission = service
+            .load_mission(&project_id, &mission_id)
+            .expect("durable granted Mission");
+        let effect = mission.effect(&effect_id).expect("granted Effect");
+        let approval = effect.approval.as_ref().expect("Domain Kernel Approval");
+        assert_eq!(effect.status, EffectStatus::Approved);
+        assert_eq!(approval.decision, ApprovalDecision::Approved);
+        assert_eq!(approval.scope_digest, scope_digest);
+        assert!(approval.valid_until > now + Duration::seconds(3));
+        assert!(effect.receipt.is_none());
+        assert!(effect.verification.is_none());
+        let events_before_replay = service
+            .mission_events(&project_id, &mission_id)
+            .expect("grant events");
+        assert_eq!(
+            events_before_replay
+                .iter()
+                .filter(|event| event.event_type == "approval.decided")
+                .count(),
+            1
+        );
+        let event_json = serde_json::to_string(&events_before_replay).expect("event JSON");
+        assert!(!event_json.contains("Receipt"));
+        assert!(!event_json.contains("Verification"));
+
+        let replay_request = DesktopWaitingApprovalGrantRequest {
+            expected_mission_revision: projected.revision,
+            ..request
+        };
+        let replayed = plane
+            .grant_waiting_approval_with(&secrets, replay_request, now + Duration::seconds(5))
+            .expect("exact grant replay");
+        let replayed_projection = replayed.inventory.projects[0]
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == mission_id)
+            .expect("replayed Mission projection");
+        assert_eq!(replayed_projection.revision, projected.revision);
+        assert_eq!(replayed_projection.pending_approval_count, 0);
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(6))
+            .expect("reopen after replay");
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged replay events"),
+            events_before_replay
+        );
+        let replayed_effect = service
+            .load_mission(&project_id, &mission_id)
+            .expect("replayed Mission")
+            .effect(&effect_id)
+            .expect("replayed Effect")
+            .clone();
+        assert_eq!(replayed_effect.status, EffectStatus::Approved);
+        assert!(replayed_effect.receipt.is_none());
+        assert!(replayed_effect.verification.is_none());
+    }
+
+    #[test]
+    fn waiting_approval_grant_cas_mismatches_refuse_without_mutating_mission() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(3);
+        let (mission_id, effect_id, scope_digest, revision) =
+            propose_waiting_approval_preview(&plane, &secrets, &project_id, "cas", now);
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(3))
+            .expect("baseline before CAS refusals");
+        let before = service
+            .load_mission(&project_id, &mission_id)
+            .expect("unmutated Mission");
+        let events_before = service
+            .mission_events(&project_id, &mission_id)
+            .expect("baseline events");
+
+        let swapped = plane.grant_waiting_approval_with(
+            &secrets,
+            DesktopWaitingApprovalGrantRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                effect_id: effect_id.clone(),
+                expected_scope_digest: "a".repeat(64),
+                expected_mission_revision: revision,
+            },
+            now + Duration::seconds(4),
+        );
+        assert!(matches!(
+            swapped,
+            Err(DesktopDataError::Application(
+                ApplicationError::ProposedEffectApprovalDigestMismatch
+            ))
+        ));
+
+        let stale_revision = plane.grant_waiting_approval_with(
+            &secrets,
+            DesktopWaitingApprovalGrantRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                effect_id: effect_id.clone(),
+                expected_scope_digest: scope_digest.clone(),
+                expected_mission_revision: revision.saturating_add(1),
+            },
+            now + Duration::seconds(5),
+        );
+        assert!(matches!(
+            stale_revision,
+            Err(DesktopDataError::Application(
+                ApplicationError::MissionRevisionMismatch { expected, actual }
+            )) if expected == revision.saturating_add(1) && actual == revision
+        ));
+
+        let sample_digest = plane.grant_waiting_approval_with(
+            &secrets,
+            DesktopWaitingApprovalGrantRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                effect_id: effect_id.clone(),
+                expected_scope_digest: "SAMPLE-r1-not-an-effect-digest".into(),
+                expected_mission_revision: revision,
+            },
+            now + Duration::seconds(6),
+        );
+        assert!(matches!(
+            sample_digest,
+            Err(DesktopDataError::InvalidWaitingApprovalGrant)
+        ));
+
+        let expired = plane.grant_waiting_approval_with(
+            &secrets,
+            DesktopWaitingApprovalGrantRequest {
+                project_id: project_id.clone(),
+                mission_id: mission_id.clone(),
+                effect_id: effect_id.clone(),
+                expected_scope_digest: scope_digest,
+                expected_mission_revision: revision,
+            },
+            now + Duration::hours(2),
+        );
+        assert!(expired.is_err());
+
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::seconds(7))
+            .expect("reopen after CAS refusals");
+        let after = service
+            .load_mission(&project_id, &mission_id)
+            .expect("Mission after refusals");
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.stage, MissionStage::WaitingApproval);
+        let effect = after.effect(&effect_id).expect("still Proposed");
+        assert_eq!(effect.status, EffectStatus::Proposed);
+        assert!(effect.approval.is_none());
+        assert!(effect.receipt.is_none());
+        assert_eq!(
+            service
+                .mission_events(&project_id, &mission_id)
+                .expect("unchanged events"),
+            events_before
+        );
     }
 }
