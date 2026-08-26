@@ -1,0 +1,27 @@
+{
+  "authorTaskId": "01a03922-cfaf-7912-82e0-6105223b0af9",
+  "baseSha": "feec95f336c311eabc96d6d759f0071c24633b1b",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "Cargo.lock",
+    "hartevo-rs/cordis/Cargo.toml",
+    "hartevo-rs/cordis/src/context.rs",
+    "hartevo-rs/cordis/src/host.rs",
+    "hartevo-rs/cordis/src/kernel.rs",
+    "hartevo-rs/cordis/src/lib.rs",
+    "hartevo-rs/cordis/src/surface.rs",
+    "hartevo-rs/cordis/tests/domain_kernel.rs",
+    "hartevo-rs/cordis/tests/host.rs",
+    "hartevo-rs/desktop/src/cordis_host.rs",
+    "hartevo-rs/desktop/src/data_plane.rs",
+    "hartevo-rs/desktop/src/lib.rs"
+  ],
+  "pr": 962,
+  "receiptDigest": "cdd9055398c021f5b4f1a4f7c1ea3b1efed016e5384961cb3a6d4d3eb857cfdb",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-25T14:01:35Z",
+  "reviewedHeadSha": "06438960eec54ef1ca08c7223d7e61e041be81f2",
+  "reviewerTaskId": "01a03935-5325-7633-a0bc-a3c754b98764",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

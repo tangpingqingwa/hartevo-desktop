@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo-aws-application-signals-result-contract/v1",
+  "schemaVersion": "hartevo-aws-application-signals-result-contract/v1",
+  "contractVersion": "aws-application-signals-result-e1/v1",
+  "evidenceLevel": "E1",
+  "layer": 1,
+  "service": {
+    "id": "aws.application-signals.result",
+    "implementation": "AwsApplicationSignalsService",
+    "version": "1.0.0",
+    "apiVersion": "2020-07-22",
+    "readOnly": true,
+    "liveExecution": false,
+    "operations": [
+      "ListServices",
+      "GetService",
+      "ListServiceLevelObjectives",
+      "GetServiceLevelObjective",
+      "Propose",
+      "Record",
+      "Verify"
+    ]
+  },
+  "provider": {
+    "id": "aws.application-signals.read",
+    "implementation": "AwsApplicationSignalsProvider",
+    "providerVersion": "1.0.0",
+    "providerRevision": "aws-application-signals-2020-07-22-r1",
+    "apiVersion": "2020-07-22",
+    "readOnly": true,
+    "native": false,
+    "connected": false,
+    "acceptedTransports": ["recording", "fixture", "loopback", "BLOCKED_ENV"],
+    "allowedOperations": [
+      "ListServices",
+      "GetService",
+      "ListServiceLevelObjectives",
+      "GetServiceLevelObjective"
+    ],
+    "iamPermissions": [
+      "application-signals:ListServices",
+      "application-signals:GetService",
+      "application-signals:ListServiceLevelObjectives",
+      "application-signals:GetServiceLevelObjective"
+    ],
+    "opaquePagination": true,
+    "bounded": true
+  },
+  "consumer": {
+    "id": "mission.aws-application-signals-result",
+    "implementation": "MissionAwsApplicationSignalsConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "deploymentBound": true,
+    "releaseBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false
+  },
+  "scope": {
+    "requiredFences": [
+      "accountId",
+      "region",
+      "serviceName",
+      "sloId",
+      "operationName",
+      "timeWindow",
+      "deploymentId",
+      "deploymentRevision",
+      "releaseId",
+      "releaseRevision",
+      "missionId",
+      "missionRevision",
+      "projectId",
+      "permissionDigest",
+      "scopeDigest",
+      "windowDigest"
+    ],
+    "secret": "opaque_non_serializing_sigv4_secret_reference"
+  },
+  "digests": [
+    "versionDigest",
+    "apiDigest",
+    "contractDigest",
+    "providerDigest",
+    "permissionDigest",
+    "scopeDigest",
+    "windowDigest",
+    "evidenceDigest"
+  ],
+  "reads": {
+    "ListServices": {
+      "items": "serviceSummary",
+      "bounded": true,
+      "readOnly": true,
+      "writes": false
+    },
+    "GetService": {
+      "items": "serviceDetail",
+      "bounded": true,
+      "readOnly": true,
+      "writes": false
+    },
+    "ListServiceLevelObjectives": {
+      "items": "sloSummary",
+      "bounded": true,
+      "readOnly": true,
+      "writes": false
+    },
+    "GetServiceLevelObjective": {
+      "items": "sloStatusAndErrorBudgetSummary",
+      "bounded": true,
+      "readOnly": true,
+      "writes": false
+    },
+    "pagination": "opaque_cursor_digest_only",
+    "record": "redacted_normalized_response",
+    "verify": [
+      "requestDigest",
+      "cursorBinding",
+      "accountFence",
+      "regionFence",
+      "serviceFence",
+      "sloFence",
+      "operationFence",
+      "timeWindowFence",
+      "permissionDigest",
+      "scopeDigest",
+      "windowDigest",
+      "evidenceDigest"
+    ]
+  },
+  "sloSummaries": {
+    "statuses": [
+      "healthy",
+      "warning",
+      "breached",
+      "no_data",
+      "partial",
+      "expired",
+      "access_lost",
+      "provider_unknown"
+    ],
+    "transition": true,
+    "errorBudget": true,
+    "noDataIsHealthy": false
+  },
+  "redaction": {
+    "retain": [
+      "boundedServiceSummary",
+      "boundedServiceDetail",
+      "boundedSloSummary",
+      "boundedSloStatus",
+      "boundedErrorBudget",
+      "statusTransition",
+      "cursorDigest",
+      "requestDigest",
+      "responseDigest",
+      "evidenceDigest"
+    ],
+    "drop": [
+      "secretMaterial",
+      "rawSigV4Headers",
+      "rawProviderPayload",
+      "rawNextToken",
+      "rawMetricSeries",
+      "rawTraceData",
+      "rawLogData"
+    ]
+  },
+  "authority": {
+    "readOnly": true,
+    "connected": false,
+    "nativeProvider": false,
+    "liveCredentialResolution": false,
+    "rawProviderPayload": false,
+    "rawSecretMaterial": false,
+    "telemetryExport": false,
+    "sloWrites": false,
+    "metricWrites": false,
+    "alertPaging": false,
+    "causalClaims": false,
+    "durableRequestReceipt": false,
+    "costReceipt": false,
+    "independentClosedWindowReadback": false,
+    "outcomeAuthority": false,
+    "workProductAdoption": false
+  },
+  "nativeClaims": {
+    "connected": false,
+    "nativeProvider": false,
+    "durableReceipt": false,
+    "blockedEnvironmentIsNative": false,
+    "fixtureIsNative": false,
+    "recordingIsNative": false,
+    "loopbackIsNative": false
+  },
+  "forbiddenEffects": [
+    "PutServiceLevelObjective",
+    "DeleteServiceLevelObjective",
+    "PutMetricData",
+    "ExportTraces",
+    "ExportLogs",
+    "PageAlerts",
+    "CausalClaim",
+    "KernelOutcomeAdoption"
+  ],
+  "layer2Exits": [
+    "nativeSigV4",
+    "durableRequestAndCostReceipt",
+    "independentClosedWindowReadback",
+    "consentedEffects"
+  ],
+  "honestNativeGap": "Layer 1 consumes only fixture, recording, loopback, or BLOCKED_ENV transport results and never claims Connected/native. Native SigV4, durable request/cost receipts, independent closed-window readback, and consented effects remain Layer-2 exits."
+}

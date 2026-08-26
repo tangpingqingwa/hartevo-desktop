@@ -1,7 +1,25 @@
 //! Application commands that connect the UI, domain kernel, store, and effect broker.
 
+mod observation_evidence_pack;
+mod plugin_invocation_timeline;
 mod runtime_text_subscription;
 
+pub use observation_evidence_pack::{
+    ObservationClassification, ObservationEvidencePack, ObservationPackConsumer,
+    ObservationPipelineError, ObservationPipelineRequest, ObservationPipelineResult,
+    ObservationPlanBinding, ObservationProviderRequest, ObservationSourceBinding,
+    ObservationSourceKind, ObservationStopCommand, ObservationStopResult,
+    RuntimeObservationProvider, TypedRuntimeObservation,
+};
+pub use plugin_invocation_timeline::{
+    PLUGIN_INVOCATION_TIMELINE_MAX_PAGE_SIZE, PluginInvocationTimeline,
+    PluginInvocationTimelineAuditPage, PluginInvocationTimelineCursor,
+    PluginInvocationTimelineEntry, PluginInvocationTimelineError,
+    PluginInvocationTimelineInlineNode, PluginInvocationTimelineInlinePage,
+    PluginInvocationTimelineLifecycle, PluginInvocationTimelineMissionShellConsumer,
+    PluginInvocationTimelineNodeStatus, PluginInvocationTimelineProvider,
+    PluginInvocationTimelineScope, PluginInvocationTimelineStage,
+};
 pub use runtime_text_subscription::{
     CatalogMissionExecutionHandle, CatalogMissionExecutionStart,
     RUNTIME_TEXT_SUBSCRIPTION_MAX_PAGE_SIZE, RuntimeTextSubscriptionBatch,
@@ -16,11 +34,12 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_browser_adapter::{
-    BrowserAction, BrowserControlHost, BrowserError, BrowserFileGrant, BrowserFileType,
-    BrowserIdentity, BrowserLeaseProof, BrowserLocatorResolution, BrowserProfile,
-    BrowserRecipeActivation, BrowserRecipeCandidate, BrowserRecipePreparedPlan,
-    BrowserRecipeRelease, BrowserRecipeResolvedAction, BrowserWorkspace, FileBroker,
-    FileBrokerReconciliation, FileSafetyScanner, FileUploadHandle, TrustedBrowserRecipeKey,
+    BrowserAction, BrowserActionBatch, BrowserBatchReceipt, BrowserControlHost, BrowserError,
+    BrowserFileGrant, BrowserFileType, BrowserIdentity, BrowserLeaseProof,
+    BrowserLocatorResolution, BrowserProfile, BrowserRecipeActivation, BrowserRecipeCandidate,
+    BrowserRecipePreparedPlan, BrowserRecipeRelease, BrowserRecipeResolvedAction, BrowserWorkspace,
+    FileBroker, FileBrokerReconciliation, FileSafetyScanner, FileUploadHandle,
+    TrustedBrowserRecipeKey,
 };
 use hartevo_catalog::{CapabilityManifest, Catalog, CatalogError, MissionManifest};
 use hartevo_cloud_storage::{
@@ -34,30 +53,30 @@ use hartevo_context_fabric::{
     ContextMaterialResolver, ContextTokenizer, ResolvedContextMaterial, RuntimeContextEnvelope,
 };
 use hartevo_domain_kernel::{
-    AcceptanceCheck, AccountId, ActorId, ApprovalPolicy, AttributionRecord,
-    AutomatedReplyAuthorization, AutonomyLevel, BrowserControlLeaseId, BrowserFileClaimId,
-    BrowserFileGrantId, BrowserProfileId, BrowserRecipeId, BrowserTabId, BrowserWorkspaceId,
-    Cadence, CadenceTriggerKind, Campaign, CampaignId, CampaignSendAuthorization, CommissionId,
-    CommissionRecord, Company, CompanyId, Connection, ConnectionError, ConnectionId,
-    ConnectionProbe, ConnectionSnapshot, ConsentPurpose, ConsentRecord, ConsentRecordId,
-    ConsentRequirement, ConsentState, Constraint, ContextAssemblyId, ContextBranch,
-    ContextBranchId, ContextBranchMerge, ContextBranchMergeId, ContextBranchStatus, ContextBudget,
-    ContextCapsule, ContextCapsuleId, ContextCapsuleStatus, ContextCheckpoint, ContextCheckpointId,
-    ContextCompactionRecord, ContextCompactionRecordId, ContextContinuationLedgerId,
-    ContextDataPolicy, ContextError, ContextFactGrant, ContextFoundationSnapshot, ContextInputRefs,
-    ContextMergePolicy, ContextReturnContract, ContextReturnReceipt, ContextWorkerMailboxId,
-    ContextWorkerMessage, ContextWorkerMessageId, ContextWorkerMessageKind, ContextWorkingItem,
-    ContextWorkingSet, ContextWorkingSetId, ContextWorkspace, ContextWorkspaceId,
-    ContinuationEntry, ContinuationEntryInput, ContinuationEntryKind, ContinuationLedger,
-    Conversation, ConversationEffectGuard, ConversationId, ConversationIdentitySnapshot,
-    CreatorApplicationId, CreatorApplicationInput, CreatorCandidate, CreatorContactEffectGuard,
-    CreatorDeliverableInput, CreatorEligibility, CreatorExternalProof, CreatorHiring,
-    CreatorHiringError, CreatorHiringId, CreatorHiringSpec, CreatorId, CreatorIdentitySnapshot,
-    CreatorMilestoneId, CreatorPayoutConfirmation, CreatorTask, CreatorTaskId, CreatorTaskSpec,
-    CreatorWorkError, CurrencyCode, DeletionError, DeletionId, DeletionReason, DeletionTombstone,
-    DeliverableId, DeliverableReviewInput, DeviceAttachment, DeviceAttachmentId,
-    DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim, DeviceHandoffContext,
-    DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
+    AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, ApprovalPolicy,
+    AttributionRecord, AutomatedReplyAuthorization, AutonomyLevel, BrowserActionBatchId,
+    BrowserControlLeaseId, BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId,
+    BrowserRecipeId, BrowserTabId, BrowserWorkspaceId, Cadence, CadenceTriggerKind, Campaign,
+    CampaignId, CampaignSendAuthorization, CommissionId, CommissionRecord, Company, CompanyId,
+    Connection, ConnectionError, ConnectionId, ConnectionProbe, ConnectionSnapshot, ConsentPurpose,
+    ConsentRecord, ConsentRecordId, ConsentRequirement, ConsentState, Constraint,
+    ContextAssemblyId, ContextBranch, ContextBranchId, ContextBranchMerge, ContextBranchMergeId,
+    ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleId, ContextCapsuleStatus,
+    ContextCheckpoint, ContextCheckpointId, ContextCompactionRecord, ContextCompactionRecordId,
+    ContextContinuationLedgerId, ContextDataPolicy, ContextError, ContextFactGrant,
+    ContextFoundationSnapshot, ContextInputRefs, ContextMergePolicy, ContextReturnContract,
+    ContextReturnReceipt, ContextWorkerMailboxId, ContextWorkerMessage, ContextWorkerMessageId,
+    ContextWorkerMessageKind, ContextWorkingItem, ContextWorkingSet, ContextWorkingSetId,
+    ContextWorkspace, ContextWorkspaceId, ContinuationEntry, ContinuationEntryInput,
+    ContinuationEntryKind, ContinuationLedger, Conversation, ConversationEffectGuard,
+    ConversationId, ConversationIdentitySnapshot, CreatorApplicationId, CreatorApplicationInput,
+    CreatorCandidate, CreatorContactEffectGuard, CreatorDeliverableInput, CreatorEligibility,
+    CreatorExternalProof, CreatorHiring, CreatorHiringError, CreatorHiringId, CreatorHiringSpec,
+    CreatorId, CreatorIdentitySnapshot, CreatorMilestoneId, CreatorPayoutConfirmation, CreatorTask,
+    CreatorTaskId, CreatorTaskSpec, CreatorWorkError, CurrencyCode, DeletionError, DeletionId,
+    DeletionReason, DeletionTombstone, DeliverableId, DeliverableReviewInput, DeviceAttachment,
+    DeviceAttachmentId, DeviceAttachmentMethod, DeviceAttachmentStatus, DeviceHandoffClaim,
+    DeviceHandoffContext, DeviceHandoffGrant, DeviceHandoffId, DeviceHandoffRevocation, DeviceId,
     DevicePublicKeyRegistration, Effect, EffectClass, EffectId, EffectRisk, EffectSpec,
     EffectStatus, Evidence, EvidenceId, EvidenceStatus, FactId, FundingReservation, IdentityError,
     IdentityLink, IdentityLinkId, IdentityLinkStatus, IdentitySubject, InboundIngest,
@@ -516,6 +535,38 @@ pub struct ProposePreviewEffect {
     pub amount: Money,
     pub idempotency_key: String,
     pub expires_in: Duration,
+}
+
+/// Window-bound ApprovalGrant for one Proposed Effect. The frozen digest and
+/// Mission CAS revision must come from the SQLCipher projection; success
+/// records Domain Kernel `ApprovalDecision::Approved` and does not execute the
+/// Effect, mint a Receipt, or claim Verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApproveProposedEffect {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub expected_scope_digest: String,
+    pub expected_mission_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposedEffectApprovalGrant {
+    pub mission: Mission,
+    pub effect_id: EffectId,
+    pub approval: Approval,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingEffectApprovalProjection {
+    pub effect_id: EffectId,
+    pub capability: String,
+    pub provider: String,
+    pub description: String,
+    pub scope_digest: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -2181,6 +2232,15 @@ pub struct ContinueBrowserWorkspace {
     pub new_lease_id: BrowserControlLeaseId,
     pub lease_expires_at: DateTime<Utc>,
     pub evidence_digest: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AcknowledgeBrowserBatchReceipt {
+    pub project_id: ProjectId,
+    pub workspace_id: BrowserWorkspaceId,
+    pub expected_revision: u64,
+    pub batch: BrowserActionBatch,
+    pub receipt: BrowserBatchReceipt,
 }
 
 #[derive(Clone)]
@@ -4314,6 +4374,8 @@ pub struct MissionProjection {
     pub work_product_count: usize,
     pub work_products: Vec<WorkProductProjection>,
     pub pending_approval_count: usize,
+    #[serde(default)]
+    pub pending_effects: Vec<PendingEffectApprovalProjection>,
     pub verified_effect_count: usize,
     pub outcome_summary: Option<String>,
     #[serde(default)]
@@ -4790,6 +4852,50 @@ impl ApplicationService {
         Ok(self
             .store
             .load_browser_workspace(project_id, workspace_id)?)
+    }
+
+    pub fn acknowledge_browser_batch_receipt(
+        &mut self,
+        command: AcknowledgeBrowserBatchReceipt,
+        now: DateTime<Utc>,
+    ) -> Result<BrowserWorkspace, ApplicationError> {
+        let mut workspace = self
+            .store
+            .load_browser_workspace(&command.project_id, &command.workspace_id)?;
+        command.receipt.validate_for(&command.batch)?;
+        if command.batch.workspace_id != command.workspace_id
+            || command.batch.project_id != command.project_id
+        {
+            return Err(BrowserError::InvalidBatchReceipt.into());
+        }
+        if workspace.batch_receipt(&command.batch.id) == Some(&command.receipt)
+            && (workspace.revision == command.expected_revision
+                || workspace.revision == command.expected_revision.saturating_add(1))
+        {
+            return Ok(workspace);
+        }
+        workspace.acknowledge_batch_receipt(
+            command.expected_revision,
+            &command.batch,
+            command.receipt,
+            now,
+        )?;
+        self.store
+            .update_browser_workspace_atomic(&workspace, command.expected_revision)?;
+        Ok(workspace)
+    }
+
+    pub fn load_browser_batch_receipt(
+        &self,
+        project_id: &ProjectId,
+        workspace_id: &BrowserWorkspaceId,
+        batch_id: &BrowserActionBatchId,
+    ) -> Result<Option<BrowserBatchReceipt>, ApplicationError> {
+        Ok(self
+            .store
+            .load_browser_workspace(project_id, workspace_id)?
+            .batch_receipt(batch_id)
+            .cloned())
     }
 
     pub fn install_browser_recipe_trust_key(
@@ -7412,6 +7518,31 @@ impl ApplicationService {
             now,
         )?;
         Ok(record)
+    }
+
+    pub fn load_consent_record(
+        &self,
+        project_id: &ProjectId,
+        record_id: &ConsentRecordId,
+    ) -> Result<ConsentRecord, ApplicationError> {
+        Ok(self.store.load_consent_record(project_id, record_id)?)
+    }
+
+    /// Application-owned consent inventory for one Project. Desktop binds the
+    /// live Domain Kernel record from this list; it never invents a second store.
+    pub fn list_consent_records(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<ConsentRecord>, ApplicationError> {
+        Ok(self.store.list_consent_records(project_id)?)
+    }
+
+    pub fn list_missions(&self, project_id: &ProjectId) -> Result<Vec<Mission>, ApplicationError> {
+        Ok(self.store.list_missions(project_id)?)
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<Project>, ApplicationError> {
+        Ok(self.store.list_projects()?)
     }
 
     pub fn open_conversation(
@@ -12596,6 +12727,88 @@ impl ApplicationService {
         Ok(mission)
     }
 
+    /// Grants Domain Kernel Approval for one Proposed Effect using the exact
+    /// frozen digest and Mission revision. The window cannot stamp a SAMPLE
+    /// digest. Success never executes the Effect or mints a Receipt.
+    pub fn approve_proposed_effect(
+        &mut self,
+        broker: &EffectBroker,
+        command: ApproveProposedEffect,
+        actor_id: ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<ProposedEffectApprovalGrant, ApplicationError> {
+        if command.expected_mission_revision == 0
+            || command.effect_id.as_str().trim().is_empty()
+            || !is_sha256_text(&command.expected_scope_digest)
+        {
+            return Err(ApplicationError::ProposedEffectApprovalCommandMismatch);
+        }
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        if mission.revision != command.expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: command.expected_mission_revision,
+                actual: mission.revision,
+            });
+        }
+        {
+            let effect = mission.effect(&command.effect_id)?;
+            if effect.status != EffectStatus::Proposed {
+                let replayed_approval = effect.approval.clone().filter(|approval| {
+                    approval.decision == ApprovalDecision::Approved
+                        && approval.scope_digest == command.expected_scope_digest
+                        && approval.scope_digest == effect.approval_digest()
+                        && now < approval.valid_until
+                });
+                return if let Some(approval) = replayed_approval {
+                    Ok(ProposedEffectApprovalGrant {
+                        mission,
+                        effect_id: command.effect_id,
+                        approval,
+                        replayed: true,
+                    })
+                } else {
+                    Err(ApplicationError::ProposedEffectApprovalUnavailable)
+                };
+            }
+            if mission.stage != MissionStage::WaitingApproval {
+                return Err(ApplicationError::ProposedEffectApprovalUnavailable);
+            }
+            if effect.approval_digest() != command.expected_scope_digest {
+                return Err(ApplicationError::ProposedEffectApprovalDigestMismatch);
+            }
+        }
+        let expected_revision = mission.revision;
+        broker.approve(&mut mission, &command.effect_id, actor_id, &self.store, now)?;
+        let approval = mission
+            .effect(&command.effect_id)?
+            .approval
+            .clone()
+            .ok_or(ApplicationError::ProposedEffectApprovalUnavailable)?;
+        if approval.decision != ApprovalDecision::Approved
+            || approval.scope_digest != command.expected_scope_digest
+            || now >= approval.valid_until
+        {
+            return Err(ApplicationError::ProposedEffectApprovalUnavailable);
+        }
+        self.store.update_mission_atomic(
+            &mission,
+            expected_revision,
+            &[PendingEvent::new(
+                "approval.decided",
+                serde_json::json!({"effectId": command.effect_id, "decision": "approved"}),
+                now,
+            )],
+        )?;
+        Ok(ProposedEffectApprovalGrant {
+            mission,
+            effect_id: command.effect_id,
+            approval,
+            replayed: false,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn execute_effect(
         &mut self,
@@ -17743,6 +17956,19 @@ fn mission_projection(
             .iter()
             .filter(|effect| effect.status == hartevo_domain_kernel::EffectStatus::Proposed)
             .count(),
+        pending_effects: mission
+            .effects
+            .iter()
+            .filter(|effect| effect.status == hartevo_domain_kernel::EffectStatus::Proposed)
+            .map(|effect| PendingEffectApprovalProjection {
+                effect_id: effect.id.clone(),
+                capability: effect.capability.clone(),
+                provider: effect.provider.clone(),
+                description: effect.description.clone(),
+                scope_digest: effect.approval_digest(),
+                expires_at: effect.expires_at,
+            })
+            .collect(),
         verified_effect_count: mission
             .effects
             .iter()
@@ -21158,6 +21384,14 @@ pub enum ApplicationError {
     Vm11NextContractCommandMismatch,
     #[error("the VM-11 next-contract replay does not match its append-once durable evidence")]
     Vm11NextContractReplayMismatch,
+    #[error(
+        "WaitingApproval grant requires an exact Proposed Effect digest and Mission CAS revision"
+    )]
+    ProposedEffectApprovalCommandMismatch,
+    #[error("the current Mission is not WaitingApproval with a Proposed Effect to grant")]
+    ProposedEffectApprovalUnavailable,
+    #[error("the WaitingApproval grant digest no longer matches the frozen Proposed Effect")]
+    ProposedEffectApprovalDigestMismatch,
     #[error(
         "Catalog Mission route, mode, market, language, audience, timezone, or budget is invalid"
     )]
@@ -38687,6 +38921,184 @@ sleep 30"#
         assert_eq!(
             restored_workspace.control_state,
             hartevo_browser_adapter::BrowserControlState::AgentControlled
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one journey proves exact browser prefix persistence, restart, tamper rejection, idempotent acknowledgement, and suffix-only recovery"
+    )]
+    fn browser_batch_receipt_survives_restart_and_resumes_only_exact_suffix() {
+        use hartevo_browser_adapter::{
+            BrowserActionKind, BrowserActionRisk, BrowserActionSurface, BrowserBatchReceiptState,
+        };
+        use hartevo_domain_kernel::BrowserSnapshotId;
+        use hartevo_storage::DatabaseKey;
+
+        let directory = tempfile::tempdir().expect("batch receipt directory");
+        let database_path = directory.path().join("browser-batch-receipt.sqlite3");
+        let key = DatabaseKey::new([83; 32]).expect("database key");
+        let store = ProjectStore::open(&database_path, &key).expect("encrypted store");
+        let mut fixture = browser_application_fixture(store, directory.path().to_path_buf());
+        let mut host = registered_browser_host(&fixture.profile, &fixture.workspace);
+        let proof = fixture
+            .workspace
+            .agent_lease_proof(now())
+            .expect("lease proof");
+        let snapshot = host
+            .observe(
+                &fixture.workspace.id,
+                &proof,
+                BrowserSnapshotId::from("snapshot-browser-batch-receipt"),
+                &fixture.workspace.active_tab_id,
+                now(),
+            )
+            .expect("initial snapshot");
+        let actions = [1, 2]
+            .into_iter()
+            .map(|sequence| BrowserAction {
+                sequence,
+                kind: BrowserActionKind::Verify,
+                surface: BrowserActionSurface::Semantic,
+                risk: BrowserActionRisk::ReadOnly,
+                tab_id: fixture.workspace.active_tab_id.clone(),
+                snapshot_id: Some(snapshot.id.clone()),
+                element_ref: None,
+                target_origin_digest: sha256(b"https://example.com"),
+                payload_digest: "9".repeat(64),
+            })
+            .collect::<Vec<_>>();
+        let batch = BrowserActionBatch::read_only(
+            BrowserActionBatchId::from("batch-browser-durable-prefix"),
+            &fixture.profile,
+            &fixture.workspace,
+            proof,
+            "a".repeat(64),
+            actions,
+            now(),
+            now() + Duration::minutes(5),
+        )
+        .expect("read-only batch");
+        let mut cursor = host
+            .begin_read_only_batch(&batch, now())
+            .expect("begin batch");
+        let first = host
+            .execute_next(&mut cursor, now())
+            .expect("first action")
+            .expect("first result");
+        assert_eq!(first.action_sequence, 1);
+        let receipt = cursor.receipt().expect("first prefix receipt");
+        assert_eq!(receipt.state, BrowserBatchReceiptState::Active);
+
+        let mut tampered = receipt.clone();
+        tampered.result_digest = "f".repeat(64);
+        assert!(matches!(
+            fixture.service.acknowledge_browser_batch_receipt(
+                AcknowledgeBrowserBatchReceipt {
+                    project_id: fixture.project_id.clone(),
+                    workspace_id: fixture.workspace.id.clone(),
+                    expected_revision: 1,
+                    batch: batch.clone(),
+                    receipt: tampered,
+                },
+                now() + Duration::seconds(1),
+            ),
+            Err(ApplicationError::Browser(BrowserError::InvalidBatchReceipt))
+        ));
+
+        let acknowledge = AcknowledgeBrowserBatchReceipt {
+            project_id: fixture.project_id.clone(),
+            workspace_id: fixture.workspace.id.clone(),
+            expected_revision: 1,
+            batch: batch.clone(),
+            receipt: receipt.clone(),
+        };
+        let acknowledged = fixture
+            .service
+            .acknowledge_browser_batch_receipt(acknowledge.clone(), now() + Duration::seconds(1))
+            .expect("persist exact prefix");
+        assert_eq!(acknowledged.revision, 2);
+        assert_eq!(
+            fixture
+                .service
+                .acknowledge_browser_batch_receipt(acknowledge, now() + Duration::seconds(1),)
+                .expect("exact acknowledgement replay")
+                .revision,
+            2
+        );
+
+        let project_id = fixture.project_id.clone();
+        let profile_id = fixture.profile.id.clone();
+        let workspace_id = fixture.workspace.id.clone();
+        drop(host);
+        drop(fixture);
+        let mut restarted = ApplicationService::new(
+            ProjectStore::open(&database_path, &key).expect("application restart"),
+        );
+        let restored_profile = restarted
+            .load_browser_profile(&project_id, &profile_id)
+            .expect("restored profile");
+        let restored_workspace = restarted
+            .load_browser_workspace(&project_id, &workspace_id)
+            .expect("restored workspace");
+        let restored_receipt = restarted
+            .load_browser_batch_receipt(&project_id, &workspace_id, &batch.id)
+            .expect("load receipt")
+            .expect("durable receipt");
+        assert_eq!(restored_receipt, receipt);
+
+        let mut restarted_host = registered_browser_host(&restored_profile, &restored_workspace);
+        restarted_host
+            .observe(
+                &workspace_id,
+                &restored_workspace
+                    .agent_lease_proof(now() + Duration::seconds(2))
+                    .expect("restored lease"),
+                snapshot.id,
+                &restored_workspace.active_tab_id,
+                now() + Duration::seconds(2),
+            )
+            .expect("restored live snapshot");
+        let mut resumed = restarted_host
+            .resume_read_only_batch(&batch, &restored_receipt, now() + Duration::seconds(2))
+            .expect("resume exact prefix");
+        let second = restarted_host
+            .execute_next(&mut resumed, now() + Duration::seconds(2))
+            .expect("execute suffix")
+            .expect("second result");
+        assert_eq!(second.action_sequence, 2);
+        assert!(
+            restarted_host
+                .execute_next(&mut resumed, now() + Duration::seconds(2))
+                .expect("complete suffix")
+                .is_none()
+        );
+        let completed = resumed.receipt().expect("completed receipt");
+        assert_eq!(completed.completed_action_count, 2);
+        assert_eq!(completed.state, BrowserBatchReceiptState::Completed);
+        let completed_workspace = restarted
+            .acknowledge_browser_batch_receipt(
+                AcknowledgeBrowserBatchReceipt {
+                    project_id: project_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    expected_revision: 2,
+                    batch,
+                    receipt: completed.clone(),
+                },
+                now() + Duration::seconds(3),
+            )
+            .expect("persist completed prefix");
+        assert_eq!(completed_workspace.revision, 3);
+        assert_eq!(
+            restarted
+                .load_browser_batch_receipt(
+                    &project_id,
+                    &workspace_id,
+                    &BrowserActionBatchId::from("batch-browser-durable-prefix"),
+                )
+                .expect("reload completed receipt"),
+            Some(completed)
         );
     }
 
