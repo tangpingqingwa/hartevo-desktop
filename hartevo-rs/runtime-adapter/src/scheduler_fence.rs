@@ -1,12 +1,14 @@
-//! Runtime-side scheduler fencing without process or Application wiring.
+//! Runtime-side scheduler fencing for production spawn and turn dispatch.
 //!
 //! [`RuntimeSchedulerGate`] is the narrow seam between a scheduler dispatch
 //! ticket and the existing [`super::StdioRuntime`] protocol methods. It binds
 //! one schedule lease to one generation of [`super::RuntimeMapping`], accepts
 //! only a turn dispatch for that exact mapping, and records terminal outcomes
-//! by attempt digest. The gate never starts a process or retries a protocol
-//! operation. Callers must record an uncertain protocol outcome explicitly;
-//! uncertain attempts remain replay-suppressed across takeover.
+//! by attempt digest. The gate itself does not spawn or retry a child; production
+//! callers must present a current [`RuntimeAttemptPermit`] before
+//! `spawn_prepared` or `start_mapped_turn`. Callers must record an uncertain
+//! protocol outcome explicitly; uncertain attempts remain replay-suppressed
+//! across takeover.
 
 use std::collections::BTreeMap;
 
@@ -180,12 +182,13 @@ struct RuntimeAttemptRecord {
     receipt: Option<RuntimeDispatchReceipt>,
 }
 
-/// A process-free Runtime dispatch gate.
+/// Runtime dispatch gate bound to one schedule digest, mapping, and lease.
 ///
-/// The caller obtains a permit immediately before calling
-/// `StdioRuntime::start_mapped_turn`. If the protocol write or its outcome is
-/// ambiguous, the caller must call [`Self::record_uncertain`]. That state is
-/// deliberately terminal for replay, including after a lease takeover.
+/// Production callers obtain a permit immediately before
+/// `StdioRuntime::spawn_prepared` or `StdioRuntime::start_mapped_turn`. If the
+/// protocol write or its outcome is ambiguous, the caller must call
+/// [`Self::record_uncertain`]. That state is deliberately terminal for replay,
+/// including after a lease takeover.
 #[derive(Debug)]
 pub struct RuntimeSchedulerGate {
     binding: RuntimeScheduleBinding,
@@ -204,6 +207,26 @@ impl RuntimeSchedulerGate {
 
     pub const fn binding(&self) -> &RuntimeScheduleBinding {
         &self.binding
+    }
+
+    /// Accepts only a current Running permit for this schedule, mapping, and
+    /// lease. Stale, taken-over, failed, uncertain, and completed permits fail
+    /// closed so a retry must call [`Self::authorize_turn`] again.
+    pub fn require_current_permit(
+        &self,
+        permit: &RuntimeAttemptPermit,
+    ) -> Result<(), RuntimeSchedulerError> {
+        let record = self.record_for_permit(permit)?;
+        match record.status {
+            RuntimeAttemptStatus::Running => Ok(()),
+            RuntimeAttemptStatus::Failed => Err(RuntimeSchedulerError::AttemptPermitLost),
+            RuntimeAttemptStatus::Uncertain => {
+                Err(RuntimeSchedulerError::UncertainReplaySuppressed)
+            }
+            RuntimeAttemptStatus::Completed => {
+                Err(RuntimeSchedulerError::CompletedReplaySuppressed)
+            }
+        }
     }
 
     /// Authorizes a fresh Runtime turn for the exact bound thread mapping.
@@ -479,6 +502,21 @@ impl RuntimeSchedulerGate {
         Ok(())
     }
 
+    fn record_for_permit(
+        &self,
+        permit: &RuntimeAttemptPermit,
+    ) -> Result<&RuntimeAttemptRecord, RuntimeSchedulerError> {
+        self.validate_permit_shape(permit)?;
+        let record = self
+            .attempts
+            .get(&permit.attempt_id_digest)
+            .ok_or(RuntimeSchedulerError::AttemptNotFound)?;
+        if record.permit != *permit {
+            return Err(RuntimeSchedulerError::AttemptPermitLost);
+        }
+        Ok(record)
+    }
+
     fn record_for_permit_mut(
         &mut self,
         permit: &RuntimeAttemptPermit,
@@ -521,7 +559,7 @@ fn validate_digest(value: &str) -> bool {
     value.len() == DIGEST_HEX_LENGTH && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum RuntimeSchedulerError {
     #[error("runtime schedule identifier digest is invalid")]
     InvalidScheduleId,
@@ -746,6 +784,54 @@ mod tests {
         assert!(matches!(
             gate.accept_dispatch(&permit, &dispatch(&no_turn, "turn-wrong", b'1', b'2')),
             Err(RuntimeSchedulerError::MappingScopeMismatch)
+        ));
+    }
+
+    #[test]
+    fn require_current_permit_fails_closed_for_stale_taken_over_uncertain_and_completed() {
+        let mut gate = RuntimeSchedulerGate::new(binding());
+        let attempt = digest(b'p');
+        let permit = authorize(&mut gate, &attempt).expect("permit");
+        gate.require_current_permit(&permit)
+            .expect("running permit is current");
+
+        gate.record_failed(&permit).expect("failed");
+        assert!(matches!(
+            gate.require_current_permit(&permit),
+            Err(RuntimeSchedulerError::AttemptPermitLost)
+        ));
+        let retry = authorize(&mut gate, &attempt).expect("fresh permit");
+        assert_ne!(permit, retry);
+        gate.require_current_permit(&retry)
+            .expect("fresh failed-retry permit");
+        assert!(matches!(
+            gate.require_current_permit(&permit),
+            Err(RuntimeSchedulerError::AttemptPermitLost)
+        ));
+
+        gate.record_uncertain(&retry).expect("uncertain");
+        assert!(matches!(
+            gate.require_current_permit(&retry),
+            Err(RuntimeSchedulerError::UncertainReplaySuppressed)
+        ));
+
+        let completed_attempt = digest(b'c');
+        let completed_permit = authorize(&mut gate, &completed_attempt).expect("complete permit");
+        let completed_dispatch = dispatch(gate.binding().mapping(), "turn-complete", b'r', b's');
+        gate.record_completed(&completed_permit, &completed_dispatch)
+            .expect("complete");
+        assert!(matches!(
+            gate.require_current_permit(&completed_permit),
+            Err(RuntimeSchedulerError::CompletedReplaySuppressed)
+        ));
+
+        let taken = digest(b'k');
+        let taken_permit = authorize(&mut gate, &taken).expect("taken permit");
+        gate.take_over(fence(b'n', b'm', 2), mapping(2, b'n'))
+            .expect("takeover");
+        assert!(matches!(
+            gate.require_current_permit(&taken_permit),
+            Err(RuntimeSchedulerError::LeaseFenceLost)
         ));
     }
 }
