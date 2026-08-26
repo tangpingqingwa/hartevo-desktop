@@ -2393,6 +2393,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "hartevo-partner-adapters"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hartevo-connector-sdk",
+ "hartevo-domain-kernel",
+ "hartevo-effect-broker",
+ "hex",
+ "ring",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "ureq",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "hartevo-plugin-runtime"
 version = "0.1.0"
 dependencies = [
