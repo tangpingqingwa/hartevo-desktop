@@ -1,0 +1,20 @@
+{
+  "authorTaskId": "01a03d77-5ca5-7d01-9f84-da44eedb2064",
+  "baseSha": "11ad52fa6686d96fa8a503bddf6e42f248b06123",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "contracts/secrets/secret-broker-native-acceptance.v1.json",
+    "hartevo-rs/eval/examples/hartevo-secret-broker-acceptance/digest.rs",
+    "hartevo-rs/eval/examples/hartevo-secret-broker-acceptance/main.rs",
+    "hartevo-rs/eval/examples/hartevo-secret-broker-acceptance/model.rs",
+    "hartevo-rs/eval/examples/hartevo-secret-broker-acceptance/verifier.rs"
+  ],
+  "pr": 180,
+  "receiptDigest": "9902c2001d2c77e0c355636a476937ecc596d563541769660f7ac88df19d3ce5",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-26T11:11:22Z",
+  "reviewedHeadSha": "a24bda9bf5587f06d6cf533e2d25fc1e69d75b4b",
+  "reviewerTaskId": "01a03dbf-f4a4-71b0-be08-4982a8512c67",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
