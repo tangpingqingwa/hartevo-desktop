@@ -12,7 +12,7 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_application::{
-    AdoptRuntimeTurnDraft, AppendMissionConversationMessage, ApplicationError,
+    AcceptWorkProduct, AdoptRuntimeTurnDraft, AppendMissionConversationMessage, ApplicationError,
     ApplicationMissionCheckpointExecution, ApplicationService, ApproveProposedEffect,
     CatalogMissionExecutionHandle, ConfirmHumanMissionCheckpoint, CreateProject,
     DecideVm11OutcomeReview, DesktopInventoryProjection, DesktopUnlockedProjectProjection,
@@ -346,6 +346,37 @@ pub struct DesktopHumanCheckpointConfirmationRequest {
     pub expected_mission_revision: u64,
     pub expected_checkpoint_revision: u64,
     pub expected_conversation_revision: u64,
+}
+
+/// Exact Desktop-to-Application fence for adopting one projected WorkProduct.
+/// The Desktop surface carries these values from the current Mission read
+/// model; Application remains the authority that validates and persists the
+/// transition.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DesktopWorkProductAdoptionRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub work_product_id: WorkProductId,
+    pub expected_mission_revision: u64,
+    pub expected_work_product_revision: u64,
+    pub expected_manifest_version: u64,
+}
+
+impl fmt::Debug for DesktopWorkProductAdoptionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopWorkProductAdoptionRequest")
+            .field("project_id", &"[REDACTED]")
+            .field("mission_id", &"[REDACTED]")
+            .field("work_product_id", &"[REDACTED]")
+            .field("expected_mission_revision", &self.expected_mission_revision)
+            .field(
+                "expected_work_product_revision",
+                &self.expected_work_product_revision,
+            )
+            .field("expected_manifest_version", &self.expected_manifest_version)
+            .finish()
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -967,6 +998,81 @@ impl DesktopDataPlane {
         now: DateTime<Utc>,
     ) -> Result<RuntimeTextSubscriptionBatch, DesktopDataError> {
         self.runtime_text_subscription_with(secret_store, handle, cursor, page_size, now)
+    }
+
+    /// Adopts one exact projected WorkProduct through the existing typed
+    /// Application consumer.  The Desktop layer adds a product-revision fence
+    /// before delegating; it never mutates a Mission or manifest directly.
+    pub fn adopt_work_product_os(
+        &self,
+        request: DesktopWorkProductAdoptionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.adopt_work_product_with(&secret_store, request, now)
+    }
+
+    #[cfg(feature = "native-journey")]
+    pub(crate) fn adopt_work_product_native(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopWorkProductAdoptionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        self.adopt_work_product_with(secret_store, request, now)
+    }
+
+    fn adopt_work_product_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopWorkProductAdoptionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if request.expected_mission_revision == 0
+            || request.expected_work_product_revision == 0
+            || request.expected_manifest_version == 0
+        {
+            return Err(DesktopDataError::WorkProductActionStale);
+        }
+        let project_id = request.project_id.clone();
+        let database_secret = self.database_secret(secret_store)?;
+        let read_service = self.open_read_application_from_secret(&database_secret)?;
+        self.require_project_context_access(&read_service, secret_store, &project_id, now)?;
+        let read_mission = read_service.load_mission(&request.project_id, &request.mission_id)?;
+        let read_product = read_mission
+            .work_products
+            .iter()
+            .find(|product| product.id == request.work_product_id)
+            .ok_or(DesktopDataError::WorkProductActionStale)?;
+        if read_mission.revision != request.expected_mission_revision
+            || read_product.revision != request.expected_work_product_revision
+        {
+            return Err(DesktopDataError::WorkProductActionStale);
+        }
+        let read_manifest = read_service
+            .load_work_product_manifest(&request.project_id, &request.work_product_id)?;
+        if read_manifest.version != request.expected_manifest_version {
+            return Err(DesktopDataError::WorkProductActionStale);
+        }
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        service.accept_work_product(
+            &AcceptWorkProduct {
+                project_id: request.project_id,
+                mission_id: request.mission_id,
+                work_product_id: request.work_product_id,
+                expected_mission_revision: request.expected_mission_revision,
+                expected_manifest_version: request.expected_manifest_version,
+            },
+            now,
+        )?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            load_product_evidence(now)?,
+            now,
+        )
     }
 
     /// Starts an explicitly confirmed VM-00..VM-11 Mission from the machine
@@ -3368,6 +3474,8 @@ pub enum DesktopDataError {
     ProjectContextIntegrityError(ProjectId),
     #[error("Runtime text subscription context does not match the authorized Tenant and Project")]
     RuntimeSubscriptionContextMismatch,
+    #[error("the selected WorkProduct revision no longer matches the current Mission projection")]
+    WorkProductActionStale,
     #[error(transparent)]
     Cordis(#[from] CordisError),
     #[error(transparent)]
