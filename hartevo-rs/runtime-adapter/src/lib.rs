@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
 mod control_plane;
 mod plugin;
 mod provider;
+pub mod scheduler_fence;
 
 pub use control_plane::{
     CONTROL_PLANE_CONTRACT_SHA256, ResolvedSecret, RuntimeBudget, RuntimeCapabilities,
