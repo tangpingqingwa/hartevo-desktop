@@ -19,7 +19,10 @@ use hartevo_domain_kernel::ProjectId;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
+pub mod local_timer;
 pub mod os;
+pub mod os_lifecycle;
+pub mod plugin_dispatch;
 pub mod plugin_invocation;
 pub mod recurring_schedule;
 

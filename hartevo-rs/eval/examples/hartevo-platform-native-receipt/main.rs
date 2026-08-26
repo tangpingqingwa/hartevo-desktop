@@ -1,4 +1,5 @@
 mod digest;
+mod host_attestation;
 mod model;
 mod signature;
 mod verifier;
@@ -35,6 +36,8 @@ fn main() {
             "releaseDecision": RELEASE_DECISION,
             "producerReadiness": PRODUCER_READINESS,
             "nativeReceiptEmissionAllowed": NATIVE_RECEIPT_EMISSION_ALLOWED,
+            "signatureVerifierAvailable": SIGNATURE_VERIFIER_AVAILABLE,
+            "hostAttestationVerifierAvailable": HOST_ATTESTATION_VERIFIER_AVAILABLE,
             "persistentNonceReplayGuardAvailable": PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE,
             "validatorStatus": if blocked_environment { "BLOCKED_ENV" } else { "FAIL" },
             "errorCode": if blocked_environment {
@@ -110,6 +113,8 @@ fn run() -> Result<()> {
         "persistentNonceReplayGuardAvailable": PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE,
         "canonicalPayloadEncoding": matrix.native_producer_policy.canonical_payload_encoding,
         "signaturePayloadProjection": matrix.native_producer_policy.signature_payload_projection,
+        "hostAttestationPayloadProjection": matrix.native_producer_policy.host_attestation_payload_projection,
+        "maxHostAttestationAgeSeconds": matrix.native_producer_policy.max_host_attestation_age_seconds,
         "sourceCommit": matrix.source_commit,
         "matrixVersion": matrix.matrix_version,
         "matrixDigest": matrix_digest,
@@ -130,6 +135,11 @@ fn run() -> Result<()> {
             "epoch": matrix.runner_registry_epoch,
             "digest": matrix.runner_registry_digest,
             "allowedRunnerCount": matrix.allowed_runners.len(),
+        },
+        "hostAttestorRegistry": {
+            "epoch": matrix.host_attestor_registry_epoch,
+            "digest": matrix.host_attestor_registry_digest,
+            "allowedAttestorCount": matrix.allowed_host_attestors.len(),
         },
         "readinessBlockers": matrix.readiness_blockers.iter().map(|blocker| json!({
             "code": blocker.code,
