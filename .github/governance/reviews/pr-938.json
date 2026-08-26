@@ -1,0 +1,18 @@
+{
+  "authorTaskId": "codex-root-governance-snapshot-repair",
+  "baseSha": "99118e9db04f79737e5d62f56a06cd61ab92aaa2",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md",
+    "scripts/repository_governance.py",
+    "scripts/tests/test_repository_governance.py"
+  ],
+  "pr": 938,
+  "receiptDigest": "8ccdc95615d0358672fcdc6b519bb8769d264cfbf558d2e5048ccd478e83716e",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-22T12:54:29Z",
+  "reviewedHeadSha": "20bd41dba482adff2534b2139b655cb59d7bc852",
+  "reviewerTaskId": "github-actions-run-32574193842",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}

@@ -2294,6 +2294,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hartevo-cordis"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "hartevo-desktop"
 version = "0.1.0"
 dependencies = [
@@ -2304,7 +2313,9 @@ dependencies = [
  "hartevo-application",
  "hartevo-catalog",
  "hartevo-context-fabric",
+ "hartevo-cordis",
  "hartevo-domain-kernel",
+ "hartevo-effect-broker",
  "hartevo-runtime-adapter",
  "hartevo-storage",
  "hex",
@@ -2379,6 +2390,26 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "hartevo-partner-adapters"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hartevo-connector-sdk",
+ "hartevo-domain-kernel",
+ "hartevo-effect-broker",
+ "hex",
+ "ring",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "ureq",
+ "url",
+ "zeroize",
 ]
 
 [[package]]

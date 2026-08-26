@@ -1,0 +1,43 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "e6c058033cbc53e69fdc979d79e48a7010d9f27b",
+  "candidateCount": 1,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "e6c058033cbc53e69fdc979d79e48a7010d9f27b",
+      "headBranch": "feat/cordis-invariants-pr7-e6c058033-1787653417",
+      "headCommit": "aa7f4b4ace0f6dd43c2d0c59bf8790d151bc6b76",
+      "number": 955,
+      "review": {
+        "authorTaskId": "01a0386c-51fa-7411-aacf-a5eb7bc96fb1",
+        "exactPaths": [
+          "hartevo-rs/cordis/Cargo.toml",
+          "hartevo-rs/cordis/src/agent.rs",
+          "hartevo-rs/cordis/src/invariants.rs",
+          "hartevo-rs/cordis/src/lib.rs",
+          "hartevo-rs/cordis/src/surface.rs",
+          "hartevo-rs/cordis/tests/agent_loop.rs",
+          "hartevo-rs/cordis/tests/invariants.rs",
+          "hartevo-rs/cordis/tests/surfaces.rs"
+        ],
+        "receiptDigest": "07f838c3c282e087b7cc9e8df4760b26740ddad895c0193742936195e966d6a6",
+        "receiptPath": ".github/governance/reviews/pr-955.json",
+        "reviewedHeadSha": "e48054d66441cd42a392f1854e2cf5db1cd039b5",
+        "reviewerTaskId": "01a03878-f64c-7cb1-9644-c725b598e950"
+      }
+    }
+  ],
+  "createdAt": "2026-08-25T10:39:49Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260825-1039"
+}
