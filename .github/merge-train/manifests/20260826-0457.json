@@ -1,0 +1,41 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "b1d8a295e6a17db0d246ff0e87238d7c3e143387",
+  "candidateCount": 1,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "b1d8a295e6a17db0d246ff0e87238d7c3e143387",
+      "headBranch": "codex/desktop-result-adoption-surface-01",
+      "headCommit": "ce6252473aef8e9d4b56a5d931cf83cb528f263d",
+      "number": 207,
+      "review": {
+        "authorTaskId": "01a03c5b-1e9a-7013-b683-d6969b5aef9f",
+        "exactPaths": [
+          "hartevo-rs/desktop/assets/prototype.css",
+          "hartevo-rs/desktop/src/data_plane.rs",
+          "hartevo-rs/desktop/src/lib.rs",
+          "hartevo-rs/desktop/src/native_runtime_journey.rs",
+          "hartevo-rs/desktop/src/result_adoption_surface.rs",
+          "scripts/run-desktop-native-runtime-journey.sh"
+        ],
+        "receiptDigest": "43e87d55e8b0086063bf0fba00752cfb07dac8f32ff1bab93b888ae2e3272ef0",
+        "receiptPath": ".github/governance/reviews/pr-207.json",
+        "reviewedHeadSha": "19101c455cf58cf4d437213a10e4d22fa30ba267",
+        "reviewerTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737"
+      }
+    }
+  ],
+  "createdAt": "2026-08-26T04:57:36Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260826-0457"
+}

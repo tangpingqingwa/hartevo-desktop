@@ -4,6 +4,20 @@
 - Change summary:
 - Scope kept to:
 
+<!-- Replace every placeholder before opening the PR. This block is parsed by CI. -->
+<!-- hartevo-governance
+{
+  "schema": "hartevo-pr-admission/v1",
+  "changeClass": "review-repair",
+  "issue": 0,
+  "owner": "replace-with-one-accountable-owner",
+  "ownedPaths": ["replace/with/exact/path-or-directory"],
+  "rollback": "replace-with-a-specific-recovery-plan",
+  "externalEffects": false,
+  "release": false
+}
+-->
+
 ## Evidence
 
 - [ ] Local workflow syntax and policy checks pass.
@@ -28,3 +42,6 @@
 - Release enabled: `false`
 - [ ] No direct or force push to `main`.
 - [ ] No production deployment or tag mutation is performed by this PR.
+- [ ] The `hartevo-governance` block is complete and covers every changed path.
+- [ ] For an ordinary candidate, `ownedPaths` includes `.github/governance/reviews/pr-<this-number>.json` before the receipt commit is appended.
+- [ ] A non-author task will append the exact review receipt as the final receipt-only commit before train admission.

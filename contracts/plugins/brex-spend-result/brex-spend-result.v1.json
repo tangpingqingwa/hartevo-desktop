@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/brex-spend-result/brex-spend-result.v1.json",
+  "title": "Hartevo Brex spend-result Layer-1 contract",
+  "schemaVersion": "hartevo.brex-spend-result/v1",
+  "contractVersion": "EXT-BREX-01-L1/v1",
+  "pluginId": "brex.spend-result",
+  "objectiveType": "governed_spend_control_observation",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_record_verify_only",
+  "contractDigestInput": "hartevo.brex-spend-result/v1|layer=1|service=brex.spend.result|provider=brex.spend.read|consumer=mission.brex-spend-result.consumer",
+  "contractDigest": "6ece8c89d4619a65f7b27b886b6ca3aecd570dc81018deb7a4579d07cda7d39a",
+  "service": {
+    "type": "BrexSpendResultService",
+    "id": "brex.spend.result",
+    "access": "read_proposal_record_verify",
+    "operations": [
+      "read_spend",
+      "read_limits",
+      "read_policies",
+      "propose",
+      "record",
+      "verify",
+      "revoke_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "BrexSpendProvider",
+    "id": "brex.spend.read",
+    "apiRevision": "brex-spend-read-v1",
+    "operations": ["read_spend", "read_limits", "read_policies"],
+    "allowedTransportProvenance": ["recording", "fixture", "fake", "loopback", "blocked_env"],
+    "authentication": {
+      "scheme": "brex_opaque_secret_reference",
+      "secretReference": "opaque_only",
+      "serialized": false,
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false,
+    "maxPageSize": 50,
+    "maxPages": 4,
+    "maxItems": 128,
+    "maxResponseBytes": 1048576,
+    "maxRetryAfterSeconds": 3600
+  },
+  "consumer": {
+    "type": "MissionBrexSpendConsumer",
+    "id": "mission.brex-spend-result.consumer",
+    "authority": "mission_review_only_below_kernel",
+    "scope": [
+      "organizationDigest",
+      "userScopeDigests",
+      "cardScopeDigests",
+      "transactionScopeDigests",
+      "limitScopeDigests",
+      "policyScopeDigests",
+      "projectDigest",
+      "missionDigest",
+      "workProductDigest",
+      "scopeRevision",
+      "consentDigest"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "effectiveAuthorization": false
+  },
+  "scope": {
+    "required": [
+      "organization",
+      "project",
+      "mission",
+      "workProduct",
+      "scopeRevision",
+      "consentRevision",
+      "permissionRevision"
+    ],
+    "boundedOptionalDimensions": ["user", "card", "transaction", "limit", "policy"],
+    "identifiersInEvidence": "digest_only",
+    "cardNumbers": false,
+    "rawPii": false,
+    "rawMerchantText": false,
+    "rawProviderDiagnostics": false
+  },
+  "digests": [
+    "queryDigest",
+    "configDigest",
+    "requestDigest",
+    "resultDigest",
+    "registrationDigest",
+    "scopeDigest",
+    "consentDigest",
+    "permissionDigest",
+    "evidenceDigest"
+  ],
+  "pagination": {
+    "cursorOpaque": true,
+    "cursorDigestOnly": true,
+    "cursorBoundTo": ["scopeDigest", "queryDigest", "configDigest", "pageNumber"],
+    "maxPages": 4,
+    "maxItems": 128,
+    "partialIsNonAdoptable": true,
+    "staleRevisionRejected": true
+  },
+  "evidence": {
+    "observations": ["spendAggregate", "limitUtilization", "policyState"],
+    "states": [
+      "complete",
+      "denied",
+      "expired",
+      "partial",
+      "provider_unknown",
+      "rate_limited",
+      "tampered",
+      "registration_revoked"
+    ],
+    "redactedReceipt": true,
+    "tamperRejected": true,
+    "replayIdempotent": true,
+    "independentProviderReadback": false,
+    "financialAdvice": false,
+    "complianceClaim": false,
+    "savingsClaim": false
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "binding": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "registrationRevision"
+    ],
+    "revokeExplicit": true,
+    "staleRegistrationRejected": true
+  },
+  "forbiddenEffects": [
+    "CreateCard",
+    "ApproveCard",
+    "PayTransaction",
+    "RefundTransaction",
+    "ChangeLimit",
+    "MutatePolicy",
+    "CreateReceipt",
+    "AdoptOutcome",
+    "AdoptWorkProduct"
+  ],
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "layer2Exits": [
+    "nativeCredentialResolution",
+    "liveBrexHttps",
+    "durableProviderReceipt",
+    "independentProviderReadback",
+    "consentedEffects",
+    "verifiedWorkProductOutcomeAdoption"
+  ]
+}

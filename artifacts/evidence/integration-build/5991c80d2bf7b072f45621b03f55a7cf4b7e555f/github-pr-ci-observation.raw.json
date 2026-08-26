@@ -1,0 +1,518 @@
+{
+  "schemaVersion": "hartevo.github-pr-ci-observation/v1",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "capturedAt": "2026-08-13T05:31:45Z",
+  "sourceApi": "github-rest-v3",
+  "pullRequests": [
+    {
+      "number": 1,
+      "state": "closed",
+      "merged": true,
+      "draft": false,
+      "baseRef": "bootstrap/macos-r0",
+      "baseSha": "4ce38354541771820a7739a2d04dcc7b4bac88fc",
+      "headRef": "codex/j01-browser-eval-contract",
+      "headSha": "1768eb6ad4003173416a0bd3daea2a717cefd9fd",
+      "mergeCommit": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+      "mergedAt": "2026-08-13T04:17:46Z",
+      "actionsRun": {
+        "provider": "github-actions",
+        "id": 31665684533,
+        "workflowId": 333267489,
+        "name": "ci",
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "status": "completed",
+        "conclusion": "success",
+        "runNumber": 1,
+        "runAttempt": 1,
+        "headBranch": "codex/j01-browser-eval-contract",
+        "headSha": "1768eb6ad4003173416a0bd3daea2a717cefd9fd",
+        "checkSuiteId": 85902415590,
+        "createdAt": "2026-08-13T04:01:13Z",
+        "updatedAt": "2026-08-13T04:17:19Z",
+        "jobs": [
+          {
+            "id": 94339626787,
+            "name": "PostgreSQL 18 Cell contract",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "1768eb6ad4003173416a0bd3daea2a717cefd9fd",
+            "startedAt": "2026-08-13T04:01:16Z",
+            "completedAt": "2026-08-13T04:02:52Z"
+          },
+          {
+            "id": 94339626733,
+            "name": "Rust workspace",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "1768eb6ad4003173416a0bd3daea2a717cefd9fd",
+            "startedAt": "2026-08-13T04:01:17Z",
+            "completedAt": "2026-08-13T04:17:18Z"
+          }
+        ]
+      }
+    },
+    {
+      "number": 2,
+      "state": "closed",
+      "merged": true,
+      "draft": false,
+      "baseRef": "bootstrap/macos-r0",
+      "baseSha": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+      "headRef": "codex/scan-01-production-scanner",
+      "headSha": "4bef7e8b0a44a88f18bcd8bc8b21d91aa8469fb9",
+      "mergeCommit": "d8040bce4ae5818a6c168a1382024a4a46bd292d",
+      "mergedAt": "2026-08-13T04:47:06Z",
+      "actionsRun": {
+        "provider": "github-actions",
+        "id": 31667032055,
+        "workflowId": 333267489,
+        "name": "ci",
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "status": "completed",
+        "conclusion": "success",
+        "runNumber": 6,
+        "runAttempt": 1,
+        "headBranch": "codex/scan-01-production-scanner",
+        "headSha": "4bef7e8b0a44a88f18bcd8bc8b21d91aa8469fb9",
+        "checkSuiteId": 85905835734,
+        "createdAt": "2026-08-13T04:26:38Z",
+        "updatedAt": "2026-08-13T04:46:49Z",
+        "jobs": [
+          {
+            "id": 94343727044,
+            "name": "PostgreSQL 18 Cell contract",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "4bef7e8b0a44a88f18bcd8bc8b21d91aa8469fb9",
+            "startedAt": "2026-08-13T04:26:41Z",
+            "completedAt": "2026-08-13T04:28:28Z"
+          },
+          {
+            "id": 94343727077,
+            "name": "Rust workspace",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "4bef7e8b0a44a88f18bcd8bc8b21d91aa8469fb9",
+            "startedAt": "2026-08-13T04:26:42Z",
+            "completedAt": "2026-08-13T04:46:49Z"
+          }
+        ]
+      }
+    },
+    {
+      "number": 8,
+      "state": "closed",
+      "merged": true,
+      "draft": false,
+      "baseRef": "bootstrap/macos-r0",
+      "baseSha": "d8040bce4ae5818a6c168a1382024a4a46bd292d",
+      "headRef": "codex/recipe-smoke-01",
+      "headSha": "b9c08435a14d914d6180c5fc5c65e29360c079c3",
+      "mergeCommit": "5ded663e639e697cadc57945fad99d4ab255eacc",
+      "mergedAt": "2026-08-13T04:55:59Z",
+      "actionsRun": {
+        "provider": "github-actions",
+        "id": 31667306158,
+        "workflowId": 333267489,
+        "name": "ci",
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "status": "completed",
+        "conclusion": "success",
+        "runNumber": 9,
+        "runAttempt": 1,
+        "headBranch": "codex/recipe-smoke-01",
+        "headSha": "b9c08435a14d914d6180c5fc5c65e29360c079c3",
+        "checkSuiteId": 85906522021,
+        "createdAt": "2026-08-13T04:31:50Z",
+        "updatedAt": "2026-08-13T04:55:35Z",
+        "jobs": [
+          {
+            "id": 94344518426,
+            "name": "PostgreSQL 18 Cell contract",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "b9c08435a14d914d6180c5fc5c65e29360c079c3",
+            "startedAt": "2026-08-13T04:31:52Z",
+            "completedAt": "2026-08-13T04:33:30Z"
+          },
+          {
+            "id": 94344518438,
+            "name": "Rust workspace",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "b9c08435a14d914d6180c5fc5c65e29360c079c3",
+            "startedAt": "2026-08-13T04:39:06Z",
+            "completedAt": "2026-08-13T04:55:34Z"
+          }
+        ]
+      }
+    },
+    {
+      "number": 4,
+      "state": "closed",
+      "merged": true,
+      "draft": false,
+      "baseRef": "bootstrap/macos-r0",
+      "baseSha": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+      "headRef": "codex/provider-approval-registry-surface-a3c",
+      "headSha": "83a4e602a776387720dfa59d55690a00f1201824",
+      "mergeCommit": "7a0f67f8b25604c0648c71ec5976494b09ab8d46",
+      "mergedAt": "2026-08-13T04:57:48Z",
+      "actionsRun": {
+        "provider": "github-actions",
+        "id": 31666593202,
+        "workflowId": 333267489,
+        "name": "ci",
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "status": "completed",
+        "conclusion": "success",
+        "runNumber": 4,
+        "runAttempt": 1,
+        "headBranch": "codex/provider-approval-registry-surface-a3c",
+        "headSha": "83a4e602a776387720dfa59d55690a00f1201824",
+        "checkSuiteId": 85904731670,
+        "createdAt": "2026-08-13T04:18:14Z",
+        "updatedAt": "2026-08-13T04:39:05Z",
+        "jobs": [
+          {
+            "id": 94342373354,
+            "name": "PostgreSQL 18 Cell contract",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "83a4e602a776387720dfa59d55690a00f1201824",
+            "startedAt": "2026-08-13T04:18:18Z",
+            "completedAt": "2026-08-13T04:19:59Z"
+          },
+          {
+            "id": 94342373333,
+            "name": "Rust workspace",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "83a4e602a776387720dfa59d55690a00f1201824",
+            "startedAt": "2026-08-13T04:18:16Z",
+            "completedAt": "2026-08-13T04:39:04Z"
+          }
+        ]
+      }
+    },
+    {
+      "number": 7,
+      "state": "closed",
+      "merged": true,
+      "draft": false,
+      "baseRef": "bootstrap/macos-r0",
+      "baseSha": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+      "headRef": "codex/chromium-cross-origin-u4",
+      "headSha": "4feb6f7fd7565ec9e7b9c6c950787d124354821f",
+      "mergeCommit": "ba9e11c5662b09d64b0106529817e6ae6e219aa8",
+      "mergedAt": "2026-08-13T04:58:20Z",
+      "actionsRun": {
+        "provider": "github-actions",
+        "id": 31667239033,
+        "workflowId": 333267489,
+        "name": "ci",
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "status": "completed",
+        "conclusion": "success",
+        "runNumber": 8,
+        "runAttempt": 1,
+        "headBranch": "codex/chromium-cross-origin-u4",
+        "headSha": "4feb6f7fd7565ec9e7b9c6c950787d124354821f",
+        "checkSuiteId": 85906350496,
+        "createdAt": "2026-08-13T04:30:34Z",
+        "updatedAt": "2026-08-13T04:51:17Z",
+        "jobs": [
+          {
+            "id": 94344324190,
+            "name": "PostgreSQL 18 Cell contract",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "4feb6f7fd7565ec9e7b9c6c950787d124354821f",
+            "startedAt": "2026-08-13T04:30:37Z",
+            "completedAt": "2026-08-13T04:32:12Z"
+          },
+          {
+            "id": 94344324189,
+            "name": "Rust workspace",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "4feb6f7fd7565ec9e7b9c6c950787d124354821f",
+            "startedAt": "2026-08-13T04:31:19Z",
+            "completedAt": "2026-08-13T04:51:16Z"
+          }
+        ]
+      }
+    },
+    {
+      "number": 5,
+      "state": "closed",
+      "merged": true,
+      "draft": false,
+      "baseRef": "bootstrap/macos-r0",
+      "baseSha": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+      "headRef": "codex/ct03-mission-runtime-authority",
+      "headSha": "93188a2eee334b9a785a7227d7c0c9ad9ba8f42a",
+      "mergeCommit": "51bee2243c11485d6383287848fccbdba74de5a2",
+      "mergedAt": "2026-08-13T04:59:27Z",
+      "actionsRun": {
+        "provider": "github-actions",
+        "id": 31666875723,
+        "workflowId": 333267489,
+        "name": "ci",
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "status": "completed",
+        "conclusion": "success",
+        "runNumber": 5,
+        "runAttempt": 1,
+        "headBranch": "codex/ct03-mission-runtime-authority",
+        "headSha": "93188a2eee334b9a785a7227d7c0c9ad9ba8f42a",
+        "checkSuiteId": 85905444585,
+        "createdAt": "2026-08-13T04:23:39Z",
+        "updatedAt": "2026-08-13T04:44:47Z",
+        "jobs": [
+          {
+            "id": 94343280838,
+            "name": "PostgreSQL 18 Cell contract",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "93188a2eee334b9a785a7227d7c0c9ad9ba8f42a",
+            "startedAt": "2026-08-13T04:23:41Z",
+            "completedAt": "2026-08-13T04:25:18Z"
+          },
+          {
+            "id": 94343280914,
+            "name": "Rust workspace",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "93188a2eee334b9a785a7227d7c0c9ad9ba8f42a",
+            "startedAt": "2026-08-13T04:23:43Z",
+            "completedAt": "2026-08-13T04:44:46Z"
+          }
+        ]
+      }
+    },
+    {
+      "number": 6,
+      "state": "closed",
+      "merged": true,
+      "draft": false,
+      "baseRef": "bootstrap/macos-r0",
+      "baseSha": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+      "headRef": "codex/evidence-docs-truth-b2",
+      "headSha": "d7ac3337a7e13c8438dc6a497eb1f37fbf09a72d",
+      "mergeCommit": "2066eb86fa9cf66c84ef5a27e0a1f2596f956693",
+      "mergedAt": "2026-08-13T05:00:33Z",
+      "actionsRun": {
+        "provider": "github-actions",
+        "id": 31667042154,
+        "workflowId": 333267489,
+        "name": "ci",
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "status": "completed",
+        "conclusion": "success",
+        "runNumber": 7,
+        "runAttempt": 1,
+        "headBranch": "codex/evidence-docs-truth-b2",
+        "headSha": "d7ac3337a7e13c8438dc6a497eb1f37fbf09a72d",
+        "checkSuiteId": 85905860000,
+        "createdAt": "2026-08-13T04:26:50Z",
+        "updatedAt": "2026-08-13T04:45:43Z",
+        "jobs": [
+          {
+            "id": 94343757409,
+            "name": "PostgreSQL 18 Cell contract",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "d7ac3337a7e13c8438dc6a497eb1f37fbf09a72d",
+            "startedAt": "2026-08-13T04:26:52Z",
+            "completedAt": "2026-08-13T04:28:53Z"
+          },
+          {
+            "id": 94343757416,
+            "name": "Rust workspace",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "d7ac3337a7e13c8438dc6a497eb1f37fbf09a72d",
+            "startedAt": "2026-08-13T04:26:53Z",
+            "completedAt": "2026-08-13T04:45:42Z"
+          }
+        ]
+      }
+    },
+    {
+      "number": 10,
+      "state": "closed",
+      "merged": true,
+      "draft": false,
+      "baseRef": "bootstrap/macos-r0",
+      "baseSha": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+      "headRef": "codex/b2-vis-01-runtime-states",
+      "headSha": "1d0f204287c9ac02a41276b7b1c0fed3f41ab6e2",
+      "mergeCommit": "03b9828c79631ad268c5d19db4ab8d994588cf2c",
+      "mergedAt": "2026-08-13T05:13:52Z",
+      "actionsRun": {
+        "provider": "github-actions",
+        "id": 31667781544,
+        "workflowId": 333267489,
+        "name": "ci",
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "status": "completed",
+        "conclusion": "success",
+        "runNumber": 11,
+        "runAttempt": 1,
+        "headBranch": "codex/b2-vis-01-runtime-states",
+        "headSha": "1d0f204287c9ac02a41276b7b1c0fed3f41ab6e2",
+        "checkSuiteId": 85907737968,
+        "createdAt": "2026-08-13T04:40:49Z",
+        "updatedAt": "2026-08-13T05:04:58Z",
+        "jobs": [
+          {
+            "id": 94345960406,
+            "name": "PostgreSQL 18 Cell contract",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "1d0f204287c9ac02a41276b7b1c0fed3f41ab6e2",
+            "startedAt": "2026-08-13T04:40:51Z",
+            "completedAt": "2026-08-13T04:42:25Z"
+          },
+          {
+            "id": 94345960404,
+            "name": "Rust workspace",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "1d0f204287c9ac02a41276b7b1c0fed3f41ab6e2",
+            "startedAt": "2026-08-13T04:45:45Z",
+            "completedAt": "2026-08-13T05:04:58Z"
+          }
+        ]
+      }
+    },
+    {
+      "number": 11,
+      "state": "closed",
+      "merged": true,
+      "draft": false,
+      "baseRef": "bootstrap/macos-r0",
+      "baseSha": "d8040bce4ae5818a6c168a1382024a4a46bd292d",
+      "headRef": "codex/d01-recipe-root-authority",
+      "headSha": "ca2369b4a1a35f0ce1abef14ccb5455badf51713",
+      "mergeCommit": "f664f9565eecfe29cbe96d3982ff12bb2493378b",
+      "mergedAt": "2026-08-13T05:15:53Z",
+      "actionsRun": {
+        "provider": "github-actions",
+        "id": 31668372363,
+        "workflowId": 333267489,
+        "name": "ci",
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "status": "completed",
+        "conclusion": "success",
+        "runNumber": 12,
+        "runAttempt": 1,
+        "headBranch": "codex/d01-recipe-root-authority",
+        "headSha": "ca2369b4a1a35f0ce1abef14ccb5455badf51713",
+        "checkSuiteId": 85909257697,
+        "createdAt": "2026-08-13T04:52:00Z",
+        "updatedAt": "2026-08-13T05:11:44Z",
+        "jobs": [
+          {
+            "id": 94347780375,
+            "name": "PostgreSQL 18 Cell contract",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "ca2369b4a1a35f0ce1abef14ccb5455badf51713",
+            "startedAt": "2026-08-13T04:52:03Z",
+            "completedAt": "2026-08-13T04:53:54Z"
+          },
+          {
+            "id": 94347780321,
+            "name": "Rust workspace",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 1,
+            "headSha": "ca2369b4a1a35f0ce1abef14ccb5455badf51713",
+            "startedAt": "2026-08-13T04:52:04Z",
+            "completedAt": "2026-08-13T05:11:43Z"
+          }
+        ]
+      }
+    },
+    {
+      "number": 9,
+      "state": "closed",
+      "merged": true,
+      "draft": false,
+      "baseRef": "bootstrap/macos-r0",
+      "baseSha": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+      "headRef": "codex/i01b-native-receipt-contract",
+      "headSha": "9587affd5c51ac5916932c8ba7479612a9c301c1",
+      "mergeCommit": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
+      "mergedAt": "2026-08-13T05:20:45Z",
+      "actionsRun": {
+        "provider": "github-actions",
+        "id": 31667701180,
+        "workflowId": 333267489,
+        "name": "ci",
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "status": "completed",
+        "conclusion": "success",
+        "runNumber": 10,
+        "runAttempt": 2,
+        "headBranch": "codex/i01b-native-receipt-contract",
+        "headSha": "9587affd5c51ac5916932c8ba7479612a9c301c1",
+        "checkSuiteId": 85907533298,
+        "createdAt": "2026-08-13T04:39:20Z",
+        "updatedAt": "2026-08-13T05:20:27Z",
+        "jobs": [
+          {
+            "id": 94349343774,
+            "name": "PostgreSQL 18 Cell contract",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 2,
+            "headSha": "9587affd5c51ac5916932c8ba7479612a9c301c1",
+            "startedAt": "2026-08-13T04:39:22Z",
+            "completedAt": "2026-08-13T04:41:06Z"
+          },
+          {
+            "id": 94349342945,
+            "name": "Rust workspace",
+            "status": "completed",
+            "conclusion": "success",
+            "runAttempt": 2,
+            "headSha": "9587affd5c51ac5916932c8ba7479612a9c301c1",
+            "startedAt": "2026-08-13T05:01:47Z",
+            "completedAt": "2026-08-13T05:20:27Z"
+          }
+        ]
+      }
+    }
+  ]
+}
