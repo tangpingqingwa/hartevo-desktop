@@ -53,12 +53,12 @@ use hartevo_context_fabric::{
     ContextMaterialResolver, ContextTokenizer, ResolvedContextMaterial, RuntimeContextEnvelope,
 };
 use hartevo_domain_kernel::{
-    AcceptanceCheck, AccountId, ActorId, ApprovalPolicy, AttributionRecord,
-    AutomatedReplyAuthorization, AutonomyLevel, BrowserActionBatchId, BrowserControlLeaseId,
-    BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId, BrowserRecipeId, BrowserTabId,
-    BrowserWorkspaceId, Cadence, CadenceTriggerKind, Campaign, CampaignId,
-    CampaignSendAuthorization, CommissionId, CommissionRecord, Company, CompanyId, Connection,
-    ConnectionError, ConnectionId, ConnectionProbe, ConnectionSnapshot, ConsentPurpose,
+    AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, ApprovalPolicy,
+    AttributionRecord, AutomatedReplyAuthorization, AutonomyLevel, BrowserActionBatchId,
+    BrowserControlLeaseId, BrowserFileClaimId, BrowserFileGrantId, BrowserProfileId,
+    BrowserRecipeId, BrowserTabId, BrowserWorkspaceId, Cadence, CadenceTriggerKind, Campaign,
+    CampaignId, CampaignSendAuthorization, CommissionId, CommissionRecord, Company, CompanyId,
+    Connection, ConnectionError, ConnectionId, ConnectionProbe, ConnectionSnapshot, ConsentPurpose,
     ConsentRecord, ConsentRecordId, ConsentRequirement, ConsentState, Constraint,
     ContextAssemblyId, ContextBranch, ContextBranchId, ContextBranchMerge, ContextBranchMergeId,
     ContextBranchStatus, ContextBudget, ContextCapsule, ContextCapsuleId, ContextCapsuleStatus,
@@ -535,6 +535,38 @@ pub struct ProposePreviewEffect {
     pub amount: Money,
     pub idempotency_key: String,
     pub expires_in: Duration,
+}
+
+/// Window-bound ApprovalGrant for one Proposed Effect. The frozen digest and
+/// Mission CAS revision must come from the SQLCipher projection; success
+/// records Domain Kernel `ApprovalDecision::Approved` and does not execute the
+/// Effect, mint a Receipt, or claim Verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApproveProposedEffect {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub effect_id: EffectId,
+    pub expected_scope_digest: String,
+    pub expected_mission_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposedEffectApprovalGrant {
+    pub mission: Mission,
+    pub effect_id: EffectId,
+    pub approval: Approval,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingEffectApprovalProjection {
+    pub effect_id: EffectId,
+    pub capability: String,
+    pub provider: String,
+    pub description: String,
+    pub scope_digest: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -4342,6 +4374,8 @@ pub struct MissionProjection {
     pub work_product_count: usize,
     pub work_products: Vec<WorkProductProjection>,
     pub pending_approval_count: usize,
+    #[serde(default)]
+    pub pending_effects: Vec<PendingEffectApprovalProjection>,
     pub verified_effect_count: usize,
     pub outcome_summary: Option<String>,
     #[serde(default)]
@@ -12693,6 +12727,88 @@ impl ApplicationService {
         Ok(mission)
     }
 
+    /// Grants Domain Kernel Approval for one Proposed Effect using the exact
+    /// frozen digest and Mission revision. The window cannot stamp a SAMPLE
+    /// digest. Success never executes the Effect or mints a Receipt.
+    pub fn approve_proposed_effect(
+        &mut self,
+        broker: &EffectBroker,
+        command: ApproveProposedEffect,
+        actor_id: ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<ProposedEffectApprovalGrant, ApplicationError> {
+        if command.expected_mission_revision == 0
+            || command.effect_id.as_str().trim().is_empty()
+            || !is_sha256_text(&command.expected_scope_digest)
+        {
+            return Err(ApplicationError::ProposedEffectApprovalCommandMismatch);
+        }
+        let mut mission = self
+            .store
+            .load_mission(&command.project_id, &command.mission_id)?;
+        if mission.revision != command.expected_mission_revision {
+            return Err(ApplicationError::MissionRevisionMismatch {
+                expected: command.expected_mission_revision,
+                actual: mission.revision,
+            });
+        }
+        {
+            let effect = mission.effect(&command.effect_id)?;
+            if effect.status != EffectStatus::Proposed {
+                let replayed_approval = effect.approval.clone().filter(|approval| {
+                    approval.decision == ApprovalDecision::Approved
+                        && approval.scope_digest == command.expected_scope_digest
+                        && approval.scope_digest == effect.approval_digest()
+                        && now < approval.valid_until
+                });
+                return if let Some(approval) = replayed_approval {
+                    Ok(ProposedEffectApprovalGrant {
+                        mission,
+                        effect_id: command.effect_id,
+                        approval,
+                        replayed: true,
+                    })
+                } else {
+                    Err(ApplicationError::ProposedEffectApprovalUnavailable)
+                };
+            }
+            if mission.stage != MissionStage::WaitingApproval {
+                return Err(ApplicationError::ProposedEffectApprovalUnavailable);
+            }
+            if effect.approval_digest() != command.expected_scope_digest {
+                return Err(ApplicationError::ProposedEffectApprovalDigestMismatch);
+            }
+        }
+        let expected_revision = mission.revision;
+        broker.approve(&mut mission, &command.effect_id, actor_id, &self.store, now)?;
+        let approval = mission
+            .effect(&command.effect_id)?
+            .approval
+            .clone()
+            .ok_or(ApplicationError::ProposedEffectApprovalUnavailable)?;
+        if approval.decision != ApprovalDecision::Approved
+            || approval.scope_digest != command.expected_scope_digest
+            || now >= approval.valid_until
+        {
+            return Err(ApplicationError::ProposedEffectApprovalUnavailable);
+        }
+        self.store.update_mission_atomic(
+            &mission,
+            expected_revision,
+            &[PendingEvent::new(
+                "approval.decided",
+                serde_json::json!({"effectId": command.effect_id, "decision": "approved"}),
+                now,
+            )],
+        )?;
+        Ok(ProposedEffectApprovalGrant {
+            mission,
+            effect_id: command.effect_id,
+            approval,
+            replayed: false,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn execute_effect(
         &mut self,
@@ -17840,6 +17956,19 @@ fn mission_projection(
             .iter()
             .filter(|effect| effect.status == hartevo_domain_kernel::EffectStatus::Proposed)
             .count(),
+        pending_effects: mission
+            .effects
+            .iter()
+            .filter(|effect| effect.status == hartevo_domain_kernel::EffectStatus::Proposed)
+            .map(|effect| PendingEffectApprovalProjection {
+                effect_id: effect.id.clone(),
+                capability: effect.capability.clone(),
+                provider: effect.provider.clone(),
+                description: effect.description.clone(),
+                scope_digest: effect.approval_digest(),
+                expires_at: effect.expires_at,
+            })
+            .collect(),
         verified_effect_count: mission
             .effects
             .iter()
@@ -21255,6 +21384,14 @@ pub enum ApplicationError {
     Vm11NextContractCommandMismatch,
     #[error("the VM-11 next-contract replay does not match its append-once durable evidence")]
     Vm11NextContractReplayMismatch,
+    #[error(
+        "WaitingApproval grant requires an exact Proposed Effect digest and Mission CAS revision"
+    )]
+    ProposedEffectApprovalCommandMismatch,
+    #[error("the current Mission is not WaitingApproval with a Proposed Effect to grant")]
+    ProposedEffectApprovalUnavailable,
+    #[error("the WaitingApproval grant digest no longer matches the frozen Proposed Effect")]
+    ProposedEffectApprovalDigestMismatch,
     #[error(
         "Catalog Mission route, mode, market, language, audience, timezone, or budget is invalid"
     )]

@@ -16,6 +16,7 @@ hartevo-catalog = { path = "../catalog" }
 hartevo-context-fabric = { path = "../context-fabric" }
 hartevo-cordis = { path = "../cordis" }
 hartevo-domain-kernel = { path = "../domain-kernel" }
+hartevo-effect-broker = { path = "../effect-broker" }
 hartevo-runtime-adapter = { path = "../runtime-adapter" }
 hartevo-storage = { path = "../storage" }
 hex.workspace = true
@@ -30,7 +31,6 @@ tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-hartevo-effect-broker = { path = "../effect-broker" }
 serde_json.workspace = true
 tempfile.workspace = true
 
