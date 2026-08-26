@@ -44,8 +44,8 @@ use data_plane::{
     DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopRuntimeCancellation,
     DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
     DesktopSnapshot, DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
-    ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
-    RecoveryKitDraft,
+    DesktopWaitingApprovalGrantRequest, ProductEvidenceProjection, ProjectContextAccessProjection,
+    ProjectContextAccessStatus, RecoveryKitDraft,
 };
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 use runtime_subscription::{
@@ -345,104 +345,117 @@ impl UiFailure {
         }
     }
 
+    fn coded(code: &str, message: &str) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
     fn from_error(error: &DesktopDataError) -> Self {
         match error {
-            DesktopDataError::MissingDatabaseKey => Self {
-                code: "BLOCKED_ENV".into(),
-                message: "本地数据库仍在，但 OS Vault 中的密钥不存在。Hartevo 不会生成新密钥覆盖现有数据；请进入恢复或支持流程。".into(),
-            },
-            DesktopDataError::ProjectEncryptionNotReady(_) => Self {
-                code: "NOT_IMPLEMENTED".into(),
-                message: "该项目尚无可用且无需轮换的加密 Keyring。安全 Recovery Kit 导出流程完成前，不会从 Desktop 创建 Mission。".into(),
-            },
-            DesktopDataError::ProjectContextRecoveryRequired(_) => Self {
-                code: "RECOVERY_REQUIRED".into(),
-                message: "Keyring 存在，但本机设备没有可用的 exact wrapping key。恢复或设备附加完成前不会创建 Mission 或打开项目内容。".into(),
-            },
-            DesktopDataError::ProjectContextBlockedEnvironment(_) => Self {
-                code: "BLOCKED_ENV".into(),
-                message: "项目工作区当前无法安全打开；未读取 Context 内容，也未创建 Mission。".into(),
-            },
-            DesktopDataError::ProjectContextIntegrityError(_) => Self {
-                code: "INTEGRITY_ERROR".into(),
-                message: "项目 Keyring、SecretReference 或 encrypted Context 未通过完整性校验；Hartevo 已停止该项目执行。".into(),
-            },
-            DesktopDataError::EmptyMissionGoal | DesktopDataError::EmptyProjectName => Self {
-                code: "WAITING_USER".into(),
-                message: "项目名称与 Mission 目标不能为空。".into(),
-            },
-            DesktopDataError::InvalidCatalogMissionContract => Self {
-                code: "WAITING_USER".into(),
-                message: "请选择明确的 VM-00～VM-11 路由与允许的运行模式，并确认市场、语言、受众、时区、ISO 币种和非负 minor-unit 预算。未创建 Mission。".into(),
-            },
-            DesktopDataError::InvalidMissionContinuation => Self {
-                code: "WAITING_USER".into(),
-                message: "同一 Mission 的续写消息与稳定幂等键不能为空；未新增 Conversation 消息，也未运行 Runtime。".into(),
-            },
-            DesktopDataError::InvalidHumanCheckpointConfirmation => Self {
-                code: "WAITING_USER".into(),
-                message: "Human Checkpoint 确认必须绑定当前 Mission/Checkpoint revision、持久 Conversation、非空确认和稳定幂等键；未写入部分状态。".into(),
-            },
+            DesktopDataError::MissingDatabaseKey => Self::coded(
+                "BLOCKED_ENV",
+                "本地数据库仍在，但 OS Vault 中的密钥不存在。Hartevo 不会生成新密钥覆盖现有数据；请进入恢复或支持流程。",
+            ),
+            DesktopDataError::ProjectEncryptionNotReady(_) => Self::coded(
+                "NOT_IMPLEMENTED",
+                "该项目尚无可用且无需轮换的加密 Keyring。安全 Recovery Kit 导出流程完成前，不会从 Desktop 创建 Mission。",
+            ),
+            DesktopDataError::ProjectContextRecoveryRequired(_) => Self::coded(
+                "RECOVERY_REQUIRED",
+                "Keyring 存在，但本机设备没有可用的 exact wrapping key。恢复或设备附加完成前不会创建 Mission 或打开项目内容。",
+            ),
+            DesktopDataError::ProjectContextBlockedEnvironment(_) => Self::coded(
+                "BLOCKED_ENV",
+                "项目工作区当前无法安全打开；未读取 Context 内容，也未创建 Mission。",
+            ),
+            DesktopDataError::ProjectContextIntegrityError(_) => Self::coded(
+                "INTEGRITY_ERROR",
+                "项目 Keyring、SecretReference 或 encrypted Context 未通过完整性校验；Hartevo 已停止该项目执行。",
+            ),
+            DesktopDataError::EmptyMissionGoal | DesktopDataError::EmptyProjectName => {
+                Self::coded("WAITING_USER", "项目名称与 Mission 目标不能为空。")
+            }
+            DesktopDataError::InvalidCatalogMissionContract => Self::coded(
+                "WAITING_USER",
+                "请选择明确的 VM-00～VM-11 路由与允许的运行模式，并确认市场、语言、受众、时区、ISO 币种和非负 minor-unit 预算。未创建 Mission。",
+            ),
+            DesktopDataError::InvalidMissionContinuation => Self::coded(
+                "WAITING_USER",
+                "同一 Mission 的续写消息与稳定幂等键不能为空；未新增 Conversation 消息，也未运行 Runtime。",
+            ),
+            DesktopDataError::InvalidHumanCheckpointConfirmation => Self::coded(
+                "WAITING_USER",
+                "Human Checkpoint 确认必须绑定当前 Mission/Checkpoint revision、持久 Conversation、非空确认和稳定幂等键；未写入部分状态。",
+            ),
             DesktopDataError::InvalidVm11OutcomeDecision
-            | DesktopDataError::InvalidVm11NextContractResolution => Self {
-                code: "WAITING_USER".into(),
-                message: "VM-11 Continue/Stop/Scale/Test 必须绑定冻结决策、父合同 digest 与当前 CAS revision；未写入部分状态。".into(),
-            },
-            DesktopDataError::InvalidRecoveryKey => Self {
-                code: "WAITING_USER".into(),
-                message: "Recovery Kit 必须是此前导出的 64 位十六进制密钥；Hartevo 不会代替用户保存或猜测恢复密钥。".into(),
-            },
-            DesktopDataError::RuntimeSubscriptionContextMismatch => Self {
-                code: "STALE_SELECTION".into(),
-                message: "Runtime 订阅句柄与当前 Tenant / Project 上下文不一致，请重新选择后重试；未读取正文或写入状态。".into(),
-            },
+            | DesktopDataError::InvalidVm11NextContractResolution
+            | DesktopDataError::InvalidWaitingApprovalGrant => Self::coded(
+                "WAITING_USER",
+                "精确窗口动作必须绑定冻结 digest 与当前 CAS revision；未写入部分状态，也未执行 Effect。",
+            ),
+            DesktopDataError::InvalidRecoveryKey => Self::coded(
+                "WAITING_USER",
+                "Recovery Kit 必须是此前导出的 64 位十六进制密钥；Hartevo 不会代替用户保存或猜测恢复密钥。",
+            ),
+            DesktopDataError::RuntimeSubscriptionContextMismatch => Self::coded(
+                "STALE_SELECTION",
+                "Runtime 订阅句柄与当前 Tenant / Project 上下文不一致，请重新选择后重试；未读取正文或写入状态。",
+            ),
             DesktopDataError::ProjectNotFound(_)
-            | DesktopDataError::ProjectEncryptionAlreadyProvisioned(_) => Self {
-                code: "STALE_SELECTION".into(),
-                message: "当前项目已变化，请刷新后重试。".into(),
-            },
-            DesktopDataError::ProjectRecoveryNotApplicable(_) => Self {
-                code: "RECOVERY_UNAVAILABLE".into(),
-                message: "该项目不是可由单一用户自持 Recovery Kit 恢复的个人 Keyring；Hartevo 未尝试修改任何设备 envelope。".into(),
-            },
+            | DesktopDataError::ProjectEncryptionAlreadyProvisioned(_) => {
+                Self::coded("STALE_SELECTION", "当前项目已变化，请刷新后重试。")
+            }
+            other => Self::from_integrity_or_application_error(other),
+        }
+    }
+
+    fn from_integrity_or_application_error(error: &DesktopDataError) -> Self {
+        match error {
+            DesktopDataError::ProjectRecoveryNotApplicable(_) => Self::coded(
+                "RECOVERY_UNAVAILABLE",
+                "该项目不是可由单一用户自持 Recovery Kit 恢复的个人 Keyring；Hartevo 未尝试修改任何设备 envelope。",
+            ),
             DesktopDataError::DataDirectoryUnavailable
             | DesktopDataError::InvalidDataRoot(_)
             | DesktopDataError::Io(_)
-            | DesktopDataError::SecretStore(_) => Self {
-                code: "BLOCKED_ENV".into(),
-                message: "本机数据目录或 OS Secret Store 当前不可用；未写入任何项目或外部系统。".into(),
-            },
+            | DesktopDataError::SecretStore(_) => Self::coded(
+                "BLOCKED_ENV",
+                "本机数据目录或 OS Secret Store 当前不可用；未写入任何项目或外部系统。",
+            ),
             DesktopDataError::Application(ApplicationError::RuntimeProcessCleanupBlocked {
                 ..
-            }) => Self {
-                code: "BLOCKED_ENV".into(),
-                message: "此前认领的本机 Runtime 进程无法被精确检查或终止。Hartevo 不会按 PID 猜测清理，也不会启动第二个 Runtime；请保留现场并进入支持恢复流程。".into(),
-            },
+            }) => Self::coded(
+                "BLOCKED_ENV",
+                "此前认领的本机 Runtime 进程无法被精确检查或终止。Hartevo 不会按 PID 猜测清理，也不会启动第二个 Runtime；请保留现场并进入支持恢复流程。",
+            ),
             DesktopDataError::Application(
                 ApplicationError::StructuredOutcomeDecisionRequired
                 | ApplicationError::StructuredOutcomeDecisionCommandMismatch
                 | ApplicationError::Vm11NextContractRouteSpecificCommandRequired,
-            ) => Self {
-                code: "WAITING_USER".into(),
-                message: "该 VM-11 Checkpoint 不接受自由文本或通用 Application 完成入口；请使用窗口中的 Continue/Stop/Scale/Test 动作。".into(),
-            },
+            ) => Self::coded(
+                "WAITING_USER",
+                "该 VM-11 Checkpoint 不接受自由文本或通用 Application 完成入口；请使用窗口中的 Continue/Stop/Scale/Test 动作。",
+            ),
             DesktopDataError::Application(
                 ApplicationError::StructuredOutcomeDecisionUnavailable
                 | ApplicationError::StructuredOutcomeDecisionReviewMismatch
                 | ApplicationError::StructuredOutcomeDecisionReplayMismatch
                 | ApplicationError::Vm11NextContractCommandMismatch
-                | ApplicationError::Vm11NextContractReplayMismatch,
-            ) => Self {
-                code: "STALE_DECISION".into(),
-                message: "冻结 Outcome Review、决策或父合同 revision 已变化；请刷新后重新审阅，旧提交未被写入或重放。".into(),
-            },
-            DesktopDataError::Storage(_)
-            | DesktopDataError::Application(_)
-            | DesktopDataError::Catalog(_)
-            | DesktopDataError::Cordis(_) => Self {
-                code: "INTEGRITY_ERROR".into(),
-                message: "持久状态或机器合同未通过完整性校验；Hartevo 已停止继续执行。".into(),
-            },
+                | ApplicationError::Vm11NextContractReplayMismatch
+                | ApplicationError::ProposedEffectApprovalCommandMismatch
+                | ApplicationError::ProposedEffectApprovalUnavailable
+                | ApplicationError::ProposedEffectApprovalDigestMismatch
+                | ApplicationError::MissionRevisionMismatch { .. },
+            ) => Self::coded(
+                "STALE_DECISION",
+                "冻结 digest 或 CAS revision 已变化；请刷新后重新审阅，旧提交未被写入或重放，也未执行 Effect。",
+            ),
+            _ => Self::coded(
+                "INTEGRITY_ERROR",
+                "持久状态或机器合同未通过完整性校验；Hartevo 已停止继续执行。",
+            ),
         }
     }
 }
@@ -1343,6 +1356,21 @@ pub fn App() -> Element {
             && mission.current_checkpoint_application_handler_status
                 == Some(ApplicationCheckpointHandlerStatus::CatalogRevisionMismatch)
     });
+    let waiting_approval_grant_active = !visual_fixture_mode
+        && mission.as_ref().is_some_and(|mission| {
+            mission.stage == MissionStage::WaitingApproval
+                && mission
+                    .pending_effects
+                    .iter()
+                    .any(|effect| effect.scope_digest.len() == 64)
+        });
+    let pending_effect_grant = mission.as_ref().and_then(|mission| {
+        mission
+            .pending_effects
+            .iter()
+            .find(|effect| effect.scope_digest.len() == 64)
+            .cloned()
+    });
     let runtime_progress_events = runtime_progress.read().clone();
     let recent_runtime_progress = runtime_progress_events
         .iter()
@@ -1361,6 +1389,8 @@ pub fn App() -> Element {
                 "正在安全恢复本地 Runtime"
             } else if vm11_next_contract_route_active {
                 "正在按冻结 Continue/Stop/Scale/Test 决议推进下一步合同"
+            } else if waiting_approval_grant_active {
+                "正在按冻结 Effect digest 写入 ApprovalGrant"
             } else if application_route_active {
                 "正在运行确定性 Application Checkpoint"
             } else if human_route_active {
@@ -1454,8 +1484,13 @@ pub fn App() -> Element {
         project_can_start_mission && application_route_active && !runtime_busy;
     let can_resolve_vm11_next_contract =
         project_can_start_mission && vm11_next_contract_route_active && !runtime_busy;
+    let can_grant_waiting_approval = project_can_start_mission
+        && waiting_approval_grant_active
+        && pending_effect_grant.is_some()
+        && !runtime_busy;
     let can_edit_continuation = project_can_start_mission
         && !human_route_active
+        && !waiting_approval_grant_active
         && mission.as_ref().is_some_and(|mission| {
             mission.conversation_revision.is_some()
                 && matches!(
@@ -2194,6 +2229,7 @@ pub fn App() -> Element {
                                     || human_route_active
                                     || application_route_active
                                     || vm11_next_contract_route_active
+                                    || waiting_approval_grant_active
                                     || application_route_not_implemented
                                     || application_route_catalog_mismatch
                                     || runtime_retry_needed
@@ -2762,6 +2798,74 @@ pub fn App() -> Element {
                                         }
                                     }
                                     div { class: "composer-actions",
+                                        if waiting_approval_grant_active {
+                                            button {
+                                                class: "application-checkpoint-button",
+                                                disabled: !can_grant_waiting_approval,
+                                                aria_label: "按冻结 Effect digest 写入 Domain Kernel ApprovalGrant",
+                                                onclick: move |_| {
+                                                    let selection = {
+                                                        let model = model.read();
+                                                        model.selected_project_id.clone().zip(
+                                                            model.current_mission().and_then(|mission| {
+                                                                let effect = mission.pending_effects.iter().find(|effect| {
+                                                                    effect.scope_digest.len() == 64
+                                                                })?;
+                                                                Some((
+                                                                    mission.mission_id.clone(),
+                                                                    effect.effect_id.clone(),
+                                                                    effect.scope_digest.clone(),
+                                                                    mission.revision,
+                                                                ))
+                                                            }),
+                                                        )
+                                                    };
+                                                    let Some((project_id, (mission_id, effect_id, expected_scope_digest, expected_mission_revision))) = selection else {
+                                                        model.write().notice = Some(UiFailure {
+                                                            code: "BLOCKED_DATA".into(),
+                                                            message: "冻结 Effect digest 或当前 Mission CAS revision 不完整；未写入 ApprovalGrant，也未执行 Effect。".into(),
+                                                        });
+                                                        return;
+                                                    };
+                                                    let request = DesktopWaitingApprovalGrantRequest {
+                                                        project_id,
+                                                        mission_id,
+                                                        effect_id,
+                                                        expected_scope_digest,
+                                                        expected_mission_revision,
+                                                    };
+                                                    mission_submitting.set(true);
+                                                    spawn(async move {
+                                                        let result = tokio::task::spawn_blocking(move || {
+                                                            DesktopDataPlane::discover().and_then(|plane| {
+                                                                plane.grant_waiting_approval_os(request, Utc::now())
+                                                            })
+                                                        })
+                                                        .await;
+                                                        match result {
+                                                            Ok(Ok(snapshot)) => {
+                                                                model.write().set_ready(snapshot, false);
+                                                            }
+                                                            Ok(Err(error)) => model.write().set_notice(&error),
+                                                            Err(_) => {
+                                                                model.write().notice = Some(UiFailure {
+                                                                    code: "WAITING_APPROVAL_GRANT_COORDINATOR_FAILED".into(),
+                                                                    message: "ApprovalGrant 协调异常结束；冻结 digest 与 Mission CAS 仍然生效，未执行 Effect、未铸造 Receipt，也未声明 Verification。".into(),
+                                                                });
+                                                            }
+                                                        }
+                                                        mission_submitting.set(false);
+                                                    });
+                                                },
+                                                if mission_submitting() {
+                                                    "正在写入精确 ApprovalGrant…"
+                                                } else if let Some(effect) = pending_effect_grant.as_ref() {
+                                                    "批准冻结 digest {short_digest(&effect.scope_digest)}"
+                                                } else {
+                                                    "冻结 digest 不完整"
+                                                }
+                                            }
+                                        }
                                         if vm11_next_contract_route_active {
                                             button {
                                                 class: "application-checkpoint-button",
@@ -5665,7 +5769,7 @@ const fn mission_next_boundary_copy(kind: MissionNextBoundaryKind) -> MissionNex
         MissionNextBoundaryKind::WaitingApproval => MissionNextBoundaryCopy {
             code: "WAITING_APPROVAL",
             title: "等待精确审批",
-            detail: "只有完整 Effect digest 的 ApprovalGrant 才能继续；页面不会替代审批或执行外部动作。",
+            detail: "使用窗口中的冻结 Effect digest 写入 ApprovalGrant；批准不等于执行 Effect，也不构成 Receipt 或 Verification。",
             tone: "attention",
         },
         MissionNextBoundaryKind::WaitingUser => MissionNextBoundaryCopy {
@@ -6289,7 +6393,11 @@ fn MissionStateCard(
             } else if mission.stage == MissionStage::Running && mission.evidence_count == 0 {
                 div { class: "boundary-note", "NOT_STARTED：Mission 已持久化，但尚无 Runtime Turn；没有研究结果、Provider Receipt 或业务完成声明。" }
             } else if mission.stage == MissionStage::WaitingApproval {
-                div { class: "boundary-note", "审批数来自 Effect Ledger；Desktop 精确 digest 审批 UI 尚未接线，因此不会在此处制造批准。" }
+                if mission.pending_effects.is_empty() {
+                    div { class: "boundary-note", "Mission 处于 WaitingApproval，但当前投影没有可授予的 Proposed Effect digest；页面不会制造 SAMPLE 批准。" }
+                } else {
+                    div { class: "boundary-note", "使用下方精确 digest 动作写入 Domain Kernel ApprovalGrant；批准不会执行 Effect、铸造 Receipt 或声明 Verification。" }
+                }
             } else if mission.stage == MissionStage::Verifying {
                 div { class: "boundary-note", "Domain 正处于 Verifying；只有持久 Verification 能推进，页面按钮不能直接完成 Mission。" }
             } else if mission.stage == MissionStage::Scheduled {
@@ -9976,6 +10084,27 @@ mod tests {
             mission_next_boundary_copy(MissionNextBoundaryKind::CatalogRevisionMismatch).code,
             "BLOCKED_CATALOG_REVISION"
         );
+    }
+
+    #[test]
+    fn fixture_waiting_approval_journey_still_refuses_to_mint_grants() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("未创建 ApprovalGrant，也未执行 Effect。"));
+        assert!(
+            source.contains(
+                "SAMPLE r{approval_digest_revision} · 不创建 ApprovalGrant / EffectIntent"
+            )
+        );
+        assert!(source.contains("预览批准后结构"));
+        assert!(source.contains("grant_waiting_approval_os"));
+        assert!(source.contains("!visual_fixture_mode"));
+        assert!(source.contains("批准冻结 digest {short_digest(&effect.scope_digest)}"));
+        assert!(source.contains("使用下方精确 digest 动作写入 Domain Kernel ApprovalGrant"));
+        assert!(source.contains("cfg(feature = \"visual-fixtures\")"));
+        let waiting = mission_next_boundary_copy(MissionNextBoundaryKind::WaitingApproval);
+        assert_eq!(waiting.code, "WAITING_APPROVAL");
+        assert!(waiting.detail.contains("ApprovalGrant"));
+        assert!(!waiting.detail.contains("尚未接线"));
     }
 
     #[test]
