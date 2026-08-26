@@ -27,8 +27,16 @@ jobs:
     outputs:
       ready: ${{ steps.ready.outputs.ready }}
     steps:
+      - name: Checkout exact protected integration head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify normal merge of an exact hosted-green train
+        if: github.event_name == 'push'
+        run: python3 scripts/ci-merge-train.py verify-bootstrap-push --event "$GITHUB_EVENT_PATH"
       - id: ready
-        name: Mark reviewed integration run ready
+        name: Mark exact integration input ready
         run: echo 'ready=true' >> "$GITHUB_OUTPUT"
 
   rust:

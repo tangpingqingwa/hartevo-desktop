@@ -1,0 +1,19 @@
+{
+  "authorTaskId": "codex-root-governance-inventory-repair",
+  "baseSha": "f195ae393808b8a58984c42377b24af655b5561f",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    ".github/workflows/rust-reusable.yml",
+    "docs/operations/REPOSITORY-GOVERNANCE-CONTROL-PLANE.md",
+    "scripts/ci-branch-policy.py",
+    "scripts/ci-workflow-policy.py"
+  ],
+  "pr": 936,
+  "receiptDigest": "7879d49b009352fbdb39b6e46a54b064edd61f6c161c7d58ddc2ef244ad9cfbf",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-22T11:40:26Z",
+  "reviewedHeadSha": "921d0a89cb88853ed856477c6bb5849772b7a8ae",
+  "reviewerTaskId": "github-actions-run-32570291626",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
