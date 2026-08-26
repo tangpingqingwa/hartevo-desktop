@@ -1,0 +1,60 @@
+name: Governance / Inventory
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: hartevo-repository-governance-inventory
+  cancel-in-progress: true
+
+jobs:
+  inventory:
+    name: Governance / Live inventory projection
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Checkout protected governance policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify policy and append-only pause ledger
+        run: |
+          python3 scripts/repository_governance.py verify-repository
+          python3 scripts/repository_governance.py verify-ledger
+      - name: Project live inventory and deterministic plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p target/governance
+          python3 scripts/repository_governance.py snapshot \
+            --repo "$GITHUB_REPOSITORY" \
+            --output target/governance/snapshot.json
+          python3 scripts/repository_governance.py plan \
+            --snapshot target/governance/snapshot.json \
+            --ledger .github/governance/events.jsonl \
+            --output target/governance/plan.json
+          python3 scripts/ci-branch-policy.py probe --repo "$GITHUB_REPOSITORY"
+          jq -e '.truth.manualCountsAccepted == false and .destructiveExecution == "DISABLED_WITHOUT_EXACT_APPROVAL"' \
+            target/governance/plan.json
+          jq -e '([.incidents[] | select(.code == "REPOSITORY_SETTING_DRIFT" or .code == "MULTIPLE_OPEN_TRAINS" or .code == "READY_TO_TRAIN_SLA_BREACH")] | length) == 0' \
+            target/governance/plan.json
+      - name: Upload governance truth and deferred-action evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: governance-inventory-${{ github.run_id }}
+          path: target/governance
+          if-no-files-found: error
+          retention-days: 30

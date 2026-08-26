@@ -1,0 +1,37 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "2ac6b0159118f90f9ff15cfda932ca2ba7a15e8e",
+  "candidateCount": 1,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "2ac6b0159118f90f9ff15cfda932ca2ba7a15e8e",
+      "headBranch": "docs/build-cordis-merge-train",
+      "headCommit": "ed1e3a8d4eb548be82db43ecdab94a9b62994853",
+      "number": 941,
+      "review": {
+        "authorTaskId": "01a0339d-2e69-7071-b824-0ca550a0083d",
+        "exactPaths": [
+          "docs/BUILD.md",
+          "docs/SOURCE-OF-TRUTH.md"
+        ],
+        "receiptDigest": "781a36aa8cb7e33f1e6f61da816142330af733fe29f886e79f01dfa552737665",
+        "receiptPath": ".github/governance/reviews/pr-941.json",
+        "reviewedHeadSha": "918cbeeba21d207187929103cad50b15d50cd81d",
+        "reviewerTaskId": "01a033b9-5b2d-7ff3-9df9-8860d4df97e4"
+      }
+    }
+  ],
+  "createdAt": "2026-08-24T12:31:43Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260824-1232"
+}

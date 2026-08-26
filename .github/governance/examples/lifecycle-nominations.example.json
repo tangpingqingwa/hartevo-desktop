@@ -1,0 +1,17 @@
+{
+  "items": [
+    {
+      "kind": "CLOSE_PR",
+      "pr": 123,
+      "reason": "The exact snapshotted pull request is superseded and has an explicitly confirmed recovery path."
+    },
+    {
+      "branch": "codex/example-orphan",
+      "kind": "DELETE_BRANCH",
+      "reason": "The exact snapshotted branch has no open pull request and is retained by a recovery tag before deletion."
+    }
+  ],
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "requestedBy": "replace-with-accountable-actor",
+  "schema": "hartevo-lifecycle-nominations/v1"
+}
