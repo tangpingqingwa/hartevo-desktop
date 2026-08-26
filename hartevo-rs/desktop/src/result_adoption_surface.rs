@@ -307,6 +307,7 @@ mod tests {
             work_product_count: 1,
             work_products: vec![product],
             pending_approval_count: 0,
+            pending_effects: Vec::new(),
             verified_effect_count: 0,
             outcome_summary: None,
             vm11_outcome_review: None,
