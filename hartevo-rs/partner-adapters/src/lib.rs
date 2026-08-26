@@ -5,4 +5,5 @@
 //! therefore testable as a standalone, scoped plugin package without changing
 //! the shared Cargo root or desktop/application surfaces.
 
+pub mod awin;
 pub mod cj;
