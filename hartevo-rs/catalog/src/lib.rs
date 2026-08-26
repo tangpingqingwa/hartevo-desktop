@@ -23,8 +23,9 @@ pub use evidence::{
     EvaluationPrivateAttestationStatus, EvaluationReferenceRunProfile,
     EvaluationReferenceThresholdStatus, EvaluationRunEvidenceAuthority,
     EvaluationRunResultReference, EvaluationRunResultReferences, EvaluationRunValidationAuthority,
-    EvaluationSafetyMappingStatus, EvidenceLevel, MissionEvidenceRecord, MissionEvidenceStatus,
-    ReleaseEvidence, ReleaseStage,
+    EvaluationSafetyMappingStatus, EvaluatorAuthorityScope, EvaluatorEvidenceAuthority,
+    EvaluatorEvidenceKind, EvaluatorExecutionStatus, EvidenceLevel, MissionEvidenceRecord,
+    MissionEvidenceStatus, ReleaseEvidence, ReleaseStage,
 };
 pub use mission_contract::{
     EXPECTED_CAPABILITY_COUNT, EXPECTED_CHECKPOINT_ROUTE_COUNT, validate_mission_contract_closure,

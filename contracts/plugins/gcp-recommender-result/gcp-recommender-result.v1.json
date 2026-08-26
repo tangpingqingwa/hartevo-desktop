@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/plugins/gcp-recommender-result/gcp-recommender-result.v1.json",
+  "title": "Hartevo governed Google Cloud Recommender and Insight result Layer-1 contract",
+  "schemaVersion": "hartevo.gcp-recommender-result.contract/v1",
+  "contractVersion": "gcp-recommender-result/v1",
+  "pluginVersion": "0.1.0",
+  "layer": "Layer-1",
+  "service": {
+    "id": "gcp.recommender-result",
+    "version": "1.0.0",
+    "operation": "bounded_recommendation_insight_result_proposal",
+    "readOnly": true,
+    "liveExecution": false,
+    "nativePostExecution": false,
+    "nativeGetReadback": false,
+    "marksRecommendation": false,
+    "executesOperationGroup": false
+  },
+  "provider": {
+    "id": "gcp.recommender.result",
+    "implementation": "GcpRecommenderProvider",
+    "apiVersion": "v1",
+    "baseUrl": "https://recommender.googleapis.com",
+    "operations": [
+      "recommendations.list",
+      "recommendations.get",
+      "insights.list",
+      "insights.get"
+    ],
+    "permissions": [
+      "recommender.recommendations.list",
+      "recommender.recommendations.get",
+      "recommender.insights.list",
+      "recommender.insights.get"
+    ],
+    "acceptedTransports": [
+      "fixture",
+      "recording",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "native": false,
+    "connected": false,
+    "firstParty": false,
+    "liveCredentialResolution": false
+  },
+  "consumer": {
+    "id": "mission.gcp-recommender-result",
+    "implementation": "MissionGcpRecommendationConsumer",
+    "missionBound": true,
+    "projectBound": true,
+    "workProductBound": true,
+    "adoptsOutcome": false,
+    "truthAuthority": false,
+    "marksRecommendation": false,
+    "executesOperationGroup": false
+  },
+  "scope": {
+    "required": [
+      "organization_or_folder_or_project_or_billing_account",
+      "location",
+      "recommender_or_insight_type",
+      "target_resource_fingerprints",
+      "project",
+      "mission",
+      "workProduct",
+      "permission",
+      "consent"
+    ],
+    "parentKinds": [
+      "organization",
+      "folder",
+      "project",
+      "billing_account"
+    ],
+    "secret": "opaque_secret_reference_only",
+    "targetResources": "digest_only"
+  },
+  "filters": {
+    "states": [
+      "active",
+      "dismissed",
+      "claimed",
+      "failed",
+      "succeeded"
+    ],
+    "priorities": ["p1", "p2", "p3", "p4"],
+    "subtypes": "scope_allowlisted_only",
+    "arbitraryExpression": false,
+    "maxValuesPerDimension": 8
+  },
+  "bounds": {
+    "maxPageSize": 100,
+    "maxPages": 16,
+    "maxResults": 500,
+    "maxTargetResourceFingerprints": 32
+  },
+  "evidence": {
+    "bounded": true,
+    "identities": true,
+    "priority": true,
+    "category": true,
+    "state": true,
+    "timestamps": true,
+    "impactClass": true,
+    "targetResourceFingerprints": "digest_only",
+    "content": "digest_only",
+    "rawDescriptions": false,
+    "customStructPayloads": false,
+    "principals": false,
+    "operationPlans": false,
+    "projectedSavings": false
+  },
+  "registration": {
+    "boundDigests": [
+      "schemaVersion",
+      "contractVersion",
+      "pluginVersion",
+      "provider",
+      "apiVersion",
+      "permission",
+      "query",
+      "scope",
+      "evidence",
+      "secretReference"
+    ],
+    "reversible": true,
+    "revocable": true,
+    "failClosedOnDrift": true
+  },
+  "transport": {
+    "fixture": true,
+    "recording": true,
+    "loopback": true,
+    "blockedEnv": true,
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "safeBackoff": true
+  },
+  "authority": {
+    "externalWrites": false,
+    "recommendationMutation": false,
+    "operationGroupExecution": false,
+    "resourceMutation": false,
+    "connected": false,
+    "nativeProvider": false,
+    "durableNativeReceipt": false,
+    "independentNativeReadback": false,
+    "kernelOutcomeAdoption": false,
+    "workProductAdoption": false,
+    "projectedSavingsAuthority": false
+  },
+  "layer2Gaps": [
+    "native_https_transport",
+    "native_oauth_or_service_account_resolution",
+    "durable_provider_receipt",
+    "independent_native_reread",
+    "consented_recommendation_optimization_effects"
+  ],
+  "honestNativeGap": "Layer 1 only prepares and verifies bounded, typed, redacted Recommender and Insight list/get evidence from fixture, recording, loopback, or BLOCKED_ENV provenance. It never resolves a live credential, calls Google Cloud, claims Connected/native/first-party, retains raw descriptions or Struct payloads, marks a recommendation, executes an operation group, mutates a resource, claims projected savings, or adopts a kernel Outcome."
+}

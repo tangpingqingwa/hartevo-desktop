@@ -1,0 +1,354 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/nomad-deployment-result/nomad-deployment-result.v1.json",
+  "title": "Hartevo HashiCorp Nomad deployment result Layer-1 contract",
+  "description": "Bounded Nomad job, deployment, and allocation metadata for a Mission proposal; never a Nomad effect or authority.",
+  "schemaVersion": "hartevo.nomad-deployment-result/v1",
+  "contractVersion": "EXT-NOMAD-01-L1/v1",
+  "pluginId": "nomad.deployment-result",
+  "pluginVersion": "1.0.0",
+  "layer": 1,
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "digestInput": "hartevo.nomad-deployment-result/v1|layer=1|service=nomad.deployment-result.read|provider=nomad.deployment-result.recording|consumer=mission.nomad-deployment.consumer",
+  "contractDigest": "cb9ad8b2d5e8b509f6790bbb3048204d822bcf77efaaf8bd7facbb7e00b5fef7",
+  "officialReferences": [
+    "https://developer.hashicorp.com/nomad/api-docs/jobs",
+    "https://developer.hashicorp.com/nomad/api-docs/deployments",
+    "https://developer.hashicorp.com/nomad/api-docs/allocations"
+  ],
+  "typedSurface": {
+    "service": "NomadDeploymentResultService",
+    "provider": "NomadProvider",
+    "consumer": "MissionNomadDeploymentConsumer",
+    "models": [
+      "Project",
+      "Mission",
+      "WorkProduct",
+      "NomadProviderScope",
+      "NomadDeploymentScope",
+      "SecretReference",
+      "NomadDeploymentRegistration",
+      "NomadDeploymentEvidence",
+      "NomadDeploymentProposal",
+      "RecordedNomadDeploymentResult"
+    ]
+  },
+  "authority": {
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "liveExternalIo": false,
+    "connected": false,
+    "nativeProvider": false,
+    "firstPartyProvider": false,
+    "durableProviderReceipt": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false,
+    "outcomeAuthority": false,
+    "workProductAdoption": false,
+    "kernelAuthority": false
+  },
+  "service": {
+    "type": "NomadDeploymentResultService",
+    "id": "nomad.deployment-result.read",
+    "access": "read_proposal_recording_verify",
+    "operations": [
+      "describe_capabilities",
+      "describe_scope",
+      "register_scope",
+      "read_job_metadata",
+      "read_deployment_metadata",
+      "read_allocation_metadata",
+      "compile_deployment_result_proposal",
+      "record_local_observation",
+      "verify_proposal",
+      "revoke_registration",
+      "restore_registration",
+      "reverse_registration"
+    ],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false,
+    "workProductAdoption": false
+  },
+  "provider": {
+    "type": "NomadProvider",
+    "id": "nomad.deployment-result.recording",
+    "version": "nomad-provider/v1",
+    "apiRevision": "nomad-jobs-deployments-allocations-v1",
+    "baseUrl": "provider-bound",
+    "operations": [
+      "GET /v1/job/{jobID}",
+      "GET /v1/deployment/{deploymentID}",
+      "GET /v1/allocation/{allocationID}"
+    ],
+    "metadataOnly": true,
+    "bounded": true,
+    "allowedTransportProvenance": [
+      "recording",
+      "fixture",
+      "fake",
+      "loopback",
+      "BLOCKED_ENV"
+    ],
+    "authentication": {
+      "schemes": ["acl_token", "vault_token"],
+      "secretReference": "opaque_non_serializing",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false,
+      "environmentExport": false
+    },
+    "connectedEvidence": false,
+    "nativeEvidence": false,
+    "firstPartyEvidence": false,
+    "providerReceipt": false,
+    "externalWrites": false,
+    "forbiddenOperations": [
+      "POST /v1/jobs",
+      "PUT /v1/job/{jobID}",
+      "DELETE /v1/job/{jobID}",
+      "POST /v1/job/{jobID}/evaluate",
+      "POST /v1/deployment/{deploymentID}/fail",
+      "POST /v1/allocation/{allocationID}/stop",
+      "GET /v1/client/allocation/{allocationID}/logs",
+      "raw_task_events",
+      "raw_job_payload",
+      "secret_export"
+    ]
+  },
+  "consumer": {
+    "type": "MissionNomadDeploymentConsumer",
+    "id": "mission.nomad-deployment.consumer",
+    "authority": "proposal_and_local_record_below_kernel",
+    "scope": [
+      "projectId",
+      "projectRevision",
+      "missionId",
+      "missionRevision",
+      "workProductId",
+      "workProductRevision",
+      "providerScopeDigest",
+      "jobId",
+      "deploymentId",
+      "allocationId"
+    ],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "verifiedDeployment": false
+  },
+  "exactScope": [
+    "project",
+    "mission",
+    "workProduct",
+    "nomadAddress",
+    "namespace",
+    "region",
+    "datacenter",
+    "job",
+    "deployment",
+    "allocation"
+  ],
+  "allowlist": {
+    "reads": [
+      {
+        "operation": "read_job_metadata",
+        "method": "GET",
+        "path": "/v1/job/{jobID}",
+        "rawJobPayload": false,
+        "rawTaskGroups": false
+      },
+      {
+        "operation": "read_deployment_metadata",
+        "method": "GET",
+        "path": "/v1/deployment/{deploymentID}",
+        "rawDeploymentEvents": false
+      },
+      {
+        "operation": "read_allocation_metadata",
+        "method": "GET",
+        "path": "/v1/allocation/{allocationID}",
+        "rawTaskStates": false,
+        "rawLogs": false
+      }
+    ],
+    "writes": [],
+    "forbidden": [
+      "job_submit",
+      "job_register",
+      "job_deregister",
+      "job_evaluate",
+      "deployment_fail",
+      "allocation_stop",
+      "allocation_restart",
+      "allocation_scale",
+      "raw_logs",
+      "raw_task_events",
+      "raw_job_payload",
+      "secret_export",
+      "kernel_receipt",
+      "kernel_outcome_authority",
+      "verified_work_product_adoption"
+    ]
+  },
+  "authentication": {
+    "boundary": "opaque_non_serializing_SecretReference",
+    "aclToken": true,
+    "vaultToken": true,
+    "rawCredentialSerialized": false,
+    "rawCredentialDebug": false,
+    "rawCredentialRequest": false,
+    "rawCredentialReceipt": false,
+    "resolvedByLayer": 2
+  },
+  "bounds": {
+    "maxPages": 4,
+    "maxRetryAttempts": 1,
+    "maxResources": 3,
+    "maxResponseBytes": 1048576,
+    "maxIdentifierBytes": 256,
+    "maxCursorBytes": 512
+  },
+  "deploymentStates": [
+    "absent",
+    "pending",
+    "running",
+    "successful",
+    "failed",
+    "stopped",
+    "partial",
+    "access_loss",
+    "provider_unknown",
+    "blocked_env",
+    "tampered",
+    "replay",
+    "registration_revoked",
+    "registration_reversed"
+  ],
+  "projection": {
+    "identifiers": "digest_only",
+    "metadata": "bounded_digest_only",
+    "jobPayload": false,
+    "deploymentEvents": false,
+    "allocationTaskStates": false,
+    "logs": false,
+    "environment": false,
+    "vaultMaterial": false,
+    "aclToken": false
+  },
+  "registration": {
+    "versionBound": true,
+    "contractDigestBound": true,
+    "providerApiRevisionBound": true,
+    "providerVersionBound": true,
+    "providerDigestBound": true,
+    "permissionDigestBound": true,
+    "consentDigestBound": true,
+    "scopeDigestBound": true,
+    "secretReferenceDigestBound": true,
+    "registrationRevisionBound": true,
+    "reversible": true,
+    "revocable": true,
+    "activeStatuses": ["active"],
+    "revokedStatuses": ["revoked"],
+    "terminalStatuses": ["reversed"],
+    "permissions": [
+      "nomad:jobs.read",
+      "nomad:deployments.read",
+      "nomad:allocations.read",
+      "mission.scope"
+    ],
+    "forbiddenPermissions": [
+      "nomad:jobs.write",
+      "nomad:deployments.write",
+      "nomad:allocations.write",
+      "nomad:logs.read",
+      "nomad:events.read",
+      "nomad:secrets.read",
+      "outcome.adopt"
+    ]
+  },
+  "evidence": {
+    "requiredDigests": [
+      "pluginVersionDigest",
+      "contractDigest",
+      "providerDigest",
+      "apiDigest",
+      "permissionDigest",
+      "consentDigest",
+      "scopeDigest",
+      "secretReferenceDigest",
+      "projectDigest",
+      "missionDigest",
+      "workProductDigest",
+      "providerScopeDigest",
+      "jobDigest",
+      "deploymentDigest",
+      "allocationDigest",
+      "evidenceDigest"
+    ],
+    "states": [
+      "absent",
+      "partial",
+      "access_loss",
+      "provider_unknown",
+      "tampered",
+      "replay",
+      "registration_revoked",
+      "registration_reversed"
+    ],
+    "tamperRejected": true,
+    "replayRejected": true,
+    "partialIsNonAdoptable": true,
+    "accessLossIsNonAdoptable": true,
+    "providerUnknownIsNonAdoptable": true,
+    "registrationRevocationIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connectedClaim": false,
+    "nativeClaim": false,
+    "firstPartyClaim": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": [
+      "typed Project/Mission/Work Product and Nomad provider scope",
+      "bounded Nomad jobs/deployments/allocations metadata reads",
+      "redacted deterministic evidence projection",
+      "version/provider/API/permission/consent/scope/evidence digest fences",
+      "reversible and revocable registration",
+      "idempotent local recording",
+      "Mission proposal projection",
+      "tamper, replay, access-loss, partial, absent, and provider-unknown states"
+    ],
+    "doesNotOwn": [
+      "Nomad ACL or Vault credential resolution",
+      "live connected HTTPS evidence",
+      "Nomad job/deployment/allocation writes",
+      "task logs or raw task events",
+      "durable provider receipts",
+      "Hartevo Truth/Consent/Effect/Receipt/Verification/Outcome authority",
+      "verified Work Product adoption"
+    ]
+  },
+  "nativeGaps": [
+    "native ACL/Vault resolution",
+    "live Nomad HTTPS transport",
+    "durable provider receipt",
+    "independent deployment read-back",
+    "consented Nomad effects",
+    "verified Work Product and Outcome adoption"
+  ]
+}
