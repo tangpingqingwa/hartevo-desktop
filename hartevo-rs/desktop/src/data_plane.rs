@@ -420,12 +420,12 @@ pub struct DesktopWaitingApprovalGrantRequest {
     pub expected_mission_revision: u64,
 }
 
-#[cfg(test)]
-type DesktopRuntimeCommandBuilder = Box<dyn FnOnce(&Path, &Path) -> RuntimeCommand>;
+#[cfg(any(test, feature = "native-journey"))]
+pub(crate) type DesktopRuntimeCommandBuilder = Box<dyn FnOnce(&Path, &Path) -> RuntimeCommand>;
 
-enum DesktopRuntimeSource {
+pub(crate) enum DesktopRuntimeSource {
     Pinned(Box<DesktopRuntimeConfiguration>),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native-journey"))]
     Fixture {
         provider: String,
         model: String,
@@ -443,7 +443,7 @@ impl DesktopRuntimeSource {
     fn provider(&self) -> &str {
         match self {
             Self::Pinned(configuration) => &configuration.provider,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture { provider, .. } => provider,
         }
     }
@@ -451,7 +451,7 @@ impl DesktopRuntimeSource {
     fn model(&self) -> &str {
         match self {
             Self::Pinned(configuration) => &configuration.model,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture { model, .. } => model,
         }
     }
@@ -466,7 +466,7 @@ impl DesktopRuntimeSource {
                 .artifact
                 .runtime_command(project_root, runtime_home)
                 .map_err(|error| DesktopDataError::Application(ApplicationError::Runtime(error))),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "native-journey"))]
             Self::Fixture {
                 command_builder, ..
             } => Ok(command_builder(project_root, runtime_home)),
@@ -546,12 +546,13 @@ impl fmt::Debug for RecoveryKitDraft {
     }
 }
 
+#[derive(Clone)]
 pub struct DesktopDataPlane {
     data_root: PathBuf,
     database_path: PathBuf,
     database_key_reference: SecretReference,
     device_id: DeviceId,
-    cordis: CordisHost,
+    cordis: Arc<Mutex<CordisHost>>,
 }
 
 impl DesktopDataPlane {
@@ -560,8 +561,8 @@ impl DesktopDataPlane {
     }
 
     /// Cordis-hosted live loop. OpenInterpreter is never this loop.
-    pub fn cordis_host(&mut self) -> &mut CordisHost {
-        &mut self.cordis
+    pub fn with_cordis_host<T>(&self, f: impl FnOnce(&mut CordisHost) -> T) -> T {
+        f(&mut self.lock_cordis())
     }
 
     /// Bind live Domain Kernel consent/approval onto the mounted host.
@@ -569,36 +570,36 @@ impl DesktopDataPlane {
     /// Production `desktop_surfaces()` stays fail-closed. `step` / `apply_effect`
     /// still require these facts; this never stamps `true` at boot.
     pub fn bind_live_domain_kernel(
-        &mut self,
+        &self,
         consent: &ConsentState,
         record: Option<&ConsentRecord>,
         approval: Option<&Approval>,
         now: DateTime<Utc>,
     ) -> Result<(), CordisError> {
-        bind_live_domain_kernel(&mut self.cordis, consent, record, approval, now)
+        bind_live_domain_kernel(&mut self.lock_cordis(), consent, record, approval, now)
     }
 
     /// Production Cordis step. Live Domain Kernel facts are rebound from
     /// ApplicationService before the host may plan; missing facts stay fail-closed.
     pub fn step(
-        &mut self,
+        &self,
         secret_store: &impl SecretStore,
         step: AgentStep,
         now: DateTime<Utc>,
     ) -> Result<AgentStepResult, DesktopDataError> {
         self.bind_live_domain_kernel_from_store(secret_store, now)?;
-        Ok(self.cordis.step(step)?)
+        Ok(self.lock_cordis().step(step)?)
     }
 
     /// Production Effect write path. Live Domain Kernel facts are rebound
     /// first; OpenInterpreter still cannot own Domain or Effect.
     pub fn apply_effect(
-        &mut self,
+        &self,
         secret_store: &impl SecretStore,
         now: DateTime<Utc>,
     ) -> Result<(), DesktopDataError> {
         self.bind_live_domain_kernel_from_store(secret_store, now)?;
-        Ok(self.cordis.apply_effect()?)
+        Ok(self.lock_cordis().apply_effect()?)
     }
 
     pub fn at_data_root(root: impl AsRef<Path>) -> Result<Self, DesktopDataError> {
@@ -629,8 +630,10 @@ impl DesktopDataPlane {
             version: 1,
         };
         let device_id = DeviceId::from_stable(format!("desktop-device:{root_digest}"));
-        let cordis = mount_cordis_host(&discover_runtime().projection)
-            .expect("Cordis host mounts SurfaceMapping, AgentLoop, and InvariantGate");
+        let cordis = Arc::new(Mutex::new(
+            mount_cordis_host(&discover_runtime().projection)
+                .expect("Cordis host mounts SurfaceMapping, AgentLoop, and InvariantGate"),
+        ));
         Ok(Self {
             data_root,
             database_path,
@@ -640,21 +643,18 @@ impl DesktopDataPlane {
         })
     }
 
-    pub fn load_os(&mut self, now: DateTime<Utc>) -> Result<DesktopLoadState, DesktopDataError> {
+    pub fn load_os(&self, now: DateTime<Utc>) -> Result<DesktopLoadState, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         self.load_with(&secret_store, now)
     }
 
-    pub fn initialize_os(
-        &mut self,
-        now: DateTime<Utc>,
-    ) -> Result<DesktopSnapshot, DesktopDataError> {
+    pub fn initialize_os(&self, now: DateTime<Utc>) -> Result<DesktopSnapshot, DesktopDataError> {
         let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
         self.initialize_with(&secret_store, now)
     }
 
     pub fn load_with(
-        &mut self,
+        &self,
         secret_store: &impl SecretStore,
         now: DateTime<Utc>,
     ) -> Result<DesktopLoadState, DesktopDataError> {
@@ -762,7 +762,7 @@ impl DesktopDataPlane {
     /// onboarding action. A key that survived an interrupted first open is
     /// reused; an existing database is never silently rebound to a new key.
     pub fn initialize_with(
-        &mut self,
+        &self,
         secret_store: &impl SecretStore,
         now: DateTime<Utc>,
     ) -> Result<DesktopSnapshot, DesktopDataError> {
@@ -917,6 +917,16 @@ impl DesktopDataPlane {
         Ok(DesktopCatalogMissionExecutionStart { snapshot, handle })
     }
 
+    #[cfg(feature = "native-journey")]
+    pub(crate) fn start_catalog_mission_execution_native(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopCatalogMissionRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopCatalogMissionExecutionStart, DesktopDataError> {
+        self.start_catalog_mission_execution_with(secret_store, request, now)
+    }
+
     /// Pulls one integrity-checked page from the encrypted Runtime text ledger
     /// after exact Tenant/Project/Device context authorization. The signed
     /// Application handle and cursor are returned unchanged; this read cannot
@@ -945,6 +955,18 @@ impl DesktopDataPlane {
         let service = self.open_read_application_from_secret(&database_secret)?;
         self.require_runtime_subscription_context_access(&service, secret_store, handle, now)?;
         Ok(service.read_runtime_text_subscription(handle, cursor, page_size)?)
+    }
+
+    #[cfg(feature = "native-journey")]
+    pub(crate) fn runtime_text_subscription_native(
+        &self,
+        secret_store: &impl SecretStore,
+        handle: &CatalogMissionExecutionHandle,
+        cursor: Option<&RuntimeTextSubscriptionCursor>,
+        page_size: usize,
+        now: DateTime<Utc>,
+    ) -> Result<RuntimeTextSubscriptionBatch, DesktopDataError> {
+        self.runtime_text_subscription_with(secret_store, handle, cursor, page_size, now)
     }
 
     /// Starts an explicitly confirmed VM-00..VM-11 Mission from the machine
@@ -1181,6 +1203,27 @@ impl DesktopDataPlane {
                 .configuration
                 .map(|configuration| DesktopRuntimeSource::Pinned(Box::new(configuration))),
             runtime.projection.status,
+            Some(cancellation),
+            now,
+        )
+    }
+
+    #[cfg(feature = "native-journey")]
+    pub(crate) fn resume_mission_runtime_native(
+        &self,
+        secret_store: &impl SecretStore,
+        scope: (&ProjectId, &MissionId),
+        runtime: DesktopRuntimeSource,
+        cancellation: &DesktopRuntimeCancellation,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopMissionSubmission, DesktopDataError> {
+        let (project_id, mission_id) = scope;
+        self.resume_mission_runtime_with_cancellation(
+            secret_store,
+            project_id,
+            mission_id,
+            Some(runtime),
+            DesktopRuntimeAvailabilityStatus::ReadyDevelopment,
             Some(cancellation),
             now,
         )
@@ -2937,7 +2980,7 @@ impl DesktopDataPlane {
     }
 
     fn bind_live_domain_kernel_from_store(
-        &mut self,
+        &self,
         secret_store: &impl SecretStore,
         now: DateTime<Utc>,
     ) -> Result<(), DesktopDataError> {
@@ -2955,8 +2998,14 @@ impl DesktopDataPlane {
         }
     }
 
+    fn lock_cordis(&self) -> std::sync::MutexGuard<'_, CordisHost> {
+        self.cordis
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn bind_live_domain_kernel_from_service(
-        &mut self,
+        &self,
         service: &ApplicationService,
         now: DateTime<Utc>,
     ) -> Result<(), DesktopDataError> {
@@ -3373,47 +3422,38 @@ mod tests {
         DesktopDataPlane::waiting_approval_broker()
     }
 
-    fn assert_host_fail_closed_on_consent(plane: &mut DesktopDataPlane) {
+    fn assert_host_fail_closed_on_consent(plane: &DesktopDataPlane) {
         use hartevo_cordis::{
             DomainSurface, OPENINTERPRETER, SurfaceOwner, host_is_cordis_loop, invariant_missing,
         };
 
-        host_is_cordis_loop(plane.cordis_host()).unwrap();
-        let domain = plane
-            .cordis_host()
-            .context()
-            .domain::<DomainSurface>()
-            .unwrap();
-        assert_eq!(domain.owner, SurfaceOwner::Hartevo);
-        assert!(!domain.consent);
-        assert!(!domain.approved);
-        assert!(
-            !plane
-                .cordis_host()
-                .context()
-                .effect_broker::<hartevo_cordis::EffectBrokerSurface>()
-                .unwrap()
-                .receipt_is_verification
-        );
-        assert_eq!(
-            plane
-                .cordis_host()
-                .step(AgentStep::new("mission-unbound", "plan"))
-                .unwrap_err(),
-            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
-        );
-        assert_eq!(
-            plane.cordis_host().apply_effect().unwrap_err(),
-            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
-        );
-        assert!(
-            plane
-                .cordis_host()
-                .context()
-                .get::<String>(OPENINTERPRETER)
-                .is_none()
-                || plane.cordis_host().runtime_plugin() == Some(OPENINTERPRETER)
-        );
+        plane.with_cordis_host(|host| {
+            host_is_cordis_loop(host).unwrap();
+            let domain = host.context().domain::<DomainSurface>().unwrap();
+            assert_eq!(domain.owner, SurfaceOwner::Hartevo);
+            assert!(!domain.consent);
+            assert!(!domain.approved);
+            assert!(
+                !host
+                    .context()
+                    .effect_broker::<hartevo_cordis::EffectBrokerSurface>()
+                    .unwrap()
+                    .receipt_is_verification
+            );
+            assert_eq!(
+                host.step(AgentStep::new("mission-unbound", "plan"))
+                    .unwrap_err(),
+                CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+            );
+            assert_eq!(
+                host.apply_effect().unwrap_err(),
+                CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+            );
+            assert!(
+                host.context().get::<String>(OPENINTERPRETER).is_none()
+                    || host.runtime_plugin() == Some(OPENINTERPRETER)
+            );
+        });
     }
 
     fn create_kernel_bind_project(
@@ -3642,7 +3682,7 @@ mod tests {
         ProjectId,
     ) {
         let directory = tempfile::tempdir().expect("directory");
-        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -4448,7 +4488,7 @@ sleep 30"#;
         reason = "the Desktop Journey verifies rejected routing, exact Catalog binding, private Contract persistence, and redacted evidence in one user flow"
     )]
     fn catalog_dispatch_persists_exact_vm_route_without_cross_executor_runtime() {
-        let (_directory, mut plane, secrets, project_id) = ready_personal_fixture();
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
         let DesktopLoadState::Ready(before_invalid) = plane
             .load_with(&secrets, observed_at() + Duration::minutes(1))
             .expect("ready fixture inventory")
@@ -7461,7 +7501,7 @@ sleep 30"#;
         reason = "the restart journey proves bounded same-generation retry, atomic authority retirement, generation replacement, replay suppression, and absence of fake Mission or Effect completion"
     )]
     fn desktop_runtime_retry_exhaustion_retires_generation_and_completes_same_mission() {
-        let (_directory, mut plane, secrets, project_id) = ready_personal_fixture();
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
         let first = plane
             .start_mission_and_run_with(
                 &secrets,
@@ -7867,36 +7907,28 @@ sleep 30"#;
         };
 
         let directory = tempfile::tempdir().expect("directory");
-        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
-        host_is_cordis_loop(plane.cordis_host()).unwrap();
-        let domain = plane
-            .cordis_host()
-            .context()
-            .domain::<DomainSurface>()
-            .unwrap();
-        assert_eq!(domain.owner, SurfaceOwner::Hartevo);
-        assert!(!domain.consent);
-        assert!(!domain.approved);
-        assert_eq!(
-            plane
-                .cordis_host()
-                .step(AgentStep::new("mission-plane", "plan"))
-                .unwrap_err(),
-            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
-        );
-        assert_eq!(
-            plane.cordis_host().apply_effect().unwrap_err(),
-            CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
-        );
-        assert!(
-            plane
-                .cordis_host()
-                .context()
-                .get::<String>(OPENINTERPRETER)
-                .is_none()
-                || plane.cordis_host().runtime_plugin() == Some(OPENINTERPRETER)
-        );
+        plane.with_cordis_host(|host| {
+            host_is_cordis_loop(host).unwrap();
+            let domain = host.context().domain::<DomainSurface>().unwrap();
+            assert_eq!(domain.owner, SurfaceOwner::Hartevo);
+            assert!(!domain.consent);
+            assert!(!domain.approved);
+            assert_eq!(
+                host.step(AgentStep::new("mission-plane", "plan"))
+                    .unwrap_err(),
+                CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+            );
+            assert_eq!(
+                host.apply_effect().unwrap_err(),
+                CordisError::MissingDependencies(vec![invariant_missing::CONSENT.to_string()])
+            );
+            assert!(
+                host.context().get::<String>(OPENINTERPRETER).is_none()
+                    || host.runtime_plugin() == Some(OPENINTERPRETER)
+            );
+        });
 
         let now = Utc.with_ymd_and_hms(2026, 8, 25, 13, 34, 33).unwrap();
         plane
@@ -7916,17 +7948,16 @@ sleep 30"#;
             )
             .unwrap();
         let out = plane
-            .cordis_host()
-            .step(AgentStep::new("mission-plane", "plan"))
+            .with_cordis_host(|host| host.step(AgentStep::new("mission-plane", "plan")))
             .unwrap();
         assert_eq!(out.id, "mission-plane");
-        plane.cordis_host().apply_effect().unwrap();
+        plane.with_cordis_host(|host| host.apply_effect()).unwrap();
     }
 
     #[test]
     fn uninitialized_and_fresh_initialize_keep_host_mounted_and_fail_closed() {
         let directory = tempfile::tempdir().expect("directory");
-        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         let DesktopLoadState::Uninitialized { .. } = plane
@@ -7935,7 +7966,7 @@ sleep 30"#;
         else {
             panic!("first run must not create a database or key implicitly");
         };
-        assert_host_fail_closed_on_consent(&mut plane);
+        assert_host_fail_closed_on_consent(&plane);
         assert_eq!(
             plane
                 .step(
@@ -7964,7 +7995,7 @@ sleep 30"#;
         plane
             .initialize_with(&secrets, observed_at())
             .expect("explicit initialization");
-        assert_host_fail_closed_on_consent(&mut plane);
+        assert_host_fail_closed_on_consent(&plane);
         assert!(matches!(
             plane.step(
                 &secrets,
@@ -7989,7 +8020,7 @@ sleep 30"#;
         let data_root = directory.path().join("desktop-data");
         let project_root = directory.path().join("project");
         fs::create_dir(&project_root).expect("project root");
-        let mut plane = DesktopDataPlane::at_data_root(&data_root).expect("data plane");
+        let plane = DesktopDataPlane::at_data_root(&data_root).expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
             .initialize_with(&secrets, observed_at())
@@ -8027,14 +8058,12 @@ sleep 30"#;
         else {
             panic!("initialized database must reopen");
         };
-        host_is_cordis_loop(plane.cordis_host()).unwrap();
-        let domain = plane
-            .cordis_host()
-            .context()
-            .domain::<DomainSurface>()
-            .unwrap();
-        assert!(domain.consent);
-        assert!(domain.approved);
+        plane.with_cordis_host(|host| {
+            host_is_cordis_loop(host).unwrap();
+            let domain = host.context().domain::<DomainSurface>().unwrap();
+            assert!(domain.consent);
+            assert!(domain.approved);
+        });
         let out = plane
             .step(
                 &secrets,
@@ -8047,9 +8076,8 @@ sleep 30"#;
             .apply_effect(&secrets, observed_at() + Duration::minutes(3))
             .expect("production apply_effect after live bind");
 
-        let mut consent_only =
-            DesktopDataPlane::at_data_root(directory.path().join("consent-only"))
-                .expect("consent-only plane");
+        let consent_only = DesktopDataPlane::at_data_root(directory.path().join("consent-only"))
+            .expect("consent-only plane");
         let consent_secrets = MemorySecretStore::default();
         consent_only
             .initialize_with(&consent_secrets, observed_at())
@@ -8091,7 +8119,7 @@ sleep 30"#;
         use hartevo_cordis::invariant_missing;
 
         let directory = tempfile::tempdir().expect("directory");
-        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -8158,7 +8186,7 @@ sleep 30"#;
         use hartevo_cordis::invariant_missing;
 
         let directory = tempfile::tempdir().expect("directory");
-        let mut expired = DesktopDataPlane::at_data_root(directory.path().join("expired"))
+        let expired = DesktopDataPlane::at_data_root(directory.path().join("expired"))
             .expect("expired plane");
         let expired_secrets = MemorySecretStore::default();
         expired
@@ -8213,7 +8241,7 @@ sleep 30"#;
         let data_root = directory.path().join("desktop-data");
         let project_root = directory.path().join("project");
         fs::create_dir(&project_root).expect("project root");
-        let mut plane = DesktopDataPlane::at_data_root(&data_root).expect("data plane");
+        let plane = DesktopDataPlane::at_data_root(&data_root).expect("data plane");
         let secrets = MemorySecretStore::default();
 
         let DesktopLoadState::Uninitialized { product_evidence } = plane
@@ -8310,7 +8338,7 @@ sleep 30"#;
         let data_root = directory.path().join("desktop-data");
         let project_root = directory.path().join("project");
         fs::create_dir(&project_root).expect("project root");
-        let mut plane = DesktopDataPlane::at_data_root(&data_root).expect("data plane");
+        let plane = DesktopDataPlane::at_data_root(&data_root).expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
             .initialize_with(&secrets, observed_at())
@@ -8403,7 +8431,7 @@ sleep 30"#;
     #[test]
     fn existing_database_without_its_os_vault_key_fails_closed() {
         let directory = tempfile::tempdir().expect("directory");
-        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -8424,7 +8452,7 @@ sleep 30"#;
     #[test]
     fn substituted_database_key_is_rejected_without_rewriting_ciphertext() {
         let directory = tempfile::tempdir().expect("directory");
-        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -8451,7 +8479,7 @@ sleep 30"#;
     #[test]
     fn exported_recovery_kit_creates_ready_personal_project_without_escrow_and_restarts() {
         let directory = tempfile::tempdir().expect("directory");
-        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -8513,7 +8541,7 @@ sleep 30"#;
     #[test]
     fn invalid_recovery_kit_fails_before_project_or_workspace_creation() {
         let directory = tempfile::tempdir().expect("directory");
-        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -8543,7 +8571,7 @@ sleep 30"#;
     #[test]
     fn interrupted_unprovisioned_project_can_resume_once_with_saved_recovery_kit() {
         let directory = tempfile::tempdir().expect("directory");
-        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
@@ -8615,7 +8643,7 @@ sleep 30"#;
     #[test]
     fn missing_or_foreign_device_key_blocks_new_missions_without_hiding_inventory() {
         let directory = tempfile::tempdir().expect("directory");
-        let mut plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
+        let plane = DesktopDataPlane::at_data_root(directory.path().join("desktop-data"))
             .expect("data plane");
         let secrets = MemorySecretStore::default();
         plane
