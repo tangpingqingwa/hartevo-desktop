@@ -2072,6 +2072,7 @@ mod tests {
             )
             .expect("resume verification from durable receipt");
         let (result, authority) = bound.into_parts();
+        let provider = authority.provider().expect("persisted provider authority");
         let verification = authority.verification().expect("recovery authority");
 
         assert_eq!(
@@ -2080,8 +2081,10 @@ mod tests {
         );
         assert_eq!(result.receipt, receipt);
         assert_eq!((executor.calls, verifier.calls), (0, 1));
-        assert!(authority.provider().is_none());
-        assert_eq!(verification.sequence(), 1);
+        assert_eq!(provider.sequence(), 1);
+        assert_eq!(provider.operation_at(), receipt_operation_at);
+        assert_eq!(verification.sequence(), 2);
+        assert!(verification.operation_at() >= provider.operation_at());
         assert!(verification.operation_at() >= recovery_entry);
         assert!(verification.operation_at() > verification_fact);
         assert_eq!(
