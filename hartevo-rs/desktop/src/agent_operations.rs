@@ -1,17 +1,19 @@
 //! Read-only Agent Operations Workbench model for Desktop.
 //!
-//! OI-01, CAP-01, CTX-01 and BW-01 own the durable control-plane records that
-//! will eventually fill these panels.  Until those APIs land, this module
-//! projects only existing Application/Desktop facts and represents every
-//! unavailable field as an honest typed state.  It has no persistence,
-//! runtime loop, browser control, approval authority or Effect path.
+//! OI-01, CAP-01 and CTX-01 own remaining control-plane records that will
+//! eventually fill these panels. Browser Continue reads the durable
+//! Mission-bound workspace projection and stays empty until a user-held lease
+//! exists. This module has no persistence, runtime loop, approval authority or
+//! Effect path.
 
 use hartevo_application::{
-    DesktopProjectProjection, MissionProjection, MissionRuntimeProjection, WorkProductProjection,
+    BrowserWorkspaceProjection as DurableBrowserWorkspaceProjection, DesktopProjectProjection,
+    MissionProjection, MissionRuntimeProjection, WorkProductProjection,
 };
+use hartevo_browser_adapter::BrowserControlState;
 use hartevo_domain_kernel::{
-    MissionStage, RuntimeProcessClaimStatus, RuntimeRecoveryStatus, RuntimeTurnStatus,
-    WorkProductStatus,
+    BrowserWorkspaceId, MissionStage, RuntimeProcessClaimStatus, RuntimeRecoveryStatus,
+    RuntimeTurnStatus, WorkProductStatus,
 };
 
 use crate::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
@@ -155,6 +157,10 @@ pub struct BrowserWorkspaceProjection {
     pub identity: String,
     pub control_owner: String,
     pub next_action: String,
+    pub workspace_id: Option<BrowserWorkspaceId>,
+    pub revision: Option<u64>,
+    pub lease_generation: Option<u64>,
+    pub continue_status: OperationsStatus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -578,19 +584,93 @@ fn approval_projection(
 }
 
 fn browser_projection(mission: Option<&MissionProjection>) -> BrowserWorkspaceProjection {
-    if mission.is_none() {
+    let Some(mission) = mission else {
         return BrowserWorkspaceProjection {
             status: OperationsStatus::Empty,
             identity: "No Mission-bound Browser Workspace".into(),
             control_owner: "No owner".into(),
             next_action: "Select a Mission".into(),
+            workspace_id: None,
+            revision: None,
+            lease_generation: None,
+            continue_status: OperationsStatus::Empty,
         };
+    };
+    let Some(workspace) = mission.browser_workspace.as_ref() else {
+        return BrowserWorkspaceProjection {
+            status: OperationsStatus::Empty,
+            identity: "No Mission-bound Browser Workspace".into(),
+            control_owner: "No owner".into(),
+            next_action: "Continue stays empty until a durable workspace exists".into(),
+            workspace_id: None,
+            revision: None,
+            lease_generation: None,
+            continue_status: OperationsStatus::Empty,
+        };
+    };
+    match workspace.control_state {
+        BrowserControlState::UserControlled => BrowserWorkspaceProjection {
+            status: OperationsStatus::WaitingUser,
+            identity: short_identity_digest(&workspace.identity_digest),
+            control_owner: "User holds the current lease".into(),
+            next_action: "Continue issues Application continue_browser_workspace".into(),
+            workspace_id: Some(workspace.workspace_id.clone()),
+            revision: Some(workspace.revision),
+            lease_generation: Some(workspace.lease_generation),
+            continue_status: OperationsStatus::Ready,
+        },
+        BrowserControlState::AgentControlled => browser_workspace_view(
+            workspace,
+            OperationsStatus::Active,
+            "Agent holds the current lease",
+            "Take over remains NOT_IMPLEMENTED; Continue stays disabled",
+            OperationsStatus::NotImplemented,
+        ),
+        BrowserControlState::PausedAgent | BrowserControlState::PausedUser => {
+            browser_workspace_view(
+                workspace,
+                OperationsStatus::WaitingUser,
+                "Workspace is paused",
+                "Pause/Resume remains NOT_IMPLEMENTED; Continue stays disabled",
+                OperationsStatus::NotImplemented,
+            )
+        }
+        BrowserControlState::Completed
+        | BrowserControlState::KeptForUser
+        | BrowserControlState::Closed => browser_workspace_view(
+            workspace,
+            OperationsStatus::Empty,
+            "Workspace is terminal",
+            "Continue does not reopen a closed workspace",
+            OperationsStatus::Empty,
+        ),
     }
+}
+
+fn browser_workspace_view(
+    workspace: &DurableBrowserWorkspaceProjection,
+    status: OperationsStatus,
+    control_owner: &str,
+    next_action: &str,
+    continue_status: OperationsStatus,
+) -> BrowserWorkspaceProjection {
     BrowserWorkspaceProjection {
-        status: OperationsStatus::NotImplemented,
-        identity: "No active authenticated profile".into(),
-        control_owner: "User control is required".into(),
-        next_action: "BW-01 must establish exact profile and takeover lease".into(),
+        status,
+        identity: short_identity_digest(&workspace.identity_digest),
+        control_owner: control_owner.into(),
+        next_action: next_action.into(),
+        workspace_id: Some(workspace.workspace_id.clone()),
+        revision: Some(workspace.revision),
+        lease_generation: Some(workspace.lease_generation),
+        continue_status,
+    }
+}
+
+fn short_identity_digest(digest: &str) -> String {
+    if digest.len() >= 12 {
+        format!("identity {}", &digest[..12])
+    } else {
+        "Mission-bound identity".into()
     }
 }
 
@@ -748,6 +828,76 @@ mod tests {
         assert!(!recovery.detail.contains("success"));
         let workers = worker_projection(None, Some(&activity));
         assert!(workers.is_empty());
+    }
+
+    #[test]
+    fn browser_continue_stays_empty_without_a_mission_bound_workspace() {
+        let mission = MissionProjection {
+            surface: "orchestrator".into(),
+            project_id: "project".into(),
+            mission_id: "mission".into(),
+            title: "goal".into(),
+            goal: "goal".into(),
+            manifest_id: None,
+            manifest_version: None,
+            catalog_digest: None,
+            current_checkpoint_id: None,
+            current_checkpoint_status: None,
+            current_checkpoint_revision: None,
+            current_checkpoint_capability_id: None,
+            current_checkpoint_executor: None,
+            current_checkpoint_application_handler_status: None,
+            current_checkpoint_application_handler_id: None,
+            current_checkpoint_oracle_ids: std::collections::BTreeSet::default(),
+            current_checkpoint_completion_policy: None,
+            browser_workspace: None,
+            completed_checkpoint_count: 0,
+            checkpoint_count: 0,
+            cycle: 1,
+            schedule: None,
+            conversation_id: None,
+            conversation_revision: None,
+            conversation_messages: Vec::new(),
+            stage: MissionStage::Running,
+            revision: 1,
+            evidence_count: 0,
+            work_product_count: 0,
+            work_products: Vec::new(),
+            pending_approval_count: 0,
+            pending_effects: Vec::new(),
+            verified_effect_count: 0,
+            outcome_summary: None,
+            vm11_outcome_review: None,
+        };
+        let empty = browser_projection(Some(&mission));
+        assert_eq!(empty.status, OperationsStatus::Empty);
+        assert_eq!(empty.continue_status, OperationsStatus::Empty);
+        assert!(empty.workspace_id.is_none());
+
+        let mut held = mission.clone();
+        held.browser_workspace = Some(DurableBrowserWorkspaceProjection {
+            workspace_id: BrowserWorkspaceId::from("workspace-held"),
+            profile_id: "profile-held".into(),
+            identity_digest: "a".repeat(64),
+            control_state: BrowserControlState::UserControlled,
+            revision: 2,
+            lease_generation: 2,
+        });
+        let ready = browser_projection(Some(&held));
+        assert_eq!(ready.continue_status, OperationsStatus::Ready);
+        assert_eq!(ready.status, OperationsStatus::WaitingUser);
+
+        held.browser_workspace
+            .as_mut()
+            .expect("workspace")
+            .control_state = BrowserControlState::AgentControlled;
+        let agent = browser_projection(Some(&held));
+        assert_eq!(agent.continue_status, OperationsStatus::NotImplemented);
+        assert!(
+            agent
+                .next_action
+                .contains("Take over remains NOT_IMPLEMENTED")
+        );
     }
 
     #[test]

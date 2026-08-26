@@ -42,14 +42,14 @@ mod visual_fixture;
 
 use agent_operations::{AgentOperationsWorkbenchProjection, OperationsStatus};
 use data_plane::{
-    DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane,
-    DesktopHumanCheckpointConfirmationRequest, DesktopLoadState, DesktopMissionContinuationRequest,
-    DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopRuntimeCancellation,
-    DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
-    DesktopSnapshot, DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
-    DesktopWaitingApprovalGrantRequest, DesktopWorkProductAdoptionRequest,
-    ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
-    RecoveryKitDraft,
+    DesktopCatalogMissionRequest, DesktopContinueBrowserWorkspaceRequest, DesktopDataError,
+    DesktopDataPlane, DesktopHumanCheckpointConfirmationRequest, DesktopLoadState,
+    DesktopMissionContinuationRequest, DesktopMissionRuntimeOutcome, DesktopMissionSubmission,
+    DesktopRuntimeCancellation, DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase,
+    DesktopRuntimeTextStreamProjection, DesktopSnapshot, DesktopVm11NextContractResolutionRequest,
+    DesktopVm11OutcomeDecisionRequest, DesktopWaitingApprovalGrantRequest,
+    DesktopWorkProductAdoptionRequest, ProductEvidenceProjection, ProjectContextAccessProjection,
+    ProjectContextAccessStatus, RecoveryKitDraft,
 };
 use result_adoption_surface::{
     ResultSurfaceAction, SelectedResultProjection, action_matches_current_projection,
@@ -399,9 +399,18 @@ impl UiFailure {
             ),
             DesktopDataError::InvalidVm11OutcomeDecision
             | DesktopDataError::InvalidVm11NextContractResolution
-            | DesktopDataError::InvalidWaitingApprovalGrant => Self::coded(
+            | DesktopDataError::InvalidWaitingApprovalGrant
+            | DesktopDataError::InvalidBrowserWorkspaceContinue => Self::coded(
                 "WAITING_USER",
                 "精确窗口动作必须绑定冻结 digest 与当前 CAS revision；未写入部分状态，也未执行 Effect。",
+            ),
+            DesktopDataError::BrowserWorkspaceUnavailable => Self::coded(
+                "EMPTY",
+                "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行 Continue。",
+            ),
+            DesktopDataError::BrowserWorkspaceContinueNotHeld => Self::coded(
+                "NOT_IMPLEMENTED",
+                "Continue 需要用户持有的 Browser Workspace lease；Take over 仍为 NOT_IMPLEMENTED，未签发新 Agent lease，也未执行 Effect。",
             ),
             DesktopDataError::InvalidRecoveryKey => Self::coded(
                 "WAITING_USER",
@@ -463,6 +472,12 @@ impl UiFailure {
             ) => Self::coded(
                 "STALE_DECISION",
                 "冻结 digest 或 CAS revision 已变化；请刷新后重新审阅，旧提交未被写入或重放，也未执行 Effect。",
+            ),
+            DesktopDataError::Application(
+                ApplicationError::BrowserHostReconciliationRequired { .. },
+            ) => Self::coded(
+                "RECOVERY_REQUIRED",
+                "Browser Workspace 已持久签发新 Agent lease，但 Host 仍更受限；需要显式 Host reconciliation，未执行 Effect，也未声明 Verification。",
             ),
             _ => Self::coded(
                 "INTEGRITY_ERROR",
@@ -1583,6 +1598,58 @@ pub fn App() -> Element {
             }
         }
     };
+    let request_operations_continue_browser = move |()| {
+        let selection = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.current_mission().cloned())
+        };
+        let Some((project_id, mission)) = selection else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message: "当前没有可用的 Mission；未发明 Browser Workspace，也未执行 Continue。"
+                    .into(),
+            });
+            return;
+        };
+        let Some(workspace) = mission.browser_workspace.as_ref() else {
+            model.write().notice = Some(UiFailure {
+                code: "EMPTY".into(),
+                message:
+                    "当前 Mission 没有持久 Browser Workspace；未发明 workspace，也未执行 Continue。"
+                        .into(),
+            });
+            return;
+        };
+        let request = DesktopContinueBrowserWorkspaceRequest {
+            project_id,
+            mission_id: mission.mission_id,
+            workspace_id: workspace.workspace_id.clone(),
+            expected_revision: workspace.revision,
+            expected_generation: workspace.lease_generation,
+        };
+        spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                DesktopDataPlane::discover()
+                    .and_then(|plane| plane.continue_browser_workspace_os(request, Utc::now()))
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    model.write().set_ready(snapshot, false);
+                }
+                Ok(Err(error)) => model.write().set_notice(&error),
+                Err(_) => {
+                    model.write().notice = Some(UiFailure {
+                        code: "BROWSER_CONTINUE_COORDINATOR_FAILED".into(),
+                        message: "Browser Workspace Continue 协调异常结束；未执行 Effect，也未声明 Verification。".into(),
+                    });
+                }
+            }
+        });
+    };
     let on_result_action = move |action: ResultSurfaceAction| {
         let (project, mission) = {
             let current = model.read();
@@ -2250,6 +2317,7 @@ pub fn App() -> Element {
                                     restore_ui_focus("mission-composer-input");
                                 },
                                 on_interrupt: request_operations_interrupt,
+                                on_continue_browser_workspace: request_operations_continue_browser,
                                 on_runtime_scroll: move |near_bottom| {
                                     let selected = {
                                         let current = model.read();
@@ -5003,6 +5071,7 @@ fn AgentOperationsWorkbench(
     interrupt_requested: bool,
     on_quick_entry: EventHandler<()>,
     on_interrupt: EventHandler<()>,
+    on_continue_browser_workspace: EventHandler<()>,
 ) -> Element {
     let recovery_required = projection.recovery.status == OperationsStatus::RecoveryRequired;
     let interrupt_disabled = !interrupt_available || interrupt_requested || recovery_required;
@@ -5221,7 +5290,24 @@ fn AgentOperationsWorkbench(
                     }
                     div { class: "operations-artifact-actions",
                         button { disabled: true, aria_label: "接管 Browser Workspace", title: "等待 BW-01 owner API", "Take over · NOT_IMPLEMENTED" }
-                        button { disabled: true, aria_label: "继续 Browser Workspace", title: "等待 BW-01 owner API", "Continue · NOT_IMPLEMENTED" }
+                        {
+                            let continue_ready = projection.browser.continue_status == OperationsStatus::Ready;
+                            let continue_title = match projection.browser.continue_status {
+                                OperationsStatus::Ready => "通过 Application continue_browser_workspace 签发新 Agent lease",
+                                OperationsStatus::Empty => "当前 Mission 没有用户持有的 Browser Workspace",
+                                _ => "Continue 需要用户持有的 lease；Take over 仍为 NOT_IMPLEMENTED",
+                            };
+                            let continue_label = format!("Continue · {}", projection.browser.continue_status.code());
+                            rsx! {
+                                button {
+                                    disabled: !continue_ready,
+                                    aria_label: "继续 Browser Workspace",
+                                    title: "{continue_title}",
+                                    onclick: move |_| on_continue_browser_workspace.call(()),
+                                    "{continue_label}"
+                                }
+                            }
+                        }
                     }
                 }
                 div { class: "operations-card operations-recovery-card",
@@ -5292,6 +5378,7 @@ fn OrchestratorSurface(
     operations: AgentOperationsWorkbenchProjection,
     interrupt_available: bool,
     interrupt_requested: bool,
+    on_continue_browser_workspace: EventHandler<()>,
     on_initialize: EventHandler<MouseEvent>,
     on_ready: EventHandler<DesktopSnapshot>,
     on_error: EventHandler<DesktopDataError>,
@@ -5388,6 +5475,7 @@ fn OrchestratorSurface(
                             interrupt_requested: false,
                             on_quick_entry,
                             on_interrupt,
+                            on_continue_browser_workspace,
                         }
                         ProjectDispatcherSurface { project, on_select_mission }
                     }
@@ -5512,6 +5600,7 @@ fn OrchestratorSurface(
                         interrupt_requested,
                         on_quick_entry,
                         on_interrupt,
+                        on_continue_browser_workspace,
                     }
                     PersistedConversationMessages {
                         mission: mission.clone(),
@@ -10282,6 +10371,17 @@ mod tests {
         assert_eq!(waiting.code, "WAITING_APPROVAL");
         assert!(waiting.detail.contains("ApprovalGrant"));
         assert!(!waiting.detail.contains("尚未接线"));
+    }
+
+    #[test]
+    fn operations_continue_calls_application_continue_browser_workspace() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("continue_browser_workspace_os"));
+        assert!(source.contains("DesktopContinueBrowserWorkspaceRequest"));
+        assert!(source.contains("Take over · NOT_IMPLEMENTED"));
+        assert!(source.contains("format!(\"Continue · {}\""));
+        assert!(source.contains("on_continue_browser_workspace"));
+        assert!(source.contains("BrowserHostReconciliationRequired"));
     }
 
     #[test]

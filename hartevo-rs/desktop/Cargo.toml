@@ -12,6 +12,7 @@ chrono.workspace = true
 dioxus.workspace = true
 dioxus-icons = "0.1"
 hartevo-application = { path = "../application" }
+hartevo-browser-adapter = { path = "../browser-adapter" }
 hartevo-catalog = { path = "../catalog" }
 hartevo-context-fabric = { path = "../context-fabric" }
 hartevo-cordis = { path = "../cordis" }
