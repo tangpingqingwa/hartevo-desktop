@@ -1,0 +1,20 @@
+{
+  "authorTaskId": "01a03ba6-2667-7720-81e8-42785d1ac9f0",
+  "baseSha": "53749e336135426768c1d0680def8a453e7e8cca",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "hartevo-rs/application/src/lib.rs",
+    "hartevo-rs/desktop/Cargo.toml",
+    "hartevo-rs/desktop/src/data_plane.rs",
+    "hartevo-rs/desktop/src/lib.rs",
+    "hartevo-rs/desktop/src/visual_fixture.rs"
+  ],
+  "pr": 968,
+  "receiptDigest": "136949a099153489b1c18e3bdf59ea23059d4c6f23e8b510dbf513858fc9f938",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-26T01:48:13Z",
+  "reviewedHeadSha": "80a4c22e27ae5d95b4d53372ecb2ebb8cca0f0cc",
+  "reviewerTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
