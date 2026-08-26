@@ -34,12 +34,12 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use hartevo_browser_adapter::{
-    BrowserAction, BrowserActionBatch, BrowserBatchReceipt, BrowserControlHost, BrowserError,
-    BrowserFileGrant, BrowserFileType, BrowserIdentity, BrowserLeaseProof,
-    BrowserLocatorResolution, BrowserProfile, BrowserRecipeActivation, BrowserRecipeCandidate,
-    BrowserRecipePreparedPlan, BrowserRecipeRelease, BrowserRecipeResolvedAction, BrowserWorkspace,
-    FileBroker, FileBrokerReconciliation, FileSafetyScanner, FileUploadHandle,
-    TrustedBrowserRecipeKey,
+    BrowserAction, BrowserActionBatch, BrowserBatchReceipt, BrowserControlHost,
+    BrowserControlState, BrowserError, BrowserFileGrant, BrowserFileType, BrowserIdentity,
+    BrowserLeaseProof, BrowserLocatorResolution, BrowserProfile, BrowserRecipeActivation,
+    BrowserRecipeCandidate, BrowserRecipePreparedPlan, BrowserRecipeRelease,
+    BrowserRecipeResolvedAction, BrowserWorkspace, FileBroker, FileBrokerReconciliation,
+    FileSafetyScanner, FileUploadHandle, TrustedBrowserRecipeKey,
 };
 use hartevo_catalog::{CapabilityManifest, Catalog, CatalogError, MissionManifest};
 use hartevo_cloud_storage::{
@@ -4365,6 +4365,8 @@ pub struct MissionProjection {
     pub current_checkpoint_oracle_ids: BTreeSet<String>,
     #[serde(default)]
     pub current_checkpoint_completion_policy: Option<MissionCheckpointCompletionPolicy>,
+    #[serde(default)]
+    pub browser_workspace: Option<BrowserWorkspaceProjection>,
     pub completed_checkpoint_count: usize,
     pub checkpoint_count: usize,
     pub cycle: u64,
@@ -4384,6 +4386,20 @@ pub struct MissionProjection {
     pub outcome_summary: Option<String>,
     #[serde(default)]
     pub vm11_outcome_review: Option<Vm11OutcomeReviewDecisionProjection>,
+}
+
+/// Content-free Browser Workspace facts for one Mission. Lease identifiers and
+/// Host session state never cross this projection; Continue uses only the
+/// durable ids, revision, generation, and control owner.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserWorkspaceProjection {
+    pub workspace_id: BrowserWorkspaceId,
+    pub profile_id: BrowserProfileId,
+    pub identity_digest: String,
+    pub control_state: BrowserControlState,
+    pub revision: u64,
+    pub lease_generation: u64,
 }
 
 /// Exact decision material shown by Desktop for VM-11. The review and both
@@ -4856,6 +4872,16 @@ impl ApplicationService {
         Ok(self
             .store
             .load_browser_workspace(project_id, workspace_id)?)
+    }
+
+    pub fn load_live_browser_workspace_for_mission(
+        &self,
+        project_id: &ProjectId,
+        mission_id: &MissionId,
+    ) -> Result<Option<BrowserWorkspace>, ApplicationError> {
+        Ok(self
+            .store
+            .load_live_browser_workspace_for_mission(project_id, mission_id)?)
     }
 
     pub fn acknowledge_browser_batch_receipt(
@@ -18285,6 +18311,16 @@ fn mission_projection(
             .count()
     });
     let vm11_outcome_review = vm11_outcome_review_decision_projection(store, &mission)?;
+    let browser_workspace = store
+        .load_live_browser_workspace_for_mission(&mission.project_id, &mission.id)?
+        .map(|workspace| BrowserWorkspaceProjection {
+            workspace_id: workspace.id,
+            profile_id: workspace.profile_id,
+            identity_digest: workspace.expected_identity_digest,
+            control_state: workspace.control_state,
+            revision: workspace.revision,
+            lease_generation: workspace.lease_generation,
+        });
     let title = if include_work_product_previews {
         mission.title
     } else {
@@ -18323,6 +18359,7 @@ fn mission_projection(
         current_checkpoint_application_handler_id,
         current_checkpoint_oracle_ids,
         current_checkpoint_completion_policy,
+        browser_workspace,
         completed_checkpoint_count,
         checkpoint_count,
         cycle,
@@ -40180,6 +40217,16 @@ sleep 30"#
                 .expect_err("old in-flight cursor is hard-stopped")
                 .code(),
             "BROWSER_CONTROL_LEASE_LOST"
+        );
+
+        assert_eq!(
+            fixture
+                .service
+                .load_live_browser_workspace_for_mission(&fixture.project_id, &fixture.mission_id)
+                .expect("live workspace after takeover")
+                .expect("one Mission-bound workspace")
+                .id,
+            fixture.workspace.id
         );
 
         let continued = fixture
