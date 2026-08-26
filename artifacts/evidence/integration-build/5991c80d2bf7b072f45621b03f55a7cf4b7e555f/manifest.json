@@ -1,0 +1,314 @@
+{
+  "schemaVersion": "hartevo.integration-build-provenance-manifest/v1",
+  "manifestId": "ev-04-5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
+  "authority": "INTEGRATION_BUILD_PROVENANCE_ONLY",
+  "source": {
+    "repository": "tangpingqingwa/hartevo-desktop",
+    "branch": "bootstrap/macos-r0",
+    "objectFormat": "sha1",
+    "rangeBaseCommit": "4ce38354541771820a7739a2d04dcc7b4bac88fc",
+    "headCommit": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
+    "headTree": "b6728edc1c1a07bf774bf27232fd1a70432110a9"
+  },
+  "rawArtifact": {
+    "kind": "GITHUB_PR_CI_OBSERVATION",
+    "path": "artifacts/evidence/integration-build/5991c80d2bf7b072f45621b03f55a7cf4b7e555f/github-pr-ci-observation.raw.json",
+    "sha256": "3a867cb5bcad7acb0e76eda1ca0eb235d1a5d621262499f61c1a278bab68280a",
+    "bytes": 17927
+  },
+  "featurePullRequests": [
+    {
+      "number": 1,
+      "integrationParent": "4ce38354541771820a7739a2d04dcc7b4bac88fc",
+      "mergeCommit": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+      "featureHead": "1768eb6ad4003173416a0bd3daea2a717cefd9fd",
+      "baseRef": "bootstrap/macos-r0",
+      "headRef": "codex/j01-browser-eval-contract",
+      "actionsRunId": 31665684533,
+      "ciConclusion": "SUCCESS",
+      "requiredJobs": [
+        {
+          "id": 94339626787,
+          "name": "PostgreSQL 18 Cell contract",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "id": 94339626733,
+          "name": "Rust workspace",
+          "conclusion": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "number": 2,
+      "integrationParent": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+      "mergeCommit": "d8040bce4ae5818a6c168a1382024a4a46bd292d",
+      "featureHead": "4bef7e8b0a44a88f18bcd8bc8b21d91aa8469fb9",
+      "baseRef": "bootstrap/macos-r0",
+      "headRef": "codex/scan-01-production-scanner",
+      "actionsRunId": 31667032055,
+      "ciConclusion": "SUCCESS",
+      "requiredJobs": [
+        {
+          "id": 94343727044,
+          "name": "PostgreSQL 18 Cell contract",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "id": 94343727077,
+          "name": "Rust workspace",
+          "conclusion": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "number": 8,
+      "integrationParent": "d8040bce4ae5818a6c168a1382024a4a46bd292d",
+      "mergeCommit": "5ded663e639e697cadc57945fad99d4ab255eacc",
+      "featureHead": "b9c08435a14d914d6180c5fc5c65e29360c079c3",
+      "baseRef": "bootstrap/macos-r0",
+      "headRef": "codex/recipe-smoke-01",
+      "actionsRunId": 31667306158,
+      "ciConclusion": "SUCCESS",
+      "requiredJobs": [
+        {
+          "id": 94344518426,
+          "name": "PostgreSQL 18 Cell contract",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "id": 94344518438,
+          "name": "Rust workspace",
+          "conclusion": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "number": 4,
+      "integrationParent": "5ded663e639e697cadc57945fad99d4ab255eacc",
+      "mergeCommit": "7a0f67f8b25604c0648c71ec5976494b09ab8d46",
+      "featureHead": "83a4e602a776387720dfa59d55690a00f1201824",
+      "baseRef": "bootstrap/macos-r0",
+      "headRef": "codex/provider-approval-registry-surface-a3c",
+      "actionsRunId": 31666593202,
+      "ciConclusion": "SUCCESS",
+      "requiredJobs": [
+        {
+          "id": 94342373354,
+          "name": "PostgreSQL 18 Cell contract",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "id": 94342373333,
+          "name": "Rust workspace",
+          "conclusion": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "number": 7,
+      "integrationParent": "7a0f67f8b25604c0648c71ec5976494b09ab8d46",
+      "mergeCommit": "ba9e11c5662b09d64b0106529817e6ae6e219aa8",
+      "featureHead": "4feb6f7fd7565ec9e7b9c6c950787d124354821f",
+      "baseRef": "bootstrap/macos-r0",
+      "headRef": "codex/chromium-cross-origin-u4",
+      "actionsRunId": 31667239033,
+      "ciConclusion": "SUCCESS",
+      "requiredJobs": [
+        {
+          "id": 94344324190,
+          "name": "PostgreSQL 18 Cell contract",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "id": 94344324189,
+          "name": "Rust workspace",
+          "conclusion": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "number": 5,
+      "integrationParent": "ba9e11c5662b09d64b0106529817e6ae6e219aa8",
+      "mergeCommit": "51bee2243c11485d6383287848fccbdba74de5a2",
+      "featureHead": "93188a2eee334b9a785a7227d7c0c9ad9ba8f42a",
+      "baseRef": "bootstrap/macos-r0",
+      "headRef": "codex/ct03-mission-runtime-authority",
+      "actionsRunId": 31666875723,
+      "ciConclusion": "SUCCESS",
+      "requiredJobs": [
+        {
+          "id": 94343280838,
+          "name": "PostgreSQL 18 Cell contract",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "id": 94343280914,
+          "name": "Rust workspace",
+          "conclusion": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "number": 6,
+      "integrationParent": "51bee2243c11485d6383287848fccbdba74de5a2",
+      "mergeCommit": "2066eb86fa9cf66c84ef5a27e0a1f2596f956693",
+      "featureHead": "d7ac3337a7e13c8438dc6a497eb1f37fbf09a72d",
+      "baseRef": "bootstrap/macos-r0",
+      "headRef": "codex/evidence-docs-truth-b2",
+      "actionsRunId": 31667042154,
+      "ciConclusion": "SUCCESS",
+      "requiredJobs": [
+        {
+          "id": 94343757409,
+          "name": "PostgreSQL 18 Cell contract",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "id": 94343757416,
+          "name": "Rust workspace",
+          "conclusion": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "number": 10,
+      "integrationParent": "2066eb86fa9cf66c84ef5a27e0a1f2596f956693",
+      "mergeCommit": "03b9828c79631ad268c5d19db4ab8d994588cf2c",
+      "featureHead": "1d0f204287c9ac02a41276b7b1c0fed3f41ab6e2",
+      "baseRef": "bootstrap/macos-r0",
+      "headRef": "codex/b2-vis-01-runtime-states",
+      "actionsRunId": 31667781544,
+      "ciConclusion": "SUCCESS",
+      "requiredJobs": [
+        {
+          "id": 94345960406,
+          "name": "PostgreSQL 18 Cell contract",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "id": 94345960404,
+          "name": "Rust workspace",
+          "conclusion": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "number": 11,
+      "integrationParent": "03b9828c79631ad268c5d19db4ab8d994588cf2c",
+      "mergeCommit": "f664f9565eecfe29cbe96d3982ff12bb2493378b",
+      "featureHead": "ca2369b4a1a35f0ce1abef14ccb5455badf51713",
+      "baseRef": "bootstrap/macos-r0",
+      "headRef": "codex/d01-recipe-root-authority",
+      "actionsRunId": 31668372363,
+      "ciConclusion": "SUCCESS",
+      "requiredJobs": [
+        {
+          "id": 94347780375,
+          "name": "PostgreSQL 18 Cell contract",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "id": 94347780321,
+          "name": "Rust workspace",
+          "conclusion": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "number": 9,
+      "integrationParent": "9c5e23712825e711adc2d360a92fc499adb50999",
+      "mergeCommit": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
+      "featureHead": "9587affd5c51ac5916932c8ba7479612a9c301c1",
+      "baseRef": "bootstrap/macos-r0",
+      "headRef": "codex/i01b-native-receipt-contract",
+      "actionsRunId": 31667701180,
+      "ciConclusion": "SUCCESS",
+      "requiredJobs": [
+        {
+          "id": 94349343774,
+          "name": "PostgreSQL 18 Cell contract",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "id": 94349342945,
+          "name": "Rust workspace",
+          "conclusion": "SUCCESS"
+        }
+      ]
+    }
+  ],
+  "integrationHistory": [
+    {
+      "kind": "FEATURE_PR_MERGE",
+      "commit": "cc662d53d55216b32be43afdc61e0195f9e5659f",
+      "pullRequest": 1
+    },
+    {
+      "kind": "FEATURE_PR_MERGE",
+      "commit": "d8040bce4ae5818a6c168a1382024a4a46bd292d",
+      "pullRequest": 2
+    },
+    {
+      "kind": "FEATURE_PR_MERGE",
+      "commit": "5ded663e639e697cadc57945fad99d4ab255eacc",
+      "pullRequest": 8
+    },
+    {
+      "kind": "FEATURE_PR_MERGE",
+      "commit": "7a0f67f8b25604c0648c71ec5976494b09ab8d46",
+      "pullRequest": 4
+    },
+    {
+      "kind": "FEATURE_PR_MERGE",
+      "commit": "ba9e11c5662b09d64b0106529817e6ae6e219aa8",
+      "pullRequest": 7
+    },
+    {
+      "kind": "FEATURE_PR_MERGE",
+      "commit": "51bee2243c11485d6383287848fccbdba74de5a2",
+      "pullRequest": 5
+    },
+    {
+      "kind": "FEATURE_PR_MERGE",
+      "commit": "2066eb86fa9cf66c84ef5a27e0a1f2596f956693",
+      "pullRequest": 6
+    },
+    {
+      "kind": "FEATURE_PR_MERGE",
+      "commit": "03b9828c79631ad268c5d19db4ab8d994588cf2c",
+      "pullRequest": 10
+    },
+    {
+      "kind": "FEATURE_PR_MERGE",
+      "commit": "f664f9565eecfe29cbe96d3982ff12bb2493378b",
+      "pullRequest": 11
+    },
+    {
+      "kind": "REVERT",
+      "commit": "9c5e23712825e711adc2d360a92fc499adb50999",
+      "parent": "f664f9565eecfe29cbe96d3982ff12bb2493378b",
+      "revertsCommit": "f664f9565eecfe29cbe96d3982ff12bb2493378b",
+      "revertedPullRequest": 11
+    },
+    {
+      "kind": "FEATURE_PR_MERGE",
+      "commit": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
+      "pullRequest": 9
+    }
+  ],
+  "summary": {
+    "featurePullRequestCount": 10,
+    "activeFeaturePullRequestCount": 9,
+    "revertedFeaturePullRequestCount": 1,
+    "mergeCommitCount": 10,
+    "firstParentCommitCount": 11,
+    "revertCommitCount": 1,
+    "actionsRunCount": 10,
+    "requiredJobCount": 20,
+    "integrationProvenanceStatus": "VERIFIED",
+    "releaseDecision": "NOT_EVALUATED",
+    "releasePassed": false,
+    "missionEvidenceLevelPromoted": false
+  }
+}

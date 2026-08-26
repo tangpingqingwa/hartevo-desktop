@@ -1,0 +1,27 @@
+{
+  "authorTaskId": "01a038d6-b225-7f61-8e11-b2f4cbcf1238",
+  "baseSha": "b8afb4bb05a13ab0dcf279fd58bd6f6a2a8302df",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "DEVELOPMENT.md",
+    "README.md",
+    "contracts/docs-machine-truth/claims.v1.json",
+    "docs/SOURCE-OF-TRUTH.md",
+    "docs/architecture/HARTEVO-DESKTOP-ARCHITECTURE.md",
+    "docs/operations/DEPLOYMENT-DR-AND-UPDATES.md",
+    "docs/quality/CURRENT-WORKTREE-EVIDENCE.md",
+    "docs/quality/DEVELOPMENT-VALIDATION-LADDER.md",
+    "docs/research/PRIME-AGENT-RUST-CONTEXT-FABRIC-INTAKE.md",
+    "docs/security/HARTEVO-THREAT-MODEL.md",
+    "hartevo-rs/desktop/src/data_plane.rs",
+    "hartevo-rs/desktop/src/lib.rs"
+  ],
+  "pr": 959,
+  "receiptDigest": "427abe289678c938ae023cbf719854ab58c4b01a3f17632a6f3ba91bf1003776",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-25T12:44:01Z",
+  "reviewedHeadSha": "28d9009f607158f59e9e2a8d7bd910e5c608d3c1",
+  "reviewerTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
