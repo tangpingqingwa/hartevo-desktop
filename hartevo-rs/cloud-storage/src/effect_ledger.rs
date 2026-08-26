@@ -6,8 +6,8 @@ use hartevo_domain_kernel::{
 use hartevo_effect_broker::{
     DurableClaimDirective, DurableRateLimitDirective, ExecutionClaimContext, ExecutionLease,
     LedgerClaim, LedgerError, PermissionEvidence, PermissionFence, PersistedClaimState,
-    RateLimitRequest, ReconciliationClaim, ReconciliationDisposition, ReconciliationLease,
-    ReconciliationObservation, ReconciliationPolicy, decide_durable_claim,
+    PersistedCompletionPoint, RateLimitRequest, ReconciliationClaim, ReconciliationDisposition,
+    ReconciliationLease, ReconciliationObservation, ReconciliationPolicy, decide_durable_claim,
     decide_durable_rate_limit,
 };
 use serde_json::Value;
@@ -786,6 +786,7 @@ struct RemoteReconciliationHead {
     retry_at: Option<DateTime<Utc>>,
     evidence_digest: Option<String>,
     observation_json: Option<Value>,
+    terminal_reason: Option<String>,
     execution_started_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -801,7 +802,7 @@ async fn load_remote_reconciliation_head(
                     policy_version, policy_digest, max_attempts, retry_delay_seconds,
                     attempts, generation, status, lease_owner, lease_expires_at,
                     retry_at, evidence_digest, observation_json,
-                    initial_execution_started_at, updated_at
+                    terminal_reason, initial_execution_started_at, updated_at
              FROM hartevo_cell.effect_reconciliation_heads
              WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND effect_id = $4
              FOR UPDATE",
@@ -841,8 +842,9 @@ async fn load_remote_reconciliation_head(
         retry_at: row.get(12),
         evidence_digest: row.get(13),
         observation_json: row.get(14),
-        execution_started_at: row.get(15),
-        updated_at: row.get(16),
+        terminal_reason: row.get(15),
+        execution_started_at: row.get(16),
+        updated_at: row.get(17),
     }))
 }
 
@@ -864,12 +866,43 @@ async fn load_remote_terminal_reconciliation_claim(
         };
     };
     let observation: ReconciliationObservation = serde_json::from_value(observation_json)?;
-    observation.validate_for(effect, head.execution_started_at)?;
+    let record = load_effect_record(transaction, scope, effect)
+        .await?
+        .ok_or_else(|| {
+            CloudStorageError::StoredValueInvalid(
+                "remote terminal reconciliation has no effect record".into(),
+            )
+        })?;
+    let execution_started_at = initial_execution_started_at(transaction, scope, effect).await?;
+    if head.execution_started_at != execution_started_at {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    observation.validate_for(effect, execution_started_at)?;
     if head.evidence_digest.as_deref() != Some(observation.evidence_digest()) {
         return Err(CloudStorageError::StoredValueInvalid(
             "remote reconciliation evidence projection diverged".into(),
         ));
     }
+    if matches!(
+        head.status.as_str(),
+        "not_executed" | "provider_rejected" | "dead_letter"
+    ) && (head.updated_at < observation.observed_at()
+        || head
+            .terminal_reason
+            .as_deref()
+            .is_none_or(|reason| reason.trim().is_empty()))
+    {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    remote_terminal_claim_from_observation(&head, &record, observation, execution_started_at)
+}
+
+fn remote_terminal_claim_from_observation(
+    head: &RemoteReconciliationHead,
+    record: &EffectRecord,
+    observation: ReconciliationObservation,
+    execution_started_at: DateTime<Utc>,
+) -> Result<Option<LedgerClaim>, CloudStorageError> {
     match (head.status.as_str(), observation) {
         (
             "not_executed",
@@ -877,11 +910,17 @@ async fn load_remote_terminal_reconciliation_claim(
                 evidence_digest,
                 observed_at,
             },
-        ) => Ok(Some(LedgerClaim::ReconciledNotExecuted {
-            evidence_digest,
-            observed_at,
-            execution_started_at: head.execution_started_at,
-        })),
+        ) => {
+            validate_remote_not_executed_idempotency(record, head, observed_at)?;
+            Ok(Some(LedgerClaim::RecoverableReconciledNotExecuted {
+                evidence_digest,
+                observed_at,
+                execution_started_at,
+                completion: PersistedCompletionPoint::reconciliation_head_not_executed(
+                    head.updated_at,
+                ),
+            }))
+        }
         (
             "provider_rejected",
             ReconciliationObservation::ProviderRejected {
@@ -889,30 +928,88 @@ async fn load_remote_terminal_reconciliation_claim(
                 observed_at,
                 ..
             },
-        ) => Ok(Some(LedgerClaim::ProviderRejected {
-            reason,
-            execution_started_at: head.execution_started_at,
-            recorded_at: observed_at,
-        })),
+        ) => {
+            validate_remote_reconciled_rejection_idempotency(record, head, &reason, observed_at)?;
+            Ok(Some(LedgerClaim::RecoverableProviderRejected {
+                reason,
+                observed_at: Some(observed_at),
+                execution_started_at,
+                completion: PersistedCompletionPoint::reconciliation_head_provider_rejected(
+                    head.updated_at,
+                ),
+            }))
+        }
         (
             "dead_letter",
             ReconciliationObservation::StillUncertain {
                 reason,
                 evidence_digest,
-                ..
+                observed_at,
             },
-        ) => Ok(Some(LedgerClaim::DeadLetter {
-            reason,
-            evidence_digest,
-            dead_lettered_at: head.updated_at,
-            attempts: head.attempts,
-            execution_started_at: head.execution_started_at,
-        })),
+        ) => {
+            validate_remote_dead_letter_idempotency(record, head, &reason, observed_at)?;
+            Ok(Some(LedgerClaim::DeadLetter {
+                reason,
+                evidence_digest,
+                dead_lettered_at: head.updated_at,
+                attempts: head.attempts,
+                execution_started_at,
+            }))
+        }
         ("receipt_found" | "leased" | "retry_wait", _) => Ok(None),
         (status, _) => Err(CloudStorageError::StoredValueInvalid(format!(
             "remote reconciliation state {status} does not match its observation"
         ))),
     }
+}
+
+fn validate_remote_reconciled_rejection_idempotency(
+    record: &EffectRecord,
+    head: &RemoteReconciliationHead,
+    reason: &str,
+    observed_at: DateTime<Utc>,
+) -> Result<(), CloudStorageError> {
+    if reason.trim().is_empty()
+        || head.updated_at < observed_at
+        || record.status != "failed"
+        || record.receipt_json.is_some()
+        || record.verification_json.is_some()
+        || record.updated_at != head.updated_at
+        || record.terminal_reason.as_deref() != Some(reason)
+        || head.terminal_reason.as_deref() != Some(reason)
+    {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    Ok(())
+}
+
+fn validate_remote_not_executed_idempotency(
+    record: &EffectRecord,
+    head: &RemoteReconciliationHead,
+    observed_at: DateTime<Utc>,
+) -> Result<(), CloudStorageError> {
+    if head.updated_at < observed_at
+        || record.status != "uncertain"
+        || record.receipt_json.is_some()
+        || record.verification_json.is_some()
+        || record.updated_at > head.updated_at
+    {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    Ok(())
+}
+
+fn validate_remote_dead_letter_idempotency(
+    record: &EffectRecord,
+    head: &RemoteReconciliationHead,
+    reason: &str,
+    observed_at: DateTime<Utc>,
+) -> Result<(), CloudStorageError> {
+    validate_remote_not_executed_idempotency(record, head, observed_at)?;
+    if reason.trim().is_empty() || head.terminal_reason.as_deref() != Some(reason) {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -928,37 +1025,80 @@ async fn claim_remote_reconciliation(
     if let Some(claim) =
         load_remote_terminal_reconciliation_claim(transaction, scope, effect).await?
     {
-        return Ok(ReconciliationClaim::Resolved(claim));
+        return Ok(ReconciliationClaim::Resolved(Box::new(claim)));
     }
-    let Some(record) = load_effect_record(transaction, scope, effect).await? else {
+    let record = load_effect_record(transaction, scope, effect).await?;
+    let Some(record) = record.as_ref() else {
+        if load_remote_reconciliation_head(transaction, scope, effect)
+            .await?
+            .is_some()
+        {
+            return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+        }
         return Ok(ReconciliationClaim::NotRequired);
     };
-    if record.status != "uncertain" {
-        return Ok(ReconciliationClaim::NotRequired);
+    let request = EffectClaimRequest {
+        scope: scope.clone(),
+        effect,
+        context: None,
+        owner,
+        now,
+        lease_expires_at,
+    };
+    if let Some(claim) =
+        completed_remote_reconciliation_claim(transaction, &request, record).await?
+    {
+        return Ok(claim);
     }
-    let execution_started_at = initial_execution_started_at(transaction, scope, effect).await?;
-    let Some(head) = load_remote_reconciliation_head(transaction, scope, effect).await? else {
+    continue_uncertain_remote_reconciliation(transaction, &request, policy).await
+}
+
+async fn continue_uncertain_remote_reconciliation(
+    transaction: &Transaction<'_>,
+    request: &EffectClaimRequest<'_>,
+    policy: &ReconciliationPolicy,
+) -> Result<ReconciliationClaim, CloudStorageError> {
+    let execution_started_at =
+        initial_execution_started_at(transaction, &request.scope, request.effect).await?;
+    let Some(head) =
+        load_remote_reconciliation_head(transaction, &request.scope, request.effect).await?
+    else {
         return insert_initial_remote_reconciliation(
             transaction,
-            scope,
-            effect,
+            &request.scope,
+            request.effect,
             policy,
-            owner,
-            now,
-            lease_expires_at,
+            request.owner,
+            request.now,
+            request.lease_expires_at,
             execution_started_at,
         )
         .await;
     };
+    if head.execution_started_at != execution_started_at {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
     validate_remote_reconciliation_policy(&head, policy)?;
     match head.status.as_str() {
-        "leased" if head.lease_expires_at.is_some_and(|expires| expires > now) => {
+        "leased"
+            if head
+                .lease_expires_at
+                .is_some_and(|expires| expires > request.now) =>
+        {
             Ok(ReconciliationClaim::Busy)
         }
         "leased" => {
-            expire_remote_reconciliation_lease(transaction, scope, effect, &head, now).await
+            expire_remote_reconciliation_lease(
+                transaction,
+                &request.scope,
+                request.effect,
+                &head,
+                execution_started_at,
+                request.now,
+            )
+            .await
         }
-        "retry_wait" if head.retry_at.is_some_and(|retry_at| retry_at > now) => {
+        "retry_wait" if head.retry_at.is_some_and(|retry_at| retry_at > request.now) => {
             Ok(ReconciliationClaim::NotReady {
                 retry_at: head.retry_at.ok_or_else(|| {
                     CloudStorageError::StoredValueInvalid(
@@ -970,18 +1110,21 @@ async fn claim_remote_reconciliation(
         "retry_wait" => {
             issue_remote_reconciliation_lease(
                 transaction,
-                scope,
-                effect,
+                &request.scope,
+                request.effect,
                 &head,
-                owner,
-                now,
-                lease_expires_at,
+                execution_started_at,
+                request.owner,
+                request.now,
+                request.lease_expires_at,
             )
             .await
         }
-        "receipt_found" | "provider_rejected" => Ok(ReconciliationClaim::NotRequired),
+        "receipt_found" | "provider_rejected" => {
+            Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict))
+        }
         "not_executed" | "dead_letter" => {
-            load_remote_terminal_reconciliation_claim(transaction, scope, effect)
+            load_remote_terminal_reconciliation_claim(transaction, &request.scope, request.effect)
                 .await?
                 .map_or_else(
                     || {
@@ -989,11 +1132,52 @@ async fn claim_remote_reconciliation(
                             "remote terminal reconciliation projection is missing".into(),
                         ))
                     },
-                    |claim| Ok(ReconciliationClaim::Resolved(claim)),
+                    |claim| Ok(ReconciliationClaim::Resolved(Box::new(claim))),
                 )
         }
         status => Err(CloudStorageError::StoredValueInvalid(format!(
             "unknown remote reconciliation status {status}"
+        ))),
+    }
+}
+
+async fn completed_remote_reconciliation_claim(
+    transaction: &Transaction<'_>,
+    request: &EffectClaimRequest<'_>,
+    record: &EffectRecord,
+) -> Result<Option<ReconciliationClaim>, CloudStorageError> {
+    match record.status.as_str() {
+        "verified" | "verification_required" => Ok(Some(ReconciliationClaim::Resolved(Box::new(
+            durable_remote_verification_claim(transaction, request, record).await?,
+        )))),
+        "failed" => Ok(Some(ReconciliationClaim::Resolved(Box::new(
+            provider_failed_claim(transaction, request, record).await?,
+        )))),
+        "receipt_recorded" => {
+            let (receipt, execution_started_at) =
+                decode_receipt_for_claim(transaction, request, record).await?;
+            persisted_remote_receipt_completion(
+                transaction,
+                request,
+                record,
+                &receipt,
+                execution_started_at,
+            )
+            .await?;
+            Ok(Some(ReconciliationClaim::NotRequired))
+        }
+        "executing" => {
+            if load_remote_reconciliation_head(transaction, &request.scope, request.effect)
+                .await?
+                .is_some()
+            {
+                return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+            }
+            Ok(Some(ReconciliationClaim::NotRequired))
+        }
+        "uncertain" => Ok(None),
+        status => Err(CloudStorageError::StoredValueInvalid(format!(
+            "invalid remote reconciliation ledger status {status}"
         ))),
     }
 }
@@ -1072,6 +1256,7 @@ async fn issue_remote_reconciliation_lease(
     scope: &CellScope,
     effect: &Effect,
     head: &RemoteReconciliationHead,
+    execution_started_at: DateTime<Utc>,
     owner: &str,
     now: DateTime<Utc>,
     lease_expires_at: DateTime<Utc>,
@@ -1128,7 +1313,7 @@ async fn issue_remote_reconciliation_lease(
     .await?;
     Ok(ReconciliationClaim::Acquired {
         lease,
-        execution_started_at: head.execution_started_at,
+        execution_started_at,
     })
 }
 
@@ -1184,6 +1369,7 @@ async fn expire_remote_reconciliation_lease(
     scope: &CellScope,
     effect: &Effect,
     head: &RemoteReconciliationHead,
+    execution_started_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Result<ReconciliationClaim, CloudStorageError> {
     let reason = "reconciliation lease expired before a durable Provider observation";
@@ -1211,13 +1397,15 @@ async fn expire_remote_reconciliation_lease(
             now,
         )
         .await?;
-        return Ok(ReconciliationClaim::Resolved(LedgerClaim::DeadLetter {
-            reason: reason.into(),
-            evidence_digest,
-            dead_lettered_at: now,
-            attempts: head.attempts,
-            execution_started_at: head.execution_started_at,
-        }));
+        return Ok(ReconciliationClaim::Resolved(Box::new(
+            LedgerClaim::DeadLetter {
+                reason: reason.into(),
+                evidence_digest,
+                dead_lettered_at: now,
+                attempts: head.attempts,
+                execution_started_at,
+            },
+        )));
     }
     let retry_at = remote_reconciliation_retry_at(now, head.policy.retry_delay_seconds)?;
     complete_remote_reconciliation_rows(
@@ -1246,8 +1434,12 @@ async fn finish_remote_reconciliation(
     let head = load_remote_reconciliation_head(transaction, scope, effect)
         .await?
         .ok_or(CloudStorageError::EffectLedger(LedgerError::LeaseLost))?;
+    let execution_started_at = initial_execution_started_at(transaction, scope, effect).await?;
+    if head.execution_started_at != execution_started_at {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
     require_current_remote_reconciliation_lease(&head, lease, now)?;
-    observation.validate_for(effect, head.execution_started_at)?;
+    observation.validate_for(effect, execution_started_at)?;
     if observation.observed_at() > now {
         return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
     }
@@ -1260,6 +1452,7 @@ async fn finish_remote_reconciliation(
                 lease,
                 &head,
                 observation,
+                execution_started_at,
                 now,
             )
             .await
@@ -1284,12 +1477,20 @@ async fn finish_remote_reconciliation(
             Ok(ReconciliationDisposition::ReconciledNotExecuted {
                 evidence_digest: evidence_digest.clone(),
                 observed_at: *observed_at,
-                execution_started_at: head.execution_started_at,
+                execution_started_at,
             })
         }
         ReconciliationObservation::ProviderRejected { .. } => {
-            finish_remote_reconciled_rejection(transaction, scope, effect, &head, observation, now)
-                .await
+            finish_remote_reconciled_rejection(
+                transaction,
+                scope,
+                effect,
+                &head,
+                observation,
+                execution_started_at,
+                now,
+            )
+            .await
         }
         ReconciliationObservation::StillUncertain { .. } => {
             finish_remote_still_uncertain(
@@ -1299,6 +1500,7 @@ async fn finish_remote_reconciliation(
                 lease,
                 &head,
                 observation,
+                execution_started_at,
                 now,
             )
             .await
@@ -1314,6 +1516,7 @@ async fn finish_remote_still_uncertain(
     lease: &ReconciliationLease,
     head: &RemoteReconciliationHead,
     observation: &ReconciliationObservation,
+    execution_started_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Result<ReconciliationDisposition, CloudStorageError> {
     let ReconciliationObservation::StillUncertain {
@@ -1342,7 +1545,7 @@ async fn finish_remote_still_uncertain(
             evidence_digest: evidence_digest.clone(),
             dead_lettered_at: now,
             attempts: lease.attempt_no,
-            execution_started_at: head.execution_started_at,
+            execution_started_at,
         });
     }
     let retry_at = remote_reconciliation_retry_at(now, head.policy.retry_delay_seconds)?;
@@ -1364,7 +1567,7 @@ async fn finish_remote_still_uncertain(
         observed_at: *observed_at,
         retry_at,
         attempt_no: lease.attempt_no,
-        execution_started_at: head.execution_started_at,
+        execution_started_at,
     })
 }
 
@@ -1394,6 +1597,7 @@ async fn finish_remote_reconciled_receipt(
     lease: &ReconciliationLease,
     head: &RemoteReconciliationHead,
     observation: &ReconciliationObservation,
+    execution_started_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Result<ReconciliationDisposition, CloudStorageError> {
     let ReconciliationObservation::ReceiptFound { receipt, .. } = observation else {
@@ -1456,7 +1660,7 @@ async fn finish_remote_reconciled_receipt(
     Ok(ReconciliationDisposition::ReceiptReadyForVerification {
         lease: verification_lease,
         receipt: receipt.clone(),
-        execution_started_at: head.execution_started_at,
+        execution_started_at,
     })
 }
 
@@ -1466,6 +1670,7 @@ async fn finish_remote_reconciled_rejection(
     effect: &Effect,
     head: &RemoteReconciliationHead,
     observation: &ReconciliationObservation,
+    execution_started_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Result<ReconciliationDisposition, CloudStorageError> {
     let ReconciliationObservation::ProviderRejected {
@@ -1513,7 +1718,7 @@ async fn finish_remote_reconciled_rejection(
         reason: reason.clone(),
         evidence_digest: evidence_digest.clone(),
         observed_at: *observed_at,
-        execution_started_at: head.execution_started_at,
+        execution_started_at,
     })
 }
 
@@ -1614,6 +1819,9 @@ async fn load_effect_claim_decision(
     CloudStorageError,
 > {
     let existing = load_effect_record(transaction, &request.scope, request.effect).await?;
+    let reconciliation_head =
+        load_remote_reconciliation_head(transaction, &request.scope, request.effect).await?;
+    validate_remote_claim_head_classification(existing.as_ref(), reconciliation_head.as_ref())?;
     let Some(record) = existing.as_ref() else {
         return Ok((decide_durable_claim(None, false), None, existing));
     };
@@ -1644,6 +1852,43 @@ async fn load_effect_claim_decision(
         latest,
         existing,
     ))
+}
+
+fn validate_remote_claim_head_classification(
+    record: Option<&EffectRecord>,
+    head: Option<&RemoteReconciliationHead>,
+) -> Result<(), CloudStorageError> {
+    let valid = match (record, head) {
+        (None, None) => true,
+        (Some(record), None) => matches!(
+            record.status.as_str(),
+            "executing"
+                | "failed"
+                | "uncertain"
+                | "receipt_recorded"
+                | "verified"
+                | "verification_required"
+        ),
+        (Some(EffectRecord { status, .. }), Some(head)) if status == "uncertain" => {
+            matches!(head.status.as_str(), "leased" | "retry_wait")
+        }
+        (Some(record), Some(head)) if head.status == "receipt_found" => {
+            match record.status.as_str() {
+                "receipt_recorded" => {
+                    record.receipt_json.is_some() && record.verification_json.is_none()
+                }
+                "verified" | "verification_required" | "failed" => {
+                    record.receipt_json.is_some() && record.verification_json.is_some()
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    Ok(())
 }
 
 async fn load_effect_record(
@@ -1706,13 +1951,7 @@ async fn materialize_effect_claim(
         }
         DurableClaimDirective::ReturnVerified => {
             let record = require_effect_record(existing, "verified")?;
-            let (receipt, verification, execution_started_at) =
-                decode_durable_verification(transaction, request, record).await?;
-            Ok(LedgerClaim::AlreadyVerified {
-                receipt,
-                verification,
-                execution_started_at,
-            })
+            durable_remote_verification_claim(transaction, request, record).await
         }
         DurableClaimDirective::ReturnProviderFailed => {
             provider_failed_claim(
@@ -1732,13 +1971,7 @@ async fn materialize_effect_claim(
         }
         DurableClaimDirective::ReturnVerification => {
             let record = require_effect_record(existing, "verification")?;
-            let (receipt, verification, execution_started_at) =
-                decode_durable_verification(transaction, request, record).await?;
-            Ok(LedgerClaim::DurableVerification {
-                receipt,
-                verification,
-                execution_started_at,
-            })
+            durable_remote_verification_claim(transaction, request, record).await
         }
         DurableClaimDirective::ReturnBusy => Ok(LedgerClaim::Busy),
         DurableClaimDirective::FreezeExpiredExecution => {
@@ -2118,6 +2351,14 @@ async fn resume_remote_verification_claim(
 ) -> Result<LedgerClaim, CloudStorageError> {
     let (receipt, execution_started_at) =
         decode_receipt_for_claim(transaction, request, record).await?;
+    let completion = persisted_remote_receipt_completion(
+        transaction,
+        request,
+        record,
+        &receipt,
+        execution_started_at,
+    )
+    .await?;
     let (attempt_no, generation) =
         next_effect_attempt(transaction, &request.scope, request.effect).await?;
     let receipt_json = serde_json::to_value(&receipt)?;
@@ -2130,10 +2371,11 @@ async fn resume_remote_verification_claim(
         Some(&receipt_json),
     )
     .await?;
-    Ok(LedgerClaim::Acquired {
+    Ok(LedgerClaim::RecoverableReceipt {
         lease,
-        receipt: Some(receipt),
+        receipt,
         execution_started_at,
+        completion,
     })
 }
 
@@ -2143,32 +2385,164 @@ async fn provider_failed_claim(
     record: &EffectRecord,
 ) -> Result<LedgerClaim, CloudStorageError> {
     if record.verification_json.is_some() {
-        let (receipt, verification, execution_started_at) =
-            decode_durable_verification(transaction, request, record).await?;
-        return Ok(LedgerClaim::DurableVerification {
-            receipt,
-            verification,
-            execution_started_at,
-        });
+        return durable_remote_verification_claim(transaction, request, record).await;
     }
     if record.receipt_json.is_some() {
         return Err(CloudStorageError::StoredValueInvalid(
             "remote provider rejection carries an unverified receipt".into(),
         ));
     }
-    Ok(LedgerClaim::ProviderRejected {
-        reason: record
-            .terminal_reason
-            .clone()
-            .unwrap_or_else(|| "provider rejected without a recorded reason".into()),
-        execution_started_at: initial_execution_started_at(
-            transaction,
-            &request.scope,
-            request.effect,
-        )
-        .await?,
-        recorded_at: record.updated_at,
+    if load_remote_reconciliation_head(transaction, &request.scope, request.effect)
+        .await?
+        .is_some()
+    {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    let reason = record
+        .terminal_reason
+        .as_ref()
+        .filter(|reason| !reason.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| CloudStorageError::EffectLedger(LedgerError::ScopeConflict))?;
+    let execution_started_at =
+        initial_execution_started_at(transaction, &request.scope, request.effect).await?;
+    if reason.trim().is_empty() || record.updated_at < execution_started_at {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    Ok(LedgerClaim::RecoverableProviderRejected {
+        reason,
+        observed_at: None,
+        execution_started_at,
+        completion: PersistedCompletionPoint::effect_idempotency_provider_rejected(
+            record.updated_at,
+        ),
     })
+}
+
+async fn durable_remote_verification_claim(
+    transaction: &Transaction<'_>,
+    request: &EffectClaimRequest<'_>,
+    record: &EffectRecord,
+) -> Result<LedgerClaim, CloudStorageError> {
+    let (receipt, verification, execution_started_at) =
+        decode_durable_verification(transaction, request, record).await?;
+    let (receipt_completion, completion) = persisted_remote_verification_completions(
+        transaction,
+        request,
+        record,
+        &receipt,
+        &verification,
+        execution_started_at,
+    )
+    .await?;
+    Ok(LedgerClaim::RecoverableVerification {
+        receipt,
+        verification,
+        execution_started_at,
+        receipt_completion,
+        completion,
+    })
+}
+
+async fn persisted_remote_receipt_completion(
+    transaction: &Transaction<'_>,
+    request: &EffectClaimRequest<'_>,
+    record: &EffectRecord,
+    receipt: &Receipt,
+    execution_started_at: DateTime<Utc>,
+) -> Result<PersistedCompletionPoint, CloudStorageError> {
+    if record.updated_at < execution_started_at || record.updated_at < receipt.accepted_at {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    let Some(head) =
+        load_remote_reconciliation_head(transaction, &request.scope, request.effect).await?
+    else {
+        return Ok(
+            PersistedCompletionPoint::effect_idempotency_provider_receipt(record.updated_at),
+        );
+    };
+    validate_remote_receipt_found_head(request.effect, &head, receipt, execution_started_at)?;
+    if record.updated_at != head.updated_at {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    Ok(PersistedCompletionPoint::reconciliation_head_receipt_found(
+        head.updated_at,
+    ))
+}
+
+async fn persisted_remote_verification_completions(
+    transaction: &Transaction<'_>,
+    request: &EffectClaimRequest<'_>,
+    record: &EffectRecord,
+    receipt: &Receipt,
+    verification: &Verification,
+    execution_started_at: DateTime<Utc>,
+) -> Result<(Option<PersistedCompletionPoint>, PersistedCompletionPoint), CloudStorageError> {
+    if record.updated_at < execution_started_at
+        || record.updated_at < receipt.accepted_at
+        || record.updated_at < verification.observed_at
+    {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    let receipt_completion =
+        match load_remote_reconciliation_head(transaction, &request.scope, request.effect).await? {
+            None => None,
+            Some(head) => {
+                validate_remote_receipt_found_head(
+                    request.effect,
+                    &head,
+                    receipt,
+                    execution_started_at,
+                )?;
+                if head.updated_at > record.updated_at {
+                    return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+                }
+                Some(PersistedCompletionPoint::reconciliation_head_receipt_found(
+                    head.updated_at,
+                ))
+            }
+        };
+    Ok((
+        receipt_completion,
+        PersistedCompletionPoint::effect_idempotency_verification(record.updated_at),
+    ))
+}
+
+fn validate_remote_receipt_found_head(
+    effect: &Effect,
+    head: &RemoteReconciliationHead,
+    receipt: &Receipt,
+    execution_started_at: DateTime<Utc>,
+) -> Result<(), CloudStorageError> {
+    if head.status != "receipt_found"
+        || head.lease_owner.is_some()
+        || head.lease_expires_at.is_some()
+        || head.execution_started_at != execution_started_at
+    {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    let observation_json = head.observation_json.clone().ok_or_else(|| {
+        CloudStorageError::StoredValueInvalid(
+            "remote receipt reconciliation has no observation".into(),
+        )
+    })?;
+    let observation: ReconciliationObservation = serde_json::from_value(observation_json)?;
+    observation.validate_for(effect, execution_started_at)?;
+    let ReconciliationObservation::ReceiptFound {
+        receipt: observed_receipt,
+        observed_at,
+        ..
+    } = &observation
+    else {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    };
+    if observed_receipt != receipt
+        || head.evidence_digest.as_deref() != Some(observation.evidence_digest())
+        || head.updated_at < *observed_at
+    {
+        return Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict));
+    }
+    Ok(())
 }
 
 async fn uncertain_claim(
@@ -2665,6 +3039,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remote_failed_receipt_found_requires_both_persisted_documents() {
+        let head = RemoteReconciliationHead {
+            policy: ReconciliationPolicy::default(),
+            policy_digest: "1".repeat(64),
+            attempts: 1,
+            generation: 1,
+            status: "receipt_found".into(),
+            lease_owner: None,
+            lease_expires_at: None,
+            retry_at: None,
+            evidence_digest: Some("2".repeat(64)),
+            observation_json: Some(serde_json::json!({"kind": "receipt_found"})),
+            terminal_reason: Some("receipt found".into()),
+            execution_started_at: now(),
+            updated_at: now() + Duration::seconds(1),
+        };
+        let completed = EffectRecord {
+            status: "failed".into(),
+            receipt_json: Some(serde_json::json!({"receipt": "present"})),
+            verification_json: Some(serde_json::json!({"verification": "present"})),
+            terminal_reason: Some("verification rejected".into()),
+            updated_at: now() + Duration::seconds(2),
+        };
+        assert!(validate_remote_claim_head_classification(Some(&completed), Some(&head)).is_ok());
+
+        let mut missing_receipt = completed.clone();
+        missing_receipt.receipt_json = None;
+        assert!(matches!(
+            validate_remote_claim_head_classification(Some(&missing_receipt), Some(&head)),
+            Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict))
+        ));
+
+        let mut missing_verification = completed;
+        missing_verification.verification_json = None;
+        assert!(matches!(
+            validate_remote_claim_head_classification(Some(&missing_verification), Some(&head)),
+            Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict))
+        ));
+    }
+
     #[derive(Clone)]
     struct FixturePermissionResolver(PermissionEvidence);
 
@@ -3094,10 +3509,11 @@ mod tests {
             .await
             .expect("durable remote receipt");
         revoke_fixture_fence(client, store, scope, project_id).await;
-        let LedgerClaim::Acquired {
+        let LedgerClaim::RecoverableReceipt {
             lease: verification_lease,
-            receipt: Some(reused),
+            receipt: reused,
             execution_started_at: recovered_start,
+            completion,
         } = store
             .claim_effect(
                 client,
@@ -3114,6 +3530,12 @@ mod tests {
         };
         assert_eq!(reused, receipt);
         assert_eq!(recovered_start, execution_started_at);
+        assert_eq!(
+            completion,
+            PersistedCompletionPoint::effect_idempotency_provider_receipt(
+                now() + Duration::seconds(3),
+            )
+        );
         let verification = Verification {
             id: VerificationId::from("remote-verification-1"),
             status: VerificationStatus::Confirmed,
@@ -3145,10 +3567,14 @@ mod tests {
                 )
                 .await
                 .expect("already verified recovery"),
-            LedgerClaim::AlreadyVerified {
+            LedgerClaim::RecoverableVerification {
                 receipt,
                 verification,
                 execution_started_at,
+                receipt_completion: None,
+                completion: PersistedCompletionPoint::effect_idempotency_verification(
+                    now() + Duration::seconds(6),
+                ),
             }
         );
     }
@@ -3406,6 +3832,14 @@ mod tests {
         idempotency: RemoteEffectIdempotencyCompletionSnapshot,
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct RemoteEffectRecoverySnapshot {
+        idempotency: Option<serde_json::Value>,
+        attempts: serde_json::Value,
+        reconciliation_head: Option<serde_json::Value>,
+        reconciliation_attempts: serde_json::Value,
+    }
+
     struct RemoteEffectCompletionFixture {
         effect: Effect,
         lease: ExecutionLease,
@@ -3549,6 +3983,96 @@ mod tests {
         }
     }
 
+    async fn remote_effect_recovery_snapshot(
+        client: &mut tokio_postgres::Client,
+        scope: &CellScope,
+        effect: &Effect,
+    ) -> RemoteEffectRecoverySnapshot {
+        let inspection = client.transaction().await.expect("recovery inspection");
+        set_scope(&inspection, scope)
+            .await
+            .expect("recovery inspection scope");
+        let row = inspection
+            .query_one(
+                "SELECT
+                   (SELECT to_jsonb(record) FROM (
+                      SELECT * FROM hartevo_cell.effect_idempotency
+                      WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND effect_id = $4
+                   ) AS record),
+                   COALESCE((SELECT jsonb_agg(to_jsonb(attempt) ORDER BY attempt.generation)
+                     FROM (SELECT * FROM hartevo_cell.effect_execution_attempts
+                           WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND effect_id = $4)
+                           AS attempt), '[]'::jsonb),
+                   (SELECT to_jsonb(head) FROM (
+                      SELECT * FROM hartevo_cell.effect_reconciliation_heads
+                      WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND effect_id = $4
+                   ) AS head),
+                   COALESCE((SELECT jsonb_agg(to_jsonb(attempt) ORDER BY attempt.generation)
+                     FROM (SELECT * FROM hartevo_cell.effect_reconciliation_attempts
+                           WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND effect_id = $4)
+                           AS attempt), '[]'::jsonb)",
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &effect.project_id.as_str(),
+                    &effect.id.as_str(),
+                ],
+            )
+            .await
+            .expect("recovery snapshot");
+        let snapshot = RemoteEffectRecoverySnapshot {
+            idempotency: row.get(0),
+            attempts: row.get(1),
+            reconciliation_head: row.get(2),
+            reconciliation_attempts: row.get(3),
+        };
+        inspection
+            .commit()
+            .await
+            .expect("recovery inspection commit");
+        snapshot
+    }
+
+    async fn remote_completion_times(
+        client: &mut tokio_postgres::Client,
+        scope: &CellScope,
+        effect: &Effect,
+    ) -> (DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+        let inspection = client
+            .transaction()
+            .await
+            .expect("completion time inspection");
+        set_scope(&inspection, scope)
+            .await
+            .expect("completion time scope");
+        let row = inspection
+            .query_one(
+                "SELECT record.updated_at,
+                        head.updated_at,
+                        head.initial_execution_started_at
+                 FROM hartevo_cell.effect_idempotency AS record
+                 LEFT JOIN hartevo_cell.effect_reconciliation_heads AS head
+                   ON head.cell = record.cell AND head.tenant_id = record.tenant_id
+                  AND head.project_id = record.project_id AND head.effect_id = record.effect_id
+                 WHERE record.cell = $1 AND record.tenant_id = $2
+                   AND record.project_id = $3 AND record.effect_id = $4",
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &effect.project_id.as_str(),
+                    &effect.id.as_str(),
+                ],
+            )
+            .await
+            .expect("completion DB times");
+        let result = (row.get(0), row.get(1), row.get(2));
+        inspection
+            .commit()
+            .await
+            .expect("completion time inspection commit");
+        result
+    }
+
     async fn claim_remote_effect(
         client: &mut tokio_postgres::Client,
         store: &PostgresCellStore,
@@ -3613,9 +4137,10 @@ mod tests {
                 )
                 .await
                 .expect("valid remote receipt before verification lease");
-            let LedgerClaim::Acquired {
+            let LedgerClaim::RecoverableReceipt {
                 lease,
-                receipt: Some(reused),
+                receipt: reused,
+                completion,
                 ..
             } = store
                 .claim_effect(
@@ -3632,6 +4157,12 @@ mod tests {
                 panic!("expected remote completion verification lease")
             };
             assert_eq!(reused, receipt);
+            assert_eq!(
+                completion,
+                PersistedCompletionPoint::effect_idempotency_provider_receipt(
+                    claim_at + Duration::seconds(1),
+                )
+            );
             lease
         } else {
             claimed.lease
@@ -4029,10 +4560,11 @@ mod tests {
         status: VerificationStatus,
         recovered_at: DateTime<Utc>,
     ) -> Verification {
-        let LedgerClaim::Acquired {
+        let LedgerClaim::RecoverableReceipt {
             lease,
-            receipt: Some(receipt),
+            receipt,
             execution_started_at,
+            completion,
         } = store
             .claim_effect(
                 client,
@@ -4049,6 +4581,12 @@ mod tests {
         };
         assert_eq!(receipt, scenario.receipt);
         assert_eq!(execution_started_at, scenario.execution_started_at);
+        assert_eq!(
+            completion,
+            PersistedCompletionPoint::effect_idempotency_provider_receipt(
+                scenario.receipt.accepted_at,
+            )
+        );
         let verification = Verification {
             id: VerificationId::from(format!("verification-{tag}").as_str()),
             status,
@@ -4410,10 +4948,13 @@ mod tests {
             store,
             &fixture.provider.rejected.effect,
             now() + Duration::seconds(310),
-            &LedgerClaim::ProviderRejected {
+            &LedgerClaim::RecoverableProviderRejected {
                 reason: PROVIDER_REJECTED_REASON.into(),
+                observed_at: None,
                 execution_started_at: fixture.provider.rejected.execution_started_at,
-                recorded_at: fixture.provider.rejected_at,
+                completion: PersistedCompletionPoint::effect_idempotency_provider_rejected(
+                    fixture.provider.rejected_at,
+                ),
             },
         )
         .await;
@@ -4442,10 +4983,14 @@ mod tests {
             store,
             &fixture.receipts.rejected.effect,
             now() + Duration::seconds(312),
-            &LedgerClaim::DurableVerification {
+            &LedgerClaim::RecoverableVerification {
                 receipt: fixture.receipts.rejected.receipt.clone(),
                 verification: evidence.rejected,
                 execution_started_at: fixture.receipts.rejected.execution_started_at,
+                receipt_completion: None,
+                completion: PersistedCompletionPoint::effect_idempotency_verification(
+                    now() + Duration::seconds(302),
+                ),
             },
         )
         .await;
@@ -4454,10 +4999,14 @@ mod tests {
             store,
             &fixture.receipts.inconclusive.effect,
             now() + Duration::seconds(313),
-            &LedgerClaim::DurableVerification {
+            &LedgerClaim::RecoverableVerification {
                 receipt: fixture.receipts.inconclusive.receipt.clone(),
                 verification: evidence.inconclusive,
                 execution_started_at: fixture.receipts.inconclusive.execution_started_at,
+                receipt_completion: None,
+                completion: PersistedCompletionPoint::effect_idempotency_verification(
+                    now() + Duration::seconds(304),
+                ),
             },
         )
         .await;
@@ -4963,15 +5512,26 @@ mod tests {
         close_test_client(second, second_task).await;
 
         let (mut recovery, recovery_task) = connect_test_client(&database_url).await;
+        let (verification_at, receipt_at, initial_at) =
+            remote_completion_times(&mut recovery, &scope, &receipt_evidence.effect).await;
+        assert_eq!(initial_at, Some(receipt_evidence.execution_started_at));
         assert_terminal_claim(
             &mut recovery,
             &store,
             &receipt_evidence.effect,
             now() + Duration::seconds(70),
-            &LedgerClaim::AlreadyVerified {
+            &LedgerClaim::RecoverableVerification {
                 receipt: receipt_evidence.receipt.clone(),
                 verification: receipt_evidence.verification.clone(),
                 execution_started_at: receipt_evidence.execution_started_at,
+                receipt_completion: Some(
+                    PersistedCompletionPoint::reconciliation_head_receipt_found(
+                        receipt_at.expect("DB receipt completion"),
+                    ),
+                ),
+                completion: PersistedCompletionPoint::effect_idempotency_verification(
+                    verification_at,
+                ),
             },
         )
         .await;
@@ -4992,5 +5552,543 @@ mod tests {
         )
         .await;
         close_test_client(recovery, recovery_task).await;
+    }
+
+    macro_rules! run_postgres_recovery_provenance_and_tamper_matrix {
+        () => {{
+        let Some(database_url) = std::env::var_os(POSTGRES_L2_URL_ENV) else {
+            eprintln!(
+                "BLOCKED_ENV: {POSTGRES_L2_URL_ENV} is absent; PostgreSQL ledger-native recovery provenance/tamper matrix did not execute"
+            );
+            return;
+        };
+        let database_url = database_url
+            .into_string()
+            .expect("PostgreSQL test URL must be valid Unicode");
+        let store = PostgresCellStore::new(DataCell::Us);
+        let (mut client, connection_task) = connect_test_client(&database_url).await;
+        let (scope, project_id) = prepare_remote_project(&mut client, &store).await;
+        let (_, _, permission) = approved_remote_effect(
+            &scope.tenant_id,
+            &project_id,
+            "recovery-matrix-permission",
+            "recovery-matrix-permission-effect",
+            "recovery-matrix-permission-key",
+        );
+        publish_active_fixture_fence(&mut client, &store, &scope, &project_id, &permission).await;
+
+        let direct = claim_remote_effect(
+            &mut client,
+            &store,
+            &scope,
+            &project_id,
+            "recovery-direct-rejected",
+            now() + Duration::seconds(1),
+        )
+        .await;
+        store
+            .record_effect_failed(
+                &mut client,
+                &direct.effect,
+                &direct.lease,
+                "stored direct Provider rejection",
+                now() + Duration::seconds(2),
+            )
+            .await
+            .expect("persist direct Provider rejection");
+        let (direct_completion, direct_head, direct_initial) =
+            remote_completion_times(&mut client, &scope, &direct.effect).await;
+        assert_eq!((direct_head, direct_initial), (None, None));
+        assert_eq!(
+            store
+                .claim_effect(
+                    &mut client,
+                    &direct.effect,
+                    None,
+                    "direct-recovery-reader",
+                    now() + Duration::seconds(3),
+                    now() + Duration::seconds(33),
+                )
+                .await
+                .expect("direct Provider recovery claim"),
+            LedgerClaim::RecoverableProviderRejected {
+                reason: "stored direct Provider rejection".into(),
+                observed_at: None,
+                execution_started_at: direct.execution_started_at,
+                completion: PersistedCompletionPoint::effect_idempotency_provider_rejected(
+                    direct_completion,
+                ),
+            }
+        );
+        let before = remote_effect_recovery_snapshot(&mut client, &scope, &direct.effect).await;
+        let tamper = client.transaction().await.expect("direct reason tamper");
+        set_scope(&tamper, &scope)
+            .await
+            .expect("direct tamper scope");
+        assert!(
+            tamper
+                .execute(
+                    "UPDATE hartevo_cell.effect_idempotency SET terminal_reason = '   '
+                     WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND effect_id = $4",
+                    &[
+                        &scope.cell.as_str(),
+                        &scope.tenant_id.as_str(),
+                        &project_id.as_str(),
+                        &direct.effect.id.as_str(),
+                    ],
+                )
+                .await
+                .is_err()
+        );
+        tamper
+            .rollback()
+            .await
+            .expect("direct reason tamper rollback");
+        assert_eq!(
+            remote_effect_recovery_snapshot(&mut client, &scope, &direct.effect).await,
+            before
+        );
+
+        let receipt_only = claim_remote_effect(
+            &mut client,
+            &store,
+            &scope,
+            &project_id,
+            "recovery-receipt-not-required",
+            now() + Duration::seconds(60),
+        )
+        .await;
+        let receipt_only_value = scenario_receipt(
+            &receipt_only.effect,
+            "recovery-receipt-not-required",
+            now() + Duration::seconds(61),
+        );
+        store
+            .record_effect_receipt(
+                &mut client,
+                &receipt_only.effect,
+                &receipt_only.lease,
+                &receipt_only_value,
+                now() + Duration::seconds(61),
+            )
+            .await
+            .expect("persist read-only receipt");
+        let before =
+            remote_effect_recovery_snapshot(&mut client, &scope, &receipt_only.effect).await;
+        assert_eq!(
+            store
+                .claim_effect_reconciliation(
+                    &mut client,
+                    &receipt_only.effect,
+                    &ReconciliationPolicy::default(),
+                    "receipt-not-required-reader",
+                    now() + Duration::seconds(62),
+                    now() + Duration::seconds(92),
+                )
+                .await
+                .expect("receipt reconciliation probe"),
+            ReconciliationClaim::NotRequired
+        );
+        assert_eq!(
+            remote_effect_recovery_snapshot(&mut client, &scope, &receipt_only.effect).await,
+            before
+        );
+
+        let rejected = seed_remote_uncertain_effect(
+            &mut client,
+            &store,
+            &scope,
+            &project_id,
+            "recovery-rh-rejected",
+            now() + Duration::seconds(120),
+        )
+        .await;
+        let policy = ReconciliationPolicy::default();
+        let ReconciliationClaim::Acquired { lease, .. } = store
+            .claim_effect_reconciliation(
+                &mut client,
+                &rejected.effect,
+                &policy,
+                "rh-rejected-reconciler",
+                now() + Duration::seconds(122),
+                now() + Duration::seconds(152),
+            )
+            .await
+            .expect("RH rejected claim")
+        else {
+            panic!("expected RH rejected lease")
+        };
+        let rejected_reason = "Provider rejected during remote reconciliation";
+        store
+            .record_effect_reconciliation(
+                &mut client,
+                &rejected.effect,
+                &lease,
+                &ReconciliationObservation::ProviderRejected {
+                    reason: rejected_reason.into(),
+                    evidence_digest: "1".repeat(64),
+                    observed_at: now() + Duration::seconds(123),
+                },
+                now() + Duration::seconds(123),
+            )
+            .await
+            .expect("persist RH rejection");
+        let (rejected_record_at, rejected_head_at, rejected_initial) =
+            remote_completion_times(&mut client, &scope, &rejected.effect).await;
+        assert_eq!(
+            rejected_record_at,
+            rejected_head_at.expect("RH rejection head")
+        );
+        assert_eq!(rejected_initial, Some(rejected.execution_started_at));
+        assert_eq!(
+            store
+                .claim_effect(
+                    &mut client,
+                    &rejected.effect,
+                    None,
+                    "rh-rejected-reader",
+                    now() + Duration::seconds(124),
+                    now() + Duration::seconds(154),
+                )
+                .await
+                .expect("recover RH rejection"),
+            LedgerClaim::RecoverableProviderRejected {
+                reason: rejected_reason.into(),
+                observed_at: Some(now() + Duration::seconds(123)),
+                execution_started_at: rejected.execution_started_at,
+                completion: PersistedCompletionPoint::reconciliation_head_provider_rejected(
+                    rejected_record_at,
+                ),
+            }
+        );
+        let tamper = client.transaction().await.expect("RH rejection tamper");
+        set_scope(&tamper, &scope)
+            .await
+            .expect("RH rejection tamper scope");
+        tamper
+            .execute(
+                "UPDATE hartevo_cell.effect_reconciliation_heads
+                 SET terminal_reason = 'different durable reason'
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND effect_id = $4",
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &project_id.as_str(),
+                    &rejected.effect.id.as_str(),
+                ],
+            )
+            .await
+            .expect("tamper RH rejection reason");
+        tamper.commit().await.expect("RH rejection tamper commit");
+        let before = remote_effect_recovery_snapshot(&mut client, &scope, &rejected.effect).await;
+        assert!(matches!(
+            store
+                .claim_effect(
+                    &mut client,
+                    &rejected.effect,
+                    None,
+                    "rh-rejected-tamper-reader",
+                    now() + Duration::seconds(124),
+                    now() + Duration::seconds(154),
+                )
+                .await,
+            Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict))
+        ));
+        assert_eq!(
+            remote_effect_recovery_snapshot(&mut client, &scope, &rejected.effect).await,
+            before
+        );
+
+        let not_executed = seed_remote_uncertain_effect(
+            &mut client,
+            &store,
+            &scope,
+            &project_id,
+            "recovery-rh-not-executed",
+            now() + Duration::seconds(180),
+        )
+        .await;
+        let ReconciliationClaim::Acquired { lease, .. } = store
+            .claim_effect_reconciliation(
+                &mut client,
+                &not_executed.effect,
+                &policy,
+                "not-executed-reconciler",
+                now() + Duration::seconds(182),
+                now() + Duration::seconds(212),
+            )
+            .await
+            .expect("not-executed claim")
+        else {
+            panic!("expected not-executed lease")
+        };
+        store
+            .record_effect_reconciliation(
+                &mut client,
+                &not_executed.effect,
+                &lease,
+                &ReconciliationObservation::NotExecuted {
+                    evidence_digest: "2".repeat(64),
+                    observed_at: now() + Duration::seconds(183),
+                },
+                now() + Duration::seconds(183),
+            )
+            .await
+            .expect("persist not-executed reconciliation");
+        let (not_executed_record_at, not_executed_head_at, not_executed_initial) =
+            remote_completion_times(&mut client, &scope, &not_executed.effect).await;
+        let not_executed_head_at = not_executed_head_at.expect("not-executed head");
+        assert!(not_executed_record_at <= not_executed_head_at);
+        assert_eq!(
+            not_executed_initial,
+            Some(not_executed.execution_started_at)
+        );
+        assert_eq!(
+            store
+                .claim_effect(
+                    &mut client,
+                    &not_executed.effect,
+                    None,
+                    "not-executed-reader",
+                    now() + Duration::seconds(184),
+                    now() + Duration::seconds(214),
+                )
+                .await
+                .expect("recover not-executed reconciliation"),
+            LedgerClaim::RecoverableReconciledNotExecuted {
+                evidence_digest: "2".repeat(64),
+                observed_at: now() + Duration::seconds(183),
+                execution_started_at: not_executed.execution_started_at,
+                completion: PersistedCompletionPoint::reconciliation_head_not_executed(
+                    not_executed_head_at,
+                ),
+            }
+        );
+        let tamper = client
+            .transaction()
+            .await
+            .expect("not-executed time tamper");
+        set_scope(&tamper, &scope)
+            .await
+            .expect("not-executed tamper scope");
+        tamper
+            .execute(
+                "UPDATE hartevo_cell.effect_idempotency SET updated_at = $5
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND effect_id = $4",
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &project_id.as_str(),
+                    &not_executed.effect.id.as_str(),
+                    &(not_executed_head_at + Duration::seconds(1)),
+                ],
+            )
+            .await
+            .expect("tamper not-executed record time");
+        tamper.commit().await.expect("not-executed tamper commit");
+        let before =
+            remote_effect_recovery_snapshot(&mut client, &scope, &not_executed.effect).await;
+        assert!(matches!(
+            store
+                .claim_effect(
+                    &mut client,
+                    &not_executed.effect,
+                    None,
+                    "not-executed-tamper-reader",
+                    now() + Duration::seconds(184),
+                    now() + Duration::seconds(214),
+                )
+                .await,
+            Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict))
+        ));
+        assert_eq!(
+            remote_effect_recovery_snapshot(&mut client, &scope, &not_executed.effect).await,
+            before
+        );
+
+        let receipt_history = seed_remote_uncertain_effect(
+            &mut client,
+            &store,
+            &scope,
+            &project_id,
+            "recovery-rh-receipt",
+            now() + Duration::seconds(240),
+        )
+        .await;
+        let ReconciliationClaim::Acquired { lease, .. } = store
+            .claim_effect_reconciliation(
+                &mut client,
+                &receipt_history.effect,
+                &policy,
+                "receipt-history-reconciler",
+                now() + Duration::seconds(242),
+                now() + Duration::seconds(272),
+            )
+            .await
+            .expect("receipt history claim")
+        else {
+            panic!("expected receipt history lease")
+        };
+        let receipt = scenario_receipt(
+            &receipt_history.effect,
+            "recovery-rh-receipt",
+            now() + Duration::seconds(241),
+        );
+        let ReconciliationDisposition::ReceiptReadyForVerification {
+            lease: verification_lease,
+            ..
+        } = store
+            .record_effect_reconciliation(
+                &mut client,
+                &receipt_history.effect,
+                &lease,
+                &ReconciliationObservation::ReceiptFound {
+                    receipt: receipt.clone(),
+                    evidence_digest: "3".repeat(64),
+                    observed_at: now() + Duration::seconds(243),
+                },
+                now() + Duration::seconds(243),
+            )
+            .await
+            .expect("persist receipt history")
+        else {
+            panic!("expected receipt history verification lease")
+        };
+        let verification = Verification {
+            id: VerificationId::from("verification-recovery-rh-receipt"),
+            status: VerificationStatus::Rejected,
+            verifier: "independent-recovery-rh-receipt".into(),
+            independent: true,
+            observed_at: now() + Duration::seconds(244),
+            evidence_digest: "4".repeat(64),
+            receipt_id: receipt.id.clone(),
+        };
+        store
+            .record_effect_verification(
+                &mut client,
+                &receipt_history.effect,
+                &verification_lease,
+                &verification,
+                now() + Duration::seconds(244),
+            )
+            .await
+            .expect("persist rejected receipt history verification");
+        let (verification_at, receipt_at, initial_at) =
+            remote_completion_times(&mut client, &scope, &receipt_history.effect).await;
+        assert_eq!(initial_at, Some(receipt_history.execution_started_at));
+        assert_eq!(
+            store
+                .claim_effect(
+                    &mut client,
+                    &receipt_history.effect,
+                    None,
+                    "receipt-history-reader",
+                    now() + Duration::seconds(245),
+                    now() + Duration::seconds(275),
+                )
+                .await
+                .expect("recover rejected receipt history verification"),
+            LedgerClaim::RecoverableVerification {
+                receipt: receipt.clone(),
+                verification: verification.clone(),
+                execution_started_at: receipt_history.execution_started_at,
+                receipt_completion: Some(
+                    PersistedCompletionPoint::reconciliation_head_receipt_found(
+                        receipt_at.expect("receipt history DB completion"),
+                    ),
+                ),
+                completion: PersistedCompletionPoint::effect_idempotency_verification(
+                    verification_at,
+                ),
+            }
+        );
+        for missing_column in ["receipt_json", "verification_json"] {
+            let before =
+                remote_effect_recovery_snapshot(&mut client, &scope, &receipt_history.effect).await;
+            let tamper = client
+                .transaction()
+                .await
+                .expect("missing RH verification document tamper");
+            set_scope(&tamper, &scope)
+                .await
+                .expect("missing RH verification document scope");
+            let statement = format!(
+                "UPDATE hartevo_cell.effect_idempotency SET {missing_column} = NULL
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND effect_id = $4"
+            );
+            assert!(
+                tamper
+                    .execute(
+                        &statement,
+                        &[
+                            &scope.cell.as_str(),
+                            &scope.tenant_id.as_str(),
+                            &project_id.as_str(),
+                            &receipt_history.effect.id.as_str(),
+                        ],
+                    )
+                    .await
+                    .is_err(),
+                "PostgreSQL must reject a failed RH verification missing {missing_column}",
+            );
+            tamper
+                .rollback()
+                .await
+                .expect("missing RH verification document rollback");
+            assert_eq!(
+                remote_effect_recovery_snapshot(&mut client, &scope, &receipt_history.effect).await,
+                before,
+            );
+        }
+        let tamper = client
+            .transaction()
+            .await
+            .expect("initial execution tamper");
+        set_scope(&tamper, &scope)
+            .await
+            .expect("initial tamper scope");
+        tamper
+            .execute(
+                "UPDATE hartevo_cell.effect_reconciliation_heads
+                 SET initial_execution_started_at = $5
+                 WHERE cell = $1 AND tenant_id = $2 AND project_id = $3 AND effect_id = $4",
+                &[
+                    &scope.cell.as_str(),
+                    &scope.tenant_id.as_str(),
+                    &project_id.as_str(),
+                    &receipt_history.effect.id.as_str(),
+                    &(receipt_history.execution_started_at - Duration::seconds(1)),
+                ],
+            )
+            .await
+            .expect("tamper RH initial execution time");
+        tamper.commit().await.expect("initial tamper commit");
+        let before =
+            remote_effect_recovery_snapshot(&mut client, &scope, &receipt_history.effect).await;
+        assert!(matches!(
+            store
+                .claim_effect(
+                    &mut client,
+                    &receipt_history.effect,
+                    None,
+                    "initial-tamper-reader",
+                    now() + Duration::seconds(245),
+                    now() + Duration::seconds(275),
+                )
+                .await,
+            Err(CloudStorageError::EffectLedger(LedgerError::ScopeConflict))
+        ));
+        assert_eq!(
+            remote_effect_recovery_snapshot(&mut client, &scope, &receipt_history.effect).await,
+            before
+        );
+
+            close_test_client(client, connection_task).await;
+        }};
+    }
+
+    #[tokio::test]
+    async fn postgres_recovery_provenance_and_tamper_matrix_reports_blocked_or_executes() {
+        run_postgres_recovery_provenance_and_tamper_matrix!();
     }
 }

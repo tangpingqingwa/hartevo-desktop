@@ -19,9 +19,14 @@ use thiserror::Error;
 use tokio_postgres::{Client, Row, Transaction};
 
 mod effect_ledger;
+mod region_transfer;
 mod scheduler;
 
 pub use effect_ledger::{CloudPermissionFenceMutation, CloudPermissionFenceResult};
+pub use region_transfer::{
+    EncryptedRegionTransferRequest, RegionTransferConsumer, RegionTransferProvider,
+    RegionTransferReceipt, RegionTransferServiceDefinition, RegionTransferStatus,
+};
 pub use scheduler::{
     MAX_SCHEDULER_LEASE_SECONDS, SchedulerAttempt, SchedulerAttemptOutcome,
     SchedulerAttemptSurface, SchedulerBackpressure, SchedulerBackpressureState, SchedulerBudget,
@@ -31,7 +36,7 @@ pub use scheduler::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_CIPHERTEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REMOTE_WORKER_LEASE: Duration = Duration::seconds(15 * 60);
 const CLAIM_OUTBOX_SQL: &str = "WITH candidates AS (
@@ -589,7 +594,7 @@ impl PostgresCellStore {
         let transaction = client.transaction().await?;
         transaction
             .query_one(
-                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v5'))",
+                "SELECT pg_advisory_xact_lock(hashtext('hartevo_cell_schema_v6'))",
                 &[],
             )
             .await?;
@@ -1656,7 +1661,8 @@ impl PostgresCellStore {
         let row = transaction
             .query_opt(
                 "SELECT h.object_kind, h.current_revision, v.key_version, v.nonce,
-                        v.ciphertext, v.aad_digest, v.content_digest, v.tombstone, v.recorded_at
+                        v.ciphertext, v.aad_digest, v.content_digest, v.tombstone, v.recorded_at,
+                        h.key_version, h.content_digest, h.tombstone, v.object_kind
                  FROM hartevo_cell.sync_object_heads h
                  JOIN hartevo_cell.sync_object_versions v
                    ON v.cell = h.cell AND v.tenant_id = h.tenant_id
@@ -1673,6 +1679,7 @@ impl PostgresCellStore {
             )
             .await?
             .ok_or(CloudStorageError::SyncObjectNotFound)?;
+        validate_sync_head_link(&row)?;
         let object = decode_sync_object(&row, scope, project_id, object_id)?;
         transaction.commit().await?;
         Ok(object)
@@ -2822,7 +2829,8 @@ async fn load_device_public_key_tx(
 ) -> Result<Option<DevicePublicKeyRegistration>, CloudStorageError> {
     let base = "SELECT v.revision, v.algorithm, v.public_key, v.public_key_digest,
                        v.authorized_by, v.authorization_evidence_digest,
-                       v.idempotency_key, v.registered_at, v.updated_at, v.revoked_at
+                       v.idempotency_key, v.registered_at, v.updated_at, v.revoked_at,
+                       h.public_key_digest, h.revoked_at
                 FROM hartevo_cell.device_public_key_heads h
                 JOIN hartevo_cell.device_public_key_versions v
                   ON v.cell = h.cell AND v.tenant_id = h.tenant_id
@@ -2865,6 +2873,13 @@ async fn load_device_public_key_tx(
         revoked_at: row.get(9),
     };
     registration.validate()?;
+    if row.get::<_, String>(10) != registration.public_key_digest
+        || row.get::<_, Option<DateTime<Utc>>>(11) != registration.revoked_at
+    {
+        return Err(CloudStorageError::StoredValueInvalid(
+            "device public key head/version fence".into(),
+        ));
+    }
     Ok(Some(registration))
 }
 
@@ -3394,6 +3409,19 @@ fn decode_sync_object(
     })
 }
 
+fn validate_sync_head_link(row: &Row) -> Result<(), CloudStorageError> {
+    if row.get::<_, String>(0) != row.get::<_, String>(12)
+        || row.get::<_, i64>(2) != row.get::<_, i64>(9)
+        || row.get::<_, String>(6) != row.get::<_, String>(10)
+        || row.get::<_, bool>(7) != row.get::<_, bool>(11)
+    {
+        return Err(CloudStorageError::StoredValueInvalid(
+            "sync object head/version fence".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn decode_outbox_message(row: &Row) -> Result<CloudOutboxMessage, CloudStorageError> {
     let cell = decode_cell(&row.get::<_, String>(1))?;
     let payload = EncryptedPayload {
@@ -3555,6 +3583,22 @@ pub enum CloudStorageError {
     InvalidRemoteWorkerTask,
     #[error("remote Worker completion or result is invalid")]
     InvalidRemoteWorkerCompletion,
+    #[error("encrypted region transfer service, provider, consumer, or scope is invalid")]
+    InvalidRegionTransfer,
+    #[error("region transfer source mission head is not visible in the exact Project scope")]
+    RegionTransferSourceHeadNotFound,
+    #[error("region transfer receipt is not visible in the exact tenant, Project, and Cell scope")]
+    RegionTransferNotFound,
+    #[error("region transfer receipt or encrypted bundle failed integrity verification")]
+    RegionTransferReceiptTampered,
+    #[error("region transfer was revoked before adoption")]
+    RegionTransferRevoked,
+    #[error("region transfer was aborted after a crash and cannot be replayed")]
+    RegionTransferCrashed,
+    #[error("region transfer target already contains a conflicting Mission head")]
+    RegionTransferTargetConflict,
+    #[error("region transfer is already terminal and cannot change state")]
+    RegionTransferAlreadyTerminal,
     #[error("tenant has not been registered in this Cell")]
     TenantNotRegistered,
     #[error("project already exists and the request is not an idempotent replay")]
@@ -3962,13 +4006,15 @@ mod tests {
 
     #[test]
     fn schema_contract_has_physical_cell_rls_ciphertext_and_append_only_versions() {
-        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(SCHEMA_VERSION, 6);
         assert!(SCHEMA.contains("FORCE ROW LEVEL SECURITY"));
         assert!(SCHEMA.contains("current_setting(''hartevo.tenant_id'', true)"));
         assert!(SCHEMA.contains("current_setting(''hartevo.cell'', true)"));
         assert!(SCHEMA.contains("sync_object_versions"));
         assert!(SCHEMA.contains("payload_ciphertext BYTEA"));
         assert!(SCHEMA.contains("sync_mutations"));
+        assert!(SCHEMA.contains("region_transfer_receipts"));
+        assert!(SCHEMA.contains("region_transfer_events"));
         assert!(SCHEMA.contains("remote_worker_mailbox_messages"));
         assert!(SCHEMA.contains("remote_worker_claims"));
         assert!(SCHEMA.contains("claim_request_digest"));
@@ -4087,7 +4133,7 @@ mod tests {
     async fn postgres_l2_contract_reports_blocked_or_executes_full_replay() {
         let Some(database_url) = std::env::var_os(POSTGRES_L2_URL_ENV) else {
             eprintln!(
-                "BLOCKED_ENV: {POSTGRES_L2_URL_ENV} is absent; PostgreSQL migration/RLS/recovery replay did not execute"
+                "NOT_RUN/BLOCKED_ENV: {POSTGRES_L2_URL_ENV} is absent; PostgreSQL migration/RLS/recovery replay did not execute"
             );
             return;
         };

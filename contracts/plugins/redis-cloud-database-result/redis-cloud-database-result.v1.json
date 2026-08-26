@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tangpingqingwa/hartevo-desktop/contracts/plugins/redis-cloud-database-result/redis-cloud-database-result.v1.json",
+  "title": "Hartevo Redis Cloud database posture result Layer-1 contract",
+  "description": "Bounded read-only Redis Cloud management metadata for one exact account/subscription/database scope. It emits review-only evidence below kernel authority and never reads data-plane values.",
+  "schemaVersion": "hartevo.redis-cloud-database-result/v1",
+  "contractVersion": "EXT-REDIS-CLOUD-01-L1/v1",
+  "pluginVersion": "1.0.0",
+  "pluginId": "redis.cloud.database.result",
+  "layer": "Layer-1",
+  "evidenceLevel": "L1_PROVIDER_CONTRACT",
+  "status": "read_proposal_recording_only",
+  "officialReferences": [
+    "https://redis.io/docs/latest/operate/rc/api/",
+    "https://redis.io/docs/latest/operate/rc/api/examples/",
+    "https://redis.io/docs/latest/operate/rc/api/api-reference/"
+  ],
+  "digestInput": "hartevo.redis-cloud-database-result/v1|layer=1|service=redis.cloud.database.result.read|provider=redis.cloud.database.result.recording|consumer=mission.redis-cloud-database.consumer|api=redis-cloud-rest-v1-read-account-subscription-database-posture-r1",
+  "contractDigest": "e1f53b0506084eba89b4948a6f0b5bdae3f7957c7c0cb97d04e2310ed13e2691",
+  "service": {
+    "type": "RedisCloudDatabaseResultService",
+    "id": "redis.cloud.database.result.read",
+    "operations": ["GetAccount", "GetSubscription", "GetDatabase", "describe_capabilities", "register", "revoke_registration", "reverse_registration", "restore_registration", "read", "propose", "record", "verify"],
+    "readOnly": true,
+    "proposalOnly": true,
+    "recordingOnly": true,
+    "externalWrites": false,
+    "kernelAuthority": false,
+    "outcomeAdoption": false
+  },
+  "provider": {
+    "type": "RedisCloudProvider",
+    "id": "redis.cloud.database.result.recording",
+    "apiRevision": "redis-cloud-rest-v1-read-account-subscription-database-posture-r1",
+    "baseUrl": "https://api.redislabs.com/v1",
+    "operations": ["GET /account", "GET /subscriptions/{subscriptionId}", "GET /subscriptions/{subscriptionId}/databases/{databaseId}"],
+    "allowlistMethods": ["GET"],
+    "allowedTransports": ["fixture", "recording", "fake", "loopback", "BLOCKED_ENV"],
+    "authentication": {
+      "scheme": "redis_cloud_account_api_key",
+      "headers": ["x-api-key", "x-api-secret-key"],
+      "secretReference": "opaque_non_serializing_only",
+      "nativeResolution": false,
+      "rawCredentialMaterial": false
+    },
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false,
+    "externalWrites": false
+  },
+  "consumer": {
+    "type": "MissionRedisCloudDatabaseConsumer",
+    "id": "mission.redis-cloud-database.consumer",
+    "authority": "proposal_and_recording_below_kernel",
+    "scope": ["accountId", "subscriptionId", "databaseId", "missionId", "missionRevision", "projectId", "projectRevision", "workProductId", "workProductRevision"],
+    "adoptsOutcome": false,
+    "adoptsWorkProduct": false,
+    "truthAuthority": false,
+    "consentAuthority": false,
+    "effectAuthority": false,
+    "receiptAuthority": false,
+    "verificationAuthority": false
+  },
+  "credentials": {
+    "boundary": "opaque Redis Cloud account API-key SecretReference",
+    "serialized": false,
+    "debugRedacted": true,
+    "rawMaterialAccepted": false,
+    "resolvedByLayer": 2
+  },
+  "scope": {
+    "required": ["accountId", "subscriptionId", "databaseId", "missionIdAndRevision", "projectIdAndRevision", "workProductIdAndRevision", "permissionDigest", "secretReferenceDigest", "scopeDigest"],
+    "target": "exactly_one_account_subscription_database",
+    "identifiersInEvidence": "digest_only",
+    "statusMetadata": true,
+    "regionMetadata": true,
+    "planMetadata": true,
+    "shardingMetadata": true,
+    "replicationMetadata": true,
+    "endpointPostureMetadata": true,
+    "rawEndpoints": false,
+    "credentials": false,
+    "data": false,
+    "keys": false,
+    "values": false,
+    "rawResponses": false,
+    "maxPages": 1,
+    "maxPageSize": 1,
+    "maxResponseBytes": 1048576
+  },
+  "registration": {
+    "version": "1.0.0",
+    "reversible": true,
+    "revocable": true,
+    "bindingDigests": ["pluginVersionDigest", "contractVersionDigest", "contractDigest", "providerDigest", "apiDigest", "permissionDigest", "scopeDigest", "secretReferenceDigest", "evidenceDigest", "registrationRevision", "registrationDigest"],
+    "permissions": ["redis-cloud:ReadAccount", "redis-cloud:ReadSubscription", "redis-cloud:ReadDatabase", "mission.scope"],
+    "forbiddenPermissions": ["redis-cloud:CreateDatabase", "redis-cloud:UpdateDatabase", "redis-cloud:DeleteDatabase", "redis-cloud:ImportDatabase", "redis-cloud:ExportDatabase", "redis-cloud:BackupDatabase", "redis-cloud:RestoreDatabase", "redis-cloud:ScaleDatabase", "redis-cloud:MutateACL", "redis-cloud:ReadData", "redis-cloud:ReadKeys", "redis-cloud:ReadValues", "outcome.adopt"],
+    "failClosedOn": ["plugin_version_drift", "contract_version_or_digest_drift", "provider_or_api_drift", "permission_drift", "scope_drift", "evidence_digest_drift", "secret_reference_revocation", "registration_tamper", "registration_revocation", "registration_reversal", "stale_provider_state", "cursor_or_filter_replay", "pagination", "truncation", "access_loss", "provider_unknown", "proposal_replay_conflict"]
+  },
+  "pagination": {
+    "style": "pageToken_pageSize",
+    "pageTokenOpaque": true,
+    "pageTokenDigestOnly": true,
+    "exactObjectResolutionOnly": true,
+    "maxPages": 1,
+    "cursorBoundTo": ["account", "subscription", "database", "operation", "pageSize", "pageNumber", "scopeDigest"],
+    "loopRejected": true,
+    "filterDriftRejected": true,
+    "truncationIsNonAdoptable": true,
+    "unexpectedPaginationIsRejected": true
+  },
+  "projection": {
+    "account": ["accountIdentityDigest"],
+    "subscription": ["subscriptionIdentityDigest", "status", "planDigest", "regionDigests", "replicationPosture", "revisionDigest"],
+    "database": ["databaseIdentityDigest", "subscriptionIdentityDigest", "status", "planDigest", "regionDigests", "shardingPosture", "replicationPosture", "endpointPosture", "revisionDigest"],
+    "endpointPosture": ["endpointCount", "privateEndpointPresent", "publicEndpointPresent", "tlsRequired", "endpointDigestOnly"],
+    "rawEndpoints": false,
+    "rawCredentials": false,
+    "rawData": false,
+    "rawKeys": false,
+    "rawValues": false,
+    "rawProviderResponse": false
+  },
+  "redaction": {
+    "secretMaterial": false,
+    "endpointHostnames": false,
+    "endpointPorts": false,
+    "rawCredentials": false,
+    "rawData": false,
+    "rawKeys": false,
+    "rawValues": false,
+    "rawPageToken": false,
+    "rawProviderPayload": false,
+    "rawErrorMessage": false
+  },
+  "receipts": {
+    "request": {"redacted": true, "retain": ["operation", "requestDigest", "pathDigest", "scopeDigest"], "drop": ["rawPath", "accountId", "subscriptionId", "databaseId", "authorizationHeader", "credentialMaterial"]},
+    "cost": {"redacted": true, "retain": ["operation", "responseBytes", "boundedRequestUnits", "costDigest"], "estimateOnly": true, "durableProviderReceipt": false},
+    "localRecording": {"durableProviderReceipt": false, "proposalIsProviderReceipt": false}
+  },
+  "evidence": {
+    "requiredDigests": ["pluginVersionDigest", "contractVersionDigest", "contractDigest", "providerDigest", "apiDigest", "permissionDigest", "scopeDigest", "secretReferenceDigest", "registrationDigest", "accountDigest", "subscriptionDigest", "databaseDigest", "requestDigest", "responseDigest", "evidenceDigest", "proposalDigest"],
+    "states": ["ready", "partial", "stale", "pagination_rejected", "truncated", "access_loss", "provider_unknown", "tampered", "replay_conflict", "registration_revoked", "registration_reversed"],
+    "tamperRejected": true,
+    "replayConflictRejected": true,
+    "revocationRejected": true,
+    "staleStateRejected": true,
+    "accessLossIsNonAdoptable": true,
+    "partialIsNonAdoptable": true,
+    "paginationIsNonAdoptable": true,
+    "truncationIsNonAdoptable": true,
+    "providerUnknownIsNonAdoptable": true
+  },
+  "provenance": {
+    "recording": "non_native_non_connected_non_first_party",
+    "fixture": "non_native_non_connected_non_first_party",
+    "fake": "non_native_non_connected_non_first_party",
+    "loopback": "non_native_non_connected_non_first_party",
+    "blockedEnv": "non_native_non_connected_non_first_party",
+    "connected": false,
+    "native": false,
+    "firstParty": false,
+    "providerReceipt": false
+  },
+  "authorityBoundary": {
+    "owns": ["bounded Redis Cloud account/subscription/database management reads", "exact account/subscription/database scope", "status, region, plan, sharding, replication, and endpoint-posture projection", "opaque pagination fences and truncation rejection", "version/contract/provider/API/permission/scope/evidence binding digests", "reversible and revocable registration", "redacted request and estimate-only cost receipts", "Mission-scoped review-only proposal and in-memory idempotent recording"],
+    "doesNotOwn": ["Hartevo Truth", "Hartevo Consent", "Hartevo Effect", "Hartevo Receipt", "Hartevo Verification authority", "Hartevo Outcome", "live Redis Cloud HTTPS", "native API-key resolution", "durable provider receipt", "database creation, update, deletion, import, export, backup, restore, or scaling", "ACL mutation", "data-plane access", "data, keys, values, raw endpoint, credential, or raw response reads", "verified Work Product adoption", "availability, authorization, correctness, or outcome claims"]
+  },
+  "forbiddenEffects": ["create_database", "update_database", "delete_database", "import_database", "export_database", "backup_database", "restore_database", "scale_database", "mutate_acl", "read_data_plane", "read_keys", "read_values", "read_raw_endpoints", "resolve_live_credentials", "serialize_credentials", "serialize_raw_provider_response", "adopt_kernel_truth", "adopt_kernel_consent", "adopt_kernel_effect", "claim_provider_receipt", "adopt_kernel_verification", "adopt_kernel_outcome", "adopt_verified_work_product"],
+  "layer2Gaps": ["native Redis Cloud API-key resolution", "live GET HTTPS transport to api.redislabs.com/v1", "production account/subscription/database read authorization", "durable provider receipt", "independent repeat-read reconciliation", "consented provider effects", "ACL or data-plane authority", "verified Mission or Work Product adoption", "Hartevo Truth, Consent, Effect, Receipt, Verification, and Outcome authority"],
+  "honestNativeGap": "This Layer-1 root is recording, fixture, fake, loopback, and BLOCKED_ENV only. Every transport remains disconnected, non-native, and non-first-party. Native Redis Cloud authentication, live read transport, durable provider receipts, independent verification, and any kernel or Work Product adoption remain Layer-2 host authority."
+}

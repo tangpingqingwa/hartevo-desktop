@@ -1,0 +1,278 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hartevo.local/contracts/harness/promotion-state.v1.json",
+  "title": "Hartevo Harness Lab signed promotion state contract",
+  "description": "Fail-closed candidate-only promotion, canary, rollback, revocation, partition and current-commit receipt contract. It never grants Provider E2/E4 or Release authority.",
+  "oneOf": [
+    {"$ref": "#/$defs/candidateIdentityFreeze"},
+    {"$ref": "#/$defs/currentCommitReceipt"},
+    {"$ref": "#/$defs/promotionTransition"},
+    {"$ref": "#/$defs/promotionStateMachine"},
+    {"$ref": "#/$defs/promotionStateDecision"}
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "sourceCommit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+    "token": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"},
+    "lane": {"enum": ["public", "vertical", "private_holdout", "fresh_shadow"]},
+    "role": {"enum": ["baseline", "candidate"]},
+    "harness": {"enum": ["native", "upstream_recommended", "hartevo_candidate"]},
+    "runnerDisposition": {
+      "enum": [
+        "EXECUTED",
+        "FAIL",
+        "NOT_EXECUTED",
+        "BLOCKED_ENV",
+        "BLOCKED_EXTERNAL_BILLING",
+        "NOT_IMPLEMENTED",
+        "FIXTURE",
+        "IGNORED"
+      ]
+    },
+    "evidenceKind": {
+      "enum": ["native_run", "controlled_simulator", "fixture", "source_audit", "missing"]
+    },
+    "providerMode": {
+      "enum": ["native_credentialed", "controlled_simulator", "fixture", "not_implemented"]
+    },
+    "promotionAction": {"enum": ["canary", "promote", "rollback", "revoke"]},
+    "promotionState": {
+      "enum": [
+        "candidate_frozen",
+        "canary_pending",
+        "canary_accepted",
+        "promoted",
+        "rolled_back",
+        "revoked",
+        "blocked_env",
+        "not_evaluated"
+      ]
+    },
+    "decisionStatus": {
+      "enum": ["DENIED", "APPROVED", "BLOCKED_ENV", "NOT_IMPLEMENTED"]
+    },
+    "candidateIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidateId",
+        "providerId",
+        "providerMode",
+        "model",
+        "modelRevision",
+        "harness",
+        "harnessRevision",
+        "effort",
+        "serviceTier",
+        "budgetMicros",
+        "retryPolicy",
+        "seedPolicy",
+        "runRepetitions",
+        "runtimeRevision",
+        "schemaVersion",
+        "toolCatalogDigest",
+        "sourceCommit",
+        "environmentDigest",
+        "configDigest",
+        "candidateScope",
+        "productionDefaultsUnchanged"
+      ],
+      "properties": {
+        "candidateId": {"$ref": "#/$defs/token"},
+        "providerId": {"$ref": "#/$defs/token"},
+        "providerMode": {"$ref": "#/$defs/providerMode"},
+        "model": {"type": "string", "minLength": 1, "maxLength": 128},
+        "modelRevision": {"type": "string", "minLength": 1, "maxLength": 128},
+        "harness": {"type": "string", "minLength": 1, "maxLength": 128},
+        "harnessRevision": {"type": "string", "minLength": 1, "maxLength": 128},
+        "effort": {"type": "string", "minLength": 1, "maxLength": 64},
+        "serviceTier": {"type": "string", "minLength": 1, "maxLength": 64},
+        "budgetMicros": {"type": "integer", "minimum": 1},
+        "retryPolicy": {"type": "string", "minLength": 1, "maxLength": 128},
+        "seedPolicy": {"type": "string", "minLength": 1, "maxLength": 128},
+        "runRepetitions": {"type": "integer", "minimum": 1},
+        "runtimeRevision": {"type": "string", "minLength": 1, "maxLength": 128},
+        "schemaVersion": {"type": "string", "minLength": 1, "maxLength": 128},
+        "toolCatalogDigest": {"$ref": "#/$defs/sha256"},
+        "sourceCommit": {"$ref": "#/$defs/sourceCommit"},
+        "environmentDigest": {"$ref": "#/$defs/sha256"},
+        "configDigest": {"$ref": "#/$defs/sha256"},
+        "candidateScope": {"const": "candidate_only"},
+        "productionDefaultsUnchanged": {"const": true}
+      }
+    },
+    "candidateIdentityFreeze": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "authority",
+        "releaseDecision",
+        "candidate",
+        "candidateIdentityDigest",
+        "sourceCommit",
+        "planDigest",
+        "matrixDigest",
+        "contractDigest",
+        "freezeSequence"
+      ],
+      "properties": {
+        "schemaVersion": {"const": "hartevo-harness-promotion-state/v1"},
+        "authority": {"const": "candidate_lab_only"},
+        "releaseDecision": {"const": "NOT_EVALUATED"},
+        "candidate": {"$ref": "#/$defs/candidateIdentity"},
+        "candidateIdentityDigest": {"$ref": "#/$defs/sha256"},
+        "sourceCommit": {"$ref": "#/$defs/sourceCommit"},
+        "planDigest": {"$ref": "#/$defs/sha256"},
+        "matrixDigest": {"$ref": "#/$defs/sha256"},
+        "contractDigest": {"$ref": "#/$defs/sha256"},
+        "freezeSequence": {"const": 1}
+      }
+    },
+    "currentCommitReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "receiptId",
+        "candidateId",
+        "candidateIdentityDigest",
+        "sourceCommit",
+        "planDigest",
+        "matrixDigest",
+        "runId",
+        "lane",
+        "role",
+        "harness",
+        "runnerDisposition",
+        "evidenceKind",
+        "providerMode",
+        "authority",
+        "evidenceDigest",
+        "replayDigest",
+        "receiptDigest"
+      ],
+      "properties": {
+        "schemaVersion": {"const": "hartevo-harness-promotion-state/v1"},
+        "receiptId": {"$ref": "#/$defs/sha256"},
+        "candidateId": {"$ref": "#/$defs/token"},
+        "candidateIdentityDigest": {"$ref": "#/$defs/sha256"},
+        "sourceCommit": {"$ref": "#/$defs/sourceCommit"},
+        "planDigest": {"$ref": "#/$defs/sha256"},
+        "matrixDigest": {"$ref": "#/$defs/sha256"},
+        "runId": {"$ref": "#/$defs/sha256"},
+        "lane": {"$ref": "#/$defs/lane"},
+        "role": {"const": "candidate"},
+        "harness": {"const": "hartevo_candidate"},
+        "runnerDisposition": {"const": "EXECUTED"},
+        "evidenceKind": {"const": "native_run"},
+        "providerMode": {"const": "native_credentialed"},
+        "authority": {"const": "candidate_lab_run_only"},
+        "evidenceDigest": {"$ref": "#/$defs/sha256"},
+        "replayDigest": {"$ref": "#/$defs/sha256"},
+        "receiptDigest": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "promotionTransition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "transitionId",
+        "sequence",
+        "action",
+        "stateBefore",
+        "stateAfter",
+        "candidateId",
+        "sourceCommit",
+        "receiptId",
+        "signedRecordDigest",
+        "transitionDigest"
+      ],
+      "properties": {
+        "schemaVersion": {"const": "hartevo-harness-promotion-state/v1"},
+        "transitionId": {"$ref": "#/$defs/token"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "action": {"$ref": "#/$defs/promotionAction"},
+        "stateBefore": {"$ref": "#/$defs/promotionState"},
+        "stateAfter": {"$ref": "#/$defs/promotionState"},
+        "candidateId": {"$ref": "#/$defs/token"},
+        "sourceCommit": {"$ref": "#/$defs/sourceCommit"},
+        "receiptId": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "signedRecordDigest": {"$ref": "#/$defs/sha256"},
+        "transitionDigest": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "promotionStateMachine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "authority",
+        "releaseDecision",
+        "sourceCommit",
+        "freeze",
+        "state",
+        "activeCandidateId",
+        "priorCandidateId",
+        "receipts",
+        "transitions",
+        "revokedCandidateIds",
+        "transitionDigest"
+      ],
+      "properties": {
+        "schemaVersion": {"const": "hartevo-harness-promotion-state/v1"},
+        "authority": {"const": "candidate_lab_only"},
+        "releaseDecision": {"const": "NOT_EVALUATED"},
+        "sourceCommit": {"$ref": "#/$defs/sourceCommit"},
+        "freeze": {"$ref": "#/$defs/candidateIdentityFreeze"},
+        "state": {"$ref": "#/$defs/promotionState"},
+        "activeCandidateId": {"$ref": "#/$defs/token"},
+        "priorCandidateId": {"anyOf": [{"$ref": "#/$defs/token"}, {"type": "null"}]},
+        "receipts": {
+          "type": "array",
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/currentCommitReceipt"}
+        },
+        "transitions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/promotionTransition"}
+        },
+        "revokedCandidateIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/token"}
+        },
+        "transitionDigest": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "promotionStateDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "state",
+        "authority",
+        "releaseDecision",
+        "candidateId",
+        "sourceCommit",
+        "action",
+        "reasons",
+        "transitionDigest"
+      ],
+      "properties": {
+        "status": {"$ref": "#/$defs/decisionStatus"},
+        "state": {"$ref": "#/$defs/promotionState"},
+        "authority": {"const": "candidate_lab_only"},
+        "releaseDecision": {"const": "NOT_EVALUATED"},
+        "candidateId": {"$ref": "#/$defs/token"},
+        "sourceCommit": {"$ref": "#/$defs/sourceCommit"},
+        "action": {"$ref": "#/$defs/promotionAction"},
+        "reasons": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "transitionDigest": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}
