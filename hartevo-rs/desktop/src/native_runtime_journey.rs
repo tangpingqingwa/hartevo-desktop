@@ -1368,6 +1368,9 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidVm11OutcomeDecision
         | DesktopDataError::InvalidVm11NextContractResolution
         | DesktopDataError::InvalidWaitingApprovalGrant
+        | DesktopDataError::InvalidBrowserWorkspaceContinue
+        | DesktopDataError::BrowserWorkspaceUnavailable
+        | DesktopDataError::BrowserWorkspaceContinueNotHeld
         | DesktopDataError::EmptyProjectName
         | DesktopDataError::InvalidRecoveryKey
         | DesktopDataError::ProjectNotFound(_)
