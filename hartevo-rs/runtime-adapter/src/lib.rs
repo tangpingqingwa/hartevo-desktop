@@ -29,6 +29,12 @@ mod plugin;
 mod provider;
 pub mod scheduler_fence;
 
+pub use hartevo_mission_scheduler::os_lifecycle::{LeaseFence, ReplayDecision};
+pub use scheduler_fence::{
+    RuntimeAttemptPermit, RuntimeAttemptStatus, RuntimeDispatchReceipt, RuntimeScheduleBinding,
+    RuntimeSchedulerError, RuntimeSchedulerGate, RuntimeTakeoverReport,
+};
+
 pub use control_plane::{
     CONTROL_PLANE_CONTRACT_SHA256, ResolvedSecret, RuntimeBudget, RuntimeCapabilities,
     RuntimeCatalog, RuntimeDataBoundary, RuntimeEndpointClass, RuntimeExecutionConfig,
@@ -1714,6 +1720,20 @@ impl StdioRuntime {
         Self::spawn_prepared_with_resolved_secrets(config, launch, &[])
     }
 
+    /// Production spawn: the child cannot start unless `permit` is the current
+    /// Running authorization for `gate`'s bound schedule digest, mapping, and
+    /// lease. Stale, taken-over, failed, uncertain, and completed permits fail
+    /// closed.
+    pub fn spawn_prepared_authorized(
+        config: &RuntimeCommand,
+        launch: &RuntimeLaunchSpec,
+        gate: &RuntimeSchedulerGate,
+        permit: &RuntimeAttemptPermit,
+    ) -> Result<Self, AdapterError> {
+        gate.require_current_permit(permit)?;
+        Self::spawn_prepared(config, launch)
+    }
+
     pub fn spawn_prepared_with_secret_resolver(
         config: &RuntimeCommand,
         launch: &RuntimeLaunchSpec,
@@ -2105,6 +2125,32 @@ impl StdioRuntime {
     }
 
     pub fn start_mapped_turn(
+        &mut self,
+        mapping: &RuntimeMapping,
+        client_user_message_id: &str,
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<RuntimeTurnDispatch, AdapterError> {
+        self.start_mapped_turn_inner(mapping, client_user_message_id, prompt, timeout)
+    }
+
+    /// Production turn start: the protocol write cannot begin unless `permit`
+    /// is the current Running authorization for `gate`'s bound schedule
+    /// digest, mapping, and lease.
+    pub fn start_mapped_turn_authorized(
+        &mut self,
+        gate: &RuntimeSchedulerGate,
+        permit: &RuntimeAttemptPermit,
+        mapping: &RuntimeMapping,
+        client_user_message_id: &str,
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<RuntimeTurnDispatch, AdapterError> {
+        gate.require_current_permit(permit)?;
+        self.start_mapped_turn_inner(mapping, client_user_message_id, prompt, timeout)
+    }
+
+    fn start_mapped_turn_inner(
         &mut self,
         mapping: &RuntimeMapping,
         client_user_message_id: &str,
@@ -4115,6 +4161,8 @@ pub enum AdapterError {
     #[error("OpenInterpreter contract subset is invalid")]
     InvalidContract,
     #[error(transparent)]
+    Scheduler(#[from] RuntimeSchedulerError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -5096,6 +5144,120 @@ wait"#,
         );
         assert!(runtime.poll_exit().expect("live runtime poll").is_none());
         assert!(runtime.shutdown().expect("exact owner shutdown").forced);
+    }
+
+    #[cfg(unix)]
+    fn scheduler_digest(byte: u8) -> String {
+        digest_hex(&[byte])
+    }
+
+    #[cfg(unix)]
+    fn scheduler_gate_for_spawn_permit()
+    -> (RuntimeSchedulerGate, RuntimeAttemptPermit, RuntimeMapping) {
+        let mapping = RuntimeMapping::new(
+            "project-runtime-fence",
+            "mission-runtime-fence",
+            1,
+            scheduler_digest(b'i'),
+            "model",
+            "provider",
+            "thread-runtime-fence",
+        )
+        .expect("mapping");
+        let fence = LeaseFence {
+            owner_digest: scheduler_digest(b'o'),
+            token_digest: scheduler_digest(b't'),
+            generation: 1,
+        };
+        let binding = RuntimeScheduleBinding::new(scheduler_digest(b's'), fence, mapping.clone())
+            .expect("binding");
+        let mut gate = RuntimeSchedulerGate::new(binding);
+        let permit = gate
+            .authorize_turn(&scheduler_digest(b'a'), &mapping)
+            .expect("permit");
+        (gate, permit, mapping)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_spawn_requires_a_current_running_permit() {
+        let token = "c".repeat(64);
+        let command = pinned_cleanup_fixture_runtime();
+        let launch = prepare_runtime_launch(&command, &token).expect("launch spec");
+        let (mut gate, permit, mapping) = scheduler_gate_for_spawn_permit();
+
+        gate.take_over(
+            LeaseFence {
+                owner_digest: scheduler_digest(b'n'),
+                token_digest: scheduler_digest(b'm'),
+                generation: 2,
+            },
+            RuntimeMapping::new(
+                "project-runtime-fence",
+                "mission-runtime-fence",
+                2,
+                scheduler_digest(b'n'),
+                "model",
+                "provider",
+                "thread-runtime-next",
+            )
+            .expect("next mapping"),
+        )
+        .expect("takeover");
+        assert!(matches!(
+            StdioRuntime::spawn_prepared_authorized(&command, &launch, &gate, &permit),
+            Err(AdapterError::Scheduler(
+                RuntimeSchedulerError::LeaseFenceLost
+            ))
+        ));
+
+        let mut failed_gate = RuntimeSchedulerGate::new(
+            RuntimeScheduleBinding::new(
+                scheduler_digest(b's'),
+                LeaseFence {
+                    owner_digest: scheduler_digest(b'o'),
+                    token_digest: scheduler_digest(b't'),
+                    generation: 1,
+                },
+                mapping.clone(),
+            )
+            .expect("failed binding"),
+        );
+        let failed_permit = failed_gate
+            .authorize_turn(&scheduler_digest(b'f'), &mapping)
+            .expect("failed permit");
+        failed_gate.record_failed(&failed_permit).expect("failed");
+        assert!(matches!(
+            StdioRuntime::spawn_prepared_authorized(
+                &command,
+                &launch,
+                &failed_gate,
+                &failed_permit
+            ),
+            Err(AdapterError::Scheduler(
+                RuntimeSchedulerError::AttemptPermitLost
+            ))
+        ));
+        let retry_permit = failed_gate
+            .authorize_turn(&scheduler_digest(b'f'), &mapping)
+            .expect("fresh permit");
+        assert_ne!(failed_permit, retry_permit);
+        assert!(matches!(
+            StdioRuntime::spawn_prepared_authorized(
+                &command,
+                &launch,
+                &failed_gate,
+                &failed_permit
+            ),
+            Err(AdapterError::Scheduler(
+                RuntimeSchedulerError::AttemptPermitLost
+            ))
+        ));
+
+        let runtime =
+            StdioRuntime::spawn_prepared_authorized(&command, &launch, &failed_gate, &retry_permit)
+                .expect("fresh permit may spawn");
+        assert!(runtime.shutdown().expect("shutdown").forced);
     }
 
     #[cfg(unix)]

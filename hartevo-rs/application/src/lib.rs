@@ -118,9 +118,11 @@ use hartevo_effect_broker::{
     EffectExecutor, EffectReconciler, EffectVerifier,
 };
 use hartevo_runtime_adapter::{
-    AdapterError, MappedTurnEventKind, ObservedRuntimeProcessIdentity, ProcessCleanupDisposition,
-    RuntimeAgentMessage, RuntimeAgentMessageDelta, RuntimeCommand, RuntimeLocalApprovalRequest,
-    RuntimeMapping, RuntimeProcessCleanupTarget, RuntimeTurnCompletionStatus, StdioRuntime,
+    AdapterError, LeaseFence, MappedTurnEventKind, ObservedRuntimeProcessIdentity,
+    ProcessCleanupDisposition, RuntimeAgentMessage, RuntimeAgentMessageDelta, RuntimeAttemptPermit,
+    RuntimeAttemptStatus, RuntimeCommand, RuntimeLocalApprovalRequest, RuntimeMapping,
+    RuntimeProcessCleanupTarget, RuntimeScheduleBinding, RuntimeSchedulerError,
+    RuntimeSchedulerGate, RuntimeTurnCompletionStatus, RuntimeTurnDispatch, StdioRuntime,
     cleanup_runtime_process, generate_runtime_launch_token, prepare_runtime_launch,
 };
 use hartevo_storage::{
@@ -1345,6 +1347,8 @@ pub struct ManagedContextRuntime {
     pub handle: WorkerHandle,
     pub mailbox: WorkerMailbox,
     pub runtime: StdioRuntime,
+    pub scheduler_gate: RuntimeSchedulerGate,
+    pub scheduler_permit: Option<RuntimeAttemptPermit>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -15051,7 +15055,31 @@ impl ApplicationService {
         self.store
             .update_runtime_turn_attempt(&attempt, expected_revision)?;
 
-        match managed.runtime.start_mapped_turn(
+        let attempt_digest = runtime_turn_attempt_digest(&attempt.id);
+        let permit = match authorize_runtime_scheduler_turn(
+            &mut managed.scheduler_gate,
+            &attempt_digest,
+            &managed.mapping,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let expected_revision = attempt.revision;
+                attempt.fail_dispatch(
+                    RuntimeTurnFailureClass::DispatchNotSent,
+                    sha256(format!("{error:?}").as_bytes()),
+                    true,
+                    now,
+                )?;
+                self.store
+                    .update_runtime_turn_attempt(&attempt, expected_revision)?;
+                return Err(error);
+            }
+        };
+        managed.scheduler_permit = Some(permit.clone());
+
+        match managed.runtime.start_mapped_turn_authorized(
+            &managed.scheduler_gate,
+            &permit,
             &managed.mapping,
             attempt.id.as_str(),
             &prompt,
@@ -15068,6 +15096,10 @@ impl ApplicationService {
                     && runtime_mapping_base_digest(&dispatch.mapping)?
                         == attempt.scope.runtime_mapping_digest;
                 let Some(runtime_turn_id) = dispatch.mapping.runtime_turn_id.clone() else {
+                    record_runtime_scheduler_uncertain(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                    )?;
                     let expected_revision = attempt.revision;
                     attempt.freeze_uncertain(
                         RuntimeTurnFailureClass::Protocol,
@@ -15082,6 +15114,10 @@ impl ApplicationService {
                     });
                 };
                 if !mapping_matches {
+                    record_runtime_scheduler_uncertain(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                    )?;
                     let expected_revision = attempt.revision;
                     attempt.freeze_uncertain(
                         RuntimeTurnFailureClass::Protocol,
@@ -15095,6 +15131,7 @@ impl ApplicationService {
                         disposition: RuntimeTurnDispatchDisposition::Uncertain,
                     });
                 }
+                managed.scheduler_gate.accept_dispatch(&permit, &dispatch)?;
                 managed.mapping = dispatch.mapping;
                 let expected_revision = attempt.revision;
                 attempt.accept_dispatch(
@@ -15112,6 +15149,17 @@ impl ApplicationService {
             }
             Err(error) => {
                 let (class, definitive) = classify_runtime_turn_dispatch_error(&error);
+                if definitive {
+                    record_runtime_scheduler_failed(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                    )?;
+                } else {
+                    record_runtime_scheduler_uncertain(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                    )?;
+                }
                 let expected_revision = attempt.revision;
                 attempt.fail_dispatch(
                     class,
@@ -15166,6 +15214,10 @@ impl ApplicationService {
             }
             Err(error) => {
                 if attempt.status != RuntimeTurnStatus::Uncertain {
+                    record_runtime_scheduler_uncertain(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                    )?;
                     let expected_revision = attempt.revision;
                     attempt.freeze_uncertain(
                         classify_runtime_turn_stream_error(&error),
@@ -15203,6 +15255,10 @@ impl ApplicationService {
                     .collect::<String>(),
             );
             if !streamed_body.is_empty() && streamed_body.as_str() != message.as_str() {
+                record_runtime_scheduler_uncertain(
+                    &mut managed.scheduler_gate,
+                    managed.scheduler_permit.as_ref(),
+                )?;
                 attempt.freeze_uncertain(
                     RuntimeTurnFailureClass::Protocol,
                     event.event_digest,
@@ -15320,7 +15376,34 @@ impl ApplicationService {
                 .update_runtime_turn_attempt(&attempt, expected_revision)?;
         }
         if attempt.status.is_terminal() {
+            match attempt.status {
+                RuntimeTurnStatus::Completed => {
+                    record_runtime_scheduler_completed(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                        &runtime_turn_dispatch_for_gate(
+                            &managed.mapping,
+                            attempt
+                                .dispatch_request_digest
+                                .clone()
+                                .unwrap_or_else(|| sha256(b"runtime-turn-missing-request-digest")),
+                            attempt
+                                .dispatch_response_digest
+                                .clone()
+                                .unwrap_or_else(|| sha256(b"runtime-turn-missing-response-digest")),
+                        ),
+                    )?;
+                }
+                RuntimeTurnStatus::Failed | RuntimeTurnStatus::Interrupted => {
+                    record_runtime_scheduler_failed(
+                        &mut managed.scheduler_gate,
+                        managed.scheduler_permit.as_ref(),
+                    )?;
+                }
+                _ => {}
+            }
             managed.mapping.runtime_turn_id = None;
+            managed.scheduler_permit = None;
         }
         Ok(ContextRuntimeTurnObservation {
             attempt,
@@ -15378,6 +15461,10 @@ impl ApplicationService {
                     .update_runtime_turn_attempt(&attempt, expected_revision)?;
             }
             Err(error) => {
+                record_runtime_scheduler_uncertain(
+                    &mut managed.scheduler_gate,
+                    managed.scheduler_permit.as_ref(),
+                )?;
                 let expected_revision = attempt.revision;
                 attempt.freeze_uncertain(
                     RuntimeTurnFailureClass::ApprovalResponseUncertain,
@@ -15419,6 +15506,10 @@ impl ApplicationService {
                     .update_runtime_turn_attempt(&attempt, expected_revision)?;
             }
             Err(error) => {
+                record_runtime_scheduler_uncertain(
+                    &mut managed.scheduler_gate,
+                    managed.scheduler_permit.as_ref(),
+                )?;
                 let expected_revision = attempt.revision;
                 attempt.freeze_uncertain(
                     RuntimeTurnFailureClass::InterruptUncertain,
@@ -15614,9 +15705,55 @@ impl ApplicationService {
             )],
             now,
         )?;
-        let mut runtime = match StdioRuntime::spawn_prepared(runtime_command, &runtime_launch) {
+        let lease = self
+            .store
+            .load_worker_lease(&attempt.project_id, &handle.lease_id)?;
+        let spawn_mapping = RuntimeMapping::new(
+            attempt.project_id.as_str(),
+            attempt.mission_id.as_str(),
+            attempt.target_attachment_epoch,
+            process_claim.launch_token_digest.clone(),
+            model.unwrap_or("unspecified-runtime-model"),
+            "unspecified-runtime-provider",
+            format!("runtime-spawn-{}", attempt.process_attempt),
+        )?;
+        let mut scheduler_gate = bind_runtime_scheduler_gate(
+            &lease,
+            &spawn_mapping,
+            runtime_scheduler_schedule_digest(&attempt, &process_claim),
+        )?;
+        let spawn_permit = match authorize_runtime_scheduler_turn(
+            &mut scheduler_gate,
+            &runtime_scheduler_spawn_attempt_digest(&attempt, &process_claim),
+            &spawn_mapping,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.reconcile_runtime_process_claim(
+                    &mut process_claim,
+                    "context.runtime_process_spawn_reconciled",
+                    now,
+                )?;
+                if let ApplicationError::RuntimeScheduler(scheduler_error) = &error {
+                    self.persist_runtime_process_failure(
+                        &mut attempt,
+                        RuntimeRecoveryFailureClass::Spawn,
+                        &AdapterError::Scheduler(scheduler_error.clone()),
+                        now,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+        let mut runtime = match StdioRuntime::spawn_prepared_authorized(
+            runtime_command,
+            &runtime_launch,
+            &scheduler_gate,
+            &spawn_permit,
+        ) {
             Ok(runtime) => runtime,
             Err(error) => {
+                scheduler_gate.record_failed(&spawn_permit)?;
                 self.reconcile_runtime_process_claim(
                     &mut process_claim,
                     "context.runtime_process_spawn_reconciled",
@@ -15789,6 +15926,12 @@ impl ApplicationService {
             )],
             now,
         )?;
+        scheduler_gate.record_failed(&spawn_permit)?;
+        let scheduler_gate = bind_runtime_scheduler_gate(
+            &lease,
+            &mapping,
+            runtime_scheduler_schedule_digest(&attempt, &process_claim),
+        )?;
         Ok(ManagedContextRuntime {
             recovery: attempt,
             process_claim,
@@ -15796,6 +15939,8 @@ impl ApplicationService {
             handle,
             mailbox,
             runtime,
+            scheduler_gate,
+            scheduler_permit: None,
         })
     }
 
@@ -15909,8 +16054,17 @@ impl ApplicationService {
         let ManagedContextRuntime {
             runtime,
             mut process_claim,
+            mut scheduler_gate,
+            scheduler_permit,
             ..
         } = managed;
+        if let Some(permit) = scheduler_permit.as_ref()
+            && scheduler_gate
+                .attempt(permit.attempt_id_digest())
+                .is_ok_and(|view| view.status == RuntimeAttemptStatus::Running)
+        {
+            scheduler_gate.record_uncertain(permit)?;
+        }
         self.shutdown_runtime_process_claim(
             runtime,
             &mut process_claim,
@@ -21552,12 +21706,134 @@ fn runtime_mapping_base_digest(mapping: &RuntimeMapping) -> Result<String, Adapt
     base.digest()
 }
 
+fn runtime_scheduler_lease_fence(lease: &WorkerLease) -> Result<LeaseFence, ApplicationError> {
+    let fence = LeaseFence {
+        owner_digest: sha256(lease.id.as_str().as_bytes()),
+        token_digest: lease.lease_token_digest.clone(),
+        generation: lease.generation,
+    };
+    fence
+        .validate()
+        .map_err(|_| ApplicationError::RuntimeSchedulerPermitRequired)?;
+    Ok(fence)
+}
+
+fn runtime_scheduler_schedule_digest(
+    attempt: &RuntimeRecoveryAttempt,
+    process_claim: &RuntimeProcessClaim,
+) -> String {
+    sha256(
+        format!(
+            "runtime-schedule:{}:{}:{}:{}",
+            attempt.id,
+            attempt.process_attempt,
+            process_claim.launch_token_digest,
+            process_claim.launch_executable_path_digest
+        )
+        .as_bytes(),
+    )
+}
+
+fn runtime_scheduler_spawn_attempt_digest(
+    attempt: &RuntimeRecoveryAttempt,
+    process_claim: &RuntimeProcessClaim,
+) -> String {
+    sha256(
+        format!(
+            "runtime-spawn:{}:{}:{}",
+            attempt.id, attempt.process_attempt, process_claim.launch_token_digest
+        )
+        .as_bytes(),
+    )
+}
+
+fn runtime_turn_attempt_digest(attempt_id: &RuntimeTurnAttemptId) -> String {
+    sha256(attempt_id.as_str().as_bytes())
+}
+
+fn thread_mapping_for_scheduler(
+    mapping: &RuntimeMapping,
+) -> Result<RuntimeMapping, ApplicationError> {
+    let mut thread_mapping = mapping.clone();
+    thread_mapping.runtime_turn_id = None;
+    thread_mapping
+        .validate()
+        .map_err(|_| ApplicationError::RuntimeTurnScopeMismatch)?;
+    Ok(thread_mapping)
+}
+
+fn bind_runtime_scheduler_gate(
+    lease: &WorkerLease,
+    mapping: &RuntimeMapping,
+    schedule_id_digest: String,
+) -> Result<RuntimeSchedulerGate, ApplicationError> {
+    let binding = RuntimeScheduleBinding::new(
+        schedule_id_digest,
+        runtime_scheduler_lease_fence(lease)?,
+        thread_mapping_for_scheduler(mapping)?,
+    )?;
+    Ok(RuntimeSchedulerGate::new(binding))
+}
+
+fn authorize_runtime_scheduler_turn(
+    gate: &mut RuntimeSchedulerGate,
+    attempt_id_digest: &str,
+    mapping: &RuntimeMapping,
+) -> Result<RuntimeAttemptPermit, ApplicationError> {
+    Ok(gate.authorize_turn(attempt_id_digest, &thread_mapping_for_scheduler(mapping)?)?)
+}
+
+fn record_runtime_scheduler_failed(
+    gate: &mut RuntimeSchedulerGate,
+    permit: Option<&RuntimeAttemptPermit>,
+) -> Result<(), ApplicationError> {
+    if let Some(permit) = permit {
+        gate.record_failed(permit)?;
+    }
+    Ok(())
+}
+
+fn record_runtime_scheduler_uncertain(
+    gate: &mut RuntimeSchedulerGate,
+    permit: Option<&RuntimeAttemptPermit>,
+) -> Result<(), ApplicationError> {
+    if let Some(permit) = permit {
+        gate.record_uncertain(permit)?;
+    }
+    Ok(())
+}
+
+fn record_runtime_scheduler_completed(
+    gate: &mut RuntimeSchedulerGate,
+    permit: Option<&RuntimeAttemptPermit>,
+    dispatch: &RuntimeTurnDispatch,
+) -> Result<(), ApplicationError> {
+    if let Some(permit) = permit {
+        gate.record_completed(permit, dispatch)?;
+    }
+    Ok(())
+}
+
+fn runtime_turn_dispatch_for_gate(
+    mapping: &RuntimeMapping,
+    request_digest: impl Into<String>,
+    response_digest: impl Into<String>,
+) -> RuntimeTurnDispatch {
+    RuntimeTurnDispatch {
+        mapping: mapping.clone(),
+        request_digest: request_digest.into(),
+        response_digest: response_digest.into(),
+        elapsed: StdDuration::from_millis(0),
+    }
+}
+
 fn classify_runtime_turn_dispatch_error(error: &AdapterError) -> (RuntimeTurnFailureClass, bool) {
     match error {
         AdapterError::TurnRequestRejected { .. } => {
             (RuntimeTurnFailureClass::DispatchRejected, true)
         }
-        AdapterError::InvalidRuntimeMapping
+        AdapterError::Scheduler(_)
+        | AdapterError::InvalidRuntimeMapping
         | AdapterError::InvalidTurnRequest
         | AdapterError::OutboundMessageTooLarge { .. }
         | AdapterError::UnsupportedClientMethod(_)
@@ -21642,6 +21918,8 @@ pub enum ApplicationError {
     CloudStorage(#[from] CloudStorageError),
     #[error(transparent)]
     Runtime(#[from] AdapterError),
+    #[error(transparent)]
+    RuntimeScheduler(#[from] RuntimeSchedulerError),
     #[error(transparent)]
     RuntimeTurn(#[from] RuntimeTurnError),
     #[error(transparent)]
@@ -21968,6 +22246,8 @@ pub enum ApplicationError {
     InvalidConversationReplyEffect,
     #[error("the durable effect reconciliation cannot be projected into the bound conversation")]
     InvalidEffectReconciliationProjection,
+    #[error("runtime spawn or turn requires a current scheduler permit")]
+    RuntimeSchedulerPermitRequired,
 }
 
 #[cfg(test)]
@@ -29311,6 +29591,18 @@ sleep 30"#
             uncertain_outcome.attempt.failures[0].class,
             RuntimeTurnFailureClass::DispatchUncertain
         );
+        let uncertain_permit = uncertain
+            .managed
+            .scheduler_permit
+            .clone()
+            .expect("uncertain permit");
+        assert!(matches!(
+            uncertain
+                .managed
+                .scheduler_gate
+                .require_current_permit(&uncertain_permit),
+            Err(RuntimeSchedulerError::UncertainReplaySuppressed)
+        ));
         let second_command = dispatch_command(
             &uncertain,
             "turn-attempt-forbidden-replay",
@@ -29340,6 +29632,193 @@ sleep 30"#
         assert_eq!(fenced, uncertain_outcome.attempt);
         assert!(
             uncertain
+                .managed
+                .runtime
+                .shutdown()
+                .expect("shutdown")
+                .forced
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one replay proves stale, taken-over, uncertain, completed, and fresh-retry permit fencing"
+    )]
+    fn runtime_turn_requires_a_current_scheduler_permit_and_retries_only_with_a_fresh_one() {
+        let mut rejected = ready_runtime_turn_fixture(|workspace| {
+            turn_dispatch_fault_runtime_command(
+                workspace,
+                "private-runtime-thread-scheduler-rejected",
+                Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "error": {"code": -32001, "message": "PRIVATE-REJECTION"}
+                })),
+            )
+        });
+        let rejected_command = dispatch_command(
+            &rejected,
+            "turn-attempt-scheduler-rejected",
+            StdDuration::from_secs(1),
+        );
+        let rejected_outcome = rejected
+            .fixture
+            .service
+            .dispatch_context_runtime_turn(
+                &mut rejected.managed,
+                rejected_command,
+                &rejected.envelope,
+                now() + Duration::seconds(6),
+            )
+            .expect("durable rejection");
+        assert_eq!(
+            rejected_outcome.disposition,
+            RuntimeTurnDispatchDisposition::Failed
+        );
+        let stale_permit = rejected
+            .managed
+            .scheduler_permit
+            .clone()
+            .expect("failed dispatch keeps the consumed permit until retry");
+        assert!(matches!(
+            rejected
+                .managed
+                .scheduler_gate
+                .require_current_permit(&stale_permit),
+            Err(RuntimeSchedulerError::AttemptPermitLost)
+        ));
+        let mapping = rejected.managed.scheduler_gate.binding().mapping().clone();
+        let retry_permit = rejected
+            .managed
+            .scheduler_gate
+            .authorize_turn(stale_permit.attempt_id_digest(), &mapping)
+            .expect("failed retry uses a fresh permit only");
+        assert_ne!(stale_permit, retry_permit);
+        assert!(matches!(
+            rejected
+                .managed
+                .scheduler_gate
+                .require_current_permit(&stale_permit),
+            Err(RuntimeSchedulerError::AttemptPermitLost)
+        ));
+        rejected
+            .managed
+            .scheduler_gate
+            .require_current_permit(&retry_permit)
+            .expect("fresh permit is current");
+        rejected
+            .managed
+            .scheduler_gate
+            .record_failed(&retry_permit)
+            .expect("close fresh permit");
+        assert!(
+            rejected
+                .managed
+                .runtime
+                .shutdown()
+                .expect("shutdown")
+                .forced
+        );
+
+        let mut completed = ready_runtime_turn_fixture(|workspace| {
+            completed_stream_fake_runtime_command(
+                workspace,
+                "private-runtime-thread-scheduler-complete",
+                "private-runtime-turn-scheduler-complete",
+                "PRIVATE-SCHEDULER-COMPLETE",
+                "PRIVATE-SCHEDULER-COMPLETE",
+            )
+        });
+        let completed_turn_id = RuntimeTurnAttemptId::from("turn-attempt-scheduler-complete");
+        let completed_command = dispatch_command(
+            &completed,
+            completed_turn_id.as_str(),
+            StdDuration::from_secs(1),
+        );
+        let dispatch = completed
+            .fixture
+            .service
+            .dispatch_context_runtime_turn(
+                &mut completed.managed,
+                completed_command,
+                &completed.envelope,
+                now() + Duration::seconds(6),
+            )
+            .expect("completed stream dispatch");
+        let current_permit = completed
+            .managed
+            .scheduler_permit
+            .clone()
+            .expect("running permit");
+        completed
+            .managed
+            .scheduler_gate
+            .require_current_permit(&current_permit)
+            .expect("running permit is current");
+        let mut revision = dispatch.attempt.revision;
+        for index in 0..5 {
+            let observation = completed
+                .fixture
+                .service
+                .observe_context_runtime_turn(
+                    &mut completed.managed,
+                    &ObserveContextRuntimeTurn {
+                        project_id: completed.fixture.project_id.clone(),
+                        id: completed_turn_id.clone(),
+                        expected_revision: revision,
+                        event_timeout: StdDuration::from_secs(1),
+                    },
+                    now() + Duration::seconds(7 + index),
+                )
+                .expect("completed stream observation");
+            revision = observation.attempt.revision;
+        }
+        assert_eq!(
+            completed
+                .fixture
+                .service
+                .runtime_turn_attempt(&completed.fixture.project_id, &completed_turn_id)
+                .expect("completed turn")
+                .status,
+            RuntimeTurnStatus::Completed
+        );
+        assert!(matches!(
+            completed
+                .managed
+                .scheduler_gate
+                .require_current_permit(&current_permit),
+            Err(RuntimeSchedulerError::CompletedReplaySuppressed)
+        ));
+        completed
+            .managed
+            .scheduler_gate
+            .take_over(
+                LeaseFence {
+                    owner_digest: sha256(b"taken-over-owner"),
+                    token_digest: sha256(b"taken-over-token"),
+                    generation: current_permit.fence().generation + 1,
+                },
+                {
+                    let mut next = completed.managed.mapping.clone();
+                    next.runtime_turn_id = None;
+                    next.runtime_generation += 1;
+                    next.runtime_instance_digest = sha256(b"taken-over-instance");
+                    next.runtime_thread_id = "taken-over-thread".into();
+                    next
+                },
+            )
+            .expect("takeover");
+        assert!(matches!(
+            completed
+                .managed
+                .scheduler_gate
+                .require_current_permit(&current_permit),
+            Err(RuntimeSchedulerError::LeaseFenceLost)
+        ));
+        assert!(
+            completed
                 .managed
                 .runtime
                 .shutdown()
