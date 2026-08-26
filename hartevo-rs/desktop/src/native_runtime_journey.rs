@@ -1366,6 +1366,8 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidMissionContinuation
         | DesktopDataError::InvalidHumanCheckpointConfirmation
         | DesktopDataError::InvalidVm11OutcomeDecision
+        | DesktopDataError::InvalidVm11NextContractResolution
+        | DesktopDataError::InvalidWaitingApprovalGrant
         | DesktopDataError::EmptyProjectName
         | DesktopDataError::InvalidRecoveryKey
         | DesktopDataError::ProjectNotFound(_)
@@ -1376,7 +1378,8 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::ProjectContextBlockedEnvironment(_)
         | DesktopDataError::ProjectContextIntegrityError(_)
         | DesktopDataError::RuntimeSubscriptionContextMismatch
-        | DesktopDataError::WorkProductActionStale => "NATIVE_RUNTIME_DESKTOP_CONTRACT_FAILED",
+        | DesktopDataError::WorkProductActionStale
+        | DesktopDataError::Cordis(_) => "NATIVE_RUNTIME_DESKTOP_CONTRACT_FAILED",
     };
     NativeJourneyError::new(code)
 }
