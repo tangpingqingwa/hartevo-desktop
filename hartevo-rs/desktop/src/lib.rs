@@ -32,6 +32,8 @@ mod agent_operations;
 mod cordis_host;
 pub use cordis_host::{bind_live_domain_kernel, mount_cordis_host};
 pub mod data_plane;
+#[cfg(feature = "native-journey")]
+pub mod native_runtime_journey;
 mod runtime_plane;
 mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
@@ -481,7 +483,7 @@ impl DesktopUiModel {
         if let Some(model) = visual_fixture::load_from_environment() {
             return model;
         }
-        match DesktopDataPlane::discover().and_then(|mut plane| plane.load_os(Utc::now())) {
+        match DesktopDataPlane::discover().and_then(|plane| plane.load_os(Utc::now())) {
             Ok(DesktopLoadState::Uninitialized { product_evidence }) => Self {
                 backend: DesktopBackendState::Uninitialized(product_evidence),
                 selected_project_id: None,
@@ -2131,7 +2133,7 @@ pub fn App() -> Element {
                                 interrupt_available: operations_interrupt_available,
                                 interrupt_requested: operations_interrupt_requested,
                                 on_initialize: move |_| {
-                                    match DesktopDataPlane::discover().and_then(|mut plane| plane.initialize_os(Utc::now())) {
+                                    match DesktopDataPlane::discover().and_then(|plane| plane.initialize_os(Utc::now())) {
                                         Ok(snapshot) => model.write().set_ready(snapshot, false),
                                         Err(error) => model.write().set_notice(&error),
                                     }
