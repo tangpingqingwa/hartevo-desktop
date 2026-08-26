@@ -6,10 +6,17 @@
 //! envelope. Only the content-free manifest is suitable for persistence.
 
 mod model_tokenizer;
+mod plugin_session;
 pub mod worker_graph;
 
 pub use model_tokenizer::{
     ConservativeByteBudgetTokenizer, PinnedModelTokenizer, PinnedTokenizerSpec,
+};
+pub use plugin_session::{
+    PluginSessionCancelReason, PluginSessionConsumer, PluginSessionDescriptor, PluginSessionError,
+    PluginSessionEvent, PluginSessionEventKind, PluginSessionEventStatus, PluginSessionFence,
+    PluginSessionJournal, PluginSessionLifecycle, PluginSessionPosition, PluginSessionProvider,
+    PluginSessionReceipt, PluginSessionScope, PluginSessionService,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

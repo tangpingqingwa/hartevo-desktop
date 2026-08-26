@@ -28,6 +28,7 @@ mod normalized;
 mod outbox;
 mod outcome_review_store;
 mod outcome_store;
+mod plugin_session_recovery_store;
 mod registration_store;
 mod relationship_store;
 mod runtime_process_store;
@@ -58,6 +59,7 @@ pub use keyring_store::{DeviceAttachmentPrepareOutcome, ProjectKeySecretReferenc
 pub use outbox::{
     OutboxAcknowledgeTimes, OutboxMessage, OutboxRelease, OutboxReleaseTimes, OutboxStatus,
 };
+pub use plugin_session_recovery_store::PLUGIN_SESSION_EVENT_TYPE;
 pub use registration_store::{
     LocalProjectCloudRegistration, LocalProjectCloudRegistrationPrepareOutcome,
     ProjectCloudRegistrationStatus,
@@ -4616,6 +4618,8 @@ pub enum StorageError {
     ContextAssembly(#[from] hartevo_context_fabric::ContextAssemblyError),
     #[error(transparent)]
     MissionRestart(#[from] hartevo_context_fabric::MissionRestartError),
+    #[error(transparent)]
+    PluginSession(#[from] hartevo_context_fabric::PluginSessionError),
     #[error(transparent)]
     MissionControl(#[from] hartevo_context_fabric::MissionControlError),
     #[error(transparent)]
