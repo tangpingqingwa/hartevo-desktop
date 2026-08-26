@@ -21,6 +21,7 @@ use dioxus::prelude::*;
 use hartevo_application::{ApplicationError, RuntimeTextSubscriptionBatch};
 use hartevo_domain_kernel::{
     KpiContract, KpiDirection, MissionId, OperatingMode, ProjectId, RuntimeTurnStatus,
+    WorkProductStatus,
 };
 use hartevo_runtime_adapter::RuntimeCommand;
 use hartevo_storage::MemorySecretStore;
@@ -30,8 +31,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::data_plane::{
-    DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane, DesktopMissionSubmission,
-    DesktopRuntimeSource, DesktopRuntimeTextStreamProjection, RecoveryKitDraft,
+    DesktopCatalogMissionRequest, DesktopDataError, DesktopDataPlane, DesktopLoadState,
+    DesktopMissionSubmission, DesktopRuntimeSource, DesktopRuntimeTextStreamProjection,
+    DesktopWorkProductAdoptionRequest, RecoveryKitDraft,
+};
+use crate::result_adoption_surface::{
+    ResultBinding, ResultSurfaceAction, SelectedResultProjection,
+    action_matches_current_projection, selected_result_projection,
 };
 use crate::runtime_subscription::{
     DESKTOP_RUNTIME_SUBSCRIPTION_PAGE_SIZE, DesktopRuntimeCommandIdentity,
@@ -157,6 +163,10 @@ enum NativeJourneyEventKind {
     TerminalObserved,
     FinalCaughtUp,
     RuntimeCommandReleased,
+    SelectedResultProjected,
+    AdoptionIntentBound,
+    AdoptionReceiptCommitted,
+    StaleAdoptionRejected,
     StopMissionAwaitingRendered,
     StopBeforeResumeIsolated,
 }
@@ -270,6 +280,10 @@ fn verify_timeline(events: &[NativeJourneyTimelineEvent]) -> Result<(), NativeJo
         NativeJourneyEventKind::TerminalObserved,
         NativeJourneyEventKind::FinalCaughtUp,
         NativeJourneyEventKind::RuntimeCommandReleased,
+        NativeJourneyEventKind::SelectedResultProjected,
+        NativeJourneyEventKind::AdoptionIntentBound,
+        NativeJourneyEventKind::AdoptionReceiptCommitted,
+        NativeJourneyEventKind::StaleAdoptionRejected,
         NativeJourneyEventKind::StopMissionAwaitingRendered,
         NativeJourneyEventKind::StopBeforeResumeIsolated,
     ];
@@ -336,11 +350,35 @@ const fn runtime_status_label(status: RuntimeTurnStatus) -> &'static str {
 
 type NativeJourneyAssertions = BTreeMap<&'static str, bool>;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeJourneyBoundaries {
     proven: Vec<&'static str>,
     not_proven: Vec<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeSelectedResultReceipt {
+    binding_digest: String,
+    expected_mission_revision: u64,
+    expected_result_revision: u64,
+    expected_manifest_version: u64,
+    adopted_mission_revision: u64,
+    adopted_result_revision: u64,
+    adopted_manifest_version: u64,
+    adopted_status: &'static str,
+    adoption_receipt_digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeAdoptionRevisions {
+    expected_mission_revision: u64,
+    expected_result_revision: u64,
+    expected_manifest_version: u64,
+    adopted_mission_revision: u64,
+    adopted_result_revision: u64,
+    adopted_manifest_version: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -353,6 +391,7 @@ struct NativeJourneyReceipt {
     boundaries: NativeJourneyBoundaries,
     assertions: NativeJourneyAssertions,
     timeline: Option<NativeJourneyTimeline>,
+    selected_result: Option<NativeSelectedResultReceipt>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -389,6 +428,22 @@ struct NativeJourneyDisplay {
     transport_caught_up: bool,
     scope_visible: bool,
     awaiting_snapshot_handle_bound: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum NativeAdoptionPhase {
+    #[default]
+    NotStarted,
+    Projected,
+    IntentBound,
+    ReceiptCommitted,
+    StaleRejected,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct NativeAdoptionState {
+    phase: NativeAdoptionPhase,
+    receipt: Option<NativeSelectedResultReceipt>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -449,6 +504,7 @@ struct NativeJourneyUiState {
     reselect_isolated: bool,
     stale_epoch_rejected: bool,
     stop_before_resume_isolated: bool,
+    adoption: NativeAdoptionState,
 }
 
 impl NativeJourneyUiState {
@@ -466,6 +522,7 @@ impl NativeJourneyUiState {
             reselect_isolated: false,
             stale_epoch_rejected: false,
             stop_before_resume_isolated: false,
+            adoption: NativeAdoptionState::default(),
         }
     }
 
@@ -992,7 +1049,260 @@ async fn run_complete_runtime_journey_inner(
         .lock()
         .map_err(|_| NativeJourneyError::new("NATIVE_STREAM_FINGERPRINT_LOCKED"))? =
         Some(fingerprint);
+    run_native_selected_result_adoption(journey).await?;
     prepare_stop_before_resume(journey).await
+}
+
+async fn run_native_selected_result_adoption(
+    journey: &mut Signal<NativeJourneyUiState>,
+) -> Result<(), NativeJourneyError> {
+    let context = journey.read().context.clone();
+    let projection = load_native_selected_result(&context).await?;
+    if !projection.can_adopt() {
+        return Err(NativeJourneyError::new(
+            "NATIVE_SELECTED_RESULT_NOT_ADOPTABLE",
+        ));
+    }
+    let action = projection.adopt_action();
+    if !matches!(action, ResultSurfaceAction::Adopt(_)) {
+        return Err(NativeJourneyError::new(
+            "NATIVE_ADOPTION_INTENT_SCOPE_INVALID",
+        ));
+    }
+    let expected_binding = projection.binding.clone();
+    {
+        let mut state = journey.write();
+        state.adoption.phase = NativeAdoptionPhase::Projected;
+    }
+    record_context_event(
+        &context,
+        NativeJourneyEventKind::SelectedResultProjected,
+        journey.read().display,
+    )?;
+    {
+        let mut state = journey.write();
+        state.adoption.phase = NativeAdoptionPhase::IntentBound;
+    }
+    record_context_event(
+        &context,
+        NativeJourneyEventKind::AdoptionIntentBound,
+        journey.read().display,
+    )?;
+    let selected_result_receipt = adopt_native_selected_result(&context, &expected_binding).await?;
+    {
+        let mut state = journey.write();
+        state.adoption.phase = NativeAdoptionPhase::ReceiptCommitted;
+        state.adoption.receipt = Some(selected_result_receipt);
+    }
+    record_context_event(
+        &context,
+        NativeJourneyEventKind::AdoptionReceiptCommitted,
+        journey.read().display,
+    )?;
+    reject_native_selected_result_attempts(&context, &expected_binding).await?;
+    journey.write().adoption.phase = NativeAdoptionPhase::StaleRejected;
+    record_context_event(
+        &context,
+        NativeJourneyEventKind::StaleAdoptionRejected,
+        journey.read().display,
+    )
+}
+
+async fn load_native_selected_result(
+    context: &NativeJourneyContext,
+) -> Result<SelectedResultProjection, NativeJourneyError> {
+    let plane = context.plane.clone();
+    let secrets = context.secrets.clone();
+    let project_id = context.project_id.clone();
+    let mission_id = context.main_mission_id.clone();
+    let snapshot =
+        tokio::task::spawn_blocking(move || plane.load_with(secrets.as_ref(), Utc::now()))
+            .await
+            .map_err(|_| NativeJourneyError::new("NATIVE_RESULT_SNAPSHOT_TASK_FAILED"))?
+            .map_err(|_| NativeJourneyError::new("NATIVE_RESULT_SNAPSHOT_READ_FAILED"))?;
+    let snapshot = match snapshot {
+        DesktopLoadState::Ready(snapshot) => snapshot,
+        DesktopLoadState::Uninitialized { .. } => {
+            return Err(NativeJourneyError::new(
+                "NATIVE_RESULT_SNAPSHOT_UNINITIALIZED",
+            ));
+        }
+    };
+    let project = snapshot
+        .inventory
+        .projects
+        .iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or(NativeJourneyError::new("NATIVE_RESULT_PROJECT_MISSING"))?;
+    let mission = project
+        .missions
+        .iter()
+        .find(|mission| mission.mission_id == mission_id)
+        .ok_or(NativeJourneyError::new("NATIVE_RESULT_MISSION_MISSING"))?;
+    let projection = selected_result_projection(project, mission, None)
+        .ok_or(NativeJourneyError::new("NATIVE_SELECTED_RESULT_MISSING"))?;
+    let action = projection.adopt_action();
+    if !action_matches_current_projection(&action, project, mission) {
+        return Err(NativeJourneyError::new(
+            "NATIVE_ADOPTION_INTENT_SCOPE_INVALID",
+        ));
+    }
+    Ok(projection)
+}
+
+async fn adopt_native_selected_result(
+    context: &NativeJourneyContext,
+    binding: &ResultBinding,
+) -> Result<NativeSelectedResultReceipt, NativeJourneyError> {
+    let request = DesktopWorkProductAdoptionRequest {
+        project_id: binding.project_id.clone(),
+        mission_id: binding.mission_id.clone(),
+        work_product_id: binding.result_id.clone(),
+        expected_mission_revision: binding.mission_revision,
+        expected_work_product_revision: binding.result_revision,
+        expected_manifest_version: binding.manifest_version,
+    };
+    let plane = context.plane.clone();
+    let secrets = context.secrets.clone();
+    let adopted_snapshot = tokio::task::spawn_blocking(move || {
+        plane.adopt_work_product_native(secrets.as_ref(), request, Utc::now())
+    })
+    .await
+    .map_err(|_| NativeJourneyError::new("NATIVE_ADOPTION_TASK_FAILED"))?
+    .map_err(|_| NativeJourneyError::new("NATIVE_ADOPTION_APPLICATION_FAILED"))?;
+    let adopted_project = adopted_snapshot
+        .inventory
+        .projects
+        .iter()
+        .find(|project| project.project_id == binding.project_id)
+        .ok_or(NativeJourneyError::new("NATIVE_ADOPTED_PROJECT_MISSING"))?;
+    let adopted_mission = adopted_project
+        .missions
+        .iter()
+        .find(|mission| mission.mission_id == binding.mission_id)
+        .ok_or(NativeJourneyError::new("NATIVE_ADOPTED_MISSION_MISSING"))?;
+    let adopted_product = adopted_mission
+        .work_products
+        .iter()
+        .find(|product| product.work_product_id == binding.result_id)
+        .ok_or(NativeJourneyError::new("NATIVE_ADOPTED_RESULT_MISSING"))?;
+    if adopted_product.adoption_status != WorkProductStatus::Accepted
+        || adopted_mission.revision <= binding.mission_revision
+        || adopted_product.work_product_revision <= binding.result_revision
+        || adopted_product.manifest_version <= binding.manifest_version
+    {
+        return Err(NativeJourneyError::new("NATIVE_ADOPTION_RECEIPT_INVALID"));
+    }
+    let revisions = NativeAdoptionRevisions {
+        expected_mission_revision: binding.mission_revision,
+        expected_result_revision: binding.result_revision,
+        expected_manifest_version: binding.manifest_version,
+        adopted_mission_revision: adopted_mission.revision,
+        adopted_result_revision: adopted_product.work_product_revision,
+        adopted_manifest_version: adopted_product.manifest_version,
+    };
+    let binding_digest = result_binding_digest(binding);
+    Ok(NativeSelectedResultReceipt {
+        binding_digest: binding_digest.clone(),
+        expected_mission_revision: revisions.expected_mission_revision,
+        expected_result_revision: revisions.expected_result_revision,
+        expected_manifest_version: revisions.expected_manifest_version,
+        adopted_mission_revision: revisions.adopted_mission_revision,
+        adopted_result_revision: revisions.adopted_result_revision,
+        adopted_manifest_version: revisions.adopted_manifest_version,
+        adopted_status: crate::work_product_status_label(&adopted_product.adoption_status),
+        adoption_receipt_digest: adoption_receipt_digest(
+            &binding_digest,
+            &revisions,
+            &adopted_product.adoption_status,
+        ),
+    })
+}
+
+async fn reject_native_selected_result_attempts(
+    context: &NativeJourneyContext,
+    binding: &ResultBinding,
+) -> Result<(), NativeJourneyError> {
+    let stale_request = DesktopWorkProductAdoptionRequest {
+        project_id: binding.project_id.clone(),
+        mission_id: binding.mission_id.clone(),
+        work_product_id: binding.result_id.clone(),
+        expected_mission_revision: binding.mission_revision,
+        expected_work_product_revision: binding.result_revision,
+        expected_manifest_version: binding.manifest_version,
+    };
+    let tampered_request = DesktopWorkProductAdoptionRequest {
+        expected_manifest_version: binding.manifest_version.saturating_add(1),
+        ..stale_request.clone()
+    };
+    let cross_scope_request = DesktopWorkProductAdoptionRequest {
+        mission_id: context.alternate_mission_id.clone(),
+        ..stale_request.clone()
+    };
+    let plane = context.plane.clone();
+    let secrets = context.secrets.clone();
+    let (stale_rejected, tamper_rejected, cross_scope_rejected) =
+        tokio::task::spawn_blocking(move || {
+            let stale = plane
+                .adopt_work_product_native(secrets.as_ref(), stale_request, Utc::now())
+                .is_err();
+            let tamper = plane
+                .adopt_work_product_native(secrets.as_ref(), tampered_request, Utc::now())
+                .is_err();
+            let cross_scope = plane
+                .adopt_work_product_native(secrets.as_ref(), cross_scope_request, Utc::now())
+                .is_err();
+            (stale, tamper, cross_scope)
+        })
+        .await
+        .map_err(|_| NativeJourneyError::new("NATIVE_STALE_ADOPTION_TASK_FAILED"))?;
+    if stale_rejected && tamper_rejected && cross_scope_rejected {
+        Ok(())
+    } else {
+        Err(NativeJourneyError::new("NATIVE_STALE_ADOPTION_ACCEPTED"))
+    }
+}
+
+fn result_binding_digest(binding: &crate::result_adoption_surface::ResultBinding) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hartevo.native-runtime-journey.result-binding.v1\0");
+    for value in [
+        binding.tenant_id.to_string(),
+        binding.project_id.to_string(),
+        binding.mission_id.to_string(),
+        binding.result_id.to_string(),
+    ] {
+        hash_timeline_field(&mut hasher, value.as_bytes());
+    }
+    hash_timeline_field(&mut hasher, &binding.result_revision.to_le_bytes());
+    hash_timeline_field(&mut hasher, &binding.mission_revision.to_le_bytes());
+    hash_timeline_field(&mut hasher, &binding.manifest_version.to_le_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn adoption_receipt_digest(
+    binding_digest: &str,
+    revisions: &NativeAdoptionRevisions,
+    status: &WorkProductStatus,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hartevo.native-runtime-journey.adoption-receipt.v1\0");
+    hash_timeline_field(&mut hasher, binding_digest.as_bytes());
+    for value in [
+        revisions.expected_mission_revision,
+        revisions.expected_result_revision,
+        revisions.expected_manifest_version,
+        revisions.adopted_mission_revision,
+        revisions.adopted_result_revision,
+        revisions.adopted_manifest_version,
+    ] {
+        hash_timeline_field(&mut hasher, &value.to_le_bytes());
+    }
+    hash_timeline_field(
+        &mut hasher,
+        crate::work_product_status_label(status).as_bytes(),
+    );
+    hex::encode(hasher.finalize())
 }
 
 fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
@@ -1068,6 +1378,7 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::ProjectContextBlockedEnvironment(_)
         | DesktopDataError::ProjectContextIntegrityError(_)
         | DesktopDataError::RuntimeSubscriptionContextMismatch
+        | DesktopDataError::WorkProductActionStale
         | DesktopDataError::Cordis(_) => "NATIVE_RUNTIME_DESKTOP_CONTRACT_FAILED",
     };
     NativeJourneyError::new(code)
@@ -1390,9 +1701,41 @@ async fn finalize_native_journey_inner(
         ),
         ("controlled_runtime_invoked_once", true),
         ("private_text_excluded_from_receipt", true),
+        (
+            "selected_result_projection_exact",
+            matches!(
+                state.adoption.phase,
+                NativeAdoptionPhase::Projected
+                    | NativeAdoptionPhase::IntentBound
+                    | NativeAdoptionPhase::ReceiptCommitted
+                    | NativeAdoptionPhase::StaleRejected
+            ),
+        ),
+        (
+            "adoption_intent_exact_revision",
+            matches!(
+                state.adoption.phase,
+                NativeAdoptionPhase::IntentBound
+                    | NativeAdoptionPhase::ReceiptCommitted
+                    | NativeAdoptionPhase::StaleRejected
+            ),
+        ),
+        (
+            "application_adoption_receipt",
+            matches!(
+                state.adoption.phase,
+                NativeAdoptionPhase::ReceiptCommitted | NativeAdoptionPhase::StaleRejected
+            ),
+        ),
+        (
+            "stale_reselect_tamper_rejected",
+            state.adoption.phase == NativeAdoptionPhase::StaleRejected,
+        ),
+        ("adoptable_result_receipt", state.adoption.receipt.is_some()),
     ]);
+    let selected_result = state.adoption.receipt.clone();
     drop(state);
-    write_success_receipt(&context, assertions)
+    write_success_receipt(&context, assertions, selected_result)
 }
 
 fn record_context_event(
@@ -1435,6 +1778,7 @@ fn write_live_timeline(
 fn write_success_receipt(
     context: &NativeJourneyContext,
     assertions: NativeJourneyAssertions,
+    selected_result: Option<NativeSelectedResultReceipt>,
 ) -> Result<(), NativeJourneyError> {
     if assertions.values().any(|passed| !passed) {
         return Err(NativeJourneyError::new("NATIVE_ASSERTION_FAILED"));
@@ -1452,6 +1796,7 @@ fn write_success_receipt(
         boundaries: native_journey_boundaries(),
         assertions,
         timeline: Some(timeline),
+        selected_result,
     };
     write_receipt(&context.config, &receipt)
 }
@@ -1466,6 +1811,7 @@ fn fail_journey(journey: &mut Signal<NativeJourneyUiState>, error: NativeJourney
         boundaries: native_journey_boundaries(),
         assertions: NativeJourneyAssertions::new(),
         timeline: None,
+        selected_result: None,
     };
     let _ = write_receipt(&context.config, &receipt);
     journey.write().phase = NativeJourneyPhase::Failed;
@@ -1827,6 +2173,10 @@ mod tests {
             NativeJourneyEventKind::TerminalObserved,
             NativeJourneyEventKind::FinalCaughtUp,
             NativeJourneyEventKind::RuntimeCommandReleased,
+            NativeJourneyEventKind::SelectedResultProjected,
+            NativeJourneyEventKind::AdoptionIntentBound,
+            NativeJourneyEventKind::AdoptionReceiptCommitted,
+            NativeJourneyEventKind::StaleAdoptionRejected,
             NativeJourneyEventKind::StopMissionAwaitingRendered,
             NativeJourneyEventKind::StopBeforeResumeIsolated,
         ]

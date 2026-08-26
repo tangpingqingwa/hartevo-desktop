@@ -122,6 +122,44 @@ for key in (
 assertions = receipt["assertions"]
 if not assertions or not all(value is True for value in assertions.values()):
     raise SystemExit("one or more native journey assertions failed")
+for key in (
+    "selected_result_projection_exact",
+    "adoption_intent_exact_revision",
+    "application_adoption_receipt",
+    "stale_reselect_tamper_rejected",
+    "adoptable_result_receipt",
+):
+    if assertions.get(key) is not True:
+        raise SystemExit(f"selected result adoption assertion missing: {key}")
+
+selected_result = receipt.get("selectedResult")
+if not isinstance(selected_result, dict):
+    raise SystemExit("selected result receipt is missing")
+for key in (
+    "bindingDigest",
+    "adoptionReceiptDigest",
+):
+    value = selected_result.get(key)
+    if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise SystemExit(f"selected result digest is invalid: {key}")
+if selected_result.get("adoptedStatus") != "ACCEPTED":
+    raise SystemExit("selected result was not accepted by the Application boundary")
+for key in (
+    "expectedMissionRevision",
+    "expectedResultRevision",
+    "expectedManifestVersion",
+    "adoptedMissionRevision",
+    "adoptedResultRevision",
+    "adoptedManifestVersion",
+):
+    if not isinstance(selected_result.get(key), int) or selected_result[key] <= 0:
+        raise SystemExit(f"selected result revision fence is invalid: {key}")
+if selected_result["adoptedMissionRevision"] <= selected_result["expectedMissionRevision"]:
+    raise SystemExit("adopted Mission revision did not advance")
+if selected_result["adoptedResultRevision"] <= selected_result["expectedResultRevision"]:
+    raise SystemExit("adopted result revision did not advance")
+if selected_result["adoptedManifestVersion"] <= selected_result["expectedManifestVersion"]:
+    raise SystemExit("adopted manifest version did not advance")
 
 timeline = receipt["timeline"]
 events = timeline["events"]
@@ -146,6 +184,10 @@ required = [
     "terminal_observed",
     "final_caught_up",
     "runtime_command_released",
+    "selected_result_projected",
+    "adoption_intent_bound",
+    "adoption_receipt_committed",
+    "stale_adoption_rejected",
     "stop_mission_awaiting_rendered",
     "stop_before_resume_isolated",
 ]

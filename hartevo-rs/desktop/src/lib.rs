@@ -34,6 +34,7 @@ pub use cordis_host::{bind_live_domain_kernel, mount_cordis_host};
 pub mod data_plane;
 #[cfg(feature = "native-journey")]
 pub mod native_runtime_journey;
+mod result_adoption_surface;
 mod runtime_plane;
 mod runtime_subscription;
 #[cfg(feature = "visual-fixtures")]
@@ -46,8 +47,13 @@ use data_plane::{
     DesktopMissionRuntimeOutcome, DesktopMissionSubmission, DesktopRuntimeCancellation,
     DesktopRuntimeProgressEvent, DesktopRuntimeProgressPhase, DesktopRuntimeTextStreamProjection,
     DesktopSnapshot, DesktopVm11NextContractResolutionRequest, DesktopVm11OutcomeDecisionRequest,
-    DesktopWaitingApprovalGrantRequest, ProductEvidenceProjection, ProjectContextAccessProjection,
-    ProjectContextAccessStatus, RecoveryKitDraft,
+    DesktopWaitingApprovalGrantRequest, DesktopWorkProductAdoptionRequest,
+    ProductEvidenceProjection, ProjectContextAccessProjection, ProjectContextAccessStatus,
+    RecoveryKitDraft,
+};
+use result_adoption_surface::{
+    ResultSurfaceAction, SelectedResultProjection, action_matches_current_projection,
+    selected_result_projection,
 };
 pub use runtime_plane::{DesktopRuntimeAvailabilityStatus, DesktopRuntimeProjection};
 use runtime_subscription::{
@@ -404,6 +410,10 @@ impl UiFailure {
             DesktopDataError::RuntimeSubscriptionContextMismatch => Self::coded(
                 "STALE_SELECTION",
                 "Runtime 订阅句柄与当前 Tenant / Project 上下文不一致，请重新选择后重试；未读取正文或写入状态。",
+            ),
+            DesktopDataError::WorkProductActionStale => Self::coded(
+                "STALE_SELECTION",
+                "结果与当前 Project / Mission revision 不一致，请刷新后重新选择；未改变正文、证据或状态。",
             ),
             DesktopDataError::ProjectNotFound(_)
             | DesktopDataError::ProjectEncryptionAlreadyProvisioned(_) => {
@@ -943,6 +953,9 @@ pub fn App() -> Element {
     let mut composer_expanded = use_signal(|| false);
     let mut composer_guidance_dismissed = use_signal(|| false);
     let mut human_work_product_selection = use_signal(BTreeSet::<WorkProductId>::new);
+    let mut selected_result_id = use_signal(|| None::<WorkProductId>);
+    let mut selected_result_scope = use_signal(|| None::<(ProjectId, MissionId)>);
+    let mut result_action_pending = use_signal(|| false);
     let mut vm11_outcome_action = use_signal(|| None::<(MissionId, OutcomeDecision)>);
     let mut workpad_open = use_signal(initial_workpad_open);
     let mut global_search_query = use_signal(String::new);
@@ -1072,6 +1085,19 @@ pub fn App() -> Element {
             }
         });
     });
+    use_effect(move || {
+        let current_scope = {
+            let current = model.read();
+            current
+                .selected_project_id
+                .clone()
+                .zip(current.selected_mission_id.clone())
+        };
+        if selected_result_scope.peek().as_ref() != current_scope.as_ref() {
+            selected_result_scope.set(current_scope);
+            selected_result_id.set(None);
+        }
+    });
     // Dioxus runs this effect after committing the render that consumed the
     // current signals. Only this post-render fence can exchange a prepared
     // phase-one receipt for non-Clone Runtime authority.
@@ -1146,6 +1172,13 @@ pub fn App() -> Element {
     let surface_context = surface_context_label(current_surface);
     let workpad_visible =
         workpad_open() && current_surface == Surface::Orchestrator && mission.is_some();
+    let selected_result_id_value = selected_result_id.read().clone();
+    let selected_result = project
+        .as_ref()
+        .zip(mission.as_ref())
+        .and_then(|(project, mission)| {
+            selected_result_projection(project, mission, selected_result_id_value.as_ref())
+        });
     let runtime_busy = mission_submitting() || runtime_retrying();
     let selected_runtime_scope = project
         .as_ref()
@@ -1547,6 +1580,74 @@ pub fn App() -> Element {
                     runtime_progress,
                     visual_streaming_fixture,
                 );
+            }
+        }
+    };
+    let on_result_action = move |action: ResultSurfaceAction| {
+        let (project, mission) = {
+            let current = model.read();
+            (
+                current.current_project().cloned(),
+                current.current_mission().cloned(),
+            )
+        };
+        let Some((project, mission)) = project.zip(mission) else {
+            model.write().notice = Some(UiFailure {
+                code: "STALE_SELECTION".into(),
+                message: "当前没有可用的 Project / Mission 结果上下文；未执行结果动作。".into(),
+            });
+            return;
+        };
+        if !action_matches_current_projection(&action, &project, &mission) {
+            model.write().notice = Some(UiFailure {
+                code: "STALE_SELECTION".into(),
+                message: "结果与当前 Project / Mission revision 不一致，请刷新后重新选择；未改变正文、证据或状态。".into(),
+            });
+            return;
+        }
+        match action {
+            ResultSurfaceAction::OpenArtifact(binding) => {
+                selected_result_id.set(Some(binding.result_id));
+                workpad_open.set(true);
+            }
+            ResultSurfaceAction::Adopt(binding) => {
+                if result_action_pending() {
+                    return;
+                }
+                result_action_pending.set(true);
+                model.write().notice = None;
+                spawn(async move {
+                    let request = DesktopWorkProductAdoptionRequest {
+                        project_id: binding.project_id,
+                        mission_id: binding.mission_id,
+                        work_product_id: binding.result_id,
+                        expected_mission_revision: binding.mission_revision,
+                        expected_work_product_revision: binding.result_revision,
+                        expected_manifest_version: binding.manifest_version,
+                    };
+                    let result = tokio::task::spawn_blocking(move || {
+                        DesktopDataPlane::discover()
+                            .and_then(|plane| plane.adopt_work_product_os(request, Utc::now()))
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(snapshot)) => {
+                            model.write().set_ready(snapshot, false);
+                            result_action_pending.set(false);
+                        }
+                        Ok(Err(error)) => {
+                            model.write().set_notice(&error);
+                            result_action_pending.set(false);
+                        }
+                        Err(_) => {
+                            model.write().notice = Some(UiFailure {
+                                code: "RESULT_ACTION_FAILED".into(),
+                                message: "结果采用协调任务异常结束；持久 WorkProduct 保持原状态，请刷新后重试。".into(),
+                            });
+                            result_action_pending.set(false);
+                        }
+                    }
+                });
             }
         }
     };
@@ -2128,6 +2229,8 @@ pub fn App() -> Element {
                                 runtime_stream_is_fixture: visual_persisted_stream_fixture,
                                 runtime_follow_latest: rendered_runtime_follow_latest,
                                 runtime_has_unseen: rendered_runtime_has_unseen,
+                                selected_result: selected_result.clone(),
+                                result_action_pending: result_action_pending(),
                                 context_access: context_access.clone(),
                                 operations: operations_projection.clone(),
                                 interrupt_available: operations_interrupt_available,
@@ -2194,6 +2297,7 @@ pub fn App() -> Element {
                                     }
                                     scroll_mission_thread_to_latest();
                                 },
+                                on_result_action,
                             }
                         } else if current_surface == Surface::Current {
                             CurrentSurface { project: project.clone(), context_access: context_access.clone() }
@@ -3529,6 +3633,7 @@ pub fn App() -> Element {
                         }
                         Workpad {
                             mission: mission.clone(),
+                            selected_work_product_id: selected_result_id.read().clone(),
                             context_access: context_access.clone(),
                             on_close: move |()| workpad_open.set(false),
                         }
@@ -5181,6 +5286,8 @@ fn OrchestratorSurface(
     runtime_stream_is_fixture: bool,
     runtime_follow_latest: bool,
     runtime_has_unseen: bool,
+    selected_result: Option<SelectedResultProjection>,
+    result_action_pending: bool,
     context_access: Option<ProjectContextAccessProjection>,
     operations: AgentOperationsWorkbenchProjection,
     interrupt_available: bool,
@@ -5194,6 +5301,7 @@ fn OrchestratorSurface(
     on_interrupt: EventHandler<()>,
     on_runtime_scroll: EventHandler<bool>,
     on_follow_latest: EventHandler<()>,
+    on_result_action: EventHandler<ResultSurfaceAction>,
 ) -> Element {
     match backend {
         DesktopBackendState::Uninitialized(evidence) => rsx! {
@@ -5410,6 +5518,13 @@ fn OrchestratorSurface(
                         runtime_text_stream: runtime_text_stream.clone(),
                         replayed_message_sequence,
                     }
+                    if let Some(result) = selected_result {
+                        SelectedResultSurface {
+                            result,
+                            action_pending: result_action_pending,
+                            on_action: on_result_action,
+                        }
+                    }
                     if let Some((state, copy)) = runtime_fixture_copy {
                         div {
                             class: "persisted-system-notice visual-runtime-state",
@@ -5490,6 +5605,58 @@ fn OrchestratorSurface(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn SelectedResultSurface(
+    result: SelectedResultProjection,
+    action_pending: bool,
+    on_action: EventHandler<ResultSurfaceAction>,
+) -> Element {
+    let adopt_enabled = result.can_adopt() && !action_pending;
+    let adopt_action = result.adopt_action();
+    let open_action = result.open_artifact_action();
+    let status_label = work_product_status_label(&result.adoption_status);
+    let evidence_label = result.evidence.label();
+    let evidence_count = result.evidence.count();
+    rsx! {
+        article {
+            class: "selected-result-surface",
+            aria_label: "当前 Mission 选定结果",
+            header { class: "selected-result-head",
+                div { class: "selected-result-title",
+                    span { class: "selected-result-kicker", "SELECTED RESULT · {result.kind.label()}" }
+                    strong { "{result.title}" }
+                    small { "{result.result_type} · revision {result.binding.result_revision} · manifest v{result.binding.manifest_version}" }
+                }
+                span { class: "selected-result-status", "{status_label}" }
+            }
+            div { class: "selected-result-evidence",
+                span { strong { "{evidence_label}" } small { "{evidence_count} 条已绑定证据" } }
+                span { strong { "{SelectedResultProjection::provenance_label()}" } small { "Project / Mission revision {result.binding.mission_revision}" } }
+                span { strong { "{result.preview_media_type}" } small { "manifest {short_digest(&result.manifest_digest)}" } }
+            }
+            footer { class: "selected-result-actions",
+                button {
+                    class: "quiet-button",
+                    disabled: !adopt_enabled,
+                    aria_label: if action_pending { "正在采用结果" } else { "采用当前结果" },
+                    onclick: move |_| on_action.call(adopt_action.clone()),
+                    UiIcon { name: UiIconName::Check, size: 13 }
+                    if action_pending { "采用中…" } else { "采用" }
+                }
+                button {
+                    class: "quiet-button",
+                    disabled: action_pending,
+                    aria_label: "在工作台打开当前结果",
+                    onclick: move |_| on_action.call(open_action.clone()),
+                    UiIcon { name: UiIconName::Panel, size: 13 }
+                    "打开产物"
+                }
+                small { "正文仅在按需工作台打开；这里不复制 Preview 内容。" }
             }
         }
     }
@@ -7624,6 +7791,7 @@ fn PrototypeWorkpad(
 #[component]
 fn Workpad(
     mission: Option<MissionProjection>,
+    selected_work_product_id: Option<WorkProductId>,
     context_access: Option<ProjectContextAccessProjection>,
     on_close: EventHandler<()>,
 ) -> Element {
@@ -7656,7 +7824,12 @@ fn Workpad(
                     } else {
                         p { class: "document-lead", "以下 Preview 来自 SQLCipher 中通过 Application 完整校验的 WorkProductManifest；不是页面生成的示例内容。" }
                         for product in mission.work_products {
-                            article { class: "work-product-preview",
+                            {
+                                let selected = selected_work_product_id
+                                    .as_ref()
+                                    .is_some_and(|selected| selected == &product.work_product_id);
+                                rsx! {
+                            article { class: if selected { "work-product-preview selected" } else { "work-product-preview" },
                                 header {
                                     span { class: "file-mark", "WP" }
                                     span {
@@ -7671,6 +7844,8 @@ fn Workpad(
                                     span { "evidence {product.evidence_count}" }
                                     span { "editable {product.editable_scope_count}" }
                                     code { title: "{product.manifest_digest}", "manifest {short_digest(&product.manifest_digest)}" }
+                                }
+                            }
                                 }
                             }
                         }
