@@ -233,9 +233,12 @@
         "osBuildDigest",
         "hostIdentityDigest",
         "virtualization",
+        "virtualizationObservationDigest",
         "observedAt",
+        "attestationId",
         "attestationReferenceId",
-        "attestationDigest"
+        "attestationDigest",
+        "attestationEnvelope"
       ],
       "properties": {
         "os": {
@@ -263,15 +266,24 @@
             "virtual_machine"
           ]
         },
+        "virtualizationObservationDigest": {
+          "$ref": "#/$defs/sha256"
+        },
         "observedAt": {
           "type": "string",
           "format": "date-time"
+        },
+        "attestationId": {
+          "$ref": "#/$defs/token"
         },
         "attestationReferenceId": {
           "$ref": "#/$defs/token"
         },
         "attestationDigest": {
           "$ref": "#/$defs/sha256"
+        },
+        "attestationEnvelope": {
+          "$ref": "#/$defs/hostAttestationEnvelope"
         }
       }
     },
@@ -343,6 +355,191 @@
         "expiresAt": {
           "type": "string",
           "format": "date-time"
+        }
+      }
+    },
+    "hostReceiptIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceCommit",
+        "matrixDigest",
+        "caseDefinitionDigest",
+        "receiptId",
+        "runId",
+        "attemptOrdinal",
+        "caseId",
+        "targetId",
+        "status",
+        "receiptKind"
+      ],
+      "properties": {
+        "sourceCommit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "matrixDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "caseDefinitionDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "receiptId": {
+          "$ref": "#/$defs/token"
+        },
+        "runId": {
+          "$ref": "#/$defs/token"
+        },
+        "attemptOrdinal": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "caseId": {
+          "$ref": "#/$defs/caseId"
+        },
+        "targetId": {
+          "$ref": "#/$defs/targetId"
+        },
+        "status": {
+          "enum": [
+            "PASS",
+            "FAIL",
+            "BLOCKED_ENV"
+          ]
+        },
+        "receiptKind": {
+          "enum": [
+            "native_preflight",
+            "native_execution"
+          ]
+        }
+      }
+    },
+    "hostObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hostIdentityDigest",
+        "os",
+        "arch",
+        "osBuildDigest",
+        "virtualization",
+        "virtualizationObservationDigest",
+        "observedAt"
+      ],
+      "properties": {
+        "hostIdentityDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "os": {
+          "enum": [
+            "macos",
+            "windows",
+            "linux"
+          ]
+        },
+        "arch": {
+          "enum": [
+            "aarch64",
+            "x86_64"
+          ]
+        },
+        "osBuildDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "virtualization": {
+          "enum": [
+            "physical",
+            "virtual_machine"
+          ]
+        },
+        "virtualizationObservationDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "observedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "hostAttestationPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "attestationId",
+        "receipt",
+        "challenge",
+        "runner",
+        "host"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "hartevo-platform-host-attestation-payload/v1"
+        },
+        "attestationId": {
+          "$ref": "#/$defs/token"
+        },
+        "receipt": {
+          "$ref": "#/$defs/hostReceiptIdentity"
+        },
+        "challenge": {
+          "$ref": "#/$defs/challengeBinding"
+        },
+        "runner": {
+          "$ref": "#/$defs/runnerBinding"
+        },
+        "host": {
+          "$ref": "#/$defs/hostObservation"
+        }
+      }
+    },
+    "hostAttestationEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "attestorIdentityDigest",
+        "registryDigest",
+        "registryEpoch",
+        "algorithm",
+        "keyDigest",
+        "signedPayloadDigest",
+        "signatureDigest",
+        "signatureHex",
+        "payload"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "hartevo-platform-host-attestation-envelope/v1"
+        },
+        "attestorIdentityDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "registryDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "registryEpoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "algorithm": {
+          "const": "ed25519"
+        },
+        "keyDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signedPayloadDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signatureDigest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signatureHex": {
+          "$ref": "#/$defs/ed25519Signature"
+        },
+        "payload": {
+          "$ref": "#/$defs/hostAttestationPayload"
         }
       }
     },
@@ -930,9 +1127,15 @@
     "runnerSignatureRequired": true,
     "actualHostAttestationRequired": true,
     "signatureVerifierAvailable": true,
-    "hostAttestationVerifierAvailable": false,
+    "hostAttestationVerifierAvailable": true,
+    "trustedHostAttestorRegistryRequired": true,
+    "hostAttestationSignatureRequired": true,
     "canonicalPayloadEncoding": "hartevo_sorted_json/v1",
     "signaturePayloadProjection": "receipt_without_signature_and_runner_signature_evidence/v1",
+    "hostAttestationPayloadProjection": "envelope_without_signature_fields/v1",
+    "hostAttestationPayloadDomain": "hartevo-platform-host-attestation-signature/v1",
+    "hostAttestationEnvelopeDigestDomain": "hartevo-platform-host-attestation-envelope-digest/v1",
+    "maxHostAttestationAgeSeconds": 300,
     "admissionTimeSource": "validator_clock_utc",
     "persistentNonceReplayGuardAvailable": false
   }

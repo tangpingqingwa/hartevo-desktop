@@ -1,0 +1,21 @@
+{
+  "authorTaskId": "01a03cd9-105c-7170-9e98-b2db58b54d17",
+  "baseSha": "bc50f81493065e30b7896cf91d80ab3fa45ab7dd",
+  "disposition": "APPROVE",
+  "exactPaths": [
+    "hartevo-rs/application/src/lib.rs",
+    "hartevo-rs/cloud-storage/src/effect_ledger.rs",
+    "hartevo-rs/effect-broker/src/lib.rs",
+    "hartevo-rs/storage/src/authorization.rs",
+    "hartevo-rs/storage/src/effect_ledger.rs",
+    "hartevo-rs/storage/src/lib.rs"
+  ],
+  "pr": 13,
+  "receiptDigest": "4e9b30a0a8f8764a55e0f28dd698ea83846a8b25d8d1d6d4d32afec4fc330d73",
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "reviewedAt": "2026-08-26T07:24:02Z",
+  "reviewedHeadSha": "cc20771e0c34d8679e2fd1d270b04504d76c0d9e",
+  "reviewerTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+  "schema": "hartevo-independent-review-receipt/v1",
+  "syntheticPreflightGreen": true
+}
