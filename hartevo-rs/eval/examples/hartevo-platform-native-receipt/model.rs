@@ -144,6 +144,12 @@ pub enum SignaturePayloadProjection {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum HostAttestationPayloadProjection {
+    #[serde(rename = "envelope_without_signature_fields/v1")]
+    EnvelopeWithoutSignatureFieldsV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum ReadinessClassification {
     #[serde(rename = "BLOCKED_ENV")]
     BlockedEnv,
@@ -259,16 +265,22 @@ pub struct NativeProducerPolicy {
     pub signature_algorithm: SignatureAlgorithm,
     pub signature_verifier_available: bool,
     pub host_attestation_verifier_available: bool,
+    pub trusted_host_attestor_registry_required: bool,
+    pub host_attestation_signature_required: bool,
     pub real_host_required: bool,
     pub content_free: bool,
     pub canonical_payload_encoding: CanonicalPayloadEncoding,
     pub signature_payload_projection: SignaturePayloadProjection,
+    pub host_attestation_payload_projection: HostAttestationPayloadProjection,
     pub challenge_nonce_digest_required: bool,
     pub persistent_nonce_replay_guard_available: bool,
     pub max_challenge_age_seconds: u64,
+    pub max_host_attestation_age_seconds: u64,
     pub max_receipt_age_seconds: u64,
     pub max_run_duration_seconds: u64,
     pub signature_payload_domain: String,
+    pub host_attestation_payload_domain: String,
+    pub host_attestation_envelope_digest_domain: String,
     pub preflight_evidence_kinds: Vec<EvidenceReferenceKind>,
     pub execution_evidence_kinds: Vec<EvidenceReferenceKind>,
 }
@@ -309,6 +321,33 @@ pub struct RunnerRegistration {
     pub revocation: Option<RunnerRevocation>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizedHostBinding {
+    pub target_id: String,
+    pub host_identity_digest: String,
+    pub os_build_digest: String,
+    pub virtualization: VirtualizationKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostAttestorRegistration {
+    pub attestor_identity_digest: String,
+    pub registry_epoch: u64,
+    pub signing_key_digest: String,
+    pub verification_key_hex: String,
+    pub signature_algorithm: SignatureAlgorithm,
+    pub valid_from: String,
+    pub valid_until: String,
+    pub allowed_receipt_kinds: Vec<ReceiptKind>,
+    pub allowed_challenge_issuer_digests: Vec<String>,
+    pub allowed_runner_identity_digests: Vec<String>,
+    pub authorized_hosts: Vec<AuthorizedHostBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation: Option<RunnerRevocation>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlatformMatrix {
@@ -328,6 +367,9 @@ pub struct PlatformMatrix {
     pub runner_registry_epoch: u64,
     pub runner_registry_digest: String,
     pub allowed_runners: Vec<RunnerRegistration>,
+    pub host_attestor_registry_epoch: u64,
+    pub host_attestor_registry_digest: String,
+    pub allowed_host_attestors: Vec<HostAttestorRegistration>,
     pub prohibited_upgrade_evidence: Vec<String>,
     pub allowed_blocker_codes: Vec<String>,
     pub targets: Vec<PlatformTarget>,
@@ -349,9 +391,12 @@ pub struct ActualHost {
     pub os_build_digest: String,
     pub host_identity_digest: String,
     pub virtualization: VirtualizationKind,
+    pub virtualization_observation_digest: String,
     pub observed_at: String,
+    pub attestation_id: String,
     pub attestation_reference_id: String,
     pub attestation_digest: String,
+    pub attestation_envelope: HostAttestationEnvelope,
 }
 
 impl From<&PlatformTarget> for TargetTuple {
@@ -395,6 +440,59 @@ pub struct ChallengeBinding {
     pub issuer_digest: String,
     pub issued_at: String,
     pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostReceiptIdentity {
+    pub source_commit: String,
+    pub matrix_digest: String,
+    pub case_definition_digest: String,
+    pub receipt_id: String,
+    pub run_id: String,
+    pub attempt_ordinal: u64,
+    pub case_id: String,
+    pub target_id: String,
+    pub status: PlatformStatus,
+    pub receipt_kind: ReceiptKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostObservation {
+    pub host_identity_digest: String,
+    pub os: OperatingSystem,
+    pub arch: Architecture,
+    pub os_build_digest: String,
+    pub virtualization: VirtualizationKind,
+    pub virtualization_observation_digest: String,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostAttestationPayload {
+    pub schema_version: String,
+    pub attestation_id: String,
+    pub receipt: HostReceiptIdentity,
+    pub challenge: ChallengeBinding,
+    pub runner: RunnerBinding,
+    pub host: HostObservation,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostAttestationEnvelope {
+    pub schema_version: String,
+    pub attestor_identity_digest: String,
+    pub registry_digest: String,
+    pub registry_epoch: u64,
+    pub algorithm: SignatureAlgorithm,
+    pub key_digest: String,
+    pub signed_payload_digest: String,
+    pub signature_digest: String,
+    pub signature_hex: String,
+    pub payload: HostAttestationPayload,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

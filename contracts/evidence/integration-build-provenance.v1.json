@@ -1,0 +1,219 @@
+{
+  "schemaVersion": "hartevo.integration-build-provenance-contract/v1",
+  "contractId": "ev-04-integration-build-provenance-v1",
+  "authority": "INTEGRATION_BUILD_PROVENANCE_ONLY",
+  "currentInstance": {
+    "manifestPath": "artifacts/evidence/integration-build/7724c5ca06425262508136ab610e63df534df939/manifest.json",
+    "manifestSha256": "cc99aad4523de6de992cae57696005648d27618d49f7b067146e2fe09670b0c1",
+    "manifestBytes": 9739,
+    "rawArtifactPath": "artifacts/evidence/integration-build/7724c5ca06425262508136ab610e63df534df939/github-pr-ci-candidate.raw.json",
+    "rawArtifactSha256": "9fdb0520035ad9ab8c8991928bdd94bbbe59f8f25790f60637e2442fe301f1e8",
+    "rawArtifactBytes": 9205
+  },
+  "historicalInstance": {
+    "manifestPath": "artifacts/evidence/integration-build/5991c80d2bf7b072f45621b03f55a7cf4b7e555f/manifest.json",
+    "manifestSha256": "ea3e1230ad9a1f358b7f4c05114f6ca425878f84c8dd8abe9657400a7b20530e",
+    "manifestBytes": 9634,
+    "rawArtifactPath": "artifacts/evidence/integration-build/5991c80d2bf7b072f45621b03f55a7cf4b7e555f/github-pr-ci-observation.raw.json",
+    "rawArtifactSha256": "3a867cb5bcad7acb0e76eda1ca0eb235d1a5d621262499f61c1a278bab68280a",
+    "rawArtifactBytes": 17927
+  },
+  "currentBaseline": {
+    "ref": "origin/bootstrap/macos-r0",
+    "commit": "6bee5f69eee691f30f37b443a18b63ec27d38414",
+    "tree": "6c1620b3d9f3ba22928d466a0b6454975912846f",
+    "requireExactCheckout": true,
+    "artifactStatus": "CURRENT_CANDIDATE_DRAFT_CI_GREEN",
+    "historicalArtifactHead": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
+    "staleReason": "The tracked 5991c80 manifest remains historical. PR #20 head c8731260 has a live completed 8-job success run but remains Draft; Bootstrap run 32023256203 on protected 6bee5f69 completed 14/14 successfully. Neither run proves native visual/accessibility/process-restart or grants Release/E-level authority."
+  },
+  "candidatePolicy": {
+    "pullRequest": {
+      "number": 20,
+      "state": "OPEN",
+      "merged": false,
+      "draft": true,
+      "baseRef": "bootstrap/macos-r0",
+      "baseCommit": "391da8885196c5b6bc6fb22b256fe2f9f424d65a",
+      "headRef": "codex/evidence-integration-receipt-ev04",
+      "headCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
+      "headTree": "3fe9eeb5f98c5008623a7e89dac4d497c9167fc5",
+      "mergeCommit": null
+    },
+    "ci": {
+      "provider": "github-actions",
+      "workflowId": 333267489,
+      "workflowName": "PR / Fast CI",
+      "workflowPath": ".github/workflows/ci.yml",
+      "event": "pull_request",
+      "requiredStatus": "completed",
+      "requiredConclusion": "success",
+      "requiredJobs": [
+        "PR / Scope plan",
+        "PR / Workflow policy",
+        "PR / Fast Rust matrix / PR / Fast Rust / fmt",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (ubuntu-24.04)",
+        "PR / Fast Rust matrix / PR / Fast Rust / test (macos-15)",
+        "PR / Fast Rust matrix / PR / Fast Rust / clippy (macos-15)",
+        "PR / Result taxonomy"
+      ]
+    },
+    "protectedIntegrationRun": {
+      "provider": "github-actions",
+      "workflowId": 333787241,
+      "workflowName": "Integration / Bootstrap CI",
+      "workflowPath": ".github/workflows/integration.yml",
+      "event": "push",
+      "runId": 32023256203,
+      "runAttempt": 1,
+      "headCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414",
+      "status": "completed",
+      "conclusion": "success",
+      "requiredJobs": [
+        "Integration / Reviewed gate",
+        "Integration / PostgreSQL 18 Cell",
+        "Integration / Catalog and evidence",
+        "Integration / Dependency and SBOM",
+        "Integration / OpenInterpreter contract",
+        "Integration / Dioxus build and receipt",
+        "Integration / Full Rust matrix / Integration / Full Rust / test shard 1 of 2 (ubuntu-24.04)",
+        "Integration / Full Rust matrix / Integration / Full Rust / clippy (ubuntu-24.04)",
+        "Integration / Full Rust matrix / Integration / Full Rust / clippy (macos-15)",
+        "Integration / Full Rust matrix / Integration / Full Rust / test (macos-15)",
+        "Integration / Full Rust matrix / Integration / Full Rust / fmt",
+        "Integration / Full Rust matrix / Integration / Full Rust / test shard 0 of 2 (ubuntu-24.04)",
+        "Integration / Full Rust matrix / Integration / Full Rust / test (ubuntu-24.04)",
+        "Integration / Result taxonomy"
+      ]
+    }
+  },
+  "nativeEvidencePolicy": {
+    "path": "contracts/evidence/current-evidence-truth.v1.json",
+    "sourceCommit": "6bee5f69eee691f30f37b443a18b63ec27d38414",
+    "sha256": "f5a5f6486b865311a79f1a6f162ee8c9fc3a7e95938904d487d3e800536ba30e",
+    "bytes": 5596,
+    "status": "NOT_PROVEN",
+    "nativeVisual": "NOT_PROVEN",
+    "nativeAccessibility": "NOT_PROVEN",
+    "processRestart": "NOT_PROVEN",
+    "releaseEvidence": "NOT_PROVEN",
+    "releasePassed": false,
+    "releaseDecision": "NOT_EVALUATED",
+    "missionEvidenceLevelPromoted": false
+  },
+  "evidenceRolePolicy": {
+    "service": {
+      "id": "evidence-query",
+      "kind": "EVIDENCE_QUERY",
+      "path": "hartevo-rs/eval/src/lib.rs",
+      "symbol": "catalog_snapshot",
+      "sourceCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
+      "sha256": "13333d80733a231df9ea5b1b25500172f8b63c4b9d097a1c2715d28df8fbc8bf",
+      "bytes": 49107
+    },
+    "provider": {
+      "id": "evidence-producer",
+      "kind": "EVIDENCE_PRODUCER",
+      "path": "hartevo-rs/catalog/src/evidence.rs",
+      "symbol": "wave_zero_baseline",
+      "sourceCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
+      "sha256": "6c64c2fa18a011c4b6d856f4f40c238b210a46d88c1e585d6a7ae6ffeece4c37",
+      "bytes": 102229
+    },
+    "consumer": {
+      "id": "release-gate-consumer",
+      "kind": "RELEASE_GATE_CONSUMER",
+      "path": "hartevo-rs/catalog/src/evidence.rs",
+      "symbol": "validate_fail_closed",
+      "sourceCommit": "c87312600dc7a005347db5d71c4515e6cab04baf",
+      "sha256": "6c64c2fa18a011c4b6d856f4f40c238b210a46d88c1e585d6a7ae6ffeece4c37",
+      "bytes": 102229
+    }
+  },
+  "source": {
+    "repository": "tangpingqingwa/hartevo-desktop",
+    "branch": "bootstrap/macos-r0",
+    "objectFormat": "sha1",
+    "rangeBaseCommit": "4ce38354541771820a7739a2d04dcc7b4bac88fc",
+    "headCommit": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
+    "headTree": "b6728edc1c1a07bf774bf27232fd1a70432110a9",
+    "expectedFirstParentCommitCount": 11,
+    "expectedFeaturePullRequestMergeCount": 10,
+    "expectedRevertCommitCount": 1
+  },
+  "pullRequestPolicy": {
+    "state": "closed",
+    "merged": true,
+    "draft": false,
+    "baseRef": "bootstrap/macos-r0",
+    "headRefPrefix": "codex/",
+    "mergeParentCount": 2,
+    "featureHeadMustEqualSecondParent": true,
+    "observedBaseMustBeAncestorOfIntegrationParent": true
+  },
+  "integrationHistoryPolicy": {
+    "allowedKinds": [
+      "FEATURE_PR_MERGE",
+      "REVERT"
+    ],
+    "revertMustTargetPriorFeatureMerge": true,
+    "revertedFeatureMayCountActive": false
+  },
+  "ciPolicy": {
+    "provider": "github-actions",
+    "workflowId": 333267489,
+    "workflowName": "ci",
+    "workflowPath": ".github/workflows/ci.yml",
+    "event": "pull_request",
+    "status": "completed",
+    "conclusion": "success",
+    "runAttemptPolicy": "POSITIVE_EXACT_MATCH",
+    "requiredJobs": [
+      "PostgreSQL 18 Cell contract",
+      "Rust workspace"
+    ]
+  },
+  "resultPolicy": {
+    "verificationCode": "INTEGRATION_BUILD_PROVENANCE_PENDING",
+    "verificationStatus": "NOT_VERIFIED",
+    "releaseDecision": "NOT_EVALUATED",
+    "releasePassed": false,
+    "missionEvidenceLevelPromoted": false,
+    "maySatisfyReleaseEvidence": false,
+    "mayPromoteMissionEvidenceLevel": false
+  },
+  "failClosedCodes": [
+    "CANDIDATE_CI_HEAD_MISMATCH",
+    "CANDIDATE_CI_NOT_EXECUTED",
+    "CI_CONCLUSION_NOT_SUCCESS",
+    "CI_HEAD_MISMATCH",
+    "CI_JOB_MISSING",
+    "CI_JOB_NOT_SUCCESS",
+    "CI_RUN_MISSING",
+    "CI_RUN_POLICY_MISMATCH",
+    "CI_STATUS_NOT_COMPLETED",
+    "CONTRACT_DIGEST_MISMATCH",
+    "CURRENT_COMMIT_MISMATCH",
+    "EVIDENCE_ROLE_MISSING",
+    "HEAD_NOT_DESCENDANT",
+    "HISTORICAL_ARTIFACT_STALE",
+    "INTEGRATION_HEAD_MISMATCH",
+    "MANIFEST_DIGEST_MISMATCH",
+    "MANIFEST_SOURCE_MISMATCH",
+    "NATIVE_EVIDENCE_ESCALATION",
+    "PR_BASE_ANCESTRY_MISMATCH",
+    "PR_BASE_MISMATCH",
+    "PR_DRAFT",
+    "PR_HEAD_MISMATCH",
+    "PR_MERGE_CHAIN_MISMATCH",
+    "PR_NOT_MERGED",
+    "RAW_ARTIFACT_DIGEST_MISMATCH",
+    "RELEASE_AUTHORITY_ESCALATION",
+    "REVERT_HISTORY_MISMATCH"
+  ],
+  "gate": {
+    "verifyCommand": "bash scripts/check-integration-build-provenance.sh verify",
+    "selfTestCommand": "bash scripts/check-integration-build-provenance.sh self-test"
+  }
+}
