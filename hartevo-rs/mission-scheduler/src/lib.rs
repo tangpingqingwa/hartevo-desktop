@@ -20,6 +20,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 pub mod local_timer;
+pub mod macos_wake_provider;
 pub mod os;
 pub mod os_lifecycle;
 pub mod plugin_dispatch;
