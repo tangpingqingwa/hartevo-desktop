@@ -1,10 +1,10 @@
 {
   "schemaVersion": "hartevo-platform-matrix/v2",
-  "matrixVersion": "i-01c-authenticated-receipt-signature/2026-08-13-v2",
+  "matrixVersion": "i-01d-signed-host-attestation/2026-08-13-v2",
   "repositoryId": "tangpingqingwa/hartevo-desktop",
-  "sourceCommit": "5991c80d2bf7b072f45621b03f55a7cf4b7e555f",
+  "sourceCommit": "2fdb8663b9694cf2daf1e21ea8f0b21890c30f14",
   "receiptSchemaUri": "https://hartevo.local/contracts/platform/receipt.schema.v2.json",
-  "receiptSchemaSha256": "f1142ff4ca9b0a6723ac285e9f0b197dc3e02914161998a7518aa861f2a8c1b8",
+  "receiptSchemaSha256": "37da34227e763e149bd76ecb0c57190a8b21d103c218c2fd800a31831392919c",
   "evidenceMode": "source_audit_baseline",
   "releaseEligible": false,
   "nativeReceiptCount": 0,
@@ -16,17 +16,23 @@
     "runnerSignatureRequired": true,
     "signatureAlgorithm": "ed25519",
     "signatureVerifierAvailable": true,
-    "hostAttestationVerifierAvailable": false,
+    "hostAttestationVerifierAvailable": true,
+    "trustedHostAttestorRegistryRequired": true,
+    "hostAttestationSignatureRequired": true,
     "realHostRequired": true,
     "contentFree": true,
     "canonicalPayloadEncoding": "hartevo_sorted_json/v1",
     "signaturePayloadProjection": "receipt_without_signature_and_runner_signature_evidence/v1",
+    "hostAttestationPayloadProjection": "envelope_without_signature_fields/v1",
     "challengeNonceDigestRequired": true,
     "persistentNonceReplayGuardAvailable": false,
     "maxChallengeAgeSeconds": 300,
+    "maxHostAttestationAgeSeconds": 300,
     "maxReceiptAgeSeconds": 600,
     "maxRunDurationSeconds": 3600,
     "signaturePayloadDomain": "hartevo-platform-native-receipt-signature/v2",
+    "hostAttestationPayloadDomain": "hartevo-platform-host-attestation-signature/v1",
+    "hostAttestationEnvelopeDigestDomain": "hartevo-platform-host-attestation-envelope-digest/v1",
     "preflightEvidenceKinds": [
       "host_attestation_digest",
       "native_preflight_digest",
@@ -45,10 +51,10 @@
   },
   "readinessBlockers": [
     {
-      "code": "NATIVE_HOST_ATTESTATION_UNAVAILABLE",
+      "code": "HOST_ATTESTOR_REGISTRY_EMPTY",
       "classification": "BLOCKED_ENV",
-      "observationSource": "native_producer_preflight:host_attestation_registry",
-      "exitCondition": "A privacy-safe actual-host attestation verifier is configured for the exact target OS and architecture."
+      "observationSource": "matrix.allowedHostAttestors",
+      "exitCondition": "A reviewed, time-bounded Ed25519 host-attestor registration with exact host, OS build, virtualization, challenge issuer, and runner allowlists is committed in a separately approved contract update."
     },
     {
       "code": "NONCE_REPLAY_GUARD_NOT_IMPLEMENTED",
@@ -79,8 +85,11 @@
     "missingReceiptDisposition": "aggregate_failure"
   },
   "runnerRegistryEpoch": 0,
-  "runnerRegistryDigest": "67875a5baea0ba0b126c86a2ea88d589249fb2ff5ca8084525d80ed3d47da658",
+  "runnerRegistryDigest": "856025fc40a36391914184aa32b12dc241fdee25bf0dab4750e66c364403e876",
   "allowedRunners": [],
+  "hostAttestorRegistryEpoch": 0,
+  "hostAttestorRegistryDigest": "8d20864a07b524a1e11b5e6113ced581c794609f5994c1baedc5e117c9f612ed",
+  "allowedHostAttestors": [],
   "prohibitedUpgradeEvidence": [
     "compile_only",
     "cross_compile",

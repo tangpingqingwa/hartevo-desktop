@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hartevo-plugin-session-acceptance/v1",
+  "title": "Hartevo plugin session native acceptance envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "documentType",
+    "authority",
+    "releaseDecision",
+    "sourceCommit",
+    "project",
+    "mission",
+    "service",
+    "provider",
+    "consumer",
+    "mount",
+    "durableLog",
+    "invoke",
+    "result",
+    "adoption",
+    "recoveryHooks"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "hartevo-plugin-session-acceptance/v1" },
+    "documentType": { "const": "plugin_session_acceptance" },
+    "authority": { "const": "plugin_session_acceptance_only" },
+    "releaseDecision": { "const": "NOT_EVALUATED" },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "project": { "$ref": "#/$defs/project" },
+    "mission": { "$ref": "#/$defs/mission" },
+    "service": { "$ref": "#/$defs/service" },
+    "provider": { "$ref": "#/$defs/provider" },
+    "consumer": { "$ref": "#/$defs/consumer" },
+    "mount": { "$ref": "#/$defs/mount" },
+    "durableLog": { "$ref": "#/$defs/durableLog" },
+    "invoke": { "$ref": "#/$defs/invoke" },
+    "result": { "$ref": "#/$defs/result" },
+    "adoption": { "$ref": "#/$defs/adoption" },
+    "recoveryHooks": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/recovery" }
+    }
+  },
+  "$defs": {
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "scopeDigest"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "revision": { "type": "integer", "minimum": 1 },
+        "scopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "mission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "scopeDigest"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "revision": { "type": "integer", "minimum": 1 },
+        "scopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projectId", "missionId", "scopeDigest"],
+      "properties": {
+        "projectId": { "type": "string", "minLength": 1 },
+        "missionId": { "type": "string", "minLength": 1 },
+        "scopeDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sourceCommit", "scope", "mounted"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "mounted": { "const": true }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sourceCommit", "scope", "mode", "outputPresent", "outputDigest"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "mode": {
+          "enum": ["native", "simulator", "fixture", "ignored", "blocked_env", "missing"]
+        },
+        "outputPresent": { "type": "boolean" },
+        "outputDigest": { "type": "string", "pattern": "^([0-9a-f]{64})?$" }
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sourceCommit", "scope", "adopted"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "adopted": { "type": "boolean" }
+      }
+    },
+    "mount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "sourceCommit", "scope", "revision", "evaluatorId", "evidenceRoot"],
+      "properties": {
+        "status": { "const": "mounted" },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "evaluatorId": { "type": "string", "minLength": 1 },
+        "evidenceRoot": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "durableLog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "sourceCommit", "scope", "eventCount", "eventTypes", "modelVisible", "durable", "logDigest"],
+      "properties": {
+        "status": { "const": "model_visible_durable" },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "eventCount": { "type": "integer", "minimum": 5 },
+        "eventTypes": {
+          "type": "array",
+          "minItems": 5,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "modelVisible": { "const": true },
+        "durable": { "const": true },
+        "logDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "invoke": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "sourceCommit", "scope", "sequence", "requestDigest", "executorOnce"],
+      "properties": {
+        "status": { "const": "completed" },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "sequence": { "const": 1 },
+        "requestDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "executorOnce": { "const": true }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "provenance", "sourceCommit", "scope", "revision", "resultDigest", "evidenceRoot"],
+      "properties": {
+        "status": { "enum": ["completed", "failed", "not_evaluated"] },
+        "provenance": {
+          "enum": ["native_provider", "simulator", "fixture", "ignored", "blocked_env", "missing"]
+        },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "resultDigest": { "type": "string", "pattern": "^([0-9a-f]{64})?$" },
+        "evidenceRoot": { "type": "string", "pattern": "^([0-9a-f]{64})?$" }
+      }
+    },
+    "adoption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "sourceCommit", "scope", "revision", "resultDigest", "evidenceRoot", "decisionDigest"],
+      "properties": {
+        "decision": { "enum": ["adopt", "reject", "not_evaluated"] },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "resultDigest": { "type": "string", "pattern": "^([0-9a-f]{64})?$" },
+        "evidenceRoot": { "type": "string", "pattern": "^([0-9a-f]{64})?$" },
+        "decisionDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hook", "sourceCommit", "scope", "revision", "evidenceRoot", "oldEvaluatorAccepted", "oldDecisionPromotable"],
+      "properties": {
+        "hook": { "enum": ["unmount", "revoke", "crash"] },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "evidenceRoot": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "oldEvaluatorAccepted": { "const": false },
+        "oldDecisionPromotable": { "const": false }
+      }
+    }
+  }
+}

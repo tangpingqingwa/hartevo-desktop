@@ -1,0 +1,98 @@
+{
+  "baseBranch": "bootstrap/macos-r0",
+  "baseCommit": "96c99cba5cfc8106b7abdc674957beae070657c5",
+  "candidateCount": 4,
+  "candidates": [
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "96c99cba5cfc8106b7abdc674957beae070657c5",
+      "headBranch": "leftover/window-review-creator-deliverable",
+      "headCommit": "d95eb017aeb1f333e9dd68c5a7bd28b5bf1e8944",
+      "number": 984,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/application/src/lib.rs",
+          "hartevo-rs/desktop/assets/prototype.css",
+          "hartevo-rs/desktop/src/agent_operations.rs",
+          "hartevo-rs/desktop/src/data_plane.rs",
+          "hartevo-rs/desktop/src/lib.rs",
+          "hartevo-rs/desktop/src/native_runtime_journey.rs",
+          "hartevo-rs/desktop/src/result_adoption_surface.rs",
+          "hartevo-rs/desktop/src/visual_fixture.rs"
+        ],
+        "receiptDigest": "31159386e1865d7778ba29beb4f72f9c248a5c20237087eff09d5d37a261b577",
+        "receiptPath": ".github/governance/reviews/pr-984.json",
+        "reviewedHeadSha": "8b38b21cde5aa42884e8a966fdb84167a9965170",
+        "reviewerTaskId": "01a04237-8c20-7182-91e9-6c57168d3c58"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "96c99cba5cfc8106b7abdc674957beae070657c5",
+      "headBranch": "codex/planning-plugin-consumption-02",
+      "headCommit": "000e3cb531e809269ea68925acb5ba3ec79dc3cc",
+      "number": 169,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/catalog/src/lib.rs",
+          "hartevo-rs/catalog/src/planning_plugin.rs",
+          "hartevo-rs/catalog/tests/planning_plugin_route.rs"
+        ],
+        "receiptDigest": "190bd6cdac9caf5ac9ec5a91a24adcd19ad1d8d76b6bc69bcf0afe4a4a81d781",
+        "receiptPath": ".github/governance/reviews/pr-169.json",
+        "reviewedHeadSha": "1b37ef3a266ebe23c4e753143cf63bfdf4975e2e",
+        "reviewerTaskId": "01a04237-8c20-7182-91e9-6c6d64b122e5"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "96c99cba5cfc8106b7abdc674957beae070657c5",
+      "headBranch": "codex/secret-broker-plugin-consumer-02",
+      "headCommit": "d3f740beea8986dc9bf259004b64fbfcabc4c0d4",
+      "number": 175,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/effect-broker/src/lib.rs",
+          "hartevo-rs/effect-broker/src/secret_broker.rs"
+        ],
+        "receiptDigest": "df1662acb0baf30802cb48cf8217fbcb22a7e22abcc68290b1431d66adf9705e",
+        "receiptPath": ".github/governance/reviews/pr-175.json",
+        "reviewedHeadSha": "f5dbca41e61db6b94204a44c041a20ff1b46242d",
+        "reviewerTaskId": "01a0422e-f7eb-7db0-bf30-225d52c45e76"
+      }
+    },
+    {
+      "baseBranch": "bootstrap/macos-r0",
+      "baseCommit": "96c99cba5cfc8106b7abdc674957beae070657c5",
+      "headBranch": "codex/steer-plugin-consumption-02",
+      "headCommit": "8ee52d884da3095f9399713793960e56980fbe10",
+      "number": 184,
+      "review": {
+        "authorTaskId": "01a0337e-82cd-7590-bbd8-23da19ffc737",
+        "exactPaths": [
+          "hartevo-rs/context-fabric/src/lib.rs",
+          "hartevo-rs/context-fabric/src/steering.rs"
+        ],
+        "receiptDigest": "34d28d56e38dbc1e64924c54f4f140b20adcec47679f291724caca3b4449e7b9",
+        "receiptPath": ".github/governance/reviews/pr-184.json",
+        "reviewedHeadSha": "913569806da449db9abef029bed0d1fd4cbba9ee",
+        "reviewerTaskId": "01a0422e-f7ed-7b71-a2ed-bcea93b7fb39"
+      }
+    }
+  ],
+  "createdAt": "2026-08-27T08:22:24Z",
+  "createdBy": "integration-manager",
+  "fullMatrixRequired": [
+    "ubuntu-24.04",
+    "macos-15"
+  ],
+  "maximumCandidateCount": 4,
+  "nativeMergeQueueStatus": "BLOCKED_ENV_PERSONAL_ACCOUNT_OWNER",
+  "release": false,
+  "repository": "tangpingqingwa/hartevo-desktop",
+  "schema": "hartevo-repository-merge-train/v1",
+  "trainBranch": "merge-train/20260827-0816"
+}

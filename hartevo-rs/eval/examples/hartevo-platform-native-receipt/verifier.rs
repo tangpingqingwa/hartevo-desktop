@@ -13,28 +13,34 @@ use crate::digest::{
     domain_canonical_json_bytes, is_lower_hex, sha256_domain_canonical_json, sha256_hex,
     sha256_json,
 };
+use crate::host_attestation::{
+    HOST_ATTESTATION_ENVELOPE_SCHEMA_VERSION, HOST_ATTESTATION_PAYLOAD_SCHEMA_VERSION,
+    host_attestation_envelope_digest, verify_host_attestation_crypto,
+};
 use crate::model::{
-    Architecture, AssertionOutcome, CanonicalPayloadEncoding, CaseDefinitionDigestMaterial,
-    DispositionCounts, EvidenceMode, EvidenceReferenceKind, EvidenceRequirement,
-    ImplementationState, MissingReceiptDisposition, NativeProducerMode, OperatingSystem,
-    PlatformMatrix, PlatformReceipt, PlatformStatus, PlatformTarget, ReadinessClassification,
-    ReceiptKind, RegistryEmptyPolicy, RunnerRegistration, SignatureAlgorithm,
-    SignaturePayloadProjection, SupportClass,
+    Architecture, AssertionOutcome, AuthorizedHostBinding, CanonicalPayloadEncoding,
+    CaseDefinitionDigestMaterial, DispositionCounts, EvidenceMode, EvidenceReferenceKind,
+    EvidenceRequirement, HostAttestationPayload, HostAttestationPayloadProjection,
+    HostAttestorRegistration, HostObservation, HostReceiptIdentity, ImplementationState,
+    MissingReceiptDisposition, NativeProducerMode, OperatingSystem, PlatformMatrix,
+    PlatformReceipt, PlatformStatus, PlatformTarget, ReadinessClassification, ReceiptKind,
+    RegistryEmptyPolicy, RunnerRegistration, SignatureAlgorithm, SignaturePayloadProjection,
+    SupportClass,
 };
 use crate::signature::{
     decode_lower_hex_exact, signature_digest, verification_key_digest, verify_ed25519,
 };
 
-pub const EXPECTED_SOURCE_COMMIT: &str = "5991c80d2bf7b072f45621b03f55a7cf4b7e555f";
+pub const EXPECTED_SOURCE_COMMIT: &str = "2fdb8663b9694cf2daf1e21ea8f0b21890c30f14";
 pub const EXPECTED_MATRIX_SCHEMA_VERSION: &str = "hartevo-platform-matrix/v2";
-pub const EXPECTED_MATRIX_VERSION: &str = "i-01c-authenticated-receipt-signature/2026-08-13-v2";
+pub const EXPECTED_MATRIX_VERSION: &str = "i-01d-signed-host-attestation/2026-08-13-v2";
 pub const MATRIX_V2_SHA256: &str =
-    "61add9931a55658caa7c2ccb3694686341dca27a31d087cef885c75bd977c13d";
+    "cbee9a18fe627cfae15e244dc59b1c6552b6c69ec17a7966ab86cea6a937d392";
 pub const EXPECTED_RECEIPT_SCHEMA_VERSION: &str = "hartevo-platform-native-receipt/v2";
 pub const RECEIPT_SCHEMA_V2_URI: &str =
     "https://hartevo.local/contracts/platform/receipt.schema.v2.json";
 pub const RECEIPT_SCHEMA_V2_SHA256: &str =
-    "f1142ff4ca9b0a6723ac285e9f0b197dc3e02914161998a7518aa861f2a8c1b8";
+    "37da34227e763e149bd76ecb0c57190a8b21d103c218c2fd800a31831392919c";
 pub const VALIDATION_SCHEMA_VERSION: &str = "hartevo-platform-native-receipt-validation/v2";
 pub const INVENTORY_AUTHORITY: &str = "platform_inventory_only";
 pub const RELEASE_DECISION: &str = "NOT_EVALUATED";
@@ -42,13 +48,15 @@ pub const EXPECTED_REPOSITORY_ID: &str = "tangpingqingwa/hartevo-desktop";
 pub const PRODUCER_READINESS: &str = "BLOCKED_ENV";
 pub const NATIVE_RECEIPT_EMISSION_ALLOWED: bool = false;
 pub const SIGNATURE_VERIFIER_AVAILABLE: bool = true;
-pub const HOST_ATTESTATION_VERIFIER_AVAILABLE: bool = false;
+pub const HOST_ATTESTATION_VERIFIER_AVAILABLE: bool = true;
 pub const PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE: bool = false;
 
 const EXPECTED_BLOCKED_ENV_COUNT: usize = 16;
 const EXPECTED_NOT_IMPLEMENTED_COUNT: usize = 25;
 const IMPLEMENTATION_DIGEST_DOMAIN: &[u8] = b"hartevo-platform-implementation-digest/v2";
 const RUNNER_REGISTRY_DIGEST_DOMAIN: &str = "hartevo-platform-runner-registry-digest/v2";
+const HOST_ATTESTOR_REGISTRY_DIGEST_DOMAIN: &str =
+    "hartevo-platform-host-attestor-registry-digest/v1";
 
 #[derive(Debug)]
 pub struct GitToolUnavailable;
@@ -229,7 +237,7 @@ const EXPECTED_EXECUTION_EVIDENCE_KINDS: &[EvidenceReferenceKind] = &[
 
 const EXPECTED_READINESS_BLOCKERS: &[(&str, ReadinessClassification)] = &[
     (
-        "NATIVE_HOST_ATTESTATION_UNAVAILABLE",
+        "HOST_ATTESTOR_REGISTRY_EMPTY",
         ReadinessClassification::BlockedEnv,
     ),
     (
@@ -267,7 +275,7 @@ pub fn validate_matrix(
     validate_git_commit(repository_root, &matrix.source_commit)?;
     ensure!(
         matrix.evidence_mode == EvidenceMode::SourceAuditBaseline,
-        "I-01C must preserve source-audit inventory authority"
+        "I-01D must preserve source-audit inventory authority"
     );
     ensure!(
         !matrix.release_eligible,
@@ -275,11 +283,15 @@ pub fn validate_matrix(
     );
     ensure!(
         matrix.native_receipt_count == 0,
-        "I-01C authenticated verifier cannot claim native receipts"
+        "I-01D signed host verifier cannot claim native receipts"
     );
     ensure!(
         matrix.allowed_runners.is_empty(),
-        "I-01C must remain fail-closed with an empty runner registry"
+        "I-01D must remain fail-closed with an empty runner registry"
+    );
+    ensure!(
+        matrix.allowed_host_attestors.is_empty(),
+        "I-01D must remain fail-closed with an empty host-attestor registry"
     );
     validate_native_producer_policy(matrix)?;
     validate_readiness_blockers(matrix)?;
@@ -287,6 +299,12 @@ pub fn validate_matrix(
         matrix.runner_registry_epoch == 0
             && matrix.runner_registry_digest == derive_runner_registry_digest(matrix)?,
         "empty runner registry epoch or digest changed"
+    );
+    ensure!(
+        matrix.host_attestor_registry_epoch == 0
+            && matrix.host_attestor_registry_digest
+                == derive_host_attestor_registry_digest(matrix)?,
+        "empty host-attestor registry epoch or digest changed"
     );
 
     validate_receipt_policy(matrix)?;
@@ -313,7 +331,7 @@ pub fn validate_matrix(
             && recomputed.fail == 0
             && recomputed.blocked_env == EXPECTED_BLOCKED_ENV_COUNT
             && recomputed.not_implemented == EXPECTED_NOT_IMPLEMENTED_COUNT,
-        "I-01C must preserve 0 PASS / 0 FAIL / 16 BLOCKED_ENV / 25 NOT_IMPLEMENTED"
+        "I-01D must preserve 0 PASS / 0 FAIL / 16 BLOCKED_ENV / 25 NOT_IMPLEMENTED"
     );
     Ok(MatrixValidation {
         counts: recomputed,
@@ -340,25 +358,34 @@ fn validate_native_producer_policy(matrix: &PlatformMatrix) -> Result<()> {
             && policy.runner_signature_required
             && policy.signature_algorithm == SignatureAlgorithm::Ed25519
             && policy.signature_verifier_available
-            && !policy.host_attestation_verifier_available
+            && policy.host_attestation_verifier_available
+            && policy.trusted_host_attestor_registry_required
+            && policy.host_attestation_signature_required
             && policy.real_host_required
             && policy.content_free
             && policy.canonical_payload_encoding == CanonicalPayloadEncoding::HartevoSortedJsonV1
             && policy.signature_payload_projection
                 == SignaturePayloadProjection::ReceiptWithoutSignatureAndRunnerSignatureEvidenceV1
+            && policy.host_attestation_payload_projection
+                == HostAttestationPayloadProjection::EnvelopeWithoutSignatureFieldsV1
             && policy.challenge_nonce_digest_required
             && !policy.persistent_nonce_replay_guard_available
             && policy.max_challenge_age_seconds == 300
+            && policy.max_host_attestation_age_seconds == 300
             && policy.max_receipt_age_seconds == 600
             && policy.max_run_duration_seconds == 3600
             && policy.signature_payload_domain == "hartevo-platform-native-receipt-signature/v2"
+            && policy.host_attestation_payload_domain
+                == "hartevo-platform-host-attestation-signature/v1"
+            && policy.host_attestation_envelope_digest_domain
+                == "hartevo-platform-host-attestation-envelope-digest/v1"
             && policy.preflight_evidence_kinds == EXPECTED_PREFLIGHT_EVIDENCE_KINDS
             && policy.execution_evidence_kinds == EXPECTED_EXECUTION_EVIDENCE_KINDS,
         "native producer policy is not the frozen fail-closed contract"
     );
     ensure!(
         SIGNATURE_VERIFIER_AVAILABLE
-            && !HOST_ATTESTATION_VERIFIER_AVAILABLE
+            && HOST_ATTESTATION_VERIFIER_AVAILABLE
             && !PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE
             && !NATIVE_RECEIPT_EMISSION_ALLOWED,
         "compiled verifier capabilities cannot silently enable native receipts"
@@ -396,6 +423,17 @@ fn derive_runner_registry_digest(matrix: &PlatformMatrix) -> Result<String> {
     });
     sha256_domain_canonical_json(RUNNER_REGISTRY_DIGEST_DOMAIN, &material)
         .context("serializing runner registry digest material")
+}
+
+fn derive_host_attestor_registry_digest(matrix: &PlatformMatrix) -> Result<String> {
+    let material = serde_json::json!({
+        "repositoryId": matrix.repository_id,
+        "sourceCommit": matrix.source_commit,
+        "epoch": matrix.host_attestor_registry_epoch,
+        "allowedHostAttestors": matrix.allowed_host_attestors,
+    });
+    sha256_domain_canonical_json(HOST_ATTESTOR_REGISTRY_DIGEST_DOMAIN, &material)
+        .context("serializing host-attestor registry digest material")
 }
 
 fn validate_receipt_policy(matrix: &PlatformMatrix) -> Result<()> {
@@ -821,12 +859,28 @@ pub fn validate_receipt_schema(
             && bool_at(schema, "/x-hartevo-policy/runnerSignatureRequired")? == Some(true)
             && bool_at(schema, "/x-hartevo-policy/actualHostAttestationRequired")? == Some(true)
             && bool_at(schema, "/x-hartevo-policy/signatureVerifierAvailable")? == Some(true)
-            && bool_at(schema, "/x-hartevo-policy/hostAttestationVerifierAvailable")?
-                == Some(false)
+            && bool_at(schema, "/x-hartevo-policy/hostAttestationVerifierAvailable")? == Some(true)
+            && bool_at(
+                schema,
+                "/x-hartevo-policy/trustedHostAttestorRegistryRequired"
+            )? == Some(true)
+            && bool_at(schema, "/x-hartevo-policy/hostAttestationSignatureRequired")? == Some(true)
             && string_at(schema, "/x-hartevo-policy/canonicalPayloadEncoding")?
                 == "hartevo_sorted_json/v1"
             && string_at(schema, "/x-hartevo-policy/signaturePayloadProjection")?
                 == "receipt_without_signature_and_runner_signature_evidence/v1"
+            && string_at(schema, "/x-hartevo-policy/hostAttestationPayloadProjection")?
+                == "envelope_without_signature_fields/v1"
+            && string_at(schema, "/x-hartevo-policy/hostAttestationPayloadDomain")?
+                == "hartevo-platform-host-attestation-signature/v1"
+            && string_at(
+                schema,
+                "/x-hartevo-policy/hostAttestationEnvelopeDigestDomain"
+            )? == "hartevo-platform-host-attestation-envelope-digest/v1"
+            && schema
+                .pointer("/x-hartevo-policy/maxHostAttestationAgeSeconds")
+                .and_then(Value::as_u64)
+                == Some(300)
             && string_at(schema, "/x-hartevo-policy/admissionTimeSource")? == "validator_clock_utc"
             && bool_at(
                 schema,
@@ -952,6 +1006,10 @@ fn validate_v2_schema_shape(schema: &Value) -> Result<()> {
             "evidenceQualifiers",
             "evidenceReference",
             "ed25519Signature",
+            "hostAttestationEnvelope",
+            "hostAttestationPayload",
+            "hostObservation",
+            "hostReceiptIdentity",
             "nativeEvidenceQualifiers",
             "productionBinding",
             "receiptSignature",
@@ -972,6 +1030,10 @@ fn validate_v2_schema_shape(schema: &Value) -> Result<()> {
         "evidenceArtifact",
         "evidenceQualifiers",
         "evidenceReference",
+        "hostAttestationEnvelope",
+        "hostAttestationPayload",
+        "hostObservation",
+        "hostReceiptIdentity",
         "productionBinding",
         "receiptSignature",
         "runnerBinding",
@@ -979,6 +1041,21 @@ fn validate_v2_schema_shape(schema: &Value) -> Result<()> {
     ] {
         validate_closed_definition(schema, definition)?;
     }
+    ensure!(
+        string_at(
+            schema,
+            "/$defs/hostAttestationPayload/properties/schemaVersion/const"
+        )? == HOST_ATTESTATION_PAYLOAD_SCHEMA_VERSION
+            && string_at(
+                schema,
+                "/$defs/hostAttestationEnvelope/properties/schemaVersion/const"
+            )? == HOST_ATTESTATION_ENVELOPE_SCHEMA_VERSION
+            && string_at(
+                schema,
+                "/$defs/hostAttestationEnvelope/properties/algorithm/const"
+            )? == "ed25519",
+        "signed host-attestation schema identity changed"
+    );
     let rules = schema
         .pointer("/allOf")
         .and_then(Value::as_array)
@@ -1154,7 +1231,7 @@ fn validate_receipt_at(
     validate_challenge(receipt, matrix, started_at, completed_at, admission_time)?;
     validate_artifact_graph(receipt, started_at, completed_at)?;
     validate_evidence_references(receipt, matrix)?;
-    validate_actual_host(receipt, target, matrix, started_at)?;
+    validate_actual_host(receipt, target, matrix, started_at, admission_time)?;
     validate_production_binding(receipt, case, matrix_validation)?;
     validate_receipt_common_safety(receipt)?;
     validate_status_semantics(receipt, case)?;
@@ -1477,6 +1554,7 @@ fn validate_actual_host(
     target: &PlatformTarget,
     matrix: &PlatformMatrix,
     started_at: DateTime<chrono::FixedOffset>,
+    admission_time: DateTime<chrono::FixedOffset>,
 ) -> Result<()> {
     let host = &receipt.actual_host;
     ensure!(
@@ -1485,15 +1563,39 @@ fn validate_actual_host(
     );
     validate_digest(&host.os_build_digest, "actualHost osBuildDigest")?;
     validate_digest(&host.host_identity_digest, "actualHost hostIdentityDigest")?;
+    validate_digest(
+        &host.virtualization_observation_digest,
+        "actualHost virtualizationObservationDigest",
+    )?;
     validate_digest(&host.attestation_digest, "actualHost attestationDigest")?;
+    validate_machine_token(&host.attestation_id, "actualHost attestationId")?;
     let observed_at = parse_utc_rfc3339(&host.observed_at, "actualHost observedAt")?;
-    let observation_age = started_at.signed_duration_since(observed_at).num_seconds();
+    let challenge_issued_at = parse_utc_rfc3339(
+        &receipt.challenge_binding.issued_at,
+        "challenge issuedAt for host attestation",
+    )?;
+    validate_host_attestation_freshness(
+        challenge_issued_at,
+        observed_at,
+        started_at,
+        admission_time,
+        matrix
+            .native_producer_policy
+            .max_host_attestation_age_seconds,
+    )?;
+    validate_host_attestation_payload_binding(
+        &host.attestation_envelope.payload,
+        &expected_host_attestation_payload(receipt),
+    )?;
     ensure!(
-        observation_age >= 0
-            && u64::try_from(observation_age).is_ok_and(|seconds| {
-                seconds <= matrix.native_producer_policy.max_challenge_age_seconds
-            }),
-        "host attestation is stale or postdates execution"
+        host.attestation_digest
+            == host_attestation_envelope_digest(
+                &matrix
+                    .native_producer_policy
+                    .host_attestation_envelope_digest_domain,
+                &host.attestation_envelope,
+            )?,
+        "actualHost attestationDigest does not cover the signed envelope"
     );
     validate_linked_evidence(
         receipt,
@@ -1501,7 +1603,280 @@ fn validate_actual_host(
         &host.attestation_digest,
         EvidenceReferenceKind::HostAttestation,
         "actualHost",
+    )?;
+    validate_host_attestor_authorization(receipt, matrix, observed_at, admission_time)
+}
+
+fn expected_host_attestation_payload(receipt: &PlatformReceipt) -> HostAttestationPayload {
+    HostAttestationPayload {
+        schema_version: HOST_ATTESTATION_PAYLOAD_SCHEMA_VERSION.to_owned(),
+        attestation_id: receipt.actual_host.attestation_id.clone(),
+        receipt: HostReceiptIdentity {
+            source_commit: receipt.source_commit.clone(),
+            matrix_digest: receipt.matrix_digest.clone(),
+            case_definition_digest: receipt.case_definition_digest.clone(),
+            receipt_id: receipt.receipt_id.clone(),
+            run_id: receipt.run_id.clone(),
+            attempt_ordinal: receipt.attempt_ordinal,
+            case_id: receipt.case_id.clone(),
+            target_id: receipt.target_id.clone(),
+            status: receipt.status,
+            receipt_kind: receipt.receipt_kind,
+        },
+        challenge: receipt.challenge_binding.clone(),
+        runner: receipt.runner_binding.clone(),
+        host: HostObservation {
+            host_identity_digest: receipt.actual_host.host_identity_digest.clone(),
+            os: receipt.actual_host.os,
+            arch: receipt.actual_host.arch,
+            os_build_digest: receipt.actual_host.os_build_digest.clone(),
+            virtualization: receipt.actual_host.virtualization,
+            virtualization_observation_digest: receipt
+                .actual_host
+                .virtualization_observation_digest
+                .clone(),
+            observed_at: receipt.actual_host.observed_at.clone(),
+        },
+    }
+}
+
+fn validate_host_attestation_payload_binding(
+    actual: &HostAttestationPayload,
+    expected: &HostAttestationPayload,
+) -> Result<()> {
+    ensure!(
+        actual == expected,
+        "host-attestation payload does not exactly bind receipt/challenge/runner/host fields"
+    );
+    Ok(())
+}
+
+fn validate_host_attestation_freshness(
+    challenge_issued_at: DateTime<chrono::FixedOffset>,
+    observed_at: DateTime<chrono::FixedOffset>,
+    started_at: DateTime<chrono::FixedOffset>,
+    admission_time: DateTime<chrono::FixedOffset>,
+    max_age_seconds: u64,
+) -> Result<()> {
+    let start_age = started_at.signed_duration_since(observed_at).num_seconds();
+    let admission_age = admission_time
+        .signed_duration_since(observed_at)
+        .num_seconds();
+    ensure!(
+        challenge_issued_at <= observed_at
+            && start_age >= 0
+            && admission_age >= 0
+            && u64::try_from(start_age).is_ok_and(|seconds| seconds <= max_age_seconds)
+            && u64::try_from(admission_age).is_ok_and(|seconds| seconds <= max_age_seconds),
+        "host attestation is stale or postdates execution"
+    );
+    Ok(())
+}
+
+fn validate_host_attestor_authorization(
+    receipt: &PlatformReceipt,
+    matrix: &PlatformMatrix,
+    observed_at: DateTime<chrono::FixedOffset>,
+    admission_time: DateTime<chrono::FixedOffset>,
+) -> Result<()> {
+    ensure!(
+        HOST_ATTESTATION_VERIFIER_AVAILABLE
+            && matrix
+                .native_producer_policy
+                .host_attestation_verifier_available,
+        "HOST_ATTESTATION_SIGNATURE_VERIFIER_NOT_IMPLEMENTED"
+    );
+    let envelope = &receipt.actual_host.attestation_envelope;
+    ensure!(
+        envelope.schema_version == HOST_ATTESTATION_ENVELOPE_SCHEMA_VERSION
+            && envelope.payload.schema_version == HOST_ATTESTATION_PAYLOAD_SCHEMA_VERSION
+            && envelope.registry_epoch > 0
+            && envelope.algorithm == SignatureAlgorithm::Ed25519,
+        "host-attestation envelope identity is invalid"
+    );
+    for (value, label) in [
+        (
+            &envelope.attestor_identity_digest,
+            "host-attestation attestor identity digest",
+        ),
+        (
+            &envelope.registry_digest,
+            "host-attestation registry digest",
+        ),
+        (&envelope.key_digest, "host-attestation key digest"),
+        (
+            &envelope.signed_payload_digest,
+            "host-attestation signed payload digest",
+        ),
+        (
+            &envelope.signature_digest,
+            "host-attestation signature digest",
+        ),
+    ] {
+        validate_digest(value, label)?;
+    }
+    let attestor = registered_host_attestor(matrix, &envelope.attestor_identity_digest)?;
+    ensure!(
+        envelope.registry_epoch == matrix.host_attestor_registry_epoch
+            && envelope.registry_digest == matrix.host_attestor_registry_digest,
+        "host-attestation registry epoch/digest mismatch"
+    );
+    validate_host_attestor_registration_shape(attestor, matrix)?;
+    ensure!(
+        envelope.algorithm == attestor.signature_algorithm
+            && envelope.key_digest == attestor.signing_key_digest
+            && envelope.registry_epoch == attestor.registry_epoch
+            && attestor
+                .allowed_receipt_kinds
+                .contains(&receipt.receipt_kind)
+            && attestor
+                .allowed_challenge_issuer_digests
+                .contains(&receipt.challenge_binding.issuer_digest)
+            && attestor
+                .allowed_runner_identity_digests
+                .contains(&receipt.runner_binding.runner_identity_digest),
+        "host-attestor registration does not authorize this receipt/challenge/runner"
+    );
+    let expected_host = AuthorizedHostBinding {
+        target_id: receipt.target_id.clone(),
+        host_identity_digest: receipt.actual_host.host_identity_digest.clone(),
+        os_build_digest: receipt.actual_host.os_build_digest.clone(),
+        virtualization: receipt.actual_host.virtualization,
+    };
+    validate_authorized_host_binding(attestor, &expected_host)?;
+    validate_host_attestor_registration_window(attestor, observed_at, admission_time)?;
+    verify_host_attestation_crypto(
+        envelope,
+        &attestor.verification_key_hex,
+        &matrix
+            .native_producer_policy
+            .host_attestation_payload_domain,
     )
+}
+
+fn registered_host_attestor<'a>(
+    matrix: &'a PlatformMatrix,
+    attestor_identity_digest: &str,
+) -> Result<&'a HostAttestorRegistration> {
+    ensure!(
+        !matrix.allowed_host_attestors.is_empty(),
+        "HOST_ATTESTOR_REGISTRY_EMPTY"
+    );
+    matrix
+        .allowed_host_attestors
+        .iter()
+        .find(|registration| registration.attestor_identity_digest == attestor_identity_digest)
+        .context("host attestor is unknown")
+}
+
+fn validate_authorized_host_binding(
+    attestor: &HostAttestorRegistration,
+    expected_host: &AuthorizedHostBinding,
+) -> Result<()> {
+    ensure!(
+        attestor.authorized_hosts.contains(expected_host),
+        "host identity, OS build, or virtualization drift is not authorized"
+    );
+    Ok(())
+}
+
+fn validate_host_attestor_registration_shape(
+    attestor: &HostAttestorRegistration,
+    matrix: &PlatformMatrix,
+) -> Result<()> {
+    for (value, label) in [
+        (
+            &attestor.attestor_identity_digest,
+            "host attestor identity digest",
+        ),
+        (&attestor.signing_key_digest, "host attestor key digest"),
+    ] {
+        validate_digest(value, label)?;
+    }
+    ensure!(
+        attestor.registry_epoch > 0
+            && attestor.signature_algorithm == SignatureAlgorithm::Ed25519
+            && verification_key_digest(&attestor.verification_key_hex)?
+                == attestor.signing_key_digest,
+        "host-attestor key registration is invalid"
+    );
+    ensure!(
+        !attestor.allowed_receipt_kinds.is_empty()
+            && attestor
+                .allowed_receipt_kinds
+                .windows(2)
+                .all(|window| window[0] < window[1]),
+        "host-attestor receipt-kind allowlist must be sorted and unique"
+    );
+    validate_sorted_unique_digests(
+        &attestor.allowed_challenge_issuer_digests,
+        "host-attestor challenge issuer allowlist",
+    )?;
+    validate_sorted_unique_digests(
+        &attestor.allowed_runner_identity_digests,
+        "host-attestor runner identity allowlist",
+    )?;
+    ensure!(
+        !attestor.allowed_challenge_issuer_digests.is_empty()
+            && !attestor.allowed_runner_identity_digests.is_empty()
+            && !attestor.authorized_hosts.is_empty()
+            && attestor
+                .authorized_hosts
+                .windows(2)
+                .all(|window| window[0] < window[1]),
+        "host-attestor authorization allowlists must be nonempty, sorted, and unique"
+    );
+    for host in &attestor.authorized_hosts {
+        validate_machine_token(&host.target_id, "authorized host targetId")?;
+        validate_digest(
+            &host.host_identity_digest,
+            "authorized host identity digest",
+        )?;
+        validate_digest(&host.os_build_digest, "authorized host OS build digest")?;
+        ensure!(
+            matrix
+                .targets
+                .iter()
+                .any(|target| target.id == host.target_id),
+            "authorized host references an unknown target"
+        );
+    }
+    let valid_from = parse_utc_rfc3339(&attestor.valid_from, "host attestor validFrom")?;
+    let valid_until = parse_utc_rfc3339(&attestor.valid_until, "host attestor validUntil")?;
+    ensure!(
+        valid_from < valid_until,
+        "host-attestor validity window is empty"
+    );
+    if let Some(revocation) = &attestor.revocation {
+        validate_blocker_code(&revocation.reason_code)?;
+        let revoked_at = parse_utc_rfc3339(&revocation.revoked_at, "host attestor revokedAt")?;
+        ensure!(
+            valid_from <= revoked_at && revoked_at < valid_until,
+            "host-attestor revocation is outside key validity"
+        );
+    }
+    Ok(())
+}
+
+fn validate_host_attestor_registration_window(
+    attestor: &HostAttestorRegistration,
+    observed_at: DateTime<chrono::FixedOffset>,
+    admission_time: DateTime<chrono::FixedOffset>,
+) -> Result<()> {
+    let valid_from = parse_utc_rfc3339(&attestor.valid_from, "host attestor validFrom")?;
+    let valid_until = parse_utc_rfc3339(&attestor.valid_until, "host attestor validUntil")?;
+    ensure!(
+        valid_from <= observed_at && observed_at < valid_until && admission_time < valid_until,
+        "host attestation is outside attestor key validity"
+    );
+    if let Some(revocation) = &attestor.revocation {
+        let revoked_at = parse_utc_rfc3339(&revocation.revoked_at, "host attestor revokedAt")?;
+        ensure!(
+            admission_time < revoked_at && observed_at < revoked_at,
+            "HOST_ATTESTOR_SIGNING_KEY_REVOKED"
+        );
+    }
+    Ok(())
 }
 
 fn validate_production_binding(
@@ -2151,18 +2526,24 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        EXPECTED_SOURCE_COMMIT, MATRIX_V2_SHA256, PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE,
-        RECEIPT_SCHEMA_V2_SHA256, SIGNATURE_VERIFIER_AVAILABLE, case_definition_digest,
+        EXPECTED_SOURCE_COMMIT, HOST_ATTESTATION_VERIFIER_AVAILABLE, MATRIX_V2_SHA256,
+        PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE, RECEIPT_SCHEMA_V2_SHA256,
+        SIGNATURE_VERIFIER_AVAILABLE, case_definition_digest, derive_host_attestor_registry_digest,
         derive_runner_registry_digest, parse_utc_rfc3339, project_detached_signature_payload,
-        validate_challenge_binding, validate_content_free_receipt_json, validate_matrix,
-        validate_matrix_raw, validate_native_admission, validate_receipt_schema,
-        validate_runner_registration_shape, validate_runner_registration_window,
-        validate_v2_schema_shape,
+        registered_host_attestor, validate_authorized_host_binding, validate_challenge_binding,
+        validate_content_free_receipt_json, validate_host_attestation_freshness,
+        validate_host_attestation_payload_binding, validate_host_attestor_registration_shape,
+        validate_host_attestor_registration_window, validate_matrix, validate_matrix_raw,
+        validate_native_admission, validate_receipt_schema, validate_runner_registration_shape,
+        validate_runner_registration_window, validate_v2_schema_shape,
     };
     use crate::digest::{domain_canonical_json_bytes, sha256_hex};
+    use crate::host_attestation::HOST_ATTESTATION_PAYLOAD_SCHEMA_VERSION;
     use crate::model::{
-        ChallengeBinding, PlatformMatrix, PlatformStatus, ReceiptKind, RunnerRegistration,
-        RunnerRevocation, SignatureAlgorithm, parse_strict_json,
+        Architecture, AuthorizedHostBinding, ChallengeBinding, HostAttestationPayload,
+        HostAttestorRegistration, HostObservation, HostReceiptIdentity, OperatingSystem,
+        PlatformMatrix, PlatformStatus, ReceiptKind, RunnerBinding, RunnerRegistration,
+        RunnerRevocation, SignatureAlgorithm, VirtualizationKind, parse_strict_json,
     };
     use crate::signature::verification_key_digest;
 
@@ -2200,6 +2581,76 @@ mod tests {
         }
     }
 
+    fn host_attestor_registration() -> HostAttestorRegistration {
+        let signer = Ed25519KeyPair::from_seed_unchecked(&[59; 32]).expect("fixed host signer");
+        let verification_key_hex = hex::encode(signer.public_key().as_ref());
+        HostAttestorRegistration {
+            attestor_identity_digest: "10".repeat(32),
+            registry_epoch: 1,
+            signing_key_digest: verification_key_digest(&verification_key_hex)
+                .expect("verification key digest"),
+            verification_key_hex,
+            signature_algorithm: SignatureAlgorithm::Ed25519,
+            valid_from: "2026-08-13T00:00:00Z".to_owned(),
+            valid_until: "2026-08-13T01:00:00Z".to_owned(),
+            allowed_receipt_kinds: vec![ReceiptKind::NativePreflight],
+            allowed_challenge_issuer_digests: vec!["44".repeat(32)],
+            allowed_runner_identity_digests: vec!["11".repeat(32)],
+            authorized_hosts: vec![AuthorizedHostBinding {
+                target_id: "macos-aarch64".to_owned(),
+                host_identity_digest: "33".repeat(32),
+                os_build_digest: "55".repeat(32),
+                virtualization: VirtualizationKind::Physical,
+            }],
+            revocation: None,
+        }
+    }
+
+    fn host_attestation_payload() -> HostAttestationPayload {
+        HostAttestationPayload {
+            schema_version: HOST_ATTESTATION_PAYLOAD_SCHEMA_VERSION.to_owned(),
+            attestation_id: "attestation_01".to_owned(),
+            receipt: HostReceiptIdentity {
+                source_commit: EXPECTED_SOURCE_COMMIT.to_owned(),
+                matrix_digest: "22".repeat(32),
+                case_definition_digest: "23".repeat(32),
+                receipt_id: "receipt_01".to_owned(),
+                run_id: "run_01".to_owned(),
+                attempt_ordinal: 1,
+                case_id: "I-01.macos-aarch64.browser.pipe_platform_default".to_owned(),
+                target_id: "macos-aarch64".to_owned(),
+                status: PlatformStatus::BlockedEnv,
+                receipt_kind: ReceiptKind::NativePreflight,
+            },
+            challenge: ChallengeBinding {
+                challenge_id: "challenge_01".to_owned(),
+                nonce_hex: "31".repeat(32),
+                nonce_digest: "32".repeat(32),
+                issuer_digest: "44".repeat(32),
+                issued_at: "2026-08-13T00:00:00Z".to_owned(),
+                expires_at: "2026-08-13T00:05:00Z".to_owned(),
+            },
+            runner: RunnerBinding {
+                runner_id: "runner_01".to_owned(),
+                runner_identity_digest: "11".repeat(32),
+                registry_digest: "34".repeat(32),
+                registry_epoch: 1,
+                signing_key_digest: "35".repeat(32),
+                signature_algorithm: SignatureAlgorithm::Ed25519,
+                producer_binary_digest: "36".repeat(32),
+            },
+            host: HostObservation {
+                host_identity_digest: "33".repeat(32),
+                os: OperatingSystem::Macos,
+                arch: Architecture::Aarch64,
+                os_build_digest: "55".repeat(32),
+                virtualization: VirtualizationKind::Physical,
+                virtualization_observation_digest: "56".repeat(32),
+                observed_at: "2026-08-13T00:01:00Z".to_owned(),
+            },
+        }
+    }
+
     #[test]
     fn committed_contracts_validate_as_zero_pass_inventory() {
         let matrix = matrix();
@@ -2210,10 +2661,18 @@ mod tests {
         assert_eq!(matrix.source_commit, EXPECTED_SOURCE_COMMIT);
         assert_eq!(matrix.allowed_runners.len(), 0);
         assert_eq!(matrix.runner_registry_epoch, 0);
+        assert_eq!(matrix.allowed_host_attestors.len(), 0);
+        assert_eq!(matrix.host_attestor_registry_epoch, 0);
         assert_eq!(matrix.native_receipt_count, 0);
         assert_eq!(matrix.readiness_blockers.len(), 3);
         assert!(SIGNATURE_VERIFIER_AVAILABLE);
+        assert!(HOST_ATTESTATION_VERIFIER_AVAILABLE);
         assert!(matrix.native_producer_policy.signature_verifier_available);
+        assert!(
+            matrix
+                .native_producer_policy
+                .host_attestation_verifier_available
+        );
         assert!(!PERSISTENT_NONCE_REPLAY_GUARD_AVAILABLE);
         assert!(
             !matrix
@@ -2291,6 +2750,15 @@ mod tests {
         projection["x-hartevo-policy"]["signaturePayloadProjection"] = json!("caller_selected/v1");
         mutations.push(("signature payload projection", projection));
 
+        let mut host_signature = baseline.clone();
+        host_signature["$defs"]["hostAttestationEnvelope"]["required"] = json!([]);
+        mutations.push(("host-attestation signature envelope", host_signature));
+
+        let mut host_projection = baseline.clone();
+        host_projection["x-hartevo-policy"]["hostAttestationPayloadProjection"] =
+            json!("caller_selected/v1");
+        mutations.push(("host-attestation payload projection", host_projection));
+
         let mut root_closure = baseline;
         root_closure["additionalProperties"] = json!(true);
         mutations.push(("root closure", root_closure));
@@ -2318,6 +2786,11 @@ mod tests {
         status["properties"]["status"]["enum"] = json!(["PASS"]);
         validate_v2_schema_shape(&status).expect_err("status enum drift must fail");
 
+        let mut host_definition = baseline.clone();
+        host_definition["$defs"]["hostAttestationPayload"]["additionalProperties"] = json!(true);
+        validate_v2_schema_shape(&host_definition)
+            .expect_err("host-attestation payload closure drift must fail");
+
         let mut definition = baseline;
         definition["$defs"]["actualHost"]["additionalProperties"] = json!(true);
         validate_v2_schema_shape(&definition).expect_err("definition closure drift must fail");
@@ -2337,7 +2810,8 @@ mod tests {
     #[test]
     fn worktree_only_source_binding_cannot_satisfy_source_commit() {
         let mut matrix = matrix();
-        let worktree_only = "hartevo-rs/eval/examples/hartevo-platform-native-receipt/signature.rs";
+        let worktree_only =
+            "hartevo-rs/eval/examples/hartevo-platform-native-receipt/host_attestation.rs";
         assert!(repository_root().join(worktree_only).is_file());
         matrix.cases[0].source_bindings[0].path = worktree_only.to_owned();
         matrix.cases[0].source_bindings[0].mode = "100644".to_owned();
@@ -2488,6 +2962,120 @@ mod tests {
     }
 
     #[test]
+    fn host_attestor_registry_is_empty_and_digest_covers_authority_drift() {
+        let baseline = matrix();
+        let error = registered_host_attestor(&baseline, &"10".repeat(32))
+            .expect_err("empty host-attestor registry must deny all");
+        assert_eq!(error.to_string(), "HOST_ATTESTOR_REGISTRY_EMPTY");
+
+        let mut configured = baseline;
+        configured.host_attestor_registry_epoch = 1;
+        configured
+            .allowed_host_attestors
+            .push(host_attestor_registration());
+        let active = derive_host_attestor_registry_digest(&configured)
+            .expect("active host-attestor registry digest");
+
+        configured.allowed_host_attestors[0].authorized_hosts[0].os_build_digest = "57".repeat(32);
+        let build_drift =
+            derive_host_attestor_registry_digest(&configured).expect("build-drift registry digest");
+        assert_ne!(active, build_drift);
+
+        configured.allowed_host_attestors[0].revocation = Some(RunnerRevocation {
+            revoked_at: "2026-08-13T00:30:00Z".to_owned(),
+            reason_code: "HOST_ATTESTOR_KEY_RETIRED".to_owned(),
+        });
+        let revoked = derive_host_attestor_registry_digest(&configured)
+            .expect("revoked host-attestor registry digest");
+        assert_ne!(build_drift, revoked);
+    }
+
+    #[test]
+    fn host_authorization_rejects_identity_build_and_virtualization_drift() {
+        let matrix = matrix();
+        let attestor = host_attestor_registration();
+        validate_host_attestor_registration_shape(&attestor, &matrix)
+            .expect("valid host-attestor registration");
+        let expected = attestor.authorized_hosts[0].clone();
+        validate_authorized_host_binding(&attestor, &expected).expect("authorized host");
+
+        for drift in ["identity", "build", "virtualization"] {
+            let mut changed = expected.clone();
+            match drift {
+                "identity" => changed.host_identity_digest = "58".repeat(32),
+                "build" => changed.os_build_digest = "59".repeat(32),
+                "virtualization" => {
+                    changed.virtualization = VirtualizationKind::VirtualMachine;
+                }
+                _ => unreachable!(),
+            }
+            validate_authorized_host_binding(&attestor, &changed)
+                .expect_err("host authorization drift must fail");
+        }
+    }
+
+    #[test]
+    fn host_attestation_freshness_and_key_revocation_fail_closed() {
+        let issued = parse_utc_rfc3339("2026-08-13T00:00:00Z", "issued").expect("issued");
+        let observed = parse_utc_rfc3339("2026-08-13T00:01:00Z", "observed").expect("observed");
+        let started = parse_utc_rfc3339("2026-08-13T00:02:00Z", "started").expect("started");
+        let admission = parse_utc_rfc3339("2026-08-13T00:03:00Z", "admission").expect("admission");
+        validate_host_attestation_freshness(issued, observed, started, admission, 300)
+            .expect("fresh observation");
+
+        let stale = parse_utc_rfc3339("2026-08-13T00:06:01Z", "stale").expect("stale");
+        validate_host_attestation_freshness(issued, observed, started, stale, 300)
+            .expect_err("stale host attestation must fail");
+        let pre_challenge =
+            parse_utc_rfc3339("2026-08-12T23:59:59Z", "observed").expect("observed");
+        validate_host_attestation_freshness(issued, pre_challenge, started, admission, 300)
+            .expect_err("prechallenge host observation must fail");
+
+        let mut revoked = host_attestor_registration();
+        revoked.revocation = Some(RunnerRevocation {
+            revoked_at: "2026-08-13T00:02:30Z".to_owned(),
+            reason_code: "HOST_ATTESTOR_KEY_COMPROMISED".to_owned(),
+        });
+        validate_host_attestor_registration_shape(&revoked, &matrix())
+            .expect("typed host-attestor revocation");
+        let error = validate_host_attestor_registration_window(&revoked, observed, admission)
+            .expect_err("revoked host-attestor key must fail admission");
+        assert_eq!(error.to_string(), "HOST_ATTESTOR_SIGNING_KEY_REVOKED");
+    }
+
+    #[test]
+    fn host_attestation_payload_rejects_partially_signed_outer_fields() {
+        let expected = host_attestation_payload();
+        validate_host_attestation_payload_binding(&expected, &expected)
+            .expect("exact host payload binding");
+        for drift in [
+            "receipt",
+            "challenge",
+            "runner",
+            "host",
+            "build",
+            "virtualization_observation",
+            "observed_at",
+        ] {
+            let mut changed = expected.clone();
+            match drift {
+                "receipt" => changed.receipt.receipt_id = "receipt_02".to_owned(),
+                "challenge" => changed.challenge.challenge_id = "challenge_02".to_owned(),
+                "runner" => changed.runner.runner_identity_digest = "60".repeat(32),
+                "host" => changed.host.host_identity_digest = "61".repeat(32),
+                "build" => changed.host.os_build_digest = "62".repeat(32),
+                "virtualization_observation" => {
+                    changed.host.virtualization_observation_digest = "63".repeat(32);
+                }
+                "observed_at" => changed.host.observed_at = "2026-08-13T00:01:01Z".to_owned(),
+                _ => unreachable!(),
+            }
+            validate_host_attestation_payload_binding(&changed, &expected)
+                .expect_err("outer field not covered by the signed payload must fail");
+        }
+    }
+
+    #[test]
     fn canonical_projection_excludes_only_detached_signature_evidence() {
         let receipt = json!({
             "receiptId": "receipt_01",
@@ -2593,14 +3181,34 @@ mod tests {
 
         let mut host = matrix();
         host.native_producer_policy
-            .host_attestation_verifier_available = true;
+            .host_attestation_verifier_available = false;
         validate_matrix(&host, &repository_root())
-            .expect_err("host verification cannot be self-reported");
+            .expect_err("compiled host verification cannot be disabled by contract drift");
+
+        let mut host_domain = matrix();
+        host_domain
+            .native_producer_policy
+            .host_attestation_payload_domain
+            .push_str("-caller-selected");
+        validate_matrix(&host_domain, &repository_root())
+            .expect_err("host-attestation signature domain cannot drift");
+
+        let mut host_freshness = matrix();
+        host_freshness
+            .native_producer_policy
+            .max_host_attestation_age_seconds = 3_600;
+        validate_matrix(&host_freshness, &repository_root())
+            .expect_err("host-attestation freshness cannot be widened by contract drift");
 
         let mut registry = matrix();
         registry.runner_registry_digest = "cc".repeat(32);
         validate_matrix(&registry, &repository_root())
             .expect_err("registry digest drift must fail closed");
+
+        let mut host_registry = matrix();
+        host_registry.host_attestor_registry_digest = "dd".repeat(32);
+        validate_matrix(&host_registry, &repository_root())
+            .expect_err("host-attestor registry digest drift must fail closed");
     }
 
     #[test]

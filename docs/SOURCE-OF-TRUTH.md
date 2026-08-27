@@ -8,6 +8,7 @@
 | --- | --- |
 | 产品为谁服务、解决什么问题 | `/PRODUCT.md` |
 | 新 Mac 怎样准备环境、克隆仓库和完成首个 Bootstrap PR | `/DEVELOPMENT.md` |
+| 下一轮 bounded merge-train 与 Cordis/Rust 插件宿主合同 | `/docs/BUILD.md`（Target Contract，不是实现证明） |
 | 为什么采用 Rust/OpenInterpreter、产品线怎样启动 | `/docs/product/HARTEVO-DESKTOP-RUST-OPENINTERPRETER-RFC.md` |
 | Hermes 的哪些能力需要用 Rust 重构、哪些不能照搬 | `/docs/research/HERMES-AGENT-V0.20-RUST-CAPABILITY-INTAKE.md` |
 | PenguinHarness 的哪些 Harness/Eval 机制需要重构 | `/docs/research/PENGUIN-HARNESS-RUST-CAPABILITY-INTAKE.md` 与 `/docs/quality/HARTEVO-HARNESS-ENGINEERING-ROADMAP.md` |
@@ -50,6 +51,7 @@
 
 - 产品层级、默认导航、自然语言入口、外部动作边界或数据所有权变化，必须同时更新交互规格、架构和相应 Eval。
 - 上游 OpenInterpreter 基线变化，必须更新 RFC，记录 release、commit、license、App Server schema digest、Harness 行为和迁移影响。
+- Cordis 插件宿主、typed event dispatch、loader overlay 或 bounded merge-train 合同变化，必须更新 [`BUILD.md`](./BUILD.md)；该文件是 Target Contract，不得把其中的 `### PR N:` 标题写成已经落地的实现。
 - 引入新的 Hermes-inspired 能力时，必须先更新 Hermes 能力引入清单，记录固定版本、Rust owner、与 OpenInterpreter 的重叠、许可证路径和 Hartevo Eval 场景。
 - 引入新的 PenguinHarness-inspired 机制时，必须固定来源版本，并证明它没有创建第二 Agent Loop、第二 wire protocol、模型自评分或可改写 Gate 的自我优化通道。
 - 引入新的 Ego Lite-inspired 机制时，必须固定公开代码 commit，区分 MIT helper 与闭源浏览器边界，并证明 Profile、Cookie、Browser Workspace、控制租约和外部 Effect 不会跨 Project 或绕过审批。
@@ -99,7 +101,7 @@
     {"claimId": "DMT-DESKTOP-EXECUTION-PAINT-01", "value": true},
     {"claimId": "DMT-DESKTOP-SUBSCRIPTION-API-01", "value": true},
     {"claimId": "DMT-DESKTOP-SUBSCRIPTION-CALLER-01", "value": true},
-    {"claimId": "DMT-DESKTOP-VM11-EIGHTH-CALLER-01", "value": false}
+    {"claimId": "DMT-DESKTOP-VM11-EIGHTH-CALLER-01", "value": true}
   ]
 }
 ```
