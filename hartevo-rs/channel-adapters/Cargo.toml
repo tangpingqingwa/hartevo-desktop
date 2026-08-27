@@ -1,6 +1,6 @@
 [package]
 name = "hartevo-channel-adapters"
-description = "YouTube read-only channel contracts and provider boundary"
+description = "TikTok authenticated read plugin contracts and provider boundary"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
