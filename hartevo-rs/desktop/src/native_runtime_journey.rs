@@ -1374,6 +1374,9 @@ fn native_submission_error(error: &DesktopDataError) -> NativeJourneyError {
         | DesktopDataError::InvalidCreatorDeliverableReview
         | DesktopDataError::CreatorDeliverableReviewUnavailable
         | DesktopDataError::CreatorDeliverableReviewStale
+        | DesktopDataError::InvalidConversationOpen
+        | DesktopDataError::ConversationOpenUnavailable
+        | DesktopDataError::ConversationAlreadyOpen
         | DesktopDataError::EmptyProjectName
         | DesktopDataError::InvalidRecoveryKey
         | DesktopDataError::ProjectNotFound(_)

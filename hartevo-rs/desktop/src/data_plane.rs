@@ -22,10 +22,10 @@ use hartevo_application::{
     MissionCheckpointDispatchState, MissionRuntimeProjection, ObserveContextRuntimeTurn,
     PrepareLocalMissionRuntimeContext, ProjectContextMaterialSession, ProjectEncryptionReadiness,
     ProvisionProjectEncryption, RecoverContextWorkerRuntime, RecoverPersonalProjectDevice,
-    ResearchPacket, ResolveVm11NextContractOrValidTerminal, RespondContextRuntimeLocalApproval,
-    RetryContextWorkerRuntime, ReviewCreatorDeliverable, RuntimeTextSubscriptionBatch,
-    RuntimeTextSubscriptionCursor, RuntimeTurnDispatchDisposition, StartCatalogMission,
-    StartMission, Vm11NextContractOrValidTerminalResult,
+    RelationshipConversationProjection, ResearchPacket, ResolveVm11NextContractOrValidTerminal,
+    RespondContextRuntimeLocalApproval, RetryContextWorkerRuntime, ReviewCreatorDeliverable,
+    RuntimeTextSubscriptionBatch, RuntimeTextSubscriptionCursor, RuntimeTurnDispatchDisposition,
+    StartCatalogMission, StartMission, Vm11NextContractOrValidTerminalResult,
 };
 use hartevo_browser_adapter::{
     BrowserControlHost, BrowserControlState, BrowserError, BrowserWorkspace,
@@ -36,14 +36,16 @@ use hartevo_catalog::{
 use hartevo_context_fabric::{ConservativeByteBudgetTokenizer, ContextAssemblyStatus};
 use hartevo_cordis::{AgentStep, AgentStepResult, CordisError, CordisHost};
 use hartevo_domain_kernel::{
-    AcceptanceCheck, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
-    BrowserWorkspaceId, ConsentRecord, ConsentState, ConsentStatus, CreatorTaskId, CurrencyCode,
-    DeliverableId, DeviceId, EffectClass, EffectId, KeyManagementError, KeyRecipient, KpiContract,
-    MissionCheckpointCompletionPolicy, MissionCheckpointExecutor, MissionConversationMessageId,
-    MissionConversationMessageKind, MissionConversationRole, MissionId, MissionStage, Money,
-    OperatingMode, OutcomeDecision, ProjectEncryptionMode, ProjectId, ProjectKeyring,
-    ReviewDecision, ReviewId, RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId,
-    RuntimeTurnStatus, StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
+    AcceptanceCheck, AccountId, ActorId, Approval, ApprovalDecision, BrowserControlLeaseId,
+    BrowserWorkspaceId, CompanyId, ConnectionId, ConsentRecord, ConsentState, ConsentStatus,
+    ContactChannel, Conversation, ConversationId, CreatorTaskId, CurrencyCode, DeliverableId,
+    DeviceId, EffectClass, EffectId, KeyManagementError, KeyRecipient, KpiContract,
+    MessagingGateway, MissionCheckpointCompletionPolicy, MissionCheckpointExecutor,
+    MissionConversationMessageId, MissionConversationMessageKind, MissionConversationRole,
+    MissionId, MissionStage, Money, OperatingMode, OutcomeDecision, PersonId,
+    ProjectEncryptionMode, ProjectId, ProjectKeyring, ReviewDecision, ReviewId,
+    RuntimeRecoveryStatus, RuntimeResumeStrategy, RuntimeTurnAttemptId, RuntimeTurnStatus,
+    StorageMode, TaskId, TenantId, WorkProductId, WorkerHandleStatus,
 };
 use hartevo_effect_broker::{EffectBroker, EffectPolicy, EffectRateLimit};
 use hartevo_runtime_adapter::{MappedTurnEventKind, RuntimeCommand, RuntimeLocalApprovalKind};
@@ -550,6 +552,24 @@ pub struct DesktopContinueBrowserWorkspaceRequest {
     pub workspace_id: BrowserWorkspaceId,
     pub expected_revision: u64,
     pub expected_generation: u64,
+}
+
+/// Window Open Conversation for one Mission-bound CRM identity. Person,
+/// Connection, gateway, and route digest must come from SQLCipher; Desktop
+/// never invents a Conversation or treats Open as Effect or Verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopOpenConversationRequest {
+    pub project_id: ProjectId,
+    pub mission_id: MissionId,
+    pub person_id: PersonId,
+    pub company_id: Option<CompanyId>,
+    pub connection_id: ConnectionId,
+    pub account_id: AccountId,
+    pub provider: String,
+    pub gateway: MessagingGateway,
+    pub contact_channel: ContactChannel,
+    pub market: String,
+    pub route_digest: String,
 }
 
 /// Window Review of one exact uploaded Creator Deliverable. Decision is a typed
@@ -1892,6 +1912,116 @@ impl DesktopDataPlane {
             },
             now,
         )?;
+        let product_evidence = load_product_evidence(now)?;
+        self.build_snapshot(
+            &service,
+            secret_store,
+            runtime_reconciliation,
+            product_evidence,
+            now,
+        )
+    }
+
+    /// Opens one Mission-bound CRM Conversation through Application
+    /// `open_conversation`. Missing Person/Connection identity fails closed.
+    /// Open Conversation itself never mints Effect or Verification.
+    pub fn open_conversation_os(
+        &self,
+        request: DesktopOpenConversationRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        let secret_store = OsSecretStore::new(OS_SECRET_SERVICE)?;
+        self.open_conversation_with(&secret_store, request, now)
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "window hops own the exact request fence; Continue/Review keep the same by-value Application boundary"
+    )]
+    pub fn open_conversation_with(
+        &self,
+        secret_store: &impl SecretStore,
+        request: DesktopOpenConversationRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DesktopSnapshot, DesktopDataError> {
+        if request.person_id.as_str().trim().is_empty()
+            || request.connection_id.as_str().trim().is_empty()
+            || request.account_id.as_str().trim().is_empty()
+            || request.provider.trim().is_empty()
+            || request.market.trim().is_empty()
+            || !request.gateway.supports_provider(&request.provider)
+        {
+            return Err(DesktopDataError::InvalidConversationOpen);
+        }
+        let project_id = request.project_id.clone();
+        let (mut service, runtime_reconciliation, _context_session) =
+            self.open_ready_runtime_project(secret_store, &project_id, now)?;
+        let live = service
+            .projection(
+                &project_id,
+                &request.mission_id,
+                hartevo_application::WorkSurface::Orchestrator,
+            )
+            .map_err(|_| DesktopDataError::ConversationOpenUnavailable)?
+            .relationship_conversation
+            .ok_or(DesktopDataError::ConversationOpenUnavailable)?;
+        if live.conversation_id.is_some() {
+            return Err(DesktopDataError::ConversationAlreadyOpen);
+        }
+        if live.person_id != request.person_id
+            || live.company_id != request.company_id
+            || live.connection_id != request.connection_id
+            || live.account_id != request.account_id
+            || live.provider != request.provider
+            || live.gateway != request.gateway
+            || live.contact_channel != request.contact_channel
+            || live.market != request.market
+        {
+            return Err(DesktopDataError::InvalidConversationOpen);
+        }
+        let person = service
+            .load_person(&project_id, &request.person_id)
+            .map_err(|_| DesktopDataError::ConversationOpenUnavailable)?;
+        if person.project_id != project_id
+            || person.id != request.person_id
+            || person.company_id != request.company_id
+        {
+            return Err(DesktopDataError::InvalidConversationOpen);
+        }
+        let connection = service
+            .load_connection(&project_id, &request.connection_id)
+            .map_err(|_| DesktopDataError::ConversationOpenUnavailable)?;
+        if connection.tenant_id() != &person.tenant_id
+            || connection.project_id() != &project_id
+            || connection.id() != &request.connection_id
+            || connection.provider() != request.provider
+            || connection.account_id() != &request.account_id
+            || !connection.is_connected(now)
+        {
+            return Err(DesktopDataError::InvalidConversationOpen);
+        }
+        let route_digest = open_conversation_route_digest(&live, now);
+        if !request.route_digest.is_empty() && request.route_digest != route_digest {
+            return Err(DesktopDataError::InvalidConversationOpen);
+        }
+        let conversation = Conversation::open(
+            ConversationId::new(),
+            person.tenant_id.clone(),
+            project_id.clone(),
+            Some(request.mission_id.clone()),
+            request.person_id.clone(),
+            request.company_id.clone(),
+            request.gateway.clone(),
+            request.provider.clone(),
+            request.connection_id.clone(),
+            request.account_id.clone(),
+            route_digest,
+            request.contact_channel.clone(),
+            request.market.clone(),
+            now,
+        )
+        .map_err(ApplicationError::from)?;
+        service.open_conversation(conversation, now)?;
         let product_evidence = load_product_evidence(now)?;
         self.build_snapshot(
             &service,
@@ -3576,6 +3706,30 @@ impl BrowserControlHost for DesktopBrowserControlHost {
     }
 }
 
+fn open_conversation_route_digest(
+    live: &RelationshipConversationProjection,
+    now: DateTime<Utc>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"desktop.conversation.open\0");
+    hasher.update(live.person_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(live.connection_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(live.account_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(live.provider.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:?}", live.gateway).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:?}", live.contact_channel).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(live.market.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(now.to_rfc3339().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn continue_browser_workspace_evidence_digest(
     workspace: &BrowserWorkspace,
     now: DateTime<Utc>,
@@ -3841,6 +3995,16 @@ pub enum DesktopDataError {
         "Creator Deliverable Review must match the current task CAS revision; stale Review was not written"
     )]
     CreatorDeliverableReviewStale,
+    #[error(
+        "Open Conversation requires the exact live Project, Mission, Person, Connection, gateway, market, and route digest"
+    )]
+    InvalidConversationOpen,
+    #[error("no live Mission-bound Person/Connection identity is ready for Open Conversation")]
+    ConversationOpenUnavailable,
+    #[error(
+        "the Mission already has an opened CRM Conversation; Open Conversation does not mint another"
+    )]
+    ConversationAlreadyOpen,
     #[error("project name cannot be empty")]
     EmptyProjectName,
     #[error("recovery key must be exactly 32 bytes encoded as 64 hexadecimal characters")]
@@ -3895,18 +4059,18 @@ mod tests {
     use hartevo_browser_adapter::FakeBrowserHost;
     use hartevo_domain_kernel::{
         AccountId, ActorId, ApprovalDecision, BrowserControlLeaseId, BrowserProfileId,
-        BrowserTabId, BrowserWorkspaceId, Connection, ConnectionId, ConnectionProbe,
-        ConsentPurpose, ConsentRecordId, ConsentRequirement, ConsentState, ContactChannel,
-        ContextBranchStatus, ContextCapsuleStatus, CreatorApplicationId, CreatorDeliverableInput,
-        CreatorEligibility, CreatorHiringAward, CreatorHiringId, CreatorId, CreatorMilestoneId,
-        CreatorMilestoneSpec, CreatorTaskId, CreatorTaskSpec, DeliverableAssessment, DeliverableId,
-        EffectId, EffectStatus, EvidenceId, ExternalIdentity, FundingReservation, IdentityLink,
-        IdentityLinkId, IdentitySubject, KeyRecipient, KpiDirection, LegalBasis,
-        MissionCheckpointExecutor, MissionScheduleStatus, MissionStage, OrderId, OutcomeDecision,
-        OutcomeEvent, OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification,
-        OutcomeVerificationMethod, PartnerId, Person, PersonId, ProbeOutcome,
-        ProjectEncryptionMode, RightsAttestation, StorageMode, TaskId, TaskStatus, UsageRights,
-        WorkProductId, WorkerLeaseStatus,
+        BrowserTabId, BrowserWorkspaceId, Company, CompanyId, Connection, ConnectionId,
+        ConnectionProbe, ConsentPurpose, ConsentRecordId, ConsentRequirement, ConsentState,
+        ContactChannel, ContextBranchStatus, ContextCapsuleStatus, ConversationState,
+        CreatorApplicationId, CreatorDeliverableInput, CreatorEligibility, CreatorHiringAward,
+        CreatorHiringId, CreatorId, CreatorMilestoneId, CreatorMilestoneSpec, CreatorTaskId,
+        CreatorTaskSpec, DeliverableAssessment, DeliverableId, EffectId, EffectStatus, EvidenceId,
+        ExternalIdentity, FundingReservation, IdentityLink, IdentityLinkId, IdentitySubject,
+        KeyRecipient, KpiDirection, LegalBasis, MessagingGateway, MissionCheckpointExecutor,
+        MissionScheduleStatus, MissionStage, OrderId, OutcomeDecision, OutcomeEvent,
+        OutcomeEventId, OutcomeEventKind, OutcomeSourceVerification, OutcomeVerificationMethod,
+        PartnerId, Person, PersonId, ProbeOutcome, ProjectEncryptionMode, RightsAttestation,
+        StorageMode, TaskId, TaskStatus, UsageRights, WorkProductId, WorkerLeaseStatus,
     };
     use hartevo_effect_broker::EffectBroker;
     use hartevo_storage::MemorySecretStore;
@@ -10386,6 +10550,298 @@ sleep 30"#;
         );
         assert!(durable.payouts.is_empty());
         assert!(durable.payout_authorizations.is_empty());
+        let mission = service
+            .load_mission(&project_id, &fixture.mission_id)
+            .expect("durable Mission");
+        assert!(mission.effects.is_empty());
+    }
+
+    struct WindowOpenConversationFixture {
+        mission_id: MissionId,
+        person_id: PersonId,
+        company_id: CompanyId,
+        connection_id: ConnectionId,
+        account_id: AccountId,
+        provider: String,
+        market: String,
+    }
+
+    fn persist_openable_conversation_identity(
+        plane: &DesktopDataPlane,
+        secrets: &MemorySecretStore,
+        project_id: &ProjectId,
+        now: DateTime<Utc>,
+    ) -> WindowOpenConversationFixture {
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (mut service, _) = plane
+            .open_application_from_secret(&database_secret, now)
+            .expect("application");
+        let inventory = service.desktop_inventory().expect("inventory");
+        let project = inventory
+            .projects
+            .iter()
+            .find(|project| &project.project_id == project_id)
+            .expect("ready project");
+        let tenant_id = project.tenant_id.clone();
+        let mission_id = MissionId::from("mission-desktop-open-conversation");
+        let person_id = PersonId::from("person-desktop-open-conversation");
+        let company_id = CompanyId::from("company-desktop-open-conversation");
+        let connection_id = ConnectionId::from("connection-desktop-open-conversation");
+        let account_id = AccountId::from("gmail-account-desktop-open");
+        service
+            .start_relationship_mission(
+                StartRelationshipMission {
+                    id: mission_id.clone(),
+                    project_id: project_id.clone(),
+                    task_id: TaskId::from("task-desktop-open-conversation"),
+                    title: "Window Open Conversation".into(),
+                    goal: "Open one live CRM Conversation without Effect".into(),
+                },
+                now,
+            )
+            .expect("relationship Mission");
+        service
+            .create_company(
+                Company::create(
+                    company_id.clone(),
+                    tenant_id.clone(),
+                    project_id.clone(),
+                    "Desktop Open Studio",
+                    "DE",
+                )
+                .expect("company"),
+                now,
+            )
+            .expect("persist company");
+        service
+            .create_person(
+                Person::create(
+                    person_id.clone(),
+                    tenant_id.clone(),
+                    project_id.clone(),
+                    "Opted-in contact",
+                    Some(company_id.clone()),
+                    vec![],
+                )
+                .expect("person"),
+                now,
+            )
+            .expect("persist person");
+        service
+            .register_connection(
+                Connection::register(
+                    connection_id.clone(),
+                    tenant_id,
+                    project_id.clone(),
+                    "gmail",
+                    account_id.clone(),
+                    "opted-in@example.invalid",
+                    ["messages.send".into()],
+                    now,
+                )
+                .expect("connection"),
+                now,
+            )
+            .expect("persist connection");
+        service
+            .record_connection_probe(
+                project_id,
+                &connection_id,
+                ConnectionProbe {
+                    outcome: ProbeOutcome::Successful,
+                    observed_external_account_id: "opted-in@example.invalid".into(),
+                    granted_scopes: BTreeSet::from(["messages.send".into()]),
+                    probed_at: now,
+                    valid_until: now + Duration::days(30),
+                    credential_expires_at: now + Duration::days(30),
+                    evidence_digest: "2".repeat(64),
+                },
+                now,
+            )
+            .expect("probe connection");
+        WindowOpenConversationFixture {
+            mission_id,
+            person_id,
+            company_id,
+            connection_id,
+            account_id,
+            provider: "gmail".into(),
+            market: "DE".into(),
+        }
+    }
+
+    #[test]
+    fn open_conversation_without_live_identity_stays_empty() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(2);
+        let started = plane
+            .start_mission_with(
+                &secrets,
+                &project_id,
+                "没有 live Person / Connection 时 Open Conversation 必须失败关闭",
+                now,
+            )
+            .expect("mission");
+        let mission = &started.inventory.projects[0].missions[0];
+        assert!(mission.relationship_conversation.is_none());
+        let refused = plane.open_conversation_with(
+            &secrets,
+            DesktopOpenConversationRequest {
+                project_id: project_id.clone(),
+                mission_id: mission.mission_id.clone(),
+                person_id: PersonId::from("person-does-not-exist"),
+                company_id: None,
+                connection_id: ConnectionId::from("connection-does-not-exist"),
+                account_id: AccountId::from("account-does-not-exist"),
+                provider: "gmail".into(),
+                gateway: MessagingGateway::Gmail,
+                contact_channel: ContactChannel::Email,
+                market: "DE".into(),
+                route_digest: String::new(),
+            },
+            now + Duration::seconds(1),
+        );
+        assert!(matches!(
+            refused,
+            Err(DesktopDataError::ConversationOpenUnavailable)
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the window Open Conversation journey asserts missing identity, mismatch, open, replay, and no-effect fences together"
+    )]
+    fn window_open_conversation_issues_application_open_conversation_without_effect() {
+        let (_directory, plane, secrets, project_id) = ready_personal_fixture();
+        let now = observed_at() + Duration::minutes(5);
+        let fixture = persist_openable_conversation_identity(&plane, &secrets, &project_id, now);
+        let snapshot = plane
+            .load_with(&secrets, now + Duration::minutes(5))
+            .expect("reload after identity");
+        let DesktopLoadState::Ready(ready) = snapshot else {
+            panic!("ready after identity");
+        };
+        let projected = ready
+            .inventory
+            .projects
+            .iter()
+            .find(|project| project.project_id == project_id)
+            .expect("project")
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == fixture.mission_id)
+            .expect("relationship Mission")
+            .relationship_conversation
+            .as_ref()
+            .expect("openable identity");
+        assert!(projected.conversation_id.is_none());
+        assert_eq!(projected.person_id, fixture.person_id);
+        assert_eq!(projected.company_id.as_ref(), Some(&fixture.company_id));
+        assert_eq!(projected.connection_id, fixture.connection_id);
+        assert_eq!(projected.account_id, fixture.account_id);
+        assert_eq!(projected.provider, fixture.provider);
+        assert_eq!(projected.market, fixture.market);
+
+        let mismatched = plane.open_conversation_with(
+            &secrets,
+            DesktopOpenConversationRequest {
+                project_id: project_id.clone(),
+                mission_id: fixture.mission_id.clone(),
+                person_id: PersonId::from("person-other"),
+                company_id: Some(fixture.company_id.clone()),
+                connection_id: fixture.connection_id.clone(),
+                account_id: fixture.account_id.clone(),
+                provider: fixture.provider.clone(),
+                gateway: MessagingGateway::Gmail,
+                contact_channel: ContactChannel::Email,
+                market: fixture.market.clone(),
+                route_digest: String::new(),
+            },
+            now + Duration::minutes(6),
+        );
+        assert!(matches!(
+            mismatched,
+            Err(DesktopDataError::InvalidConversationOpen)
+        ));
+
+        let opened = plane
+            .open_conversation_with(
+                &secrets,
+                DesktopOpenConversationRequest {
+                    project_id: project_id.clone(),
+                    mission_id: fixture.mission_id.clone(),
+                    person_id: fixture.person_id.clone(),
+                    company_id: Some(fixture.company_id.clone()),
+                    connection_id: fixture.connection_id.clone(),
+                    account_id: fixture.account_id.clone(),
+                    provider: fixture.provider.clone(),
+                    gateway: MessagingGateway::Gmail,
+                    contact_channel: ContactChannel::Email,
+                    market: fixture.market.clone(),
+                    route_digest: String::new(),
+                },
+                now + Duration::minutes(6),
+            )
+            .expect("window Open Conversation through Application");
+        let opened_identity = opened
+            .inventory
+            .projects
+            .iter()
+            .find(|project| project.project_id == project_id)
+            .expect("project")
+            .missions
+            .iter()
+            .find(|mission| mission.mission_id == fixture.mission_id)
+            .expect("opened Mission")
+            .relationship_conversation
+            .as_ref()
+            .expect("opened conversation");
+        let conversation_id = opened_identity
+            .conversation_id
+            .clone()
+            .expect("durable conversation id");
+        assert_eq!(opened_identity.state, Some(ConversationState::Open));
+        assert_eq!(opened_identity.revision, Some(1));
+        assert_eq!(opened_identity.person_id, fixture.person_id);
+        assert_eq!(opened_identity.connection_id, fixture.connection_id);
+
+        let replay = plane.open_conversation_with(
+            &secrets,
+            DesktopOpenConversationRequest {
+                project_id: project_id.clone(),
+                mission_id: fixture.mission_id.clone(),
+                person_id: fixture.person_id.clone(),
+                company_id: Some(fixture.company_id.clone()),
+                connection_id: fixture.connection_id.clone(),
+                account_id: fixture.account_id.clone(),
+                provider: fixture.provider.clone(),
+                gateway: MessagingGateway::Gmail,
+                contact_channel: ContactChannel::Email,
+                market: fixture.market.clone(),
+                route_digest: String::new(),
+            },
+            now + Duration::minutes(7),
+        );
+        assert!(matches!(
+            replay,
+            Err(DesktopDataError::ConversationAlreadyOpen)
+        ));
+
+        let database_secret = secrets
+            .get(plane.database_key_reference())
+            .expect("database secret");
+        let (service, _) = plane
+            .open_application_from_secret(&database_secret, now + Duration::minutes(8))
+            .expect("reopen after Open Conversation");
+        let durable = service
+            .load_conversation(&project_id, &conversation_id)
+            .expect("durable conversation");
+        assert_eq!(durable.state, ConversationState::Open);
+        assert_eq!(durable.revision, 1);
+        assert!(durable.messages.is_empty());
         let mission = service
             .load_mission(&project_id, &fixture.mission_id)
             .expect("durable Mission");
